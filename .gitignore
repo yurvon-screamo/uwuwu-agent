@@ -26,3 +26,4 @@ Desktop.ini
 *.swp
 *.swo
 __pycache__/
+package-lock.json
