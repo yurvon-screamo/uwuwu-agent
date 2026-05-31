@@ -1,0 +1,27 @@
+server:
+    port: 8420
+    host: "127.0.0.1"
+
+data:
+    baseDir: "~/uwuwu-memory-content"
+
+llm:
+    baseUrl: "https://openrouter.ai/api/v1"
+    apiKey: "${OPENROUTER_API_KEY}"
+    model: "openrouter/owl-alpha"
+
+memory:
+    recall:
+        strategy: "hybrid"
+
+    bm25:
+        enabled: true
+        language: "en"
+
+    embedding:
+        enabled: true
+        provider: "openai"
+        baseUrl: "http://localhost:11434/v1"
+        apiKey: "ollama"
+        model: "nomic-embed-text-v2-moe"
+        dimensions: 768

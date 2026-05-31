@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Memory data (stored separately in ~/uwuwu-memory-content)
+memory/content/
+
+# Memory DB artifacts
+*.db
+*.db-shm
+*.db-wal
+
+# Windows artefacts
+memory/nul
+
+# Graphify output
+graphify-out/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+__pycache__/
