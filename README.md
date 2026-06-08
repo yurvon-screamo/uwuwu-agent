@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src=".media/logo.jpg" alt="uwuwu-agent logo" width="120" />
+
 # 🤖 uwuwu-agent
 
 **AI agent skills, tools, and memory gateway for [opencode](https://opencode.ai)**
