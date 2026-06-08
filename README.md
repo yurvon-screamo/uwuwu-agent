@@ -2,7 +2,7 @@
 
 <img src=".media/logo.jpg" alt="uwuwu-agent logo" width="120" />
 
-# 🤖 uwuwu-agent
+# Uwuwu Agent
 
 **AI agent skills, tools, and memory gateway for [opencode](https://opencode.ai)**
 
@@ -107,4 +107,4 @@ opencode
 
 ## 📋 License
 
-Private use. All rights reserved.
+This project is licensed under the [MIT License](LICENSE).
