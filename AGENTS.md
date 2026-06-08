@@ -32,5 +32,3 @@ Code rules:
 Save meaningful findings from your work via `memory_capture` so other agents can find them. 
 
 ALWAYS check relevant memory context before starting and while during your work.
-
-**Close the session ALWAYS** - call `/session/end` for the current `session_key`. This ensures memories are persisted. If you need to write more data after closing a session — just call `/capture` with the same `session_key`.

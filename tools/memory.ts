@@ -43,7 +43,7 @@ export const recall = tool({
 
 export const capture = tool({
     description:
-        "Save a question-answer pair to memory. Use at the end of a session or after significant findings.",
+        "Save a question-answer pair to memory and immediately flush (session/end). Always persists data — no separate session_end needed.",
     args: {
         user_content: tool.schema
             .string()
@@ -68,7 +68,23 @@ export const capture = tool({
         };
         if (args.session_id) body.session_id = args.session_id;
         if (args.user_id) body.user_id = args.user_id;
-        return apiRequest("/capture", "POST", body);
+
+        const captureResult = await apiRequest("/capture", "POST", body);
+
+        const flushBody: Record<string, string> = {
+            session_key: args.session_key,
+        };
+        if (args.user_id) flushBody.user_id = args.user_id;
+        const flushResult = await apiRequest("/session/end", "POST", flushBody);
+
+        return JSON.stringify(
+            {
+                capture: JSON.parse(captureResult),
+                flush: JSON.parse(flushResult),
+            },
+            null,
+            2,
+        );
     },
 });
 
@@ -115,24 +131,6 @@ export const search_conversations = tool({
         if (args.limit !== undefined) body.limit = args.limit;
         if (args.session_key) body.session_key = args.session_key;
         return apiRequest("/search/conversations", "POST", body);
-    },
-});
-
-export const session_end = tool({
-    description:
-        "End the memory session and flush buffers. Call at the end of a session.",
-    args: {
-        session_key: tool.schema
-            .string()
-            .describe("Unique key of the session to end"),
-        user_id: tool.schema.string().optional().describe("User ID (optional)"),
-    },
-    async execute(args) {
-        const body: Record<string, string> = {
-            session_key: args.session_key,
-        };
-        if (args.user_id) body.user_id = args.user_id;
-        return apiRequest("/session/end", "POST", body);
     },
 });
 
