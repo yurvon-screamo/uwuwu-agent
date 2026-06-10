@@ -40,8 +40,7 @@ Memory data is stored **externally** at `~/uwuwu-memory-content/` (not in this r
 
 ```bash
 # Start the memory gateway
-./start-memory.sh       # Unix
-./start-memory.ps1      # Windows (PowerShell)
+./start-memory.sh
 ```
 
 ### Configuration

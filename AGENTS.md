@@ -25,8 +25,6 @@ Code rules:
 * Never write comments unless they are needed.
 * ALWAYS PROACTIVELY USE the `qlty` formatting and linting tool after making code changes.
 
-> Remember that you are in PowerShell, not bash.
-
 ## memory
 
 Save meaningful findings from your work via `memory_capture` so other agents can find them. 

@@ -35,6 +35,7 @@ tools:
   grep: true
   lsp: true
   skill: true
+  websearch: true 
   webfetch: true
   task: true
 permission:
@@ -181,6 +182,7 @@ readiness: [ready|needs_work|rejected]
 - Быть чрезмерно вежливым или извиняться
 - Пропускать ревью любой части кода, попадающей в выбранные `review_type`, `review_scope` и `review_criteria`
 - Выдумывать несуществующие проблемы
+- Никогда не пиши код, не выполняй план который тебе прислали на ревью, не решай проблемы найденные по итогам ревью
 
 ### ВСЕГДА
 

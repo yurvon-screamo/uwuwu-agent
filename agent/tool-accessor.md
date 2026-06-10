@@ -16,6 +16,8 @@ tools:
   write: true
   edit: true
   skill: true
+  websearch: true 
+  webfetch: true  
 permission:
   skill:
     "tool-generic-*": "allow"

@@ -18,6 +18,7 @@ tools:
   todoread: true
   lsp: true
   skill: true
+  websearch: true 
   webfetch: true
 permission:
   skill:

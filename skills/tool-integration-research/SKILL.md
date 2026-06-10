@@ -1,51 +1,79 @@
 ---
 name: tool-integration-research
-description: "Unified research skill: fetch library docs (Context7), explore GitHub repos (DeepWiki), search code across GitHub (grep.app), search the web (DuckDuckGo), read URLs. Use when you need to research libraries, frameworks, repos, code examples, or general technical information. Triggers: 'docs for X', 'how does X work', 'search code', 'look up X online', 'wiki for repo X', 'search the web', 'find information', 'research topic', 'web search', 'look up online', 'find documentation'. Do NOT use for refactoring, business logic, or general programming concepts."
+description: "Unified research skill: fetch library docs (ctx7), search code across GitHub (grep.app), search the web and extract URLs (Tavily). Use when you need to research libraries, frameworks, code examples, or general technical information. Triggers: 'docs for X', 'how does X work', 'search code', 'look up X online', 'search the web', 'find information', 'research topic', 'web search', 'look up online', 'find documentation'. Do NOT use for refactoring, business logic, or general programming concepts."
 ---
 
 # CLI: research
 
-Unified research skill combining four backends via CLI scripts. Each script wraps an MCP backend.
+Unified research skill using native CLI tools.
 
-## Scripts
+## Tools
 
 ### Context7 — library documentation
 
 ```bash
-bun skills/cli-research/scripts/context7.ts <command> [options]
+ctx7 library <name> [query]              # Resolve library name to Context7 ID
+ctx7 library react "how to use hooks"
+ctx7 docs <libraryId> <query>            # Fetch up-to-date docs for a library
+ctx7 docs /facebook/react "useEffect examples"
 ```
 
-- `resolve-library-id` — resolve library name to Context7 ID
-- `query-docs` — fetch up-to-date docs for a library
-
-### DeepWiki — GitHub repo documentation
-
-```bash
-bun skills/cli-research/scripts/deepwiki.ts <command> [options]
-```
-
-- `ask-question` — ask a question about a GitHub repo
-- `read-wiki-contents` — read full wiki docs for a repo
-- `read-wiki-structure` — list documentation topics for a repo
+Both commands support `--json` for machine-readable output.
 
 ### Grep — code search on GitHub
 
 ```bash
-bun skills/cli-research/scripts/grep.ts <command> [options]
+bun skills/tool-integration-research/scripts/grep.ts searchGitHub --query <pattern> [options]
 ```
 
-- `searchGitHub` — search literal code patterns across public GitHub repos
+- `--language <lang>` — filter by language (JavaScript, TypeScript, Python, etc.)
+- `--use-regexp true` — enable regex mode (prefix with `(?s)` for multiline)
+- `--repo <owner/repo>` — restrict to specific repo
+- `--match-case true` — case-sensitive search
 
-### Web Search — DuckDuckGo
+**Important:** Searches for literal code patterns, not keywords. Search for actual code, not descriptions.
+
+### Tavily — web search, extract, crawl, map
 
 ```bash
-bun skills/cli-research/scripts/websearch.ts <command> [options]
+# Search
+tvly search <query> [--max-results N] [--depth basic|advanced] [--topic general|news|finance]
+                    [--time-range day|week|month|year] [--include-domains DOMAINS]
+                    [--exclude-domains DOMAINS] [--include-answer basic|advanced]
+                    [--include-raw-content markdown|text] [--json]
+
+# Extract content from URLs (up to 20)
+tvly extract <URL> [<URL>...] [--query TEXT] [--format markdown|text] [--json]
+
+# Crawl website
+tvly crawl <URL> [--max-depth N] [--limit N] [--instructions TEXT] [--json]
+
+# Discover URLs on a website
+tvly map <URL> [--max-depth N] [--limit N] [--instructions TEXT] [--json]
+
+# Deep research (async)
+tvly research run <query>
+tvly research status <id>
+tvly research poll <id>
 ```
 
-- `search` — search the web via DuckDuckGo
-- `fetch-content` — fetch and extract text content from a URL
+## When to Use Which Tool
 
-Run any script with `--help` to see available commands and flags.
+| Question type | Tool | Why |
+|---|---|---|
+| "How does X work?", "docs for Y" | **ctx7** | Curated docs with explanations |
+| "Best practices for X" | **ctx7** | Official documentation sources |
+| "How do people actually use Z?" | **grep** | Real code from public repos |
+| "Find calls to `someObscureApi()`" | **grep** | Literal code search, regex support |
+| "What is X?", general lookup | **tvly search** | Web search with AI answer |
+| "Read this URL" | **tvly extract** | Extract clean content from any page |
+| "Crawl this documentation site" | **tvly crawl** | Multi-page content extraction |
+| "Deep research on topic X" | **tvly research** | Multi-step AI research |
+
+**ctx7 vs grep rule of thumb:**
+- `ctx7` = natural language question → curated answer with context
+- `grep` = literal code pattern → raw real-world usage examples
+- When in doubt, start with `ctx7`. Fall back to `grep` only when you need to see how real projects integrate something.
 
 ## Research Methodology
 
@@ -55,15 +83,13 @@ Before searching, determine:
 - What is the core question?
 - What type of information is needed (factual, comparative, best practices, code examples)?
 - What level of detail is appropriate?
-- Are there time constraints (fresh info vs. historical)?
 
 ### Step 2: Strategic search
 
-1. Start with **websearch** (`search`) for broad discovery
-2. Use **context7** (`query-docs`) for library/framework documentation
-3. Use **deepwiki** (`ask-question`) for deep dive into specific repos
-4. Use **grep** (`searchGitHub`) to find specific code patterns or usage examples
-5. Use **websearch** (`fetch-content`) to extract content from promising URLs
+1. Start with **ctx7** for library/framework questions ("how does X work?")
+2. Use **tvly search** for broad discovery or non-library questions
+3. Use **grep** when you need real-world code patterns, not docs
+4. Use **tvly extract** to get clean content from promising URLs
 
 ### Step 3: Synthesize
 
@@ -128,4 +154,4 @@ When research hits obstacles:
 
 ## Language
 
-Respond in the same language the user used in their query. Russian query → Russian response. English query → English response.
+Respond in the same language the user used in your query. Russian query → Russian response. English query → English response.

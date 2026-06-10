@@ -50,7 +50,7 @@ playwriter -s <SESSION_ID> -e '<JS_CODE>'
 
 **ALWAYS use single quotes** (`'...'`) for the `-e` argument. Single quotes prevent the shell from interpreting `$`, backticks, and backslashes. Inside JS strings, use **double quotes** (`"..."`) or **backtick template literals** (`` `...` ``).
 
-**NEVER** use heredoc (`<<'EOF'`) or `$(cat ...)` constructs in PowerShell.
+**NEVER** use heredoc (`<<'EOF'`) or `$(cat ...)` constructs — pass JS code directly via `-e`.
 
 ## Navigation
 

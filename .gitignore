@@ -27,3 +27,8 @@ Desktop.ini
 *.swo
 __pycache__/
 package-lock.json
+
+# SearXNG
+searxng/.env
+searxng/core-data/
+searxng/.env.example
