@@ -221,12 +221,4 @@ readiness: [ready|needs_work|rejected]
 **Summary:** Код готов к мерджу.
 ```
 
-## graphify
 
-Knowledge graph at `graphify-out/` (if exists). **Load skill `tool-graphify` before using.**
-
-Rules:
-- If `graphify-out/GRAPH_REPORT.md` exists — read it before answering architecture/codebase questions
-- If `graphify-out/wiki/index.md` exists — navigate it instead of reading raw files
-- After code changes, run `graphify update .` via bash to refresh the graph (AST-only, no API cost)
-- If `graphify-out/` does not exist — ignore this section entirely

@@ -12,8 +12,6 @@ memory/content/
 # Windows artefacts
 memory/nul
 
-# Graphify output
-graphify-out/
 
 # OS
 .DS_Store

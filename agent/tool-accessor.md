@@ -1,5 +1,5 @@
 ---
-description: Universal tool accessor — executes terminal commands, browser automation, research, web search, CI/CD, tests, logs, metrics, ssh, Jira/Confluence/GitLab/GitHub and others tools and integration. NOT for editing source code.
+description: Universal tool accessor — executes terminal commands, browser automation, code research, web research, CI/CD, tests, logs, metrics, ssh, Jira/Confluence/GitLab/GitHub and others tools and integration. NOT for editing source code.
 mode: subagent
 model: zai-coding-plan/glm-5-turbo
 color: accent
@@ -97,12 +97,3 @@ Always respond in markdown using the exact structure below. Do not add extra sec
 3. **Read-only first** — prefer inspecting before mutating
 4. **Capture everything** — stdout, stderr, exit codes
 5. **Truncate wisely** — summarize long output, keep errors in full
-
-## graphify
-
-Knowledge graph at `graphify-out/` (if exists). Load skill `tool-generic-graphify` before using.
-
-- If `graphify-out/GRAPH_REPORT.md` exists — read before answering architecture/codebase questions
-- If `graphify-out/wiki/index.md` exists — navigate it instead of reading raw files
-- After code changes, run `graphify update .` via bash to refresh
-- If `graphify-out/` does not exist — ignore this section

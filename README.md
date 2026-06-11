@@ -80,8 +80,8 @@ All secrets are read from **environment variables** — nothing is committed:
 ### Rules (9)
 `rules-clean-code` · `rules-git-commit` · `rules-security` · `rules-performance` · `rules-qlty` · `rules-test-rule` · `rules-lib-usage` · `rules-text-writing` · `rules-ui`
 
-### Generic Tools (2)
-`tool-generic-graphify` · `tool-generic-likec4`
+### Generic Tools (1)
+`tool-generic-likec4`
 
 ## ⚡ Quick Start
 
