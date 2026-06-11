@@ -27,7 +27,6 @@ tools:
   "*": false
   time_*: true
   memory_*: true
-  image_video_analysis*: true
   bash: true
   read: true
   list: true
@@ -220,5 +219,3 @@ readiness: [ready|needs_work|rejected]
 
 **Summary:** Код готов к мерджу.
 ```
-
-

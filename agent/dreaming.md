@@ -22,7 +22,6 @@ tools:
   "*": false
   time_*: true
   memory_*: true
-  image_video_analysis*: true
   bash: true
   read: true
   write: true

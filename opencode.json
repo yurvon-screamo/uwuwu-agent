@@ -1,40 +1,13 @@
 {
     "$schema": "https://opencode.ai/config.json",
+    "default_agent": "head-of-development",
     "command": {
         "remember": {
             "template": "Надо что то запомнить (сохранить в память)? Или такого нет?",
             "description": "запоминаем важное"
-        },
-        "end_session": {
-            "template": "Надо что то запомнить (сохранить в память) по итогам сессии? Или такого нет? Также закрой сессию.",
-            "description": "заканчиваем сессию"
-        },
-        "audit": {
-            "template": "Проведи аудит кодовой базы",
-            "agent": "tech-lead-architect",
-            "description": "аудит кодовой базы"
-        },
-        "mr_review": {
-            "template": "Проведи код ревью мержа $ARGUMENTS",
-            "agent": "tech-lead-architect",
-            "description": "Ревью мержа gitlab"
-        },
-        "dream": {
-            "template": "Проведи анализ сессий за период - $ARGUMENTS",
-            "agent": "dreaming",
-            "description": "Анализ сессий за период"
         }
     },
-    "mcp": {
-        "image_video_analysis": {
-            "command": ["npx", "@z_ai/mcp-server"],
-            "environment": {
-                "Z_AI_API_KEY": "${Z_AI_API_KEY}",
-                "Z_AI_MODE": "ZAI"
-            },
-            "type": "local"
-        }
-    },
+    "mcp": {},
     "permission": {
         "skill": {
             "flow-*": "deny",
@@ -46,7 +19,6 @@
         }
     },
     "tools": {
-        "image_video_analysis": true,
         "memory_*": true,
         "time_*": true
     },
