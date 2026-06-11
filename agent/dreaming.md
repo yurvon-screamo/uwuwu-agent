@@ -28,6 +28,8 @@ tools:
   task: true
   skill: true
 permission:
+  task:
+    tool-accessor: "allow"
   skill:
     "*": "allow"
 ---

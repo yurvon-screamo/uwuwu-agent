@@ -19,7 +19,10 @@ tools:
   skill: true
   websearch: true 
   webfetch: true
+  task: true
 permission:
+  task:
+    tool-accessor: "allow"  
   skill:
     "rules-*": "allow"
     "tool-generic-*": "allow"      

@@ -17,6 +17,10 @@ tools:
   question: true
   skill: true
 permission:
+  task:
+    code-quality-reviewer: "allow"
+    engineer: "allow"
+    tool-accessor: "allow"
   skill:
     "flow-*": "allow"
     "rules-*": "allow"

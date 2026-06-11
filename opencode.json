@@ -16,6 +16,9 @@
             "office-coworker-*": "deny",
             "rules-*": "allow",
             "tool-generic-*": "allow"
+        },
+        "task": {
+            "*": "deny"
         }
     },
     "tools": {
