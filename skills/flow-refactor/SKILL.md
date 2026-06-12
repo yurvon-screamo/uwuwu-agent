@@ -5,63 +5,34 @@ description: Invoke this skill when you need to refactor code.
 
 # flow-refactor
 
-Act as a refactoring expert — systematically improve readability, maintainability, and compliance with Clean Code principles **without changing external behavior**.
+Coordinate systematic refactoring — improve readability, maintainability, and compliance with Clean Code principles **without changing external behavior**.
 
-**Agents excel at following existing patterns.** The cleaner the codebase, the cleaner the future code generated from its example. Refactoring is not cosmetics — it is raising the quality of all future changes.
+This skill contains refactoring coordination specifics.
 
-## Refactoring Specifics
-
-### Key Principles
+## Key Principles
 
 - **Preserve 100% of original behavior** — tests must pass before and after
 - **Never make large monolithic changes** — only increments (vertical slices)
 - **Never start execution without plan confirmation**
-- Focus on **SRP** violations and **size limit** exceeded (functions, files, modules)
 
-### Analysis
+## Clarifying Questions
 
-When analyzing code, look for:
+If necessary, ask the user clarifying questions:
 
-- Functions with multiple responsibilities (SRP violations)
-- Overly long functions/files (exceeding limits from `rules-clean-code`)
-- Code duplication
-- Poor variable/function names
-- Redundant comments
-- Complex conditions (is an abstraction needed?)
+- What specific areas need refactoring?
+- Are there known pain points or problem modules?
+- Any constraints on the scope of changes?
+- Are there areas where tests are missing (critical for safe refactoring)?
 
-Additionally, use the `rules-qlty` skill for objective analysis.
+## Delegation to Architect
 
-### Pre-Plan Checklist (additions)
+Передай проектировщику задачу с типом `refactor`. Входные данные:
 
-Add to the baseline checklist:
-- [ ] For each change, the reason is clear (which violation is being addressed)
-- [ ] The task order does not require modifying many files simultaneously
+- Описание проблемных мест (от пользователя или из анализа)
+- Ключевой контекст из оспаривания задачи (Шаг 0)
+- Тип задачи: `refactor`
 
-## Plan Structure
-
-```markdown
-## Code Analysis for Refactoring
-
-**Problem areas:**
-- `src/config.rs` — parse_config() function is 220 lines, multiple responsibilities.
-- `src/api/handlers.rs` — 720 lines, one large file.
-
-**Non-functional requirements:**
-- NFR-1: Performance: [specific target]
-- NFR-2: Security: [specific requirement]
-
-**Increments (vertical slices):**
-[Slice format from tech-lead-architect.md → "Slice format"]
-
-**Strategy:** Incremental approach with mandatory user approval.
-
-**Notes:**
-- [Potential risks, alternative approaches]
-
----
-
-Awaiting plan confirmation before starting refactoring.
-```
+Проектировщик загрузит `architect-refactor` skill, проанализирует код и вернёт валидированный план инкрементального рефакторинга.
 
 ## Results (Stages 2–3)
 
@@ -82,6 +53,6 @@ In addition to baseline checks:
   3. Compliance with Clean Code Standards (sizes, SRP, naming)
   4. Absence of unnecessary changes outside the plan's scope
 
-----
+---
 
 > **Clean Code Standards** — see skill `rules-clean-code`

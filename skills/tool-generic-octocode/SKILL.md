@@ -1,6 +1,6 @@
 ---
 name: tool-generic-octocode
-description: Octocode — indexed codebase search tool. Use for semantic code search by natural language query (`octocode search`), structural AST grep with ast-grep patterns (`octocode grep`), and viewing file signatures (`octocode view`). Triggers: 'search codebase', 'find code', 'semantic search', 'ast grep', 'structural search', 'octocode'. Only covers search, grep, and view subcommands.
+description: Codebase search tool. Use for semantic code search by natural language query, structural AST grep with ast-grep patterns, and viewing file signatures
 ---
 
 # Octocode CLI (search / grep / view)

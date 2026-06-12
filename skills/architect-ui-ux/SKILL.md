@@ -1,5 +1,5 @@
 ---
-name: engineer-ui-ux
+name: architect-ui-ux
 description: "UI/UX design guide."
 ---
 

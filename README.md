@@ -57,7 +57,7 @@ All secrets are read from **environment variables** — nothing is committed:
 
 ## 🎯 Skills Overview
 
-### Engineers (7)
+### Engineers (6)
 | Skill | Stack |
 |---|---|
 | `engineer-rust` | Rust |
@@ -66,7 +66,6 @@ All secrets are read from **environment variables** — nothing is committed:
 | `engineer-typescript` | TypeScript |
 | `engineer-python` | Python |
 | `engineer-playwright` | Playwright E2E |
-| `engineer-ui-ux` | UI/UX design system |
 
 ### Workflows (8)
 `flow-feature` · `flow-bug` · `flow-refactor` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`

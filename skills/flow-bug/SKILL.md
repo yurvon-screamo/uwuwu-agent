@@ -5,17 +5,13 @@ description: Invoke this skill when the user asks to fix a bug or encounters inc
 
 # flow-bug
 
-Your task is to find and fix the bug the user has encountered.
-
-It is very important to thoroughly investigate the symptoms, determine the root cause, and deliver a quality fix that eliminates the bug without side effects and without breaking existing functionality.
+Your task is to coordinate the bug-fixing process.
 
 **Moving fast only matters if you are moving in the right direction.** A quick fix that does not address the root cause or introduces new problems is movement in the wrong direction. Solve the problem, not its symptoms.
 
-This skill contains bug-fixing specifics.
+This skill contains bug-fixing coordination specifics.
 
-## Problem Analysis
-
-### Clarifying Questions
+## Clarifying Questions
 
 If necessary, ask the user clarifying questions:
 
@@ -26,44 +22,18 @@ If necessary, ask the user clarifying questions:
 - Logs, screenshots, trace_id, or other diagnostic information
 - Software version / environment
 
-### Codebase Investigation
+## Delegation to Architect
 
-- Study the problem description and find the related code
-- Investigate the git history of changes in affected files to understand context
-- If understanding the problem requires knowledge of external libraries or dependencies — use the `@web-researcher` subagent
-- Analyze the code and hypothesize where exactly the error occurs
-- **It is HIGHLY DESIRABLE to learn to reproduce the problem** so you can confirm its elimination at the end
+Передай проектировщику задачу с типом `bug`. Входные данные:
 
-### Root Cause Determination
+- Описание проблемы от пользователя (симптомы, шаги воспроизведения)
+- Ответы на уточняющие вопросы
+- Ключевой контекст из оспаривания задачи (Шаг 0)
+- Тип задачи: `bug`
 
-Determine the **root cause** — clearly articulate why the bug occurs:
+Проектировщик загрузит `architect-bug` skill, исследует код, определит root cause и вернёт валидированный план.
 
-- **If this is expected behavior** → explain to the user and close the task
-- **Only with a confirmed bug** → proceed to planning
-
-### Test Case
-
-Create a test case within the project's existing test framework (if none exist, skip this step).
-
-## Plan Structure
-
-Use the plan template from `tech-lead-architect.md` → "Шаблон полного плана".
-
-Adapt the "Обзор" section to include:
-
-**Problem description:** [symptoms]
-
-**Root cause:** [explanation]
-
-**Functional requirements:**
-- FR-1: [Requirement description]
-
-**Non-functional requirements:**
-- NFR-1: Performance: [specific target]
-- NFR-2: Security: [specific requirement]
-
-**Affected files:**
-- `path/to/file.rs` — [what we are changing]
+Если проектировщик не смог определить root cause — уточни у пользователя дополнительную информацию и повтори делегирование.
 
 ## Results (Stages 2–3)
 
