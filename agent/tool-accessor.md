@@ -1,5 +1,5 @@
 ---
-description: Universal tool accessor — executes terminal commands, browser automation, code research, web research, CI/CD, tests, logs, metrics, ssh, Jira/Confluence/GitLab/GitHub and others tools and integration. NOT for editing source code.
+description: Universal tool accessor — executes terminal commands, browser automation, code research, web research, CI/CD, tests, logs, metrics, ssh, Jira/Confluence/GitLab/GitHub/Railway and others tools and integration. NOT for editing source code.
 mode: subagent
 model: zai-coding-plan/glm-5-turbo
 color: accent
