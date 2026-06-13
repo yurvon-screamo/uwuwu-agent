@@ -17,7 +17,7 @@ description: >-
     Фокус forensic-аудита (по умолчанию "all", только при analysis_focus="forensic").
 mode: primary
 color: error
-model: zai-coding-plan/glm-5.1
+model: zai-coding-plan/glm-5.2
 tools:
   "*": false
   time_*: true

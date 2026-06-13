@@ -1,7 +1,7 @@
 ---
 description: Проектирование архитектуры, создание планов реализации и инкрементальная разработка сложных фич.
 mode: primary
-model: zai-coding-plan/glm-5.1
+model: zai-coding-plan/glm-5.2
 color: warning
 tools:
   "*": false

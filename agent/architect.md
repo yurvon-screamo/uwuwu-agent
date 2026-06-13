@@ -1,7 +1,7 @@
 ---
 description: Проектирование планов реализации. Получает цель от руководителя, исследует кодовую базу, формирует план и самостоятельно согласовывает его с ревьювером.
 mode: subagent
-model: zai-coding-plan/glm-5.1
+model: zai-coding-plan/glm-5.2
 tools:
   "*": false 
   time_*: true
