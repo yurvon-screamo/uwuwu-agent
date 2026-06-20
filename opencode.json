@@ -23,7 +23,8 @@
     },
     "tools": {
         "memory_*": true,
-        "time_*": true
+        "time_*": true,
+        "bg_*": true
     },
     "plugin": ["@warp-dot-dev/opencode-warp"]
 }

@@ -24,11 +24,10 @@ uwuwu-agent/
 │   ├── office-coworker-*/ #   Office document automation (docx, xlsx, pptx, pdf)
 │   ├── rules-*/         #   Quality rules (clean code, security, performance, ...)
 │   └── tool-integration-*/ #   External tool integrations (GitLab, GitHub, Atlassian, browser)
-├── tools/               # Runtime tool wrappers (memory, time)
+├── tools/               # Runtime tool wrappers (memory, time, bg)
 ├── memory/              # TDAI memory gateway (TencentDB vector memory)
 ├── .qlty/               # Qlty quality hooks (pre-commit, pre-push)
 ├── start-memory.sh      # Memory gateway launch (Unix)
-├── start-memory.ps1     # Memory gateway launch (Windows)
 └── opencode.json        # opencode agent configuration
 ```
 

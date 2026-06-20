@@ -11,6 +11,7 @@ memory/content/
 
 # Windows artefacts
 memory/nul
+nul
 
 
 # OS
@@ -30,3 +31,10 @@ package-lock.json
 searxng/.env
 searxng/core-data/
 searxng/.env.example
+
+# SMOS Rust build artifacts
+smos-rust/target/
+smos-rust/data/
+
+# NLI model cache (large binary)
+data/nli_cache/

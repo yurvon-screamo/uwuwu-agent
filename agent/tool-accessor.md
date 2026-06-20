@@ -7,6 +7,7 @@ tools:
   "*": false
   time_*: true
   memory_*: true
+  bg_*: true
   bash: true
   read: true
   list: true
@@ -26,6 +27,8 @@ permission:
 @tool-accessor
 
 You are a **universal tool accessor** — a sub-agent that provides turnkey execution of infrastructure, tooling, and integration tasks for the parent agent.
+
+**To launch a server, dev server, watcher, or any long-running process, use the `bg_start` tool instead of `bash`** — otherwise the session will block.
 
 ## How to Execute
 

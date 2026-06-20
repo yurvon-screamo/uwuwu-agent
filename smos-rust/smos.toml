@@ -1,0 +1,88 @@
+# SMOS proxy default configuration.
+# Copy/edit next to the binary (or pass via a custom path) and run:
+#   cargo run --bin smos -- serve
+# Any section omitted here falls back to the built-in defaults in
+# smos-adapters/src/config.rs.
+
+[surreal]
+path = "./data/smos.db"
+namespace = "smos"
+database = "smos"
+
+[server]
+host = "127.0.0.1"
+port = 8888
+shutdown_extraction_grace_seconds = 30
+enable_response_extraction = true
+graceful_degradation = true
+log_format = "json"
+
+[upstream]
+url = "http://localhost:11434/v1/chat/completions"
+api_key = "ollama"
+auth_header = "Authorization"
+timeout_seconds = 120
+
+[ollama]
+url = "http://localhost:11434"
+embedding_model = "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:latest"
+extraction_model = "qwen3.5:2b"
+timeout_seconds = 30
+# Deterministic extraction: temperature=0 disables random sampling, seed pins
+# the RNG so two runs against the same input re-yield the same bullet list.
+# This is what keeps FactId = SHA1(content) stable across re-extraction runs.
+extraction_seed = 42
+extraction_temperature = 0.0
+
+[reranker]
+url = "http://localhost:8181"
+model = "qwen3-reranker"
+timeout_seconds = 60
+
+[retrieval]
+top_k_initial = 50
+top_k_final = 5
+min_confidence = 0.7
+min_topic_chars = 3
+
+[merge]
+cosine_threshold = 0.85
+
+[confidence]
+base = 0.5
+multi_source_bonus = 0.2
+no_contradiction_bonus = 0.1
+accept_threshold = 0.7
+pending_threshold = 0.4
+
+# NLI verdict thresholds consumed by the domain predicates
+# (`is_contradiction` / `is_entailment`). Soft caps so a borderline softmax
+# distribution does not flip a verdict.
+[nli]
+contradiction_threshold = 0.5
+entailment_threshold = 0.6
+
+# Semantic dedup safety net for fact extraction (persist_facts step 2).
+# When the extractor rephrases a fact just enough to break the FactId =
+# SHA1(content) exact match, the semantic layer catches it via cosine
+# similarity and routes it through cross-session confirmation instead of
+# leaving the fact stuck at single-source confidence.
+[extraction]
+dedup_cosine_threshold = 0.95
+
+# Native ort + ONNX Runtime NLI backend.
+#   model     — Hugging Face repo id (DeBERTa-v3 ONNX export).
+#   cache_dir — local directory that holds the downloaded ONNX model +
+#               tokenizer.json. First run downloads ~643 MB.
+[nli_backend]
+model = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+cache_dir = "./data/nli_cache"
+
+[heat]
+decay_rate = 0.03
+min_threshold = 0.2
+
+[session]
+timeout_seconds = 1800
+pending_overflow_threshold = 20
+scan_interval_seconds = 60

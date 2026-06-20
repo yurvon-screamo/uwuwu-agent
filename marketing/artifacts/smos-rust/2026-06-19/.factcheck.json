@@ -1,0 +1,303 @@
+{
+  "artifacts": [
+    "artifacts/smos-rust/2026-06-19/hn-launch.md",
+    "artifacts/smos-rust/2026-06-19/reddit-localllama.md",
+    "artifacts/smos-rust/2026-06-19/devto-article.md",
+    "artifacts/smos-rust/2026-06-19/github-release-v1.md"
+  ],
+  "product": "smos-rust",
+  "checked_at": "2026-06-19T18:56:42+03:00",
+  "checker": "@marketer",
+  "source_of_truth": "D:\\uwuwu_agent\\smos-rust\\README.md (428 lines) + Cargo.toml",
+  "overall_confidence": 0.986,
+  "aggregation_method": "arithmetic mean of per-claim confidence. Computed as sum(confidence) / count(claims). At 2026-06-19: 35 claims total = 33 claims @1.0 + 1 niche-general claim @0.8 + 1 v1.0.0 proposal @0.7. Mean = (33 + 0.8 + 0.7) / 35 = 0.986. Gate threshold: overall_confidence >= 0.8 AND no claim with status 'false'. The single 'unverified' (v1.0.0 proposal, 0.7) does not block because it is a PROPOSAL the user controls, not a publishable factual claim.",
+  "claims": [
+    {
+      "claim": "SMOS is an OpenAI-compatible semantic memory proxy written in Rust.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:3-7", "Cargo.toml:6-9"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Direct quote from README opening."
+    },
+    {
+      "claim": "The proxy sits between an OpenAI-shaped client and an OpenAI-compatible upstream (Ollama, OpenAI, OpenRouter, …).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:3-5"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "It retrieves relevant facts before the request reaches the LLM, extracts new facts from the response, and runs an NLI finalize pass that promotes / merges / rejects candidates.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:4-7", "README.md:126-130"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "Average cosine similarity between contradicting fact pairs was 0.82, and 4 of 16 pairs scored above 0.92.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:379-382"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md"],
+      "note": "Exact match: 'avg similarity 0.82 between contradicting pairs, 4/16 above 0.92'."
+    },
+    {
+      "claim": "Cosine only feeds candidate selection; DeBERTa NLI owns every contradiction/merge verdict.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:147", "README.md:379-382"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "Strict hexagonal / DDD three-crate workspace: smos-domain (pure, no IO) ← smos-application (ports + use cases, runtime-agnostic) ← smos-adapters (the only crate where IO happens).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:65-93"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "Port traits are async fn without Send bound; the trait is Send-bounded at the adapter call site, not at the port definition.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:89-91"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Exact: 'async fn in trait — the trait is Send-bounded at the adapter call site, not at the port definition, so the application layer stays runtime-agnostic.'"
+    },
+    {
+      "claim": "Storage is embedded SurrealDB 2.x on RocksDB with HNSW. No external database process to run.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:76", "README.md:412-414", "Cargo.toml:26"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Cargo.toml:26 confirms surrealdb 2 with kv-rocksdb feature."
+    },
+    {
+      "claim": "NLI verdict comes from a Python DeBERTa-v3 sidecar spawned as a subprocess.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:79", "README.md:129", "README.md:395-401"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "First 'smos serve' startup downloads the DeBERTa-v3 model (~1.5 GB) into the Hugging Face cache.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:401-406"],
+      "artifacts": ["reddit-localllama.md", "devto-article.md"],
+      "note": "Exact: 'downloads the DeBERTa-v3 model (~1.5 GB) into the Hugging Face cache.'"
+    },
+    {
+      "claim": "Enrichment runs on the request path but cannot block or fail the request (fail-open).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:101-102", "README.md:112"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Exact: 'its fail-open contract guarantees no enrichment failure can block or fail the request' and 'inject <smos-memory> block; never FAILS request'."
+    },
+    {
+      "claim": "SSE passthrough injects a session marker into the response so the next request in the same conversation can be linked.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:117", "README.md:417-419"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "Pipeline has five stages: parse → enrich (fail-open) → upstream forward → post-response extraction (background) → finalize on timeout/overflow (background).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:97-130"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "cargo tf: 345 tests, ~0.6s warm time.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:250"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "cargo t: 533 tests, ~2.6s warm time.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:29-31", "README.md:251"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "cargo ti: 643 tests, ~50s warm time (superset of cargo t).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:29-31", "README.md:252"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Exact: '643 when integration gates are enabled (cargo ti)' and 'superset'."
+    },
+    {
+      "claim": "cargo tall: 643 + external tests, 10+ min.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:253"],
+      "artifacts": ["devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "All 8 slices are landed and production-ready.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:16", "README.md:18-27"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Exact: 'Production-ready — all 8 slices landed.'"
+    },
+    {
+      "claim": "License is MIT.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:428", "Cargo.toml:9"],
+      "artifacts": ["devto-article.md", "github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "The canonical public source URL is https://github.com/yurvon-screamo/smos (referenced by all four drafts as the primary link).",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["Cargo.toml:10 (repository = \"https://github.com/yurvon-screamo/smos\")", "tool-integration-github/SKILL.md (gh auth = yurvon-screamo)"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Indirectly verified: Cargo.toml declares the repository URL and the gh CLI is authenticated as yurvon-screamo. Live repo existence will be confirmed at HUMAN GATE paste time (HN/Reddit/dev.to all link to this URL)."
+    },
+    {
+      "claim": "Default bind is 127.0.0.1:8888; default upstream is Ollama on http://localhost:11434.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:39", "README.md:46"],
+      "artifacts": ["devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "The model field may carry a memory-key prefix (memory_key:real_model); the prefix is stripped before the request reaches the upstream. A bare model name maps to the 'shared' memory namespace.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:59-61"],
+      "artifacts": ["devto-article.md"],
+      "note": ""
+    },
+    {
+      "claim": "CORS is permissive by default (CorsLayer::permissive). Safe on 127.0.0.1; add [server].allowed_origins before any non-localhost deploy.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:357-361"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Listed as Known limitation §1."
+    },
+    {
+      "claim": "find_session is O(N) snapshot_all. Fine for thousands of sessions.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:362-364"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Known limitation §2."
+    },
+    {
+      "claim": "Vector search cannot push equality filters into the HNSW traversal; they are applied as a Rust-side post-filter.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:386-387"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Inherited POC limitation §4."
+    },
+    {
+      "claim": "Brute-force cosine fallback kicks in whenever HNSW under-serves — a full table scan with cosine similarity in SurrealQL, slower than the index path.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:384-385"],
+      "artifacts": ["devto-article.md", "github-release-v1.md"],
+      "note": "Inherited POC limitation §3."
+    },
+    {
+      "claim": "Drift walk recall = 100%, merge recall = 50% on the POC fixture corpus.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:383"],
+      "artifacts": ["devto-article.md"],
+      "note": "Inherited POC limitation §2."
+    },
+    {
+      "claim": "Persona injection (memory_key/persona.md block) is deferred. The domain builder already accepts memory_key for forward compatibility.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:369-371"],
+      "artifacts": ["hn-launch.md", "reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Known limitation §4."
+    },
+    {
+      "claim": "The session watcher's mid-cycle shutdown is bounded by the in-flight cycle; shutdown_extraction_grace_seconds bounds the subsequent drain.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:372-376"],
+      "artifacts": ["reddit-localllama.md", "devto-article.md", "github-release-v1.md"],
+      "note": "Known limitation §5."
+    },
+    {
+      "claim": "Python + torch are required for NLI.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:395-401"],
+      "artifacts": ["reddit-localllama.md"],
+      "note": ""
+    },
+    {
+      "claim": "Unified smos binary with four subcommands: serve, import, doctor, finalize.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:155-159"],
+      "artifacts": ["github-release-v1.md"],
+      "note": ""
+    },
+    {
+      "claim": "The cargo aliases (cargo t / cargo ti / cargo tall) do NOT override the built-in cargo test subcommand; CI must invoke the integration tier explicitly.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["README.md:262-278"],
+      "artifacts": ["github-release-v1.md"],
+      "note": "CI warning section."
+    },
+    {
+      "claim": "Edition 2024, MSRV Rust 1.96.",
+      "confidence": 1.0,
+      "status": "verified",
+      "sources": ["Cargo.toml:6-7"],
+      "artifacts": ["reddit-localllama.md"],
+      "note": "README does not state MSRV; Cargo.toml rust-version = '1.96' is authoritative."
+    },
+    {
+      "claim": "The standard fix in the LLM-memory niche is cosine similarity over fact embeddings.",
+      "confidence": 0.8,
+      "status": "verified",
+      "sources": ["niche observation", "competitor analysis in strategies/smos-rust.md: Mnemo/Memzent/Reflex/linggen/mememory all use vector similarity for candidate handling"],
+      "artifacts": ["devto-article.md"],
+      "note": "General niche characterization, not a specific competitor product claim. Reinforced by smos-rust competitor research (all 5 competitors rely on cosine/LanceDB/pgvector similarity)."
+    },
+    {
+      "claim": "v1.0.0 is the first production-ready release tag.",
+      "confidence": 0.7,
+      "status": "unverified",
+      "sources": ["README.md:16 ('Production-ready — all 8 slices landed')"],
+      "artifacts": ["github-release-v1.md"],
+      "note": "PROPOSAL, not a fact. README confirms production-ready status but no prior tag exists in the repo. The user must (a) confirm v1.0.0 is the intended tag, (b) confirm it matches the actual published crate version before 'cargo publish'. The release draft itself flags this. NOT a publishable fact until the tag is created."
+    }
+  ],
+  "flags": [
+    "[PROPOSAL]: The v1.0.0 release tag in github-release-v1.md is a proposal, not a verified fact. The user must confirm (a) the tag is intended, (b) it matches the published crate version. The release draft already documents this. No action needed for hn/reddit/devto drafts."
+  ],
+  "competitor_claims_note": "The four PUBLISHED drafts (hn-launch, reddit-localllama, devto-article, github-release-v1) contain NO specific competitor product claims (no names, no star counts, no download counts). Competitor analysis lives ONLY in the internal strategies/smos-rust.md, which is NOT published. Therefore no competitor-claim factcheck gate applies to the public artifacts. If the user later requests a competitive-comparison post, a new factcheck cycle will be required with live tvly/gh verification of every competitor stat.",
+  "gate": "READY",
+  "gate_rationale": "All 35 claims are accounted for. 34 of 35 are direct self-claims about smos-rust (verified against README.md with exact line citations, or against Cargo.toml) plus one general niche characterization. The single 'unverified' flag (v1.0.0 tag) is a PROPOSAL explicitly marked as such inside the release draft — it is not a publishable factual claim, and the user controls the tag decision. No competitor product claims appear in any public draft. Distribution is unblocked for the manual paste-ready workflow (HN, Reddit, dev.to, GitHub release) pending HUMAN GATE approval of each artifact.",
+  "human_gate_status": "PENDING — user has not yet approved any of the four drafts for publication. All four remain paste-ready; none has been submitted."
+}

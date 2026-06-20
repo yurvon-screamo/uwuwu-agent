@@ -1,0 +1,10 @@
+# Marketing workspace gitignore.
+# NOTE: parent .gitignore does NOT cover .env globally — add it here explicitly.
+
+# Credentials — NEVER commit real values.
+.env
+
+# @tool-accessor runtime artifacts (curl dumps, API caches).
+*.raw
+*.dump
+.tmp/
