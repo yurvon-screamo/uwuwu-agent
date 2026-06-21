@@ -37,6 +37,19 @@ anyhow = "1"
 # CLI argument parsing for the unified `smos` binary's subcommands.
 clap = { version = "4", features = ["derive"] }
 
+# SMOS Dreaming Agent — autonomous memory audit via an LLM with tool-calling.
+# rig-core is pinned to the 0.14 line and stripped of its default reqwest
+# features so it shares the workspace's rustls stack (no native-tls, no
+# duplicate OpenSSL on Linux). The `derive` feature pulls in `rig-derive`
+# which is convenient for any future ToolEmbedding impls.
+rig-core = { version = "0.14", default-features = false, features = [
+    "derive",
+    "reqwest-rustls",
+] }
+# tokio-cron-scheduler backs the periodic `dreaming` audit trigger declared in
+# `[audit].schedule`. Pinned to the 0.14 line (latest stable as of writing).
+tokio-cron-scheduler = "0.14"
+
 # Native NLI backend (ort + tokenizers + hf-hub). Native NLI is the only
 # available backend (the legacy Python implementation was removed). The
 # version pin on `ort` is exact (=2.0.0-rc.12) because the API is still

@@ -10,13 +10,17 @@
 //! - `smos import` — import an opencode session transcript.
 //! - `smos doctor` — environment validation, stats, Markdown report.
 //! - `smos finalize` — manual single-session drain trigger.
+//! - `smos service` — install/uninstall/start/stop/restart/status SMOS as
+//!   a system or user service (Windows: sc.exe, Linux: systemd, macOS:
+//!   launchd).
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
 use smos_adapters::cli::{
-    DoctorArgs, ImportArgs, run_doctor, run_finalize, run_import, run_server,
+    AuditArgs, AuditProvider, DoctorArgs, ImportArgs, ServiceAction, run_audit_cli, run_doctor,
+    run_finalize, run_import, run_server, run_service,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "smos.toml";
@@ -26,7 +30,7 @@ const DEFAULT_CONFIG_PATH: &str = "smos.toml";
     name = "smos",
     version,
     about = "SMOS — Semantic Memory OS",
-    long_about = "Unified SMOS binary. Subcommands: serve, import, doctor, finalize."
+    long_about = "Unified SMOS binary. Subcommands: serve, import, doctor, finalize, service."
 )]
 struct Cli {
     /// Path to the config file. Defaults to `smos.toml` in the CWD.
@@ -114,6 +118,24 @@ enum Command {
         #[arg(long)]
         memory_key: Option<String>,
     },
+
+    /// Manage SMOS as a system service (install/uninstall/start/stop/status).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
+    /// Run the SMOS Dreaming Agent audit once in the foreground.
+    Audit {
+        /// Override the configured LLM provider (`cloud` | `local`).
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Dry-run: validate provider configuration and bail out before
+        /// loading the NLI / embedder models.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -169,6 +191,19 @@ async fn main() -> anyhow::Result<ExitCode> {
             memory_key,
         } => {
             run_finalize(&cli.config, &session_id, memory_key.as_deref()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Service { action } => {
+            run_service(action, &cli.config).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Audit { provider, dry_run } => {
+            let provider = match provider.as_deref() {
+                Some(s) => Some(AuditProvider::parse(s)?),
+                None => None,
+            };
+            let args = AuditArgs { provider, dry_run };
+            run_audit_cli(&cli.config, args).await?;
             Ok(ExitCode::SUCCESS)
         }
     }

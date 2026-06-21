@@ -59,6 +59,13 @@ dimensions = 1024                          # MUST match the HNSW index DDL
 api_key = ""
 timeout_seconds = 30
 
+# Reranker (REQUIRED for production-quality enrichment).
+# The enrich pipeline reranks vector-search survivors via a cross-encoder
+# before injecting them into the request; without it the pipeline runs in
+# degraded mode (vector-order-only ranking) and logs a WARN on every request.
+# Start the llama.cpp reranker server with a Qwen3-Reranker GGUF model:
+#   ./llama-server --model qwen3-reranker-0.6b-q8_0.gguf --port 8181
+# The adapter expects an OpenAI-compatible /v1/rerank endpoint.
 [reranker]
 url = "http://localhost:8181"
 model = "qwen3-reranker"
@@ -114,3 +121,22 @@ min_threshold = 0.2
 timeout_seconds = 1800
 pending_overflow_threshold = 20
 scan_interval_seconds = 60
+
+# SMOS Dreaming Agent — autonomous LLM-driven memory audit. Disabled by
+# default; flip `enabled = true` to opt in. The agent runs on a cron schedule,
+# reviews stored facts via rig tool-calling, applies bounded mutations
+# (deletions, merges, conflict flags), and writes a markdown report.
+[audit]
+enabled = false
+schedule = "0 3 * * *"
+llm_provider = "cloud"
+cloud_model = "z-ai/glm-4.6"
+# Set this to "${OPENROUTER_API_KEY}" to keep the secret out of TOML; the
+# dreaming module expands the placeholder via std::env::var at runtime.
+cloud_api_key = ""
+cloud_base_url = "https://openrouter.ai/api/v1"
+local_model = "granite4.1:3b"
+local_url = "http://localhost:11434"
+max_deletions_per_run = 50
+max_merges_per_run = 100
+report_dir = "./reports"

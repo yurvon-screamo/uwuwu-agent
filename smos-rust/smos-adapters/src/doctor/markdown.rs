@@ -100,8 +100,15 @@ mod tests {
             "url: http://localhost:11434\nmodels: 12",
         ));
         r.push(
-            CheckResult::warn("Reranker", "url: http://localhost:8181 unreachable")
-                .with_recommendation("start llama.cpp server"),
+            CheckResult::warn(
+                "Reranker (REQUIRED for production-quality enrichment)",
+                "url: http://localhost:8181 unreachable",
+            )
+            .with_recommendation(
+                "reranker REQUIRED for production-quality enrichment — start the \
+                 llama.cpp reranker server; without it the enrich pipeline runs \
+                 in degraded mode (vector-order-only ranking)",
+            ),
         );
         r.push(
             CheckResult::fail("granite4.1:3b", "model missing")
@@ -131,7 +138,7 @@ mod tests {
     fn markdown_summary_table_lists_every_check() {
         let md = render_markdown(&sample_report());
         assert!(md.contains("| smos binary | PASS |"));
-        assert!(md.contains("| Reranker | WARN |"));
+        assert!(md.contains("| Reranker (REQUIRED for production-quality enrichment) | WARN |"));
         assert!(md.contains("| granite4.1:3b | FAIL |"));
     }
 
@@ -155,7 +162,9 @@ mod tests {
     fn markdown_recommendations_section_only_non_pass() {
         let md = render_markdown(&sample_report());
         assert!(md.contains("## Recommendations"));
-        assert!(md.contains("Reranker: start llama.cpp server"));
+        assert!(
+            md.contains("Reranker (REQUIRED for production-quality enrichment): reranker REQUIRED")
+        );
         assert!(md.contains("granite4.1:3b: ollama pull granite4.1:3b"));
         // Passing checks should not be echoed as recommendations.
         assert!(!md.contains("Recommendations\n- smos binary"));

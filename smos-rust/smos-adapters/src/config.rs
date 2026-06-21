@@ -28,6 +28,7 @@
 //! | `[nli_backend]`     | [`NliBackendConfig`]       | Adapter-only: native ort/ONNX `model` + `cache_dir`. |
 //! | `[extraction]`      | [`ExtractionConfig`]       | Re-exported from `smos-domain`.|
 //! | `[session]`         | [`SessionConfig`]          |                                |
+//! | `[audit]`           | [`AuditConfig`]            | Dreaming agent (LLM audit).    |
 
 use serde::{Deserialize, Serialize};
 pub use smos_domain::config::{
@@ -120,6 +121,13 @@ pub struct SmosConfig {
 
     #[serde(default)]
     pub session: SessionConfig,
+
+    /// SMOS Dreaming Agent — autonomous periodic audit of stored memory
+    /// (deletions of trivial facts, semantic-duplicate merges, conflict
+    /// flagging, markdown report). Disabled by default so a fresh `smos.toml`
+    /// never silently spends LLM tokens.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +311,58 @@ pub struct SessionConfig {
     pub scan_interval_seconds: u64,
 }
 
+/// SMOS Dreaming Agent configuration.
+///
+/// The dreaming agent is an autonomous LLM-driven auditor that runs on a cron
+/// schedule, reviews stored facts, and applies bounded mutations (deletions,
+/// merges, conflict flags) before writing a markdown report. The agent
+/// operates through `rig::tool::Tool` impls that gate every write operation
+/// behind per-run rate limits — a misbehaving LLM cannot nuke the memory
+/// store because `DeleteFactTool` refuses calls past `max_deletions_per_run`.
+///
+/// Provider selection is `"cloud" | "local"`:
+/// - `"cloud"` — OpenRouter (or any OpenAI-compatible chat-completions
+///   endpoint) identified by `cloud_*` fields. The `cloud_api_key` field
+///   accepts either a literal key or the placeholder `"${ENV_VAR}"`, which
+///   `dreaming::resolve_env_var` expands via [`std::env::var`]. The
+///   placeholder form keeps secrets out of `smos.toml`.
+/// - `"local"` — an Ollama-compatible chat server (default
+///   `http://localhost:11434`). No API key required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Master switch. When `false` the scheduler never starts and `smos audit`
+    /// is a no-op. Defaults to `false` so an operator shipping the default
+    /// `smos.toml` never silently incurs LLM costs.
+    pub enabled: bool,
+    /// Cron expression (5-field UNIX style, UTC). Defaults to `0 3 * * *`
+    /// (03:00 UTC daily).
+    pub schedule: String,
+    /// `"cloud"` (default) or `"local"`. Unknown values are rejected by
+    /// `dreaming::run_audit` at runtime.
+    pub llm_provider: String,
+    /// Cloud model id passed to the OpenRouter completions endpoint.
+    pub cloud_model: String,
+    /// Cloud API key. Accepts `"${ENV_VAR}"` placeholder form; see
+    /// [`crate::dreaming::resolve_env_var`].
+    pub cloud_api_key: String,
+    /// Cloud base URL (no path). Defaults to OpenRouter.
+    pub cloud_base_url: String,
+    /// Local model id (Ollama tag, e.g. `granite4.1:3b`).
+    pub local_model: String,
+    /// Local chat-server base URL.
+    pub local_url: String,
+    /// Hard cap on the number of `delete_fact` calls the agent may issue in a
+    /// single audit run. Past the cap the tool returns a rate-limit error to
+    /// the LLM.
+    pub max_deletions_per_run: usize,
+    /// Hard cap on the number of `merge_facts` calls per run.
+    pub max_merges_per_run: usize,
+    /// Filesystem directory where `write_report` drops the markdown audit
+    /// report. Created on first write if missing.
+    pub report_dir: String,
+}
+
 // ---------------------------------------------------------------------------
 // Default impls
 // ---------------------------------------------------------------------------
@@ -392,6 +452,24 @@ impl Default for SessionConfig {
     }
 }
 
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "0 3 * * *".into(),
+            llm_provider: "cloud".into(),
+            cloud_model: "z-ai/glm-4.6".into(),
+            cloud_api_key: String::new(),
+            cloud_base_url: "https://openrouter.ai/api/v1".into(),
+            local_model: "granite4.1:3b".into(),
+            local_url: "http://localhost:11434".into(),
+            max_deletions_per_run: 50,
+            max_merges_per_run: 100,
+            report_dir: "./reports".into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults for serde `default = "..."` attributes
 // ---------------------------------------------------------------------------
@@ -475,11 +553,19 @@ impl SmosConfig {
     /// - `llm_extraction.temperature` in `[0, 2]`.
     /// - `session.timeout_seconds > 0`.
     /// - `server.port > 0`.
+    /// - `reranker.url` non-empty (reranker is required for enrichment;
+    ///   the pipeline degrades to vector-order-only ranking when the URL
+    ///   is missing, so an operator who blanks the field gets a startup
+    ///   error instead of a silent quality drop).
     /// - `upstream.providers` non-empty (the proxy needs at least one
     ///   provider to forward chat completions to) and every provider carries
     ///   a non-empty URL + non-zero timeout.
     /// - `nli.contradiction_threshold` in `[0, 1]`.
     /// - `merge.cosine_threshold` in `[-1, 1]`.
+    /// - `audit.*` semantic checks — only enforced when `audit.enabled = true`
+    ///   (a disabled audit is opt-in; see [`SmosConfig::validate_audit_always`]
+    ///   for the variant that checks audit fields regardless of the enabled
+    ///   flag, used by `smos audit --provider` to catch typos before the run).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -537,6 +623,12 @@ impl SmosConfig {
             errors.push("server.port must be > 0".into());
         }
 
+        if self.reranker.url.trim().is_empty() {
+            errors.push(
+                "reranker.url must not be empty — reranker is required for enrichment".into(),
+            );
+        }
+
         if self.upstream.providers.is_empty() {
             errors.push("upstream.providers must not be empty".into());
         }
@@ -565,11 +657,56 @@ impl SmosConfig {
             ));
         }
 
+        if self.audit.enabled {
+            errors.extend(self.validate_audit_fields());
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(ConfigError::Validation(errors.join("; ")))
         }
+    }
+
+    /// Validate the audit fields REGARDLESS of `audit.enabled`.
+    ///
+    /// Used by `smos audit` (the manual one-shot runner) so a typo in
+    /// `cloud_base_url` or an unknown `llm_provider` is surfaced at the
+    /// invocation rather than as a runtime error mid-audit. The full
+    /// [`SmosConfig::validate`] only checks audit fields when
+    /// `audit.enabled = true`, which is correct for `smos serve` (where
+    /// the audit is off by default and a stale config should not block
+    /// server startup) but wrong for the manual runner.
+    pub fn validate_audit_always(&self) -> Result<(), ConfigError> {
+        let errors = self.validate_audit_fields();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Validation(errors.join("; ")))
+        }
+    }
+
+    /// Shared semantic checks for the audit section. Returns the (possibly
+    /// empty) list of problems; the caller decides whether to fail or
+    /// accumulate them into a wider validation pass.
+    fn validate_audit_fields(&self) -> Vec<String> {
+        let mut errors: Vec<String> = Vec::new();
+        if self.audit.schedule.trim().is_empty() {
+            errors.push("audit.schedule must not be empty when audit is enabled".into());
+        }
+        let provider = self.audit.llm_provider.as_str();
+        if !matches!(provider, "cloud" | "local") {
+            errors.push(format!(
+                "audit.llm_provider must be 'cloud' or 'local', got {provider:?}"
+            ));
+        }
+        if provider == "cloud" && self.audit.cloud_base_url.trim().is_empty() {
+            errors.push("audit.cloud_base_url must not be empty for the cloud provider".into());
+        }
+        if provider == "local" && self.audit.local_url.trim().is_empty() {
+            errors.push("audit.local_url must not be empty for the local provider".into());
+        }
+        errors
     }
 }
 
@@ -1170,6 +1307,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_empty_reranker_url() {
+        // The reranker is REQUIRED for production-quality enrichment — an
+        // operator who blanks the URL must get a startup error pointing at
+        // the field instead of a silent quality drop to vector-order-only
+        // ranking.
+        let mut cfg = SmosConfig::default();
+        cfg.reranker.url = String::new();
+        cfg.upstream
+            .providers
+            .push(UpstreamProvider::new("u", "http://u"));
+        let err = cfg.validate().expect_err("empty reranker url must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reranker.url must not be empty"),
+            "msg = {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_reranker_url() {
+        // `trim().is_empty()` catches whitespace-only strings so a typo like
+        // `url = "   "` is treated identically to an empty string.
+        let mut cfg = SmosConfig::default();
+        cfg.reranker.url = "   ".into();
+        cfg.upstream
+            .providers
+            .push(UpstreamProvider::new("u", "http://u"));
+        let err = cfg
+            .validate()
+            .expect_err("whitespace-only reranker url must fail");
+        assert!(err.to_string().contains("reranker.url must not be empty"));
+    }
+
+    #[test]
     fn validate_collects_multiple_errors_in_one_message() {
         // Two unrelated problems: bad dimensions AND no providers. The
         // operator should see both in a single error so they can fix them
@@ -1184,6 +1355,70 @@ mod tests {
         assert!(
             msg.contains(";"),
             "multiple errors joined by ';' in msg = {msg}"
+        );
+    }
+
+    // --- AuditConfig behaviour -------------------------------------------
+
+    #[test]
+    fn audit_section_disabled_by_default() {
+        let cfg = SmosConfig::default();
+        assert!(!cfg.audit.enabled, "audit must be off by default");
+        assert_eq!(cfg.audit.schedule, "0 3 * * *");
+        assert_eq!(cfg.audit.llm_provider, "cloud");
+        assert_eq!(cfg.audit.max_deletions_per_run, 50);
+        assert_eq!(cfg.audit.max_merges_per_run, 100);
+        assert_eq!(cfg.audit.report_dir, "./reports");
+    }
+
+    #[test]
+    fn audit_validation_skipped_when_disabled() {
+        // Audit off => bad provider string does NOT fail validation. The
+        // audit is opt-in; a stale `llm_provider` typo in a deployment that
+        // never enables the audit should not block server startup.
+        let mut cfg = SmosConfig::default();
+        cfg.audit.enabled = false;
+        cfg.audit.llm_provider = "garbage".into();
+        cfg.upstream
+            .providers
+            .push(UpstreamProvider::new("u", "http://u"));
+        assert!(cfg.validate().is_ok(), "disabled audit must not validate");
+    }
+
+    #[test]
+    fn audit_validation_rejects_unknown_provider_when_enabled() {
+        let mut cfg = SmosConfig::default();
+        cfg.audit.enabled = true;
+        cfg.audit.llm_provider = "garbage".into();
+        cfg.upstream
+            .providers
+            .push(UpstreamProvider::new("u", "http://u"));
+        let err = cfg.validate().expect_err("bad provider must fail");
+        assert!(err.to_string().contains("audit.llm_provider"));
+    }
+
+    #[test]
+    fn audit_validation_rejects_empty_schedule_when_enabled() {
+        let mut cfg = SmosConfig::default();
+        cfg.audit.enabled = true;
+        cfg.audit.schedule = "   ".into();
+        cfg.upstream
+            .providers
+            .push(UpstreamProvider::new("u", "http://u"));
+        let err = cfg.validate().expect_err("empty schedule must fail");
+        assert!(err.to_string().contains("audit.schedule"));
+    }
+
+    #[test]
+    fn audit_section_roundtrips_through_serde_json() {
+        let cfg = SmosConfig::default();
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: SmosConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.audit.schedule, cfg.audit.schedule);
+        assert_eq!(back.audit.cloud_model, cfg.audit.cloud_model);
+        assert_eq!(
+            back.audit.max_deletions_per_run,
+            cfg.audit.max_deletions_per_run
         );
     }
 }

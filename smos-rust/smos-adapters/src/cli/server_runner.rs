@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::cli::shutdown::shutdown_signal;
 use crate::cli::tracing_setup::init_tracing_for_server;
 use crate::config::SmosConfig;
+use crate::dreaming::start_scheduler;
 use crate::http::axum_server::{AppState, build_router, is_loopback_host, serve_with_shutdown};
 use crate::nli::build_classifier;
 use crate::runtime::{ExtractionSupervisor, SessionWatcher};
@@ -26,6 +27,13 @@ use smos_application::ports::{Clock, IdGenerator};
 /// together; `None` means no NLI backend was available so the watcher
 /// never started.
 type WatcherHandle = Option<(tokio::task::JoinHandle<()>, mpsc::Sender<()>)>;
+
+/// Handle returned by [`spawn_audit_scheduler`]. The [`JobScheduler`] is
+/// held until [`run_server`] returns so the audit cron keeps firing for the
+/// lifetime of the server. `None` means the audit is disabled or its
+/// dependencies could not be built — in either case the HTTP server keeps
+/// running.
+type AuditHandle = Option<tokio_cron_scheduler::JobScheduler>;
 
 /// Start the SMOS proxy (default `smos serve` mode).
 pub async fn run_server(config_path: &str) -> Result<()> {
@@ -61,6 +69,11 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     let state = build_app_state(&config, store.clone(), extraction_supervisor.clone())?;
     let watcher_handle = spawn_watcher(&config, store.clone()).await;
+    // The dreaming audit scheduler is built unconditionally so a startup
+    // failure (bad cron, missing NLI backend) is logged at server boot
+    // rather than the first tick. When `audit.enabled = false` (the
+    // default), `spawn_audit_scheduler` returns `None` immediately.
+    let audit_handle = spawn_audit_scheduler(&config, store.clone()).await;
 
     let router = build_router(Arc::new(state));
     let listener =
@@ -83,6 +96,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     .await?;
 
     drain_watcher(watcher_handle).await;
+    // Drop the audit scheduler explicitly so its shutdown is logged in a
+    // predictable order (after watcher drain, before the final "stopped"
+    // line). Dropping triggers the scheduler's internal shutdown path.
+    drop(audit_handle);
 
     tracing::info!("SMOS proxy stopped");
     Ok(())
@@ -232,6 +249,69 @@ async fn drain_watcher(watcher_handle: WatcherHandle) {
     if let Some((handle, shutdown_tx)) = watcher_handle {
         let _ = shutdown_tx.send(()).await;
         let _ = handle.await;
+    }
+}
+
+/// Build the dreaming audit scheduler.
+///
+/// Returns `None` (and logs the reason) when:
+/// - the audit is disabled (`config.audit.enabled = false`); or
+/// - the NLI backend, embedder, or scheduler could not be built.
+///
+/// The HTTP server keeps running in every `None` case so chat completions
+/// stay available even if the audit stack failed to start. This mirrors the
+/// watcher's own degrade behaviour: a missing ML backend must never take
+/// down the proxy.
+async fn spawn_audit_scheduler(config: &SmosConfig, store: SurrealStore) -> AuditHandle {
+    if !config.audit.enabled {
+        tracing::info!("dreaming audit disabled (audit.enabled = false); scheduler not started");
+        return None;
+    }
+
+    // Build a fresh NLI classifier for the audit. This intentionally does
+    // NOT share the watcher's classifier: `NativeNliClassifier` is not
+    // `Clone` (its `Tokenizer` is `!Clone`), and sharing would require an
+    // invasive refactor of `SessionWatcher`'s generic parameter. The cost
+    // is one extra ~643 MB resident model when BOTH the watcher and the
+    // audit are enabled; operators with constrained memory can disable the
+    // watcher OR the audit to halve the resident footprint.
+    let classifier = match build_classifier(config).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "audit NLI backend failed to start; dreaming scheduler disabled \
+                 (HTTP server keeps running). Restart the proxy once the model \
+                 / interpreter is available."
+            );
+            return None;
+        }
+    };
+
+    let embedder = match OllamaEmbedding::new(Arc::new(config.embedding.clone())) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "audit embedder failed to start; dreaming scheduler disabled \
+                 (HTTP server keeps running)."
+            );
+            return None;
+        }
+    };
+
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
+
+    match start_scheduler(&config.audit, store, Arc::new(classifier), embedder, clock).await {
+        Ok(sched) => Some(sched),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "audit scheduler failed to start; dreaming disabled \
+                 (HTTP server keeps running)."
+            );
+            None
+        }
     }
 }
 

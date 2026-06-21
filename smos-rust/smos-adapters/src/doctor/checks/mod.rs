@@ -58,10 +58,14 @@ fn http_client_unavailable_rows() -> Vec<CheckResult> {
         )
         .with_recommendation("verify rustls/native-tls setup and re-run"),
         CheckResult::warn(
-            "Reranker",
+            llm_providers::RERANKER_CHECK_NAME,
             "HTTP client construction failed (TLS init error)",
         )
-        .with_recommendation("reranker optional; resolve TLS setup and re-run"),
+        .with_recommendation(
+            "reranker REQUIRED for production-quality enrichment — resolve \
+             TLS setup and re-run; without it the enrich pipeline runs in \
+             degraded mode (vector-order-only ranking)",
+        ),
     ]
 }
 
@@ -196,15 +200,18 @@ mod tests {
             "Ollama hint must point at TLS setup"
         );
         assert_eq!(rows[1].name, "Ollama connectivity (embedding)");
-        assert_eq!(rows[2].name, "Reranker");
+        assert_eq!(
+            rows[2].name,
+            "Reranker (REQUIRED for production-quality enrichment)"
+        );
         assert_eq!(rows[2].status, CheckStatus::Warn);
         assert!(
             rows[2]
                 .recommendation
                 .as_deref()
                 .unwrap()
-                .contains("optional"),
-            "reranker is optional, hint must say so"
+                .contains("REQUIRED"),
+            "reranker is REQUIRED for production-quality enrichment, hint must say so"
         );
     }
 }

@@ -1,11 +1,14 @@
-//! LLM/embedding connectivity + required-models check + optional reranker probe.
+//! LLM/embedding connectivity + required-models check + reranker probe.
 //!
 //! Two public entry points:
 //! - [`check_llm_extractions`] / [`check_embeddings`] — `GET {url}/api/tags`,
 //!   list models, match against the configured extraction + embedding
 //!   expectations respectively.
-//! - [`check_reranker`] — probe the llama.cpp reranker URL. Reranker is
-//!   optional, so unreachable → WARN with a remediation hint, never FAIL.
+//! - [`check_reranker`] — probe the llama.cpp reranker URL. The reranker is
+//!   REQUIRED for production-quality enrichment; an unreachable endpoint
+//!   downgrades the enrich pipeline to vector-order-only ranking (degraded
+//!   mode), so the probe emits WARN — not FAIL, because SMOS still serves
+//!   requests without it — with an explicit remediation hint.
 //!
 //! The match logic lives in [`super::super::models`]; this module owns the
 //! HTTP IO and the row construction.
@@ -156,8 +159,25 @@ async fn check_one_endpoint(
     results
 }
 
-/// Probe the reranker. WARN on any failure — the reranker is optional and
-/// the proxy falls back to embedding-only ranking when it is unavailable.
+/// Doctor check name for the reranker probe. Shared between the live probe
+/// ([`check_reranker`]) and the TLS-init-failure fallback
+/// ([`super::http_client_unavailable_rows`]) so the operator sees a stable
+/// row identifier across every code path that emits a reranker result.
+pub(crate) const RERANKER_CHECK_NAME: &str =
+    "Reranker (REQUIRED for production-quality enrichment)";
+
+/// Recommendation emitted when the reranker is unreachable from the live
+/// probe. The wording reinforces the REQUIRED-for-enrichment contract so
+/// the operator understands the quality cost of leaving it down.
+const RERANKER_UNREACHABLE_HINT: &str = "reranker REQUIRED for production-quality enrichment — start the \
+     llama.cpp reranker server; without it the enrich pipeline runs \
+     in degraded mode (vector-order-only ranking)";
+
+/// Probe the reranker. WARN on any failure — the reranker is REQUIRED for
+/// production-quality enrichment, but SMOS keeps serving requests without it
+/// (degraded mode: vector-order-only ranking). A WARN rather than FAIL keeps
+/// the doctor non-blocking for dev setups while making the production-quality
+/// expectation loud.
 ///
 /// `timeout` bounds the health probe so an unreachable reranker surfaces
 /// as WARN instead of stalling the doctor.
@@ -169,20 +189,19 @@ pub async fn check_reranker(
     let url = format!("{}/health", config.url.trim_end_matches('/'));
     match client.get(&url).timeout(timeout).send().await {
         Ok(r) if r.status().is_success() => CheckResult::pass(
-            "Reranker",
+            RERANKER_CHECK_NAME,
             format!("url: {}\nmodel: {}", config.url, config.model),
         ),
         Ok(r) => CheckResult::warn(
-            "Reranker",
+            RERANKER_CHECK_NAME,
             format!("url: {}\nHTTP {}", config.url, r.status()),
         )
-        .with_recommendation(
-            "reranker optional; start llama.cpp server for improved retrieval quality",
-        ),
-        Err(_) => CheckResult::warn("Reranker", format!("url: {}\nunreachable", config.url))
-            .with_recommendation(
-                "reranker optional; start llama.cpp server for improved retrieval quality",
-            ),
+        .with_recommendation(RERANKER_UNREACHABLE_HINT),
+        Err(_) => CheckResult::warn(
+            RERANKER_CHECK_NAME,
+            format!("url: {}\nunreachable", config.url),
+        )
+        .with_recommendation(RERANKER_UNREACHABLE_HINT),
     }
 }
 

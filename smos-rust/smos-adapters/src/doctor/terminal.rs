@@ -112,7 +112,15 @@ mod tests {
         let mut r = DoctorReport::new("2026-06-18T13:45:01Z", "smos.toml");
         r.push(CheckResult::pass("smos binary", "version: 0.1.0"));
         r.push(
-            CheckResult::warn("Reranker", "url unreachable").with_recommendation("start llama.cpp"),
+            CheckResult::warn(
+                "Reranker (REQUIRED for production-quality enrichment)",
+                "url unreachable",
+            )
+            .with_recommendation(
+                "reranker REQUIRED for production-quality enrichment — start the \
+                 llama.cpp reranker server; without it the enrich pipeline runs \
+                 in degraded mode (vector-order-only ranking)",
+            ),
         );
         r.push(
             CheckResult::fail("granite4.1:3b", "missing")
@@ -148,7 +156,7 @@ mod tests {
     fn render_without_color_emits_plain_labels() {
         let out = render_terminal(&sample(), false);
         assert!(out.contains("[PASS] smos binary"));
-        assert!(out.contains("[WARN] Reranker"));
+        assert!(out.contains("[WARN] Reranker (REQUIRED for production-quality enrichment)"));
         assert!(out.contains("[FAIL] granite4.1:3b"));
         // No ANSI escapes when color is off.
         assert!(!out.contains("\x1b["));
@@ -166,7 +174,7 @@ mod tests {
     #[test]
     fn render_emits_recommendation_line_indented() {
         let out = render_terminal(&sample(), false);
-        assert!(out.contains("       Recommendation: start llama.cpp"));
+        assert!(out.contains("       Recommendation: reranker REQUIRED"));
         assert!(out.contains("       Recommendation: ollama pull granite4.1:3b"));
     }
 

@@ -29,8 +29,11 @@
 //!      `[persona-...]` block will be added alongside a `PersonaRepository`
 //!      port; the domain builder already accepts `memory_key` for forward
 //!      compatibility.
-//! 8. Rerank survivors with the cross-encoder.
-//! 9. Fallback to top-N survivors when reranking returned nothing.
+//! 8. Rerank survivors with the cross-encoder (REQUIRED for production
+//!    quality; an empty result or provider error degrades to top-N survivors
+//!    and logs at WARN — never silently).
+//! 9. Fallback to top-N survivors when reranking returned nothing
+//!    (degraded mode, logged at WARN).
 //! 10. Session dedup — drop facts already injected into this session.
 //! 11. Short-circuit when no new facts survived dedup.
 //! 12. Build the `<smos-memory>` block from the new facts.
@@ -224,6 +227,14 @@ where
     /// Rerank survivors with the cross-encoder; on empty result fall back to
     /// the first `top_k_final` survivors in retrieval order (parity with POC
     /// `enrich.py::_rerank_candidates` fallback branch).
+    ///
+    /// The reranker is REQUIRED for production-quality enrichment (§3 step 8).
+    /// Both failure modes — `Err` from the provider and an empty `Vec` — fall
+    /// back to top-N survivors so the pipeline stays fail-open and never
+    /// blocks a request, but each branch logs at WARN with an explicit
+    /// "degraded mode" hint so an operator running without the reranker sees
+    /// the drop in retrieval quality in the logs rather than silently
+    /// shipping vector-order-only ranking.
     async fn rerank_survivors(&self, topic: &str, survivors: &[RetrievalHit]) -> Vec<RetrievalHit> {
         let documents: Vec<String> = survivors.iter().map(|s| s.document.clone()).collect();
         let ranked = match self
@@ -233,7 +244,11 @@ where
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, "reranker error; using survivor fallback");
+                tracing::warn!(
+                    error = %e,
+                    "reranker unavailable; using survivor fallback \
+                     (degraded mode) — check llama.cpp server"
+                );
                 return survivors
                     .iter()
                     .take(self.retrieval_cfg.top_k_final)
@@ -242,7 +257,10 @@ where
             }
         };
         if ranked.is_empty() {
-            tracing::info!("reranker returned empty; using survivor fallback");
+            tracing::warn!(
+                "reranker returned empty results; using survivor fallback \
+                 (degraded mode) — verify the reranker model and query"
+            );
             return survivors
                 .iter()
                 .take(self.retrieval_cfg.top_k_final)

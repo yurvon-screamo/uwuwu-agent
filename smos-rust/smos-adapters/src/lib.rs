@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod config;
 pub mod doctor;
+pub mod dreaming;
 pub mod http;
 pub mod nli;
 pub mod opencode;
@@ -21,8 +22,9 @@ pub mod storage;
 pub mod upstream;
 
 pub use config::{
-    EmbeddingConfig, LlmExtractionConfig, NliBackendConfig, RerankerConfig, ServerConfig,
-    SessionConfig, SmosConfig, SurrealConfig, UpstreamConfig, UpstreamProvider, UpstreamStrategy,
+    AuditConfig, EmbeddingConfig, LlmExtractionConfig, NliBackendConfig, RerankerConfig,
+    ServerConfig, SessionConfig, SmosConfig, SurrealConfig, UpstreamConfig, UpstreamProvider,
+    UpstreamStrategy,
 };
 pub use nli::NativeNliClassifier;
 pub use opencode::{DiscoveryError, SessionSource};

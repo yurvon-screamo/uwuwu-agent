@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 
 /// Outcome of a single doctor probe.
 ///
-/// `Warn` is reserved for optional infrastructure (reranker) — a warning
-/// never fails the doctor run, but it IS surfaced to the operator so
-/// degraded quality is not silent. `Fail` always marks a missing required
-/// dependency (an Ollama model, the binary, the database) and must be fixed
-/// before the operator proceeds with the smoke test.
+/// `Warn` is reserved for REQUIRED-but-degradable infrastructure (the
+/// reranker): SMOS keeps serving requests without it, but the enrich
+/// pipeline runs in degraded mode (vector-order-only ranking), so a warning
+/// never fails the doctor run while still surfacing the quality drop to the
+/// operator. `Fail` always marks a missing hard dependency (an Ollama model,
+/// the binary, the database) and must be fixed before the operator proceeds
+/// with the smoke test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckStatus {
     Pass,
