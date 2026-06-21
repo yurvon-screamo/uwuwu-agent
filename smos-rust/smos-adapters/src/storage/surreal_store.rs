@@ -367,15 +367,18 @@ impl SessionRow {
 
         // Round-trip safe path: `SessionState::rehydrate` rebuilds every
         // field verbatim, including the injected_facts set that has no
-        // public mutator.
-        Ok(SessionState::rehydrate(
+        // public mutator. The `?` propagates the `last_active < created_at`
+        // invariant failure as a `SerializationFailed` so a corrupt row is
+        // surfaced loudly instead of silently producing an impossible state.
+        SessionState::rehydrate(
             id,
             memory_key,
             injected_facts,
             pending_facts,
             created_at,
             last_active,
-        ))
+        )
+        .map_err(|e| RepoError::SerializationFailed(e.to_string()))
     }
 }
 
@@ -639,14 +642,18 @@ impl SurrealStore {
     ///    equality predicates into the HNSW traversal. Issuing the KNN
     ///    alone and post-filtering in Rust is the validated workaround.
     ///
-    /// 2. Filter the candidates by memory_key + status + valid_until and
-    ///    return up to `limit` hits.
+    /// 2. Filter the HNSW candidates by memory_key + status + valid_until.
     ///
-    /// 3. If the HNSW pass returned fewer than `limit` *matching* hits
-    ///    (skewed namespaces, sparse data), fall back to a brute-force
-    ///    cosine scan with equality pre-filters. This guarantees the
-    ///    caller always receives up to `limit` results when they exist,
-    ///    at the cost of one extra round-trip on cold/skewed queries.
+    /// 3. ALWAYS run the brute-force cosine scan as well, regardless of
+    ///    how many hits the HNSW pass returned. The HNSW index is
+    ///    approximate: under skewed namespaces or post-deletion churn it
+    ///    can miss a true neighbour that an exact cosine scan finds. The
+    ///    brute-force pass is the correctness backstop; the cost is one
+    ///    extra round-trip per search (acceptable for the SMOS workload —
+    ///    every search is per-request, not per-token).
+    ///
+    /// 4. Merge the two passes (dedup by FactId, prefer the smaller
+    ///    `distance`), sort ascending, and truncate to `limit`.
     async fn vector_search(
         &self,
         embedding: Vec<f32>,
@@ -660,19 +667,31 @@ impl SurrealStore {
         let hnsw_hits = self
             .search_similar_hnsw(&embedding_f64, over_fetch, memory_key, scope)
             .await?;
-
-        if hnsw_hits.len() >= limit {
-            return Ok(hnsw_hits.into_iter().take(limit).collect());
-        }
-
         let bf_hits = self
             .search_similar_bruteforce(&embedding_f64, memory_key, limit, scope)
             .await?;
+
+        // Dedup by FactId, keeping the hit with the smaller distance on
+        // collisions. HNSW and brute-force often return the same FactId
+        // with slightly different distances; preferring the smaller one
+        // surfaces the most similar fact regardless of which pass found it.
         let mut merged: Vec<SearchHit> = Vec::with_capacity(hnsw_hits.len() + bf_hits.len());
-        let mut seen: std::collections::HashSet<FactId> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashMap<FactId, usize> =
+            std::collections::HashMap::with_capacity(hnsw_hits.len() + bf_hits.len());
         for hit in hnsw_hits.into_iter().chain(bf_hits) {
-            if seen.insert(hit.id.clone()) {
-                merged.push(hit);
+            match seen.get(&hit.id) {
+                None => {
+                    seen.insert(hit.id.clone(), merged.len());
+                    merged.push(hit);
+                }
+                Some(&idx) => {
+                    let incumbent = &merged[idx];
+                    let incumbent_dist = incumbent.metadata.distance.unwrap_or(f32::INFINITY);
+                    let new_dist = hit.metadata.distance.unwrap_or(f32::INFINITY);
+                    if new_dist < incumbent_dist {
+                        merged[idx] = hit;
+                    }
+                }
             }
         }
         merged.sort_by(|a, b| {
@@ -1062,6 +1081,14 @@ impl SessionRepository for SurrealStore {
         // the same row may conflict at COMMIT time. We retry up to 5 times
         // with linear backoff — the second attempt almost always succeeds
         // because the first commit has resolved the conflict.
+        //
+        // Error tracking: a transaction-conflict error is the expected
+        // "retry me" signal. Any OTHER error is also recorded into
+        // `last_err` (and the loop still retries) because a transient
+        // transport / connection error deserves the same retry budget as a
+        // conflict — the alternative (return immediately on the first
+        // non-conflict error) would surface an intermittent blip as a hard
+        // failure even though the second attempt would have succeeded.
         let mut last_err: Option<RepoError> = None;
         for attempt in 0..5u32 {
             if attempt > 0 {
@@ -1078,9 +1105,13 @@ impl SessionRepository for SurrealStore {
                 Err(e) => {
                     if Self::is_transaction_conflict(&e) {
                         last_err = Some(RepoError::TransactionConflict);
-                        continue;
+                    } else {
+                        // Save the underlying error so the final return is
+                        // informative; keep retrying in case the failure is
+                        // transient (connection blip, leader handoff, …).
+                        last_err = Some(Self::map_db_error(e));
                     }
-                    return Err(Self::map_db_error(e));
+                    continue;
                 }
             };
             if let Err(e) = Self::check_errors(&mut res, "dedup_and_mark") {
@@ -1090,9 +1121,10 @@ impl SessionRepository for SurrealStore {
                 // variant so callers (and tests) can match structurally.
                 if Self::is_transaction_conflict_message(&e.to_string()) {
                     last_err = Some(RepoError::TransactionConflict);
-                    continue;
+                } else {
+                    last_err = Some(e);
                 }
-                return Err(e);
+                continue;
             }
             let new_strings: Vec<String> = res.take(0).map_err(Self::map_db_error)?;
             let mut out = Vec::with_capacity(new_strings.len());

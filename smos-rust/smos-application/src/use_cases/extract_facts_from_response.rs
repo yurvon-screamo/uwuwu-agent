@@ -211,6 +211,22 @@ where
     /// Dedup a single (raw, embedding) pair through the 3-layer flow.
     /// Returns `Some(FactId)` when a NEW fact was created; `None` when the
     /// fact confirmed an existing one (exact or semantic match).
+    ///
+    /// # Layer 2 vs Layer 1 confidence gap
+    ///
+    /// Layer 2 (semantic dedup) and Layer 1 (exact `FactId` match) both
+    /// call [`Fact::confirm_cross_session`], which internally invokes
+    /// `reclassify(None, cfg)` — WITHOUT an NLI verdict. As a result the
+    /// `no_contradiction_bonus` (default `0.1`) is NOT applied on either
+    /// path: a fact that confirms via dedup reaches at most
+    /// `base (0.5) + multi_source_bonus (0.2) = 0.7`, exactly equal to the
+    /// default `accept_threshold`. Only [`FinalizeSession`]'s NLI-backed
+    /// merge path applies the `no_contradiction_bonus` (lifting the
+    /// confirmation to `0.8`). The gap is intentional: dedup happens on
+    /// every extraction cycle (cheap, synchronous), NLI only on
+    /// session-end (expensive, async). Promoting via dedup at
+    /// `accept_threshold` is the safe minimum; the bonus is reserved for
+    /// the path that actually proved there is no contradiction.
     async fn persist_one_fact(
         &self,
         raw: &str,
@@ -377,6 +393,45 @@ mod tests {
     impl EmbeddingProvider for ConstantEmbedder {
         async fn embed(&self, _text: &str) -> Result<Option<Vec<f32>>, ProviderError> {
             Ok(Some(self.0.clone()))
+        }
+    }
+
+    /// Embedding provider that records every `embed` call and returns a
+    /// deterministic 1024-dim vector unique to the input text. Used to
+    /// verify the extraction pipeline hands distinct embeddings to
+    /// distinct facts (so Layer 2 dedup makes the right call). The
+    /// default `embed_batch` implementation loops `embed`, so every call
+    /// is recorded without an extra override.
+    struct RecordingEmbedder {
+        calls: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+    impl RecordingEmbedder {
+        fn new() -> (Self, std::sync::Arc<Mutex<Vec<String>>>) {
+            let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+        fn vector_for(text: &str) -> Vec<f32> {
+            // Stable, content-derived 1024-dim one-hot-ish vector: hash
+            // the text into a single u64, use it as the index of a
+            // single non-zero dimension. Different inputs ⇒ different
+            // indices ⇒ cosine similarity 0 across distinct hashes.
+            let hash = text
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            let mut vec = vec![0.0; 1024];
+            vec[(hash as usize) % 1024] = 1.0;
+            vec
+        }
+    }
+    impl EmbeddingProvider for RecordingEmbedder {
+        async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, ProviderError> {
+            self.calls.lock().unwrap().push(text.to_string());
+            Ok(Some(Self::vector_for(text)))
         }
     }
 
@@ -1177,6 +1232,137 @@ mod tests {
             confirmed.source_sessions().distinct_count(),
             2,
             "semantic collapse grows provenance"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RecordingEmbedder — verify distinct facts get distinct vectors
+    // -----------------------------------------------------------------------
+
+    /// Build a use case backed by a `RecordingEmbedder`. The default
+    /// `embed_batch` loops `embed`, so every fact handed to the pipeline
+    /// produces one recorded call.
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_recording_embedder<'a>(
+        facts: &'a InMemoryFacts,
+        sessions: &'a RecordingSessions,
+        extractor: &'a ScriptedExtractor,
+        embedder: &'a RecordingEmbedder,
+        clock: &'a FixedClock,
+        cfg: &'a ConfidenceConfig,
+        extraction_cfg: &'a ExtractionConfig,
+    ) -> ExtractFactsFromResponse<
+        'a,
+        InMemoryFacts,
+        RecordingSessions,
+        RecordingEmbedder,
+        ScriptedExtractor,
+        FixedClock,
+        NoOpDelay,
+    > {
+        ExtractFactsFromResponse {
+            facts,
+            sessions,
+            embedder,
+            extractor,
+            clock,
+            delay: &NO_OP_DELAY,
+            confidence_cfg: cfg,
+            extraction_cfg,
+            enable_response_extraction: true,
+        }
+    }
+
+    /// The extraction pipeline MUST hand distinct embeddings to distinct
+    /// extracted facts — otherwise Layer 2 dedup would collapse two
+    /// unrelated facts (cosine ~1) and silently lose data. The
+    /// `RecordingEmbedder` returns a content-derived one-hot vector so
+    /// two distinct facts end up with cosine similarity 0; this test
+    /// pins that contract by checking the recorded calls + the resulting
+    /// store state.
+    #[tokio::test]
+    async fn recording_embedder_yields_distinct_vectors_for_distinct_facts() {
+        let facts = InMemoryFacts::default();
+        let sessions = RecordingSessions::default();
+        let extractor = ScriptedExtractor::new(vec![Ok(vec![
+            "alpha configuration directive".to_string(),
+            "beta configuration directive".to_string(),
+        ])]);
+        let (embedder, calls) = RecordingEmbedder::new();
+        let clock = clock();
+        let cfg = cfg();
+        let extraction_cfg = extraction_cfg();
+        let uc = build_with_recording_embedder(
+            &facts,
+            &sessions,
+            &extractor,
+            &embedder,
+            &clock,
+            &cfg,
+            &extraction_cfg,
+        );
+
+        let n = uc
+            .execute("content covering both directives", &[], &mk(), &sid(1))
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "two distinct facts persisted");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "embedder called once per extracted fact"
+        );
+        // Two distinct FactIds in the store → no collapse happened.
+        let id_a = FactId::from_content("alpha configuration directive");
+        let id_b = FactId::from_content("beta configuration directive");
+        assert!(facts.store.lock().unwrap().contains_key(id_a.as_str()));
+        assert!(facts.store.lock().unwrap().contains_key(id_b.as_str()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty raw fact in extraction batch — must not crash
+    // -----------------------------------------------------------------------
+
+    /// An empty string in the extracted facts list surfaces as `Err` —
+    /// the pipeline propagates the underlying domain failure rather than
+    /// silently dropping the empty entry or persisting a malformed fact.
+    /// The whole batch fails: the call site (background extraction task)
+    /// logs the error and the facts that would have been persisted in
+    /// the same batch are lost too. A future refactor that filters
+    /// empty raw facts BEFORE the `Fact::new_pending` constructor would
+    /// change this test from `is_err()` to `n == 1`; that change is
+    /// intentional and the test should be updated alongside it.
+    #[tokio::test]
+    async fn execute_propagates_err_when_batch_contains_empty_raw_fact() {
+        let facts = InMemoryFacts::default();
+        let sessions = RecordingSessions::default();
+        // Mix one empty + one real fact in the extractor output.
+        let extractor = ScriptedExtractor::new(vec![Ok(vec![
+            String::new(),
+            "real fact that should still persist".to_string(),
+        ])]);
+        let fix = Fix::new();
+        let uc = build(
+            &facts,
+            &sessions,
+            &extractor,
+            &fix.embedder,
+            &fix.clock,
+            &fix.cfg,
+            &fix.extraction_cfg,
+        );
+
+        let result = uc
+            .execute(
+                "content long enough to clear MIN_INPUT_CHARS",
+                &[],
+                &mk(),
+                &sid(1),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "empty raw fact must surface as Err (the only safe non-silent path)"
         );
     }
 }

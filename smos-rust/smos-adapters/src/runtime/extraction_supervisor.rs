@@ -160,4 +160,64 @@ mod tests {
             "drain must return after the grace window, not wait for the slow task"
         );
     }
+
+    /// A panicking extraction task MUST NOT wedge the drain. The
+    /// `InFlightGuard`'s `Drop` runs on panic-unwind, performs the
+    /// `fetch_sub`, and notifies the drain — otherwise a panic mid-task
+    /// would leave the counter at +1 forever (the drain would wait the
+    /// full grace window on every subsequent shutdown for a task that
+    /// already died). This test pins that contract.
+    #[tokio::test]
+    async fn drain_survives_task_panic_and_returns_promptly() {
+        let supervisor = ExtractionSupervisor::new();
+        supervisor.spawn(async {
+            panic!("simulated extraction panic");
+        });
+        // Yield once so the panicking task gets polled at least once
+        // before the drain begins — without this the current-thread
+        // runtime may schedule the panic AFTER the drain has already
+        // started waiting on `notified()`, which is fine for production
+        // but makes the timing-based assertion below flaky.
+        tokio::task::yield_now().await;
+        // A short grace — if the panic leaks the slot, this drain would
+        // wait the full 500 ms instead of returning as soon as the
+        // panicking task unwinds.
+        let start = Instant::now();
+        supervisor.drain(Duration::from_millis(500)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "drain must NOT wait the full grace window when the only in-flight \
+             task panicked — the Drop guard must have decremented the counter \
+             (elapsed = {elapsed:?})"
+        );
+    }
+
+    /// After a panicking task has unwound, the supervisor MUST accept
+    /// fresh spawns and drain them normally. A leaked counter from the
+    /// panic would make a later drain return early (counter never reaches
+    /// zero) or wedge (counter stuck above zero) — both are
+    /// unacceptable. This test pins the "panic then continue" contract.
+    #[tokio::test]
+    async fn supervisor_continues_working_after_a_panic() {
+        let supervisor = ExtractionSupervisor::new();
+        supervisor.spawn(async {
+            panic!("first task panics");
+        });
+        // Yield once so the panicking task gets scheduled and unwinds
+        // before the second spawn.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tracked = counter.clone();
+        supervisor.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tracked.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        supervisor.drain(Duration::from_secs(2)).await;
+        assert_eq!(
+            counter.load(AtomicOrdering::SeqCst),
+            1,
+            "post-panic task must complete and be observed by the drain"
+        );
+    }
 }

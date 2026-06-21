@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::cli::shutdown::shutdown_signal;
 use crate::cli::tracing_setup::init_tracing_for_server;
 use crate::config::SmosConfig;
-use crate::http::axum_server::{AppState, build_router, serve_with_shutdown};
+use crate::http::axum_server::{AppState, build_router, is_loopback_host, serve_with_shutdown};
 use crate::nli::build_classifier;
 use crate::runtime::{ExtractionSupervisor, SessionWatcher};
 use crate::upstream::ReqwestUpstreamPool;
@@ -92,29 +92,60 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 /// whose bearer token is the built-in placeholder, or when permissive
 /// CORS meets a non-localhost bind.
 fn warn_on_insecure_config(config: &SmosConfig) {
-    // Inspect every configured provider's api_key — any one of them being
-    // the built-in placeholder is worth flagging.
-    let any_placeholder = config
-        .upstream
-        .providers
-        .iter()
-        .any(|p| p.api_key == "ollama");
-    if any_placeholder {
-        tracing::warn!(
-            "at least one upstream provider's api_key is the built-in placeholder 'ollama'; \
-             set SMOS__UPSTREAM__API_KEY for production upstreams"
-        );
+    let is_loopback = is_loopback_host(&config.server.host);
+
+    // Inspect every configured provider's api_key. A placeholder key is
+    // acceptable on loopback (local Ollama); on a non-localhost bind it is
+    // an outright insecure configuration and gets an ERROR-level log so
+    // the operator notices before going to production.
+    for provider in &config.upstream.providers {
+        if is_placeholder_key(&provider.api_key) {
+            if is_loopback {
+                tracing::warn!(
+                    provider = %provider.name,
+                    api_key = %provider.api_key,
+                    "upstream api_key is a known placeholder; set SMOS__UPSTREAM__API_KEY \
+                     before exposing the proxy on a non-localhost interface"
+                );
+            } else {
+                tracing::error!(
+                    provider = %provider.name,
+                    host = %config.server.host,
+                    "api_key is a known placeholder AND host is non-localhost — this is \
+                     insecure. Set a real api_key before deploying."
+                );
+            }
+        }
     }
 
     let is_wildcard_host = matches!(config.server.host.as_str(), "0.0.0.0" | "::" | "[::]" | "*");
     if is_wildcard_host {
         tracing::warn!(
             host = %config.server.host,
-            "server.host binds to a non-localhost interface while the router \
-             ships a permissive CORS layer; any browser origin will be able \
-             to drive the proxy. Add an origin allow-list before deploying."
+            "server.host binds to a non-localhost interface; the router ships an \
+             EMPTY CORS layer (no Access-Control-Allow-* headers are emitted, so \
+             browsers block cross-origin requests by default). Same-origin requests \
+             and non-browser clients (curl) keep working. Add an explicit origin \
+             allow-list (`[server].allowed_origins`) if browser-driven cross-origin \
+             access is needed."
         );
     }
+}
+
+/// Known placeholder api_keys that MUST NOT be used outside loopback.
+///
+/// `ollama` is the canonical placeholder for local Ollama (which ignores
+/// the key). `changeme`, `test`, `password`, `secret`, and the `sk-test*`
+/// family are the textbook examples operators reach for when they "just
+/// want to get it running" — flagging them prevents a copy-paste from a
+/// tutorial ending up in production.
+const PLACEHOLDER_API_KEYS: &[&str] = &[
+    "ollama", "changeme", "sk-test", "test", "password", "secret", "",
+];
+
+fn is_placeholder_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    PLACEHOLDER_API_KEYS.iter().any(|p| lower == *p) || lower.starts_with("sk-test")
 }
 
 /// Wire every concrete adapter into [`AppState`] so the axum router can
@@ -201,5 +232,46 @@ async fn drain_watcher(watcher_handle: WatcherHandle) {
     if let Some((handle, shutdown_tx)) = watcher_handle {
         let _ = shutdown_tx.send(()).await;
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_loopback_host_recognises_canonical_loopback() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+    }
+
+    #[test]
+    fn is_loopback_host_rejects_wildcard_and_public() {
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.0.1"));
+        assert!(!is_loopback_host("smos.example.com"));
+    }
+
+    #[test]
+    fn is_placeholder_key_flags_known_placeholders() {
+        for k in ["ollama", "changeme", "test", "password", "secret", ""] {
+            assert!(
+                is_placeholder_key(k),
+                "expected {k:?} to be flagged as a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_key_flags_sk_test_prefix() {
+        assert!(is_placeholder_key("sk-test-abc"));
+        assert!(is_placeholder_key("SK-TEST-UPPER"));
+    }
+
+    #[test]
+    fn is_placeholder_key_passes_through_real_keys() {
+        assert!(!is_placeholder_key("sk-or-1234567890abcdef"));
+        assert!(!is_placeholder_key("live-key-XYZ"));
     }
 }

@@ -32,6 +32,22 @@ struct BufferState {
     tool_calls: Vec<PartialToolCall>,
 }
 
+/// Sanity cap on the `index` of an `append_tool_call_delta` call.
+///
+/// OpenAI's streaming protocol reuses `index` to identify each tool call
+/// positionally; a healthy stream never has more than a handful. A wildly
+/// out-of-range `index` (e.g. `u64::MAX` from a malformed chunk) would let
+/// one bad chunk allocate `index + 1` slots — `Vec<PartialToolCall>` — and
+/// OOM the proxy. The cap is generous (1024 tool calls in a single
+/// assistant turn is well above any reasonable usage) and a hit is logged
+/// at WARN so a misbehaving upstream is visible without crashing the
+/// stream.
+///
+/// Semantics: indices `0..MAX_TOOL_CALLS` are accepted (exactly
+/// `MAX_TOOL_CALLS` slots); `index >= MAX_TOOL_CALLS` is dropped. The
+/// name pins the slot count, not the maximum accepted index.
+pub const MAX_TOOL_CALLS: usize = 1024;
+
 /// In-progress tool call before its arguments JSON is complete.
 #[derive(Default)]
 struct PartialToolCall {
@@ -53,12 +69,25 @@ impl StreamingBuffer {
     /// incrementally: the first delta usually carries `function.name`, later
     /// deltas append to `function.arguments`. Missing deltas (`None`) leave
     /// the field untouched.
+    ///
+    /// `index >= MAX_TOOL_CALLS` is dropped (with a WARN log) so a malformed
+    /// upstream chunk cannot OOM the proxy by forcing a huge `Vec`
+    /// allocation. The cap is generous: 1024 tool calls in a single
+    /// assistant turn is well above any healthy usage.
     pub async fn append_tool_call_delta(
         &self,
         index: usize,
         name_delta: Option<&str>,
         args_delta: Option<&str>,
     ) {
+        if index >= MAX_TOOL_CALLS {
+            tracing::warn!(
+                index,
+                max = MAX_TOOL_CALLS,
+                "tool_call index exceeds sanity cap; dropping delta to avoid OOM"
+            );
+            return;
+        }
         let mut state = self.inner.lock().await;
         while state.tool_calls.len() <= index {
             state.tool_calls.push(PartialToolCall::default());
@@ -169,5 +198,41 @@ mod tests {
         clone.append_content("shared").await;
         let (content, _calls) = buf.finalize().await;
         assert_eq!(content, "shared", "clone shares the underlying state");
+    }
+
+    #[tokio::test]
+    async fn append_tool_call_delta_drops_index_above_cap() {
+        // An out-of-range `index` must NOT trigger a huge Vec allocation.
+        // The buffer surfaces a WARN and discards the delta; the existing
+        // tool calls (if any) are preserved unchanged.
+        let buf = StreamingBuffer::new();
+        buf.append_tool_call_delta(0, Some("keep"), None).await;
+        buf.append_tool_call_delta(MAX_TOOL_CALLS, Some("drop"), None)
+            .await;
+        let (_content, calls) = buf.finalize().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "out-of-range index must not allocate a slot"
+        );
+        assert_eq!(calls[0].name, "keep");
+    }
+
+    #[tokio::test]
+    async fn append_tool_call_delta_accepts_index_just_below_cap() {
+        // Boundary: index == MAX_TOOL_CALLS - 1 is the last allowed slot.
+        // The cap is on slot count, so exactly `MAX_TOOL_CALLS` slots
+        // (indices 0..MAX_TOOL_CALLS) are accepted.
+        let buf = StreamingBuffer::new();
+        let last_allowed = MAX_TOOL_CALLS - 1;
+        buf.append_tool_call_delta(last_allowed, Some("edge"), None)
+            .await;
+        let (_content, calls) = buf.finalize().await;
+        assert_eq!(
+            calls.len(),
+            MAX_TOOL_CALLS,
+            "index == MAX_TOOL_CALLS - 1 must allocate"
+        );
+        assert_eq!(calls[last_allowed].name, "edge");
     }
 }

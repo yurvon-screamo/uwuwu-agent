@@ -1242,6 +1242,77 @@ mod tests {
         let existing_after = facts.get_clone(&existing_id).expect("existing present");
         assert_eq!(existing_after.conflicts_with().len(), 1);
         assert!(existing_after.conflicts_with().contains(&pending_id));
+        // Pending twin also keeps its pre-flagged conflict link — the C3
+        // guard leaves both sides untouched, which is the contract that
+        // keeps a re-finalized session idempotent (no spurious
+        // double-flag, no leak of the conflict to fresh candidates).
+        let pending_after = facts.get_clone(&pending_id).expect("pending present");
+        assert_eq!(pending_after.conflicts_with().len(), 1);
+        assert!(
+            pending_after.conflicts_with().contains(&existing_id),
+            "pending twin must retain its pre-existing conflict flag"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-contradiction — pending fact drifts against 2+ existing facts
+    // -----------------------------------------------------------------------
+
+    /// A pending fact that contradicts MULTIPLE accepted facts flags every
+    /// contradiction it finds. Drift-priority means the FIRST
+    /// contradiction wins for the *outcome* (the loop returns
+    /// `Conflict` on the first one), but `resolve_one` continues scanning
+    /// only until the first contradiction — it does NOT keep flagging
+    /// after the drift is observed. This test pins that semantics: the
+    /// second contradicting candidate is NOT visited once the first
+    /// contradiction has fired.
+    #[tokio::test]
+    async fn multi_contradiction_returns_after_first_drift() {
+        let facts = InMemoryFacts::default();
+        let sessions = InMemorySessions::default();
+        let existing_a = accepted("ttl=60 seconds", vec![1.0, 0.0, 0.0]);
+        let existing_b = accepted("ttl=30 seconds", vec![0.95, 0.05, 0.0]);
+        let a_id = existing_a.id().clone();
+        let b_id = existing_b.id().clone();
+        facts.seed(existing_a);
+        facts.seed(existing_b);
+        let pending_fact = pending("ttl=10 seconds", vec![1.0, 0.0, 0.0]);
+        let pending_id = pending_fact.id().clone();
+        facts.seed(pending_fact.clone());
+        sessions.seed(session_with_pending(vec![pending_id.clone()]));
+
+        // First candidate returns contradiction → loop returns
+        // immediately. The second verdict (also contradiction) is never
+        // consumed.
+        let classifier = ScriptedNliClassifier::new(vec![Ok(contradiction_available())]);
+        let fix = Fix::new();
+        let uc = build(&facts, &sessions, &classifier, &fix);
+
+        let stats = uc.execute(&sid(1), &memory_key()).await.unwrap();
+        assert_eq!(stats.conflicts, 1);
+        assert_eq!(stats.processed, 1);
+        assert_eq!(
+            classifier.calls().len(),
+            1,
+            "first contradiction must short-circuit; second candidate not visited"
+        );
+
+        // The pending twin carries exactly ONE drift flag (against
+        // whichever candidate was visited first — the merge-candidate
+        // order is deterministic via cosine).
+        let pending_after = facts.get_clone(&pending_id).expect("pending present");
+        assert_eq!(
+            pending_after.conflicts_with().len(),
+            1,
+            "exactly one drift flag on the pending twin"
+        );
+        // Sanity: the flagged id is one of the two existing facts.
+        let flagged = pending_after
+            .conflicts_with()
+            .iter()
+            .next()
+            .expect("flag set");
+        assert!(*flagged == a_id || *flagged == b_id);
     }
 
     // -----------------------------------------------------------------------

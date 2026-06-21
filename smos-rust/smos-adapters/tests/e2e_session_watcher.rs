@@ -234,7 +234,8 @@ async fn seed_session_aged(
         pending,
         aged_ts,
         aged_ts,
-    );
+    )
+    .expect("valid: created_at == last_active");
     SessionRepository::save(store, session, &state)
         .await
         .expect("save session");

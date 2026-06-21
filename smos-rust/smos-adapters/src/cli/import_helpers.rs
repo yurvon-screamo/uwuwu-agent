@@ -89,7 +89,21 @@ pub fn derive_session_id(raw: &str) -> SessionId {
         "opencode session id does not match the SMOS pattern; \
          derived a deterministic SMOS id from its SHA-1 hash"
     );
-    SessionId::from_raw(&derived).expect("SHA-1-derived hex is always 12 lowercase chars")
+    SessionId::from_raw(&derived).unwrap_or_else(|_| {
+        // Defensive: SHA-1 of an arbitrary byte string always yields 12
+        // lowercase hex chars under the construction above, so this branch
+        // is unreachable in practice. Falling back to a static valid id
+        // keeps the helper total — a `panic!` here would crash `smos import`
+        // halfway through a long-running import on a deterministic derivation
+        // path, which is the worst possible time to crash.
+        tracing::error!(
+            original = raw,
+            derived = %derived,
+            "SHA-1-derived session id failed SessionId validation; using static fallback"
+        );
+        SessionId::from_raw("sess_000000000000")
+            .expect("static fallback id is valid by construction")
+    })
 }
 
 /// Validate `raw` as a SMOS memory_key; surfaces a friendlier `anyhow`

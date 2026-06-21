@@ -17,6 +17,7 @@ use smos_domain::SessionId;
 use std::sync::LazyLock;
 
 use crate::helpers::openai_content::flatten_text;
+use crate::types::EnrichmentMessages;
 
 /// Match the marker and capture the inner session id token.
 ///
@@ -69,6 +70,24 @@ pub fn detect_from_messages(messages: &[Value]) -> Option<SessionId> {
             && let Some(id) = detect_in_text(&flatten_text(content))
         {
             return Some(id);
+        }
+    }
+    None
+}
+
+/// Typed-message counterpart of [`detect_from_messages`].
+///
+/// Operates on the [`EnrichmentMessages`] array the request pipeline uses
+/// internally (built via `enrichment_messages_from_json`); same trailing
+/// [`WINDOW`] scan, same newest-to-oldest iteration, same first-hit-wins
+/// semantics. The typed path avoids a per-message `serde_json::Value`
+/// lookup, which matters because the marker scan runs on every request.
+pub fn detect_from_typed_messages(messages: &EnrichmentMessages) -> Option<SessionId> {
+    let start = messages.len().saturating_sub(WINDOW);
+    for msg in messages[start..].iter().rev() {
+        let id = detect_in_text(&msg.content.as_text());
+        if id.is_some() {
+            return id;
         }
     }
     None

@@ -6,12 +6,17 @@
 
 pub mod chat_request;
 pub mod chat_response;
+pub mod enrichment_messages;
 pub mod merge_result;
 pub mod rerank_result;
 pub mod search_hit;
 
 pub use chat_request::ChatRequest;
 pub use chat_response::ChatResponse;
+pub use enrichment_messages::{
+    ChatMessageDto, ContentPart, EnrichmentMessages, MessageContent, ToolCallDto, ToolCallFunction,
+    enrichment_messages_from_json, enrichment_messages_to_json,
+};
 pub use merge_result::MergeResult;
 pub use rerank_result::RerankResult;
 pub use search_hit::{SearchHit, SearchHitMetadata};

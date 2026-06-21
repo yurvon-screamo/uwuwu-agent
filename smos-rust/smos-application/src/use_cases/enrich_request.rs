@@ -47,7 +47,7 @@ use crate::helpers::request_enricher;
 use crate::helpers::retrieval_planner::{self, RetrievalHit};
 use crate::helpers::topic_extractor;
 use crate::ports::{Clock, EmbeddingProvider, FactRepository, RerankProvider, SessionRepository};
-use crate::types::SearchHit;
+use crate::types::{SearchHit, enrichment_messages_from_json};
 
 /// Borrow-style bundle of every dependency the enrichment pipeline needs.
 ///
@@ -81,17 +81,41 @@ where
     /// type level. [`HandleChatCompletion`] therefore consumes the request's
     /// messages via `std::mem::take` and assigns the enriched result back
     /// unconditionally — no `Err` arm to forget to repopulate.
+    ///
+    /// # H-5 wire-shape preservation
+    ///
+    /// The function operates on `Vec<serde_json::Value>` **end-to-end**: the
+    /// typed [`EnrichmentMessages`] projection is built once at the top for
+    /// the read-only helpers (topic extraction, marker detection) and NEVER
+    /// re-serialised back to JSON. The mutation step (`request_enricher::
+    /// inject_value`) works on the raw `Value` directly, preserving every
+    /// per-message *sibling* field of `messages[0]` (`name`, `tool_call_id`,
+    /// `refusal`, unknown future OpenAI extensions) and every message in
+    /// `[1..]` verbatim. The content field itself is flattened to text
+    /// before prepend (so a multipart `messages[0].content` with
+    /// `image_url` parts is reduced to its concatenated text parts +
+    /// the prepended block) — same behaviour as the pre-H-5 pipeline,
+    /// pinned by the e2e enrichment suite. Round-tripping the typed DTO
+    /// would silently drop the sibling fields and break the fail-open
+    /// contract for tool-calling and vision workflows.
     pub async fn execute(
         &self,
         messages: Vec<Value>,
         memory_key: &MemoryKey,
         session_id: &SessionId,
     ) -> Vec<Value> {
+        // Read-only typed projection: used only for topic extraction here
+        // (session-marker detection runs in `HandleChatCompletion`, which
+        // also uses the read-only projection). NEVER re-serialised — the
+        // raw `messages: Vec<Value>` stays the source of truth for the
+        // mutation + return path.
+        let typed_projection = enrichment_messages_from_json(&messages);
+
         // Step 1 + 2 — short-circuit on empty / too-short topic. POC parity:
         // `if len(topic.strip()) < min_topic_chars`. Trimming prevents
         // whitespace-only topics (e.g. `"   "`) from passing the gate and
         // producing a garbage embedding downstream.
-        let topic = extract_topic_from_messages(&messages);
+        let topic = topic_extractor::extract_from_messages(&typed_projection);
         let trimmed_len = topic.trim().chars().count();
         if trimmed_len < self.retrieval_cfg.min_topic_chars {
             tracing::debug!(
@@ -163,18 +187,20 @@ where
             return messages;
         }
 
-        // Step 13 — build memory block + inject. `inject` returns a fresh
-        // `Value::Array` (it clones internally); we move the messages in via
-        // `Value::Array(messages)` (cheap) and pattern-match the result back
-        // out so the happy path performs exactly one allocation total — no
-        // extra deep clone of the entire messages array.
+        // Step 13 — build memory block + inject via the JSON-path entry
+        // point. `inject_value` operates on the raw `Value` and mutates
+        // only `messages[0].content`, preserving every other per-message
+        // field the typed DTO does not model (name, tool_call_id,
+        // refusal, image_url parts, …). Round-tripping the typed DTO
+        // here would silently drop those fields.
         let block = build_memory_block(&new_facts, session_id, memory_key);
         let messages_value = Value::Array(messages);
-        let enriched = request_enricher::inject(&messages_value, &block);
+        let enriched = request_enricher::inject_value(&messages_value, &block);
         match enriched {
             Value::Array(arr) => arr,
-            // Defensive: `inject` is documented to always echo the input shape
-            // (array in → array out); anything else indicates a domain bug.
+            // Defensive: `inject_value` is documented to always echo the
+            // input shape (array in → array out); anything else indicates
+            // a domain bug.
             other => vec![other],
         }
     }
@@ -262,18 +288,6 @@ where
 
 // Module-private free functions keep the `impl` block under the size limit and
 // make the pure pieces individually testable without spinning up ports.
-
-/// Extract the topic from the last message's `content` field.
-///
-/// Mirrors the POC `extract_topic(messages[-1])`: flatten string or multipart
-/// content of the trailing message into a single space-joined string.
-fn extract_topic_from_messages(messages: &[Value]) -> String {
-    let Some(last) = messages.last() else {
-        return String::new();
-    };
-    let content = last.get("content").unwrap_or(&Value::Null);
-    topic_extractor::extract_from_content(content)
-}
 
 /// Convert `SearchHit` rows (the adapter DTO) into the domain's `RetrievalHit`
 /// projection, then apply pre-filters + heat post-filter.
@@ -380,37 +394,62 @@ fn build_memory_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::types::{ChatMessageDto, EnrichmentMessages, MessageContent};
     use smos_domain::{MemoryKey, SessionId};
+
+    fn user_msg(content: &str) -> ChatMessageDto {
+        ChatMessageDto {
+            role: "user".into(),
+            content: MessageContent::Text(content.into()),
+            tool_calls: None,
+        }
+    }
 
     #[test]
     fn extract_topic_from_string_content() {
-        let msgs = vec![json!({"role": "user", "content": "hello world"})];
-        assert_eq!(extract_topic_from_messages(&msgs), "hello world");
+        let msgs: EnrichmentMessages = vec![user_msg("hello world")];
+        assert_eq!(topic_extractor::extract_from_messages(&msgs), "hello world");
     }
 
     #[test]
     fn extract_topic_returns_empty_when_no_messages() {
-        assert_eq!(extract_topic_from_messages(&[]), "");
+        let msgs: EnrichmentMessages = Vec::new();
+        assert_eq!(topic_extractor::extract_from_messages(&msgs), "");
     }
 
     #[test]
     fn extract_topic_returns_empty_when_missing_content() {
-        let msgs = vec![json!({"role": "user"})];
-        assert_eq!(extract_topic_from_messages(&msgs), "");
+        let msg = ChatMessageDto {
+            role: "user".into(),
+            content: MessageContent::Text(String::new()),
+            tool_calls: None,
+        };
+        let msgs: EnrichmentMessages = vec![msg];
+        assert_eq!(topic_extractor::extract_from_messages(&msgs), "");
     }
 
     #[test]
     fn extract_topic_flattens_multipart() {
-        let msgs = vec![json!({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "alpha"},
-                {"type": "image_url"},
-                {"type": "text", "text": "beta"},
-            ]
-        })];
-        assert_eq!(extract_topic_from_messages(&msgs), "alpha beta");
+        let msg = ChatMessageDto {
+            role: "user".into(),
+            content: MessageContent::Multipart(vec![
+                crate::types::ContentPart {
+                    kind: "text".into(),
+                    text: "alpha".into(),
+                },
+                crate::types::ContentPart {
+                    kind: "image_url".into(),
+                    text: String::new(),
+                },
+                crate::types::ContentPart {
+                    kind: "text".into(),
+                    text: "beta".into(),
+                },
+            ]),
+            tool_calls: None,
+        };
+        let msgs: EnrichmentMessages = vec![msg];
+        assert_eq!(topic_extractor::extract_from_messages(&msgs), "alpha beta");
     }
 
     // -----------------------------------------------------------------------

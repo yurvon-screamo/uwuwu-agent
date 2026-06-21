@@ -34,7 +34,7 @@ use crate::ports::{
     Clock, EmbeddingProvider, FactRepository, IdGenerator, LlmUpstream, RerankProvider,
     SessionRepository,
 };
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, enrichment_messages_from_json};
 use crate::use_cases::enrich_request::EnrichRequest;
 
 /// Top-level chat-completion orchestration.
@@ -77,21 +77,36 @@ where
         let (memory_key, real_model) = model_parser::parse_model(&request.model)?;
         request.model = real_model;
 
-        // Step 2 — detect session. Falls back to a freshly-minted id from
-        // the injected generator when no marker survived in the trailing
-        // window. Generation goes through the `IdGenerator` port so the
-        // domain's `SessionId::new()` constructor stays `pub(crate)` and
-        // id generation is an explicit, mockable capability.
-        let session_id = session_marker::detect_from_messages(&request.messages)
+        // H-5: build a *read-only* typed projection of the messages for
+        // the helpers that need to introspect message content (session
+        // marker detection here, topic extraction inside EnrichRequest).
+        // The projection is NEVER re-serialised back into
+        // `request.messages` — the raw `Vec<Value>` stays the source of
+        // truth so per-message fields the typed DTO does not model
+        // (`name`, `tool_call_id`, `refusal`, `image_url` parts, audio
+        // parts, future OpenAI extensions) survive the enrichment
+        // pipeline verbatim. The previous round-trip design lost those
+        // fields and broke the fail-open contract for tool-calling and
+        // vision workflows.
+        let typed_projection = enrichment_messages_from_json(&request.messages);
+
+        // Step 2 — detect session from the typed projection. Falls back
+        // to a freshly-minted id from the injected generator when no
+        // marker survived in the trailing window. Generation goes
+        // through the `IdGenerator` port so the domain's
+        // `SessionId::new()` constructor stays `pub(crate)` and id
+        // generation is an explicit, mockable capability.
+        let session_id = session_marker::detect_from_typed_messages(&typed_projection)
             .unwrap_or_else(|| self.id_generator.new_session_id());
 
-        // Step 3 — enrichment (infallible fail-open). `EnrichRequest::execute`
-        // returns `Vec<Value>` directly: every port-level error already
-        // fail-opens to the original messages inside `execute`, so the type
-        // system rules out a future bug where an `Err` arm silently replaces
-        // the consumed `request.messages` with `Vec::new()`. We `mem::take`
-        // because the result is guaranteed to contain at least the original
-        // messages — no extra clone, no copy-back risk.
+        // Step 3 — enrichment (infallible fail-open). `EnrichRequest::
+        // execute` returns `Vec<Value>` directly: every port-level error
+        // already fail-opens to the original messages inside `execute`,
+        // so the type system rules out a future bug where an `Err` arm
+        // silently replaces the consumed `request.messages` with
+        // `Vec::new()`. We `mem::take` because the result is guaranteed
+        // to contain at least the original messages — no extra clone, no
+        // copy-back risk, no wire-shape loss.
         let enriched_messages = self
             .enrich(
                 std::mem::take(&mut request.messages),

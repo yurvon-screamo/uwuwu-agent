@@ -28,7 +28,7 @@ use smos_application::errors::UpstreamError;
 use smos_domain::chat::ToolCall;
 
 use crate::upstream::sse_parser::{self, SseEvent, SseParser};
-use crate::upstream::streaming_buffer::StreamingBuffer;
+use crate::upstream::streaming_buffer::{MAX_TOOL_CALLS, StreamingBuffer};
 
 /// Inject the marker into a terminal event and return the re-serialised data
 /// payload; on a non-terminal/`[DONE]` event the original data is returned
@@ -226,12 +226,25 @@ async fn feed_buffer(buffer: &StreamingBuffer, event: &SseEvent) {
 }
 
 /// Feed a single `tool_calls[]` delta entry into `buffer`, keyed by `index`.
+///
+/// `index >= MAX_TOOL_CALLS` is dropped at this layer too (defence-in-
+/// depth: the buffer enforces the same cap, but filtering at the parser
+/// avoids even constructing the request). A WARN log surfaces the
+/// malformed chunk so a misbehaving upstream is visible.
 async fn feed_tool_call_delta(buffer: &StreamingBuffer, entry: &Value) {
     let index = entry
         .get("index")
         .and_then(Value::as_u64)
         .map(|i| i as usize)
         .unwrap_or(0);
+    if index >= MAX_TOOL_CALLS {
+        tracing::warn!(
+            index,
+            max = MAX_TOOL_CALLS,
+            "stream chunk carried a tool_call index above the sanity cap; dropping"
+        );
+        return;
+    }
     let name = entry.pointer("/function/name").and_then(Value::as_str);
     let args = entry.pointer("/function/arguments").and_then(Value::as_str);
     buffer.append_tool_call_delta(index, name, args).await;

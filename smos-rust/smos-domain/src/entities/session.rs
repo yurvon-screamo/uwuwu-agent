@@ -4,6 +4,7 @@
 //! registry of these) lives in the application layer; the domain layer only
 //! owns the value type and its pure update operations.
 
+use crate::error::DomainError;
 use crate::value_objects::{FactId, MemoryKey, SessionId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -38,6 +39,12 @@ impl SessionState {
     /// `injected_facts`, which has no public mutator — without recomputation.
     /// The `injected_facts` iterator is consumed into a `BTreeSet` (duplicates
     /// collapse); `pending_facts` is taken as-is.
+    ///
+    /// Returns [`DomainError::InvalidTimestamp`] when `last_active < created_at`:
+    /// a session that was last touched before it was created is an impossible
+    /// state and indicates a corrupt row. Fail-fast at rehydrate keeps the
+    /// invariant pinned in one place rather than relying on every caller to
+    /// remember the check.
     pub fn rehydrate(
         id: SessionId,
         memory_key: MemoryKey,
@@ -45,15 +52,20 @@ impl SessionState {
         pending_facts: Vec<FactId>,
         created_at: Timestamp,
         last_active: Timestamp,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DomainError> {
+        if last_active < created_at {
+            return Err(DomainError::InvalidTimestamp(format!(
+                "last_active ({last_active}) < created_at ({created_at})"
+            )));
+        }
+        Ok(Self {
             id,
             memory_key,
             injected_facts: injected_facts.into_iter().collect(),
             pending_facts,
             created_at,
             last_active,
-        }
+        })
     }
 
     /// Refresh `last_active` to `now`.
@@ -224,7 +236,8 @@ mod tests {
             state.pending_facts().to_vec(),
             state.created_at(),
             state.last_active(),
-        );
+        )
+        .expect("valid timestamps: last_active >= created_at");
 
         assert_eq!(rehydrated.id(), state.id());
         assert_eq!(
@@ -238,5 +251,36 @@ mod tests {
         assert_eq!(rehydrated.pending_facts(), state.pending_facts(),);
         assert_eq!(rehydrated.created_at(), state.created_at());
         assert_eq!(rehydrated.last_active(), state.last_active());
+    }
+
+    #[test]
+    fn rehydrate_rejects_last_active_before_created_at() {
+        // A session that was last touched before it was created is an
+        // impossible state — `rehydrate` must fail loudly so a corrupt row
+        // never reaches the rest of the system.
+        let created = at(2_000);
+        let last_active = at(1_000);
+        let result = SessionState::rehydrate(
+            sid(),
+            key(),
+            std::iter::empty(),
+            Vec::new(),
+            created,
+            last_active,
+        );
+        let err = result.expect_err("last_active < created_at must fail rehydrate");
+        let msg = err.to_string();
+        assert!(msg.contains("last_active"), "msg = {msg}");
+        assert!(msg.contains("created_at"), "msg = {msg}");
+    }
+
+    #[test]
+    fn rehydrate_accepts_equal_created_and_last_active() {
+        // Boundary: created_at == last_active is the freshly-created state —
+        // must NOT trip the `last_active < created_at` invariant.
+        let now = at(1_700_000_000);
+        let state = SessionState::rehydrate(sid(), key(), std::iter::empty(), Vec::new(), now, now)
+            .expect("created_at == last_active is valid");
+        assert_eq!(state.created_at(), state.last_active());
     }
 }

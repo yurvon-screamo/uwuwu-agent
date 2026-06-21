@@ -61,7 +61,26 @@ impl Timestamp {
     }
 
     pub fn as_unix_millis(&self) -> i64 {
-        self.0.unix_timestamp_nanos() as i64 / 1_000_000
+        // `unix_timestamp_nanos` returns an `i128`; for the supported
+        // OffsetDateTime range the value is always positive and well below
+        // `i64::MAX`, but the previous `as i64` cast would silently wrap on a
+        // far-future timestamp (and produce a negative `i64`). Use
+        // `i64::try_from` and saturate at BOTH ends so a far-past timestamp
+        // saturates to `i64::MIN` (not `i64::MAX` — the previous one-sided
+        // saturation was asymmetric and would have shifted a far-past
+        // timestamp into the far-future bucket).
+        let nanos = self.0.unix_timestamp_nanos();
+        let millis = nanos / 1_000_000;
+        match i64::try_from(millis) {
+            Ok(v) => v,
+            Err(_) => {
+                if millis < 0 {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            }
+        }
     }
 
     pub fn as_offset_date_time(&self) -> OffsetDateTime {
