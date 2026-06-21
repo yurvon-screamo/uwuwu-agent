@@ -87,10 +87,8 @@ impl StreamingBuffer {
     /// cannot wrap past the cap on a 32-bit target.
     pub async fn append_content(&self, delta: &str) {
         let mut state = self.inner.lock().await;
-        // `saturating_add` guards the cap check itself against `usize`
-        // wrap-around on a 32-bit target with a pathological `delta.len()`;
-        // on 64-bit this branch is unreachable in practice but stays as
-        // defense-in-depth.
+        // On 64-bit targets the saturating branch is unreachable in practice
+        // (memory OOM happens first); it stays as defense-in-depth for 32-bit.
         let new_len = state.content.len().saturating_add(delta.len());
         if new_len > MAX_CONTENT_BYTES {
             tracing::warn!(
