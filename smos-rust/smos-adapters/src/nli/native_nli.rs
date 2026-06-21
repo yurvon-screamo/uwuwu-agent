@@ -40,6 +40,20 @@ const LOGIT_NEUTRAL: usize = 1;
 const LOGIT_CONTRADICTION: usize = 2;
 
 /// Native NLI classifier over ort + ONNX Runtime.
+///
+/// ## Concurrency: serialized inference
+///
+/// `Session::run` requires `&mut self`, so all NLI classifications are
+/// serialized on a single `Mutex`. Concurrent finalize for N sessions
+/// executes inference sequentially.
+///
+/// This is a **deliberate trade-off** for single-process SMOS:
+/// - NLI runs in background finalize, not per-request hot path
+/// - Sequential inference is predictable and avoids GPU memory contention
+/// - Batching (`classify_batch`) is a future scalability improvement
+///
+/// For high-throughput deployments, consider spawning multiple
+/// `NativeNliClassifier` instances with round-robin dispatch.
 pub struct NativeNliClassifier {
     // `Arc<Mutex<Session>>` because `Session::run` takes `&mut self`: every
     // concurrent classify call must serialise at the session level. The

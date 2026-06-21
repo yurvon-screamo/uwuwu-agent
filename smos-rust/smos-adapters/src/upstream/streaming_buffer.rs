@@ -32,6 +32,17 @@ struct BufferState {
     tool_calls: Vec<PartialToolCall>,
 }
 
+/// Defense-in-depth cap on the total accumulated `content` length.
+///
+/// The streaming passthrough forwards content to the client 1:1 as it
+/// arrives, so the buffer is not the production memory bound — the HTTP
+/// layer is. This cap exists so a runaway upstream (or a bug that disables
+/// client flow-control) cannot grow `content` unbounded and OOM the proxy
+/// process. 16 MB is well above any legitimate assistant reply; a hit is
+/// logged at WARN and the offending delta is dropped, preserving whatever
+/// was accumulated so far.
+pub const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Sanity cap on the `index` of an `append_tool_call_delta` call.
 ///
 /// OpenAI's streaming protocol reuses `index` to identify each tool call
@@ -61,8 +72,23 @@ impl StreamingBuffer {
     }
 
     /// Append a content delta (SSE `choices[0].delta.content`).
+    ///
+    /// Defense-in-depth: if `content.len() + delta.len()` would exceed
+    /// [`MAX_CONTENT_BYTES`], the delta is dropped with a WARN log rather
+    /// than letting a runaway upstream grow the buffer unbounded.
     pub async fn append_content(&self, delta: &str) {
-        self.inner.lock().await.content.push_str(delta);
+        let mut state = self.inner.lock().await;
+        let new_len = state.content.len() + delta.len();
+        if new_len > MAX_CONTENT_BYTES {
+            tracing::warn!(
+                current = state.content.len(),
+                delta = delta.len(),
+                max = MAX_CONTENT_BYTES,
+                "content buffer exceeds cap, dropping delta"
+            );
+            return;
+        }
+        state.content.push_str(delta);
     }
 
     /// Append a tool-call delta for the tool call at `index`. SSE chunks arrive
@@ -133,6 +159,29 @@ mod tests {
         let (content, calls) = buf.finalize().await;
         assert_eq!(content, "Hello world");
         assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_content_drops_delta_above_cap() {
+        // A delta that would push the buffer past MAX_CONTENT_BYTES must be
+        // dropped; the buffer stays at its prior size (empty here) instead of
+        // allocating the runaway delta.
+        let buf = StreamingBuffer::new();
+        let big = "x".repeat(MAX_CONTENT_BYTES + 1);
+        buf.append_content(&big).await;
+        let state = buf.inner.lock().await;
+        assert!(state.content.is_empty(), "content should be dropped");
+    }
+
+    #[tokio::test]
+    async fn append_content_accepts_delta_just_below_cap() {
+        // Normal-sized deltas are unaffected by the cap; this guards against
+        // an off-by-one that would reject legitimate replies.
+        let buf = StreamingBuffer::new();
+        let ok = "x".repeat(100);
+        buf.append_content(&ok).await;
+        let state = buf.inner.lock().await;
+        assert_eq!(state.content.len(), 100);
     }
 
     #[tokio::test]

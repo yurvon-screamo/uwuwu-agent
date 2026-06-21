@@ -308,9 +308,23 @@ fn parse_fact_status(s: &str) -> Result<FactStatus, RepoError> {
 
 fn format_iso(ts: OffsetDateTime) -> String {
     // `time`'s `Rfc3339` format is widely compatible and accepted by
-    // SurrealDB's `datetime` parser.
-    ts.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    // SurrealDB's `datetime` parser. Formatting a `Rfc3339`-compatible
+    // `OffsetDateTime` should never fail in practice, but the previous
+    // silent fallback to `"1970-01-01T00:00:00Z"` would corrupt the
+    // timestamp-dependent heat decay if it ever did. Surface the error at
+    // ERROR level and fall back to the debug representation (which still
+    // carries the timestamp) instead of silently emitting the epoch.
+    match ts.format(&time::format_description::well_known::Rfc3339) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                timestamp = ?ts,
+                "Rfc3339 formatting failed; this should be unreachable — please report"
+            );
+            format!("{:?}", ts)
+        }
+    }
 }
 
 fn parse_iso(s: &str) -> Result<Timestamp, RepoError> {

@@ -36,5 +36,12 @@ searxng/.env.example
 smos-rust/target/
 smos-rust/data/
 
+# SMOS Rust runtime artifacts (logs, build stdout/stderr, temp scripts)
+*.log
+*_out.txt
+*_err.txt
+build_*.ps1
+dxdiag_output.txt
+
 # NLI model cache (large binary)
 data/nli_cache/
