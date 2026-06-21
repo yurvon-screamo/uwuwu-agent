@@ -41,6 +41,13 @@ struct BufferState {
 /// process. 16 MB is well above any legitimate assistant reply; a hit is
 /// logged at WARN and the offending delta is dropped, preserving whatever
 /// was accumulated so far.
+///
+/// Trade-off: dropped deltas affect the **post-stream extraction prompt**
+/// (see `spawn_extraction`), not the client SSE stream — the client already
+/// received every byte 1:1. The extraction task sees a truncated buffer and
+/// its NLI verdict degrades accordingly. For content past the 16 MB cap
+/// the extraction is questionable anyway, but callers must not assume the
+/// buffer ever holds the *complete* upstream reply.
 pub const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Sanity cap on the `index` of an `append_tool_call_delta` call.
@@ -75,10 +82,16 @@ impl StreamingBuffer {
     ///
     /// Defense-in-depth: if `content.len() + delta.len()` would exceed
     /// [`MAX_CONTENT_BYTES`], the delta is dropped with a WARN log rather
-    /// than letting a runaway upstream grow the buffer unbounded.
+    /// than letting a runaway upstream grow the buffer unbounded. The
+    /// check uses `saturating_add` so a pathologically huge `delta.len()`
+    /// cannot wrap past the cap on a 32-bit target.
     pub async fn append_content(&self, delta: &str) {
         let mut state = self.inner.lock().await;
-        let new_len = state.content.len() + delta.len();
+        // `saturating_add` guards the cap check itself against `usize`
+        // wrap-around on a 32-bit target with a pathological `delta.len()`;
+        // on 64-bit this branch is unreachable in practice but stays as
+        // defense-in-depth.
+        let new_len = state.content.len().saturating_add(delta.len());
         if new_len > MAX_CONTENT_BYTES {
             tracing::warn!(
                 current = state.content.len(),
@@ -174,14 +187,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_content_accepts_delta_just_below_cap() {
-        // Normal-sized deltas are unaffected by the cap; this guards against
-        // an off-by-one that would reject legitimate replies.
+    async fn append_content_accepts_delta_at_exact_cap_boundary() {
+        // Boundary: the check is strict `> MAX_CONTENT_BYTES`, so a delta
+        // that lands the buffer EXACTLY on `MAX_CONTENT_BYTES` is accepted.
+        // This guards against an off-by-one (`>=` regression) that would
+        // reject the last legal byte.
         let buf = StreamingBuffer::new();
-        let ok = "x".repeat(100);
-        buf.append_content(&ok).await;
+        let exact = "x".repeat(MAX_CONTENT_BYTES);
+        buf.append_content(&exact).await;
         let state = buf.inner.lock().await;
-        assert_eq!(state.content.len(), 100);
+        assert_eq!(
+            state.content.len(),
+            MAX_CONTENT_BYTES,
+            "delta landing exactly on the cap must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_content_drops_delta_one_byte_above_cap() {
+        // Boundary mirror: delta of `MAX_CONTENT_BYTES + 1` from an empty
+        // buffer must be rejected. Pairs with the exact-cap test to pin the
+        // `>` vs `>=` boundary.
+        let buf = StreamingBuffer::new();
+        let over = "x".repeat(MAX_CONTENT_BYTES + 1);
+        buf.append_content(&over).await;
+        let state = buf.inner.lock().await;
+        assert_eq!(
+            state.content.len(),
+            0,
+            "delta one byte above the cap must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_content_accumulation_then_drop_streaming_scenario() {
+        // Realistic streaming scenario: many small deltas fill the buffer
+        // close to the cap, then a final delta that would cross it is
+        // dropped while the previously accumulated content is preserved.
+        let buf = StreamingBuffer::new();
+        // Fill to within 100 bytes of the cap.
+        let fill = "x".repeat(MAX_CONTENT_BYTES - 100);
+        buf.append_content(&fill).await;
+        // Crossing delta — must be dropped, accumulated content stays.
+        buf.append_content(&"y".repeat(200)).await;
+        let state = buf.inner.lock().await;
+        assert_eq!(
+            state.content.len(),
+            MAX_CONTENT_BYTES - 100,
+            "accumulated content preserved; crossing delta dropped"
+        );
+        // Last 100 bytes of headroom still fit.
+        drop(state);
+        buf.append_content(&"z".repeat(100)).await;
+        let state = buf.inner.lock().await;
+        assert_eq!(
+            state.content.len(),
+            MAX_CONTENT_BYTES,
+            "delta within remaining headroom is accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_content_small_delta_after_giant_drop_still_accepted() {
+        // After a giant delta is dropped (buffer frozen at its prior size),
+        // a subsequent small delta that fits under the cap must still be
+        // accepted — the cap is on `content.len() + delta.len()`, not a
+        // "permanently poisoned" flag.
+        let buf = StreamingBuffer::new();
+        let seed = "x".repeat(1_000);
+        buf.append_content(&seed).await;
+        // Giant drop.
+        buf.append_content(&"y".repeat(MAX_CONTENT_BYTES)).await;
+        // Small delta must still append to the seed.
+        buf.append_content("tail").await;
+        let state = buf.inner.lock().await;
+        assert_eq!(
+            state.content.len(),
+            1_000 + "tail".len(),
+            "small delta after a dropped giant delta must still be accepted"
+        );
     }
 
     #[tokio::test]

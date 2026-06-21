@@ -40,7 +40,7 @@ smos-rust/data/
 *.log
 *_out.txt
 *_err.txt
-build_*.ps1
+build_release.ps1
 dxdiag_output.txt
 
 # NLI model cache (large binary)

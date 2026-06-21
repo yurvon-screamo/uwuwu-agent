@@ -50,7 +50,9 @@ const LOGIT_CONTRADICTION: usize = 2;
 /// This is a **deliberate trade-off** for single-process SMOS:
 /// - NLI runs in background finalize, not per-request hot path
 /// - Sequential inference is predictable and avoids GPU memory contention
-/// - Batching (`classify_batch`) is a future scalability improvement
+/// - Micro-batching multiple facts into one inference pass is a future
+///   scalability improvement (not yet implemented; today every fact
+///   incurs one `Session::run`)
 ///
 /// For high-throughput deployments, consider spawning multiple
 /// `NativeNliClassifier` instances with round-robin dispatch.

@@ -312,8 +312,15 @@ fn format_iso(ts: OffsetDateTime) -> String {
     // `OffsetDateTime` should never fail in practice, but the previous
     // silent fallback to `"1970-01-01T00:00:00Z"` would corrupt the
     // timestamp-dependent heat decay if it ever did. Surface the error at
-    // ERROR level and fall back to the debug representation (which still
-    // carries the timestamp) instead of silently emitting the epoch.
+    // ERROR level and fall back to the debug representation instead of
+    // silently emitting the epoch.
+    //
+    // Caveat: the `time` crate's `Debug` for `OffsetDateTime` is NOT a
+    // valid Rfc3339 string, so `parse_iso` will likely fail on a
+    // round-trip. The branch is "should be unreachable" — the goal is to
+    // avoid the silent epoch-corruption of heat decay timestamps and to
+    // leave a forensic trail in the ERROR log + stored row, not to keep
+    // the row readable.
     match ts.format(&time::format_description::well_known::Rfc3339) {
         Ok(s) => s,
         Err(e) => {
