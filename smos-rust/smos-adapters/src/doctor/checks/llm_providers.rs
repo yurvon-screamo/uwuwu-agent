@@ -1,8 +1,9 @@
-//! Ollama connectivity + required-models check + optional reranker probe.
+//! LLM/embedding connectivity + required-models check + optional reranker probe.
 //!
 //! Two public entry points:
-//! - [`check_ollama`] — `GET {url}/api/tags`, list models, match against
-//!   the configured upstream/embedding/extraction expectations.
+//! - [`check_llm_extractions`] / [`check_embeddings`] — `GET {url}/api/tags`,
+//!   list models, match against the configured extraction + embedding
+//!   expectations respectively.
 //! - [`check_reranker`] — probe the llama.cpp reranker URL. Reranker is
 //!   optional, so unreachable → WARN with a remediation hint, never FAIL.
 //!
@@ -15,7 +16,7 @@ use reqwest::Client;
 
 use super::super::models::{ExpectedModel, match_expected_models};
 use super::super::types::CheckResult;
-use crate::config::{OllamaConfig, RerankerConfig};
+use crate::config::{EmbeddingConfig, LlmExtractionConfig, RerankerConfig};
 
 /// Ollama `/api/tags` response shape — only the fields the doctor reads.
 /// Extra fields returned by the server are silently ignored by serde.
@@ -29,28 +30,67 @@ struct TagsModel {
     name: String,
 }
 
-/// Build the expected-model list from the SMOS config. One row per role:
-/// the upstream chat model (granite4.1:3b), the embedding model (Jina v5),
-/// and the extraction model (qwen3.5:2b).
-pub fn expected_models_from_config(config: &OllamaConfig) -> Vec<ExpectedModel> {
+/// Build the expected-model list from the SMOS extraction + embedding
+/// configs. One row per role. Exposed for tests that exercise the doctor
+/// helper without spinning up Ollama.
+#[cfg(test)]
+fn expected_models_from_config(
+    extraction: &LlmExtractionConfig,
+    embedding: &EmbeddingConfig,
+) -> Vec<ExpectedModel> {
     vec![
-        ExpectedModel::new("upstream chat model", "granite4.1:3b"),
-        ExpectedModel::new("embedding model", &config.embedding_model),
-        ExpectedModel::new("extraction model", &config.extraction_model),
+        ExpectedModel::new("extraction model", &extraction.model),
+        ExpectedModel::new("embedding model", &embedding.model),
     ]
 }
 
-/// Probe Ollama and emit one row per expected model + one connectivity row.
+/// Probe the LLM extraction endpoint and emit one row per expected model +
+/// one connectivity row.
 ///
-/// `timeout` bounds each HTTP request so a wedged Ollama that accepts the
+/// `timeout` bounds each HTTP request so a wedged backend that accepts the
 /// TCP handshake but never responds surfaces as FAIL instead of hanging
-/// the doctor. Mirrors the per-request cap on [`check_reranker`].
-pub async fn check_ollama(
+/// the doctor.
+pub async fn check_llm_extractions(
     client: &Client,
-    config: &OllamaConfig,
+    extraction: &LlmExtractionConfig,
     timeout: Duration,
 ) -> Vec<CheckResult> {
-    let url = format!("{}/api/tags", config.url.trim_end_matches('/'));
+    check_one_endpoint(
+        client,
+        &extraction.url,
+        &extraction.model,
+        "extraction",
+        timeout,
+    )
+    .await
+}
+
+/// Probe the embedding endpoint and emit one row per expected model + one
+/// connectivity row. Kept separate from [`check_llm_extractions`] because the
+/// two sections may point at different hosts.
+pub async fn check_embeddings(
+    client: &Client,
+    embedding: &EmbeddingConfig,
+    timeout: Duration,
+) -> Vec<CheckResult> {
+    check_one_endpoint(
+        client,
+        &embedding.url,
+        &embedding.model,
+        "embedding",
+        timeout,
+    )
+    .await
+}
+
+async fn check_one_endpoint(
+    client: &Client,
+    base_url: &str,
+    model: &str,
+    role: &'static str,
+    timeout: Duration,
+) -> Vec<CheckResult> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let mut results = Vec::new();
 
     let response = client.get(&url).timeout(timeout).send().await;
@@ -61,28 +101,30 @@ pub async fn check_ollama(
 
     let Some(bytes) = body else {
         results.push(
-            CheckResult::fail("Ollama connectivity", format!("url: {}", config.url))
-                .with_recommendation("start `ollama serve`"),
+            CheckResult::fail(
+                format!("Ollama connectivity ({role})"),
+                format!("url: {base_url}"),
+            )
+            .with_recommendation("start `ollama serve`"),
         );
-        // Push FAIL rows for every expected model so the operator sees the
-        // full delta at once instead of fixing Ollama and re-running.
-        for m in expected_models_from_config(config) {
-            results.push(
-                CheckResult::fail(
-                    format!("Required model: {}", m.configured),
-                    "Ollama unreachable",
-                )
-                .with_recommendation(format!("ollama pull {}", m.configured)),
-            );
-        }
+        results.push(
+            CheckResult::fail(
+                format!("Required model ({role}): {model}"),
+                "Ollama unreachable",
+            )
+            .with_recommendation(format!("ollama pull {model}")),
+        );
         return results;
     };
 
     let parsed: Result<TagsResponse, _> = serde_json::from_slice(&bytes);
     let Ok(parsed) = parsed else {
         results.push(
-            CheckResult::fail("Ollama connectivity", "response was not valid JSON")
-                .with_recommendation("check Ollama version (>=0.1.x)"),
+            CheckResult::fail(
+                format!("Ollama connectivity ({role})"),
+                "response was not valid JSON",
+            )
+            .with_recommendation("check Ollama version (>=0.1.x)"),
         );
         return results;
     };
@@ -90,11 +132,16 @@ pub async fn check_ollama(
     let names: Vec<String> = parsed.models.into_iter().map(|m| m.name).collect();
     let count = names.len();
     results.push(CheckResult::pass(
-        "Ollama connectivity",
-        format!("url: {}\navailable models: {count}", config.url),
+        format!("Ollama connectivity ({role})"),
+        format!("url: {base_url}\navailable models: {count}"),
     ));
 
-    let expected = expected_models_from_config(config);
+    let role_label: &'static str = match role {
+        "extraction" => "extraction model",
+        "embedding" => "embedding model",
+        other => other,
+    };
+    let expected = vec![ExpectedModel::new(role_label, model)];
     for (m, hit) in match_expected_models(&expected, &names) {
         let name = format!("Required model: {}", m.configured);
         if hit {
@@ -152,23 +199,28 @@ pub(crate) fn parse_tags_for_test(body: &[u8]) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
-    fn cfg() -> OllamaConfig {
-        OllamaConfig {
+    fn extraction() -> LlmExtractionConfig {
+        LlmExtractionConfig {
             url: "http://localhost:11434".into(),
-            embedding_model: "hf.co/jinaai/jina-embeddings-v5:latest".into(),
-            extraction_model: "qwen3.5:2b".into(),
-            timeout_seconds: 30,
-            ..OllamaConfig::default()
+            model: "qwen3.5:2b".into(),
+            ..LlmExtractionConfig::default()
+        }
+    }
+
+    fn embedding() -> EmbeddingConfig {
+        EmbeddingConfig {
+            url: "http://localhost:11434".into(),
+            model: "hf.co/jinaai/jinaai-embeddings-v5:latest".into(),
+            ..EmbeddingConfig::default()
         }
     }
 
     #[test]
-    fn expected_models_from_config_lists_all_three_roles() {
-        let expected = expected_models_from_config(&cfg());
-        assert_eq!(expected.len(), 3);
-        assert_eq!(expected[0].role, "upstream chat model");
+    fn expected_models_from_config_lists_both_roles() {
+        let expected = expected_models_from_config(&extraction(), &embedding());
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].role, "extraction model");
         assert_eq!(expected[1].role, "embedding model");
-        assert_eq!(expected[2].role, "extraction model");
     }
 
     #[test]

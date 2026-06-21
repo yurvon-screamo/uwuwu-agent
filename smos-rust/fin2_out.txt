@@ -1,0 +1,48 @@
+{"timestamp":"2026-06-21T13:04:27.627855Z","level":"INFO","fields":{"message":"Starting kvs store at rocksdb://data\\smos.db"},"target":"surrealdb::core::kvs::ds"}
+{"timestamp":"2026-06-21T13:04:27.632560Z","level":"INFO","fields":{"message":"Background thread count: 22"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:27.635269Z","level":"INFO","fields":{"message":"Maximum background jobs count: 44"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:27.637497Z","level":"INFO","fields":{"message":"Maximum number of open files: 1024"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:27.644689Z","level":"INFO","fields":{"message":"Number of log files to keep: 10"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.033394Z","level":"INFO","fields":{"message":"Maximum write buffers: 8"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.081199Z","level":"INFO","fields":{"message":"Write buffer size: 134217728"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.081616Z","level":"INFO","fields":{"message":"Target file size for compaction: 67108864"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.081764Z","level":"INFO","fields":{"message":"Target file size compaction multiplier: 2"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.081867Z","level":"INFO","fields":{"message":"Minimum write buffers to merge: 2"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.082043Z","level":"INFO","fields":{"message":"Number of files to trigger compaction: 4"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.124013Z","level":"INFO","fields":{"message":"Compaction readahead size: 16777216"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.127953Z","level":"INFO","fields":{"message":"Maximum concurrent subcompactions: 4"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.128301Z","level":"INFO","fields":{"message":"Use separate thread queues: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.128446Z","level":"INFO","fields":{"message":"Enable separation of keys and values: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.128703Z","level":"INFO","fields":{"message":"Minimum blob value size: 4096"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.128920Z","level":"INFO","fields":{"message":"Target blob file size: 268435456"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129146Z","level":"INFO","fields":{"message":"Enable blob garbage collection: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129313Z","level":"INFO","fields":{"message":"Blob GC age cutoff: 0.25"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129501Z","level":"INFO","fields":{"message":"Blob GC force threshold: 1"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129673Z","level":"INFO","fields":{"message":"Blob compaction readahead size: 0"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129781Z","level":"INFO","fields":{"message":"Write-ahead-log file size limit: 0MB"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.129953Z","level":"INFO","fields":{"message":"Allow concurrent memtable writes: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.130071Z","level":"INFO","fields":{"message":"Avoid unnecessary blocking IO: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.130231Z","level":"INFO","fields":{"message":"Allow adaptive write thread yielding: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.130366Z","level":"INFO","fields":{"message":"Wait for disk sync acknowledgement: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.171211Z","level":"INFO","fields":{"message":"Block cache size: 15819534336"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.172662Z","level":"INFO","fields":{"message":"Enable memory-mapped reads: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.172879Z","level":"INFO","fields":{"message":"Enable memory-mapped writes: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.173016Z","level":"INFO","fields":{"message":"Setting delete compaction factory: 1000 / 50 (0.5)"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.173150Z","level":"INFO","fields":{"message":"Setting compaction style: level"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.173287Z","level":"INFO","fields":{"message":"Setting compression level"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.173400Z","level":"INFO","fields":{"message":"Setting storage engine log level: warn"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.173545Z","level":"INFO","fields":{"message":"Background write-ahead-log flushing: disabled"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T13:04:28.266048Z","level":"INFO","fields":{"message":"Started kvs store at rocksdb://data\\smos.db"},"target":"surrealdb::core::kvs::ds"}
+{"timestamp":"2026-06-21T13:04:28.334246Z","level":"INFO","fields":{"message":"starting finalize trigger","session":"sess_29f5df29f888","memory_key":"Some(\"smoke-test\")","model":"MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"},"target":"smos_adapters::cli::finalize_runner"}
+{"timestamp":"2026-06-21T13:04:28.337974Z","level":"INFO","fields":{"message":"native NLI device detected","device":"directml"},"target":"smos_adapters::nli::native_nli"}
+{"timestamp":"2026-06-21T13:04:36.823800Z","level":"INFO","fields":{"message":"finalize: no pending facts for session","session":"sess_29f5df29f888","memory_key":"smoke-test"},"target":"smos_application::use_cases::finalize_session"}
+{
+  "session_id": "sess_29f5df29f888",
+  "memory_keys_scanned": 1,
+  "processed": 0,
+  "finalized": 0,
+  "merged": 0,
+  "conflicts": 0,
+  "rejected": 0
+}
+{"timestamp":"2026-06-21T13:04:36.826796Z","level":"INFO","fields":{"message":"finalize trigger complete","session":"sess_29f5df29f888"},"target":"smos_adapters::cli::finalize_runner"}

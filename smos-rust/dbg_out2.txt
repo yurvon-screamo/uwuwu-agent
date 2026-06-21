@@ -1,0 +1,11 @@
+{"timestamp":"2026-06-21T13:12:24.019549Z","level":"INFO","fields":{"message":"native NLI device detected","device":"directml"},"target":"smos_adapters::nli::native_nli"}
+{"timestamp":"2026-06-21T13:12:24.020401Z","level":"DEBUG","fields":{"message":"normalized ort model path (forward slashes for ort Windows compat)","original":"./data/nli_cache\\model_quantized.onnx","normalized":"./data/nli_cache/model_quantized.onnx"},"target":"smos_adapters::nli::device"}
+{
+  "session_id": "sess_b60e0c39141c",
+  "memory_keys_scanned": 1,
+  "processed": 0,
+  "finalized": 0,
+  "merged": 0,
+  "conflicts": 0,
+  "rejected": 0
+}

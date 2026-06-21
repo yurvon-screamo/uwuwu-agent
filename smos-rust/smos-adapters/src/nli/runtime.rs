@@ -11,15 +11,27 @@ use anyhow::Result;
 use crate::config::SmosConfig;
 use crate::nli::NativeNliClassifier;
 
-/// Build a [`NativeNliClassifier`] from `config.nli_backend`.
+/// Build a [`NativeNliClassifier`] from `config.nli`.
 ///
 /// Used by `smos finalize` and `smos serve`. The classifier owns the ort
 /// session + tokenizer; constructing it once at startup avoids paying the
 /// model-load cost per request.
+///
+/// The ort session build + tokenizer load are CPU-bound, blocking operations
+/// (HF Hub download, file IO, graph optimisation, EP init — 1–5 s on a warm
+/// cache, much longer on a cold one). Running them on the tokio runtime's
+/// async worker thread would block every other future sharing that worker
+/// for the whole build window. `spawn_blocking` lifts the work onto the
+/// dedicated blocking-pool where it belongs; the async caller still gets a
+/// `NativeNliClassifier` back via `.await`.
 pub async fn build_classifier(config: &SmosConfig) -> Result<NativeNliClassifier> {
-    let classifier = NativeNliClassifier::new(
-        &config.nli_backend.model,
-        PathBuf::from(&config.nli_backend.cache_dir),
-    )?;
+    let model = config.nli_backend.model.clone();
+    let cache_dir = PathBuf::from(&config.nli_backend.cache_dir);
+    let classifier =
+        tokio::task::spawn_blocking(move || NativeNliClassifier::new(&model, cache_dir))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("spawn_blocking join error during classifier build: {e}")
+            })??;
     Ok(classifier)
 }

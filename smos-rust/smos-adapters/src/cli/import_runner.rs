@@ -124,8 +124,8 @@ async fn run_import_pipeline(
     .await?;
     store.run_migrations().await?;
 
-    let embedder = OllamaEmbedding::new(Arc::new(config.ollama.clone()))?;
-    let extractor = OllamaExtractor::new(Arc::new(config.ollama.clone()))?;
+    let embedder = OllamaEmbedding::new(Arc::new(config.embedding.clone()))?;
+    let extractor = OllamaExtractor::new(Arc::new(config.llm_extraction.clone()))?;
     let clock = SystemClock;
     let delay = TokioDelay;
 

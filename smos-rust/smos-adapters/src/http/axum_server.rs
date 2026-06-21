@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::{get, post};
-use smos_application::ports::Clock;
+use smos_application::ports::{Clock, IdGenerator};
 use smos_domain::config::{ConfidenceConfig, ExtractionConfig, HeatConfig, RetrievalConfig};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -21,7 +21,7 @@ use crate::config::SmosConfig;
 use crate::http::routes;
 use crate::providers::{LlamaCppReranker, OllamaEmbedding, OllamaExtractor};
 use crate::runtime::ExtractionSupervisor;
-use crate::upstream::ReqwestUpstream;
+use crate::upstream::ReqwestUpstreamPool;
 
 /// Shared state handed to every handler via axum's `State` extractor.
 ///
@@ -37,8 +37,12 @@ pub struct AppState {
     pub reranker: LlamaCppReranker,
     /// Slice-5 response extractor (Ollama Qwen3.5-2B via `/api/chat`).
     pub extractor: OllamaExtractor,
-    pub upstream: ReqwestUpstream,
+    pub upstream: ReqwestUpstreamPool,
     pub clock: Arc<dyn Clock + Send + Sync>,
+    /// Fresh session-id source. The domain's `SessionId::new()` constructor
+    /// is `pub(crate)`; production wiring goes through this port so id
+    /// generation is an explicit, mockable capability.
+    pub id_generator: Arc<dyn IdGenerator + Send + Sync>,
     pub retrieval_cfg: Arc<RetrievalConfig>,
     pub heat_cfg: Arc<HeatConfig>,
     pub confidence_cfg: Arc<ConfidenceConfig>,
@@ -87,11 +91,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 ///
 /// # Shutdown drain
 /// `axum::serve`'s graceful shutdown waits for in-flight HTTP connections to
-/// finish (bounded by `upstream.timeout_seconds`). After the HTTP layer
-/// drains, this function ALSO drains background extraction tasks for
-/// `shutdown_extraction_grace_seconds` — so a Ctrl+C does not silently cancel
-/// half-finished fact extraction (the response already reached the client, so
-/// a cancelled extraction is an unrecoverable loss).
+/// finish (bounded by the connection keep-alive, no SMOS config field
+/// controls it). After the HTTP layer drains, this function ALSO drains
+/// background extraction tasks for `shutdown_extraction_grace_seconds` — so
+/// a Ctrl+C does not silently cancel half-finished fact extraction (the
+/// response already reached the client, so a cancelled extraction is an
+/// unrecoverable loss).
 pub async fn serve(
     router: Router,
     host: &str,

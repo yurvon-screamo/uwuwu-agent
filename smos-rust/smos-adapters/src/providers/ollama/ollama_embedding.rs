@@ -14,27 +14,33 @@ use serde::{Deserialize, Serialize};
 use smos_application::errors::ProviderError;
 use smos_application::ports::EmbeddingProvider;
 
-use crate::config::OllamaConfig;
+use crate::config::EmbeddingConfig;
 use crate::providers::ollama::ollama_client::build_client;
 
 /// Ollama-backed embedding adapter (Jina v5 by default).
 #[derive(Clone)]
 pub struct OllamaEmbedding {
     client: Client,
-    config: Arc<OllamaConfig>,
+    config: Arc<EmbeddingConfig>,
 }
 
 impl OllamaEmbedding {
     /// Build the adapter with a fresh pooled HTTP client sized to the config's
     /// timeout. Construction does NOT contact the server — the first request
     /// is the first network call.
-    pub fn new(config: Arc<OllamaConfig>) -> Result<Self, ProviderError> {
-        let client = build_client(&config)?;
+    pub fn new(config: Arc<EmbeddingConfig>) -> Result<Self, ProviderError> {
+        let client = build_client(config.timeout_seconds)?;
         Ok(Self { client, config })
     }
 
     fn embeddings_url(&self) -> String {
         format!("{}/api/embeddings", self.config.url.trim_end_matches('/'))
+    }
+
+    /// Read-only access to the configured dimensions. Exposed for tests that
+    /// want to seed embeddings matching the adapter's vector index.
+    pub fn dimensions(&self) -> usize {
+        self.config.dimensions
     }
 }
 
@@ -57,7 +63,7 @@ impl EmbeddingProvider for OllamaEmbedding {
             return Ok(None);
         }
         let body = EmbeddingsRequest {
-            model: &self.config.embedding_model,
+            model: &self.config.model,
             prompt: text,
         };
         let response = match self
@@ -103,13 +109,11 @@ impl EmbeddingProvider for OllamaEmbedding {
 mod tests {
     use super::*;
 
-    fn cfg(url: &str) -> Arc<OllamaConfig> {
-        Arc::new(OllamaConfig {
+    fn cfg(url: &str) -> Arc<EmbeddingConfig> {
+        Arc::new(EmbeddingConfig {
             url: url.into(),
-            embedding_model: "m".into(),
-            extraction_model: "x".into(),
-            timeout_seconds: 2,
-            ..OllamaConfig::default()
+            model: "m".into(),
+            ..EmbeddingConfig::default()
         })
     }
 
@@ -123,5 +127,11 @@ mod tests {
     fn embeddings_url_for_plain_base() {
         let embed = OllamaEmbedding::new(cfg("http://ollama:11434")).expect("build");
         assert_eq!(embed.embeddings_url(), "http://ollama:11434/api/embeddings");
+    }
+
+    #[test]
+    fn dimensions_exposes_configured_value() {
+        let embed = OllamaEmbedding::new(cfg("http://ollama:11434")).expect("build");
+        assert_eq!(embed.dimensions(), EmbeddingConfig::default().dimensions);
     }
 }

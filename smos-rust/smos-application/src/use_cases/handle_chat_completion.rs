@@ -24,14 +24,15 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use smos_domain::chat::ToolCall;
+use smos_domain::chat::{ToolArguments, ToolCall};
 use smos_domain::config::{HeatConfig, RetrievalConfig};
 use smos_domain::{MemoryKey, SessionId};
 
 use crate::errors::UseCaseError;
 use crate::helpers::{model_parser, session_marker};
 use crate::ports::{
-    Clock, EmbeddingProvider, FactRepository, LlmUpstream, RerankProvider, SessionRepository,
+    Clock, EmbeddingProvider, FactRepository, IdGenerator, LlmUpstream, RerankProvider,
+    SessionRepository,
 };
 use crate::types::{ChatRequest, ChatResponse};
 use crate::use_cases::enrich_request::EnrichRequest;
@@ -41,18 +42,19 @@ use crate::use_cases::enrich_request::EnrichRequest;
 /// Owns the ports the REQUEST-side pipeline needs (enrichment + upstream
 /// forwarding). Extraction ports live in `AppState` and are wired by the
 /// adapter — see the module docs for the layering rationale.
-pub struct HandleChatCompletion<FR, SR, EP, RP, LU, C> {
+pub struct HandleChatCompletion<FR, SR, EP, RP, LU, C, IG> {
     pub facts: FR,
     pub sessions: SR,
     pub embedder: EP,
     pub reranker: RP,
     pub upstream: LU,
     pub clock: C,
+    pub id_generator: IG,
     pub retrieval_cfg: Arc<RetrievalConfig>,
     pub heat_cfg: Arc<HeatConfig>,
 }
 
-impl<FR, SR, EP, RP, LU, C> HandleChatCompletion<FR, SR, EP, RP, LU, C>
+impl<FR, SR, EP, RP, LU, C, IG> HandleChatCompletion<FR, SR, EP, RP, LU, C, IG>
 where
     FR: FactRepository,
     SR: SessionRepository,
@@ -60,6 +62,7 @@ where
     RP: RerankProvider,
     LU: LlmUpstream,
     C: Clock,
+    IG: IdGenerator,
 {
     /// Run the chat-completion pipeline.
     ///
@@ -74,9 +77,13 @@ where
         let (memory_key, real_model) = model_parser::parse_model(&request.model)?;
         request.model = real_model;
 
-        // Step 2 — detect session.
-        let session_id =
-            session_marker::detect_from_messages(&request.messages).unwrap_or_default();
+        // Step 2 — detect session. Falls back to a freshly-minted id from
+        // the injected generator when no marker survived in the trailing
+        // window. Generation goes through the `IdGenerator` port so the
+        // domain's `SessionId::new()` constructor stays `pub(crate)` and
+        // id generation is an explicit, mockable capability.
+        let session_id = session_marker::detect_from_messages(&request.messages)
+            .unwrap_or_else(|| self.id_generator.new_session_id());
 
         // Step 3 — enrichment (infallible fail-open). `EnrichRequest::execute`
         // returns `Vec<Value>` directly: every port-level error already
@@ -126,11 +133,11 @@ where
 /// Extract the assistant content + structured tool calls from an OpenAI-shaped
 /// non-streaming response so the extraction pipeline can reason over both.
 ///
-/// `arguments` arrives as a JSON **string** on the wire (OpenAI quirk); it is
-/// parsed into a `Value` for the domain [`ToolCall`]. Unparseable argument
-/// strings fall back to the raw string so no information is lost. Exported so
-/// the adapter can run the same parsing on the buffered non-streaming body
-/// before spawning the background extraction task.
+/// `arguments` arrives as a JSON **string** on the wire (OpenAI quirk); the
+/// domain stores it verbatim as an opaque [`ToolArguments`] — parsing is
+/// deferred to the adapter layer that actually needs to interpret the
+/// payload. Exported so the adapter can run the same parsing on the buffered
+/// non-streaming body before spawning the background extraction task.
 pub fn extract_response_payload(value: &Value) -> (String, Vec<ToolCall>) {
     let content = value
         .pointer("/choices/0/message/content")
@@ -147,15 +154,21 @@ pub fn extract_response_payload(value: &Value) -> (String, Vec<ToolCall>) {
 
 /// Convert one OpenAI tool-call object (`{id, type, function:{name, arguments}}`)
 /// into the domain [`ToolCall`] shape.
+///
+/// `arguments` is normalised to a JSON-shaped string so the opaque
+/// [`ToolArguments`] is always text — the OpenAI string form is forwarded
+/// verbatim; an actual JSON object (some servers send that) is re-serialised;
+/// a missing field degrades to `"null"`.
 fn parse_openai_tool_call(v: &Value) -> Option<ToolCall> {
     let function = v.get("function")?;
     let name = function.get("name")?.as_str()?.to_string();
     let arguments = match function.get("arguments") {
-        Some(Value::String(raw)) => {
-            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
-        }
-        Some(other) => other.clone(),
-        None => Value::Null,
+        Some(Value::String(raw)) => raw.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+        None => "null".to_string(),
     };
-    Some(ToolCall { name, arguments })
+    Some(ToolCall {
+        name,
+        arguments: ToolArguments::from_json(arguments),
+    })
 }

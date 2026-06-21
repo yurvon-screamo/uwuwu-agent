@@ -14,7 +14,23 @@ use time::OffsetDateTime;
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
-    pub fn now_utc() -> Self {
+    /// Construct from a raw `OffsetDateTime`. Adapters that need
+    /// "current time" (e.g. `SystemClock` in `smos-adapters`) call this
+    /// with `OffsetDateTime::now_utc()`; the domain crate itself never
+    /// reaches for wall-clock time so it stays IO-free.
+    pub fn from_offset_date_time(odt: OffsetDateTime) -> Self {
+        Self(odt)
+    }
+
+    /// Current UTC instant.
+    ///
+    /// `pub(crate)` on purpose: reading the system clock is IO, and the
+    /// domain crate is IO-free in production. The helper survives for
+    /// domain-internal tests that do not want to thread a `Clock` port
+    /// through every fixture; production code reaches the wall clock
+    /// through the `Clock` port in `smos-application`.
+    #[allow(dead_code)] // only called from in-crate tests
+    pub(crate) fn now_utc() -> Self {
         Self(OffsetDateTime::now_utc())
     }
 

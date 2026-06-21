@@ -31,6 +31,13 @@ pub enum UpstreamError {
 
     #[error("upstream serialization error: {0}")]
     SerializationError(String),
+
+    /// Every provider in an [`UpstreamConfig`] multi-provider list failed.
+    /// Carries the last provider's error message so the caller still sees a
+    /// meaningful cause; earlier errors are logged at `WARN` by the pool's
+    /// failover path before this variant is constructed.
+    #[error("all upstream providers failed; last error: {0}")]
+    AllProvidersFailed(String),
 }
 
 #[cfg(test)]

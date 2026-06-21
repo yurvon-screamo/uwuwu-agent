@@ -479,6 +479,7 @@ fn sample_fact(content: &str, embedding: Vec<f32>) -> Fact {
         SessionId::from_raw("sess_abcdef012345").unwrap(),
         Embedding::new(embedding).unwrap(),
         Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .unwrap()
 }

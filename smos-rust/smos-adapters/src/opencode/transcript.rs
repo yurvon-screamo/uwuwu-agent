@@ -27,7 +27,7 @@
 use serde_json::Value;
 
 use smos_application::use_cases::import_opencode_session::AssistantTurn;
-use smos_domain::chat::ToolCall;
+use smos_domain::chat::{ToolArguments, ToolCall};
 
 /// Parse an opencode export transcript into flattened assistant turns.
 ///
@@ -153,6 +153,10 @@ fn parse_message(message: &Value) -> Option<AssistantTurn> {
 /// as a JSON **string**; the string is parsed so the pipeline sees real
 /// arguments instead of an empty `{}`. Anything that is neither an object nor
 /// a parseable JSON object falls back to `{}` (POC `_coerce_tool_input`).
+///
+/// The resulting arguments are stored verbatim as a JSON-shaped string inside
+/// the opaque [`ToolArguments`]; this layer keeps the `serde_json` dependency
+/// that the domain deliberately avoids.
 fn parse_tool_call(part: &Value) -> Option<ToolCall> {
     let name = part
         .get("tool")
@@ -162,29 +166,35 @@ fn parse_tool_call(part: &Value) -> Option<ToolCall> {
         .to_string();
     let raw_input = part.get("state").and_then(|s| s.get("input"));
     let arguments = coerce_tool_input(raw_input);
-    Some(ToolCall { name, arguments })
+    Some(ToolCall {
+        name,
+        arguments: ToolArguments::from_json(arguments),
+    })
 }
 
-/// Normalize a `state.input` value into a JSON object.
+/// Normalize a `state.input` value into a JSON-shaped string suitable for the
+/// opaque [`ToolArguments`].
 ///
-/// - `Object` → returned as-is.
-/// - `String` → JSON-parsed; on success and the parsed value is an object,
-///   the parsed object is returned; otherwise `{}`.
+/// - `Object` → re-serialised to JSON.
+/// - `String` → if it parses into a JSON object, the original string is kept
+///   verbatim (avoids a round-trip that would reorder keys); otherwise `{}`.
 /// - anything else (missing, null, array, …) → `{}`.
-fn coerce_tool_input(raw_input: Option<&Value>) -> Value {
+fn coerce_tool_input(raw_input: Option<&Value>) -> String {
     match raw_input {
-        Some(Value::Object(map)) => Value::Object(map.clone()),
+        Some(Value::Object(map)) => {
+            serde_json::to_string(&Value::Object(map.clone())).unwrap_or_else(|_| "{}".to_string())
+        }
         Some(Value::String(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                return Value::Object(Default::default());
+                return "{}".to_string();
             }
             match serde_json::from_str::<Value>(trimmed) {
-                Ok(parsed @ Value::Object(_)) => parsed,
-                _ => Value::Object(Default::default()),
+                Ok(Value::Object(_)) => trimmed.to_string(),
+                _ => "{}".to_string(),
             }
         }
-        _ => Value::Object(Default::default()),
+        _ => "{}".to_string(),
     }
 }
 
@@ -215,7 +225,10 @@ mod tests {
         assert_eq!(turns[0].content, "TTL=10 prevents refresh loop");
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].name, "read_file");
-        assert_eq!(turns[0].tool_calls[0].arguments, json!({"path": "auth.rs"}));
+        assert_eq!(
+            turns[0].tool_calls[0].arguments.as_str(),
+            r#"{"path":"auth.rs"}"#
+        );
     }
 
     #[test]
@@ -268,7 +281,7 @@ mod tests {
         });
         let turns = parse_transcript(&transcript);
         assert_eq!(turns[0].tool_calls[0].name, "bash");
-        assert_eq!(turns[0].tool_calls[0].arguments, json!({"cmd": "ls"}));
+        assert_eq!(turns[0].tool_calls[0].arguments.as_str(), r#"{"cmd":"ls"}"#);
     }
 
     #[test]
@@ -282,7 +295,7 @@ mod tests {
             }]
         });
         let turns = parse_transcript(&transcript);
-        assert_eq!(turns[0].tool_calls[0].arguments, json!({}));
+        assert_eq!(turns[0].tool_calls[0].arguments.as_str(), "{}");
     }
 
     #[test]
@@ -296,7 +309,7 @@ mod tests {
             }]
         });
         let turns = parse_transcript(&transcript);
-        assert_eq!(turns[0].tool_calls[0].arguments, json!({}));
+        assert_eq!(turns[0].tool_calls[0].arguments.as_str(), "{}");
     }
 
     #[test]

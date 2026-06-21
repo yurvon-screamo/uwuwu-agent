@@ -11,11 +11,11 @@
 //! # Fail-open contract
 //!
 //! The use case NEVER raises on a per-fact failure (§9 known limitation
-//! "sidecar unavailable graceful"): any NLI / save / mutation error is logged
-//! and the loop continues. Pending facts that could not be resolved stay
-//! pending for the next session-end cycle. Only the outer pool-load error
-//! surface propagates as `Err` (and even then the use case degrades to
-//! `Ok(stats)` with `processed == 0`).
+//! "NLI backend unavailable graceful"): any NLI / save / mutation error is
+//! logged and the loop continues. Pending facts that could not be resolved
+//! stay pending for the next session-end cycle. Only the outer pool-load
+//! error surface propagates as `Err` (and even then the use case degrades
+//! to `Ok(stats)` with `processed == 0`).
 //!
 //! # Session ownership — `source_sessions`, not `SessionState.pending_facts`
 //!
@@ -231,7 +231,7 @@ where
     /// Resolve one pending fact against the (growing) comparison pool.
     ///
     /// Drift-priority semantics (§9):
-    /// - Exact-match short-circuit returns entailment WITHOUT a sidecar call.
+    /// - Exact-match short-circuit returns entailment WITHOUT an NLI call.
     /// - C3 guard skips pairs already flagged as conflicting (no double-flag).
     /// - First contradiction wins immediately (flag + return). We do NOT
     ///   commit an earlier entailment candidate before the contradiction is
@@ -254,8 +254,8 @@ where
         // Last non-merge NLI verdict — feeds the `no_contradiction_bonus` on
         // the standalone path (POC `last_observed_nli`).
         let mut last_observed_nli: Option<NliResult> = None;
-        // Did the sidecar actually return ANY verdict for any candidate? When
-        // the sidecar is fully unreachable, we cannot tell whether a
+        // Did the NLI backend actually return ANY verdict for any candidate?
+        // When the backend is fully unreachable, we cannot tell whether a
         // contradiction exists — keep the fact pending (graceful degradation,
         // §9). The flag also flips on an exact-match short-circuit (which is
         // a real verdict, just resolved locally).
@@ -265,12 +265,12 @@ where
             let existing = &candidate.fact;
 
             // C3 guard — already-flagged conflict pair. Skip the (expensive)
-            // sidecar call entirely; the conflict is already recorded. The
-            // pair still counts as "NLI observed" because the conflict was
-            // resolved by an earlier finalize cycle — without this, a pending
-            // twin of an already-flagged pair would be stuck in pending
-            // forever (every cycle would skip the same pair and report
-            // "NLI never observed").
+            // NLI call entirely; the conflict is already recorded. The pair
+            // still counts as "NLI observed" because the conflict was
+            // resolved by an earlier finalize cycle — without this, a
+            // pending twin of an already-flagged pair would be stuck in
+            // pending forever (every cycle would skip the same pair and
+            // report "NLI never observed").
             if pending.conflicts_with().contains(existing.id())
                 || existing.conflicts_with().contains(pending.id())
             {
@@ -297,12 +297,12 @@ where
                     .await
                 {
                     Ok(nli) if nli.available => {
-                        // Real verdict from the sidecar. A `available = false`
-                        // reply (the sidecar's own graceful-degradation
-                        // placeholder) is treated as Unavailable: skip pair,
-                        // do NOT bump `nli_observed` — otherwise a permanently
-                        // broken sidecar would silently promote facts
-                        // without drift detection.
+                        // Real verdict from the NLI backend. An
+                        // `available = false` reply (the backend's own
+                        // graceful-degradation placeholder) is treated as
+                        // Unavailable: skip pair, do NOT bump `nli_observed`
+                        // — otherwise a permanently broken backend would
+                        // silently promote facts without drift detection.
                         nli_observed = true;
                         nli
                     }
@@ -356,7 +356,7 @@ where
             return self.apply_merge(pending, &existing, &nli, pool).await;
         }
 
-        // The sidecar never answered for any candidate → keep the fact
+        // The NLI backend never answered for any candidate → keep the fact
         // pending. We have candidates but no NLI signal; promoting would
         // silently mask a potential drift.
         if !nli_observed {
@@ -505,8 +505,8 @@ mod tests {
     //!
     //! The fakes (`InMemoryFacts`, `InMemorySessions`, `ScriptedNliClassifier`)
     //! are local to this module so the use case can be exercised without
-    //! spinning up SurrealDB or a Python sidecar. E2E coverage against a real
-    //! `SurrealStore` lives in `smos-adapters/tests/e2e_finalize.rs`.
+    //! spinning up SurrealDB or a native NLI backend. E2E coverage against a
+    //! real `SurrealStore` lives in `smos-adapters/tests/e2e_finalize.rs`.
 
     use super::*;
     use std::collections::HashMap;
@@ -678,7 +678,7 @@ mod tests {
             fact_ids: &[FactId],
         ) -> Result<(), crate::errors::RepoError> {
             if let Some(state) = self.sessions.lock().unwrap().get_mut(id.as_str()) {
-                let _ = state.add_pending(fact_ids);
+                state.add_pending(fact_ids);
             }
             Ok(())
         }
@@ -688,7 +688,7 @@ mod tests {
             owned: &[FactId],
         ) -> Result<(), crate::errors::RepoError> {
             if let Some(state) = self.sessions.lock().unwrap().get_mut(id.as_str()) {
-                let _ = state.remove_owned(owned);
+                state.remove_owned(owned);
             }
             Ok(())
         }
@@ -798,7 +798,7 @@ mod tests {
 
     /// NLI verdict that always returns `Neutral` (above the no-contradiction
     /// threshold but below entailment). Used when tests do not care about the
-    /// specific label, only that the sidecar was reachable.
+    /// specific label, only that the NLI backend was reachable.
     fn neutral_available() -> NliResult {
         NliResult {
             label: NliLabel::Neutral,
@@ -855,6 +855,7 @@ mod tests {
             sid(1),
             Embedding::new(embedding).unwrap(),
             ts(),
+            ConfidenceConfig::default().base,
         )
         .unwrap()
     }
@@ -868,6 +869,7 @@ mod tests {
             sid(2),
             Embedding::new(embedding).unwrap(),
             ts(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         f.set_status_and_confidence(
@@ -882,7 +884,7 @@ mod tests {
     /// Build a session state carrying `owned` pending fact ids.
     fn session_with_pending(owned: Vec<FactId>) -> SessionState {
         let mut state = SessionState::new(sid(1), memory_key(), ts());
-        let _ = state.add_pending(&owned);
+        state.add_pending(&owned);
         state
     }
 

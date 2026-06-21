@@ -64,6 +64,7 @@ fn accepted_fact(content: &str, embedding: Embedding, session: SessionId) -> Fac
         session,
         embedding,
         timestamp(1_700_000_000),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact");
     fact.set_status_and_confidence(
@@ -82,6 +83,7 @@ fn pending_fact(content: &str, embedding: Embedding, session: SessionId) -> Fact
         session,
         embedding,
         timestamp(1_700_000_000),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact")
 }
@@ -313,6 +315,7 @@ async fn search_similar_excludes_other_memory_keys() {
         session_id(1),
         unit_embedding(1024, 0),
         timestamp(1_700_000_000),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("fact");
     FactRepository::save(&store, &foreign)
@@ -362,6 +365,7 @@ async fn search_similar_returns_full_top_k_when_namespace_is_skewed() {
             session_id(1),
             Embedding::new(emb).unwrap(),
             timestamp(1_700_000_000),
+            smos_domain::config::ConfidenceConfig::default().base,
         )
         .unwrap();
         fact.set_status_and_confidence(

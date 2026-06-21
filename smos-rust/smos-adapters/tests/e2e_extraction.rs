@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use common::{build_state, enrichment_memory_key, serve_state, unit_embedding_1024};
 use serde_json::{Value, json};
-use smos_application::ports::FactRepository;
+use smos_adapters::SystemClock;
+use smos_application::ports::{Clock, FactRepository};
 use smos_domain::{MemoryKey, SessionId};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -457,7 +458,8 @@ async fn extraction_cross_session_confirmation_unions_provenance() {
         enrichment_memory_key(),
         fixed_session(1),
         unit_embedding_1024(0),
-        smos_domain::Timestamp::now_utc(),
+        SystemClock.now(),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact");
     let fact_id = fact.id().clone();

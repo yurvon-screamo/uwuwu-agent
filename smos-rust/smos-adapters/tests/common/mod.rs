@@ -19,11 +19,12 @@ use std::sync::Arc;
 use axum::Router;
 use serde_json::{Value, json};
 use smos_adapters::SystemClock;
-use smos_adapters::config::{ServerConfig, SmosConfig};
+use smos_adapters::SystemIdGenerator;
+use smos_adapters::config::{ServerConfig, SmosConfig, UpstreamProvider};
 use smos_adapters::http::axum_server::{AppState, build_router};
-use smos_adapters::upstream::ReqwestUpstream;
+use smos_adapters::upstream::ReqwestUpstreamPool;
 use smos_adapters::{LlamaCppReranker, OllamaEmbedding, OllamaExtractor, SurrealStore};
-use smos_application::ports::{Clock, FactRepository};
+use smos_application::ports::{Clock, FactRepository, IdGenerator};
 use smos_domain::{
     Confidence, Embedding, Fact, FactId, FactStatus, MemoryKey, SessionId, Timestamp,
 };
@@ -43,11 +44,17 @@ data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
 \n\
 data: [DONE]\n\n";
 
-/// Build an SMOS config whose upstream URL points at `upstream_base`.
+/// Build an SMOS config whose upstream `[[upstream.providers]]` pool points
+/// at `upstream_base`.
 pub fn config_pointing_at(upstream_base: &str) -> SmosConfig {
     let mut config = SmosConfig::default();
-    config.upstream.url = format!("{upstream_base}/v1/chat/completions");
-    config.upstream.timeout_seconds = 5;
+    config.upstream.providers = vec![UpstreamProvider {
+        name: "test-upstream".into(),
+        url: format!("{upstream_base}/v1/chat/completions"),
+        api_key: String::new(),
+        auth_header: "Authorization".into(),
+        timeout_seconds: 5,
+    }];
     config.server = ServerConfig::default();
     config
 }
@@ -57,8 +64,10 @@ pub fn config_pointing_at(upstream_base: &str) -> SmosConfig {
 /// short-circuit enrichment via fail-open). Used by passthrough tests.
 pub async fn spawn_smos(upstream_base: &str) -> String {
     let mut config = config_pointing_at(upstream_base);
-    config.ollama.url = "http://127.0.0.1:1".into();
-    config.ollama.timeout_seconds = 1;
+    config.llm_extraction.url = "http://127.0.0.1:1".into();
+    config.llm_extraction.timeout_seconds = 1;
+    config.embedding.url = "http://127.0.0.1:1".into();
+    config.embedding.timeout_seconds = 1;
     config.reranker.url = "http://127.0.0.1:1".into();
     config.reranker.timeout_seconds = 1;
     // Passthrough tests do not assert on extraction; disable the pipeline so
@@ -99,11 +108,13 @@ pub async fn build_state(mut config: SmosConfig) -> Arc<AppState> {
     let store = SurrealStore::from_client(db);
     store.run_migrations().await.expect("migrations");
 
-    let upstream = ReqwestUpstream::new(Arc::new(config.upstream.clone())).expect("upstream");
-    let embedder = OllamaEmbedding::new(Arc::new(config.ollama.clone())).expect("embedder");
+    let upstream = ReqwestUpstreamPool::new(&config.upstream).expect("upstream pool");
+    let embedder = OllamaEmbedding::new(Arc::new(config.embedding.clone())).expect("embedder");
     let reranker = LlamaCppReranker::new(Arc::new(config.reranker.clone())).expect("reranker");
-    let extractor = OllamaExtractor::new(Arc::new(config.ollama.clone())).expect("extractor");
+    let extractor =
+        OllamaExtractor::new(Arc::new(config.llm_extraction.clone())).expect("extractor");
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
+    let id_generator: Arc<dyn IdGenerator + Send + Sync> = Arc::new(SystemIdGenerator);
     let retrieval_cfg = Arc::new(config.retrieval.clone());
     let heat_cfg = Arc::new(config.heat.clone());
     let confidence_cfg = Arc::new(config.confidence.clone());
@@ -118,6 +129,7 @@ pub async fn build_state(mut config: SmosConfig) -> Arc<AppState> {
         extractor,
         upstream,
         clock,
+        id_generator,
         retrieval_cfg,
         heat_cfg,
         confidence_cfg,
@@ -194,8 +206,13 @@ pub fn fixed_session_id(tag: u8) -> SessionId {
 /// Reference timestamp used as `now` in fixture facts. Uses the wall-clock so
 /// the heat post-filter (which compares `last_access_at` against the runtime
 /// clock) does not instantly decay seeded facts to zero.
+///
+/// Routed through `SystemClock` rather than `Timestamp::now_utc()` because
+/// the latter is `pub(crate)` in the domain — production callers reach the
+/// wall clock through the `Clock` port (the domain itself is IO-free).
 pub fn fixed_now() -> Timestamp {
-    Timestamp::now_utc()
+    use smos_application::ports::Clock;
+    SystemClock.now()
 }
 
 /// Reference embedding dimensionality — pinned to 1024 to match the HNSW
@@ -267,6 +284,7 @@ pub async fn seed_accepted_fact_with_threshold(
         session,
         embedding,
         extracted_at,
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact");
     let cfg = smos_domain::config::ConfidenceConfig {
@@ -298,6 +316,7 @@ pub async fn seed_pending_fact(
         session,
         embedding,
         extracted_at,
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact");
     let id = fact.id().clone();
@@ -320,6 +339,7 @@ pub async fn seed_expired_fact(
         session,
         embedding,
         extracted_at,
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact");
     fact.set_status_and_confidence(
@@ -350,10 +370,17 @@ pub fn config_with_mocks(
     reranker_server: &MockServer,
 ) -> SmosConfig {
     let mut config = SmosConfig::default();
-    config.upstream.url = format!("{}/v1/chat/completions", upstream_server.uri());
-    config.upstream.timeout_seconds = 5;
-    config.ollama.url = ollama_server.uri();
-    config.ollama.timeout_seconds = 5;
+    config.upstream.providers = vec![UpstreamProvider {
+        name: "test-upstream".into(),
+        url: format!("{}/v1/chat/completions", upstream_server.uri()),
+        api_key: String::new(),
+        auth_header: "Authorization".into(),
+        timeout_seconds: 5,
+    }];
+    config.llm_extraction.url = ollama_server.uri();
+    config.llm_extraction.timeout_seconds = 5;
+    config.embedding.url = ollama_server.uri();
+    config.embedding.timeout_seconds = 5;
     config.reranker.url = reranker_server.uri();
     config.reranker.timeout_seconds = 5;
     config.server = ServerConfig::default();

@@ -1,0 +1,44 @@
+{"timestamp":"2026-06-21T14:11:13.375328Z","level":"WARN","fields":{"message":"at least one upstream provider's api_key is the built-in placeholder 'ollama'; set SMOS__UPSTREAM__API_KEY for production upstreams"},"target":"smos_adapters::cli::server_runner"}
+{"timestamp":"2026-06-21T14:11:13.375532Z","level":"INFO","fields":{"message":"starting SMOS proxy","version":"0.1.0","upstream_providers":1,"upstream_strategy":"single","extraction_url":"http://localhost:11434","embedding_url":"http://localhost:11434","reranker":"http://localhost:8181","host":"127.0.0.1","port":8888},"target":"smos_adapters::cli::server_runner"}
+{"timestamp":"2026-06-21T14:11:13.376547Z","level":"INFO","fields":{"message":"Starting kvs store at rocksdb://data\\smos.db"},"target":"surrealdb::core::kvs::ds"}
+{"timestamp":"2026-06-21T14:11:13.377275Z","level":"INFO","fields":{"message":"Background thread count: 22"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.378264Z","level":"INFO","fields":{"message":"Maximum background jobs count: 44"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.378405Z","level":"INFO","fields":{"message":"Maximum number of open files: 1024"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.378554Z","level":"INFO","fields":{"message":"Number of log files to keep: 10"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.936058Z","level":"INFO","fields":{"message":"Maximum write buffers: 8"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.976246Z","level":"INFO","fields":{"message":"Write buffer size: 134217728"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.976308Z","level":"INFO","fields":{"message":"Target file size for compaction: 67108864"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:13.976321Z","level":"INFO","fields":{"message":"Target file size compaction multiplier: 2"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.006975Z","level":"INFO","fields":{"message":"Minimum write buffers to merge: 2"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.007037Z","level":"INFO","fields":{"message":"Number of files to trigger compaction: 4"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049846Z","level":"INFO","fields":{"message":"Compaction readahead size: 16777216"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049912Z","level":"INFO","fields":{"message":"Maximum concurrent subcompactions: 4"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049926Z","level":"INFO","fields":{"message":"Use separate thread queues: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049933Z","level":"INFO","fields":{"message":"Enable separation of keys and values: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049943Z","level":"INFO","fields":{"message":"Minimum blob value size: 4096"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049950Z","level":"INFO","fields":{"message":"Target blob file size: 268435456"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049960Z","level":"INFO","fields":{"message":"Enable blob garbage collection: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049968Z","level":"INFO","fields":{"message":"Blob GC age cutoff: 0.25"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.049992Z","level":"INFO","fields":{"message":"Blob GC force threshold: 1"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050002Z","level":"INFO","fields":{"message":"Blob compaction readahead size: 0"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050009Z","level":"INFO","fields":{"message":"Write-ahead-log file size limit: 0MB"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050014Z","level":"INFO","fields":{"message":"Allow concurrent memtable writes: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050063Z","level":"INFO","fields":{"message":"Avoid unnecessary blocking IO: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050072Z","level":"INFO","fields":{"message":"Allow adaptive write thread yielding: true"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.050079Z","level":"INFO","fields":{"message":"Wait for disk sync acknowledgement: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081732Z","level":"INFO","fields":{"message":"Block cache size: 15819534336"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081920Z","level":"INFO","fields":{"message":"Enable memory-mapped reads: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081936Z","level":"INFO","fields":{"message":"Enable memory-mapped writes: false"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081948Z","level":"INFO","fields":{"message":"Setting delete compaction factory: 1000 / 50 (0.5)"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081962Z","level":"INFO","fields":{"message":"Setting compaction style: level"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081970Z","level":"INFO","fields":{"message":"Setting compression level"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081980Z","level":"INFO","fields":{"message":"Setting storage engine log level: warn"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.081994Z","level":"INFO","fields":{"message":"Background write-ahead-log flushing: disabled"},"target":"surrealdb::core::kvs::rocksdb"}
+{"timestamp":"2026-06-21T14:11:14.140360Z","level":"INFO","fields":{"message":"Started kvs store at rocksdb://data\\smos.db"},"target":"surrealdb::core::kvs::ds"}
+{"timestamp":"2026-06-21T14:11:14.195739Z","level":"INFO","fields":{"message":"native NLI device detected","device":"directml"},"target":"smos_adapters::nli::native_nli"}
+{"timestamp":"2026-06-21T14:11:23.099935Z","level":"INFO","fields":{"message":"NLI backend started for session watcher","model":"MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"},"target":"smos_adapters::cli::server_runner"}
+{"timestamp":"2026-06-21T14:11:23.100071Z","level":"INFO","fields":{"message":"session watcher started","scan_interval_secs":60,"timeout_secs":1800,"overflow_threshold":20},"target":"smos_adapters::runtime::session_watcher"}
+{"timestamp":"2026-06-21T14:11:23.102350Z","level":"INFO","fields":{"message":"SMOS HTTP server listening","host":"127.0.0.1","port":8888},"target":"smos_adapters::cli::server_runner"}
+{"timestamp":"2026-06-21T14:11:55.987676Z","level":"WARN","fields":{"message":"reranker send failed (fail-open: empty result)","error":"error sending request for url (http://localhost:8181/v1/rerank)"},"target":"smos_adapters::providers::llama_cpp::llama_cpp_reranker"}
+{"timestamp":"2026-06-21T14:11:55.987829Z","level":"INFO","fields":{"message":"reranker returned empty; using survivor fallback"},"target":"smos_application::use_cases::enrich_request"}
+{"timestamp":"2026-06-21T14:12:16.939035Z","level":"INFO","fields":{"message":"background response extraction completed","count":2,"session":"sess_2719db625ab6"},"target":"smos_adapters::http::routes::chat_completions"}

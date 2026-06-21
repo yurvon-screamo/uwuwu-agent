@@ -38,21 +38,25 @@ impl ExtractionSupervisor {
     /// Spawn `task` and track it. The task is NOT detached from the
     /// supervisor — the in-flight counter is decremented on completion so
     /// [`drain`](Self::drain) can wait for it.
+    ///
+    /// The decrement runs inside an [`InFlightGuard`]'s `Drop`, which
+    /// fires on normal completion, error propagation, AND panic-unwind —
+    /// so a panicking extraction task can never leak its slot. Without
+    /// this guard, a panic mid-task would leave the counter at +1 and
+    /// the drain would wedge against the grace window forever (the
+    /// `Notify` would never fire because `fetch_sub(1)` never ran).
     pub fn spawn<F>(&self, task: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let in_flight = self.in_flight.clone();
-        let done = self.done.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        let done = Arc::clone(&self.done);
         tokio::spawn(async move {
+            // Guard drops first on every exit path (panic, `?`, normal),
+            // performing the `fetch_sub` + last-task `notify_one`.
+            let _guard = InFlightGuard { in_flight, done };
             task.await;
-            // `notify_one` stores a permit if the drain is between the
-            // `in_flight.load()` check and `notified()`, so the wakeup is not
-            // lost when the LAST task completes in that window.
-            if in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                done.notify_one();
-            }
         });
     }
 
@@ -78,6 +82,31 @@ impl ExtractionSupervisor {
             // `notified()` consumes a permit if `notify_waiters` already fired;
             // otherwise it waits until the next completion (or the timeout).
             let _ = tokio::time::timeout_at(deadline, self.done.notified()).await;
+        }
+    }
+}
+
+/// RAII decrement for [`ExtractionSupervisor::in_flight`].
+///
+/// Created inside the spawned task before `task.await`; dropped on every
+/// exit path (normal return, `?`-propagation, panic-unwind). Performs the
+/// `fetch_sub(1)` + last-task `notify_one()` pair so the drain is woken
+/// the moment the counter hits zero — even when the underlying task
+/// panicked, which the previous inline `fetch_sub` would have skipped.
+struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+    done: Arc<Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // `notify_one` stores a permit if the drain is between the
+        // `in_flight.load()` check and `notified()`, so the wakeup is not
+        // lost when the LAST task completes in that window. This must run
+        // on panic too — a leaked slot would wedge the drain against the
+        // grace window forever.
+        if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.done.notify_one();
         }
     }
 }

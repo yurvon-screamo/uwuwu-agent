@@ -43,17 +43,21 @@ pub struct SurrealStore {
 
 impl SurrealStore {
     /// Open (or create) a SurrealDB database at `path` (filesystem directory
-    /// for RocksDB). Retries up to three times with exponential backoff
-    /// (1 s, 2 s, 4 s) — the engine occasionally returns a transient lock
-    /// error on rapid re-opens in tests.
+    /// for RocksDB). Retries up to three attempts with exponential backoff
+    /// (1 s after the first failure, 2 s after the second) — the engine
+    /// occasionally returns a transient lock error on rapid re-opens in
+    /// tests, and the doubling schedule means a hypothetical fourth attempt
+    /// would wait 4 s without code changes.
     pub async fn connect(path: &str, namespace: &str, database: &str) -> Result<Self, RepoError> {
         let mut last_err: Option<String> = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
-                // Linear backoff (1 s, then 2 s) on each retry. The engine
-                // occasionally returns a transient lock error on rapid
-                // re-opens in tests, so we keep the schedule simple.
-                let backoff_ms = u64::from(attempt) * 1000;
+                // Exponential backoff: `attempt = 1` waits 1 s, `attempt = 2`
+                // waits 2 s. The doubling base means adding a fourth attempt
+                // (e.g. for a flakier engine) would naturally sleep 4 s
+                // without further tuning. `attempt` is bounded by the loop
+                // constant (≤ 2), so the shift cannot overflow a u64.
+                let backoff_ms = 1000_u64 << (attempt - 1);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
             match Surreal::new::<surrealdb::engine::local::RocksDb>(path.to_string()).await {

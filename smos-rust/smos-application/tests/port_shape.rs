@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use smos_application::errors::{ProviderError, RepoError, UpstreamError};
 use smos_application::ports::{
-    Clock, EmbeddingProvider, FactRepository, LlmExtractor, LlmUpstream, NliClassifier,
-    RerankProvider, SessionRepository,
+    Clock, EmbeddingProvider, FactRepository, IdGenerator, LlmExtractor, LlmUpstream,
+    NliClassifier, RerankProvider, SessionRepository,
 };
 use smos_application::types::{ChatRequest, ChatResponse, MergeResult, RerankResult, SearchHit};
 use smos_domain::{
     Fact, FactId, Heat, MemoryKey, NliResult, NliScores, SessionId, SessionState, Timestamp,
-    chat::ToolCall,
+    chat::ToolCall, config::ConfidenceConfig,
 };
 use std::time::Duration;
 
@@ -42,6 +42,30 @@ impl Default for MockClock {
 impl Clock for MockClock {
     fn now(&self) -> Timestamp {
         self.fixed
+    }
+}
+
+/// Mock `IdGenerator` that hands out deterministic, monotonically-increasing
+/// session ids. Mirrors the per-port `Mock*` pattern so `IdGenerator` has the
+/// same shape coverage as every other port in this file.
+struct CountingIdGenerator {
+    counter: Arc<AtomicUsize>,
+}
+
+impl CountingIdGenerator {
+    fn new() -> Self {
+        Self {
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl IdGenerator for CountingIdGenerator {
+    fn new_session_id(&self) -> SessionId {
+        let n = self.counter.fetch_add(1, Ordering::SeqCst) as u64;
+        // 12 hex chars, zero-padded — matches the canonical `sess_<12 hex>`
+        // shape that `SessionId::from_raw` validates.
+        SessionId::from_raw(&format!("sess_{:012x}", n)).expect("well-formed mock id")
     }
 }
 
@@ -294,6 +318,7 @@ async fn fact_repository_stub_implements_all_methods() {
             SessionId::from_raw("sess_abcdef012345").unwrap(),
             smos_domain::Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(0).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap(),
     )
@@ -396,4 +421,32 @@ async fn merge_result_type_compiles_and_carries_data() {
     };
     assert!(!r.merged);
     assert!(r.merged_fact.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// IdGenerator — the only port whose primary method is synchronous. Verify it
+// (a) implements against a mock, (b) composes via generic dispatch, and
+// (c) yields the canonical `sess_<12 hex>` shape so the marker round-trip
+// still works.
+// ---------------------------------------------------------------------------
+
+fn use_id_generator<G: IdGenerator>(generator: &G) -> SessionId {
+    generator.new_session_id()
+}
+
+#[test]
+fn id_generator_stub_implements_port_and_yields_canonical_shape() {
+    let generator = CountingIdGenerator::new();
+    let id = use_id_generator(&generator);
+    let s = id.as_str();
+    assert!(s.starts_with("sess_"));
+    let hex = &s["sess_".len()..];
+    assert_eq!(hex.len(), 12);
+    assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    // The id round-trips through the marker pipeline (`to_marker` +
+    // `detect_in_text` is the production path that re-discovers the id from
+    // the trailing comment).
+    let marker = id.to_marker();
+    let recovered = smos_application::helpers::session_marker::detect_in_text(&marker);
+    assert_eq!(recovered.as_ref(), Some(&id));
 }

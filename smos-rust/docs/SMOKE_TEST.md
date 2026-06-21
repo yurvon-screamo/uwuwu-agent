@@ -20,7 +20,7 @@ Before starting, confirm:
   ollama pull hf.co/jinaai/jinaai-jina-embeddings-v5-text-small-retrieval-GGUF:latest
   ollama pull qwen3.5:2b
   ```
-- [ ] DeBERTa-v3 ONNX model cacheable (`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`, ~643 MB on first run; lands under `[nli_backend].cache_dir`)
+- [ ] DeBERTa-v3 ONNX model cacheable (`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`, ~643 MB on first run; lands under `[nli].cache_dir`)
 - [ ] `opencode` CLI installed and on PATH
 - [ ] (Optional) llama.cpp server running on `:8181` for the reranker
 - [ ] Working directory is the workspace root: `D:\uwuwu_agent\smos-rust`
@@ -345,7 +345,7 @@ Re-run `cargo run --release --bin smos -- doctor` to confirm.
 The native ort + ONNX Runtime backend could not initialise. Likely causes:
 
 - First-run model download failed — check network access to HF Hub and free
-  disk space under `[nli_backend].cache_dir` (default `./data/nli_cache`).
+  disk space under `[nli].cache_dir` (default `./data/nli_cache`).
   The DeBERTa-v3 ONNX export is ~643 MB.
 - Selected GPU EP cannot initialise on the host — re-build with a
   different GPU feature (or no GPU feature) per `README.md` → Native NLI

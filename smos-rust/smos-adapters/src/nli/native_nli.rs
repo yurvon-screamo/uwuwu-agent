@@ -355,9 +355,9 @@ mod tests {
 
     #[test]
     fn logit_slot_constants_match_deberta_v3_label_order() {
-        // The Python sidecar's LABEL_ORDER tuple hard-coded this order; the
-        // native classifier must reproduce it exactly so the persisted
-        // verdicts match across the migration.
+        // The legacy Python NLI backend's LABEL_ORDER tuple hard-coded this
+        // order; the native classifier must reproduce it exactly so the
+        // persisted verdicts match across the migration.
         assert_eq!(LOGIT_ENTAILMENT, 0);
         assert_eq!(LOGIT_NEUTRAL, 1);
         assert_eq!(LOGIT_CONTRADICTION, 2);

@@ -22,7 +22,7 @@ use smos_application::errors::ProviderError;
 use smos_application::ports::LlmExtractor;
 use smos_domain::chat::ToolCall;
 
-use crate::config::OllamaConfig;
+use crate::config::LlmExtractionConfig;
 use crate::providers::ollama::ollama_client::build_client;
 
 /// System prompt: KNOWLEDGE-fact extraction contract (POC `prompts.py` shape).
@@ -55,14 +55,14 @@ Output as a bullet list, one fact per line starting with \"- \". Quality over qu
 #[derive(Clone)]
 pub struct OllamaExtractor {
     client: Client,
-    config: Arc<OllamaConfig>,
+    config: Arc<LlmExtractionConfig>,
 }
 
 impl OllamaExtractor {
     /// Build the adapter with a pooled HTTP client sized to the config timeout.
     /// Construction does NOT contact the server.
-    pub fn new(config: Arc<OllamaConfig>) -> Result<Self, ProviderError> {
-        let client = build_client(&config)?;
+    pub fn new(config: Arc<LlmExtractionConfig>) -> Result<Self, ProviderError> {
+        let client = build_client(config.timeout_seconds)?;
         Ok(Self { client, config })
     }
 
@@ -114,7 +114,7 @@ impl LlmExtractor for OllamaExtractor {
         _tool_calls: &[ToolCall],
     ) -> Result<Vec<String>, ProviderError> {
         let body = ChatRequest {
-            model: &self.config.extraction_model,
+            model: &self.config.model,
             messages: vec![
                 ChatMessage {
                     role: "system",
@@ -129,8 +129,8 @@ impl LlmExtractor for OllamaExtractor {
             ],
             stream: false,
             options: ChatOptions {
-                temperature: self.config.extraction_temperature,
-                seed: self.config.extraction_seed,
+                temperature: self.config.temperature,
+                seed: self.config.seed,
             },
             think: false,
         };
@@ -235,13 +235,12 @@ const PROMPT_ECHO_PREFIXES: &[&str] = &[
 mod tests {
     use super::*;
 
-    fn cfg(url: &str) -> Arc<OllamaConfig> {
-        Arc::new(OllamaConfig {
+    fn cfg(url: &str) -> Arc<LlmExtractionConfig> {
+        Arc::new(LlmExtractionConfig {
             url: url.into(),
-            embedding_model: "m".into(),
-            extraction_model: "qwen3.5:2b".into(),
+            model: "qwen3.5:2b".into(),
             timeout_seconds: 2,
-            ..OllamaConfig::default()
+            ..LlmExtractionConfig::default()
         })
     }
 

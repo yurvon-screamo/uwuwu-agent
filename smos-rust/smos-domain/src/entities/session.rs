@@ -4,7 +4,6 @@
 //! registry of these) lives in the application layer; the domain layer only
 //! owns the value type and its pure update operations.
 
-use crate::error::DomainError;
 use crate::value_objects::{FactId, MemoryKey, SessionId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -63,22 +62,20 @@ impl SessionState {
     }
 
     /// Append fact ids to the pending list, deduplicating in place.
-    pub fn add_pending(&mut self, ids: &[FactId]) -> Result<(), DomainError> {
+    pub fn add_pending(&mut self, ids: &[FactId]) {
         for id in ids {
             if !self.pending_facts.contains(id) {
                 self.pending_facts.push(id.clone());
             }
         }
-        Ok(())
     }
 
     /// Remove only the supplied ids (preserving any concurrent additions).
     ///
     /// Used by session-end processing to drain exactly the fact ids it owns,
     /// even if another flow has appended new ones in the meantime.
-    pub fn remove_owned(&mut self, owned: &[FactId]) -> Result<(), DomainError> {
+    pub fn remove_owned(&mut self, owned: &[FactId]) {
         self.pending_facts.retain(|id| !owned.contains(id));
-        Ok(())
     }
 
     /// `true` if the session has been inactive for longer than `timeout`.
@@ -154,9 +151,9 @@ mod tests {
         let mut state = SessionState::new(sid(), key(), at(0));
         let id1 = fid("first");
         let id2 = fid("second");
-        state.add_pending(&[id1.clone(), id2.clone()]).unwrap();
+        state.add_pending(&[id1.clone(), id2.clone()]);
         assert_eq!(state.pending_facts(), &[id1.clone(), id2.clone()]);
-        state.add_pending(&[id1.clone(), id2.clone()]).unwrap();
+        state.add_pending(&[id1.clone(), id2.clone()]);
         assert_eq!(state.pending_facts().len(), 2);
     }
 
@@ -166,10 +163,8 @@ mod tests {
         let id1 = fid("first");
         let id2 = fid("second");
         let id3 = fid("third");
-        state
-            .add_pending(&[id1.clone(), id2.clone(), id3.clone()])
-            .unwrap();
-        state.remove_owned(&[id1.clone(), id3.clone()]).unwrap();
+        state.add_pending(&[id1.clone(), id2.clone(), id3.clone()]);
+        state.remove_owned(&[id1.clone(), id3.clone()]);
         assert_eq!(state.pending_facts(), std::slice::from_ref(&id2));
     }
 
@@ -178,11 +173,11 @@ mod tests {
         let mut state = SessionState::new(sid(), key(), at(0));
         let id1 = fid("first");
         let id2 = fid("second");
-        state.add_pending(&[id1.clone(), id2.clone()]).unwrap();
+        state.add_pending(&[id1.clone(), id2.clone()]);
         // Caller snapshots `owned = [id1, id2]`, then a concurrent flow adds id3.
         let id3 = fid("third");
-        state.add_pending(std::slice::from_ref(&id3)).unwrap();
-        state.remove_owned(&[id1.clone(), id2.clone()]).unwrap();
+        state.add_pending(std::slice::from_ref(&id3));
+        state.remove_owned(&[id1.clone(), id2.clone()]);
         assert_eq!(state.pending_facts(), std::slice::from_ref(&id3));
     }
 
@@ -218,7 +213,7 @@ mod tests {
         // Persistence adapters call `rehydrate` on read; this test pins the
         // round-trip contract — every field must survive unchanged.
         let mut state = SessionState::new(sid(), key(), at(1_700_000_000));
-        state.add_pending(&[fid("p1"), fid("p2")]).unwrap();
+        state.add_pending(&[fid("p1"), fid("p2")]);
         let injected = [fid("i1"), fid("i2"), fid("i1")]; // duplicate intentional
         state.touch(at(1_700_000_999));
 

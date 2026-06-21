@@ -33,8 +33,21 @@ impl Default for ConfidenceConfig {
     }
 }
 
-/// Soft NLI score thresholds (§9 usage notes).
+/// NLI verdict thresholds consumed by the domain layer (§5.5, §9).
+///
+/// The domain only needs the threshold pair that drives
+/// [`NliResult::is_contradiction`] / [`NliResult::is_entailment`] and the
+/// merge decision in [`NliResult::decide_merge`]. The adapter-boundary
+/// strings (`model`, `cache_dir`) live in
+/// `smos_adapters::config::NliBackendConfig` so this crate stays free of
+/// the "domain type carries data only an adapter can interpret" smell.
+///
+/// `deny_unknown_fields` turns the most common operator mistake (putting
+/// `model` / `cache_dir` under `[nli]` instead of `[nli_backend]`) into a
+/// loud startup error rather than a silent drop — the layering invariant
+/// is enforced at parse time, not just by code review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NliConfig {
     /// Minimum `contradiction` softmax score for the contradiction verdict.
     pub contradiction_threshold: f32,

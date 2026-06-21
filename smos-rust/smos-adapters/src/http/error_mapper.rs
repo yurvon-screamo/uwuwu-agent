@@ -38,7 +38,8 @@ fn classify(error: &UpstreamError) -> ErrorClass {
         | UpstreamError::ConnectFailed(_)
         | UpstreamError::Timeout(_)
         | UpstreamError::StreamError(_)
-        | UpstreamError::BadResponse(_) => ErrorClass::BadGateway,
+        | UpstreamError::BadResponse(_)
+        | UpstreamError::AllProvidersFailed(_) => ErrorClass::BadGateway,
         UpstreamError::SerializationError(_) => ErrorClass::Internal,
     }
 }
@@ -120,6 +121,9 @@ fn message_for(error: &UpstreamError) -> String {
         }
         UpstreamError::StatusError { status, .. } => {
             format!("upstream LLM returned HTTP {status}")
+        }
+        UpstreamError::AllProvidersFailed(_) => {
+            "every configured upstream LLM provider failed".to_string()
         }
         UpstreamError::SerializationError(_) => error.to_string(),
     }

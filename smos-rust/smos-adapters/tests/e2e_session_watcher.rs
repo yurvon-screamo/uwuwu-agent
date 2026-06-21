@@ -19,9 +19,10 @@ use std::time::Duration;
 
 use smos_adapters::SessionWatcher;
 use smos_adapters::SurrealStore;
+use smos_adapters::SystemClock;
 use smos_adapters::config::{ServerConfig, SessionConfig};
 use smos_application::errors::ProviderError;
-use smos_application::ports::{FactRepository, NliClassifier, SessionRepository};
+use smos_application::ports::{Clock, FactRepository, NliClassifier, SessionRepository};
 use smos_application::types::NliResult;
 use smos_domain::config::{ConfidenceConfig, MergeConfig, NliConfig};
 use smos_domain::enums::NliLabel;
@@ -155,7 +156,8 @@ fn pending_fact(content: &str, embedding: Embedding, session: SessionId) -> Fact
         memory_key(),
         session,
         embedding,
-        Timestamp::now_utc(),
+        SystemClock.now(),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending fact")
 }
@@ -167,7 +169,8 @@ fn accepted_fact(content: &str, embedding: Embedding, session: SessionId) -> Fac
         memory_key(),
         session,
         embedding,
-        Timestamp::now_utc(),
+        SystemClock.now(),
+        smos_domain::config::ConfidenceConfig::default().base,
     )
     .expect("pending");
     f.set_status_and_confidence(
@@ -221,7 +224,7 @@ async fn seed_session_aged(
     pending: Vec<FactId>,
     age: Duration,
 ) {
-    let now_secs = Timestamp::now_utc().as_unix_secs();
+    let now_secs = SystemClock.now().as_unix_secs();
     let aged_secs = now_secs - age.as_secs() as i64;
     let aged_ts = Timestamp::from_unix_secs(aged_secs).expect("aged ts");
     let state = SessionState::rehydrate(

@@ -488,7 +488,7 @@ mod tests {
         let mut short_with_tool = turn("a", "ok");
         short_with_tool.tool_calls.push(ToolCall {
             name: "read_file".into(),
-            arguments: serde_json::json!({"path": "auth.rs"}),
+            arguments: smos_domain::chat::ToolArguments::from_json(r#"{"path":"auth.rs"}"#),
         });
         let stats = import
             .execute(vec![short_with_tool], &mk(), &sid(1), None)
@@ -573,6 +573,7 @@ mod tests {
             sid(1),
             smos_domain::Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let fid = first.id().clone();

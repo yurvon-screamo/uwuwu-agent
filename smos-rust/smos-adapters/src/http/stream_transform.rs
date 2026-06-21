@@ -358,7 +358,7 @@ mod tests {
         assert!(content.is_empty(), "no content deltas in this stream");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments["path"], "auth.rs");
+        assert_eq!(calls[0].arguments.as_str(), r#"{"path":"auth.rs"}"#);
     }
 
     #[tokio::test]

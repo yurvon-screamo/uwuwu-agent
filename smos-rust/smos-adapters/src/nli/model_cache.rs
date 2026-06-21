@@ -196,6 +196,14 @@ fn fetch_canonical(
     // (or a stale-`.part` detection inside `try_claim`) and falls through
     // to the polling loop below. The claim's owned file handle is the
     // copy target so we never re-open the same path twice.
+    //
+    // Error triage on `try_claim`:
+    //   * `AlreadyExists` — a concurrent process holds the `.part`; we are
+    //     the loser and must poll for the canonical rename. This is the
+    //     expected race outcome.
+    //   * Any other IO error (permission denied, disk full, …) — a real
+    //     environment problem. Failing fast surfaces it instead of polling
+    //     a canonical path that will never appear.
     match PartClaim::try_claim(part_path.clone()) {
         Ok(mut claim) => {
             // Stream the HF copy through memory-mapped buffers; `io::copy`
@@ -220,7 +228,7 @@ fn fetch_canonical(
             // leak is acceptable for the race-safety it buys.
             std::mem::forget(claim);
         }
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Another caller won the claim. Poll the canonical path until
             // either the rename lands or we exhaust the retry budget; the
             // budget is generous because a 643 MB download on a slow link
@@ -237,6 +245,12 @@ fn fetch_canonical(
                 "canonical file did not appear after {RETRIES} retries: {}",
                 local.display()
             )));
+        }
+        Err(other) => {
+            // Real IO problem (permission denied, read-only filesystem, …).
+            // Fail fast so the operator sees the root cause instead of a
+            // mysterious "canonical file did not appear" timeout later.
+            return Err(ModelCacheError::Io(other));
         }
     }
 

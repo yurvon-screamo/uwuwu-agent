@@ -21,8 +21,8 @@ pub mod storage;
 pub mod upstream;
 
 pub use config::{
-    NliBackendConfig, OllamaConfig, RerankerConfig, ServerConfig, SessionConfig, SmosConfig,
-    SurrealConfig, UpstreamConfig,
+    EmbeddingConfig, LlmExtractionConfig, NliBackendConfig, RerankerConfig, ServerConfig,
+    SessionConfig, SmosConfig, SurrealConfig, UpstreamConfig, UpstreamProvider, UpstreamStrategy,
 };
 pub use nli::NativeNliClassifier;
 pub use opencode::{DiscoveryError, SessionSource};
@@ -31,4 +31,5 @@ pub use runtime::SessionWatcher;
 pub use runtime::TokioDelay;
 pub use storage::surreal_store::SurrealStore;
 pub use storage::system_clock::SystemClock;
-pub use upstream::reqwest_upstream::ReqwestUpstream;
+pub use storage::system_id_generator::SystemIdGenerator;
+pub use upstream::reqwest_upstream::{ReqwestUpstream, ReqwestUpstreamPool};

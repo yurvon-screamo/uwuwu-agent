@@ -276,6 +276,7 @@ where
             session_id.clone(),
             emb,
             self.clock.now(),
+            self.confidence_cfg.base,
         )?;
         self.facts.save(&fact).await?;
         Ok(Some(fact_id))
@@ -597,7 +598,7 @@ mod tests {
     fn format_tool_calls_renders_name_and_arguments() {
         let calls = vec![ToolCall {
             name: "read_file".into(),
-            arguments: serde_json::json!({"path": "auth.rs"}),
+            arguments: smos_domain::chat::ToolArguments::from_json(r#"{"path":"auth.rs"}"#),
         }];
         assert_eq!(
             format_tool_calls(&calls),
@@ -822,6 +823,7 @@ mod tests {
             sid(1),
             Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let fid = first.id().clone();
@@ -906,6 +908,7 @@ mod tests {
             sid(1),
             Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let stored_id = stored.id().clone();
@@ -991,6 +994,7 @@ mod tests {
             sid(1),
             Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let stored_id = stored.id().clone();
@@ -1057,6 +1061,7 @@ mod tests {
             sid(1),
             Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let stored_id = stored.id().clone();
@@ -1116,6 +1121,7 @@ mod tests {
             sid(1),
             Embedding::new(vec![1.0]).unwrap(),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap();
         let stored_id = stored.id().clone();

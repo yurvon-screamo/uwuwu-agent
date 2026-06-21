@@ -12,10 +12,11 @@
 //!
 //! The watcher is the only mechanism that retires pending facts without an
 //! operator pressing `smos finalize`. If a transient error (SurrealDB hiccup,
-//! sidecar restart) terminated the loop, every subsequent session would pin
-//! its pending facts forever — the proxy would silently degrade into a
-//! write-only memory. So every cycle error is logged at `WARN`/`ERROR` and the
-//! loop continues; only the explicit shutdown channel terminates the task.
+//! NLI backend restart) terminated the loop, every subsequent session would
+//! pin its pending facts forever — the proxy would silently degrade into a
+//! write-only memory. So every cycle error is logged at `WARN`/`ERROR` and
+//! the loop continues; only the explicit shutdown channel terminates the
+//! task.
 //!
 //! # Concurrency seam
 //!
@@ -24,10 +25,11 @@
 //! `source_sessions`-owned pending ids at entry, so two concurrent runs
 //! would each load the same pending pool, classify every pair twice, and
 //! race on the merge saves. The `inflight` guard is the single concurrency
-//! seam: marked before the call, removed after, checked under a
-//! `tokio::Mutex`. Different session ids may still be processed concurrently
-//! if a future refactor parallelises the per-cycle scan (the spec's
-//! `run_cycle` awaits sequentially, mirroring the POC
+//! seam: marked before the call, removed after (via an RAII guard whose
+//! `Drop` runs on normal return, error propagation, AND panic-unwind),
+//! checked under a `std::sync::Mutex`. Different session ids may still be
+//! processed concurrently if a future refactor parallelises the per-cycle
+//! scan (the spec's `run_cycle` awaits sequentially, mirroring the POC
 //! `_process_overflow_sessions`).
 //!
 //! # Why `into_loop` instead of `spawn`
@@ -46,6 +48,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use smos_application::errors::UseCaseError;
@@ -53,7 +56,6 @@ use smos_application::ports::{FactRepository, NliClassifier, SessionRepository};
 use smos_application::use_cases::FinalizeSession;
 use smos_domain::config::{ConfidenceConfig, MergeConfig, NliConfig};
 use smos_domain::{MemoryKey, SessionId};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 
 use crate::config::{ServerConfig, SessionConfig};
@@ -83,7 +85,19 @@ pub struct SessionWatcher<FR, SR, NC> {
     /// skips the remaining sessions, whose pending facts stay pending for
     /// the next process start.
     server_cfg: Arc<ServerConfig>,
-    inflight: Arc<Mutex<HashSet<SessionId>>>,
+    /// Sync mutex guarding the in-flight session set.
+    ///
+    /// Deliberately `std::sync::Mutex` (not `tokio::sync::Mutex`): the only
+    /// operations on this set are `contains` / `insert` / `remove`, all
+    /// non-async and sub-microsecond. Using the std variant makes the
+    /// [`InflightGuard`] RAII pattern sound: `std::sync::MutexGuard`'s
+    /// `Drop` is synchronous (it just releases the lock), so a guard that
+    /// owns a guard can run its own `Drop` even during a panic unwind.
+    /// `tokio::sync::Mutex`'s `Drop` would need an async context to lock
+    /// again, which is unavailable inside `Drop` — so a panicking finalize
+    /// task would leak the session id from the set and the next cycle
+    /// would skip it forever. The std mutex closes that hole.
+    inflight: Arc<StdMutex<HashSet<SessionId>>>,
 }
 
 impl<FR, SR, NC> SessionWatcher<FR, SR, NC>
@@ -113,7 +127,7 @@ where
             merge_cfg,
             session_cfg,
             server_cfg,
-            inflight: Arc::new(Mutex::new(HashSet::new())),
+            inflight: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -230,7 +244,15 @@ where
     /// invariant; per-cycle serialisation is an artifact of the current
     /// awaited-loop design, not a contract.
     ///
-    /// Finalize errors are swallowed: a transient sidecar / store failure
+    /// The session id is removed from `inflight` via an RAII
+    /// [`InflightGuard`]: the guard's `Drop` runs on the normal path, on
+    /// error returns, AND on panic-unwind, so a panicking finalize task
+    /// can never pin its id in the set. (This is the reason `inflight`
+    /// uses `std::sync::Mutex` — its guard's `Drop` is sync and
+    /// panic-safe; `tokio::sync::Mutex` would need an async context that
+    /// is unavailable inside `Drop`.)
+    ///
+    /// Finalize errors are swallowed: a transient NLI backend / store failure
     /// must not skip subsequent sessions in the same cycle. The cycle-level
     /// error path (storage unavailable, etc.) is the only `Err` returned.
     async fn try_finalize(
@@ -238,14 +260,28 @@ where
         session_id: &SessionId,
         memory_key: &MemoryKey,
     ) -> Result<(), UseCaseError> {
+        // Mark in-flight under the lock; bail if another task already owns
+        // this session. `lock().unwrap_or_else(into_inner)` recovers from a
+        // poisoned mutex — std mutexes poison on panic, but our `Drop` guard
+        // runs before the poisoning propagates, so the data is still
+        // consistent. A panic in one finalize task must not wedge every
+        // subsequent cycle.
         {
-            let mut inflight = self.inflight.lock().await;
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
             if inflight.contains(session_id) {
                 tracing::debug!(session = %session_id, "finalize already in-flight; skipping");
                 return Ok(());
             }
             inflight.insert(session_id.clone());
         }
+
+        // RAII guard: removes `session_id` on drop — covers normal return,
+        // early `?`-return, and panic-unwind. Held across the (long)
+        // finalize call so the lock is NOT held while finalize runs.
+        let _guard = InflightGuard {
+            inflight: Arc::clone(&self.inflight),
+            id: Some(session_id.clone()),
+        };
 
         let result = {
             let finalize = FinalizeSession {
@@ -258,11 +294,6 @@ where
             };
             finalize.execute(session_id, memory_key).await
         };
-
-        {
-            let mut inflight = self.inflight.lock().await;
-            inflight.remove(session_id);
-        }
 
         match result {
             Ok(stats) => {
@@ -303,10 +334,10 @@ where
     /// deploy can configure `terminationGracePeriodSeconds` (K8s) /
     /// `TimeoutStopSec` (systemd) to a single value that covers the full
     /// §12 sequence. With N sessions and budget B, total drain time ≤ B
-    /// (NOT N×B): a wedged sidecar / pathological pending backlog consumes
-    /// the remaining budget, the loop breaks, and the unprocessed sessions'
-    /// pending facts stay pending for the next process start (graceful
-    /// degradation, not data loss).
+    /// (NOT N×B): a wedged NLI backend / pathological pending backlog
+    /// consumes the remaining budget, the loop breaks, and the
+    /// unprocessed sessions' pending facts stay pending for the next
+    /// process start (graceful degradation, not data loss).
     async fn drain_all(&self) -> Result<(), UseCaseError> {
         let total_budget = Duration::from_secs(self.server_cfg.shutdown_extraction_grace_seconds);
         let deadline = tokio::time::Instant::now() + total_budget;
@@ -390,5 +421,40 @@ where
             "session watcher drain complete"
         );
         Ok(())
+    }
+}
+
+/// RAII guard that removes a session id from the watcher's `inflight` set
+/// on drop.
+///
+/// Created AFTER the id has been inserted under the lock; dropped when the
+/// surrounding scope exits — whether via normal return, `?` propagation, or
+/// panic-unwind. The `Option<SessionId>` field lets `Drop` distinguish
+/// "still owned" from "already taken" so a future caller can hand off
+/// ownership (e.g., move the id into a follow-up task) without double
+/// removing.
+///
+/// Uses `std::sync::Mutex` because the only operations are `lock` +
+/// `HashSet::remove`, both synchronous and sub-microsecond. `tokio::sync`
+/// would forbid the lock acquisition from inside `Drop` (no async context
+/// available during unwinding), so a panicking finalize task would leak its
+/// id into the set forever.
+struct InflightGuard {
+    inflight: Arc<StdMutex<HashSet<SessionId>>>,
+    id: Option<SessionId>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // `unwrap_or_else(into_inner)` recovers from a poisoned mutex:
+            // a prior panic would have left the lock poisoned, but the
+            // underlying HashSet is still consistent (the panicking task's
+            // own guard ran during unwind before the poisoning propagated
+            // to us). Leaking the id here would re-introduce the bug this
+            // guard exists to fix.
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            inflight.remove(&id);
+        }
     }
 }

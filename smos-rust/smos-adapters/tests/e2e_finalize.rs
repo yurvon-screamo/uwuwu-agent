@@ -176,13 +176,28 @@ fn blend_embedding(b: f32) -> Embedding {
 
 /// Pending fact (status `Pending`, single-source provenance, base confidence).
 fn pending_fact(content: &str, embedding: Embedding, session: SessionId) -> Fact {
-    Fact::new_pending(content, memory_key(), session, embedding, ts()).expect("pending fact")
+    Fact::new_pending(
+        content,
+        memory_key(),
+        session,
+        embedding,
+        ts(),
+        ConfidenceConfig::default().base,
+    )
+    .expect("pending fact")
 }
 
 /// Accepted fact lifted above the accept threshold via `set_status_and_confidence`.
 fn accepted_fact(content: &str, embedding: Embedding, session: SessionId) -> Fact {
-    let mut f =
-        Fact::new_pending(content, memory_key(), session, embedding, ts()).expect("pending");
+    let mut f = Fact::new_pending(
+        content,
+        memory_key(),
+        session,
+        embedding,
+        ts(),
+        ConfidenceConfig::default().base,
+    )
+    .expect("pending");
     f.set_status_and_confidence(
         FactStatus::Accepted,
         Confidence::new(0.9).expect("confidence"),
@@ -1166,6 +1181,7 @@ async fn list_memory_keys_for_session_returns_distinct_keys() {
         sid(1),
         unit_embedding(3),
         ts(),
+        ConfidenceConfig::default().base,
     )
     .expect("pending");
     FactRepository::save(&store, &mk_a).await.expect("save a");
@@ -1183,6 +1199,7 @@ async fn list_memory_keys_for_session_returns_distinct_keys() {
         sid(2),
         unit_embedding(4),
         ts(),
+        ConfidenceConfig::default().base,
     )
     .expect("pending");
     FactRepository::save(&store, &other_session_fact)

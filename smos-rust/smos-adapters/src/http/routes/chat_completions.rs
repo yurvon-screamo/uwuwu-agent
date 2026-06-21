@@ -32,7 +32,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use smos_application::ports::Clock as ClockPort;
+use smos_application::ports::{Clock as ClockPort, IdGenerator as IdGeneratorPort};
 use smos_application::types::{ChatRequest, ChatResponse};
 use smos_application::use_cases::extract_facts_from_response::ExtractFactsFromResponse;
 use smos_application::use_cases::{HandleChatCompletion, extract_response_payload};
@@ -64,6 +64,7 @@ pub async fn handle(
         reranker: state.reranker.clone(),
         upstream: state.upstream.clone(),
         clock: FlatClock(state.clock.clone()),
+        id_generator: FlatIdGenerator(state.id_generator.clone()),
         retrieval_cfg: state.retrieval_cfg.clone(),
         heat_cfg: state.heat_cfg.clone(),
     };
@@ -258,5 +259,18 @@ struct FlatClock(Arc<dyn ClockPort + Send + Sync>);
 impl ClockPort for FlatClock {
     fn now(&self) -> smos_domain::Timestamp {
         self.0.now()
+    }
+}
+
+/// Wrapper around `Arc<dyn IdGenerator>` that implements `IdGenerator` by
+/// delegating. Same shape as [`FlatClock`]: the shared state holds the id
+/// generator behind a trait object, but `HandleChatCompletion` requires
+/// `IG: IdGenerator` (a by-value bound).
+#[derive(Clone)]
+struct FlatIdGenerator(Arc<dyn IdGeneratorPort + Send + Sync>);
+
+impl IdGeneratorPort for FlatIdGenerator {
+    fn new_session_id(&self) -> SessionId {
+        self.0.new_session_id()
     }
 }

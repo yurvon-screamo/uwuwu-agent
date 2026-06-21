@@ -17,22 +17,47 @@ enable_response_extraction = true
 graceful_degradation = true
 log_format = "json"
 
-[upstream]
+# Upstream LLM providers for chat completions (forward user requests).
+# Multiple providers supported — `single` (first only), `round_robin`
+# (default, even distribution), or `failover` (try next on error).
+[[upstream.providers]]
+name = "ollama-local"
 url = "http://localhost:11434/v1/chat/completions"
 api_key = "ollama"
 auth_header = "Authorization"
 timeout_seconds = 120
 
-[ollama]
-url = "http://localhost:11434"
-embedding_model = "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:latest"
-extraction_model = "qwen3.5:2b"
+# Optional second provider (consulted under `mode = "failover"`).
+# [[upstream.providers]]
+# name = "openrouter"
+# url = "https://openrouter.ai/api/v1/chat/completions"
+# api_key = ""  # set SMOS__UPSTREAM__API_KEY to keep secrets out of TOML
+# auth_header = "Authorization"
+# timeout_seconds = 120
+
+[upstream.strategy]
+mode = "single"
+
+# LLM for fact extraction (Qwen3.5:2b or any Ollama-/OpenAI-compatible model).
+[llm_extraction]
+url = "http://localhost:11434"           # API base (the adapter appends /api/chat)
+model = "qwen3.5:2b"
+api_key = ""                              # optional, for cloud providers
 timeout_seconds = 30
 # Deterministic extraction: temperature=0 disables random sampling, seed pins
 # the RNG so two runs against the same input re-yield the same bullet list.
 # This is what keeps FactId = SHA1(content) stable across re-extraction runs.
-extraction_seed = 42
-extraction_temperature = 0.0
+temperature = 0.0
+seed = 42
+
+# Embedding model for vector search (may be a different provider than the
+# extraction LLM).
+[embedding]
+url = "http://localhost:11434"           # the adapter appends /api/embeddings
+model = "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:latest"
+dimensions = 1024                          # MUST match the HNSW index DDL
+api_key = ""
+timeout_seconds = 30
 
 [reranker]
 url = "http://localhost:8181"
@@ -55,12 +80,23 @@ no_contradiction_bonus = 0.1
 accept_threshold = 0.7
 pending_threshold = 0.4
 
-# NLI verdict thresholds consumed by the domain predicates
-# (`is_contradiction` / `is_entailment`). Soft caps so a borderline softmax
-# distribution does not flip a verdict.
+# NLI verdict thresholds (domain layer). Drives the `is_contradiction` /
+# `is_entailment` / `decide_merge` predicates. Soft caps so a borderline
+# softmax distribution does not flip a verdict.
 [nli]
 contradiction_threshold = 0.5
 entailment_threshold = 0.6
+
+# Native ort + ONNX Runtime backend for NLI inference — adapter-only sibling
+# of `[nli]`. The model id and cache directory are interpreter-level data
+# that the domain layer never reads; keeping them under their own section
+# preserves the layering invariant ("domain types carry no IO-boundary
+# data"). Putting `model` / `cache_dir` under `[nli]` is a loud startup
+# error — both sections carry `#[serde(deny_unknown_fields)]`, so the
+# parser rejects the misplacement instead of silently dropping it.
+[nli_backend]
+model = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+cache_dir = "./data/nli_cache"
 
 # Semantic dedup safety net for fact extraction (persist_facts step 2).
 # When the extractor rephrases a fact just enough to break the FactId =
@@ -69,14 +105,6 @@ entailment_threshold = 0.6
 # leaving the fact stuck at single-source confidence.
 [extraction]
 dedup_cosine_threshold = 0.95
-
-# Native ort + ONNX Runtime NLI backend.
-#   model     — Hugging Face repo id (DeBERTa-v3 ONNX export).
-#   cache_dir — local directory that holds the downloaded ONNX model +
-#               tokenizer.json. First run downloads ~643 MB.
-[nli_backend]
-model = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
-cache_dir = "./data/nli_cache"
 
 [heat]
 decay_rate = 0.03

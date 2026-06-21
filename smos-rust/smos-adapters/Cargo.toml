@@ -38,9 +38,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Native NLI backend (ort + tokenizers + hf-hub). Native NLI is the only
-# available backend since the Python sidecar was removed. The version pin on
-# `ort` is exact (=2.0.0-rc.12) because the API is still pre-stable and a
-# patch release could silently change EP wiring.
+# available backend (the legacy Python implementation was removed). The
+# version pin on `ort` is exact (=2.0.0-rc.12) because the API is still
+# pre-stable and a patch release could silently change EP wiring.
 #
 # `tls-rustls` is selected (not the default `tls-native`) so the ort binary
 # downloader shares the rustls stack already pulled in by `reqwest`.

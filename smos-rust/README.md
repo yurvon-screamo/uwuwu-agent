@@ -14,7 +14,7 @@ intentional). When this README and the spec disagree, the spec wins.
 ## Status
 
 **Production-ready — all 8 slices landed.** Native ort + ONNX Runtime NLI is
-the only NLI backend; the legacy Python sidecar was removed.
+the only NLI backend (the legacy Python implementation was removed).
 
 | Slice | Scope |
 |-------|-------|
@@ -27,7 +27,7 @@ the only NLI backend; the legacy Python sidecar was removed.
 | 7 — session watcher   | background drain loop, graceful shutdown, restart budget |
 | 8 — import CLI        | `smos import` re-runs the live pipeline over opencode transcripts |
 
-Test surface: **665 tests** in the default suite (`cargo t`); **5 additional
+Test surface: **679 tests** in the default suite (`cargo t`); **5 additional
 `#[ignore]` tests** that require a 643 MB DeBERTa ONNX download or a
 live Ollama server (`cargo tall`). See [Testing](#testing).
 
@@ -75,7 +75,7 @@ smos-rust/
 │   └── NO IO here either — async fn in trait, runtime-agnostic
 └── smos-adapters/       # the ONLY crate where IO happens
     ├── src/storage/           # SurrealStore (embedded RocksDB), SystemClock
-    ├── src/upstream/          # ReqwestUpstream, SSE parser, StreamingBuffer
+    ├── src/upstream/          # ReqwestUpstream (+ ReqwestUpstreamPool for multi-provider), SSE parser, StreamingBuffer
     ├── src/providers/         # OllamaEmbedding/Extractor, LlamaCppReranker
     ├── src/nli/               # NativeNliClassifier (ort + ONNX DeBERTa-v3)
     ├── src/runtime/           # SessionWatcher, ExtractionSupervisor
@@ -137,20 +137,20 @@ override the built-in defaults; any section omitted falls back to its
 canonical default. See [`smos.toml`](smos.toml) for the canonical example and
 [`smos-adapters/src/config.rs`](smos-adapters/src/config.rs) for every field.
 
-| Section          | Purpose                                                            |
-|------------------|-------------------------------------------------------------------|
-| `[surreal]`      | embedded RocksDB path + namespace/database                        |
-| `[server]`       | bind host/port, shutdown grace, extraction toggle, log format     |
-| `[upstream]`     | OpenAI-compatible LLM endpoint, auth header, timeout              |
-| `[ollama]`       | Ollama URL + embedding/extraction model ids                       |
-| `[reranker]`     | llama.cpp reranker URL (`/v1/rerank`)                             |
-| `[retrieval]`    | top-K initial/final, min_topic_chars, min_confidence              |
-| `[merge]`        | cosine candidate-selection threshold for merge detection          |
-| `[confidence]`   | base + multi-source/non-contradiction bonuses, accept/pending cut |
-| `[nli]`          | contradiction/entailment softmax thresholds                       |
-| `[nli_backend]`  | native ort + ONNX Runtime NLI: HF model id + cache directory      |
-| `[heat]`         | decay rate, min threshold                                         |
-| `[session]`      | timeout, pending overflow threshold, watcher scan interval        |
+| Section                | Purpose                                                            |
+|------------------------|-------------------------------------------------------------------|
+| `[surreal]`            | embedded RocksDB path + namespace/database                        |
+| `[server]`             | bind host/port, shutdown grace, extraction toggle, log format     |
+| `[upstream]`           | Multi-provider LLM endpoints via `[[upstream.providers]]` + `[upstream.strategy]` |
+| `[llm_extraction]`     | Fact-extraction LLM endpoint (model, temperature, seed)           |
+| `[embedding]`          | Embedding model endpoint (model, dimensions)                      |
+| `[reranker]`           | llama.cpp reranker URL (`/v1/rerank`)                             |
+| `[retrieval]`          | top-K initial/final, min_topic_chars, min_confidence              |
+| `[merge]`              | cosine candidate-selection threshold for merge detection          |
+| `[confidence]`         | base + multi-source/non-contradiction bonuses, accept/pending cut |
+| `[nli]`                | NLI softmax thresholds + native ort/ONNX model id + cache dir     |
+| `[heat]`               | decay rate, min threshold                                         |
+| `[session]`            | timeout, pending overflow threshold, watcher scan interval        |
 
 ## Binaries
 
@@ -246,8 +246,8 @@ external services.
 | Command | Scope | Tests |
 |---------|-------|-------|
 | `cargo tf` | `smos-domain` + `smos-application` unit tests only | 351 |
-| `cargo t` | Full workspace + every embedded-SurrealDB / wiremock e2e binary | 665 |
-| `cargo tall` | Adds the `#[ignore]` tests (native NLI 643 MB model download + any live Ollama test) | 665 + 5 ignored |
+| `cargo t` | Full workspace + every embedded-SurrealDB / wiremock e2e binary | 679 |
+| `cargo tall` | Adds the `#[ignore]` tests (native NLI 643 MB model download + any live Ollama test) | 679 + 5 ignored |
 
 ### Dev workflow
 
@@ -356,7 +356,7 @@ cargo fmt --all --check
 
 **Native ort + ONNX Runtime is the only NLI backend.** No Python, no torch,
 no subprocess. The first `smos serve` startup downloads the DeBERTa-v3 ONNX
-export (~643 MB) into `[nli_backend].cache_dir`. Pre-warm the cache with:
+export (~643 MB) into `[nli].cache_dir`. Pre-warm the cache with:
 
 ```bash
 # Pre-warm the native NLI model cache (downloads ~643 MB).
@@ -375,10 +375,12 @@ configured `host` is non-localhost together with the permissive layer.
 directory on disk; the proxy creates it on first run. No external database
 process is needed.
 
-**Upstream** — point `[upstream].url` at your OpenAI-compatible endpoint.
-The proxy forwards the (enriched) request verbatim and injects a session
-marker into the response so the next request in the same conversation can be
-linked. Streaming (`stream: true`) and non-streaming are both supported.
+**Upstream** — point `[[upstream.providers]]` at your OpenAI-compatible
+endpoints. One entry is enough; multiple entries enable round-robin or
+failover via `[upstream.strategy].mode`. The proxy forwards the (enriched)
+request verbatim and injects a session marker into the response so the next
+request in the same conversation can be linked. Streaming (`stream: true`)
+and non-streaming are both supported.
 
 **Graceful shutdown** — Ctrl+C / SIGTERM triggers a coordinated drain: HTTP
 connections finish → in-flight extraction tasks drain (bounded by
@@ -387,8 +389,8 @@ Native NLI is in-process and needs no explicit teardown.
 
 ## Native NLI backend (ort + ONNX Runtime)
 
-Native ort + ONNX Runtime is the only NLI backend (the legacy Python sidecar
-was removed). The model is the DeBERTa-v3 ONNX export from
+Native ort + ONNX Runtime is the only NLI backend (the legacy Python
+implementation was removed). The model is the DeBERTa-v3 ONNX export from
 `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`.
 
 ### GPU support feature flags

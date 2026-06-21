@@ -1,0 +1,4 @@
+   Compiling smos-domain v0.1.0 (D:\uwuwu_agent\smos-rust\smos-domain)
+   Compiling smos-application v0.1.0 (D:\uwuwu_agent\smos-rust\smos-application)
+   Compiling smos-adapters v0.1.0 (D:\uwuwu_agent\smos-rust\smos-adapters)
+    Finished `release` profile [optimized] target(s) in 8m 49s

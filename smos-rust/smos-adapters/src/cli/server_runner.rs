@@ -14,9 +14,12 @@ use crate::config::SmosConfig;
 use crate::http::axum_server::{AppState, build_router, serve_with_shutdown};
 use crate::nli::build_classifier;
 use crate::runtime::{ExtractionSupervisor, SessionWatcher};
-use crate::upstream::ReqwestUpstream;
-use crate::{LlamaCppReranker, OllamaEmbedding, OllamaExtractor, SurrealStore, SystemClock};
-use smos_application::ports::Clock;
+use crate::upstream::ReqwestUpstreamPool;
+use crate::{
+    LlamaCppReranker, OllamaEmbedding, OllamaExtractor, SurrealStore, SystemClock,
+    SystemIdGenerator,
+};
+use smos_application::ports::{Clock, IdGenerator};
 
 /// Handle returned by [`spawn_watcher`] so [`run_server`] can drive the
 /// §12 drain ordering. The watcher task + its shutdown sender live or die
@@ -33,8 +36,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        upstream = %config.upstream.url,
-        ollama = %config.ollama.url,
+        upstream_providers = config.upstream.providers.len(),
+        upstream_strategy = %config.upstream.strategy.mode,
+        extraction_url = %config.llm_extraction.url,
+        embedding_url = %config.embedding.url,
         reranker = %config.reranker.url,
         host = %config.server.host,
         port = config.server.port,
@@ -87,9 +92,16 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 /// whose bearer token is the built-in placeholder, or when permissive
 /// CORS meets a non-localhost bind.
 fn warn_on_insecure_config(config: &SmosConfig) {
-    if config.upstream.api_key == "ollama" {
+    // Inspect every configured provider's api_key — any one of them being
+    // the built-in placeholder is worth flagging.
+    let any_placeholder = config
+        .upstream
+        .providers
+        .iter()
+        .any(|p| p.api_key == "ollama");
+    if any_placeholder {
         tracing::warn!(
-            "upstream.api_key is the built-in placeholder 'ollama'; \
+            "at least one upstream provider's api_key is the built-in placeholder 'ollama'; \
              set SMOS__UPSTREAM__API_KEY for production upstreams"
         );
     }
@@ -112,11 +124,12 @@ fn build_app_state(
     store: SurrealStore,
     extraction_supervisor: ExtractionSupervisor,
 ) -> Result<AppState> {
-    let upstream = ReqwestUpstream::new(Arc::new(config.upstream.clone()))?;
-    let embedder = OllamaEmbedding::new(Arc::new(config.ollama.clone()))?;
+    let upstream = ReqwestUpstreamPool::new(&config.upstream)?;
+    let embedder = OllamaEmbedding::new(Arc::new(config.embedding.clone()))?;
     let reranker = LlamaCppReranker::new(Arc::new(config.reranker.clone()))?;
-    let extractor = OllamaExtractor::new(Arc::new(config.ollama.clone()))?;
+    let extractor = OllamaExtractor::new(Arc::new(config.llm_extraction.clone()))?;
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
+    let id_generator: Arc<dyn IdGenerator + Send + Sync> = Arc::new(SystemIdGenerator);
     let retrieval_cfg = Arc::new(config.retrieval.clone());
     let heat_cfg = Arc::new(config.heat.clone());
     let confidence_cfg = Arc::new(config.confidence.clone());
@@ -130,6 +143,7 @@ fn build_app_state(
         extractor,
         upstream,
         clock,
+        id_generator,
         retrieval_cfg,
         heat_cfg,
         confidence_cfg,

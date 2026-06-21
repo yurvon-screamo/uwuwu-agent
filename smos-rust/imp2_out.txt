@@ -1,0 +1,55 @@
+Parsed 3 assistant turns
+After offset/limit: 3 turns to process
+[2m2026-06-21T13:02:36.203869Z[0m [32m INFO[0m [2msurrealdb::core::kvs::ds[0m[2m:[0m Starting kvs store at rocksdb://data\smos.db
+[2m2026-06-21T13:02:36.204530Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Background thread count: 22
+[2m2026-06-21T13:02:36.205414Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Maximum background jobs count: 44
+[2m2026-06-21T13:02:36.205892Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Maximum number of open files: 1024
+[2m2026-06-21T13:02:36.206438Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Number of log files to keep: 10
+[2m2026-06-21T13:02:36.634183Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Maximum write buffers: 8
+[2m2026-06-21T13:02:36.681227Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Write buffer size: 134217728
+[2m2026-06-21T13:02:36.682615Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Target file size for compaction: 67108864
+[2m2026-06-21T13:02:36.683039Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Target file size compaction multiplier: 2
+[2m2026-06-21T13:02:36.683556Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Minimum write buffers to merge: 2
+[2m2026-06-21T13:02:36.683882Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Number of files to trigger compaction: 4
+[2m2026-06-21T13:02:36.737241Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Compaction readahead size: 16777216
+[2m2026-06-21T13:02:36.738782Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Maximum concurrent subcompactions: 4
+[2m2026-06-21T13:02:36.739144Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Use separate thread queues: true
+[2m2026-06-21T13:02:36.739493Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Enable separation of keys and values: true
+[2m2026-06-21T13:02:36.740082Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Minimum blob value size: 4096
+[2m2026-06-21T13:02:36.740357Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Target blob file size: 268435456
+[2m2026-06-21T13:02:36.740628Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Enable blob garbage collection: false
+[2m2026-06-21T13:02:36.740882Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Blob GC age cutoff: 0.25
+[2m2026-06-21T13:02:36.741112Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Blob GC force threshold: 1
+[2m2026-06-21T13:02:36.741325Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Blob compaction readahead size: 0
+[2m2026-06-21T13:02:36.741482Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Write-ahead-log file size limit: 0MB
+[2m2026-06-21T13:02:36.741595Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Allow concurrent memtable writes: true
+[2m2026-06-21T13:02:36.741714Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Avoid unnecessary blocking IO: true
+[2m2026-06-21T13:02:36.741828Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Allow adaptive write thread yielding: true
+[2m2026-06-21T13:02:36.741978Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Wait for disk sync acknowledgement: false
+[2m2026-06-21T13:02:36.793112Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Block cache size: 15819534336
+[2m2026-06-21T13:02:36.793943Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Enable memory-mapped reads: false
+[2m2026-06-21T13:02:36.794219Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Enable memory-mapped writes: false
+[2m2026-06-21T13:02:36.794455Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Setting delete compaction factory: 1000 / 50 (0.5)
+[2m2026-06-21T13:02:36.794805Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Setting compaction style: level
+[2m2026-06-21T13:02:36.795074Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Setting compression level
+[2m2026-06-21T13:02:36.795320Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Setting storage engine log level: warn
+[2m2026-06-21T13:02:36.795773Z[0m [32m INFO[0m [2msurrealdb::core::kvs::rocksdb[0m[2m:[0m Background write-ahead-log flushing: disabled
+[2m2026-06-21T13:02:36.832166Z[0m [32m INFO[0m [2msurrealdb::core::kvs::ds[0m[2m:[0m Started kvs store at rocksdb://data\smos.db
+[2m2026-06-21T13:02:36.912277Z[0m [32m INFO[0m [2msmos_adapters::cli::import_helpers[0m[2m:[0m opencode session id does not match the SMOS pattern; derived a deterministic SMOS id from its SHA-1 hash [3moriginal[0m[2m=[0m"ses_smokeseed0002" [3mderived[0m[2m=[0msess_29f5df29f888
+[2m2026-06-21T13:02:43.271083Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:43.273350Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:50.901631Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:50.929269Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:50.930144Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:50.930907Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:58.604610Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:58.624592Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:58.627485Z[0m [33m WARN[0m [2msmos_adapters::providers::ollama::ollama_embedding[0m[2m:[0m ollama embeddings non-2xx (fail-open) [3mstatus[0m[2m=[0m404
+[2m2026-06-21T13:02:58.630634Z[0m [32m INFO[0m [2msmos_application::use_cases::import_opencode_session[0m[2m:[0m import complete [3msession[0m[2m=[0msess_29f5df29f888 [3mmemory_key[0m[2m=[0msmoke-test [3mprocessed[0m[2m=[0m3 [3mskipped[0m[2m=[0m0 [3mnew_facts[0m[2m=[0m0
+
+=== Import complete ===
+Session:      sess_29f5df29f888
+Memory key:   smoke-test
+Processed:    3 turns
+Skipped:      0 turns
+New facts:    0

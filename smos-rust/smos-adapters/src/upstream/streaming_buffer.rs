@@ -9,12 +9,13 @@
 //! OpenAI streams `tool_calls` incrementally by `index`: the first delta
 //! carries `function.name`, subsequent deltas append to
 //! `function.arguments` (a JSON **string** split across chunks). The buffer
-//! reassembles them positionally and parses the arguments string into a
-//! [`ToolCall`] on [`StreamingBuffer::finalize`].
+//! reassembles them positionally and wraps the arguments string into a
+//! [`ToolCall`] on [`StreamingBuffer::finalize`]. The arguments stay opaque
+//! at the domain layer (raw string); adapters parse the JSON when needed.
 
 use std::sync::Arc;
 
-use smos_domain::chat::ToolCall;
+use smos_domain::chat::{ToolArguments, ToolCall};
 use tokio::sync::Mutex;
 
 /// Concurrent buffer that accumulates `content` + `tool_calls` from a
@@ -72,9 +73,10 @@ impl StreamingBuffer {
     }
 
     /// Drain the accumulated content + reassembled tool calls. Each tool
-    /// call's arguments string is parsed into a [`serde_json::Value`]; an
-    /// unparseable arguments string degrades to the raw string so no
-    /// information is lost.
+    /// call's accumulated arguments string is wrapped into the opaque
+    /// [`ToolArguments`] verbatim — no JSON parsing happens at this layer
+    /// (an unparseable string stays unparseable, the next layer that
+    /// cares can decide what to do with it).
     pub async fn finalize(self) -> (String, Vec<ToolCall>) {
         let mut state = self.inner.lock().await;
         let content = std::mem::take(&mut state.content);
@@ -83,8 +85,7 @@ impl StreamingBuffer {
             .into_iter()
             .map(|p| ToolCall {
                 name: p.name,
-                arguments: serde_json::from_str(&p.args)
-                    .unwrap_or_else(|_| serde_json::Value::String(p.args)),
+                arguments: ToolArguments::from_json(p.args),
             })
             .collect();
         (content, tool_calls)
@@ -119,7 +120,10 @@ mod tests {
         let (_content, calls) = buf.finalize().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments["path"], "auth.rs");
+        // The opaque string carries the assembled JSON verbatim; the test
+        // asserts the raw payload rather than indexing into a Value because
+        // the domain layer no longer parses the arguments.
+        assert_eq!(calls[0].arguments.as_str(), r#"{"path":"auth.rs"}"#);
     }
 
     #[tokio::test]
@@ -133,8 +137,9 @@ mod tests {
         let (_content, calls) = buf.finalize().await;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "first");
-        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[0].arguments.as_str(), r#"{"x":1}"#);
         assert_eq!(calls[1].name, "second");
+        assert_eq!(calls[1].arguments.as_str(), r#"{}"#);
     }
 
     #[tokio::test]
@@ -144,7 +149,9 @@ mod tests {
             .await;
         let (_content, calls) = buf.finalize().await;
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments, serde_json::json!("{not json"));
+        // Opaque payload preserves the malformed JSON verbatim; downstream
+        // parsers decide what to do with it.
+        assert_eq!(calls[0].arguments.as_str(), "{not json");
     }
 
     #[tokio::test]

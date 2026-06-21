@@ -17,8 +17,8 @@ Hardware: developer laptop (CPU bound on cold compiles)
 
 Every test that does NOT carry `#[ignore]` runs under the default `cargo t`.
 The previous feature-gate tier system (`slow-tests` / `surrealdb-tests` /
-`sidecar-tests` / `native-nli-tests`) was removed: the gates were code smell
-that hid pre-existing regressions and made `cargo t --workspace` (the
+`legacy-nli-tests` / `native-nli-tests`) was removed: the gates were code
+smell that hid pre-existing regressions and made `cargo t --workspace` (the
 plain command a developer types) silently skip every `e2e_*` binary. Tests
 that genuinely need an external dependency carry `#[ignore = "<reason>"]`
 instead and run via `cargo tall` (`--include-ignored`).

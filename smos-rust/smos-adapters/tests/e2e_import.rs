@@ -69,14 +69,18 @@ async fn build_import(
     SystemClock,
     TokioDelay,
 > {
-    let ollama_cfg = smos_adapters::config::OllamaConfig {
+    let extraction_cfg = smos_adapters::config::LlmExtractionConfig {
+        url: ollama_uri.clone(),
+        timeout_seconds: 5,
+        ..smos_adapters::config::LlmExtractionConfig::default()
+    };
+    let embedding_cfg = smos_adapters::config::EmbeddingConfig {
         url: ollama_uri,
         timeout_seconds: 5,
-        ..smos_adapters::config::OllamaConfig::default()
+        ..smos_adapters::config::EmbeddingConfig::default()
     };
-    let cfg = Arc::new(ollama_cfg);
-    let embedder = OllamaEmbedding::new(cfg.clone()).expect("embedder");
-    let extractor = OllamaExtractor::new(cfg).expect("extractor");
+    let embedder = OllamaEmbedding::new(Arc::new(embedding_cfg)).expect("embedder");
+    let extractor = OllamaExtractor::new(Arc::new(extraction_cfg)).expect("extractor");
     let confidence_cfg = Arc::new(SmosConfig::default().confidence);
     let extraction_cfg = Arc::new(SmosConfig::default().extraction);
 
@@ -344,7 +348,7 @@ async fn import_includes_tool_calls_in_extraction_input() {
         content: "ok".into(),
         tool_calls: vec![smos_domain::chat::ToolCall {
             name: "read_file".into(),
-            arguments: json!({"path": "auth.rs"}),
+            arguments: smos_domain::chat::ToolArguments::from_json(r#"{"path":"auth.rs"}"#),
         }],
     };
 

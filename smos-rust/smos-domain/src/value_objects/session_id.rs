@@ -23,11 +23,14 @@ pub struct SessionId(String);
 impl SessionId {
     /// Generate a fresh `sess_<12 hex>` id.
     ///
-    /// Uses a thread-local xorshift seeded from system time and an address-derived
-    /// salt so concurrent threads do not collide. We deliberately avoid pulling
-    /// a uuid/rand crate into the domain layer to keep its dependency surface
-    /// minimal.
-    pub fn new() -> Self {
+    /// `pub(crate)` on purpose: id generation reads system entropy, which
+    /// is an IO concern. Production code routes through the `IdGenerator`
+    /// port in `smos-application` (with `SystemIdGenerator` as the
+    /// adapter impl); only domain-internal tests call this constructor
+    /// directly so they can mint an id without threading a port through
+    /// every fixture.
+    #[allow(dead_code)] // only called from in-crate tests
+    pub(crate) fn new() -> Self {
         let value = next_random_u64();
         let hex = format!("{:012x}", value & 0xFFFF_FFFF_FFFF);
         Self(format!("sess_{hex}"))
@@ -66,6 +69,7 @@ fn is_valid_session_id(s: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
+#[allow(dead_code)] // only exercised via SessionId::new() in tests
 fn next_random_u64() -> u64 {
     RNG_STATE.with(|cell| {
         let mut state = cell.get();
@@ -94,17 +98,13 @@ fn next_random_u64() -> u64 {
 
 /// Knuth's golden-ratio constant (0x9E3779B97F4A7C15) — well-known odd
 /// multiplier for hash mixing, used here as the RNG's non-zero fallback seed.
+#[allow(dead_code)] // only referenced via SessionId::new() in tests
 const KNUTH_GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Salt for mixing the stack-address entropy into the seed. Any odd constant
 /// works; this one was picked arbitrarily and just needs to be non-trivial.
+#[allow(dead_code)] // only referenced via SessionId::new() in tests
 const ADDR_SALT_MULTIPLIER: u64 = 0x517C_C1B7_2722_0A95;
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,8 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_new() {
-        let id = SessionId::default();
+    fn new_produces_canonical_shape() {
+        let id = SessionId::new();
         assert!(id.as_str().starts_with("sess_"));
     }
 

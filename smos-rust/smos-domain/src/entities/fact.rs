@@ -48,22 +48,27 @@ pub struct MergeCandidate {
 impl Fact {
     /// Construct a fresh pending fact right after extraction.
     ///
-    /// Defaults match the POC: status `Pending`, confidence `base`, heat `1.0`,
-    /// fact_type `Entity`, no conflicts, no `valid_until`. Confidence and status
-    /// are recomputed by [`Fact::reclassify`] once NLI is available.
+    /// Defaults match the POC: status `Pending`, confidence `base_confidence`,
+    /// heat `1.0`, fact_type `Entity`, no conflicts, no `valid_until`.
+    /// Confidence and status are recomputed by [`Fact::reclassify`] once NLI
+    /// is available. The caller passes the configured
+    /// [`ConfidenceConfig::base`] so the domain stays free of the
+    /// "default 0.5" hard-coding that bit the POC (a config tweak to
+    /// `confidence.base` was silently ignored at extraction time).
     pub fn new_pending(
         content: &str,
         memory_key: MemoryKey,
         session: SessionId,
         embedding: Embedding,
         now: Timestamp,
+        base_confidence: f32,
     ) -> Result<Self, DomainError> {
         Ok(Self {
             id: FactId::from_content(content),
             memory_key,
             content: FactContent::new(content.to_string())?,
             fact_type: FactType::Entity,
-            confidence: Confidence::new(0.5)?,
+            confidence: Confidence::new(base_confidence)?,
             status: FactStatus::Pending,
             valid_from: now,
             valid_until: None,
@@ -309,8 +314,7 @@ impl Fact {
 
     /// Rewarm the fact after a retrieval hit (§7 boost).
     pub fn boost_heat(&mut self, now: Timestamp) {
-        // 1.0 is statically valid; the unwrap is unreachable.
-        self.heat_base = Heat::new(1.0).expect("1.0 is always a valid Heat");
+        self.heat_base = Heat::MAX;
         self.last_access_at = now;
     }
 
@@ -453,6 +457,7 @@ mod tests {
             session,
             emb(8),
             Timestamp::from_unix_secs(1_700_000_000).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap()
     }
@@ -487,6 +492,7 @@ mod tests {
             sid(1),
             emb(4),
             Timestamp::from_unix_secs(0).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap_err();
         assert!(matches!(err, DomainError::EmptyFactContent));
@@ -988,6 +994,7 @@ mod tests {
             sid(1),
             Embedding::new(embedding).unwrap(),
             Timestamp::from_unix_secs(0).unwrap(),
+            ConfidenceConfig::default().base,
         )
         .unwrap()
     }
