@@ -4,10 +4,13 @@
 //! 1. Parse `"memory_key:real_model"` and strip the prefix.
 //! 2. Detect the session id from the trailing 20 messages' markers (or mint a
 //!    fresh one).
-//! 3. Run [`EnrichRequest`] (memory retrieval + injection). Infallible: the
-//!    use case's fail-open contract is enforced at the type level, so the
-//!    original `messages` are always preserved (the request is forwarded
-//!    unchanged if any enrichment port misbehaves).
+//! 3. Run [`EnrichRequest`] (memory retrieval + injection). Fail-open for
+//!    every port EXCEPT the reranker: an embedder / vector-search / dedup
+//!    failure forwards the original messages unchanged, but a reranker
+//!    failure (provider error or empty result) propagates as
+//!    `Err(UseCaseError::Provider(_))` so the HTTP handler returns 503.
+//!    No degraded mode for the reranker — see [`EnrichRequest`] for the
+//!    rationale.
 //! 4. Forward the (possibly enriched) request to the LLM upstream.
 //!
 //! Slice-5 extraction is wired in the **adapter** layer (`http/`), not here.
