@@ -4,7 +4,11 @@
 //! 1. Hand the request to `HandleChatCompletion`, which:
 //!    - parses `"memory_key:real_model"` and strips the prefix,
 //!    - detects / mints the session id from history,
-//!    - runs `EnrichRequest` (memory retrieval + injection, fail-open),
+//!    - runs `EnrichRequest` (memory retrieval + injection). Enrichment is
+//!      **fail-open** for embedder / vector-search / dedup (forwards the
+//!      original messages) and **fail-closed** for the reranker (provider
+//!      error or empty result → `UseCaseError::Provider(_)` → HTTP 503;
+//!      SMOS has NO degraded mode for the reranker),
 //!    - forwards to the upstream.
 //! 2. Inject the session marker into the upstream response.
 //!    - Streaming → tunnel chunks 1:1 with the marker appended to the

@@ -193,14 +193,16 @@ where
         // returns 503. No degraded mode — see the module docs for rationale.
         let ranked_facts = self.rerank_survivors(&topic, &survivors).await?;
 
-        // Step 9 — short-circuit when reranking produced nothing usable.
-        // (Unreachable in practice: `rerank_survivors` already returns Err
-        // on an empty result. Kept as a defensive guard for the typed
-        // contract — if a future change lets an empty Vec through, the
-        // pipeline must still forward the original messages rather than
-        // build an empty `<smos-memory>` block.)
+        // Step 9 — defensive guard: `rerank_survivors` already returns Err
+        // when the provider responds with zero results OR when none of the
+        // returned indices map back to survivors. The guard exists only so
+        // a future port implementation that produces an empty `Vec` through
+        // a different code path STILL honours the fail-closed contract
+        // rather than silently building an empty `<smos-memory>` block.
         if ranked_facts.is_empty() {
-            return Ok(messages);
+            return Err(UseCaseError::Provider(ProviderError::InvalidResponse(
+                "reranker returned no usable results".to_string(),
+            )));
         }
 
         // Step 10 — session dedup (atomic via SessionRepository::dedup_and_mark).

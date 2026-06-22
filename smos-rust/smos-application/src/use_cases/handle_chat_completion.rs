@@ -102,21 +102,20 @@ where
         let session_id = session_marker::detect_from_typed_messages(&typed_projection)
             .unwrap_or_else(|| self.id_generator.new_session_id());
 
-        // Step 3 — enrichment (infallible fail-open). `EnrichRequest::
-        // execute` returns `Vec<Value>` directly: every port-level error
-        // already fail-opens to the original messages inside `execute`,
-        // so the type system rules out a future bug where an `Err` arm
-        // silently replaces the consumed `request.messages` with
-        // `Vec::new()`. We `mem::take` because the result is guaranteed
-        // to contain at least the original messages — no extra clone, no
-        // copy-back risk, no wire-shape loss.
+        // Step 3 — enrichment. Fail-open for embedder / vector-search / dedup
+        // (those return the original messages on `Ok`); fail-closed for the
+        // reranker (propagates as `Err(UseCaseError::Provider(_))` → HTTP
+        // 503). `std::mem::take` is safe because every `Ok` path returns at
+        // least the original messages — no `Vec::new()` replacement risk.
+        // The `?` propagates ONLY the reranker error to the handler; every
+        // other failure already fail-opened inside `execute`.
         let enriched_messages = self
             .enrich(
                 std::mem::take(&mut request.messages),
                 &memory_key,
                 &session_id,
             )
-            .await;
+            .await?;
         request.messages = enriched_messages;
 
         // Step 4 — forward.
@@ -124,17 +123,17 @@ where
         Ok((response, session_id, memory_key))
     }
 
-    /// Run `EnrichRequest` and return its result. With the infallible
-    /// `execute` signature there is no error to swallow — the §12 fail-open
-    /// contract is enforced inside `EnrichRequest::execute` (every port-level
-    /// error falls back to the original messages), so this is a thin wrapper
-    /// that exists only to keep `execute` readable.
+    /// Run `EnrichRequest` and propagate its `Result`. The only `Err` path
+    /// is the reranker ([`UseCaseError::Provider`]); every other port-level
+    /// failure already fail-opened inside `execute` and returned the
+    /// original messages. The wrapper exists only to keep `execute`
+    /// readable.
     async fn enrich(
         &self,
         messages: Vec<Value>,
         memory_key: &MemoryKey,
         session_id: &SessionId,
-    ) -> Vec<Value> {
+    ) -> Result<Vec<Value>, UseCaseError> {
         let enrich = EnrichRequest {
             facts: &self.facts,
             sessions: &self.sessions,

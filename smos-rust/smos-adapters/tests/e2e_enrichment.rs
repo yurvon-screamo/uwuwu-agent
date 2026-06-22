@@ -8,8 +8,11 @@
 //! Assertions target the externally-observable behaviour: the body the
 //! upstream mock received (memory-block presence, fact id lines) and the
 //! persisted state (heat_base / last_access_at after retrieval). Fail-open
-//! semantics are covered by tests that mount a 500 on the embedder / reranker
-//! and verify the request still forwards.
+//! semantics are covered by tests that mount a 500 on the embedder and
+//! verify the request still forwards; fail-closed semantics for the reranker
+//! are covered by tests that mount a 500 (or empty `results`) on the
+//! reranker and verify the request fails with HTTP 503 — SMOS has NO
+//! degraded mode for the reranker.
 
 mod common;
 
@@ -83,7 +86,8 @@ async fn mount_reranker_ok(server: &MockServer, scores: Vec<(usize, f32)>) {
         .await;
 }
 
-/// Mount a 500 reranker to drive the top-N-survivors fallback.
+/// Mount a 500 reranker to drive the fail-closed path (HTTP 503). Used by
+/// `enrichment_reranker_error_returns_http_503_and_skips_upstream`.
 async fn mount_reranker_500(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/rerank"))
@@ -282,10 +286,12 @@ async fn enrichment_failure_preserves_original_user_message_verbatim() {
     )
     .await;
 
-    // Force every enrichment stage that could conceivably fail to fail:
-    // embedder 500 ⇒ short-circuit at step 3. Reranker is mounted 500 too so
-    // the test stays correct even if a future refactor changes which step
-    // the fail-open triggers at (reranker-error fallback path).
+    // Force the embedder to 500 so the pipeline short-circuits at step 3
+    // (fail-open for embedder errors). The reranker mock is mounted 500 too
+    // as defence-in-depth — it is NEVER called because the embedder short-
+    // circuit happens first, but if a future refactor reorders the pipeline
+    // the reranker mock would surface as HTTP 503 (fail-closed) and this
+    // test would fail loudly rather than silently passing.
     mount_ollama_500(&ollama).await;
     mount_reranker_500(&reranker).await;
     mount_upstream_ok(&upstream).await;
@@ -338,47 +344,72 @@ async fn enrichment_failure_preserves_original_user_message_verbatim() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Fail-open: reranker error → fallback to top-N survivors
+// 3. Fail-closed: reranker error → HTTP 503 (NO degraded mode)
 // ---------------------------------------------------------------------------
 
+/// Reranker is a hard dependency — there is NO degraded mode. A 500 from the
+/// reranker must surface as HTTP 503 on the chat-completion endpoint and the
+/// upstream LLM must NOT be invoked (no quality-silent vector-order-only
+/// fallback). This test pins the post-degradation-removal contract: a future
+/// refactor that re-introduces a survivor fallback on reranker error would
+/// let `last_upstream_request` succeed and fail this assertion.
 #[tokio::test]
-async fn enrichment_fail_open_on_reranker_error_uses_survivor_fallback() {
+async fn enrichment_reranker_error_returns_http_503_and_skips_upstream() {
     let upstream = MockServer::start().await;
     let ollama = MockServer::start().await;
     let reranker = MockServer::start().await;
 
     let config = common::config_with_mocks(&upstream, &ollama, &reranker);
     let state = build_state(config).await;
-    let session = fixed_session_id(1);
-    let id = seed_accepted_fact(
+    let _ = seed_accepted_fact(
         &state.store,
         "Rust is memory-safe",
         unit_embedding_1024(0),
         0.9,
-        session,
+        fixed_session_id(1),
         fixed_now(),
     )
     .await;
 
     mount_ollama_ok(&ollama, query_embedding()).await;
     mount_reranker_500(&reranker).await;
-    mount_upstream_ok(&upstream).await;
+    // Upstream must NOT be called: the request fails at enrichment time.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-x",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+        })))
+        .expect(0)
+        .mount(&upstream)
+        .await;
 
     let smos = serve_state(state).await;
-    let _ = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .post(format!("{smos}/v1/chat/completions"))
         .json(&enrichment_chat_body())
         .send()
         .await
         .expect("send");
 
-    let upstream_body = last_upstream_request(&upstream).await;
-    let first_content = upstream_body["messages"][0]["content"]
+    // Provider error maps to 503 "SMOS provider unavailable: …" per the
+    // `render_use_case_error` matrix.
+    assert_eq!(
+        resp.status(),
+        503,
+        "reranker error must surface as HTTP 503 (no degraded mode)"
+    );
+    let body: Value = resp.json().await.expect("body json");
+    let message = body["error"]["message"]
         .as_str()
-        .expect("content");
+        .expect("error.message string");
     assert!(
-        first_content.contains(&format!("[{}]", id.as_str())),
-        "expected survivor fallback to inject the fact; got: {first_content}"
+        message.contains("provider unavailable") || message.contains("reranker"),
+        "503 body must reference the provider/reranker; got: {message}"
     );
 }
 
@@ -740,24 +771,29 @@ async fn enrichment_heat_boost_persists_after_retrieval_hit() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Reranker empty response → top-N survivor fallback
+// 10. Fail-closed: reranker empty response → HTTP 503 (NO degraded mode)
 // ---------------------------------------------------------------------------
 
+/// Mirror of `enrichment_reranker_error_returns_http_503_and_skips_upstream`
+/// for the empty-results branch: a 200 from the reranker with an empty
+/// `results` array must also surface as HTTP 503 and never reach the upstream
+/// LLM. The use case converts the empty Vec into
+/// `ProviderError::InvalidResponse("reranker returned empty results")`, so
+/// the 503 body must mention that exact root cause.
 #[tokio::test]
-async fn enrichment_reranker_empty_results_falls_back_to_survivors() {
+async fn enrichment_reranker_empty_results_returns_http_503_and_skips_upstream() {
     let upstream = MockServer::start().await;
     let ollama = MockServer::start().await;
     let reranker = MockServer::start().await;
 
     let config = common::config_with_mocks(&upstream, &ollama, &reranker);
     let state = build_state(config).await;
-    let session = fixed_session_id(1);
-    let id = seed_accepted_fact(
+    let _ = seed_accepted_fact(
         &state.store,
         "fallback survivor",
         unit_embedding_1024(0),
         0.9,
-        session,
+        fixed_session_id(1),
         fixed_now(),
     )
     .await;
@@ -768,23 +804,41 @@ async fn enrichment_reranker_empty_results_falls_back_to_survivors() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
         .mount(&reranker)
         .await;
-    mount_upstream_ok(&upstream).await;
+    // Upstream must NOT be called.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-x",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+        })))
+        .expect(0)
+        .mount(&upstream)
+        .await;
 
     let smos = serve_state(state).await;
-    let _ = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .post(format!("{smos}/v1/chat/completions"))
         .json(&enrichment_chat_body())
         .send()
         .await
         .expect("send");
 
-    let upstream_body = last_upstream_request(&upstream).await;
-    let first_content = upstream_body["messages"][0]["content"]
+    assert_eq!(
+        resp.status(),
+        503,
+        "empty reranker result must surface as HTTP 503 (no degraded mode)"
+    );
+    let body: Value = resp.json().await.expect("body json");
+    let message = body["error"]["message"]
         .as_str()
-        .expect("content");
+        .expect("error.message string");
     assert!(
-        first_content.contains(&format!("[{}]", id.as_str())),
-        "expected survivor fallback injection; got: {first_content}"
+        message.contains("empty"),
+        "503 body must mention the empty reranker result; got: {message}"
     );
 }
 

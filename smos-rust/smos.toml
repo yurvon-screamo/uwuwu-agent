@@ -59,10 +59,11 @@ dimensions = 1024                          # MUST match the HNSW index DDL
 api_key = ""
 timeout_seconds = 30
 
-# Reranker (REQUIRED for production-quality enrichment).
+# Reranker (REQUIRED for enrichment — NO degraded mode).
 # The enrich pipeline reranks vector-search survivors via a cross-encoder
-# before injecting them into the request; without it the pipeline runs in
-# degraded mode (vector-order-only ranking) and logs a WARN on every request.
+# before injecting them into the request. If the reranker is unreachable
+# or returns an empty result, every chat-completion request fails with
+# HTTP 503 rather than silently shipping vector-order-only ranking.
 # Start the llama.cpp reranker server with a Qwen3-Reranker GGUF model:
 #   ./llama-server --model qwen3-reranker-0.6b-q8_0.gguf --port 8181
 # The adapter expects an OpenAI-compatible /v1/rerank endpoint.

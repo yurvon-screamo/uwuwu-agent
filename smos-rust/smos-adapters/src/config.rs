@@ -553,9 +553,13 @@ impl SmosConfig {
     /// - `llm_extraction.temperature` in `[0, 2]`.
     /// - `session.timeout_seconds > 0`.
     /// - `server.port > 0`.
-    /// - `reranker.url` non-empty (reranker is required for enrichment;
-    ///   the pipeline degrades to vector-order-only ranking when the URL
-    ///   is missing, so an operator who blanks the field gets a startup
+    /// - `retrieval.top_k_initial > 0` and `retrieval.top_k_final > 0`
+    ///   (a zero would either short-circuit the pipeline or surface as a
+    ///   mysterious HTTP 503 once the reranker is consulted).
+    /// - `reranker.url` non-empty (reranker is a hard dependency for
+    ///   enrichment — SMOS has NO degraded mode for it, and every request
+    ///   fails with HTTP 503 while the URL is missing or the server is
+    ///   unreachable; an operator who blanks the field gets a startup
     ///   error instead of a silent quality drop).
     /// - `upstream.providers` non-empty (the proxy needs at least one
     ///   provider to forward chat completions to) and every provider carries
@@ -621,6 +625,21 @@ impl SmosConfig {
 
         if self.server.port == 0 {
             errors.push("server.port must be > 0".into());
+        }
+
+        if self.retrieval.top_k_final == 0 {
+            // `top_k_final == 0` would make `RerankProvider::rerank` return
+            // `Ok(vec![])` (the legitimate "nothing to do" path), which the
+            // fail-closed enrich pipeline converts into
+            // `ProviderError::InvalidResponse("reranker returned empty
+            // results")` → every chat-completion request fails with HTTP
+            // 503. Reject at startup so the operator hears about it as a
+            // config error, not as a mysterious 503.
+            errors.push("retrieval.top_k_final must be > 0".into());
+        }
+
+        if self.retrieval.top_k_initial == 0 {
+            errors.push("retrieval.top_k_initial must be > 0".into());
         }
 
         if self.reranker.url.trim().is_empty() {
@@ -1308,10 +1327,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_reranker_url() {
-        // The reranker is REQUIRED for production-quality enrichment — an
-        // operator who blanks the URL must get a startup error pointing at
-        // the field instead of a silent quality drop to vector-order-only
-        // ranking.
+        // The reranker is a hard dependency for enrichment (no degraded
+        // mode) — an operator who blanks the URL must get a startup error
+        // pointing at the field instead of discovering the dependency via
+        // an HTTP 503 on the first request.
         let mut cfg = SmosConfig::default();
         cfg.reranker.url = String::new();
         cfg.upstream
