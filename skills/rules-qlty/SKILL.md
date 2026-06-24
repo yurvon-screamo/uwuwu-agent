@@ -41,3 +41,7 @@ Find code smells such as duplication and complexity.
 2. **Command selection**: Choose between `check` (linting), `metrics` (quality scores), or `smells` (complexity/duplication).
 3. **Execution**: Run the command using the `Shell` tool.
 4. **Output analysis**: Review the tool results and fix any detected issues.
+
+Checking structure of N files в output.
+- If N=0 → НЕ доверяй «No issues», в таком случае используй нативный тулчейн как primary linting
+- If  N>0 → qlty валиден, можно доверять.

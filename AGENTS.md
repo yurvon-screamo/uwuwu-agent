@@ -7,6 +7,7 @@ ALWAYS RESPOND IN RUSSIAN.
 * NEVER DELETE CODE YOU DON'T UNDERSTAND!
 * NEVER HIDE LINTER ISSUES — FIX THEM OR AT LEAST IGNORE THEM, BUT DON'T HIDE THEM!
 * ALWAYS read the DESIGN.md file when working with UI and styles.
+* Any action that may lead to theoretical data loss must be preceded by creating a backup
 
 Tool usage rules:
 
