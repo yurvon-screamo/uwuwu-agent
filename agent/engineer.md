@@ -126,6 +126,12 @@ permission:
 8. **🚧 GATE: Валидация через @code-quality-reviewer** (см. ниже)
 9. **Выдай результат** — отчёт о выполнении
 
+### Сабагенты - `task` vs `task_status`
+
+- **`task`** — создаёт subagent. Для связных задач запускай существующего сабагента (для этого надо передать task_id для resume), а не создавай нового.
+- **`task_status`** — проверяет прогресс **уже запущенного** subagent-а
+- При ошибке `"Task is already running"` → используй `task_status`, **не повторяй `task`**
+
 ## 🚧 GATE: Валидация кода через @code-quality-reviewer
 
 > **БЛОКИРУЮЩИЙ ШАГ. Без `recommendation: approve` от ревьювера работа не завершена.**
