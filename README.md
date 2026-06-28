@@ -17,7 +17,7 @@
 
 ```
 uwuwu-agent/
-├── agent/              # Agent personas (engineer, dreaming, office-coworker, ...)
+├── agent/              # Agent personas (developer, head-of-development, dreaming, office-coworker, ...)
 ├── skills/              # Modular skill library
 │   ├── engineer-*/      #   Language-specific engineers (Rust, C#, Leptos, TS, ...)
 │   ├── flow-*/          #   Workflow flows (feature, bug, refactor, audit, ...)

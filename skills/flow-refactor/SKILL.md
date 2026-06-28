@@ -24,15 +24,15 @@ If necessary, ask the user clarifying questions:
 - Any constraints on the scope of changes?
 - Are there areas where tests are missing (critical for safe refactoring)?
 
-## Delegation to Architect
+## Delegation to Developer
 
-Передай проектировщику задачу с типом `refactor`. Входные данные:
+Передай developer'у задачу с типом `refactor`. Входные данные:
 
 - Описание проблемных мест (от пользователя или из анализа)
 - Ключевой контекст из оспаривания задачи (Шаг 0)
 - Тип задачи: `refactor`
 
-Проектировщик загрузит `architect-refactor` skill, проанализирует код и вернёт валидированный план инкрементального рефакторинга.
+Developer загрузит `architect-refactor` skill, проанализирует код и вернёт валидированный план инкрементального рефакторинга.
 
 ## Results (Stages 2–3)
 

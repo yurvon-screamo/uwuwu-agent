@@ -25,16 +25,16 @@ If necessary, ask the user clarifying questions:
 - Scale expectations (users, data volume, requests/sec)
 - Timeline constraints
 
-## Delegation to Architect
+## Delegation to Developer
 
-Передай проектировщику задачу с типом `feature`. Входные данные:
+Передай developer'у задачу с типом `feature`. Входные данные:
 
 - Описание фичи от пользователя
 - Функциональные и нефункциональные требования (из ответов на уточняющие вопросы)
 - Ключевой контекст из оспаривания задачи (Шаг 0)
 - Тип задачи: `feature`
 
-Проектировщик загрузит `architect-feature` skill, исследует кодовую базу и вернёт валидированный план.
+Developer загрузит `architect-feature` skill, исследует кодовую базу и вернёт валидированный план.
 
 ## Results (Stages 2–3)
 

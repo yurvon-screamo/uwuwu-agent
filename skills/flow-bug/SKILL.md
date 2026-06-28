@@ -22,18 +22,18 @@ If necessary, ask the user clarifying questions:
 - Logs, screenshots, trace_id, or other diagnostic information
 - Software version / environment
 
-## Delegation to Architect
+## Delegation to Developer
 
-Передай проектировщику задачу с типом `bug`. Входные данные:
+Передай developer'у задачу с типом `bug`. Входные данные:
 
 - Описание проблемы от пользователя (симптомы, шаги воспроизведения)
 - Ответы на уточняющие вопросы
 - Ключевой контекст из оспаривания задачи (Шаг 0)
 - Тип задачи: `bug`
 
-Проектировщик загрузит `architect-bug` skill, исследует код, определит root cause и вернёт валидированный план.
+Developer загрузит `architect-bug` skill, исследует код, определит root cause и вернёт валидированный план.
 
-Если проектировщик не смог определить root cause — уточни у пользователя дополнительную информацию и повтори делегирование.
+Если developer не смог определить root cause — уточни у пользователя дополнительную информацию и повтори делегирование.
 
 ## Results (Stages 2–3)
 
