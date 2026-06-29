@@ -24,7 +24,8 @@
     "tools": {
         "memory_*": true,
         "time_*": true,
-        "bg_*": true
+        "bg_*": true,
+        "vision_*": true
     },
     "plugin": ["@warp-dot-dev/opencode-warp"]
 }
