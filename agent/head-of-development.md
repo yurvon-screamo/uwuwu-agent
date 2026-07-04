@@ -21,6 +21,7 @@ permission:
         developer: "allow"
         tool-accessor: "allow"
         marketer: "allow"
+        code-quality-reviewer: "allow"
     skill:
         "flow-*": "allow"
         "rules-*": "allow"

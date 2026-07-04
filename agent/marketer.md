@@ -19,6 +19,7 @@ tools:
     task: true
 permission:
     task:
+        code-quality-reviewer: "allow"
         tool-accessor: "allow"
     skill:
         "rules-*": "allow"

@@ -17,3 +17,11 @@ cp "$SCRIPT_DIR/AGENTS.md" ~/.config/opencode/AGENTS.md
 cp "$SCRIPT_DIR/opencode.json" ~/.config/opencode/opencode.json
 cp "$SCRIPT_DIR/dcp.jsonc" ~/.config/opencode/dcp.jsonc
 cp "$SCRIPT_DIR/package.json" ~/.config/opencode/package.json
+
+SMOS_HOME="$HOME/.smos"
+
+rm -rf "$SMOS_HOME/persons"
+rm -rf "$SMOS_HOME/config.toml"
+
+cp "$SCRIPT_DIR/smos/config.toml" "$SMOS_HOME/config.toml"
+cp -r "$SCRIPT_DIR/smos/persons" "$SMOS_HOME/persons"
