@@ -81,8 +81,8 @@ max_concurrent_forwards = 8            # multi-slot cloud endpoint
 # `request.model` to the upstream model declared below before forwarding.
 
 [persons.uwuwu]
-provider = "llama-local"            # MUST match a [[providers]].name
-model = "qwen3.5-2b"                # upstream model id
+provider = "openrouter"            # MUST match a [[providers]].name
+model = "poolside/laguna-xs-2.1:free"                # upstream model id
 persona = "~/.smos/persons/uwuwu.md"  # optional; `~` expands to user home
 
 # Example second person.
@@ -110,8 +110,8 @@ seed = 42
 # extraction LLM).
 [embedding]
 url = "http://localhost:28081"           # the adapter appends /v1/embeddings
-model = "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:latest"
-dimensions = 1024                          # MUST match the HNSW index DDL
+model = "hf.co/jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF:Q8_0"
+dimensions = 768                          # MUST match the HNSW index DDL
 api_key = ""
 timeout_seconds = 30
 
@@ -224,7 +224,7 @@ max_tool_rounds = 10
 # server is reused. Disable if you launch llama-server yourself or use a
 # remote / cloud provider.
 [llama_cpp]
-binary = "llama-server"
+binary = "C:/Users/redmi/AppData/Local/Microsoft/WinGet/Packages/ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe/llama-server.exe"
 auto_launch = true
 # Unload models from VRAM after this many seconds idle (5 min default).
 # Set to 0 to disable. The flag is only appended when the underlying
@@ -232,9 +232,9 @@ auto_launch = true
 idle_timeout_seconds = 300
 
 [llama_cpp.embedding]
-model_path = "~/.smos/models/jina-embeddings-v5.gguf"
+model_path = "~/.smos/models/v5-nano-retrieval-Q8_0.gguf"
 port = 28081
-extra_args = ["--ctx-size", "2048", "--embeddings"]
+extra_args = ["--ctx-size", "8192", "--embeddings", "--pooling", "last"]
 
 [llama_cpp.reranker]
 model_path = "~/.smos/models/qwen3-reranker.gguf"
@@ -250,7 +250,7 @@ model_path = "~/.smos/models/qwen3.5-2b-q5_k_m.gguf"
 port = 28082
 # MTP speculative decode: `-np 1` is REQUIRED (parallel slots >1 unsupported
 # with draft-mtp), `--no-mmproj` skips the vision encoder (text-only model).
-extra_args = ["--ctx-size", "4096", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "-np", "1", "--no-mmproj"]
+extra_args = ["--ctx-size", "32768", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "-np", "1", "--no-mmproj"]
 
 # ---------------------------------------------------------------------------
 # Git-backed memory sync.
