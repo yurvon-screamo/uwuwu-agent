@@ -132,6 +132,7 @@ top_k_initial = 50
 top_k_final = 5
 min_confidence = 0.7
 min_topic_chars = 3
+min_relevance_score = 0.05
 
 [merge]
 cosine_threshold = 0.85
@@ -237,13 +238,13 @@ port = 28081
 extra_args = ["--ctx-size", "8192", "--embeddings", "--pooling", "last"]
 
 [llama_cpp.reranker]
-model_path = "~/.smos/models/qwen3-reranker.gguf"
+model_path = "~/.smos/models/qwen3-reranker-0.6b-q8_0.gguf"
 port = 28181
 # `--reranking` is REQUIRED: modern llama-server only exposes /v1/rerank
 # when launched with this flag. Without it the server returns HTTP 501
 # ("This server does not support reranking") and SMOS enrichment fails
 # fail-closed (HTTP 503) on every non-stream request carrying fact candidates.
-extra_args = ["--ctx-size", "8192", "--reranking"]
+extra_args = ["--ctx-size", "8192", "--reranking", "--pooling", "rank", "--embedding"]
 
 [llama_cpp.extraction]
 model_path = "~/.smos/models/qwen3.5-2b-q5_k_m.gguf"
