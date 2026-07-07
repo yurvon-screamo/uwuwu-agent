@@ -99,7 +99,7 @@ persona = "~/.smos/persons/uwuwu.md"  # optional; `~` expands to user home
 url = "http://localhost:28082"           # API base (the adapter appends /v1/chat/completions)
 model = "qwen3.5-2b"
 api_key = ""                            # optional, for cloud providers
-timeout_seconds = 30
+timeout_seconds = 180
 # Deterministic extraction: temperature=0 disables random sampling, seed pins
 # the RNG so two runs against the same input re-yield the same bullet list.
 # This is what keeps FactId = SHA1(content) stable across re-extraction runs.

@@ -27,6 +27,7 @@ tools:
   "*": false
   time_*: true
   memory_*: true
+  vision_*: true    
   bash: true
   read: true
   list: true
