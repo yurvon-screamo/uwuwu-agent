@@ -6,7 +6,7 @@ color: success
 tools:
     "*": false
     time_*: true
-    memory_*: true
+    wiki_*: true
     vision_*: true
     bg_*: true
     bash: true
@@ -16,8 +16,6 @@ tools:
     grep: true
     write: true
     edit: true
-    todowrite: true
-    todoread: true
     lsp: true
     skill: true
     websearch: true
@@ -116,7 +114,7 @@ permission:
 
 ## Шаг 0: Загрузка контекста
 
-1. **Восстанови контекст:** вызови `memory_recall` с query по теме задачи
+1. **Восстанови контекст:** вызови `wiki_search` с query по теме задачи
 2. **Загрузи скилл по типу задачи:**
     - bug → `architect-bug`
     - feature → `architect-feature`

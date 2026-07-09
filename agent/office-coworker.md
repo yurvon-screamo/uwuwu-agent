@@ -5,7 +5,7 @@ color: success
 tools:
   "*": false 
   time_*: true
-  memory_*: true
+  wiki_*: true
   vision_*: true
   bash: true
   read: true
@@ -14,8 +14,6 @@ tools:
   grep: true
   write: true
   edit: true
-  todowrite: true
-  todoread: true
   lsp: true
   skill: true
   websearch: true 

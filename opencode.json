@@ -36,7 +36,7 @@
         }
     },
     "tools": {
-        "memory_*": true,
+        "wiki_*": true,
         "time_*": true,
         "bg_*": true,
         "vision_*": true

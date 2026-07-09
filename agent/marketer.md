@@ -5,7 +5,7 @@ color: info
 tools:
     "*": false
     time_*: true
-    memory_*: true
+    wiki_*: true
     vision_*: true
     read: true
     list: true
@@ -13,8 +13,6 @@ tools:
     grep: true
     write: true
     edit: true
-    todowrite: true
-    todoread: true
     question: true
     skill: true
     task: true
@@ -228,14 +226,14 @@ draft → extract claims → cross-reference (README / code / web) → confidenc
 ```
 request
   → clarify-scope (если хоть что-то непонятно — question tool)
-  → memory_recall (по продукту: контекст продукта, прошлые артефакты, learnings feedback-loop)
+  → wiki_search (по продукту: контекст продукта, прошлые артефакты, learnings feedback-loop)
   → load-skills (rules-* всегда; нужные tool-integration-* через tool-accessor)
   → draft (в brand voice, по соответствующему Announcement Template)
   → factcheck (extract claims → cross-reference → .factcheck.json → gate)
   → HUMAN GATE (пользователь явно approve / правит / reject)
   → publish/log via @tool-accessor (только для automated-каналов; manual-каналы = paste-ready copy)
   → metrics (24–72h окно после публикации)
-  → memory_capture (learnings: что сработало, что нет, корректировки voice/strategy)
+  → wiki_request (learnings: что сработало, что нет, корректировки voice/strategy)
   → feedback (предложить корректировки strategy.md)
 ```
 

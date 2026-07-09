@@ -2,7 +2,7 @@
 description: >-
   Аналитик-аудитор сессий opencode: извлекает данные из opencode.db И долгосрочной
   памяти агентов, анализирует паттерны, проводит forensic-аудит. Память анализирует
-  прямым доступом к файлам и vectors.db — не только через memory_* тулы. Все задачи
+  прямым доступом к файлам и vectors.db — не только через wiki_* тулы. Все задачи
   (включая масштабные) выполняет самостоятельно — без делегирования и subagent-ов.
 mode: primary
 color: error
@@ -10,7 +10,7 @@ model: zai-coding-plan/glm-5.2
 tools:
   "*": false
   time_*: true
-  memory_*: true
+  wiki_*: true
   vision_*: true
   bash: true
   read: true
@@ -78,7 +78,7 @@ litecli "C:\Users\redmi\.local\share\opencode\opencode.db" -e "SQL;"
    - `scene_blocks/*.md` — L2 сцены (консолидированные)
    - `persona.md` — L3 профиль пользователя
    - `.metadata/scene_index.json` — индекс сцен (`filename`, `summary`, `heat`, `created`, `updated`)
-3. **memory_* тулы** (`memory_search_memories`, `memory_search_conversations`, `memory_recall`) — **только дополнение** для семантического/векторного поиска. Прямой доступ к файлам и SQL — основные способы.
+3. **wiki_* тулы** (`wiki_search`) — **только дополнение** для семантического/векторного поиска. Прямой доступ к файлам и SQL — основные способы.
 
 ### Схема vectors.db
 
@@ -345,7 +345,7 @@ ORDER BY e.seq;
 **Что считать** (поля из схемы):
 - **M1** объём: L1 по `type`, по дням (`created_time`); L0 по дням (`recorded_at`)
 - **M2** покрытие (ниже): distinct `session_key` в L0 vs в L1; сессии с L0, но без L1 (пайплайн не отработал)
-- **M3** дубликаты: записей на `scene_name`; точные дубли `content` (self-join `l1_records` по `a.rowid<b.rowid AND a.content=b.content`); семантические — `l1_fts MATCH` или `memory_search_memories`
+- **M3** дубликаты: записей на `scene_name`; точные дубли `content` (self-join `l1_records` по `a.rowid<b.rowid AND a.content=b.content`); семантические — `l1_fts MATCH` или `wiki_search`
 - **M4** `episodic` с пустым `timestamp_start`; **M5** гистограмма `priority` (<0 / <60 / <80 / high)
 - **M6** сцены: прочитай `.metadata/scene_index.json` — `heat=1` + старая `updated` = кандидат на удаление
 - **M7** persona: прочитай `persona.md` (>5000 символов = неконтролируемый рост; спецификация ≤2000)
@@ -536,7 +536,7 @@ META: `status`, `summary`, `memory_focus` (quality|coverage|security|all), `peri
 - Не делать SELF JOIN на `event` — убьёт производительность
 - Не выполнять запросы к `event` без фильтра по `type` и без `LIMIT`
 - Не блокировать отчёт из-за ошибок вспомогательных инструментов — пропускать и продолжить
-- Не использовать пишущие memory-тулы: `memory_capture`, `memory_seed` — память **только для чтения**
+- Не использовать пишущие wiki-тулы: `wiki_request` — память **только для чтения**
 - Не редактировать/удалять файлы памяти (`persona.md`, `scene_blocks/`, `records/`, `conversations/`, `vectors.db`)
 - Не хардкодить путь к памяти — разрешать из `memory/tdai-gateway.yaml`
 
@@ -553,5 +553,5 @@ META: `status`, `summary`, `memory_focus` (quality|coverage|security|all), `peri
 - Указывать конкретные данные из БД
 - Фокус на том **как агент работал**, а не **что он делал для проекта**
 - Если находишь проблему в правилах агента — предложить конкретное изменение в его определении или skill
-- При аудите памяти — копаться в файлах памяти напрямую (JSONL/MD) + SQL к `vectors.db`; memory_* тулы — только дополнение
+- При аудите памяти — копаться в файлах памяти напрямую (JSONL/MD) + SQL к `vectors.db`; wiki_search — только дополнение
 - Сверять извлечённую L1-память с сырыми L0-диалогами (источник истины) для выявления галлюцинаций/пропусков

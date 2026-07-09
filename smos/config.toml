@@ -99,7 +99,10 @@ persona = "~/.smos/persons/uwuwu.md"  # optional; `~` expands to user home
 url = "http://localhost:28082"           # API base (the adapter appends /v1/chat/completions)
 model = "qwen3.5-2b"
 api_key = ""                            # optional, for cloud providers
+# absorbs long-prompt extraction (prompt-processing + generation > 30s at 5K+ tokens)
 timeout_seconds = 180
+# hard stop against Qwen3.5-2B thinking loops (per model card); 4096 fits 50+ facts
+max_tokens = 4096
 # Deterministic extraction: temperature=0 disables random sampling, seed pins
 # the RNG so two runs against the same input re-yield the same bullet list.
 # This is what keeps FactId = SHA1(content) stable across re-extraction runs.
@@ -111,7 +114,7 @@ seed = 42
 [embedding]
 url = "http://localhost:28081"           # the adapter appends /v1/embeddings
 model = "hf.co/jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF:Q8_0"
-dimensions = 768                          # MUST match the HNSW index DDL
+dimensions = 768                           # MUST match the HNSW index DDL
 api_key = ""
 timeout_seconds = 30
 
@@ -119,8 +122,9 @@ timeout_seconds = 30
 # The enrich pipeline reranks vector-search survivors via a cross-encoder
 # before injecting them into the request. Without a reachable reranker,
 # enrichment returns HTTP 503 (no fallback to vector-order-only ranking).
-# Start the llama.cpp reranker with a Qwen3-Reranker GGUF model:
-#   ./llama-server --model qwen3-reranker-0.6b-q8_0.gguf --port 28181
+# Start the llama.cpp reranker with the working Qwen3-Reranker GGUF build:
+#   ./llama-server --model qwen3-reranker-0.6b-q8_0.gguf --port 28181 \
+#     --reranking --pooling rank --embedding
 # The adapter expects an OpenAI-compatible /v1/rerank endpoint.
 [reranker]
 url = "http://localhost:28181"
@@ -132,6 +136,12 @@ top_k_initial = 50
 top_k_final = 5
 min_confidence = 0.7
 min_topic_chars = 3
+# Floor on the cross-encoder rerank score (NOT cosine confidence). Facts
+# whose rerank score falls below this are dropped in both `smos search` and
+# chat enrichment, so a broken or weak reranker cannot surface garbage
+# (0.001-0.003) into the search output or the injected memory block.
+# Default 0.05 is conservative: relevant rerank scores are typically 0.8+
+# and garbage is ~0.003, so the gap is huge. Set to 0.0 to disable.
 min_relevance_score = 0.05
 
 [merge]
@@ -235,15 +245,22 @@ idle_timeout_seconds = 300
 [llama_cpp.embedding]
 model_path = "~/.smos/models/v5-nano-retrieval-Q8_0.gguf"
 port = 28081
+# ctx-size 8192 = nano max seq. `--pooling last` is REQUIRED: the nano model
+# is an EuroBERT base using last-token pooling. Needs llama.cpp >= 2026-02-26
+# (PR #19826 EuroBERT architecture); an older build fails to load it.
 extra_args = ["--ctx-size", "8192", "--embeddings", "--pooling", "last"]
 
 [llama_cpp.reranker]
 model_path = "~/.smos/models/qwen3-reranker-0.6b-q8_0.gguf"
 port = 28181
-# `--reranking` is REQUIRED: modern llama-server only exposes /v1/rerank
-# when launched with this flag. Without it the server returns HTTP 501
-# ("This server does not support reranking") and SMOS enrichment fails
-# fail-closed (HTTP 503) on every non-stream request carrying fact candidates.
+# All three flags are required by the working Voodisss Qwen3-Reranker-0.6B
+# GGUF build (which declares pooling_type=RANK in its metadata):
+#   --reranking  exposes /v1/rerank (otherwise HTTP 501).
+#   --pooling rank  selects rank pooling. Without it llama-server defaults
+#     to a different mode and /v1/rerank returns inverted / near-zero scores
+#     (the regression that motivated the GGUF swap — see llama.cpp #16407).
+#   --embedding  (SINGULAR — distinct from the embedding service's
+#     `--embeddings` plural). Enables the score output.
 extra_args = ["--ctx-size", "8192", "--reranking", "--pooling", "rank", "--embedding"]
 
 [llama_cpp.extraction]
@@ -257,15 +274,25 @@ extra_args = ["--ctx-size", "32768", "--spec-type", "draft-mtp", "--spec-draft-n
 # Git-backed memory sync.
 # ---------------------------------------------------------------------------
 #
-# When `repo_url` is non-empty, SMOS dual-writes extracted facts to a local
-# clone of the repo as markdown files (one fact per .md) and commits + pushes
-# after every FinalizeSession. The layout is read back by
-# `smos import git <url>` so two SMOS instances can share memory through git.
+# SMOS writes extracted facts to a local git repository at `local_path` as
+# markdown files (one fact per .md) and commits after every FinalizeSession
+# — always, regardless of remote configuration. This gives the operator an
+# offline audit trail of the on-disk memory under `~/.smos/git`.
 #
-# Empty `repo_url` disables sync; the local_path still works for offline use.
+# Pushing to a remote is opt-in: set `auto_push = true` AND configure an
+# `origin` remote on the local checkout yourself via
+#   git -C ~/.smos/git remote add origin <url>
+# SMOS never clones and does not know any remote URL. The push fails open
+# (warn log, no error) when `origin` is missing.
+#
+# `smos import git <path>` reads the same layout back from any local
+# directory (a freshly cloned memory repo, a backup, or an in-progress
+# checkout) so two SMOS instances can share memory through git.
+#
+# Note: `repo_url` (deprecated since v0.7.0) is silently ignored for
+# backward compat — remove it from your config when convenient.
 [git]
-repo_url = ""
 branch = "main"
 auto_push = false
-local_path = "~/.smos/git/memory"
+local_path = "~/.smos/git"
 disable_gpg_sign = true            # SMOS commits are unsigned by default

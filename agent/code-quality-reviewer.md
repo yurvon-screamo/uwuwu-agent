@@ -26,7 +26,7 @@ model: zai-coding-plan/glm-5.2
 tools:
   "*": false
   time_*: true
-  memory_*: true
+  wiki_*: true
   vision_*: true    
   bash: true
   read: true

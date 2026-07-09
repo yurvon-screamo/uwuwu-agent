@@ -153,7 +153,7 @@ ISO week. Example: `metrics/smos-rust/2026-W25.md` covers all smos-rust publicat
 ## Adjustments for next launch
 - _ (voice / timing / channel / format change)
 
-## memory_capture payload
+## wiki_request payload
 - key insight: _ (1 sentence)
 - repeat: _
 - avoid: _
@@ -162,7 +162,7 @@ ISO week. Example: `metrics/smos-rust/2026-W25.md` covers all smos-rust publicat
 ## Feedback loop
 
 ```
-publish → wait 72h → snapshot metrics/<product>/YYYY-Www.md → analyze what worked / didn't → memory_capture (learnings) → update strategy.md if messaging change is warranted
+publish → wait 72h → snapshot metrics/<product>/YYYY-Www.md → analyze what worked / didn't → wiki_request (learnings) → update strategy.md if messaging change is warranted
 ```
 
-`memory_capture` entries feed the next launch's pre-flight: the @marketer agent calls `memory_recall` at the start of each request and reads prior learnings. Voice drift, channel-mix tweaks, and timing adjustments propagate through this loop.
+`wiki_request` entries feed the next launch's pre-flight: the @marketer agent calls `wiki_search` at the start of each request and reads prior learnings. Voice drift, channel-mix tweaks, and timing adjustments propagate through this loop.

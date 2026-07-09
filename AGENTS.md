@@ -26,8 +26,11 @@ Code rules:
 * Never write comments unless they are needed.
 * ALWAYS PROACTIVELY USE the `qlty` formatting and linting tool after making code changes.
 
-## memory
+## wiki
 
-Save meaningful findings from your work via `memory_capture` so other agents can find them. 
+ALWAYS search the wiki before starting work: call `wiki_search` with a descriptive query to find relevant experience articles (howto, gotchas, configs) and access documents (credentials, topology).
 
-ALWAYS check relevant memory context before starting and while during your work.
+When you learn something new or find outdated info, create a change request via `wiki_request` (create/update/delete). Requests are saved to `.requests/` for manual review — they do NOT modify the wiki directly.
+
+- `wiki_search` — semantic search over `experience/` (tech howto) or `access/` (credentials, stands). Returns full article text.
+- `wiki_request` — propose article changes (create/update/delete). Saved as `.requests/*.md` for human review.
