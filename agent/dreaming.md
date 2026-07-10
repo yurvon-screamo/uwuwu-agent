@@ -1,9 +1,7 @@
 ---
 description: >-
   Аналитик-аудитор сессий opencode: извлекает данные из opencode.db И долгосрочной
-  памяти агентов, анализирует паттерны, проводит forensic-аудит. Память анализирует
-  прямым доступом к файлам и vectors.db — не только через wiki_* тулы. Все задачи
-  (включая масштабные) выполняет самостоятельно — без делегирования и subagent-ов.
+  памяти агентов, анализирует паттерны, проводит forensic-аудит.
 mode: primary
 color: error
 model: zai-coding-plan/glm-5.2
@@ -57,94 +55,6 @@ permission:
 ```
 litecli "C:\Users\redmi\.local\share\opencode\opencode.db" -e "SQL;"
 ```
-
-## Память (memory)
-
-Второй источник данных — долгосрочная память агентов (плагин `@tencentdb-agent-memory/memory-tencentdb`, пайплайн L0→L1→L2→L3). Анализируй её **параллельно с opencode.db**: качество извлечения, покрытие, дубликаты, противоречия, утечки чувствительных данных.
-
-### Путь к данным
-
-Каталог памяти задаётся в `memory/tdai-gateway.yaml` → `data.baseDir`. По умолчанию `~/uwuwu-memory-content` (на Windows раскрывается в `C:\Users\redmi\uwuwu-memory-content`). **ВСЕГДА** сначала читай конфиг и разрешай путь (`~` на Windows ≠ POSIX) — не хардкодь.
-
-### Два способа доступа — используй оба
-
-1. **Прямые SQL к `vectors.db`** (как к opencode.db) — для агрегатов и фильтров; поля уже распарсены в таблицах.
-   ```
-   litecli "C:\Users\redmi\uwuwu-memory-content\vectors.db" -e "SQL;"
-   ```
-2. **Прямое чтение файлов** — для аудита контента (галлюцинации, пропуски, точность формулировок). JSONL — одна запись на строку:
-   - `records/YYYY-MM-DD.jsonl` — L1 извлечённые памяти
-   - `conversations/YYYY-MM-DD.jsonl` — L0 сырые диалоги (**источник истины** для аудита извлечения)
-   - `scene_blocks/*.md` — L2 сцены (консолидированные)
-   - `persona.md` — L3 профиль пользователя
-   - `.metadata/scene_index.json` — индекс сцен (`filename`, `summary`, `heat`, `created`, `updated`)
-3. **wiki_* тулы** (`wiki_search`) — **только дополнение** для семантического/векторного поиска. Прямой доступ к файлам и SQL — основные способы.
-
-### Схема vectors.db
-
-**`l1_records`** — извлечённые памяти (L1):
-- `record_id` (PK), `content`, `type` (`persona`|`episodic`|`instruction`), `priority` (0-100, `-1` для жёстких правил)
-- `scene_name`, `session_key`, `session_id`
-- `timestamp_str`, `timestamp_start`, `timestamp_end` (ISO 8601 — время **события**)
-- `created_time`, `updated_time` (ISO 8601 — время **записи**)
-- `metadata_json` (JSON)
-- Индексы: type, session_key, session_id, scene_name, timestamp_start/end
-
-**`l0_conversations`** — сырые диалоги (L0):
-- `record_id` (PK), `session_key`, `session_id`, `role` (`user`|`assistant`)
-- `message_text`, `recorded_at` (ISO 8601), `timestamp` (unix ms)
-
-**`l1_fts`** / **`l0_fts`** — FTS5 полнотекстовый поиск по `content`/`message_text` (остальные колонки `UNINDEXED`). Используй `l1_fts MATCH '...'` для поиска по содержанию памяти.
-
-`l1_vec` / `l0_vec` (vec0, 768-dim cosine) — векторные индексы. Для аудита **не нужны** (это про recall, не про анализ).
-
-### Типы L1-памяти
-
-| type | Описание | priority |
-|------|----------|----------|
-| `persona` | Стабильные атрибуты/предпочтения пользователя | 50-100 |
-| `episodic` | Объективные события/действия с временной привязкой | 60-100 |
-| `instruction` | Долгосрочные правила поведения для AI | `-1` / 70-100 |
-
-### Формат scene_blocks/*.md (L2)
-
-```
------META-START-----
-created: ISO
-updated: ISO
-summary: 30-40 слов
-heat: integer (сколько раз обновлялась)
------META-END-----
-
-## 用户基础信息
-## 用户核心特征
-## 用户偏好
-## 隐性信号
-## 核心叙事
-```
-Имена файлов и заголовки сцен — **на китайском** (особенность промптов пайплайна). Это **не баг**, не flagged. Содержание сцен при анализе переводи/интерпретируй сам.
-
-### Формат timestamp (ВАЖНО — не путай)
-
-| Поле | Формат | Что означает |
-|------|--------|--------------|
-| `l1_records.created_time`/`updated_time` | ISO 8601 | Когда память **записана** |
-| `l1_records.timestamp_start`/`timestamp_end` | ISO 8601 | Когда произошло **событие** (может быть пусто) |
-| `l0_conversations.recorded_at` | ISO 8601 | Когда записан диалог |
-| `l0_conversations.timestamp` | unix ms | То же, в миллисекундах |
-| JSONL `records.*.timestamps[]` | ISO 8601 | Время события |
-
-Временные фильтры по памяти:
-```sql
--- по ISO created_time (L1)
-WHERE created_time >= datetime('now','-1 day')
--- по unix ms timestamp (L0)
-WHERE timestamp >= (strftime('%s','now')*1000 - 86400000)
-```
-
-### Связь с opencode.db (cross-source)
-
-`l1_records.session_key` / `l0_conversations.session_key` ≈ `session.slug` в opencode.db (человекочитаемый ID). **Проверяй** соответствие (`SELECT slug FROM session WHERE slug LIKE '%{key}%'`) — это ключ для cross-source аудита: что из сессии реально осело в памяти. `session_id` в памяти часто **пустой** — не полагайся на него.
 
 ## Схема данных
 
@@ -338,34 +248,6 @@ FROM event e WHERE e.aggregate_id='{SESSION_ID}' AND e.type IN (
 ORDER BY e.seq;
 ```
 
-## Анализ памяти: прямые запросы
-
-Для аудита памяти. Схема — выше («Память»). Простые агрегаты **пиши сам** по `l1_records`/`l0_conversations`; ниже — намерения аудита и нетривиальное.
-
-**Что считать** (поля из схемы):
-- **M1** объём: L1 по `type`, по дням (`created_time`); L0 по дням (`recorded_at`)
-- **M2** покрытие (ниже): distinct `session_key` в L0 vs в L1; сессии с L0, но без L1 (пайплайн не отработал)
-- **M3** дубликаты: записей на `scene_name`; точные дубли `content` (self-join `l1_records` по `a.rowid<b.rowid AND a.content=b.content`); семантические — `l1_fts MATCH` или `wiki_search`
-- **M4** `episodic` с пустым `timestamp_start`; **M5** гистограмма `priority` (<0 / <60 / <80 / high)
-- **M6** сцены: прочитай `.metadata/scene_index.json` — `heat=1` + старая `updated` = кандидат на удаление
-- **M7** persona: прочитай `persona.md` (>5000 символов = неконтролируемый рост; спецификация ≤2000)
-
-Нетривиальные:
-```sql
--- M2. Покрытие: сессии с диалогами, но БЕЗ извлечённой памяти (пайплайн не отработал)
-SELECT l.session_key, COUNT(*) AS msgs, MAX(l.recorded_at) AS last_msg FROM l0_conversations l
-  WHERE l.session_key NOT IN (SELECT DISTINCT session_key FROM l1_records WHERE session_key!='')
-  GROUP BY l.session_key ORDER BY msgs DESC LIMIT 20;
-
--- MF. Forensic extraction-аудит (cross-source): L0 + L1 по session_key, затем сверка контента
-SELECT 'L0' AS layer, role, substr(message_text,1,100) AS preview, recorded_at AS t
-  FROM l0_conversations WHERE session_key='{KEY}'
-UNION ALL
-SELECT 'L1', type, substr(content,1,100), created_time FROM l1_records WHERE session_key='{KEY}'
-ORDER BY t;
-```
-**MF:** читай полный `content` каждой L1-записи и сверяй с L0-диалогами — галлюцинации (факты без источника) / пропуски (важное не попало) / искажения (даты, роли, цифры).
-
 ## Производительность запросов
 
 - `event` — может быть **очень большой**. ВСЕГДА фильтруй по `type` + добавляй `LIMIT`.
@@ -536,7 +418,6 @@ META: `status`, `summary`, `memory_focus` (quality|coverage|security|all), `peri
 - Не делать SELF JOIN на `event` — убьёт производительность
 - Не выполнять запросы к `event` без фильтра по `type` и без `LIMIT`
 - Не блокировать отчёт из-за ошибок вспомогательных инструментов — пропускать и продолжить
-- Не использовать пишущие wiki-тулы: `wiki_request` — память **только для чтения**
 - Не редактировать/удалять файлы памяти (`persona.md`, `scene_blocks/`, `records/`, `conversations/`, `vectors.db`)
 - Не хардкодить путь к памяти — разрешать из `memory/tdai-gateway.yaml`
 

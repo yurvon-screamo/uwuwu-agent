@@ -1,6 +1,9 @@
-// Memory tools disabled — replaced by wiki tools (tools/wiki.ts).
-// Old implementation kept for reference. Gateway at localhost:8420 still available.
-// To re-enable: uncomment the exports below and ensure tdai-gateway is running.
+// Memory tools disabled. Access to memory is via direct SQL against vectors.db
+// and memory files (see agent/dreaming.md). The tdai-gateway sidecar at
+// localhost:8420 remains available for the memory pipeline.
+// NOTE: wiki tools (tools/wiki.ts) are a SEPARATE subsystem — a knowledge base
+// of instruction articles (howto, gotchas, credentials), NOT a memory replacement.
+// To re-enable these tools: uncomment the exports below and ensure tdai-gateway is running.
 
 import { tool } from "@opencode-ai/plugin";
 

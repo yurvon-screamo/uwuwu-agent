@@ -33,6 +33,54 @@ export const wiki_search = tool({
     },
 });
 
+export const wiki_grep = tool({
+    description:
+        "Grep through uwuwu_wiki articles using regex. Returns matching lines with file paths and line numbers. Use to find specific config values, API names, error messages, etc.",
+    args: {
+        pattern: tool.schema
+            .string()
+            .describe("Regex pattern to search for"),
+        doc_type: tool.schema
+            .string()
+            .optional()
+            .describe("'experience' (default) or 'access'"),
+    },
+    async execute(args) {
+        const type = args.doc_type || "experience";
+        try {
+            const escapedPattern = args.pattern.replace(/"/g, '\\"');
+            return execSync(`wiki-cli grep ${type} "${escapedPattern}"`, {
+                encoding: "utf-8",
+                timeout: 30000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+        } catch (e) {
+            return `Grep failed: ${e}`;
+        }
+    },
+});
+
+export const wiki_get = tool({
+    description:
+        "Get full content of a wiki article by path. Returns the article body without frontmatter. Use after wiki_grep to read the full document.",
+    args: {
+        path: tool.schema
+            .string()
+            .describe("Document path (e.g. 'experience/rust/axum.md')"),
+    },
+    async execute(args) {
+        try {
+            return execSync(`wiki-cli get "${args.path}"`, {
+                encoding: "utf-8",
+                timeout: 10000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+        } catch (e) {
+            return `Get failed: ${e}`;
+        }
+    },
+});
+
 export const wiki_request = tool({
     description:
         "Create a change request for uwuwu_wiki (create/update/delete article). Saved to .requests/ for manual review — does NOT modify wiki directly.",

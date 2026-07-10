@@ -24,7 +24,7 @@ uwuwu-agent/
 │   ├── office-coworker-*/ #   Office document automation (docx, xlsx, pptx, pdf)
 │   ├── rules-*/         #   Quality rules (clean code, security, performance, ...)
 │   └── tool-integration-*/ #   External tool integrations (GitLab, GitHub, Atlassian, browser)
-├── tools/               # Runtime tool wrappers (memory, time, bg)
+├── tools/               # Runtime tool wrappers (wiki, time, bg, vision)
 ├── memory/              # TDAI memory gateway (TencentDB vector memory)
 ├── .qlty/               # Qlty quality hooks (pre-commit, pre-push)
 ├── start-memory.sh      # Memory gateway launch (Unix)
