@@ -5,7 +5,9 @@ description: Python expertise - type hints, async/await, pydantic, dataclasses, 
 
 # Python Development Standards
 
-## Safety and Typing
+> Общие правила (размеры, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только Python-специфика.
+
+## Typing
 
 - **Type Hints**: All function signatures MUST have type hints for parameters and return values.
 - **Strict Typing**: NEVER use `Any` from `typing` — prefer `object`, `Protocol`, or generics.
@@ -13,32 +15,42 @@ description: Python expertise - type hints, async/await, pydantic, dataclasses, 
 - **Immutability**: Prefer `dataclass(frozen=True)`, `NamedTuple`, or `Sequence` over mutable defaults.
 - **Pydantic**: Use `pydantic` for data validation and serialization over plain dicts.
 
-## Performance
+### Hints toolbox
+
+- Prefer `T | None` over `Optional[T]` (Python 3.10+).
+- Use `TypeVar` for generic functions, `Generic[T]` for generic classes.
+- Use `Final` for constants, `Literal` for string enums.
+- Use `TypedDict` for structured dicts, `NamedTuple` for lightweight data.
+
+## Async & Performance
 
 - **Async/Await**: Use `asyncio` for I/O-bound operations. NEVER mix sync blocking calls in async code — use `run_in_executor`.
 - **Generators**: Prefer generators (`yield`) and `itertools` over materializing large lists.
 - **Comprehensions**: Use list/dict/set comprehensions but avoid deeply nested ones (max 2 levels).
 - **Pathlib**: ALWAYS use `pathlib.Path` instead of `os.path` or string paths.
 
-## Architecture (SOLID/SRP)
+### Async toolbox
+
+- Always handle exceptions in coroutines (`try/except`).
+- Use `asyncio.gather()` for parallel tasks, `asyncio.TaskGroup` (3.11+) for structured concurrency.
+- Use `asyncio.timeout()` for timeouts (3.11+).
+- NEVER call blocking functions in async code without `await loop.run_in_executor()`.
+
+## Architecture
 
 - **DI**: Use constructor injection or function parameters. Avoid global mutable state.
 - **Protocols**: Design from `Protocol` or `ABC` for testing and extensibility.
 - **Modules**: Keep `__init__.py` clean. Re-export public API explicitly.
 
-## Size Limits (strict)
+## Size Limits (stack-specific)
 
-- **Function/Method**: ≤ 50 lines.
-- **Class**: ≤ 150 lines.
-- **MAXIMUM file size**: 300 lines.
+Python classes can grow large easily — a stricter class limit than the baseline in `rules-clean-code` (which only covers functions and files):
+
+- **Function/Method**: ≤ 50 lines (baseline)
+- **Class**: ≤ 150 lines **(Python-specific — baseline has no class limit)**
+- **File**: MAXIMUM 300 lines (baseline max)
 - If a function exceeds the limit — extract into smaller functions.
 - If a file exceeds the limit — split into modules.
-
-## Comments
-
-- **Only "WHY"**: Code should be self-documenting. Comments explain only non-trivial business decisions or architectural compromises.
-- **Language**: All comments in ENGLISH.
-- **Docstrings**: Use for public API only (`"""` with Args/Returns/Raises sections).
 
 ## Recommended Stack (pip/uv)
 
@@ -54,36 +66,20 @@ description: Python expertise - type hints, async/await, pydantic, dataclasses, 
 - **Serialization**: `orjson` for JSON, `pydantic` for model serialization.
 - **ORM**: `sqlalchemy` (2.0+ async style).
 
-## Best Practices
-
-### Type Hints
-
-- Prefer `T | None` over `Optional[T]` (Python 3.10+).
-- Use `TypeVar` for generic functions, `Generic[T]` for generic classes.
-- Use `Final` for constants, `Literal` for string enums.
-- Use `TypedDict` for structured dicts, `NamedTuple` for lightweight data.
-
-### Async Patterns
-
-- Always handle exceptions in coroutines (`try/except`).
-- Use `asyncio.gather()` for parallel tasks, `asyncio.TaskGroup` (3.11+) for structured concurrency.
-- Use `asyncio.timeout()` for timeouts (3.11+).
-- NEVER call blocking functions in async code without `await loop.run_in_executor()`.
-
-### Error Handling
+## Error Handling
 
 - Create custom exception classes inheriting from `Exception`.
 - Use `match/case` with exception types (Python 3.11+ exception groups).
 - NEVER use bare `except:` — always specify exception type.
 - Log error context with `logger.exception()` in except blocks.
 
-### Strings and Encoding
+## Strings and Encoding
 
 - Use f-strings for string formatting.
 - Always specify encoding explicitly when reading/writing files: `Path("file.txt").read_text(encoding="utf-8")`.
 - Use `re` module sparingly — prefer `.startswith()`, `.endswith()`, string methods for simple cases.
 
-### Context Managers
+## Context Managers
 
 - Prefer `with` statement for resource management.
 - Use `contextlib.contextmanager` or `contextlib.asynccontextmanager` for custom managers.

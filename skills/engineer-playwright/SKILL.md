@@ -5,12 +5,7 @@ description: Apply these rules when writing Playwright tests in TypeScript - E2E
 
 # Playwright Testing Standards
 
-## TypeScript and Typing
-
-- **Strict Mode**: Always enable `"strict": true` in tests. Avoid `any` — use proper Playwright types (`Page`, `Locator`, `BrowserContext`, etc.).
-- **Immutability**: Prefer `const` for test data and configurations. Use `readonly` for page object properties where appropriate.
-- **Explicit Types**: Properly type test fixtures, custom functions, and page objects. Use built-in Playwright types.
-- **Null Safety**: Use optional chaining (`?.`) and nullish coalescing (`??`) when working with optional elements or configurations.
+> TypeScript-базу (strict mode, async, ESLint) — в `engineer-typescript`. Общие правила (размеры, комментарии) — в `rules-clean-code`. Здесь только Playwright-специфика.
 
 ## Test Structure and Performance
 
@@ -26,18 +21,14 @@ description: Apply these rules when writing Playwright tests in TypeScript - E2E
 - **Reusability**: Create base page objects and utility classes for common functionality (login, navigation).
 - **Fixtures**: Use Playwright fixtures for shared setup/teardown and dependency injection.
 
-## Size Limits (strict)
+## Size Limits (stack-specific)
 
-- **Test Case**: ≤ 30 lines (excluding imports and hooks).
-- **Page Object Method**: ≤ 20 lines.
-- **Page Object File**: MAXIMUM 200 lines.
+Test code has different density than production code. These limits override the baseline in `rules-clean-code` for test files:
+
+- **Test Case**: ≤ 30 lines (excluding imports and hooks)
+- **Page Object Method**: ≤ 20 lines
+- **Page Object File**: MAXIMUM 200 lines
 - If a test is too complex — split it into multiple tests or extract logic into page objects/helpers.
-
-## Comments
-
-- **Only "WHY"**: Test code should be self-documenting. Comments explain only non-trivial test logic or business rules.
-- **Language**: All comments in ENGLISH.
-- **JSDoc**: Use for public page object methods and test utilities (`/** */` with `@param`, `@returns`).
 
 ## Recommended Stack
 
@@ -85,12 +76,6 @@ description: Apply these rules when writing Playwright tests in TypeScript - E2E
 - Use fixtures for setup/teardown logic.
 - Combine built-in fixtures with custom ones.
 
-### Error Handling
-
-- Always handle errors in async functions (try/catch or `.catch()`).
-- Use `Promise.allSettled()` for parallel operations.
-- Log error context with screenshots for debugging.
-
 ## Quality Standards
 
 - **Deterministic Tests**: Tests should produce the same result every time.
@@ -106,10 +91,3 @@ Before outputting code, verify:
 1. `npm run type-check` or `tsc --noEmit` — for type errors.
 2. `npm run lint` — compliance with style and Playwright best practices.
 3. Tests are independent and can run in parallel.
-
-## Output Format
-
-- Complete test implementations (no `// ... rest of code`).
-- Include necessary imports and configuration.
-- Brief explanations in English when writing tests.
-- Structured reports when running tests (in the same language as the task).

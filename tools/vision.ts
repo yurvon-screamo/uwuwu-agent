@@ -3,7 +3,7 @@ import { readFile } from "fs/promises";
 import { basename } from "path";
 
 const OLLAMA_URL = "http://127.0.0.1:11434";
-const MODEL = "qwen3.5:2b";
+const MODEL = "gemma4:cloud";
 
 interface OllamaChatResponse {
     message?: { content?: string };
@@ -13,7 +13,7 @@ interface OllamaChatResponse {
 export const ask = tool({
     description:
         "Answer a question about an image using a local vision LLM via Ollama " +
-        `(model: ${MODEL}, non-thinking mode). Pass an absolute path to the ` +
+        `(model: ${MODEL}). Pass an absolute path to the ` +
         "image file and a natural-language question. Returns the model's text answer.",
     args: {
         image_path: tool.schema
@@ -33,7 +33,7 @@ export const ask = tool({
             body: JSON.stringify({
                 model: MODEL,
                 stream: false,
-                think: false,
+                // think: false,
                 messages: [
                     {
                         role: "user",
@@ -50,12 +50,14 @@ export const ask = tool({
                 `Ollama error (${res.status}): ${data.error ?? res.statusText}`,
             );
         }
+
         const content = data.message?.content?.trim();
         if (!content) {
             throw new Error(
                 `Ollama returned empty answer for ${basename(args.image_path)}`,
             );
         }
+
         return content;
     },
 });

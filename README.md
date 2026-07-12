@@ -19,11 +19,12 @@
 uwuwu-agent/
 ├── agent/              # Agent personas (developer, head-of-development, dreaming, office-coworker, ...)
 ├── skills/              # Modular skill library
+│   ├── architect-*/     #   Planning & design (task methodology, UI/UX strategy)
 │   ├── engineer-*/      #   Language-specific engineers (Rust, C#, Leptos, TS, ...)
-│   ├── flow-*/          #   Workflow flows (feature, bug, refactor, audit, ...)
+│   ├── flow-*/          #   Workflow flows (task, challenge-ask, audit, ...)
 │   ├── office-coworker-*/ #   Office document automation (docx, xlsx, pptx, pdf)
-│   ├── rules-*/         #   Quality rules (clean code, security, performance, ...)
-│   └── tool-integration-*/ #   External tool integrations (GitLab, GitHub, Atlassian, browser)
+│   ├── rules-*/         #   Quality rules (clean code, security, performance, UI, ...)
+│   └── tool-integration-*/ #   External tool integrations (GitLab, GitHub, browser, research, ...)
 ├── tools/               # Runtime tool wrappers (wiki, time, bg, vision)
 ├── memory/              # TDAI memory gateway (TencentDB vector memory)
 ├── .qlty/               # Qlty quality hooks (pre-commit, pre-push)
@@ -56,6 +57,12 @@ All secrets are read from **environment variables** — nothing is committed:
 
 ## 🎯 Skills Overview
 
+### Architects (2)
+| Skill | Purpose |
+|---|---|
+| `architect-task` | Planning methodology (bug/feature/refactor: Prove-It, Contract-First, Baseline-First) |
+| `architect-ui-ux` | UI/UX design strategy, workflow, redesign protocol |
+
 ### Engineers (6)
 | Skill | Stack |
 |---|---|
@@ -66,14 +73,14 @@ All secrets are read from **environment variables** — nothing is committed:
 | `engineer-python` | Python |
 | `engineer-playwright` | Playwright E2E |
 
-### Workflows (8)
-`flow-feature` · `flow-bug` · `flow-refactor` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`
+### Workflows (7)
+`flow-task` · `flow-challenge-ask` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`
 
 ### Office Automation (4)
 `office-coworker-docx` · `office-coworker-xlsx` · `office-coworker-pptx` · `office-coworker-pdf`
 
-### Integrations (5)
-`tool-integration-gitlab` · `tool-integration-github` · `tool-integration-atlassian` · `tool-integration-browser` · `tool-integration-research`
+### Integrations (9)
+`tool-integration-gitlab` · `tool-integration-github` · `tool-integration-atlassian` · `tool-integration-browser` · `tool-integration-research` · `tool-integration-devto` · `tool-integration-producthunt` · `tool-integration-reddit` · `tool-integration-railway`
 
 ### Rules (9)
 `rules-clean-code` · `rules-git-commit` · `rules-security` · `rules-performance` · `rules-qlty` · `rules-test-rule` · `rules-lib-usage` · `rules-text-writing` · `rules-ui`

@@ -5,6 +5,8 @@ description: Rust expertise - ownership, borrowing, lifetimes, async/await, clip
 
 # Rust Development Standards
 
+> Общие правила (размеры функций/файлов, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только Rust-специфика.
+
 ## Safety
 
 - **NEVER use `unsafe`** — prohibited without exceptions
@@ -21,26 +23,13 @@ description: Rust expertise - ownership, borrowing, lifetimes, async/await, clip
 - Apply iterators and their methods instead of manual loops where appropriate
 - Use `&str` instead of `String` where possible
 
-## Architecture and SRP
+## Size Limits (stack-specific)
 
-- One function — one task. If a function does more than one thing — decompose it
-- Functions should be small and focused
-- Split logic into modules logically
+Rust is held to a stricter file limit than the baseline in `rules-clean-code` — idiomatic Rust favours small, focused modules:
 
-## Size Limits (strict)
-
-- Recommended function size: ≤ 50 lines
-- MAXIMUM function size: 100 lines (hard limit)
-- MAXIMUM file size: 200 lines (hard limit)
-- If a function exceeds the limit — decompose into multiple functions
-- If a file exceeds the limit — split into modules
-
-## Comments
-
-- DO NOT write comments explaining "what the code does" — code should be self-documenting
-- Comments are acceptable only to explain "WHY" an architectural decision was made
-- All comments in ENGLISH
-- doc-comments (`///`) are acceptable for public API
+- **Function**: ≤ 50 lines recommended, ≤ 100 lines hard limit (baseline)
+- **File**: MAXIMUM 200 lines **hard limit** (vs ≤200 recommended / ≤300 max baseline — the 300 max does NOT apply to Rust)
+- If a file exceeds 200 lines — split into modules.
 
 ## Recommended Crates
 
@@ -53,6 +42,7 @@ description: Rust expertise - ownership, borrowing, lifetimes, async/await, clip
 ## Workflow
 
 Before submitting code, always run the check:
+
 1. `cargo clippy` — code must pass without warnings
 2. `cargo fmt` — code must be formatted
 3. `cargo test` — all tests must pass

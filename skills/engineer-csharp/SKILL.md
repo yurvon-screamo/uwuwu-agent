@@ -5,37 +5,33 @@ description: C# and .NET expertise - async programming, LINQ, DI, generics, Span
 
 # C# / .NET Expertise
 
-## Strict Rules
+> Общие правила (размеры, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только C#-специфика.
 
-### Safety and Typing
+## Safety and Typing
 
 - **Nullable Reference Types (NRT)**: Always enabled. Code must not contain potential `NullReferenceException`. Use `?`, `!`, `??` and `default` consciously.
 - **Immutability**: Prefer `record` and `readonly struct` for DTOs and simple objects.
 - **Explicit Access**: Always specify access modifiers (`private`, `public`, `internal`).
 
-### Performance
+## Performance
 
 - **Async/Await**: NEVER use `.Result` or `.Wait()`. Use `ValueTask` for frequently called methods where the result is often available synchronously.
 - **LINQ**: Use only where it doesn't hurt performance in hot loops. Avoid Multiple Enumeration.
 - **Collections**: Choose the right type (`List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `ReadOnlySpan<T>`).
 
-### Architecture (SOLID/SRP)
+## Architecture
 
 - **DI**: Always use dependency injection through constructors.
 - **Interface vs Implementation**: Design from interfaces where necessary for testing or extensibility.
 - **Minimal APIs**: For small services, prefer Minimal APIs over controllers.
 
-### Size Limits (strict)
+## Size Limits (stack-specific)
 
-- **Function/Method**: ≤ 60 lines (C# is slightly more verbose than Rust due to braces).
-- **Class/File**: MAXIMUM 250 lines.
+C# is slightly more verbose than the baseline in `rules-clean-code` due to braces and explicit syntax. Override the baseline with these values:
+
+- **Function/Method**: ≤ 60 lines (vs ≤50 baseline)
+- **Class/File**: MAXIMUM 250 lines (vs ≤200 recommended / ≤300 max baseline)
 - If a method is larger — extract logic into private methods or separate services.
-
-### Comments
-
-- **Only "WHY"**: Code should be clear. Comments explain only non-trivial business decisions or architectural hacks.
-- **Language**: All comments in ENGLISH.
-- **XML Docs**: Only for public interfaces and methods (`/// <summary>`).
 
 ## Recommended Stack (NuGet)
 
