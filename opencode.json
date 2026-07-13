@@ -1,6 +1,6 @@
 {
     "$schema": "https://opencode.ai/config.json",
-    "default_agent": "head-of-development",
+    "default_agent": "developer",
     "provider": {
         "smos": {
             "npm": "@ai-sdk/openai-compatible",
@@ -16,9 +16,12 @@
         }
     },
     "command": {
-        "remember": {
-            "template": "Надо что то запомнить (сохранить в память)? Или такого нет?",
-            "description": "запоминаем важное"
+        "wiki": {
+            "template": "Были ли получены ранее неизвестные навыки работы с инструментами? Стоит ли дополнить статьи в wiki? Или создать новые? Если да, то создавай запрос на изменение в wiki.",
+            "description": "Wiki request"
+        },
+        "goal": {
+            "template": "Действуй пока поставленная цель не будет достигнута. Я как пользователь ушел."
         }
     },
     "mcp": {},
