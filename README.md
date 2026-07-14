@@ -17,7 +17,7 @@
 
 ```
 uwuwu-agent/
-├── agent/              # Agent personas (developer, head-of-development, dreaming, office-coworker, ...)
+├── agent/              # Agent personas (developer, head-of-development, office-coworker, ...)
 ├── skills/              # Modular skill library
 │   ├── architect-*/     #   Planning & design (task methodology, UI/UX strategy)
 │   ├── engineer-*/      #   Language-specific engineers (Rust, C#, Leptos, TS, ...)

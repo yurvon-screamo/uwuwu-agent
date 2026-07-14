@@ -29,7 +29,7 @@ function validateProject(project: string): string {
 
 export const wiki_search = tool({
     description:
-        "Search uwuwu_wiki experience/ for howto/tech articles. Returns a compact list (title + description, score, filepath) for top 5 matches above threshold 0.3 — NOT full article bodies. Call wiki_get with the returned filepath for full text.\n\nAccess docs (credentials, topology) have moved to `projects/<P>/access/` — use `access_search` instead.",
+        "Search uwuwu_wiki experience for howto/tech articles. Returns a compact list (title + description, score, slug) for top 5 matches above threshold 0.3 — NOT full article bodies. Slug is the filename without extension; call wiki_get with it for full text.\n\nFor access docs (credentials, topology) use `access_search` instead.",
     args: {
         query: tool.schema
             .string()
@@ -38,7 +38,7 @@ export const wiki_search = tool({
     async execute(args) {
         try {
             return runWikiCli(
-                ["wiki", "search", "experience", args.query, "--top", "5"],
+                ["wiki", "search", args.query, "--top", "5"],
                 120000,
                 50,
             );
@@ -50,7 +50,7 @@ export const wiki_search = tool({
 
 export const wiki_grep = tool({
     description:
-        "Grep through uwuwu_wiki experience/ articles using regex. Returns matching lines with file paths and line numbers. Use to find specific config values, API names, error messages.\n\nFor access docs use `access_grep`.",
+        "Grep through uwuwu_wiki experience articles using regex. Returns matching lines grouped by slug (filename without .md) with line numbers. Use to find specific config values, API names, error messages.\n\nFor access docs use `access_grep`.",
     args: {
         pattern: tool.schema
             .string()
@@ -58,7 +58,7 @@ export const wiki_grep = tool({
     },
     async execute(args) {
         try {
-            return runWikiCli(["wiki", "grep", "experience", args.pattern], 30000, 10);
+            return runWikiCli(["wiki", "grep", args.pattern], 30000, 10);
         } catch (e) {
             return `Grep failed: ${e}`;
         }
@@ -67,15 +67,15 @@ export const wiki_grep = tool({
 
 export const wiki_get = tool({
     description:
-        "Get full content of a wiki experience/ article by path. Returns the article body without frontmatter. Use after wiki_grep to read the full document.",
+        "Get full content of a uwuwu_wiki experience article by slug. Returns the article body without frontmatter. The slug is the filename without extension (e.g. 'axum') — call wiki_search or wiki_grep to find it.",
     args: {
-        path: tool.schema
+        slug: tool.schema
             .string()
-            .describe("Document path (e.g. 'experience/rust/axum.md')"),
+            .describe("Article slug (filename without .md, e.g. 'axum')"),
     },
     async execute(args) {
         try {
-            return runWikiCli(["wiki", "get", args.path], 10000, 10);
+            return runWikiCli(["wiki", "get", args.slug], 10000, 10);
         } catch (e) {
             return `Get failed: ${e}`;
         }
@@ -84,14 +84,14 @@ export const wiki_get = tool({
 
 export const wiki_request = tool({
     description:
-        "Create a change request for uwuwu_wiki (create/update/delete article). Saved to .requests/ for manual review — does NOT modify wiki directly.",
+        "Create a change request for uwuwu_wiki (create/update/delete article). Saved to staging for manual review — does NOT modify wiki directly.",
     args: {
         action: tool.schema
             .string()
             .describe("Action: create, update, or delete"),
         content: tool.schema
             .string()
-            .describe("Article content (create/update) or target filepath (delete)"),
+            .describe("Article content (create/update) or target slug — filename without .md (delete)"),
         reason: tool.schema
             .string()
             .describe("Why this change is needed"),
@@ -108,12 +108,12 @@ export const wiki_request = tool({
             .replace(/-+/g, "-")
             .slice(0, 60);
         const filename = `${ts}_${args.action}_${slug}.md`;
-        const filepath = join(REQUESTS_DIR, filename);
+        const requestPath = join(REQUESTS_DIR, filename);
 
         const body = `---\ntype: ${args.action}\nreason: ${args.reason}\ncreated: ${now.toISOString()}\n---\n\n${args.content}\n`;
 
-        writeFileSync(filepath, body, ENCODING);
-        return `Request saved: ${filepath}`;
+        writeFileSync(requestPath, body, ENCODING);
+        return `Request saved: ${filename}`;
     },
 });
 
@@ -132,7 +132,7 @@ export const projects = tool({
 
 export const task_search = tool({
     description:
-        "Семантический поиск по задачам проекта в uwuwu_wiki/projects/<project>/tasks/. Возвращает компактный список (title + description, score, filepath) для топ-5 совпадений.\n\nОбязательный arg: `project`. Опциональные фильтры (через AND): `status` (`open | in_progress | blocked | closed`), `from`/`to` (`YYYY-MM-DD`, по `created`, inclusive).",
+        "Семантический поиск по задачам проекта. Возвращает компактный список (title + description, score, slug) для топ-5 совпадений. Slug — имя файла без расширения.\n\nОбязательный arg: `project`. Опциональные фильтры (через AND): `status` (`open | in_progress | blocked | closed`), `from`/`to` (`YYYY-MM-DD`, по `created`, inclusive).",
     args: {
         project: tool.schema
             .string()
@@ -173,14 +173,16 @@ export const task_search = tool({
 
 export const task_list = tool({
     description:
-        "Простой список задач проекта по статусу (без embeddings-ранжирования, sorted by created). Обязательные args: `project`, `status`. Опциональные: `from`/`to`.",
+        "Простой список задач (без embeddings-ранжирования, sorted by created). Если `project` не указан — все проекты, сгруппированные по проектам. Если `status` не указан — все задачи кроме closed. Опциональные: `from`/`to`.",
     args: {
         project: tool.schema
             .string()
-            .describe("Имя проекта. Обязательный."),
+            .optional()
+            .describe("Имя проекта. Если не указан — все проекты (с группировкой по проектам)."),
         status: tool.schema
             .string()
-            .describe("Статус (точный матч): open | in_progress | blocked | closed. Обязательный."),
+            .optional()
+            .describe("Статус (точный матч): open | in_progress | blocked | closed. Если не указан — все кроме closed."),
         from: tool.schema
             .string()
             .optional()
@@ -192,14 +194,12 @@ export const task_list = tool({
     },
     async execute(args) {
         try {
-            const cliArgs: string[] = [
-                "task", "list",
-                validateProject(args.project),
-                "--status", args.status,
-            ];
+            const cliArgs: string[] = ["task", "list"];
+            if (args.project) cliArgs.push(validateProject(args.project));
+            if (args.status) cliArgs.push("--status", args.status);
             if (args.from) cliArgs.push("--from", args.from);
             if (args.to) cliArgs.push("--to", args.to);
-            return runWikiCli(cliArgs, 10000, 10);
+            return runWikiCli(cliArgs, 30000, 10);
         } catch (e) {
             return `Task list failed: ${e}`;
         }
@@ -208,7 +208,7 @@ export const task_list = tool({
 
 export const task_grep = tool({
     description:
-        "Regex-поиск по задачам проекта. Возвращает совпадающие строки с file paths и line numbers.",
+        "Regex-поиск по задачам проекта. Возвращает совпадающие строки сгруппированные по slug (имя файла без .md) с line numbers.",
     args: {
         project: tool.schema
             .string()
