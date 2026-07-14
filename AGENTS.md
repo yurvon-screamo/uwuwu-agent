@@ -28,13 +28,23 @@ Code rules:
 
 ## wiki
 
-Wiki — это **база знаний-инструкций** (howto, gotchas, конфиги, credentials, топология), а НЕ память агентов. Память — отдельная подсистема (memory gateway / `vectors.db`); wiki к ней отношения не имеет.
+Wiki — это **база знаний-инструкций** (howto, gotchas, конфиги, credentials, топология). 
 
-ALWAYS search in the wiki: call `wiki_search` with a descriptive query to find relevant experience articles (howto, gotchas, configs) and access documents (credentials, topology).
+ALWAYS search in the wiki: call `wiki_search` with a descriptive query to find relevant experience articles (howto, gotchas, configs).
 
 When you learn something new or find outdated info, create a change request via `wiki_request` (create/update/delete). 
 
-- `wiki_search` — semantic search over `experience/` (tech howto) or `access/` (credentials, stands). Returns full article text.
-- `wiki_grep` — regex search across all articles. Returns matching lines with file paths and line numbers.
-- `wiki_get` — get full article content by path (e.g. `experience/rust/axum.md`).
-- `wiki_request` — propose article changes (create/update/delete). Saved as `.requests/*.md` for human review.
+Вики - это знаний, не привязанные к конкретным проектам.
+
+## projects
+
+- `projects` — список всех проектов с полным README. Используй чтобы понять в каких проектах ты работаешь.
+- `access_search`, `access_grep`, `access_get` — поиск и чтение access-документов проекта (credentials, topology, stands).
+
+## tasks
+
+Личный таск-трекер. При начале работы найди с какой задачей ты работаешь.
+
+**Агент может заводить задачи через `task_create`** — но только для задач, рождённых **в чате с пользователем**, которы ранее не было заведены в трекер.
+
+Агент читает задачи и **дописывает worklog** по завершению работы.

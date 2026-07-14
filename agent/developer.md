@@ -115,7 +115,7 @@ permission:
 ## Шаг 0: Загрузка контекста
 
 1. **Классифицируй задачу** — `bug` / `feature` / `refactor`. Если тип не передан явно — определи по формулировке и зафиксируй.
-2. **Найди релевантные инструкции:** вызови `wiki_search` с query по теме задачи (база знаний: howto, gotchas, конфиги — это инструкции, не память)
+2. **Найди релевантные инструкции:** вызови `wiki_search` с query по теме задачи (база знаний: howto, gotchas, конфиги — это инструкции, не память). `wiki_search` возвращает компактный список (title + description); для полного текста статьи вызови `wiki_get` по возвращённому filepath.
 3. **Загрузи скиллы по типу задачи:**
     - `flow-task` — методология координации (clarifying questions, delegation, verification по типу bug/feature/refactor)
     - `architect-task` — методология проектирования (Prove-It / Contract-First / Baseline-First)
