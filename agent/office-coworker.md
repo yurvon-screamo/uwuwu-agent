@@ -20,11 +20,10 @@ tools:
   webfetch: true
   task: true
 permission:
-  task:
-    tool-accessor: "allow"  
+  task: {}
   skill:
     "rules-*": "allow"
-    "tool-generic-*": "allow"      
+    "tool-*": "allow"      
     "office-coworker-*": "allow"
 ---
 @office-coworker

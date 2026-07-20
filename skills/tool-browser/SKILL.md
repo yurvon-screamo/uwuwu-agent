@@ -1,5 +1,5 @@
 ---
-name: tool-integration-browser
+name: tool-browser
 description: "Browser automation via Playwriter CLI. Control user's Edge browser: navigate, click, type, extract data, run JS. Triggers: 'open browser', 'click button', 'fill form', 'scrape page', 'take screenshot', 'browser automation', 'playwriter'. Use when any browser interaction is needed."
 ---
 

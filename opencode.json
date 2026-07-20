@@ -28,11 +28,10 @@
     "permission": {
         "skill": {
             "flow-*": "deny",
-            "tool-*": "deny",
             "engineer-*": "deny",
             "office-coworker-*": "deny",
             "rules-*": "allow",
-            "tool-generic-*": "allow"
+            "tool-*": "allow"
         },
         "task": {
             "*": "deny"

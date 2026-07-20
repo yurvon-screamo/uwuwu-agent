@@ -1,5 +1,5 @@
 ---
-name: tool-integration-railway
+name: tool-railway
 description: "Railway operations via railway CLI. Deploy apps, manage projects, services, environments, variables, volumes, databases, domains, and more. Triggers: 'deploy to railway', 'railway deploy', 'railway up', 'railway logs', 'railway service', 'railway variable', 'railway project'. Do NOT use for other cloud platforms (AWS, GCP, Azure, Vercel)."
 ---
 

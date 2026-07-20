@@ -24,12 +24,11 @@ tools:
 permission:
     task:
         code-quality-reviewer: "allow"
-        tool-accessor: "allow"
     skill:
         "architect-*": "allow"
         "engineer-*": "allow"
         "rules-*": "allow"
-        "tool-generic-*": "allow"
+        "tool-*": "allow"
         "flow-*": "allow"
 ---
 

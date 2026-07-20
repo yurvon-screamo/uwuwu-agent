@@ -24,7 +24,7 @@ uwuwu-agent/
 │   ├── flow-*/          #   Workflow flows (task, challenge-ask, audit, ...)
 │   ├── office-coworker-*/ #   Office document automation (docx, xlsx, pptx, pdf)
 │   ├── rules-*/         #   Quality rules (clean code, security, performance, UI, ...)
-│   └── tool-integration-*/ #   External tool integrations (GitLab, GitHub, browser, research, ...)
+│   └── tool-*/ #   External tool integrations (GitLab, GitHub, browser, research, ...)
 ├── tools/               # Runtime tool wrappers (wiki, time, bg, vision)
 ├── memory/              # TDAI memory gateway (TencentDB vector memory)
 ├── .qlty/               # Qlty quality hooks (pre-commit, pre-push)
@@ -80,13 +80,13 @@ All secrets are read from **environment variables** — nothing is committed:
 `office-coworker-docx` · `office-coworker-xlsx` · `office-coworker-pptx` · `office-coworker-pdf`
 
 ### Integrations (9)
-`tool-integration-gitlab` · `tool-integration-github` · `tool-integration-atlassian` · `tool-integration-browser` · `tool-integration-research` · `tool-integration-devto` · `tool-integration-producthunt` · `tool-integration-reddit` · `tool-integration-railway`
+`tool-gitlab` · `tool-github` · `tool-atlassian` · `tool-browser` · `tool-research`
 
 ### Rules (9)
 `rules-clean-code` · `rules-git-commit` · `rules-security` · `rules-performance` · `rules-qlty` · `rules-test-rule` · `rules-lib-usage` · `rules-text-writing` · `rules-ui`
 
 ### Generic Tools (1)
-`tool-generic-likec4`
+`tool-likec4`
 
 ## ⚡ Quick Start
 

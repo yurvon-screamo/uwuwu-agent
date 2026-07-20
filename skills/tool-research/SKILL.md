@@ -1,5 +1,5 @@
 ---
-name: tool-integration-research
+name: tool-research
 description: "Unified research skill: fetch library docs (ctx7), search code across GitHub (grep.app), search the web and extract URLs (Tavily). Use when you need to research libraries, frameworks, code examples, or general technical information. Triggers: 'docs for X', 'how does X work', 'search code', 'look up X online', 'search the web', 'find information', 'research topic', 'web search', 'look up online', 'find documentation'. Do NOT use for refactoring, business logic, or general programming concepts."
 ---
 
@@ -23,7 +23,7 @@ Both commands support `--json` for machine-readable output.
 ### Grep — code search on GitHub
 
 ```bash
-bun skills/tool-integration-research/scripts/grep.ts searchGitHub --query <pattern> [options]
+bun skills/tool-research/scripts/grep.ts searchGitHub --query <pattern> [options]
 ```
 
 - `--language <lang>` — filter by language (JavaScript, TypeScript, Python, etc.)

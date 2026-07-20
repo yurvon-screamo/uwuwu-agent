@@ -1,6 +1,6 @@
 ---
 name: rules-logging
-description: Stack-neutral logging rules. Treat logs as a contract: structured records (not free text), fixed schema (timestamp, severity, event, trace context, resource/service, attributes), stable event field, message grammar (ACTION/PROGRESS/STATUS), severity levels, log-trace correlation. Based on the OpenTelemetry Logs Data Model and the "logs as a language" practice. Use when adding logging to a service, standardizing logs across services, setting up observability, or designing a log contract.
+description: Stack-neutral logging rules. Treat logs as a contract structured records (not free text), fixed schema (timestamp, severity, event, trace context, resource/service, attributes), stable event field, message grammar (ACTION/PROGRESS/STATUS), severity levels, log-trace correlation. Based on the OpenTelemetry Logs Data Model and the "logs as a language" practice. Use when adding logging to a service, standardizing logs across services, setting up observability, or designing a log contract.
 ---
 
 # Logging
