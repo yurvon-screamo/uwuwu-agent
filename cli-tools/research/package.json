@@ -1,0 +1,15 @@
+{
+  "name": "research-cli",
+  "version": "1.0.0",
+  "description": "CLI for grep.app code search via the mcporter runtime.",
+  "bin": {
+    "grep-github": "./grep.ts"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "mcporter": "^0.11.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "atlassian-cli",
+  "version": "1.0.0",
+  "description": "MCP-backed CLI for Jira and Confluence (wraps mcp-atlassian via bun).",
+  "bin": {
+    "atlassian": "./bin.ts"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "mcporter": "^0.11.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1"
+  }
+}
