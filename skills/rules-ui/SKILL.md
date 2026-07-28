@@ -1,6 +1,6 @@
 ---
 name: rules-ui
-description: "UI implementation rules — design engineering directives, layout discipline, image strategy, AI tells (forbidden patterns), motion, dark mode, performance & accessibility, common pitfalls. Apply when writing UI code. For planning/strategy use architect-ui-ux."
+description: "UI implementation rules — design engineering directives, layout discipline, image strategy, AI tells (forbidden patterns), motion, dark mode, performance & accessibility, common pitfalls. Apply when writing UI code."
 ---
 
 # UI Implementation Rules
@@ -439,11 +439,3 @@ See `rules-performance` for the full Core Web Vitals targets (LCP/INP/CLS), opti
 | **Max-width** | Same `max-w-6xl` or `max-w-7xl` throughout | Mix different container widths |
 | **Theme colors** | Use directly (`bg-primary`) | Wrap in `var()` |
 | **Transitions** | `transition-colors duration-200` | Instant changes or >500ms |
-
----
-
-## References
-
-- `architect-ui-ux` — UI/UX planning strategy, workflow (audit existing style, brief inference, three dials, design system selection), redesign protocol, pre-flight checklist
-- `rules-text-writing` — copywriting rules, anti-AI-cliché dictionary
-- `rules-performance` — Core Web Vitals and full performance optimization rules

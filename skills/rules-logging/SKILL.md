@@ -37,18 +37,18 @@ Why structured: monitoring backends auto-parse named fields into columns; search
 
 Model each record after the OpenTelemetry Logs Data Model — two timestamp kinds, severity, a stable body, trace context, resource, and attributes.
 
-| Field | Meaning | Notes |
-|---|---|---|
-| `Timestamp` | When the event **occurred** (origin clock). | Prefer this for event time. Optional if unknown. |
-| `ObservedTimestamp` | When the collection system **observed** it. | For first-party logs often equals `Timestamp`. If a backend supports only one timestamp, use `Timestamp` if present, else `ObservedTimestamp`. |
-| `SeverityText` | Log level as a string (`INFO`, `ERROR`...). | Original representation from the source. |
-| `SeverityNumber` | Numeric severity (see table below). | Enables unambiguous mapping across formats. |
-| `Body` / `event` | Human-readable description of the event. | **Must be stable** for a given event class — see below. |
-| `TraceId` / `SpanId` / `TraceFlags` | W3C trace context. | If `SpanId` is present, `TraceId` SHOULD be too. |
-| `Resource` | The entity that emitted the log — `service.name`, `host.name`, etc. | Identifies who logged. |
-| `InstrumentationScope` | The scope (module/library) that emitted the log. | |
-| `Attributes` | Arbitrary additional key-value data. | Use for params, durations, paths — anything event-specific. |
-| `EventName` | Identifies the class/type of event. | Optional but powerful for analytics. |
+| Field                               | Meaning                                                             | Notes                                                                                                                                          |
+| ----------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Timestamp`                         | When the event **occurred** (origin clock).                         | Prefer this for event time. Optional if unknown.                                                                                               |
+| `ObservedTimestamp`                 | When the collection system **observed** it.                         | For first-party logs often equals `Timestamp`. If a backend supports only one timestamp, use `Timestamp` if present, else `ObservedTimestamp`. |
+| `SeverityText`                      | Log level as a string (`INFO`, `ERROR`...).                         | Original representation from the source.                                                                                                       |
+| `SeverityNumber`                    | Numeric severity (see table below).                                 | Enables unambiguous mapping across formats.                                                                                                    |
+| `Body` / `event`                    | Human-readable description of the event.                            | **Must be stable** for a given event class — see below.                                                                                        |
+| `TraceId` / `SpanId` / `TraceFlags` | W3C trace context.                                                  | If `SpanId` is present, `TraceId` SHOULD be too.                                                                                               |
+| `Resource`                          | The entity that emitted the log — `service.name`, `host.name`, etc. | Identifies who logged.                                                                                                                         |
+| `InstrumentationScope`              | The scope (module/library) that emitted the log.                    |                                                                                                                                                |
+| `Attributes`                        | Arbitrary additional key-value data.                                | Use for params, durations, paths — anything event-specific.                                                                                    |
+| `EventName`                         | Identifies the class/type of event.                                 | Optional but powerful for analytics.                                                                                                           |
 
 Rules for the schema:
 
@@ -69,11 +69,11 @@ Rules for the schema:
 
 Constrain how event text is formed. Three grammatical modes, in order of preference:
 
-| Mode | Form | When |
-|---|---|---|
-| **ACTION** (preferred) | Verb (Past Simple) → Object → [details] | A completed event. `"Created task"`, `"Loaded audio file"`. |
-| **PROGRESS** | Verb (Present Participle) → Object → [details] | An in-progress state. `"Loading audio file"`. Use sparingly — prefer logging the completed action after it finishes. |
-| **STATUS** (least preferred) | State / Fact | A fact, final state, or high-level error condition. |
+| Mode                         | Form                                           | When                                                                                                                 |
+| ---------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **ACTION** (preferred)       | Verb (Past Simple) → Object → [details]        | A completed event. `"Created task"`, `"Loaded audio file"`.                                                          |
+| **PROGRESS**                 | Verb (Present Participle) → Object → [details] | An in-progress state. `"Loading audio file"`. Use sparingly — prefer logging the completed action after it finishes. |
+| **STATUS** (least preferred) | State / Fact                                   | A fact, final state, or high-level error condition.                                                                  |
 
 Errors:
 
@@ -82,20 +82,20 @@ Errors:
 - State the cause with **`due to`** when known: `"Failed to load audio file due to codec error"`.
 - Put machine-readable cause in a field (`error.type`, `error.message`), not only in the text.
 
-Decision shortcut: if a message is logged *before* a short action completes, move it to *after* completion and write it as ACTION.
+Decision shortcut: if a message is logged _before_ a short action completes, move it to _after_ completion and write it as ACTION.
 
 ## Severity levels
 
 Map levels to the OpenTelemetry severity ranges. Smaller number = less severe.
 
-| SeverityNumber | Name | Meaning |
-|---|---|---|
-| 1–4 | TRACE | Fine-grained debugging; off by default. |
-| 5–8 | DEBUG | Debugging event. |
-| 9–12 | INFO | Informational — something happened. |
-| 13–16 | WARN | Warning — not an error, but more important than info. |
-| 17–20 | ERROR | Error — something went wrong. |
-| 21–24 | FATAL | Fatal — app/system crash. |
+| SeverityNumber | Name  | Meaning                                               |
+| -------------- | ----- | ----------------------------------------------------- |
+| 1–4            | TRACE | Fine-grained debugging; off by default.               |
+| 5–8            | DEBUG | Debugging event.                                      |
+| 9–12           | INFO  | Informational — something happened.                   |
+| 13–16          | WARN  | Warning — not an error, but more important than info. |
+| 17–20          | ERROR | Error — something went wrong.                         |
+| 21–24          | FATAL | Fatal — app/system crash.                             |
 
 - `ERROR` (numeric ≥ 17) marks an erroneous situation. Don't log normal flow at ERROR; don't swallow errors at INFO.
 - When mapping a source format with several levels in one range, assign numbers by relative importance (e.g. `Error`→17, `Critical`→18).
@@ -117,12 +117,12 @@ logger.info("Created task", total=counter)
 
 ## Make logs debuggable
 
-The schema tells you *how* to write a record. This section is about *what* to put in it so that weeks later you can reproduce a bug from the logs alone — not stare at `failed to process` with no idea what was processed or why.
+The schema tells you _how_ to write a record. This section is about _what_ to put in it so that weeks later you can reproduce a bug from the logs alone — not stare at `failed to process` with no idea what was processed or why.
 
 - **Log intent + input, not only the result.** `Failed to process order` with `order_id`, `input=...` — not bare `Failed to process`. A month later, one line can't be reproduced.
 - **Operation boundaries, not only the outcome.** For non-trivial work, log start/end + duration so the timeline is visible instead of a black hole before the error. Long operations: log progress on a step boundary.
 - **Exceptions whole — type, message, stack.** Carry `error.type`, `error.message`, and the stack trace in a field. Never `str(e)`, and never swallow an exception at INFO.
-- **Decision points.** At branches that change behavior (chosen path, fallback, retry decision) log *why* that branch was taken. Otherwise "why did it fall back?" is unanswerable forever.
+- **Decision points.** At branches that change behavior (chosen path, fallback, retry decision) log _why_ that branch was taken. Otherwise "why did it fall back?" is unanswerable forever.
 - **Where, not only what.** Component + operation in `Resource`/`InstrumentationScope`/`Attributes`, so you know the location, not just the event.
 - **Correlation across boundaries.** `TraceId`/`SpanId` + `request_id`/`causation_id`, so "error here" links back to "root cause in another service". The schema fields exist for exactly this — use them for debugging, not just for dashboards.
 - **What's already done (idempotency).** In distributed flows, log "step N done", so an investigation can see which step died and whether a partial effect landed.
@@ -136,17 +136,17 @@ The schema tells you *how* to write a record. This section is about *what* to pu
 
 ## Anti-patterns
 
-| Anti-pattern | Fix |
-|---|---|
-| Free text / string interpolation in the message | Structured named fields |
-| Same event, different wording | Stable `event` + shared dictionary |
-| Grepping/regex-parsing logs in dashboards | Filter by fields |
-| Everything at INFO (or ERROR) | Severity by meaning |
-| No correlation id | Bind `request_id`/`TraceId` at entry |
-| Variable data baked into the event text | Move to `Attributes` |
-| Secrets / PII in logs | Never log credentials, tokens, personal data |
-| Duplicate info repeated across lines | One event, one record |
-| One timestamp used for both event and ingest | Distinguish `Timestamp` vs `ObservedTimestamp` |
+| Anti-pattern                                    | Fix                                            |
+| ----------------------------------------------- | ---------------------------------------------- |
+| Free text / string interpolation in the message | Structured named fields                        |
+| Same event, different wording                   | Stable `event` + shared dictionary             |
+| Grepping/regex-parsing logs in dashboards       | Filter by fields                               |
+| Everything at INFO (or ERROR)                   | Severity by meaning                            |
+| No correlation id                               | Bind `request_id`/`TraceId` at entry           |
+| Variable data baked into the event text         | Move to `Attributes`                           |
+| Secrets / PII in logs                           | Never log credentials, tokens, personal data   |
+| Duplicate info repeated across lines            | One event, one record                          |
+| One timestamp used for both event and ingest    | Distinguish `Timestamp` vs `ObservedTimestamp` |
 
 ## Checklist before calling logs "production-ready"
 

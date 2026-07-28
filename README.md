@@ -73,8 +73,8 @@ All secrets are read from **environment variables** — nothing is committed:
 | `engineer-python` | Python |
 | `engineer-playwright` | Playwright E2E |
 
-### Workflows (7)
-`flow-task` · `flow-challenge-ask` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`
+### Workflows (6)
+`flow-task` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`
 
 ### Office Automation (4)
 `office-coworker-docx` · `office-coworker-xlsx` · `office-coworker-pptx` · `office-coworker-pdf`

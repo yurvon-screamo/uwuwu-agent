@@ -24,6 +24,25 @@ When exceeded, decompose — don't rationalize.
 
 Exception: generated code, or a single cohesive algorithm that cannot be split without leaking internal state. If a file legitimately exceeds the limit, document WHY at the top (`// Single cohesive X parser; splitting would expose internals`). **Noise is never an excuse** — a 400-line file full of redundant comments violates this rule, not satisfies it.
 
+### Качество кода важнее краткости
+
+НЕ СЖИМАЙ ЛОГИКУ в ущерб читаемости. Размер файла — не метрика качества.
+
+**Запрещено (это про структуру алгоритма, а НЕ про комментарии):**
+
+- Схлопывать многострочные конструкции в одну строку
+- Убирать пустые строки, которые разделяют логические блоки
+- Сокращать имена переменных/функций без веской причины
+- Объединять независимые операции в одну строку через `&&`, `;` и т.п.
+
+**Допустимые сокращения** — только те, которые улучшают понимание кода:
+
+- Использование синтаксического сахара языка (деструктуризация, `?.`, `??` и т.д.)
+- Удаление реально избыточного/дублирующегося кода (DRY)
+- Замена многословной конструкции на идиоматичную для языка
+
+> «Читаемость» = понятные имена, логическое разделение, идиоматичный код. НЕ = больше комментариев. Большой файл — нормально, но только за счёт логики, а не шума.
+
 ## Naming
 
 Names disclose intent. A reader should understand WHAT without reading the body.
@@ -43,7 +62,10 @@ Code with clear names documents itself. A redundant comment HURTS readability �
 - "For readability" on self-documenting code
 - Section headers (`// === VALIDATION ===`) — extract a function instead
 - Commented-out code (use git)
-- Non-English comments
+- Non-English comments (always English, even in non-English codebases)
+- Essays / long-form prose in comments
+- Architectural decisions in comments — use ADR docs instead
+- References to task tracker / prompt / workflow — transient artifacts that rot quickly
 
 **Allowed ONLY when code cannot explain itself:**
 

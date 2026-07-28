@@ -6,45 +6,62 @@ ALWAYS RESPOND IN RUSSIAN.
 * NEVER PERFORM UNSAFE GIT OPERATIONS
 * NEVER DELETE CODE YOU DON'T UNDERSTAND!
 * NEVER HIDE LINTER ISSUES — FIX THEM OR AT LEAST IGNORE THEM, BUT DON'T HIDE THEM!
-* ALWAYS read the DESIGN.md file when working with UI and styles.
+* ALWAYS PROACTIVELY USE the `qlty` formatting and linting tool after making code changes.
 * Any action that may lead to theoretical data loss must be preceded by creating a backup
 
-Tool usage rules:
+SKILLS rules:
 
-* NEVER guess file paths — use `find_path` (glob) to locate files before reading/editing them. No exceptions.
 * ALWAYS PROACTIVELY USE SKILLS.
 * ALWAYS use SKILLS if there are relevant ones for the task. This is VERY important.
-* ALWAYS use relevant MCPs to solve the task. This is VERY important.
 * ALWAYS invoke ALL relevant SKILLS. Don't limit yourself to just one if you see other relevant skills. This is VERY important.
-* ALWAYS use uv/uvx/uv tool instead of pip for installing packages and python for running scripts.
 
-Code rules:
+## uwuwu-cli
 
-* Don't write tests for the sake of writing tests.
-* When working with git (commit, comments, etc.) ALWAYS use ENGLISH.
-* Never write code without types, like `any`, `unsafe`, etc.
-* Never write comments unless they are needed.
-* ALWAYS PROACTIVELY USE the `qlty` formatting and linting tool after making code changes.
+uwuwu-cli — это cli утилита для **база знаний-инструкций** (howto, gotchas, конфиги, credentials, топология, задачи, таск-трекинг). 
 
-## wiki
+ALWAYS search in the wiki: call `uwuwu-cli wiki search/grep/get` with a descriptive query to find relevant experience articles.
 
-Wiki — это **база знаний-инструкций** (howto, gotchas, конфиги, credentials, топология). 
+When you learn something new or find outdated info, create a change request via `uwuwu-cli wiki request`. 
 
-ALWAYS search in the wiki: call `wiki_search` with a descriptive query to find relevant experience articles (howto, gotchas, configs).
+Wiki - это знаний, не привязанные к конкретным проектам.
 
-When you learn something new or find outdated info, create a change request via `wiki_request` (create/update/delete). 
+`uwuwu-cli projects` — список всех проектов с полным README. Используй чтобы понять в каких проектах ты работаешь.
 
-Вики - это знаний, не привязанные к конкретным проектам.
+`uwuwu-cli access search/grep/get` — поиск и чтение access-документов проекта (credentials, topology, stands).
 
-## projects
+`uwuwu-cli task` - личный таск-трекер. При начале работы найди с какой задачей ты работаешь.
 
-- `projects` — список всех проектов с полным README. Используй чтобы понять в каких проектах ты работаешь.
-- `access_search`, `access_grep`, `access_get` — поиск и чтение access-документов проекта (credentials, topology, stands).
+Ты можешь заводить задачи — для задач, рождённых **в чате с пользователем**, которы ранее не было заведены в трекер.
 
-## tasks
+По окончанию работы обязательно дописывай worklog к задаче.
 
-Личный таск-трекер. При начале работы найди с какой задачей ты работаешь.
+## Серверы и долгие процессы
 
-**Агент может заводить задачи через `task_create`** — но только для задач, рождённых **в чате с пользователем**, которы ранее не было заведены в трекер.
+Серверы, dev-серверы, вотчеры и любые долгие процессы — запускай тулом `bg_start`, а не `bash`, иначе сессия заблокируется.
 
-Агент читает задачи и **дописывает worklog** по завершению работы.
+## Уточнение требований
+
+ПЕРЕД работой проанализируй задачу. Если хоть что-то непонятно — ОСТАНОВИСЬ и уточни:
+
+- Нужен ответ юзера (на любой фазе) → верни маркер `NEEDS_CLARIFICATION` с конкретными вопросами
+- Технический тупик (упал инструмент, не могу прочитать файл и т.п.) → верни маркер `BLOCKED`
+
+Не догадывайся — лучше потратить время на уточнение, чем сделать неправильно. 
+Если задачу можно интерпретировать по-разному — спроси, какая интерпретация верна.
+
+> **Эффект накопления:** ИИ-агенты реализуют размытые требования буквально или изобретательно интерпретируют их — и делают это в 10 раз быстрее людей. 
+> Неправильный код становится шаблоном для будущих генераций: каждая реализованная «наугад» функция множит технический долг.
+
+## Не борись с ошибками
+
+Если столкнулся с одной и той же ошибкой ДВАЖДЫ — ОСТАНОВИСЬ.
+
+Не пытайся «продавить» решение подбором вариантов — это мотание туда-сюда, которое тратит контекст и время без результата.
+
+**Порядок действий:**
+
+1. Первая ошибка → попробуй исправить, это нормально
+2. Та же ошибка снова → НЕМЕДЛЕННО ОСТАНОВИСЬ и верни `BLOCKED`:
+    - Полный текст ошибки
+    - Что уже пробовал
+    - Гипотеза причины
