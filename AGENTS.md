@@ -21,7 +21,7 @@ uwuwu-cli — это cli утилита для **база знаний-инст�
 
 ALWAYS search in the wiki: call `uwuwu-cli wiki search/grep/get` with a descriptive query to find relevant experience articles.
 
-When you learn something new or find outdated info, create a change request via `uwuwu-cli wiki request`.
+When you learn something new or find outdated info, create a change request via `uwuwu-cli request create <create|update|delete> <experience-path> --reason "..." --content "..."` (target path is experience/-relative, e.g. `cli/open-codereview-delegation.md`). Other `request` subcommands: `list`, `get`, `delete`.
 
 Wiki - это знаний, не привязанные к конкретным проектам.
 

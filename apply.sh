@@ -10,6 +10,9 @@ rm -rf ~/.config/opencode/tools
 cp -r "$SCRIPT_DIR/skills" ~/.agents/skills
 cp "$SCRIPT_DIR/AGENTS.md" ~/.agents/AGENTS.md
 
+mkdir -p ~/.opencodereview
+cp -r "$SCRIPT_DIR/opencodereview/." ~/.opencodereview/
+
 cp -r "$SCRIPT_DIR/agent" ~/.config/opencode/agent
 cp -r "$SCRIPT_DIR/tools" ~/.config/opencode/tools
 
