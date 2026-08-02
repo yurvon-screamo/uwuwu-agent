@@ -32,7 +32,14 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-const WIKI_ROOT: &str = "D:/uwuwu/wiki";
+
+pub fn wiki_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("WIKI_ROOT") {
+        PathBuf::from(dir)
+    } else {
+        uwuwu_data_dir()
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "uwuwu-cli")]
@@ -75,12 +82,6 @@ enum Commands {
         #[arg(long, help = "Preview without writing")]
         dry_run: bool,
     },
-}
-
-pub fn wiki_root() -> PathBuf {
-    std::env::var("WIKI_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(WIKI_ROOT))
 }
 
 pub fn uwuwu_data_dir() -> PathBuf {
