@@ -1,0 +1,36 @@
+[package]
+name = "uwuwu-cli"
+version = "0.5.0"
+edition = "2021"
+description = "CLI for uwuwu/wiki: semantic search over experience, task tracker (with priority/deadline/designed meta + assets), access docs, projects listing"
+
+[[bin]]
+name = "uwuwu-cli"
+path = "src/main.rs"
+
+[lib]
+name = "uwuwu_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+surrealdb = { version = "3", features = ["kv-surrealkv"] }
+anyhow = "1"
+comfy-table = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.23"
+
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+debug = "line-tables-only"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "4"
