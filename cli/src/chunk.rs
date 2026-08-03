@@ -29,7 +29,22 @@ fn parse_deadline(value: &str) -> Option<String> {
     if v.is_empty() {
         return None;
     }
-    crate::task_search::parse_date(v).ok()
+    parse_date(v).ok()
+}
+
+fn parse_date(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(|x| x.is_ascii_digit())
+        && b[5..7].iter().all(|x| x.is_ascii_digit())
+        && b[8..10].iter().all(|x| x.is_ascii_digit());
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err(format!("invalid date format: {s}, expected YYYY-MM-DD"))
+    }
 }
 
 fn parse_designed(value: &str) -> Option<bool> {

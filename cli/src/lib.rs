@@ -2,7 +2,6 @@ pub mod access;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
-pub mod enrich;
 pub mod file_io;
 pub mod get;
 pub mod grep;
@@ -12,21 +11,8 @@ pub mod projects;
 pub mod request;
 pub mod request_util;
 pub mod search;
-pub mod task;
-pub mod task_asset;
-pub mod task_clone;
-pub mod task_create;
-pub mod task_edit;
-pub mod task_get;
-pub mod task_grep;
-pub mod task_list;
-pub mod task_list_render;
-pub mod task_query;
-pub mod task_search;
-pub mod task_set_status;
 pub mod time_util;
 pub mod wiki;
-pub mod worklog;
 
 use std::path::PathBuf;
 
@@ -44,7 +30,7 @@ pub fn wiki_root() -> PathBuf {
 #[derive(Parser)]
 #[command(name = "uwuwu-cli")]
 #[command(
-    about = "CLI for uwuwu/wiki: semantic search over experience, task tracker, access docs, projects listing"
+    about = "CLI for uwuwu/wiki: semantic search over experience, access docs, projects listing"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,11 +46,6 @@ enum Commands {
     },
     /// List all projects with their README content.
     Projects,
-    /// Personal task tracker (project-scoped).
-    Task {
-        #[command(subcommand)]
-        command: task::TaskSub,
-    },
     /// Access docs per project (credentials, stands, topology).
     Access {
         #[command(subcommand)]
@@ -74,13 +55,6 @@ enum Commands {
     Request {
         #[command(subcommand)]
         command: request::RequestSub,
-    },
-    /// Enrich markdown files with title + description via a local Ollama model.
-    Enrich {
-        #[arg(help = "File or directory to enrich")]
-        path: String,
-        #[arg(long, help = "Preview without writing")]
-        dry_run: bool,
     },
 }
 
@@ -124,12 +98,8 @@ pub async fn run() -> anyhow::Result<()> {
     match cli.command {
         Commands::Wiki { command } => wiki::handle(command, &root, &cache_path()).await?,
         Commands::Projects => projects::handle_projects(&root)?,
-        Commands::Task { command } => task::handle(command, &root, &cache_path()).await?,
         Commands::Access { command } => access::handle(command, &root, &cache_path()).await?,
         Commands::Request { command } => request::handle(command, &requests_dir())?,
-        Commands::Enrich { path, dry_run } => {
-            enrich::run(&PathBuf::from(path), dry_run).await?;
-        }
     }
 
     Ok(())
