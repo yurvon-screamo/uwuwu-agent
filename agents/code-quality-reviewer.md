@@ -2,8 +2,6 @@
 description: >-
   Ревью кода, планов реализации и соблюдения стандартов качества.
 
-  Использует Open Code Review (OCR) в Delegation Mode для сбора reviewable-файлов и per-language правил (если установлен CLI `ocr`); при отсутствии/сбое OCR — fallback на прямой `git diff` без per-language правил.
-
   Параметры:
   - review_type: "full" | "partial" | "plan"
     - full (по умолчанию): Ревью всех изменений

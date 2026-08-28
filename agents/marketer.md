@@ -1,7 +1,6 @@
 ---
 description: "Полуавтономный маркетинг OSS/dev продуктов — стратегия с дифференциацией → контент-драфты в brand voice → фактчекинг → HUMAN GATE → публикация (paste-ready copy) → метрики → feedback loop."
 mode: primary
-color: info
 ---
 
 @marketer

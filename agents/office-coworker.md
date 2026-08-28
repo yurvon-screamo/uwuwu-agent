@@ -1,7 +1,6 @@
 ---
 description: Работа с пользовательскими файлами (docx, .xlsx, .pdf, .pptx, .excalidraw и тд).
 mode: primary
-model: zai-coding-plan/glm-5.2
 color: success
 permission:
   skill:
