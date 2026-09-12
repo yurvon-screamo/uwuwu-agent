@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 
 use crate::cache::{Cache, ChunkRecord};
 use crate::chunk::{read_meta, read_task_meta, split_chunks};
@@ -22,8 +22,8 @@ fn acquire_db_lock(cache_path: &Path) -> Result<std::fs::File> {
     let mut warned = false;
     loop {
         match f.try_lock_exclusive() {
-            Ok(()) => return Ok(f),
-            Err(_) => {
+            Ok(true) => return Ok(f),
+            Ok(false) | Err(_) => {
                 if !warned {
                     eprintln!("  другой uwuwu-cli search держит индекс — ждём (до 120с)…");
                     warned = true;
@@ -63,55 +63,6 @@ pub async fn search(
     search_with_filter(query, doc_type, wiki_root, cache_path, top_k, None).await
 }
 
-pub async fn reindex_file(exp_relpath: &str, wiki_root: &Path, cache_path: &Path) -> Result<()> {
-    let full_path = wiki_root.join("experience").join(exp_relpath);
-    if !full_path.exists() {
-        anyhow::bail!("file not found: {}", full_path.display());
-    }
-
-    let cache_key = format!("experience/{exp_relpath}");
-    let mtime = file_mtime(&full_path);
-    let chunks = split_chunks(&full_path, wiki_root);
-    if chunks.is_empty() {
-        anyhow::bail!("no chunks produced for {cache_key} (empty body?)");
-    }
-
-    let _db_lock = acquire_db_lock(cache_path)?;
-    let cache = Cache::open(cache_path).await?;
-    cache.delete_file(&cache_key).await?;
-
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let previews: Vec<String> = chunks
-        .iter()
-        .map(|c| {
-            c.text
-                .chars()
-                .take(200)
-                .collect::<String>()
-                .replace('\n', " ")
-        })
-        .collect();
-
-    const BATCH: usize = 20;
-    let mut idx = 0i64;
-    for batch in texts.chunks(BATCH) {
-        let embeddings = embed::batch_embed(MODEL, batch).await?;
-        for emb in embeddings {
-            let preview = &previews[idx as usize];
-            let rec = ChunkRecord {
-                filepath: cache_key.clone(),
-                chunk_index: idx,
-                mtime,
-                embedding: emb.clone(),
-                preview: preview.clone(),
-            };
-            cache.put_chunk(&rec).await?;
-            idx += 1;
-        }
-    }
-
-    Ok(())
-}
 
 pub async fn search_with_filter(
     query: &str,

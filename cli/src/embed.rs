@@ -2,6 +2,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const OLLAMA_URL: &str = "http://localhost:11434";
+const HTTP_TIMEOUT_SECS: u64 = 300;
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .expect("reqwest client build")
+}
 
 #[derive(Serialize)]
 struct EmbedRequest<'a, T> {
@@ -22,7 +30,7 @@ pub async fn embed(model: &str, text: &str) -> Result<Vec<f32>> {
         keep_alive: "30m",
     };
 
-    let resp: EmbedResponse = reqwest::Client::new()
+    let resp: EmbedResponse = client()
         .post(format!("{}/api/embed", OLLAMA_URL))
         .json(&req)
         .send()
@@ -53,7 +61,7 @@ pub async fn batch_embed(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>>
         keep_alive: "30m",
     };
 
-    let resp: EmbedResponse = reqwest::Client::new()
+    let resp: EmbedResponse = client()
         .post(format!("{}/api/embed", OLLAMA_URL))
         .json(&req)
         .send()
