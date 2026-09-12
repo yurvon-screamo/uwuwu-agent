@@ -42,10 +42,25 @@ struct Cli {
 enum Commands {
     /// List all projects with their README content.
     Projects,
-    /// Manage change requests in .requests/ (create/list/get/delete).
+    /// Manage change requests in .requests/. Bare call with text/--stdin
+    /// creates a request (facts-style); subcommands: list/get/delete.
     Request {
         #[command(subcommand)]
-        command: request::RequestSub,
+        command: Option<request::RequestSub>,
+        /// Request body text (quick create; multiline → --stdin)
+        #[arg(
+            help = "Request body text (quick create). Note: a text starting with \
+                    'list'/'get'/'delete' is parsed as a subcommand — use --stdin."
+        )]
+        text: Vec<String>,
+        #[arg(long, help = "Read the request body from stdin")]
+        stdin: bool,
+        #[arg(long, value_parser = ["create", "update", "delete"], default_value = "create")]
+        action: String,
+        #[arg(long, help = "Target experience/-relative path (required for quick create)")]
+        target: Option<String>,
+        #[arg(long, help = "Reason for this request (required for quick create)")]
+        reason: Option<String>,
     },
     /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access).
     Read {
@@ -170,7 +185,27 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Commands::Sofa { id } => wiki::sofa_post(&id).await?,
         Commands::Projects => projects::handle_projects(&root)?,
-        Commands::Request { command } => request::handle(command, &requests_dir())?,
+        Commands::Request { command, text, stdin, action, target, reason } => {
+            let quick = if command.is_none() && (!text.is_empty() || stdin) {
+                let (target, reason) = (target.as_deref(), reason.as_deref());
+                if target.is_none() || reason.is_none() {
+                    anyhow::bail!(
+                        "быстрое создание заявки требует --target <path> и --reason \"...\" \
+                         (текст — аргументом или --stdin); очередь: uwuwu-cli request"
+                    );
+                }
+                Some(request::QuickCreate {
+                    text: text.iter().map(|s| s.as_str()).collect(),
+                    stdin,
+                    action: &action,
+                    target: target.unwrap(),
+                    reason: reason.unwrap(),
+                })
+            } else {
+                None
+            };
+            request::handle(command, quick, &requests_dir())?
+        }
         Commands::Search { query, top, facts, access, sofa, threshold } => {
             if !(0.0..=1.0).contains(&threshold) {                anyhow::bail!("--threshold должен быть в 0..1, получено: {threshold}");
             }

@@ -11,22 +11,6 @@ pub use crate::request_util::RequestMeta;
 
 #[derive(Subcommand)]
 pub enum RequestSub {
-    /// Create a change request in .requests/ (staged proposal).
-    Create {
-        #[arg(value_parser = REQUEST_ACTIONS, help = "Action: create, update, or delete")]
-        action: String,
-        #[arg(help = "Target experience/-relative path, e.g. databases/redis.md")]
-        target: String,
-        #[arg(
-            long,
-            allow_hyphen_values = true,
-            default_value = "",
-            help = "Article content (create/update)"
-        )]
-        content: String,
-        #[arg(long, help = "Reason for this request")]
-        reason: String,
-    },
     /// List pending change requests.
     List,
     /// Read a request's full content.
@@ -41,18 +25,23 @@ pub enum RequestSub {
     },
 }
 
-pub fn handle(command: RequestSub, requests_dir: &Path) -> Result<()> {
+/// Параметры быстрого создания заявки (топ-режим `uwuwu-cli request "…" `):
+/// текст позиционным аргументом или --stdin — симметрия с `uwuwu-cli facts`.
+pub struct QuickCreate<'a> {
+    pub text: Vec<&'a str>,
+    pub stdin: bool,
+    pub action: &'a str,
+    pub target: &'a str,
+    pub reason: &'a str,
+}
+
+pub fn handle(
+    command: Option<RequestSub>,
+    quick: Option<QuickCreate<'_>>,
+    requests_dir: &Path,
+) -> Result<()> {
     match command {
-        RequestSub::Create {
-            action,
-            target,
-            content,
-            reason,
-        } => {
-            let path = create_request(&action, &target, &content, &reason, requests_dir)?;
-            println!("Request saved: {}", path.display());
-        }
-        RequestSub::List => {
+        Some(RequestSub::List) => {
             let entries = list_requests(requests_dir)?;
             if entries.is_empty() {
                 println!("No requests.");
@@ -64,13 +53,38 @@ pub fn handle(command: RequestSub, requests_dir: &Path) -> Result<()> {
             }
             println!("\n{} request(s)", entries.len());
         }
-        RequestSub::Get { id } => {
+        Some(RequestSub::Get { id }) => {
             let content = get_request(&id, requests_dir)?;
             println!("{content}");
         }
-        RequestSub::Delete { id } => {
+        Some(RequestSub::Delete { id }) => {
             delete_request(&id, requests_dir)?;
             println!("Request discarded: {id}");
+        }
+        None if quick.is_none() => {
+            // голый `uwuwu-cli request` → list (дефолт-просмотр очереди)
+            let entries = list_requests(requests_dir)?;
+            if entries.is_empty() {
+                println!("No requests.");
+                return Ok(());
+            }
+            for e in &entries {
+                println!("{}  [{}] {} — {}", e.created, e.action, e.target, e.reason);
+                println!("    id: {}", e.id);
+            }
+            println!("\n{} request(s)", entries.len());
+        }
+        None => {
+            let q = quick.expect("quick create args");
+            let content = if q.stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                q.text.join(" ")
+            };
+            let path = create_request(q.action, q.target, &content, q.reason, requests_dir)?;
+            println!("Request saved: {}", path.display());
         }
     }
     Ok(())
