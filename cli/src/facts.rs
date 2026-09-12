@@ -705,6 +705,7 @@ fn git_commit(message: &str) -> Result<()> {
     if !commit.status.success()
         && !out.contains("nothing to commit")
         && !out.contains("nothing added to commit")
+        && !out.contains("no changes added to commit")
     {
         eprintln!("warn: git commit failed: {out}");
     }
