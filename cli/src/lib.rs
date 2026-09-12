@@ -201,6 +201,12 @@ pub async fn run() -> anyhow::Result<()> {
                     target: target.unwrap(),
                     reason: reason.unwrap(),
                 })
+            } else if command.is_none() && (target.is_some() || reason.is_some()) {
+                // интент создания (create-флаги) без тела — молчаливый list был бы сюрпризом
+                anyhow::bail!(
+                    "указаны --target/--reason без тела заявки: передайте текст аргументом \
+                     или --stdin; просмотр очереди — без флагов"
+                );
             } else {
                 None
             };

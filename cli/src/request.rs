@@ -75,6 +75,8 @@ pub fn handle(
             println!("\n{} request(s)", entries.len());
         }
         None => {
+            // Инвариант: None-ветка без quick недостижима (lib.rs направляет
+            // голый вызов в list-ветку выше); quick строится при тексте/stdin.
             let q = quick.expect("quick create args");
             let content = if q.stdin {
                 let mut buf = String::new();
