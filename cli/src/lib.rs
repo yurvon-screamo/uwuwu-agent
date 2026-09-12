@@ -2,6 +2,7 @@ pub mod access;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
+pub mod facts;
 pub mod file_io;
 pub mod get;
 pub mod grep;
@@ -11,6 +12,7 @@ pub mod projects;
 pub mod request;
 pub mod request_util;
 pub mod search;
+pub mod sofa;
 pub mod time_util;
 pub mod wiki;
 
@@ -56,6 +58,26 @@ enum Commands {
         #[command(subcommand)]
         command: request::RequestSub,
     },
+    /// Factize raw text: extraction → sanitize → full dedup → facts/ + git.
+    /// Single engine for manual input and the python orchestrator.
+    /// Trivial-threshold (1000 chars) applies ONLY to --stdin (session digests);
+    /// a manual text argument is intentional input and skips the threshold.
+    Facts {
+        /// Read the fact source text from stdin instead of <text...>
+        #[arg(long)]
+        stdin: bool,
+        /// Source label (default: manual/<today>); orchestrator passes opencode/<date>/<sid>
+        #[arg(long)]
+        source: Option<String>,
+        /// Fact date YYYY-MM-DD (default: today; sets facts/YYYY-MM dir + updated)
+        #[arg(long)]
+        date: Option<String>,
+        /// Only flush a scoped git commit for facts/sidecar files (no LLM)
+        #[arg(long)]
+        sync: bool,
+        /// Raw text to factize (ignored with --stdin/--sync)
+        text: Vec<String>,
+    },
 }
 
 pub fn uwuwu_data_dir() -> PathBuf {
@@ -66,6 +88,23 @@ pub fn uwuwu_data_dir() -> PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .expect("USERPROFILE or HOME environment variable must be set");
     PathBuf::from(home).join(".uwuwu")
+}
+
+/// Локальная дата дня (как в audit/python: локальные даты, не UTC).
+fn local_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// YYYY-MM-DD или паника слайсинга месяца каталога — валидируем на входе.
+fn valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            match i {
+                4 | 7 => *c == b'-',
+                _ => c.is_ascii_digit(),
+            }
+        })
 }
 
 pub fn cache_path() -> PathBuf {
@@ -100,6 +139,21 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Projects => projects::handle_projects(&root)?,
         Commands::Access { command } => access::handle(command, &root, &cache_path()).await?,
         Commands::Request { command } => request::handle(command, &requests_dir())?,
+        Commands::Facts { stdin, source, date, sync, text } => {
+            let today = local_today();
+            let date = date.unwrap_or_else(|| today.clone());
+            if !valid_date(&date) {
+                anyhow::bail!("--date должен быть YYYY-MM-DD, получено: '{date}'");
+            }
+            if sync {
+                facts::sync_git("facts: sidecar sync")?;
+            } else {
+                let text = facts::read_text(stdin, &text)?;
+                let source = source.unwrap_or_else(|| format!("manual/{today}"));
+                let out = facts::run_facts(&text, &source, &date, stdin).await;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+        }
     }
 
     Ok(())

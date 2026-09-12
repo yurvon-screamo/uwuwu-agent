@@ -10,6 +10,7 @@ use crate::embed;
 const MODEL: &str = "qwen3-embedding:0.6b";
 const THRESHOLD: f32 = 0.3;
 
+#[derive(Clone)]
 pub struct SearchResult {
     pub filepath: String,
     pub score: f32,
@@ -87,16 +88,45 @@ pub async fn search_with_filter(
     top_k: usize,
     filter: Option<&(dyn Fn(&Path) -> bool + Sync)>,
 ) -> Result<Vec<SearchResult>> {
-    let base_dir = wiki_root.join(doc_type);
-    if !base_dir.exists() {
-        eprintln!("Error: directory '{}' not found", base_dir.display());
+    search_multi_with_filter(query, &[doc_type], wiki_root, cache_path, top_k, filter).await
+}
+
+/// Поиск по НЕСКОЛЬКИМ doc_type одним проходом (один Cache::open — SurrealDB
+/// однопроцессовый: второй open в том же процессе ловит LOCK).
+/// filepath результата содержит префикс doc_type (experience/…, facts/…).
+pub async fn search_multi_with_filter(
+    query: &str,
+    doc_types: &[&str],
+    wiki_root: &Path,
+    cache_path: &Path,
+    top_k: usize,
+    filter: Option<&(dyn Fn(&Path) -> bool + Sync)>,
+) -> Result<Vec<SearchResult>> {
+    let base_dirs: Vec<std::path::PathBuf> = doc_types
+        .iter()
+        .map(|d| wiki_root.join(d))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter(|d| {
+            if d.exists() {
+                true
+            } else {
+                eprintln!("Error: directory '{}' not found", d.display());
+                false
+            }
+        })
+        .collect();
+    if base_dirs.is_empty() {
         return Ok(vec![]);
     }
 
     let cache = Cache::open(cache_path).await?;
     let cached = cache.load_all().await?;
 
-    let all_md_files = collect_md_files(&base_dir);
+    let all_md_files: Vec<PathBuf> = base_dirs
+        .iter()
+        .flat_map(|d| collect_md_files(d))
+        .collect();
     let md_files = match filter {
         Some(f) => all_md_files.into_iter().filter(|p| f(p)).collect(),
         None => all_md_files,

@@ -2,7 +2,7 @@
 name = "uwuwu-cli"
 version = "0.5.0"
 edition = "2021"
-description = "CLI for uwuwu/wiki: semantic search over experience, task tracker (with priority/deadline/designed meta + assets), access docs, projects listing"
+description = "CLI for uwuwu/wiki: semantic search over experience, access docs, projects listing"
 
 [[bin]]
 name = "uwuwu-cli"
@@ -15,9 +15,14 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
+regex = "1"
+unicode-normalization = "0.1"
+filetime = "0.2"
 surrealdb = { version = "3", features = ["kv-surrealkv"] }
 anyhow = "1"
 comfy-table = "7"
