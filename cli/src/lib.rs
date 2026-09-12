@@ -58,6 +58,30 @@ enum Commands {
         #[command(subcommand)]
         command: request::RequestSub,
     },
+    /// Unified search: experience + facts + access docs + SOFA in one call.
+    Search {
+        #[arg(help = "Search query")]
+        query: String,
+        #[arg(long, default_value = "5", help = "experience/ articles per result (0 = off)")]
+        top: usize,
+        #[arg(long, default_value = "10", help = "facts per result (0 = off)")]
+        facts: usize,
+        #[arg(long, default_value = "5", help = "projects/*/access docs per result (0 = off)")]
+        access: usize,
+        #[arg(long, default_value = "5", help = "SOFA public results (0 = off)")]
+        sofa: usize,
+        #[arg(long, default_value = "0.3", help = "min score threshold")]
+        threshold: f32,
+    },
+    /// Grep: substring search over experience/ + facts/ + access docs.
+    Grep {
+        #[arg(help = "Literal substring pattern")]
+        pattern: String,
+        #[arg(long, help = "skip facts/")]
+        no_facts: bool,
+        #[arg(long, help = "skip projects/*/access")]
+        no_access: bool,
+    },
     /// Factize raw text: extraction → sanitize → full dedup → facts/ + git.
     /// Single engine for manual input and the python orchestrator.
     /// Trivial-threshold (1000 chars) applies ONLY to --stdin (session digests);
@@ -98,13 +122,17 @@ fn local_today() -> String {
 /// YYYY-MM-DD или паника слайсинга месяца каталога — валидируем на входе.
 fn valid_date(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| {
-            match i {
-                4 | 7 => *c == b'-',
-                _ => c.is_ascii_digit(),
-            }
-        })
+    if b.len() != 10 {
+        return false;
+    }
+    if !b.iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        _ => c.is_ascii_digit(),
+    }) {
+        return false;
+    }
+    let num = |from: usize, to: usize| -> u32 { s[from..to].parse().unwrap_or(0) };
+    (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
 }
 
 pub fn cache_path() -> PathBuf {
@@ -139,6 +167,15 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Projects => projects::handle_projects(&root)?,
         Commands::Access { command } => access::handle(command, &root, &cache_path()).await?,
         Commands::Request { command } => request::handle(command, &requests_dir())?,
+        Commands::Search { query, top, facts, access, sofa, threshold } => {
+            let opts = wiki::UnifiedOpts {
+                top, facts, access, sofa, threshold,
+            };
+            wiki::unified_search(&query, &opts, &root, &cache_path()).await?
+        }
+        Commands::Grep { pattern, no_facts, no_access } => {
+            wiki::unified_grep(&pattern, !no_facts, !no_access, &root)?
+        }
         Commands::Facts { stdin, source, date, sync, text } => {
             let today = local_today();
             let date = date.unwrap_or_else(|| today.clone());

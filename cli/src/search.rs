@@ -88,12 +88,13 @@ pub async fn search_with_filter(
     top_k: usize,
     filter: Option<&(dyn Fn(&Path) -> bool + Sync)>,
 ) -> Result<Vec<SearchResult>> {
-    search_multi_with_filter(query, &[doc_type], wiki_root, cache_path, top_k, filter).await
+    search_multi_with_filter(query, &[doc_type], wiki_root, cache_path, top_k, filter, None).await
 }
 
 /// Поиск по НЕСКОЛЬКИМ doc_type одним проходом (один Cache::open — SurrealDB
 /// однопроцессовый: второй open в том же процессе ловит LOCK).
 /// filepath результата содержит префикс doc_type (experience/…, facts/…).
+/// threshold: минимальный score (None → константный THRESHOLD).
 pub async fn search_multi_with_filter(
     query: &str,
     doc_types: &[&str],
@@ -101,6 +102,7 @@ pub async fn search_multi_with_filter(
     cache_path: &Path,
     top_k: usize,
     filter: Option<&(dyn Fn(&Path) -> bool + Sync)>,
+    threshold: Option<f32>,
 ) -> Result<Vec<SearchResult>> {
     let base_dirs: Vec<std::path::PathBuf> = doc_types
         .iter()
@@ -220,7 +222,7 @@ pub async fn search_multi_with_filter(
 
     let mut results: Vec<(String, f32)> = article_scores
         .into_iter()
-        .filter(|(_, score)| *score >= THRESHOLD)
+        .filter(|(_, score)| *score >= threshold.unwrap_or(THRESHOLD))
         .collect();
 
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

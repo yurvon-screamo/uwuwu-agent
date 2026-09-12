@@ -55,6 +55,64 @@ pub async fn handle(command: WikiSub, wiki_root: &Path, cache_path: &Path) -> Re
     }
 }
 
+/// Единый grep: experience + facts (+ access), префиксы источников в выдаче.
+pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_root: &Path) -> Result<()> {
+    let mut matches = grep::grep(pattern, "experience", wiki_root)?;
+    let mut facts_count = 0;
+    if with_facts {
+        let m = grep::grep(pattern, "facts", wiki_root)?;
+        facts_count = m.len();
+        matches.extend(m);
+    }
+    if with_access {
+        // grep по всем projects/*/access: collect вручную (grep::grep берёт один doc_type)
+        for proj_dir in sorted_project_dirs(wiki_root) {
+            matches.extend(grep::grep(pattern, &proj_dir, wiki_root)?);
+        }
+    }
+    if matches.is_empty() {
+        println!("  No matches found.");
+        return Ok(());
+    }
+    let mut last_file = String::new();
+    for m in &matches {
+        let mut slug = path::slug_from_relpath(&m.filepath);
+        if m.filepath.starts_with("facts/") {
+            slug = format!("facts/{slug}");
+        }
+        if slug != last_file {
+            println!("\n{slug}");
+            last_file = slug;
+        }
+        println!("  {}: {}", m.line_number, m.line);
+    }
+    println!(
+        "\n{} matches in {} files (facts: {facts_count})",
+        matches.len(),
+        matches
+            .iter()
+            .map(|m| &m.filepath)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
+    Ok(())
+}
+
+fn sorted_project_dirs(wiki_root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(wiki_root.join("projects")) {
+        for e in entries.flatten() {
+            if e.path().join("access").is_dir() {
+                if let Some(name) = e.file_name().to_str() {
+                    out.push(format!("projects/{name}/access"));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 async fn handle_search(
     query: &str,
     top: usize,
@@ -76,6 +134,7 @@ async fn handle_search(
         wiki_root,
         cache_path,
         top.max(3),
+        None,
         None,
     );
     let (multi_res, sofa_res) = match sofa_fut {
@@ -116,7 +175,120 @@ async fn handle_search(
     Ok(())
 }
 
-/// Факты (авто-извлечённые из сессий): слаг с префиксом facts/, лимит 3 в выдаче.
+/// Опции единого поиска (топ-команды `uwuwu-cli search`).
+pub struct UnifiedOpts {
+    pub top: usize,        // experience
+    pub facts: usize,      // facts (0 = off)
+    pub access: usize,     // projects/*/access (0 = off)
+    pub sofa: usize,       // SOFA (0 = off)
+    pub threshold: f32,
+}
+
+/// Единый поиск: experience + facts + access одним индексным проходом
+/// (один Cache::open), SOFA параллельно. Рендер по секциям.
+pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, cache_path: &Path) -> Result<()> {
+    println!("Searching for: \"{query}\"\n");
+    let sofa_fut = if opts.sofa > 0 {
+        Some(sofa::search(query, opts.sofa))
+    } else {
+        None
+    };
+    let local_fut = search::search_multi_with_filter(
+        query,
+        &["experience", "facts", "projects"],
+        wiki_root,
+        cache_path,
+        opts.top.max(opts.facts).max(opts.access),
+        Some(&|p: &Path| {
+            let s = p.to_string_lossy();
+            s.contains("experience/") || s.contains("facts/")
+                || (s.contains("projects/") && s.contains("/access/"))
+        }),
+        Some(opts.threshold),
+    );
+    let (local_res, sofa_res) = match sofa_fut {
+        Some(fut) => {
+            let (a, c) = tokio::join!(local_fut, fut);
+            (a, Some(c))
+        }
+        None => (local_fut.await, None),
+    };
+    let all = local_res?;
+    let facts: Vec<search::SearchResult> = all
+        .iter()
+        .filter(|r| r.filepath.starts_with("facts/"))
+        .take(opts.facts)
+        .cloned()
+        .collect();
+    let access: Vec<search::SearchResult> = all
+        .iter()
+        .filter(|r| r.filepath.starts_with("projects/"))
+        .take(opts.access)
+        .cloned()
+        .collect();
+    let results: Vec<search::SearchResult> = all
+        .into_iter()
+        .filter(|r| !r.filepath.starts_with("facts/") && !r.filepath.starts_with("projects/"))
+        .take(opts.top)
+        .collect();
+
+    if results.is_empty() {
+        println!("  No experience results (threshold {:.2}).", opts.threshold);
+    } else {
+        print_local_table(&results);
+    }
+    print_facts_table(&facts);
+    print_access_table(&access);
+    let sofa_hits = sofa_res
+        .map(|r| {
+            r.unwrap_or_else(|err| {
+                eprintln!("warning: SOFA недоступен ({err:#}); локальные результаты ниже");
+                Vec::new()
+            })
+        })
+        .unwrap_or_default();
+    print_sofa_block(&sofa_hits, opts.sofa == 0);
+    Ok(())
+}
+
+/// Access-доки (projects/*/access): слаг = project/файл для access get.
+fn print_access_table(access: &[search::SearchResult]) {
+    if access.is_empty() {
+        return;
+    }
+    println!("\nAccess (per-project docs, credentials/topology):");
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Score"),
+            Cell::new("Title").add_attribute(Attribute::Bold),
+            Cell::new("Description"),
+            Cell::new("Doc").fg(Color::Yellow),
+        ]);
+    if !std::io::stdout().is_terminal() {
+        table.set_width(180);
+    }
+    for r in access {
+        // projects/<proj>/access/<file>.md → <proj>/<file-stem>
+        let parts: Vec<&str> = r.filepath.split('/').collect();
+        let doc = if parts.len() >= 3 {
+            format!("{}/{}", parts[1], parts.last().unwrap_or(&"").trim_end_matches(".md"))
+        } else {
+            path::slug_from_relpath(&r.filepath)
+        };
+        table.add_row(vec![
+            Cell::new(format!("{:.3}", r.score)).fg(Color::DarkGrey),
+            Cell::new(r.title.as_deref().unwrap_or("(no title)")),
+            Cell::new(r.description.as_deref().unwrap_or("")),
+            Cell::new(doc).fg(Color::Yellow),
+        ]);
+    }
+    println!("{table}");
+    println!("  чтение: uwuwu-cli access get <project> <slug>");
+}
+/// Факты (авто-извлечённые из сессий): слаг с префиксом facts/.
 fn print_facts_table(facts: &[search::SearchResult]) {
     if facts.is_empty() {
         return;
