@@ -59,7 +59,7 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
     }
     println!(
         "\n{} matches in {} files (facts: {facts_count}, access: {access_count}; \
-         access читать: uwuwu-cli access get <project> <slug>)",
+         access читать: uwuwu-cli read <project>/<slug>)",
         matches.len(),
         matches
             .iter()

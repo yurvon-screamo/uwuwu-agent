@@ -1,11 +1,43 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use fs2::FileExt;
 
 use crate::cache::{Cache, ChunkRecord};
 use crate::chunk::{read_meta, read_task_meta, split_chunks};
 use crate::embed;
+
+/// Advisory-лок на время работы с embeddings.db: SurrealDB однопроцессовый
+/// (LOCK-файл), параллельный Cache::open падает. Сериализуем процессы CLI:
+/// ждём до 120с (прогрев индекса бывает долгим), потом внятная ошибка.
+fn acquire_db_lock(cache_path: &Path) -> Result<std::fs::File> {
+    let lock_path = cache_path.with_extension("db.searchlock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut warned = false;
+    loop {
+        match f.try_lock_exclusive() {
+            Ok(()) => return Ok(f),
+            Err(_) => {
+                if !warned {
+                    eprintln!("  другой uwuwu-cli search держит индекс — ждём (до 120с)…");
+                    warned = true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(anyhow!(
+                        "индекс занят другим uwuwu-cli search дольше 120с — повторите позже"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
 
 const MODEL: &str = "qwen3-embedding:0.6b";
 const THRESHOLD: f32 = 0.3;
@@ -44,6 +76,7 @@ pub async fn reindex_file(exp_relpath: &str, wiki_root: &Path, cache_path: &Path
         anyhow::bail!("no chunks produced for {cache_key} (empty body?)");
     }
 
+    let _db_lock = acquire_db_lock(cache_path)?;
     let cache = Cache::open(cache_path).await?;
     cache.delete_file(&cache_key).await?;
 
@@ -122,6 +155,7 @@ pub async fn search_multi_with_filter(
         return Ok(vec![]);
     }
 
+    let _db_lock = acquire_db_lock(cache_path)?;
     let cache = Cache::open(cache_path).await?;
     let cached = cache.load_all().await?;
 
