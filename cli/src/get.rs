@@ -7,6 +7,18 @@ pub fn get_document_by_slug(slug: &str, wiki_root: &Path) -> Result<String> {
     // facts/YYYY-MM/): слаг глобально уникален (гарантирует facts_extract).
     let (matches, is_fact): (Vec<PathBuf>, bool) = if let Some(rest) = slug.strip_prefix("facts/") {
         (resolve_by_slug(rest, &wiki_root.join("facts"))?, true)
+    } else if let Some((project, rest)) = slug.split_once('/') {
+        // <project>/<slug>: access-документ (топ-секция поиска печатает proj/slug)
+        let base = wiki_root.join("projects").join(project).join("access");
+        let mut m = vec![base.join(format!("{rest}.md"))];
+        m.retain(|p| p.is_file());
+        if m.is_empty() {
+            m = resolve_by_slug(rest, &base)?;
+        }
+        if m.is_empty() {
+            anyhow::bail!("access doc not found: '{slug}' (точный поиск: uwuwu-cli grep)");
+        }
+        (m, false)
     } else {
         // fail-closed: без канонизации wiki_root защита не ослабляется молча
         let root = wiki_root

@@ -1,4 +1,3 @@
-pub mod access;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
@@ -41,22 +40,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Semantic search/grep/get over experience/ (NOT access — use `access` subgroup).
-    Wiki {
-        #[command(subcommand)]
-        command: wiki::WikiSub,
-    },
     /// List all projects with their README content.
     Projects,
-    /// Access docs per project (credentials, stands, topology).
-    Access {
-        #[command(subcommand)]
-        command: access::AccessSub,
-    },
     /// Manage change requests in .requests/ (create/list/get/delete).
     Request {
         #[command(subcommand)]
         command: request::RequestSub,
+    },
+    /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access).
+    Read {
+        #[arg(help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access doc)")]
+        slug: String,
+    },
+    /// Read a full Stack Overflow for Agents post by id (from the Public block).
+    Sofa {
+        #[arg(help = "Post UUID from the Public (SOFA) block of search")]
+        id: String,
     },
     /// Unified search: experience + facts + access docs + SOFA in one call.
     /// Per-source flags are LIMITS from one shared ranked pool (sections can
@@ -165,9 +164,12 @@ pub async fn run() -> anyhow::Result<()> {
     let root = wiki_root();
 
     match cli.command {
-        Commands::Wiki { command } => wiki::handle(command, &root, &cache_path()).await?,
+        Commands::Read { slug } => {
+            let content = get::get_document_by_slug(&slug, &root)?;
+            println!("{content}");
+        }
+        Commands::Sofa { id } => wiki::sofa_post(&id).await?,
         Commands::Projects => projects::handle_projects(&root)?,
-        Commands::Access { command } => access::handle(command, &root, &cache_path()).await?,
         Commands::Request { command } => request::handle(command, &requests_dir())?,
         Commands::Search { query, top, facts, access, sofa, threshold } => {
             if !(0.0..=1.0).contains(&threshold) {                anyhow::bail!("--threshold должен быть в 0..1, получено: {threshold}");

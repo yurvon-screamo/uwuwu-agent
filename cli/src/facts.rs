@@ -122,11 +122,18 @@ pub fn sync_git(message: &str) -> Result<()> {
 
 fn valid_date(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| match i {
-            4 | 7 => *c == b'-',
-            _ => c.is_ascii_digit(),
-        })
+    if b.len() != 10 {
+        return false;
+    }
+    if !b.iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        _ => c.is_ascii_digit(),
+    }) {
+        return false;
+    }
+    // реальность: месяц 01-12, день 01-31 (мусорных каталогов не плодим)
+    let num = |from: usize, to: usize| -> u32 { s[from..to].parse().unwrap_or(0) };
+    (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
 }
 
 fn today() -> String {
