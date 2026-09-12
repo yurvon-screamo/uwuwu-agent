@@ -62,15 +62,10 @@ enum Commands {
         #[arg(long, help = "Reason for this request (required for quick create)")]
         reason: Option<String>,
     },
-    /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access).
+    /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access) | sofa/<post_id>.
     Read {
-        #[arg(help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access doc)")]
+        #[arg(help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access) | 'sofa/<post_id>'")]
         slug: String,
-    },
-    /// Read a full Stack Overflow for Agents post by id (from the Public block).
-    Sofa {
-        #[arg(help = "Post UUID from the Public (SOFA) block of search")]
-        id: String,
     },
     /// Unified search: experience + facts + access docs + SOFA in one call.
     /// Per-source flags are LIMITS from one shared ranked pool (sections can
@@ -180,10 +175,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Read { slug } => {
-            let content = get::get_document_by_slug(&slug, &root)?;
-            println!("{content}");
+            if let Some(post_id) = slug.strip_prefix("sofa/") {
+                wiki::sofa_post(post_id).await?
+            } else {
+                let content = get::get_document_by_slug(&slug, &root)?;
+                println!("{content}");
+            }
         }
-        Commands::Sofa { id } => wiki::sofa_post(&id).await?,
         Commands::Projects => projects::handle_projects(&root)?,
         Commands::Request { command, text, stdin, action, target, reason } => {
             let quick = if command.is_none() && (!text.is_empty() || stdin) {
