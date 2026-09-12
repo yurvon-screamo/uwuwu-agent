@@ -13,7 +13,7 @@ use crate::sofa;
 
 #[derive(Subcommand)]
 pub enum WikiSub {
-    /// Semantic search over experience/ (+ публичный SOFA-блок, --no-sofa для офлайн).
+    /// Semantic search over experience/ (DEPRECATED: use top-level `search`).
     Search {
         #[arg(help = "Search query")]
         query: String,
@@ -75,10 +75,18 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
         return Ok(());
     }
     let mut last_file = String::new();
+    let mut access_count = 0usize;
     for m in &matches {
         let mut slug = path::slug_from_relpath(&m.filepath);
         if m.filepath.starts_with("facts/") {
             slug = format!("facts/{slug}");
+        } else if m.filepath.starts_with("projects/") {
+            // неймспейс access-хитов: <project>/<slug> (симметрия с unified_search)
+            let parts: Vec<&str> = m.filepath.split('/').collect();
+            if parts.len() >= 3 {
+                slug = format!("{}/{}", parts[1], parts.last().unwrap_or(&"").trim_end_matches(".md"));
+                access_count += 1;
+            }
         }
         if slug != last_file {
             println!("\n{slug}");
@@ -87,7 +95,8 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
         println!("  {}: {}", m.line_number, m.line);
     }
     println!(
-        "\n{} matches in {} files (facts: {facts_count})",
+        "\n{} matches in {} files (facts: {facts_count}, access: {access_count}; \
+         access читать: uwuwu-cli access get <project> <slug>)",
         matches.len(),
         matches
             .iter()
@@ -193,19 +202,33 @@ pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, c
     } else {
         None
     };
-    let local_fut = search::search_multi_with_filter(
-        query,
-        &["experience", "facts", "projects"],
-        wiki_root,
-        cache_path,
-        opts.top.max(opts.facts).max(opts.access),
-        Some(&|p: &Path| {
-            let s = p.to_string_lossy();
-            s.contains("experience/") || s.contains("facts/")
-                || (s.contains("projects/") && s.contains("/access/"))
-        }),
-        Some(opts.threshold),
-    );
+    let any_local = opts.top + opts.facts + opts.access > 0;
+    let local_fut = async {
+        if !any_local {
+            return Ok(Vec::new());
+        }
+        search::search_multi_with_filter(
+            query,
+            &["experience", "facts", "projects"],
+            wiki_root,
+            cache_path,
+            opts.top.max(opts.facts).max(opts.access),
+            Some(&|p: &Path| {
+                // компоненты пути, не substring: experience/ | facts/ | projects/*/access/**
+                let rel = p.strip_prefix(wiki_root).unwrap_or(p);
+                let comps: Vec<_> = rel.components().collect();
+                if comps.is_empty() {
+                    return false;
+                }
+                let first = comps[0].as_os_str().to_string_lossy();
+                (first == "experience" || first == "facts")
+                    || (first == "projects"
+                        && comps.iter().any(|c| c.as_os_str() == "access"))
+            }),
+            Some(opts.threshold),
+        )
+        .await
+    };
     let (local_res, sofa_res) = match sofa_fut {
         Some(fut) => {
             let (a, c) = tokio::join!(local_fut, fut);
@@ -233,7 +256,9 @@ pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, c
         .collect();
 
     if results.is_empty() {
-        println!("  No experience results (threshold {:.2}).", opts.threshold);
+        if opts.top > 0 {
+            println!("  No experience results (threshold {:.2}).", opts.threshold);
+        }
     } else {
         print_local_table(&results);
     }

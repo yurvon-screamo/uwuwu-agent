@@ -59,18 +59,20 @@ enum Commands {
         command: request::RequestSub,
     },
     /// Unified search: experience + facts + access docs + SOFA in one call.
+    /// Per-source flags are LIMITS from one shared ranked pool (sections can
+    /// crowd each other out at low thresholds), not guaranteed quotas.
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(long, default_value = "5", help = "experience/ articles per result (0 = off)")]
+        #[arg(long, default_value = "5", help = "experience/ articles limit (0 = off)")]
         top: usize,
-        #[arg(long, default_value = "10", help = "facts per result (0 = off)")]
+        #[arg(long, default_value = "10", help = "facts/ limit (0 = off)")]
         facts: usize,
-        #[arg(long, default_value = "5", help = "projects/*/access docs per result (0 = off)")]
+        #[arg(long, default_value = "5", help = "projects/*/access limit (0 = off)")]
         access: usize,
-        #[arg(long, default_value = "5", help = "SOFA public results (0 = off)")]
+        #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
         sofa: usize,
-        #[arg(long, default_value = "0.3", help = "min score threshold")]
+        #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
         threshold: f32,
     },
     /// Grep: substring search over experience/ + facts/ + access docs.
@@ -168,6 +170,8 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Access { command } => access::handle(command, &root, &cache_path()).await?,
         Commands::Request { command } => request::handle(command, &requests_dir())?,
         Commands::Search { query, top, facts, access, sofa, threshold } => {
+            if !(0.0..=1.0).contains(&threshold) {                anyhow::bail!("--threshold должен быть в 0..1, получено: {threshold}");
+            }
             let opts = wiki::UnifiedOpts {
                 top, facts, access, sofa, threshold,
             };
