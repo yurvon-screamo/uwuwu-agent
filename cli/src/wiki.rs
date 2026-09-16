@@ -13,12 +13,12 @@ use crate::sofa;
 pub struct UnifiedOpts {
     pub top: usize,        // experience
     pub facts: usize,      // facts (0 = off)
-    pub access: usize,     // projects/*/access (0 = off)
+    pub access: usize,     // projects/** docs: runbooks+creds (0 = off)
     pub sofa: usize,       // SOFA (0 = off)
     pub threshold: f32,
 }
 
-/// Единый grep: experience + facts (+ access), префиксы источников в выдаче.
+/// Единый grep: experience + facts (+ projects), префиксы источников в выдаче.
 pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_root: &Path) -> Result<()> {
     let mut matches = grep::grep(pattern, "experience", wiki_root)?;
     let mut facts_count = 0;
@@ -28,7 +28,7 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
         matches.extend(m);
     }
     if with_access {
-        // grep по всем projects/*/access: collect вручную (grep::grep берёт один doc_type)
+        // grep по всем projects/: collect вручную (grep::grep берёт один doc_type)
         for proj_dir in sorted_project_dirs(wiki_root) {
             matches.extend(grep::grep(pattern, &proj_dir, wiki_root)?);
         }
@@ -44,7 +44,7 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
         if m.filepath.starts_with("facts/") {
             slug = format!("facts/{slug}");
         } else if m.filepath.starts_with("projects/") {
-            // неймспейс access-хитов: <project>/<slug> (симметрия с unified_search)
+            // неймспейс проектных хитов: <project>/<slug> (симметрия с unified_search)
             let parts: Vec<&str> = m.filepath.split('/').collect();
             if parts.len() >= 3 {
                 slug = format!("{}/{}", parts[1], parts.last().unwrap_or(&"").trim_end_matches(".md"));
@@ -58,8 +58,8 @@ pub fn unified_grep(pattern: &str, with_facts: bool, with_access: bool, wiki_roo
         println!("  {}: {}", m.line_number, m.line);
     }
     println!(
-        "\n{} matches in {} files (facts: {facts_count}, access: {access_count}; \
-         access читать: uwuwu-cli read <project>/<slug>)",
+        "\n{} matches in {} files (facts: {facts_count}, projects: {access_count}; \
+         читать: uwuwu-cli read <project>/<slug>)",
         matches.len(),
         matches
             .iter()
@@ -74,9 +74,9 @@ fn sorted_project_dirs(wiki_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(wiki_root.join("projects")) {
         for e in entries.flatten() {
-            if e.path().join("access").is_dir() {
+            if e.path().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
-                    out.push(format!("projects/{name}/access"));
+                    out.push(format!("projects/{name}"));
                 }
             }
         }
@@ -104,16 +104,19 @@ pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, c
             cache_path,
             opts.top.max(opts.facts).max(opts.access),
             Some(&|p: &Path| {
-                // компоненты пути, не substring: experience/ | facts/ | projects/*/access/**
+                // компоненты пути, не substring: experience/ | facts/ | projects/** (без README)
                 let rel = p.strip_prefix(wiki_root).unwrap_or(p);
                 let comps: Vec<_> = rel.components().collect();
                 if comps.is_empty() {
                     return false;
                 }
                 let first = comps[0].as_os_str().to_string_lossy();
+                let is_readme = comps
+                    .last()
+                    .map(|c| c.as_os_str() == "README.md")
+                    .unwrap_or(false);
                 (first == "experience" || first == "facts")
-                    || (first == "projects"
-                        && comps.iter().any(|c| c.as_os_str() == "access"))
+                    || (first == "projects" && !is_readme)
             }),
             Some(opts.threshold),
         )
@@ -166,12 +169,12 @@ pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, c
     Ok(())
 }
 
-/// Access-доки (projects/*/access): слаг = project/файл для access get.
+/// Проектные доки (runbook/креды/топология): слаг = project/файл для read.
 fn print_access_table(access: &[search::SearchResult]) {
     if access.is_empty() {
         return;
     }
-    println!("\nAccess (per-project docs, credentials/topology):");
+    println!("\nProjects (runbooks, topology, credentials):");
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)

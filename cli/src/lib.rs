@@ -77,7 +77,7 @@ enum Commands {
         top: usize,
         #[arg(long, default_value = "10", help = "facts/ limit (0 = off)")]
         facts: usize,
-        #[arg(long, default_value = "5", help = "projects/*/access limit (0 = off)")]
+        #[arg(long, default_value = "5", help = "projects/** docs: runbooks+creds limit (0 = off)")]
         access: usize,
         #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
         sofa: usize,
@@ -90,7 +90,7 @@ enum Commands {
         pattern: String,
         #[arg(long, help = "skip facts/")]
         no_facts: bool,
-        #[arg(long, help = "skip projects/*/access")]
+        #[arg(long, help = "skip projects/ docs")]
         no_access: bool,
     },
     /// Factize raw text: extraction → sanitize → full dedup → facts/ + git.
