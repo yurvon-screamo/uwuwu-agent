@@ -109,6 +109,7 @@ pub async fn search_multi_with_filter(
     let _db_lock = acquire_db_lock(cache_path)?;
     let cache = Cache::open(cache_path).await?;
     let cached = cache.load_all().await?;
+    let cached_keys: Vec<String> = cached.keys().cloned().collect();
 
     let all_md_files: Vec<PathBuf> = base_dirs
         .iter()
@@ -187,6 +188,29 @@ pub async fn search_multi_with_filter(
             "  embedded {need_embed} chunks across {} articles",
             md_files.len()
         );
+    }
+
+    // GC: записи кэша по исчезнувшим путям (миграции/переименования каталогов)
+    // не удаляются сами — чистим в пределах текущих doc_type-префиксов.
+    {
+        let known: std::collections::HashSet<String> = md_files
+            .iter()
+            .map(|f| {
+                f.strip_prefix(wiki_root)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        let stale_keys = cached_keys.clone();
+        for stale in stale_keys {
+            let in_scope = doc_types
+                .iter()
+                .any(|d| stale.starts_with(&format!("{d}/")));
+            if in_scope && !known.contains(&stale) {
+                let _ = cache.delete_file(&stale).await;
+            }
+        }
     }
 
     let q_emb = embed::embed(MODEL, query).await?;

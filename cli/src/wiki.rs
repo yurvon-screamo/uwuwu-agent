@@ -111,9 +111,11 @@ pub async fn unified_search(query: &str, opts: &UnifiedOpts, wiki_root: &Path, c
                     return false;
                 }
                 let first = comps[0].as_os_str().to_string_lossy();
+                // README любой глубины исключён из индекса (витрина — через
+                // `uwuwu-cli projects`; case-insensitive на случай readme.md)
                 let is_readme = comps
                     .last()
-                    .map(|c| c.as_os_str() == "README.md")
+                    .map(|c| c.as_os_str().eq_ignore_ascii_case("README.md"))
                     .unwrap_or(false);
                 (first == "experience" || first == "facts")
                     || (first == "projects" && !is_readme)
