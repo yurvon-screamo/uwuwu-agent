@@ -45,3 +45,10 @@ dxdiag_output.txt
 
 # NLI model cache (large binary)
 data/nli_cache/
+
+# runtime-хвосты (не для git)
+plugins/node_modules/
+plugins/.backup-*/
+*.bak*
+state.json
+hub.json

@@ -88,6 +88,18 @@ All secrets are read from **environment variables** — nothing is committed:
 ### Generic Tools (1)
 `tool-likec4`
 
+## 🔗 Установка (симлинки)
+
+Конфиги опенкода живут **в этом репозитории**; `~/.config/opencode`, `~/.agents` и `~/.claude/skills` — симлинки сюда. Правишь файл в репе — работает сразу; рассинхрон невозможен.
+
+```bash
+git clone https://github.com/yurvon-screamo/uwuwu-agent.git
+cd uwuwu-agent
+./link.sh        # бэкапит существующие конфиги (*.pre-link-*) и создаёт симлинки
+```
+
+Что линкуется: `opencode.json`, `cli.json`, `AGENTS.md`, `agents/`, `plugins/`, `skills/` (→ `~/.agents/skills` и `~/.claude/skills`). Секреты и стейт (`hub.json`, `state.json`, бэкапы) в репу не попадают — см. `.gitignore`.
+
 ## ⚡ Quick Start
 
 ```bash

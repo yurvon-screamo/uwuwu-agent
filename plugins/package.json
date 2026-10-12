@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@opencode-ai/plugin": "^0.0.0-beta-17728"
+    "@opencode/plugin": "0.0.0-beta-19425",
+    "psinetron-opencode-visualizer": "^1.0.17"
   }
 }
