@@ -190,14 +190,15 @@ export default Plugin.define({
             // 3) судья закончил — отдаём вердикт ожидающему
             if (type === "session.execution.succeeded") {
               const wait = judgeWait.get(d.sessionID)
-              if (!wait) continue
-              judgeWait.delete(d.sessionID)
-              wait.resolve(lastMessageText(wait.segments))
-              continue
-            }
+              if (wait) {
+                judgeWait.delete(d.sessionID)
+                wait.resolve(lastMessageText(wait.segments))
+                continue
+              }
 
-            // 4) сессия ушла в idle — прогон завершён целиком: время суда
-            if (type === "session.idle") {
+              // 4) прогон цели завершён (session.idle в V2 не приходит) — время
+              // суда. Пинок судьи запускает следующий прогон, его успех снова
+              // триггерит судью — цикл до DONE/IMPOSSIBLE/стопа.
               const sid: string = d.sessionID
               const goal = goals.get(sid)
               if (!goal || judging.has(sid)) continue
