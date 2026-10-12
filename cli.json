@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "theme": {
+    "name": "vesper"
+  },
+  "session": {
+    "sidebar": "hide",
+    "terminal": true,
+    "scrollbar": true,
+    "permissions": "autoaccept",
+    "new_location": "inherit"
+  },
+  "animations": true,
+  "tabs": {
+    "enabled": true,
+    "scope": "global",
+    "layout": "vertical",
+    "indicators": "status"
+  },
+  "diffs": {
+    "wrap": "word"
+  },
+  "debug": {
+    "devtools": false
+  }
+}

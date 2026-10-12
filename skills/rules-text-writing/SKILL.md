@@ -1,321 +1,133 @@
----
-name: rules-text-writing
-description: How to write documentation/articles/text. A guide to creating quality, "human" content.
----
+## 1. PRINCIPLES OF HUMAN WRITING
 
-## PRINCIPLES OF HUMAN WRITING
+### ✅ Do this
 
-### ✅ Do this:
+| Principle         | Description                                      | Example                                      |
+|-------------------|--------------------------------------------------|----------------------------------------------|
+| **Specificity**   | Precise facts, figures, dates, names             | "Founded on March 15, 1989 in Barcelona"     |
+| **Neutrality**    | No value judgments or advertising                | "The company produces 500 units per month"   |
+| **Naturalness**   | Write like a human for a human                   | Vary sentence length                         |
+| **Context**       | Explain significance of facts, not just list them| "This reduced processing time by 30%"        |
+| **Proportionality**| Don't exaggerate ordinary things                | Don't call a routine event a "turning point" |
 
-| Principle | Description | Example |
-|-----------|-------------|---------|
-| **Specificity** | Use precise facts, figures, dates, names | "Founded on March 15, 1989 in Barcelona" |
-| **Neutrality** | Avoid value judgments and advertising | "The company produces 500 units per month" |
-| **Naturalness** | Write like a human for a human | Vary sentence length |
-| **Context** | Explain the significance of facts, not just list them | "This reduced processing time by 30%" |
-| **Proportionality** | Don't exaggerate the significance of ordinary things | Don't call a routine event a "turning point" |
+### ❌ Don't do this
 
-### ❌ Don't do this:
+| Mistake                | Why it's bad                          | How to fix                  |
+|------------------------|---------------------------------------|-----------------------------|
+| Regression to the mean | Smoothing facts into generic phrases  | Bring back specific details |
+| Inflating significance | Every event is "historic"             | Assess real importance      |
+| Formulaic conclusions  | "Despite successes, there are problems..." | Avoid formulaic endings |
+| Vague attribution      | "Experts say" without names           | Name specific sources       |
 
-| Mistake | Why it's bad | How to fix |
-|---------|--------------|------------|
-| Regression to the mean | Smoothing facts into generic phrases | Bring back specific details |
-| Inflating significance | Every event is "historic" | Assess real importance |
-| Formulaic conclusions | "Despite successes, there are problems..." | Avoid formulaic conclusions |
-| Vague attribution | "Experts say" without names | Name specific sources |
+## 2. CONTROLLED LANGUAGE STANDARDS
 
----
+Use these when writing technical documentation, instructions, tool descriptions, error messages or agent-facing text.
 
-## FORBIDDEN AI-STYLE PATTERNS
+### 2.1 English → ASD-STE100 (Simplified Technical English)
 
-### Excessive emphasis on significance
+Apply when the text is in English and must be unambiguous (especially for non-native readers or other agents).
 
-**Signal phrases:**
+**Core rules (Issue 9 style):**
+- Procedures: max **20 words** per sentence, one instruction per sentence.
+- Descriptions: max **25 words** per sentence.
+- Active voice. Imperative for instructions.
+- One meaning per word. Prefer the simplest approved word.
+- No stacked auxiliaries (should/would/may/might), no -ing clauses that hide the subject.
+- No long noun clusters.
+- Consistent terminology: one name for one thing.
+
+**Trigger phrases for the model:**
+- "Rewrite in ASD-STE100"
+- "Apply STE100"
+- "Make this STE-compliant"
+- "80% of the way to ASD-STE100" (softer version)
+
+**Recommended open skills:**
+- `npx skills add danyuchn/asd-ste100-skill`
+- `npx skills add nuelcyoung/asd-ste100`
+- `npx skills add blagoySimandov/asd-ste100-writer-skill`
+
+### 2.2 Russian → УТР (Упрощённый технический русский)
+
+Apply when the text is in Russian and must be clear and unambiguous (especially technical documentation).
+
+**Core rules (based on ГОСТ Р 58049-2017 §8.2 + УТР-1 practice):**
+- Max **20 words** per sentence.
+- One thought / one command per sentence.
+- Active voice (действительный залог).
+- Instructions: imperative mood, **plural** form, verb first.
+- Direct word order (подлежащее не в конце, прямое дополнение не перед сказуемым).
+- No participles/деепричастия if they complicate the sentence.
+- No passive voice in instructions.
+- One term — one meaning. No synonyms for the same concept.
+- Max three nouns in a row.
+- Short paragraphs (one topic).
+
+**Trigger phrases for the model:**
+- "Пиши по правилам УТР"
+- "Перепиши в упрощённом техническом русском"
+- "Примени УТР (ГОСТ Р 58049-2017)"
+- "Приблизься к УТР на 80–90 %"
+
+**Example prompt block:**
 ```
-• "is a testament/reminder of..."
-• "plays a vital/key/crucial role"
-• "underscores its importance/significance"
-• "reflects broader trends"
-• "symbolizes its lasting/enduring influence"
-• "contributes to..."
-• "sets the stage for..."
-• "marks/shapes a turning point"
-• "leaves an indelible mark"
-• "is deeply rooted in..."
+Пиши строго по правилам Упрощённого технического русского (УТР):
+1. Предложения максимум 20 слов.
+2. Одна мысль / одна команда в предложении.
+3. Действительный залог.
+4. В инструкциях — повелительное наклонение множественного числа, глагол на первом месте.
+5. Прямой порядок слов.
+6. Без причастных и деепричастных оборотов, без страдательного залога.
+7. Один термин — одно значение.
+8. Не больше трёх существительных подряд.
 ```
 
-**❌ AI text example:**
-> "The founding of Idescat in 1989 became **a turning point in the evolution** of regional statistics in Spain, **marking a significant shift** toward statistical independence..."
+## 3. FORBIDDEN AI-STYLE PATTERNS
 
-**✅ How to fix:**
-> "The Statistical Institute of Catalonia (Idescat) was officially established in 1989 in Barcelona. The institute is responsible for collecting and publishing statistical data for Catalonia."
+### Excessive significance
+Avoid: "is a testament/reminder of…", "plays a vital/key/crucial role", "underscores its importance", "marks a turning point", "leaves an indelible mark".
 
----
-
-### Advertising and promo language
-
-**Signal phrases:**
-```
-• "boasts a"
-• "vibrant"
-• "rich heritage"
-• "profound"
-• "enhancing"
-• "showcasing"
-• "exemplifies"
-• "commitment to"
-• "natural beauty"
-• "nestled in the heart of"
-• "groundbreaking"
-• "renowned"
-• "diverse array"
-```
-
-**❌ AI text example:**
-> "**Nestled in the heart of** the stunning Gondar region, Alamata Raya Kobo **is a vibrant town with a rich cultural heritage**... **offering visitors** a fascinating glimpse into the diverse fabric of Ethiopia."
-
-**✅ How to fix:**
-> "Alamata is a town in the Amhara region, Ethiopia. Administrative center of the South Wollo zone. Population is approximately 95,000 (2023)."
-
----
+### Advertising language
+Avoid: "boasts a", "vibrant", "rich heritage", "nestled in the heart of", "groundbreaking", "renowned", "diverse array".
 
 ### Superficial analysis
-
-**Pattern:** Participles (-ing) at the end of sentences with vague conclusions
-
-**❌ AI text example:**
-> "The population of Douera was approximately 56,998 inhabitants, **creating a bustling community** within its boundaries... **further cementing its significance** as a dynamic hub of activity and culture... **offering a diverse spectrum** of experiences against the backdrop of Algeria's stunning natural beauty."
-
-**✅ How to fix:**
-> "According to the April 2008 census, the population of Douera was 56,998. The town is located in the north-central part of the country, near the capital Algiers."
-
----
+Avoid ending sentences with vague -ing clauses that add no information.
 
 ### Vague attribution
+Avoid: "Experts say…", "Observers note…", "Industry reports show…". Name the actual source.
 
-**Signal phrases:**
-```
-• "Industry reports show..."
-• "Observers note..."
-• "Experts argue..."
-• "Some critics argue..."
-• "Several sources/publications..."
-• "Researchers and conservationists are interested..."
-```
+### Formulaic "challenges + future" endings
+Avoid the classic AI sandwich: "Despite X, faces challenges… Despite these challenges, continues to… Future investments could…"
 
-**❌ AI text example:**
-> "Thanks to its unique characteristics, the Haolai River is of interest to **researchers and conservationists**. **Efforts are underway** to monitor its ecological health..."
-
-**✅ How to fix:**
-> "The Haolai River is being studied as part of the Inner Mongolia ecosystem monitoring program (Institute of Ecology, Chinese Academy of Sciences, 2021-2024)."
-
----
-
-### Formulaic conclusions about problems and the future
-
-**AI formula:**
-```
-"Despite [positive words], [object] faces challenges..."
-→ listing problems
-→ "Despite these challenges, [object] continues to..."
-→ "Future investments/initiatives could..."
-```
-
-**❌ AI text example:**
-> "**Despite** industrial and residential prosperity, Korattur **faces challenges** typical of urban areas... **Despite these challenges**, Korattur continues to thrive..."
-
-**✅ How to fix:**
-> "Korattur is a neighborhood in Chennai, India. Key industries: textile manufacturing, automotive. Infrastructure issues include traffic congestion and water shortages."
-
----
-
-### Excessive emphasis on media coverage
-
-**Signal phrases:**
-```
-• "independent coverage"
-• "local/regional/national media"
-• "profiled in..."
-• "written by a leading expert"
-• "active social media presence"
-• "mentioned in ABC News coverage"
-```
-
-**❌ AI text example:**
-> "She spoke about AI on CNN and was **profiled in Vogue, Wired, Toronto Star, and other media**. Her views were also **quoted in The New York Times, BBC, Financial Times, and The Hindu**."
-
-**✅ How to fix:**
-> "In 2023, she gave an interview to CNN about AI regulation. Publications about her work appeared in Vogue (March 2023) and Wired (July 2023)."
-
----
-
-## AI-CLICHÉ DICTIONARY
+## 4. AI-CLICHÉ DICTIONARY
 
 ### High risk (avoid always)
+delve, tapestry, testament, pivotal, underscore, showcase, vibrant, landscape (as abstraction), intricate, interplay, fostering, garner, meticulous, enduring, crucial
 
-| Word/Phrase | Why it's a problem | Alternative |
-|-------------|-------------------|-------------|
-| **delve** | Overused by GPT | study, examine |
-| **tapestry** | Cliché metaphor | combination, mix |
-| **testament** | Overly dramatic | shows, demonstrates |
-| **pivotal** | Exaggeration | important, significant |
-| **underscore** | AI marker | note, point out |
-| **showcase** | Promotional tone | show, present |
-| **vibrant** | Empty descriptor | active, developing |
-| **landscape** (as abstraction) | Vague | field, domain, industry |
-| **intricate/intricacies** | Overly complex | complex, detailed |
-| **interplay** | Abstract | interaction, connection |
-| **fostering** | Bureaucratic | development, support |
-| **garner** | Unnatural | get, collect |
-| **meticulous/meticulously** | Exaggeration | detailed, thorough |
-| **enduring** | Overly dramatic | long-lasting, permanent |
-| **crucial** | Overused | important, necessary |
+### Medium risk (use only with concrete metrics)
+enhance, highlight, emphasizing, align with, contributing to, symbolizing, reflecting
 
-### Medium risk (use with caution)
+## 5. STRUCTURAL RECOMMENDATIONS
 
-| Word/Phrase | Limitation context |
-|-------------|-------------------|
-| **enhance** | Only with specific metrics |
-| **highlight** | Not as a filler verb |
-| **emphasizing** | Avoid at the end of sentences |
-| **align with** | Only when there's a real connection |
-| **contributing to** | Only with proven impact |
-| **symbolizing** | Almost never |
-| **reflecting** | Only with a direct connection |
+- Get straight to the facts. No "In this article we explore…".
+- Prefer flexible structure over rigid "History → Significance → Challenges → Future".
+- Sources: specific name + date + title. Put trivial sources in footnotes.
+- Prefer short sentences and concrete numbers over abstract adjectives.
 
-## STRUCTURAL RECOMMENDATIONS
+## 6. FINAL PRINCIPLES
 
-### Headings and introductions
+1. Specificity over grandiosity — numbers beat adjectives.
+2. Names over abstractions — "Prof. Petrov" beats "experts".
+3. Facts over interpretations — what happened, not what it means.
+4. Footnotes over body text for sources.
+5. Controlled language when clarity is critical:
+   - English → ASD-STE100
+   - Russian → УТР
 
-| ❌ AI pattern | ✅ Human approach |
-|--------------|----------------------|
-| "[List name] is a curated compilation..." | Direct definition without self-referencing |
-| "In this article, we explore..." | Get straight to the facts |
-| Defining the heading as an entity | Natural inclusion in context |
+## 7. QUICK CHECK
 
-**❌ Example:**
-> "'List of songs about Mexico' is a curated compilation of musical works that reference Mexico, its culture, geography, or identity as a central theme."
-
-**✅ Example:**
-> "This list includes songs whose lyrics mention Mexico, its culture, or geography."
-
-### Working with sections
-
-**Avoid rigid structure:**
-```
-❌ Typical AI structure:
-1. Introduction
-2. History
-3. Significance and legacy
-4. Challenges
-5. Future prospects
-6. Conclusion
-```
-
-**Prefer flexible structure:**
-```
-✅ Human structure:
-1. Introduction (brief)
-2. Facts on the topic (without grandiosity)
-3. Context (if needed)
-4. Sources (in footnotes, not in the text)
-```
-
-## WORKING WITH SOURCES
-
-### Citation
-
-| ❌ AI pattern | ✅ Human approach |
-|--------------|----------------------|
-| Mentioning sources in text for trivial facts | Footnotes for disputed/important claims |
-| "According to independent coverage..." | Specific reference with date and title |
-| Attributing to sources what they don't say | Accurate quoting or paraphrasing |
-| Source lists in bullet point format | Integration into text with footnotes |
-
-**❌ Example:**
-> "Significance documented in archival school event programs and regional press coverage, including *Mesabi Daily News*, which regularly reviewed performances."
-
-**✅ Example:**
-> "School events were covered in *Mesabi Daily News* during 2018-2022.[1]"
-
-### Attribution of opinions
-
-| ❌ AI pattern | ✅ Human approach |
-|--------------|----------------------|
-| "Experts argue..." | "Prof. Ivanov (2023) writes..." |
-| "Several publications noted..." | List specific publications |
-| "Researchers are interested in..." | Names of institutions and projects |
-| Exaggerating the number of sources | Exact count with names |
-
----
-
-## SPECIAL CASES
-
-### Technical documents
-
-| AI problem | Solution |
-|------------|---------|
-| Over-explaining the obvious | Write for the target audience |
-| Grandiosity about "revolutionary" nature | Facts about features and metrics |
-| Vague "improvements" | Specific % and numbers |
-
-### Biographies
-
-| AI problem | Solution |
-|------------|---------|
-| "Left an indelible mark" | Specific achievements with dates |
-| Lists of media coverage | Key publications with context |
-| "Active social media presence" | Only if relevant to the topic |
-
-### Company/product descriptions
-
-| AI problem | Solution |
-|------------|---------|
-| Promotional tone | Neutral facts |
-| "Commitment to quality" | Certificates, metrics |
-| "Bright future" | Plans with dates and budgets |
-
----
-
-## FINAL PRINCIPLES
-
-### Golden rules:
-
-1. **Specificity over grandiosity** — numbers beat adjectives
-2. **Names over abstractions** — "Prof. Petrov" beats "experts"
-3. **Facts over interpretations** — what happened, not what it means
-4. **Footnotes over body text** — sources in notes, not in the body
-5. **Simplicity over complexity** — short sentences beat convoluted ones
-
-### Remember:
-
-> These patterns are **indicators of a potential problem**, not the problem itself.
-> Don't just "clean up" AI words — understand **why** they appeared and what's behind them.
-> Often behind the AI style lie more serious problems: unverified facts, synthesis without sources,
-> violation of neutrality.
-
-## QUICK AI-MARKER MAP
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  🔴 RED ZONE — Rewrite immediately                         │
-├─────────────────────────────────────────────────────────────┤
-│  delve, tapestry, testament, pivotal, underscore,          │
-│  showcase, vibrant, landscape (abstr.), intricate,         │
-│  interplay, fostering, garner, meticulous, enduring        │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│  🟡 YELLOW ZONE — Check context                            │
-├─────────────────────────────────────────────────────────────┤
-│  enhance, highlight, emphasizing, align with,              │
-│  contributing to, symbolizing, reflecting, crucial         │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│  🟢 GREEN ZONE — Usually safe                              │
-├─────────────────────────────────────────────────────────────┤
-│  Specific facts, figures, dates, names,                   │
-│  direct quotes with sources                                │
-└─────────────────────────────────────────────────────────────┘
-```
+Before publishing:
+- Run through desloper cli.
+- For English technical text — apply ASD-STE100 rules.
+- For Russian technical text — apply УТР rules.
+- Check that no high-risk AI clichés remain.
