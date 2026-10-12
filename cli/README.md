@@ -89,7 +89,6 @@ uwuwu-cli/
     projects.rs          # list projects with README
     access.rs            # access search/grep/get (project-scoped)
     wiki.rs              # WikiSub enum + dispatch
-    file_io.rs           # atomic write + line-ending normalize + path-component validation
     log_filter.rs        # tracing filter (surrealdb silenced to warn)
     time_util.rs         # format_date_now, format_timestamp_now, days_to_ymd
   tests/

@@ -53,26 +53,26 @@ mod tests {
         // No RUST_LOG → own logs at info, rest at warn, both DB crates silenced.
         assert_eq!(
             build("uwuwu_cli=info,warn"),
-            "uwuwu_cli=info,warn,surrealkv=warn,surrealdb=warn"
+            "uwuwu_cli=info,warn,surrealkv=error,surrealdb=error"
         );
     }
 
     #[test]
     fn global_info_silences_db_crate() {
         // The actual user environment: RUST_LOG=INFO globally.
-        assert_eq!(build("info"), "info,surrealkv=warn,surrealdb=warn");
+        assert_eq!(build("info"), "info,surrealkv=error,surrealdb=error");
     }
 
     #[test]
     fn explicit_target_level_kept() {
         // Escape hatch: explicit surrealdb=debug must NOT be re-silenced.
-        assert_eq!(build("surrealdb=debug"), "surrealdb=debug,surrealkv=warn");
+        assert_eq!(build("surrealdb=debug"), "surrealdb=debug,surrealkv=error");
     }
 
     #[test]
     fn bare_target_kept() {
         // RUST_LOG=surrealdb (no level) → leave surrealdb untouched.
-        assert_eq!(build("surrealdb"), "surrealdb,surrealkv=warn");
+        assert_eq!(build("surrealdb"), "surrealdb,surrealkv=error");
     }
 
     #[test]
@@ -87,20 +87,20 @@ mod tests {
     fn mixed_directives() {
         assert_eq!(
             build("uwuwu_cli=debug,surrealdb=trace"),
-            "uwuwu_cli=debug,surrealdb=trace,surrealkv=warn"
+            "uwuwu_cli=debug,surrealdb=trace,surrealkv=error"
         );
     }
 
     #[test]
     fn empty_base_is_tolerated() {
         // Empty RUST_LOG must not produce a malformed filter / panic.
-        assert_eq!(build(""), ",surrealkv=warn,surrealdb=warn");
+        assert_eq!(build(""), ",surrealkv=error,surrealdb=error");
     }
 
     #[test]
     fn no_double_silence_on_repeat() {
         // Idempotent-ish: a crate already mentioned is never duplicated.
-        let out = build("surrealkv=warn,surrealdb=warn");
+        let out = build("surrealkv=error,surrealdb=error");
         assert_eq!(out.matches("surrealkv").count(), 1);
         assert_eq!(out.matches("surrealdb").count(), 1);
     }
