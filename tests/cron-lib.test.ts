@@ -69,6 +69,11 @@ describe("parseSchedule", () => {
   test("конфликт двух полей → null", () => {
     expect(parseSchedule({ in: "20m", every: "5m" }, now)).toBeNull()
   })
+  test("лишние не-временные поля (name/prompt) не мешают — баг E2E", () => {
+    expect(parseSchedule({ every: "2m" } as never, now)).toEqual({ kind: "every", intervalMs: 2 * MIN })
+    const withExtras = { name: "x", prompt: "y", reportPolicy: "z", ...{ every: "2m" } }
+    expect(parseSchedule(withExtras as never, now)).toEqual({ kind: "every", intervalMs: 2 * MIN })
+  })
   test("пусто → null", () => {
     expect(parseSchedule({}, now)).toBeNull()
   })

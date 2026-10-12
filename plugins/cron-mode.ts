@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, readFileSync, renameSync, writeFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import {
@@ -7,37 +7,36 @@ import {
   parseCronFields,
   nextFire,
   renderBrief,
+  describeSchedule,
   compactResult,
+  fmtLocal,
+  peakHoursWarning,
+  validateTaskInput,
   newId,
   type CronTask,
   type Schedule,
 } from "../lib/cron-lib"
 
-// cron-mode — планировщик задач сессий. Интерфейс — файл
-// ~/.config/opencode/cron-tasks.json (формат в skill schedule):
-// агент дописывает задачу write-тулом, плагин исполняет по расписанию.
-//
-//   { "tasks": [ { "id": "a3f2", "name": "…", "sessionID": "ses_…",
-//                  "prompt": "…", "schedule": { "kind": "every", "intervalMs": 7200000 } } ] }
-//
-// schedule: {kind:"once", at:epoch-ms} | {kind:"every", intervalMs≥60000} |
-//           {kind:"cron", expr:"0 9 * * 1-5"} (локальное время).
+// cron-mode — планировщик задач сессий. Интерфейс — типизированные тула:
+//   cron_set    — поставить (одноразово: in/at; постоянно: every/cron)
+//   cron_list   — живые задачи текущей сессии
+//   cron_remove — снять по id
 //
 // При срабатывании в сессию летит БРИФ — самодостаточный промпт с историей
 // прошлого прогона (переживает компакшн). Доставка — session.prompt (queue:
 // агент занят — промпт ждёт). Пропущенный за простой триггер догоняется раз.
 // session.deleted → задачи сессии умирают.
 //
-// Инстансов плагина несколько (по локации) — тикер у каждого, дубль
-// предотвращается lastFiredAt в файле: fire был < пол-интервала назад — скип.
-// Запись файла атомарная (tmp+rename).
+// Задачи хранятся в ctx.storage (переживает рестарты). Инстансов плагина
+// несколько (по локации): тикер у каждого, дубль гасится lastFiredAt в
+// хранилище — чей-то свежий fire виден всем при перечитывании перед fire.
 
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/cron-mode.log")
-const TASKS_FILE = join(homedir(), ".config/opencode/cron-tasks.json")
+const TASKS_KEY = "cron-mode:tasks"
 const TICK_MS = 30_000
 const RESULT_CAP = 500
-const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const MIN_TASK_MS = 60_000
+const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 const log = (message: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${message}\n`) } catch {}
@@ -75,99 +74,37 @@ async function lastAssistantText(sessionID: string): Promise<string> {
   return ""
 }
 
-// ——— файл задач ———
+// ——— хранилище задач (ctx.storage) ———
 
-interface RawTask {
-  id?: unknown
-  name?: unknown
-  sessionID?: unknown
-  prompt?: unknown
-  schedule?: unknown
-  in?: unknown
-  at?: unknown
-  every?: unknown
-  cron?: unknown
-  createdAt?: unknown
-  createdBy?: unknown
-  lastFiredAt?: unknown
-  lastResult?: unknown
-  fireCount?: unknown
+interface Storage {
+  read: () => Promise<CronTask[]>
+  update: (fn: (tasks: CronTask[]) => CronTask[]) => Promise<void>
 }
 
-/** Разбор schedule-объекта из файла: {kind, at|intervalMs|expr}. */
-function parseScheduleObject(s: unknown): Schedule | null {
-  if (typeof s !== "object" || s === null) return null
-  const o = s as { kind?: unknown; at?: unknown; intervalMs?: unknown; expr?: unknown }
-  if (o.kind === "once" && typeof o.at === "number" && Number.isFinite(o.at) && o.at > 0) {
-    return { kind: "once", at: o.at }
+function createStorage(ctx: Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]): Storage {
+  const read = async (): Promise<CronTask[]> => {
+    try {
+      const stored = await ctx.storage.get(TASKS_KEY)
+      const arr: unknown = (stored as { tasks?: unknown } | undefined)?.tasks
+      if (!Array.isArray(arr)) return []
+      const out: CronTask[] = []
+      for (const t of arr as CronTask[]) {
+        if (
+          t && typeof t.id === "string" && typeof t.sessionID === "string" &&
+          typeof t.prompt === "string" && t.schedule &&
+          typeof (t.schedule as Schedule).kind === "string"
+        ) out.push(t)
+      }
+      return out
+    } catch (e) { log(`storage read: ${e}`); return [] }
   }
-  if (o.kind === "every" && typeof o.intervalMs === "number" && Number.isFinite(o.intervalMs) && o.intervalMs >= MIN_TASK_MS) {
-    return { kind: "every", intervalMs: o.intervalMs }
+  const update = async (fn: (tasks: CronTask[]) => CronTask[]): Promise<void> => {
+    try {
+      const snapshot = JSON.parse(JSON.stringify(fn(await read())))
+      await ctx.storage.set(TASKS_KEY, { tasks: snapshot })
+    } catch (e) { log(`storage write: ${e}`) }
   }
-  if (o.kind === "cron" && typeof o.expr === "string" && parseCronFields(o.expr) !== null) {
-    return { kind: "cron", expr: o.expr }
-  }
-  return null
-}
-
-function readTasks(): CronTask[] {
-  let raw: unknown
-  try {
-    raw = JSON.parse(readFileSync(TASKS_FILE, "utf-8"))
-  } catch {
-    return [] // файла нет или битый — тик молча пуст
-  }
-  const arr: unknown = (raw as { tasks?: unknown } | undefined)?.tasks
-  if (!Array.isArray(arr)) return []
-  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined)
-  const tasks: CronTask[] = []
-  let dirty = false
-  const ids = new Set<string>()
-  for (const r of arr as RawTask[]) {
-    if (typeof r !== "object" || r === null) continue
-    if (typeof r.prompt !== "string" || r.prompt.trim().length < 3) continue
-    if (typeof r.sessionID !== "string" || !r.sessionID.startsWith("ses_")) continue
-    let schedule: Schedule | null = parseScheduleObject(r.schedule)
-    if (schedule === null) {
-      schedule = parseSchedule(
-        { in: str(r.in), at: str(r.at), every: str(r.every), cron: str(r.cron) },
-        Date.now(),
-      )
-    }
-    if (schedule === null) continue
-    let id = typeof r.id === "string" ? r.id : ""
-    if (!/^[0-9a-f]{4,8}$/.test(id)) {
-      id = newId((x) => ids.has(x))
-      dirty = true
-    }
-    if (ids.has(id)) continue
-    ids.add(id)
-    const createdAt = typeof r.createdAt === "number" ? r.createdAt : Date.now()
-    if (typeof r.createdAt !== "number") dirty = true
-    tasks.push({
-      id,
-      name: typeof r.name === "string" && r.name.trim() !== "" ? r.name : r.prompt.slice(0, 40),
-      sessionID: r.sessionID,
-      prompt: r.prompt.trim(),
-      schedule,
-      createdAt,
-      createdBy: typeof r.createdBy === "string" ? r.createdBy : "агент",
-      lastFiredAt: typeof r.lastFiredAt === "number" ? r.lastFiredAt : undefined,
-      lastResult: typeof r.lastResult === "string" ? r.lastResult : undefined,
-      fireCount: typeof r.fireCount === "number" ? r.fireCount : 0,
-    })
-  }
-  if (dirty) writeTasks(tasks)
-  return tasks
-}
-
-function writeTasks(tasks: CronTask[]): void {
-  try {
-    mkdirSync(join(TASKS_FILE, ".."), { recursive: true })
-    const tmp = `${TASKS_FILE}.tmp`
-    writeFileSync(tmp, JSON.stringify({ tasks }, null, 2))
-    renameSync(tmp, TASKS_FILE)
-  } catch (e) { log(`write tasks: ${e}`) }
+  return { read, update }
 }
 
 // ——— плагин ———
@@ -175,6 +112,7 @@ function writeTasks(tasks: CronTask[]): void {
 export default Plugin.define({
   id: "cron-mode",
   setup: async (ctx) => {
+    const storage = createStorage(ctx)
     const firing = new Set<string>()
 
     const fire = async (task: CronTask, note = ""): Promise<void> => {
@@ -193,26 +131,24 @@ export default Plugin.define({
     }
 
     const tick = async (): Promise<void> => {
-      const tasks = readTasks()
-      if (tasks.length === 0) return
+      const tasks = await storage.read()
       const now = Date.now()
-      let changed = false
-      for (const task of tasks) {
-        // анти-дубль между инстансами: чей-то свежий fire виден в файле
+      const due = tasks.filter((task) => {
         const halfMs = task.schedule.kind === "every" ? task.schedule.intervalMs / 2 : 30_000
-        if (task.lastFiredAt !== undefined && now - task.lastFiredAt < halfMs) continue
+        if (task.lastFiredAt !== undefined && now - task.lastFiredAt < halfMs) return false // чужой свежий fire
         const next = nextFire(task.schedule, task.lastFiredAt ?? task.createdAt)
-        if (next === null || now < next) continue
-        await fire(task)
-        changed = true
+        return next !== null && now >= next
+      })
+      for (const task of due) await fire(task)
+      if (due.length > 0) {
+        await storage.update((all) => all.map((t) => due.find((d) => d.id === t.id) ?? t))
+        // одноразовые — сняты после исполнения
+        await storage.update((all) => all.filter((t) => t.schedule.kind !== "once" || t.lastFiredAt === undefined))
       }
-      const alive = tasks.filter((t) => t.schedule.kind !== "once" || t.lastFiredAt === undefined)
-      if (changed) writeTasks(alive)
     }
 
-    // catch-up при старте: просроченные за простой — один раз
+    // тикер + catch-up: у каждого инстанса, дубль гасится lastFiredAt
     void tick().catch((e: unknown) => log(`tick: ${e}`))
-
     const timer = setInterval(() => {
       void tick().catch((e: unknown) => log(`tick: ${e}`))
     }, TICK_MS)
@@ -225,11 +161,10 @@ export default Plugin.define({
           for await (const event of ctx.event.subscribe({ signal: eventsAbort.signal })) {
             if (event.type !== "session.deleted") continue
             const sid = event.data.sessionID
-            const tasks = readTasks()
-            const alive = tasks.filter((t) => t.sessionID !== sid)
-            if (alive.length === tasks.length) continue
-            writeTasks(alive)
-            log(`session ${sid} удалена — снято задач: ${tasks.length - alive.length}`)
+            const before = (await storage.read()).length
+            await storage.update((all) => all.filter((t) => t.sessionID !== sid))
+            const after = (await storage.read()).length
+            if (after !== before) log(`session ${sid} удалена — снято задач: ${before - after}`)
           }
         } catch (e) {
           log(`event stream: ${e} — переподписка через 5с`)
@@ -239,8 +174,114 @@ export default Plugin.define({
       }
     })()
 
-    log(`cron-mode: on (файл: ${TASKS_FILE})`)
+    // ——— тула (namespace+codemode — как в офиц. доках V2) ———
 
+    await ctx.tool.transform((editor) => {
+      editor.namespace({
+        name: "cron",
+        description: "Планировщик задач: одноразовые напоминания и периодические проверки сессии",
+      })
+      editor.add({
+        name: "cron_set",
+        description:
+          "Поставить задачу по расписанию в ТЕКУЩУЮ сессию. РОВНО ОДИН параметр времени: in | at | every | cron. " +
+          "prompt — САМОДОСТАТОЧНАЯ инструкция (что делать, что с результатом): при срабатывании исполняется " +
+          "как отдельный бриф, без памяти этой беседы. Задача живёт, пока жива сессия. Время — локальное (Осака/JST).",
+        input: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Короткое имя задачи" },
+            prompt: { type: "string", description: "Самодостаточная инструкция: что делать, что с результатом, критерий снятия" },
+            in: { type: "string", description: "Однократно через интервал: «20m», «90s», «2h»" },
+            at: { type: "string", description: "Однократно в локальное время: «15:00»" },
+            every: { type: "string", description: "Постоянно интервалом: «30m», «2h», «1d» (мин. 1m)" },
+            cron: { type: "string", description: "Постоянно по cron (5 полей, локальное время): «0 9 * * 1-5»" },
+            reportPolicy: { type: "string", description: "Что делать с результатом: «>80% — алерт, иначе тихо»" },
+          },
+          required: ["prompt"],
+          additionalProperties: false,
+        },
+        options: { namespace: "cron", codemode: true },
+        async execute(rawInput, toolCtx) {
+          log(`cron_set input: ${JSON.stringify(rawInput)?.slice(0, 300)}`)
+          const input = rawInput as { name?: string; prompt?: string; reportPolicy?: string } & Parameters<typeof parseSchedule>[0]
+          const valid = validateTaskInput(input)
+          if (!valid.ok) return { content: `❌ ${valid.error}` }
+          const now = Date.now()
+          const all = await storage.read()
+          const schedule = parseSchedule(input, now)
+          if (schedule === null) {
+            const seen = { in: input.in, at: input.at, every: input.every, cron: input.cron }
+            log(`cron_set input seen: ${JSON.stringify(seen)} / all: ${JSON.stringify(input).slice(0, 200)}`)
+            return { content: `❌ укажи РОВНО ОДНО время: in | at | every | cron. Получено: ${JSON.stringify(seen)}` }
+          }
+          const id = newId((x) => all.some((t) => t.id === x))
+          let prompt = valid.prompt
+          if (input.reportPolicy) prompt += `\nПолитика отчёта: ${input.reportPolicy}`
+          const task: CronTask = {
+            id,
+            name: input.name?.trim() || prompt.slice(0, 40),
+            sessionID: toolCtx.sessionID,
+            prompt,
+            schedule,
+            createdAt: now,
+            createdBy: "агент",
+            fireCount: 0,
+          }
+          await storage.update((all) => [...all, task])
+          const next = nextFire(schedule, now)
+          const warn = peakHoursWarning(next ?? now)
+          log(`set #${id} ${toolCtx.sessionID}: ${describeSchedule(schedule)}`)
+          return {
+            content:
+              `✓ задача #${id} «${task.name}» — ${describeSchedule(schedule)}; первый запуск ` +
+              `${next === null ? "?" : fmtLocal(next)}${warn ? `; ${warn}` : ""}. ` +
+              `Кратко сообщи пользователю, что задача поставлена и когда сработает.`,
+          }
+        },
+      })
+      editor.add({
+        name: "cron_list",
+        description: "Список задач по расписанию в текущей сессии: id, расписание, следующий запуск, последний результат.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        options: { namespace: "cron", codemode: true },
+        async execute(_input, toolCtx) {
+          const mine = (await storage.read()).filter((t) => t.sessionID === toolCtx.sessionID)
+          if (mine.length === 0) return { content: "задач нет" }
+          const lines = mine.map((t) => {
+            const next = nextFire(t.schedule, t.lastFiredAt ?? t.createdAt)
+            return `#${t.id} «${t.name}» · ${describeSchedule(t.schedule)} · след. ${next ? fmtLocal(next) : "?"}${t.lastResult ? ` · прошлое: ${t.lastResult.slice(0, 80)}` : ""}`
+          })
+          return { content: lines.join("\n") }
+        },
+      })
+      editor.add({
+        name: "cron_remove",
+        description: "Снять задачу по id (см. cron_list).",
+        input: {
+          type: "object",
+          properties: { id: { type: "string", description: "id задачи, напр. a3f2" } },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        options: { namespace: "cron", codemode: true },
+        async execute(rawInput) {
+          const { id } = (rawInput ?? {}) as { id?: string }
+          const clean = typeof id === "string" ? id.trim().replace(/^#/, "") : ""
+          let removed = ""
+          await storage.update((all) => {
+            const task = all.find((t) => t.id === clean)
+            if (task) removed = `✓ задача #${task.id} «${task.name}» снята`
+            return all.filter((t) => t.id !== clean)
+          })
+          if (removed === "") return { content: "❌ задача не найдена (cron_list покажет живые)" }
+          log(`remove #${clean}`)
+          return { content: removed }
+        },
+      })
+    })
+
+    log(`cron-mode: on`)
     return () => {
       clearInterval(timer)
       eventsAbort.abort()

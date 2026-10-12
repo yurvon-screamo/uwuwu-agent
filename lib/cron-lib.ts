@@ -61,29 +61,31 @@ export function parseHHMM(s: string): { h: number; m: number } | null {
 
 /** Разбор ввода в Schedule. null — ничего не распознано / конфликт. */
 export function parseSchedule(input: ScheduleInput, now: number): Schedule | null {
-  const filled = Object.values(input).filter((v) => v !== undefined).length
+  // считаем ТОЛЬКО поля времени: name/prompt в input валидны и не мешают
+  const time = { in: input.in, at: input.at, every: input.every, cron: input.cron }
+  const filled = Object.values(time).filter((v) => v !== undefined).length
   if (filled !== 1) return null // ровно один способ задать время
 
-  if (input.in !== undefined) {
-    const ms = parseDuration(input.in)
+  if (time.in !== undefined) {
+    const ms = parseDuration(time.in)
     if (ms === null) return null
     return { kind: "once", at: now + ms }
   }
-  if (input.at !== undefined) {
-    const hm = parseHHMM(input.at)
+  if (time.at !== undefined) {
+    const hm = parseHHMM(time.at)
     if (hm === null) return null
     const d = new Date(now)
     const at = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hm.h, hm.m, 0, 0).getTime()
     // если время уже прошло сегодня — завтра
     return { kind: "once", at: at > now ? at : at + DAY }
   }
-  if (input.every !== undefined) {
-    const ms = parseDuration(input.every)
+  if (time.every !== undefined) {
+    const ms = parseDuration(time.every)
     if (ms === null || ms < MINUTE) return null // постоянка короче минуты не бывает
     return { kind: "every", intervalMs: ms }
   }
-  if (input.cron !== undefined) {
-    return parseCronFields(input.cron) ? { kind: "cron", expr: input.cron } : null
+  if (time.cron !== undefined) {
+    return parseCronFields(time.cron) ? { kind: "cron", expr: time.cron } : null
   }
   return null
 }
