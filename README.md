@@ -1,126 +1,51 @@
-<div align="center">
+# uwuwu-agent
 
-<img src=".media/logo.jpg" alt="uwuwu-agent logo" width="120" />
+Конфиги, агенты, плагины и скиллы опенкода + исходники uwuwu-cli. Репозиторий — единственное место, где файлы существуют: живые конфиги (`~/.config/opencode`, `~/.agents`, `~/.claude/skills`) — симлинки сюда.
 
-# Uwuwu Agent
-
-**AI agent skills, tools, and memory gateway for [opencode](https://opencode.ai)**
-
-[![GitHub](https://img.shields.io/badge/GitHub-yurvon--screamo%2Fuwuwu--agent-181717?logo=github)](https://github.com/yurvon-screamo/uwuwu-agent)
-[![opencode](https://img.shields.io/badge/opencode-AI%20coding%20agent-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxZW0iIGhlaWdodD0iMWVtIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGZpbGw9IndoaXRlIiBkPSJNNy4yIDE3LjhsLTUuMi0zbC41LTguOUw3LjQgMy41TDkgOS41bC0uMiAyLjRsLTMuNiAyLjRsMy44IDIuMmwxLjQtMy4zem0xMC44IDBsNS4yLTNsLS41LTguOUwxNi42IDMuNUwxNSA5LjVsLjIgMi40bDMuNiAyLjRsLTMuOCAyLjJsLTEuNC0zLjN6bS00LjEtMS4ybC4zIDQuNWwtNC4yIDJ2LTUuOGw0LjktLjd6Ii8+PC9zdmc+)](https://opencode.ai)
-
-</div>
-
----
-
-## 📁 Structure
+## Структура
 
 ```
-uwuwu-agent/
-├── agent/              # Agent personas (developer, head-of-development, office-coworker, ...)
-├── skills/              # Modular skill library
-│   ├── architect-*/     #   Planning & design (task methodology, UI/UX strategy)
-│   ├── engineer-*/      #   Language-specific engineers (Rust, C#, Leptos, TS, ...)
-│   ├── flow-*/          #   Workflow flows (task, challenge-ask, audit, ...)
-│   ├── office-coworker-*/ #   Office document automation (docx, xlsx, pptx, pdf)
-│   ├── rules-*/         #   Quality rules (clean code, security, performance, UI, ...)
-│   └── tool-*/ #   External tool integrations (GitLab, GitHub, browser, research, ...)
-├── tools/               # Runtime tool wrappers (wiki, time, bg, vision)
-├── memory/              # TDAI memory gateway (TencentDB vector memory)
-├── .qlty/               # Qlty quality hooks (pre-commit, pre-push)
-├── start-memory.sh      # Memory gateway launch (Unix)
-└── opencode.json        # opencode agent configuration
+agents/        субагенты: code-quality-reviewer, developer, office-coworker
+plugins/       sticky-retry, ocv-v2-adapter (+ disabled/)
+skills/        29 скиллов (см. ниже)
+cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
+cli-tools/     atlassian, research
+opencodereview/ правила ревью
+link.sh        установка симлинками
+opencode.json  главный конфиг опенкода (jsonc)
+cli.json       TUI-конфиг
+AGENTS.md      системные инструкции (глобальные)
 ```
 
-## 🧠 Memory Gateway
+## Скиллы (29)
 
-The memory subsystem runs a standalone HTTP sidecar based on [`@tencentdb-agent-memory/memory-tencentdb`](https://www.npmjs.com/package/@tencentdb-agent-memory/memory-tencentdb) — hybrid BM25 + vector search for persistent agent memory.
+- **Architect (1)**: architect-ui-ux
+- **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
+- **Workflows (5)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review · flow-timesheet
+- **Office (4)**: docx · pdf · pptx · xlsx
+- **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
+- **Integrations (2)**: hf-cli · use-railway
 
-Memory data is stored **externally** at `~/uwuwu-memory-content/` (not in this repo).
-
-```bash
-# Start the memory gateway
-./start-memory.sh
-```
-
-### Configuration
-
-All secrets are read from **environment variables** — nothing is committed:
-
-| Variable | Description |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter LLM API key |
-| `GITLAB_PERSONAL_ACCESS_TOKEN` | GitLab PAT |
-| `CONFLUENCE_PERSONAL_TOKEN` | Confluence API token |
-| `JIRA_PERSONAL_TOKEN` | Jira API token |
-| `Z_AI_API_KEY` | Z.AI image/video analysis key |
-
-## 🎯 Skills Overview
-
-### Architects (2)
-| Skill | Purpose |
-|---|---|
-| `architect-task` | Planning methodology (bug/feature/refactor: Prove-It, Contract-First, Baseline-First) |
-| `architect-ui-ux` | UI/UX design strategy, workflow, redesign protocol |
-
-### Engineers (6)
-| Skill | Stack |
-|---|---|
-| `engineer-rust` | Rust |
-| `engineer-csharp` | C# / .NET |
-| `engineer-leptos` | Leptos (Rust WASM) |
-| `engineer-typescript` | TypeScript |
-| `engineer-python` | Python |
-| `engineer-playwright` | Playwright E2E |
-
-### Workflows (6)
-`flow-task` · `flow-audit` · `flow-merge-review` · `flow-code-documentation` · `flow-agents-md-writer` · `flow-timesheet`
-
-### Office Automation (4)
-`office-coworker-docx` · `office-coworker-xlsx` · `office-coworker-pptx` · `office-coworker-pdf`
-
-### Integrations (9)
-`tool-gitlab` · `tool-github` · `tool-atlassian` · `tool-browser` · `tool-research`
-
-### Rules (9)
-`rules-clean-code` · `rules-git-commit` · `rules-security` · `rules-performance` · `rules-qlty` · `rules-test-rule` · `rules-lib-usage` · `rules-text-writing` · `rules-ui`
-
-### Generic Tools (1)
-`tool-likec4`
-
-## 🔗 Установка (симлинки)
-
-Конфиги опенкода живут **в этом репозитории**; `~/.config/opencode`, `~/.agents` и `~/.claude/skills` — симлинки сюда. Правишь файл в репе — работает сразу; рассинхрон невозможен.
+## Установка
 
 ```bash
 git clone https://github.com/yurvon-screamo/uwuwu-agent.git
 cd uwuwu-agent
-./link.sh        # бэкапит существующие конфиги (*.pre-link-*) и создаёт симлинки
+./link.sh
 ```
 
-Что линкуется: `opencode.json`, `cli.json`, `AGENTS.md`, `agents/`, `plugins/`, `skills/` (→ `~/.agents/skills` и `~/.claude/skills`). Секреты и стейт (`hub.json`, `state.json`, бэкапы) в репу не попадают — см. `.gitignore`.
+`link.sh` бэкапит существующие конфиги (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После — перезапустить opencode.
 
-## ⚡ Quick Start
+## Маркетинговый зоопарк
+
+Живёт отдельно: `~/origa/marketing/.opencode` (репа [origa](https://github.com/yurvon-screamo/origa)) — 6 агентов, TG-хаб, humanizer-конвейер.
+
+## Сборка uwuwu-cli
 
 ```bash
-# Clone
-git clone https://github.com/yurvon-screamo/uwuwu-agent.git
-cd uwuwu-agent
-
-# Install dependencies
-npm install
-cd memory && npm install && cd ..
-
-# Set required environment variables
-export OPENROUTER_API_KEY="your-key"
-
-# Start memory gateway
-./start-memory.sh
-
-# Run with opencode
-opencode
+cd cli && cargo build --release
 ```
 
-## 📋 License
+## License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT

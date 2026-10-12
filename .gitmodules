@@ -1,3 +1,0 @@
-[submodule "knowledge-catalog"]
-	path = knowledge-catalog
-	url = https://github.com/GoogleCloudPlatform/knowledge-catalog.git
