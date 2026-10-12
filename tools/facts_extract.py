@@ -4,6 +4,7 @@
 Требования окружения: uwuwu-cli в PATH (override: UWUWU_CLI),
 ollama с qwen3.5:4b, git-репо вики (UWUWU_WIKI, дефолт ~/.uwuwu),
 opencode.db (Linux XDG-путь, override: --db у opencode_audit).
+НЕ смешивать UWUWU_DATA_DIR с UWUWU_WIKI (кэш и факты разойдутся по разным корням).
 
     .venv/bin/python tools/facts_extract.py YYYY-MM-DD [YYYY-MM-DD ...]
 
