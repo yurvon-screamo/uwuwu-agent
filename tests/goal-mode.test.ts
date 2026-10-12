@@ -8,7 +8,7 @@ import {
   lastMessageText,
   lastAssistantText,
   type TranscriptMessage,
-} from "../plugins/goal-lib"
+} from "../lib/goal-lib"
 
 describe("parseGoalCommand", () => {
   test("goal: с текстом — регистрирует цель", () => {

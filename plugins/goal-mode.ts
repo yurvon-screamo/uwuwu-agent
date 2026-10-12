@@ -10,7 +10,7 @@ import {
   lastMessageText,
   lastAssistantText,
   type Goal,
-} from "./goal-lib"
+} from "../lib/goal-lib"
 
 // goal-mode — режим цели для обычных сессий OpenCode V2.
 //
@@ -89,8 +89,8 @@ export default Plugin.define({
     // Плагин инстанцируется на каждую локацию (5+ экземпляров), а события
     // видны всем — без гарда каждый экземпляр заводит своего судью на то же
     // событие (шторм пинков, проверено на живом). Подписывается ровно один.
-    const GUARD = Symbol("goal-mode-subscribed")
-    const globals = globalThis as { [GUARD]?: boolean }
+    const GUARD = "goal-mode:subscribed"
+    const globals = globalThis as unknown as Record<string, boolean>
     if (globals[GUARD]) {
       log("goal-mode: инстанс этой локации уже подписан — скип")
       return
@@ -130,43 +130,55 @@ export default Plugin.define({
         location: { directory: "/tmp" },
       })
 
-      // ждём завершения судьи, затем читаем его вердикт из истории сессии
-      await ctx.session.wait({ sessionID: judge.id })
-
-      // флаш может запаздывать: одна повторная попытка через 3с
-      let msgs = await restMessages(judge.id)
-      if (lastAssistantText(msgs) === "") {
-        await new Promise((r) => setTimeout(r, 3_000))
-        msgs = await restMessages(judge.id)
-      }
+      // вердикт собирается из событий судьи; завершение — execution.succeeded
+      const verdict = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (judgeWait.delete(judge.id)) reject(new Error("judge timeout 10min"))
+        }, JUDGE_TIMEOUT_MS)
+        judgeWait.set(judge.id, {
+          segments: new Map(),
+          resolve: (t) => { clearTimeout(timer); resolve(t) },
+        })
+        void ctx.session
+          .prompt({ sessionID: judge.id, text: judgePrompt(goal.text, transcript) })
+          .catch((e: unknown) => {
+            clearTimeout(timer)
+            if (judgeWait.delete(judge.id)) reject(e)
+          })
+      })
       await restRemoveSession(judge.id)
 
-      const reply = lastAssistantText(msgs)
-
-      const verdict = parseVerdict(reply)
-      log(`verdict ${sessionID}: ${verdict.kind} — ${verdict.detail.slice(0, 100)}`)
-
-      if (verdict.kind === "done") {
-        goals.delete(sessionID)
-        await persist()
+      // пустой вердикт — предупреждение без пинка (не создаём цикл)
+      if (verdict === "") {
+        log(`judge ${sessionID}: пустой ответ — цель остаётся активной, без пинка`)
         await ctx.session.synthetic({
           sessionID,
-          text: `[goal-mode] ✅ судья подтвердил достижение цели: ${verdict.detail}`,
+          text: "[goal-mode] ⚠️ судья не дал вердикта — цель остаётся активной. Проверка повторится после следующего шага.",
         })
         return
       }
-      if (verdict.kind === "impossible") {
+      const v = parseVerdict(verdict)
+      log(`verdict ${sessionID}: ${v.kind} — ${v.detail.slice(0, 100)}`)
+
+      if (v.kind === "done") {
+        // цель достигнута — тихо снимаем: агента не тревожим подтверждением
+        goals.delete(sessionID)
+        await persist()
+        log(`DONE ${sessionID}: ${v.detail}`)
+        return
+      }
+      if (v.kind === "impossible") {
         goals.delete(sessionID)
         await persist()
         await ctx.session.synthetic({
           sessionID,
-          text: `[goal-mode] ⛔ судья: цель недостижима — ${verdict.detail}. Цель снята.`,
+          text: `[goal-mode] ⛔ судья: цель недостижима — ${v.detail}. Цель снята.`,
         })
         return
       }
       await ctx.session.synthetic({
         sessionID,
-        text: `⚖️ GOAL-судья: цель «${goal.text}» ещё НЕ достигнута. ${verdict.detail}\nПродолжай работу над целью до полного выполнения. Не отчитывайся словами — доноси до результата.`,
+        text: `⚖️ GOAL-судья: цель «${goal.text}» ещё НЕ достигнута. ${v.detail}\nПродолжай работу над целью до полного выполнения. Не отчитывайся словами — доноси до результата.`,
       })
     }
 
