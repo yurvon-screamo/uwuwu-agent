@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "types": [
+      "bun-types"
+    ]
+  },
+  "include": [
+    "goal-mode.ts",
+    "goal-lib.ts",
+    "../tests/goal-mode.test.ts"
+  ]
+}
