@@ -6,7 +6,7 @@
 
 ```
 agents/        субагенты: code-quality-reviewer, developer, office-coworker
-plugins/       sticky-retry, ocv-v2-adapter (+ disabled/)
+plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
 cli-tools/     atlassian, research
