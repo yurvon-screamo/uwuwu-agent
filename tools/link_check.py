@@ -3,11 +3,14 @@
 
 Проверяет относительные .md-ссылки [..](..md..): цель существует и внутри
 вики-корня. HTTP(S)-ссылки не трогает. Анкоры (#foo) игнорируются.
+Ограничения: POSIX-пути (виндовые \\ не резолвятся); фенсы считаются
+закрытыми парами (незакрытый — предупреждение).
 
 usage:
   link_check.py [--root PATH]   # дефолт: UWUWU_WIKI или ~/.uwuwu
 Выход: rc=0 (чисто) / rc=1 (есть битые, список в stdout).
 """
+
 from __future__ import annotations
 
 import os
@@ -31,6 +34,8 @@ def check(root: Path) -> list[tuple[str, str, str]]:
     files = [f for z in ZONES for f in (root / z).rglob("*.md")]
     for f in files:
         text = f.read_text(encoding="utf-8")
+        if text.count("```") % 2:
+            print(f"WARN: {f}: нечётное число фенсов — хвост файла не проверен")
         text = FENCE_RE.sub("", text)  # примеры в код-фенсах — не наши линки
         for _, target in LINK_RE.findall(text):
             if target.startswith(("http://", "https://")):
@@ -50,7 +55,13 @@ def check(root: Path) -> list[tuple[str, str, str]]:
 
 
 def main() -> int:
-    root = Path(sys.argv[sys.argv.index("--root") + 1]) if "--root" in sys.argv else wiki_root()
+    root = wiki_root()
+    if "--root" in sys.argv:
+        i = sys.argv.index("--root")
+        if i + 1 >= len(sys.argv):
+            print("--root требует значение: путь к вики", file=sys.stderr)
+            return 2
+        root = Path(sys.argv[i + 1])
     broken = check(root)
     if broken:
         for f, t, why in broken:
