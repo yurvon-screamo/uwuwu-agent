@@ -39,6 +39,15 @@ impl Cache {
         Ok(Self { db })
     }
 
+    /// Graceful shutdown хранилища: вызвать ДО завершения async-контекста,
+    /// иначе surrealkv дропается при остановленном рантайме (WARN/JoinError).
+    pub async fn close(self) -> Result<()> {
+        self.db
+            .invalidate()
+            .await
+            .map_err(|e| anyhow::anyhow!("surrealdb invalidate: {e}"))
+    }
+
     pub async fn load_all(&self) -> Result<HashMap<String, (i64, Vec<ChunkRecord>)>> {
         let mut res = self
             .db

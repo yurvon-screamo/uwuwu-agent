@@ -255,6 +255,11 @@ pub async fn search_multi_with_filter(
         });
     }
 
+    // Graceful close ДО гашения tokio-рантайма: иначе surrealkv дропается
+    // в shutdown и шумит «No runtime available» + JoinError::Cancelled.
+    if let Err(e) = cache.close().await {
+        eprintln!("warn: cache close: {e:#}");
+    }
     Ok(search_results)
 }
 

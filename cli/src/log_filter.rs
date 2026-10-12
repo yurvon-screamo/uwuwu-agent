@@ -1,13 +1,14 @@
 //! Builds the `tracing` env-filter for the CLI.
 //!
 //! Own logs default to `info`, everything else to `warn`. The embedded DB stack
-//! (`surrealdb`, `surrealkv`) is force-silenced to `warn` because `surrealdb` prints a
-//! block of INFO messages on every kvs-store open — which pollutes CLI output (and breaks
-//! agents parsing the output). `RUST_LOG` still overrides the rest. A user can still
-//! explicitly target a silenced crate to raise it again, e.g.
-//! `RUST_LOG=surrealdb=debug,surrealkv=debug`.
+//! (`surrealdb`, `surrealkv`) is force-silenced to `error`: `surrealdb` prints a
+//! block of INFO messages on every kvs-store open, and `surrealkv` WARNs
+//! "No runtime available for closing the store correctly" at exit — its Tree is
+//! dropped from a global registry after the tokio runtime is gone, so the WARN
+//! is structural and cannot be fixed on our side. `RUST_LOG` still overrides
+//! the rest; an explicit per-crate target re-enables it for debugging.
 
-/// Crates that are force-silenced to `warn` unless the user sets them explicitly.
+/// Crates that are force-silenced to `error` unless the user sets them explicitly.
 const SILENCED_CRATES: &[&str] = &["surrealkv", "surrealdb"];
 
 /// Default filter applied when `RUST_LOG` is not set: own logs at `info`, rest at `warn`.
@@ -15,14 +16,14 @@ pub const DEFAULT_BASE: &str = "uwuwu_cli=info,warn";
 
 /// Compose the final env-filter string from a base (the `RUST_LOG` value, or the default).
 ///
-/// `surrealdb`/`surrealkv` are appended at `warn` unless the base already mentions them
+/// `surrealdb`/`surrealkv` are appended at `error` unless the base already mentions them
 /// (either as a bare target or as `target=level`), so an explicit override wins.
 pub fn build(base: &str) -> String {
     let mut parts: Vec<&str> = vec![base];
     let mut extras: Vec<String> = Vec::new();
     for crate_name in SILENCED_CRATES {
         if !is_set(base, crate_name) {
-            extras.push(format!("{crate_name}=warn"));
+            extras.push(format!("{crate_name}=error"));
         }
     }
     if extras.is_empty() {

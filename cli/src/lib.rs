@@ -2,7 +2,6 @@ pub mod cache;
 pub mod chunk;
 pub mod embed;
 pub mod facts;
-pub mod file_io;
 pub mod get;
 pub mod grep;
 pub mod log_filter;
