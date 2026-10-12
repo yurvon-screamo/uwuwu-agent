@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]+?\.md(?:#[^)]*)?)\)")
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 ZONES = ("experience", "projects")
 
@@ -30,6 +31,7 @@ def check(root: Path) -> list[tuple[str, str, str]]:
     files = [f for z in ZONES for f in (root / z).rglob("*.md")]
     for f in files:
         text = f.read_text(encoding="utf-8")
+        text = FENCE_RE.sub("", text)  # примеры в код-фенсах — не наши линки
         for _, target in LINK_RE.findall(text):
             if target.startswith(("http://", "https://")):
                 continue
