@@ -725,8 +725,18 @@ struct LockGuard {
 impl LockGuard {
     fn acquire() -> Result<Self> {
         let path = wiki_root().join(LOCK_PATH);
+        // env-вики (UWUWU_WIKI) может ещё не существовать — создаём корень
+        // до lock-цикла, иначе create_new возвращает NotFound навсегда.
+        std::fs::create_dir_all(&wiki_root()).map_err(|e| {
+            anyhow!("wiki_root create_dir_all({:?}): {}", wiki_root(), e)
+        })?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
+            // Дедлайн наверху тела: ни одна ветка (включая stale-continue)
+            // не имеет права обходить его — иначе вечный цикл.
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("facts.lock: не дождались освобождения за 60с"));
+            }
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(f) => {
                     let pid = std::process::id();
@@ -764,9 +774,6 @@ impl LockGuard {
                             let _ = std::fs::remove_file(&path);
                         }
                         continue;
-                    }
-                    if std::time::Instant::now() > deadline {
-                        return Err(anyhow!("facts.lock: не дождались освобождения за 60с"));
                     }
                     // sync-CLI: thread::sleep осознан (вызовы из не-async sync_git)
                     std::thread::sleep(std::time::Duration::from_millis(300));
