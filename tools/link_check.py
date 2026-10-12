@@ -34,7 +34,12 @@ def check(root: Path) -> list[tuple[str, str, str]]:
     files = [f for z in ZONES for f in (root / z).rglob("*.md")]
     for f in files:
         text = f.read_text(encoding="utf-8")
-        if text.count("```") % 2:
+        # Фенс-разделитель CommonMark: до 3 ведущих пробелов + ``` в НАЧАЛЕ строки.
+        # Упоминания `` ``` `` в середине строки — inline-код, не фенсы.
+        fence_lines = sum(
+            1 for ln in text.splitlines() if ln.lstrip(" \t")[:3] == "```"
+        )
+        if fence_lines % 2:
             print(f"WARN: {f}: нечётное число фенсов — хвост файла не проверен")
         text = FENCE_RE.sub("", text)  # примеры в код-фенсах — не наши линки
         for _, target in LINK_RE.findall(text):
