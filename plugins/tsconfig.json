@@ -13,7 +13,10 @@
   },
   "include": [
     "goal-mode.ts",
-    "goal-lib.ts",
-    "../tests/goal-mode.test.ts"
+    "cron-mode.ts",
+    "../lib/goal-lib.ts",
+    "../lib/cron-lib.ts",
+    "../tests/goal-mode.test.ts",
+    "../tests/cron-lib.test.ts"
   ]
 }
