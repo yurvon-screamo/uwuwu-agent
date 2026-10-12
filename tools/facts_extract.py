@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """facts_extract — оркестратор фактизации дней opencode-сессий.
 
+Требования окружения: uwuwu-cli в PATH (override: UWUWU_CLI),
+ollama с qwen3.5:4b, git-репо вики (UWUWU_WIKI, дефолт ~/.uwuwu),
+opencode.db (Linux XDG-путь, override: --db у opencode_audit).
+
     .venv/bin/python tools/facts_extract.py YYYY-MM-DD [YYYY-MM-DD ...]
 
 Движок фактизации (экстракция → санитайзинг → полный дедуп → запись →
@@ -30,12 +34,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from session_view import export_day, to_doc
 
-WIKI = Path(os.environ.get("UWUWU_WIKI", Path.home() / ".uwuwu"))
+WIKI = Path(os.environ.get("UWUWU_WIKI", str(Path.home() / ".uwuwu")))
 SIDECAR = WIKI / "facts.ing.json"
 RETRIES = WIKI / "facts.retries.json"
 TODAY = _date.today().isoformat()
 
-CLI = "uwuwu-cli"
+CLI = os.environ.get("UWUWU_CLI", "uwuwu-cli")
 # worst-case движка: экстракция 600с + вердикт-пачки (до 2×600с) + буфер
 CLI_TIMEOUT_S = 2400
 MAX_EXTRACT_RETRIES = 3

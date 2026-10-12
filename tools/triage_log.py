@@ -26,7 +26,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
-ROOT = Path(os.environ.get("UWUWU_WIKI", Path.home() / ".uwuwu"))
+ROOT = Path(os.environ.get("UWUWU_WIKI", str(Path.home() / ".uwuwu")))
 STORE = ROOT / "facts.triage.json"
 LABELS = ("garbage", "keep")
 STMT_MIN_CHARS = 15  # симметрия MIN движка: пустышки не засоряют корпус

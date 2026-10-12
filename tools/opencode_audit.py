@@ -38,9 +38,9 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# Defaults
+# Defaults (Linux/XDG; на других ОС задавайте пути явно: --db, UWUWU_WIKI)
 DEFAULT_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
-DEFAULT_WIKI = Path(os.environ.get("UWUWU_WIKI", Path.home() / ".uwuwu"))
+DEFAULT_WIKI = Path(os.environ.get("UWUWU_WIKI", str(Path.home() / ".uwuwu")))
 
 # opencode v2: живая таблица сессий (легаси `session` заморожена на миграции)
 SESSION_TABLE = "session_v2"

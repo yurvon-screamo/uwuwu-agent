@@ -21,7 +21,11 @@ use clap::{Parser, Subcommand};
 
 
 pub fn wiki_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("WIKI_ROOT") {
+    // UWUWU_WIKI — каноническое имя (общее с python-тулзой ~/uwuwu-agent/tools);
+    // WIKI_ROOT — легаси-синоним. Оба имеют приоритет над дефолтом данных.
+    if let Ok(dir) = std::env::var("UWUWU_WIKI") {
+        PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("WIKI_ROOT") {
         PathBuf::from(dir)
     } else {
         uwuwu_data_dir()
@@ -117,6 +121,9 @@ enum Commands {
 
 pub fn uwuwu_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("UWUWU_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("UWUWU_WIKI") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("USERPROFILE")
