@@ -119,15 +119,36 @@ export default Plugin.define({
       if (firing.has(task.id)) return
       firing.add(task.id)
       try {
-        task.lastResult = compactResult(await lastAssistantText(task.sessionID), RESULT_CAP)
-        const brief = renderBrief(task, Date.now()) + (note ? `\n(${note})` : "")
-        await ctx.session.prompt({ sessionID: task.sessionID, text: brief })
-        task.fireCount++
-        task.lastFiredAt = Date.now()
-        task.lastResult = ""
-        log(`fire #${task.id} → ${task.sessionID}`)
-      } catch (e) { log(`fire #${task.id}: ${e}`) }
-      finally { firing.delete(task.id) }
+        // Перечитать свежее состояние: параллельный инстанс мог уже фаернуть
+        const latest = (await storage.read()).find((t) => t.id === task.id)
+        if (latest === undefined) return // задачу сняли
+        const halfMs = latest.schedule.kind === "every" ? latest.schedule.intervalMs / 2 : 30_000
+        if (latest.lastFiredAt !== undefined && Date.now() - latest.lastFiredAt < halfMs) return
+        // РЕЗЕРВ ДО fire: инстанс, прочитавший резерв, скипнет (анти-дубль)
+        const prev = latest.lastFiredAt
+        const reservedAt = Date.now()
+        latest.lastFiredAt = reservedAt
+        await storage.update((all) => all.map((t) => (t.id === latest.id ? { ...t, lastFiredAt: reservedAt } : t)))
+        try {
+          latest.lastResult = compactResult(await lastAssistantText(latest.sessionID), RESULT_CAP)
+          const brief = renderBrief(latest, Date.now()) + (note ? `\n(${note})` : "")
+          await ctx.session.prompt({ sessionID: latest.sessionID, text: brief })
+          latest.fireCount++
+          if (latest.schedule.kind === "once") {
+            // одноразовая — снята после исполнения
+            await storage.update((all) => all.filter((t) => t.id !== latest.id))
+          } else {
+            await storage.update((all) => all.map((t) => (t.id === latest.id ? { ...latest } : t)))
+          }
+          log(`fire #${latest.id} → ${latest.sessionID}`)
+        } catch (e) {
+          // откат резерва: следующий тик честно ретрайнет
+          await storage.update((all) => all.map((t) => (t.id === latest.id ? { ...t, lastFiredAt: prev } : t)))
+          log(`fire #${latest.id}: ${e} — резерв откачен`)
+        }
+      } finally {
+        firing.delete(task.id)
+      }
     }
 
     const tick = async (): Promise<void> => {
@@ -140,11 +161,6 @@ export default Plugin.define({
         return next !== null && now >= next
       })
       for (const task of due) await fire(task)
-      if (due.length > 0) {
-        await storage.update((all) => all.map((t) => due.find((d) => d.id === t.id) ?? t))
-        // одноразовые — сняты после исполнения
-        await storage.update((all) => all.filter((t) => t.schedule.kind !== "once" || t.lastFiredAt === undefined))
-      }
     }
 
     // тикер + catch-up: у каждого инстанса, дубль гасится lastFiredAt
