@@ -154,12 +154,20 @@ def mlp_scores(model: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
 
 
 def fit_logreg(
-    x: np.ndarray, y: np.ndarray, epochs: int = EPOCHS, lr: float = LR, l2: float = L2
+    x: np.ndarray,
+    y: np.ndarray,
+    epochs: int = EPOCHS,
+    lr: float = LR,
+    l2: float = L2,
+    init: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Full-batch softmax-логрегрессия, класс-веса inverse-frequency."""
     n, d = x.shape
     x1 = np.hstack([x, np.ones((n, 1), dtype=np.float32)])
     w = np.zeros((d + 1, 2), dtype=np.float32)
+    if init is not None:
+        w[:-1] = init[0]
+        w[-1] = init[1]
     counts = np.bincount(y, minlength=2)
     weights = (n / counts).astype(np.float32)  # inverse freq
     y_onehot = np.eye(2, dtype=np.float32)[y]
@@ -259,6 +267,17 @@ def cmd_train(args: argparse.Namespace) -> int:
     assert np.isfinite(emb).all(), "non-finite embeddings — см. vllm-pooling bf16-урок"
 
     folds = stratified_folds(y, args.folds, args.seed)
+    pre = None
+    if args.pretrain:
+        p = np.load(args.pretrain)
+        if p["x"].shape[1] != DIM or set(np.unique(p["y"])) - {0, 1}:
+            print(
+                f"pretrain npz несовместим: x={p['x'].shape}, y={np.unique(p['y'])}",
+                file=sys.stderr,
+            )
+            return 2
+        pre = (p["x"], p["y"])
+        print(f"pretrain: {len(pre[1])} внешних кейсов из {args.pretrain}")
     oof = np.zeros(len(y), dtype=np.float32)
     for f, val in enumerate(folds):
         train = np.setdiff1d(np.arange(len(y)), val)
@@ -266,7 +285,14 @@ def cmd_train(args: argparse.Namespace) -> int:
             model = fit_mlp(emb[train], y[train], seed=args.seed + f)
             oof[val] = mlp_scores(model, emb[val])
         else:
-            w, b = fit_logreg(emb[train], y[train])
+            init = fit_logreg(*pre, epochs=200) if pre else None
+            w, b = fit_logreg(
+                emb[train],
+                y[train],
+                init=init,
+                epochs=200 if init is not None else EPOCHS,
+                lr=LR * 0.5 if init is not None else LR,
+            )
             logits = emb[val] @ w + b
             logits -= logits.max(axis=1, keepdims=True)
             p = np.exp(logits)
@@ -294,7 +320,14 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.arch == "mlp":
         np.savez(MODEL_DIR / "model.npz", **fit_mlp(emb, y, seed=args.seed))
     else:
-        w, b = fit_logreg(emb, y)
+        init = fit_logreg(*pre, epochs=200) if pre else None
+        w, b = fit_logreg(
+            emb,
+            y,
+            init=init,
+            epochs=200 if init is not None else EPOCHS,
+            lr=LR * 0.5 if init is not None else LR,
+        )
         np.savez(MODEL_DIR / "model.npz", w=w, b=b)
     meta = {
         "model": f"{args.arch}-l2-normemb",
@@ -371,6 +404,7 @@ def main() -> int:
     t.add_argument("--seed", type=int, default=7)
     t.add_argument("--folds", type=int, default=5)
     t.add_argument("--arch", choices=("mlp", "linear"), default="linear")
+    t.add_argument("--pretrain", help="npz с внешним корпусом (x=эмбеддинги, y=0/1)")
     i = sub.add_parser("infer", help="вердикт для текста")
     i.add_argument("--text")
     args = p.parse_args()
