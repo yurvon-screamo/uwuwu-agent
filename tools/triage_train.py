@@ -87,6 +87,20 @@ def load_embeddings(texts: list[str], corpus_sha: str) -> np.ndarray:
     return emb
 
 
+def two_stage_fit(
+    x: np.ndarray, y: np.ndarray, pre: tuple[np.ndarray, np.ndarray] | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Одна точка двухстадийного рецепта: (претрейн на внешних) → fine-tune."""
+    init = fit_logreg(*pre, epochs=200) if pre else None
+    return fit_logreg(
+        x,
+        y,
+        init=init,
+        epochs=200 if init is not None else EPOCHS,
+        lr=LR * 0.5 if init is not None else LR,
+    )
+
+
 def stratified_folds(y: np.ndarray, folds: int, seed: int) -> list[np.ndarray]:
     """Индексы фолда i = строки, попадающие в val-часть фолда i."""
     rng = np.random.default_rng(seed)
@@ -270,14 +284,21 @@ def cmd_train(args: argparse.Namespace) -> int:
     pre = None
     if args.pretrain:
         p = np.load(args.pretrain)
-        if p["x"].shape[1] != DIM or set(np.unique(p["y"])) - {0, 1}:
+        try:
+            px, py = p["x"], p["y"]
+        except KeyError as e:
+            print(f"pretrain npz без ключа {e} (нужны x/y)", file=sys.stderr)
+            return 2
+        if px.ndim != 2 or px.shape[1] != DIM or set(np.unique(py)) - {0, 1}:
             print(
-                f"pretrain npz несовместим: x={p['x'].shape}, y={np.unique(p['y'])}",
+                f"pretrain npz несовместим: x={px.shape}, y={np.unique(py)}",
                 file=sys.stderr,
             )
             return 2
-        pre = (p["x"], p["y"])
-        print(f"pretrain: {len(pre[1])} внешних кейсов из {args.pretrain}")
+        # контракт: внешние эмбеды L2-нормируем здесь — их источник не гарантирован
+        px = px / (np.linalg.norm(px, axis=1, keepdims=True) + 1e-9)
+        pre = (px, py)
+        print(f"pretrain: {len(py)} внешних кейсов из {args.pretrain}")
     oof = np.zeros(len(y), dtype=np.float32)
     for f, val in enumerate(folds):
         train = np.setdiff1d(np.arange(len(y)), val)
@@ -285,14 +306,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             model = fit_mlp(emb[train], y[train], seed=args.seed + f)
             oof[val] = mlp_scores(model, emb[val])
         else:
-            init = fit_logreg(*pre, epochs=200) if pre else None
-            w, b = fit_logreg(
-                emb[train],
-                y[train],
-                init=init,
-                epochs=200 if init is not None else EPOCHS,
-                lr=LR * 0.5 if init is not None else LR,
-            )
+            w, b = two_stage_fit(emb[train], y[train], pre)
             logits = emb[val] @ w + b
             logits -= logits.max(axis=1, keepdims=True)
             p = np.exp(logits)
@@ -320,14 +334,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.arch == "mlp":
         np.savez(MODEL_DIR / "model.npz", **fit_mlp(emb, y, seed=args.seed))
     else:
-        init = fit_logreg(*pre, epochs=200) if pre else None
-        w, b = fit_logreg(
-            emb,
-            y,
-            init=init,
-            epochs=200 if init is not None else EPOCHS,
-            lr=LR * 0.5 if init is not None else LR,
-        )
+        w, b = two_stage_fit(emb, y, pre)
         np.savez(MODEL_DIR / "model.npz", w=w, b=b)
     meta = {
         "model": f"{args.arch}-l2-normemb",
