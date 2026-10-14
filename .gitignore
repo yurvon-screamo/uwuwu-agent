@@ -52,3 +52,7 @@ plugins/.backup-*/
 *.bak*
 state.json
 hub.json
+
+# triage tooling (heavy deps + caches)
+tools/.venv-triage/
+tools/*.npz
