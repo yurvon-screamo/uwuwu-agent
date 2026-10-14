@@ -59,7 +59,10 @@ def embed_all(texts: list[str]) -> np.ndarray:
                 )
                 with urllib.request.urlopen(req, timeout=300) as r:
                     emb = json.loads(r.read())["embeddings"]
-                assert len(emb) == len(chunk)
+                if len(emb) != len(chunk):
+                    raise RuntimeError(
+                        f"ollama вернула {len(emb)} эмбеддингов на {len(chunk)} текстов"
+                    )
                 out[i : i + len(chunk)] = emb
                 break
             except Exception as e:
@@ -174,13 +177,22 @@ def fit_logreg(
 
 
 def auc_mann_whitney(scores: np.ndarray, y: np.ndarray) -> float:
-    """AUC ранжированием (класс 1 = garbage положительный)."""
+    """AUC ранжированием (класс 1 = garbage положительный); midrank для связей."""
     pos, neg = scores[y == 1], scores[y == 0]
     if len(pos) == 0 or len(neg) == 0:
         return float("nan")
-    order = np.argsort(np.concatenate([pos, neg]))
+    allv = np.concatenate([pos, neg])
+    order = np.argsort(allv, kind="stable")
     ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(pos) + len(neg) + 1)
+    # связанные значения получают средний ранг (midrank)
+    sorted_v = allv[order]
+    i = 0
+    while i < len(sorted_v):
+        j = i
+        while j + 1 < len(sorted_v) and sorted_v[j + 1] == sorted_v[i]:
+            j += 1
+        ranks[order[i : j + 1]] = (i + j + 2) / 2.0  # 1-based среднее
+        i = j + 1
     r_pos = ranks[: len(pos)].sum()
     return float((r_pos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
 
@@ -216,8 +228,24 @@ def metrics(pred: np.ndarray, y: np.ndarray) -> dict:
 
 def cmd_train(args: argparse.Namespace) -> int:
     corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    # Guard вырожденных корпусов: внятная ошибка вместо трейсбека из глубины
+    if len(corpus) < 2 * args.folds:
+        print(
+            f"корпус слишком мал: {len(corpus)} кейсов < 2×folds "
+            f"({2 * args.folds}); нужен минимум по {args.folds} на класс",
+            file=sys.stderr,
+        )
+        return 2
     texts = [v["statement"] for v in corpus.values()]
     y = np.array([0 if v["label"] == "keep" else 1 for v in corpus.values()])
+    counts = np.bincount(y, minlength=2)
+    if (counts == 0).any():
+        print(
+            f"в корпусе один класс: garbage={counts[1]} keep={counts[0]}; "
+            "для обучения нужны оба",
+            file=sys.stderr,
+        )
+        return 2
     days = sorted({v["day"] for v in corpus.values()})
     print(
         f"corpus: {len(texts)} (garbage={int(y.sum())}, keep={int((y == 0).sum())}), "
@@ -251,6 +279,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         )
 
     thr, _ = max_f1_threshold(oof, y)
+    # NB: порог подобран по полному OOF и применяется к тем же OOF-строкам —
+    # метрики НА пороге слегка оптимистичны (AUC от порога не зависит — чист).
     m_thr = metrics((oof >= thr).astype(int), y)
     m_05 = metrics((oof >= 0.5).astype(int), y)
     auc = auc_mann_whitney(oof, y)
@@ -301,12 +331,21 @@ def cmd_infer(args: argparse.Namespace) -> int:
         return 2
     vec = embed_all([text])[0]
     vec = vec / (np.linalg.norm(vec) + 1e-9)
+    npz_arch = "mlp" if "w1" in m else "linear"
+    if meta.get("model", "").split("-")[0] != npz_arch:
+        print(
+            f"рассинхрон model.json ({meta.get('model')}) и model.npz "
+            f"({npz_arch}) — переобучи модель (train)",
+            file=sys.stderr,
+        )
+        return 2
     if "w1" in m:
         p_garbage = float(
             mlp_scores({"w1": m["w1"], "w2": m["w2"], "b2": m["b2"]}, vec[None, :])[0]
         )
     else:
         logits = vec @ m["w"] + m["b"]
+        logits = logits - logits.max()  # стабилизация как в train
         p_garbage = float(np.exp(logits[1]) / np.exp(logits).sum())
     verdict = "garbage" if p_garbage >= meta["threshold"] else "keep"
     print(
