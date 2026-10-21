@@ -402,6 +402,52 @@ def cmd_infer(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rank(args: argparse.Namespace) -> int:
+    """Скоринг фактов головой: список путей → таблица p_garbage по убыванию."""
+    from triage_log import statement_of
+
+    m = np.load(MODEL_DIR / "model.npz")
+    meta = json.loads((MODEL_DIR / "model.json").read_text(encoding="utf-8"))
+    texts, files = [], []
+    for pat in args.files:
+        for path in (
+            sorted(Path().glob(pat)) if any(c in pat for c in "*?[") else [Path(pat)]
+        ):
+            body = path.read_text(encoding="utf-8")
+            stmt = statement_of(body)
+            if stmt:
+                texts.append(stmt)
+                files.append(str(path))
+    if not texts:
+        print("нет валидных файлов фактов", file=sys.stderr)
+        return 2
+    emb = embed_all(texts)
+    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9)
+    if "w1" in m:
+        scores = mlp_scores({"w1": m["w1"], "w2": m["w2"], "b2": m["b2"]}, emb)
+    else:
+        logits = np.hstack([emb, np.ones((len(emb), 1), dtype=np.float32)]) @ np.vstack(
+            [m["w"], m["b"][None, :]]
+        )
+        logits -= logits.max(axis=1, keepdims=True)
+        p = np.exp(logits)
+        p /= p.sum(axis=1, keepdims=True)
+        scores = p[:, 1]
+    order = np.argsort(-scores)
+    thr = meta["threshold"]
+    hi = 0
+    for i in order:
+        mark = " *" if scores[i] >= 0.5 else ""
+        hi += scores[i] >= 0.5
+        print(f"{scores[i]:.3f}  {files[i]}{mark}")
+    print(
+        f"\nитого: {len(texts)}, кандидаты мусора (p>=0.5): {hi} "
+        f"[точность ~{meta['oof_thr05']['precision_garbage']:.2f} по OOF]; "
+        f"порог модели {thr:.3f} (max-F1, агрессивный)"
+    )
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -414,8 +460,14 @@ def main() -> int:
     t.add_argument("--pretrain", help="npz с внешним корпусом (x=эмбеддинги, y=0/1)")
     i = sub.add_parser("infer", help="вердикт для текста")
     i.add_argument("--text")
+    r = sub.add_parser("rank", help="скоринг файлов фактов (пути/глобы)")
+    r.add_argument("files", nargs="+")
     args = p.parse_args()
-    return cmd_train(args) if args.cmd == "train" else cmd_infer(args)
+    if args.cmd == "train":
+        return cmd_train(args)
+    if args.cmd == "rank":
+        return cmd_rank(args)
+    return cmd_infer(args)
 
 
 if __name__ == "__main__":
