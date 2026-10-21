@@ -403,21 +403,37 @@ def cmd_infer(args: argparse.Namespace) -> int:
 
 
 def cmd_rank(args: argparse.Namespace) -> int:
-    """Скоринг фактов головой: список путей → таблица p_garbage по убыванию."""
+    """Скоринг фактов головой: список путей/глобов → таблица p_garbage по убыванию."""
+    import glob as _glob
+
     from triage_log import statement_of
 
     m = np.load(MODEL_DIR / "model.npz")
     meta = json.loads((MODEL_DIR / "model.json").read_text(encoding="utf-8"))
-    texts, files = [], []
+    npz_arch = "mlp" if "w1" in m else "linear"
+    if meta.get("model", "").split("-")[0] != npz_arch:
+        print(
+            f"рассинхрон model.json ({meta.get('model')}) и model.npz ({npz_arch}) "
+            f"— переобучи модель (train)",
+            file=sys.stderr,
+        )
+        return 2
+    texts, files, skipped = [], [], 0
     for pat in args.files:
-        for path in (
-            sorted(Path().glob(pat)) if any(c in pat for c in "*?[") else [Path(pat)]
-        ):
-            body = path.read_text(encoding="utf-8")
-            stmt = statement_of(body)
+        # stdlib glob: поддерживает абсолютные паттерны (pathlib — нет)
+        matches = _glob.glob(pat) if any(c in pat for c in "*?[") else [pat]
+        for name in matches:
+            path = Path(name)
+            if not path.is_file():
+                print(f"пропущен (не файл): {name}", file=sys.stderr)
+                skipped += 1
+                continue
+            stmt = statement_of(path.read_text(encoding="utf-8"))
             if stmt:
                 texts.append(stmt)
                 files.append(str(path))
+            else:
+                skipped += 1
     if not texts:
         print("нет валидных файлов фактов", file=sys.stderr)
         return 2
@@ -441,7 +457,8 @@ def cmd_rank(args: argparse.Namespace) -> int:
         hi += scores[i] >= 0.5
         print(f"{scores[i]:.3f}  {files[i]}{mark}")
     print(
-        f"\nитого: {len(texts)}, кандидаты мусора (p>=0.5): {hi} "
+        f"\nитого: {len(texts)} (пропущено невалидных: {skipped}), "
+        f"кандидаты мусора (p>=0.5): {hi} "
         f"[точность ~{meta['oof_thr05']['precision_garbage']:.2f} по OOF]; "
         f"порог модели {thr:.3f} (max-F1, агрессивный)"
     )
