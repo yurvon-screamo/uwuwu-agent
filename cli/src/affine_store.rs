@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::affine_client::AffineConfig;
+
 const MAP_FILE: &str = "affine_map.json";
 
 /// Container/daily keys are prefixed so they can never collide with slugs.
@@ -32,22 +34,26 @@ impl MigrationMap {
     /// meaningless on another, and a shared map silently skips the whole
     /// migration (seen live: 2679 "skipped" against an empty workspace).
     /// The default local gateway keeps the legacy `affine_map.json` name.
-    pub fn load_for(wiki_root: &Path, gateway_url: &str) -> Result<Self> {
-        MigrationMap::load_path(&Self::map_path(wiki_root, gateway_url))
+    pub fn load_for(wiki_root: &Path, cfg: &AffineConfig) -> Result<Self> {
+        MigrationMap::load_path(&Self::map_path(wiki_root, cfg))
     }
 
-    fn map_path(wiki_root: &Path, gateway_url: &str) -> PathBuf {
-        let host = gateway_host(gateway_url);
-        if host == "localhost" || host == "127.0.0.1" {
-            wiki_root.join("affine_map.json")
-        } else {
-            let slug: String = host
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .take(60)
-                .collect();
-            wiki_root.join(format!("affine_map_{slug}.json"))
-        }
+    /// Instance identity = gateway host AND workspace id: two workspaces
+    /// behind one gateway share nothing, docIds of one are invalid in the
+    /// other (same failure class the per-host split was introduced for).
+    fn map_path(wiki_root: &Path, cfg: &AffineConfig) -> PathBuf {
+        let host = gateway_host(&cfg.url)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(48)
+            .collect::<String>();
+        let ws: String = cfg
+            .workspace
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        wiki_root.join(format!("affine_map_{host}-{ws}.json"))
     }
 
     pub fn load(wiki_root: &Path) -> Result<Self> {

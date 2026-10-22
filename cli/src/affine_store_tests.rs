@@ -1,7 +1,16 @@
 //! Tests for affine_store: frontmatter parsing, fact section rendering,
 //! table splitting, and the migration map.
 
+use crate::affine_client::AffineConfig;
 use crate::affine_store::{split_frontmatter, MigrationMap};
+
+fn cfg(url: &str, workspace: &str) -> AffineConfig {
+    AffineConfig {
+        url: url.to_string(),
+        token: "t".to_string(),
+        workspace: workspace.to_string(),
+    }
+}
 
 fn fact_fixture() -> crate::affine_store::FactEntry {
     crate::affine_store::FactEntry {
@@ -60,29 +69,32 @@ fn fact_section_contains_meta_and_statement() {
 }
 
 #[test]
-fn map_is_per_gateway_instance() {
+fn map_is_per_gateway_and_workspace() {
     let dir = tempfile::tempdir().unwrap();
-    // local gateway → legacy name
-    let local = MigrationMap::load_for(dir.path(), "http://localhost:3000/mcp").unwrap();
-    local.save().unwrap();
-    assert!(dir.path().join("affine_map.json").exists());
-    // remote gateway → own file, does not see the local map's entries
-    let mut remote = MigrationMap::load_for(
-        dir.path(),
+    let remote = cfg(
         "https://affine-mcp-production.up.railway.app/mcp",
-    )
-    .unwrap();
-    assert!(remote.doc_id("axum").is_none());
-    remote.put_doc("axum", "prod-doc-1");
-    remote.save().unwrap();
-    assert!(dir.path().join("affine_map.json").exists());
-    assert!(dir
-        .path()
-        .join("affine_map_affine-mcp-production-up-railway-app.json")
-        .exists());
-    // local map still knows nothing about the remote doc
-    let local_again = MigrationMap::load_for(dir.path(), "http://localhost:3000/mcp").unwrap();
-    assert!(local_again.doc_id("axum").is_none());
+        "81475705-028a-4153-a8f5-f06e402ee31e",
+    );
+    let mut ws_a = MigrationMap::load_for(dir.path(), &remote).unwrap();
+    ws_a.put_doc("axum", "doc-a");
+    ws_a.save().unwrap();
+    // same gateway, another workspace → another file, no shared docIds
+    let ws_b = cfg(&remote.url, "00000000-dead-beef-0000-000000000000");
+    let map_b = MigrationMap::load_for(dir.path(), &ws_b).unwrap();
+    assert!(map_b.doc_id("axum").is_none());
+    // reload of the first workspace still sees its entry
+    let ws_a_again = MigrationMap::load_for(dir.path(), &remote).unwrap();
+    assert_eq!(ws_a_again.doc_id("axum"), Some("doc-a"));
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("affine_map_"))
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "one file per instance+workspace, created lazily"
+    );
 }
 
 #[test]

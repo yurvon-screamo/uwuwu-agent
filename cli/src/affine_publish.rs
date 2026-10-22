@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_collect::group_by_date;
@@ -20,7 +20,7 @@ use crate::facts::LockGuard;
 /// (network calls inside are fine — the facts pipeline never waits on it).
 pub async fn publish_facts(root: &Path, cfg: &AffineConfig, facts: &[FactEntry]) -> Result<usize> {
     let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
-    let mut map = MigrationMap::load_for(root, &cfg.url)?;
+    let mut map = MigrationMap::load_for(root, cfg)?;
     // Skip the gateway session entirely when every fact is already visible
     // in its bucket — a retried run pays nothing for converged state.
     let days: Vec<(String, Vec<&FactEntry>)> = group_by_date(facts)
@@ -111,7 +111,8 @@ fn mark_facts(map: &mut MigrationMap, fresh: &[&FactEntry], bucket_id: &str) {
 }
 
 /// Recover the bucket id when the create answer carries no docId but the
-/// document may exist (timeout-ish ambiguity): exact-title search.
+/// document may exist (timeout-ish ambiguity): exact-title search filtered
+/// by the parsed results — see `parse_bucket_search`.
 async fn find_bucket_by_title(
     client: &mut AffineClient,
     workspace: &str,
@@ -123,11 +124,14 @@ async fn find_bucket_by_title(
             json!({"workspaceId": workspace, "query": date, "limit": 10}),
         )
         .await?;
-    let results = resp
-        .get("results")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+    Ok(parse_bucket_search(&resp, date))
+}
+
+/// Pick the daily-bucket docId from a search_docs answer: exact title match,
+/// not trashed, and not already mapped to another slug (a user note named
+/// like a date must not silently become the bucket).
+pub(crate) fn parse_bucket_search(resp: &Value, date: &str) -> Option<String> {
+    let results = resp.get("results")?.as_array()?;
     for item in results {
         let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let in_trash = item
@@ -136,9 +140,32 @@ async fn find_bucket_by_title(
             .unwrap_or(true);
         if title == date && !in_trash {
             if let Some(id) = item.get("docId").and_then(|d| d.as_str()) {
-                return Ok(Some(id.to_string()));
+                return Some(id.to_string());
             }
         }
     }
-    Ok(None)
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bucket_search;
+    use serde_json::json;
+
+    #[test]
+    fn bucket_recovery_matches_exact_title_and_live_docs() {
+        let resp = json!({"results": [
+            {"docId": "note1", "title": "2026-10-22 заметка", "inTrash": false},
+            {"docId": "gone", "title": "2026-10-23", "inTrash": true},
+            {"docId": "hit", "title": "2026-10-23", "inTrash": false},
+        ]});
+        assert_eq!(parse_bucket_search(&resp, "2026-10-23"), Some("hit".into()));
+    }
+
+    #[test]
+    fn bucket_recovery_returns_none_when_nothing_matches() {
+        let resp = json!({"results": [{"docId": "x", "title": "other", "inTrash": false}]});
+        assert_eq!(parse_bucket_search(&resp, "2026-10-23"), None);
+        assert_eq!(parse_bucket_search(&json!({}), "2026-10-23"), None);
+    }
 }
