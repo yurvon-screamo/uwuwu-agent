@@ -7,6 +7,8 @@
     "moduleResolution": "bundler",
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "types": [
       "bun-types"
     ]
@@ -14,9 +16,15 @@
   "include": [
     "goal-mode.ts",
     "cron-mode.ts",
+    "sticky-retry/index.ts",
+    "sticky-retry/contract.ts",
+    "sticky-retry/tui.tsx",
     "../lib/goal-lib.ts",
     "../lib/cron-lib.ts",
     "../tests/goal-mode.test.ts",
-    "../tests/cron-lib.test.ts"
+    "../tests/cron-lib.test.ts",
+    "../plugins-tests/sticky-retry.test.ts",
+    "../plugins-tests/sticky-retry-contract.test.ts",
+    "../plugins-tests/sticky-retry-forwarder.test.ts"
   ]
 }

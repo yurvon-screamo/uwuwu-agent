@@ -1,6 +1,15 @@
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
+import {
+  RETRY_AFTER_CAP_MS,
+  RETRY_RPC,
+  type RetryStatusEvent,
+  extractErrorDetail,
+  scrubDetail,
+} from "./contract"
+
+export { RETRY_AFTER_CAP_MS } from "./contract"
 
 // sticky-retry — infinite provider retries for OpenCode V2.
 //
@@ -47,9 +56,17 @@ import { dirname } from "node:path"
 // truthfully (bounded by the server's pending-handler patience, which the
 // E2E suite measures).
 //
+//   5. status events: every retry decision, recovery and give-up is emitted
+//      through an RPC port ("sticky-retry", event "status") for the TUI
+//      companion plugin — footer line + toasts (see ./contract.ts and
+//      ./tui.tsx). Provider error bodies are attached, scrubbed to 400
+//      chars. The log lines below carry the same fields as a machine-
+//      readable suffix `| kind=... status=... ...` so the TUI can fall
+//      back to tailing this file if the RPC channel is unavailable.
+//
 // Known limitations (deliberate):
 //   - While the forwarder retries, the session looks busy; retry status is
-//     only visible in the log file (LOG_PATH below).
+//     visible in the log file (LOG_PATH below) and via the RPC events.
 //   - Request bodies are buffered once to make retries replayable; very
 //     large streaming request bodies are not supported (LLM JSON is fine).
 //   - A retried POST whose request actually reached the provider may be
@@ -71,7 +88,6 @@ const LOG_PATH = `${LOG_DIR}/sticky-retry.log`
 /** Delay schedule in ms: 1, 2, 3, 5, 7, 10, 15 min — then 15 min forever. */
 export const SCHEDULE_MS = [60_000, 120_000, 180_000, 300_000, 420_000, 600_000, 900_000] as const
 export const RETRY_AFTER_BUFFER_MS = 1_000
-export const RETRY_AFTER_CAP_MS = 30 * 60_000
 const KEEPALIVE_INTERVAL_MS = 30_000
 /** OpenCode's silent-stream watchdog kills a legitimate model stream after
  *  ~480s, so a retrying proxy stream older than this cap is serving an
@@ -81,6 +97,36 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 const STREAM_MAX_LIFETIME_MS = 20 * 60_000
 const PATH_PREFIX = "/s/"
 const RETRYABLE_STATUSES = new Set([408, 429])
+/** Threading sessionID to the forwarder: added by the model.request hook,
+ *  stripped in prepareUpstream before the request reaches the provider. */
+const SESSION_HEADER = "x-sticky-retry-session"
+const DETAIL_BODY_READ_CHARS = 4 * 1024
+
+/** UI/log event sink. undefined = RPC unavailable, log-only (TUI falls back
+ *  to tailing the log file). */
+type Emit = (event: RetryStatusEvent) => void
+type EmitSupplier = () => Emit | undefined
+
+/** Test seam: real time uses the retry decision's delay; the e2e suite
+ *  overrides it to keep the forwarder's schedule out of test time. */
+export interface ProxyEmitOptions {
+  readonly delayMs?: (decision: { retry: boolean; delayMs: number }) => number
+}
+
+const emitOrLog = (emit: Emit | undefined, base: string, event: RetryStatusEvent): void => {
+  if (emit !== undefined) {
+    try {
+      emit(event)
+    } catch {
+      // UI events must never break traffic
+    }
+  }
+  log(`${base} ${eventLogSuffix(event)}`)
+}
+
+/** Machine-readable suffix parsed by the TUI log-tail fallback. */
+const eventLogSuffix = (event: RetryStatusEvent): string =>
+  `| kind=${event.kind} status=${event.status ?? "-"} attempt=${event.attempt ?? "-"} delay=${event.delayMs ?? "-"}${event.detail !== undefined ? ` detail=${event.detail}` : ""}${event.sessionID !== undefined ? ` session=${event.sessionID}` : ""}`
 
 const log = (message: string): void => {
   try {
@@ -190,16 +236,41 @@ interface ProxyHandle {
   readonly port: number
 }
 
+/** Bounded read of a provider error body. Retryable responses are discarded
+ *  right after this (they are never relayed), so consuming the stream is safe. */
+const readBodyDetail = async (upstream: Response): Promise<string | undefined> => {
+  try {
+    const body = upstream.body
+    if (body === null) return undefined
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
+    let text = ""
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      text += decoder.decode(value, { stream: true })
+      if (text.length >= DETAIL_BODY_READ_CHARS) {
+        void reader.cancel().catch(() => {})
+        break
+      }
+    }
+    return extractErrorDetail(text)
+  } catch {
+    return undefined
+  }
+}
+
 /** Start the forwarder once per process (plugin setup runs per location). */
-const startProxy = (): ProxyHandle | null => {
+const startProxy = (emitSupplier: EmitSupplier): ProxyHandle | null => {
   try {
     mkdirSync(dirname(LOG_PATH), { recursive: true })
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       idleTimeout: 255,
-      fetch: (request) => proxyHandler(request),
+      fetch: (request) => createProxyHandler(emitSupplier)(request),
     })
+    if (server.port === undefined) throw new Error("Bun.serve returned no port")
     log(`proxy listening on 127.0.0.1:${server.port}`)
     return { port: server.port }
   } catch (error) {
@@ -215,6 +286,7 @@ interface PreparedRequest {
   readonly headers: Headers
   readonly bodyBuffer: ArrayBuffer | undefined
   readonly abort: AbortController
+  readonly sessionID: string | undefined
 }
 
 const prepareUpstream = async (request: Request): Promise<PreparedRequest | null> => {
@@ -227,6 +299,8 @@ const prepareUpstream = async (request: Request): Promise<PreparedRequest | null
   const headers = new Headers(request.headers)
   headers.delete("host")
   headers.delete("connection")
+  const sessionID = headers.get(SESSION_HEADER) ?? undefined
+  headers.delete(SESSION_HEADER)
   const abort = new AbortController()
   // Client disconnect must stop the retry loop on BOTH relay paths; the SSE
   // stream cancel() below is the second, belt-and-suspenders trigger.
@@ -242,6 +316,7 @@ const prepareUpstream = async (request: Request): Promise<PreparedRequest | null
     headers,
     bodyBuffer: hasBody ? await request.arrayBuffer() : undefined,
     abort,
+    sessionID,
   }
 }
 
@@ -261,41 +336,66 @@ const upstreamDecision = (upstream: Response, attempt: number) =>
     attempt,
   })
 
-const proxyHandler = async (request: Request): Promise<Response> => {
-  const prepared = await prepareUpstream(request)
-  if (prepared === null) {
-    return new Response("sticky-retry: unknown path or scheme", { status: 404 })
-  }
+export const createProxyHandler =
+  (emitSupplier: EmitSupplier, options: ProxyEmitOptions = {}) =>
+  async (request: Request): Promise<Response> => {
+    const prepared = await prepareUpstream(request)
+    if (prepared === null) {
+      return new Response("sticky-retry: unknown path or scheme", { status: 404 })
+    }
 
-  const wantsSse = (request.headers.get("accept") ?? "").includes("text/event-stream")
+    const wantsSse = (request.headers.get("accept") ?? "").includes("text/event-stream")
+    const delayOf = (decision: { retry: boolean; delayMs: number }): number =>
+      options.delayMs !== undefined ? options.delayMs(decision) : decision.delayMs
 
-  // First attempt before committing any response bytes: non-retryable
-  // statuses must reach the caller with their true status and headers.
-  let upstream: Response
-  try {
-    upstream = await fetchUpstream(prepared)
-  } catch (error) {
-    if (prepared.abort.signal.aborted) return new Response("aborted", { status: 499 })
-    const decision = decide({ transportError: true, attempt: 1 })
-    log(
-      `retry transport="${scrubErrorText(error)}" attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
+    // First attempt before committing any response bytes: non-retryable
+    // statuses must reach the caller with their true status and headers.
+    let upstream: Response
+    try {
+      upstream = await fetchUpstream(prepared)
+    } catch (error) {
+      if (prepared.abort.signal.aborted) return new Response("aborted", { status: 499 })
+      const decision = decide({ transportError: true, attempt: 1 })
+      emitOrLog(
+        emitSupplier(),
+        `retry transport="${scrubErrorText(error)}" attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
+        {
+          kind: "retry",
+          transport: scrubDetail(String(error)),
+          attempt: 1,
+          delayMs: delayOf(decision),
+          url: prepared.displayUrl,
+          sessionID: prepared.sessionID,
+        },
+      )
+      return wantsSse
+        ? retryingSseResponse(prepared, emitSupplier, delayOf, 2, delayOf(decision))
+        : retryThenRelay(prepared, emitSupplier, delayOf, 2, delayOf(decision))
+    }
+    const decision = upstreamDecision(upstream, 1)
+    if (!decision.retry) {
+      log(`pass status=${upstream.status} attempt=1 url=${prepared.displayUrl}`)
+      return relayResponse(upstream)
+    }
+    const detail = await readBodyDetail(upstream)
+    const firstDelayMs = delayOf(decision)
+    emitOrLog(
+      emitSupplier(),
+      `retry status=${upstream.status} attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
+      {
+        kind: "retry",
+        status: upstream.status,
+        detail,
+        attempt: 1,
+        delayMs: firstDelayMs,
+        url: prepared.displayUrl,
+        sessionID: prepared.sessionID,
+      },
     )
     return wantsSse
-      ? retryingSseResponse(prepared, 2, decision.delayMs)
-      : retryThenRelay(prepared, 2, decision.delayMs)
+      ? retryingSseResponse(prepared, emitSupplier, delayOf, 2, firstDelayMs)
+      : retryThenRelay(prepared, emitSupplier, delayOf, 2, firstDelayMs)
   }
-  const decision = upstreamDecision(upstream, 1)
-  if (!decision.retry) {
-    log(`pass status=${upstream.status} attempt=1 url=${prepared.displayUrl}`)
-    return relayResponse(upstream)
-  }
-  log(
-    `retry status=${upstream.status} attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
-  )
-  return wantsSse
-    ? retryingSseResponse(prepared, 2, decision.delayMs)
-    : retryThenRelay(prepared, 2, decision.delayMs)
-}
 
 /** Non-SSE path: the whole retry loop runs inside the handler, then the
  *  final response (whatever its status) is relayed truthfully. Every sleep
@@ -303,11 +403,14 @@ const proxyHandler = async (request: Request): Promise<Response> => {
  *  and aborts as soon as the caller disconnects. */
 const retryThenRelay = async (
   prepared: PreparedRequest,
+  emitSupplier: EmitSupplier,
+  delayOf: (decision: { retry: boolean; delayMs: number }) => number,
   nextAttempt: number,
   firstDelayMs: number,
 ): Promise<Response> => {
   let pendingDelayMs = firstDelayMs
   const bornAt = Date.now()
+  let hadRetry = false
   for (let attempt = nextAttempt; ; attempt += 1) {
     try {
       await abortableSleep(pendingDelayMs, prepared.abort.signal)
@@ -315,7 +418,13 @@ const retryThenRelay = async (
       return new Response("aborted", { status: 499 })
     }
     if (Date.now() - bornAt > STREAM_MAX_LIFETIME_MS) {
-      log(`give-up stale-stream attempt=${attempt} url=${prepared.displayUrl}`)
+      emitOrLog(emitSupplier(), `give-up stale-stream attempt=${attempt} url=${prepared.displayUrl}`, {
+        kind: "give-up",
+        transport: "stream lifetime cap",
+        attempt,
+        url: prepared.displayUrl,
+        sessionID: prepared.sessionID,
+      })
       return new Response("sticky-retry: stream lifetime cap", { status: 504 })
     }
     try {
@@ -323,17 +432,48 @@ const retryThenRelay = async (
       const decision = upstreamDecision(upstream, attempt)
       if (!decision.retry) {
         log(`pass status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`)
+        if (hadRetry) {
+          emitOrLog(emitSupplier(), `recovered status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`, {
+            kind: "recovered",
+            status: upstream.status,
+            attempt,
+            url: prepared.displayUrl,
+            sessionID: prepared.sessionID,
+          })
+        }
         return relayResponse(upstream)
       }
-      pendingDelayMs = decision.delayMs
-      log(
+      hadRetry = true
+      pendingDelayMs = delayOf(decision)
+      const detail = await readBodyDetail(upstream)
+      emitOrLog(
+        emitSupplier(),
         `retry status=${upstream.status} attempt=${attempt} next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
+        {
+          kind: "retry",
+          status: upstream.status,
+          detail,
+          attempt,
+          delayMs: pendingDelayMs,
+          url: prepared.displayUrl,
+          sessionID: prepared.sessionID,
+        },
       )
     } catch (error) {
       if (prepared.abort.signal.aborted) return new Response("aborted", { status: 499 })
-      pendingDelayMs = decide({ transportError: true, attempt }).delayMs
-      log(
+      hadRetry = true
+      pendingDelayMs = delayOf(decide({ transportError: true, attempt }))
+      emitOrLog(
+        emitSupplier(),
         `retry transport="${scrubErrorText(error)}" attempt=${attempt} next=${Math.round(pendingDelayMs / 1000)}s url=${prepared.displayUrl}`,
+        {
+          kind: "retry",
+          transport: scrubDetail(String(error)),
+          attempt,
+          delayMs: pendingDelayMs,
+          url: prepared.displayUrl,
+          sessionID: prepared.sessionID,
+        },
       )
     }
   }
@@ -347,6 +487,8 @@ const retryThenRelay = async (
  *  OpenCode's own retry pipeline. */
 const retryingSseResponse = (
   prepared: PreparedRequest,
+  emitSupplier: EmitSupplier,
+  delayOf: (decision: { retry: boolean; delayMs: number }) => number,
   nextAttempt: number,
   firstDelayMs: number,
 ): Response => {
@@ -375,6 +517,7 @@ const retryingSseResponse = (
       }, KEEPALIVE_INTERVAL_MS)
       let pendingDelayMs = firstDelayMs
       const bornAt = Date.now()
+      let hadRetry = false
       try {
         for (let attempt = nextAttempt; ; attempt += 1) {
           try {
@@ -383,7 +526,13 @@ const retryingSseResponse = (
             return
           }
           if (Date.now() - bornAt > STREAM_MAX_LIFETIME_MS) {
-            log(`give-up stale-stream attempt=${attempt} url=${prepared.displayUrl}`)
+            emitOrLog(emitSupplier(), `give-up stale-stream attempt=${attempt} url=${prepared.displayUrl}`, {
+              kind: "give-up",
+              transport: "stream lifetime cap",
+              attempt,
+              url: prepared.displayUrl,
+              sessionID: prepared.sessionID,
+            })
             return
           }
           try {
@@ -391,24 +540,65 @@ const retryingSseResponse = (
             const decision = upstreamDecision(upstream, attempt)
             if (!decision.retry) {
               if (upstream.ok) {
-                log(`recovered status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`)
+                if (hadRetry) {
+                  emitOrLog(emitSupplier(), `recovered status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`, {
+                    kind: "recovered",
+                    status: upstream.status,
+                    attempt,
+                    url: prepared.displayUrl,
+                    sessionID: prepared.sessionID,
+                  })
+                } else {
+                  log(`pass status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`)
+                }
                 await pipeBody(upstream, controller)
                 return
               }
-              log(
+              emitOrLog(
+                emitSupplier(),
                 `give-up status=${upstream.status} attempt=${attempt} stream-closed url=${prepared.displayUrl}`,
+                {
+                  kind: "give-up",
+                  status: upstream.status,
+                  detail: await readBodyDetail(upstream),
+                  attempt,
+                  url: prepared.displayUrl,
+                  sessionID: prepared.sessionID,
+                },
               )
               return
             }
-            pendingDelayMs = decision.delayMs
-            log(
+            hadRetry = true
+            pendingDelayMs = delayOf(decision)
+            const detail = await readBodyDetail(upstream)
+            emitOrLog(
+              emitSupplier(),
               `retry status=${upstream.status} attempt=${attempt} next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
+              {
+                kind: "retry",
+                status: upstream.status,
+                detail,
+                attempt,
+                delayMs: pendingDelayMs,
+                url: prepared.displayUrl,
+                sessionID: prepared.sessionID,
+              },
             )
           } catch (error) {
             if (prepared.abort.signal.aborted) return
-            pendingDelayMs = decide({ transportError: true, attempt }).delayMs
-            log(
+            hadRetry = true
+            pendingDelayMs = delayOf(decide({ transportError: true, attempt }))
+            emitOrLog(
+              emitSupplier(),
               `retry transport="${scrubErrorText(error)}" attempt=${attempt} next=${Math.round(pendingDelayMs / 1000)}s url=${prepared.displayUrl}`,
+              {
+                kind: "retry",
+                transport: scrubDetail(String(error)),
+                attempt,
+                delayMs: pendingDelayMs,
+                url: prepared.displayUrl,
+                sessionID: prepared.sessionID,
+              },
             )
           }
         }
@@ -477,6 +667,7 @@ const parseProxyPath = (
 }
 
 const PROXY_GUARD = Symbol.for("sticky-retry.proxy")
+const RPC_GUARD = Symbol.for("sticky-retry.rpc")
 const AUTO_CONTINUE_GUARD = Symbol.for("sticky-retry.auto-continue")
 
 const AUTO_CONTINUE_DEDUPE_MS = 15_000
@@ -558,9 +749,33 @@ export default Plugin.define({
   id: "sticky-retry",
   setup: async (ctx) => {
     const globals = globalThis as { [key: symbol]: unknown }
+
+    // RPC port is a per-process singleton exactly like the proxy: several
+    // location instances share one registration, and it is never disposed on
+    // unload (same lifetime policy as the forwarder). Registration failure
+    // is non-fatal: emit stays undefined and the TUI falls back to the log.
+    let emit = globals[RPC_GUARD] as Emit | undefined
+    if (emit === undefined) {
+      try {
+        const rpcRegistration = await ctx.rpc.register(RETRY_RPC, {})
+        emit = (event) => {
+          void rpcRegistration.events
+            .emit("status", event as never)
+            .catch(() => {
+              // a dead TUI must never break a retry
+            })
+        }
+        globals[RPC_GUARD] = emit
+        log("rpc status-events armed")
+      } catch (error) {
+        log(`rpc registration failed — TUI falls back to log tail (${scrubErrorText(error)})`)
+      }
+    }
+    const emitSupplier: EmitSupplier = () => globals[RPC_GUARD] as Emit | undefined
+
     let proxy = globals[PROXY_GUARD] as ProxyHandle | null | undefined
     if (proxy === undefined) {
-      proxy = startProxy()
+      proxy = startProxy(emitSupplier)
       globals[PROXY_GUARD] = proxy
     }
 
@@ -580,6 +795,9 @@ export default Plugin.define({
             if (!/^https?:\/\//i.test(base)) return
             if (base.startsWith(`${proxyOrigin}/`)) return
             event.baseURL = `${proxyOrigin}${PATH_PREFIX}${encodeURIComponent(base)}`
+            // Threading sessionID for status events; prepareUpstream strips
+            // the header before the request reaches the provider.
+            event.headers[SESSION_HEADER] = event.sessionID
             log(`rewrite ${event.model.providerID} -> ${originAndPath(base)}`)
           } catch {
             // never break the request over a rewrite failure
@@ -598,8 +816,17 @@ export default Plugin.define({
             attempt: event.attempt,
           })
           if (decision.retry) {
-            log(
+            emitOrLog(
+              emitSupplier(),
               `fallback-retry attempt=${event.attempt} type=${event.error.type} delay=${Math.round(decision.delayMs / 1000)}s`,
+              {
+                kind: "fallback-retry",
+                sessionID: event.sessionID,
+                status: event.error.status,
+                transport: event.error.type,
+                attempt: event.attempt,
+                delayMs: decision.delayMs,
+              },
             )
             event.decision = { retry: true, delay: decision.delayMs }
           }
@@ -627,7 +854,7 @@ export default Plugin.define({
           log("event-subscribe opening")
           for await (const event of ctx.event.subscribe({ signal: subscription.signal })) {
             try {
-              scheduleAutoContinue(ctx, state, event, subscription.signal)
+              scheduleAutoContinue(ctx, state, event as unknown as SessionFailureEvent, subscription.signal, emitSupplier)
             } catch {
               // one bad event must never break the stream
             }
@@ -665,6 +892,7 @@ const scheduleAutoContinue = (
   state: AutoContinueState,
   event: SessionFailureEvent,
   subscriptionSignal: AbortSignal,
+  emitSupplier: EmitSupplier,
 ): void => {
   const sessionID = event.data?.sessionID
   if (sessionID === undefined) return
@@ -672,6 +900,7 @@ const scheduleAutoContinue = (
 
   if (event.type === "session.execution.interrupted") {
     state.stop(sessionID)
+    emitSupplier()?.({ kind: "continue-cancelled", sessionID })
     return
   }
   if (event.type === "session.execution.started") {
@@ -702,20 +931,36 @@ const scheduleAutoContinue = (
   if (now - entry.handledAt < AUTO_CONTINUE_DEDUPE_MS) return
   if (entry.consecutive >= MAX_AUTO_CONTINUES) {
     log(`auto-continue cap reached session=${sessionID} (${MAX_AUTO_CONTINUES}) — giving up`)
+    emitSupplier()?.({
+      kind: "continue-capped",
+      sessionID,
+      attempt: entry.consecutive,
+      transport: error.type,
+    })
     return
   }
   entry.handledAt = now
   entry.consecutive += 1
   const attempt = entry.consecutive
   const delayMs = scheduleDelayMs(attempt)
-  log(
+  emitOrLog(
+    emitSupplier(),
     `auto-continue session=${sessionID} attempt=${attempt} type=${error.type} in=${Math.round(delayMs / 1000)}s`,
+    {
+      kind: "continue-scheduled",
+      sessionID,
+      attempt,
+      delayMs,
+      transport: error.type,
+      detail: error.message !== undefined ? scrubDetail(error.message) : undefined,
+    },
   )
   setTimeout(() => {
     const fresh = state.sessions.get(sessionID)
     if (subscriptionSignal.aborted) return
     if (fresh === undefined || fresh.stopped) {
       log(`auto-continue cancelled session=${sessionID}`)
+      emitSupplier()?.({ kind: "continue-cancelled", sessionID, attempt })
       return
     }
     void ctx.session
@@ -723,9 +968,18 @@ const scheduleAutoContinue = (
         sessionID,
         text: `[sticky-retry] provider outage (${error.type}) — auto-continuing, attempt ${attempt}.`,
       })
-      .then(() => log(`auto-continue sent session=${sessionID} attempt=${attempt}`))
-      .catch((error: unknown) =>
-        log(`auto-continue failed session=${sessionID}: ${scrubErrorText(error)}`),
-      )
+      .then(() => {
+        log(`auto-continue sent session=${sessionID} attempt=${attempt}`)
+        emitSupplier()?.({ kind: "continue-sent", sessionID, attempt })
+      })
+      .catch((syntheticError: unknown) => {
+        log(`auto-continue failed session=${sessionID}: ${scrubErrorText(syntheticError)}`)
+        emitSupplier()?.({
+          kind: "continue-failed",
+          sessionID,
+          attempt,
+          transport: scrubDetail(String(syntheticError)),
+        })
+      })
   }, delayMs)
 }
