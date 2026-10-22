@@ -42,21 +42,27 @@ fn read_file(path: &Path) -> Result<String, String> {
 pub fn collect_experience(root: &Path) -> CollectResult<DocToMigrate> {
     let base = root.join("experience");
     let paths = collect_md(&base);
-    let errors: Vec<String> = paths.iter().filter_map(|p| read_file(p).err()).collect();
-    let items = paths
-        .iter()
-        .filter_map(|path| {
-            let content = read_file(path).ok()?;
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for path in &paths {
+        let content = match read_file(path) {
+            Ok(content) => content,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        {
             let rel = path.strip_prefix(&base).unwrap_or(path);
             let slug = rel.with_extension("").to_string_lossy().replace('\\', "/");
             let (fm, body) = split_frontmatter(&content);
-            Some(DocToMigrate {
+            items.push(DocToMigrate {
                 title: fm.title.unwrap_or_else(|| slug.clone()),
                 markdown: body,
                 slug,
-            })
-        })
-        .collect();
+            });
+        }
+    }
     CollectResult { items, errors }
 }
 
@@ -119,18 +125,24 @@ pub fn collect_projects(root: &Path) -> CollectResult<ProjectDocs> {
 
 pub fn collect_facts(root: &Path) -> CollectResult<FactEntry> {
     let paths = collect_md(&root.join("facts"));
-    let errors: Vec<String> = paths.iter().filter_map(|p| read_file(p).err()).collect();
-    let items = paths
-        .iter()
-        .filter_map(|path| {
-            let content = read_file(path).ok()?;
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for path in &paths {
+        let content = match read_file(path) {
+            Ok(content) => content,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        {
             let slug = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
             let (fm, statement) = split_frontmatter(&content);
-            Some(FactEntry {
+            items.push(FactEntry {
                 date: fm.updated.clone().unwrap_or_else(|| month_fallback(path)),
                 title: fm.title.unwrap_or_else(|| slug.clone()),
                 statement,
@@ -138,9 +150,9 @@ pub fn collect_facts(root: &Path) -> CollectResult<FactEntry> {
                 confidence: fm.confidence.unwrap_or_else(|| "-".into()),
                 sources: fm.sources,
                 slug,
-            })
-        })
-        .collect();
+            });
+        }
+    }
     CollectResult { items, errors }
 }
 

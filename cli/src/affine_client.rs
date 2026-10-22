@@ -20,6 +20,8 @@ const CALL_TIMEOUT_SECS: u64 = 120;
 /// Timeouts are NOT retried — the server may have applied the write, and
 /// replaying non-idempotent tools (create/append) would duplicate content.
 const CALL_RETRIES: usize = 2;
+/// Pause between retry attempts: instant retries would hammer a 429/5xx burst.
+const RETRY_PAUSE_MS: u64 = 500;
 
 pub struct AffineConfig {
     pub url: String,
@@ -101,10 +103,14 @@ impl AffineClient {
         Self::tool_result(name, &resp.body)
     }
 
-    /// POST a request until it answers; only transport errors repeat.
+    /// POST a request until it answers; only transport errors repeat, with a
+    /// pause between attempts so 429/5xx bursts are not hammered instantly.
     async fn request_with_retry(&mut self, method: &str, params: Value) -> Result<RpcResponse> {
         let mut last_err = None;
-        for _ in 0..=CALL_RETRIES {
+        for attempt in 0..=CALL_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(RETRY_PAUSE_MS)).await;
+            }
             let call_id = self.alloc_id();
             let body = json!({
                 "jsonrpc": "2.0",

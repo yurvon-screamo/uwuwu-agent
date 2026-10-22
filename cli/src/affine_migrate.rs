@@ -43,13 +43,14 @@ impl MigrationReport {
 }
 
 /// Migrate the requested kinds from the wiki root into the workspace.
-/// Holds the facts pipeline lock for the whole run: both write affine_map.json.
+/// Holds affine_map.lock (NOT the facts pipeline lock — a long migration
+/// must not starve fact extraction runs on their 60s deadline).
 pub async fn run_migration(
     root: &Path,
     kinds: &[Kind],
     cfg: &AffineConfig,
 ) -> Result<MigrationReport> {
-    let _guard = LockGuard::acquire()?;
+    let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
     let mut client = AffineClient::connect(cfg).await?;
     let mut map = MigrationMap::load(root)?;
     let mut report = MigrationReport::default();
@@ -249,6 +250,9 @@ async fn ensure_container(
     let id = doc_id_from_response(&resp)
         .ok_or_else(|| anyhow!("container {name} created but no docId returned"))?;
     map.put_container(name, &id);
+    // checkpoint immediately: a crash right after container creation must
+    // not produce a duplicate container on restart
+    map.save()?;
     Ok(id)
 }
 

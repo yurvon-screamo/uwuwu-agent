@@ -931,11 +931,19 @@ pub(crate) struct LockGuard {
 
 impl LockGuard {
     pub(crate) fn acquire() -> Result<Self> {
-        let path = wiki_root().join(LOCK_PATH);
-        // env-вики (UWUWU_WIKI) может ещё не существовать — создаём корень
+        Self::acquire_at(&wiki_root().join(LOCK_PATH))
+    }
+
+    /// Lock по явному пути: например, affine_map.lock для писателей
+    /// affine_map.json (миграция и publish-хук) — не блокирует facts.lock.
+    pub(crate) fn acquire_at(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        // каталог lock-файла может ещё не существовать (env-вики) — создаём
         // до lock-цикла, иначе create_new возвращает NotFound навсегда.
-        std::fs::create_dir_all(&wiki_root())
-            .map_err(|e| anyhow!("wiki_root create_dir_all({:?}): {}", wiki_root(), e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("lock dir create_dir_all({:?}): {e}", parent))?;
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             // Дедлайн наверху тела: ни одна ветка (включая stale-continue)
