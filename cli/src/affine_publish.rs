@@ -21,7 +21,7 @@ use crate::facts::LockGuard;
 pub async fn publish_facts(root: &Path, cfg: &AffineConfig, facts: &[FactEntry]) -> Result<usize> {
     let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
     let mut client = AffineClient::connect(cfg).await?;
-    let mut map = MigrationMap::load(root)?;
+    let mut map = MigrationMap::load_for(root, &cfg.url)?;
     let mut published = 0usize;
     for (date, day_facts) in group_by_date(facts) {
         published +=

@@ -60,6 +60,32 @@ fn fact_section_contains_meta_and_statement() {
 }
 
 #[test]
+fn map_is_per_gateway_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    // local gateway → legacy name
+    let local = MigrationMap::load_for(dir.path(), "http://localhost:3000/mcp").unwrap();
+    local.save().unwrap();
+    assert!(dir.path().join("affine_map.json").exists());
+    // remote gateway → own file, does not see the local map's entries
+    let mut remote = MigrationMap::load_for(
+        dir.path(),
+        "https://affine-mcp-production.up.railway.app/mcp",
+    )
+    .unwrap();
+    assert!(remote.doc_id("axum").is_none());
+    remote.put_doc("axum", "prod-doc-1");
+    remote.save().unwrap();
+    assert!(dir.path().join("affine_map.json").exists());
+    assert!(dir
+        .path()
+        .join("affine_map_affine-mcp-production-up-railway-app.json")
+        .exists());
+    // local map still knows nothing about the remote doc
+    let local_again = MigrationMap::load_for(dir.path(), "http://localhost:3000/mcp").unwrap();
+    assert!(local_again.doc_id("axum").is_none());
+}
+
+#[test]
 fn migration_map_roundtrip_and_corruption_is_loud() {
     let dir = tempfile::tempdir().unwrap();
     let mut map = MigrationMap::load(dir.path()).unwrap();

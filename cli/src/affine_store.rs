@@ -28,8 +28,34 @@ pub struct MigrationMap {
 }
 
 impl MigrationMap {
+    /// Map file is per-gateway-instance: docIds from one AFFiNE server are
+    /// meaningless on another, and a shared map silently skips the whole
+    /// migration (seen live: 2679 "skipped" against an empty workspace).
+    /// The default local gateway keeps the legacy `affine_map.json` name.
+    pub fn load_for(wiki_root: &Path, gateway_url: &str) -> Result<Self> {
+        MigrationMap::load_path(&Self::map_path(wiki_root, gateway_url))
+    }
+
+    fn map_path(wiki_root: &Path, gateway_url: &str) -> PathBuf {
+        let host = gateway_host(gateway_url);
+        if host == "localhost" || host == "127.0.0.1" {
+            wiki_root.join("affine_map.json")
+        } else {
+            let slug: String = host
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .take(60)
+                .collect();
+            wiki_root.join(format!("affine_map_{slug}.json"))
+        }
+    }
+
     pub fn load(wiki_root: &Path) -> Result<Self> {
-        let path = wiki_root.join(MAP_FILE);
+        MigrationMap::load_path(&wiki_root.join(MAP_FILE))
+    }
+
+    fn load_path(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
         if !path.exists() {
             return Ok(Self {
                 path,
@@ -199,6 +225,20 @@ pub fn render_fact_section(fact: &FactEntry) -> String {
         "## {}\n\n{}\n\n*{} · conf {} · sources: {} · slug: {}*\n",
         fact.title, fact.statement, tags, fact.confidence, sources, fact.slug
     )
+}
+
+/// Extract the host from a gateway URL (no url crate needed): strip the
+/// scheme, take up to port or path.
+fn gateway_host(url: &str) -> String {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let end = rest
+        .find(':')
+        .or_else(|| rest.find('/'))
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
 /// Extract a docId from a create-tool response (tries common shapes).

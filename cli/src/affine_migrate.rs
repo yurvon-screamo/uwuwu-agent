@@ -52,7 +52,7 @@ pub async fn run_migration(
 ) -> Result<MigrationReport> {
     let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
     let mut client = AffineClient::connect(cfg).await?;
-    let mut map = MigrationMap::load(root)?;
+    let mut map = MigrationMap::load_for(root, &cfg.url)?;
     let mut report = MigrationReport::default();
 
     if kinds.contains(&Kind::Experience) {
