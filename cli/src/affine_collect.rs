@@ -52,16 +52,14 @@ pub fn collect_experience(root: &Path) -> CollectResult<DocToMigrate> {
                 continue;
             }
         };
-        {
-            let rel = path.strip_prefix(&base).unwrap_or(path);
-            let slug = rel.with_extension("").to_string_lossy().replace('\\', "/");
-            let (fm, body) = split_frontmatter(&content);
-            items.push(DocToMigrate {
-                title: fm.title.unwrap_or_else(|| slug.clone()),
-                markdown: body,
-                slug,
-            });
-        }
+        let rel = path.strip_prefix(&base).unwrap_or(path);
+        let slug = rel.with_extension("").to_string_lossy().replace('\\', "/");
+        let (fm, body) = split_frontmatter(&content);
+        items.push(DocToMigrate {
+            title: fm.title.unwrap_or_else(|| slug.clone()),
+            markdown: body,
+            slug,
+        });
     }
     CollectResult { items, errors }
 }
@@ -135,23 +133,21 @@ pub fn collect_facts(root: &Path) -> CollectResult<FactEntry> {
                 continue;
             }
         };
-        {
-            let slug = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let (fm, statement) = split_frontmatter(&content);
-            items.push(FactEntry {
-                date: fm.updated.clone().unwrap_or_else(|| month_fallback(path)),
-                title: fm.title.unwrap_or_else(|| slug.clone()),
-                statement,
-                tags: fm.tags,
-                confidence: fm.confidence.unwrap_or_else(|| "-".into()),
-                sources: fm.sources,
-                slug,
-            });
-        }
+        let slug = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let (fm, statement) = split_frontmatter(&content);
+        items.push(FactEntry {
+            date: fm.updated.clone().unwrap_or_else(|| month_fallback(path)),
+            title: fm.title.unwrap_or_else(|| slug.clone()),
+            statement,
+            tags: fm.tags,
+            confidence: fm.confidence.unwrap_or_else(|| "-".into()),
+            sources: fm.sources,
+            slug,
+        });
     }
     CollectResult { items, errors }
 }
