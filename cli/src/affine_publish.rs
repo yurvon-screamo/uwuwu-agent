@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};

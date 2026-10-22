@@ -433,7 +433,7 @@ fn affine_entry_from_file(path: &Path, fallback_date: &str) -> anyhow::Result<Fa
     Ok(FactEntry {
         slug: slug.clone(),
         date: fm.updated.unwrap_or_else(|| fallback_date.to_string()),
-        title: fm.title.unwrap_or_else(|| slug),
+        title: fm.title.unwrap_or(slug),
         statement,
         tags: fm.tags,
         confidence: fm.confidence.unwrap_or_else(|| "-".into()),
