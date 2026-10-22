@@ -765,11 +765,19 @@ export default Plugin.define({
     if (emit === undefined) {
       try {
         const rpcRegistration = await ctx.rpc.register(RETRY_RPC, {})
-        emit = (event) => {
+        // Undefined fields must be STRIPPED before emit: the server validates
+        // the payload against the event schema, and an explicit undefined
+        // behind an optional property fails it ("Expected string").
+        emit = (rawEvent) => {
+          const event = Object.fromEntries(
+            Object.entries(rawEvent).filter(([, value]) => value !== undefined),
+          )
           void rpcRegistration.events
             .emit("status", event as unknown as Record<string, unknown>)
-            .catch(() => {
-              // a dead TUI must never break a retry
+            .catch((emitError: unknown) => {
+              // a dead TUI must never break a retry — but a dead channel
+              // must be visible, or the log-tail fallback hides its need
+              log(`rpc emit failed kind=${String(event.kind)}: ${scrubErrorText(emitError)}`)
             })
         }
         globals[RPC_GUARD] = emit
