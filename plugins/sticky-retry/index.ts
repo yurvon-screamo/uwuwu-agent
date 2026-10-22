@@ -124,9 +124,15 @@ const emitOrLog = (emit: Emit | undefined, base: string, event: RetryStatusEvent
   log(`${base} ${eventLogSuffix(event)}`)
 }
 
-/** Machine-readable suffix parsed by the TUI log-tail fallback. */
-const eventLogSuffix = (event: RetryStatusEvent): string =>
-  `| kind=${event.kind} status=${event.status ?? "-"} attempt=${event.attempt ?? "-"} delay=${event.delayMs ?? "-"}${event.detail !== undefined ? ` detail=${event.detail}` : ""}${event.sessionID !== undefined ? ` session=${event.sessionID}` : ""}`
+/** Machine-readable suffix parsed by the TUI log-tail fallback. detail and
+ *  transport are flattened to one line: multi-line CDN error bodies would
+ *  otherwise shred the suffix the parser depends on. */
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim()
+export const eventLogSuffix = (event: RetryStatusEvent): string => {
+  const detail = event.detail !== undefined ? ` detail=${oneLine(event.detail)}` : ""
+  const transport = event.transport !== undefined ? ` transport=${oneLine(event.transport)}` : ""
+  return `| kind=${event.kind} status=${event.status ?? "-"} attempt=${event.attempt ?? "-"} delay=${event.delayMs ?? "-"}${detail}${transport}${event.sessionID !== undefined ? ` session=${event.sessionID}` : ""}`
+}
 
 const log = (message: string): void => {
   try {
@@ -347,6 +353,27 @@ export const createProxyHandler =
     const wantsSse = (request.headers.get("accept") ?? "").includes("text/event-stream")
     const delayOf = (decision: { retry: boolean; delayMs: number }): number =>
       options.delayMs !== undefined ? options.delayMs(decision) : decision.delayMs
+    const enterRetryLoop = async (
+      base: string,
+      fields: { status?: number; detail?: string; transport?: string },
+      attempt: number,
+      decision: { retry: boolean; delayMs: number },
+    ): Promise<Response> => {
+      const delayMs = delayOf(decision)
+      emitOrLog(emitSupplier(), base, {
+        kind: "retry",
+        status: fields.status,
+        detail: fields.detail,
+        transport: fields.transport,
+        attempt,
+        delayMs,
+        url: prepared.displayUrl,
+        sessionID: prepared.sessionID,
+      })
+      return wantsSse
+        ? retryingSseResponse(prepared, emitSupplier, delayOf, attempt + 1, delayMs)
+        : retryThenRelay(prepared, emitSupplier, delayOf, attempt + 1, delayMs)
+    }
 
     // First attempt before committing any response bytes: non-retryable
     // statuses must reach the caller with their true status and headers.
@@ -356,21 +383,12 @@ export const createProxyHandler =
     } catch (error) {
       if (prepared.abort.signal.aborted) return new Response("aborted", { status: 499 })
       const decision = decide({ transportError: true, attempt: 1 })
-      emitOrLog(
-        emitSupplier(),
+      return enterRetryLoop(
         `retry transport="${scrubErrorText(error)}" attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
-        {
-          kind: "retry",
-          transport: scrubDetail(String(error)),
-          attempt: 1,
-          delayMs: delayOf(decision),
-          url: prepared.displayUrl,
-          sessionID: prepared.sessionID,
-        },
+        { transport: scrubDetail(String(error)) },
+        1,
+        decision,
       )
-      return wantsSse
-        ? retryingSseResponse(prepared, emitSupplier, delayOf, 2, delayOf(decision))
-        : retryThenRelay(prepared, emitSupplier, delayOf, 2, delayOf(decision))
     }
     const decision = upstreamDecision(upstream, 1)
     if (!decision.retry) {
@@ -378,23 +396,12 @@ export const createProxyHandler =
       return relayResponse(upstream)
     }
     const detail = await readBodyDetail(upstream)
-    const firstDelayMs = delayOf(decision)
-    emitOrLog(
-      emitSupplier(),
+    return enterRetryLoop(
       `retry status=${upstream.status} attempt=1 next=${Math.round(decision.delayMs / 1000)}s url=${prepared.displayUrl}`,
-      {
-        kind: "retry",
-        status: upstream.status,
-        detail,
-        attempt: 1,
-        delayMs: firstDelayMs,
-        url: prepared.displayUrl,
-        sessionID: prepared.sessionID,
-      },
+      { status: upstream.status, detail },
+      1,
+      decision,
     )
-    return wantsSse
-      ? retryingSseResponse(prepared, emitSupplier, delayOf, 2, firstDelayMs)
-      : retryThenRelay(prepared, emitSupplier, delayOf, 2, firstDelayMs)
   }
 
 /** Non-SSE path: the whole retry loop runs inside the handler, then the
@@ -410,7 +417,9 @@ const retryThenRelay = async (
 ): Promise<Response> => {
   let pendingDelayMs = firstDelayMs
   const bornAt = Date.now()
-  let hadRetry = false
+  // Entering the loop means attempt 1 already failed and emitted retry:
+  // a recovery here is always a real recovery.
+  let hadRetry = true
   for (let attempt = nextAttempt; ; attempt += 1) {
     try {
       await abortableSleep(pendingDelayMs, prepared.abort.signal)
@@ -443,7 +452,6 @@ const retryThenRelay = async (
         }
         return relayResponse(upstream)
       }
-      hadRetry = true
       pendingDelayMs = delayOf(decision)
       const detail = await readBodyDetail(upstream)
       emitOrLog(
@@ -461,7 +469,6 @@ const retryThenRelay = async (
       )
     } catch (error) {
       if (prepared.abort.signal.aborted) return new Response("aborted", { status: 499 })
-      hadRetry = true
       pendingDelayMs = delayOf(decide({ transportError: true, attempt }))
       emitOrLog(
         emitSupplier(),
@@ -517,7 +524,9 @@ const retryingSseResponse = (
       }, KEEPALIVE_INTERVAL_MS)
       let pendingDelayMs = firstDelayMs
       const bornAt = Date.now()
-      let hadRetry = false
+      // Entering the loop means attempt 1 already failed and emitted retry:
+      // a recovery here is always a real recovery.
+      let hadRetry = true
       try {
         for (let attempt = nextAttempt; ; attempt += 1) {
           try {
@@ -568,7 +577,6 @@ const retryingSseResponse = (
               )
               return
             }
-            hadRetry = true
             pendingDelayMs = delayOf(decision)
             const detail = await readBodyDetail(upstream)
             emitOrLog(
@@ -586,7 +594,6 @@ const retryingSseResponse = (
             )
           } catch (error) {
             if (prepared.abort.signal.aborted) return
-            hadRetry = true
             pendingDelayMs = delayOf(decide({ transportError: true, attempt }))
             emitOrLog(
               emitSupplier(),
@@ -760,7 +767,7 @@ export default Plugin.define({
         const rpcRegistration = await ctx.rpc.register(RETRY_RPC, {})
         emit = (event) => {
           void rpcRegistration.events
-            .emit("status", event as never)
+            .emit("status", event as unknown as Record<string, unknown>)
             .catch(() => {
               // a dead TUI must never break a retry
             })
@@ -899,8 +906,10 @@ const scheduleAutoContinue = (
   state.sweep(Date.now())
 
   if (event.type === "session.execution.interrupted") {
+    // No continue-cancelled here: most interrupts have no scheduled
+    // continue behind them; a real scheduled one is cancelled (and
+    // emitted) by its own timeout callback seeing stopped=true.
     state.stop(sessionID)
-    emitSupplier()?.({ kind: "continue-cancelled", sessionID })
     return
   }
   if (event.type === "session.execution.started") {

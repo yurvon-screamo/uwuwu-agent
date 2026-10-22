@@ -70,6 +70,28 @@ export const RETRY_RPC = {
 
 export const DETAIL_MAX_CHARS = 400;
 
+type ProviderErrorShape = {
+  error?: { message?: unknown; code?: unknown; status?: unknown; type?: unknown };
+  message?: unknown;
+};
+
+/** message из известных форм тел провайдеров; "" — форма не распознана. */
+const providerMessage = (parsed: ProviderErrorShape): string => {
+  const e = parsed.error;
+  if (e !== undefined) {
+    const message = typeof e.message === "string" ? e.message : "";
+    if (message === "") return "";
+    const qualifier =
+      typeof e.code === "string" || typeof e.code === "number"
+        ? String(e.code)
+        : typeof e.status === "string"
+          ? e.status
+          : undefined;
+    return qualifier === undefined ? message : `${qualifier}: ${message}`;
+  }
+  return typeof parsed.message === "string" ? parsed.message : "";
+};
+
 /** Маскирование секретов в тексте для UI/лога: URL, авторизация, ключи.
  *  Тела ошибок шлюзов иногда эхом возвращают заголовки запроса. */
 export const scrubDetail = (text: string): string =>
@@ -77,7 +99,7 @@ export const scrubDetail = (text: string): string =>
     .replace(/https?:\/\/\S+/g, "[url]")
     .replace(/\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
     .replace(/\bAIza[A-Za-z0-9_-]{10,}\b/g, "[redacted]")
-    .replace(/\bsk-[A-Za-z0-9]{8,}\b/g, "[redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
     .replace(
       /\b(x-api-key|api-key|apikey|authorization|cookie)\b\s*[:=]\s*\S+/gi,
       "$1: [redacted]",
@@ -96,33 +118,8 @@ export const extractErrorDetail = (bodyText: string): string => {
   const trimmed = bodyText.trim();
   if (trimmed === "") return "";
   try {
-    const parsed = JSON.parse(trimmed) as {
-      error?: { message?: unknown; code?: unknown; status?: unknown; type?: unknown };
-      message?: unknown;
-    };
-    const fromError = (e: {
-      message?: unknown;
-      code?: unknown;
-      status?: unknown;
-      type?: unknown;
-    }): string => {
-      const message = typeof e.message === "string" ? e.message : "";
-      if (message === "") return "";
-      const qualifier =
-        typeof e.code === "string" || typeof e.code === "number"
-          ? String(e.code)
-          : typeof e.status === "string"
-            ? e.status
-            : undefined;
-      return qualifier === undefined ? message : `${qualifier}: ${message}`;
-    };
-    if (parsed.error !== undefined) {
-      const detail = fromError(parsed.error);
-      if (detail !== "") return scrubDetail(detail);
-    }
-    if (typeof parsed.message === "string" && parsed.message !== "") {
-      return scrubDetail(parsed.message);
-    }
+    const message = providerMessage(JSON.parse(trimmed) as ProviderErrorShape);
+    if (message !== "") return scrubDetail(message);
   } catch {
     // не JSON — плоский текст ниже
   }

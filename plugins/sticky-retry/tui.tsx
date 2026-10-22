@@ -28,7 +28,19 @@ export default Plugin.define({
     const [store, updateStore] = context.storage.memory<RetryStore>("status", {
       initial: { bySession: {} },
     })
-    let lastToastKey = ""
+    // Bounded recent-key memory: suppresses duplicate toasts from per-location
+    // hook instances; old keys age out once the map exceeds its cap.
+    const recentToastKeys = new Map<string, number>()
+    const RECENT_TOAST_CAP = 64
+    const seenToastRecently = (key: string): boolean => {
+      if (recentToastKeys.has(key)) return true
+      recentToastKeys.set(key, Date.now())
+      if (recentToastKeys.size > RECENT_TOAST_CAP) {
+        const oldest = recentToastKeys.keys().next().value
+        if (oldest !== undefined) recentToastKeys.delete(oldest)
+      }
+      return false
+    }
 
     const handleStatusEvent = (event: RetryStatusEvent): void => {
       const entry: Entry = { ...event, at: Date.now() }
@@ -48,8 +60,7 @@ export default Plugin.define({
       const current = context.ui.router.current()
       const currentSessionID = current.type === "session" ? current.sessionID : undefined
       const dedupeKey = `${event.sessionID ?? ""}|${event.kind}|${event.attempt ?? 0}`
-      if (dedupeKey === lastToastKey) return
-      lastToastKey = dedupeKey
+      if (seenToastRecently(dedupeKey)) return
       const foreign =
         event.sessionID !== undefined && event.sessionID !== currentSessionID
           ? `[…${event.sessionID.slice(-6)}] `
@@ -126,6 +137,9 @@ export default Plugin.define({
 
 // Доступ к стору — внутри when-выражения: prop-геттер Show переоценивается в
 // реактивном memo, трекинг Solid работает; компонент сверху не трекается.
+// Осознанный допуск: свежесть проверяется через Date.now(), нереактивную ко
+// времени — протухшая запись исчезает не мгновенно, а при ближайшей мутации
+// стора свипером (до +60с поверх fresh-окна).
 const RetryFooter = (props: { sessionID?: string; store: RetryStore }) => {
   const line = () => {
     if (props.sessionID === undefined) return undefined
