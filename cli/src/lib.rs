@@ -1,3 +1,6 @@
+pub mod affine_client;
+pub mod affine_migrate;
+pub mod affine_store;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
@@ -17,7 +20,6 @@ pub mod wiki;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-
 
 pub fn wiki_root() -> PathBuf {
     // UWUWU_WIKI — каноническое имя (общее с python-тулзой ~/uwuwu-agent/tools);
@@ -51,23 +53,26 @@ enum Commands {
         #[command(subcommand)]
         command: Option<request::RequestSub>,
         /// Request body text (quick create; multiline → --stdin)
-        #[arg(
-            help = "Request body text (quick create). Note: a text starting with \
-                    'list'/'get'/'delete' is parsed as a subcommand — use --stdin."
-        )]
+        #[arg(help = "Request body text (quick create). Note: a text starting with \
+                    'list'/'get'/'delete' is parsed as a subcommand — use --stdin.")]
         text: Vec<String>,
         #[arg(long, help = "Read the request body from stdin")]
         stdin: bool,
         #[arg(long, value_parser = ["create", "update", "delete"], default_value = "create")]
         action: String,
-        #[arg(long, help = "Target experience/-relative path (required for quick create)")]
+        #[arg(
+            long,
+            help = "Target experience/-relative path (required for quick create)"
+        )]
         target: Option<String>,
         #[arg(long, help = "Reason for this request (required for quick create)")]
         reason: Option<String>,
     },
     /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access) | sofa/<post_id>.
     Read {
-        #[arg(help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access) | 'sofa/<post_id>'")]
+        #[arg(
+            help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access) | 'sofa/<post_id>'"
+        )]
         slug: String,
     },
     /// Unified search: experience + facts + access docs + SOFA in one call.
@@ -76,11 +81,19 @@ enum Commands {
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(long, default_value = "5", help = "experience/ articles limit (0 = off)")]
+        #[arg(
+            long,
+            default_value = "5",
+            help = "experience/ articles limit (0 = off)"
+        )]
         top: usize,
         #[arg(long, default_value = "10", help = "facts/ limit (0 = off)")]
         facts: usize,
-        #[arg(long, default_value = "5", help = "projects/** docs: runbooks+creds limit (0 = off)")]
+        #[arg(
+            long,
+            default_value = "5",
+            help = "projects/** docs: runbooks+creds limit (0 = off)"
+        )]
         access: usize,
         #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
         sofa: usize,
@@ -115,6 +128,20 @@ enum Commands {
         sync: bool,
         /// Raw text to factize (ignored with --stdin/--sync)
         text: Vec<String>,
+    },
+    /// Migrate wiki data into the AFFiNE workspace: experience/ and projects/
+    /// as documents, facts/ as daily journal buckets. Idempotent (resume-safe).
+    /// Env: UWUWU_AFFINE_URL (default localhost:3000/mcp), UWUWU_AFFINE_TOKEN,
+    /// UWUWU_AFFINE_WORKSPACE_ID.
+    Affine {
+        #[arg(long, help = "migrate experience/ articles")]
+        experience: bool,
+        #[arg(long, help = "migrate projects/ docs")]
+        projects: bool,
+        #[arg(long, help = "migrate facts/ into daily journal buckets")]
+        facts: bool,
+        #[arg(long, help = "migrate everything")]
+        all: bool,
     },
 }
 
@@ -189,7 +216,14 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Projects => projects::handle_projects(&root)?,
-        Commands::Request { command, text, stdin, action, target, reason } => {
+        Commands::Request {
+            command,
+            text,
+            stdin,
+            action,
+            target,
+            reason,
+        } => {
             let quick = if command.is_none() && (!text.is_empty() || stdin) {
                 let (target, reason) = (target.as_deref(), reason.as_deref());
                 if target.is_none() || reason.is_none() {
@@ -216,18 +250,38 @@ pub async fn run() -> anyhow::Result<()> {
             };
             request::handle(command, quick, &requests_dir())?
         }
-        Commands::Search { query, top, facts, access, sofa, threshold } => {
-            if !(0.0..=1.0).contains(&threshold) {                anyhow::bail!("--threshold должен быть в 0..1, получено: {threshold}");
+        Commands::Search {
+            query,
+            top,
+            facts,
+            access,
+            sofa,
+            threshold,
+        } => {
+            if !(0.0..=1.0).contains(&threshold) {
+                anyhow::bail!("--threshold должен быть в 0..1, получено: {threshold}");
             }
             let opts = wiki::UnifiedOpts {
-                top, facts, access, sofa, threshold,
+                top,
+                facts,
+                access,
+                sofa,
+                threshold,
             };
             wiki::unified_search(&query, &opts, &root, &cache_path()).await?
         }
-        Commands::Grep { pattern, no_facts, no_access } => {
-            wiki::unified_grep(&pattern, !no_facts, !no_access, &root)?
-        }
-        Commands::Facts { stdin, source, date, sync, text } => {
+        Commands::Grep {
+            pattern,
+            no_facts,
+            no_access,
+        } => wiki::unified_grep(&pattern, !no_facts, !no_access, &root)?,
+        Commands::Facts {
+            stdin,
+            source,
+            date,
+            sync,
+            text,
+        } => {
             let today = local_today();
             let date = date.unwrap_or_else(|| today.clone());
             if !valid_date(&date) {
@@ -240,6 +294,37 @@ pub async fn run() -> anyhow::Result<()> {
                 let source = source.unwrap_or_else(|| format!("manual/{today}"));
                 let out = facts::run_facts(&text, &source, &date, stdin).await;
                 println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+        }
+        Commands::Affine {
+            experience,
+            projects,
+            facts,
+            all,
+        } => {
+            let mut kinds = Vec::new();
+            if all || experience {
+                kinds.push(affine_migrate::Kind::Experience);
+            }
+            if all || projects {
+                kinds.push(affine_migrate::Kind::Projects);
+            }
+            if all || facts {
+                kinds.push(affine_migrate::Kind::Facts);
+            }
+            if kinds.is_empty() {
+                anyhow::bail!("выберите --experience / --projects / --facts или --all");
+            }
+            let cfg = affine_client::AffineConfig::from_env()?;
+            let report = affine_migrate::run_migration(&root, &kinds, &cfg).await?;
+            println!(
+                "affine migrate: created {}, skipped {}, errors {}",
+                report.created,
+                report.skipped,
+                report.errors.len()
+            );
+            for error in &report.errors {
+                println!("  ! {error}");
             }
         }
     }

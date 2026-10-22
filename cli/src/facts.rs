@@ -12,9 +12,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use unicode_normalization::UnicodeNormalization;
 use sha1::{Digest as _, Sha1};
+use unicode_normalization::UnicodeNormalization;
 
+use crate::affine_client::AffineConfig;
+use crate::affine_migrate;
+use crate::affine_store::FactEntry;
 use crate::wiki_root;
 
 const OLLAMA_URL: &str = "http://localhost:11434";
@@ -103,12 +106,20 @@ pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> Fac
         Err(e) if e.to_string().contains("OLLAMA_UNREACHABLE") => FactsOutcome {
             ok: false,
             error: Some("ollama_unreachable".into()),
-            bad: None, trivial: None, new: vec![], dup: vec![], conflict: vec![],
+            bad: None,
+            trivial: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
         },
         Err(e) => FactsOutcome {
             ok: false,
             error: Some(format!("{e:#}")),
-            bad: None, trivial: None, new: vec![], dup: vec![], conflict: vec![],
+            bad: None,
+            trivial: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
         },
     }
 }
@@ -145,17 +156,32 @@ fn valid_verdict(v: &str) -> bool {
     matches!(v, "duplicate" | "conflict" | "distinct")
 }
 
-async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> Result<FactsOutcome> {
+async fn run_facts_inner(
+    text: &str,
+    source: &str,
+    date: &str,
+    stdin: bool,
+) -> Result<FactsOutcome> {
     if !valid_date(date) {
         return Ok(FactsOutcome {
-            ok: false, error: Some("bad_date".into()), bad: None, trivial: None,
-            new: vec![], dup: vec![], conflict: vec![],
+            ok: false,
+            error: Some("bad_date".into()),
+            bad: None,
+            trivial: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
         });
     }
     if stdin && text.chars().count() < MIN_DIGEST_CHARS {
         return Ok(FactsOutcome {
-            ok: true, trivial: Some(true), error: None, bad: None,
-            new: vec![], dup: vec![], conflict: vec![],
+            ok: true,
+            trivial: Some(true),
+            error: None,
+            bad: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
         });
     }
 
@@ -163,8 +189,13 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
     let (objs, bad) = parse_jsonl(&raw);
     if bad > 0 {
         return Ok(FactsOutcome {
-            ok: false, error: Some("bad_jsonl".into()), bad: Some(bad),
-            trivial: None, new: vec![], dup: vec![], conflict: vec![],
+            ok: false,
+            error: Some("bad_jsonl".into()),
+            bad: Some(bad),
+            trivial: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
         });
     }
 
@@ -177,7 +208,11 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
                 return None;
             }
             let conf = o.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.6);
-            let conf = if (0.1..=1.0).contains(&conf) { conf } else { 0.6 };
+            let conf = if (0.1..=1.0).contains(&conf) {
+                conf
+            } else {
+                0.6
+            };
             Some(Candidate {
                 statement: truncate_chars(&st, STMT_MAX_CHARS),
                 title: truncate_chars(&title, TITLE_MAX_CHARS),
@@ -207,8 +242,13 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
 
     // Пустой валидный выхлоп — тоже результат (нет фактов), ok:true.
     let mut outcome = FactsOutcome {
-        ok: true, error: None, bad: None, trivial: Some(false),
-        new: vec![], dup: vec![], conflict: vec![],
+        ok: true,
+        error: None,
+        bad: None,
+        trivial: Some(false),
+        new: vec![],
+        dup: vec![],
+        conflict: vec![],
     };
     if candidates.is_empty() {
         return Ok(outcome);
@@ -218,6 +258,8 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
     let root = wiki_root();
     let mut store = FactStore::load(&root)?;
     let month = format!("{}-{}", &date[0..4], &date[5..7]);
+    // Новые факты этого прогона — кандидататы для публикации в AFFiNE-бакет дня
+    let mut affine_facts: Vec<FactEntry> = Vec::new();
 
     for f in candidates {
         let s = sha1_norm(&f.statement);
@@ -240,24 +282,30 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
         let olds: Vec<(String, String)> = scored
             .into_iter()
             .take(5)
-            .filter_map(|(_, k)| {
-                store.by_sha.get(&k).map(|v| (k, v.statement.clone()))
-            })
+            .filter_map(|(_, k)| store.by_sha.get(&k).map(|v| (k, v.statement.clone())))
             .collect();
 
         let mut verd: HashMap<String, String> = HashMap::new();
         if !olds.is_empty() {
-            let pairs: Vec<(&Candidate, &String)> =
-                olds.iter().map(|(_, st)| (&f, st)).collect();
+            let pairs: Vec<(&Candidate, &String)> = olds.iter().map(|(_, st)| (&f, st)).collect();
             // ключи для мапы после вердиктов
             let keys: Vec<String> = olds.iter().map(|(k, _)| k.clone()).collect();
             let vmap = verdicts(&pairs).await?;
             for (i, k) in keys.iter().enumerate() {
-                verd.insert(k.clone(), vmap.get(&i).cloned().unwrap_or_else(|| "distinct".into()));
+                verd.insert(
+                    k.clone(),
+                    vmap.get(&i).cloned().unwrap_or_else(|| "distinct".into()),
+                );
             }
         }
-        let conflict_k = verd.iter().find(|(_, v)| v.as_str() == "conflict").map(|(k, _)| k.clone());
-        let dup_k = verd.iter().find(|(_, v)| v.as_str() == "duplicate").map(|(k, _)| k.clone());
+        let conflict_k = verd
+            .iter()
+            .find(|(_, v)| v.as_str() == "conflict")
+            .map(|(k, _)| k.clone());
+        let dup_k = verd
+            .iter()
+            .find(|(_, v)| v.as_str() == "duplicate")
+            .map(|(k, _)| k.clone());
 
         if let (Some(dk), None) = (dup_k, &conflict_k) {
             let path = store.by_sha[&dk].path.clone();
@@ -268,28 +316,80 @@ async fn run_facts_inner(text: &str, source: &str, date: &str, stdin: bool) -> R
 
         let slug = store.unique_slug(&slugify(&f.title));
         let conflict_slug = conflict_k.as_ref().map(|k| store.by_sha[k].slug.clone());
-        let path = write_fact(&root, &month, &slug, &f, source, date,
-                              &conflict_k, &conflict_slug)?;
+        let path = write_fact(
+            &root,
+            &month,
+            &slug,
+            &f,
+            source,
+            date,
+            &conflict_k,
+            &conflict_slug,
+        )?;
         if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
             let old_path = store.by_sha[ck].path.clone();
             append_source(&old_path, source, &today())?;
             add_conflict_link(&old_path, &s, cslug, &today())?;
-            outcome.conflict.push(ConflictPair { slug: slug.clone(), with: cslug.clone() });
+            outcome.conflict.push(ConflictPair {
+                slug: slug.clone(),
+                with: cslug.clone(),
+            });
         }
-        store.by_sha.insert(s, ExistingFact {
-            path, slug: slug.clone(), statement: f.statement.clone(),
-            shingles: js,
-        });
+        store.by_sha.insert(
+            s,
+            ExistingFact {
+                path,
+                slug: slug.clone(),
+                statement: f.statement.clone(),
+                shingles: js,
+            },
+        );
         store.by_slug.insert(slug.clone());
-        outcome.new.push(NewFact { slug, title: f.title.clone() });
+        affine_facts.push(FactEntry {
+            slug: slug.clone(),
+            date: date.to_string(),
+            title: f.title.clone(),
+            statement: f.statement.clone(),
+            tags: f.tags.clone(),
+            confidence: format!("{:.2}", f.confidence),
+            sources: vec![source.to_string()],
+        });
+        outcome.new.push(NewFact {
+            slug,
+            title: f.title.clone(),
+        });
     }
 
     let msg = format!(
         "facts: {source} (+{} new, {} dup, {} conflict)",
-        outcome.new.len(), outcome.dup.len(), outcome.conflict.len()
+        outcome.new.len(),
+        outcome.dup.len(),
+        outcome.conflict.len()
     );
     let _ = git_commit(&msg); // диагностика внутри; фейл коммита не роняет результат
+    if std::env::var("UWUWU_AFFINE_PUBLISH").ok().as_deref() == Some("1")
+        && !affine_facts.is_empty()
+    {
+        publish_to_affine(&root, &affine_facts).await;
+    }
     Ok(outcome)
+}
+
+/// Best-effort публикация новых фактов в дейли-бакеты AFFiNE (opt-in через
+/// UWUWU_AFFINE_PUBLISH=1). Ошибки шлюза не влияют на исход пайплайна:
+/// ФС остаётся source of truth.
+async fn publish_to_affine(root: &Path, facts: &[FactEntry]) {
+    let cfg = match AffineConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("warn: affine publish skipped: {e:#}");
+            return;
+        }
+    };
+    match affine_migrate::publish_facts(root, &cfg, facts).await {
+        Ok(count) => eprintln!("affine: {count} facts published to daily buckets"),
+        Err(e) => eprintln!("warn: affine publish failed: {e:#}"),
+    }
 }
 
 // ---------- структуры ----------
@@ -317,7 +417,8 @@ struct FactStore {
 impl FactStore {
     fn load(root: &Path) -> Result<Self> {
         let mut store = FactStore {
-            by_sha: HashMap::new(), by_slug: std::collections::HashSet::new(),
+            by_sha: HashMap::new(),
+            by_slug: std::collections::HashSet::new(),
             removed: std::collections::HashSet::new(),
         };
         let tomb = root.join("facts.removed.json");
@@ -329,18 +430,37 @@ impl FactStore {
             }
         }
         for path in sorted_md(root.join("facts")) {
-            let Ok(body) = std::fs::read_to_string(&path) else { continue };
-            let Some((_, statement)) = split_fact(&body) else { continue };
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some((_, statement)) = split_fact(&body) else {
+                continue;
+            };
             let s = sha1_norm(&statement);
-            store.by_slug.insert(path.file_stem().unwrap_or_default().to_string_lossy().to_string());
-            store.by_sha.insert(s, ExistingFact {
-                path, slug: String::new(), statement,
-                shingles: Default::default(),
-            });
+            store.by_slug.insert(
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            store.by_sha.insert(
+                s,
+                ExistingFact {
+                    path,
+                    slug: String::new(),
+                    statement,
+                    shingles: Default::default(),
+                },
+            );
             // slug/shingles заполняем после вставки ключа
         }
         for v in store.by_sha.values_mut() {
-            v.slug = v.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            v.slug = v
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             v.shingles = shingles(&v.statement);
         }
         Ok(store)
@@ -434,7 +554,9 @@ fn strip_think(raw: &str) -> String {
     static RE_FENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let think = RE_THINK.get_or_init(|| regex::Regex::new(r"(?s)<think>.*?</think>").unwrap());
     let fence = RE_FENCE.get_or_init(|| regex::Regex::new(r"```(?:json)?").unwrap());
-    fence.replace_all(&think.replace_all(raw, ""), "").to_string()
+    fence
+        .replace_all(&think.replace_all(raw, ""), "")
+        .to_string()
 }
 
 /// Вердикты пачками ≤VERDICT_BATCH: {индекс_пары → duplicate|conflict|distinct}.
@@ -463,8 +585,12 @@ async fn verdicts(pairs: &[(&Candidate, &String)]) -> Result<HashMap<usize, Stri
         }
         let mut seen = std::collections::HashSet::new();
         for o in &objs {
-            let Some(idx) = o.get("pair").and_then(|v| v.as_u64()) else { continue };
-            let Some(v) = o.get("verdict").and_then(|v| v.as_str()) else { continue };
+            let Some(idx) = o.get("pair").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let Some(v) = o.get("verdict").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let v = v.to_lowercase();
             if idx >= 1 && idx as usize <= chunk.len() && valid_verdict(&v) {
                 result.insert(chunk_start + idx as usize - 1, v);
@@ -514,7 +640,11 @@ fn slugify(title: &str) -> String {
         }
     }
     let slug = out.trim_matches('-').to_string();
-    if slug.is_empty() { "fact".into() } else { slug }
+    if slug.is_empty() {
+        "fact".into()
+    } else {
+        slug
+    }
 }
 
 /// Биграммы слов (совместимы с python: [a-zа-яё0-9]+ токены).
@@ -547,7 +677,8 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
 
 fn ipv6_sub(s: &str) -> bool {
     // Время (12:30:45) — только цифры/двоеточия; IPv6 содержит hex-буквы или 3+ colon
-    s.chars().any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit())
+    s.chars()
+        .any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit())
         || s.matches(':').count() >= 3
 }
 
@@ -571,7 +702,11 @@ fn sanitize(text: &str) -> String {
     let text = v6
         .replace_all(&text, |c: &regex::Captures| {
             let m = c.get(0).map(|g| g.as_str()).unwrap_or_default();
-            if ipv6_sub(m) { "<ip>".to_string() } else { m.to_string() }
+            if ipv6_sub(m) {
+                "<ip>".to_string()
+            } else {
+                m.to_string()
+            }
         })
         .to_string();
     fqdn.replace_all(&text, "<host>").to_string()
@@ -587,7 +722,9 @@ fn sorted_md(dir: PathBuf) -> Vec<PathBuf> {
 }
 
 fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -614,8 +751,14 @@ fn split_fact(body: &str) -> Option<(String, String)> {
 
 #[allow(clippy::too_many_arguments)]
 fn write_fact(
-    root: &Path, month: &str, slug: &str, f: &Candidate, source: &str, date: &str,
-    conflict_k: &Option<String>, conflict_slug: &Option<String>,
+    root: &Path,
+    month: &str,
+    slug: &str,
+    f: &Candidate,
+    source: &str,
+    date: &str,
+    conflict_k: &Option<String>,
+    conflict_slug: &Option<String>,
 ) -> Result<PathBuf> {
     let dir = root.join("facts").join(month);
     std::fs::create_dir_all(&dir)?;
@@ -626,8 +769,16 @@ fn write_fact(
         f.title,
         truncate_chars(&f.statement, DESC_MAX_CHARS).replace('\n', " "),
         f.confidence,
-        if f.tags.is_empty() { "fact".to_string() } else { f.tags.join(", ") },
-        if conflict_k.is_some() { "conflict" } else { "accepted" },
+        if f.tags.is_empty() {
+            "fact".to_string()
+        } else {
+            f.tags.join(", ")
+        },
+        if conflict_k.is_some() {
+            "conflict"
+        } else {
+            "accepted"
+        },
     );
     if let Some(ck) = conflict_k {
         fm.push_str(&format!("conflicts: [{ck}]\n"));
@@ -645,11 +796,15 @@ fn write_fact(
 
 fn append_source(path: &Path, uri: &str, date: &str) -> Result<()> {
     let body = std::fs::read_to_string(path)?;
-    let (fm, statement) = split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
+    let (fm, statement) =
+        split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
     let mut lines: Vec<String> = Vec::new();
     for line in fm.lines() {
         if line.starts_with("sources: [") && !line.contains(uri) {
-            let inner = line["sources: [".len()..].trim_end_matches(']').trim().to_string();
+            let inner = line["sources: [".len()..]
+                .trim_end_matches(']')
+                .trim()
+                .to_string();
             let sep = if inner.is_empty() { "" } else { ", " };
             lines.push(format!("sources: [{inner}{sep}{uri}]"));
         } else if line.starts_with("updated: ") {
@@ -658,13 +813,17 @@ fn append_source(path: &Path, uri: &str, date: &str) -> Result<()> {
             lines.push(line.to_string());
         }
     }
-    std::fs::write(path, format!("---\n{}\n---\n{statement}\n", lines.join("\n")))?;
+    std::fs::write(
+        path,
+        format!("---\n{}\n---\n{statement}\n", lines.join("\n")),
+    )?;
     Ok(())
 }
 
 fn add_conflict_link(path: &Path, other_sha: &str, other_slug: &str, date: &str) -> Result<()> {
     let body = std::fs::read_to_string(path)?;
-    let (fm, mut statement) = split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
+    let (fm, mut statement) =
+        split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
     let status = regex::Regex::new(r"(?m)^status: .*$").unwrap();
     let mut new_fm = status.replace(&fm, "status: conflict").to_string();
     let conflicts_line = regex::Regex::new(r"(?m)^conflicts: \[(.*)\]$").unwrap();
@@ -682,26 +841,59 @@ fn add_conflict_link(path: &Path, other_sha: &str, other_slug: &str, date: &str)
         statement.push_str(&format!("\n\n[conflict: {other_slug}]"));
     }
     let updated = regex::Regex::new(r"(?m)^updated: .*$").unwrap();
-    let new_fm = updated.replace(&new_fm, format!("updated: {date}")).to_string();
-    std::fs::write(path, format!("---\n{}\n---\n{statement}\n", new_fm.trim_end()))?;
+    let new_fm = updated
+        .replace(&new_fm, format!("updated: {date}"))
+        .to_string();
+    std::fs::write(
+        path,
+        format!("---\n{}\n---\n{statement}\n", new_fm.trim_end()),
+    )?;
     Ok(())
 }
 
 /// Scoped git: ТОЛЬКО факты и sidecar-файлы (все 4 пути — Rust единственный коммитер).
 fn git_commit(message: &str) -> Result<()> {
     let root = wiki_root();
-    let paths = ["facts/", "facts.ing.json", "facts.removed.json", "facts.retries.json"];
-    let existing: Vec<&str> = paths.iter().copied().filter(|p| root.join(p).exists()).collect();
+    let paths = [
+        "facts/",
+        "facts.ing.json",
+        "facts.removed.json",
+        "facts.retries.json",
+    ];
+    let existing: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|p| root.join(p).exists())
+        .collect();
     let add = std::process::Command::new("git")
-        .args(["add"]).args(&existing).current_dir(&root).output()?;
+        .args(["add"])
+        .args(&existing)
+        .current_dir(&root)
+        .output()?;
     if !add.status.success() {
-        eprintln!("warn: git add failed: {}", String::from_utf8_lossy(&add.stderr));
+        eprintln!(
+            "warn: git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
         return Ok(());
     }
     let commit = std::process::Command::new("git")
-        .args(["-c", "user.name=uwuwu", "-c", "user.email=uwuwu@local", "commit", "-qm", message])
-        .current_dir(&root).output()?;
-    let out = format!("{}{}", String::from_utf8_lossy(&commit.stdout), String::from_utf8_lossy(&commit.stderr));
+        .args([
+            "-c",
+            "user.name=uwuwu",
+            "-c",
+            "user.email=uwuwu@local",
+            "commit",
+            "-qm",
+            message,
+        ])
+        .current_dir(&root)
+        .output()?;
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&commit.stdout),
+        String::from_utf8_lossy(&commit.stderr)
+    );
     if !commit.status.success()
         && !out.contains("nothing to commit")
         && !out.contains("nothing added to commit")
@@ -727,9 +919,8 @@ impl LockGuard {
         let path = wiki_root().join(LOCK_PATH);
         // env-вики (UWUWU_WIKI) может ещё не существовать — создаём корень
         // до lock-цикла, иначе create_new возвращает NotFound навсегда.
-        std::fs::create_dir_all(&wiki_root()).map_err(|e| {
-            anyhow!("wiki_root create_dir_all({:?}): {}", wiki_root(), e)
-        })?;
+        std::fs::create_dir_all(&wiki_root())
+            .map_err(|e| anyhow!("wiki_root create_dir_all({:?}): {}", wiki_root(), e))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             // Дедлайн наверху тела: ни одна ветка (включая stale-continue)
@@ -737,7 +928,11 @@ impl LockGuard {
             if std::time::Instant::now() > deadline {
                 return Err(anyhow!("facts.lock: не дождались освобождения за 60с"));
             }
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(f) => {
                     let pid = std::process::id();
                     let _ = std::fs::write(&path, pid.to_string());
@@ -745,7 +940,8 @@ impl LockGuard {
                     let p = path.clone();
                     let touch = tokio::spawn(async move {
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(LOCK_TOUCH_SECS)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(LOCK_TOUCH_SECS))
+                                .await;
                             // touch mtime
                             if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&p) {
                                 drop(f);
@@ -754,7 +950,10 @@ impl LockGuard {
                             }
                         }
                     });
-                    return Ok(LockGuard { path, touch: Some(touch) });
+                    return Ok(LockGuard {
+                        path,
+                        touch: Some(touch),
+                    });
                 }
                 Err(_) => {
                     // stale-детект: mtime старше порога. Повторная проверка после
@@ -807,6 +1006,8 @@ pub fn read_text(use_stdin: bool, args: &[String]) -> Result<String> {
     } else if !args.is_empty() {
         Ok(args.join(" "))
     } else {
-        Err(anyhow!("нет текста: укажите --stdin или передайте текст аргументом"))
+        Err(anyhow!(
+            "нет текста: укажите --stdin или передайте текст аргументом"
+        ))
     }
 }
