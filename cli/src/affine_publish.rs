@@ -20,10 +20,19 @@ use crate::facts::LockGuard;
 /// (network calls inside are fine — the facts pipeline never waits on it).
 pub async fn publish_facts(root: &Path, cfg: &AffineConfig, facts: &[FactEntry]) -> Result<usize> {
     let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
-    let mut client = AffineClient::connect(cfg).await?;
     let mut map = MigrationMap::load_for(root, &cfg.url)?;
+    // Skip the gateway session entirely when every fact is already visible
+    // in its bucket — a retried run pays nothing for converged state.
+    let days: Vec<(String, Vec<&FactEntry>)> = group_by_date(facts)
+        .into_iter()
+        .filter(|(_, day)| day.iter().any(|f| map.doc_id(&f.slug).is_none()))
+        .collect();
+    if days.is_empty() {
+        return Ok(0);
+    }
+    let mut client = AffineClient::connect(cfg).await?;
     let mut published = 0usize;
-    for (date, day_facts) in group_by_date(facts) {
+    for (date, day_facts) in days {
         published +=
             upsert_daily_bucket(&mut client, &mut map, &cfg.workspace, &date, &day_facts).await?;
         map.save()?;
@@ -68,8 +77,16 @@ pub(crate) async fn upsert_daily_bucket(
                     json!({"workspaceId": workspace, "title": date, "markdown": markdown}),
                 )
                 .await?;
-            let bucket_id = doc_id_from_response(&resp)
-                .ok_or_else(|| anyhow!("daily bucket {date} created but no docId returned"))?;
+            // Ambiguous "no docId" answer: the create may have been applied.
+            // Look the bucket up by exact title instead of failing — a blind
+            // retry would create a second bucket for the same date.
+            let bucket_id = match doc_id_from_response(&resp) {
+                Some(id) => id,
+                None => match find_bucket_by_title(client, workspace, date).await? {
+                    Some(id) => id,
+                    None => anyhow::bail!("daily bucket {date} created but no docId returned"),
+                },
+            };
             // bucket first, then the facts — both BEFORE the journal call:
             // a journal failure must leave a consistent, resumable state
             map.put_daily_bucket(date, &bucket_id);
@@ -91,4 +108,37 @@ fn mark_facts(map: &mut MigrationMap, fresh: &[&FactEntry], bucket_id: &str) {
     for f in fresh {
         map.put_doc(&f.slug, bucket_id);
     }
+}
+
+/// Recover the bucket id when the create answer carries no docId but the
+/// document may exist (timeout-ish ambiguity): exact-title search.
+async fn find_bucket_by_title(
+    client: &mut AffineClient,
+    workspace: &str,
+    date: &str,
+) -> Result<Option<String>> {
+    let resp = client
+        .call_tool(
+            "search_docs",
+            json!({"workspaceId": workspace, "query": date, "limit": 10}),
+        )
+        .await?;
+    let results = resp
+        .get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for item in results {
+        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let in_trash = item
+            .get("inTrash")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(true);
+        if title == date && !in_trash {
+            if let Some(id) = item.get("docId").and_then(|d| d.as_str()) {
+                return Ok(Some(id.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }

@@ -306,9 +306,7 @@ async fn run_facts_inner(
         }
         if let Some(existing) = store.by_sha.get(&s) {
             append_source(&existing.path, source, &today())?;
-            if let Some(entry) = affine_entry_from_file(&existing.path, date) {
-                affine_facts.push(entry);
-            }
+            push_affine_entry(&mut affine_facts, &existing.path, date)?;
             outcome.dup.push(existing.slug.clone());
             continue;
         }
@@ -351,9 +349,7 @@ async fn run_facts_inner(
         if let (Some(dk), None) = (dup_k, &conflict_k) {
             let path = store.by_sha[&dk].path.clone();
             append_source(&path, source, &today())?;
-            if let Some(entry) = affine_entry_from_file(&path, date) {
-                affine_facts.push(entry);
-            }
+            push_affine_entry(&mut affine_facts, &path, date)?;
             outcome.dup.push(store.by_sha[&dk].slug.clone());
             continue;
         }
@@ -372,9 +368,7 @@ async fn run_facts_inner(
         )?;
         if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
             let old_path = store.by_sha[ck].path.clone();
-            if let Some(entry) = affine_entry_from_file(&old_path, date) {
-                affine_facts.push(entry);
-            }
+            push_affine_entry(&mut affine_facts, &old_path, date)?;
             append_source(&old_path, source, &today())?;
             add_conflict_link(&old_path, &s, cslug, &today())?;
             outcome.conflict.push(ConflictPair {
@@ -417,9 +411,6 @@ async fn run_facts_inner(
     Ok((outcome, affine_facts))
 }
 
-/// Best-effort публикация новых фактов в дейли-бакеты AFFiNE (opt-in через
-/// UWUWU_AFFINE_PUBLISH=1). Ошибки шлюза не влияют на исход пайплайна:
-/// ФС остаётся source of truth.
 /// Mandatory AFFiNE publication: new AND dup facts of this run. Dup facts
 /// re-published so a retried run converges after a previous publish failure
 /// (the map skips facts already visible in the bucket).
@@ -430,19 +421,31 @@ async fn publish_to_affine(root: &Path, facts: &[FactEntry]) -> anyhow::Result<u
 
 /// FactEntry из уже записанного файла факта — для публикации dup/conflict
 /// фактов, которые могли не доехать до AFFiNE в упавшем прошлом прогоне.
-fn affine_entry_from_file(path: &Path, date: &str) -> Option<FactEntry> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let slug = path.file_stem()?.to_string_lossy().to_string();
+fn affine_entry_from_file(path: &Path, fallback_date: &str) -> anyhow::Result<FactEntry> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read fact {}: {e}", path.display()))?;
+    let slug = path
+        .file_stem()
+        .ok_or_else(|| anyhow::anyhow!("fact path without stem: {}", path.display()))?
+        .to_string_lossy()
+        .to_string();
     let (fm, statement) = crate::affine_store::split_frontmatter(&raw);
-    Some(FactEntry {
-        slug,
-        date: date.to_string(),
-        title: fm.title.unwrap_or_default(),
+    Ok(FactEntry {
+        slug: slug.clone(),
+        date: fm.updated.unwrap_or_else(|| fallback_date.to_string()),
+        title: fm.title.unwrap_or_else(|| slug),
         statement,
         tags: fm.tags,
         confidence: fm.confidence.unwrap_or_else(|| "-".into()),
         sources: fm.sources,
     })
+}
+
+/// Собрать dup-факт для публикации; ошибка чтения валит прогон —
+/// тихий пропуск публикации запрещён контрактом mandatory-режима.
+fn push_affine_entry(facts: &mut Vec<FactEntry>, path: &Path, date: &str) -> anyhow::Result<()> {
+    facts.push(affine_entry_from_file(path, date)?);
+    Ok(())
 }
 
 // ---------- структуры ----------
