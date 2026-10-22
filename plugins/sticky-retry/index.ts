@@ -7,6 +7,7 @@ import {
   type RetryStatusEvent,
   extractErrorDetail,
   scrubDetail,
+  stripUndefined,
 } from "./contract"
 
 export { RETRY_AFTER_CAP_MS } from "./contract"
@@ -769,9 +770,7 @@ export default Plugin.define({
         // the payload against the event schema, and an explicit undefined
         // behind an optional property fails it ("Expected string").
         emit = (rawEvent) => {
-          const event = Object.fromEntries(
-            Object.entries(rawEvent).filter(([, value]) => value !== undefined),
-          )
+          const event = stripUndefined(rawEvent)
           void rpcRegistration.events
             .emit("status", event as unknown as Record<string, unknown>)
             .catch((emitError: unknown) => {

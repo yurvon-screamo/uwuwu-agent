@@ -75,22 +75,35 @@ type ProviderErrorShape = {
   message?: unknown;
 };
 
-/** message из известных форм тел провайдеров; "" — форма не распознана. */
+/** message из известных форм тел провайдеров; "" — форма не распознана.
+ *  Пустой error.message проваливается на корневой message: нестандартные
+ *  шлюзы кладут {"error":{"code"},"message":"fallback"}. */
 const providerMessage = (parsed: ProviderErrorShape): string => {
   const e = parsed.error;
   if (e !== undefined) {
     const message = typeof e.message === "string" ? e.message : "";
-    if (message === "") return "";
-    const qualifier =
-      typeof e.code === "string" || typeof e.code === "number"
-        ? String(e.code)
-        : typeof e.status === "string"
-          ? e.status
-          : undefined;
-    return qualifier === undefined ? message : `${qualifier}: ${message}`;
+    if (message !== "") {
+      const qualifier =
+        typeof e.code === "string" || typeof e.code === "number"
+          ? String(e.code)
+          : typeof e.status === "string"
+            ? e.status
+            : undefined;
+      return qualifier === undefined ? message : `${qualifier}: ${message}`;
+    }
   }
   return typeof parsed.message === "string" ? parsed.message : "";
 };
+
+/** Сервер валидирует payload события схемой: явный undefined за optional-
+ *  свойством валит валидацию («Expected string»), undefined-ключи ДО эмита
+ *  вырезаются. Чистая функция — юнит-тест контракта payload'а. */
+export const stripUndefined = (
+  event: RetryStatusEvent,
+): Record<string, unknown> =>
+  Object.fromEntries(
+    Object.entries(event).filter(([, value]) => value !== undefined),
+  );
 
 /** Маскирование секретов в тексте для UI/лога: URL, авторизация, ключи.
  *  Тела ошибок шлюзов иногда эхом возвращают заголовки запроса. */
