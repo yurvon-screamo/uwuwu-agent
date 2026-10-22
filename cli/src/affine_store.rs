@@ -1,6 +1,11 @@
 //! Migration map: local slug → AFFiNE docId, stored in the wiki root next to
 //! the facts sidecars. Powers idempotent migration (rerun skips mapped docs)
 //! and daily-bucket reuse for the facts → journal publish hook.
+//! Plus the frontmatter/section primitives shared by collectors and publisher.
+//!
+//! Slightly over the 200-line module limit: the map struct and the parsing
+//! primitives it travels with form one cohesive storage contract; splitting
+//! them would leak the map's save/load lifecycle across files.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +19,9 @@ const MAP_FILE: &str = "affine_map.json";
 const CONTAINER_PREFIX: &str = "__container_";
 const DAILY_PREFIX: &str = "__daily_";
 
+/// AFFiNE doc titles are truncated to keep the sidebar readable.
+pub const AFFINE_DOC_TITLE_MAX_CHARS: usize = 120;
+
 pub struct MigrationMap {
     path: PathBuf,
     entries: BTreeMap<String, String>,
@@ -22,10 +30,24 @@ pub struct MigrationMap {
 impl MigrationMap {
     pub fn load(wiki_root: &Path) -> Result<Self> {
         let path = wiki_root.join(MAP_FILE);
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
-            .unwrap_or_default();
+        if !path.exists() {
+            return Ok(Self {
+                path,
+                entries: BTreeMap::new(),
+            });
+        }
+        // A corrupt map silently resets idempotency to zero and duplicates
+        // every document in the workspace — fail loudly instead.
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let entries =
+            serde_json::from_str::<BTreeMap<String, String>>(&raw).with_context(|| {
+                format!(
+                    "parse {} — the map guards against duplicates; \
+                 fix or remove the file and rerun the migration",
+                    path.display()
+                )
+            })?;
         Ok(Self { path, entries })
     }
 
@@ -59,14 +81,6 @@ impl MigrationMap {
             .insert(format!("{DAILY_PREFIX}{date}"), doc_id.to_string());
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Persist atomically (tmp + rename) — concurrent facts runs may write it.
     pub fn save(&self) -> Result<()> {
         let json =
@@ -93,14 +107,30 @@ pub struct Frontmatter {
     pub status: Option<String>,
 }
 
+/// Split frontmatter from the body. CRLF is normalized first. A body that
+/// does not start with `---` is returned as-is (an early horizontal rule
+/// must not be mistaken for frontmatter); the candidate block must also look
+/// like `key: value` lines before it is treated as frontmatter.
 pub fn split_frontmatter(content: &str) -> (Frontmatter, String) {
-    let rest = content.strip_prefix("---\n").unwrap_or(content);
+    let normalized = content.replace("\r\n", "\n");
+    let Some(rest) = normalized.strip_prefix("---\n") else {
+        return (Frontmatter::default(), normalized.trim().to_string());
+    };
     let Some(end) = rest.find("\n---\n") else {
-        return (Frontmatter::default(), content.trim().to_string());
+        return (Frontmatter::default(), normalized.trim().to_string());
     };
     let fm_raw = &rest[..end];
+    if !looks_like_frontmatter(fm_raw) {
+        return (Frontmatter::default(), normalized.trim().to_string());
+    }
     let body = rest[end + 5..].trim().to_string();
     (parse_frontmatter(fm_raw), body)
+}
+
+fn looks_like_frontmatter(raw: &str) -> bool {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.split_once(':').is_some_and(|(k, _)| !k.trim().is_empty()))
 }
 
 fn parse_frontmatter(raw: &str) -> Frontmatter {
@@ -188,127 +218,4 @@ pub fn doc_id_from_response(resp: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         })
-}
-
-/// AFFiNE's markdown importer caps tables at 20 rows total; longer tables
-/// abort the whole import. Split oversized tables into consecutive chunks
-/// (header repeated) so every chunk fits the cap.
-pub fn split_long_tables(markdown: &str, max_data_rows: usize) -> String {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = lines[i];
-        if is_table_row(line) && i + 1 < lines.len() && is_table_delimiter(lines[i + 1]) {
-            let header = line.to_string();
-            let delimiter = lines[i + 1].to_string();
-            let mut j = i + 2;
-            let mut data: Vec<&str> = Vec::new();
-            while j < lines.len() && is_table_row(lines[j]) {
-                data.push(lines[j]);
-                j += 1;
-            }
-            if data.len() > max_data_rows {
-                for chunk in data.chunks(max_data_rows) {
-                    if !out.is_empty() && !out.last().map(|l| l.is_empty()).unwrap_or(false) {
-                        out.push(String::new());
-                    }
-                    out.push(header.clone());
-                    out.push(delimiter.clone());
-                    out.extend(chunk.iter().map(|l| l.to_string()));
-                }
-            } else {
-                out.push(header);
-                out.push(delimiter);
-                out.extend(data.iter().map(|l| l.to_string()));
-            }
-            i = j;
-        } else {
-            out.push(line.to_string());
-            i += 1;
-        }
-    }
-    out.join("\n")
-}
-
-fn is_table_row(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1
-}
-
-fn is_table_delimiter(line: &str) -> bool {
-    let t = line.trim();
-    is_table_row(t)
-        && t.chars()
-            .all(|c| c == '|' || c == '-' || c == ':' || c.is_whitespace())
-        && t.contains('-')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frontmatter_roundtrip_fact_file() {
-        let raw = "---\nupdated: 2026-10-05\ntitle: Port 3010 affine\ndescription: d\nconfidence: 0.9\nsources: [manual/2026-10-05, opencode/x]\ntags: [affine, docker]\nstatus: accepted\n---\n\nAffine selfhost listens on 3010.";
-        let (fm, body) = split_frontmatter(raw);
-        assert_eq!(fm.updated.as_deref(), Some("2026-10-05"));
-        assert_eq!(fm.tags, vec!["affine", "docker"]);
-        assert_eq!(fm.sources.len(), 2);
-        assert_eq!(fm.confidence.as_deref(), Some("0.9"));
-        assert!(body.starts_with("Affine selfhost"));
-    }
-
-    #[test]
-    fn frontmatter_absent_yields_whole_body() {
-        let (fm, body) = split_frontmatter("just text");
-        assert!(fm.title.is_none());
-        assert_eq!(body, "just text");
-    }
-
-    #[test]
-    fn fact_section_contains_meta_and_statement() {
-        let fact = FactEntry {
-            slug: "affine-port".into(),
-            date: "2026-10-05".into(),
-            title: "Affine port".into(),
-            statement: "Selfhost listens on 3010.".into(),
-            tags: vec!["affine".into()],
-            confidence: "0.9".into(),
-            sources: vec!["manual/2026-10-05".into()],
-        };
-        let section = render_fact_section(&fact);
-        assert!(section.contains("## Affine port"));
-        assert!(section.contains("Selfhost listens on 3010."));
-        assert!(section.contains("slug: affine-port"));
-    }
-
-    #[test]
-    fn long_table_is_split_into_fitting_chunks() {
-        let rows: Vec<String> = (1..=45).map(|n| format!("| col{n} | value |")).collect();
-        let markdown = format!(
-            "# t\n\n| h1 | h2 |\n|---|---|\n{}\n\ntail text",
-            rows.join("\n")
-        );
-        let split = split_long_tables(&markdown, 18);
-        let header_count = split.matches("| h1 | h2 |").count();
-        assert_eq!(header_count, 3, "45 rows / 18 = 3 chunks");
-        assert!(split.contains("tail text"));
-        for chunk in split.split("| h1 | h2 |\n|---|---|\n").skip(1) {
-            let data_rows = chunk.lines().take_while(|l| is_table_row(l)).count();
-            assert!(data_rows <= 18);
-        }
-    }
-
-    #[test]
-    fn short_table_passes_through_untouched() {
-        let markdown = "| h |\n|---|\n| a |\n| b |";
-        assert_eq!(split_long_tables(markdown, 18), markdown);
-    }
-
-    #[test]
-    fn non_table_pipes_are_ignored() {
-        let markdown = "just `|code|` inline\nand text";
-        assert_eq!(split_long_tables(markdown, 18), markdown);
-    }
 }

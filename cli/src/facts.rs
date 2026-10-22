@@ -16,7 +16,7 @@ use sha1::{Digest as _, Sha1};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::affine_client::AffineConfig;
-use crate::affine_migrate;
+
 use crate::affine_store::FactEntry;
 use crate::wiki_root;
 
@@ -102,7 +102,17 @@ pub struct ConflictPair {
 /// активен; ручной аргумент-текст — намеренный ввод, порог не применяется.
 pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> FactsOutcome {
     match run_facts_inner(text, source, date, stdin).await {
-        Ok(out) => out,
+        Ok((out, affine_facts)) => {
+            // Publish runs OUTSIDE the pipeline lock: the hook does network I/O
+            // (up to 120s per call) and must never hold the FS lock hostage
+            // for concurrent facts runs waiting on their 60s deadline.
+            if std::env::var("UWUWU_AFFINE_PUBLISH").ok().as_deref() == Some("1")
+                && !affine_facts.is_empty()
+            {
+                publish_to_affine(&wiki_root(), &affine_facts).await;
+            }
+            out
+        }
         Err(e) if e.to_string().contains("OLLAMA_UNREACHABLE") => FactsOutcome {
             ok: false,
             error: Some("ollama_unreachable".into()),
@@ -161,42 +171,51 @@ async fn run_facts_inner(
     source: &str,
     date: &str,
     stdin: bool,
-) -> Result<FactsOutcome> {
+) -> Result<(FactsOutcome, Vec<FactEntry>)> {
     if !valid_date(date) {
-        return Ok(FactsOutcome {
-            ok: false,
-            error: Some("bad_date".into()),
-            bad: None,
-            trivial: None,
-            new: vec![],
-            dup: vec![],
-            conflict: vec![],
-        });
+        return Ok((
+            FactsOutcome {
+                ok: false,
+                error: Some("bad_date".into()),
+                bad: None,
+                trivial: None,
+                new: vec![],
+                dup: vec![],
+                conflict: vec![],
+            },
+            vec![],
+        ));
     }
     if stdin && text.chars().count() < MIN_DIGEST_CHARS {
-        return Ok(FactsOutcome {
-            ok: true,
-            trivial: Some(true),
-            error: None,
-            bad: None,
-            new: vec![],
-            dup: vec![],
-            conflict: vec![],
-        });
+        return Ok((
+            FactsOutcome {
+                ok: true,
+                trivial: Some(true),
+                error: None,
+                bad: None,
+                new: vec![],
+                dup: vec![],
+                conflict: vec![],
+            },
+            vec![],
+        ));
     }
 
     let raw = chat(EXTRACT_SYSTEM, text).await?;
     let (objs, bad) = parse_jsonl(&raw);
     if bad > 0 {
-        return Ok(FactsOutcome {
-            ok: false,
-            error: Some("bad_jsonl".into()),
-            bad: Some(bad),
-            trivial: None,
-            new: vec![],
-            dup: vec![],
-            conflict: vec![],
-        });
+        return Ok((
+            FactsOutcome {
+                ok: false,
+                error: Some("bad_jsonl".into()),
+                bad: Some(bad),
+                trivial: None,
+                new: vec![],
+                dup: vec![],
+                conflict: vec![],
+            },
+            vec![],
+        ));
     }
 
     let candidates: Vec<Candidate> = objs
@@ -251,14 +270,14 @@ async fn run_facts_inner(
         conflict: vec![],
     };
     if candidates.is_empty() {
-        return Ok(outcome);
+        return Ok((outcome, vec![]));
     }
 
     let _guard = LockGuard::acquire()?;
     let root = wiki_root();
     let mut store = FactStore::load(&root)?;
     let month = format!("{}-{}", &date[0..4], &date[5..7]);
-    // Новые факты этого прогона — кандидататы для публикации в AFFiNE-бакет дня
+    // Новые факты этого прогона — кандидаты для публикации в AFFiNE-бакет дня
     let mut affine_facts: Vec<FactEntry> = Vec::new();
 
     for f in candidates {
@@ -367,12 +386,7 @@ async fn run_facts_inner(
         outcome.conflict.len()
     );
     let _ = git_commit(&msg); // диагностика внутри; фейл коммита не роняет результат
-    if std::env::var("UWUWU_AFFINE_PUBLISH").ok().as_deref() == Some("1")
-        && !affine_facts.is_empty()
-    {
-        publish_to_affine(&root, &affine_facts).await;
-    }
-    Ok(outcome)
+    Ok((outcome, affine_facts))
 }
 
 /// Best-effort публикация новых фактов в дейли-бакеты AFFiNE (opt-in через
@@ -386,7 +400,7 @@ async fn publish_to_affine(root: &Path, facts: &[FactEntry]) {
             return;
         }
     };
-    match affine_migrate::publish_facts(root, &cfg, facts).await {
+    match crate::affine_publish::publish_facts(root, &cfg, facts).await {
         Ok(count) => eprintln!("affine: {count} facts published to daily buckets"),
         Err(e) => eprintln!("warn: affine publish failed: {e:#}"),
     }
@@ -908,14 +922,15 @@ fn git_commit(message: &str) -> Result<()> {
 
 /// Файловый lock: держатель touch'ит mtime каждые LOCK_TOUCH_SECS (фоновая
 /// задача); lock старше LOCK_STALE_SECS считается брошенным (pid внутри —
-/// для диагностики).
-struct LockGuard {
+/// для диагностики). Используется и миграцией affine (конкурент с facts
+/// на affine_map.json).
+pub(crate) struct LockGuard {
     path: PathBuf,
     touch: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LockGuard {
-    fn acquire() -> Result<Self> {
+    pub(crate) fn acquire() -> Result<Self> {
         let path = wiki_root().join(LOCK_PATH);
         // env-вики (UWUWU_WIKI) может ещё не существовать — создаём корень
         // до lock-цикла, иначе create_new возвращает NotFound навсегда.

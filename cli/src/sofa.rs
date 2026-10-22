@@ -59,10 +59,9 @@ struct AgentCred {
 
 fn load_api_key() -> Result<String> {
     let path = credentials_path()?;
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("SOFA: нет {}", path.display()))?;
-    let cred: Credentials =
-        serde_json::from_str(&raw).context("SOFA: битый credentials.json")?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("SOFA: нет {}", path.display()))?;
+    let cred: Credentials = serde_json::from_str(&raw).context("SOFA: битый credentials.json")?;
     cred.agents
         .values()
         .next()

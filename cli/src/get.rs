@@ -61,7 +61,9 @@ pub fn get_document_by_slug(slug: &str, wiki_root: &Path) -> Result<String> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::bail!("ambiguous slug '{slug}': {list} (у фактов используйте префикс facts/<slug>)")
+            anyhow::bail!(
+                "ambiguous slug '{slug}': {list} (у фактов используйте префикс facts/<slug>)"
+            )
         }
     }
 }

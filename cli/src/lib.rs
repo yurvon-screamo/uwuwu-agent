@@ -1,6 +1,10 @@
 pub mod affine_client;
+pub mod affine_collect;
 pub mod affine_migrate;
+pub mod affine_publish;
+pub mod affine_sse;
 pub mod affine_store;
+pub mod affine_tables;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
@@ -20,6 +24,15 @@ pub mod wiki;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+#[cfg(test)]
+mod affine_collect_tests;
+#[cfg(test)]
+mod affine_sse_tests;
+#[cfg(test)]
+mod affine_store_tests;
+#[cfg(test)]
+mod affine_tables_tests;
 
 pub fn wiki_root() -> PathBuf {
     // UWUWU_WIKI — каноническое имя (общее с python-тулзой ~/uwuwu-agent/tools);
@@ -324,7 +337,7 @@ pub async fn run() -> anyhow::Result<()> {
                 report.errors.len()
             );
             for error in &report.errors {
-                println!("  ! {error}");
+                eprintln!("  ! {error}");
             }
         }
     }

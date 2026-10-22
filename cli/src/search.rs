@@ -63,7 +63,6 @@ pub async fn search(
     search_with_filter(query, doc_type, wiki_root, cache_path, top_k, None).await
 }
 
-
 pub async fn search_with_filter(
     query: &str,
     doc_type: &str,
@@ -72,7 +71,16 @@ pub async fn search_with_filter(
     top_k: usize,
     filter: Option<&(dyn Fn(&Path) -> bool + Sync)>,
 ) -> Result<Vec<SearchResult>> {
-    search_multi_with_filter(query, &[doc_type], wiki_root, cache_path, top_k, filter, None).await
+    search_multi_with_filter(
+        query,
+        &[doc_type],
+        wiki_root,
+        cache_path,
+        top_k,
+        filter,
+        None,
+    )
+    .await
 }
 
 /// Поиск по НЕСКОЛЬКИМ doc_type одним проходом (один Cache::open — SurrealDB
@@ -111,10 +119,7 @@ pub async fn search_multi_with_filter(
     let cached = cache.load_all().await?;
     let cached_keys: Vec<String> = cached.keys().cloned().collect();
 
-    let all_md_files: Vec<PathBuf> = base_dirs
-        .iter()
-        .flat_map(|d| collect_md_files(d))
-        .collect();
+    let all_md_files: Vec<PathBuf> = base_dirs.iter().flat_map(|d| collect_md_files(d)).collect();
     let md_files = match filter {
         Some(f) => all_md_files.into_iter().filter(|p| f(p)).collect(),
         None => all_md_files,
