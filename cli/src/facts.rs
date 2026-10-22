@@ -75,6 +75,9 @@ pub struct FactsOutcome {
     pub bad: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trivial: Option<bool>,
+    /// Facts published into AFFiNE daily buckets this run (mandatory stage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub new: Vec<NewFact>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -100,16 +103,26 @@ pub struct ConflictPair {
 /// `date` — день факта (месяц каталога + updated). stdout-JSON печатает вызывающий.
 /// `stdin` — вход от оркестратора (дайджест сессии): тривиал-порог MIN_DIGEST_CHARS
 /// активен; ручной аргумент-текст — намеренный ввод, порог не применяется.
+/// Publishes into AFFiNE ALWAYS — the workspace is the primary destination,
+/// not an optional mirror. A gateway failure fails the whole run (ok:false);
+/// the FS copy stays as the local index for dedup/semantic search, and dup
+/// facts are re-published too so a retried run converges after a failure.
 pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> FactsOutcome {
     match run_facts_inner(text, source, date, stdin).await {
-        Ok((out, affine_facts)) => {
+        Ok((mut out, affine_facts)) => {
+            if affine_facts.is_empty() {
+                return out;
+            }
             // Publish runs OUTSIDE the pipeline lock: the hook does network I/O
             // (up to 120s per call) and must never hold the FS lock hostage
             // for concurrent facts runs waiting on their 60s deadline.
-            if std::env::var("UWUWU_AFFINE_PUBLISH").ok().as_deref() == Some("1")
-                && !affine_facts.is_empty()
-            {
-                publish_to_affine(&wiki_root(), &affine_facts).await;
+            match publish_to_affine(&wiki_root(), &affine_facts).await {
+                Ok(published) => out.published = Some(published),
+                Err(e) => {
+                    eprintln!("error: affine publish failed: {e:#}");
+                    out.ok = false;
+                    out.error = Some(format!("affine_publish_failed: {e:#}"));
+                }
             }
             out
         }
@@ -121,6 +134,7 @@ pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> Fac
             new: vec![],
             dup: vec![],
             conflict: vec![],
+            published: None,
         },
         Err(e) => FactsOutcome {
             ok: false,
@@ -130,6 +144,7 @@ pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> Fac
             new: vec![],
             dup: vec![],
             conflict: vec![],
+            published: None,
         },
     }
 }
@@ -182,6 +197,7 @@ async fn run_facts_inner(
                 new: vec![],
                 dup: vec![],
                 conflict: vec![],
+                published: None,
             },
             vec![],
         ));
@@ -196,6 +212,7 @@ async fn run_facts_inner(
                 new: vec![],
                 dup: vec![],
                 conflict: vec![],
+                published: None,
             },
             vec![],
         ));
@@ -213,6 +230,7 @@ async fn run_facts_inner(
                 new: vec![],
                 dup: vec![],
                 conflict: vec![],
+                published: None,
             },
             vec![],
         ));
@@ -268,6 +286,7 @@ async fn run_facts_inner(
         new: vec![],
         dup: vec![],
         conflict: vec![],
+        published: None,
     };
     if candidates.is_empty() {
         return Ok((outcome, vec![]));
@@ -287,6 +306,9 @@ async fn run_facts_inner(
         }
         if let Some(existing) = store.by_sha.get(&s) {
             append_source(&existing.path, source, &today())?;
+            if let Some(entry) = affine_entry_from_file(&existing.path, date) {
+                affine_facts.push(entry);
+            }
             outcome.dup.push(existing.slug.clone());
             continue;
         }
@@ -329,6 +351,9 @@ async fn run_facts_inner(
         if let (Some(dk), None) = (dup_k, &conflict_k) {
             let path = store.by_sha[&dk].path.clone();
             append_source(&path, source, &today())?;
+            if let Some(entry) = affine_entry_from_file(&path, date) {
+                affine_facts.push(entry);
+            }
             outcome.dup.push(store.by_sha[&dk].slug.clone());
             continue;
         }
@@ -347,6 +372,9 @@ async fn run_facts_inner(
         )?;
         if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
             let old_path = store.by_sha[ck].path.clone();
+            if let Some(entry) = affine_entry_from_file(&old_path, date) {
+                affine_facts.push(entry);
+            }
             append_source(&old_path, source, &today())?;
             add_conflict_link(&old_path, &s, cslug, &today())?;
             outcome.conflict.push(ConflictPair {
@@ -392,18 +420,29 @@ async fn run_facts_inner(
 /// Best-effort публикация новых фактов в дейли-бакеты AFFiNE (opt-in через
 /// UWUWU_AFFINE_PUBLISH=1). Ошибки шлюза не влияют на исход пайплайна:
 /// ФС остаётся source of truth.
-async fn publish_to_affine(root: &Path, facts: &[FactEntry]) {
-    let cfg = match AffineConfig::from_env() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("warn: affine publish skipped: {e:#}");
-            return;
-        }
-    };
-    match crate::affine_publish::publish_facts(root, &cfg, facts).await {
-        Ok(count) => eprintln!("affine: {count} facts published to daily buckets"),
-        Err(e) => eprintln!("warn: affine publish failed: {e:#}"),
-    }
+/// Mandatory AFFiNE publication: new AND dup facts of this run. Dup facts
+/// re-published so a retried run converges after a previous publish failure
+/// (the map skips facts already visible in the bucket).
+async fn publish_to_affine(root: &Path, facts: &[FactEntry]) -> anyhow::Result<usize> {
+    let cfg = AffineConfig::from_env()?;
+    crate::affine_publish::publish_facts(root, &cfg, facts).await
+}
+
+/// FactEntry из уже записанного файла факта — для публикации dup/conflict
+/// фактов, которые могли не доехать до AFFiNE в упавшем прошлом прогоне.
+fn affine_entry_from_file(path: &Path, date: &str) -> Option<FactEntry> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let slug = path.file_stem()?.to_string_lossy().to_string();
+    let (fm, statement) = crate::affine_store::split_frontmatter(&raw);
+    Some(FactEntry {
+        slug,
+        date: date.to_string(),
+        title: fm.title.unwrap_or_default(),
+        statement,
+        tags: fm.tags,
+        confidence: fm.confidence.unwrap_or_else(|| "-".into()),
+        sources: fm.sources,
+    })
 }
 
 // ---------- структуры ----------
