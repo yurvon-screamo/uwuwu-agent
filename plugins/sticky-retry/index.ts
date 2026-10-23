@@ -416,7 +416,8 @@ const retryThenRelay = async (
   nextAttempt: number,
   firstDelayMs: number,
 ): Promise<Response> => {
-  let pendingDelayMs = firstDelayMs
+  let pendingDelayMs: number | null = null
+  let streamedBytes = 0
   const bornAt = Date.now()
   // Entering the loop means attempt 1 already failed and emitted retry:
   // a recovery here is always a real recovery.
@@ -561,7 +562,7 @@ const retryingSseResponse = (
                 } else {
                   log(`pass status=${upstream.status} attempt=${attempt} url=${prepared.displayUrl}`)
                 }
-                await pipeBody(upstream, controller)
+                await pipeBody(upstream, controller, (t) => { streamedBytes = t })
                 return
               }
               emitOrLog(
@@ -595,6 +596,23 @@ const retryingSseResponse = (
             )
           } catch (error) {
             if (prepared.abort.signal.aborted) return
+            // Mid-body break: bytes already went to the client — retrying
+            // would pipe a full second response into the same stream.
+            // Give up; the client's own retry pipeline handles recovery.
+            if (streamedBytes > 0) {
+              emitOrLog(
+                emitSupplier(),
+                `give-up mid-body transport="${scrubErrorText(error)}" attempt=${attempt} streamed=${streamedBytes} url=${prepared.displayUrl}`,
+                {
+                  kind: "give-up",
+                  transport: scrubDetail(String(error)),
+                  attempt,
+                  url: prepared.displayUrl,
+                  sessionID: prepared.sessionID,
+                },
+              )
+              return
+            }
             pendingDelayMs = delayOf(decide({ transportError: true, attempt }))
             emitOrLog(
               emitSupplier(),
@@ -642,13 +660,19 @@ export const relayResponse = (upstream: Response): Response => {
 const pipeBody = async (
   upstream: Response,
   controller: ReadableStreamDefaultController<Uint8Array>,
+  onBytes?: (total: number) => void,
 ): Promise<void> => {
   if (upstream.body === null) return
   const reader = upstream.body.getReader()
+  let total = 0
   for (;;) {
     const { done, value } = await reader.read()
     if (done) return
-    if (value !== undefined) controller.enqueue(value)
+    if (value !== undefined) {
+      controller.enqueue(value)
+      total += value.byteLength
+      if (onBytes) onBytes(total)
+    }
   }
 }
 

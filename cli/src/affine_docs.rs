@@ -1,5 +1,5 @@
 //! AFFiNE document access: slug → docId resolution and markdown reads.
-//! Slugs live as `slug:<slug>` doc tags in the workspace, so ANY machine
+//! Slugs live as bare doc tags in the workspace (no prefix), so ANY machine
 //! resolves them without shared files; the local per-instance map is only
 //! a write cache. Multi-PC safe by design.
 
@@ -134,7 +134,7 @@ pub async fn ensure_requests_container(
     .await
 }
 
-/// Backfill `slug:` tags for every mapped document (one-time migration aid).
+/// Backfill bare slug tags for every mapped document (one-time migration aid).
 pub async fn backfill_slug_tags(root: &Path, cfg: &AffineConfig) -> Result<(usize, usize)> {
     let mut client = AffineClient::connect(cfg).await?;
     let map = MigrationMap::load_for(root, cfg)?;
