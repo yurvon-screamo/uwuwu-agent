@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail as cache_bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -95,6 +95,12 @@ impl ContentCache {
             )
             .await?;
         let nodes = flatten_tree(&tree);
+        if nodes.is_empty() {
+            // an unrecognized answer shape must NOT wipe the cache
+            cache_bail!(
+                "workspace tree came back empty — cache left untouched, run `uwuwu-cli sync`"
+            );
+        }
         // drop entries the workspace no longer has (trashed/deleted docs)
         let live_ids: std::collections::HashSet<&str> =
             nodes.iter().map(|n| n.doc_id.as_str()).collect();

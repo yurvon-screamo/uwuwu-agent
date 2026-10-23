@@ -19,11 +19,23 @@ pub async fn session(
     root: &Path,
     cfg: &AffineConfig,
 ) -> Result<(AffineClient, ContentCache, FactIndex)> {
+    session_with_ttl(root, cfg, 600).await
+}
+
+/// A cache synced within the TTL is reused instead of re-walking the whole
+/// workspace tree on every single read/grep.
+pub async fn session_with_ttl(
+    root: &Path,
+    cfg: &AffineConfig,
+    ttl_secs: u64,
+) -> Result<(AffineClient, ContentCache, FactIndex)> {
     let mut client = AffineClient::connect(cfg).await?;
     let mut cache = ContentCache::load(root)?;
-    let report = cache.sync(&mut client, cfg, root).await?;
-    if report.fetched > 0 {
-        eprintln!("affine: content cache +{} docs", report.fetched);
+    if !cache.is_fresh(ttl_secs) {
+        let report = cache.sync(&mut client, cfg, root).await?;
+        if report.fetched > 0 {
+            eprintln!("affine: content cache +{} docs", report.fetched);
+        }
     }
     let mut index = FactIndex::load_or_bootstrap(root)?;
     sync_fact_buckets(&mut client, cfg, root, &mut index).await?;
