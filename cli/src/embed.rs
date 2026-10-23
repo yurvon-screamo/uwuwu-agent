@@ -15,7 +15,6 @@ fn client() -> reqwest::Client {
 struct EmbedRequest<'a, T> {
     model: &'a str,
     input: T,
-    keep_alive: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -24,11 +23,7 @@ struct EmbedResponse {
 }
 
 pub async fn embed(model: &str, text: &str) -> Result<Vec<f32>> {
-    let req = EmbedRequest {
-        model,
-        input: text,
-        keep_alive: "30m",
-    };
+    let req = EmbedRequest { model, input: text };
 
     let resp: EmbedResponse = client()
         .post(format!("{}/api/embed", OLLAMA_URL))
@@ -58,7 +53,6 @@ pub async fn batch_embed(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>>
     let req = EmbedRequest {
         model,
         input: texts,
-        keep_alive: "30m",
     };
 
     let resp: EmbedResponse = client()
