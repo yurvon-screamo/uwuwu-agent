@@ -23,7 +23,10 @@ pub async fn session(
 }
 
 /// A cache synced within the TTL is reused instead of re-walking the whole
-/// workspace tree on every single read/grep.
+/// workspace tree on every single read/grep. NOTE: the TTL covers the
+/// content cache only — the daily-bucket fact ingest (one depth-1 tree walk
+/// + up to 3 recent-day reads) still runs on every session on purpose:
+/// cross-PC dedup freshness must not degrade to the TTL window.
 pub async fn session_with_ttl(
     root: &Path,
     cfg: &AffineConfig,
