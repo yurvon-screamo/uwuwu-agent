@@ -99,6 +99,12 @@ impl MigrationMap {
             .map(|s| s.as_str())
     }
 
+    /// True when the docId is already bound to some slug — a recovered doc
+    /// owned by another slug must not be re-bound (write recovery guard).
+    pub fn owns_doc(&self, doc_id: &str) -> bool {
+        self.entries.values().any(|v| v == doc_id)
+    }
+
     pub fn put_doc(&mut self, slug: &str, doc_id: &str) {
         self.entries.insert(slug.to_string(), doc_id.to_string());
     }

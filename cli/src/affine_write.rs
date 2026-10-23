@@ -74,8 +74,10 @@ pub async fn run_write(
     let doc_id = match doc_id_from_response(&resp) {
         Some(id) => id,
         None => match find_doc_by_title(&mut client, &cfg.workspace, &title).await? {
-            Some(id) => id,
-            None => anyhow::bail!("created but no docId returned: {resp:.300}"),
+            // a doc already bound to another slug is not ours — binding it
+            // here would alias two slugs onto one document
+            Some(id) if !map.owns_doc(&id) => id,
+            _ => anyhow::bail!("created but no docId returned: {resp:.300}"),
         },
     };
     map.put_doc(slug, &doc_id);

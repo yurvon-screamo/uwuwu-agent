@@ -143,7 +143,9 @@ impl FactIndex {
         let path: PathBuf = root.join(INDEX_FILE);
         let json = serde_json::to_string(&self).with_context(|| "serialize facts index")?;
         if path.exists() {
-            let _ = std::fs::copy(&path, path.with_extension("bak"));
+            if let Err(e) = std::fs::copy(&path, path.with_extension("bak")) {
+                eprintln!("warn: facts index backup copy failed: {e}");
+            }
         }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
@@ -239,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_index_without_legacy_facts_is_loud() {
         let dir = tempfile::tempdir().unwrap();
         let err = FactIndex::load(dir.path()).unwrap_err();
@@ -261,8 +264,14 @@ mod tests {
         )
         .unwrap();
         let index = FactIndex::load(dir.path()).unwrap();
+        // load() saved once during bootstrap; re-create the clean slate and
+        // exercise two explicit saves to observe .bak generation
+        std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
         index.save(dir.path()).unwrap();
-        assert!(dir.path().join(format!("{INDEX_FILE}.bak")).exists() || true);
+        let bak = dir.path().join("affine_facts_index.bak");
+        assert!(!bak.exists(), "no .bak when nothing to back up");
+        index.save(dir.path()).unwrap();
+        assert!(bak.exists(), ".bak keeps the previous generation");
         std::fs::write(dir.path().join(INDEX_FILE), "{broken").unwrap();
         assert!(FactIndex::load(dir.path()).is_err());
     }
