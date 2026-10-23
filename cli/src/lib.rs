@@ -5,9 +5,11 @@ pub mod affine_publish;
 pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
+pub mod affine_write;
 pub mod cache;
 pub mod chunk;
 pub mod embed;
+pub mod fact_index;
 pub mod facts;
 pub mod get;
 pub mod grep;
@@ -141,6 +143,17 @@ enum Commands {
         sync: bool,
         /// Raw text to factize (ignored with --stdin/--sync)
         text: Vec<String>,
+    },
+    /// Write a document straight into AFFiNE: markdown from stdin → doc.
+    /// `<slug>` (experience) or --project <proj> <slug> (project doc).
+    /// Env: UWUWU_AFFINE_URL/TOKEN/WORKSPACE_ID.
+    Write {
+        #[arg(help = "Document slug (unique across the workspace)")]
+        slug: String,
+        #[arg(long, help = "Target project (projects/<proj>/…); omit for experience")]
+        project: Option<String>,
+        #[arg(long, help = "Doc title (defaults to slug)")]
+        title: Option<String>,
     },
     /// Migrate wiki data into the AFFiNE workspace: experience/ and projects/
     /// as documents, facts/ as daily journal buckets. Idempotent (resume-safe).
@@ -308,6 +321,19 @@ pub async fn run() -> anyhow::Result<()> {
                 let out = facts::run_facts(&text, &source, &date, stdin).await;
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
+        }
+        Commands::Write {
+            slug,
+            project,
+            title,
+        } => {
+            let cfg = affine_client::AffineConfig::from_env()?;
+            let markdown = affine_write::read_markdown_stdin()?;
+            let title = title.unwrap_or_else(|| slug.clone());
+            let doc_id =
+                affine_write::run_write(&root, &cfg, &slug, project.as_deref(), &title, &markdown)
+                    .await?;
+            println!("created: {slug} → {doc_id}");
         }
         Commands::Affine {
             experience,

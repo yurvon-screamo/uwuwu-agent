@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use sha1::{Digest as _, Sha1};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::affine_client::AffineConfig;
@@ -36,7 +35,6 @@ const STMT_MAX_CHARS: usize = 600;
 const TITLE_MAX_CHARS: usize = 120;
 const TAG_MAX_CHARS: usize = 24;
 const MAX_TAGS: usize = 4;
-const DESC_MAX_CHARS: usize = 150;
 
 const LOCK_PATH: &str = "facts.lock";
 const LOCK_STALE_SECS: u64 = 300;
@@ -109,15 +107,24 @@ pub struct ConflictPair {
 /// facts are re-published too so a retried run converges after a failure.
 pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> FactsOutcome {
     match run_facts_inner(text, source, date, stdin).await {
-        Ok((mut out, affine_facts)) => {
-            if affine_facts.is_empty() {
-                return out;
-            }
+        Ok((mut out, affine_facts, index)) => {
+            let Some(index) = index else {
+                return out; // ранний выход: индекс не создавался — не трогаем
+            };
             // Publish runs OUTSIDE the pipeline lock: the hook does network I/O
             // (up to 120s per call) and must never hold the FS lock hostage
             // for concurrent facts runs waiting on their 60s deadline.
+            // The dedup index is saved ONLY after a successful publish —
+            // a failed run must not mark facts as processed.
             match publish_to_affine(&wiki_root(), &affine_facts).await {
-                Ok(published) => out.published = Some(published),
+                Ok(published) => {
+                    if let Err(e) = index.save(&wiki_root()) {
+                        out.ok = false;
+                        out.error = Some(format!("facts_index_save_failed: {e:#}"));
+                        return out;
+                    }
+                    out.published = Some(published);
+                }
                 Err(e) => {
                     eprintln!("error: affine publish failed: {e:#}");
                     out.ok = false;
@@ -149,11 +156,10 @@ pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> Fac
     }
 }
 
-/// `uwuwu-cli facts --sync`: только scoped git-коммит sidecar/фактов (без LLM).
-/// Зовётся python-оркестратором в конце дня (sidecar python сохраняет сам).
-pub fn sync_git(message: &str) -> Result<()> {
-    let _guard = LockGuard::acquire()?;
-    git_commit(message)
+/// `uwuwu-cli facts --sync` — deprecated no-op: факты больше не живут в git.
+/// Команда остаётся, чтобы python-оркестратор не падал на старом контракте.
+pub fn sync_git(_message: &str) -> Result<()> {
+    Ok(())
 }
 
 fn valid_date(s: &str) -> bool {
@@ -186,7 +192,11 @@ async fn run_facts_inner(
     source: &str,
     date: &str,
     stdin: bool,
-) -> Result<(FactsOutcome, Vec<FactEntry>)> {
+) -> Result<(
+    FactsOutcome,
+    Vec<FactEntry>,
+    Option<crate::fact_index::FactIndex>,
+)> {
     if !valid_date(date) {
         return Ok((
             FactsOutcome {
@@ -200,6 +210,7 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
+            None,
         ));
     }
     if stdin && text.chars().count() < MIN_DIGEST_CHARS {
@@ -215,6 +226,7 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
+            None,
         ));
     }
 
@@ -233,6 +245,7 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
+            None,
         ));
     }
 
@@ -289,30 +302,29 @@ async fn run_facts_inner(
         published: None,
     };
     if candidates.is_empty() {
-        return Ok((outcome, vec![]));
+        return Ok((outcome, vec![], None));
     }
 
     let _guard = LockGuard::acquire()?;
     let root = wiki_root();
-    let mut store = FactStore::load(&root)?;
-    let month = format!("{}-{}", &date[0..4], &date[5..7]);
+    let mut index = crate::fact_index::FactIndex::load(&root)?;
+    let removed = load_removed(&root);
     // Новые факты этого прогона — кандидаты для публикации в AFFiNE-бакет дня
     let mut affine_facts: Vec<FactEntry> = Vec::new();
 
     for f in candidates {
         let s = sha1_norm(&f.statement);
-        if store.removed.contains(&s) {
+        if removed.contains(&s) {
             continue; // tombstone: удалённый dreaming'ом мусор не воскрешаем
         }
-        if let Some(existing) = store.by_sha.get(&s) {
-            append_source(&existing.path, source, &today())?;
-            push_affine_entry(&mut affine_facts, &existing.path, date)?;
+        if let Some(existing) = index.get_mut(&s) {
+            index_touch(existing, source, &today());
+            affine_facts.push(indexed_to_fact(existing));
             outcome.dup.push(existing.slug.clone());
             continue;
         }
         let js = shingles(&f.statement);
-        let mut scored: Vec<(f32, String)> = store
-            .by_sha
+        let mut scored: Vec<(f32, String)> = index
             .iter()
             .map(|(k, v)| (jaccard(&js, &v.shingles), k.clone()))
             .filter(|(sim, _)| *sim >= JACCARD_THRESHOLD)
@@ -321,13 +333,12 @@ async fn run_facts_inner(
         let olds: Vec<(String, String)> = scored
             .into_iter()
             .take(5)
-            .filter_map(|(_, k)| store.by_sha.get(&k).map(|v| (k, v.statement.clone())))
+            .filter_map(|(_, k)| index.get_mut(&k).map(|v| (k, v.statement.clone())))
             .collect();
 
         let mut verd: HashMap<String, String> = HashMap::new();
         if !olds.is_empty() {
             let pairs: Vec<(&Candidate, &String)> = olds.iter().map(|(_, st)| (&f, st)).collect();
-            // ключи для мапы после вердиктов
             let keys: Vec<String> = olds.iter().map(|(k, _)| k.clone()).collect();
             let vmap = verdicts(&pairs).await?;
             for (i, k) in keys.iter().enumerate() {
@@ -347,45 +358,46 @@ async fn run_facts_inner(
             .map(|(k, _)| k.clone());
 
         if let (Some(dk), None) = (dup_k, &conflict_k) {
-            let path = store.by_sha[&dk].path.clone();
-            append_source(&path, source, &today())?;
-            push_affine_entry(&mut affine_facts, &path, date)?;
-            outcome.dup.push(store.by_sha[&dk].slug.clone());
+            if let Some(dup) = index.get_mut(&dk) {
+                index_touch(dup, source, &today());
+                affine_facts.push(indexed_to_fact(dup));
+                outcome.dup.push(dup.slug.clone());
+            }
             continue;
         }
 
-        let slug = store.unique_slug(&slugify(&f.title));
-        let conflict_slug = conflict_k.as_ref().map(|k| store.by_sha[k].slug.clone());
-        let path = write_fact(
-            &root,
-            &month,
-            &slug,
-            &f,
-            source,
-            date,
-            &conflict_k,
-            &conflict_slug,
-        )?;
+        let slug = unique_slug(&index, &slugify(&f.title));
+        let conflict_slug = conflict_k
+            .as_ref()
+            .and_then(|k| index.get_mut(k).map(|v| v.slug.clone()));
         if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
-            let old_path = store.by_sha[ck].path.clone();
-            push_affine_entry(&mut affine_facts, &old_path, date)?;
-            append_source(&old_path, source, &today())?;
-            add_conflict_link(&old_path, &s, cslug, &today())?;
+            if let Some(old) = index.get_mut(ck) {
+                mark_conflict(old, &s, source, &today());
+                affine_facts.push(indexed_to_fact(old));
+            }
             outcome.conflict.push(ConflictPair {
                 slug: slug.clone(),
                 with: cslug.clone(),
             });
         }
-        store.by_sha.insert(
-            s,
-            ExistingFact {
-                path,
+        index.insert_new(
+            s.clone(),
+            crate::fact_index::IndexedFact {
                 slug: slug.clone(),
+                title: f.title.clone(),
                 statement: f.statement.clone(),
+                date: date.to_string(),
+                sources: vec![source.to_string()],
                 shingles: js,
+                conflicts: Vec::new(),
+                status: if conflict_k.is_some() {
+                    "conflict"
+                } else {
+                    "accepted"
+                }
+                .into(),
             },
         );
-        store.by_slug.insert(slug.clone());
         affine_facts.push(FactEntry {
             slug: slug.clone(),
             date: date.to_string(),
@@ -401,14 +413,7 @@ async fn run_facts_inner(
         });
     }
 
-    let msg = format!(
-        "facts: {source} (+{} new, {} dup, {} conflict)",
-        outcome.new.len(),
-        outcome.dup.len(),
-        outcome.conflict.len()
-    );
-    let _ = git_commit(&msg); // диагностика внутри; фейл коммита не роняет результат
-    Ok((outcome, affine_facts))
+    Ok((outcome, affine_facts, Some(index)))
 }
 
 /// Mandatory AFFiNE publication: new AND dup facts of this run. Dup facts
@@ -417,35 +422,6 @@ async fn run_facts_inner(
 async fn publish_to_affine(root: &Path, facts: &[FactEntry]) -> anyhow::Result<usize> {
     let cfg = AffineConfig::from_env()?;
     crate::affine_publish::publish_facts(root, &cfg, facts).await
-}
-
-/// FactEntry из уже записанного файла факта — для публикации dup/conflict
-/// фактов, которые могли не доехать до AFFiNE в упавшем прошлом прогоне.
-fn affine_entry_from_file(path: &Path, fallback_date: &str) -> anyhow::Result<FactEntry> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read fact {}: {e}", path.display()))?;
-    let slug = path
-        .file_stem()
-        .ok_or_else(|| anyhow::anyhow!("fact path without stem: {}", path.display()))?
-        .to_string_lossy()
-        .to_string();
-    let (fm, statement) = crate::affine_store::split_frontmatter(&raw);
-    Ok(FactEntry {
-        slug: slug.clone(),
-        date: fm.updated.unwrap_or_else(|| fallback_date.to_string()),
-        title: fm.title.unwrap_or(slug),
-        statement,
-        tags: fm.tags,
-        confidence: fm.confidence.unwrap_or_else(|| "-".into()),
-        sources: fm.sources,
-    })
-}
-
-/// Собрать dup-факт для публикации; ошибка чтения валит прогон —
-/// тихий пропуск публикации запрещён контрактом mandatory-режима.
-fn push_affine_entry(facts: &mut Vec<FactEntry>, path: &Path, date: &str) -> anyhow::Result<()> {
-    facts.push(affine_entry_from_file(path, date)?);
-    Ok(())
 }
 
 // ---------- структуры ----------
@@ -457,79 +433,59 @@ struct Candidate {
     confidence: f64,
 }
 
-struct ExistingFact {
-    path: PathBuf,
-    slug: String,
-    statement: String,
-    shingles: std::collections::HashSet<String>,
+// ---------- index helpers ----------
+
+/// Tombstones из facts.removed.json: удалённый dreaming'ом мусор
+/// не должен воскресать в новых прогонах.
+fn load_removed(root: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(root.join("facts.removed.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .map(|arr| arr.into_iter().collect())
+        .unwrap_or_default()
 }
 
-struct FactStore {
-    by_sha: HashMap<String, ExistingFact>,
-    by_slug: std::collections::HashSet<String>,
-    removed: std::collections::HashSet<String>,
-}
-
-impl FactStore {
-    fn load(root: &Path) -> Result<Self> {
-        let mut store = FactStore {
-            by_sha: HashMap::new(),
-            by_slug: std::collections::HashSet::new(),
-            removed: std::collections::HashSet::new(),
-        };
-        let tomb = root.join("facts.removed.json");
-        if tomb.exists() {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(
-                &std::fs::read_to_string(&tomb).unwrap_or_default(),
-            ) {
-                store.removed = arr.into_iter().collect();
-            }
-        }
-        for path in sorted_md(root.join("facts")) {
-            let Ok(body) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some((_, statement)) = split_fact(&body) else {
-                continue;
-            };
-            let s = sha1_norm(&statement);
-            store.by_slug.insert(
-                path.file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-            store.by_sha.insert(
-                s,
-                ExistingFact {
-                    path,
-                    slug: String::new(),
-                    statement,
-                    shingles: Default::default(),
-                },
-            );
-            // slug/shingles заполняем после вставки ключа
-        }
-        for v in store.by_sha.values_mut() {
-            v.slug = v
-                .path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            v.shingles = shingles(&v.statement);
-        }
-        Ok(store)
+fn unique_slug(index: &crate::fact_index::FactIndex, base: &str) -> String {
+    let mut slug = base.to_string();
+    let mut i = 2;
+    while index.slug_exists(&slug) {
+        slug = format!("{base}-{i}");
+        i += 1;
     }
+    slug
+}
 
-    fn unique_slug(&self, base: &str) -> String {
-        let mut slug = base.to_string();
-        let mut i = 2;
-        while self.by_slug.contains(&slug) {
-            slug = format!("{base}-{i}");
-            i += 1;
-        }
-        slug
+/// Источник уже видел этот факт — фиксируем в индексе (аналог бывшего
+/// append_source в md-файле).
+fn index_touch(fact: &mut crate::fact_index::IndexedFact, source: &str, date: &str) {
+    if !fact.sources.iter().any(|s| s == source) {
+        fact.sources.push(source.to_string());
+    }
+    fact.date = date.to_string();
+}
+
+fn mark_conflict(
+    fact: &mut crate::fact_index::IndexedFact,
+    other_sha: &str,
+    source: &str,
+    date: &str,
+) {
+    fact.status = "conflict".into();
+    if !fact.conflicts.iter().any(|c| c == other_sha) {
+        fact.conflicts.push(other_sha.to_string());
+    }
+    index_touch(fact, source, date);
+}
+
+fn indexed_to_fact(fact: &crate::fact_index::IndexedFact) -> FactEntry {
+    FactEntry {
+        slug: fact.slug.clone(),
+        date: fact.date.clone(),
+        title: fact.title.clone(),
+        statement: fact.statement.clone(),
+        tags: Vec::new(),
+        confidence: "-".into(),
+        sources: fact.sources.clone(),
     }
 }
 
@@ -665,18 +621,7 @@ async fn verdicts(pairs: &[(&Candidate, &String)]) -> Result<HashMap<usize, Stri
 
 // ---------- текстовые примитивы (порт python 1:1) ----------
 
-fn sha1_norm(text: &str) -> String {
-    let norm: String = text
-        .nfkc()
-        .flat_map(|c| c.to_lowercase())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut h = Sha1::new();
-    h.update(norm.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::fact_index::sha1_norm;
 
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -703,24 +648,7 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Биграммы слов (совместимы с python: [a-zа-яё0-9]+ токены).
-fn shingles(text: &str) -> std::collections::HashSet<String> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"[a-zа-яё0-9]+").unwrap());
-    let words: Vec<String> = re
-        .find_iter(&text.to_lowercase())
-        .map(|m| m.as_str().to_string())
-        .collect();
-    let mut set = std::collections::HashSet::new();
-    for i in 0..words.len().saturating_sub(1).max(1) {
-        if i + 1 < words.len() {
-            set.insert(format!("{} {}", words[i], words[i + 1]));
-        } else if words.len() == 1 {
-            set.insert(words[i].clone());
-        }
-    }
-    set
-}
+use crate::fact_index::shingles;
 
 fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f32 {
     if a.is_empty() || b.is_empty() {
@@ -769,196 +697,6 @@ fn sanitize(text: &str) -> String {
 }
 
 // ---------- io ----------
-
-fn sorted_md(dir: PathBuf) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_md(&dir, &mut out);
-    out.sort();
-    out
-}
-
-fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_md(&p, out);
-        } else if p.extension().map(|x| x == "md").unwrap_or(false) {
-            out.push(p);
-        }
-    }
-}
-
-/// frontmatter/тело по первому `\n---\n` (python split_fact).
-fn split_fact(body: &str) -> Option<(String, String)> {
-    if let Some(rest) = body.strip_prefix("---\n") {
-        if let Some(idx) = rest.find("\n---\n") {
-            let fm = rest[..idx].to_string();
-            let st = rest[idx + 5..].trim().to_string();
-            if !st.is_empty() {
-                return Some((fm, st));
-            }
-        }
-    }
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_fact(
-    root: &Path,
-    month: &str,
-    slug: &str,
-    f: &Candidate,
-    source: &str,
-    date: &str,
-    conflict_k: &Option<String>,
-    conflict_slug: &Option<String>,
-) -> Result<PathBuf> {
-    let dir = root.join("facts").join(month);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{slug}.md"));
-    let mut fm = format!(
-        "---\nupdated: {date}\ntitle: {}\ndescription: {}\nconfidence: {}\n\
-         sources: [{source}]\ntags: [{}]\nstatus: {}\n",
-        f.title,
-        truncate_chars(&f.statement, DESC_MAX_CHARS).replace('\n', " "),
-        f.confidence,
-        if f.tags.is_empty() {
-            "fact".to_string()
-        } else {
-            f.tags.join(", ")
-        },
-        if conflict_k.is_some() {
-            "conflict"
-        } else {
-            "accepted"
-        },
-    );
-    if let Some(ck) = conflict_k {
-        fm.push_str(&format!("conflicts: [{ck}]\n"));
-    }
-    fm.push_str("---\n\n");
-    // эскейп markdown-hr (python-паритет)
-    let hr = regex::Regex::new(r"(?m)^\s*-{3,}\s*$").unwrap();
-    let mut body = hr.replace_all(&f.statement, "—").to_string();
-    if let Some(cs) = conflict_slug {
-        body.push_str(&format!("\n\n[conflict: {cs}]"));
-    }
-    std::fs::write(&path, format!("{fm}{body}\n"))?;
-    Ok(path)
-}
-
-fn append_source(path: &Path, uri: &str, date: &str) -> Result<()> {
-    let body = std::fs::read_to_string(path)?;
-    let (fm, statement) =
-        split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
-    let mut lines: Vec<String> = Vec::new();
-    for line in fm.lines() {
-        if line.starts_with("sources: [") && !line.contains(uri) {
-            let inner = line["sources: [".len()..]
-                .trim_end_matches(']')
-                .trim()
-                .to_string();
-            let sep = if inner.is_empty() { "" } else { ", " };
-            lines.push(format!("sources: [{inner}{sep}{uri}]"));
-        } else if line.starts_with("updated: ") {
-            lines.push(format!("updated: {date}"));
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    std::fs::write(
-        path,
-        format!("---\n{}\n---\n{statement}\n", lines.join("\n")),
-    )?;
-    Ok(())
-}
-
-fn add_conflict_link(path: &Path, other_sha: &str, other_slug: &str, date: &str) -> Result<()> {
-    let body = std::fs::read_to_string(path)?;
-    let (fm, mut statement) =
-        split_fact(&body).ok_or_else(|| anyhow!("bad fact: {}", path.display()))?;
-    let status = regex::Regex::new(r"(?m)^status: .*$").unwrap();
-    let mut new_fm = status.replace(&fm, "status: conflict").to_string();
-    let conflicts_line = regex::Regex::new(r"(?m)^conflicts: \[(.*)\]$").unwrap();
-    if let Some(c) = conflicts_line.captures(&new_fm) {
-        let whole = c.get(0).unwrap().as_str().to_string();
-        let inner = c.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-        if !inner.contains(other_sha) {
-            let sep = if inner.is_empty() { "" } else { ", " };
-            new_fm = new_fm.replace(&whole, &format!("conflicts: [{inner}{sep}{other_sha}]"));
-        }
-    } else {
-        new_fm.push_str(&format!("conflicts: [{other_sha}]\n"));
-    }
-    if !statement.contains(&format!("[conflict: {other_slug}")) {
-        statement.push_str(&format!("\n\n[conflict: {other_slug}]"));
-    }
-    let updated = regex::Regex::new(r"(?m)^updated: .*$").unwrap();
-    let new_fm = updated
-        .replace(&new_fm, format!("updated: {date}"))
-        .to_string();
-    std::fs::write(
-        path,
-        format!("---\n{}\n---\n{statement}\n", new_fm.trim_end()),
-    )?;
-    Ok(())
-}
-
-/// Scoped git: ТОЛЬКО факты и sidecar-файлы (все 4 пути — Rust единственный коммитер).
-fn git_commit(message: &str) -> Result<()> {
-    let root = wiki_root();
-    let paths = [
-        "facts/",
-        "facts.ing.json",
-        "facts.removed.json",
-        "facts.retries.json",
-    ];
-    let existing: Vec<&str> = paths
-        .iter()
-        .copied()
-        .filter(|p| root.join(p).exists())
-        .collect();
-    let add = std::process::Command::new("git")
-        .args(["add"])
-        .args(&existing)
-        .current_dir(&root)
-        .output()?;
-    if !add.status.success() {
-        eprintln!(
-            "warn: git add failed: {}",
-            String::from_utf8_lossy(&add.stderr)
-        );
-        return Ok(());
-    }
-    let commit = std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=uwuwu",
-            "-c",
-            "user.email=uwuwu@local",
-            "commit",
-            "-qm",
-            message,
-        ])
-        .current_dir(&root)
-        .output()?;
-    let out = format!(
-        "{}{}",
-        String::from_utf8_lossy(&commit.stdout),
-        String::from_utf8_lossy(&commit.stderr)
-    );
-    if !commit.status.success()
-        && !out.contains("nothing to commit")
-        && !out.contains("nothing added to commit")
-        && !out.contains("no changes added to commit")
-    {
-        eprintln!("warn: git commit failed: {out}");
-    }
-    Ok(())
-}
 
 // ---------- lock ----------
 

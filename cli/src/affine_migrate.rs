@@ -227,7 +227,7 @@ async fn push_docs(
     Ok(())
 }
 
-async fn ensure_container(
+pub(crate) async fn ensure_container(
     client: &mut AffineClient,
     map: &mut MigrationMap,
     workspace: &str,
