@@ -50,9 +50,11 @@ pub async fn sync_fact_buckets(
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap_or_default();
+    // recent days are always re-read: other machines append to them after
+    // we synced (hash check inside ingest_buckets skips unchanged content)
     let mut buckets = Vec::new();
     for node in daily_roots(&serde_json::json!({ "tree": roots })) {
-        if !index.is_day_synced(&node.0) {
+        if is_recent_day(&node.0) || !index.day_known(&node.0) {
             let markdown = read_markdown(client, cfg, &node.1).await?;
             buckets.push((node.0, node.1, markdown));
         }
@@ -67,6 +69,18 @@ pub async fn sync_fact_buckets(
         report.facts_indexed, report.buckets_read
     );
     Ok(())
+}
+
+/// Days within 3 days of today: append-heavy, always re-checked.
+fn is_recent_day(date: &str) -> bool {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match (
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d"),
+    ) {
+        (Ok(d), Ok(t)) => (t - d).num_days().abs() <= 3,
+        _ => false,
+    }
 }
 
 fn daily_roots(tree: &serde_json::Value) -> Vec<(String, String)> {

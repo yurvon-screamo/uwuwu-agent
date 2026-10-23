@@ -39,9 +39,11 @@ pub struct FactIndex {
     /// slug set for O(1) uniqueness checks; rebuilt on load.
     #[serde(skip)]
     by_slug: HashSet<String>,
-    /// daily buckets already ingested from the workspace (cross-PC sync).
+    /// daily buckets already ingested: day → content hash. A changed hash
+    /// (appends from other machines) re-ingests the day — cross-PC dedup
+    /// sees appends, not just new days.
     #[serde(default)]
-    synced_days: HashSet<String>,
+    synced_days: BTreeMap<String, String>,
 }
 
 impl FactIndex {
@@ -245,12 +247,13 @@ impl FactIndex {
     pub fn ingest_buckets(&mut self, buckets: &[(String, String, String)]) -> BucketSyncReport {
         let mut report = BucketSyncReport::default();
         for (date, doc_id, markdown) in buckets {
-            if self.synced_days.contains(date.as_str()) {
+            let hash = content_hash(markdown);
+            if self.is_day_current(date, &hash) {
                 continue;
             }
             report.buckets_read += 1;
+            let before = self.entries.len();
             for fact in parse_fact_sections(markdown) {
-                report.facts_indexed += 1;
                 let statement = fact.statement.clone();
                 let sha = sha1_norm(&statement);
                 let shingles = shingles(&statement);
@@ -270,13 +273,20 @@ impl FactIndex {
                 self.by_slug.insert(slug_clone);
                 let _ = doc_id;
             }
-            self.synced_days.insert(date.clone());
+            report.facts_indexed += self.entries.len() - before;
+            self.synced_days.insert(date.clone(), hash);
         }
         report
     }
 
-    pub fn is_day_synced(&self, date: &str) -> bool {
-        self.synced_days.contains(date)
+    /// True when the day is ingested at this exact content hash.
+    pub fn is_day_current(&self, date: &str, content_hash: &str) -> bool {
+        self.synced_days.get(date).map(String::as_str) == Some(content_hash)
+    }
+
+    /// True when the day was ingested at any content (first-sync tracker).
+    pub fn day_known(&self, date: &str) -> bool {
+        self.synced_days.contains_key(date)
     }
 }
 
@@ -301,18 +311,24 @@ fn parse_fact_sections(markdown: &str) -> Vec<BucketFact> {
     let mut statement_lines: Vec<String> = Vec::new();
     for line in markdown.lines() {
         if let Some(title) = line.strip_prefix("## ") {
-            flush(&mut current, &mut statement_lines, &mut facts);
-            current = Some(BucketFact {
-                title: title.trim().to_string(),
-                ..Default::default()
-            });
-            continue;
+            // a heading inside a statement (statement containing "## ")
+            // must not split the section — only completed sections split
+            let already_closed = current.as_ref().is_some_and(|f| !f.slug.is_empty());
+            if already_closed || current.is_none() {
+                flush(&mut current, &mut statement_lines, &mut facts);
+                current = Some(BucketFact {
+                    title: title.trim().to_string(),
+                    ..Default::default()
+                });
+                continue;
+            }
         }
         if let Some(fact) = current.as_mut() {
             let trimmed = line.trim();
-            if let Some(meta) = trimmed.strip_prefix('*') {
-                // meta line ends with the trailing asterisk
-                let meta = meta.trim_end_matches('*');
+            let is_meta =
+                trimmed.starts_with('*') && trimmed.ends_with('*') && trimmed.contains("slug: ");
+            if is_meta {
+                let meta = trimmed.trim_start_matches('*').trim_end_matches('*');
                 ingest_meta(fact, meta);
             } else if !trimmed.is_empty() || !statement_lines.is_empty() {
                 statement_lines.push(line.to_string());
@@ -355,6 +371,14 @@ fn ingest_meta(fact: &mut BucketFact, meta: &str) {
     }
 }
 
+fn content_hash(text: &str) -> String {
+    use sha1::{Digest as _, Sha1};
+    let mut h = Sha1::new();
+    h.update(text.as_bytes());
+    h.update((text.len() as u64).to_le_bytes().as_slice());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod bucket_tests {
     use super::*;
@@ -382,16 +406,44 @@ mod bucket_tests {
     }
 
     #[test]
-    fn ingest_buckets_dedups_by_sha_and_tracks_days() {
+    fn markdown_hostile_statements_survive_roundtrip() {
+        let entry = crate::affine_store::FactEntry {
+            slug: "tricky".into(),
+            date: "2026-10-23".into(),
+            title: "Tricky".into(),
+            statement: "Line one.\n## looks like a heading\n*looks like meta*\nLine last.".into(),
+            tags: vec![],
+            confidence: "0.5".into(),
+            sources: vec!["s".into()],
+            status: "accepted".into(),
+        };
+        let markdown = crate::affine_store::render_fact_section(&entry);
+        let parsed = parse_fact_sections(&markdown);
+        assert_eq!(parsed.len(), 1, "one section, not split");
+        assert!(parsed[0].statement.contains("looks like a heading"));
+        assert!(parsed[0].statement.contains("Line last."));
+        assert_eq!(parsed[0].slug, "tricky");
+    }
+
+    #[test]
+    fn ingest_buckets_skips_unchanged_days_and_sees_appends() {
         let markdown = "## A\n\nStatement A here.\n\n*tag1 · conf 0.8 · sources: s1 · slug: a*\n";
         let mut index = FactIndex::default();
         let r1 = index.ingest_buckets(&[("2026-10-23".into(), "d1".into(), markdown.into())]);
         assert_eq!(r1.facts_indexed, 1);
-        // same day again → skipped
+        // identical content → skipped entirely
         let r2 = index.ingest_buckets(&[("2026-10-23".into(), "d1".into(), markdown.into())]);
         assert_eq!(r2.buckets_read, 0);
-        assert!(index.is_day_synced("2026-10-23"));
+        // another machine appended a fact → the day is re-read and the new
+        // fact lands in the index (cross-PC dedup over the append path)
+        let appended = format!(
+            "{markdown}## B\n\nStatement B here.\n\n*t · conf 0.9 · sources: s2 · slug: b*\n"
+        );
+        let r3 = index.ingest_buckets(&[("2026-10-23".into(), "d1".into(), appended)]);
+        assert_eq!(r3.buckets_read, 1);
+        assert_eq!(r3.facts_indexed, 1);
         assert!(index.slug_exists("a"));
+        assert!(index.slug_exists("b"));
     }
 }
 

@@ -14,6 +14,13 @@ use crate::fact_index::FactIndex;
 
 const MODEL: &str = "qwen3-embedding:0.6b";
 const CACHE_FILE: &str = "affine_embedding_cache.json";
+/// Max fresh embeddings per search call: the first run on a new machine
+/// indexes up to this many docs and continues on the next search instead
+/// of blocking for the whole workspace.
+const MAX_EMBEDS_PER_RUN: usize = 300;
+/// Long docs are chunked by paragraphs so one vector does not have to
+/// summarize a whole runbook.
+const CHUNK_TARGET_CHARS: usize = 1200;
 
 #[derive(Serialize, Deserialize, Default)]
 struct EmbeddingCache {
@@ -77,30 +84,52 @@ pub async fn search(
     }
 
     for (slug, title, description, body, kind) in docs {
-        let key = content_key(&body);
-        let vector = match embed_cache.vectors.get(&key) {
-            Some(v) => v.clone(),
-            None => {
-                let v = embed(MODEL, &body).await?;
-                embed_cache.vectors.insert(key, v.clone());
-                embed_calls += 1;
-                if embed_calls.is_multiple_of(25) {
-                    let _ = save_cache(root, &embed_cache);
+        let chunks = chunk_markdown(&body);
+        let mut best: Option<f32> = None;
+        let mut uncached = false;
+        for chunk in &chunks {
+            let key = content_key(chunk);
+            let vector = match embed_cache.vectors.get(&key) {
+                Some(v) => v.clone(),
+                None => {
+                    if embed_calls >= MAX_EMBEDS_PER_RUN {
+                        uncached = true;
+                        continue;
+                    }
+                    let v = embed(MODEL, chunk).await?;
+                    embed_cache.vectors.insert(key, v.clone());
+                    embed_calls += 1;
+                    if embed_calls.is_multiple_of(25) {
+                        let _ = save_cache(root, &embed_cache);
+                    }
+                    v
                 }
-                v
+            };
+            let score = cosine(&query_vec, &vector);
+            if best.is_none_or(|b| score > b) {
+                best = Some(score);
             }
-        };
-        let score = cosine(&query_vec, &vector);
-        if score >= opts.threshold {
-            scored.push(SearchHit {
-                score,
-                slug,
-                title,
-                description,
-                body,
-                kind,
-            });
         }
+        if uncached && best.is_none() {
+            continue; // not indexed yet — the next search continues indexing
+        }
+        if let Some(score) = best {
+            if score >= opts.threshold {
+                scored.push(SearchHit {
+                    score,
+                    slug,
+                    title,
+                    description,
+                    body,
+                    kind,
+                });
+            }
+        }
+    }
+    if embed_calls >= MAX_EMBEDS_PER_RUN {
+        eprintln!(
+            "affine: embedding budget reached ({MAX_EMBEDS_PER_RUN}) — indexing continues on the next search"
+        );
     }
     save_cache(root, &embed_cache)?;
     scored.sort_by(|a, b| {
@@ -137,6 +166,29 @@ pub async fn search(
         }
     }
     Ok(out)
+}
+
+/// Paragraph-bundled chunks around CHUNK_TARGET_CHARS.
+fn chunk_markdown(markdown: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for para in markdown.split("\n\n") {
+        if current.len() + para.len() > CHUNK_TARGET_CHARS && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(para);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        vec![markdown.to_string()]
+    } else {
+        chunks
+    }
 }
 
 fn first_line(markdown: &str) -> String {
@@ -192,6 +244,17 @@ fn save_cache(root: &Path, cache: &EmbeddingCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_docs_split_into_paragraph_chunks() {
+        let doc = format!("{}\n\n{}", "a".repeat(700), "b".repeat(700));
+        let chunks = chunk_markdown(&doc);
+        assert!(chunks.len() >= 2, "long doc must not be one vector");
+        for c in &chunks {
+            assert!(c.len() < 1500);
+        }
+        assert_eq!(chunk_markdown("short").len(), 1);
+    }
 
     #[test]
     fn cosine_identifies_identical_vectors() {

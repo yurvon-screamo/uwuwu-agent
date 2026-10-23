@@ -33,6 +33,9 @@ pub struct CachedDoc {
 #[derive(Default, Serialize, Deserialize)]
 pub struct ContentCache {
     docs: BTreeMap<String, CachedDoc>, // slug (or synthetic id) → doc
+    /// epoch seconds of the last successful sync (session TTL).
+    #[serde(default)]
+    last_synced_at: u64,
 }
 
 impl ContentCache {
@@ -119,8 +122,22 @@ impl ContentCache {
                 },
             );
         }
+        self.last_synced_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.save(root)?;
         Ok(report)
+    }
+
+    /// Fresh enough for an interactive command? Avoids two tree walks per
+    /// single `read`/`grep` when the cache was synced moments ago.
+    pub fn is_fresh(&self, max_age_secs: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_synced_at != 0 && now.saturating_sub(self.last_synced_at) < max_age_secs
     }
 }
 

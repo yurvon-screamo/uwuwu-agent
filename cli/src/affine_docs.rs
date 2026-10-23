@@ -25,33 +25,44 @@ pub async fn resolve_slug(
     if let Some(id) = map.doc_id(slug) {
         return Ok(Some(id.to_string()));
     }
-    let resp = client
-        .call_tool(
-            "search_docs",
-            json!({"workspaceId": cfg.workspace, "query": slug, "tag": slug_tag(slug), "limit": 5}),
-        )
-        .await?;
-    let results = resp.get("results").and_then(|r| r.as_array()).cloned();
-    if let Some(doc) = results.unwrap_or_default().into_iter().find_map(|item| {
-        let in_trash = item
-            .get("inTrash")
-            .and_then(|t| t.as_bool())
-            .unwrap_or(true);
-        let tags = item
-            .get("tags")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let has_tag = tags.iter().any(|t| t.as_str() == Some(&slug_tag(slug)));
-        if !in_trash && has_tag {
-            item.get("docId").and_then(|d| d.as_str()).map(String::from)
-        } else {
-            None
+    // The gateway requires a non-empty full-text query beside the tag
+    // filter; try progressively broader queries and match the exact tag
+    // client-side so the tag wins regardless of the text query.
+    let tag = slug_tag(slug);
+    let tail = slug.rsplit('/').next().unwrap_or(slug);
+    for query in [slug, tail, "e"] {
+        let resp = client
+            .call_tool(
+                "search_docs",
+                json!({"workspaceId": cfg.workspace, "query": query, "tag": tag, "limit": 20}),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+        let results = resp.get("results").and_then(|r| r.as_array()).cloned();
+        if let Some(doc) = results.unwrap_or_default().into_iter().find_map(|item| {
+            let in_trash = item
+                .get("inTrash")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(true);
+            let tags = item
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let has_tag = tags.iter().any(|t| t.as_str() == Some(tag.as_str()));
+            if !in_trash && has_tag {
+                item.get("docId").and_then(|d| d.as_str()).map(String::from)
+            } else {
+                None
+            }
+        }) {
+            map.put_doc(slug, &doc);
+            map.save()?;
+            return Ok(Some(doc));
         }
-    }) {
-        map.put_doc(slug, &doc);
-        map.save()?;
-        return Ok(Some(doc));
     }
     Ok(None)
 }
