@@ -53,15 +53,29 @@ MIT
 ## AFFiNE-first (2026-10)
 
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
-share one workspace; locally only operational caches live (`affine_content_cache.json`,
-`affine_embedding_cache.json`, `affine_facts_index.json`, `affine_map_*.json`).
+share one workspace; locally only operational caches live.
+
+**Production**: `https://affine.uwuwu.net` (UI) / `https://mcp.affine.uwuwu.net` (MCP gateway)
 
 Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
 
-- `search` — semantic search over the workspace (local Ollama embeddings)
-- `read` / `grep` / `projects` — workspace content (slug tags address docs)
-- `request` — queue as AFFiNE docs ("Requests" container)
-- `facts` — extraction → dedup → mandatory publish into daily buckets
+**Workspace structure** (folders, not container docs):
+- 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …)
+- 📁 Projects — 7 project subfolders (1xgames, ckii, desloper, foilcap, netcore, origa, uwuwu)
+- 📁 Daily — journal buckets (one per day, facts inside)
+- 📁 Requests — knowledge article queue
+
+**Tags** = bare slugs for multi-PC addressing (`axum`, `origa/topology`).
+Folders handle organization; tags are only for lookup.
+
+**Commands**:
+- `search` — semantic search (local Ollama `qwen3-embedding:0.6b`, chunked, budgeted)
+- `read` / `grep` / `projects` — workspace content via slug tags or content cache
+- `request` — queue as AFFiNE docs (Requests folder, `request` tag)
+- `facts` — extraction → dedup (cross-PC content-hash) → mandatory daily bucket publish
 - `write` — publish an article/project doc straight from stdin
-- `sync` — full cache resync (new machine entry point)
+- `sync` — full cache resync (new machine entry point, ~800 docs)
 - `affine --all` / `--tag-slugs` — one-time legacy migration / tag backfill
+
+**Infrastructure**: Railway (Singapore) — AFFiNE + MCP gateway + Postgres (pgvector)
++ Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.
