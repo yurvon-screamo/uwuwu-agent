@@ -105,6 +105,16 @@ impl MigrationMap {
         self.entries.values().any(|v| v == doc_id)
     }
 
+    /// (slug, docId) pairs suitable for slug tagging: real slugs only,
+    /// facts (value "daily") and service keys excluded.
+    pub fn taggable_entries(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .filter(|(k, v)| !k.starts_with("__") && v.as_str() != "daily")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     pub fn put_doc(&mut self, slug: &str, doc_id: &str) {
         self.entries.insert(slug.to_string(), doc_id.to_string());
     }

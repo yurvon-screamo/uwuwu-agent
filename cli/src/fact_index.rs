@@ -39,9 +39,26 @@ pub struct FactIndex {
     /// slug set for O(1) uniqueness checks; rebuilt on load.
     #[serde(skip)]
     by_slug: HashSet<String>,
+    /// daily buckets already ingested from the workspace (cross-PC sync).
+    #[serde(default)]
+    synced_days: HashSet<String>,
 }
 
 impl FactIndex {
+    /// Load for interactive sessions: a missing index with no legacy facts
+    /// is fine — the AFFiNE bucket sync will populate it (multi-PC entry
+    /// point). Corruption still fails loudly.
+    pub fn load_or_bootstrap(root: &Path) -> Result<Self> {
+        match Self::load(root) {
+            Ok(index) => Ok(index),
+            Err(e) if e.to_string().contains("no legacy facts") => {
+                eprintln!("affine: facts index missing — bootstrapping from daily buckets");
+                Ok(Self::default())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(INDEX_FILE);
         if path.exists() {
@@ -212,6 +229,170 @@ pub(crate) fn shingles(text: &str) -> HashSet<String> {
         }
     }
     set
+}
+
+#[derive(Default, Debug, PartialEq)]
+pub struct BucketSyncReport {
+    pub buckets_read: usize,
+    pub facts_indexed: usize,
+}
+
+impl FactIndex {
+    /// Cross-PC dedup: pull facts from the workspace daily buckets into the
+    /// local index. Facts created on other machines are invisible locally
+    /// otherwise. `bucket_slugs` = (date, docId, markdown) tuples for buckets
+    /// not yet synced (tracked via `synced_days`).
+    pub fn ingest_buckets(&mut self, buckets: &[(String, String, String)]) -> BucketSyncReport {
+        let mut report = BucketSyncReport::default();
+        for (date, doc_id, markdown) in buckets {
+            if self.synced_days.contains(date.as_str()) {
+                continue;
+            }
+            report.buckets_read += 1;
+            for fact in parse_fact_sections(markdown) {
+                report.facts_indexed += 1;
+                let statement = fact.statement.clone();
+                let sha = sha1_norm(&statement);
+                let shingles = shingles(&statement);
+                let slug_clone = fact.slug.clone();
+                self.entries.entry(sha).or_insert_with(|| IndexedFact {
+                    slug: fact.slug,
+                    title: fact.title,
+                    statement,
+                    date: fact.date.unwrap_or_else(|| date.clone()),
+                    sources: fact.sources,
+                    shingles,
+                    conflicts: Vec::new(),
+                    status: fact.status,
+                    tags: fact.tags,
+                    confidence: fact.confidence,
+                });
+                self.by_slug.insert(slug_clone);
+                let _ = doc_id;
+            }
+            self.synced_days.insert(date.clone());
+        }
+        report
+    }
+
+    pub fn is_day_synced(&self, date: &str) -> bool {
+        self.synced_days.contains(date)
+    }
+}
+
+/// One section of a daily bucket rendered by `render_fact_section`.
+#[derive(Default, Debug)]
+struct BucketFact {
+    slug: String,
+    title: String,
+    statement: String,
+    date: Option<String>,
+    sources: Vec<String>,
+    tags: Vec<String>,
+    confidence: String,
+    status: String,
+}
+
+/// Parse `render_fact_section` output back into structured facts. Our own
+/// format is the contract; unknown lines land in the statement.
+fn parse_fact_sections(markdown: &str) -> Vec<BucketFact> {
+    let mut facts = Vec::new();
+    let mut current: Option<BucketFact> = None;
+    let mut statement_lines: Vec<String> = Vec::new();
+    for line in markdown.lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            flush(&mut current, &mut statement_lines, &mut facts);
+            current = Some(BucketFact {
+                title: title.trim().to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(fact) = current.as_mut() {
+            let trimmed = line.trim();
+            if let Some(meta) = trimmed.strip_prefix('*') {
+                // meta line ends with the trailing asterisk
+                let meta = meta.trim_end_matches('*');
+                ingest_meta(fact, meta);
+            } else if !trimmed.is_empty() || !statement_lines.is_empty() {
+                statement_lines.push(line.to_string());
+            }
+        }
+    }
+    flush(&mut current, &mut statement_lines, &mut facts);
+    facts
+}
+
+fn flush(
+    current: &mut Option<BucketFact>,
+    statement_lines: &mut Vec<String>,
+    facts: &mut Vec<BucketFact>,
+) {
+    if let Some(mut fact) = current.take() {
+        fact.statement = statement_lines.join("\n").trim().to_string();
+        statement_lines.clear();
+        if !fact.statement.is_empty() && !fact.slug.is_empty() {
+            facts.push(fact);
+        }
+    }
+    statement_lines.clear();
+}
+
+fn ingest_meta(fact: &mut BucketFact, meta: &str) {
+    for part in meta.split(" · ") {
+        let part = part.trim();
+        if let Some(tags) = part.strip_prefix("conf ") {
+            fact.confidence = tags.to_string();
+        } else if let Some(rest) = part.strip_prefix("sources: ") {
+            fact.sources = rest.split(", ").map(String::from).collect();
+        } else if let Some(slug) = part.strip_prefix("slug: ") {
+            fact.slug = slug.to_string();
+        } else if part.contains("СТАТУС: КОНФЛИКТ") {
+            fact.status = "conflict".into();
+        } else if !part.is_empty() && !part.starts_with("fact") && !part.contains(':') {
+            fact.tags = part.split(", ").map(String::from).collect();
+        }
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    #[test]
+    fn sections_roundtrip_through_render_and_parse() {
+        let entry = crate::affine_store::FactEntry {
+            slug: "affine-port".into(),
+            date: "2026-10-05".into(),
+            title: "Affine port".into(),
+            statement: "Selfhost listens on 3010.".into(),
+            tags: vec!["affine".into()],
+            confidence: "0.9".into(),
+            sources: vec!["manual/x".into()],
+            status: "accepted".into(),
+        };
+        let markdown = crate::affine_store::render_fact_section(&entry);
+        let parsed = parse_fact_sections(&markdown);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].slug, "affine-port");
+        assert_eq!(parsed[0].statement, "Selfhost listens on 3010.");
+        assert_eq!(parsed[0].tags, vec!["affine"]);
+        assert_eq!(parsed[0].confidence, "0.9");
+        assert_eq!(parsed[0].sources, vec!["manual/x"]);
+    }
+
+    #[test]
+    fn ingest_buckets_dedups_by_sha_and_tracks_days() {
+        let markdown = "## A\n\nStatement A here.\n\n*tag1 · conf 0.8 · sources: s1 · slug: a*\n";
+        let mut index = FactIndex::default();
+        let r1 = index.ingest_buckets(&[("2026-10-23".into(), "d1".into(), markdown.into())]);
+        assert_eq!(r1.facts_indexed, 1);
+        // same day again → skipped
+        let r2 = index.ingest_buckets(&[("2026-10-23".into(), "d1".into(), markdown.into())]);
+        assert_eq!(r2.buckets_read, 0);
+        assert!(index.is_day_synced("2026-10-23"));
+        assert!(index.slug_exists("a"));
+    }
 }
 
 #[cfg(test)]
