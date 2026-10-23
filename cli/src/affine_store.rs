@@ -213,6 +213,8 @@ pub struct FactEntry {
     pub tags: Vec<String>,
     pub confidence: String,
     pub sources: Vec<String>,
+    /// "accepted" | "conflict" | "" — surfaced in the bucket section meta.
+    pub status: String,
 }
 
 /// Render one fact as a markdown section inside the daily bucket.
@@ -227,9 +229,14 @@ pub fn render_fact_section(fact: &FactEntry) -> String {
     } else {
         fact.sources.join(", ")
     };
+    let status = if fact.status == "conflict" {
+        " · СТАТУС: КОНФЛИКТ"
+    } else {
+        ""
+    };
     format!(
-        "## {}\n\n{}\n\n*{} · conf {} · sources: {} · slug: {}*\n",
-        fact.title, fact.statement, tags, fact.confidence, sources, fact.slug
+        "## {}\n\n{}\n\n*{} · conf {} · sources: {} · slug: {}{}*\n",
+        fact.title, fact.statement, tags, fact.confidence, sources, fact.slug, status
     )
 }
 

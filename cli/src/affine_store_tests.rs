@@ -21,6 +21,7 @@ fn fact_fixture() -> crate::affine_store::FactEntry {
         tags: vec!["affine".into()],
         confidence: "0.9".into(),
         sources: vec!["manual/2026-10-05".into()],
+        status: "accepted".into(),
     }
 }
 

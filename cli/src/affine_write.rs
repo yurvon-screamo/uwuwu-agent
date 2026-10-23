@@ -5,13 +5,15 @@
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_migrate::ensure_container;
-use crate::affine_store::{doc_id_from_response, MigrationMap};
+use crate::affine_publish::find_doc_by_title;
+use crate::affine_store::{doc_id_from_response, MigrationMap, AFFINE_DOC_TITLE_MAX_CHARS};
 use crate::affine_tables::{split_long_tables, AFFINE_TABLE_CHUNK_ROWS};
+use crate::facts::LockGuard;
 
 /// Container name for a slug: experience articles live under "Experience",
 /// project docs under "Projects/<project>".
@@ -34,6 +36,9 @@ pub async fn run_write(
     if let Some(proj) = project {
         crate::path::sanitize_project(proj)?;
     }
+    // Same map lock as the pipeline and the migration: concurrent writers
+    // must not lose each other's slug→docId entries.
+    let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
     let mut client = AffineClient::connect(cfg).await?;
     let mut map = MigrationMap::load_for(root, cfg)?;
     if map.doc_id(slug).is_some() {
@@ -52,6 +57,7 @@ pub async fn run_write(
         &intro,
     )
     .await?;
+    let title: String = title.chars().take(AFFINE_DOC_TITLE_MAX_CHARS).collect();
     let resp = client
         .call_tool(
             "create_doc_from_markdown",
@@ -63,8 +69,15 @@ pub async fn run_write(
             }),
         )
         .await?;
-    let doc_id = doc_id_from_response(&resp)
-        .ok_or_else(|| anyhow!("created but no docId returned: {resp:.300}"))?;
+    // Ambiguous "no docId" answer: the create may have been applied — recover
+    // by exact-title search instead of failing into a duplicate on retry.
+    let doc_id = match doc_id_from_response(&resp) {
+        Some(id) => id,
+        None => match find_doc_by_title(&mut client, &cfg.workspace, &title).await? {
+            Some(id) => id,
+            None => anyhow::bail!("created but no docId returned: {resp:.300}"),
+        },
+    };
     map.put_doc(slug, &doc_id);
     map.save()?;
     Ok(doc_id)

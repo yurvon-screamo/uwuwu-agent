@@ -146,6 +146,7 @@ pub fn collect_facts(root: &Path) -> CollectResult<FactEntry> {
             tags: fm.tags,
             confidence: fm.confidence.unwrap_or_else(|| "-".into()),
             sources: fm.sources,
+            status: fm.status.unwrap_or_default(),
             slug,
         });
     }

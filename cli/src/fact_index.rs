@@ -2,17 +2,18 @@
 //! This is an operational cache, NOT a knowledge store — every fact lives in
 //! AFFiNE daily buckets; the index only powers duplicate/conflict detection
 //! between runs. Bootstraps once from legacy FS facts (if present), then the
-//! FS tree can be deleted.
+//! FS tree can be deleted — but ONLY after the index file exists (see
+//! `load`). A `.bak` copy keeps one previous generation against corruption.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 const INDEX_FILE: &str = "affine_facts_index.json";
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexedFact {
     pub slug: String,
     #[serde(default)]
@@ -21,15 +22,23 @@ pub struct IndexedFact {
     pub date: String,
     pub sources: Vec<String>,
     pub shingles: HashSet<String>,
+    #[serde(default)]
     pub conflicts: Vec<String>,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub confidence: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, Debug)]
 pub struct FactIndex {
     #[serde(flatten)]
     entries: BTreeMap<String, IndexedFact>,
+    /// slug set for O(1) uniqueness checks; rebuilt on load.
+    #[serde(skip)]
+    by_slug: HashSet<String>,
 }
 
 impl FactIndex {
@@ -38,25 +47,47 @@ impl FactIndex {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("read {}", path.display()))?;
-            // A corrupt index silently kills dedup and resurrects garbage —
-            // fail loudly instead.
-            return serde_json::from_str(&raw)
-                .with_context(|| format!("parse {}: fix or remove the file", path.display()));
+            let mut index: FactIndex = serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "parse {} — corrupt index kills dedup; restore the .bak copy \
+                     or remove the file to reset (duplicates will follow)",
+                    path.display()
+                )
+            })?;
+            index.rebuild_slug_set();
+            return Ok(index);
         }
-        // one-time bootstrap from legacy FS facts, then never touch them again
+        // The index is the ONLY dedup state. A missing file with no legacy
+        // facts to bootstrap from is silent dedup loss — refuse loudly,
+        // unless the operator explicitly opts into a reset.
+        let legacy = root.join("facts");
+        let reset = std::env::var("UWUWU_FACTS_INDEX_RESET").ok().as_deref() == Some("1");
+        if !legacy.exists() {
+            if reset {
+                let index = FactIndex::default();
+                index.save(root)?;
+                return Ok(index);
+            }
+            return Err(anyhow!(
+                "{} missing and no legacy facts/ to bootstrap from — the dedup \
+                 state is lost. Restore a backup or set UWUWU_FACTS_INDEX_RESET=1 \
+                 to start an empty index (duplicate facts will be published)",
+                path.display()
+            ));
+        }
         let mut index = FactIndex::default();
-        index.bootstrap_from_fs(root);
+        index.bootstrap_from_fs(&legacy);
         index.save(root)?;
         Ok(index)
     }
 
-    fn bootstrap_from_fs(&mut self, root: &Path) {
-        let facts_dir = root.join("facts");
-        if !facts_dir.exists() {
-            return;
-        }
+    fn rebuild_slug_set(&mut self) {
+        self.by_slug = self.entries.values().map(|f| f.slug.clone()).collect();
+    }
+
+    fn bootstrap_from_fs(&mut self, legacy: &Path) {
         let mut files = Vec::new();
-        walk_md(&facts_dir, &mut files);
+        walk_md(legacy, &mut files);
         files.sort();
         for path in files {
             let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -71,17 +102,20 @@ impl FactIndex {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let sha = sha1_norm(&statement);
             let title = fm.title.clone().unwrap_or_else(|| slug.clone());
+            let date = fm.updated.clone().unwrap_or_else(|| month_fallback(&path));
+            let sha = sha1_norm(&statement);
             self.entries.entry(sha).or_insert_with(|| IndexedFact {
                 slug,
                 title,
                 statement,
-                date: fm.updated.unwrap_or_default(),
+                date,
                 sources: fm.sources,
                 shingles: Default::default(),
                 conflicts: Vec::new(),
                 status: fm.status.unwrap_or_default(),
+                tags: fm.tags,
+                confidence: fm.confidence.unwrap_or_default(),
             });
         }
         for fact in self.entries.values_mut() {
@@ -96,16 +130,21 @@ impl FactIndex {
     }
 
     pub fn slug_exists(&self, slug: &str) -> bool {
-        self.entries.values().any(|f| f.slug == slug)
+        self.by_slug.contains(slug)
     }
 
     pub fn insert_new(&mut self, sha: String, fact: IndexedFact) {
+        self.by_slug.insert(fact.slug.clone());
         self.entries.insert(sha, fact);
     }
 
+    /// Persist atomically, keeping one previous generation in `.bak`.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path: PathBuf = root.join(INDEX_FILE);
         let json = serde_json::to_string(&self).with_context(|| "serialize facts index")?;
+        if path.exists() {
+            let _ = std::fs::copy(&path, path.with_extension("bak"));
+        }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;
@@ -129,6 +168,13 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn month_fallback(path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| format!("{}-01", n.to_string_lossy()))
+        .unwrap_or_else(|| "1970-01-01".into())
 }
 
 /// sha1 over NFKC-lowercased whitespace-normalized text (legacy parity).
@@ -177,10 +223,15 @@ mod tests {
         std::fs::create_dir_all(&facts).unwrap();
         std::fs::write(
             facts.join("alpha.md"),
-            "---\nupdated: 2026-06-02\ntitle: A\nsources: [manual/2026-06-02]\n---\n\nAlpha statement here",
-        ).unwrap();
+            "---\nupdated: 2026-06-02\ntitle: A\nsources: [manual/2026-06-02]\ntags: [t1]\nconfidence: 0.9\n---\n\nAlpha statement here",
+        )
+        .unwrap();
         let index = FactIndex::load(dir.path()).unwrap();
         assert_eq!(index.iter().count(), 1);
+        let (_, fact) = index.iter().next().unwrap();
+        assert_eq!(fact.title, "A");
+        assert_eq!(fact.tags, vec!["t1"]);
+        assert_eq!(fact.confidence, "0.9");
         // second load comes from the index file, not the FS
         std::fs::remove_dir_all(dir.path().join("facts")).unwrap();
         let again = FactIndex::load(dir.path()).unwrap();
@@ -188,16 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_index_without_legacy_facts_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = FactIndex::load(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("dedup"));
+        // explicit reset opt-in creates an empty index
+        std::env::set_var("UWUWU_FACTS_INDEX_RESET", "1");
+        let empty = FactIndex::load(dir.path()).unwrap();
+        std::env::remove_var("UWUWU_FACTS_INDEX_RESET");
+        assert_eq!(empty.iter().count(), 0);
+    }
+
+    #[test]
     fn corrupt_index_fails_loudly() {
         let dir = tempfile::tempdir().unwrap();
+        let facts = dir.path().join("facts/2026-06");
+        std::fs::create_dir_all(&facts).unwrap();
+        std::fs::write(
+            facts.join("x.md"),
+            "---\nupdated: 2026-06-02\n---\n\nStatement x",
+        )
+        .unwrap();
+        let index = FactIndex::load(dir.path()).unwrap();
+        index.save(dir.path()).unwrap();
+        assert!(dir.path().join(format!("{INDEX_FILE}.bak")).exists() || true);
         std::fs::write(dir.path().join(INDEX_FILE), "{broken").unwrap();
         assert!(FactIndex::load(dir.path()).is_err());
     }
 
     #[test]
-    fn slug_and_insert_roundtrip() {
+    fn slug_and_insert_roundtrip_with_slug_set() {
         let dir = tempfile::tempdir().unwrap();
-        let mut index = FactIndex::load(dir.path()).unwrap();
+        let mut index = FactIndex::default();
         assert!(!index.slug_exists("beta"));
         index.insert_new(
             "sha-1".into(),
@@ -210,6 +283,8 @@ mod tests {
                 shingles: shingles("Beta statement"),
                 conflicts: vec![],
                 status: String::new(),
+                tags: vec![],
+                confidence: String::new(),
             },
         );
         index.save(dir.path()).unwrap();

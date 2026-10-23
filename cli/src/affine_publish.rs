@@ -82,7 +82,7 @@ pub(crate) async fn upsert_daily_bucket(
             // retry would create a second bucket for the same date.
             let bucket_id = match doc_id_from_response(&resp) {
                 Some(id) => id,
-                None => match find_bucket_by_title(client, workspace, date).await? {
+                None => match find_doc_by_title(client, workspace, date).await? {
                     Some(id) => id,
                     None => anyhow::bail!("daily bucket {date} created but no docId returned"),
                 },
@@ -113,32 +113,31 @@ fn mark_facts(map: &mut MigrationMap, fresh: &[&FactEntry], bucket_id: &str) {
 /// Recover the bucket id when the create answer carries no docId but the
 /// document may exist (timeout-ish ambiguity): exact-title search filtered
 /// by the parsed results — see `parse_bucket_search`.
-async fn find_bucket_by_title(
+pub(crate) async fn find_doc_by_title(
     client: &mut AffineClient,
     workspace: &str,
-    date: &str,
+    title: &str,
 ) -> Result<Option<String>> {
     let resp = client
         .call_tool(
             "search_docs",
-            json!({"workspaceId": workspace, "query": date, "limit": 10}),
+            json!({"workspaceId": workspace, "query": title, "limit": 10}),
         )
         .await?;
-    Ok(parse_bucket_search(&resp, date))
+    Ok(parse_doc_search(&resp, title))
 }
 
-/// Pick the daily-bucket docId from a search_docs answer: exact title match,
-/// not trashed, and not already mapped to another slug (a user note named
-/// like a date must not silently become the bucket).
-pub(crate) fn parse_bucket_search(resp: &Value, date: &str) -> Option<String> {
+/// Pick a docId from a search_docs answer by exact title match, skipping
+/// trashed docs. Used by bucket and write recovery paths.
+pub(crate) fn parse_doc_search(resp: &Value, title: &str) -> Option<String> {
     let results = resp.get("results")?.as_array()?;
     for item in results {
-        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let item_title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let in_trash = item
             .get("inTrash")
             .and_then(|t| t.as_bool())
             .unwrap_or(true);
-        if title == date && !in_trash {
+        if item_title == title && !in_trash {
             if let Some(id) = item.get("docId").and_then(|d| d.as_str()) {
                 return Some(id.to_string());
             }
@@ -149,7 +148,7 @@ pub(crate) fn parse_bucket_search(resp: &Value, date: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bucket_search;
+    use super::parse_doc_search;
     use serde_json::json;
 
     #[test]
@@ -159,13 +158,13 @@ mod tests {
             {"docId": "gone", "title": "2026-10-23", "inTrash": true},
             {"docId": "hit", "title": "2026-10-23", "inTrash": false},
         ]});
-        assert_eq!(parse_bucket_search(&resp, "2026-10-23"), Some("hit".into()));
+        assert_eq!(parse_doc_search(&resp, "2026-10-23"), Some("hit".into()));
     }
 
     #[test]
     fn bucket_recovery_returns_none_when_nothing_matches() {
         let resp = json!({"results": [{"docId": "x", "title": "other", "inTrash": false}]});
-        assert_eq!(parse_bucket_search(&resp, "2026-10-23"), None);
-        assert_eq!(parse_bucket_search(&json!({}), "2026-10-23"), None);
+        assert_eq!(parse_doc_search(&resp, "2026-10-23"), None);
+        assert_eq!(parse_doc_search(&json!({}), "2026-10-23"), None);
     }
 }

@@ -107,24 +107,18 @@ pub struct ConflictPair {
 /// facts are re-published too so a retried run converges after a failure.
 pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> FactsOutcome {
     match run_facts_inner(text, source, date, stdin).await {
-        Ok((mut out, affine_facts, index)) => {
-            let Some(index) = index else {
-                return out; // ранний выход: индекс не создавался — не трогаем
-            };
-            // Publish runs OUTSIDE the pipeline lock: the hook does network I/O
-            // (up to 120s per call) and must never hold the FS lock hostage
-            // for concurrent facts runs waiting on their 60s deadline.
-            // The dedup index is saved ONLY after a successful publish —
-            // a failed run must not mark facts as processed.
+        Ok((mut out, affine_facts)) => {
+            if affine_facts.is_empty() {
+                return out;
+            }
+            // The dedup index has already been saved INSIDE the pipeline
+            // lock (see run_facts_inner) — no race window, no lost updates.
+            // Publish runs OUTSIDE the lock: network I/O must not starve
+            // concurrent runs. A failed publish leaves facts marked in the
+            // index, so a retry walks the dup path and republishes them —
+            // convergence is guaranteed by republication, not by ordering.
             match publish_to_affine(&wiki_root(), &affine_facts).await {
-                Ok(published) => {
-                    if let Err(e) = index.save(&wiki_root()) {
-                        out.ok = false;
-                        out.error = Some(format!("facts_index_save_failed: {e:#}"));
-                        return out;
-                    }
-                    out.published = Some(published);
-                }
+                Ok(published) => out.published = Some(published),
                 Err(e) => {
                     eprintln!("error: affine publish failed: {e:#}");
                     out.ok = false;
@@ -178,10 +172,6 @@ fn valid_date(s: &str) -> bool {
     (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
 }
 
-fn today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
-}
-
 /// Вердикт — строгое множество (мусорный вердикт не занимает seen-слот).
 fn valid_verdict(v: &str) -> bool {
     matches!(v, "duplicate" | "conflict" | "distinct")
@@ -192,11 +182,7 @@ async fn run_facts_inner(
     source: &str,
     date: &str,
     stdin: bool,
-) -> Result<(
-    FactsOutcome,
-    Vec<FactEntry>,
-    Option<crate::fact_index::FactIndex>,
-)> {
+) -> Result<(FactsOutcome, Vec<FactEntry>)> {
     if !valid_date(date) {
         return Ok((
             FactsOutcome {
@@ -210,7 +196,6 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
-            None,
         ));
     }
     if stdin && text.chars().count() < MIN_DIGEST_CHARS {
@@ -226,7 +211,6 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
-            None,
         ));
     }
 
@@ -245,7 +229,6 @@ async fn run_facts_inner(
                 published: None,
             },
             vec![],
-            None,
         ));
     }
 
@@ -302,7 +285,7 @@ async fn run_facts_inner(
         published: None,
     };
     if candidates.is_empty() {
-        return Ok((outcome, vec![], None));
+        return Ok((outcome, vec![]));
     }
 
     let _guard = LockGuard::acquire()?;
@@ -318,7 +301,7 @@ async fn run_facts_inner(
             continue; // tombstone: удалённый dreaming'ом мусор не воскрешаем
         }
         if let Some(existing) = index.get_mut(&s) {
-            index_touch(existing, source, &today());
+            index_touch(existing, source);
             affine_facts.push(indexed_to_fact(existing));
             outcome.dup.push(existing.slug.clone());
             continue;
@@ -359,7 +342,7 @@ async fn run_facts_inner(
 
         if let (Some(dk), None) = (dup_k, &conflict_k) {
             if let Some(dup) = index.get_mut(&dk) {
-                index_touch(dup, source, &today());
+                index_touch(dup, source);
                 affine_facts.push(indexed_to_fact(dup));
                 outcome.dup.push(dup.slug.clone());
             }
@@ -372,7 +355,7 @@ async fn run_facts_inner(
             .and_then(|k| index.get_mut(k).map(|v| v.slug.clone()));
         if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
             if let Some(old) = index.get_mut(ck) {
-                mark_conflict(old, &s, source, &today());
+                mark_conflict(old, &s, source);
                 affine_facts.push(indexed_to_fact(old));
             }
             outcome.conflict.push(ConflictPair {
@@ -396,6 +379,8 @@ async fn run_facts_inner(
                     "accepted"
                 }
                 .into(),
+                tags: f.tags.clone(),
+                confidence: format!("{:.2}", f.confidence),
             },
         );
         affine_facts.push(FactEntry {
@@ -406,6 +391,12 @@ async fn run_facts_inner(
             tags: f.tags.clone(),
             confidence: format!("{:.2}", f.confidence),
             sources: vec![source.to_string()],
+            status: if conflict_k.is_some() {
+                "conflict"
+            } else {
+                "accepted"
+            }
+            .into(),
         });
         outcome.new.push(NewFact {
             slug,
@@ -413,7 +404,11 @@ async fn run_facts_inner(
         });
     }
 
-    Ok((outcome, affine_facts, Some(index)))
+    // Persist the dedup index inside the critical section: concurrent runs
+    // always load the freshest state, and a failed publish later does not
+    // corrupt the dedup baseline (retries republish via the dup path).
+    index.save(&root)?;
+    Ok((outcome, affine_facts))
 }
 
 /// Mandatory AFFiNE publication: new AND dup facts of this run. Dup facts
@@ -457,24 +452,20 @@ fn unique_slug(index: &crate::fact_index::FactIndex, base: &str) -> String {
 
 /// Источник уже видел этот факт — фиксируем в индексе (аналог бывшего
 /// append_source в md-файле).
-fn index_touch(fact: &mut crate::fact_index::IndexedFact, source: &str, date: &str) {
+fn index_touch(fact: &mut crate::fact_index::IndexedFact, source: &str) {
     if !fact.sources.iter().any(|s| s == source) {
         fact.sources.push(source.to_string());
     }
-    fact.date = date.to_string();
+    // date stays the fact's own day — a later duplicate sighting must not
+    // relocate the fact to the duplicate run's bucket
 }
 
-fn mark_conflict(
-    fact: &mut crate::fact_index::IndexedFact,
-    other_sha: &str,
-    source: &str,
-    date: &str,
-) {
+fn mark_conflict(fact: &mut crate::fact_index::IndexedFact, other_sha: &str, source: &str) {
     fact.status = "conflict".into();
     if !fact.conflicts.iter().any(|c| c == other_sha) {
         fact.conflicts.push(other_sha.to_string());
     }
-    index_touch(fact, source, date);
+    index_touch(fact, source);
 }
 
 fn indexed_to_fact(fact: &crate::fact_index::IndexedFact) -> FactEntry {
@@ -483,9 +474,14 @@ fn indexed_to_fact(fact: &crate::fact_index::IndexedFact) -> FactEntry {
         date: fact.date.clone(),
         title: fact.title.clone(),
         statement: fact.statement.clone(),
-        tags: Vec::new(),
-        confidence: "-".into(),
+        tags: fact.tags.clone(),
+        confidence: if fact.confidence.is_empty() {
+            "-".into()
+        } else {
+            fact.confidence.clone()
+        },
         sources: fact.sources.clone(),
+        status: fact.status.clone(),
     }
 }
 
