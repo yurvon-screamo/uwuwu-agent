@@ -12,7 +12,8 @@ use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_store::MigrationMap;
 
 pub fn slug_tag(slug: &str) -> String {
-    format!("slug:{slug}")
+    // bare slug, no prefix — folders handle organization, tags handle addressing
+    slug.to_string()
 }
 
 /// Resolve a slug to a docId: local map first, then the workspace by tag.
