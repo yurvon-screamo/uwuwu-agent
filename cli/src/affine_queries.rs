@@ -753,6 +753,7 @@ async fn ensure_request_properties(
         ("reason", "text"),
         ("status", "text"),
         ("created", "date"),
+        ("created_at", "text"), // date prop drops HH:MM; keep the time here
     ];
     // list_doc_properties requires a docId; any doc lists the workspace-wide
     // definitions. create_custom_property is not idempotent, so missing-only.
@@ -763,6 +764,9 @@ async fn ensure_request_properties(
         )
         .await
         .context("list_doc_properties")?;
+    // {ok:false} arrives as HTTP 200 — an unchecked failure here would
+    // look like "no definitions" and mass-create duplicates
+    tool_ok(&resp, "list_doc_properties")?;
     let existing: Vec<String> = resp
         .get("definitions")
         .and_then(|d| d.as_array())
@@ -783,6 +787,39 @@ async fn ensure_request_properties(
                 .await
                 .with_context(|| format!("create_custom_property {name}"))?;
             tool_ok(&resp, "create_custom_property")?;
+            // Cross-machine race: a concurrent create may have landed the
+            // same name. Re-list; if the name is now duplicated, drop OUR
+            // new definition (keep the oldest) before it poisons set-by-name.
+            let new_id = resp.get("propertyId").and_then(|i| i.as_str());
+            if let Some(new_id) = new_id {
+                if let Ok(recheck) = client
+                    .call_tool(
+                        "list_doc_properties",
+                        json!({"workspaceId": cfg.workspace, "docId": defs_doc_id}),
+                    )
+                    .await
+                {
+                    let ids: Vec<&str> = recheck
+                        .get("definitions")
+                        .and_then(|d| d.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter(|d| d.get("name").and_then(|n| n.as_str()) == Some(name))
+                                .filter_map(|d| d.get("id").and_then(|i| i.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if ids.len() > 1 && ids.contains(&new_id) {
+                        let _ = client
+                            .call_tool(
+                                "delete_custom_property",
+                                json!({"workspaceId": cfg.workspace, "property": new_id}),
+                            )
+                            .await;
+                        eprintln!("affine: гонка дефиниций {name} разряжена (наш дубль удалён)");
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -805,6 +842,10 @@ async fn set_request_properties(
         (
             "created",
             chrono::Local::now().format("%Y-%m-%d").to_string(),
+        ),
+        (
+            "created_at",
+            chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         ),
     ] {
         let resp = client
@@ -846,7 +887,10 @@ pub async fn read_doc_properties(
                     .collect()
             })
             .unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            eprintln!("affine: проперти не прочитаны ({e:#}); фоллбек на мета-строки");
+            Vec::new()
+        }
     }
 }
 
