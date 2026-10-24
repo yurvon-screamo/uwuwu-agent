@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """triage_affine — чистка мусорных фактов в AFFiNE дейли-бакетах.
 
-Замыкает dreaming-контур в AFFiNE-мире: секции бакета → rank триаж-головой
-(подсветка p_garbage) → ручной вердикт → пересборка бакета (replace_doc_with_markdown)
-+ логирование в корпус facts.triage.json.
+Замыкает dreaming-контур в AFFiNE-мире: секции бакета → ранжирование
+ансамблем (logreg-голова + d3:2b decision-модель, bake-off 2026-10-24:
+dual-agreement P 0.973 на корпусе 1078) → ручной вердикт → пересборка.
 
 Требования: контент-кэш после sync (для sections), MCP-шлюз (для apply);
-ранкинг — tools/.venv-triage (numpy) + ollama qwen3-embedding.
+ранкинг — tools/.venv-triage (numpy) + ollama (qwen3-embedding, d3:2b).
 
 Команды:
-  sections <date>                    — распарсить бакет дня из кэша, ранжировать секции
-  apply <date> --drop s1,s2 [--yes]  — пересобрать бакет без указанных слагов
-                                       (без --yes — dry-run: показать план);
-                                       слаги удаляются из affine-мапы (факт сможет
-                                       переиздаться при переизвлечении)
+  sections <date>                    — таблица секций: p_logreg | p_d3,
+                                       маркер A у dual-agreement-кандидатов
+  apply <date> [--drop s1,s2] [--auto] [--yes]
+                                     — пересобрать бакет; --drop — ручные
+                                       слаги (навсегда: rm + мапа + корпус);
+                                       --auto — dual-agreement-секции
+                                       (lr≥0.6 ∧ d3≥0.18) В КАРАНТИН-док
+                                       '<date> [quarantine]' (обратимо, мапу
+                                       не трогаем — факт не переиздаётся);
+                                       без --yes — dry-run
   corpus <date> --keep s1,s2         — залогировать keep-вердикты в корпус
-  (apply логирует drop-секции в корпус как garbage автоматически)
+  (ручные --drop логируются в корпус как garbage; авто-вердикты в корпус
+   НЕ логируются — корпус только для ручных разметок, иначе переобучение
+   сядет на само-подтверждение ансамбля)
 """
 
 from __future__ import annotations
@@ -52,6 +59,11 @@ MCP_HEADERS = {
 
 SLUG_RE = re.compile(r"slug: ([a-z0-9-]+)")
 SECTION_RE = re.compile(r"(?m)^## ")
+
+# Ансамбль (bake-off 2026-10-24, корпус 1078: dual P 0.973 / покрытие 39%)
+D3_MODEL = "d3:2b"
+LR_AUTO = 0.6
+D3_AUTO = 0.18
 
 
 def load_bucket_markdown(date: str) -> tuple[str, str]:
@@ -102,6 +114,32 @@ def write_section_files(date: str, sections: list[dict]) -> list[Path]:
     return files
 
 
+def score_logreg(files: list[Path]) -> dict[str, float]:
+    """p_garbage от logreg-головы через rank (кеш эмбеддингов тёплый)."""
+
+    proc = subprocess.run(
+        [
+            str(VENV_PY),
+            str(TOOLS / "triage_train.py"),
+            "rank",
+            *(str(f) for f in files),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+    scores = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                scores[Path(parts[1]).stem] = float(parts[0])
+            except ValueError:
+                continue
+    return scores
+
+
 def cmd_sections(args: argparse.Namespace) -> int:
     markdown, _ = load_bucket_markdown(args.date)
     sections = parse_sections(markdown)
@@ -109,10 +147,31 @@ def cmd_sections(args: argparse.Namespace) -> int:
         print(f"бакет {args.date}: секций нет")
         return 0
     files = write_section_files(args.date, sections)
-    print(f"бакет {args.date}: {len(sections)} секций, ранжирую…\n", flush=True)
-    return subprocess.call(
-        [str(VENV_PY), str(TOOLS / "triage_train.py"), "rank", *(str(f) for f in files)]
+    print(f"бакет {args.date}: {len(sections)} секций; logreg…", flush=True)
+    lr = score_logreg(files)
+    print("d3:2b…", flush=True)
+    from triage_bakeoff import systemone
+
+    d3 = [systemone(D3_MODEL, section_statement(s) or s["title"]) for s in sections]
+    auto_idx = {
+        i
+        for i, s in enumerate(sections)
+        if lr.get(s["slug"], -1) >= LR_AUTO and d3[i] >= D3_AUTO
+    }
+    order = sorted(range(len(sections)), key=lambda i: -lr.get(sections[i]["slug"], 0))
+    print(f"\n{'logreg':>7} {'d3:2b':>7}  авто  slug — заголовок")
+    for i in order:
+        s = sections[i]
+        mark = "  A  " if i in auto_idx else "     "
+        print(
+            f"{lr.get(s['slug'], -1):>7.3f} {d3[i]:>7.3f} {mark}"
+            f" {s['slug'] or '?'} — {s['title'][:52]}"
+        )
+    print(
+        f"\nитого: {len(sections)}; dual-agreement (lr≥{LR_AUTO} ∧ d3≥{D3_AUTO}): "
+        f"{len(auto_idx)} — кандидаты apply --auto (карантин, обратимо)"
     )
+    return 0
 
 
 def mcp_call(
@@ -172,20 +231,43 @@ def mcp_result(resp: object) -> dict:
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
-    drop = {s.strip() for s in args.drop.split(",") if s.strip()}
+    drop = (
+        {s.strip() for s in args.drop.split(",") if s.strip()} if args.drop else set()
+    )
     markdown, doc_id = load_bucket_markdown(args.date)
     sections = parse_sections(markdown)
-    keep_secs = [s for s in sections if s["slug"] not in drop]
-    dropped = [s for s in sections if s["slug"] in drop]
+
+    # dual-agreement-кандидаты (скорим всегда — dry-run тоже показывает план)
+    auto_slugs: set[str] = set()
+    if args.auto:
+        files = write_section_files(args.date, sections)
+        lr = score_logreg(files)
+        from triage_bakeoff import systemone
+
+        for i, sec in enumerate(sections):
+            if sec["slug"] in drop:
+                continue  # ручной вердикт приоритетнее
+            p_d3 = systemone(D3_MODEL, section_statement(sec) or sec["title"])
+            if lr.get(sec["slug"], -1) >= LR_AUTO and p_d3 >= D3_AUTO:
+                auto_slugs.add(sec["slug"])
+
+    manual = [s for s in sections if s["slug"] in drop]
+    quarantined = [s for s in sections if s["slug"] in auto_slugs]
+    keep_secs = [
+        s for s in sections if s["slug"] not in drop and s["slug"] not in auto_slugs
+    ]
     missing = drop - {s["slug"] for s in sections}
     print(
-        f"бакет {args.date} ({doc_id}): {len(sections)} секций, "
-        f"drop {len(dropped)}, останется {len(keep_secs)}"
+        f"бакет {args.date} ({doc_id}): {len(sections)} секций → "
+        f"drop {len(manual)} (навсегда), карантин {len(quarantined)} (dual-agreement), "
+        f"останется {len(keep_secs)}"
     )
     if missing:
         print(f"!! слаги не найдены в бакете: {sorted(missing)}")
-    for s in dropped:
+    for s in manual:
         print(f"  − {s['slug']} :: {s['title'][:70]}")
+    for s in quarantined:
+        print(f"  ↦ {s['slug']} :: {s['title'][:70]}")
 
     if not args.yes:
         print("\n(dry-run: добавь --yes для применения)")
@@ -193,21 +275,23 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     # 1) пересборка markdown: префикс дока + raw-секции в ИСХОДНОМ порядке,
     #    соответствие секция↔raw по позиции (split и parse шли по одним границам)
+    removed = drop | auto_slugs
     raws = SECTION_RE.split(markdown)
     rebuilt = raws[0]
     for sec, raw in zip(sections, raws[1:]):
-        if sec["slug"] not in drop:
+        if sec["slug"] not in removed:
             rebuilt += "## " + raw
     rebuilt = rebuilt.strip() + "\n"
 
-    # 2) корпус-записи валидируем ДО replace (пустой/короткий statement не
-    #    должен ронять логирование ПОСЛЕ мутации дока)
+    # 2) корпус-записи для РУЧНЫХ drop валидируем ДО мутаций (авто в корпус
+    #    не пишем — только ручные разметки, иначе переобучение сядет на
+    #    само-подтверждение ансамбля)
     sys.path.insert(0, str(TOOLS))
     from triage_log import add, load, save
 
     store = load()
     corpus_logged = 0
-    for s in dropped:
+    for s in manual:
         stmt = section_statement(s) or s["title"]
         try:
             add(store, stmt, "garbage", args.date, f"affine/{args.date}/{s['slug']}")
@@ -215,7 +299,10 @@ def cmd_apply(args: argparse.Namespace) -> int:
         except SystemExit:
             print(f"  warn: секция {s['slug']} не влезла в корпус (короткий текст)")
 
-    # 3) MCP: одна сессия — replace контента; ошибка = exit до мутаций
+    # 3) MCP: одна сессия; порядок мутаций: карантин-append → daily-replace
+    #    (обрыв между ними даст дубль секции в карантине — терпимо, карантин
+    #    не претендует на уникальность; потеря невозможна: replace не идёт
+    #    раньше успешного append)
     resp, sid = mcp_call(
         "initialize",
         {
@@ -226,6 +313,29 @@ def cmd_apply(args: argparse.Namespace) -> int:
     )
     mcp_result(resp)
     mcp_call("notifications/initialized", {}, sid, notify=True)
+
+    q_appended = 0
+    if quarantined:
+        q_doc = quarantine_doc(args.date, sid)
+        q_md = ""
+        for i, sec in enumerate(sections):
+            if sec["slug"] in auto_slugs:
+                q_md += "## " + raws[1 + i]
+        resp, _ = mcp_call(
+            "tools/call",
+            {
+                "name": "append_markdown",
+                "arguments": {
+                    "workspaceId": WORKSPACE,
+                    "docId": q_doc,
+                    "markdown": q_md,
+                },
+            },
+            sid,
+        )
+        mcp_result(resp)
+        q_appended = len(quarantined)
+
     resp, _ = mcp_call(
         "tools/call",
         {
@@ -240,7 +350,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     )
     mcp_result(resp)
 
-    # 4) мапа: убрать дропнутые слаги (факт сможет переиздаться);
+    # 4) мапа: убрать ТОЛЬКО ручные слаги (факт сможет переиздаться);
+    #    карантин-слаги остаются в мапе — мусор не должен вернуться;
     #    при нескольких мапах берём самую свежую по mtime
     candidates = [WIKI / "affine_map.json", *WIKI.glob("affine_map_*.json")]
     map_path = max(
@@ -251,11 +362,66 @@ def cmd_apply(args: argparse.Namespace) -> int:
     map_path.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
     save(store)
     print(
-        f"готово: бакет пересобран ({len(keep_secs)} секций), мапа −{len(removed_map)}, "
-        f"корпус +{corpus_logged} garbage ({map_path.name})"
+        f"готово: бакет пересобран ({len(keep_secs)} секций), карантин +{q_appended}, "
+        f"мапа −{len(removed_map)} (ручные), корпус +{corpus_logged} garbage"
     )
     print("напоминание: uwuwu-cli sync — обновить кэши после правки")
     return 0
+
+
+def quarantine_doc(date: str, sid: str) -> str:
+    """doc_id карантин-дока '<date> [quarantine]'; создаётся при отсутствии.
+
+    Ключ __quarantine_<date> в affine-мапе (service-префикс игнорируется
+    Rust-кодом MigrationMap)."""
+    candidates = [WIKI / "affine_map.json", *WIKI.glob("affine_map_*.json")]
+    map_path = max(
+        (p for p in candidates if p.exists()), key=lambda p: p.stat().st_mtime
+    )
+    m = json.loads(map_path.read_text(encoding="utf-8"))
+    key = f"__quarantine_{date}"
+    if m.get(key):
+        return m[key]
+    title = f"{date} [quarantine]"
+    header = (
+        f"# {title}\n\nСекции, изъятые из дейли-бакета ансамблем триажа "
+        f"(logreg ≥{LR_AUTO} ∧ {D3_MODEL} ≥{D3_AUTO}). Обратимо: вернуть "
+        f"копированием секции обратно в бакет.\n"
+    )
+    resp, _ = mcp_call(
+        "tools/call",
+        {
+            "name": "create_doc_from_markdown",
+            "arguments": {"workspaceId": WORKSPACE, "title": title, "markdown": header},
+        },
+        sid,
+    )
+    res = mcp_result(resp)
+
+    def find_id(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k.lower() in ("docid", "doc_id") and isinstance(v, str):
+                    return v
+                if k == "id" and isinstance(v, str) and len(v) >= 10:
+                    return v
+                f = find_id(v)
+                if f:
+                    return f
+        elif isinstance(o, list):
+            for i in o:
+                f = find_id(i)
+                if f:
+                    return f
+        return None
+
+    doc_id = find_id(res)
+    if not doc_id:
+        print(f"!! не нашёл docId в ответе create: {json.dumps(res)[:300]}")
+        sys.exit(2)
+    m[key] = doc_id
+    map_path.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
+    return doc_id
 
 
 def log_corpus(sections: list[dict], label: str, day: str) -> None:
@@ -294,9 +460,16 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     s1 = sub.add_parser("sections", help="ранжировать секции бакета")
     s1.add_argument("date", help="YYYY-MM-DD")
-    a = sub.add_parser("apply", help="пересобрать бакет без drop-слагов")
+    a = sub.add_parser(
+        "apply", help="пересобрать бакет (drop навсегда, auto — в карантин)"
+    )
     a.add_argument("date")
-    a.add_argument("--drop", required=True, help="slug1,slug2,…")
+    a.add_argument("--drop", help="slug1,slug2,… — ручные (навсегда)")
+    a.add_argument(
+        "--auto",
+        action="store_true",
+        help=f"dual-agreement lr≥{LR_AUTO} ∧ d3≥{D3_AUTO} — в карантин",
+    )
     a.add_argument("--yes", action="store_true", help="применить (иначе dry-run)")
     c = sub.add_parser("corpus", help="залогировать keep-вердикты")
     c.add_argument("date")

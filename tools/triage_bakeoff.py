@@ -271,9 +271,9 @@ def cmd_report(_: argparse.Namespace) -> int:
             if len(both) < 10:
                 continue
             dual = metrics(
-                [(max(p, lr[sha]), corpus[sha]["label"]) for sha, p in both], 0.5
+                [(min(p, lr[sha]), corpus[sha]["label"]) for sha, p in both], 0.5
             )
-            # dual-agreement: обе модели ≥0.5; max() как прокси (обе≥0.5 ⟺ max≥0.5)
+            # dual-agreement: обе модели ≥0.5; честный AND = min() ≥ порога
             agree_garbage = sum(1 for sha, p in both if p >= 0.5 and lr[sha] >= 0.5)
             agree_keep = sum(1 for sha, p in both if p < 0.5 and lr[sha] < 0.5)
             print(f"═ logreg + {model}: dual-agreement (обе ≥0.5)")
