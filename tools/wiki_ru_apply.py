@@ -9,6 +9,8 @@ wiki_ru_apply.py <docId> <файл-перевода.md>
 from __future__ import annotations
 
 import sys
+import urllib.error
+import urllib.request
 import urllib.request
 from pathlib import Path
 
@@ -61,18 +63,16 @@ def main() -> int:
         # шлюз держит висящие StreamableHTTP-сессии (~2 на клиента) и режет
         # новые initialize 503 — закрытие обязательно (инцидент батча-00)
         try:
+            headers = {"mcp-session-id": sid}
+            if MCP_TOKEN:
+                headers["Authorization"] = f"Bearer {MCP_TOKEN}"
             req = urllib.request.Request(
-                f"{MCP_URL}",
-                data=b"",
-                method="DELETE",
-                headers={
-                    "Authorization": f"Bearer {MCP_TOKEN}" if MCP_TOKEN else {},
-                    "mcp-session-id": sid,
-                },
+                MCP_URL, data=b"", method="DELETE", headers=headers
             )
             urllib.request.urlopen(req, timeout=15).read()
-        except Exception:
-            pass
+        except urllib.error.URLError as e:
+            # протухшая сессия умрёт по idle-timeout — не блокируем результат
+            print(f"  warn: закрытие сессии не удалось ({e})", file=sys.stderr)
     print(f"ok: {doc_id} заменён ({len(new)} симв, было {len(orig)})")
     return 0
 
