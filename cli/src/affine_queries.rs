@@ -536,7 +536,11 @@ fn render_tree(
     // a visited-set + depth cap keep the recursion bounded instead of
     // aborting the whole process with a stack overflow.
     if depth >= MAX_MINDMAP_DEPTH || !visited.insert(node_id.to_string()) {
-        return String::new();
+        return if depth >= MAX_MINDMAP_DEPTH {
+            format!("{}…\n", "  ".repeat(depth))
+        } else {
+            String::new()
+        };
     }
     let text = text_by_id.get(node_id).cloned().unwrap_or_default();
     let mut out = format!("{}- {}\n", "  ".repeat(depth), text);
