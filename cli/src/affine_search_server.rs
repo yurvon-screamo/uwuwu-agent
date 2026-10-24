@@ -51,6 +51,8 @@ impl ServerSearch {
     pub async fn connect(ss: &ServerSearchConfig, workspace: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .cookie_store(true)
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("http client for affine ui")?;
         let resp = http
@@ -121,23 +123,17 @@ impl ServerSearch {
                 .get("fields")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let doc_id = fields
-                .get("doc_id")
-                .or_else(|| fields.get("docId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+            let doc_id = first_string(&fields, &["doc_id", "docId"]);
             if doc_id.is_empty() || !seen.insert(doc_id.clone()) {
                 continue;
             }
+            // block search returns fields.content[] instead of highlights
             let snippet = node
                 .get("highlights")
                 .and_then(|h| h.get("content"))
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+                .and_then(first_of_array)
+                .or_else(|| first_string_opt(&fields, &["content"]))
+                .unwrap_or_default();
             hits.push(ServerHit {
                 doc_id,
                 title: String::new(), // resolved from the cache by the caller
@@ -145,5 +141,31 @@ impl ServerSearch {
             });
         }
         Ok(hits)
+    }
+}
+
+/// First string value under any of the keys; arrays contribute [0].
+fn first_string(fields: &serde_json::Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| fields.get(*k))
+        .and_then(first_of_array_opt)
+        .unwrap_or_default()
+}
+
+fn first_string_opt(fields: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| fields.get(*k))
+        .and_then(first_of_array_opt)
+}
+
+fn first_of_array(v: &serde_json::Value) -> Option<String> {
+    first_of_array_opt(v)
+}
+
+fn first_of_array_opt(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => arr.first().and_then(|x| x.as_str()).map(String::from),
+        _ => None,
     }
 }

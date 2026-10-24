@@ -408,7 +408,7 @@ pub async fn run() -> anyhow::Result<()> {
                 // last sync are filtered out as "unknown" until the cache
                 // catches up (freshness degrades to the cache age).
                 let cache = content_cache::ContentCache::load(&root).unwrap_or_default();
-                let by_doc_id: std::collections::BTreeMap<&str, (&str, &str)> = cache
+                let by_doc_id: std::collections::BTreeMap<&str, (&str, &str, &str)> = cache
                     .iter()
                     .map(|(slug, doc)| {
                         let kind = match doc.kind {
@@ -418,15 +418,23 @@ pub async fn run() -> anyhow::Result<()> {
                             content_cache::DocKind::Daily => "fact",
                             content_cache::DocKind::Other => "other",
                         };
-                        (doc.doc_id.as_str(), (slug.as_str(), kind))
+                        (
+                            doc.doc_id.as_str(),
+                            (slug.as_str(), kind, doc.title.as_str()),
+                        )
                     })
                     .collect();
                 let mut printed = 0usize;
                 for h in hits {
-                    let Some((slug, kind)) = by_doc_id.get(h.doc_id.as_str()) else {
+                    let Some((slug, kind, title)) = by_doc_id.get(h.doc_id.as_str()) else {
                         continue; // daily buckets / requests / unknown — noise
                     };
-                    println!("server\t{kind}\t{}\t{}", h.title, slug);
+                    let title = if h.title.is_empty() {
+                        *title
+                    } else {
+                        h.title.as_str()
+                    };
+                    println!("server\t{kind}\t{title}\t{slug}");
                     if !h.snippet.is_empty() {
                         println!("    {}", h.snippet.replace('\n', " "));
                     }
