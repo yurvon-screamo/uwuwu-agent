@@ -39,6 +39,12 @@ MCP_URL = os.environ.get(
 )
 MCP_TOKEN = os.environ.get("UWUWU_AFFINE_TOKEN", "")
 WORKSPACE = os.environ.get("UWUWU_AFFINE_WORKSPACE_ID", "")
+if not WORKSPACE:  # fish universal vars не видны из bash-подпроцессов
+    for map_file in (Path.home() / ".uwuwu").glob("affine_map_*_*.json"):
+        m = re.search(r"-([0-9a-f-]{36})\.json$", map_file.name)
+        if m:
+            WORKSPACE = m.group(1)
+            break
 MCP_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -109,26 +115,60 @@ def cmd_sections(args: argparse.Namespace) -> int:
     )
 
 
-def mcp_call(method: str, params: dict, sid: str | None = None) -> tuple[object, str]:
+def mcp_call(
+    method: str, params: dict, sid: str | None = None, notify: bool = False
+) -> tuple[object, str]:
     headers = dict(MCP_HEADERS)
     if MCP_TOKEN:
         headers["Authorization"] = f"Bearer {MCP_TOKEN}"
     if sid:
         headers["mcp-session-id"] = sid
+    payload: dict = {"jsonrpc": "2.0", "method": method, "params": params}
+    if not notify:
+        payload["id"] = 1  # notification не имеет id (JSON-RPC 2.0)
     req = urllib.request.Request(
-        MCP_URL,
-        data=json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        ).encode(),
-        headers=headers,
+        MCP_URL, data=json.dumps(payload).encode(), headers=headers
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         sid = sid or r.headers.get("mcp-session-id")
         body = r.read().decode()
+    if not body.strip():
+        # 202 на notification — пустое тело валидно
+        return {}, sid or ""
     if body.startswith("event:"):
         data = [ln[6:] for ln in body.splitlines() if ln.startswith("data: ")]
         body = data[-1] if data else "{}"
-    return json.loads(body), sid or ""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as e:
+        print(
+            f"!! MCP {method}: не-JSON ответ (status {r.status}, "
+            f"{len(body)} байт): {body[:200]!r}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from e
+    return parsed, sid or ""
+
+
+def mcp_result(resp: object) -> dict:
+    """Валидированный result: JSON-RPC error / isError / ok:false → exit ДО мутаций."""
+    if not isinstance(resp, dict) or "error" in resp or "result" not in resp:
+        print(f"!! шлюз вернул ошибку: {json.dumps(resp, ensure_ascii=False)[:300]}")
+        sys.exit(2)
+    result = resp["result"]
+    if not isinstance(result, dict):
+        return {}
+    if result.get("isError") or result.get("ok") is False:
+        detail = ""
+        for c in result.get("content", []):
+            if isinstance(c, dict) and c.get("text"):
+                detail = c["text"]
+                break
+        print(
+            f"!! инструмент отказал: {detail or json.dumps(result, ensure_ascii=False)[:300]}"
+        )
+        sys.exit(2)
+    return result
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
@@ -151,14 +191,31 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print("\n(dry-run: добавь --yes для применения)")
         return 0
 
-    # 1) пересборка markdown: заголовок-тайтл дока + оставшиеся секции целиком
-    rebuilt = SECTION_RE.split(markdown)[0]
-    for sec, raw in zip(keep_secs, [p for p in SECTION_RE.split(markdown)[1:]]):
+    # 1) пересборка markdown: префикс дока + raw-секции в ИСХОДНОМ порядке,
+    #    соответствие секция↔raw по позиции (split и parse шли по одним границам)
+    raws = SECTION_RE.split(markdown)
+    rebuilt = raws[0]
+    for sec, raw in zip(sections, raws[1:]):
         if sec["slug"] not in drop:
-            rebuilt += "## " + raw if not raw.startswith("## ") else raw
+            rebuilt += "## " + raw
     rebuilt = rebuilt.strip() + "\n"
 
-    # 2) MCP: одна сессия — replace контента
+    # 2) корпус-записи валидируем ДО replace (пустой/короткий statement не
+    #    должен ронять логирование ПОСЛЕ мутации дока)
+    sys.path.insert(0, str(TOOLS))
+    from triage_log import add, load, save
+
+    store = load()
+    corpus_logged = 0
+    for s in dropped:
+        stmt = section_statement(s) or s["title"]
+        try:
+            add(store, stmt, "garbage", args.date, f"affine/{args.date}/{s['slug']}")
+            corpus_logged += 1
+        except SystemExit:
+            print(f"  warn: секция {s['slug']} не влезла в корпус (короткий текст)")
+
+    # 3) MCP: одна сессия — replace контента; ошибка = exit до мутаций
     resp, sid = mcp_call(
         "initialize",
         {
@@ -167,7 +224,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
             "clientInfo": {"name": "triage-affine", "version": "1"},
         },
     )
-    mcp_call("notifications/initialized", {}, sid)
+    mcp_result(resp)
+    mcp_call("notifications/initialized", {}, sid, notify=True)
     resp, _ = mcp_call(
         "tools/call",
         {
@@ -180,24 +238,21 @@ def cmd_apply(args: argparse.Namespace) -> int:
         },
         sid,
     )
-    ok = isinstance(resp, dict) and resp.get("result", {}).get("ok", True) is not False
-    if not ok:
-        print(f"!! шлюз отказал: {json.dumps(resp, ensure_ascii=False)[:300]}")
-        return 2
+    mcp_result(resp)
 
-    # 3) мапа: убрать дропнутые слаги (факт сможет переиздаться)
-    map_path = WIKI / "affine_map.json"
-    for p in sorted(WIKI.glob("affine_map_*.json")):
-        map_path = p  # предпочитаем инстанс-специфичную
+    # 4) мапа: убрать дропнутые слаги (факт сможет переиздаться);
+    #    при нескольких мапах берём самую свежую по mtime
+    candidates = [WIKI / "affine_map.json", *WIKI.glob("affine_map_*.json")]
+    map_path = max(
+        (p for p in candidates if p.exists()), key=lambda p: p.stat().st_mtime
+    )
     m = json.loads(map_path.read_text(encoding="utf-8"))
     removed_map = [s for s in drop if m.pop(s, None) is not None]
     map_path.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
-
-    # 4) корпус: drop-секции как garbage
-    log_corpus(dropped, "garbage", args.date)
+    save(store)
     print(
         f"готово: бакет пересобран ({len(keep_secs)} секций), мапа −{len(removed_map)}, "
-        f"корпус +{len(dropped)} garbage"
+        f"корпус +{corpus_logged} garbage ({map_path.name})"
     )
     print("напоминание: uwuwu-cli sync — обновить кэши после правки")
     return 0
@@ -223,6 +278,10 @@ def cmd_corpus(args: argparse.Namespace) -> int:
     keep = {s.strip() for s in args.keep.split(",") if s.strip()}
     markdown, _ = load_bucket_markdown(args.date)
     sections = [s for s in parse_sections(markdown) if s["slug"] in keep]
+    found = {s["slug"] for s in sections}
+    missing = keep - found
+    if missing:
+        print(f"!! слаги не найдены в бакете: {sorted(missing)}")
     log_corpus(sections, "keep", args.date)
     print(f"корпус +{len(sections)} keep ({args.date})")
     return 0
