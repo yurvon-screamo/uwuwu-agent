@@ -810,13 +810,24 @@ async fn ensure_request_properties(
                         })
                         .unwrap_or_default();
                     if ids.len() > 1 && ids.contains(&new_id) {
-                        let _ = client
+                        match client
                             .call_tool(
                                 "delete_custom_property",
                                 json!({"workspaceId": cfg.workspace, "property": new_id}),
                             )
-                            .await;
-                        eprintln!("affine: гонка дефиниций {name} разряжена (наш дубль удалён)");
+                            .await
+                        {
+                            Ok(del) if del.get("ok").and_then(|o| o.as_bool()) != Some(false) => {
+                                eprintln!(
+                                    "affine: гонка дефиниций {name} разряжена (наш дубль удалён)"
+                                );
+                            }
+                            _ => {
+                                eprintln!(
+                                    "affine: гонка дефиниций {name}: наш дубль удалить не удалось — следующий set-by-name может быть ambiguous"
+                                );
+                            }
+                        }
                     }
                 }
             }
