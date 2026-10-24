@@ -353,8 +353,8 @@ pub async fn run() -> anyhow::Result<()> {
                         println!("request deleted: {title}");
                     }
                     other => {
-                        let (_, cache, _) = affine_queries::session(&root, &cfg).await?;
-                        request::render_queue(other, &cache)?;
+                        let (mut client, cache, _) = affine_queries::session(&root, &cfg).await?;
+                        request::render_queue(&mut client, &cfg, other, &cache).await?;
                     }
                 },
             }

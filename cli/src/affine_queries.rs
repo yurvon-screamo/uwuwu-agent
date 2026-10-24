@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
@@ -709,11 +709,8 @@ pub async fn create_request(
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
     let container = ensure_requests_container(&mut client, &mut map, cfg).await?;
     let title = request_title(body);
-    // meta as plain lines: the markdown importer drops YAML frontmatter
-    let markdown = format!(
-        "action: {action}\ntarget: {target}\nreason: {reason}\ncreated: {}\n\n{body}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M")
-    );
+    // meta lives in native doc properties; the body is just the text
+    let markdown = format!("{body}\n");
     let resp = client
         .call_tool(
             "create_doc_from_markdown",
@@ -722,8 +719,135 @@ pub async fn create_request(
         .await?;
     let doc_id = crate::affine_store::doc_id_from_response(&resp)
         .ok_or_else(|| anyhow!("request created but no docId: {resp:.200}"))?;
-    // no tag: requests are classified by the Requests container path in the content cache
+    if let Err(e) = set_request_properties(&mut client, cfg, &doc_id, action, target, reason).await
+    {
+        // the doc exists; property failure must not lose the request
+        eprintln!("affine: свойства заявки не записаны ({e:#}); мета недоступна в list до фикса");
+    }
     Ok(doc_id)
+}
+
+/// Workspace-wide property definitions for requests. create_custom_property
+/// is NOT idempotent (a duplicate name makes later set-by-name ambiguous),
+/// so existing definitions are listed first and only missing ones created.
+/// Gateway tools return HTTP 200 with {ok:false} on tool errors — check it.
+fn tool_ok(resp: &serde_json::Value, what: &str) -> Result<()> {
+    if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        let err = resp
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown tool error");
+        anyhow::bail!("{what}: {err}");
+    }
+    Ok(())
+}
+
+async fn ensure_request_properties(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    defs_doc_id: &str,
+) -> Result<()> {
+    let defs = [
+        ("action", "text"),
+        ("target", "text"),
+        ("reason", "text"),
+        ("status", "text"),
+        ("created", "date"),
+    ];
+    // list_doc_properties requires a docId; any doc lists the workspace-wide
+    // definitions. create_custom_property is not idempotent, so missing-only.
+    let resp = client
+        .call_tool(
+            "list_doc_properties",
+            json!({"workspaceId": cfg.workspace, "docId": defs_doc_id}),
+        )
+        .await
+        .context("list_doc_properties")?;
+    let existing: Vec<String> = resp
+        .get("definitions")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("name").and_then(|n| n.as_str()))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, ptype) in defs {
+        if !existing.iter().any(|e| e == name) {
+            let resp = client
+                .call_tool(
+                    "create_custom_property",
+                    json!({"workspaceId": cfg.workspace, "name": name, "type": ptype}),
+                )
+                .await
+                .with_context(|| format!("create_custom_property {name}"))?;
+            tool_ok(&resp, "create_custom_property")?;
+        }
+    }
+    Ok(())
+}
+
+async fn set_request_properties(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+    action: &str,
+    target: &str,
+    reason: &str,
+) -> Result<()> {
+    ensure_request_properties(client, cfg, doc_id).await?;
+    for (prop, value) in [
+        ("action", action.to_string()),
+        ("target", target.to_string()),
+        ("reason", reason.to_string()),
+        ("status", "new".to_string()),
+        (
+            "created",
+            chrono::Local::now().format("%Y-%m-%d").to_string(),
+        ),
+    ] {
+        let resp = client
+            .call_tool(
+                "set_doc_property",
+                json!({"workspaceId": cfg.workspace, "docId": doc_id, "property": prop, "value": value}),
+            )
+            .await
+            .with_context(|| format!("set_doc_property {prop}"))?;
+        tool_ok(&resp, "set_doc_property")?;
+    }
+    Ok(())
+}
+
+/// Read one doc's request properties (name → value).
+pub async fn read_doc_properties(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+) -> Vec<(String, String)> {
+    let resp = client
+        .call_tool(
+            "list_doc_properties",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+        )
+        .await;
+    match resp {
+        Ok(resp) => resp
+            .get("properties")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|p| p.get("set").and_then(|s| s.as_bool()) != Some(false))
+                    .filter_map(|p| {
+                        let name = p.get("name").and_then(|n| n.as_str())?;
+                        let value = p.get("value").and_then(|v| v.as_str())?;
+                        Some((name.to_string(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn request_title(body: &str) -> String {

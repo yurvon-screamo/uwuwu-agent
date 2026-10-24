@@ -16,7 +16,12 @@ pub enum RequestSub {
     Delete { title: String },
 }
 
-pub fn render_queue(command: Option<RequestSub>, cache: &ContentCache) -> anyhow::Result<()> {
+pub async fn render_queue(
+    client: &mut crate::affine_client::AffineClient,
+    cfg: &crate::affine_client::AffineConfig,
+    command: Option<RequestSub>,
+    cache: &ContentCache,
+) -> anyhow::Result<()> {
     let requests = cache.docs_by_kind(&DocKind::Request);
     match command {
         None | Some(RequestSub::List) => {
@@ -27,10 +32,20 @@ pub fn render_queue(command: Option<RequestSub>, cache: &ContentCache) -> anyhow
             println!("{} request(s):", requests.len());
             for (slug, doc) in requests {
                 println!("  {slug}");
-                let target = meta_field(&doc.markdown, "target").unwrap_or_else(|| "-".into());
-                let reason = meta_field(&doc.markdown, "reason").unwrap_or_else(|| "-".into());
-                println!("    target: {target}");
-                println!("    reason: {reason}");
+                // native properties first; legacy meta lines as fallback
+                let props =
+                    crate::affine_queries::read_doc_properties(client, cfg, &doc.doc_id).await;
+                let get = |key: &str| {
+                    props
+                        .iter()
+                        .find(|(n, _)| n == key)
+                        .map(|(_, v)| v.clone())
+                        .or_else(|| meta_field(&doc.markdown, key))
+                        .unwrap_or_else(|| "-".into())
+                };
+                println!("    target: {}", get("target"));
+                println!("    reason: {}", get("reason"));
+                println!("    status: {}", get("status"));
             }
         }
         Some(RequestSub::Get { title }) => {
@@ -39,13 +54,21 @@ pub fn render_queue(command: Option<RequestSub>, cache: &ContentCache) -> anyhow
                 .find(|(slug, _)| slug.as_str() == title.as_str())
                 .map(|(_, d)| d);
             match doc {
-                Some(doc) => println!("{}", doc.markdown),
+                Some(doc) => {
+                    let props =
+                        crate::affine_queries::read_doc_properties(client, cfg, &doc.doc_id).await;
+                    if !props.is_empty() {
+                        for (name, value) in &props {
+                            println!("{name}: {value}");
+                        }
+                        println!();
+                    }
+                    println!("{}", doc.markdown);
+                }
                 None => anyhow::bail!("request not found: '{title}'"),
             }
         }
         Some(RequestSub::Delete { .. }) => {
-            // delete needs the network; the caller (lib) has the config —
-            // rendered here as guidance, actual deletion happens in lib
             println!("delete: run `uwuwu-cli request delete <title>` from the command root");
         }
     }
