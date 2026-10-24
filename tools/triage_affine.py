@@ -115,7 +115,10 @@ def write_section_files(date: str, sections: list[dict]) -> list[Path]:
 
 
 def score_logreg(files: list[Path]) -> dict[str, float]:
-    """p_garbage от logreg-головы через rank (кеш эмбеддингов тёплый)."""
+    """p_garbage от logreg-головы через rank (кеш эмбеддингов тёплый).
+
+    Отказ ранка (ollama лежит, venv сломан) = fail-fast: тихая деградация
+    «все скоринги -1 → авто находит 0 мусора» недопустима для авто-контура."""
 
     proc = subprocess.run(
         [
@@ -129,6 +132,12 @@ def score_logreg(files: list[Path]) -> dict[str, float]:
         timeout=1800,
         check=False,
     )
+    if proc.returncode != 0:
+        print(
+            f"!! logreg-ранк упал (rc={proc.returncode}): {proc.stderr[-400:]}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     scores = {}
     for line in proc.stdout.splitlines():
         parts = line.split()
@@ -137,6 +146,12 @@ def score_logreg(files: list[Path]) -> dict[str, float]:
                 scores[Path(parts[1]).stem] = float(parts[0])
             except ValueError:
                 continue
+    if not scores:
+        print(
+            f"!! logreg-ранк не дал ни одного скоринга: {proc.stdout[-200:]}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     return scores
 
 
@@ -299,6 +314,11 @@ def cmd_apply(args: argparse.Namespace) -> int:
         except SystemExit:
             print(f"  warn: секция {s['slug']} не влезла в корпус (короткий текст)")
 
+    # save корпуса ДО мутаций: add идемпотентен по sha(statement) — обрыв
+    # после save оставит лейблы при живой секции (повтор перезапишет тем же),
+    # вместо потери лейблов при удалённой секции
+    save(store)
+
     # 3) MCP: одна сессия; порядок мутаций: карантин-append → daily-replace
     #    (обрыв между ними даст дубль секции в карантине — терпимо, карантин
     #    не претендует на уникальность; потеря невозможна: replace не идёт
@@ -360,7 +380,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
     m = json.loads(map_path.read_text(encoding="utf-8"))
     removed_map = [s for s in drop if m.pop(s, None) is not None]
     map_path.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
-    save(store)
     print(
         f"готово: бакет пересобран ({len(keep_secs)} секций), карантин +{q_appended}, "
         f"мапа −{len(removed_map)} (ручные), корпус +{corpus_logged} garbage"
@@ -373,7 +392,9 @@ def quarantine_doc(date: str, sid: str) -> str:
     """doc_id карантин-дока '<date> [quarantine]'; создаётся при отсутствии.
 
     Ключ __quarantine_<date> в affine-мапе (service-префикс игнорируется
-    Rust-кодом MigrationMap)."""
+    Rust-кодом MigrationMap). Окно create→map-write микроскопично; обрыв в
+    нём оставит осиротевший пустой карантин-док — повтор создаст второй
+    (принятый риск: дубль пустого дока дешевле потери ключа)."""
     candidates = [WIKI / "affine_map.json", *WIKI.glob("affine_map_*.json")]
     map_path = max(
         (p for p in candidates if p.exists()), key=lambda p: p.stat().st_mtime
@@ -397,25 +418,10 @@ def quarantine_doc(date: str, sid: str) -> str:
         sid,
     )
     res = mcp_result(resp)
-
-    def find_id(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if k.lower() in ("docid", "doc_id") and isinstance(v, str):
-                    return v
-                if k == "id" and isinstance(v, str) and len(v) >= 10:
-                    return v
-                f = find_id(v)
-                if f:
-                    return f
-        elif isinstance(o, list):
-            for i in o:
-                f = find_id(i)
-                if f:
-                    return f
-        return None
-
-    doc_id = find_id(res)
+    # строгий регекс по сериализованному ответу: порядок-зависимый обход dict
+    # мог перехватить чужой "id" (job/run) вместо docId
+    m_id = re.search(r'"(?:docId|doc_id)"\s*:\s*"([^"]+)"', json.dumps(res))
+    doc_id = m_id.group(1) if m_id else None
     if not doc_id:
         print(f"!! не нашёл docId в ответе create: {json.dumps(res)[:300]}")
         sys.exit(2)
