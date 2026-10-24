@@ -69,8 +69,12 @@ Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_
 Folders handle organization; tags are only for lookup.
 
 **Commands**:
-- `search` — semantic search (local Ollama `qwen3-embedding:0.6b`, chunked, budgeted)
-- `read` / `grep` / `projects` — workspace content via slug tags or content cache
+- `search` — two-tier: AFFiNE server-side full-text (Manticore) first, automatic fallback to local semantic search (Ollama `qwen3-embedding:0.6b`)
+- `read` — markdown + rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
+- `blob <key>` — download workspace blobs (images/attachments)
+- `shot <slug> [--edgeless]` — doc screenshot via headless chromium (the native render path — AFFiNE has no server-side PNG API)
+- `grep` / `projects` — workspace content via title cache
+- `request` / `write` — creation with `--attach <file>` (images → image blocks, files → attachment blocks)
 - `request` — queue as AFFiNE docs (Requests folder, `request` tag)
 - `facts` — extraction → dedup (cross-PC content-hash) → mandatory daily bucket publish
 - `write` — publish an article/project doc straight from stdin
