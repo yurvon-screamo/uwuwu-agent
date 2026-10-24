@@ -10,7 +10,6 @@ pub mod affine_search_server;
 pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
-pub mod affine_write;
 pub mod content_cache;
 pub mod embed;
 pub mod fact_index;
@@ -152,20 +151,6 @@ enum Commands {
     /// Write a document straight into AFFiNE: markdown from stdin → doc.
     /// `<slug>` (experience) or --project <proj> <slug> (project doc).
     /// Env: UWUWU_AFFINE_URL/TOKEN/WORKSPACE_ID.
-    Write {
-        #[arg(help = "Document slug (unique across the workspace)")]
-        slug: String,
-        #[arg(long, help = "Target project (projects/<proj>/…); omit for experience")]
-        project: Option<String>,
-        #[arg(long, help = "Doc title (defaults to slug)")]
-        title: Option<String>,
-        #[arg(
-            long = "attach",
-            value_name = "FILE",
-            help = "Attach a file/image to the created doc (repeatable)"
-        )]
-        attach: Vec<PathBuf>,
-    },
     /// Refresh local caches from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
     Refresh,
@@ -532,22 +517,6 @@ pub async fn run() -> anyhow::Result<()> {
             let source = source.unwrap_or_else(|| format!("manual/{today}"));
             let out = facts::run_facts(&text, &source, &date, stdin).await;
             println!("{}", serde_json::to_string_pretty(&out)?);
-        }
-        Commands::Write {
-            slug,
-            project,
-            title,
-            attach,
-        } => {
-            let markdown = affine_write::read_markdown_stdin()?;
-            let title = title.unwrap_or_else(|| slug.clone());
-            let doc_id =
-                affine_write::run_write(&root, &cfg, &slug, project.as_deref(), &title, &markdown)
-                    .await?;
-            println!("created: {slug} → {doc_id}");
-            if !attach.is_empty() {
-                affine_blob::attach_files(&cfg, &doc_id, &attach).await?;
-            }
         }
         Commands::Refresh => {
             let mut client = affine_client::AffineClient::connect(&cfg).await?;

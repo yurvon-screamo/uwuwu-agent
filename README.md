@@ -74,10 +74,8 @@ Folders handle organization; tags are only for lookup.
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot <slug> [--edgeless]` — doc screenshot via headless chromium (the native render path — AFFiNE has no server-side PNG API)
 - `grep` / `projects` — workspace content via title cache
-- `request` / `write` — creation with `--attach <file>` (images → image blocks, files → attachment blocks)
 - `request` — queue as AFFiNE docs (Requests folder, `request` tag)
 - `facts` — extraction → dedup (cross-PC content-hash) → mandatory daily bucket publish
-- `write` — publish an article/project doc straight from stdin
 - `refresh` — full cache refresh from AFFiNE (new machine entry point, ~800 docs)
 - `affine --all` / `--tag-slugs` — one-time legacy migration / tag backfill
 

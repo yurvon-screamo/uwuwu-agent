@@ -181,7 +181,7 @@ pub async fn attach_files(
     paths: &[std::path::PathBuf],
 ) -> Result<usize> {
     // one attach session per command call: cheap (single SSE handshake)
-    // and keeps create_request/run_write signatures client-free.
+    // and keeps create_request signatures client-free.
     let mut client = crate::affine_client::AffineClient::connect(cfg).await?;
     const MAX_ATTACH_SIZE: u64 = 50 * 1024 * 1024;
     let mut attached = 0usize;
