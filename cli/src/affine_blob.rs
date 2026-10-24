@@ -180,56 +180,93 @@ pub async fn attach_files(
     doc_id: &str,
     paths: &[std::path::PathBuf],
 ) -> Result<usize> {
-    use base64::Engine as _;
-
+    // one attach session per command call: cheap (single SSE handshake)
+    // and keeps create_request/run_write signatures client-free.
     let mut client = crate::affine_client::AffineClient::connect(cfg).await?;
+    const MAX_ATTACH_SIZE: u64 = 50 * 1024 * 1024;
     let mut attached = 0usize;
+    let mut failed: Vec<String> = Vec::new();
     for path in paths {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("не читается {}", path.display()))?;
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_string());
-        let mime = mime_for(&name);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let resp = client
-            .call_tool(
-                "upload_blob",
-                json!({
-                    "workspaceId": cfg.workspace,
-                    "content": b64,
-                    "encoding": "base64",
-                    "filename": name,
-                    "contentType": mime,
-                }),
-            )
-            .await
-            .with_context(|| format!("upload_blob {name}"))?;
-        let key = ["key", "blobKey", "sourceId"]
-            .iter()
-            .find_map(|k| resp.get(*k).and_then(|v| v.as_str()))
-            .ok_or_else(|| anyhow!("upload_blob {name}: нет ключа блоба: {resp:.120}"))?;
-        let block = if mime.starts_with("image/") {
-            json!({
-                "workspaceId": cfg.workspace, "docId": doc_id,
-                "type": "image", "sourceId": key, "caption": name,
-            })
+        // Continue past per-file failures: the doc already exists, so an
+        // aborted run would leave a partial attach with no resume path —
+        // and a full retry would duplicate the whole document.
+        if let Err(e) = attach_one(&mut client, cfg, doc_id, path, MAX_ATTACH_SIZE).await {
+            eprintln!("attach failed: {} — {e:#}", path.display());
+            failed.push(path.display().to_string());
         } else {
-            json!({
-                "workspaceId": cfg.workspace, "docId": doc_id,
-                "type": "attachment", "sourceId": key,
-                "name": name, "mimeType": mime, "size": bytes.len(),
-            })
-        };
-        client
-            .call_tool("append_block", block)
-            .await
-            .with_context(|| format!("append_block {name}"))?;
-        attached += 1;
-        println!("attached: {name} ({mime}, {} bytes) → {key}", bytes.len());
+            attached += 1;
+        }
+    }
+    println!("attached {}/{} файлов", attached, attached + failed.len());
+    if !failed.is_empty() {
+        eprintln!(
+            "не приложены: {} — док уже создан; ретрай команды задвоит его, дополни вручную",
+            failed.join(", ")
+        );
     }
     Ok(attached)
+}
+
+async fn attach_one(
+    client: &mut crate::affine_client::AffineClient,
+    cfg: &crate::affine_client::AffineConfig,
+    doc_id: &str,
+    path: &std::path::Path,
+    max_size: u64,
+) -> Result<()> {
+    use base64::Engine as _;
+
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("не читается {}", path.display()))?;
+    if meta.len() > max_size {
+        bail!(
+            "файл {} слишком большой ({} байт > лимит {max_size}); base64 раздул бы память",
+            path.display(),
+            meta.len()
+        );
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("не читается {}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+    let mime = mime_for(&name);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let resp = client
+        .call_tool(
+            "upload_blob",
+            json!({
+                "workspaceId": cfg.workspace,
+                "content": b64,
+                "encoding": "base64",
+                "filename": name,
+                "contentType": mime,
+            }),
+        )
+        .await
+        .with_context(|| format!("upload_blob {name}"))?;
+    let key = ["key", "blobKey", "sourceId"]
+        .iter()
+        .find_map(|k| resp.get(*k).and_then(|v| v.as_str()))
+        .ok_or_else(|| anyhow!("upload_blob {name}: нет ключа блоба: {resp:.120}"))?;
+    let block = if mime.starts_with("image/") {
+        json!({
+            "workspaceId": cfg.workspace, "docId": doc_id,
+            "type": "image", "sourceId": key, "caption": name,
+        })
+    } else {
+        json!({
+            "workspaceId": cfg.workspace, "docId": doc_id,
+            "type": "attachment", "sourceId": key,
+            "name": name, "mimeType": mime, "size": bytes.len(),
+        })
+    };
+    client
+        .call_tool("append_block", block)
+        .await
+        .with_context(|| format!("append_block {name}"))?;
+    println!("attached: {name} ({mime}, {} bytes) → {key}", bytes.len());
+    Ok(())
 }
 
 fn mime_for(name: &str) -> String {
@@ -259,4 +296,19 @@ fn mime_for(name: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::mime_for;
+
+    #[test]
+    fn mime_by_extension() {
+        assert_eq!(mime_for("a.png"), "image/png");
+        assert_eq!(mime_for("a.JPG"), "image/jpeg");
+        assert_eq!(mime_for("archive.tar.gz"), "application/gzip");
+        assert_eq!(mime_for("noext"), "application/octet-stream");
+        assert_eq!(mime_for(".hidden"), "application/octet-stream");
+        assert_eq!(mime_for("icon.svg"), "image/svg+xml");
+    }
 }
