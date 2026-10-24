@@ -41,8 +41,14 @@ pub async fn run_write(
     let _guard = LockGuard::acquire_at(&root.join("affine_map.lock"))?;
     let mut client = AffineClient::connect(cfg).await?;
     let mut map = MigrationMap::load_for(root, cfg)?;
-    if map.doc_id(slug).is_some() {
-        anyhow::bail!("'{slug}' already exists in the workspace (affine map)");
+    // project docs share the slug namespace per-project: key the map as
+    // <project>/<slug> so "readme" in two projects don't collide
+    let map_key = match project {
+        Some(proj) => format!("{proj}/{slug}"),
+        None => slug.to_string(),
+    };
+    if map.doc_id(&map_key).is_some() {
+        anyhow::bail!("'{map_key}' already exists in the workspace (affine map)");
     }
     let container_name = container_for(project);
     let intro = match project {
@@ -80,7 +86,7 @@ pub async fn run_write(
             _ => anyhow::bail!("created but no docId returned: {resp:.300}"),
         },
     };
-    map.put_doc(slug, &doc_id);
+    map.put_doc(&map_key, &doc_id);
     map.save()?;
     Ok(doc_id)
 }

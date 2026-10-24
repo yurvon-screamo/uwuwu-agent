@@ -60,8 +60,8 @@ share one workspace; locally only operational caches live.
 Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
 
 **Workspace structure** (folders, not container docs):
-- 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …)
-- 📁 Projects — 7 project subfolders (1xgames, ckii, desloper, foilcap, netcore, origa, uwuwu)
+- 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …), no direct docs
+- 📁 Projects — 7 project subfolders, each starting with a `<Proj> Project (README)` doc (description carrier for `projects`)
 - 📁 Daily — journal buckets (one per day, facts inside)
 - 📁 Requests — knowledge article queue
 

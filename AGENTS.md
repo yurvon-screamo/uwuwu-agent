@@ -27,7 +27,7 @@ SKILLS rules:
 - `uwuwu-cli projects` — реестр проектов из воркспейса.
 - `uwuwu-cli request` — очередь заявок в AFFiNE (папка Requests, классификация по контейнеру, без тегов): создание с текстом + `--target/--reason`; `list/get/delete`.
 - `uwuwu-cli facts --stdin` — фактизация: экстракция (Ollama) → дедуп (индекс `affine_facts_index.json`, бутстрап из дейли-бакетов AFFiNE) → обязательная публикация в дейли-бакет. Падение шлюза = `ok:false, affine_publish_failed`. `--sync` — deprecated no-op. Кросс-ПК дедуп: индекс синкает дейли-бакеты по content-hash при каждом прогоне.
-- `uwuwu-cli write <slug> [--project <proj>]` — статья/ранбук из stdin сразу в AFFiNE.
+- `uwuwu-cli write <slug> [--project <proj>]` — статья/ранбук из stdin сразу в AFFiNE. Проектные слаги в мапе хранятся как `<proj>/<slug>` (без коллизий между проектами).
 - `uwuwu-cli sync` — принудительный полный ресинк кэшей (новая машина / после больших правок). Первый прогон на новой машине долог (тащит ~800 доков).
 - `uwuwu-cli affine --all` — разовая миграция легаси-ФС (теги больше не проставляются — адресация через кэш/мапу); мапа `affine_map_*.json` — локальный кэш слагов с машин, где миграция выполнялась.
 - Локальные кэши (все — операционные, не знания): `affine_content_cache.json`, `affine_embedding_cache.json`, `affine_facts_index.json` (+`.bak`), `affine_map_*.json`. Легаси `experience/`, `projects/`, `facts/`, `.requests/` больше не читаются и не пишутся.
@@ -37,7 +37,7 @@ SKILLS rules:
 - **UI**: `https://affine.up.railway.app` (аккаунт `yurvon@yahoo.co.jp`)
 - **MCP-шлюз**: `https://affine-mcp-production.up.railway.app/mcp` (bearer, 107 инструментов)
 - **Воркспейс**: `uwuwu-wiki` (id `81475705-028a-4153-a8f5-f06e402ee31e`)
-- **Структура**: 📁 Experience (33 подпапки по темам) / 📁 Projects (7 проектов: 1xgames, ckii, desloper, foilcap, netcore, origa, uwuwu) / 📁 Daily (дейли-бакеты) / 📁 Requests (заявки). Контейнерные доки удалены — доки привязаны к папкам напрямую.
+- **Структура**: 📁 Experience (только 33 подпапки по темам, прямых доков нет) / 📁 Projects (7 проектов, каждый начинается с `<Proj> Project (README)` — док-описание, из него `uwuwu-cli projects` берёт описание) / 📁 Daily (дейли-бакеты) / 📁 Requests (заявки). Контейнерные доки удалены — доки привязаны к папкам напрямую.
 - **Теги**: их нет (0 шт). Адресация: тайтл через контент-кэш (`read "Actix Web Setup"`), кебаб-слаг через локальную мапу `affine_map_*.json` на машинах, где миграция выполнялась (`read cicd/airflow`); факты — через fact index из содержимого бакетов; заявки — по пути в контейнере Requests.
 - **Индексатор**: BYOK-профиль `Ollama relay embedding` (qwen3-embedding:0.6b, 1024d) на Ollama relay; `AFFINE_INDEXER_ENABLED=true`; чанки в `embedding_chunks`. Конфиг Rust-рантайма — `/app/config.json` через startCommand (не env-путь!). `AFFINE_PRIVATE_KEY` = EC PEM.
 - **Ollama relay**: `ollama-relay-production.up.railway.app` (rathole через TCP proxy `metro.proxy.rlwy.net:47361`) → ноут `localhost:11434`. Bearer-гейт на `/v1/`. Для BYOK афины (эмбеддинги индексатора).
