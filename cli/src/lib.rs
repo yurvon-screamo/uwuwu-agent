@@ -319,7 +319,13 @@ pub async fn run() -> anyhow::Result<()> {
             // bodies return date-titled buckets and pollute the output.
             let mut use_local = true;
             if let Some(Ok(hits)) = &server_res {
-                let (_, cache, _) = affine_queries::session(&root, &cfg).await?;
+                // doc_id→slug mapping from the LOCAL cache file only — the
+                // server branch must not depend on the MCP gateway. Known
+                // limitation: docs created from another machine after the
+                // last sync are filtered out as "unknown" until the cache
+                // catches up (freshness degrades to the cache age).
+                let cache = content_cache::ContentCache::load(&root)
+                    .unwrap_or_default();
                 let by_doc_id: std::collections::BTreeMap<&str, (&str, &str)> = cache
                     .iter()
                     .map(|(slug, doc)| {
