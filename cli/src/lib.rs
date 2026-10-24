@@ -1,3 +1,4 @@
+pub mod affine_blob;
 pub mod affine_client;
 pub mod affine_collect;
 pub mod affine_docs;
@@ -22,6 +23,7 @@ pub mod wiki;
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 pub fn wiki_root() -> PathBuf {
@@ -77,6 +79,27 @@ enum Commands {
             help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access) | 'sofa/<post_id>'"
         )]
         slug: String,
+    },
+    /// Download a workspace blob (image/attachment) by key. Keys appear in
+    /// read output as affine://blob/<key>.
+    Blob {
+        #[arg(help = "Blob key, e.g. pixel.png")]
+        key: String,
+        #[arg(long, help = "Output file ('-' = stdout). Default: <key> in cwd")]
+        out: Option<String>,
+    },
+    /// Screenshot an AFFiNE doc page (incl. edgeless: mindmaps, canvas) to
+    /// PNG via headless chromium — the visual view of interactive content.
+    Shot {
+        #[arg(help = "Doc slug or title (same addressing as read)")]
+        slug: String,
+        #[arg(long, help = "Output PNG path. Default: shot-<docId>.png in cwd")]
+        out: Option<String>,
+        #[arg(
+            long,
+            help = "Open the doc in edgeless mode (mindmaps, canvas) instead of page"
+        )]
+        edgeless: bool,
     },
     /// Unified semantic search: experience + facts + access docs + SOFA.
     /// AFFiNE is the source; local Ollama embeddings cache per machine.
@@ -221,6 +244,47 @@ pub async fn run() -> anyhow::Result<()> {
                 println!("{content}");
             }
         }
+        Commands::Blob { key, out } => {
+            let ss = affine_search_server::ServerSearchConfig::from_env()
+                .context("нужны UWUWU_AFFINE_UI_URL/_EMAIL/_PASSWORD")?;
+            let bytes = affine_blob::download_blob(&ss, &cfg.workspace, &key).await?;
+            match out.as_deref() {
+                Some("-") => {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&bytes)?;
+                }
+                Some(path) => {
+                    std::fs::write(path, &bytes)?;
+                    println!("{} → {} bytes → {path}", key, bytes.len());
+                }
+                None => {
+                    let name = key.rsplit('/').next().unwrap_or("blob");
+                    std::fs::write(name, &bytes)?;
+                    println!("{} → {} bytes → {}", key, bytes.len(), name);
+                }
+            }
+        }
+        Commands::Shot {
+            slug,
+            out,
+            edgeless,
+        } => {
+            let ss = affine_search_server::ServerSearchConfig::from_env()
+                .context("нужны UWUWU_AFFINE_UI_URL/_EMAIL/_PASSWORD")?;
+            let doc_id = affine_queries::resolve_doc_id(&root, &cfg, &slug)
+                .await?
+                .with_context(|| format!("док '{slug}' не найден"))?;
+            let out = out.unwrap_or_else(|| format!("shot-{doc_id}.png"));
+            let path = affine_blob::shot_doc(
+                &ss,
+                &cfg.workspace,
+                &doc_id,
+                std::path::Path::new(&out),
+                edgeless,
+            )
+            .await?;
+            println!("скриншот: {path}");
+        }
         Commands::Projects => {
             let (_, cache, _) = affine_queries::session(&root, &cfg).await?;
             let rows = affine_queries::projects(&cache);
@@ -324,8 +388,7 @@ pub async fn run() -> anyhow::Result<()> {
                 // limitation: docs created from another machine after the
                 // last sync are filtered out as "unknown" until the cache
                 // catches up (freshness degrades to the cache age).
-                let cache = content_cache::ContentCache::load(&root)
-                    .unwrap_or_default();
+                let cache = content_cache::ContentCache::load(&root).unwrap_or_default();
                 let by_doc_id: std::collections::BTreeMap<&str, (&str, &str)> = cache
                     .iter()
                     .map(|(slug, doc)| {

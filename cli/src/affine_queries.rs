@@ -139,7 +139,7 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
         if let Some(summary) = rich_blocks_section(&mut client, cfg, &doc.doc_id).await {
             md.push_str(&summary);
         }
-        return Ok(md);
+        return Ok(annotate_blob_links(md));
     }
     // cache miss on a fresh doc: resolve by tag and read directly
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
@@ -148,9 +148,59 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
         if let Some(summary) = rich_blocks_section(&mut client, cfg, &doc_id).await {
             md.push_str(&summary);
         }
-        return Ok(md);
+        return Ok(annotate_blob_links(md));
     }
     anyhow::bail!("article not found by slug: '{slug}'")
+}
+
+/// Resolve a slug/title to a doc id (cache → migration map → gateway title
+/// search). Shared by commands that need the id without the markdown body.
+pub async fn resolve_doc_id(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<Option<String>> {
+    let (mut client, cache, _) = session(root, cfg).await?;
+    if let Some(doc) = cache.get(slug) {
+        return Ok(Some(doc.doc_id.clone()));
+    }
+    let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
+    if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
+        return Ok(Some(doc_id));
+    }
+    // last resort: title search through the gateway
+    let resp = client
+        .call_tool(
+            "search_docs",
+            json!({"workspaceId": cfg.workspace, "query": slug, "limit": 1}),
+        )
+        .await;
+    if let Ok(resp) = resp {
+        if let Some(results) = resp.get("results").and_then(|r| r.as_array()) {
+            for r in results {
+                if r.get("inTrash").and_then(|t| t.as_bool()) == Some(false) {
+                    if let Some(id) = r.get("docId").and_then(|d| d.as_str()) {
+                        return Ok(Some(id.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Rewrite `affine://blob/<key>` image links into a download hint — the
+/// scheme is not fetchable; `uwuwu-cli blob <key>` fetches the bytes.
+fn annotate_blob_links(md: String) -> String {
+    if !md.contains("affine://blob/") {
+        return md;
+    }
+    let re = regex::Regex::new(r"!\[([^\]]*)\]\(affine://blob/([^)\s]+)\)").unwrap();
+    re.replace_all(&md, |caps: &regex::Captures| {
+        format!(
+            "**[image: {} (key: {})] → скачай: `uwuwu-cli blob {} > файл`**",
+            caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+            caps.get(2).map(|m| m.as_str()).unwrap_or(""),
+            caps.get(2).map(|m| m.as_str()).unwrap_or("")
+        )
+    })
+    .to_string()
 }
 
 /// Render non-markdown blocks (databases, mindmaps, canvas) into a text
