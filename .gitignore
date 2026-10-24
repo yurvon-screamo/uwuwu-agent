@@ -56,3 +56,4 @@ hub.json
 # triage tooling (heavy deps + caches)
 tools/.venv-triage/
 tools/*.npz
+.backups/
