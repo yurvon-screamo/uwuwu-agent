@@ -55,7 +55,7 @@ MIT
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
 share one workspace; locally only operational caches live.
 
-**Production**: `https://affine.uwuwu.net` (UI) / `https://mcp.affine.uwuwu.net` (MCP gateway)
+**Production**: `https://affine.up.railway.app` (UI) / `https://affine-mcp-production.up.railway.app` (MCP gateway)
 
 Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
 
