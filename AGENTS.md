@@ -25,7 +25,7 @@ SKILLS rules:
 - `uwuwu-cli read <slug>` — статья/ранбук `<project>/<slug>`, факт `facts/<slug>`; источник — AFFiNE (контент-кэш по тайтлу + локальная мапа слагов, тегов в воркспейсе нет). Док с майндмапами/базами/канвой получает хвост `⚠️ Не-markdown контент: …` — содержимое недоступно в тексте, смотреть в UI афины.
 - `uwuwu-cli grep "подстрока"` — по контент-кэшу AFFiNE (статьи+проекты+факты).
 - `uwuwu-cli projects` — реестр проектов из воркспейса.
-- `uwuwu-cli request` — очередь заявок в AFFiNE (папка Requests, классификация по контейнеру, без тегов): создание с текстом + `--target/--reason`; `list/get/delete`.
+- `uwuwu-cli request` — очередь заявок в AFFiNE (папка Requests, классификация по контейнеру, без тегов): создание с текстом + `--target/--reason` + `--attach <файл>` (repeatable: картинки → image-блок с caption, остальное → attachment-блок; upload_blob под капотом); `list/get/delete`. `write` тоже принимает `--attach`.
 - `uwuwu-cli facts --stdin` — фактизация: экстракция (Ollama) → дедуп (индекс `affine_facts_index.json`, бутстрап из дейли-бакетов AFFiNE) → обязательная публикация в дейли-бакет. Падение шлюза = `ok:false, affine_publish_failed`. `--sync` — deprecated no-op. Кросс-ПК дедуп: индекс синкает дейли-бакеты по content-hash при каждом прогоне.
 - `uwuwu-cli write <slug> [--project <proj>]` — статья/ранбук из stdin сразу в AFFiNE. Проектные слаги в мапе хранятся как `<proj>/<slug>` (без коллизий между проектами).
 - `uwuwu-cli sync` — принудительный полный ресинк кэшей (новая машина / после больших правок). Первый прогон на новой машине долог (тащит ~800 доков).

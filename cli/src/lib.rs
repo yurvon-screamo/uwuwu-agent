@@ -72,6 +72,12 @@ enum Commands {
         target: Option<String>,
         #[arg(long, help = "Reason for this request (required for quick create)")]
         reason: Option<String>,
+        #[arg(
+            long = "attach",
+            value_name = "FILE",
+            help = "Attach a file/image to the created request (repeatable)"
+        )]
+        attach: Vec<PathBuf>,
     },
     /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access) | sofa/<post_id>.
     Read {
@@ -156,6 +162,12 @@ enum Commands {
         project: Option<String>,
         #[arg(long, help = "Doc title (defaults to slug)")]
         title: Option<String>,
+        #[arg(
+            long = "attach",
+            value_name = "FILE",
+            help = "Attach a file/image to the created doc (repeatable)"
+        )]
+        attach: Vec<PathBuf>,
     },
     /// Force a cache resync from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
@@ -305,6 +317,7 @@ pub async fn run() -> anyhow::Result<()> {
             action,
             target,
             reason,
+            attach,
         } => {
             let quick = if command.is_none() && (!text.is_empty() || stdin) {
                 let (target, reason) = (target.as_deref(), reason.as_deref());
@@ -330,6 +343,9 @@ pub async fn run() -> anyhow::Result<()> {
                         affine_queries::create_request(&root, &cfg, &action, target, reason, &body)
                             .await?;
                     println!("request created: {doc_id}");
+                    if !attach.is_empty() {
+                        affine_blob::attach_files(&cfg, &doc_id, &attach).await?;
+                    }
                 }
                 None => match command {
                     Some(request::RequestSub::Delete { title }) => {
@@ -521,6 +537,7 @@ pub async fn run() -> anyhow::Result<()> {
             slug,
             project,
             title,
+            attach,
         } => {
             let markdown = affine_write::read_markdown_stdin()?;
             let title = title.unwrap_or_else(|| slug.clone());
@@ -528,6 +545,9 @@ pub async fn run() -> anyhow::Result<()> {
                 affine_write::run_write(&root, &cfg, &slug, project.as_deref(), &title, &markdown)
                     .await?;
             println!("created: {slug} → {doc_id}");
+            if !attach.is_empty() {
+                affine_blob::attach_files(&cfg, &doc_id, &attach).await?;
+            }
         }
         Commands::Sync => {
             let mut client = affine_client::AffineClient::connect(&cfg).await?;

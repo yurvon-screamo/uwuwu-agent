@@ -1,7 +1,7 @@
 //! Blob download (`uwuwu-cli blob <key>`) and doc screenshot
 //! (`uwuwu-cli shot <slug>`) — both ride the AFFiNE UI session.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
 use crate::affine_search_server::ServerSearchConfig;
@@ -170,4 +170,93 @@ pub async fn shot_doc(
         bail!("shot упал: node exit {status}");
     }
     Ok(out_str)
+}
+
+/// Attach local files to a doc: upload each as a workspace blob, then
+/// append an image block (raster/vector images, with caption) or an
+/// attachment block (everything else). Returns the number attached.
+pub async fn attach_files(
+    cfg: &crate::affine_client::AffineConfig,
+    doc_id: &str,
+    paths: &[std::path::PathBuf],
+) -> Result<usize> {
+    use base64::Engine as _;
+
+    let mut client = crate::affine_client::AffineClient::connect(cfg).await?;
+    let mut attached = 0usize;
+    for path in paths {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("не читается {}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string());
+        let mime = mime_for(&name);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let resp = client
+            .call_tool(
+                "upload_blob",
+                json!({
+                    "workspaceId": cfg.workspace,
+                    "content": b64,
+                    "encoding": "base64",
+                    "filename": name,
+                    "contentType": mime,
+                }),
+            )
+            .await
+            .with_context(|| format!("upload_blob {name}"))?;
+        let key = ["key", "blobKey", "sourceId"]
+            .iter()
+            .find_map(|k| resp.get(*k).and_then(|v| v.as_str()))
+            .ok_or_else(|| anyhow!("upload_blob {name}: нет ключа блоба: {resp:.120}"))?;
+        let block = if mime.starts_with("image/") {
+            json!({
+                "workspaceId": cfg.workspace, "docId": doc_id,
+                "type": "image", "sourceId": key, "caption": name,
+            })
+        } else {
+            json!({
+                "workspaceId": cfg.workspace, "docId": doc_id,
+                "type": "attachment", "sourceId": key,
+                "name": name, "mimeType": mime, "size": bytes.len(),
+            })
+        };
+        client
+            .call_tool("append_block", block)
+            .await
+            .with_context(|| format!("append_block {name}"))?;
+        attached += 1;
+        println!("attached: {name} ({mime}, {} bytes) → {key}", bytes.len());
+    }
+    Ok(attached)
+}
+
+fn mime_for(name: &str) -> String {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
