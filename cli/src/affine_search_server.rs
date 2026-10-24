@@ -76,10 +76,10 @@ impl ServerSearch {
             "variables": {
                 "ws": self.workspace,
                 "in": {
-                    "table": "doc",
-                    "query": {"type": "match", "match": query, "field": "plainText"},
+                    "table": "block",
+                    "query": {"type": "match", "match": query, "field": "content"},
                     "options": {
-                        "fields": ["title", "plainText"],
+                        "fields": ["doc_id", "content", "flavour"],
                         "pagination": {"limit": limit.max(1)}
                     }
                 }
@@ -113,7 +113,9 @@ impl ServerSearch {
             .pointer("/data/workspace/search/nodes")
             .and_then(|v| v.as_array())
             .ok_or_else(|| anyhow!("unexpected search response shape"))?;
-        let mut hits = Vec::new();
+        // Block-level hits: dedupe by doc_id, keep the first snippet each.
+        let mut hits: Vec<ServerHit> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for node in nodes {
             let fields = node
                 .get("fields")
@@ -125,26 +127,22 @@ impl ServerSearch {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let title = fields
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(без названия)")
-                .to_string();
+            if doc_id.is_empty() || !seen.insert(doc_id.clone()) {
+                continue;
+            }
             let snippet = node
                 .get("highlights")
-                .and_then(|h| h.get("plainText"))
+                .and_then(|h| h.get("content"))
                 .and_then(|v| v.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            if !doc_id.is_empty() {
-                hits.push(ServerHit {
-                    doc_id,
-                    title,
-                    snippet,
-                });
-            }
+            hits.push(ServerHit {
+                doc_id,
+                title: String::new(), // resolved from the cache by the caller
+                snippet,
+            });
         }
         Ok(hits)
     }
