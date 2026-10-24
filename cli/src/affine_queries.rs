@@ -164,19 +164,23 @@ pub async fn resolve_doc_id(root: &Path, cfg: &AffineConfig, slug: &str) -> Resu
     if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
         return Ok(Some(doc_id));
     }
-    // last resort: title search through the gateway
+    // last resort: title search through the gateway — exact match only,
+    // so a mistyped slug never resolves to a different document
     let resp = client
         .call_tool(
             "search_docs",
-            json!({"workspaceId": cfg.workspace, "query": slug, "limit": 1}),
+            json!({"workspaceId": cfg.workspace, "query": slug, "limit": 5}),
         )
         .await;
     if let Ok(resp) = resp {
         if let Some(results) = resp.get("results").and_then(|r| r.as_array()) {
             for r in results {
                 if r.get("inTrash").and_then(|t| t.as_bool()) == Some(false) {
-                    if let Some(id) = r.get("docId").and_then(|d| d.as_str()) {
-                        return Ok(Some(id.to_string()));
+                    let exact = r.get("title").and_then(|t| t.as_str()) == Some(slug);
+                    if exact {
+                        if let Some(id) = r.get("docId").and_then(|d| d.as_str()) {
+                            return Ok(Some(id.to_string()));
+                        }
                     }
                 }
             }
@@ -191,7 +195,9 @@ fn annotate_blob_links(md: String) -> String {
     if !md.contains("affine://blob/") {
         return md;
     }
-    let re = regex::Regex::new(r"!\[([^\]]*)\]\(affine://blob/([^)\s]+)\)").unwrap();
+    static BLOB_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = BLOB_RE
+        .get_or_init(|| regex::Regex::new(r"!\[([^\]]*)\]\(affine://blob/([^)\s]+)\)").unwrap());
     re.replace_all(&md, |caps: &regex::Captures| {
         format!(
             "**[image: {} (key: {})] → скачай: `uwuwu-cli blob {} > файл`**",

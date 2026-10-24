@@ -251,6 +251,9 @@ pub async fn run() -> anyhow::Result<()> {
             match out.as_deref() {
                 Some("-") => {
                     use std::io::Write;
+                    if unsafe { libc::isatty(1) } == 1 {
+                        eprintln!("warning: бинарные данные ({}) в терминал; перенаправь в файл: uwuwu-cli blob {key} --out файл", bytes.len());
+                    }
                     std::io::stdout().write_all(&bytes)?;
                 }
                 Some(path) => {

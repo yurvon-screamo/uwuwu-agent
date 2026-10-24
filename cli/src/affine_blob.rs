@@ -149,7 +149,9 @@ pub async fn shot_doc(
 ) -> Result<String> {
     let dir = std::env::temp_dir().join("uwuwu-shot");
     std::fs::create_dir_all(&dir)?;
-    let script = dir.join("affine-shot.mjs");
+    // salted name: predictable /tmp paths are a swap/DoS vector on
+    // multi-user hosts
+    let script = dir.join(format!("affine-shot-{}.mjs", std::process::id()));
     std::fs::write(&script, SHOT_SCRIPT)?;
     let out_str = out.to_string_lossy().to_string();
     let status = tokio::process::Command::new("node")
