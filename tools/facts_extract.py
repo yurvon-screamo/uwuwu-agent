@@ -19,7 +19,7 @@ scoped git-коммит) — ЕДИНЫЙ: `uwuwu-cli facts` (cli/src/facts.rs).
   - retry/gave-up: bad_jsonl → сессия не помечается; после 3 битых прогонов
     помечается "<marker>#gave-up";
   - ollama_unreachable — фатально (день аборт, сессии не теряются);
-  - в конце дня: `uwuwu-cli facts --sync` (sidecar-файлы коммитит движок).
+  - публикация в AFFiNE — движком внутри прогона (sidecar-коммиты и --sync удалены).
 
 Контракты факта/дедупа/промпта см. cli/src/facts.rs (одна точка правды).
 """
@@ -152,9 +152,9 @@ def process_day(date: str, sidecar: dict, retries: dict, auto: bool = False) -> 
     save_json(SIDECAR, sidecar)
     save_json(RETRIES, retries)
     # Sidecar-файлы коммитит движок (Rust — единственный коммитер)
-    sync = subprocess.run([CLI, "facts", "--sync"], capture_output=True, check=False)
-    if sync.returncode != 0 or sync.stderr.strip():
-        print(f"    warn: facts --sync: {sync.stderr.strip()[:160]}", file=sys.stderr)
+    # facts --sync удалён из CLI (deprecated no-op → аргумент не существует);
+    # движок публикует в AFFiNE сам, sidecar-коммитов больше нет
+
     print(
         f"{tag}{date}: sessions={stats['sessions']} upgrown={stats['upgrown']} skipped={stats['skipped']} "
         f"new={stats['facts']} dup={stats['dup']} conflict={stats['conflict']}"

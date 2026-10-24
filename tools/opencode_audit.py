@@ -140,6 +140,13 @@ def load_session_content(con: sqlite3.Connection, sid: str) -> list[dict]:
     buckets = _load_session_message(con, sid)  # v2 store
     if buckets:
         return buckets
+    # legacy-хранилище существует только в старых БД; в v2-схеме таблицы message
+    # нет — пустой v2-ответ для сессии без сообщений не должен ронять аудит
+    has_legacy = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message'"
+    ).fetchone()
+    if not has_legacy:
+        return []
     return _load_message_part(con, sid)  # legacy store
 
 
