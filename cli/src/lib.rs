@@ -171,7 +171,6 @@ enum Commands {
     },
     /// Refresh local caches from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
-    #[command(alias = "sync")]
     Refresh,
     /// Migrate wiki data into the AFFiNE workspace: experience/ and projects/
     /// as documents, facts/ as daily journal buckets. Idempotent (resume-safe).
