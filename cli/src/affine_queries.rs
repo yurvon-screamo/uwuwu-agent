@@ -135,14 +135,100 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
     }
     let (mut client, cache, _) = session(root, cfg).await?;
     if let Some(doc) = cache.get(slug) {
-        return Ok(doc.markdown.clone());
+        let mut md = doc.markdown.clone();
+        if let Some(summary) = rich_blocks_summary(&mut client, cfg, &doc.doc_id).await {
+            md.push_str(&summary);
+        }
+        return Ok(md);
     }
     // cache miss on a fresh doc: resolve by tag and read directly
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
     if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
-        return read_markdown(&mut client, cfg, &doc_id).await;
+        let mut md = read_markdown(&mut client, cfg, &doc_id).await?;
+        if let Some(summary) = rich_blocks_summary(&mut client, cfg, &doc_id).await {
+            md.push_str(&summary);
+        }
+        return Ok(md);
     }
     anyhow::bail!("article not found by slug: '{slug}'")
+}
+
+/// Append a short marker when a document carries non-markdown blocks
+/// (databases, mindmaps, canvas shapes) that the markdown readback loses.
+/// One extra gateway call per read; surface elements trigger one more
+/// (get_edgeless_canvas) to count mindmaps/shapes/connectors.
+async fn rich_blocks_summary(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+) -> Option<String> {
+    let resp = client
+        .call_tool(
+            "read_doc",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id, "includeMarkdown": false}),
+        )
+        .await
+        .ok()?;
+    let blocks = resp.get("blocks").and_then(|b| b.as_array())?;
+    let mut databases = 0usize;
+    let mut has_surface = false;
+    for block in blocks {
+        match block.get("flavour").and_then(|f| f.as_str()) {
+            Some("affine:database") => databases += 1,
+            Some("affine:surface") => has_surface = true,
+            _ => {}
+        }
+    }
+    if !has_surface && databases == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if databases > 0 {
+        parts.push(format!("базы: {databases}"));
+    }
+    if has_surface {
+        if let Ok(canvas) = client
+            .call_tool(
+                "get_edgeless_canvas",
+                json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+            )
+            .await
+        {
+            let mut mindmaps = 0usize;
+            let mut shapes = 0usize;
+            let mut connectors = 0usize;
+            if let Some(elements) = canvas.get("surfaceElements").and_then(|e| e.as_array()) {
+                for el in elements {
+                    match el.get("type").and_then(|t| t.as_str()) {
+                        Some("connector") => connectors += 1,
+                        Some("shape") => shapes += 1,
+                        Some("mindmap") | Some("mindmap-root") => mindmaps += 1,
+                        _ => {}
+                    }
+                }
+            }
+            let mut canvas_parts = Vec::new();
+            if mindmaps > 0 {
+                canvas_parts.push(format!("майндмапы: {mindmaps}"));
+            }
+            if shapes > 0 {
+                canvas_parts.push(format!("шейпы: {shapes}"));
+            }
+            if connectors > 0 {
+                canvas_parts.push(format!("коннекторы: {connectors}"));
+            }
+            if !canvas_parts.is_empty() {
+                parts.push(format!("канва ({})", canvas_parts.join(", ")));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n---\n⚠️ Не-markdown контент (недоступен в текстовом ридбэке): {}\n",
+        parts.join(", ")
+    ))
 }
 
 // ---------- projects ----------

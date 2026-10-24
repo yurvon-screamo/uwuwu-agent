@@ -5,6 +5,7 @@ pub mod affine_migrate;
 pub mod affine_publish;
 pub mod affine_queries;
 pub mod affine_search;
+pub mod affine_search_server;
 pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
@@ -292,8 +293,44 @@ pub async fn run() -> anyhow::Result<()> {
             } else {
                 None
             };
+            // Server-side full-text search first (fresh index, no local deps);
+            // fall back to local semantic search when unavailable or empty.
+            let server_res = async {
+                let limit = top.max(facts).max(access).max(10);
+                match affine_search_server::ServerSearchConfig::from_env() {
+                    Some(ss) => {
+                        match affine_search_server::ServerSearch::connect(&ss, &cfg.workspace).await
+                        {
+                            Ok(conn) => Some(conn.search(&query, limit).await),
+                            Err(e) => {
+                                eprintln!(
+                                    "affine: серверный поиск недоступен ({e:#}); локальный ниже"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            }
+            .await;
+            let mut use_local = true;
+            if let Some(Ok(hits)) = &server_res {
+                if !hits.is_empty() {
+                    for h in hits {
+                        println!("server\t{}\t{}", h.title, h.doc_id);
+                        if !h.snippet.is_empty() {
+                            println!("    {}", h.snippet.replace('\n', " "));
+                        }
+                    }
+                    use_local = false;
+                }
+            }
+            if let Some(Err(e)) = &server_res {
+                eprintln!("affine: серверный поиск упал ({e:#}); локальный ниже");
+            }
             let local_fut = async {
-                if top + facts + access == 0 {
+                if !use_local || top + facts + access == 0 {
                     return Ok(Vec::new());
                 }
                 let (_, cache, index) = affine_queries::session(&root, &cfg).await?;
