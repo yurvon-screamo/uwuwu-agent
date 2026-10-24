@@ -38,7 +38,7 @@ SKILLS rules:
 - **MCP-шлюз**: `https://affine-mcp-production.up.railway.app/mcp` (bearer, 107 инструментов)
 - **Воркспейс**: `uwuwu-wiki` (id `81475705-028a-4153-a8f5-f06e402ee31e`)
 - **Структура**: 📁 Experience (33 подпапки по темам) / 📁 Projects (7 проектов: 1xgames, ckii, desloper, foilcap, netcore, origa, uwuwu) / 📁 Daily (дейли-бакеты) / 📁 Requests (заявки). Контейнерные доки удалены — доки привязаны к папкам напрямую.
-- **Теги**: слаг-адресация без префикса (`axum`, `origa/topology`). Тег = слаг для мульти-ПК резолва. Категорийные теги НЕ используются — папки это делают.
+- **Теги**: слаг-адресация без префикса (`cicd/airflow`, `origa/topology`), ~717 шт. только на статьях и проектных доках. **Факты тегов не имеют** — `read facts/<slug>` резолвится через fact index (бутстрап из содержимого дейли-бакетов), теги фактов снесены как UI-мусор. Категорийные теги НЕ используются — папки это делают.
 - **Индексатор**: BYOK-профиль `Ollama relay embedding` (qwen3-embedding:0.6b, 1024d) на Ollama relay; `AFFINE_INDEXER_ENABLED=true`; чанки в `embedding_chunks`. Конфиг Rust-рантайма — `/app/config.json` через startCommand (не env-путь!). `AFFINE_PRIVATE_KEY` = EC PEM.
 - **Ollama relay**: `ollama-relay-production.up.railway.app` (rathole через TCP proxy `metro.proxy.rlwy.net:47361`) → ноут `localhost:11434`. Bearer-гейт на `/v1/`. Для BYOK афины (эмбеддинги индексатора).
 - **DNS**: Bunny (`coco/kiki.bunny.net`), управление через `bunny` CLI (skill `bunny-cli`). Кастомные домены `*.uwuwu.net` не подключены (Let's Encrypt rate limit); сервисы живут на Railway-доменах `*.up.railway.app`.
