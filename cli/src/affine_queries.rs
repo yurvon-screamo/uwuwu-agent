@@ -282,19 +282,56 @@ async fn render_database(
         for row in rows {
             let mut cells: Vec<String> = Vec::with_capacity(col_names.len());
             for name in &col_names {
-                let value = if name.eq_ignore_ascii_case("title") {
-                    row.get("title").and_then(|t| t.as_str()).unwrap_or("")
+                let raw = if name.eq_ignore_ascii_case("title") {
+                    row.get("title").cloned().unwrap_or(serde_json::Value::Null)
                 } else {
                     row.pointer(&format!("/cells/{}/value", name))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
                 };
-                cells.push(value.replace('|', "\\|").replace('\n', " "));
+                cells.push(
+                    tolerant_cell_text(&raw)
+                        .replace('|', "\\|")
+                        .replace('\n', " "),
+                );
             }
             out.push_str(&format!("| {} |\n", cells.join(" | ")));
         }
     }
     Ok(Some(out))
+}
+
+/// Cell value → text: strings as-is, numbers via their JSON form, rich-text
+/// arrays ([{text: ".."}] or [{insert: ".."}]) joined — anything else empty.
+fn tolerant_cell_text(value: &serde_json::Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(n) = value.as_f64() {
+        return if n.fract() == 0.0 {
+            format!("{}", n as i64)
+        } else {
+            format!("{n}")
+        };
+    }
+    if let Some(arr) = value.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            let t = item
+                .get("text")
+                .or_else(|| item.get("insert"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+        return parts.join(" ");
+    }
+    if let Some(b) = value.as_bool() {
+        return b.to_string();
+    }
+    String::new()
 }
 
 /// Render canvas: mindmap trees (get_mindmap) + standalone shapes, text and
@@ -358,6 +395,25 @@ async fn render_canvas(
     let mut out = String::from("### 🎨 Канва\n\n");
     let mut member_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
+    // Canvas mindmap elements carry their member ids in `children` — seed
+    // member_ids from there so shapes do not duplicate even when the
+    // get_mindmap call fails.
+    let canvas_mindmap_members: std::collections::BTreeMap<&str, Vec<String>> = elements
+        .iter()
+        .filter_map(|el| {
+            let id = el.get("id").and_then(|i| i.as_str())?;
+            if el.get("type").and_then(|t| t.as_str()) != Some("mindmap") {
+                return None;
+            }
+            let mut ids: Vec<String> = vec![id.to_string()];
+            if let Some(children) = el.get("children").and_then(|c| c.as_object()) {
+                for cid in children.keys() {
+                    ids.push(cid.clone());
+                }
+            }
+            Some((id, ids))
+        })
+        .collect();
     for mm_id in &mindmap_ids {
         match client
             .call_tool(
@@ -367,6 +423,9 @@ async fn render_canvas(
             .await
         {
             Ok(mm) => {
+                if let Some(ids) = canvas_mindmap_members.get(mm_id.as_str()) {
+                    member_ids.extend(ids.iter().cloned());
+                }
                 let root_id = mm
                     .get("rootId")
                     .and_then(|r| r.as_str())
@@ -399,11 +458,22 @@ async fn render_canvas(
                 }
                 out.push_str(&format!(
                     "**Майндмап** ({} узлов):\n{}\n",
-                    text_by_id.len().max(member_ids.len()),
-                    render_tree(root_id, &text_by_id, &children_by_parent, 0)
+                    text_by_id.len(),
+                    render_tree(
+                        root_id,
+                        &text_by_id,
+                        &children_by_parent,
+                        0,
+                        &mut std::collections::BTreeSet::new(),
+                    )
                 ));
             }
-            Err(e) => eprintln!("affine: майндмап {mm_id} не прочитан ({e:#})"),
+            Err(e) => {
+                eprintln!("affine: майндмап {mm_id} не прочитан ({e:#})");
+                if let Some(ids) = canvas_mindmap_members.get(mm_id.as_str()) {
+                    member_ids.extend(ids.iter().cloned());
+                }
+            }
         }
     }
 
@@ -421,15 +491,27 @@ async fn render_canvas(
     for t in &texts {
         out.push_str(&format!("- 📝 {t}\n"));
     }
+    let texts_by_id: std::collections::BTreeMap<&str, &str> = elements
+        .iter()
+        .filter_map(|el| {
+            let id = el.get("id").and_then(|i| i.as_str())?;
+            let t = el.get("text").and_then(|t| t.as_str())?;
+            Some((id, t))
+        })
+        .collect();
     for (from, to, label) in &connectors {
         let from_t = shapes_by_id
             .get(from)
             .map(|(_, t)| t.clone())
             .filter(|t| !t.is_empty())
+            .or_else(|| texts_by_id.get(from.as_str()).map(|t| t.to_string()))
+            .filter(|t| !t.is_empty())
             .unwrap_or_else(|| from.clone());
         let to_t = shapes_by_id
             .get(to)
             .map(|(_, t)| t.clone())
+            .filter(|t| !t.is_empty())
+            .or_else(|| texts_by_id.get(to.as_str()).map(|t| t.to_string()))
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| to.clone());
         if label.is_empty() {
@@ -441,12 +523,21 @@ async fn render_canvas(
     Some(out)
 }
 
+const MAX_MINDMAP_DEPTH: usize = 32;
+
 fn render_tree(
     node_id: &str,
     text_by_id: &std::collections::BTreeMap<String, String>,
     children_by_parent: &std::collections::BTreeMap<String, Vec<String>>,
     depth: usize,
+    visited: &mut std::collections::BTreeSet<String>,
 ) -> String {
+    // Cyclic parentId graphs are external data (editor/importer bugs):
+    // a visited-set + depth cap keep the recursion bounded instead of
+    // aborting the whole process with a stack overflow.
+    if depth >= MAX_MINDMAP_DEPTH || !visited.insert(node_id.to_string()) {
+        return String::new();
+    }
     let text = text_by_id.get(node_id).cloned().unwrap_or_default();
     let mut out = format!("{}- {}\n", "  ".repeat(depth), text);
     if let Some(children) = children_by_parent.get(node_id) {
@@ -456,6 +547,7 @@ fn render_tree(
                 text_by_id,
                 children_by_parent,
                 depth + 1,
+                visited,
             ));
         }
     }
@@ -595,4 +687,75 @@ pub async fn delete_request(root: &Path, cfg: &AffineConfig, title: &str) -> Res
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rich_render_tests {
+    use super::{render_tree, tolerant_cell_text};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn kids(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_nested_children() {
+        let texts = map(&[("root", "Корень"), ("a", "Ветка A"), ("a1", "Лист A1")]);
+        let children = kids(&[("root", &["a"]), ("a", &["a1"])]);
+        let out = render_tree("root", &texts, &children, 0, &mut BTreeSet::new());
+        assert!(out.contains("- Корень"));
+        assert!(out.contains("  - Ветка A"));
+        assert!(out.contains("    - Лист A1"));
+    }
+
+    #[test]
+    fn survives_parent_cycle() {
+        // a → b → a: unguarded recursion would loop forever / overflow.
+        let texts = map(&[("a", "A"), ("b", "B")]);
+        let children = kids(&[("a", &["b", "b", "a"]), ("b", &["a"])]);
+        let out = render_tree("a", &texts, &children, 0, &mut BTreeSet::new());
+        assert_eq!(out.matches("- A").count(), 1);
+        assert_eq!(out.matches("- B").count(), 1);
+    }
+
+    #[test]
+    fn caps_extreme_depth() {
+        let mut texts = BTreeMap::new();
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for i in 0..1000 {
+            texts.insert(i.to_string(), format!("n{i}"));
+            children.insert(i.to_string(), vec![(i + 1).to_string()]);
+        }
+        texts.insert("1000".to_string(), "end".to_string());
+        let out = render_tree("0", &texts, &children, 0, &mut BTreeSet::new());
+        assert!(!out.contains("- end"));
+    }
+
+    #[test]
+    fn tolerant_cells() {
+        assert_eq!(tolerant_cell_text(&serde_json::json!("plain")), "plain");
+        assert_eq!(tolerant_cell_text(&serde_json::json!(42)), "42");
+        assert_eq!(tolerant_cell_text(&serde_json::json!(3.5)), "3.5");
+        assert_eq!(tolerant_cell_text(&serde_json::json!(true)), "true");
+        assert_eq!(
+            tolerant_cell_text(&serde_json::json!([{"text": "a"}, {"insert": "b"}])),
+            "a b"
+        );
+        assert_eq!(tolerant_cell_text(&serde_json::json!(null)), "");
+    }
 }
