@@ -253,12 +253,7 @@ pub async fn create_request(
         .await?;
     let doc_id = crate::affine_store::doc_id_from_response(&resp)
         .ok_or_else(|| anyhow!("request created but no docId: {resp:.200}"))?;
-    client
-        .call_tool(
-            "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": doc_id, "tag": "request"}),
-        )
-        .await?;
+    // no tag: requests are classified by the Requests container path in the content cache
     Ok(doc_id)
 }
 
