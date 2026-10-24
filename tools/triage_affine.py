@@ -245,11 +245,63 @@ def mcp_result(resp: object) -> dict:
     return result
 
 
+def live_bucket_markdown(date: str) -> tuple[str, str]:
+    """(markdown, doc_id) ПО ЖИВОМУ доку через MCP export — apply обязан
+    работать с актуальным контентом: стейл-кэш вернул бы изъятые секции
+    (lost-update против чужих правок между sync и apply)."""
+    _, doc_id = load_bucket_markdown(date)  # doc_id из кэша (стабилен)
+    resp, sid = mcp_call(
+        "initialize",
+        {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "triage-affine", "version": "1"},
+        },
+    )
+    mcp_result(resp)
+    mcp_call("notifications/initialized", {}, sid, notify=True)
+    resp, _ = mcp_call(
+        "tools/call",
+        {
+            "name": "export_doc_markdown",
+            "arguments": {"workspaceId": WORKSPACE, "docId": doc_id},
+        },
+        sid,
+    )
+    res = mcp_result(resp)
+
+    # конвенция шлюза: markdown либо в structuredContent, либо JSON-строкой
+    # внутри content[0].text (см. affine-selfhost-mcp-integration)
+    def extract_md(r: dict) -> str | None:
+        sc = r.get("structuredContent")
+        if isinstance(sc, dict) and isinstance(sc.get("markdown"), str):
+            return sc["markdown"]
+        for c in r.get("content", []):
+            t = c.get("text") if isinstance(c, dict) else None
+            if not t:
+                continue
+            try:
+                inner = json.loads(t)
+            except json.JSONDecodeError:
+                if "## " in t:
+                    return t
+                continue
+            if isinstance(inner, dict) and isinstance(inner.get("markdown"), str):
+                return inner["markdown"]
+        return None
+
+    md = extract_md(res)
+    if not md:
+        print(f"!! export не вернул markdown: {json.dumps(res)[:300]}")
+        sys.exit(2)
+    return md, doc_id
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     drop = (
         {s.strip() for s in args.drop.split(",") if s.strip()} if args.drop else set()
     )
-    markdown, doc_id = load_bucket_markdown(args.date)
+    markdown, doc_id = live_bucket_markdown(args.date)
     sections = parse_sections(markdown)
 
     # dual-agreement-кандидаты (скорим всегда — dry-run тоже показывает план)
