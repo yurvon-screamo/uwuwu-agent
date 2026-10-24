@@ -67,16 +67,26 @@ D3_AUTO = 0.18
 
 
 def load_bucket_markdown(date: str) -> tuple[str, str]:
-    """(markdown, doc_id) бакета из контент-кэша."""
+    """(markdown, doc_id) бакета из контент-кэша.
+
+    Fallback: кэш битый/отстал (sync-баг) — doc_id из affine-мапы
+    (__daily_<date>, пишет publisher), markdown добывается живьём."""
     cache = json.loads(CACHE.read_text(encoding="utf-8"))
     docs = cache.get("docs", cache)  # кэш может быть вложен в "docs"
     doc = docs.get(date) or next(
         (v for v in docs.values() if isinstance(v, dict) and v.get("title") == date),
         None,
     )
-    if not doc:
-        sys.exit(f"бакет {date} не найден в контент-кэше (sync?)")
-    return doc["markdown"], doc["doc_id"]
+    if doc:
+        return doc["markdown"], doc["doc_id"]
+    # fallback: daily-ключ из мапы; markdown пустой — live-ветка добудет
+    for p in [WIKI / "affine_map.json", *WIKI.glob("affine_map_*.json")]:
+        if p.exists():
+            m = json.loads(p.read_text(encoding="utf-8"))
+            did = m.get(f"__daily_{date}")
+            if did:
+                return "", did
+    sys.exit(f"бакет {date} не найден ни в кэше, ни в мапе (__daily_{date})")
 
 
 def parse_sections(markdown: str) -> list[dict]:
@@ -157,6 +167,8 @@ def score_logreg(files: list[Path]) -> dict[str, float]:
 
 def cmd_sections(args: argparse.Namespace) -> int:
     markdown, _ = load_bucket_markdown(args.date)
+    if not markdown:  # кэш битый — берём живой док
+        markdown, _ = live_bucket_markdown(args.date)
     sections = parse_sections(markdown)
     if not sections:
         print(f"бакет {args.date}: секций нет")
