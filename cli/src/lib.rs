@@ -294,9 +294,9 @@ pub async fn run() -> anyhow::Result<()> {
                 None
             };
             // Server-side full-text search first (fresh index, no local deps);
-            // fall back to local semantic search when unavailable or empty.
+            // fall back to local semantic search when unavailable or useless.
             let server_res = async {
-                let limit = top.max(facts).max(access).max(10);
+                let limit = top.max(access).max(10);
                 match affine_search_server::ServerSearchConfig::from_env() {
                     Some(ss) => {
                         match affine_search_server::ServerSearch::connect(&ss, &cfg.workspace).await
@@ -314,15 +314,37 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
             .await;
+            // Map server doc_ids back to slugs via the content cache and drop
+            // noisy kinds (daily buckets, requests): keyword hits in fact
+            // bodies return date-titled buckets and pollute the output.
             let mut use_local = true;
             if let Some(Ok(hits)) = &server_res {
-                if !hits.is_empty() {
-                    for h in hits {
-                        println!("server\t{}\t{}", h.title, h.doc_id);
-                        if !h.snippet.is_empty() {
-                            println!("    {}", h.snippet.replace('\n', " "));
-                        }
+                let (_, cache, _) = affine_queries::session(&root, &cfg).await?;
+                let by_doc_id: std::collections::BTreeMap<&str, (&str, &str)> = cache
+                    .iter()
+                    .map(|(slug, doc)| {
+                        let kind = match doc.kind {
+                            content_cache::DocKind::Experience => "experience",
+                            content_cache::DocKind::Project => "access",
+                            content_cache::DocKind::Request => "request",
+                            content_cache::DocKind::Daily => "fact",
+                            content_cache::DocKind::Other => "other",
+                        };
+                        (doc.doc_id.as_str(), (slug.as_str(), kind))
+                    })
+                    .collect();
+                let mut printed = 0usize;
+                for h in hits {
+                    let Some((slug, kind)) = by_doc_id.get(h.doc_id.as_str()) else {
+                        continue; // daily buckets / requests / unknown — noise
+                    };
+                    println!("server\t{kind}\t{}\t{}", h.title, slug);
+                    if !h.snippet.is_empty() {
+                        println!("    {}", h.snippet.replace('\n', " "));
                     }
+                    printed += 1;
+                }
+                if printed > 0 {
                     use_local = false;
                 }
             }

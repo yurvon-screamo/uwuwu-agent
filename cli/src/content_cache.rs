@@ -39,6 +39,11 @@ pub struct ContentCache {
 }
 
 impl ContentCache {
+    /// Iterate all cached docs as (slug, doc).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &CachedDoc)> {
+        self.docs.iter()
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(CACHE_FILE);
         if !path.exists() {

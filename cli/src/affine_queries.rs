@@ -162,13 +162,19 @@ async fn rich_blocks_summary(
     cfg: &AffineConfig,
     doc_id: &str,
 ) -> Option<String> {
-    let resp = client
+    let resp = match client
         .call_tool(
             "read_doc",
             json!({"workspaceId": cfg.workspace, "docId": doc_id, "includeMarkdown": false}),
         )
         .await
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("affine: проверка rich-блоков не удалась ({e:#}); маркер пропущен");
+            return None;
+        }
+    };
     let blocks = resp.get("blocks").and_then(|b| b.as_array())?;
     let mut databases = 0usize;
     let mut has_surface = false;
@@ -187,38 +193,43 @@ async fn rich_blocks_summary(
         parts.push(format!("базы: {databases}"));
     }
     if has_surface {
-        if let Ok(canvas) = client
+        match client
             .call_tool(
                 "get_edgeless_canvas",
                 json!({"workspaceId": cfg.workspace, "docId": doc_id}),
             )
             .await
         {
-            let mut mindmaps = 0usize;
-            let mut shapes = 0usize;
-            let mut connectors = 0usize;
-            if let Some(elements) = canvas.get("surfaceElements").and_then(|e| e.as_array()) {
-                for el in elements {
-                    match el.get("type").and_then(|t| t.as_str()) {
-                        Some("connector") => connectors += 1,
-                        Some("shape") => shapes += 1,
-                        Some("mindmap") | Some("mindmap-root") => mindmaps += 1,
-                        _ => {}
+            Ok(canvas) => {
+                let mut mindmaps = 0usize;
+                let mut shapes = 0usize;
+                let mut connectors = 0usize;
+                if let Some(elements) = canvas.get("surfaceElements").and_then(|e| e.as_array()) {
+                    for el in elements {
+                        match el.get("type").and_then(|t| t.as_str()) {
+                            Some("connector") => connectors += 1,
+                            Some("shape") => shapes += 1,
+                            Some("mindmap") | Some("mindmap-root") => mindmaps += 1,
+                            _ => {}
+                        }
                     }
                 }
+                let mut canvas_parts = Vec::new();
+                if mindmaps > 0 {
+                    canvas_parts.push(format!("майндмапы: {mindmaps}"));
+                }
+                if shapes > 0 {
+                    canvas_parts.push(format!("шейпы: {shapes}"));
+                }
+                if connectors > 0 {
+                    canvas_parts.push(format!("коннекторы: {connectors}"));
+                }
+                if !canvas_parts.is_empty() {
+                    parts.push(format!("канва ({})", canvas_parts.join(", ")));
+                }
             }
-            let mut canvas_parts = Vec::new();
-            if mindmaps > 0 {
-                canvas_parts.push(format!("майндмапы: {mindmaps}"));
-            }
-            if shapes > 0 {
-                canvas_parts.push(format!("шейпы: {shapes}"));
-            }
-            if connectors > 0 {
-                canvas_parts.push(format!("коннекторы: {connectors}"));
-            }
-            if !canvas_parts.is_empty() {
-                parts.push(format!("канва ({})", canvas_parts.join(", ")));
+            Err(e) => {
+                eprintln!("affine: канва не прочитана ({e:#}); маркер канвы пропущен");
             }
         }
     }

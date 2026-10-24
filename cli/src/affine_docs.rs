@@ -1,7 +1,9 @@
 //! AFFiNE document access: slug → docId resolution and markdown reads.
-//! Slugs live as bare doc tags in the workspace (no prefix), so ANY machine
-//! resolves them without shared files; the local per-instance map is only
-//! a write cache. Multi-PC safe by design.
+//! Addressing: titles via the content cache on every machine; kebab-slugs
+//! via the local migration map (machines that ran `affine --all`). Slug TAGS
+//! were removed from the workspace — `resolve_slug`'s tag fallback always
+//! misses on the current production workspace and stays only for legacy
+//! compatibility.
 
 use std::path::Path;
 
