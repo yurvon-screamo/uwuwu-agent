@@ -19,6 +19,7 @@
     "sticky-retry/index.ts",
     "sticky-retry/contract.ts",
     "sticky-retry/tui.tsx",
+    "arkive/tui.tsx",
     "../lib/goal-lib.ts",
     "../lib/cron-lib.ts",
     "../tests/goal-mode.test.ts",

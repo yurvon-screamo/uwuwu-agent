@@ -416,8 +416,7 @@ const retryThenRelay = async (
   nextAttempt: number,
   firstDelayMs: number,
 ): Promise<Response> => {
-  let pendingDelayMs: number | null = null
-  let streamedBytes = 0
+  let pendingDelayMs = firstDelayMs
   const bornAt = Date.now()
   // Entering the loop means attempt 1 already failed and emitted retry:
   // a recovery here is always a real recovery.
@@ -526,6 +525,9 @@ const retryingSseResponse = (
       }, KEEPALIVE_INTERVAL_MS)
       let pendingDelayMs = firstDelayMs
       const bornAt = Date.now()
+      // Mid-body break tracking: bytes already piped to the client make a
+      // retry impossible (a second response would go into the same stream).
+      let streamedBytes = 0
       // Entering the loop means attempt 1 already failed and emitted retry:
       // a recovery here is always a real recovery.
       let hadRetry = true
