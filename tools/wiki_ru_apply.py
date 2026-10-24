@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wiki_ru_apply — применить русифицированный markdown дока (для сабов).
 
-wiki_ru_apply.py <docId> <файл-перевода.md>
+wiki_ru_apply.py <docId> <файл-перевода.md> [--stub]  # --stub: заглушка-редирект без длиновой защиты
 - сверяет длину (перевод не должен терять контент: >55% оригинала)
 - replace_doc_with_markdown по docId
 """
@@ -32,7 +32,8 @@ def main() -> int:
         orig = (json.loads(docs.read_text(encoding="utf-8")).get(doc_id) or {}).get(
             "markdown"
         ) or ""
-    if orig and len(new) < len(orig) * 0.55:
+    stub = "--stub" in sys.argv
+    if orig and not stub and len(new) < len(orig) * 0.55:
         print(f"!! перевод подозрительно короток: {len(new)} vs {len(orig)} — правь")
         return 2
     resp, sid = mcp_call(
