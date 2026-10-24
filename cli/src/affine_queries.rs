@@ -136,7 +136,7 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
     let (mut client, cache, _) = session(root, cfg).await?;
     if let Some(doc) = cache.get(slug) {
         let mut md = doc.markdown.clone();
-        if let Some(summary) = rich_blocks_summary(&mut client, cfg, &doc.doc_id).await {
+        if let Some(summary) = rich_blocks_section(&mut client, cfg, &doc.doc_id).await {
             md.push_str(&summary);
         }
         return Ok(md);
@@ -145,7 +145,7 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
     if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
         let mut md = read_markdown(&mut client, cfg, &doc_id).await?;
-        if let Some(summary) = rich_blocks_summary(&mut client, cfg, &doc_id).await {
+        if let Some(summary) = rich_blocks_section(&mut client, cfg, &doc_id).await {
             md.push_str(&summary);
         }
         return Ok(md);
@@ -153,11 +153,11 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
     anyhow::bail!("article not found by slug: '{slug}'")
 }
 
-/// Append a short marker when a document carries non-markdown blocks
-/// (databases, mindmaps, canvas shapes) that the markdown readback loses.
-/// One extra gateway call per read; surface elements trigger one more
-/// (get_edgeless_canvas) to count mindmaps/shapes/connectors.
-async fn rich_blocks_summary(
+/// Render non-markdown blocks (databases, mindmaps, canvas) into a text
+/// appendix so `read` is self-sufficient: markdown export cannot represent
+/// them, but the structural APIs can. One blocks-only gateway call per read;
+/// databases/canvas/mindmaps trigger extra calls only when present.
+async fn rich_blocks_section(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     doc_id: &str,
@@ -171,27 +171,42 @@ async fn rich_blocks_summary(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("affine: проверка rich-блоков не удалась ({e:#}); маркер пропущен");
+            eprintln!("affine: проверка rich-блоков не удалась ({e:#}); приложение пропущено");
             return None;
         }
     };
     let blocks = resp.get("blocks").and_then(|b| b.as_array())?;
-    let mut databases = 0usize;
+    let mut database_ids: Vec<String> = Vec::new();
     let mut has_surface = false;
     for block in blocks {
         match block.get("flavour").and_then(|f| f.as_str()) {
-            Some("affine:database") => databases += 1,
+            Some("affine:database") => {
+                if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                    database_ids.push(id.to_string());
+                }
+            }
             Some("affine:surface") => has_surface = true,
             _ => {}
         }
     }
-    if !has_surface && databases == 0 {
+    if !has_surface && database_ids.is_empty() {
         return None;
     }
-    let mut parts = Vec::new();
-    if databases > 0 {
-        parts.push(format!("базы: {databases}"));
+    let mut sections: Vec<String> = Vec::new();
+
+    // --- databases → GFM tables
+    for db_id in &database_ids {
+        match render_database(client, cfg, doc_id, db_id).await {
+            Ok(Some(table)) => sections.push(table),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("affine: база {db_id} не прочитана ({e:#})");
+                sections.push(format!("### 📊 База {db_id} (не прочитана)\n"));
+            }
+        }
     }
+
+    // --- canvas: mindmaps → trees, standalone shapes/connectors/text → list
     if has_surface {
         match client
             .call_tool(
@@ -201,45 +216,250 @@ async fn rich_blocks_summary(
             .await
         {
             Ok(canvas) => {
-                let mut mindmaps = 0usize;
-                let mut shapes = 0usize;
-                let mut connectors = 0usize;
-                if let Some(elements) = canvas.get("surfaceElements").and_then(|e| e.as_array()) {
-                    for el in elements {
-                        match el.get("type").and_then(|t| t.as_str()) {
-                            Some("connector") => connectors += 1,
-                            Some("shape") => shapes += 1,
-                            Some("mindmap") | Some("mindmap-root") => mindmaps += 1,
-                            _ => {}
-                        }
-                    }
-                }
-                let mut canvas_parts = Vec::new();
-                if mindmaps > 0 {
-                    canvas_parts.push(format!("майндмапы: {mindmaps}"));
-                }
-                if shapes > 0 {
-                    canvas_parts.push(format!("шейпы: {shapes}"));
-                }
-                if connectors > 0 {
-                    canvas_parts.push(format!("коннекторы: {connectors}"));
-                }
-                if !canvas_parts.is_empty() {
-                    parts.push(format!("канва ({})", canvas_parts.join(", ")));
+                if let Some(canvas_section) = render_canvas(client, cfg, doc_id, &canvas).await {
+                    sections.push(canvas_section);
                 }
             }
             Err(e) => {
-                eprintln!("affine: канва не прочитана ({e:#}); маркер канвы пропущен");
+                eprintln!("affine: канва не прочитана ({e:#}); приложение канвы пропущено");
             }
         }
     }
-    if parts.is_empty() {
+
+    if sections.is_empty() {
         return None;
     }
-    Some(format!(
-        "\n\n---\n⚠️ Не-markdown контент (недоступен в текстовом ридбэке): {}\n",
-        parts.join(", ")
-    ))
+    Some(format!("\n\n---\n{}\n", sections.join("\n\n")))
+}
+
+/// Read one database block and render it as a GFM table.
+async fn render_database(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+    db_id: &str,
+) -> Result<Option<String>> {
+    let cols_resp = client
+        .call_tool(
+            "read_database_columns",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id, "databaseBlockId": db_id}),
+        )
+        .await?;
+    let cells_resp = client
+        .call_tool(
+            "read_database_cells",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id, "databaseBlockId": db_id}),
+        )
+        .await?;
+    let Some(columns) = cols_resp.get("columns").and_then(|c| c.as_array()) else {
+        return Ok(None);
+    };
+    let rows = cells_resp.get("rows").and_then(|r| r.as_array());
+    let title = cols_resp
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("база");
+    let mut out = format!(
+        "### 📊 {title} ({} строк × {} колонок)\n\n",
+        rows.map(|r| r.len()).unwrap_or(0),
+        columns.len()
+    );
+    let col_names: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            c.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+    let header = format!("| {} |", col_names.join(" | "));
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&format!("|{}|", vec![" --- "; col_names.len()].join("|")));
+    out.push('\n');
+    if let Some(rows) = rows {
+        for row in rows {
+            let mut cells: Vec<String> = Vec::with_capacity(col_names.len());
+            for name in &col_names {
+                let value = if name.eq_ignore_ascii_case("title") {
+                    row.get("title").and_then(|t| t.as_str()).unwrap_or("")
+                } else {
+                    row.pointer(&format!("/cells/{}/value", name))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                };
+                cells.push(value.replace('|', "\\|").replace('\n', " "));
+            }
+            out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Render canvas: mindmap trees (get_mindmap) + standalone shapes, text and
+/// connectors with endpoints resolved to shape texts. Mindmap member shapes
+/// are excluded from the standalone list to avoid double listing.
+async fn render_canvas(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+    canvas: &serde_json::Value,
+) -> Option<String> {
+    let elements = canvas.get("surfaceElements").and_then(|e| e.as_array())?;
+    let mut mindmap_ids: Vec<String> = Vec::new();
+    let mut shapes_by_id: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut connectors: Vec<(String, String, String)> = Vec::new(); // from, to, label
+    for el in elements {
+        let id = el.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+        match el.get("type").and_then(|t| t.as_str()) {
+            Some("mindmap") => mindmap_ids.push(id.to_string()),
+            Some("shape") => {
+                let shape_type = el
+                    .get("shapeType")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("shape");
+                let text = el.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                shapes_by_id.insert(id.to_string(), (shape_type.to_string(), text.to_string()));
+            }
+            Some("text") => {
+                if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                    texts.push(t.to_string());
+                }
+            }
+            Some("connector") => {
+                let from = el
+                    .pointer("/source/id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let to = el
+                    .pointer("/target/id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let label = el
+                    .get("label")
+                    .and_then(|s| s.as_str())
+                    .or_else(|| el.get("labelText").and_then(|s| s.as_str()))
+                    .unwrap_or("");
+                connectors.push((from.to_string(), to.to_string(), label.to_string()));
+            }
+            _ => {}
+        }
+    }
+    if mindmap_ids.is_empty()
+        && shapes_by_id.is_empty()
+        && texts.is_empty()
+        && connectors.is_empty()
+    {
+        return None;
+    }
+    let mut out = String::from("### 🎨 Канва\n\n");
+    let mut member_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for mm_id in &mindmap_ids {
+        match client
+            .call_tool(
+                "get_mindmap",
+                json!({"workspaceId": cfg.workspace, "docId": doc_id, "mindmapId": mm_id}),
+            )
+            .await
+        {
+            Ok(mm) => {
+                let root_id = mm
+                    .get("rootId")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or_default();
+                let nodes = mm.get("nodes").and_then(|n| n.as_array());
+                let mut text_by_id: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
+                let mut children_by_parent: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                if let Some(nodes) = nodes {
+                    for n in nodes {
+                        let Some(nid) = n.get("nodeId").and_then(|i| i.as_str()) else {
+                            continue;
+                        };
+                        member_ids.insert(nid.to_string());
+                        if let Some(t) = n.get("text").and_then(|t| t.as_str()) {
+                            text_by_id.insert(nid.to_string(), t.to_string());
+                        }
+                        let parent = n.get("parentId").and_then(|p| p.as_str());
+                        if let Some(parent) = parent {
+                            children_by_parent
+                                .entry(parent.to_string())
+                                .or_default()
+                                .push(nid.to_string());
+                        }
+                    }
+                }
+                if !root_id.is_empty() {
+                    member_ids.insert(root_id.to_string());
+                }
+                out.push_str(&format!(
+                    "**Майндмап** ({} узлов):\n{}\n",
+                    text_by_id.len().max(member_ids.len()),
+                    render_tree(root_id, &text_by_id, &children_by_parent, 0)
+                ));
+            }
+            Err(e) => eprintln!("affine: майндмап {mm_id} не прочитан ({e:#})"),
+        }
+    }
+
+    for (id, (shape_type, text)) in &shapes_by_id {
+        if member_ids.contains(id) {
+            continue; // mindmap node shapes are already in the tree
+        }
+        let label = if text.is_empty() {
+            shape_type.clone()
+        } else {
+            text.clone()
+        };
+        out.push_str(&format!("- [{shape_type}] {label}\n"));
+    }
+    for t in &texts {
+        out.push_str(&format!("- 📝 {t}\n"));
+    }
+    for (from, to, label) in &connectors {
+        let from_t = shapes_by_id
+            .get(from)
+            .map(|(_, t)| t.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| from.clone());
+        let to_t = shapes_by_id
+            .get(to)
+            .map(|(_, t)| t.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| to.clone());
+        if label.is_empty() {
+            out.push_str(&format!("- 🔗 {from_t} → {to_t}\n"));
+        } else {
+            out.push_str(&format!("- 🔗 {from_t} → {to_t} ({label})\n"));
+        }
+    }
+    Some(out)
+}
+
+fn render_tree(
+    node_id: &str,
+    text_by_id: &std::collections::BTreeMap<String, String>,
+    children_by_parent: &std::collections::BTreeMap<String, Vec<String>>,
+    depth: usize,
+) -> String {
+    let text = text_by_id.get(node_id).cloned().unwrap_or_default();
+    let mut out = format!("{}- {}\n", "  ".repeat(depth), text);
+    if let Some(children) = children_by_parent.get(node_id) {
+        for child in children {
+            out.push_str(&render_tree(
+                child,
+                text_by_id,
+                children_by_parent,
+                depth + 1,
+            ));
+        }
+    }
+    out
 }
 
 // ---------- projects ----------
