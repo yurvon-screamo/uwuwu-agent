@@ -103,7 +103,7 @@ impl ContentCache {
         if nodes.is_empty() {
             // an unrecognized answer shape must NOT wipe the cache
             cache_bail!(
-                "workspace tree came back empty — cache left untouched, run `uwuwu-cli sync`"
+                "workspace tree came back empty — cache left untouched, run `uwuwu-cli refresh`"
             );
         }
         // drop entries the workspace no longer has (trashed/deleted docs)

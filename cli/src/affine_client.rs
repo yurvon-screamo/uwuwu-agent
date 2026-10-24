@@ -161,7 +161,18 @@ impl AffineClient {
             .and_then(|c| c.get("text"))
             .and_then(|t| t.as_str())
             .ok_or_else(|| anyhow!("tool result has neither structuredContent nor text"))?;
-        Ok(serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_string())))
+        let parsed =
+            serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_string()));
+        // text-blob tools wrap logical failures as {ok:false} INSIDE the
+        // blob — surface them instead of returning error JSON as data
+        if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let detail = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown tool error");
+            anyhow::bail!("tool error (text payload): {detail}");
+        }
+        Ok(parsed)
     }
 
     fn alloc_id(&mut self) -> u64 {

@@ -150,12 +150,6 @@ pub async fn run_facts(text: &str, source: &str, date: &str, stdin: bool) -> Fac
     }
 }
 
-/// `uwuwu-cli facts --sync` — deprecated no-op: факты больше не живут в git.
-/// Команда остаётся, чтобы python-оркестратор не падал на старом контракте.
-pub fn sync_git(_message: &str) -> Result<()> {
-    Ok(())
-}
-
 fn valid_date(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 10 {
@@ -773,7 +767,7 @@ impl LockGuard {
                         }
                         continue;
                     }
-                    // sync-CLI: thread::sleep осознан (вызовы из не-async sync_git)
+                    // удержание лока: thread::sleep осознан (не-async контекст)
                     std::thread::sleep(std::time::Duration::from_millis(300));
                 }
             }

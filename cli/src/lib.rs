@@ -146,10 +146,7 @@ enum Commands {
         /// Fact date YYYY-MM-DD (default: today; bucket grouping)
         #[arg(long)]
         date: Option<String>,
-        /// Deprecated no-op (the pipeline no longer touches git/FS)
-        #[arg(long)]
-        sync: bool,
-        /// Raw text to factize (ignored with --stdin/--sync)
+        /// Raw text to factize (ignored with --stdin)
         text: Vec<String>,
     },
     /// Write a document straight into AFFiNE: markdown from stdin → doc.
@@ -524,7 +521,6 @@ pub async fn run() -> anyhow::Result<()> {
             stdin,
             source,
             date,
-            sync,
             text,
         } => {
             let today = local_today();
@@ -532,14 +528,10 @@ pub async fn run() -> anyhow::Result<()> {
             if !valid_date(&date) {
                 anyhow::bail!("--date должен быть YYYY-MM-DD, получено: '{date}'");
             }
-            if sync {
-                eprintln!("facts --sync: deprecated no-op (the pipeline is AFFiNE-first)");
-            } else {
-                let text = facts::read_text(stdin, &text)?;
-                let source = source.unwrap_or_else(|| format!("manual/{today}"));
-                let out = facts::run_facts(&text, &source, &date, stdin).await;
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            }
+            let text = facts::read_text(stdin, &text)?;
+            let source = source.unwrap_or_else(|| format!("manual/{today}"));
+            let out = facts::run_facts(&text, &source, &date, stdin).await;
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Commands::Write {
             slug,
