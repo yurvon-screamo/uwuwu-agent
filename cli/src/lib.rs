@@ -169,9 +169,10 @@ enum Commands {
         )]
         attach: Vec<PathBuf>,
     },
-    /// Force a cache resync from AFFiNE (content cache, dedup index,
+    /// Refresh local caches from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
-    Sync,
+    #[command(alias = "sync")]
+    Refresh,
     /// Migrate wiki data into the AFFiNE workspace: experience/ and projects/
     /// as documents, facts/ as daily journal buckets. Idempotent (resume-safe).
     /// Env: UWUWU_AFFINE_URL (default localhost:3000/mcp), UWUWU_AFFINE_TOKEN,
@@ -557,7 +558,7 @@ pub async fn run() -> anyhow::Result<()> {
                 affine_blob::attach_files(&cfg, &doc_id, &attach).await?;
             }
         }
-        Commands::Sync => {
+        Commands::Refresh => {
             let mut client = affine_client::AffineClient::connect(&cfg).await?;
             // full refetch: fresh cache replaces the incremental one
             let mut fresh = content_cache::ContentCache::default();
