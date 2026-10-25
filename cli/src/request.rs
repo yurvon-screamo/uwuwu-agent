@@ -2,9 +2,11 @@
 //! Queue creation lives in affine_queries::create_request; this module owns
 //! the CLI surface: list / get / delete.
 
+use anyhow::Context as _;
 use clap::Subcommand;
+use serde_json::json;
 
-use crate::content_cache::{ContentCache, DocKind};
+use crate::content_cache::ContentCache;
 
 #[derive(Subcommand)]
 pub enum RequestSub {
@@ -22,7 +24,39 @@ pub async fn render_queue(
     command: Option<RequestSub>,
     cache: &ContentCache,
 ) -> anyhow::Result<()> {
-    let requests = cache.docs_by_kind(&DocKind::Request);
+    // заявки классифицируются тегом «Request» (не деревом: папки не входят
+    // в list_workspace_tree) — живой запрос, как и проперти
+    let tagged = client
+        .call_tool(
+            "list_docs_by_tag",
+            json!({"workspaceId": cfg.workspace, "tag": "Request"}),
+        )
+        .await
+        .context("list_docs_by_tag")?;
+    let doc_ids: Vec<String> = tagged
+        .get("docs")
+        .or_else(|| tagged.get("results"))
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    d.get("docId")
+                        .or_else(|| d.get("id"))
+                        .and_then(|v| v.as_str())
+                })
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let requests: Vec<(String, crate::content_cache::CachedDoc)> = doc_ids
+        .into_iter()
+        .filter_map(|doc_id| {
+            cache
+                .iter()
+                .find(|(_, d)| d.doc_id == doc_id)
+                .map(|(slug, d)| (slug.clone(), d.clone()))
+        })
+        .collect();
     match command {
         None | Some(RequestSub::List) => {
             if requests.is_empty() {

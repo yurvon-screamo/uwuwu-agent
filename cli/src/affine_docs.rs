@@ -120,22 +120,6 @@ pub async fn tag_slug(
     Ok(())
 }
 
-/// Ensure the "Requests" container exists and return its docId.
-pub async fn ensure_requests_container(
-    client: &mut AffineClient,
-    map: &mut MigrationMap,
-    cfg: &AffineConfig,
-) -> Result<String> {
-    crate::affine_migrate::ensure_container(
-        client,
-        map,
-        &cfg.workspace,
-        "Requests",
-        "# Requests\n\nОчередь заявок на статьи опыта (обработка → `uwuwu-cli write`).",
-    )
-    .await
-}
-
 /// Backfill bare slug tags for every mapped document (one-time migration aid).
 pub async fn backfill_slug_tags(root: &Path, cfg: &AffineConfig) -> Result<(usize, usize)> {
     let mut client = AffineClient::connect(cfg).await?;

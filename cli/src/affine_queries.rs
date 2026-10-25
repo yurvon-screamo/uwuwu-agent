@@ -9,7 +9,10 @@ use anyhow::{anyhow, Context as _, Result};
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
-use crate::affine_docs::{ensure_requests_container, read_markdown, resolve_slug};
+
+/// Папка Requests (сайдбар) — заявки крепятся сюда напрямую.
+pub const REQUESTS_FOLDER_ID: &str = "9rkqdytOCvh-93bReTV3V";
+use crate::affine_docs::{read_markdown, resolve_slug};
 use crate::content_cache::{ContentCache, DocKind};
 use crate::fact_index::FactIndex;
 
@@ -698,7 +701,7 @@ pub fn grep(cache: &ContentCache, index: &FactIndex, pattern: &str) -> Vec<GrepH
 // ---------- requests ----------
 
 pub async fn create_request(
-    root: &Path,
+    _root: &Path,
     cfg: &AffineConfig,
     action: &str,
     target: &str,
@@ -706,19 +709,25 @@ pub async fn create_request(
     body: &str,
 ) -> Result<String> {
     let mut client = AffineClient::connect(cfg).await?;
-    let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
-    let container = ensure_requests_container(&mut client, &mut map, cfg).await?;
     let title = request_title(body);
-    // meta lives in native doc properties; the body is just the text
+    // заявки = доки в папке Requests + тег «Request» (хаб-контейнер удалён);
+    // классификация — по тегу, не по дереву
     let markdown = format!("{body}\n");
     let resp = client
         .call_tool(
             "create_doc_from_markdown",
-            json!({"workspaceId": cfg.workspace, "title": title, "markdown": markdown, "parentDocId": container}),
+            json!({"workspaceId": cfg.workspace, "title": title, "markdown": markdown,
+                   "folderId": REQUESTS_FOLDER_ID}),
         )
         .await?;
     let doc_id = crate::affine_store::doc_id_from_response(&resp)
         .ok_or_else(|| anyhow!("request created but no docId: {resp:.200}"))?;
+    let _ = client
+        .call_tool(
+            "add_tag_to_doc",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id, "tag": "Request"}),
+        )
+        .await;
     if let Err(e) = set_request_properties(&mut client, cfg, &doc_id, action, target, reason).await
     {
         // the doc exists; property failure must not lose the request
