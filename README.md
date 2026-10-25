@@ -62,6 +62,7 @@ cutover с gh-ишью 25.10), тела задач = доки с тегом «Ta
 Демон (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+kickoff → In Progress →
 коммент-мост (🤖-фильтр) → PR → Review → MERGED → Done + cleanup.
 `factory/` — Bun/TS: multi-project конфиг, session-recovery MCP, state+reconcile.
+Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
 ### Кроны (uwuwu-cron)
 
