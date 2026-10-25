@@ -1,0 +1,7 @@
+{
+  "name": "uwuwu-cron",
+  "private": true,
+  "devDependencies": {
+    "bun-types": "^1.4.4"
+  }
+}
