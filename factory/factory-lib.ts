@@ -25,6 +25,8 @@ export interface TrackedTask {
   branch: string
   bodyDoc: string
   title: string
+  /** проект (ключ конфига демона) */
+  project: string
   /** ms-время последнего обработанного коммента */
   lastCommentAt: number
   /** id последнего обработанного коммента (тай-брейк в одну мс) */
@@ -93,9 +95,15 @@ export function snapshotText(content: unknown): string {
 }
 
 /** Промпт-контракт пайпа для новой задачи. */
-export function kickoffPrompt(task: TaskRef, body: string, repo: string): string {
+export interface KickoffProfile {
+  repo: string
+  pipeline: string[]
+  rules: string[]
+}
+
+export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile): string {
   return [
-    `Ты — девелопер фабрики uwuwu. Репозиторий: ${repo}. Задача: «${task.title.replace(/[\r\n]+/g, " ")}» (канбан-строка ${task.rowId}).`,
+    `Ты — девелопер фабрики uwuwu. Репозиторий: ${profile.repo}. Задача: «${task.title.replace(/[\r\n]+/g, " ")}» (канбан-строка ${task.rowId}).`,
     "",
     "=== ТЕЛО ЗАДАЧИ ===",
     sanitizeBoundary(body || "(пусто)"),
@@ -114,6 +122,7 @@ export function kickoffPrompt(task: TaskRef, body: string, repo: string): string
     `7. СРАЗУ после PR: uwuwu-cli task edit ${task.rowId} --pr <url> --status Review --branch <ветка>.`,
     "8. Проверь CI (gh pr checks --watch может висеть — опрашивай gh pr view). Красный — чини.",
     "9. Мержит пользователь. Замечания придут комментами — исправляй в ветке и пушь.",
+    ...profile.pipeline,
     "",
     "ШАБЛОН ОТЧЁТА:",
     AGENT_MARK + " Отчёт: «" + task.title + "»",
@@ -126,6 +135,7 @@ export function kickoffPrompt(task: TaskRef, body: string, repo: string): string
     "- ВСЁ для пользователя — только комменты задачи (uwuwu-cli task comment). Текст в сессии юзер не читает.",
     "- Не мержи сам. Не закрывай задачу сам (uwuwu-cli task close — только демон по мержу PR).",
     `- Разрешено: uwuwu-cli task comment/get/edit, gh pr create/view/checks. Запрещено: gh pr merge.`,
+    ...profile.rules,
   ].join("\n")
 }
 
@@ -162,7 +172,8 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     typeof t.createdAt !== "number" ||
     typeof t.attempts !== "number" ||
     typeof t.bodyDoc !== "string" ||
-    typeof t.title !== "string"
+    typeof t.title !== "string" ||
+    typeof t.project !== "string"
   ) return false
   const sesOk = t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))
   if (!sesOk) return false

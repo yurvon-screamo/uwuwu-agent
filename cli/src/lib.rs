@@ -68,6 +68,8 @@ enum TaskSub {
     List {
         #[arg(long, help = "Фильтр по статусу (todo|design|in progress|…)")]
         status: Option<String>,
+        #[arg(long, help = "Проект (переопределяет --project задачи)")]
+        project: Option<String>,
     },
     /// Карточка задачи: колонки + свежие комменты
     Get {
@@ -625,7 +627,17 @@ pub async fn run() -> anyhow::Result<()> {
                         affine_blob::attach_files(&cfg, &row.body_doc, &attach).await?;
                     }
                 }
-                TaskSub::List { status } => {
+                TaskSub::List {
+                    status,
+                    project: proj_override,
+                } => {
+                    let project = proj_override
+                        .or_else(|| Some(project.clone()))
+                        .unwrap_or_else(|| "uwuwu".to_string());
+                    let mut client = affine_client::AffineClient::connect(&cfg).await?;
+                    let board = affine_tasks::find_board(&mut client, &cfg, &project)
+                        .await
+                        .with_context(|| format!("доска проекта «{project}» не найдена"))?;
                     let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let filtered: Vec<_> = rows
                         .iter()
