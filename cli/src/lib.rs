@@ -614,21 +614,19 @@ pub async fn run() -> anyhow::Result<()> {
                     } else {
                         String::new()
                     };
-                    let row = affine_tasks::create_task(
-                        &mut client,
-                        &cfg,
-                        &board,
-                        &title,
-                        &body,
-                        &attach,
-                    )
-                    .await?;
+                    let row =
+                        affine_tasks::create_task(&mut client, &cfg, &board, &title, &body).await?;
                     println!("создана: {}", row.title);
                     println!("  строка: {}", row.row_id);
                     println!("  тело:   {}", row.body_doc);
+                    // аттачи — после «создана»: сбой не прячет id задачи,
+                    // ретрай create осознан (задача уже существует)
+                    if !attach.is_empty() {
+                        affine_blob::attach_files(&cfg, &row.body_doc, &attach).await?;
+                    }
                 }
                 TaskSub::List { status } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let filtered: Vec<_> = rows
                         .iter()
                         .filter(|r| {
@@ -653,7 +651,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                 }
                 TaskSub::Get { id } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let row = affine_tasks::resolve_row(&rows, &id)?;
                     println!("Задача:   {}", row.title);
                     println!("Статус:   {}", row.status);
@@ -686,7 +684,7 @@ pub async fn run() -> anyhow::Result<()> {
                     pr,
                     branch,
                 } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let row = affine_tasks::resolve_row(&rows, &id)?;
                     let patch = affine_tasks::RowPatch {
                         status: status.clone(),
@@ -698,7 +696,7 @@ pub async fn run() -> anyhow::Result<()> {
                     println!("обновлено: {}", row.title);
                 }
                 TaskSub::Comment { id, stdin, text } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let row = affine_tasks::resolve_row(&rows, &id)?;
                     let body = facts::read_text(stdin, &text)?;
                     if body.trim().is_empty() {
@@ -708,7 +706,7 @@ pub async fn run() -> anyhow::Result<()> {
                     println!("коммент отправлен: {}", truncate(&body, 60));
                 }
                 TaskSub::Close { id, note } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     let row = affine_tasks::resolve_row(&rows, &id)?;
                     let patch = affine_tasks::RowPatch {
                         status: Some("Done".into()),

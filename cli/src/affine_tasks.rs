@@ -74,12 +74,23 @@ pub struct TaskRow {
     pub branch: String,
 }
 
-/// Прочитать все строки доски.
+/// Прочитать все строки доски. Заголовки линкованных строк резолвятся
+/// из контент-кэша (sync уже принёс тела задач) и только при промахе —
+/// get_doc-ом: без кэша list делал бы N round-trip-ов до Сингапура.
 pub async fn read_rows(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     board: &Board,
+    root: &std::path::Path,
 ) -> Result<Vec<TaskRow>> {
+    let cache_titles: std::collections::BTreeMap<String, String> =
+        crate::content_cache::ContentCache::load(root)
+            .map(|c| {
+                c.iter()
+                    .map(|(_, d)| (d.doc_id.clone(), d.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
     let resp = client
         .call_tool(
             "read_database_cells",
@@ -110,20 +121,25 @@ pub async fn read_rows(
             .unwrap_or(" ")
             .trim()
             .to_string();
-        // linked rows carry their title on the linked page, not the cell
+        // linked rows carry their title on the linked page, not the
+        // cell: the "title" cell is a single-space LinkedPage reference,
+        // blank after trim — resolve from the cache, network on miss
         if title.is_empty() && !linked.is_empty() {
-            if let Ok(doc) = client
-                .call_tool(
-                    "get_doc",
-                    json!({"workspaceId": cfg.workspace, "docId": linked}),
-                )
-                .await
-            {
-                title = doc
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string();
+            title = cache_titles.get(&linked).cloned().unwrap_or_default();
+            if title.is_empty() {
+                if let Ok(doc) = client
+                    .call_tool(
+                        "get_doc",
+                        json!({"workspaceId": cfg.workspace, "docId": linked}),
+                    )
+                    .await
+                {
+                    title = doc
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                }
             }
         }
         out.push(TaskRow {
@@ -176,7 +192,6 @@ pub async fn create_task(
     board: &Board,
     title: &str,
     body_markdown: &str,
-    attach_paths: &[std::path::PathBuf],
 ) -> Result<TaskRow> {
     // 1. док-тело — ребёнок доски
     let md = if body_markdown.trim().is_empty() {
@@ -216,6 +231,41 @@ pub async fn create_task(
                 json!({"workspaceId": cfg.workspace, "tag": "таск"}),
             )
             .await;
+        // cross-machine race: a concurrent create may land the same name.
+        // delete_tag works by name only, so duplicates get disarmed by a
+        // name-reset (delete + single re-create) — the #7 requests lesson
+        if let Ok(relist) = client
+            .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
+            .await
+        {
+            let dup = relist
+                .get("tags")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|x| {
+                            x.get("name").and_then(|n| n.as_str()) == Some("таск")
+                                || x.get("tag").and_then(|n| n.as_str()) == Some("таск")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if dup > 1 {
+                let _ = client
+                    .call_tool(
+                        "delete_tag",
+                        json!({"workspaceId": cfg.workspace, "tag": "таск"}),
+                    )
+                    .await;
+                let _ = client
+                    .call_tool(
+                        "create_tag",
+                        json!({"workspaceId": cfg.workspace, "tag": "таск"}),
+                    )
+                    .await;
+                eprintln!("affine: гонка тега «таск» разряжена (name-reset)");
+            }
+        }
     }
     let _ = client
         .call_tool(
@@ -236,11 +286,6 @@ pub async fn create_task(
         .await
         .context("add_database_row")?;
     let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
-
-    // 4. аттачи в тело
-    if !attach_paths.is_empty() {
-        crate::affine_blob::attach_files(cfg, &body_doc, attach_paths).await?;
-    }
 
     Ok(TaskRow {
         row_id,
@@ -355,6 +400,13 @@ pub async fn recent_comments(
                 .and_then(|p| p.as_str())
                 .unwrap_or_default()
                 .to_string();
+            // fresh comments may carry an empty preview — walk the
+            // snapshot blocks for the actual text deltas
+            let preview = if preview.trim().is_empty() {
+                snapshot_text(&content)
+            } else {
+                preview
+            };
             let resolved = node
                 .get("resolved")
                 .and_then(|r| r.as_bool())
@@ -373,6 +425,34 @@ fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
         .map(String::from)
+}
+
+/// Concatenate all text deltas from a comment's snapshot block tree.
+fn snapshot_text(content: &Value) -> String {
+    fn walk(node: &Value, out: &mut String) {
+        if let Some(delta) = node
+            .get("props")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.get("delta"))
+            .and_then(|d| d.as_array())
+        {
+            for d in delta {
+                if let Some(ins) = d.get("insert").and_then(|i| i.as_str()) {
+                    out.push_str(ins);
+                }
+            }
+        }
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            for ch in children {
+                walk(ch, out);
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(blocks) = content.get("snapshot").and_then(|s| s.get("blocks")) {
+        walk(blocks, &mut out);
+    }
+    out.trim().to_string()
 }
 
 #[cfg(test)]
