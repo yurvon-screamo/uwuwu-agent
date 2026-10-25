@@ -97,8 +97,8 @@ function saveState(state: CronState): void {
 interface BoardIds { docId: string; dbId: string }
 
 async function findBoard(): Promise<BoardIds> {
-  const r = await mcp.tool<{ matches?: { id: string }[] }>("find_doc_by_title", { title: BOARD_TITLE, caseInsensitive: true, limit: 1 })
-  const docId = r.matches?.[0]?.id
+  const r = await mcp.tool<{ matches?: { id: string; inTrash?: boolean }[] }>("find_doc_by_title", { title: BOARD_TITLE, caseInsensitive: true, limit: 5 })
+  const docId = r.matches?.find(m => m.inTrash !== true)?.id
   if (docId === undefined) throw new Error(`доска «${BOARD_TITLE}» не найдена`)
   const doc = await mcp.tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
   const dbId = doc.blocks?.find((b) => b.flavour === "affine:database" || b.flavour === "affine:data_view")?.id

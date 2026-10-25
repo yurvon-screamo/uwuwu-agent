@@ -33,14 +33,18 @@ pub async fn find_board_by_title(
     let resp = client
         .call_tool(
             "find_doc_by_title",
-            json!({"workspaceId": cfg.workspace, "title": title, "caseInsensitive": true, "limit": 1}),
+            json!({"workspaceId": cfg.workspace, "title": title, "caseInsensitive": true, "limit": 5}),
         )
         .await
         .context("find_doc_by_title")?;
+    // трэшнутые доки остаются в поиске — берём первый живой
     let doc_id = resp
         .get("matches")
         .and_then(|m| m.as_array())
-        .and_then(|arr| arr.first())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("inTrash").and_then(|t| t.as_bool()) != Some(true))
+        })
         .and_then(|m| m.get("id"))
         .and_then(|v| v.as_str())
         .map(String::from)
