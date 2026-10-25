@@ -58,7 +58,7 @@ MIT
 ### Фабрика разработки (uwuwu-factory)
 
 Issue-driven → **task-driven**: задачи = строки канбан-досок `<Proj> Tasks` (uwuwu, origa —
-cutover с gh-ишью 25.10), тела задач = доки с тегом «таск», диалог = нативные комменты.
+cutover с gh-ишью 25.10), тела задач = доки с тегом «Task», диалог = нативные комменты.
 Демон (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+kickoff → In Progress →
 коммент-мост (🤖-фильтр) → PR → Review → MERGED → Done + cleanup.
 `factory/` — Bun/TS: multi-project конфиг, session-recovery MCP, state+reconcile.

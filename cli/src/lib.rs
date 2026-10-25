@@ -52,7 +52,7 @@ struct Cli {
 /// Сабкоманды uwuwu-cli task.
 #[derive(clap::Subcommand)]
 enum TaskSub {
-    /// Создать задачу: док-тело (тег «таск») + строка Todo
+    /// Создать задачу: док-тело (тег «Task») + строка Todo
     Create {
         #[arg(long, help = "Заголовок задачи")]
         title: String,
@@ -244,7 +244,7 @@ enum Commands {
         command: CronSub,
     },
     /// Kanban tasks on AFFiNE (`<Proj> Tasks` boards): create/list/get/
-    /// edit/comment/close. Body doc gets the «таск» tag; comments are
+    /// edit/comment/close. Body doc gets the «Task» tag; comments are
     /// native AFFiNE comments on the body.
     Task {
         #[command(subcommand)]
@@ -708,7 +708,7 @@ pub async fn run() -> anyhow::Result<()> {
                     let _ = client
                         .call_tool(
                             "add_tag_to_doc",
-                            json!({"workspaceId": cfg.workspace, "docId": body, "tag": "таск"}),
+                            json!({"workspaceId": cfg.workspace, "docId": body, "tag": affine_tasks::CRON_TAG}),
                         )
                         .await;
                     let row = client

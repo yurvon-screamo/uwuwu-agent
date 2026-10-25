@@ -2,12 +2,17 @@
 //!
 //! Модель (см. док «Фабрика разработки на AFFiNE»): задача = строка
 //! database в доске проекта (`<Proj> Tasks`) + линкованный док-тело с
-//! тегом «таск». Комменты — нативные комменты афины к доку-телу.
+//! тегом «Task». Комменты — нативные комменты афины к доку-телу.
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::{json, Value};
 
 use crate::affine_client::{AffineClient, AffineConfig};
+
+/// Тег тел задач (доки-тела на досках <Proj> Tasks).
+pub const TAG: &str = "Task";
+/// Тег тел крон (доска Crons).
+pub const CRON_TAG: &str = "Cron";
 
 /// Доска проекта: док + database-блок внутри него.
 pub struct Board {
@@ -222,7 +227,7 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
     )
 }
 
-/// Создать задачу: док-тело (тег «таск») + строка Todo, слинкованная с телом.
+/// Создать задачу: док-тело (тег «Task») + строка Todo, слинкованная с телом.
 pub async fn create_task(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -246,7 +251,7 @@ pub async fn create_task(
     let body_doc = first_str(&resp, &["docId", "id"])
         .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
 
-    // 2. тег «таск» (идемпотентно)
+    // 2. тег «Task» (идемпотентно)
     let tags = client
         .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
         .await;
@@ -255,8 +260,8 @@ pub async fn create_task(
         .and_then(|t| {
             t.get("tags").and_then(|a| a.as_array()).map(|arr| {
                 arr.iter().any(|x| {
-                    x.get("name").and_then(|n| n.as_str()) == Some("таск")
-                        || x.get("tag").and_then(|n| n.as_str()) == Some("таск")
+                    x.get("name").and_then(|n| n.as_str()) == Some(TAG)
+                        || x.get("tag").and_then(|n| n.as_str()) == Some(TAG)
                 })
             })
         })
@@ -265,7 +270,7 @@ pub async fn create_task(
         let _ = client
             .call_tool(
                 "create_tag",
-                json!({"workspaceId": cfg.workspace, "tag": "таск"}),
+                json!({"workspaceId": cfg.workspace, "tag": TAG}),
             )
             .await;
         // cross-machine race: a concurrent create may land the same name.
@@ -284,8 +289,8 @@ pub async fn create_task(
                 .map(|arr| {
                     arr.iter()
                         .filter(|x| {
-                            x.get("name").and_then(|n| n.as_str()) == Some("таск")
-                                || x.get("tag").and_then(|n| n.as_str()) == Some("таск")
+                            x.get("name").and_then(|n| n.as_str()) == Some(TAG)
+                                || x.get("tag").and_then(|n| n.as_str()) == Some(TAG)
                         })
                         .count()
                 })
@@ -294,23 +299,23 @@ pub async fn create_task(
                 let _ = client
                     .call_tool(
                         "delete_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": "таск"}),
+                        json!({"workspaceId": cfg.workspace, "tag": TAG}),
                     )
                     .await;
                 let _ = client
                     .call_tool(
                         "create_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": "таск"}),
+                        json!({"workspaceId": cfg.workspace, "tag": TAG}),
                     )
                     .await;
-                eprintln!("affine: гонка тега «таск» разряжена (name-reset)");
+                eprintln!("affine: гонка тега {TAG} разряжена… заменяю (name-reset)");
             }
         }
     }
     let _ = client
         .call_tool(
             "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": "таск"}),
+            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": TAG}),
         )
         .await;
 
