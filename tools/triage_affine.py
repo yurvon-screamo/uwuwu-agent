@@ -221,9 +221,11 @@ def mcp_call(
     if not body.strip():
         # 202 на notification — пустое тело валидно
         return {}, sid or ""
-    if body.startswith("event:"):
-        data = [ln[6:] for ln in body.splitlines() if ln.startswith("data: ")]
-        body = data[-1] if data else "{}"
+    # SSE-стрим: сервер может слать ": keepalive"-комментарии ДО event/data
+    # (замечено на больших ответах ~400KB — дерево воркспейса)
+    data_lines = [ln[6:] for ln in body.splitlines() if ln.startswith("data: ")]
+    if data_lines:
+        body = data_lines[-1]
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as e:
