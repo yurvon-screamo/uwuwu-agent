@@ -10,6 +10,7 @@ pub mod affine_search_server;
 pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
+pub mod affine_tasks;
 pub mod content_cache;
 pub mod embed;
 pub mod fact_index;
@@ -45,6 +46,63 @@ pub fn wiki_root() -> PathBuf {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Сабкоманды uwuwu-cli task.
+#[derive(clap::Subcommand)]
+enum TaskSub {
+    /// Создать задачу: док-тело (тег «таск») + строка Todo
+    Create {
+        #[arg(long, help = "Заголовок задачи")]
+        title: String,
+        #[arg(long, help = "Текст тела из stdin (опционально)")]
+        stdin: bool,
+        #[arg(
+            long = "attach",
+            value_name = "FILE",
+            help = "Аттач в тело (repeatable)"
+        )]
+        attach: Vec<std::path::PathBuf>,
+    },
+    /// Очередь задач доски
+    List {
+        #[arg(long, help = "Фильтр по статусу (todo|design|in progress|…)")]
+        status: Option<String>,
+    },
+    /// Карточка задачи: колонки + свежие комменты
+    Get {
+        #[arg(help = "row-id / doc-id / уникальный префикс")]
+        id: String,
+    },
+    /// Правка колонок строки
+    Edit {
+        #[arg(help = "row-id / doc-id / префикс")]
+        id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        pr: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Коммент в док задачи (диалог юзер ↔ агент)
+    Comment {
+        #[arg(help = "row-id / doc-id / префикс")]
+        id: String,
+        #[arg(long, help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(trailing_var_arg = true, help = "Текст коммента")]
+        text: Vec<String>,
+    },
+    /// Закрыть задачу (Done) с опциональной заметкой
+    Close {
+        #[arg(help = "row-id / doc-id / префикс")]
+        id: String,
+        #[arg(long, help = "Заметка-коммент при закрытии")]
+        note: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +209,16 @@ enum Commands {
     /// Write a document straight into AFFiNE: markdown from stdin → doc.
     /// `<slug>` (experience) or --project <proj> <slug> (project doc).
     /// Env: UWUWU_AFFINE_URL/TOKEN/WORKSPACE_ID.
+    /// Kanban tasks on AFFiNE (`<Proj> Tasks` boards): create/list/get/
+    /// edit/comment/close. Body doc gets the «таск» tag; comments are
+    /// native AFFiNE comments on the body.
+    Task {
+        #[command(subcommand)]
+        command: TaskSub,
+        /// Project board (default: uwuwu)
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Refresh local caches from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
     Refresh,
@@ -207,6 +275,15 @@ fn valid_date(s: &str) -> bool {
     }
     let num = |from: usize, to: usize| -> u32 { s[from..to].parse().unwrap_or(0) };
     (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
+    }
 }
 
 fn init_tracing() {
@@ -517,6 +594,133 @@ pub async fn run() -> anyhow::Result<()> {
             let source = source.unwrap_or_else(|| format!("manual/{today}"));
             let out = facts::run_facts(&text, &source, &date, stdin).await;
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Commands::Task { command, project } => {
+            let project = project.unwrap_or_else(|| "uwuwu".to_string());
+            let mut client = affine_client::AffineClient::connect(&cfg).await?;
+            let board = affine_tasks::find_board(&mut client, &cfg, &project)
+                .await
+                .with_context(|| format!("доска проекта «{project}» не найдена"))?;
+            match command {
+                TaskSub::Create {
+                    title,
+                    stdin,
+                    attach,
+                } => {
+                    let body = if stdin {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                        buf
+                    } else {
+                        String::new()
+                    };
+                    let row = affine_tasks::create_task(
+                        &mut client,
+                        &cfg,
+                        &board,
+                        &title,
+                        &body,
+                        &attach,
+                    )
+                    .await?;
+                    println!("создана: {}", row.title);
+                    println!("  строка: {}", row.row_id);
+                    println!("  тело:   {}", row.body_doc);
+                }
+                TaskSub::List { status } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let filtered: Vec<_> = rows
+                        .iter()
+                        .filter(|r| {
+                            status
+                                .as_deref()
+                                .map(|s| r.status.to_lowercase().starts_with(&s.to_lowercase()))
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        println!("Задач нет.");
+                    }
+                    println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
+                    for r in &filtered {
+                        println!(
+                            "{:<13} {:<12} {:<34} {}",
+                            r.status,
+                            &r.row_id[..r.row_id.len().min(12)],
+                            truncate(&r.title, 32),
+                            r.pr
+                        );
+                    }
+                }
+                TaskSub::Get { id } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    println!("Задача:   {}", row.title);
+                    println!("Статус:   {}", row.status);
+                    if !row.pr.is_empty() {
+                        println!("PR:       {}", row.pr);
+                    }
+                    if !row.branch.is_empty() {
+                        println!("Ветка:    {}", row.branch);
+                    }
+                    println!("Строка:   {}", row.row_id);
+                    if !row.body_doc.is_empty() {
+                        println!(
+                            "Тело:     https://affine.up.railway.app/workspace/{}/{}",
+                            cfg.workspace, row.body_doc
+                        );
+                        let comments =
+                            affine_tasks::recent_comments(&mut client, &cfg, row, 5).await?;
+                        if !comments.is_empty() {
+                            println!("Комменты:");
+                            for (text, _) in comments {
+                                println!("  • {}", truncate(&text, 90));
+                            }
+                        }
+                    }
+                }
+                TaskSub::Edit {
+                    id,
+                    status,
+                    title,
+                    pr,
+                    branch,
+                } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let patch = affine_tasks::RowPatch {
+                        status: status.clone(),
+                        title: title.clone(),
+                        pr: pr.clone(),
+                        branch: branch.clone(),
+                    };
+                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    println!("обновлено: {}", row.title);
+                }
+                TaskSub::Comment { id, stdin, text } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let body = facts::read_text(stdin, &text)?;
+                    if body.trim().is_empty() {
+                        anyhow::bail!("пустой коммент");
+                    }
+                    affine_tasks::comment_task(&mut client, &cfg, row, &body).await?;
+                    println!("коммент отправлен: {}", truncate(&body, 60));
+                }
+                TaskSub::Close { id, note } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board).await?;
+                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let patch = affine_tasks::RowPatch {
+                        status: Some("Done".into()),
+                        ..Default::default()
+                    };
+                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    if let Some(note) = note {
+                        affine_tasks::comment_task(&mut client, &cfg, row, &note).await?;
+                    }
+                    println!("закрыта: {}", row.title);
+                }
+            }
         }
         Commands::Refresh => {
             let mut client = affine_client::AffineClient::connect(&cfg).await?;
