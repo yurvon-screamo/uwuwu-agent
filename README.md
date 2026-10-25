@@ -52,6 +52,30 @@ MIT
 
 ## AFFiNE-first (2026-10)
 
+Вся база знаний живёт в AFFiNE (Railway): articles/requests/facts через `uwuwu-cli`,
+прямой доступ к докам — MCP-шлюз (107 tools).
+
+### Фабрика разработки (uwuwu-factory)
+
+Issue-driven → **task-driven**: задачи = строки канбан-досок `<Proj> Tasks` (uwuwu, origa —
+cutover с gh-ишью 25.10), тела задач = доки с тегом «таск», диалог = нативные комменты.
+Демон (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+kickoff → In Progress →
+коммент-мост (🤖-фильтр) → PR → Review → MERGED → Done + cleanup.
+`factory/` — Bun/TS: multi-project конфиг, session-recovery MCP, state+reconcile.
+
+### Кроны (uwuwu-cron)
+
+Доска «Crons»: Schedule (cron-expr | `5m/2h/1d` | разовое `09:30`), промпт = тело-док.
+Демон (тик 1 мин) поднимает сессию агента по расписанию — отчёты комментами 🤖 в тело.
+Заменяют сессионные cron_set: переживают сессии, видны в UI, с историей.
+
+### CLI
+
+`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
+(id/заголовок, фоллбек Crons); `request` (properties+attach), `facts`, `search`
+(сервер Manticore + семантика), `read/blob/shot` (мультимодальное чтение).
+
+
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
 share one workspace; locally only operational caches live.
 
