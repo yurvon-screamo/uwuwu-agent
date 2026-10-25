@@ -31,7 +31,11 @@ PAUSE = 120
 
 
 def session() -> str:
+    """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
+    (HTTP 503, URLError/timeout); фатальные SystemExit от mcp_result
+    (isError/JSON-RPC error) — сразу наверх с причиной."""
     for attempt in range(RETRIES):
+        sid = None
         try:
             resp, sid = mcp_call(
                 "initialize",
@@ -41,19 +45,35 @@ def session() -> str:
                     "clientInfo": {"name": "wiki-ops", "version": "1"},
                 },
             )
-            mcp_result(resp)
+            mcp_result(resp)  # SystemExit здесь = фатально, не ретраим
             mcp_call("notifications/initialized", {}, sid, notify=True)
             return sid
-        except (SystemExit, urllib.error.HTTPError) as e:
-            if attempt == RETRIES - 1:
+        except SystemExit:
+            if sid:
+                close(sid)
+            raise
+        except urllib.error.HTTPError as e:
+            if sid:
+                close(sid)
+            if e.code != 503:
                 raise
-            print(
-                f"шлюз занят ({attempt + 1}): {str(e)[:60]}; пауза {PAUSE}с",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(PAUSE)
+            _retry_wait(attempt, e)
+        except urllib.error.URLError as e:
+            if sid:
+                close(sid)
+            _retry_wait(attempt, e)
+        # успешный путь: sid возвращается живым — close только в НЕУСПЕШНЫХ ветках
+        # (finally закрыл бы сессию и при return — call после session ловил 404)
     raise RuntimeError("unreachable")
+
+
+def _retry_wait(attempt: int, e: Exception) -> None:
+    print(
+        f"шлюз занят/недоступен ({attempt + 1}/{RETRIES}): {str(e)[:60]}; пауза {PAUSE}с",
+        file=sys.stderr,
+        flush=True,
+    )
+    time.sleep(PAUSE)
 
 
 def close(sid: str) -> None:
@@ -218,7 +238,7 @@ def cmd_children(a) -> int:
                     t = c.get("title") or ""
                     print(
                         c["docId"],
-                        t if "\\u" not in t else t.encode().decode("unicode_escape"),
+                        json.loads(f'"{t}"') if "\\u" in t else t,
                     )
                 return 0
         print("не найден", file=sys.stderr)
@@ -233,8 +253,9 @@ def cmd_find(a) -> int:
         res = call(sid, "list_workspace_tree", {"workspaceId": WORKSPACE, "depth": 4})
         s = json.dumps(res)
         pat = re.compile(
-            r'"docId"\s*:\s*"([^"]+)"[^}]{0,300}?"title"\s*:\s*"((?:[^"\\]|\\.)*%s(?:[^"\\]|\\.)*)"'
-            % re.escape(a.query),
+            r'"docId"\s*:\s*"([^"]+)"[^}]{0,300}?"title"\s*:\s*"((?:[^"\\]|\\.)*'
+            + re.escape(a.query)
+            + r'(?:[^"\\]|\\.)*)"',
             re.IGNORECASE,
         )
         hits = pat.findall(s)
@@ -242,8 +263,9 @@ def cmd_find(a) -> int:
             hits = [
                 (d, t)
                 for t, d in re.findall(
-                    r'"title"\s*:\s*"((?:[^"\\]|\\.)*%s(?:[^"\\]|\\.)*)"[^}]{0,300}?"docId"\s*:\s*"([^"]+)"'
-                    % re.escape(a.query),
+                    r'"title"\s*:\s*"((?:[^"\\]|\\.)*'
+                    + re.escape(a.query)
+                    + r'(?:[^"\\]|\\.)*)"[^}]{0,300}?"docId"\s*:\s*"([^"]+)"',
                     s,
                     re.IGNORECASE,
                 )
