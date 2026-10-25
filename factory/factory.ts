@@ -4,7 +4,7 @@
 // в сессию (фильтр 🤖), следит за PR (Review → MERGED → Done + чистка).
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "./mcp"
@@ -111,6 +111,9 @@ function loadState(): FactoryState {
 
 function saveState(state: FactoryState): void {
   mkdirSync(STATE_DIR, { recursive: true })
+  if (existsSync(STATE_FILE)) {
+    try { copyFileSync(STATE_FILE, `${STATE_FILE}.bak`) } catch {}
+  }
   const tmp = `${STATE_FILE}.tmp`
   writeFileSync(tmp, JSON.stringify(state, null, 2))
   renameSync(tmp, STATE_FILE)
@@ -185,24 +188,43 @@ async function taskBody(bodyDoc: string): Promise<string> {
   return r.markdown ?? "(пусто)"
 }
 
+interface CommentEdge { node?: { id?: string; content?: unknown } }
+
+async function commentPage(bodyDoc: string, after: string): Promise<{
+  edges: CommentEdge[]
+  endCursor: string
+  hasNext: boolean
+}> {
+  const args: Record<string, unknown> = { docId: bodyDoc, first: 50 }
+  if (after !== "") args.after = after
+  const r = await mcp.tool<{
+    edges?: CommentEdge[]
+    pageInfo?: { hasNextPage?: boolean; endCursor?: string }
+  }>("list_comments", args)
+  return {
+    edges: r.edges ?? [],
+    endCursor: r.pageInfo?.endCursor ?? "",
+    hasNext: r.pageInfo?.hasNextPage === true,
+  }
+}
+
+/** ВСЕ комменты тела с relay-пагинацией (без досылки мост слепнет на
+ *  задачах с длинной историей: 50-окно роняет свежие комменты). */
 async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
   if (bodyDoc === "") return []
-  const r = await mcp.tool<{
-    edges?: {
-      node?: {
-        id?: string
-        content?: unknown
-        resolved?: boolean
-      }
-    }[]
-  }>("list_comments", { docId: bodyDoc, first: 50 })
   const out: TaskComment[] = []
-  for (const e of r.edges ?? []) {
-    const n = e.node
-    if (n === undefined || typeof n.id !== "string") continue
-    const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
-    const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
-    out.push({ id: n.id, text: snapshotText(n.content), createdAt: created })
+  let cursor = ""
+  for (let page = 0; page < 10; page++) {
+    const { edges, endCursor, hasNext } = await commentPage(bodyDoc, cursor)
+    for (const e of edges) {
+      const n = e.node
+      if (n === undefined || typeof n.id !== "string") continue
+      const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
+      const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
+      out.push({ id: n.id, text: snapshotText(n.content), createdAt: created })
+    }
+    if (!hasNext || endCursor === "") break
+    cursor = endCursor
   }
   return out
 }
@@ -481,6 +503,29 @@ async function tick(state: FactoryState): Promise<void> {
 
     if (row.status === "Review" && row.pr !== "") {
       if (await checkMerged(row, board, state)) continue
+    }
+
+    // юзер перевёл живую задачу в Todo руками = «перезапусти»:
+    // молчать нельзя (сигнал потерян), затирать без предупреждения тоже
+    if (row.status === "Todo" && tracked.sessionID !== "") {
+      log(`задача ${rowId.slice(0, 8)}: юзер перевёл в Todo — перезапуск`)
+      await notify(tracked,
+        "🤖 [factory] вижу перевод в Todo — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
+      tracked.sessionID = ""
+      saveState(state)
+      const comments = (await taskComments(tracked.bodyDoc)).filter(isUserComment)
+      const last = comments.length > 0 ? comments[comments.length - 1] : null
+      if (last !== null) {
+        tracked.lastCommentAt = last.createdAt
+        tracked.lastCommentId = last.id
+        saveState(state)
+      }
+      try {
+        await startTask(row, board, state, tracked.attempts)
+      } catch (e) {
+        await registerFailure(row, board, state, tracked.attempts, e)
+      }
+      continue
     }
 
     const comments = await taskComments(tracked.bodyDoc)

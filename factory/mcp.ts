@@ -1,5 +1,7 @@
 // mcp.ts — минимальный JSON-RPC клиент MCP-шлюза AFFiNE для демона.
 // Сессия одна на процесс; tool-ошибки ({ok:false} внутри HTTP 200) — исключения.
+// Протухшая сессия (шлюз редеплоился → 404) — сброс + один ретрай: демон
+// long-running, слепнуть навсегда нельзя.
 
 const URL_ = process.env.UWUWU_AFFINE_URL ?? "https://affine-mcp-production.up.railway.app/mcp"
 const TOKEN = process.env.UWUWU_AFFINE_TOKEN ?? ""
@@ -13,27 +15,33 @@ if (TOKEN === "" || WORKSPACE === "") {
 let session: string | null = null
 let nextId = 0
 
-async function rpc(method: string, params: unknown): Promise<unknown> {
+class SessionExpired extends Error {}
+
+async function rpc(method: string, params: unknown, sid: string): Promise<unknown> {
   const headers: Record<string, string> = {
     authorization: `Bearer ${TOKEN}`,
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
+    "mcp-session-id": sid,
   }
-  if (session !== null) headers["mcp-session-id"] = session
   const res = await fetch(URL_, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
     signal: AbortSignal.timeout(60_000),
   })
-  const sid = res.headers.get("mcp-session-id")
-  if (sid !== null) session = sid
+  if (res.status === 404 || res.status === 400) throw new SessionExpired(`HTTP ${res.status}`)
   if (!res.ok) throw new Error(`mcp HTTP ${res.status}`)
   const text = await res.text()
   for (const line of text.split("\n")) {
     if (!line.startsWith("data: ")) continue
-    const msg = JSON.parse(line.slice(6)) as {
-      result?: { isError?: boolean; content?: { type: string; text?: string }[]; structuredContent?: unknown; error?: unknown }
+    let msg: {
+      result?: { isError?: boolean; content?: { type: string; text?: string }[]; structuredContent?: unknown }
+    }
+    try {
+      msg = JSON.parse(line.slice(6))
+    } catch {
+      continue // мусорная SSE-строка — не роняем тик
     }
     if (msg.result === undefined) continue
     if (msg.result.isError) {
@@ -61,25 +69,59 @@ async function rpc(method: string, params: unknown): Promise<unknown> {
   return {}
 }
 
-export async function connect(): Promise<void> {
-  await rpc("initialize", {
-    protocolVersion: "2025-03-26",
-    capabilities: {},
-    clientInfo: { name: "uwuwu-factory", version: "0.1.0" },
+async function handshake(): Promise<string> {
+  const res = await fetch(URL_, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: ++nextId,
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "uwuwu-factory", version: "0.1.0" } },
+    }),
+    signal: AbortSignal.timeout(60_000),
   })
+  if (!res.ok) throw new Error(`mcp initialize HTTP ${res.status}`)
+  const sid = res.headers.get("mcp-session-id")
+  if (sid === null) throw new Error("mcp initialize: нет mcp-session-id")
   await fetch(URL_, {
     method: "POST",
     headers: {
       authorization: `Bearer ${TOKEN}`,
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
-      "mcp-session-id": session ?? "",
+      "mcp-session-id": sid,
     },
     body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
   }).catch(() => {})
+  return sid
+}
+
+export async function connect(): Promise<void> {
+  session = await handshake()
 }
 
 export async function tool<T = Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> {
-  if (session === null) await connect()
-  return (await rpc("tools/call", { name, arguments: { workspaceId: WORKSPACE, ...args } })) as T
+  if (session === null) session = await handshake()
+  const call = (sid: string): Promise<unknown> =>
+    rpc("tools/call", { name, arguments: { workspaceId: WORKSPACE, ...args } }, sid)
+  try {
+    return (await call(session)) as T
+  } catch (e) {
+    if (!(e instanceof SessionExpired)) throw e
+    // шлюз редеплоился: новая сессия и один ретрай
+    session = await handshake()
+    return (await call(session)) as T
+  }
+}
+
+/** Только для тестов: подменить сессию битой (симуляция редеплоя шлюза). */
+export const __test = {
+  expireSession(): void {
+    session = "bogus-session-id"
+  },
 }
