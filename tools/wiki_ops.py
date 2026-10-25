@@ -3,7 +3,7 @@
 
 Одна сессия на вызов, DELETE-закрытие в finally, 503-ретраи с паузами.
 Гоча argparse: docId с ВЕДУЩИМ дефисом (напр. -GnAmdAk45) парсится как флаг —
-передавай его после `--` (wiki_ops.py move -- -GnAmdAk45 --parent X).
+опции ставь ДО `--`: wiki_ops.py move --parent <id> -- -GnAmdAk45.
 
 Команды:
   create <тайтл> <файл.md> [--parent <docId>]   — создать док (опц. сразу под родителя), печатает docId
