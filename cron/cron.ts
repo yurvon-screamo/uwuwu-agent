@@ -258,11 +258,20 @@ async function main(): Promise<void> {
   log(`uwuwu-cron: старт (board=${BOARD_TITLE}, tick=${TICK_SEC}s, model=${MODEL.id})`)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
+  let consecutiveFails = 0
   while (true) {
     try {
       await tick(state)
+      consecutiveFails = 0
     } catch (e) {
-      log(`tick: ${e}`)
+      consecutiveFails++
+      log(`tick (${consecutiveFails} подряд): ${e}`)
+      if (consecutiveFails >= 5) {
+        // отравленное соединение/пул: свежий процесс чище вечных ретраев
+        log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")
+        process.exit(1)
+      }
+      await mcp.connect().catch(() => {}) // попробовать пересобрать сессию сразу
     }
     if (ONCE) {
       log("ONCE-режим: тик выполнен — выходим")

@@ -61,11 +61,12 @@ describe("due", () => {
     const off = new Date("2026-10-25T12:31:00")
     expect(due(s, 0, off)).toBe(false)
   })
-  test("at: только своя минута, один раз", () => {
+  test("at: своя минута и догон, один раз", () => {
     const s = parseSchedule("09:30")!
     expect(due(s, 0, new Date("2026-10-25T09:30:00"))).toBe(true)
     expect(due(s, minuteStart(new Date("2026-10-25T09:30:00")), new Date("2026-10-25T09:30:30"))).toBe(false)
-    expect(due(s, 0, new Date("2026-10-25T09:31:00"))).toBe(false)
+    expect(due(s, 0, new Date("2026-10-25T09:31:00"))).toBe(true) // догон после дауна
+    expect(due(s, 0, new Date("2026-10-25T09:29:00"))).toBe(false) // рано
   })
   test("at с датой", () => {
     const s = parseSchedule("09:30 01.12")!
@@ -116,5 +117,16 @@ describe("parseSchedule: мусорные cron-поля", () => {
     expect(parseSchedule("* 25 * * *")).toBeNull() // 25 часа — вне диапазона, теперь null
     expect(parseSchedule("*/ * * * *")).toBeNull()
     expect(parseSchedule("1-2-3 * * * *")).toBeNull()
+  })
+})
+
+describe("at: догон пропущенной минуты", () => {
+  test("минута прошла пока демон лежал — стреляем поздно", () => {
+    const s = parseSchedule("09:30")!
+    expect(due(s, 0, new Date("2026-10-25T09:37:12"))).toBe(true)
+  })
+  test("минута ещё не наступила — нет", () => {
+    const s = parseSchedule("09:30")!
+    expect(due(s, 0, new Date("2026-10-25T09:29:00"))).toBe(false)
   })
 })

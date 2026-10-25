@@ -119,9 +119,11 @@ export function due(sched: Sched, lastFiredAt: number, now: Date): boolean {
     case "cron":
       return cronMatches(sched.fields, now) && minuteStart(now) > lastFiredAt
     case "at": {
-      if (now.getHours() !== sched.hour || now.getMinutes() !== sched.minute) return false
       if (sched.day !== undefined && (now.getDate() !== sched.day || now.getMonth() + 1 !== (sched.month ?? now.getMonth() + 1))) return false
-      return minuteStart(now) > lastFiredAt
+      // догон: минута наступила (в т.ч. пропущена из-за дауна демона) —
+      // стреляем поздно один раз, авто-paused прикроет повтор
+      const scheduled = new Date(now.getFullYear(), now.getMonth(), now.getDate(), sched.hour, sched.minute)
+      return now.getTime() >= scheduled.getTime() && minuteStart(now) > lastFiredAt
     }
   }
 }

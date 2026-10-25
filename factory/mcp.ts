@@ -112,8 +112,10 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
   try {
     return (await call(session)) as T
   } catch (e) {
-    if (!(e instanceof SessionExpired)) throw e
-    // шлюз редеплоился: новая сессия и один ретрай
+    // протухшая сессия (редеплой шлюза) ИЛИ транспортный сбой
+    // (отравленный keep-alive сокет у долгоживущего процесса) —
+    // обе лечатся полной пересборкой сессии = новое соединение
+    session = null
     session = await handshake()
     return (await call(session)) as T
   }
