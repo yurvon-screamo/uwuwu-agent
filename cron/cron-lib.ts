@@ -51,9 +51,17 @@ export function parseSchedule(s: string): Sched | null {
   // каждое поле: запятая-список из (*|N[-M])[/step] — мусор вида "abc"
   // иначе парсится «легально» и молча не срабатывает никогда
   const partRe = /^(\*|\d+(?:-\d+)?)(?:\/\d+)?$/
-  const valid = fields.every(f =>
-    f.split(",").every(p => partRe.test(p) && !p.endsWith("/")),
-  )
+  const ranges: Array<[number, number]> = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]]
+  const valid = fields.every((f, i) => {
+    const [min, max] = ranges[i]!
+    return f.split(",").every(p => {
+      if (!partRe.test(p) || p.endsWith("/")) return false
+      const m = /^(\*|\d+)(?:-(\d+))?/.exec(p)!
+      const lo = m[1] === "*" ? min : Number(m[1])
+      const hi = m[2] !== undefined ? Number(m[2]) : lo
+      return lo >= min && hi <= max && lo <= hi
+    })
+  })
   return valid ? { kind: "cron", fields } : null
 }
 

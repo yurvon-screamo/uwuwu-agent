@@ -197,8 +197,11 @@ async function tick(state: CronState): Promise<void> {
   for (const row of rows) {
     if (row.status !== "active") continue
     const sched0 = parseSchedule(row.schedule)
-    // reconcile: разовый уже стрелял (демон упал до setCells) → дозаповедать
-    if (sched0 !== null && isOneShot(sched0) && (state.crons[row.rowId]?.lastFiredAt ?? 0) > 0) {
+    // reconcile: разовый уже стрелял (демон упал до setCells) → дозаповедать.
+    // окно 24ч: юзерский re-arm (paused→active руками) вне окна не гасится
+    const prevFire = state.crons[row.rowId]?.lastFiredAt ?? 0
+    if (sched0 !== null && isOneShot(sched0) && prevFire > 0
+        && now.getTime() - prevFire < 86_400_000) {
       await setCells(board, row.rowId, { Status: "paused" })
       log(`крон «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — paused (reconcile)`)
       continue
