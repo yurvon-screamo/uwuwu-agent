@@ -106,13 +106,21 @@ impl ContentCache {
                 "workspace tree came back empty — cache left untouched, run `uwuwu-cli refresh`"
             );
         }
-        // drop entries the workspace no longer has (trashed/deleted docs)
-        let live_ids: std::collections::HashSet<&str> =
-            nodes.iter().map(|n| n.doc_id.as_str()).collect();
-        self.docs
-            .retain(|_, doc| live_ids.contains(doc.doc_id.as_str()));
-        for node in nodes {
-            let kind = node.kind;
+        // Truncated-tree guard: the gateway nondeterministically returns a
+        // partial tree under session load (caught live twice on 24.10:
+        // ~250 of 848 nodes, exit 0, Daily/Projects/Requests silently
+        // wiped from the cache). A real workspace never shrinks 20%+ in
+        // one sync — bail instead of letting retain() cut live docs.
+        if !self.docs.is_empty() && tree_looks_truncated(nodes.len(), self.docs.len()) {
+            cache_bail!(
+                "workspace tree truncated: {} nodes vs {} cached (gateway flake?) — \
+                 cache left untouched, rerun `uwuwu-cli refresh`",
+                nodes.len(),
+                self.docs.len()
+            );
+        }
+        for node in &nodes {
+            let kind = node.kind.clone();
             let slug = node.slug.clone();
             if self.docs.contains_key(&slug) {
                 continue;
@@ -133,6 +141,15 @@ impl ContentCache {
                 },
             );
         }
+        // Drop entries the workspace no longer has (trashed/deleted docs).
+        // Deliberately AFTER the fetch loop: a mid-sync failure (`?` above)
+        // or a flaky gateway must never leave a cache with live docs cut —
+        // intermediate saves only ever ADD fetched docs on top of the old
+        // state, removals happen once the whole cycle succeeded.
+        let live_ids: std::collections::HashSet<&str> =
+            nodes.iter().map(|n| n.doc_id.as_str()).collect();
+        self.docs
+            .retain(|_, doc| live_ids.contains(doc.doc_id.as_str()));
         self.last_synced_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -170,6 +187,13 @@ fn flatten_tree(resp: &serde_json::Value) -> Vec<TreeNode> {
     // defensively: find every object with a docId/title pair.
     walk_nodes(resp, &mut Vec::new(), &mut out);
     out
+}
+
+/// A partial tree from the gateway must not look like mass deletions:
+/// if the node count dropped below 80% of the cached size, assume a
+/// truncation flake rather than real workspace shrinkage.
+fn tree_looks_truncated(nodes: usize, cached: usize) -> bool {
+    (nodes as f64) < 0.8 * (cached as f64)
 }
 
 fn walk_nodes(value: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<TreeNode>) {
@@ -299,5 +323,16 @@ mod tests {
         let again = ContentCache::load(dir.path()).unwrap();
         assert_eq!(again.get("axum").unwrap().doc_id, "d1");
         assert_eq!(again.docs_by_kind(&DocKind::Experience).len(), 1);
+    }
+
+    #[test]
+    fn truncated_tree_is_detected() {
+        // 250 nodes vs 848 cached — the live 24.10 incident shape
+        assert!(tree_looks_truncated(250, 848));
+        // mild shrinkage is normal (a few docs deleted)
+        assert!(!tree_looks_truncated(840, 848));
+        assert!(!tree_looks_truncated(850, 848));
+        // empty cache can't be truncated against itself
+        assert!(!tree_looks_truncated(0, 0));
     }
 }
