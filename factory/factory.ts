@@ -28,6 +28,8 @@ export interface ProjectCfg {
   board: string
   repo: string
   local: string
+  /** путь к gh-обёртке для постингов от бота (публичные репо) */
+  ghAgent?: string
   /** доп. строки ПАЙПА (проект-специфика: скрины, coverage, креды) */
   pipeline: string[]
   /** доп. строки ПРАВИЛ */
@@ -46,6 +48,7 @@ const PROJECTS: Record<string, ProjectCfg> = {
     board: "Origa Tasks",
     repo: "yurvon-screamo/origa",
     local: join(homedir(), "origa"),
+    ghAgent: join(homedir(), "origa/.opencode/factory/gh-as-agent"),
     pipeline: [
       "5а. UI-задачи: скрины ТОЛЬКО инструментом (свой скрипт писать нельзя):",
       "    cd end2end && npm ci && npm run shots -- list",
@@ -55,9 +58,10 @@ const PROJECTS: Record<string, ProjectCfg> = {
       "5б. PR с кодом: дождись coverage-комментария qltysh[bot] (~10 мин после CI) и прими его.",
     ],
     rules: [
-      "- ВСЕ постинги в GitHub — через gh-as-agent (/home/yurvon/origa/.opencode/factory/gh-as-agent),",
-      "  голый gh для issue comment/pr create ЗАПРЕЩЁН (репо публичное, выступаешь uwuwu-agent[bot]).",
+      "- ВСЕ постинги в GitHub — через gh-as-agent (путь ниже), голый gh для",
+      "  issue comment/pr create ЗАПРЕЩЁН (репо публичное, выступаешь uwuwu-agent[bot]).",
       "  Пуш — от бота (credential helper уже настроен в ворктри).",
+      `  gh-as-agent: \${GH_AGENT}`,
     ],
   },
 }
@@ -393,7 +397,14 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
     title = body.split("\n")[0]?.replace(/^#+\s*/, "").trim() ?? ""
     if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
   }
-  const sent = await promptSession(sessionID, kickoffPrompt({ ...task, title }, body, cfg))
+  const history = (await taskComments(task.bodyDoc))
+    .slice(-8)
+    .map((c) => `${c.text.trimStart().startsWith("🤖") ? "агент" : "юзер"}: ${c.text.trim().slice(0, 400)}`)
+    .join("\n---\n")
+  const sent = await promptSession(
+    sessionID,
+    kickoffPrompt({ ...task, title }, body, cfg, history),
+  )
   if (!sent) throw new Error("kickoff-промпт не ушёл")
 
   // граница комментов ДО старта — не будить агента старыми;
@@ -453,15 +464,18 @@ async function notify(task: TrackedTask, body: string): Promise<void> {
 }
 
 async function registerFailure(
-  task: TaskRef, cfg: ProjectCfg, board: BoardIds, state: FactoryState, seed: number, err: unknown,
+  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, seed: number, err: unknown,
 ): Promise<void> {
   const attempts = seed + 1
   const prev = state.tasks[task.rowId]
   const entry: TrackedTask = prev ?? {
     sessionID: "", worktree: "", branch: "",
-    bodyDoc: task.bodyDoc, title: task.title, project: "",
+    bodyDoc: task.bodyDoc, title: task.title, project: projectName,
     lastCommentAt: 0, lastCommentId: "", createdAt: Date.now(), attempts: 0,
   }
+  // без этого чужой тик считал бы запись своей потерянной («строка исчезла»)
+  // и стирал её — бесконечный цикл стартов вместо Blocked
+  if (entry.project === "") entry.project = projectName
   entry.attempts = attempts
   state.tasks[task.rowId] = entry
   saveState(state)
@@ -510,7 +524,7 @@ async function restartTask(
   try {
     await startTask(task, projectName, cfg, board, state, seed)
   } catch (e) {
-    await registerFailure(task, cfg, board, state, seed, e)
+    await registerFailure(task, projectName, cfg, board, state, seed, e)
   }
 }
 
@@ -525,7 +539,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       await startTask(task, projectName, cfg, board, state, 0)
       started.add(task.rowId)
     } catch (e) {
-      await registerFailure(task, cfg, board, state, 0, e)
+      await registerFailure(task, projectName, cfg, board, state, 0, e)
     }
   }
 
@@ -567,7 +581,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       try {
         await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts)
       } catch (e) {
-        await registerFailure(row, cfg, board, state, tracked.attempts, e)
+        await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
       }
       continue
     }

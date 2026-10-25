@@ -99,9 +99,11 @@ export interface KickoffProfile {
   repo: string
   pipeline: string[]
   rules: string[]
+  /** путь gh-обёртки бота (подставляется в правила как ${GH_AGENT}) */
+  ghAgent?: string
 }
 
-export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile): string {
+export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile, commentsHistory = ""): string {
   return [
     `Ты — девелопер фабрики uwuwu. Репозиторий: ${profile.repo}. Задача: «${task.title.replace(/[\r\n]+/g, " ")}» (канбан-строка ${task.rowId}).`,
     "",
@@ -135,7 +137,13 @@ export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfi
     "- ВСЁ для пользователя — только комменты задачи (uwuwu-cli task comment). Текст в сессии юзер не читает.",
     "- Не мержи сам. Не закрывай задачу сам (uwuwu-cli task close — только демон по мержу PR).",
     `- Разрешено: uwuwu-cli task comment/get/edit, gh pr create/view/checks. Запрещено: gh pr merge.`,
-    ...profile.rules,
+    ...profile.rules.map((r) => r.replace("${GH_AGENT}", profile.ghAgent ?? "gh")),
+    ...(commentsHistory === "" ? [] : [
+      "",
+      "=== НЕДАВНИЕ КОММЕНТЫ ЗАДАЧИ (контекст, миграции/предыстория) ===",
+      sanitizeBoundary(commentsHistory),
+      "=== КОНЕЦ КОММЕНТОВ ===",
+    ]),
   ].join("\n")
 }
 
