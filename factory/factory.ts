@@ -399,7 +399,11 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
   }
   const history = (await taskComments(task.bodyDoc))
     .slice(-8)
-    .map((c) => `${c.text.trimStart().startsWith("🤖") ? "агент" : "юзер"}: ${c.text.trim().slice(0, 400)}`)
+    .map((c) => {
+      const t = c.text.trimStart()
+      const who = t.startsWith("🤖") ? "агент" : t.startsWith("[factory]") ? "фабрика" : "юзер"
+      return `${who}: ${c.text.trim().slice(0, 400)}`
+    })
     .join("\n---\n")
   const sent = await promptSession(
     sessionID,
