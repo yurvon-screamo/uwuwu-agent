@@ -202,8 +202,8 @@ async function tick(state: CronState): Promise<void> {
     const prevFire = state.crons[row.rowId]?.lastFiredAt ?? 0
     if (sched0 !== null && isOneShot(sched0) && prevFire > 0
         && now.getTime() - prevFire < 86_400_000) {
-      await setCells(board, row.rowId, { Status: "paused" })
-      log(`крон «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — paused (reconcile)`)
+      await setCells(board, row.rowId, { Status: "fired" })
+      log(`крон «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — fired (reconcile)`)
       continue
     }
     const sched = sched0
@@ -240,8 +240,10 @@ async function tick(state: CronState): Promise<void> {
     saveState(state)
     await setCells(board, row.rowId, { "Last Run": now.toISOString().slice(0, 16).replace("T", " ") })
     if (isOneShot(sched)) {
-      await setCells(board, row.rowId, { Status: "paused" })
-      log(`крон «${title}»: разовый — сработал, paused`)
+      // fired ≠ paused: разовый сработал и завершён (самообъясняюще из
+      // таблицы); paused — только явное решение юзера остановить повторяющийся
+      await setCells(board, row.rowId, { Status: "fired" })
+      log(`крон «${title}»: разовый — сработал, fired`)
     }
     log(`крон «${title}»: сработал → сессия ${sessionID}`)
   }
