@@ -15,13 +15,21 @@ pub struct Board {
     pub db_id: String,
 }
 
-/// Найти доску проекта: док с тайтлом `<project> Tasks` → его database-блок.
+/// Найти доску проекта (`<project> Tasks`).
 pub async fn find_board(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     project: &str,
 ) -> Result<Board> {
-    let title = format!("{project} Tasks");
+    find_board_by_title(client, cfg, &format!("{project} Tasks")).await
+}
+
+/// Найти доску по точному тайтлу (например, «Crons»).
+pub async fn find_board_by_title(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    title: &str,
+) -> Result<Board> {
     let resp = client
         .call_tool(
             "find_doc_by_title",

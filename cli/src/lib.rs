@@ -302,6 +302,27 @@ fn init_tracing() {
         .try_init();
 }
 
+/// Резолв строки по id/заголовку: сперва доска проекта, затем доска Crons
+/// (крон-агенты комментят свои тела через тот же task comment).
+pub async fn resolve_row_any_board(
+    client: &mut affine_client::AffineClient,
+    cfg: &affine_client::AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: &str,
+) -> anyhow::Result<(affine_tasks::Board, affine_tasks::TaskRow)> {
+    let board = affine_tasks::find_board(client, cfg, project).await?;
+    let rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
+    if let Ok(row) = affine_tasks::resolve_row(&rows, id) {
+        return Ok((board, row.clone()));
+    }
+    let cron_board = affine_tasks::find_board_by_title(client, cfg, "Crons").await?;
+    let cron_rows = affine_tasks::read_rows(client, cfg, &cron_board, root).await?;
+    let row = affine_tasks::resolve_row(&cron_rows, id)
+        .map_err(|e| anyhow::anyhow!("{e} (искали и на доске проекта, и на Crons)"))?;
+    Ok((cron_board, row.clone()))
+}
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -663,8 +684,8 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                 }
                 TaskSub::Get { id } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
                     println!("Задача:   {}", row.title);
                     println!("Статус:   {}", row.status);
                     if !row.pr.is_empty() {
@@ -680,7 +701,7 @@ pub async fn run() -> anyhow::Result<()> {
                             cfg.workspace, row.body_doc
                         );
                         let comments =
-                            affine_tasks::recent_comments(&mut client, &cfg, row, 5).await?;
+                            affine_tasks::recent_comments(&mut client, &cfg, &row, 5).await?;
                         if !comments.is_empty() {
                             println!("Комменты:");
                             for (text, _) in comments {
@@ -696,37 +717,37 @@ pub async fn run() -> anyhow::Result<()> {
                     pr,
                     branch,
                 } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
                     let patch = affine_tasks::RowPatch {
                         status: status.clone(),
                         title: title.clone(),
                         pr: pr.clone(),
                         branch: branch.clone(),
                     };
-                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    affine_tasks::edit_row(&mut client, &cfg, &_board, &row, &patch).await?;
                     println!("обновлено: {}", row.title);
                 }
                 TaskSub::Comment { id, stdin, text } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
                     let body = facts::read_text(stdin, &text)?;
                     if body.trim().is_empty() {
                         anyhow::bail!("пустой коммент");
                     }
-                    affine_tasks::comment_task(&mut client, &cfg, row, &body).await?;
+                    affine_tasks::comment_task(&mut client, &cfg, &row, &body).await?;
                     println!("коммент отправлен: {}", truncate(&body, 60));
                 }
                 TaskSub::Close { id, note } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, &id)?;
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
                     let patch = affine_tasks::RowPatch {
                         status: Some("Done".into()),
                         ..Default::default()
                     };
-                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    affine_tasks::edit_row(&mut client, &cfg, &_board, &row, &patch).await?;
                     if let Some(note) = note {
-                        affine_tasks::comment_task(&mut client, &cfg, row, &note).await?;
+                        affine_tasks::comment_task(&mut client, &cfg, &row, &note).await?;
                     }
                     println!("закрыта: {}", row.title);
                 }
