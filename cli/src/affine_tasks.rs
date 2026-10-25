@@ -84,6 +84,29 @@ pub struct TaskRow {
     pub status: String,
     pub pr: String,
     pub branch: String,
+    /// доска Crons: расписание и последний запуск
+    pub schedule: String,
+    pub last_run: String,
+}
+
+impl TaskRow {
+    pub fn cron_schedule_of(&self) -> &str {
+        &self.schedule
+    }
+
+    pub fn last_run_display(&self) -> &str {
+        &self.last_run
+    }
+}
+
+impl RowPatch {
+    /// Статус для доски Crons (active/paused/fired).
+    pub fn cron_status(status: &str) -> Self {
+        RowPatch {
+            status: Some(status.to_string()),
+            ..Default::default()
+        }
+    }
 }
 
 /// Прочитать все строки доски. Заголовки линкованных строк резолвятся
@@ -161,6 +184,8 @@ pub async fn read_rows(
             status: cell("Status"),
             pr: cell("PR"),
             branch: cell("Branch"),
+            schedule: cell("Schedule"),
+            last_run: cell("Last Run"),
         });
     }
     Ok(out)
@@ -468,6 +493,67 @@ fn snapshot_text(content: &Value) -> String {
         walk(blocks, &mut out);
     }
     out.trim().to_string()
+}
+
+// ——— кроны (доска Crons) ———
+
+/// Заглушка тела крона: что делать на каждом срабатывании.
+pub fn cron_body_stub(title: &str, schedule: &str, prompt: &str) -> String {
+    if prompt.trim().is_empty() {
+        format!(
+            "# {title}\n\nРасписание: `{schedule}`.\n\n## Что делать на каждом срабатывании\n(опиши работу агента)\n\n## Лог\n_Отчёты приходят комментами._\n"
+        )
+    } else {
+        format!("# {title}\n\nРасписание: `{schedule}`.\n\n## Что делать\n\n{prompt}\n")
+    }
+}
+
+/// Разобрать человекочитаемое смещение (10m/90s/2h) в минуты.
+pub fn parse_offset_minutes(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("--in '{s}': ожидалось число+единица (10m/90s/2h)"))?;
+    match unit {
+        "s" => Ok((n + 59) / 60), // секунды округляем вверх до минут (гранулярность демона)
+        "m" => Ok(n),
+        "h" => Ok(n * 60),
+        _ => anyhow::bail!("--in '{s}': единицы s/m/h"),
+    }
+}
+
+/// Schedule-строка для разового срабатывания через `minutes` от сейчас.
+/// Формат «HH:MM» сегодня или «HH:MM DD.MM» при переходе через полночь.
+pub fn one_shot_schedule(minutes: i64) -> String {
+    use chrono::{Duration, Local};
+    let target = Local::now() + Duration::minutes(minutes);
+    let now = Local::now();
+    if target.date_naive() == now.date_naive() {
+        target.format("%H:%M").to_string()
+    } else {
+        target.format("%H:%M %d.%m").to_string()
+    }
+}
+
+/// Валидация Schedule-строки (упрощённая — полный парсер в демоне).
+pub fn validate_schedule(s: &str) -> Result<()> {
+    let t = s.trim();
+    if regex::Regex::new(r"^\d+[mhd]$").unwrap().is_match(t) {
+        return Ok(());
+    }
+    if regex::Regex::new(r"^\d{1,2}:\d{2}( \d{1,2}\.\d{1,2})?$")
+        .unwrap()
+        .is_match(t)
+    {
+        return Ok(());
+    }
+    if t.split_whitespace().count() == 5 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "расписание '{s}': ожидался интервал (5m), время (09:30 [01.12]) или cron-expr (5 полей)"
+    )
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use serde_json::json;
 
 pub fn wiki_root() -> PathBuf {
     // UWUWU_WIKI — каноническое имя (общее с python-тулзой ~/uwuwu-agent/tools);
@@ -105,6 +106,35 @@ enum TaskSub {
         #[arg(long, help = "Заметка-коммент при закрытии")]
         note: Option<String>,
     },
+}
+
+/// Кроны на доске Crons: агентские отложенные/периодические работы.
+/// Дефолтный механизм: сессионный cron_set умирает с сессией — эти живут.
+#[derive(clap::Subcommand)]
+enum CronSub {
+    /// Поставить крон (тело = промпт из stdin или заглушка)
+    Set {
+        #[arg(long, help = "Заголовок крона")]
+        title: String,
+        #[arg(long, value_name = "10m|90s|2h", help = "Разово через N (one-shot)")]
+        r#in: Option<String>,
+        #[arg(long, value_name = "5m|2h|1d", help = "Повторять каждые N")]
+        every: Option<String>,
+        #[arg(long, value_name = "09:30 [01.12]", help = "Разово в указанное время")]
+        at: Option<String>,
+        #[arg(long, value_name = "EXPR", help = "Cron-выражение (5 полей)")]
+        cron_expr: Option<String>,
+        #[arg(long, help = "Промпт из stdin (иначе заглушка)")]
+        stdin: bool,
+    },
+    /// Все кроны доски
+    List,
+    /// Остановить (Status=paused)
+    Pause { id: String },
+    /// Запустить обратно (Status=active)
+    Resume { id: String },
+    /// Удалить крон (строка + тело в трэш)
+    Rm { id: String },
 }
 
 #[derive(Subcommand)]
@@ -208,9 +238,11 @@ enum Commands {
         /// Raw text to factize (ignored with --stdin)
         text: Vec<String>,
     },
-    /// Write a document straight into AFFiNE: markdown from stdin → doc.
-    /// `<slug>` (experience) or --project <proj> <slug> (project doc).
-    /// Env: UWUWU_AFFINE_URL/TOKEN/WORKSPACE_ID.
+    /// Crons on the AFFiNE «Crons» board (durable agent schedules).
+    Cron {
+        #[command(subcommand)]
+        command: CronSub,
+    },
     /// Kanban tasks on AFFiNE (`<Proj> Tasks` boards): create/list/get/
     /// edit/comment/close. Body doc gets the «таск» tag; comments are
     /// native AFFiNE comments on the body.
@@ -617,6 +649,135 @@ pub async fn run() -> anyhow::Result<()> {
             let source = source.unwrap_or_else(|| format!("manual/{today}"));
             let out = facts::run_facts(&text, &source, &date, stdin).await;
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Commands::Cron { ref command } => {
+            let mut client = affine_client::AffineClient::connect(&cfg).await?;
+            let board = affine_tasks::find_board_by_title(&mut client, &cfg, "Crons")
+                .await
+                .context("доска «Crons» не найдена (папка Crons → док-таблица)")?;
+            let command_ref = command;
+            match command_ref {
+                CronSub::Set {
+                    title,
+                    r#in,
+                    every,
+                    at,
+                    cron_expr,
+                    stdin,
+                } => {
+                    let specs = [
+                        r#in.as_ref(),
+                        every.as_ref(),
+                        at.as_ref(),
+                        cron_expr.as_ref(),
+                    ];
+                    let n = specs.iter().flatten().count();
+                    if n != 1 {
+                        anyhow::bail!("ровно один из --in/--every/--at/--cron (передано {n})");
+                    }
+                    let schedule = if let Some(off) = &r#in {
+                        affine_tasks::one_shot_schedule(affine_tasks::parse_offset_minutes(off)?)
+                    } else if let Some(e) = &every {
+                        e.clone()
+                    } else if let Some(a) = &at {
+                        a.clone()
+                    } else {
+                        cron_expr.clone().unwrap_or_default()
+                    };
+                    affine_tasks::validate_schedule(&schedule)?;
+                    let prompt = if *stdin {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                        buf
+                    } else {
+                        String::new()
+                    };
+                    let body_md = affine_tasks::cron_body_stub(title, &schedule, &prompt);
+                    let resp = client
+                        .call_tool(
+                            "create_doc_from_markdown",
+                            json!({"workspaceId": cfg.workspace, "title": title, "markdown": body_md, "parentDocId": board.doc_id}),
+                        )
+                        .await
+                        .context("create_doc_from_markdown")?;
+                    let body = resp
+                        .get("docId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = client
+                        .call_tool(
+                            "add_tag_to_doc",
+                            json!({"workspaceId": cfg.workspace, "docId": body, "tag": "таск"}),
+                        )
+                        .await;
+                    let row = client
+                        .call_tool(
+                            "add_database_row",
+                            json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
+                                   "databaseBlockId": board.db_id,
+                                   "cells": {"Title": title, "Schedule": schedule, "Status": "active"},
+                                   "linkedDocId": body}),
+                        )
+                        .await
+                        .context("add_database_row")?;
+                    println!("крон поставлен: {title}");
+                    println!("  расписание: {schedule}");
+                    println!(
+                        "  строка: {}",
+                        row.get("rowBlockId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                    );
+                    println!("  тело:   {body}");
+                }
+                CronSub::List => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
+                    println!(
+                        "{:<8} {:<18} {:<17} {:<13} ЗАГОЛОВОК",
+                        "СТАТУС", "РАСПИСАНИЕ", "LAST RUN", "СТРОКА"
+                    );
+                    for r in &rows {
+                        println!(
+                            "{:<8} {:<18} {:<17} {:<13} {}",
+                            r.status,
+                            r.cron_schedule_of(),
+                            r.last_run_display(),
+                            &r.row_id[..r.row_id.len().min(12)],
+                            truncate(&r.title, 40)
+                        );
+                    }
+                }
+                CronSub::Pause { id } | CronSub::Resume { id } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
+                    let row = affine_tasks::resolve_row(&rows, id)?;
+                    let status = if matches!(command_ref, CronSub::Pause { .. }) {
+                        "paused"
+                    } else {
+                        "active"
+                    };
+                    let patch = affine_tasks::RowPatch::cron_status(status);
+                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    println!("статус: {status}");
+                }
+                CronSub::Rm { id } => {
+                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
+                    let row = affine_tasks::resolve_row(&rows, id)?;
+                    client
+                        .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
+                        .await
+                        .context("delete_database_row")?;
+                    if !row.body_doc.is_empty() {
+                        let _ = client
+                            .call_tool(
+                                "trash_doc",
+                                json!({"workspaceId": cfg.workspace, "docId": row.body_doc}),
+                            )
+                            .await;
+                    }
+                    println!("крон удалён: {}", row.title);
+                }
+            }
         }
         Commands::Task { command, project } => {
             let project = project.unwrap_or_else(|| "uwuwu".to_string());
