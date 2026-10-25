@@ -47,8 +47,14 @@ export function parseSchedule(s: string): Sched | null {
     }
   }
   const fields = t.split(/\s+/)
-  if (fields.length === 5) return { kind: "cron", fields }
-  return null
+  if (fields.length !== 5) return null
+  // каждое поле: запятая-список из (*|N[-M])[/step] — мусор вида "abc"
+  // иначе парсится «легально» и молча не срабатывает никогда
+  const partRe = /^(\*|\d+(?:-\d+)?)(?:\/\d+)?$/
+  const valid = fields.every(f =>
+    f.split(",").every(p => partRe.test(p) && !p.endsWith("/")),
+  )
+  return valid ? { kind: "cron", fields } : null
 }
 
 /** Совпадение одного cron-поля (мин/час/день/мес/день-недели) со значением. */

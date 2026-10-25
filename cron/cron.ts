@@ -19,6 +19,9 @@ const STATE_FILE = join(STATE_DIR, "state.json")
 const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
+/** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
+ *  исполняющая среда не должна видеть весь домашний каталог */
+const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
 /** пауза между срабатываниями одного крона пока жива его сессия */
@@ -159,13 +162,18 @@ async function fireSession(title: string, prompt: string): Promise<string | null
     body: {
       title: `⏰ ${title.replace(/[\r\n]+/g, " ").slice(0, 60)}`,
       model: { providerID: MODEL.providerID, id: MODEL.id },
-      location: { directory: homedir() },
+      location: { directory: WORKSPACE },
     },
   })
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) return null
   const ok = await restCall(`/session/${id}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
-  return ok ? id : null
+  if (!ok) {
+    // rollback: сессия без промпта — сирота
+    await restCall(`/session/${id}`, { method: "DELETE" }).catch(() => {})
+    return null
+  }
+  return id
 }
 
 async function sessionAlive(sessionID: string): Promise<boolean | null> {
@@ -188,8 +196,19 @@ async function tick(state: CronState): Promise<void> {
 
   for (const row of rows) {
     if (row.status !== "active") continue
-    const sched = parseSchedule(row.schedule)
-    if (sched === null) continue // кривое расписание — молча ждём правки
+    const sched0 = parseSchedule(row.schedule)
+    // reconcile: разовый уже стрелял (демон упал до setCells) → дозаповедать
+    if (sched0 !== null && isOneShot(sched0) && (state.crons[row.rowId]?.lastFiredAt ?? 0) > 0) {
+      await setCells(board, row.rowId, { Status: "paused" })
+      log(`крон «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — paused (reconcile)`)
+      continue
+    }
+    const sched = sched0
+    if (sched === null) {
+      // диагностика: молчащий навсегда крон — худший режим отказа
+      log(`крон «${row.title || row.rowId.slice(0, 8)}»: кривое расписание «${row.schedule}» — пропущен`)
+      continue
+    }
 
     const tracked = state.crons[row.rowId]
     const lastFired = tracked?.lastFiredAt ?? 0
@@ -212,6 +231,8 @@ async function tick(state: CronState): Promise<void> {
       log(`крон «${title}»: сессия не поднялась`)
       continue
     }
+    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента;
+    // агент без 🤖-коммента невидим (детекция — следующий срез, если болит)
     state.crons[row.rowId] = { sessionID, lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
     await setCells(board, row.rowId, { "Last Run": now.toISOString().slice(0, 16).replace("T", " ") })
@@ -229,6 +250,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
+  mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
   log(`uwuwu-cron: старт (board=${BOARD_TITLE}, tick=${TICK_SEC}s, model=${MODEL.id})`)
   const state = loadState()

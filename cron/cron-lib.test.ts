@@ -109,3 +109,12 @@ describe("cronBodyStub", () => {
     expect(md).toContain("## Лог")
   })
 })
+
+describe("parseSchedule: мусорные cron-поля", () => {
+  test("abc в поле → null (не молчащий навсегда крон)", () => {
+    expect(parseSchedule("abc * * * *")).toBeNull()
+    expect(parseSchedule("* 25 * * *")).not.toBeNull() // 25 валиден синтаксисом; не совпадёт — но это осознанно
+    expect(parseSchedule("*/ * * * *")).toBeNull()
+    expect(parseSchedule("1-2-3 * * * *")).toBeNull()
+  })
+})
