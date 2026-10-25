@@ -103,9 +103,27 @@ export interface KickoffProfile {
   ghAgent?: string
 }
 
-export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile, commentsHistory = ""): string {
+/** Тип задачи (тег тела): определяет мантру пайпа. */
+export type TaskKind = "dev" | "spike" | "bug"
+
+const KIND_MANTRA: Record<TaskKind, string[]> = {
+  dev: [],
+  spike: [
+    "ТИП: СПАЙК. Код НЕ писать (только минимальные пробы для исследования).",
+    "Исследуй вопрос из тела; заполни секции Вывод и Границы в теле задачи (MCP append_markdown).",
+    "Без PR: итог — отчёт-коммент (🤖 … [DONE]) и ЗАКРОЙ задачу: uwuwu-cli task close <rowId>.",
+  ],
+  bug: [
+    "ТИП: БАГ. Пайп строго TDD: сначала воспроизведи по BDD-сценарию из тела (красный тест).",
+    "Не воспроизвёлся — СТОП: спроси юзера комментом (🤖 детали окружения) и заверши ход.",
+    "Воспроизвёлся: причина → фикс → красный тест зелёный → PR (в PR — имя теста).",
+  ],
+}
+
+export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile, commentsHistory = "", kind: TaskKind = "dev"): string {
   return [
     `Ты — девелопер фабрики uwuwu. Репозиторий: ${profile.repo}. Задача: «${task.title.replace(/[\r\n]+/g, " ")}» (канбан-строка ${task.rowId}).`,
+    ...(kind === "dev" ? [] : KIND_MANTRA[kind]),
     "",
     "=== ТЕЛО ЗАДАЧИ ===",
     sanitizeBoundary(body || "(пусто)"),

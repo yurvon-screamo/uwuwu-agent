@@ -56,6 +56,8 @@ enum TaskSub {
     Create {
         #[arg(long, help = "Заголовок задачи")]
         title: String,
+        #[arg(long, help = "Тип: dev | spike | bug (тег + шаблон тела)")]
+        r#type: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
         #[arg(
@@ -788,9 +790,17 @@ pub async fn run() -> anyhow::Result<()> {
             match command {
                 TaskSub::Create {
                     title,
+                    r#type: ty,
                     stdin,
                     attach,
                 } => {
+                    let task_type = affine_tasks::TaskType::parse(ty.as_deref().unwrap_or("dev"))
+                        .with_context(|| {
+                        format!(
+                            "--type '{}': ожидался dev|spike|bug",
+                            ty.as_deref().unwrap_or("")
+                        )
+                    })?;
                     let body = if stdin {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
@@ -798,8 +808,15 @@ pub async fn run() -> anyhow::Result<()> {
                     } else {
                         String::new()
                     };
-                    let row =
-                        affine_tasks::create_task(&mut client, &cfg, &board, &title, &body).await?;
+                    let row = affine_tasks::create_task(
+                        &mut client,
+                        &cfg,
+                        &board,
+                        &title,
+                        &body,
+                        task_type,
+                    )
+                    .await?;
                     println!("создана: {}", row.title);
                     println!("  строка: {}", row.row_id);
                     println!("  тело:   {}", row.body_doc);

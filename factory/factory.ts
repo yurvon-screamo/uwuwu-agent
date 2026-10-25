@@ -371,7 +371,7 @@ function reconcileOrphans(state: FactoryState): void {
   }
 }
 
-async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, attemptsSeed: number): Promise<void> {
+async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, attemptsSeed: number, kinds: Map<string, "dev" | "spike" | "bug">): Promise<void> {
   const { branch, worktree } = worktreePaths(WORKTREES_ROOT, task.rowId)
   mkdirSync(WORKTREES_ROOT, { recursive: true })
 
@@ -405,9 +405,10 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
       return `${who}: ${c.text.trim().slice(0, 400)}`
     })
     .join("\n---\n")
+  const kind = kinds.get(task.bodyDoc) ?? "dev"
   const sent = await promptSession(
     sessionID,
-    kickoffPrompt({ ...task, title }, body, cfg, history),
+    kickoffPrompt({ ...task, title }, body, cfg, history, kind),
   )
   if (!sent) throw new Error("kickoff-промпт не ушёл")
 
@@ -515,7 +516,7 @@ async function checkMerged(task: TaskRef, board: BoardIds, state: FactoryState):
 }
 
 async function restartTask(
-  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, fresh: TaskComment[],
+  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, fresh: TaskComment[], kinds: Map<string, "dev" | "spike" | "bug">,
 ): Promise<void> {
   const tracked = state.tasks[task.rowId]
   if (tracked === undefined) return
@@ -526,21 +527,36 @@ async function restartTask(
   tracked.sessionID = "" // карантин до успеха старта
   saveState(state)
   try {
-    await startTask(task, projectName, cfg, board, state, seed)
+    await startTask(task, projectName, cfg, board, state, seed, kinds)
   } catch (e) {
     await registerFailure(task, projectName, cfg, board, state, seed, e)
   }
 }
 
+/** Карта docId → тип задачи по тегам тел (3 запроса на тик). */
+async function taskKinds(): Promise<Map<string, "dev" | "spike" | "bug">> {
+  const map = new Map<string, "dev" | "spike" | "bug">()
+  for (const kind of ["spike", "bug"] as const) {
+    try {
+      const r = await mcp.tool<{ docs?: { id?: string }[] }>("list_docs_by_tag", { tag: kind[0].toUpperCase() + kind.slice(1) })
+      for (const d of r.docs ?? []) {
+        if (typeof d.id === "string") map.set(d.id, kind)
+      }
+    } catch { /* нет тега — все dev */}
+  }
+  return map
+}
+
 async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
+  const kinds = await taskKinds()
 
   // 1. новые Todo (только строки ЭТОЙ доски)
   const started = new Set<string>()
   for (const task of untrackedTasks(rows.filter((r) => r.status === "Todo"), state)) {
     try {
-      await startTask(task, projectName, cfg, board, state, 0)
+      await startTask(task, projectName, cfg, board, state, 0, kinds)
       started.add(task.rowId)
     } catch (e) {
       await registerFailure(task, projectName, cfg, board, state, 0, e)
@@ -566,6 +582,12 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if (row.status === "Review" && row.pr !== "") {
       if (await checkMerged(row, board, state)) continue
     }
+    // спайк/закрытая руками: Status=Done при живой state-записи → чистка
+    if (row.status === "Done") {
+      log(`задача ${rowId.slice(0, 8)}: Done (закрыта агентом/юзером) — чистка`)
+      await finishTask(rowId, tracked, state)
+      continue
+    }
 
     // юзер перевёл живую задачу в Todo руками = «перезапусти»:
     // молчать нельзя (сигнал потерян), затирать без предупреждения тоже
@@ -583,7 +605,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         saveState(state)
       }
       try {
-        await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts)
+        await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts, kinds)
       } catch (e) {
         await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
       }
@@ -596,7 +618,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
       if (fresh.length === 0) continue
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
+      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh, kinds)
       continue
     }
 
@@ -620,7 +642,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     }
     if (liveness === "dead") {
       log(`задача ${rowId.slice(0, 8)}: сессия умерла — перезапуск`)
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
+      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh, kinds)
       continue
     }
     log(`задача ${rowId.slice(0, 8)}: ${fresh.length} новых коммент(ов) → сессия`)

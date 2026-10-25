@@ -9,8 +9,54 @@ use serde_json::{json, Value};
 
 use crate::affine_client::{AffineClient, AffineConfig};
 
-/// Тег тел задач (доки-тела на досках <Proj> Tasks).
-pub const TAG: &str = "Task";
+/// Тип задачи — тег на теле. Определяет шаблон тела и пайп агента.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskType {
+    Dev,
+    Spike,
+    Bug,
+}
+
+impl TaskType {
+    pub fn tag(self) -> &'static str {
+        match self {
+            TaskType::Dev => "Dev",
+            TaskType::Spike => "Spike",
+            TaskType::Bug => "Bug",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "dev" | "разработка" => Some(TaskType::Dev),
+            "spike" | "спайк" => Some(TaskType::Spike),
+            "bug" | "баг" => Some(TaskType::Bug),
+            _ => None,
+        }
+    }
+
+    /// Стартовый костяк тела: принципиальное описание, не протокол.
+    /// Секции-подсказки; диаграммы — только по запросу/неясности текста.
+    pub fn body_template(self, title: &str, user_text: &str) -> String {
+        let ctx = if user_text.trim().is_empty() {
+            "<текст постановки>".to_string()
+        } else {
+            user_text.trim().to_string()
+        };
+        match self {
+            TaskType::Dev => format!(
+                "# {title}\n\n## Постановка\n{ctx}\n\n## Решение\n<принципиально, как для нового инженера: как теперь устроено и почему так — концепция, без файлов>\n\n## Юзкейсы\n<сценарии: кто что делает>\n\n## Сиквенсы\n<взаимодействия текстом, по строке на шаг: А → Б: что>\n\n## Проверка\n<исполняемое: команды, тесты, живой прогон>\n"
+            ),
+            TaskType::Spike => format!(
+                "# {title}\n\n## Контекст\n{ctx}\n\n## Варианты\n<что рассматривали: суть → плюсы/минусы/замеры; сравнение — таблица>\n\n## Вывод\n<рекомендация + доказательства: «путь A, потому что …»>\n\n## Границы\n<что НЕ исследовано и почему; где вывод не действует>\n"
+            ),
+            TaskType::Bug => format!(
+                "# {title}\n\n## Сценарий (BDD)\n```gherkin\nСценарий: <название>\n  Дано <состояние мира>\n  Когда <действие>\n  Тогда <ожидание>  # факт: <что было на самом деле>\n```\n\n{ctx}\n\n## Красный тест\n<имя теста, который воспроизводит; не воспроизвёлся на стенде → детали окружения>\n\n## Причина\n<механизм: почему система так себя вела>\n\n## Фикс\n<что изменилось; красный тест теперь зелёный>\n\n## Профилактика\n<как класс бага закрыт: тест/инвариант/линтер>\n"
+            ),
+        }
+    }
+}
+
 /// Тег тел крон (доска Crons).
 pub const CRON_TAG: &str = "Cron";
 
@@ -234,13 +280,10 @@ pub async fn create_task(
     board: &Board,
     title: &str,
     body_markdown: &str,
+    task_type: TaskType,
 ) -> Result<TaskRow> {
-    // 1. док-тело — ребёнок доски
-    let md = if body_markdown.trim().is_empty() {
-        format!("{title}\n")
-    } else {
-        format!("{title}\n\n{body_markdown}\n")
-    };
+    // 1. док-тело — ребёнок доски; стартовый костяк по типу задачи
+    let md = task_type.body_template(title, body_markdown);
     let resp = client
         .call_tool(
             "create_doc_from_markdown",
@@ -251,7 +294,8 @@ pub async fn create_task(
     let body_doc = first_str(&resp, &["docId", "id"])
         .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
 
-    // 2. тег «Task» (идемпотентно)
+    // 2. тег типа (идемпотентно)
+    let tag = task_type.tag();
     let tags = client
         .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
         .await;
@@ -260,8 +304,8 @@ pub async fn create_task(
         .and_then(|t| {
             t.get("tags").and_then(|a| a.as_array()).map(|arr| {
                 arr.iter().any(|x| {
-                    x.get("name").and_then(|n| n.as_str()) == Some(TAG)
-                        || x.get("tag").and_then(|n| n.as_str()) == Some(TAG)
+                    x.get("name").and_then(|n| n.as_str()) == Some(tag)
+                        || x.get("tag").and_then(|n| n.as_str()) == Some(tag)
                 })
             })
         })
@@ -270,7 +314,7 @@ pub async fn create_task(
         let _ = client
             .call_tool(
                 "create_tag",
-                json!({"workspaceId": cfg.workspace, "tag": TAG}),
+                json!({"workspaceId": cfg.workspace, "tag": tag}),
             )
             .await;
         // cross-machine race: a concurrent create may land the same name.
@@ -289,8 +333,8 @@ pub async fn create_task(
                 .map(|arr| {
                     arr.iter()
                         .filter(|x| {
-                            x.get("name").and_then(|n| n.as_str()) == Some(TAG)
-                                || x.get("tag").and_then(|n| n.as_str()) == Some(TAG)
+                            x.get("name").and_then(|n| n.as_str()) == Some(tag)
+                                || x.get("tag").and_then(|n| n.as_str()) == Some(tag)
                         })
                         .count()
                 })
@@ -299,23 +343,23 @@ pub async fn create_task(
                 let _ = client
                     .call_tool(
                         "delete_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": TAG}),
+                        json!({"workspaceId": cfg.workspace, "tag": tag}),
                     )
                     .await;
                 let _ = client
                     .call_tool(
                         "create_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": TAG}),
+                        json!({"workspaceId": cfg.workspace, "tag": tag}),
                     )
                     .await;
-                eprintln!("affine: гонка тега {TAG} разряжена… заменяю (name-reset)");
+                eprintln!("affine: гонка тега {tag} разряжена (name-reset)");
             }
         }
     }
     let _ = client
         .call_tool(
             "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": TAG}),
+            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": tag}),
         )
         .await;
 
