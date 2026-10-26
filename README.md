@@ -92,7 +92,7 @@ Folders handle organization; tags are only for lookup.
 - `request` — queue as AFFiNE docs (Requests folder, `Request` tag)
 - `facts` — extraction → dedup (cross-PC content-hash) → mandatory daily bucket publish
 - `refresh` — full cache refresh from AFFiNE (new machine entry point, ~800 docs)
-- `affine --all` / `--tag-slugs` — one-time legacy migration / tag backfill
+- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown with ```html_embed diagram fences (Vesper theme, see `skills/visual-diagrams`)
 
 **Infrastructure**: Railway (Singapore) — AFFiNE + MCP gateway + Postgres (pgvector)
 
