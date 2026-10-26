@@ -114,7 +114,7 @@ const KIND_MANTRA: Record<TaskKind, string[]> = {
   dev: [],
   spike: [
     "ТИП: СПАЙК. Код НЕ писать (только минимальные пробы для исследования).",
-    "Исследуй вопрос из тела; заполни секции Вывод и Границы в теле задачи (MCP append_markdown).",
+    "Исследуй вопрос из тела; свои выводы доложи комментом 🤖 (правки тела — за юзером).",
     "Без PR: итог — отчёт-коммент (🤖 … [DONE]) и ЗАКРОЙ задачу: uwuwu-cli task close <rowId>.",
   ],
   bug: [
@@ -157,6 +157,7 @@ export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfi
     "ПРАВИЛА:",
     "- КАЖДЫЙ твой комментарий начинается с " + AGENT_MARK + " — иначе разбудишь себя.",
     "- ВСЁ для пользователя — только комменты задачи (uwuwu-cli task comment). Текст в сессии юзер не читает.",
+    "- Тело задачи перечитывай `uwuwu-cli task get` (печатает тело целиком).",
     "- Не мержи сам. Не закрывай задачу сам (uwuwu-cli task close — только демон по мержу PR).",
     `- Разрешено: uwuwu-cli task comment/get/edit, gh pr create/view/checks. Запрещено: gh pr merge.`,
     ...profile.rules.map((r) => r.replace("${GH_AGENT}", profile.ghAgent ?? "gh")),
@@ -174,7 +175,7 @@ export function mergeCheckPrompt(rowId: string): string {
   return [
     `[factory] Сверка тела задачи ${rowId}: документ менялся, пока ты работал.`,
     "",
-    "Часть изменений — твои (твоя работа). Проверь тело (export_doc_markdown):",
+    "Часть изменений — твои (твоя работа). Перечитай тело (uwuwu-cli task get):",
     "- есть правки, которые НЕ твои (от юзера: требования/правки/дополнения)?",
     "  → учти их в работе, ответь по пайпу комментом 🤖 что учёл;",
     "- всё твоё или ничего значимого → НИЧЕГО не делай, это штатная сверка.",
@@ -186,7 +187,7 @@ export function bodyEditPrompt(rowId: string): string {
   return [
     `[factory] Юзер отредактировал ТЕЛО задачи ${rowId} (не коммент).`,
     "",
-    "Перечитай тело (MCP export_doc_markdown или uwuwu-cli task get), найди что изменилось,",
+    "Перечитай тело (uwuwu-cli task get — печатает тело целиком), найди что изменилось,",
     "учти изменения в работе. Ответь/доложи по пайпу — комментом 🤖.",
   ].join("\n")
 }

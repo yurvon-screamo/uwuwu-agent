@@ -911,6 +911,20 @@ pub async fn run() -> anyhow::Result<()> {
                             "Тело:     https://affine.up.railway.app/workspace/{}/{}",
                             cfg.workspace, row.body_doc
                         );
+                        // тело целиком: task get — единственный cli-путь агента
+                        // к содержимому (MCP-шлюз агентам запрещён)
+                        if let Ok(e) = client
+                            .call_tool(
+                                "export_doc_markdown",
+                                json!({"workspaceId": cfg.workspace, "docId": row.body_doc}),
+                            )
+                            .await
+                        {
+                            let md = e.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
+                            if !md.trim().is_empty() {
+                                println!("\n----- тело -----\n{md}");
+                            }
+                        }
                         let comments =
                             affine_tasks::recent_comments(&mut client, &cfg, &row, 5).await?;
                         if !comments.is_empty() {

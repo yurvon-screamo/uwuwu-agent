@@ -164,7 +164,7 @@ describe("bodyEditPrompt", () => {
   test("контракт: перечитай тело + 🤖-ответ", () => {
     const p = bodyEditPrompt("r1")
     expect(p).toContain("отредактировал ТЕЛО задачи r1")
-    expect(p).toContain("export_doc_markdown")
+    expect(p).toContain("task get")
     expect(p).toContain("🤖")
   })
 })
