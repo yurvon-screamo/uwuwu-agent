@@ -359,6 +359,94 @@ pub async fn resolve_row_any_board(
     Ok((cron_board, row.clone()))
 }
 
+/// Выгрузить картинки тела (`affine://blob/<key>` в markdown) в
+/// /tmp/uwuwu-task-<row>/ — агент получает локальные пути одним get.
+/// UI-кредов нет / шлюз лежит → молча остаёмся на ссылках.
+async fn save_body_images(md: &str, row_id: &str) -> Vec<String> {
+    const MAX: usize = 10;
+    let mut out = Vec::new();
+    // собрать уникальные ключи в порядке появления
+    let mut keys: Vec<String> = Vec::new();
+    for cap in regex::Regex::new(r"affine://blob/([A-Za-z0-9._%~:+-]+)")
+        .unwrap()
+        .captures_iter(md)
+    {
+        let raw = cap.get(1).unwrap().as_str().to_string();
+        // ключ в URL percent-encoded — декодируем %XX
+        let key = percent_decode(&raw);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return out;
+    }
+    let Some(ss) = affine_search_server::ServerSearchConfig::from_env() else {
+        return out;
+    };
+    let Ok(ws_cfg) = affine_client::AffineConfig::from_env() else {
+        return out;
+    };
+    let dir = format!(
+        "/tmp/uwuwu-task-{}",
+        row_id
+            .trim_start_matches('-')
+            .chars()
+            .take(8)
+            .collect::<String>()
+    );
+    if std::fs::create_dir_all(&dir).is_err() {
+        return out;
+    }
+    for (i, key) in keys.iter().take(MAX).enumerate() {
+        match affine_blob::download_blob(&ss, &ws_cfg.workspace, key).await {
+            Ok(bytes) if !bytes.is_empty() => {
+                let ext = sniff_ext(&bytes);
+                let path = format!("{dir}/img-{}.{ext}", i + 1);
+                if std::fs::write(&path, &bytes).is_ok() {
+                    out.push(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Простой %XX-декодер (ключи блобов приезжают URL-encoded).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Расширение по magic bytes (png/jpg/gif/webp, иначе bin).
+fn sniff_ext(b: &[u8]) -> &'static str {
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "png"
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if b.starts_with(b"GIF8") {
+        "gif"
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "bin"
+    }
+}
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -912,7 +1000,7 @@ pub async fn run() -> anyhow::Result<()> {
                             cfg.workspace, row.body_doc
                         );
                         // тело целиком: task get — единственный cli-путь агента
-                        // к содержимому (MCP-шлюз агентам запрещён)
+                        // к содержимому; картинки из markdown выгружаются рядом
                         if let Ok(e) = client
                             .call_tool(
                                 "export_doc_markdown",
@@ -923,6 +1011,13 @@ pub async fn run() -> anyhow::Result<()> {
                             let md = e.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
                             if !md.trim().is_empty() {
                                 println!("\n----- тело -----\n{md}");
+                                let imgs = save_body_images(md, &row.row_id).await;
+                                if !imgs.is_empty() {
+                                    println!("Картинки:");
+                                    for p in imgs {
+                                        println!("  {p}");
+                                    }
+                                }
                             }
                         }
                         let comments =
