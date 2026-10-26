@@ -2,7 +2,6 @@ pub mod affine_blob;
 pub mod affine_client;
 pub mod affine_collect;
 pub mod affine_docs;
-pub mod affine_migrate;
 pub mod affine_publish;
 pub mod affine_queries;
 pub mod affine_search;
@@ -270,25 +269,6 @@ enum Commands {
     /// Refresh local caches from AFFiNE (content cache, dedup index,
     /// embeddings stay lazy). Use on a new machine or after heavy edits.
     Refresh,
-    /// Migrate wiki data into the AFFiNE workspace: experience/ and projects/
-    /// as documents, facts/ as daily journal buckets. Idempotent (resume-safe).
-    /// Env: UWUWU_AFFINE_URL (default localhost:3000/mcp), UWUWU_AFFINE_TOKEN,
-    /// UWUWU_AFFINE_WORKSPACE_ID.
-    Affine {
-        #[arg(long, help = "migrate experience/ articles")]
-        experience: bool,
-        #[arg(long, help = "migrate projects/ docs")]
-        projects: bool,
-        #[arg(long, help = "migrate facts/ into daily journal buckets")]
-        facts: bool,
-        #[arg(long, help = "migrate everything")]
-        all: bool,
-        #[arg(
-            long,
-            help = "backfill slug: tags for all mapped docs (multi-PC addressing)"
-        )]
-        tag_slugs: bool,
-    },
 }
 
 pub fn uwuwu_data_dir() -> PathBuf {
@@ -1119,42 +1099,6 @@ pub async fn run() -> anyhow::Result<()> {
                 report.fetched,
                 index.iter().count()
             );
-        }
-        Commands::Affine {
-            experience,
-            projects,
-            facts,
-            all,
-            tag_slugs,
-        } => {
-            if tag_slugs {
-                let (tagged, skipped) = affine_docs::backfill_slug_tags(&root, &cfg).await?;
-                println!("slug tags: {tagged} set, {skipped} skipped");
-                return Ok(());
-            }
-            let mut kinds = Vec::new();
-            if all || experience {
-                kinds.push(affine_migrate::Kind::Experience);
-            }
-            if all || projects {
-                kinds.push(affine_migrate::Kind::Projects);
-            }
-            if all || facts {
-                kinds.push(affine_migrate::Kind::Facts);
-            }
-            if kinds.is_empty() {
-                anyhow::bail!("выберите --experience / --projects / --facts или --all");
-            }
-            let report = affine_migrate::run_migration(&root, &kinds, &cfg).await?;
-            println!(
-                "affine migrate: created {}, skipped {}, errors {}",
-                report.created,
-                report.skipped,
-                report.errors.len()
-            );
-            for error in &report.errors {
-                eprintln!("  ! {error}");
-            }
         }
     }
 

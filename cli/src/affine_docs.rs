@@ -5,8 +5,6 @@
 //! misses on the current production workspace and stays only for legacy
 //! compatibility.
 
-use std::path::Path;
-
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
@@ -118,24 +116,6 @@ pub async fn tag_slug(
         )
         .await?;
     Ok(())
-}
-
-/// Backfill bare slug tags for every mapped document (one-time migration aid).
-pub async fn backfill_slug_tags(root: &Path, cfg: &AffineConfig) -> Result<(usize, usize)> {
-    let mut client = AffineClient::connect(cfg).await?;
-    let map = MigrationMap::load_for(root, cfg)?;
-    let mut tagged = 0usize;
-    let mut skipped = 0usize;
-    for (slug, doc_id) in map.taggable_entries() {
-        match tag_slug(&mut client, cfg, &doc_id, &slug).await {
-            Ok(()) => tagged += 1,
-            Err(e) => {
-                eprintln!("warn: tag {slug}: {e:#}");
-                skipped += 1;
-            }
-        }
-    }
-    Ok((tagged, skipped))
 }
 
 #[cfg(test)]
