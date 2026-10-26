@@ -43,11 +43,14 @@ cd uwuwu-agent
 
 ### Фабрика разработки (uwuwu-factory)
 
-Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa, foilcap —
-cutover с gh-ишью 25.10), тела задач = доки с тегом «Task», диалог = нативные комменты.
-Демон (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+kickoff → In Progress →
-коммент-мост (🤖-фильтр) → PR → Review → MERGED → Done + cleanup.
-`factory/` — Bun/TS: multi-project конфиг, session-recovery MCP, state+reconcile.
+Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa),
+тела задач = доки с тегом Dev/Spike/Bug, диалог = нативные комменты.
+Демон — **только будильник** (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+короткий
+spawn → In Progress; новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин
+→ рестарт по комменту); Done (мерж-крон агента / Spike / руки) → чистка ворктри.
+Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
+глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
+`factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
 
 ### Кроны (uwuwu-cron)
 
