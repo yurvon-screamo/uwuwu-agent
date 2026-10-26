@@ -247,14 +247,14 @@ enum Commands {
         #[command(subcommand)]
         command: CronSub,
     },
-    /// Kanban tasks on AFFiNE (`<Proj> Tasks` boards): create/list/get/
-    /// edit/comment/close. Body doc gets the «Task» tag; comments are
+    /// Kanban tasks on AFFiNE («Задачи <Proj>» boards): create/list/get/
+    /// edit/comment/close. Body doc gets the type tag; comments are
     /// native AFFiNE comments on the body.
     Task {
         #[command(subcommand)]
         command: TaskSub,
-        /// Project board (default: uwuwu)
-        #[arg(long)]
+        /// Project board (обязательно: uwuwu | origa | foilcap | …)
+        #[arg(long, global = true)]
         project: Option<String>,
     },
     /// Refresh local caches from AFFiNE (content cache, dedup index,
@@ -812,7 +812,10 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Task { command, project } => {
-            let project = project.unwrap_or_else(|| "uwuwu".to_string());
+            // required-флаг в clap не живёт после субкоманды — проверяем сами
+            let Some(project) = project else {
+                anyhow::bail!("--project <имя> обязателен (uwuwu | origa | foilcap | …)");
+            };
             let mut client = affine_client::AffineClient::connect(&cfg).await?;
             let board = affine_tasks::find_board(&mut client, &cfg, &project)
                 .await

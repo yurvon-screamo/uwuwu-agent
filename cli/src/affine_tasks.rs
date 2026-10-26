@@ -1,7 +1,7 @@
 //! `uwuwu-cli task` — CRUD канбан-задач на AFFiNE.
 //!
 //! Модель (см. док «Фабрика разработки на AFFiNE»): задача = строка
-//! database в доске проекта (`<Proj> Tasks`) + линкованный док-тело с
+//! database в доске проекта (`Задачи <Proj>`) + линкованный док-тело с
 //! тегом «Task». Комменты — нативные комменты афины к доку-телу.
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -66,13 +66,73 @@ pub struct Board {
     pub db_id: String,
 }
 
-/// Найти доску проекта (`<project> Tasks`).
+/// Найти доску проекта (`Задачи <project>`).
 pub async fn find_board(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     project: &str,
 ) -> Result<Board> {
-    find_board_by_title(client, cfg, &format!("{project} Tasks")).await
+    let title = format!("Задачи {project}");
+    match find_board_by_title(client, cfg, &title).await {
+        Ok(board) => Ok(board),
+        // индекс тайтлов отстаёт от свежих/переименованных доков —
+        // фоллбек через организ-дерево: папка проекта → дети по тайтлу
+        Err(search_err) => match find_board_via_folder(client, cfg, project, &title).await {
+            Some(board) => Ok(board),
+            None => Err(search_err),
+        },
+    }
+}
+
+/// Резолв доски без поискового индекса: папка `<project>` → её доки → точный тайтл.
+async fn find_board_via_folder(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    project: &str,
+    title: &str,
+) -> Option<Board> {
+    let nodes = client
+        .call_tool("list_organize_nodes", json!({"workspaceId": cfg.workspace}))
+        .await
+        .ok()?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let all = nodes
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or(empty);
+    let folder_ids: Vec<String> = all
+        .iter()
+        .filter(|n| {
+            n.get("type").and_then(|t| t.as_str()) == Some("folder")
+                && n.get("data").and_then(|d| d.as_str()) == Some(project)
+        })
+        .filter_map(|n| n.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect();
+    for fid in folder_ids {
+        let doc_ids: Vec<String> = all
+            .iter()
+            .filter(|n| {
+                n.get("type").and_then(|t| t.as_str()) == Some("doc")
+                    && n.get("parentId").and_then(|p| p.as_str()) == Some(&fid)
+            })
+            .filter_map(|n| n.get("data").and_then(|d| d.as_str()).map(String::from))
+            .collect();
+        for doc_id in doc_ids {
+            if let Ok(d) = client
+                .call_tool(
+                    "get_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+                )
+                .await
+            {
+                if d.get("title").and_then(|t| t.as_str()) == Some(title) {
+                    return board_from_doc(client, cfg, &doc_id).await.ok();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Найти доску по точному тайтлу (например, «Crons»).
@@ -101,8 +161,19 @@ pub async fn find_board_by_title(
         .map(String::from)
         .or_else(|| first_str(&resp, &["docId", "id", "doc_id"]))
         .ok_or_else(|| {
-            anyhow!("доска «{title}» не найдена (ожидается док <Proj> Tasks с канбаном)")
+            anyhow!("доска «{title}» не найдена (ожидается док Задачи <Proj> с канбаном)")
         })?;
+    board_from_doc(client, cfg, &doc_id)
+        .await
+        .with_context(|| format!("доска «{title}»"))
+}
+
+/// Доска из дока: найти database-блок (affine:database / affine:data_view).
+async fn board_from_doc(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+) -> Result<Board> {
     let doc = client
         .call_tool(
             "read_doc",
@@ -113,7 +184,7 @@ pub async fn find_board_by_title(
     let blocks = doc
         .get("blocks")
         .and_then(|b| b.as_array())
-        .ok_or_else(|| anyhow!("доска «{title}»: пустой read_doc"))?;
+        .ok_or_else(|| anyhow!("пустой read_doc"))?;
     let db_id = blocks
         .iter()
         .find(|b| {
@@ -121,9 +192,12 @@ pub async fn find_board_by_title(
             f == "affine:database" || f == "affine:data_view"
         })
         .and_then(|b| b.get("id").and_then(|v| v.as_str()))
-        .ok_or_else(|| anyhow!("в доке «{title}» нет database-блока"))?
+        .ok_or_else(|| anyhow!("нет database-блока"))?
         .to_string();
-    Ok(Board { doc_id, db_id })
+    Ok(Board {
+        doc_id: doc_id.to_string(),
+        db_id,
+    })
 }
 
 /// Одна строка доски.

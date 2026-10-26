@@ -40,14 +40,14 @@ export interface ProjectCfg {
 
 const PROJECTS: Record<string, ProjectCfg> = {
   uwuwu: {
-    board: "uwuwu Tasks",
+    board: "Задачи uwuwu",
     repo: "yurvon-screamo/uwuwu-agent",
     local: join(homedir(), "uwuwu-agent"),
     pipeline: [],
     rules: [],
   },
   origa: {
-    board: "Origa Tasks",
+    board: "Задачи origa",
     repo: "yurvon-screamo/origa",
     local: join(homedir(), "origa"),
     ghAgent: join(homedir(), "origa/.opencode/factory/gh-as-agent"),
@@ -188,12 +188,40 @@ interface BoardIds { docId: string; dbId: string }
 
 async function findBoard(title: string): Promise<BoardIds> {
   const r = await mcp.tool<{ matches?: { id: string; inTrash?: boolean }[] }>("find_doc_by_title", { title, caseInsensitive: true, limit: 5 })
-  const docId = r.matches?.find(m => m.inTrash !== true)?.id
-  if (docId === undefined) throw new Error(`доска «${title}» не найдена`)
+  let docId = r.matches?.find(m => m.inTrash !== true)?.id
+  if (docId === undefined) {
+    // индекс тайтлов отстаёт от свежих/переименованных доков — фоллбек
+    // через организ-дерево: «Задачи X» → папка X → дети по точному тайтлу
+    docId = (await boardViaOrganize(title)) ?? ""
+  }
+  if (docId === "") throw new Error(`доска «${title}» не найдена`)
   const doc = await mcp.tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
   const dbId = doc.blocks?.find((b) => b.flavour === "affine:database" || b.flavour === "affine:data_view")?.id
   if (dbId === undefined) throw new Error(`в «${title}» нет database-блока`)
   return { docId, dbId }
+}
+
+/** Доска без поискового индекса: «Задачи <proj>» → папка <proj> → доки. */
+async function boardViaOrganize(title: string): Promise<string | null> {
+  const proj = title.startsWith("Задачи ") ? title.slice("Задачи ".length) : null
+  if (proj === null) return null
+  try {
+    const r = await mcp.tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>(
+      "list_organize_nodes", {})
+    const nodes = r.nodes ?? []
+    const folders = nodes.filter(n => n.type === "folder" && n.data === proj)
+    for (const f of folders) {
+      const docIds = nodes
+        .filter(n => n.type === "doc" && n.parentId === f.id)
+        .map(n => n.data)
+        .filter((d): d is string => typeof d === "string")
+      for (const docId of docIds) {
+        const d = await mcp.tool<{ title?: string }>("get_doc", { docId })
+        if (d.title === title) return docId
+      }
+    }
+  } catch { /* организ недоступен — остаётся ошибка поиска */ }
+  return null
 }
 
 async function readTasks(board: BoardIds): Promise<TaskRef[]> {

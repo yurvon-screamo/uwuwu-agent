@@ -43,7 +43,7 @@ cd uwuwu-agent
 
 ### Фабрика разработки (uwuwu-factory)
 
-Issue-driven → **task-driven**: задачи = строки канбан-досок `<Proj> Tasks` (uwuwu, origa —
+Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa, foilcap —
 cutover с gh-ишью 25.10), тела задач = доки с тегом «Task», диалог = нативные комменты.
 Демон (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+kickoff → In Progress →
 коммент-мост (🤖-фильтр) → PR → Review → MERGED → Done + cleanup.
