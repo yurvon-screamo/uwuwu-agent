@@ -25,6 +25,10 @@ export interface TrackedTask {
   branch: string
   bodyDoc: string
   title: string
+  /** ISO updatedAt тела при последнем поглощённом состоянии */
+  bodyUpdated?: string
+  /** агент в работе (не idle): его правки тела не будят его же */
+  agentActive?: boolean
   /** проект (ключ конфига демона) */
   project: string
   /** ms-время последнего обработанного коммента */
@@ -165,6 +169,16 @@ export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfi
   ].join("\n")
 }
 
+/** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
+export function bodyEditPrompt(rowId: string): string {
+  return [
+    `[factory] Юзер отредактировал ТЕЛО задачи ${rowId} (не коммент).`,
+    "",
+    "Перечитай тело (MCP export_doc_markdown или uwuwu-cli task get), найди что изменилось,",
+    "учти изменения в работе. Ответь/доложи по пайпу — комментом 🤖.",
+  ].join("\n")
+}
+
 /** Промпт-будильник на новые комменты юзера. */
 export function wakeupPrompt(rowId: string, comments: TaskComment[]): string {
   const quoted = comments.map((c) => c.text.trim()).join("\n---\n")
@@ -201,6 +215,10 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     typeof t.title !== "string" ||
     typeof t.project !== "string"
   ) return false
+  if (
+    t.bodyUpdated !== undefined && typeof t.bodyUpdated !== "string"
+  ) return false
+  if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
   const sesOk = t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))
   if (!sesOk) return false
   if (t.worktree === "" && t.branch === "") return true

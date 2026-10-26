@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   newUserComments,
+  bodyEditPrompt,
   untrackedTasks,
   isUserComment,
   kickoffPrompt,
@@ -155,5 +156,14 @@ describe("kickoff профиль + история", () => {
   test("без истории секции нет", () => {
     const p = kickoffPrompt(task, "тело", { repo: "r", pipeline: [], rules: [] })
     expect(p).not.toContain("НЕДАВНИЕ КОММЕНТЫ")
+  })
+})
+
+describe("bodyEditPrompt", () => {
+  test("контракт: перечитай тело + 🤖-ответ", () => {
+    const p = bodyEditPrompt("r1")
+    expect(p).toContain("отредактировал ТЕЛО задачи r1")
+    expect(p).toContain("export_doc_markdown")
+    expect(p).toContain("🤖")
   })
 })

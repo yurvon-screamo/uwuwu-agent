@@ -14,6 +14,7 @@ import {
   isUserComment,
   kickoffPrompt,
   wakeupPrompt,
+  bodyEditPrompt,
   worktreePaths,
   isValidTracked,
   snapshotText,
@@ -340,6 +341,29 @@ async function sessionLiveness(sessionID: string): Promise<Liveness> {
   }
 }
 
+/** Последний тип сообщения сессии: "idle" = агент закончил и ждёт. */
+async function lastMessageType(sessionID: string): Promise<string | null> {
+  try {
+    const msgs = await restCall(`/session/${sessionID}/message`) as { data?: unknown[] } | unknown[]
+    const arr = (msgs as { data?: unknown[] }).data ?? (msgs as unknown[])
+    if (!Array.isArray(arr) || arr.length === 0) return null
+    return (arr[arr.length - 1] as { type?: unknown }).type as string | null
+  } catch {
+    return null
+  }
+}
+
+/** updatedAt тела (ISO) или null. */
+async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
+  if (bodyDoc === "") return null
+  try {
+    const r = await mcp.tool<{ updatedAt?: string }>("get_doc", { docId: bodyDoc })
+    return r.updatedAt ?? null
+  } catch {
+    return null
+  }
+}
+
 // ——— жизненный цикл задачи ———
 
 function readdirSafe(p: string): string[] {
@@ -431,6 +455,8 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
     createdAt: Date.now(),
     attempts: attemptsSeed,
     project: projectName,
+    bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
+    agentActive: true, // kickoff отправлен — агент работает
   }
   saveState(state)
   await setCells(board, task.rowId, { Status: "In Progress", Branch: branch })
@@ -645,11 +671,34 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       await restartTask(row, tracked.project || projectName, cfg, board, state, fresh, kinds)
       continue
     }
+
+    // детект правок ТЕЛА (юзер правит док, не комментит):
+    // правки агента поглощаются в базлайн при его переходе в idle
+    const idle = (await lastMessageType(tracked.sessionID)) === "idle"
+    const updated = await bodyUpdatedAt(tracked.bodyDoc)
+    if (idle && updated !== null) {
+      if (tracked.agentActive === true) {
+        // агент закончил: его финальные правки тела — в базлайн, без будильника
+        tracked.agentActive = false
+        tracked.bodyUpdated = updated
+        saveState(state)
+      } else if ((tracked.bodyUpdated ?? "") !== "" && updated > (tracked.bodyUpdated ?? "")) {
+        log(`задача ${rowId.slice(0, 8)}: юзер отредактировал тело → сессия`)
+        if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
+          tracked.bodyUpdated = updated
+          tracked.agentActive = true
+          saveState(state)
+        }
+        continue
+      }
+    }
+
     log(`задача ${rowId.slice(0, 8)}: ${fresh.length} новых коммент(ов) → сессия`)
     if (await promptSession(tracked.sessionID, wakeupPrompt(rowId, fresh))) {
       const last = fresh[fresh.length - 1]
       tracked.lastCommentAt = last.createdAt
       tracked.lastCommentId = last.id
+      tracked.agentActive = true
       saveState(state)
     } else {
       log(`задача ${rowId.slice(0, 8)}: промпт не ушёл — граница комментов не сдвинута`)
