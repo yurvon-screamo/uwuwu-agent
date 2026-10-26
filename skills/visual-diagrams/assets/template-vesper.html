@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+/* Эталон visual-diagrams: Vesper, тёмная афина. Известно-рабочая база —
+   копируй структуру и палитру, меняй содержание. */
+:root{--bg:#101010;--panel:#181818;--panel2:#1E1E1E;--line:#2E2E2E;--fg:#FFFFFF;--mut:#A0A0A0;--dim:#7E7E7E;--peach:#FFC799;--mint:#99FFE4;--purple:#ACA1CF;--rose:#F5A191;--gold:#FFCFA8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,'Segoe UI',sans-serif;padding:2px}
+.hdr{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding:2px 0 10px}
+h1{margin:0;font:600 16px/1.2 inherit}
+h1 b{color:var(--peach);font-weight:600}
+.tag{font:11px monospace;color:var(--mint);border:1px solid #2a4038;background:#101010;padding:3px 8px;border-radius:6px}
+.flow{display:flex;align-items:stretch;margin:14px 0}
+.step{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0}
+.step .n{font:10px monospace;color:var(--dim);letter-spacing:.08em}
+.step .t{font-weight:600;font-size:13px;margin:3px 0 5px}
+.step .d{font-size:11.5px;color:var(--mut);line-height:1.45}
+.step.hot{border-color:#4a3527}.step.hot .t{color:var(--peach)}
+.step.cool{border-color:#2a4038}.step.cool .t{color:var(--mint)}
+.step.vio{border-color:#33314a}.step.vio .t{color:var(--purple)}
+.arr{align-self:center;color:var(--dim);padding:0 7px;font-size:13px}
+.cards{display:flex;gap:10px}
+.c{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:11.5px;color:var(--mut);line-height:1.5}
+.c b{color:var(--fg);font-size:12.5px;display:block;margin-bottom:3px}
+</style>
+</head>
+<body>
+<div class="hdr"><h1><b>Заголовок</b> — подзаголовок</h1><span class="tag">метка-чип</span></div>
+<div class="flow">
+  <div class="step"><div class="n">01 · РОЛЬ</div><div class="t">Шаг</div><div class="d">детали</div></div>
+  <div class="arr">→</div>
+  <div class="step hot"><div class="n">02 · РОЛЬ</div><div class="t">Шаг</div><div class="d">детали</div></div>
+  <div class="arr">→</div>
+  <div class="step cool"><div class="n">03 · РОЛЬ</div><div class="t">Шаг</div><div class="d">детали</div></div>
+</div>
+<div class="cards">
+  <div class="c"><b>Карточка</b>пояснение</div>
+  <div class="c"><b>Карточка</b>пояснение</div>
+</div>
+</body>
+</html>
