@@ -212,6 +212,58 @@ def cmd_export(a) -> int:
         close(sid)
 
 
+def cmd_orgls(a) -> int:
+    """Список organize-папок (id + имя + parent) — для поиска folderId."""
+    sid = session()
+    try:
+        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
+
+        def get_text(o):
+            if isinstance(o, dict):
+                for c in o.get("content", []):
+                    if isinstance(c, dict) and "text" in c:
+                        return c["text"]
+
+        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        for n in nodes:
+            if n.get("type") == "folder":
+                print(n["id"], n.get("data"))
+        return 0
+    finally:
+        close(sid)
+
+
+def cmd_org(a) -> int:
+    """Перенести doc-линк в organize-папку: org <docId> --to <folderId>."""
+    sid = session()
+    try:
+        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
+
+        def get_text(o):
+            if isinstance(o, dict):
+                for c in o.get("content", []):
+                    if isinstance(c, dict) and "text" in c:
+                        return c["text"]
+
+        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        link = next(
+            (n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId),
+            None,
+        )
+        if not link:
+            print("линк дока не найден в organize", file=sys.stderr)
+            return 1
+        call(
+            sid,
+            "move_organize_node",
+            {"workspaceId": WORKSPACE, "nodeId": link["id"], "parentId": a.to},
+        )
+        print("moved")
+        return 0
+    finally:
+        close(sid)
+
+
 def cmd_children(a) -> int:
     sid = session()
     try:
@@ -302,6 +354,10 @@ def main() -> int:
     f.add_argument("query")
     ch = sub.add_parser("children")
     ch.add_argument("docId")
+    ol = sub.add_parser("orgls")
+    om = sub.add_parser("org")
+    om.add_argument("docId")
+    om.add_argument("--to", required=True)
     a = p.parse_args()
     return {
         "create": cmd_create,
@@ -311,6 +367,8 @@ def main() -> int:
         "export": cmd_export,
         "find": cmd_find,
         "children": cmd_children,
+        "orgls": cmd_orgls,
+        "org": cmd_org,
     }[a.cmd](a)
 
 
