@@ -9,14 +9,32 @@ description: Диаграммы и визуальные объяснения к�
 
 ## Как писать
 
-- Возьми `assets/template-vesper.html` — тема (палитра + типографика), макет и фигуры свои под содержание
+- **Нод-графы (архитектуры, конвейеры, связи)** → **Cytoscape.js + dagre** (см. секцию ниже) — движок сам считает layout, канвас-рендер, интерактив
+- Текстовые блок-схемы/сиквенсы → mermaid (инлайн; CDN jsdelivr в песочнице афины НЕ грузится)
+- Возьми `assets/template-vesper.html` (тема для плоского HTML) или `assets/template-cyto.html` (каркас нод-графа) — палитра + типографика, макет и фигуры свои под содержание
 - Анимации/JS — приветствуются, когда движение помогает понять (исполняется в sandbox)
-- Живой пример в проде: док «Фабрика: диаграмма конвейера» (папка uwuwu)
+- Живые примеры в проде: док «Фабрика: диаграмма конвейера» (uwuwu), «uwuwu: Стек и архитектура» L1 (cytoscape CDN)
+
+## Нод-графы: Cytoscape.js + dagre (канон для нод)
+
+Дефолт для графов из нодов/связей/зон. Layout считает dagre (никакой ручной геометрии — класс багов «стрелки поехали» закрыт), рендер и интерактив — cytoscape (canvas).
+
+- **CDN (основной путь, 6КБ)**: три скрипта с **unpkg** (jsdelivr в песочнице блокируется!), ПОРЯДОК важен — dagre → cytoscape → cytoscape-dagre (саморегистрируется):
+  ```html
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  ```
+- **Инлайн-фоллбэк** (offline-гарантия): `assets/cyto-dagre.min.js` (482КБ, cytoscape+плагин одним IIFE) вместо трёх src. Пересборка: `bun build entry.js --minify` c `cytoscape.use(cytoscapeDagre)`.
+- **Зоны** = compound-ноды (`parent: "ZONE_ID"` + класс `zone`): dash-рамка, uppercase-лейбл сверху; dagre учитывает их при раскладке. Промежуточные ноды-зоны без контента прятать (`style visibility hidden`) не нужно — просто не давай label.
+- **Канвас большой**: `#cy {width:100%; min-width:1200px; height:92vh; min-height:1000px}` + `window.resize → cy.resize(); cy.fit(undefined, 36)` — embed разворачивается на весь экран юзером, канвас перерастягивается.
+- Стили — наша палитра классами (`core` персик / `gw` лаванда / `store` мята / `actor` стальной; рёбра `ea/ed/ew/eg`); тап по ноде — подсветка closedNeighborhood, остальное `.dim`.
+- Гоча: `cytoscape-dagre` не тянет рёбра compound-нод («dagre can't handle edges on compound nodes») — связи только лист-к-листу.
 
 ## Возможности (проверено на нашем self-hosted AFFiNE)
 
 - `embed_html`-блок принимает самодостаточную страницу: `<!DOCTYPE>`, `<head>`, `<style>`, `<script>`
-- **JS исполняется** (sandbox-iframe): анимации, степперы, интерактивные состояния
+- **JS исполняется** (sandbox-iframe): анимации, степперы, интерактивные состояния; **внешние CDN — только unpkg** (jsdelivr блокируется песочницей; проверено 26.10 на mermaid vs cytoscape)
 - Рендерится в page-режиме прямо в потоке дока
 
 ## Домашняя палитра — Vesper (AFFiNE у нас в тёмной теме)

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<!-- template-cyto: нод-граф на cytoscape+dagre (CDN unpkg; инлайн-фоллбэк = assets/cyto-dagre.min.js вместо трёх script src). Замени elements+стили под свой контент. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+:root{--bg:#101010}
+body{margin:0;background:var(--bg);font:13px/1.4 -apple-system,'Segoe UI',sans-serif}
+#cy{width:100%;min-width:1200px;height:92vh;min-height:1000px;background:var(--bg)}
+.hint{color:#7E7E7E;font-size:10px;text-align:right;padding:2px 8px}
+</style>
+</head>
+<body>
+<div id="cy"></div>
+<div class="hint">тап по узлу — связи · колесо — зум · drag — пан</div>
+<script>__CYTO_JS__</script>
+<script>
+const V = {peach:"#FFC799", mint:"#99FFE4", rose:"#F5A191", gold:"#FFCFA8", purple:"#ACA1CF",
+           fg:"#E8E8E8", mut:"#A0A0A0", dim:"#7E7E7E", line:"#505050", panel:"#1E1E1E"};
+const cy = cytoscape({
+  container: document.getElementById("cy"),
+  layout: {name:"dagre", rankDir:"TB", nodeSep:46, edgeSep:24, rankSep:80, ranker:"network-simplex"},
+  style: [
+    {selector:"node", style:{shape:"round-rectangle","background-color":V.panel,
+      "border-color":V.line,"border-width":1,color:V.fg,"font-size":14,
+      "text-valign":"center","text-halign":"center",width:"label",height:"label",
+      padding:"11px","text-wrap":"wrap",label:"data(label)"}},
+    {selector:"node.zone", style:{"background-color":"#141414AA","border-color":V.line,
+      "border-style":"dashed","border-opacity":.8,"font-size":12,color:V.dim,
+      "text-valign":"top","text-halign":"center","text-transform":"uppercase",
+      "letter-spacing":"0.08em",padding:"14px"}},
+    {selector:"node.core", style:{"border-color":V.peach,"border-width":1.6,color:"#FFDDB8"}},
+    {selector:"node.gw", style:{"border-color":V.purple,"border-width":1.4,color:"#CFC5E8"}},
+    {selector:"node.store", style:{"border-color":"#6FA895",color:"#BFE8D9"}},
+    {selector:"node.actor", style:{"border-color":"#6A6A6A"}},
+    {selector:"edge", style:{"width":1.5,"line-color":V.line,
+      "target-arrow-color":V.line,"target-arrow-shape":"triangle",
+      "curve-style":"bezier",color:"#9A9A9A","font-size":12,
+      "text-background-color":"#101010","text-background-opacity":1,
+      "text-background-padding":2,label:"data(label)"}},
+    {selector:"edge.ea", style:{"line-color":V.peach,"target-arrow-color":V.peach}},
+    {selector:"edge.ed", style:{"line-color":V.mint,"target-arrow-color":V.mint}},
+    {selector:"edge.ew", style:{"line-color":V.rose,"target-arrow-color":V.rose}},
+    {selector:"edge.eg", style:{"line-color":V.gold,"target-arrow-color":V.gold,"width":2}},
+    {selector:".hl", style:{"border-width":2.5,opacity:1}},
+    {selector:".dim", style:{opacity:.16}},
+  ],
+  elements: {nodes:[
+    {data:{id:"rwy",parent:"RAILWAY"},classes:""},
+    {data:{id:"gw",parent:"RAILWAY",label:"affine-mcp\nшлюз · 107 инстр"},classes:"gw"},
+    {data:{id:"affine",parent:"RAILWAY",label:"affine\nUI · API · канва"},classes:"core"},
+    {data:{id:"pg",parent:"RAILWAY",label:"Postgres\nданные · чанки"},classes:"store"},
+    {data:{id:"rd",parent:"RAILWAY",label:"Redis db4\nочереди"},classes:"store"},
+    {data:{id:"mc",parent:"RAILWAY",label:"manticore\nполнотекст"},classes:"store"},
+    {data:{id:"relay",parent:"RAILWAY",label:"ollama-relay\nrathole :47361"},classes:"gw"},
+    {data:{id:"nb",parent:"NOTEBOOK"}},
+    {data:{id:"oc",parent:"NOTEBOOK",label:"opencode-сессии\nglm-5.3-flash"},classes:"gw"},
+    {data:{id:"ollama",parent:"NOTEBOOK",label:"Ollama :11434\nqwen3-embed 0.6b"},classes:"store"},
+    {data:{id:"cli",parent:"NOTEBOOK",label:"uwuwu-cli\nкэши · факты"},classes:""},
+    {data:{id:"fac",parent:"NOTEBOOK",label:"uwuwu-factory\nтик 3 мин"},classes:""},
+    {data:{id:"cron",parent:"NOTEBOOK",label:"uwuwu-cron\nтик 1 мин"},classes:""},
+    {data:{id:"az",parent:"AEZA"}},
+    {data:{id:"aqua",parent:"AEZA",label:"adequate-aqua · FR\nCaddy · cookie-gate"},classes:""},
+    {data:{id:"violet",parent:"AEZA",label:"mass-violet · СПб\nSNI-демукс"},classes:""},
+    {data:{id:"pm",parent:"PERIM"}},
+    {data:{id:"bny",parent:"PERIM",label:"Bunny DNS\nuwuwu.net · .ru"},classes:"gw"},
+    {data:{id:"owner",parent:"PERIM",label:"Владелец\nбраузер"},classes:"actor"},
+    {data:{id:"gh",parent:"PERIM",label:"GitHub\nрепо · PR · bot"},classes:""},
+    {data:{id:"RAILWAY",label:"Railway · Сингапур"},classes:"zone"},
+    {data:{id:"NOTEBOOK",label:"Ноут (дом)"},classes:"zone"},
+    {data:{id:"AEZA",label:"Aeza VPS"},classes:"zone"},
+    {data:{id:"PERIM",label:"Периметр"},classes:"zone"},
+  ],edges:[
+    {data:{id:"e1",source:"gw",target:"affine",label:""},classes:"ea"},
+    {data:{id:"e2",source:"affine",target:"pg"}},
+    {data:{id:"e3",source:"affine",target:"rd"}},
+    {data:{id:"e4",source:"affine",target:"mc"}},
+    {data:{id:"e5",source:"affine",target:"relay",label:"эмбеддинги"},classes:"ed"},
+    {data:{id:"e6",source:"cron",target:"oc"}},
+    {data:{id:"e7",source:"fac",target:"oc"}},
+    {data:{id:"e8",source:"oc",target:"gw",label:"агенты · MCP"},classes:"ea"},
+    {data:{id:"e9",source:"cli",target:"gw"},classes:"ea"},
+    {data:{id:"e10",source:"fac",target:"gw",label:"доски"},classes:"ea"},
+    {data:{id:"e11",source:"relay",target:"ollama",label:"rathole"},classes:"ed"},
+    {data:{id:"e12",source:"fac",target:"gh",label:"PR (gh)"},classes:"eg"},
+    {data:{id:"e13",source:"owner",target:"bny"},classes:"ew"},
+    {data:{id:"e14",source:"bny",target:"aqua",label:"мир"},classes:"ew"},
+    {data:{id:"e15",source:"bny",target:"violet",label:"РФ"},classes:"ew"},
+    {data:{id:"e16",source:"aqua",target:"affine",label:"origin"},classes:"ew"},
+    {data:{id:"e17",source:"violet",target:"affine"},classes:"ew"},
+  ]},
+});
+// зоны-посредники убрать из вида: это контейнеры без стыков
+cy.getElementById(["rwy","nb","az","pm"]).style("visibility","hidden").removeData("label");
+cy.getElementById(["RAILWAY","NOTEBOOK","AEZA","PERIM"]).style({opacity:1});
+let sel = null;
+cy.on("tap", "node", (e) => {
+  const n = e.target;
+  cy.elements().removeClass("hl dim");
+  if (sel === n.id()) { sel = null; return; }
+  sel = n.id();
+  n.addClass("hl");
+  n.closedNeighborhood().addClass("hl");
+  const par = n.parent();
+  if (par.nonempty()) par.addClass("hl");
+  cy.elements().not(".hl").addClass("dim");
+});
+cy.fit(undefined, 36);
+window.addEventListener("resize", () => { cy.resize(); cy.fit(undefined, 36); });
+</script>
+</body>
+</html>
