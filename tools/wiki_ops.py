@@ -96,6 +96,31 @@ def call(sid: str, name: str, args: dict) -> dict:
     return mcp_result(r)
 
 
+def deep_md(o):
+    """markdown из export-ответа (JSON-строка в content[0].text ЛИБО structuredContent)."""
+    if isinstance(o, dict):
+        if "markdown" in o and isinstance(o["markdown"], str):
+            return o["markdown"]
+        for c in o.get("content", []):
+            if isinstance(c, dict) and isinstance(c.get("text"), str):
+                try:
+                    inner = json.loads(c["text"])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(inner, dict) and isinstance(inner.get("markdown"), str):
+                    return inner["markdown"]
+        for v in o.values():
+            r = deep_md(v)
+            if r:
+                return r
+    elif isinstance(o, list):
+        for i in o:
+            r = deep_md(i)
+            if r:
+                return r
+    return None
+
+
 def get_md(o):
     if isinstance(o, dict):
         for k, v in o.items():
@@ -354,7 +379,7 @@ def main() -> int:
     f.add_argument("query")
     ch = sub.add_parser("children")
     ch.add_argument("docId")
-    ol = sub.add_parser("orgls")
+    sub.add_parser("orgls")
     om = sub.add_parser("org")
     om.add_argument("docId")
     om.add_argument("--to", required=True)
