@@ -73,11 +73,6 @@ export function untrackedTasks(rows: TaskRef[], state: FactoryState): TaskRef[] 
   return rows.filter((r) => state.tasks[r.rowId] === undefined)
 }
 
-/** Нейтрализация подделываемых границ в теле (промпт-инъекция). */
-export function sanitizeBoundary(text: string): string {
-  return text.replace(/^\s*===.*$/gm, "≡")
-}
-
 /** Конкатенация текстовых дельт дерева блоков коммента/дока. */
 export function snapshotText(content: unknown): string {
   const out: string[] = []
@@ -98,88 +93,14 @@ export function snapshotText(content: unknown): string {
   return out.join("").trim()
 }
 
-/** Промпт-контракт пайпа для новой задачи. */
-export interface KickoffProfile {
-  repo: string
-  pipeline: string[]
-  rules: string[]
-  /** путь gh-обёртки бота (подставляется в правила как ${GH_AGENT}) */
-  ghAgent?: string
-}
-
-/** Тип задачи (тег тела): определяет мантру пайпа. */
-export type TaskKind = "dev" | "spike" | "bug"
-
-const KIND_MANTRA: Record<TaskKind, string[]> = {
-  dev: [],
-  spike: [
-    "ТИП: СПАЙК. Код НЕ писать (только минимальные пробы для исследования).",
-    "Исследуй вопрос из тела; свои выводы доложи комментом 🤖 (правки тела — за юзером).",
-    "Без PR: итог — отчёт-коммент (🤖 … [DONE]) и ЗАКРОЙ задачу: uwuwu-cli task close <rowId>.",
-  ],
-  bug: [
-    "ТИП: БАГ. Пайп строго TDD: сначала воспроизведи по BDD-сценарию из тела (красный тест).",
-    "Не воспроизвёлся — СТОП: спроси юзера комментом (🤖 детали окружения) и заверши ход.",
-    "Воспроизвёлся: причина → фикс → красный тест зелёный → PR (в PR — имя теста).",
-  ],
-}
-
-export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfile, commentsHistory = "", kind: TaskKind = "dev"): string {
+/** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
+ *  демон знает только «какая задача» и «где работать». */
+export function spawnPrompt(rowId: string, project: string, repo: string): string {
   return [
-    `Ты — девелопер фабрики uwuwu. Репозиторий: ${profile.repo}. Задача: «${task.title.replace(/[\r\n]+/g, " ")}» (канбан-строка ${task.rowId}).`,
-    ...(kind === "dev" ? [] : KIND_MANTRA[kind]),
+    `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
-    "=== ТЕЛО ЗАДАЧИ ===",
-    sanitizeBoundary(body || "(пусто)"),
-    "=== КОНЕЦ ТЕЛА ===",
-    "",
-    "ПАЙП (строго по порядку):",
-    "1. Изучи задачу и репо (ветка ворктри уже создана — работай здесь).",
-    "2. Если для старта нужны решения пользователя — задай вопросы ОДНИМ комментарием:",
-    `   uwuwu-cli task comment ${task.rowId} "🤖 <вопросы>"`,
-    "   (первая строка обязательно 🤖) и ЗАВЕРШИ ход. Ответ придёт комментом — тебя разбудят.",
-    "3. Если всё ясно: прогони план через code-quality-reviewer сабагента, исправь замечания.",
-    "4. Реализуй. Коммить атомарно. Пуш ветки — обычный git push.",
-    `5. Отчёт в задачу: uwuwu-cli task comment ${task.rowId} "🤖 <отчёт по шаблону ниже>".`,
-    "6. PR: gh pr create --title «<кратко>» --body-file <файл> (выжимка отчёта + ссылка на задачу:",
-    `   https://affine.up.railway.app/workspace/81475705-028a-4153-a8f5-f06e402ee31e/${task.bodyDoc}).`,
-    `7. СРАЗУ после PR: uwuwu-cli task edit ${task.rowId} --pr <url> --status Review --branch <ветка>.`,
-    "8. Проверь CI (gh pr checks --watch может висеть — опрашивай gh pr view). Красный — чини.",
-    "9. Мержит пользователь. Замечания придут комментами — исправляй в ветке и пушь.",
-    ...profile.pipeline,
-    "",
-    "ШАБЛОН ОТЧЁТА:",
-    AGENT_MARK + " Отчёт: «" + task.title + "»",
-    "**Что сделано:** …",
-    "**Как проверить:** … (шаги)",
-    "**Риски:** …",
-    "",
-    "ПРАВИЛА:",
-    "- КАЖДЫЙ твой комментарий начинается с " + AGENT_MARK + " — иначе разбудишь себя.",
-    "- ВСЁ для пользователя — только комменты задачи (uwuwu-cli task comment). Текст в сессии юзер не читает.",
-    "- Тело задачи перечитывай `uwuwu-cli task get` (печатает тело целиком).",
-    "- Не мержи сам. Не закрывай задачу сам (uwuwu-cli task close — только демон по мержу PR).",
-    `- Разрешено: uwuwu-cli task comment/get/edit/body, gh pr create/view/checks. Запрещено: gh pr merge.`,
-    "- Тело дозаписывай: uwuwu-cli task body <rowId> --project <proj> --stdin (markdown; диаграммы — skill visual-diagrams, фенс \\`\\`\\`html_embed имя\\`)",
-    ...profile.rules.map((r) => r.replace("${GH_AGENT}", profile.ghAgent ?? "gh")),
-    ...(commentsHistory === "" ? [] : [
-      "",
-      "=== НЕДАВНИЕ КОММЕНТЫ ЗАДАЧИ (контекст, миграции/предыстория) ===",
-      sanitizeBoundary(commentsHistory),
-      "=== КОНЕЦ КОММЕНТОВ ===",
-    ]),
-  ].join("\n")
-}
-
-/** Сверка после работы агента: тело менялось, чьи правки — знает агент. */
-export function mergeCheckPrompt(rowId: string): string {
-  return [
-    `[factory] Сверка тела задачи ${rowId}: документ менялся, пока ты работал.`,
-    "",
-    "Часть изменений — твои (твоя работа). Перечитай тело (uwuwu-cli task get):",
-    "- есть правки, которые НЕ твои (от юзера: требования/правки/дополнения)?",
-    "  → учти их в работе, ответь по пайпу комментом 🤖 что учёл;",
-    "- всё твоё или ничего значимого → НИЧЕГО не делай, это штатная сверка.",
+    "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
+    "Ворктри и ветка уже созданы — работай здесь. Вопросы/отчёты — комментом 🤖.",
   ].join("\n")
 }
 

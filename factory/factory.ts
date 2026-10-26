@@ -1,7 +1,10 @@
-// uwuwu-factory — демон фабрики разработки на AFFiNE.
-// Поллит канбан-доску (Status=Todo), на каждую задачу поднимает сессию
-// девелопера в своём ворктри от свежего master, мостит комменты юзера
-// в сессию (фильтр 🤖), следит за PR (Review → MERGED → Done + чистка).
+// uwuwu-factory — будильник фабрики разработки на AFFiNE.
+// Вся логика пайпа — у агента (глобальный AGENTS.md, раздел «Работа над
+// задачей»). Демон делает ровно три вещи:
+//   1. Todo на доске → worktree + сессия + короткий spawn-промпт
+//   2. новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин,
+//      коммент юзера → рестарт)
+//   3. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка ворктри
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
@@ -12,10 +15,9 @@ import {
   newUserComments,
   untrackedTasks,
   isUserComment,
-  kickoffPrompt,
+  spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
-  mergeCheckPrompt,
   worktreePaths,
   isValidTracked,
   snapshotText,
@@ -25,17 +27,11 @@ import {
   type TrackedTask,
 } from "./factory-lib"
 
-// ——— конфиг проектов ———
+// ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 export interface ProjectCfg {
   board: string
   repo: string
   local: string
-  /** путь к gh-обёртке для постингов от бота (публичные репо) */
-  ghAgent?: string
-  /** доп. строки ПАЙПА (проект-специфика: скрины, coverage, креды) */
-  pipeline: string[]
-  /** доп. строки ПРАВИЛ */
-  rules: string[]
 }
 
 const PROJECTS: Record<string, ProjectCfg> = {
@@ -43,28 +39,11 @@ const PROJECTS: Record<string, ProjectCfg> = {
     board: "Задачи uwuwu",
     repo: "yurvon-screamo/uwuwu-agent",
     local: join(homedir(), "uwuwu-agent"),
-    pipeline: [],
-    rules: [],
   },
   origa: {
     board: "Задачи origa",
     repo: "yurvon-screamo/origa",
     local: join(homedir(), "origa"),
-    ghAgent: join(homedir(), "origa/.opencode/factory/gh-as-agent"),
-    pipeline: [
-      "5а. UI-задачи: скрины ТОЛЬКО инструментом (свой скрипт писать нельзя):",
-      "    cd end2end && npm ci && npm run shots -- list",
-      "    npm run shots -- capture --scenario <id> --label task --upload",
-      "    Пререквизит ORIGA_CDN_CACHE_DIR (symlink на чекаут разработчика).",
-      "    Скрины НЕ коммитить — ссылки CDN в отчёт и PR.",
-      "5б. PR с кодом: дождись coverage-комментария qltysh[bot] (~10 мин после CI) и прими его.",
-    ],
-    rules: [
-      "- ВСЕ постинги в GitHub — через gh-as-agent (путь ниже), голый gh для",
-      "  issue comment/pr create ЗАПРЕЩЁН (репо публичное, выступаешь uwuwu-agent[bot]).",
-      "  Пуш — от бота (credential helper уже настроен в ворктри).",
-      `  gh-as-agent: \${GH_AGENT}`,
-    ],
   },
 }
 const WORKTREES_ROOT = join(homedir(), ".local/share/uwuwu-factory/worktrees")
@@ -249,12 +228,6 @@ async function setCells(board: BoardIds, rowId: string, cells: Record<string, st
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
-async function taskBody(bodyDoc: string): Promise<string> {
-  if (bodyDoc === "") return "(тела нет)"
-  const r = await mcp.tool<{ markdown?: string }>("export_doc_markdown", { docId: bodyDoc })
-  return r.markdown ?? "(пусто)"
-}
-
 interface CommentEdge { node?: { id?: string; content?: unknown } }
 
 async function commentPage(bodyDoc: string, after: string): Promise<{
@@ -424,7 +397,7 @@ function reconcileOrphans(state: FactoryState): void {
   }
 }
 
-async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, attemptsSeed: number, kinds: Map<string, "dev" | "spike" | "bug">): Promise<void> {
+async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, attemptsSeed: number): Promise<void> {
   const { branch, worktree } = worktreePaths(WORKTREES_ROOT, task.rowId)
   mkdirSync(WORKTREES_ROOT, { recursive: true })
 
@@ -442,28 +415,11 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
   const sessionID = await createSession(worktree, task.title)
   if (sessionID === null) throw new Error("сессия не создалась")
 
-  let body = await taskBody(task.bodyDoc)
-  // линкованные строки несут заголовок в теле-доке, не в ячейке:
-  // деривируем из первой строки экспорта (обычно «# Заголовок»)
-  let title = task.title
-  if (title === "" && task.bodyDoc !== "") {
-    title = body.split("\n")[0]?.replace(/^#+\s*/, "").trim() ?? ""
-    if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
-  }
-  const history = (await taskComments(task.bodyDoc))
-    .slice(-8)
-    .map((c) => {
-      const t = c.text.trimStart()
-      const who = t.startsWith("🤖") ? "агент" : t.startsWith("[factory]") ? "фабрика" : "юзер"
-      return `${who}: ${c.text.trim().slice(0, 400)}`
-    })
-    .join("\n---\n")
-  const kind = kinds.get(task.bodyDoc) ?? "dev"
   const sent = await promptSession(
     sessionID,
-    kickoffPrompt({ ...task, title }, body, cfg, history, kind),
+    spawnPrompt(task.rowId, projectName, cfg.repo),
   )
-  if (!sent) throw new Error("kickoff-промпт не ушёл")
+  if (!sent) throw new Error("spawn-промпт не ушёл")
 
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
@@ -478,7 +434,7 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
     worktree,
     branch,
     bodyDoc: task.bodyDoc,
-    title,
+    title: task.title,
     lastCommentAt: last?.createdAt ?? 0,
     lastCommentId: last?.id ?? "",
     createdAt: Date.now(),
@@ -547,31 +503,8 @@ async function registerFailure(
   }
 }
 
-/** PR-надзор: Review + PR-url → merged → Done + чистка. */
-async function checkMerged(task: TaskRef, board: BoardIds, state: FactoryState): Promise<boolean> {
-  const tracked = state.tasks[task.rowId]
-  if (tracked === undefined) return false
-  let out = ""
-  try {
-    out = await sh(["gh", "pr", "view", task.pr, "--json", "state"])
-  } catch (e) {
-    log(`pr view ${task.pr}: ${e}`)
-    return false
-  }
-  try {
-    const st = (JSON.parse(out) as { state?: string }).state?.toLowerCase()
-    if (st === "merged") {
-      await setCells(board, task.rowId, { Status: "Done" })
-      await notify(tracked, "🤖 [factory] PR смержен — задача закрыта, ворктри убран.")
-      await finishTask(task.rowId, tracked, state)
-      return true
-    }
-  } catch { /* ответ не JSON — на след. тике */ }
-  return false
-}
-
 async function restartTask(
-  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, fresh: TaskComment[], kinds: Map<string, "dev" | "spike" | "bug">,
+  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, fresh: TaskComment[],
 ): Promise<void> {
   const tracked = state.tasks[task.rowId]
   if (tracked === undefined) return
@@ -582,36 +515,21 @@ async function restartTask(
   tracked.sessionID = "" // карантин до успеха старта
   saveState(state)
   try {
-    await startTask(task, projectName, cfg, board, state, seed, kinds)
+    await startTask(task, projectName, cfg, board, state, seed)
   } catch (e) {
     await registerFailure(task, projectName, cfg, board, state, seed, e)
   }
 }
 
-/** Карта docId → тип задачи по тегам тел (3 запроса на тик). */
-async function taskKinds(): Promise<Map<string, "dev" | "spike" | "bug">> {
-  const map = new Map<string, "dev" | "spike" | "bug">()
-  for (const kind of ["spike", "bug"] as const) {
-    try {
-      const r = await mcp.tool<{ docs?: { id?: string }[] }>("list_docs_by_tag", { tag: kind[0].toUpperCase() + kind.slice(1) })
-      for (const d of r.docs ?? []) {
-        if (typeof d.id === "string") map.set(d.id, kind)
-      }
-    } catch { /* нет тега — все dev */}
-  }
-  return map
-}
-
 async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
-  const kinds = await taskKinds()
 
   // 1. новые Todo (только строки ЭТОЙ доски)
   const started = new Set<string>()
   for (const task of untrackedTasks(rows.filter((r) => r.status === "Todo"), state)) {
     try {
-      await startTask(task, projectName, cfg, board, state, 0, kinds)
+      await startTask(task, projectName, cfg, board, state, 0)
       started.add(task.rowId)
     } catch (e) {
       await registerFailure(task, projectName, cfg, board, state, 0, e)
@@ -634,10 +552,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     // Done ставим только мы (по мержу), но исчезновение In Progress с доски =
     // удаление строки — уже обработано выше.
 
-    if (row.status === "Review" && row.pr !== "") {
-      if (await checkMerged(row, board, state)) continue
-    }
-    // спайк/закрытая руками: Status=Done при живой state-записи → чистка
+    // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
     if (row.status === "Done") {
       log(`задача ${rowId.slice(0, 8)}: Done (закрыта агентом/юзером) — чистка`)
       await finishTask(rowId, tracked, state)
@@ -660,7 +575,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         saveState(state)
       }
       try {
-        await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts, kinds)
+        await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts)
       } catch (e) {
         await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
       }
@@ -673,7 +588,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
       if (fresh.length === 0) continue
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh, kinds)
+      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
       continue
     }
 
@@ -697,40 +612,32 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     }
     if (liveness === "dead") {
       log(`задача ${rowId.slice(0, 8)}: сессия умерла — перезапуск`)
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh, kinds)
+      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
       continue
     }
 
-    // детект правок ТЕЛА (юзер правит док, не комментит):
-    // правки агента поглощаются в базлайн при его переходе в idle
+    // будильник правок ТЕЛА: активного агента не дёргаем; после его хода
+    // (idle) любое изменение с базлайна — wakeup, атрибуция на агенте
+    // (он знает, что писал сам: чужое учтёт, своё пропустит молча)
     const idle = (await lastMessageType(tracked.sessionID)) === "idle"
     const updated = await bodyUpdatedAt(tracked.bodyDoc)
-    if (idle && updated !== null) {
-      if (tracked.agentActive === true) {
-        // агент закончил. Тело менялось с базлайна? Атрибуция правок — на
-        // агенте (он знает, что писал сам): сверка ловит и правки юзера,
-        // внесённые ВО ВРЕМЯ работы агента (демон их не различает)
-        const changed = (tracked.bodyUpdated ?? "") !== "" && updated > (tracked.bodyUpdated ?? "")
-        tracked.agentActive = false
+    const bodyChanged = updated !== null
+      && (tracked.bodyUpdated ?? "") !== ""
+      && updated > (tracked.bodyUpdated ?? "")
+    if (idle && bodyChanged) {
+      log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup (атрибуция на агенте)`)
+      if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
         tracked.bodyUpdated = updated
+        tracked.agentActive = true
         saveState(state)
-        if (changed) {
-          log(`задача ${rowId.slice(0, 8)}: тело менялось за ход агента — сверка`)
-          if (await promptSession(tracked.sessionID, mergeCheckPrompt(rowId))) {
-            tracked.agentActive = true
-            saveState(state)
-          }
-          continue
-        }
-      } else if ((tracked.bodyUpdated ?? "") !== "" && updated > (tracked.bodyUpdated ?? "")) {
-        log(`задача ${rowId.slice(0, 8)}: юзер отредактировал тело → сессия`)
-        if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
-          tracked.bodyUpdated = updated
-          tracked.agentActive = true
-          saveState(state)
-        }
-        continue
       }
+      continue
+    }
+    if (idle && tracked.agentActive === true && updated !== null) {
+      // ход агента завершён без правок тела — просто снять флаг
+      tracked.agentActive = false
+      tracked.bodyUpdated = updated
+      saveState(state)
     }
 
     log(`задача ${rowId.slice(0, 8)}: ${fresh.length} новых коммент(ов) → сессия`)
