@@ -5,12 +5,12 @@
 ## Структура
 
 ```
+opencodereview/ правила ревью
 agents/        субагенты: code-quality-reviewer, developer, office-coworker
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
 cli-tools/     atlassian, research
-opencodereview/ правила ревью
 link.sh        установка симлинками
 opencode.json  главный конфиг опенкода (jsonc)
 cli.json       TUI-конфиг
@@ -36,21 +36,7 @@ cd uwuwu-agent
 
 `link.sh` бэкапит существующие конфиги (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После — перезапустить opencode.
 
-## Маркетинговый зоопарк
-
-Живёт отдельно: `~/origa/marketing/.opencode` (репа [origa](https://github.com/yurvon-screamo/origa)) — 6 агентов, TG-хаб, humanizer-конвейер.
-
-## Сборка uwuwu-cli
-
-```bash
-cd cli && cargo build --release
-```
-
-## License
-
-MIT
-
-## AFFiNE-first (2026-10)
+## AFFiNE-first 
 
 Вся база знаний живёт в AFFiNE (Railway): articles/requests/facts через `uwuwu-cli`,
 прямой доступ к докам — MCP-шлюз (107 tools).
@@ -69,7 +55,7 @@ cutover с gh-ишью 25.10), тела задач = доки с тегом «Ta
 промпт = тело-док. Демон (тик 1 мин) поднимает сессию агента по расписанию —
 отчёты комментами 🤖 в тело; разовые → авто-`fired`.
 
-CLI (единственный механизм — сессионный cron_set удалён, плагин в disabled/):
+CLI:
 `uwuwu-cli cron set --title "…" (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`,
 `cron list / pause / resume / rm`.
 
@@ -79,7 +65,6 @@ CLI (единственный механизм — сессионный cron_set
 (id/заголовок, фоллбек Crons); `request` (properties+attach), `facts`, `search`
 (сервер Manticore + семантика), `read/blob/shot` (мультимодальное чтение).
 
-
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
 share one workspace; locally only operational caches live.
 
@@ -87,7 +72,8 @@ share one workspace; locally only operational caches live.
 
 Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
 
-**Workspace structure** (folders, not container docs):
+**Workspace structure**:
+
 - 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …), no direct docs
 - 📁 Projects — 7 project subfolders, each starting with a `<Proj> Project (README)` doc (description carrier for `projects`)
 - 📁 Daily — journal buckets (one per day, facts inside)
@@ -97,6 +83,7 @@ Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_
 Folders handle organization; tags are only for lookup.
 
 **Commands**:
+
 - `search` — two-tier: AFFiNE server-side full-text (Manticore) first, automatic fallback to local semantic search (Ollama `qwen3-embedding:0.6b`)
 - `read` — markdown + rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
 - `blob <key>` — download workspace blobs (images/attachments)
@@ -108,4 +95,5 @@ Folders handle organization; tags are only for lookup.
 - `affine --all` / `--tag-slugs` — one-time legacy migration / tag backfill
 
 **Infrastructure**: Railway (Singapore) — AFFiNE + MCP gateway + Postgres (pgvector)
-+ Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.
+
+- Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.

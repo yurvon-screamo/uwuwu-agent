@@ -35,6 +35,15 @@ SKILLS rules:
 - `uwuwu-cli affine --all` — разовая миграция легаси-ФС (теги больше не проставляются — адресация через кэш/мапу); мапа `affine_map_*.json` — локальный кэш слагов с машин, где миграция выполнялась.
 - Локальные кэши (все — операционные, не знания): `affine_content_cache.json`, `affine_embedding_cache.json`, `affine_facts_index.json` (+`.bak`), `affine_map_*.json`. Легаси `experience/`, `projects/`, `facts/`, `.requests/` больше не читаются и не пишутся.
 
+### Сохранение опыта
+
+После завершения задачи — сохрани извлечённый опыт в базу знаний:
+
+1. Сформулируй ключевые находки: что сделано, какие решения приняты, какие gotchas обнаружены, какие инструменты/паттерны сработали или нет
+2. Вызови `uwuwu-cli wiki request`
+
+Сохраняй только нетривиальный опыт. Если задача рутинная и не дала новых инсайтов — пропускай.
+
 ## AFFiNE продакшен (Railway, Сингапур)
 
 - **UI**: `https://affine.up.railway.app` (аккаунт `yurvon@yahoo.co.jp`)
@@ -60,4 +69,3 @@ SKILLS rules:
 - **Полнотекстовый поиск**: Manticoresearch (Railway-сервис `manticore`, HTTP 9308, volume `/var/lib/manticore`), афина подключена через `AFFINE_INDEXER_SEARCH_ENDPOINT=http://manticore.railway.internal:9308`. Состояние очередей — Redis **DB 4** (`affine_job:*`). Полная переиндексация: `UPDATE workspaces SET indexed=false` + удалить delayed-джобу `autoIndexWorkspaces` (ZREM+DEL в db4) → cron-30s подхватит.
 - **Ollama relay**: `ollama-relay-production.up.railway.app` (rathole через TCP proxy `metro.proxy.rlwy.net:47361`) → ноут `localhost:11434`. Bearer-гейт на `/v1/`. Для BYOK афины (эмбеддинги индексатора).
 - **DNS**: Bunny (`coco/kiki.bunny.net`), управление через `bunny` CLI (skill `bunny-cli`). Кастомные домены `*.uwuwu.net` не подключены (Let's Encrypt rate limit); сервисы живут на Railway-доменах `*.up.railway.app`.
-
