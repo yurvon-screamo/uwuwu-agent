@@ -19,6 +19,8 @@ pub enum DocKind {
     Project,
     Daily,
     Request,
+    Task,
+    Cron,
     Other,
 }
 

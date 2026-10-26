@@ -532,6 +532,8 @@ pub async fn run() -> anyhow::Result<()> {
                             content_cache::DocKind::Project => "access",
                             content_cache::DocKind::Request => "request",
                             content_cache::DocKind::Daily => "fact",
+                            content_cache::DocKind::Task => "task",
+                            content_cache::DocKind::Cron => "cron",
                             content_cache::DocKind::Other => "other",
                         };
                         (
@@ -567,7 +569,20 @@ pub async fn run() -> anyhow::Result<()> {
                 if !use_local || top + facts + access == 0 {
                     return Ok(Vec::new());
                 }
-                let (_, cache, index) = affine_queries::session(&root, &cfg).await?;
+                // тела задач/кронов — живой тег-источник (дерево их не видит)
+                let mut client = affine_client::AffineClient::connect(&cfg).await?;
+                let extra = affine_queries::tagged_docs(&mut client, &cfg).await;
+                eprintln!("affine: тел задач/кронов в семантике: {}", extra.len());
+                // кэш: свежий если синк успел; иначе старый файл лучше пустоты
+                let (cache, index) = match affine_queries::session(&root, &cfg).await {
+                    Ok((_, cache, index)) => (cache, index),
+                    Err(e) => {
+                        eprintln!("affine: синк не прошёл ({e:#}) — кэш/факты могут отставать");
+                        let cache = content_cache::ContentCache::load(&root).unwrap_or_default();
+                        let index = crate::fact_index::FactIndex::load(&root).unwrap_or_default();
+                        (cache, index)
+                    }
+                };
                 affine_search::search(
                     &root,
                     &cache,
@@ -579,6 +594,7 @@ pub async fn run() -> anyhow::Result<()> {
                         access,
                         threshold,
                     },
+                    &extra,
                 )
                 .await
             };
@@ -594,6 +610,8 @@ pub async fn run() -> anyhow::Result<()> {
                 let kind = match hit.kind {
                     content_cache::DocKind::Daily => "fact",
                     content_cache::DocKind::Project => "access",
+                    content_cache::DocKind::Task => "task",
+                    content_cache::DocKind::Cron => "cron",
                     _ => "experience",
                 };
                 println!("{:.3}\t{kind}\t{}\t{}", hit.score, hit.title, hit.slug);

@@ -52,6 +52,7 @@ pub async fn search(
     index: &FactIndex,
     query: &str,
     opts: &SearchOpts,
+    extra_docs: &[(String, String, String, &'static str)],
 ) -> Result<Vec<SearchHit>> {
     let mut embed_cache = load_cache(root)?;
     let query_vec = embed(MODEL, query).await?;
@@ -82,6 +83,28 @@ pub async fn search(
             DocKind::Daily,
         ));
     }
+
+    // тела задач/кронов по тегам: дерево их не видит — живой источник
+    let extra: Vec<(String, String, String, String, DocKind)> = extra_docs
+        .iter()
+        .map(|(_id, title, body, kind)| {
+            (
+                format!("task/{title}"),
+                title.clone(),
+                first_line(body),
+                body.clone(),
+                match *kind {
+                    "cron" => DocKind::Cron,
+                    _ => DocKind::Task,
+                },
+            )
+        })
+        .collect();
+    // extras (свежие тела задач/кронов) — первыми в очередь эмбеддинга:
+    // бюджет прогона не должен съедаться до их пула
+    let mut ordered = extra;
+    ordered.extend(docs);
+    let docs = ordered;
 
     for (slug, title, description, body, kind) in docs {
         let chunks = chunk_markdown(&body);
@@ -154,6 +177,13 @@ pub async fn search(
             DocKind::Project => {
                 if access < opts.access {
                     access += 1;
+                    out.push(hit);
+                }
+            }
+            DocKind::Task | DocKind::Cron => {
+                // тела задач/кронов — полноправный опыт: делят experience-квоту
+                if exp < opts.experience {
+                    exp += 1;
                     out.push(hit);
                 }
             }

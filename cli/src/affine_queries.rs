@@ -10,6 +10,62 @@ use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
 
+/// Живой сбор тел задач/кронов по тегам — не зависит от дерева
+/// (linked-тела невидимы list_workspace_tree). Cap guards от разросшейся доски.
+pub async fn tagged_docs(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+) -> Vec<(String, String, String, &'static str)> {
+    const CAP: usize = 60;
+    let mut out: Vec<(String, String, String, &'static str)> = Vec::new();
+    for (tag, kind) in [
+        ("Dev", "task"),
+        ("Spike", "task"),
+        ("Bug", "task"),
+        ("Cron", "cron"),
+    ] {
+        let Ok(r) = client
+            .call_tool(
+                "list_docs_by_tag",
+                json!({"workspaceId": cfg.workspace, "tag": tag}),
+            )
+            .await
+        else {
+            continue;
+        };
+        let docs = r
+            .get("docs")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for d in docs {
+            if out.len() >= CAP {
+                return out;
+            }
+            let id = d
+                .get("id")
+                .or_else(|| d.get("docId"))
+                .and_then(|v| v.as_str());
+            let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(id) = id else { continue };
+            if out.iter().any(|(did, ..)| did == id) {
+                continue;
+            }
+            if let Ok(e) = client
+                .call_tool(
+                    "export_doc_markdown",
+                    json!({"workspaceId": cfg.workspace, "docId": id}),
+                )
+                .await
+            {
+                let md = e.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
+                out.push((id.to_string(), title.to_string(), md.to_string(), kind));
+            }
+        }
+    }
+    out
+}
+
 /// Папка Requests (сайдбар) — заявки крепятся сюда напрямую.
 pub const REQUESTS_FOLDER_ID: &str = "9rkqdytOCvh-93bReTV3V";
 use crate::affine_docs::{read_markdown, resolve_slug};
