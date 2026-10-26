@@ -169,6 +169,18 @@ export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfi
   ].join("\n")
 }
 
+/** Сверка после работы агента: тело менялось, чьи правки — знает агент. */
+export function mergeCheckPrompt(rowId: string): string {
+  return [
+    `[factory] Сверка тела задачи ${rowId}: документ менялся, пока ты работал.`,
+    "",
+    "Часть изменений — твои (твоя работа). Проверь тело (export_doc_markdown):",
+    "- есть правки, которые НЕ твои (от юзера: требования/правки/дополнения)?",
+    "  → учти их в работе, ответь по пайпу комментом 🤖 что учёл;",
+    "- всё твоё или ничего значимого → НИЧЕГО не делай, это штатная сверка.",
+  ].join("\n")
+}
+
 /** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
 export function bodyEditPrompt(rowId: string): string {
   return [

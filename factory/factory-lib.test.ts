@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import {
   newUserComments,
   bodyEditPrompt,
+  mergeCheckPrompt,
   untrackedTasks,
   isUserComment,
   kickoffPrompt,
@@ -165,5 +166,14 @@ describe("bodyEditPrompt", () => {
     expect(p).toContain("отредактировал ТЕЛО задачи r1")
     expect(p).toContain("export_doc_markdown")
     expect(p).toContain("🤖")
+  })
+})
+
+describe("mergeCheckPrompt", () => {
+  test("атрибуция на агенте, молчаливое штатное завершение", () => {
+    const p = mergeCheckPrompt("r2")
+    expect(p).toContain("Сверка тела задачи r2")
+    expect(p).toContain("НЕ твои")
+    expect(p).toContain("НИЧЕГО не делай")
   })
 })

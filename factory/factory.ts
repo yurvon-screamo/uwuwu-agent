@@ -15,6 +15,7 @@ import {
   kickoffPrompt,
   wakeupPrompt,
   bodyEditPrompt,
+  mergeCheckPrompt,
   worktreePaths,
   isValidTracked,
   snapshotText,
@@ -678,10 +679,21 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     const updated = await bodyUpdatedAt(tracked.bodyDoc)
     if (idle && updated !== null) {
       if (tracked.agentActive === true) {
-        // агент закончил: его финальные правки тела — в базлайн, без будильника
+        // агент закончил. Тело менялось с базлайна? Атрибуция правок — на
+        // агенте (он знает, что писал сам): сверка ловит и правки юзера,
+        // внесённые ВО ВРЕМЯ работы агента (демон их не различает)
+        const changed = (tracked.bodyUpdated ?? "") !== "" && updated > (tracked.bodyUpdated ?? "")
         tracked.agentActive = false
         tracked.bodyUpdated = updated
         saveState(state)
+        if (changed) {
+          log(`задача ${rowId.slice(0, 8)}: тело менялось за ход агента — сверка`)
+          if (await promptSession(tracked.sessionID, mergeCheckPrompt(rowId))) {
+            tracked.agentActive = true
+            saveState(state)
+          }
+          continue
+        }
       } else if ((tracked.bodyUpdated ?? "") !== "" && updated > (tracked.bodyUpdated ?? "")) {
         log(`задача ${rowId.slice(0, 8)}: юзер отредактировал тело → сессия`)
         if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
