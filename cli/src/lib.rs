@@ -209,6 +209,8 @@ enum Commands {
             help = "experience/ articles limit (0 = off)"
         )]
         top: usize,
+        #[arg(long, default_value = "10", help = "task/cron bodies limit (0 = off)")]
+        tasks: usize,
         #[arg(long, default_value = "10", help = "facts/ limit (0 = off)")]
         facts: usize,
         #[arg(long, default_value = "5", help = "projects/** docs limit (0 = off)")]
@@ -478,6 +480,7 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Search {
             query,
             top,
+            tasks,
             facts,
             access,
             sofa,
@@ -574,7 +577,15 @@ pub async fn run() -> anyhow::Result<()> {
                 let extra = affine_queries::tagged_docs(&mut client, &cfg).await;
                 eprintln!("affine: тел задач/кронов в семантике: {}", extra.len());
                 // кэш: свежий если синк успел; иначе старый файл лучше пустоты
-                let (cache, index) = match affine_queries::session(&root, &cfg).await {
+                // больной шлюз может висеть без ошибки — таймаут = фоллбек
+                let synced = tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    affine_queries::session(&root, &cfg),
+                )
+                .await;
+                let (cache, index) = match synced
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("таймаут синка 90с")))
+                {
                     Ok((_, cache, index)) => (cache, index),
                     Err(e) => {
                         eprintln!("affine: синк не прошёл ({e:#}) — кэш/факты могут отставать");
@@ -592,6 +603,7 @@ pub async fn run() -> anyhow::Result<()> {
                         experience: top,
                         facts,
                         access,
+                        tasks,
                         threshold,
                     },
                     &extra,

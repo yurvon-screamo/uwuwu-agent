@@ -41,6 +41,8 @@ pub struct SearchOpts {
     pub experience: usize,
     pub facts: usize,
     pub access: usize,
+    /// отдельная квота тел задач/кронов (теги Dev/Spike/Bug/Cron)
+    pub tasks: usize,
     pub threshold: f32,
 }
 
@@ -166,6 +168,7 @@ pub async fn search(
     let mut exp = 0;
     let mut facts = 0;
     let mut access = 0;
+    let mut tasks = 0;
     for hit in scored {
         match hit.kind {
             DocKind::Daily => {
@@ -181,9 +184,9 @@ pub async fn search(
                 }
             }
             DocKind::Task | DocKind::Cron => {
-                // тела задач/кронов — полноправный опыт: делят experience-квоту
-                if exp < opts.experience {
-                    exp += 1;
+                // тела задач/кронов — своя квота: не конкурируют со статьями
+                if tasks < opts.tasks {
+                    tasks += 1;
                     out.push(hit);
                 }
             }
