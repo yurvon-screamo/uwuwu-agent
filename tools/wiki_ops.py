@@ -237,6 +237,99 @@ def cmd_export(a) -> int:
         close(sid)
 
 
+def cmd_embed(a) -> int:
+    """Вставить/заменить HTML-диаграмму (embed_html) в ЛЮБОЙ док.
+    embed <docId> --html файл [--name arch] — с именем: replace-семантика по маркеру
+    (без имени — простая вставка в конец).
+    """
+    html = Path(a.html).read_text(encoding="utf-8") if a.html else sys.stdin.read()
+    sid = session()
+    try:
+        if a.name:
+            marker = f"⁂ diagram:{a.name}"
+            res = call(sid, "read_doc", {"workspaceId": WORKSPACE, "docId": a.docId})
+            blocks = res.get("blocks", []) if isinstance(res, dict) else []
+            note = next(
+                (
+                    b
+                    for b in blocks
+                    if b.get("flavour") == "affine:note"
+                    or "note" in str(b.get("flavour", ""))
+                ),
+                {},
+            )
+            child_ids = [c for c in (note.get("childIds") or []) if isinstance(c, str)]
+            by_id = {b.get("id"): b for b in blocks if isinstance(b, dict)}
+            marker_id = next(
+                (cid for cid in child_ids if by_id.get(cid, {}).get("text") == marker),
+                None,
+            )
+            if marker_id:
+                # replace: удалить следящий embed, вставить новый после маркера
+                i = child_ids.index(marker_id)
+                if i + 1 < len(child_ids):
+                    nxt = child_ids[i + 1]
+                    if "embed" in str(by_id.get(nxt, {}).get("flavour", "")):
+                        call(
+                            sid,
+                            "delete_block",
+                            {
+                                "workspaceId": WORKSPACE,
+                                "docId": a.docId,
+                                "blockId": nxt,
+                            },
+                        )
+                call(
+                    sid,
+                    "append_block",
+                    {
+                        "workspaceId": WORKSPACE,
+                        "docId": a.docId,
+                        "type": "embed_html",
+                        "html": html,
+                        "placement": {"afterBlockId": marker_id},
+                    },
+                )
+                print(f"replaced diagram:{a.name}")
+            else:
+                r = call(
+                    sid,
+                    "append_block",
+                    {
+                        "workspaceId": WORKSPACE,
+                        "docId": a.docId,
+                        "type": "paragraph",
+                        "text": marker,
+                    },
+                )
+                mid = r.get("blockId") if isinstance(r, dict) else None
+                args = {
+                    "workspaceId": WORKSPACE,
+                    "docId": a.docId,
+                    "type": "embed_html",
+                    "html": html,
+                }
+                if mid:
+                    args["placement"] = {"afterBlockId": mid}
+                call(sid, "append_block", args)
+                print(f"inserted diagram:{a.name}")
+        else:
+            call(
+                sid,
+                "append_block",
+                {
+                    "workspaceId": WORKSPACE,
+                    "docId": a.docId,
+                    "type": "embed_html",
+                    "html": html,
+                },
+            )
+            print("inserted (anonymous)")
+        return 0
+    finally:
+        close(sid)
+
+
 def cmd_orgls(a) -> int:
     """Список organize-папок (id + имя + parent) — для поиска folderId."""
     sid = session()
@@ -380,6 +473,10 @@ def main() -> int:
     ch = sub.add_parser("children")
     ch.add_argument("docId")
     sub.add_parser("orgls")
+    emb = sub.add_parser("embed")
+    emb.add_argument("docId")
+    emb.add_argument("--html")
+    emb.add_argument("--name")
     om = sub.add_parser("org")
     om.add_argument("docId")
     om.add_argument("--to", required=True)
@@ -393,6 +490,7 @@ def main() -> int:
         "find": cmd_find,
         "children": cmd_children,
         "orgls": cmd_orgls,
+        "embed": cmd_embed,
         "org": cmd_org,
     }[a.cmd](a)
 
