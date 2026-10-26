@@ -709,3 +709,256 @@ mod tests {
         assert!(resolve_row(&rows, "ab").is_err());
     }
 }
+
+// ——— тело задачи: markdown с html_embed-фенсами ———
+
+/// Фенс диаграммы из исходного markdown: ```html_embed [имя]\n…\n```
+#[derive(Clone, Debug, PartialEq)]
+pub struct HtmlEmbedFence {
+    pub name: String,
+    pub html: String,
+}
+
+/// Вытащить html_embed-фенсы из markdown (для предудаления старых версий).
+pub fn parse_html_embed_fences(md: &str) -> Vec<HtmlEmbedFence> {
+    let mut out = Vec::new();
+    let mut lines = md.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("```html_embed") {
+            let name = rest.trim().to_string();
+            let mut html = Vec::new();
+            for l in lines.by_ref() {
+                if l.trim_start().starts_with("```") {
+                    break; // конец фенса
+                }
+                html.push(l);
+            }
+            out.push(HtmlEmbedFence {
+                name,
+                html: html.join("\n").trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Маркер-абзац перед embed: читается обратно (html-проп блока не читается).
+pub fn diagram_marker(name: &str) -> String {
+    format!("⁂ diagram:{name}")
+}
+
+/// Дописать markdown в тело: предудаление именованных старых диаграмм,
+/// append_markdown, конвертация code[language=html_embed …] → маркер + embed.
+/// Возвращает (вставлено диаграмм, удалено старых).
+pub async fn append_body_markdown(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    body_doc: &str,
+    md: &str,
+) -> Result<(usize, usize)> {
+    let fences = parse_html_embed_fences(md);
+    let mut deleted = 0usize;
+
+    // 1. именованные фенсы: удалить прежние пары маркер+embed
+    if !fences.is_empty() {
+        let doc = client
+            .call_tool(
+                "read_doc",
+                json!({"workspaceId": cfg.workspace, "docId": body_doc}),
+            )
+            .await
+            .context("read_doc body")?;
+        let blocks = doc
+            .get("blocks")
+            .and_then(|b| b.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let note = blocks
+            .iter()
+            .find(|b| b.get("flavour").and_then(|f| f.as_str()) == Some("affine:note"));
+        let child_ids: Vec<String> = note
+            .and_then(|n| n.get("childIds"))
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let by_id: std::collections::HashMap<String, serde_json::Value> = blocks
+            .iter()
+            .filter_map(|b| {
+                b.get("id")
+                    .and_then(|i| i.as_str())
+                    .map(String::from)
+                    .map(|id| (id.clone(), b.clone()))
+            })
+            .collect();
+        for fence in &fences {
+            if fence.name.is_empty() {
+                continue; // анонимные — только вставка
+            }
+            let marker = diagram_marker(&fence.name);
+            for (i, cid) in child_ids.iter().enumerate() {
+                let is_marker = by_id
+                    .get(cid)
+                    .map(|b| b.get("text").and_then(|t| t.as_str()) == Some(&marker))
+                    .unwrap_or(false);
+                if !is_marker {
+                    continue;
+                }
+                let _ = client
+                    .call_tool(
+                        "delete_block",
+                        json!({"workspaceId": cfg.workspace, "docId": body_doc, "blockId": cid}),
+                    )
+                    .await;
+                deleted += 1;
+                // следом идущий embed (если есть) — тоже
+                if let Some(next) = child_ids.get(i + 1) {
+                    let is_embed = by_id
+                        .get(next)
+                        .map(|b| {
+                            (b.get("flavour").and_then(|f| f.as_str()))
+                                .unwrap_or("")
+                                .contains("embed")
+                        })
+                        .unwrap_or(false);
+                    if is_embed {
+                        let _ = client
+                            .call_tool(
+                                "delete_block",
+                                json!({"workspaceId": cfg.workspace, "docId": body_doc, "blockId": next}),
+                            )
+                            .await;
+                    }
+                }
+                // без break: чистим и дубли (легаси-мусор)
+            }
+        }
+    }
+
+    // 2. append markdown как есть (фенсы станут code-блоками)
+    let resp = client
+        .call_tool(
+            "append_markdown",
+            json!({"workspaceId": cfg.workspace, "docId": body_doc, "markdown": md}),
+        )
+        .await
+        .context("append_markdown")?;
+    if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        bail!(
+            "append_markdown: {}",
+            resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+        );
+    }
+
+    // 3. конвертация: code[language=html_embed …] → маркер ¶ + embed_html, code — снести
+    let doc = client
+        .call_tool(
+            "read_doc",
+            json!({"workspaceId": cfg.workspace, "docId": body_doc}),
+        )
+        .await
+        .context("read_doc after append")?;
+    let blocks = doc
+        .get("blocks")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut inserted = 0usize;
+    for b in &blocks {
+        let lang = b.get("language").and_then(|l| l.as_str()).unwrap_or("");
+        let Some(rest) = lang.strip_prefix("html_embed") else {
+            continue;
+        };
+        let name = rest.trim().to_string();
+        let html = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let code_id = b.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+        if html.trim().is_empty() {
+            // пустой фенс = чистое удаление старой (уже удалена в п.1); code — снести
+            let _ = client
+                .call_tool(
+                    "delete_block",
+                    json!({"workspaceId": cfg.workspace, "docId": body_doc, "blockId": code_id}),
+                )
+                .await;
+            continue;
+        }
+        // маркер ¶ после code (stackAfter), затем embed после маркера
+        let marker_resp = client
+            .call_tool(
+                "append_block",
+                json!({"workspaceId": cfg.workspace, "docId": body_doc, "type": "paragraph",
+                       "text": diagram_marker(&name),
+                       "placement": {"afterBlockId": code_id}}),
+            )
+            .await;
+        let marker_id = marker_resp
+            .ok()
+            .and_then(|r| r.get("blockId").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_default();
+        let stack = if marker_id.is_empty() {
+            code_id
+        } else {
+            &marker_id
+        };
+        let emb = client
+            .call_tool(
+                "append_block",
+                json!({"workspaceId": cfg.workspace, "docId": body_doc, "type": "embed_html",
+                       "html": html,
+                       "placement": {"afterBlockId": stack}}),
+            )
+            .await;
+        // вставка не удалась (ok:false / транспорт) — code оставляем как источник
+        let embed_ok =
+            matches!(&emb, Ok(r) if r.get("ok").and_then(|o| o.as_bool()) != Some(false));
+        if !embed_ok {
+            continue;
+        }
+        let _ = client
+            .call_tool(
+                "delete_block",
+                json!({"workspaceId": cfg.workspace, "docId": body_doc, "blockId": code_id}),
+            )
+            .await;
+        inserted += 1;
+    }
+    Ok((inserted, deleted))
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    #[test]
+    fn parse_fences() {
+        let md = "текст\n\n```html_embed arch\n<div>один</div>\n```\n\nещё\n\n```html_embed\n<div>аноним</div>\n```\n";
+        let f = parse_html_embed_fences(md);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].name, "arch");
+        assert_eq!(f[0].html, "<div>один</div>");
+        assert_eq!(f[1].name, "");
+    }
+
+    #[test]
+    fn empty_fence_is_delete() {
+        let md = "```html_embed arch\n```";
+        let f = parse_html_embed_fences(md);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].html.is_empty());
+    }
+
+    #[test]
+    fn other_fences_untouched() {
+        let md = "```rust\nfn x() {}\n```";
+        assert!(parse_html_embed_fences(md).is_empty());
+    }
+
+    #[test]
+    fn marker_format() {
+        assert_eq!(diagram_marker("arch"), "⁂ diagram:arch");
+    }
+}

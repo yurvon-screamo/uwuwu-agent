@@ -159,7 +159,8 @@ export function kickoffPrompt(task: TaskRef, body: string, profile: KickoffProfi
     "- ВСЁ для пользователя — только комменты задачи (uwuwu-cli task comment). Текст в сессии юзер не читает.",
     "- Тело задачи перечитывай `uwuwu-cli task get` (печатает тело целиком).",
     "- Не мержи сам. Не закрывай задачу сам (uwuwu-cli task close — только демон по мержу PR).",
-    `- Разрешено: uwuwu-cli task comment/get/edit, gh pr create/view/checks. Запрещено: gh pr merge.`,
+    `- Разрешено: uwuwu-cli task comment/get/edit/body, gh pr create/view/checks. Запрещено: gh pr merge.`,
+    "- Тело задачи дозаписывай uwuwu-cli task body <rowId> --project <proj> --stdin (markdown). Диаграммы — фенсом ```html_embed имя```: именованный заменяет прежнюю диаграмму, пустой фенс удаляет.",
     ...profile.rules.map((r) => r.replace("${GH_AGENT}", profile.ghAgent ?? "gh")),
     ...(commentsHistory === "" ? [] : [
       "",

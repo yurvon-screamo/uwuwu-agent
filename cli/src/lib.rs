@@ -108,6 +108,16 @@ enum TaskSub {
         #[arg(long, help = "Заметка-коммент при закрытии")]
         note: Option<String>,
     },
+    /// Дописать markdown в тело задачи/крона (stdin или --md файл).
+    /// Фенсы ```html_embed [имя] конвертируются в живые embed_html-диаграммы:
+    /// именованный фенс заменяет прежнюю диаграмму с этим именем,
+    /// пустой (```html_embed имя без тела) — удаляет её.
+    Body {
+        #[arg(help = "row-id / doc-id / префикс / подстрока заголовка")]
+        id: String,
+        #[arg(long, help = "Файл с markdown (иначе stdin)")]
+        md: Option<String>,
+    },
 }
 
 /// Кроны на доске Crons: агентские отложенные/периодические работы.
@@ -1070,6 +1080,30 @@ pub async fn run() -> anyhow::Result<()> {
                         affine_tasks::comment_task(&mut client, &cfg, &row, &note).await?;
                     }
                     println!("закрыта: {}", row.title);
+                }
+                TaskSub::Body { id, md } => {
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
+                    if row.body_doc.is_empty() {
+                        anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
+                    }
+                    let text = match &md {
+                        Some(path) => {
+                            std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?
+                        }
+                        None => {
+                            let mut buf = String::new();
+                            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                            buf
+                        }
+                    };
+                    let (n_diagrams, n_deleted) =
+                        affine_tasks::append_body_markdown(&mut client, &cfg, &row.body_doc, &text)
+                            .await?;
+                    println!(
+                        "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
+                        row.title
+                    );
                 }
             }
         }
