@@ -1055,8 +1055,10 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     println!("Строка:   {}", row.row_id);
                     if !row.body_doc.is_empty() {
+                        let ui = std::env::var("UWUWU_AFFINE_UI_URL")
+                            .unwrap_or_else(|_| "https://affine.uwuwu.net".into());
                         println!(
-                            "Тело:     https://affine.uwuwu.net/workspace/{}/{}",
+                            "Тело:     {ui}/workspace/{}/{}",
                             cfg.workspace, row.body_doc
                         );
                         // тело целиком: task get — единственный cli-путь агента

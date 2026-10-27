@@ -5,7 +5,7 @@
 //! change). Falls back to local search when credentials are absent or the
 //! endpoint fails — see `lib.rs` for the wiring.
 //!
-//! Env: `UWUWU_AFFINE_UI_URL` (e.g. https://affine.up.railway.app),
+//! Env: `UWUWU_AFFINE_UI_URL` (e.g. https://affine.uwuwu.net),
 //! `UWUWU_AFFINE_EMAIL`, `UWUWU_AFFINE_PASSWORD`.
 
 use anyhow::{anyhow, Context, Result};
