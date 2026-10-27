@@ -44,6 +44,16 @@ const PROJECTS: Record<string, ProjectCfg> = {
     repo: "yurvon-screamo/origa",
     local: join(homedir(), "origa"),
   },
+  foilcap: {
+    board: "Задачи foilcap",
+    repo: "git.l4a.ru/ek/ai-generator",
+    local: join(homedir(), "foilcap-ai-generator"),
+  },
+  "true-wash": {
+    board: "Задачи true-wash",
+    repo: "~/true-wash (detector, saas — репо в подпапках)",
+    local: join(homedir(), "true-wash"),
+  },
 }
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-factory")
 const STATE_FILE = join(STATE_DIR, "state.json")
