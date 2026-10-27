@@ -52,7 +52,7 @@ likec4-view{{display:block;width:100%;min-width:1200px;height:92vh;min-height:10
 
 def extract_c4(md: str) -> list[str]:
     """Извлечь блоки ```c4 … ``` из markdown модель-дока."""
-    blocks = re.findall(r"```c4\n(.*?)```", md, re.S)
+    blocks = re.findall(r"```c4\n(.*?)```", md, re.DOTALL)
     if not blocks:
         raise SystemExit("в модель-доке нет фенсов ```c4")
     return blocks
@@ -138,7 +138,7 @@ def main() -> int:
         order, by_id = dump()
         m = next((cid for cid in order if btext(by_id.get(cid, {})) == marker), None)
         if not m:
-            r = call(
+            call(
                 sid,
                 "append_block",
                 {
