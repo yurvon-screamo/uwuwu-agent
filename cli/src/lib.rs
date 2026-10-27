@@ -1056,7 +1056,7 @@ pub async fn run() -> anyhow::Result<()> {
                     println!("Строка:   {}", row.row_id);
                     if !row.body_doc.is_empty() {
                         println!(
-                            "Тело:     https://affine.up.railway.app/workspace/{}/{}",
+                            "Тело:     https://affine.uwuwu.net/workspace/{}/{}",
                             cfg.workspace, row.body_doc
                         );
                         // тело целиком: task get — единственный cli-путь агента
