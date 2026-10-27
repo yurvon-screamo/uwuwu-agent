@@ -127,7 +127,9 @@ enum TaskSub {
 /// Дефолтный механизм: сессионный cron_set умирает с сессией — эти живут.
 #[derive(clap::Subcommand)]
 enum CronSub {
-    /// Поставить крон (тело = промпт из stdin или заглушка)
+    /// Поставить крон (тело = промпт из stdin или заглушка).
+    /// --project <proj> → доска «Кроны <proj>» в папке проекта,
+    /// без --project → глобальная доска «Crons».
     Set {
         #[arg(long, help = "Заголовок крона")]
         title: String,
@@ -139,6 +141,8 @@ enum CronSub {
         at: Option<String>,
         #[arg(long, value_name = "EXPR", help = "Cron-выражение (5 полей)")]
         cron_expr: Option<String>,
+        #[arg(long, help = "Проект (доска «Кроны <proj>» в папке проекта)")]
+        project: Option<String>,
         #[arg(long, help = "Промпт из stdin (иначе заглушка)")]
         stdin: bool,
     },
@@ -346,11 +350,50 @@ pub async fn resolve_row_any_board(
     if let Ok(row) = affine_tasks::resolve_row(&rows, id) {
         return Ok((board, row.clone()));
     }
+    // фоллбек: крон-доски (Crons + «Кроны <proj>» всех проектов)
+    for bt in affine_tasks::cron_board_titles(client, cfg).await? {
+        if bt == "Crons" {
+            continue;
+        }
+        let Ok(b) = affine_tasks::find_board_by_title(client, cfg, &bt).await else {
+            continue;
+        };
+        let Ok(rows) = affine_tasks::read_rows(client, cfg, &b, root).await else {
+            continue;
+        };
+        if let Ok(row) = affine_tasks::resolve_row(&rows, id) {
+            return Ok((b, row.clone()));
+        }
+    }
     let cron_board = affine_tasks::find_board_by_title(client, cfg, "Crons").await?;
     let cron_rows = affine_tasks::read_rows(client, cfg, &cron_board, root).await?;
     let row = affine_tasks::resolve_row(&cron_rows, id)
-        .map_err(|e| anyhow::anyhow!("{e} (искали и на доске проекта, и на Crons)"))?;
+        .map_err(|e| anyhow::anyhow!("{e} (искали на доске проекта и всех крон-досках)"))?;
     Ok((cron_board, row.clone()))
+}
+
+/// Найти крон на любой крон-доске (Crons + «Кроны <proj>» проектов).
+pub async fn resolve_cron_any_board(
+    client: &mut affine_client::AffineClient,
+    cfg: &affine_client::AffineConfig,
+    board_titles: &[String],
+    root: &std::path::Path,
+    id: &str,
+) -> anyhow::Result<(affine_tasks::Board, affine_tasks::TaskRow)> {
+    let mut last_err = String::new();
+    for bt in board_titles {
+        let Ok(board) = affine_tasks::find_board_by_title(client, cfg, bt).await else {
+            continue;
+        };
+        let Ok(rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
+            continue;
+        };
+        match affine_tasks::resolve_row(&rows, id) {
+            Ok(row) => return Ok((board, row.clone())),
+            Err(e) => last_err = format!("{e}"),
+        }
+    }
+    anyhow::bail!("крон «{id}» не найден на крон-досках ({last_err})")
 }
 
 /// Выгрузить картинки тела (`affine://blob/<key>` в markdown) в
@@ -766,9 +809,8 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Commands::Cron { ref command } => {
             let mut client = affine_client::AffineClient::connect(&cfg).await?;
-            let board = affine_tasks::find_board_by_title(&mut client, &cfg, "Crons")
-                .await
-                .context("доска «Crons» не найдена (папка Crons → док-таблица)")?;
+            // крон-доски: глобальная «Crons» + «Кроны <proj>» по папкам Projects
+            let cron_boards = affine_tasks::cron_board_titles(&mut client, &cfg).await?;
             let command_ref = command;
             match command_ref {
                 CronSub::Set {
@@ -777,8 +819,22 @@ pub async fn run() -> anyhow::Result<()> {
                     every,
                     at,
                     cron_expr,
+                    project,
                     stdin,
                 } => {
+                    let board = match project.as_deref() {
+                        Some(proj) => {
+                            let bt = format!("Кроны {proj}");
+                            affine_tasks::find_board_by_title(&mut client, &cfg, &bt)
+                                .await
+                                .with_context(|| {
+                                    format!("доска «{bt}» не найдена — создай док-таблицу в папке проекта «{proj}»")
+                                })?
+                        }
+                        None => affine_tasks::find_board_by_title(&mut client, &cfg, "Crons")
+                            .await
+                            .context("доска «Crons» не найдена")?,
+                    };
                     let specs = [
                         r#in.as_ref(),
                         every.as_ref(),
@@ -846,37 +902,47 @@ pub async fn run() -> anyhow::Result<()> {
                     println!("  тело:   {body}");
                 }
                 CronSub::List => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
                     println!(
-                        "{:<8} {:<18} {:<17} {:<13} ЗАГОЛОВОК",
-                        "СТАТУС", "РАСПИСАНИЕ", "LAST RUN", "СТРОКА"
+                        "{:<14} {:<8} {:<18} {:<17} {:<13} ЗАГОЛОВОК",
+                        "ДОСКА", "СТАТУС", "РАСПИСАНИЕ", "LAST RUN", "СТРОКА"
                     );
-                    for r in &rows {
-                        println!(
-                            "{:<8} {:<18} {:<17} {:<13} {}",
-                            r.status,
-                            r.cron_schedule_of(),
-                            r.last_run_display(),
-                            &r.row_id[..r.row_id.len().min(12)],
-                            truncate(&r.title, 40)
-                        );
+                    for bt in &cron_boards {
+                        // несуществующие доски (доску кронов делает юзер) — молча мимо
+                        let Ok(board) =
+                            affine_tasks::find_board_by_title(&mut client, &cfg, bt).await
+                        else {
+                            continue;
+                        };
+                        let rows =
+                            affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
+                        for r in &rows {
+                            println!(
+                                "{:<14} {:<8} {:<18} {:<17} {:<13} {}",
+                                truncate(bt, 13),
+                                r.status,
+                                r.cron_schedule_of(),
+                                r.last_run_display(),
+                                &r.row_id[..r.row_id.len().min(12)],
+                                truncate(&r.title, 36)
+                            );
+                        }
                     }
                 }
                 CronSub::Pause { id } | CronSub::Resume { id } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, id)?;
                     let status = if matches!(command_ref, CronSub::Pause { .. }) {
                         "paused"
                     } else {
                         "active"
                     };
+                    let (board, row) =
+                        resolve_cron_any_board(&mut client, &cfg, &cron_boards, &root, id).await?;
                     let patch = affine_tasks::RowPatch::cron_status(status);
-                    affine_tasks::edit_row(&mut client, &cfg, &board, row, &patch).await?;
+                    affine_tasks::edit_row(&mut client, &cfg, &board, &row, &patch).await?;
                     println!("статус: {status}");
                 }
                 CronSub::Rm { id } => {
-                    let rows = affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                    let row = affine_tasks::resolve_row(&rows, id)?;
+                    let (board, row) =
+                        resolve_cron_any_board(&mut client, &cfg, &cron_boards, &root, id).await?;
                     client
                         .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
                         .await

@@ -136,6 +136,51 @@ async fn find_board_via_folder(
 }
 
 /// Найти доску по точному тайтлу (например, «Crons»).
+/// Крон-доски: «Crons» + «Кроны <proj>» по папкам Projects (динамически —
+/// новые проекты подхватываются без правки cli). Заголовки, не Board'ы.
+pub async fn cron_board_titles(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+) -> Result<Vec<String>> {
+    let mut out = vec!["Crons".to_string()];
+    let Ok(nodes) = client
+        .call_tool("list_organize_nodes", json!({"workspaceId": cfg.workspace}))
+        .await
+    else {
+        return Ok(out);
+    };
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let all = nodes
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or(empty);
+    let Some(pid) = all
+        .iter()
+        .find(|n| {
+            n.get("type").and_then(|t| t.as_str()) == Some("folder")
+                && n.get("data").and_then(|d| d.as_str()) == Some("Projects")
+        })
+        .and_then(|n| n.get("id").and_then(|i| i.as_str()))
+        .map(String::from)
+    else {
+        return Ok(out);
+    };
+    let mut projects: Vec<String> = all
+        .iter()
+        .filter(|n| {
+            n.get("type").and_then(|t| t.as_str()) == Some("folder")
+                && n.get("parentId").and_then(|p| p.as_str()) == Some(pid.as_str())
+        })
+        .filter_map(|n| n.get("data").and_then(|d| d.as_str()).map(String::from))
+        .collect();
+    projects.sort();
+    for p in projects {
+        out.push(format!("Кроны {p}"));
+    }
+    Ok(out)
+}
+
 pub async fn find_board_by_title(
     client: &mut AffineClient,
     cfg: &AffineConfig,

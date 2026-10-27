@@ -13,7 +13,6 @@ import {
   type CronRow, type CronState,
 } from "./cron-lib"
 
-const BOARD_TITLE = "Crons"
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const LOCK_DIR = join(STATE_DIR, "lock")
@@ -96,14 +95,71 @@ function saveState(state: CronState): void {
 
 interface BoardIds { docId: string; dbId: string }
 
-async function findBoard(): Promise<BoardIds> {
-  const r = await mcp.tool<{ matches?: { id: string; inTrash?: boolean }[] }>("find_doc_by_title", { title: BOARD_TITLE, caseInsensitive: true, limit: 5 })
-  const docId = r.matches?.find(m => m.inTrash !== true)?.id
-  if (docId === undefined) throw new Error(`доска «${BOARD_TITLE}» не найдена`)
+/** Крон-доски: глобальная «Crons» + «Кроны <proj>» по папкам Projects
+ *  (динамически — новые проекты подхватываются без правки демона).
+ *  Отсутствующие доски тихо скипаются (создаёт юзер руками). */
+const GLOBAL_CRON_BOARD = "Crons"
+
+async function cronBoardTitles(): Promise<string[]> {
+  try {
+    const r = await mcp.tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>(
+      "list_organize_nodes", {})
+    const nodes = r.nodes ?? []
+    const pid = nodes.find(n => n.type === "folder" && n.data === "Projects")?.id
+    const projects = nodes
+      .filter(n => n.type === "folder" && n.parentId === pid)
+      .map(n => n.data)
+      .filter((d): d is string => typeof d === "string")
+    return [GLOBAL_CRON_BOARD, ...projects.map(p => `Кроны ${p}`)]
+  } catch { return [GLOBAL_CRON_BOARD] }
+}
+
+async function findBoard(title: string): Promise<BoardIds | null> {
+  const r = await mcp.tool<{ matches?: { id: string; inTrash?: boolean }[] }>("find_doc_by_title", { title, caseInsensitive: true, limit: 5 })
+  let docId = r.matches?.find(m => m.inTrash !== true)?.id
+  if (docId === undefined) {
+    // индекс тайтлов отстаёт от свежих/переименованных доков — фоллбек
+    // через организ-дерево: «Кроны X» → папка X → дети по точному тайтлу
+    const proj = title.startsWith("Кроны ") ? title.slice("Кроны ".length) : null
+    if (proj !== null) docId = await boardViaOrganize(proj, title) ?? undefined
+  }
+  if (docId === undefined) return null
   const doc = await mcp.tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
   const dbId = doc.blocks?.find((b) => b.flavour === "affine:database" || b.flavour === "affine:data_view")?.id
-  if (dbId === undefined) throw new Error(`в «${BOARD_TITLE}» нет database-блока`)
+  if (dbId === undefined) return null
   return { docId, dbId }
+}
+
+/** Доска без поискового индекса: «Кроны <proj>» → папка <proj> → доки. */
+async function boardViaOrganize(proj: string, title: string): Promise<string | null> {
+  try {
+    const r = await mcp.tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>(
+      "list_organize_nodes", {})
+    const nodes = r.nodes ?? []
+    const folders = nodes.filter(n => n.type === "folder" && n.data === proj)
+    for (const f of folders) {
+      const docIds = nodes
+        .filter(n => n.type === "doc" && n.parentId === f.id)
+        .map(n => n.data)
+        .filter((d): d is string => typeof d === "string")
+      for (const docId of docIds) {
+        const d = await mcp.tool<{ title?: string }>("get_doc", { docId })
+        if (d.title === title) return docId
+      }
+    }
+  } catch { /* организ недоступен — остаётся null */ }
+  return null
+}
+
+async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
+  const out: { title: string; board: BoardIds }[] = []
+  for (const title of await cronBoardTitles()) {
+    try {
+      const board = await findBoard(title)
+      if (board !== null) out.push({ title, board })
+    } catch { /* доска недоступна — скип тика по ней */ }
+  }
+  return out
 }
 
 async function readCrons(board: BoardIds): Promise<CronRow[]> {
@@ -190,9 +246,15 @@ async function sessionAlive(sessionID: string): Promise<boolean | null> {
 // ——— тик ———
 
 async function tick(state: CronState): Promise<void> {
-  const board = await findBoard()
-  const rows = await readCrons(board)
+  const boards = await findCronBoards()
   const now = new Date()
+  for (const { title: boardTitle, board } of boards) {
+    await tickBoard(state, board, boardTitle, now)
+  }
+}
+
+async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
+  const rows = await readCrons(board)
 
   for (const row of rows) {
     if (row.status !== "active") continue
@@ -257,7 +319,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
-  log(`uwuwu-cron: старт (board=${BOARD_TITLE}, tick=${TICK_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id})`)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
   let consecutiveFails = 0
