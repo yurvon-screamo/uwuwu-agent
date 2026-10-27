@@ -125,8 +125,12 @@ impl AffineClient {
             }
         }
         Err(anyhow!(
-            "{method} failed after {CALL_RETRIES} retries: {}",
-            last_err.map(|e| e.to_string()).unwrap_or_default()
+            "{method} failed after {CALL_RETRIES} retries: {}\n\
+             шлюз недоступен по UWUWU_AFFINE_URL={}\n\
+             подсказки: локальный шлюз ноут-афины — http://127.0.0.1:8000/mcp, \
+             с других машин — https://affine.uwuwu.net/mcp (перезапусти терминал после смены env)",
+            last_err.map(|e| e.to_string()).unwrap_or_default(),
+            self.url
         ))
     }
 
