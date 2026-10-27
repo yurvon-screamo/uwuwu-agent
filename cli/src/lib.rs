@@ -116,6 +116,10 @@ enum TaskSub {
         id: String,
         #[arg(long, help = "Файл с markdown (иначе stdin)")]
         md: Option<String>,
+        /// Заменить тело ЦЕЛИКОМ (агент читает task get, правит, шлёт новое).
+        /// Rich-контент (embed-диаграммы) не переживает — пересоздай фенсами.
+        #[arg(long)]
+        replace: bool,
     },
 }
 
@@ -1061,7 +1065,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     println!("закрыта: {}", row.title);
                 }
-                TaskSub::Body { id, md } => {
+                TaskSub::Body { id, md, replace } => {
                     let (_board, row) =
                         resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
                     if row.body_doc.is_empty() {
@@ -1077,13 +1081,24 @@ pub async fn run() -> anyhow::Result<()> {
                             buf
                         }
                     };
-                    let (n_diagrams, n_deleted) =
-                        affine_tasks::append_body_markdown(&mut client, &cfg, &row.body_doc, &text)
-                            .await?;
-                    println!(
-                        "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
-                        row.title
-                    );
+                    if replace {
+                        let n_diagrams =
+                            affine_tasks::replace_body(&mut client, &cfg, &row.body_doc, &text)
+                                .await?;
+                        println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
+                    } else {
+                        let (n_diagrams, n_deleted) = affine_tasks::append_body_markdown(
+                            &mut client,
+                            &cfg,
+                            &row.body_doc,
+                            &text,
+                        )
+                        .await?;
+                        println!(
+                            "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
+                            row.title
+                        );
+                    }
                 }
             }
         }

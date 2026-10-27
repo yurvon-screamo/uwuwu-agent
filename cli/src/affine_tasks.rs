@@ -854,14 +854,25 @@ pub async fn append_body_markdown(
         );
     }
 
-    // 3. конвертация: code[language=html_embed …] → маркер ¶ + embed_html, code — снести
+    // 3. фенсы → живые embed-диаграммы
+    let inserted = convert_embed_fences(client, cfg, body_doc).await?;
+    Ok((inserted, deleted))
+}
+
+/// code[language=html_embed …] → маркер ¶ + embed_html, code — снести.
+/// Возвращает число вставленных диаграмм.
+async fn convert_embed_fences(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    body_doc: &str,
+) -> Result<usize> {
     let doc = client
         .call_tool(
             "read_doc",
             json!({"workspaceId": cfg.workspace, "docId": body_doc}),
         )
         .await
-        .context("read_doc after append")?;
+        .context("read_doc for fence conversion")?;
     let blocks = doc
         .get("blocks")
         .and_then(|b| b.as_array())
@@ -926,7 +937,32 @@ pub async fn append_body_markdown(
             .await;
         inserted += 1;
     }
-    Ok((inserted, deleted))
+    Ok(inserted)
+}
+
+/// Заменить тело задачи ЦЕЛИКОМ (агент читал task get, правил, шлёт новое).
+/// Rich-контент прежнего тела не переживает — диаграммы пересоздаются фенсами
+/// html_embed из нового текста. Возвращает число вставленных диаграмм.
+pub async fn replace_body(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    body_doc: &str,
+    md: &str,
+) -> Result<usize> {
+    let resp = client
+        .call_tool(
+            "replace_doc_with_markdown",
+            json!({"workspaceId": cfg.workspace, "docId": body_doc, "markdown": md}),
+        )
+        .await
+        .context("replace_doc_with_markdown")?;
+    if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        bail!(
+            "replace_doc_with_markdown: {}",
+            resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+        );
+    }
+    convert_embed_fences(client, cfg, body_doc).await
 }
 
 #[cfg(test)]

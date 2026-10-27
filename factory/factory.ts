@@ -444,7 +444,8 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
     agentActive: true, // kickoff отправлен — агент работает
   }
   saveState(state)
-  await setCells(board, task.rowId, { Status: "In Progress", Branch: branch })
+  // ветка живёт в PR/ворктри — канбан-проперти Branch снесены
+  await setCells(board, task.rowId, { Status: "In Progress" })
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, In Progress (попыток до этого: ${attemptsSeed})`)
 }
 
