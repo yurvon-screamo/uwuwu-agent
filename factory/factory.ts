@@ -49,9 +49,9 @@ const PROJECTS: Record<string, ProjectCfg> = {
     repo: "git.l4a.ru/ek/ai-generator",
     local: join(homedir(), "foilcap-ai-generator"),
   },
-  "true-wash": {
-    board: "Задачи true-wash",
-    repo: "~/true-wash (detector, saas — репо в подпапках)",
+  "true-washing": {
+    board: "Задачи true-washing",
+    repo: "~/true-washing (detector, saas — репо в подпапках)",
     local: join(homedir(), "true-wash"),
   },
 }
