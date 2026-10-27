@@ -3,7 +3,7 @@
 // Протухшая сессия (шлюз редеплоился → 404) — сброс + один ретрай: демон
 // long-running, слепнуть навсегда нельзя.
 
-const URL_ = process.env.UWUWU_AFFINE_URL ?? "https://affine-mcp-production.up.railway.app/mcp"
+const URL_ = process.env.UWUWU_AFFINE_URL ?? "http://127.0.0.1:8000/mcp"
 const TOKEN = process.env.UWUWU_AFFINE_TOKEN ?? ""
 const WORKSPACE = process.env.UWUWU_AFFINE_WORKSPACE_ID ?? ""
 
