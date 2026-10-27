@@ -7,7 +7,7 @@
 //   3. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка ворктри
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "./mcp"
@@ -18,7 +18,6 @@ import {
   spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
-  worktreePaths,
   isValidTracked,
   snapshotText,
   type FactoryState,
@@ -46,7 +45,6 @@ const PROJECTS: Record<string, ProjectCfg> = {
     local: join(homedir(), "origa"),
   },
 }
-const WORKTREES_ROOT = join(homedir(), ".local/share/uwuwu-factory/worktrees")
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-factory")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const LOCK_DIR = join(STATE_DIR, "lock")
@@ -150,15 +148,6 @@ async function sh(cmd: string[], opts: { cwd?: string } = {}): Promise<string> {
   clearTimeout(killer)
   if (code !== 0) throw new Error(`${cmd[0]} (${code}): ${(err.trim() || out.trim()).slice(0, 200)}`)
   return out.trim()
-}
-
-async function shOk(cmd: string[], opts: { cwd?: string } = {}): Promise<boolean> {
-  try {
-    await sh(cmd, opts)
-    return true
-  } catch {
-    return false
-  }
 }
 
 // ——— доска AFFiNE ———
@@ -368,51 +357,10 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 // ——— жизненный цикл задачи ———
 
-function readdirSafe(p: string): string[] {
-  try {
-    return readdirSync(p)
-  } catch {
-    return []
-  }
-}
-
-/** Сверка на старте: осиротевшие ворктри без state — вычистить. */
-function reconcileOrphans(state: FactoryState): void {
-  const known = new Set(Object.values(state.tasks).map((t) => t.worktree))
-  if (!existsSync(WORKTREES_ROOT)) return
-  for (const name of readdirSafe(WORKTREES_ROOT)) {
-    const full = join(WORKTREES_ROOT, name)
-    if (!known.has(full) && /^task-[a-zA-Z0-9_-]+$/.test(name)) {
-      try {
-        log(`reconcile: осиротевший ворктри ${full} — удаляю`)
-        rmSync(full, { recursive: true, force: true })
-        for (const cfg of Object.values(PROJECTS)) {
-          void shOk(["git", "-C", cfg.local, "worktree", "prune"])
-          void shOk(["git", "-C", cfg.local, "branch", "-D", `work/${name}`])
-        }
-      } catch (e) {
-        log(`reconcile: ${full} не удался — ${e}`)
-      }
-    }
-  }
-}
-
-async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, attemptsSeed: number): Promise<void> {
-  const { branch, worktree } = worktreePaths(WORKTREES_ROOT, task.rowId)
-  mkdirSync(WORKTREES_ROOT, { recursive: true })
-
-  if (existsSync(worktree)) {
-    log(`задача ${task.rowId.slice(0, 8)}: ворктри уже есть — чищу перед пересозданием`)
-    rmSync(worktree, { recursive: true, force: true })
-  }
-  const git = ["git", "-C", cfg.local] as const
-  await shOk([...git, "worktree", "prune"])
-  await shOk([...git, "branch", "-D", branch])
-
-  await sh([...git, "fetch", "origin", "master"])
-  await sh([...git, "worktree", "add", "-b", branch, worktree, "origin/master"])
-
-  const sessionID = await createSession(worktree, task.title)
+async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
+  // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
+  // сессия стартует в основном чекауте репо
+  const sessionID = await createSession(cfg.local, task.title)
   if (sessionID === null) throw new Error("сессия не создалась")
 
   const sent = await promptSession(
@@ -431,8 +379,8 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
 
   state.tasks[task.rowId] = {
     sessionID,
-    worktree,
-    branch,
+    worktree: "",
+    branch: "",
     bodyDoc: task.bodyDoc,
     title: task.title,
     lastCommentAt: last?.createdAt ?? 0,
@@ -441,36 +389,17 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, bo
     attempts: attemptsSeed,
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
-    agentActive: true, // kickoff отправлен — агент работает
+    agentActive: true, // spawn отправлен — агент работает
   }
   saveState(state)
-  // ветка живёт в PR/ворктри — канбан-проперти Branch снесены
-  await setCells(board, task.rowId, { Status: "In Progress" })
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, In Progress (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, агент ведёт сам (попыток до этого: ${attemptsSeed})`)
 }
 
-/** Полная чистка (Done); state-запись умирает только при подтверждении ФС. */
+/** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает. */
 async function finishTask(rowId: string, tracked: TrackedTask, state: FactoryState): Promise<void> {
-  const cfg = PROJECTS[tracked.project]
-  log(`задача ${rowId.slice(0, 8)}: Done — чистка (сессия сохранена для истории)`)
-  let clean = true
-  if (cfg !== undefined && existsSync(tracked.worktree)) {
-    const git = ["git", "-C", cfg.local] as const
-    const removed = await shOk([...git, "worktree", "remove", "--force", tracked.worktree])
-    if (!removed) {
-      rmSync(tracked.worktree, { recursive: true, force: true })
-      await shOk([...git, "worktree", "prune"])
-    }
-    if (existsSync(tracked.worktree)) {
-      clean = false
-      log(`задача ${rowId.slice(0, 8)}: ворктри не удалился — ретрай на след. тике`)
-    }
-  }
-  if (cfg !== undefined) await shOk(["git", "-C", cfg.local, "branch", "-D", tracked.branch])
-  if (clean) {
-    delete state.tasks[rowId]
-    saveState(state)
-  }
+  log(`задача ${rowId.slice(0, 8)}: Done — чистка state`)
+  delete state.tasks[rowId]
+  saveState(state)
 }
 
 async function notify(task: TrackedTask, body: string): Promise<void> {
@@ -516,7 +445,7 @@ async function restartTask(
   tracked.sessionID = "" // карантин до успеха старта
   saveState(state)
   try {
-    await startTask(task, projectName, cfg, board, state, seed)
+    await startTask(task, projectName, cfg, state, seed)
   } catch (e) {
     await registerFailure(task, projectName, cfg, board, state, seed, e)
   }
@@ -530,7 +459,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const started = new Set<string>()
   for (const task of untrackedTasks(rows.filter((r) => r.status === "Todo"), state)) {
     try {
-      await startTask(task, projectName, cfg, board, state, 0)
+      await startTask(task, projectName, cfg, state, 0)
       started.add(task.rowId)
     } catch (e) {
       await registerFailure(task, projectName, cfg, board, state, 0, e)
@@ -576,7 +505,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         saveState(state)
       }
       try {
-        await startTask(row, tracked.project || projectName, cfg, board, state, tracked.attempts)
+        await startTask(row, tracked.project || projectName, cfg, state, tracked.attempts)
       } catch (e) {
         await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
       }
@@ -667,7 +596,6 @@ async function main(): Promise<void> {
   log(`uwuwu-factory: старт (проекты: ${Object.keys(PROJECTS).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
-  reconcileOrphans(state)
   while (true) {
     for (const [name, cfg] of Object.entries(PROJECTS)) {
       try {

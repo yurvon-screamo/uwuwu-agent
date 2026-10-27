@@ -100,7 +100,8 @@ export function spawnPrompt(rowId: string, project: string, repo: string): strin
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
-    "Ворктри и ветка уже созданы — работай здесь. Вопросы/отчёты — комментом 🤖.",
+    "Репо — текущий каталог: сам создай worktree+ветку от origin/master с осмысленным именем",
+    "(по сути задачи, не id), 🤖-коммент «взялся» и статусы двигай task edit'ом. Вопросы/отчёты — 🤖.",
   ].join("\n")
 }
 
@@ -137,7 +138,8 @@ export function worktreePaths(root: string, rowId: string): { branch: string; wo
 
 /** Валидация записи state.json. Три легальных формата: полный
  *  (ses_ + пути), чистый карантин (всё пусто) и гибрид (сессия умерла,
- *  пути живы — работа сохраняется до решения юзера). */
+ *  пути живы — работа сохраняется до решения юзера). worktree/branch —
+ *  legacy (ворктри теперь делает агент, демону не нужен). */
 export function isValidTracked(v: unknown): v is TrackedTask {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
@@ -159,6 +161,6 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.worktree === "" && t.branch === "") return true
   return (
     typeof t.worktree === "string" && t.worktree.startsWith("/") &&
-    typeof t.branch === "string" && t.branch.startsWith("work/task-")
+    typeof t.branch === "string" && t.branch.startsWith("work/")
   )
 }
