@@ -3,7 +3,7 @@
 
 Источние модели — док AFFiNE с c4-фенсами (```c4 ... ```). Конвейер:
   1. export модель-дока → извлечь фенсы → tmp-папка/*.c4
-  2. podman likec4/likec4 gen webcomponent → самодостаточный wc.mjs
+  2. likec4 gen webcomponent (нативный CLI) → самодостаточный wc.mjs
   3. обёртка HTML (<likec4-view>) → вставка/замена эмбеда в целевом доке по маркеру
      ⁂ diagram:likec4-<view>
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wiki_ops import call, close, deep_md, session
 
 WS = "81475705-028a-4153-a8f5-f06e402ee31e"
-IMAGE = "docker.io/likec4/likec4:1.60.0"
+LIKEC4_BIN = "likec4"  # нативный CLI (bun add -g likec4); фоллбэк — bunx likec4
 
 HTML_TPL = """<!DOCTYPE html>
 <html>
@@ -52,7 +53,7 @@ likec4-view{{display:block;width:100%;min-width:1200px;height:92vh;min-height:10
 
 def extract_c4(md: str) -> list[str]:
     """Извлечь блоки ```c4 … ``` из markdown модель-дока."""
-    blocks = re.findall(r"```c4\n(.*?)```", md, re.DOTALL)
+    blocks = re.findall(r"``` ?c4\n(.*?)```", md, re.DOTALL)
     if not blocks:
         raise SystemExit("в модель-доке нет фенсов ```c4")
     return blocks
@@ -87,24 +88,16 @@ def main() -> int:
             for i, b in enumerate(blocks):
                 (tmpd / f"src-{i:02d}.c4").write_text(b, encoding="utf-8")
             print(f"извлечено фенсов: {len(blocks)}")
-            # 2) генерация веб-компонента
+            # 2) генерация веб-компонента (нативный likec4 из PATH, без graphviz)
+            cmd = (
+                [LIKEC4_BIN] if shutil.which(LIKEC4_BIN) else ["bunx", "likec4@1.60.0"]
+            )
             subprocess.run(
-                [
-                    "podman",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{tmp}:/data",
-                    IMAGE,
-                    "gen",
-                    "webcomponent",
-                    "/data",
-                    "-o",
-                    "/data/wc.mjs",
-                ],
+                [*cmd, "gen", "webcomponent", ".", "-o", "./wc.mjs", "--no-use-dot"],
                 check=True,
                 capture_output=True,
                 text=True,
+                cwd=tmp,
             )
             js = (tmpd / "wc.mjs").read_text(encoding="utf-8")
             if len(js) < 100_000:
