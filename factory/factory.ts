@@ -446,7 +446,9 @@ async function registerFailure(
   saveState(state)
   log(`задача ${task.rowId.slice(0, 8)}: старт не удался (попытка ${attempts}) — ${err}`)
   if (attempts >= MAX_ATTEMPTS) {
-    await setCells(board, task.rowId, { Status: "Blocked" })
+    // единый статус «ждёт юзера»: не важно — агент вопрос задал или
+    // демон не смог стартовать; реакция юзера одна (коммент в задачу)
+    await setCells(board, task.rowId, { Status: "Needs attention" })
     await notify(entry,
       `🤖 [factory] не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH} и напиши комментарий — попробую снова.`)
   }
