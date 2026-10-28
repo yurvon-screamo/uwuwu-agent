@@ -12,6 +12,56 @@ use crate::affine_client::{AffineClient, AffineConfig};
 
 /// Живой сбор тел задач/кронов по тегам — не зависит от дерева
 /// (linked-тела невидимы list_workspace_tree). Cap guards от разросшейся доски.
+/// Кэш тел задач/кронов для поисковой семантики (TTL 300с): 36+ живых
+/// export-вызовов на каждый search — недопустимый множитель через туннель.
+/// Свежий кэш = мгновенно; протухший = один живой проход + сохранение.
+const TAGGED_CACHE_TTL_SECS: u64 = 300;
+
+pub async fn tagged_docs_cached(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &Path,
+) -> Vec<(String, String, String, &'static str)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let path = root.join("tagged_docs_cache.json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            if now.saturating_sub(ts) < TAGGED_CACHE_TTL_SECS {
+                if let Ok(rows) = serde_json::from_value::<Vec<(String, String, String, String)>>(v)
+                {
+                    // типы статические восстанавливаем по 4-му полю
+                    return rows
+                        .into_iter()
+                        .map(|(a, b, c, d)| {
+                            let kind: &'static str = match d.as_str() {
+                                "cron" => "cron",
+                                _ => "task",
+                            };
+                            (a, b, c, kind)
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    let rows = tagged_docs(client, cfg).await;
+    let payload = serde_json::json!({
+        "ts": now,
+        "rows": rows.iter()
+            .map(|(a, b, c, d)| (a, b, c, d.to_string()))
+            .collect::<Vec<_>>(),
+    });
+    if let Ok(s) = serde_json::to_string(&payload) {
+        let _ = std::fs::write(&path, s);
+    }
+    rows
+}
+
 pub async fn tagged_docs(
     client: &mut AffineClient,
     cfg: &AffineConfig,

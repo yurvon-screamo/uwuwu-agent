@@ -697,28 +697,15 @@ pub async fn run() -> anyhow::Result<()> {
                 if !use_local || top + facts + access == 0 {
                     return Ok(Vec::new());
                 }
-                // тела задач/кронов — живой тег-источник (дерево их не видит)
+                // тела задач/кронов — кэш с TTL (живой проход не чаще 5 мин)
                 let mut client = affine_client::AffineClient::connect(&cfg).await?;
-                let extra = affine_queries::tagged_docs(&mut client, &cfg).await;
+                let extra = affine_queries::tagged_docs_cached(&mut client, &cfg, &root).await;
                 eprintln!("affine: тел задач/кронов в семантике: {}", extra.len());
-                // кэш: свежий если синк успел; иначе старый файл лучше пустоты
-                // больной шлюз может висеть без ошибки — таймаут = фоллбек
-                let synced = tokio::time::timeout(
-                    std::time::Duration::from_secs(90),
-                    affine_queries::session(&root, &cfg),
-                )
-                .await;
-                let (cache, index) = match synced
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("таймаут синка 90с")))
-                {
-                    Ok((_, cache, index)) => (cache, index),
-                    Err(e) => {
-                        eprintln!("affine: синк не прошёл ({e:#}) — кэш/факты могут отставать");
-                        let cache = content_cache::ContentCache::load(&root).unwrap_or_default();
-                        let index = crate::fact_index::FactIndex::load(&root).unwrap_or_default();
-                        (cache, index)
-                    }
-                };
+                // search НЕ гонит синки (list_workspace_tree на 946 доках
+                // упирается в лимит шлюза и сжирает минуту): локальные кэши
+                // + tagged-кэш TTL 5 мин. Свежесть дают остальные cli-команды.
+                let cache = content_cache::ContentCache::load(&root).unwrap_or_default();
+                let index = crate::fact_index::FactIndex::load(&root).unwrap_or_default();
                 affine_search::search(
                     &root,
                     &cache,
