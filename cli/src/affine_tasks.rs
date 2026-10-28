@@ -181,11 +181,22 @@ pub async fn cron_board_titles(
     Ok(out)
 }
 
-pub async fn find_board_by_title(
+/// Результат поиска доски по тайтлу: живая / в трэше / нет вообще.
+/// Нужен, чтобы cron list честно показывал ВСЕ крон-доски, а не только
+/// непустые — «молчаливые» пропуски читались как «видна одна пустая доска».
+pub enum BoardFind {
+    Found(Board),
+    /// док с тайтлом есть, но все матччи в трэше
+    Trashed,
+    /// живого дока с таким тайтлом нет
+    Missing,
+}
+
+pub async fn board_lookup(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     title: &str,
-) -> Result<Board> {
+) -> Result<BoardFind> {
     let resp = client
         .call_tool(
             "find_doc_by_title",
@@ -193,24 +204,42 @@ pub async fn find_board_by_title(
         )
         .await
         .context("find_doc_by_title")?;
-    // трэшнутые доки остаются в поиске — берём первый живой
-    let doc_id = resp
+    let matches = resp
         .get("matches")
         .and_then(|m| m.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|m| m.get("inTrash").and_then(|t| t.as_bool()) != Some(true))
-        })
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| first_str(&resp, &["docId", "id", "doc_id"]))
-        .ok_or_else(|| {
-            anyhow!("доска «{title}» не найдена (ожидается док Задачи <Proj> с канбаном)")
-        })?;
-    board_from_doc(client, cfg, &doc_id)
-        .await
-        .with_context(|| format!("доска «{title}»"))
+        .cloned()
+        .unwrap_or_default();
+    let alive = matches
+        .iter()
+        .find(|m| m.get("inTrash").and_then(|t| t.as_bool()) != Some(true));
+    let Some(doc) = alive.and_then(|m| m.get("id")).and_then(|v| v.as_str()) else {
+        return Ok(if matches.is_empty() {
+            BoardFind::Missing
+        } else {
+            BoardFind::Trashed
+        });
+    };
+    match board_from_doc(client, cfg, doc).await {
+        Ok(board) => Ok(BoardFind::Found(board)),
+        // живой док есть, но канбана в нём нет — для крон-досок это «нет доски»
+        Err(_) => Ok(BoardFind::Missing),
+    }
+}
+
+pub async fn find_board_by_title(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    title: &str,
+) -> Result<Board> {
+    match board_lookup(client, cfg, title).await? {
+        BoardFind::Found(board) => Ok(board),
+        BoardFind::Trashed => Err(anyhow!(
+            "доска «{title}» в трэше — восстанови из корзины или пересоздай"
+        )),
+        BoardFind::Missing => Err(anyhow!(
+            "доска «{title}» не найдена (ожидается док с канбаном)"
+        )),
+    }
 }
 
 /// Доска из дока: найти database-блок (affine:database / affine:data_view).

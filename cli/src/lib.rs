@@ -901,26 +901,54 @@ pub async fn run() -> anyhow::Result<()> {
                         "{:<14} {:<8} {:<18} {:<17} {:<13} ЗАГОЛОВОК",
                         "ДОСКА", "СТАТУС", "РАСПИСАНИЕ", "LAST RUN", "СТРОКА"
                     );
+                    let mut summary: Vec<String> = Vec::new();
                     for bt in &cron_boards {
-                        // несуществующие доски (доску кронов делает юзер) — молча мимо
-                        let Ok(board) =
-                            affine_tasks::find_board_by_title(&mut client, &cfg, bt).await
-                        else {
-                            continue;
-                        };
-                        let rows =
-                            affine_tasks::read_rows(&mut client, &cfg, &board, &root).await?;
-                        for r in &rows {
-                            println!(
-                                "{:<14} {:<8} {:<18} {:<17} {:<13} {}",
-                                truncate(bt, 13),
-                                r.status,
-                                r.cron_schedule_of(),
-                                r.last_run_display(),
-                                &r.row_id[..r.row_id.len().min(12)],
-                                truncate(&r.title, 36)
-                            );
+                        // полный статус каждой доски: пустые/трэш/отсутствующие
+                        // тоже видны — молчаливые пропуски читаются как баг
+                        match affine_tasks::board_lookup(&mut client, &cfg, bt).await {
+                            Ok(affine_tasks::BoardFind::Found(board)) => {
+                                let rows =
+                                    affine_tasks::read_rows(&mut client, &cfg, &board, &root)
+                                        .await?;
+                                summary.push(format!("{bt}: {}", rows.len()));
+                                for r in &rows {
+                                    println!(
+                                        "{:<14} {:<8} {:<18} {:<17} {:<13} {}",
+                                        truncate(bt, 13),
+                                        r.status,
+                                        r.cron_schedule_of(),
+                                        r.last_run_display(),
+                                        &r.row_id[..r.row_id.len().min(12)],
+                                        truncate(&r.title, 36)
+                                    );
+                                }
+                            }
+                            Ok(affine_tasks::BoardFind::Trashed) => {
+                                if bt == "Crons" {
+                                    summary
+                                        .push("Crons: в трэше (глобальная не используется)".into());
+                                } else {
+                                    summary.push(format!(
+                                        "{bt}: доска в трэше — восстанови или пересоздай"
+                                    ));
+                                }
+                            }
+                            Ok(affine_tasks::BoardFind::Missing) => {
+                                if bt == "Crons" {
+                                    summary.push(
+                                        "Crons: глобальной доски нет (не используется)".into(),
+                                    );
+                                } else {
+                                    summary
+                                        .push(format!("{bt}: доски нет — создай в папке проекта"));
+                                }
+                            }
+                            Err(e) => summary.push(format!("{bt}: ошибка поиска ({e:#})")),
                         }
+                    }
+                    if !summary.is_empty() {
+                        println!();
+                        println!("доски: {}", summary.join(" · "));
                     }
                 }
                 CronSub::Pause { id } | CronSub::Resume { id } => {
