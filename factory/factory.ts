@@ -411,6 +411,7 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
+    lastStatus: task.status, // спавн из этого статуса (Design) — не рестартить им же
   }
   saveState(state)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, агент ведёт сам (попыток до этого: ${attemptsSeed})`)
@@ -512,12 +513,13 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // юзер вернул живую задачу в Design = «перепланируй/переделай»:
-    // молчать нельзя (сигнал потерян), затирать без предупреждения тоже
-    if (row.status === "Design" && tracked.sessionID !== "") {
-      log(`задача ${rowId.slice(0, 8)}: юзер вернул в Design — перезапуск`)
+    // юзер ПЕРЕВЁЛ живую задачу в Design = «перепланируй» (edge-триггер:
+    // срабатывает на переход — агент штатно живёт в Design-стадии, повторные
+    // тики с тем же статусом НЕ рестартят, иначе плодятся дубли сессий)
+    if (row.status === "Design" && tracked.sessionID !== "" && (tracked.lastStatus ?? "") !== "Design") {
+      log(`задача ${rowId.slice(0, 8)}: юзер перевёл в Design — перезапуск`)
       await notify(tracked,
-        "🤖 [factory] вижу снос статуса — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
+        "🤖 [factory] вижу перевод в Design — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
       tracked.sessionID = ""
       saveState(state)
       const comments = (await taskComments(tracked.bodyDoc)).filter(isUserComment)
@@ -533,6 +535,11 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
       }
       continue
+    }
+    // запоминаем наблюдённый статус — граница перехода для след. тика
+    if (tracked.lastStatus !== row.status) {
+      tracked.lastStatus = row.status
+      saveState(state)
     }
 
     const comments = await taskComments(tracked.bodyDoc)
@@ -569,26 +576,24 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // будильник правок ТЕЛА: активного агента не дёргаем; после его хода
-    // (idle) любое изменение с базлайна — wakeup, атрибуция на агенте
-    // (он знает, что писал сам: чужое учтёт, своё пропустит молча)
-    const idle = (await lastMessageType(tracked.sessionID)) === "idle"
+    // будильник правок ТЕЛА — немедленно, без отложений: любое изменение
+    // с базлайна = wakeup, атрибуция на агенте (знает, что писал сам:
+    // чужое учтёт, своё пропустит молча). Есть свежие комменты — они
+    // разбудят тем же тиком (агент перечитает тело сам), базлайн двигаем
     const updated = await bodyUpdatedAt(tracked.bodyDoc)
     const bodyChanged = updated !== null
       && (tracked.bodyUpdated ?? "") !== ""
       && updated > (tracked.bodyUpdated ?? "")
-    if (idle && bodyChanged) {
-      log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup (атрибуция на агенте)`)
-      if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
-        tracked.bodyUpdated = updated
-        tracked.agentActive = true
-        saveState(state)
+    if (bodyChanged) {
+      if (fresh.length === 0) {
+        log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно`)
+        if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
+          tracked.bodyUpdated = updated
+          saveState(state)
+        }
+        continue
       }
-      continue
-    }
-    if (idle && tracked.agentActive === true && updated !== null) {
-      // ход агента завершён без правок тела — просто снять флаг
-      tracked.agentActive = false
+      // комменты ниже разбудят той же пачкой — тело агент перечитает сам
       tracked.bodyUpdated = updated
       saveState(state)
     }

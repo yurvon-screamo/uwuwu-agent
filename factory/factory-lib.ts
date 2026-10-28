@@ -29,6 +29,8 @@ export interface TrackedTask {
   bodyUpdated?: string
   /** агент в работе (не idle): его правки тела не будят его же */
   agentActive?: boolean
+  /** последний наблюдённый статус — граница edge-триггеров (Design-рестарт) */
+  lastStatus?: string
   /** проект (ключ конфига демона) */
   project: string
   /** ms-время последнего обработанного коммента */
@@ -162,6 +164,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     t.bodyUpdated !== undefined && typeof t.bodyUpdated !== "string"
   ) return false
   if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
+  if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   const sesOk = t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))
   if (!sesOk) return false
   if (t.worktree === "" && t.branch === "") return true
