@@ -100,6 +100,8 @@ export function spawnPrompt(rowId: string, project: string, repo: string): strin
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
+    "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты 🤖, статус Needs attention",
+    "пока ждёшь ответа). План утрясан и вопросов нет → сам поставь Status: In Progress и реализуй.",
     "Репо — текущий каталог: сам создай worktree+ветку от origin/master с осмысленным именем",
     "(по сути задачи, не id), 🤖-коммент «взялся» и статусы двигай task edit'ом.",
     "",

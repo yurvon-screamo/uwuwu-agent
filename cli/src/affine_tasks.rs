@@ -488,7 +488,7 @@ pub async fn create_task(
             "add_database_row",
             json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
                    "databaseBlockId": board.db_id,
-                   "cells": {"Title": title, "Status": "Todo"},
+                   "cells": {"Title": title},
                    "linkedDocId": body_doc}),
         )
         .await
@@ -499,7 +499,7 @@ pub async fn create_task(
         row_id,
         title: title.to_string(),
         body_doc,
-        status: "Todo".into(),
+        status: String::new(), // пустой статус = черновик юзера; Design = спавн агента
         ..Default::default()
     })
 }

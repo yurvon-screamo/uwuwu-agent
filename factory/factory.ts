@@ -476,9 +476,9 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
 
-  // 1. новые Todo (только строки ЭТОЙ доски)
+  // 1. новые Design-задачи (пустой статус = черновик юзера, не трогаем)
   const started = new Set<string>()
-  for (const task of untrackedTasks(rows.filter((r) => r.status === "Todo"), state)) {
+  for (const task of untrackedTasks(rows.filter((r) => r.status === "Design"), state)) {
     try {
       await startTask(task, projectName, cfg, state, 0)
       started.add(task.rowId)
@@ -510,12 +510,12 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // юзер перевёл живую задачу в Todo руками = «перезапусти»:
+    // юзер вернул живую задачу в Design = «перепланируй/переделай»:
     // молчать нельзя (сигнал потерян), затирать без предупреждения тоже
-    if (row.status === "Todo" && tracked.sessionID !== "") {
-      log(`задача ${rowId.slice(0, 8)}: юзер перевёл в Todo — перезапуск`)
+    if (row.status === "Design" && tracked.sessionID !== "") {
+      log(`задача ${rowId.slice(0, 8)}: юзер вернул в Design — перезапуск`)
       await notify(tracked,
-        "🤖 [factory] вижу перевод в Todo — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
+        "🤖 [factory] вижу снос статуса — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
       tracked.sessionID = ""
       saveState(state)
       const comments = (await taskComments(tracked.bodyDoc)).filter(isUserComment)
