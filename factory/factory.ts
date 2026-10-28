@@ -517,9 +517,8 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     // срабатывает на переход — агент штатно живёт в Design-стадии, повторные
     // тики с тем же статусом НЕ рестартят, иначе плодятся дубли сессий)
     if (row.status === "Design" && tracked.sessionID !== "" && (tracked.lastStatus ?? "") !== "Design") {
+      // тихо: юзер сам перевёл — знает; механика в лог демона, не в задачу
       log(`задача ${rowId.slice(0, 8)}: юзер перевёл в Design — перезапуск`)
-      await notify(tracked,
-        "🤖 [factory] вижу перевод в Design — перезапускаю задачу. Несмерженное в ворктри будет перезаписано с master.")
       tracked.sessionID = ""
       saveState(state)
       const comments = (await taskComments(tracked.bodyDoc)).filter(isUserComment)
