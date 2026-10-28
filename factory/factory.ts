@@ -532,27 +532,16 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // юзер ПЕРЕВЁЛ живую задачу в Design = «перепланируй» (edge-триггер:
-    // срабатывает на переход — агент штатно живёт в Design-стадии, повторные
-    // тики с тем же статусом НЕ рестартят, иначе плодятся дубли сессий)
+    // юзер ПЕРЕВЁЛ живую задачу в Design = «вернись к утряске» — мягкий
+    // wakeup (НЕ рестарт: рестарт плодил дубли сессий и убивал контекст;
+    // агент жив, поведение edge — только на переход)
     if (row.status === "Design" && tracked.sessionID !== "" && (tracked.lastStatus ?? "") !== "Design") {
-      // тихо: юзер сам перевёл — знает; механика в лог демона, не в задачу
-      log(`задача ${rowId.slice(0, 8)}: юзер перевёл в Design — перезапуск`)
-      tracked.sessionID = ""
-      saveState(state)
-      const comments = (await taskComments(tracked.bodyDoc)).filter(isUserComment)
-      const last = comments.length > 0 ? comments[comments.length - 1] : null
-      if (last !== null) {
-        tracked.lastCommentAt = last.createdAt
-        tracked.lastCommentId = last.id
-        saveState(state)
-      }
-      try {
-        await startTask(row, tracked.project || projectName, cfg, state, tracked.attempts)
-      } catch (e) {
-        await registerFailure(row, tracked.project || projectName, cfg, board, state, tracked.attempts, e)
-      }
-      continue
+      log(`задача ${rowId.slice(0, 8)}: юзер вернул в Design — wakeup на перепланирование`)
+      await promptSession(
+        tracked.sessionID,
+        `[factory] Юзер вернул задачу ${rowId} в Design: перепланируй — перечитай тело/комменты (task get),` +
+          ` уточни вопросы, согласуй новый план; статус Design/In Progress дальше двигай по контракту.`,
+      )
     }
     // запоминаем наблюдённый статус — граница перехода для след. тика
     if (tracked.lastStatus !== row.status) {
