@@ -370,7 +370,16 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
   // сессия стартует в основном чекауте репо
-  const sessionID = await createSession(cfg.local, task.title)
+  // тайтл: линкованная строка несёт заголовок в доке-теле — деривируем из него
+  let title = task.title
+  if (title === "" && task.bodyDoc !== "") {
+    const doc = await mcp.tool<{ title?: string }>("get_doc", { docId: task.bodyDoc })
+    title = (doc.title ?? "").trim()
+  }
+  if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
+
+  // имя сессии «проект: тайтл» — осмысленно в списке сессий опенкода
+  const sessionID = await createSession(cfg.local, `${projectName}: ${title}`)
   if (sessionID === null) throw new Error("сессия не создалась")
 
   const sent = await promptSession(
@@ -392,7 +401,7 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
     worktree: "",
     branch: "",
     bodyDoc: task.bodyDoc,
-    title: task.title,
+    title,
     lastCommentAt: last?.createdAt ?? 0,
     lastCommentId: last?.id ?? "",
     createdAt: Date.now(),
