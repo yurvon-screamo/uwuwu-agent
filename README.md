@@ -71,7 +71,7 @@ CLI:
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
 share one workspace; locally only operational caches live.
 
-**Production**: `https://affine.uwuwu.net` (UI) / `https://affine-mcp-production.up.railway.app` (MCP gateway)
+**Production**: `https://affine.uwuwu.net` (UI) / MCP gateway — контейнер в compose ноут-афины (`127.0.0.1:8000/mcp`, снаружи `https://affine.uwuwu.net/mcp`)
 
 Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
 
@@ -97,6 +97,6 @@ Folders handle organization; tags are only for lookup.
 - `refresh` — full cache refresh from AFFiNE (new machine entry point, ~800 docs)
 - `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown with ```html_embed diagram fences (Vesper theme, see `skills/visual-diagrams`)
 
-**Infrastructure**: Railway (Singapore) — AFFiNE + MCP gateway + Postgres (pgvector)
+**Infrastructure**: ноут (podman-compose: AFFiNE + pgvector/PG18 + Redis + Manticore + MCP gateway), наружу — rathole-туннель через VPS; Railway-след удалён
 
 - Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.

@@ -17,6 +17,29 @@ use crate::affine_client::{AffineClient, AffineConfig};
 /// Свежий кэш = мгновенно; протухший = один живой проход + сохранение.
 const TAGGED_CACHE_TTL_SECS: u64 = 300;
 
+/// Загрузить tagged-кэш без шлюза (деградация поиска при лежащем MCP).
+pub fn tagged_docs_cache_load(root: &Path) -> Vec<(String, String, String, &'static str)> {
+    read_tagged_cache(root).unwrap_or_default()
+}
+
+fn read_tagged_cache(root: &Path) -> Option<Vec<(String, String, String, &'static str)>> {
+    let raw = std::fs::read_to_string(root.join("tagged_docs_cache.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let rows: Vec<(String, String, String, String)> =
+        serde_json::from_value(v.get("rows")?.clone()).ok()?;
+    Some(
+        rows.into_iter()
+            .map(|(a, b, c, d)| {
+                let kind: &'static str = match d.as_str() {
+                    "cron" => "cron",
+                    _ => "task",
+                };
+                (a, b, c, kind)
+            })
+            .collect(),
+    )
+}
+
 pub async fn tagged_docs_cached(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -50,14 +73,18 @@ pub async fn tagged_docs_cached(
         }
     }
     let rows = tagged_docs(client, cfg).await;
-    let payload = serde_json::json!({
-        "ts": now,
-        "rows": rows.iter()
-            .map(|(a, b, c, d)| (a, b, c, d.to_string()))
-            .collect::<Vec<_>>(),
-    });
-    if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(&path, s);
+    // пустой живой проход не кэшируем: моргающий апстрим не должен
+    // губить семантику задач на 5 минут
+    if !rows.is_empty() {
+        let payload = serde_json::json!({
+            "ts": now,
+            "rows": rows.iter()
+                .map(|(a, b, c, d)| (a, b, c, d.to_string()))
+                .collect::<Vec<_>>(),
+        });
+        if let Ok(s) = serde_json::to_string(&payload) {
+            let _ = std::fs::write(&path, s);
+        }
     }
     rows
 }

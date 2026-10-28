@@ -90,14 +90,14 @@ Code with clear names documents itself. A redundant comment HURTS readability �
 
 ## DRY — knowledge, not code
 
-## Change discipline
-
-- **Subtract Before You Add**: если изменение раздувает сложность — сначала вычти (убери ставшее лишним), потом добавляй новое.
-- **Attack the Premise**: два фикса, разделяющих одну посылку, упали на одном гейте → запиши посылку одним предложением, найди, кто держит дисбаланс, устрани её — не начинай третий фикс.
-- Не усложняй ради гипотетической гонки состояний или маловероятного сценария: сначала покажи юзеру проблему, вероятность и цену усложнения — получи согласие.
-
 DRY applies to domain knowledge, not identical-looking code. Two identical fragments may model different concepts that evolve independently (e.g. shipping address vs. warehouse address). Merging them couples unrelated change rates.
 
 - Do not extract on the first repetition. Wait for the third occurrence (Rule of Three / AHA — Avoid Hasty Abstractions) and confirm all copies must change together when the underlying rule changes.
 - A correct abstraction has a real domain name (`Money`, `TaxRate`, `InvoiceNumber`). If the best name is `Helper`, `Utils`, or `ProcessData`, you are abstracting form, not knowledge.
 - Do not cross module boundaries with shared code: two modules keeping their own `Order` model is often correct, even if the shapes look alike.
+
+## Change discipline
+
+- **Subtract Before You Add**: если изменение раздувает сложность — сначала вычти (убери ставшее лишним), потом добавляй новое.
+- **Attack the Premise**: два фикса, разделяющих одну посылку, упали на одном гейте → запиши посылку одним предложением, найди, кто держит дисбаланс, устрани её — не начинай третий фикс.
+- Не усложняй ради гипотетической гонки состояний или маловероятного сценария: сначала покажи юзеру проблему, вероятность и цену усложнения — получи согласие.

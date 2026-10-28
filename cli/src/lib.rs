@@ -697,9 +697,17 @@ pub async fn run() -> anyhow::Result<()> {
                 if !use_local || top + facts + access == 0 {
                     return Ok(Vec::new());
                 }
-                // тела задач/кронов — кэш с TTL (живой проход не чаще 5 мин)
-                let mut client = affine_client::AffineClient::connect(&cfg).await?;
-                let extra = affine_queries::tagged_docs_cached(&mut client, &cfg, &root).await;
+                // тела задач/кронов — кэш с TTL (живой проход не чаще 5 мин);
+                // шлюз недоступен → деградация на кэш, поиск не падает
+                let extra = match affine_client::AffineClient::connect(&cfg).await {
+                    Ok(mut client) => {
+                        affine_queries::tagged_docs_cached(&mut client, &cfg, &root).await
+                    }
+                    Err(e) => {
+                        eprintln!("affine: шлюз недоступен ({e:#}) — семантика задач из кэша");
+                        affine_queries::tagged_docs_cache_load(&root)
+                    }
+                };
                 eprintln!("affine: тел задач/кронов в семантике: {}", extra.len());
                 // search НЕ гонит синки (list_workspace_tree на 946 доках
                 // упирается в лимит шлюза и сжирает минуту): локальные кэши
