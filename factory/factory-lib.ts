@@ -75,6 +75,21 @@ export function untrackedTasks(rows: TaskRef[], state: FactoryState): TaskRef[] 
   return rows.filter((r) => state.tasks[r.rowId] === undefined)
 }
 
+/** Текст коммента с контекстом ответа: page-режим (ответ цитатой на кусок
+ *  дока/коммента) несёт preview = цитата-якорь; треды — см. taskComments. */
+export function commentText(content: unknown): string {
+  const c = content as { mode?: string; preview?: string } | null
+  const body = snapshotText(content)
+  if (
+    c !== null && typeof c === "object" &&
+    c.mode === "page" && typeof c.preview === "string" &&
+    c.preview !== "" && c.preview !== body
+  ) {
+    return `(в ответ на: «${c.preview.slice(0, 120)}») ${body}`
+  }
+  return body
+}
+
 /** Конкатенация текстовых дельт дерева блоков коммента/дока. */
 export function snapshotText(content: unknown): string {
   const out: string[] = []

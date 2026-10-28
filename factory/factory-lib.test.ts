@@ -1,6 +1,7 @@
 // factory-lib.test.ts — юнит-тесты чистых функций uwuwu-factory.
 import { describe, expect, test } from "bun:test"
 import {
+  commentText,
   newUserComments,
   bodyEditPrompt,
   spawnPrompt,
@@ -141,5 +142,22 @@ describe("bodyEditPrompt", () => {
     expect(p).toContain("отредактировал ТЕЛО задачи r1")
     expect(p).toContain("task get")
     expect(p).toContain("🤖")
+  })
+})
+
+describe("commentText — контекст ответов", () => {
+  const pageReply = {
+    mode: "page",
+    preview: "A. Сжать до одной строки-вердикта — рекомендация",
+    snapshot: { blocks: { props: { text: { delta: [{ insert: "В целом нормвариант" }] } }, children: [] } },
+  }
+  const plain = { snapshot: { blocks: { props: { text: { delta: [{ insert: "🤖 отчёт" }] } }, children: [] } } }
+  test("page-режим (ответ цитатой) несёт якорь preview", () => {
+    const t = commentText(pageReply)
+    expect(t).toContain("в ответ на: «A. Сжать")
+    expect(t).toContain("В целом нормвариант")
+  })
+  test("обычный коммент — без якоря", () => {
+    expect(commentText(plain)).toBe("🤖 отчёт")
   })
 })

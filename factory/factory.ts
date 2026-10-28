@@ -17,6 +17,7 @@ import {
   newUserComments,
   untrackedTasks,
   isUserComment,
+  commentText,
   spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
@@ -250,7 +251,9 @@ async function commentPage(bodyDoc: string, after: string): Promise<{
 }
 
 /** ВСЕ комменты тела с relay-пагинацией (без досылки мост слепнет на
- *  задачах с длинной историей: 50-окно роняет свежие комменты). */
+ *  задачах с длинной историей: 50-окно роняет свежие комменты).
+ *  Разворачивает и треды (replies ноды) — ответ юзера тредом виден
+ *  с якорем «тред-ответ на …». */
 async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
   if (bodyDoc === "") return []
   const out: TaskComment[] = []
@@ -262,7 +265,23 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
       if (n === undefined || typeof n.id !== "string") continue
       const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
       const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
-      out.push({ id: n.id, text: snapshotText(n.content), createdAt: created })
+      const text = commentText(n.content)
+      out.push({ id: n.id, text, createdAt: created })
+      // тред-ответы: отдельные комменты с якорем родителя
+      const replies = (n as { replies?: unknown }).replies
+      if (Array.isArray(replies)) {
+        const parentHead = text.replace(/^\(в ответ на: [^)]*\)\s*/, "").slice(0, 60)
+        for (const rep of replies) {
+          const r = rep as { id?: unknown; content?: unknown; createdAt?: unknown }
+          if (typeof r.id !== "string") continue
+          const repText = commentText(r.content)
+          out.push({
+            id: r.id,
+            text: `(тред-ответ на «${parentHead}…») ${repText}`,
+            createdAt: typeof r.createdAt === "number" ? r.createdAt : created + 1,
+          })
+        }
+      }
     }
     if (!hasNext || endCursor === "") break
     cursor = endCursor
