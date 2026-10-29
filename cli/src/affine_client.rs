@@ -197,10 +197,12 @@ impl AffineClient {
             .await
             .with_context(|| "gateway notification failed")?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("gateway HTTP {status}: {text}");
         }
+        // успех = fire-and-forget: шлюз держит SSE-стрим открытым (~6с) —
+        // чтение тела на каждое уведомление съедало полкоманды
         Ok(())
     }
 
