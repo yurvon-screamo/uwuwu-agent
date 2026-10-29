@@ -226,6 +226,97 @@ pub async fn board_lookup(
     }
 }
 
+/// Фоллбек: индексатор поиска слепнет к части доков (ACL-снапшот на момент
+/// индексации — доки без правок с миграции не находятся боту). Резолвим доску
+/// через organize-дерево: папка проекта → doc-линки → get_doc → тайтл.
+/// Лимит 50 кандидатов: доски задач/кронов стоят в начале папок по index.
+pub async fn find_board_by_title_tree(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    title: &str,
+) -> Result<Board> {
+    let nodes = client
+        .call_tool("list_organize_nodes", json!({"workspaceId": cfg.workspace}))
+        .await
+        .context("list_organize_nodes")?;
+    let all = nodes
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // «Задачи origa» / «Кроны origa» → папка origa в Projects
+    let project = title.split_once(' ').map(|(_, p)| p.to_string());
+    let is_folder =
+        |n: &serde_json::Value| n.get("type").and_then(|t| t.as_str()) == Some("folder");
+    let pid = all
+        .iter()
+        .find(|n| is_folder(n) && n.get("data").and_then(|d| d.as_str()) == Some("Projects"))
+        .and_then(|n| n.get("id"))
+        .and_then(|i| i.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("папка Projects не найдена в дереве"))?;
+    let folder: Option<String> = project.as_ref().and_then(|p| {
+        all.iter()
+            .find(|n| {
+                is_folder(n)
+                    && n.get("parentId").and_then(|x| x.as_str()) == Some(pid.as_str())
+                    && n.get("data").and_then(|d| d.as_str()) == Some(p.as_str())
+            })
+            .and_then(|n| n.get("id"))
+            .and_then(|i| i.as_str())
+            .map(String::from)
+    });
+    let folder_ids: Vec<String> = match &folder {
+        Some(f) => vec![f.clone()],
+        None => all
+            .iter()
+            .filter(|n| {
+                is_folder(n) && n.get("parentId").and_then(|x| x.as_str()) == Some(pid.as_str())
+            })
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect(),
+    };
+    let mut checked = 0usize;
+    for n in &all {
+        if n.get("type").and_then(|t| t.as_str()) != Some("doc") {
+            continue;
+        }
+        let Some(parent) = n.get("parentId").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if !folder_ids.iter().any(|f| f == parent) {
+            continue;
+        }
+        let Some(doc_id) = n.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        if checked >= 50 {
+            break;
+        }
+        checked += 1;
+        let Ok(doc) = client
+            .call_tool(
+                "get_doc",
+                json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+            )
+            .await
+        else {
+            continue;
+        };
+        let t = doc
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if t == title {
+            return board_from_doc(client, cfg, doc_id).await;
+        }
+    }
+    Err(anyhow!(
+        "доска «{title}» не найдена в дереве (просмотрено {checked} доков)"
+    ))
+}
+
 pub async fn find_board_by_title(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -233,11 +324,12 @@ pub async fn find_board_by_title(
 ) -> Result<Board> {
     match board_lookup(client, cfg, title).await? {
         BoardFind::Found(board) => Ok(board),
+        BoardFind::Missing => {
+            // поиск слепнет — резолвим деревом (канон-путь для досок проектов)
+            find_board_by_title_tree(client, cfg, title).await
+        }
         BoardFind::Trashed => Err(anyhow!(
             "доска «{title}» в трэше — восстанови из корзины или пересоздай"
-        )),
-        BoardFind::Missing => Err(anyhow!(
-            "доска «{title}» не найдена (ожидается док с канбаном)"
         )),
     }
 }
