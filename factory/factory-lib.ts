@@ -16,6 +16,8 @@ export interface TaskComment {
   text: string
   /** ms-таймстамп из снапшота (надёжный порядок) */
   createdAt: number
+  /** автор коммента (user.id из афины) — точный фильтр юзер/бот */
+  userId?: string
 }
 
 /** Состояние одной задачи фабрики. */
@@ -49,7 +51,11 @@ export interface FactoryState {
 export const AGENT_MARK = "🤖"
 
 /** Юзерский коммент: не наш (🤖), не служебный ([factory]). */
-export function isUserComment(c: TaskComment): boolean {
+export function isUserComment(c: TaskComment, botUserId?: string): boolean {
+  // точный фильтр: комменты бот-аккаунта — не юзер (независимо от текста)
+  if (botUserId !== undefined && c.userId !== undefined && c.userId === botUserId) {
+    return false
+  }
   const body = c.text.trimStart()
   if (body.startsWith(AGENT_MARK)) return false
   if (body.startsWith("[factory]")) return false
@@ -60,9 +66,10 @@ export function isUserComment(c: TaskComment): boolean {
 export function newUserComments(
   comments: TaskComment[],
   lastSeen: { at: number; id: string },
+  botUserId?: string,
 ): TaskComment[] {
   const users = comments
-    .filter(isUserComment)
+    .filter((c) => isUserComment(c, botUserId))
     .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt))
   if (lastSeen.id === "" && lastSeen.at === 0) return users
   const idx = users.findIndex((c) => c.id === lastSeen.id)
@@ -119,11 +126,12 @@ export function spawnPrompt(rowId: string, project: string, repo: string): strin
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты 🤖, статус Needs attention",
     "пока ждёшь ответа). План утрясан и вопросов нет → сам поставь Status: In Progress и реализуй.",
-    "Репо — текущий каталог: сам создай worktree+ветку от origin/master с осмысленным именем",
-    "(по сути задачи, не id), 🤖-коммент «взялся» и статусы двигай task edit'ом.",
+    "Репо — текущий каталог: сам создай worktree+ветку от origin/master с осмысленным",
+    "именем (по сути задачи, не id); статусы двигай task edit'ом. Без пустого шума в",
+    "комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
-    "вопросы/отчёты — task comment (🤖), выводы — task body; ждёшь ответа юзера →",
+    "вопросы — task comment (🤖), результаты и выводы — task body; ждёшь ответа юзера →",
     "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
   ].join("\n")
 }

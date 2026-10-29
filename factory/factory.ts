@@ -70,6 +70,8 @@ const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
+/** бот-аккаунт афины: его комменты — не сигналы юзера */
+const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6c71d8afeae"
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
@@ -266,19 +268,27 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
       const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
       const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
       const text = commentText(n.content)
-      out.push({ id: n.id, text, createdAt: created })
+      const userId = (n as { user?: { id?: unknown } }).user?.id
+      out.push({
+        id: n.id,
+        text,
+        createdAt: created,
+        ...(typeof userId === "string" ? { userId } : {}),
+      })
       // тред-ответы: отдельные комменты с якорем родителя
       const replies = (n as { replies?: unknown }).replies
       if (Array.isArray(replies)) {
         const parentHead = text.replace(/^\(в ответ на: [^)]*\)\s*/, "").slice(0, 60)
         for (const rep of replies) {
-          const r = rep as { id?: unknown; content?: unknown; createdAt?: unknown }
+          const r = rep as { id?: unknown; content?: unknown; createdAt?: unknown; user?: { id?: unknown } }
           if (typeof r.id !== "string") continue
           const repText = commentText(r.content)
+          const repUser = r.user?.id
           out.push({
             id: r.id,
             text: `(тред-ответ на «${parentHead}…») ${repText}`,
             createdAt: typeof r.createdAt === "number" ? r.createdAt : created + 1,
+            ...(typeof repUser === "string" ? { userId: repUser } : {}),
           })
         }
       }
@@ -412,7 +422,9 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
   // newUserComments идёт по юзерскому списку)
-  const comments = (await taskComments(task.bodyDoc)).filter(isUserComment)
+  const comments = (await taskComments(task.bodyDoc)).filter((c) =>
+    isUserComment(c, BOT_USER_ID),
+  )
   const last = comments.length > 0
     ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
     : null
@@ -550,7 +562,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     }
 
     const comments = await taskComments(tracked.bodyDoc)
-    const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId })
+    const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
 
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
