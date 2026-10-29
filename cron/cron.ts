@@ -17,6 +17,12 @@ const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
+
+/** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
+function formatLocal(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
@@ -300,7 +306,7 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // агент без 🤖-коммента невидим (детекция — следующий срез, если болит)
     state.crons[row.rowId] = { sessionID, lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
-    await setCells(board, row.rowId, { "Last Run": now.toISOString().slice(0, 16).replace("T", " ") })
+    await setCells(board, row.rowId, { "Last Run": formatLocal(now) })
     if (isOneShot(sched)) {
       // fired ≠ paused: разовый сработал и завершён (самообъясняюще из
       // таблицы); paused — только явное решение юзера остановить повторяющийся
