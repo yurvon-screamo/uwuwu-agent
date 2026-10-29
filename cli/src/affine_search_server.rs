@@ -20,7 +20,14 @@ pub struct ServerSearchConfig {
 
 impl ServerSearchConfig {
     pub fn from_env() -> Option<Self> {
-        let ui_url = std::env::var("UWUWU_AFFINE_UI_URL").ok()?;
+        // Railway-хост мёртв: игнорируем с подсказкой (креды при этом валидны)
+        let mut ui_url = std::env::var("UWUWU_AFFINE_UI_URL").ok()?;
+        if ui_url.contains("railway.app") {
+            eprintln!(
+                "uwuwu-cli: UWUWU_AFFINE_UI_URL={ui_url} — Railway-хост мёртв, использую https://affine.uwuwu.net"
+            );
+            ui_url = "https://affine.uwuwu.net".to_string();
+        }
         let email = std::env::var("UWUWU_AFFINE_EMAIL").ok()?;
         let password = std::env::var("UWUWU_AFFINE_PASSWORD").ok()?;
         if ui_url.is_empty() || email.is_empty() || password.is_empty() {

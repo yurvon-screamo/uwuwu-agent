@@ -173,13 +173,29 @@ pub async fn session_with_ttl(
     let mut client = AffineClient::connect(cfg).await?;
     let mut cache = ContentCache::load(root)?;
     if !cache.is_fresh(ttl_secs) {
-        let report = cache.sync(&mut client, cfg, root).await?;
-        if report.fetched > 0 {
-            eprintln!("affine: content cache +{} docs", report.fetched);
+        // Слепой tree у ограниченного акка (бот-член: list_workspace_tree пуст)
+        // НЕ должен ронять команду: работаем с локальным кэшем, резолв добирает
+        // через search_docs (resolve_doc_id last resort). Пустой кэш — честная ошибка.
+        match cache.sync(&mut client, cfg, root).await {
+            Ok(report) => {
+                if report.fetched > 0 {
+                    eprintln!("affine: content cache +{} docs", report.fetched);
+                }
+            }
+            Err(e) if cache.iter().count() > 0 => {
+                eprintln!(
+                    "affine: синк пропущен ({e:#}) — работаем с локальным кэшем ({} доков)",
+                    cache.iter().count()
+                );
+            }
+            Err(e) => return Err(e),
         }
     }
     let mut index = FactIndex::load_or_bootstrap(root)?;
-    sync_fact_buckets(&mut client, cfg, root, &mut index).await?;
+    if let Err(e) = sync_fact_buckets(&mut client, cfg, root, &mut index).await {
+        // факты — деградация не летальна: дейли-бакеты через слепой tree не видны
+        eprintln!("affine: факт-синк пропущен ({e:#})");
+    }
     Ok((client, cache, index))
 }
 

@@ -318,6 +318,21 @@ fn valid_date(s: &str) -> bool {
     (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
 }
 
+/// UI-URL для ссылок/поиска: env, но устаревший Railway-хост игнорируется
+/// (старые env опенкод-серверов не должны вредить).
+pub fn ui_url() -> String {
+    match std::env::var("UWUWU_AFFINE_UI_URL") {
+        Ok(u) if !u.contains("railway.app") => u,
+        Ok(u) => {
+            eprintln!(
+                "uwuwu-cli: UWUWU_AFFINE_UI_URL={u} — Railway-хост мёртв, использую https://affine.uwuwu.net"
+            );
+            "https://affine.uwuwu.net".into()
+        }
+        Err(_) => "https://affine.uwuwu.net".into(),
+    }
+}
+
 /// HH:MM из ms-таймстампа (локальная зона машины).
 fn chrono_like_hhmm(ms: i64) -> String {
     if ms <= 0 {
@@ -1107,8 +1122,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     println!("Строка:   {}", row.row_id);
                     if !row.body_doc.is_empty() {
-                        let ui = std::env::var("UWUWU_AFFINE_UI_URL")
-                            .unwrap_or_else(|_| "https://affine.uwuwu.net".into());
+                        let ui = ui_url();
                         println!(
                             "Тело:     {ui}/workspace/{}/{}",
                             cfg.workspace, row.body_doc
