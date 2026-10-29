@@ -1,7 +1,7 @@
 // uwuwu-cron — демон кронов на AFFiNE.
 // Поллит доску «Crons»: строка = крон (Schedule/Status/LastRun, промпт в теле).
 // Наступило расписание → OpenCode-сессия с промптом из тела → агент работает
-// и докладывает комментом (🤖); разовые (at) после срабатывания → paused.
+// и докладывает комментом; разовые (at) после срабатывания → paused.
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"

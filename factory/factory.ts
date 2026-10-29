@@ -484,7 +484,7 @@ async function registerFailure(
     // демон не смог стартовать; реакция юзера одна (коммент в задачу)
     await setCells(board, task.rowId, { Status: "Needs attention" })
     await notify(entry,
-      `🤖 [factory] не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH} и напиши комментарий — попробую снова.`)
+      `[factory] не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH} и напиши комментарий — попробую снова.`)
   }
 }
 
@@ -579,7 +579,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         tracked.sessionID = ""
         saveState(state)
         await notify(tracked,
-          "🤖 [factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с master).")
+          "[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с master).")
       }
       continue
     }
