@@ -127,7 +127,7 @@ describe("spawnPrompt", () => {
     expect(p).toContain("yurvon-screamo/uwuwu-agent")
     expect(p).toContain("AGENTS.md")
     expect(p).toContain("task get")
-    expect(p).toContain("🤖")
+    expect(p).not.toContain("🤖")
   })
   test("пайпа в промпте нет — он в глобальных инструкциях", () => {
     const p = spawnPrompt("r1", "origa", "yurvon-screamo/origa")
@@ -137,11 +137,11 @@ describe("spawnPrompt", () => {
 })
 
 describe("bodyEditPrompt", () => {
-  test("контракт: перечитай тело + 🤖-ответ", () => {
+  test("контракт: перечитай тело + ответ комментом", () => {
     const p = bodyEditPrompt("r1")
     expect(p).toContain("отредактировал ТЕЛО задачи r1")
     expect(p).toContain("task get")
-    expect(p).toContain("🤖")
+    expect(p).not.toContain("🤖")
   })
 })
 

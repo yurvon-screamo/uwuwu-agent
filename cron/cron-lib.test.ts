@@ -93,7 +93,7 @@ describe("firePrompt", () => {
   test("контракт: коммент с 🤖, [DONE] для разовых, границы", () => {
     const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь и доложи")
     expect(p).toContain("uwuwu-cli task comment r1")
-    expect(p).toContain("🤖")
+    expect(p).not.toContain("🤖")
     expect(p).toContain("[DONE]")
     expect(p).toContain("≡")
   })
