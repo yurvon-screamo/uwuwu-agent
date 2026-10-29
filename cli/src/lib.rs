@@ -100,6 +100,11 @@ enum TaskSub {
         #[arg(trailing_var_arg = true, help = "Текст коммента")]
         text: Vec<String>,
     },
+    /// Цепочки комментов: какая тема, кто что ответил
+    Thread {
+        #[arg(help = "row-id / doc-id / префикс")]
+        id: String,
+    },
     /// Закрыть задачу (Done) с опциональной заметкой
     Close {
         #[arg(help = "row-id / doc-id / префикс")]
@@ -311,6 +316,30 @@ fn valid_date(s: &str) -> bool {
     }
     let num = |from: usize, to: usize| -> u32 { s[from..to].parse().unwrap_or(0) };
     (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
+}
+
+/// HH:MM из ms-таймстампа (локальная зона машины).
+fn chrono_like_hhmm(ms: i64) -> String {
+    if ms <= 0 {
+        return "—".into();
+    }
+    // без chrono: дни/остаток от эпохи через секунды, часовой сдвиг берём из локали через `date`
+    let secs = ms.div_euclid(1000);
+    let today_local = std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_else(|| "+0000".into());
+    let sign: i64 = if today_local.starts_with('-') { -1 } else { 1 };
+    let hours_off: i64 = today_local
+        .trim_start_matches(['+', '-'])
+        .get(..2)
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(0);
+    let local = secs + sign * hours_off * 3600;
+    let day_secs = local.rem_euclid(86_400);
+    format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1132,6 +1161,40 @@ pub async fn run() -> anyhow::Result<()> {
                     };
                     affine_tasks::edit_row(&mut client, &cfg, &_board, &row, &patch).await?;
                     println!("обновлено: {}", row.title);
+                }
+                TaskSub::Thread { id } => {
+                    let (_board, row) =
+                        resolve_row_any_board(&mut client, &cfg, &root, &project, &id).await?;
+                    let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
+                        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
+                    let comments = affine_tasks::thread_comments(&mut client, &cfg, &row).await?;
+                    if comments.is_empty() {
+                        println!("комментов нет");
+                        return Ok(());
+                    }
+                    let mut topic = 0usize;
+                    for (text, user_id, created, resolved) in &comments {
+                        let is_bot = *user_id == bot_user_id
+                            || text.trim_start().starts_with("🤖")
+                            || text.trim_start().starts_with("[factory]");
+                        let time = chrono_like_hhmm(*created);
+                        let mark = if *resolved { " [✓]" } else { "" };
+                        if !is_bot {
+                            topic += 1;
+                            println!();
+                            println!("── тема {topic} · {time} · ЮЗЕР{mark}:");
+                            for line in text.lines() {
+                                println!("  {line}");
+                            }
+                        } else {
+                            println!("     ↳ {time} агент:");
+                            for line in text.lines() {
+                                println!("       {line}");
+                            }
+                        }
+                    }
+                    println!();
+                    println!("тем: {topic}");
                 }
                 TaskSub::Comment { id, stdin, text } => {
                     let (_board, row) =

@@ -784,6 +784,77 @@ fn snapshot_text(content: &Value) -> String {
     out.trim().to_string()
 }
 
+/// Все комменты тела задачи хронологически: (текст, userId, ms-таймстамп, resolved).
+/// userId — автор (бот vs юзер), createDate — из снапшота (надёжный порядок).
+pub async fn thread_comments(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    row: &TaskRow,
+) -> Result<Vec<(String, String, i64, bool)>> {
+    if row.body_doc.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    for _page in 0..10 {
+        let mut args = json!({"workspaceId": cfg.workspace, "docId": row.body_doc, "first": 50});
+        if !cursor.is_empty() {
+            args["after"] = json!(cursor);
+        }
+        let resp = client
+            .call_tool("list_comments", args)
+            .await
+            .context("list_comments")?;
+        let edges = resp
+            .get("edges")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let has_next = resp
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|h| h.as_bool())
+            .unwrap_or(false);
+        cursor = resp
+            .pointer("/pageInfo/endCursor")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string();
+        for e in &edges {
+            let node = e.get("node").cloned().unwrap_or(Value::Null);
+            let content = node.get("content").cloned().unwrap_or(Value::Null);
+            let preview = content
+                .get("preview")
+                .and_then(|p| p.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let preview = if preview.trim().is_empty() {
+                snapshot_text(&content)
+            } else {
+                preview
+            };
+            let created = content
+                .pointer("/snapshot/meta/createDate")
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0);
+            let resolved = node
+                .get("resolved")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
+            let user_id = node
+                .pointer("/user/id")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.push((preview, user_id, created, resolved));
+        }
+        if !has_next || cursor.is_empty() {
+            break;
+        }
+    }
+    out.sort_by_key(|(_, _, created, _)| *created);
+    Ok(out)
+}
+
 // ——— кроны (доска Crons) ———
 
 /// Заглушка тела крона: что делать на каждом срабатывании.
