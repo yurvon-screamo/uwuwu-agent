@@ -21,28 +21,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE, mcp_call, mcp_result
+from triage_affine import WORKSPACE, get_md, mcp_call, mcp_result
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
 PLAN = AUDIT / "plan.json"
 DOCS = AUDIT / "docs.json"
 LOG = AUDIT / "apply-log.json"
 
-
-def get_md(o):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            if k == "markdown" and isinstance(v, str):
-                return v
-            f = get_md(v)
-            if f:
-                return f
-    elif isinstance(o, list):
-        for i in o:
-            f = get_md(i)
-            if f:
-                return f
-    return None
 
 
 def patch(markdown: str, reps: list[dict]) -> tuple[str, int]:

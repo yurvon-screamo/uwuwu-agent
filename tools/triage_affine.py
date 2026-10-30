@@ -259,6 +259,25 @@ def mcp_result(resp: object) -> dict:
     return result
 
 
+def get_md(o):
+    """Рекурсивно достать markdown из export-ответа (markdown-поле где-то
+    в структуре: structuredContent или content[].text-JSON). Общий хелпер
+    wiki_ops/wiki_audit/wiki_apply — правится в одном месте."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "markdown" and isinstance(v, str):
+                return v
+            f = get_md(v)
+            if f:
+                return f
+    elif isinstance(o, list):
+        for i in o:
+            f = get_md(i)
+            if f:
+                return f
+    return None
+
+
 def live_bucket_markdown(date: str) -> tuple[str, str]:
     """(markdown, doc_id) ПО ЖИВОМУ доку через MCP export — apply обязан
     работать с актуальным контентом: стейл-кэш вернул бы изъятые секции

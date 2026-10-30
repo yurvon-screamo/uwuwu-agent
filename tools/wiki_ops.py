@@ -26,7 +26,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import MCP_TOKEN, MCP_URL, WORKSPACE, mcp_call, mcp_result
+from triage_affine import MCP_TOKEN, MCP_URL, WORKSPACE, get_md, mcp_call, mcp_result
 
 RETRIES = 8
 PAUSE = 120
@@ -118,22 +118,6 @@ def deep_md(o):
             r = deep_md(i)
             if r:
                 return r
-    return None
-
-
-def get_md(o):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            if k == "markdown" and isinstance(v, str):
-                return v
-            f = get_md(v)
-            if f:
-                return f
-    elif isinstance(o, list):
-        for i in o:
-            f = get_md(i)
-            if f:
-                return f
     return None
 
 
