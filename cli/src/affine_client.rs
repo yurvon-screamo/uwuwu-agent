@@ -55,7 +55,9 @@ pub struct AffineClient {
 }
 
 impl AffineClient {
-    /// Open a session: initialize + initialized notification.
+    /// Open a session: переиспользуем сохранённый session-id (initialize =
+    /// sign-in афины ~4-7с на каждый запуск — главный источник латентности).
+    /// Протухшая сессия даёт ошибку на первом tool → полный handshake.
     pub async fn connect(cfg: &AffineConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(CALL_TIMEOUT_SECS))
@@ -67,29 +69,49 @@ impl AffineClient {
             http,
             next_id: 0,
         };
-        let init = client
-            .request_with_retry(
-                "initialize",
+        let session_file = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".uwuwu/mcp-session.txt"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".uwuwu/mcp-session.txt"));
+        if let Ok(saved) = std::fs::read_to_string(&session_file) {
+            let sid = saved.trim().to_string();
+            if !sid.is_empty() {
+                client.session = sid;
+                return Ok(client);
+            }
+        }
+        client.handshake(&session_file).await?;
+        Ok(client)
+    }
+
+    /// Полный handshake: initialize + initialized, session-id сохраняется.
+    /// Без request_with_retry (он может ре-handshake'нуться — рекурсия в async запрещена):
+    /// initialize не ретраится, транспортная ошибка — наружу.
+    async fn handshake(&mut self, session_file: &std::path::Path) -> Result<()> {
+        let init = self
+            .raw_post(
                 json!({
                     "protocolVersion": "2025-03-26",
                     "capabilities": {},
                     "clientInfo": {"name": "uwuwu-cli", "version": env!("CARGO_PKG_VERSION")}
                 }),
+                self.alloc_id(),
             )
-            .await?;
-        client.session = init
+            .await
+            .map_err(|e| anyhow!("initialize failed: {e:?}"))?;
+        self.session = init
             .headers
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("gateway did not return mcp-session-id"))?;
-        client
-            .post_notification(json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .await?;
-        Ok(client)
+        let _ = std::fs::create_dir_all(session_file.parent().unwrap_or(std::path::Path::new(".")));
+        let _ = std::fs::write(session_file, &self.session);
+        self.post_notification(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await?;
+        Ok(())
     }
 
     /// Call a gateway tool; returns its structured output (or the parsed
@@ -106,6 +128,7 @@ impl AffineClient {
     /// POST a request until it answers; only transport errors repeat, with a
     /// pause between attempts so 429/5xx bursts are not hammered instantly.
     async fn request_with_retry(&mut self, method: &str, params: Value) -> Result<RpcResponse> {
+        let mut stale_retried = false;
         let mut last_err = None;
         for attempt in 0..=CALL_RETRIES {
             if attempt > 0 {
@@ -118,8 +141,21 @@ impl AffineClient {
                 "method": method,
                 "params": params
             });
-            match self.raw_post(body, call_id).await {
+            match self.raw_post(body.clone(), call_id).await {
                 Ok(resp) => return Ok(resp),
+                Err(GatewayError::StaleSession(e)) if !stale_retried => {
+                    // сессия протухла (idle timeout шлюза) — полный handshake и повтор
+                    stale_retried = true;
+                    self.session = String::new();
+                    let session_file = std::env::var("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(".uwuwu/mcp-session.txt"))
+                        .unwrap_or_else(|_| std::path::PathBuf::from(".uwuwu/mcp-session.txt"));
+                    let _ = std::fs::remove_file(&session_file);
+                    eprintln!("uwuwu-cli: сессия протухла — пере-handshake");
+                    self.handshake(&session_file).await?;
+                    last_err = Some(e);
+                }
+                Err(GatewayError::StaleSession(e)) => last_err = Some(e),
                 Err(GatewayError::Transport(e)) => last_err = Some(e),
                 Err(GatewayError::Fatal(e)) => return Err(e),
             }
@@ -228,6 +264,12 @@ impl AffineClient {
         };
         let status = resp.status();
         let headers = resp.headers().clone();
+        // протухшая/чужая сессия: 400/404 на этапе обработки — сигнал к re-handshake
+        if (status.as_u16() == 400 || status.as_u16() == 404) && !self.session.is_empty() {
+            return Err(GatewayError::StaleSession(anyhow!(
+                "HTTP {status}: session rejected"
+            )));
+        }
         let raw = resp.text().await.unwrap_or_default();
         if status.as_u16() == 429 || status.is_server_error() {
             return Err(GatewayError::Transport(anyhow!("HTTP {status}: {raw}")));
@@ -255,4 +297,6 @@ struct RpcResponse {
 enum GatewayError {
     Transport(anyhow::Error),
     Fatal(anyhow::Error),
+    /// сессия отклонена шлюзом — нужен полный handshake и повтор вызова
+    StaleSession(anyhow::Error),
 }
