@@ -33,7 +33,7 @@ TREE = AUDIT / "tree.json"
 def session() -> str:
     # общая переиспользуемая сессия wiki-ops (файл разделяем с uwuwu-cli):
     # initialize = sign-in афины 4-7с на каждый запуск — больше не платим
-    return wiki_ops_session()
+    return wiki_ops_session("wiki-audit")
 
 
 def cmd_fetch(_: argparse.Namespace) -> int:

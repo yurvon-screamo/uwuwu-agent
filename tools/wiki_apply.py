@@ -88,7 +88,7 @@ def main() -> int:
         flush=True,
     )
 
-    sid = session()
+    sid = session("wiki-apply")
 
     log = json.loads(LOG.read_text()) if LOG.exists() else {}
     done = replaced = skipped = 0

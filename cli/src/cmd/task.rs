@@ -29,83 +29,12 @@ pub(crate) async fn run(
             r#type: ty,
             stdin,
             attach,
-        } => {
-            let task_type = affine_tasks::TaskType::parse(ty.as_deref().unwrap_or("dev"))
-                .with_context(|| {
-                    format!(
-                        "--type '{}': ожидался dev|spike|bug",
-                        ty.as_deref().unwrap_or("")
-                    )
-                })?;
-            let body = if stdin {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-                buf
-            } else {
-                String::new()
-            };
-            let row = affine_tasks::create_task(&mut client, cfg, &board, &title, &body, task_type)
-                .await?;
-            println!("создана: {}", row.title);
-            println!("  строка: {}", row.row_id);
-            println!("  тело:   {}", row.body_doc);
-            // аттачи — после «создана»: сбой не прячет id задачи,
-            // ретрай create осознан (задача уже существует)
-            if !attach.is_empty() {
-                crate::affine_blob::attach_files(cfg, &row.body_doc, &attach).await?;
-            }
-        }
+        } => create(&mut client, cfg, &board, &title, ty, stdin, attach).await,
         TaskSub::List {
             status,
             project: proj_override,
-        } => {
-            let project = proj_override
-                .or_else(|| Some(project.clone()))
-                .unwrap_or_else(|| "uwuwu".to_string());
-            let mut client = AffineClient::connect(cfg).await?;
-            let board = affine_tasks::find_board(&mut client, cfg, &project)
-                .await
-                .with_context(|| format!("доска проекта «{project}» не найдена"))?;
-            let rows = affine_tasks::read_rows(&mut client, cfg, &board, root).await?;
-            let filtered: Vec<_> = rows
-                .iter()
-                .filter(|r| {
-                    status
-                        .as_deref()
-                        .map(|s| r.status.to_lowercase().starts_with(&s.to_lowercase()))
-                        .unwrap_or(true)
-                })
-                .collect();
-            if filtered.is_empty() {
-                println!("Задач нет.");
-            }
-            println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
-            for r in &filtered {
-                println!(
-                    "{:<13} {:<12} {:<34} {}",
-                    r.status,
-                    &r.row_id[..r.row_id.len().min(12)],
-                    truncate(&r.title, 32),
-                    r.pr
-                );
-            }
-        }
-        TaskSub::Get { id } => {
-            let (_board, row) =
-                resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            println!("Задача:   {}", row.title);
-            println!("Статус:   {}", row.status);
-            if !row.pr.is_empty() {
-                println!("PR:       {}", row.pr);
-            }
-            if !row.branch.is_empty() {
-                println!("Ветка:    {}", row.branch);
-            }
-            println!("Строка:   {}", row.row_id);
-            if !row.body_doc.is_empty() {
-                print_body_and_comments(&mut client, cfg, &row).await?;
-            }
-        }
+        } => list(cfg, root, project, status, proj_override).await,
+        TaskSub::Get { id } => get(&mut client, cfg, root, &project, id).await,
         TaskSub::Edit {
             id,
             status,
@@ -113,102 +42,257 @@ pub(crate) async fn run(
             pr,
             branch,
         } => {
-            let (board, row) = resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            let patch = affine_tasks::RowPatch {
-                status: status.clone(),
-                title: title.clone(),
-                pr: pr.clone(),
-                branch: branch.clone(),
-            };
-            affine_tasks::edit_row(&mut client, cfg, &board, &row, &patch).await?;
-            println!("обновлено: {}", row.title);
+            edit(
+                &mut client,
+                cfg,
+                root,
+                &project,
+                id,
+                affine_tasks::RowPatch {
+                    status,
+                    title,
+                    pr,
+                    branch,
+                },
+            )
+            .await
         }
-        TaskSub::Thread { id } => {
-            let (_board, row) =
-                resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
-                .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
-            let comments = affine_tasks::thread_comments(&mut client, cfg, &row).await?;
-            if comments.is_empty() {
-                println!("комментов нет");
-                return Ok(());
-            }
-            let mut topic = 0usize;
-            for (text, user_id, created, resolved) in &comments {
-                let is_bot = *user_id == bot_user_id
-                    || text.trim_start().starts_with("🤖")
-                    || text.trim_start().starts_with("[factory]");
-                let time = chrono_like_hhmm(*created);
-                let mark = if *resolved { " [✓]" } else { "" };
-                if !is_bot {
-                    topic += 1;
-                    println!();
-                    println!("── тема {topic} · {time} · ЮЗЕР{mark}:");
-                    for line in text.lines() {
-                        println!("  {line}");
-                    }
-                } else {
-                    println!("     ↳ {time} агент:");
-                    for line in text.lines() {
-                        println!("       {line}");
-                    }
-                }
-            }
-            println!();
-            println!("тем: {topic}");
-        }
+        TaskSub::Thread { id } => thread(&mut client, cfg, root, &project, id).await,
         TaskSub::Comment { id, stdin, text } => {
-            let (_board, row) =
-                resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            let body = facts::read_text(stdin, &text)?;
-            if body.trim().is_empty() {
-                anyhow::bail!("пустой коммент");
-            }
-            affine_tasks::comment_task(&mut client, cfg, &row, &body).await?;
-            println!("коммент отправлен: {}", truncate(&body, 60));
+            comment(&mut client, cfg, root, &project, id, stdin, text).await
         }
-        TaskSub::Close { id, note } => {
-            let (board, row) = resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            let patch = affine_tasks::RowPatch {
-                status: Some("Done".into()),
-                ..Default::default()
-            };
-            affine_tasks::edit_row(&mut client, cfg, &board, &row, &patch).await?;
-            if let Some(note) = note {
-                affine_tasks::comment_task(&mut client, cfg, &row, &note).await?;
-            }
-            println!("закрыта: {}", row.title);
-        }
+        TaskSub::Close { id, note } => close_task(&mut client, cfg, root, &project, id, note).await,
         TaskSub::Body { id, md, replace } => {
-            let (_board, row) =
-                resolve_row_any_board(&mut client, cfg, root, &project, &id).await?;
-            if row.body_doc.is_empty() {
-                anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
+            body(&mut client, cfg, root, &project, id, md, replace).await
+        }
+    }
+}
+
+async fn create(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    board: &affine_tasks::Board,
+    title: &str,
+    ty: Option<String>,
+    stdin: bool,
+    attach: Vec<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let task_type =
+        affine_tasks::TaskType::parse(ty.as_deref().unwrap_or("dev")).with_context(|| {
+            format!(
+                "--type '{}': ожидался dev|spike|bug",
+                ty.as_deref().unwrap_or("")
+            )
+        })?;
+    let body = if stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        String::new()
+    };
+    let row = affine_tasks::create_task(client, cfg, board, title, &body, task_type).await?;
+    println!("создана: {}", row.title);
+    println!("  строка: {}", row.row_id);
+    println!("  тело:   {}", row.body_doc);
+    // аттачи — после «создана»: сбой не прячет id задачи,
+    // ретрай create осознан (задача уже существует)
+    if !attach.is_empty() {
+        crate::affine_blob::attach_files(cfg, &row.body_doc, &attach).await?;
+    }
+    Ok(())
+}
+
+/// List идёт своим коннектом: --project субкоманды переопределяет доску.
+async fn list(
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: String,
+    status: Option<String>,
+    proj_override: Option<String>,
+) -> anyhow::Result<()> {
+    let project = proj_override
+        .or(Some(project))
+        .unwrap_or_else(|| "uwuwu".to_string());
+    let mut client = AffineClient::connect(cfg).await?;
+    let board = affine_tasks::find_board(&mut client, cfg, &project)
+        .await
+        .with_context(|| format!("доска проекта «{project}» не найдена"))?;
+    let rows = affine_tasks::read_rows(&mut client, cfg, &board, root).await?;
+    let filtered: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            status
+                .as_deref()
+                .map(|s| r.status.to_lowercase().starts_with(&s.to_lowercase()))
+                .unwrap_or(true)
+        })
+        .collect();
+    if filtered.is_empty() {
+        println!("Задач нет.");
+    }
+    println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
+    for r in &filtered {
+        println!(
+            "{:<13} {:<12} {:<34} {}",
+            r.status,
+            &r.row_id[..r.row_id.len().min(12)],
+            truncate(&r.title, 32),
+            r.pr
+        );
+    }
+    Ok(())
+}
+
+async fn get(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+) -> anyhow::Result<()> {
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    println!("Задача:   {}", row.title);
+    println!("Статус:   {}", row.status);
+    if !row.pr.is_empty() {
+        println!("PR:       {}", row.pr);
+    }
+    if !row.branch.is_empty() {
+        println!("Ветка:    {}", row.branch);
+    }
+    println!("Строка:   {}", row.row_id);
+    if !row.body_doc.is_empty() {
+        print_body_and_comments(client, cfg, &row).await?;
+    }
+    Ok(())
+}
+
+async fn edit(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+    patch: affine_tasks::RowPatch,
+) -> anyhow::Result<()> {
+    let (board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    affine_tasks::edit_row(client, cfg, &board, &row, &patch).await?;
+    println!("обновлено: {}", row.title);
+    Ok(())
+}
+
+async fn thread(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+) -> anyhow::Result<()> {
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
+        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
+    let comments = affine_tasks::thread_comments(client, cfg, &row).await?;
+    if comments.is_empty() {
+        println!("комментов нет");
+        return Ok(());
+    }
+    let mut topic = 0usize;
+    for (text, user_id, created, resolved) in &comments {
+        let is_bot = *user_id == bot_user_id
+            || text.trim_start().starts_with("🤖")
+            || text.trim_start().starts_with("[factory]");
+        let time = chrono_like_hhmm(*created);
+        let mark = if *resolved { " [✓]" } else { "" };
+        if !is_bot {
+            topic += 1;
+            println!();
+            println!("── тема {topic} · {time} · ЮЗЕР{mark}:");
+            for line in text.lines() {
+                println!("  {line}");
             }
-            let text = match &md {
-                Some(path) => {
-                    std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?
-                }
-                None => {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-                    buf
-                }
-            };
-            if replace {
-                let n_diagrams =
-                    affine_tasks::replace_body(&mut client, cfg, &row.body_doc, &text).await?;
-                println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
-            } else {
-                let (n_diagrams, n_deleted) =
-                    affine_tasks::append_body_markdown(&mut client, cfg, &row.body_doc, &text)
-                        .await?;
-                println!(
-                    "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
-                    row.title
-                );
+        } else {
+            println!("     ↳ {time} агент:");
+            for line in text.lines() {
+                println!("       {line}");
             }
         }
+    }
+    println!();
+    println!("тем: {topic}");
+    Ok(())
+}
+
+async fn comment(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+    stdin: bool,
+    text: Vec<String>,
+) -> anyhow::Result<()> {
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    let body = facts::read_text(stdin, &text)?;
+    if body.trim().is_empty() {
+        anyhow::bail!("пустой коммент");
+    }
+    affine_tasks::comment_task(client, cfg, &row, &body).await?;
+    println!("коммент отправлен: {}", truncate(&body, 60));
+    Ok(())
+}
+
+async fn close_task(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+    note: Option<String>,
+) -> anyhow::Result<()> {
+    let (board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    let patch = affine_tasks::RowPatch {
+        status: Some("Done".into()),
+        ..Default::default()
+    };
+    affine_tasks::edit_row(client, cfg, &board, &row, &patch).await?;
+    if let Some(note) = note {
+        affine_tasks::comment_task(client, cfg, &row, &note).await?;
+    }
+    println!("закрыта: {}", row.title);
+    Ok(())
+}
+
+async fn body(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    project: &str,
+    id: String,
+    md: Option<String>,
+    replace: bool,
+) -> anyhow::Result<()> {
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    if row.body_doc.is_empty() {
+        anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
+    }
+    let text = match &md {
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?,
+        None => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            buf
+        }
+    };
+    if replace {
+        let n_diagrams = affine_tasks::replace_body(client, cfg, &row.body_doc, &text).await?;
+        println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
+    } else {
+        let (n_diagrams, n_deleted) =
+            affine_tasks::append_body_markdown(client, cfg, &row.body_doc, &text).await?;
+        println!(
+            "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
+            row.title
+        );
     }
     Ok(())
 }

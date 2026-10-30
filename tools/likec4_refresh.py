@@ -69,7 +69,7 @@ def main() -> int:
     p.add_argument("--title", default=None, help="подпись-заголовок над эмбедом (опц.)")
     a = p.parse_args()
 
-    sid = session()
+    sid = session("likec4-refresh")
     try:
         # 1) сорцы из дока
         md = (

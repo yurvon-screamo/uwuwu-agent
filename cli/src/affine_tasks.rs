@@ -1207,6 +1207,46 @@ mod embed_tests {
     use super::*;
 
     #[test]
+    fn parse_offset_minutes_accepts_units_and_rounds_seconds_up() {
+        assert_eq!(parse_offset_minutes("10m").unwrap(), 10);
+        assert_eq!(parse_offset_minutes("2h").unwrap(), 120);
+        assert_eq!(parse_offset_minutes("90s").unwrap(), 2); // ceil до минут
+        assert_eq!(parse_offset_minutes("60s").unwrap(), 1);
+        assert!(parse_offset_minutes("5x").is_err()); // неизвестная единица
+        assert!(parse_offset_minutes("m").is_err()); // нет числа
+    }
+
+    #[test]
+    fn validate_schedule_accepts_interval_time_and_cron() {
+        assert!(validate_schedule("5m").is_ok());
+        assert!(validate_schedule("2h").is_ok());
+        assert!(validate_schedule("09:30").is_ok());
+        assert!(validate_schedule("09:30 01.12").is_ok());
+        assert!(validate_schedule("*/5 * * * *").is_ok());
+        assert!(validate_schedule("мусор").is_err());
+        assert!(validate_schedule("5 m").is_err());
+    }
+
+    #[test]
+    fn one_shot_schedule_renders_hhmm_or_with_date() {
+        // 30 минут вперёд от сейчас — всегда валидный HH:MM (± дата)
+        let s = one_shot_schedule(30);
+        assert!(s.len() >= 5);
+        assert!(s[..2].chars().all(|c| c.is_ascii_digit()));
+        // формат либо "HH:MM", либо "HH:MM DD.MM"
+        assert!(s.len() == 5 || s.len() == 11, "got: {s}");
+    }
+
+    #[test]
+    fn cron_body_stub_varies_by_prompt() {
+        let no_prompt = cron_body_stub("T", "5m", "");
+        let with_prompt = cron_body_stub("T", "5m", "делай так");
+        assert!(no_prompt.contains("## Что делать на каждом срабатывании"));
+        assert!(with_prompt.contains("## Что делать\n\nделай так"));
+        assert!(with_prompt.contains("Расписание: `5m`"));
+    }
+
+    #[test]
     fn parse_fences() {
         let md = "текст\n\n```html_embed arch\n<div>один</div>\n```\n\nещё\n\n```html_embed\n<div>аноним</div>\n```\n";
         let f = parse_html_embed_fences(md);

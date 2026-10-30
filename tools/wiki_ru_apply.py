@@ -34,7 +34,7 @@ def main() -> int:
     if orig and not stub and len(new) < len(orig) * 0.55:
         print(f"!! перевод подозрительно короток: {len(new)} vs {len(orig)} — правь")
         return 2
-    sid = session()
+    sid = session("wiki-ru")
     try:
         # общая переиспользуемая сессия (файл разделяем с uwuwu-cli);
         # close() в finally не трогает общую — инцидент батча-00 (503 от

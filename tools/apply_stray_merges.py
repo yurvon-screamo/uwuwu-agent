@@ -56,7 +56,7 @@ def main() -> int:
         "verdicts-1xgames": "1xgames",
     }
     appended = deleted = skipped = 0
-    sid = session()
+    sid = session("stray-merges")
     try:
         for vf in sys.argv[1:]:
             proj = proj_by_file[Path(vf).stem]

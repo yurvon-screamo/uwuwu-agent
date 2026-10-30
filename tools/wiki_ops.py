@@ -57,10 +57,11 @@ def _save_session(sid: str) -> None:
         pass  # сохранить не смогли — сессия живёт до idle-timeout шлюза
 
 
-def _handshake() -> str:
+def _handshake(client_name: str = "wiki-ops") -> str:
     """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
     (HTTP 503, URLError/timeout); фатальные SystemExit от mcp_result
-    (isError/JSON-RPC error) — сразу наверх с причиной."""
+    (isError/JSON-RPC error) — сразу наверх с причиной. client_name виден
+    в логах шлюза на initialize — кто создал сессию (wiki-audit/wiki-apply/…)."""
     for attempt in range(RETRIES):
         sid = None
         try:
@@ -69,7 +70,7 @@ def _handshake() -> str:
                 {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {},
-                    "clientInfo": {"name": "wiki-ops", "version": "1"},
+                    "clientInfo": {"name": client_name, "version": "1"},
                 },
             )
             mcp_result(resp)  # SystemExit здесь = фатально, не ретраим
@@ -95,15 +96,17 @@ def _handshake() -> str:
     raise RuntimeError("unreachable")
 
 
-def session() -> str:
+def session(client_name: str = "wiki-ops") -> str:
     """Переиспользовать сохранённую сессию (общая с uwuwu-cli), иначе
-    полный handshake. Протухшая сессия ловится в call() и обновляется."""
+    полный handshake. Протухшая сессия ловится в call() и обновляется.
+    client_name — только для диагностики в логах шлюза (на чей initialize
+    создана сессия)."""
     if _live_sid:
         return _live_sid
     saved = _load_saved_session()
     if saved:
         return saved
-    return _handshake()
+    return _handshake(client_name)
 
 
 def _retry_wait(attempt: int, e: Exception) -> None:

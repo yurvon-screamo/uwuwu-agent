@@ -233,18 +233,29 @@ fn parse_candidates(objs: &[serde_json::Value]) -> Vec<Candidate> {
         .collect()
 }
 
+/// Изменяемое состояние пайплайна дедупа одного прогона: индекс, tombstone'ы,
+/// метки источника/даты и накопители итога. Один контекст вместо пачки
+/// изменяемых параметров classify_candidate.
+struct DedupCtx<'a> {
+    index: &'a mut crate::fact_index::FactIndex,
+    removed: &'a std::collections::HashSet<String>,
+    source: &'a str,
+    date: &'a str,
+    outcome: &'a mut FactsOutcome,
+    affine_facts: &'a mut Vec<FactEntry>,
+}
+
 /// Дедуп одного кандидата против индекса: tombstone → точный хит →
-/// шинглы+вердикты → новая запись (с конфликтом или без). Мутирует индекс,
-/// итог прогона и пул на публикацию.
-async fn classify_candidate(
-    f: Candidate,
-    index: &mut crate::fact_index::FactIndex,
-    removed: &std::collections::HashSet<String>,
-    source: &str,
-    date: &str,
-    outcome: &mut FactsOutcome,
-    affine_facts: &mut Vec<FactEntry>,
-) -> Result<()> {
+/// шинглы+вердикты → новая запись (с конфликтом или без).
+async fn classify_candidate(f: Candidate, ctx: &mut DedupCtx<'_>) -> Result<()> {
+    let DedupCtx {
+        index,
+        removed,
+        source,
+        date,
+        outcome,
+        affine_facts,
+    } = ctx;
     let s = sha1_norm(&f.statement);
     if removed.contains(&s) {
         return Ok(()); // tombstone: удалённый dreaming'ом мусор не воскрешаем
@@ -412,12 +423,14 @@ async fn run_facts_inner(
     for f in candidates {
         classify_candidate(
             f,
-            &mut index,
-            &removed,
-            source,
-            date,
-            &mut outcome,
-            &mut affine_facts,
+            &mut DedupCtx {
+                index: &mut index,
+                removed: &removed,
+                source,
+                date,
+                outcome: &mut outcome,
+                affine_facts: &mut affine_facts,
+            },
         )
         .await?;
     }
