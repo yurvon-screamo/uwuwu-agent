@@ -87,6 +87,7 @@ impl AffineClient {
     /// Без request_with_retry (он может ре-handshake'нуться — рекурсия в async запрещена):
     /// initialize не ретраится, транспортная ошибка — наружу.
     async fn handshake(&mut self, session_file: &std::path::Path) -> Result<()> {
+        let call_id = self.alloc_id();
         let init = self
             .raw_post(
                 json!({
@@ -94,7 +95,7 @@ impl AffineClient {
                     "capabilities": {},
                     "clientInfo": {"name": "uwuwu-cli", "version": env!("CARGO_PKG_VERSION")}
                 }),
-                self.alloc_id(),
+                call_id,
             )
             .await
             .map_err(|e| anyhow!("initialize failed: {e:?}"))?;
@@ -294,6 +295,7 @@ struct RpcResponse {
     headers: reqwest::header::HeaderMap,
 }
 
+#[derive(Debug)]
 enum GatewayError {
     Transport(anyhow::Error),
     Fatal(anyhow::Error),
