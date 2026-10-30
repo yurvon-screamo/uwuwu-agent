@@ -259,7 +259,7 @@ def mcp_result(resp: object) -> dict:
     return result
 
 
-def get_md(o):
+def get_md(o):  # noqa: S3776 — рекурсивный обход ответа, перенесён дословно из трёх байт-идентичных копий (behavior-preserving рефакторинг); упрощение рекурсии — отдельным сознательным шагом
     """Рекурсивно достать markdown из export-ответа (markdown-поле где-то
     в структуре: structuredContent или content[].text-JSON). Общий хелпер
     wiki_ops/wiki_audit/wiki_apply — правится в одном месте."""

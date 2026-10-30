@@ -29,7 +29,6 @@ DOCS = AUDIT / "docs.json"
 LOG = AUDIT / "apply-log.json"
 
 
-
 def patch(markdown: str, reps: list[dict]) -> tuple[str, int]:
     """Применить замены; возвращает (новый markdown, число замен).
 

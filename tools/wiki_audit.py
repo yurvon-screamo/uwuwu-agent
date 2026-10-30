@@ -43,7 +43,6 @@ def session() -> str:
     return sid
 
 
-
 def cmd_fetch(_: argparse.Namespace) -> int:
     AUDIT.mkdir(parents=True, exist_ok=True)
     sid = session()
