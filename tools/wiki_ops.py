@@ -61,7 +61,8 @@ def _handshake(client_name: str = "wiki-ops") -> str:
     """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
     (HTTP 503, URLError/timeout); фатальные SystemExit от mcp_result
     (isError/JSON-RPC error) — сразу наверх с причиной. client_name виден
-    в логах шлюза на initialize — кто создал сессию (wiki-audit/wiki-apply/…)."""
+    на уровне ПРОТОКОЛА (initialize.clientInfo, MCP-трейс/инспектор);
+    stdout шлюза логирует только UUID сессий."""
     for attempt in range(RETRIES):
         sid = None
         try:
@@ -99,8 +100,8 @@ def _handshake(client_name: str = "wiki-ops") -> str:
 def session(client_name: str = "wiki-ops") -> str:
     """Переиспользовать сохранённую сессию (общая с uwuwu-cli), иначе
     полный handshake. Протухшая сессия ловится в call() и обновляется.
-    client_name — только для диагностики в логах шлюза (на чей initialize
-    создана сессия)."""
+    client_name — идентичность создателя на уровне протокола initialize
+    (MCP-трейс); в stdout-логах шлюза её нет, там только UUID."""
     if _live_sid:
         return _live_sid
     saved = _load_saved_session()
