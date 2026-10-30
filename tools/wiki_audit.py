@@ -23,8 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from triage_affine import WORKSPACE, get_md
-from wiki_ops import call
-from wiki_ops import session as wiki_ops_session
+from wiki_ops import call, session as wiki_ops_session  # локальная session() делегирует
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
 DOCS = AUDIT / "docs.json"
