@@ -1271,6 +1271,8 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Refresh => {
+            // явный refresh — сброс слепого-tree флага: пробуем полный проход
+            content_cache::tree_disabled_clear(&root);
             let mut client = affine_client::AffineClient::connect(&cfg).await?;
             // full refetch: fresh cache replaces the incremental one
             let mut fresh = content_cache::ContentCache::default();

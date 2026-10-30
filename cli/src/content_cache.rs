@@ -103,10 +103,12 @@ impl ContentCache {
             .await?;
         let nodes = flatten_tree(&tree);
         if nodes.is_empty() {
-            // an unrecognized answer shape must NOT wipe the cache
-            cache_bail!(
-                "workspace tree came back empty — cache left untouched, run `uwuwu-cli refresh`"
-            );
+            // Бот-член воркспейса не видит list_workspace_tree (ACL-путь):
+            // пустой tree = константа, а не сбой. Помечаем и не дёргаем
+            // слепые вызовы ещё сутки (явный `refresh` сбрасывает флаг).
+            let flag = root.join("tree_disabled");
+            let _ = std::fs::write(&flag, now_secs().to_string());
+            return Ok(report);
         }
         // Truncated-tree guard: the gateway nondeterministically returns a
         // partial tree under session load (caught live twice on 24.10:
@@ -271,6 +273,31 @@ fn slug_for(path: &[String], title: &str, kind: &DocKind) -> String {
         },
         _ => title.to_string(),
     }
+}
+
+/// HH:MM-style epoch seconds helper (no chrono dependency).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Слепой tree: флаг «list_workspace_tree недоступен этому акку» (24ч TTL).
+/// Явный `uwuwu-cli refresh` сбрасывает.
+pub fn tree_disabled(root: &Path) -> bool {
+    match std::fs::read_to_string(root.join("tree_disabled")) {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(|ts| now_secs() - ts < 86_400)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+pub fn tree_disabled_clear(root: &Path) {
+    let _ = std::fs::remove_file(root.join("tree_disabled"));
 }
 
 #[cfg(test)]

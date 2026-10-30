@@ -172,7 +172,8 @@ pub async fn session_with_ttl(
 ) -> Result<(AffineClient, ContentCache, FactIndex)> {
     let mut client = AffineClient::connect(cfg).await?;
     let mut cache = ContentCache::load(root)?;
-    if !cache.is_fresh(ttl_secs) {
+    let tree_blind = crate::content_cache::tree_disabled(root);
+    if !cache.is_fresh(ttl_secs) && !tree_blind {
         // Слепой tree у ограниченного акка (бот-член: list_workspace_tree пуст)
         // НЕ должен ронять команду: работаем с локальным кэшем, резолв добирает
         // через search_docs (resolve_doc_id last resort). Пустой кэш — честная ошибка.
@@ -192,6 +193,10 @@ pub async fn session_with_ttl(
         }
     }
     let mut index = FactIndex::load_or_bootstrap(root)?;
+    if tree_blind {
+        // факт-синк тоже идёт через дерево — слепой путь пропускаем
+        return Ok((client, cache, index));
+    }
     if let Err(e) = sync_fact_buckets(&mut client, cfg, root, &mut index).await {
         // факты — деградация не летальна: дейли-бакеты через слепой tree не видны
         eprintln!("affine: факт-синк пропущен ({e:#})");
