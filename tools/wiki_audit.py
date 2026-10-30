@@ -22,7 +22,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE, get_md, mcp_call, mcp_result
+from triage_affine import WORKSPACE, get_md
+from wiki_ops import call
+from wiki_ops import session as wiki_ops_session
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
 DOCS = AUDIT / "docs.json"
@@ -30,31 +32,19 @@ TREE = AUDIT / "tree.json"
 
 
 def session() -> str:
-    resp, sid = mcp_call(
-        "initialize",
-        {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "wiki-audit", "version": "1"},
-        },
-    )
-    mcp_result(resp)
-    mcp_call("notifications/initialized", {}, sid, notify=True)
-    return sid
+    # общая переиспользуемая сессия wiki-ops (файл разделяем с uwuwu-cli):
+    # initialize = sign-in афины 4-7с на каждый запуск — больше не платим
+    return wiki_ops_session()
 
 
 def cmd_fetch(_: argparse.Namespace) -> int:
     AUDIT.mkdir(parents=True, exist_ok=True)
     sid = session()
-    r, _ = mcp_call(
-        "tools/call",
-        {
-            "name": "list_workspace_tree",
-            "arguments": {"workspaceId": WORKSPACE, "depth": 3},
-        },
+    res = call(
         sid,
+        "list_workspace_tree",
+        {"workspaceId": WORKSPACE, "depth": 3},
     )
-    res = mcp_result(r)
     s = json.dumps(res)
     TREE.write_text(s)
     nodes = re.findall(r'\{"docId"\s*:\s*"([^"]+)"[^}]*?"title"\s*:\s*"([^"]*)"', s)
@@ -72,15 +62,12 @@ def cmd_fetch(_: argparse.Namespace) -> int:
     t0 = time.time()
     for i, (did, title) in enumerate(todo, 1):
         try:
-            r, _ = mcp_call(
-                "tools/call",
-                {
-                    "name": "export_doc_markdown",
-                    "arguments": {"workspaceId": WORKSPACE, "docId": did},
-                },
+            res = call(
                 sid,
+                "export_doc_markdown",
+                {"workspaceId": WORKSPACE, "docId": did},
             )
-            known[did] = {"title": title, "markdown": get_md(mcp_result(r)) or ""}
+            known[did] = {"title": title, "markdown": get_md(res) or ""}
         except SystemExit:
             print(f"  !! {did} ({title}): export отказал, пропускаю", flush=True)
             known[did] = {"title": title, "markdown": "", "error": True}

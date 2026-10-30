@@ -21,7 +21,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE, get_md, mcp_call, mcp_result
+from triage_affine import WORKSPACE, get_md
+from wiki_ops import call, session
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
 PLAN = AUDIT / "plan.json"
@@ -87,31 +88,23 @@ def main() -> int:
         flush=True,
     )
 
-    resp, sid = mcp_call(
-        "initialize",
-        {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "wiki-apply", "version": "1"},
-        },
-    )
-    mcp_result(resp)
-    mcp_call("notifications/initialized", {}, sid, notify=True)
+    sid = session()
 
     log = json.loads(LOG.read_text()) if LOG.exists() else {}
     done = replaced = skipped = 0
     for t in todo:
         if t["docId"] in log and log[t["docId"]].get("status") == "ok":
             continue
-        r, _ = mcp_call(
-            "tools/call",
-            {
-                "name": "export_doc_markdown",
-                "arguments": {"workspaceId": WORKSPACE, "docId": t["docId"]},
-            },
-            sid,
+        live = (
+            get_md(
+                call(
+                    sid,
+                    "export_doc_markdown",
+                    {"workspaceId": WORKSPACE, "docId": t["docId"]},
+                )
+            )
+            or ""
         )
-        live = get_md(mcp_result(r)) or ""
         new, n = patch(live, t["replacements"])
         if n == 0:
             log[t["docId"]] = {
@@ -126,19 +119,15 @@ def main() -> int:
             log[t["docId"]] = {"title": t["title"], "status": "dry", "replacements": n}
             done += 1
             continue
-        r, _ = mcp_call(
-            "tools/call",
-            {
-                "name": "replace_doc_with_markdown",
-                "arguments": {
-                    "workspaceId": WORKSPACE,
-                    "docId": t["docId"],
-                    "markdown": new,
-                },
-            },
+        call(
             sid,
+            "replace_doc_with_markdown",
+            {
+                "workspaceId": WORKSPACE,
+                "docId": t["docId"],
+                "markdown": new,
+            },
         )
-        mcp_result(r)
         log[t["docId"]] = {"title": t["title"], "status": "ok", "replacements": n}
         replaced += n
         done += 1

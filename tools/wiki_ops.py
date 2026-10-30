@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """wiki_ops — CLI-хелпер MCP-операций над доками AFFiNE (для сабагентов).
 
-Одна сессия на вызов, DELETE-закрытие в finally, 503-ретраи с паузами.
+Сессия переиспользуется через ~/.uwuwu/mcp-session.txt (общая с uwuwu-cli):
+initialize = sign-in афины 4-7с, платим только когда сохранённая протухла —
+call() тогда сам пере-handshake'ится (400/404 → один ретрай). 503-ретраи
+транзиентов с паузами сохранены; close() в finally трогает только
+осиротевшие сессии — общую не инвалидирует.
 Гоча argparse: docId с ВЕДУЩИМ дефисом (напр. -GnAmdAk45) парсится как флаг —
 опции ставь ДО `--`: wiki_ops.py move --parent <id> -- -GnAmdAk45.
 
@@ -31,8 +35,29 @@ from triage_affine import MCP_TOKEN, MCP_URL, WORKSPACE, get_md, mcp_call, mcp_r
 RETRIES = 8
 PAUSE = 120
 
+# Общая сессия с uwuwu-cli (Rust): initialize = sign-in афины 4-7с на каждый
+# запуск — главный источник латентности python-тулз. Файл разделяемый;
+# протухшую сессию call() пере-handshake'ит сам (паттерн affine_client.rs).
+SESSION_FILE = Path.home() / ".uwuwu" / "mcp-session.txt"
+_live_sid: str | None = None
 
-def session() -> str:
+
+def _load_saved_session() -> str:
+    try:
+        return SESSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _save_session(sid: str) -> None:
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(sid, encoding="utf-8")
+    except OSError:
+        pass  # сохранить не смогли — сессия живёт до idle-timeout шлюза
+
+
+def _handshake() -> str:
     """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
     (HTTP 503, URLError/timeout); фатальные SystemExit от mcp_result
     (isError/JSON-RPC error) — сразу наверх с причиной."""
@@ -49,6 +74,7 @@ def session() -> str:
             )
             mcp_result(resp)  # SystemExit здесь = фатально, не ретраим
             mcp_call("notifications/initialized", {}, sid, notify=True)
+            _save_session(sid)
             return sid
         except SystemExit:
             if sid:
@@ -69,6 +95,17 @@ def session() -> str:
     raise RuntimeError("unreachable")
 
 
+def session() -> str:
+    """Переиспользовать сохранённую сессию (общая с uwuwu-cli), иначе
+    полный handshake. Протухшая сессия ловится в call() и обновляется."""
+    if _live_sid:
+        return _live_sid
+    saved = _load_saved_session()
+    if saved:
+        return saved
+    return _handshake()
+
+
 def _retry_wait(attempt: int, e: Exception) -> None:
     print(
         f"шлюз занят/недоступен ({attempt + 1}/{RETRIES}): {str(e)[:60]}; пауза {PAUSE}с",
@@ -79,6 +116,12 @@ def _retry_wait(attempt: int, e: Exception) -> None:
 
 
 def close(sid: str) -> None:
+    """DELETE /mcp — только для осиротевших сессий (недоделанный handshake).
+    Общую сохранённую сессию не закрываем: она разделяема с uwuwu-cli и
+    следующими запусками — закрытие здесь инвалидировало бы файл для всех.
+    Осиротевшие умрут по idle-timeout шлюза, но DELETE дешевле слота."""
+    if sid and sid == _load_saved_session():
+        return
     try:
         headers = {"mcp-session-id": sid}
         if MCP_TOKEN:
@@ -92,7 +135,22 @@ def close(sid: str) -> None:
 
 
 def call(sid: str, name: str, args: dict) -> dict:
-    r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, sid)
+    """tools/call с восстановлением протухшей сессии: 400/404 → один
+    пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
+    call(старый_sid,...) продолжают работать."""
+    global _live_sid
+    effective = _live_sid or sid
+    try:
+        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, effective)
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 404):
+            raise
+        e.close()  # отпустить соединение до повторного запроса
+        print(
+            "wiki-ops: сессия протухла — пере-handshake", file=sys.stderr, flush=True
+        )
+        _live_sid = _handshake()
+        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, _live_sid)
     return mcp_result(r)
 
 

@@ -9,12 +9,11 @@ wiki_ru_apply.py <docId> <файл-перевода.md> [--stub]  # --stub: за
 from __future__ import annotations
 
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import MCP_TOKEN, MCP_URL, WORKSPACE, mcp_call, mcp_result
+from triage_affine import WORKSPACE
+from wiki_ops import call, close, session
 
 
 def main() -> int:
@@ -35,44 +34,22 @@ def main() -> int:
     if orig and not stub and len(new) < len(orig) * 0.55:
         print(f"!! перевод подозрительно короток: {len(new)} vs {len(orig)} — правь")
         return 2
-    resp, sid = mcp_call(
-        "initialize",
-        {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "wiki-ru", "version": "1"},
-        },
-    )
+    sid = session()
     try:
-        mcp_result(resp)
-        mcp_call("notifications/initialized", {}, sid, notify=True)
-        resp, _ = mcp_call(
-            "tools/call",
-            {
-                "name": "replace_doc_with_markdown",
-                "arguments": {
-                    "workspaceId": WORKSPACE,
-                    "docId": doc_id,
-                    "markdown": new,
-                },
-            },
+        # общая переиспользуемая сессия (файл разделяем с uwuwu-cli);
+        # close() в finally не трогает общую — инцидент батча-00 (503 от
+        # висящих сессий) закрыт структурно: сессий больше не плодим
+        call(
             sid,
+            "replace_doc_with_markdown",
+            {
+                "workspaceId": WORKSPACE,
+                "docId": doc_id,
+                "markdown": new,
+            },
         )
-        mcp_result(resp)
     finally:
-        # шлюз держит висящие StreamableHTTP-сессии (~2 на клиента) и режет
-        # новые initialize 503 — закрытие обязательно (инцидент батча-00)
-        try:
-            headers = {"mcp-session-id": sid}
-            if MCP_TOKEN:
-                headers["Authorization"] = f"Bearer {MCP_TOKEN}"
-            req = urllib.request.Request(
-                MCP_URL, data=b"", method="DELETE", headers=headers
-            )
-            urllib.request.urlopen(req, timeout=15).read()
-        except urllib.error.URLError as e:
-            # протухшая сессия умрёт по idle-timeout — не блокируем результат
-            print(f"  warn: закрытие сессии не удалось ({e})", file=sys.stderr)
+        close(sid)
     print(f"ok: {doc_id} заменён ({len(new)} симв, было {len(orig)})")
     return 0
 
