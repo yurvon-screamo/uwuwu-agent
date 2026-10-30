@@ -88,23 +88,42 @@ impl AffineClient {
     /// initialize не ретраится, транспортная ошибка — наружу.
     async fn handshake(&mut self, session_file: &std::path::Path) -> Result<()> {
         let call_id = self.alloc_id();
-        let init = self
-            .raw_post(
-                json!({
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {"name": "uwuwu-cli", "version": env!("CARGO_PKG_VERSION")}
-                }),
-                call_id,
-            )
-            .await
-            .map_err(|e| anyhow!("initialize failed: {e:?}"))?;
-        self.session = init
-            .headers
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "uwuwu-cli", "version": env!("CARGO_PKG_VERSION")}
+            }
+        });
+        // СВЕЖИЙ клиент без пула: handshake не должен переиспользовать
+        // соединения, которые шлюз уже привязал к другой (мёртвой) сессии
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(CALL_TIMEOUT_SECS))
+            .build()?;
+        let req = http
+            .post(&self.url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&payload);
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return Err(anyhow!("initialize send failed: {e}")),
+        };
+        let status = resp.status();
+        let sid_hdr = resp
+            .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("gateway did not return mcp-session-id"))?;
+            .map(|s| s.to_string());
+        let raw = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("initialize failed: HTTP {status}: {raw}");
+        }
+        self.session = sid_hdr.ok_or_else(|| anyhow!("gateway did not return mcp-session-id"))?;
         let _ = std::fs::create_dir_all(session_file.parent().unwrap_or(std::path::Path::new(".")));
         let _ = std::fs::write(session_file, &self.session);
         self.post_notification(json!({
@@ -248,12 +267,26 @@ impl AffineClient {
         body: Value,
         expected_id: u64,
     ) -> std::result::Result<RpcResponse, GatewayError> {
+        self.raw_post_opts(body, expected_id, false).await
+    }
+
+    /// fresh_conn=true: Connection: close — initialize идёт по чистому
+    /// соединению (шлюз путает состояние initialize на keep-alive reuse).
+    async fn raw_post_opts(
+        &self,
+        body: Value,
+        expected_id: u64,
+        fresh_conn: bool,
+    ) -> std::result::Result<RpcResponse, GatewayError> {
         let mut req = self
             .http
             .post(&self.url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
+        if fresh_conn {
+            req = req.header("Connection", "close");
+        }
         if !self.session.is_empty() {
             req = req.header("mcp-session-id", &self.session);
         }
@@ -264,7 +297,6 @@ impl AffineClient {
             Err(e) => return Err(GatewayError::Transport(e.into())),
         };
         let status = resp.status();
-        let headers = resp.headers().clone();
         // протухшая/чужая сессия: 400/404 на этапе обработки — сигнал к re-handshake
         if (status.as_u16() == 400 || status.as_u16() == 404) && !self.session.is_empty() {
             return Err(GatewayError::StaleSession(anyhow!(
@@ -283,16 +315,12 @@ impl AffineClient {
         if let Some(err) = payload.get("error") {
             return Err(GatewayError::Fatal(anyhow!("RPC error: {err}")));
         }
-        Ok(RpcResponse {
-            body: payload,
-            headers,
-        })
+        Ok(RpcResponse { body: payload })
     }
 }
 
 struct RpcResponse {
     body: Value,
-    headers: reqwest::header::HeaderMap,
 }
 
 #[derive(Debug)]
