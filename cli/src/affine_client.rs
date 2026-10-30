@@ -267,26 +267,12 @@ impl AffineClient {
         body: Value,
         expected_id: u64,
     ) -> std::result::Result<RpcResponse, GatewayError> {
-        self.raw_post_opts(body, expected_id, false).await
-    }
-
-    /// fresh_conn=true: Connection: close — initialize идёт по чистому
-    /// соединению (шлюз путает состояние initialize на keep-alive reuse).
-    async fn raw_post_opts(
-        &self,
-        body: Value,
-        expected_id: u64,
-        fresh_conn: bool,
-    ) -> std::result::Result<RpcResponse, GatewayError> {
         let mut req = self
             .http
             .post(&self.url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
-        if fresh_conn {
-            req = req.header("Connection", "close");
-        }
         if !self.session.is_empty() {
             req = req.header("mcp-session-id", &self.session);
         }

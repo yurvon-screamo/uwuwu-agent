@@ -171,63 +171,28 @@ fn valid_verdict(v: &str) -> bool {
     matches!(v, "duplicate" | "conflict" | "distinct")
 }
 
-async fn run_facts_inner(
-    text: &str,
-    source: &str,
-    date: &str,
-    stdin: bool,
-) -> Result<(FactsOutcome, Vec<FactEntry>)> {
-    if !valid_date(date) {
-        return Ok((
-            FactsOutcome {
-                ok: false,
-                error: Some("bad_date".into()),
-                bad: None,
-                trivial: None,
-                new: vec![],
-                dup: vec![],
-                conflict: vec![],
-                published: None,
-            },
-            vec![],
-        ));
-    }
-    if stdin && text.chars().count() < MIN_DIGEST_CHARS {
-        return Ok((
-            FactsOutcome {
-                ok: true,
-                trivial: Some(true),
-                error: None,
-                bad: None,
-                new: vec![],
-                dup: vec![],
-                conflict: vec![],
-                published: None,
-            },
-            vec![],
-        ));
-    }
+/// Отрицательный исход до дедупа (плохая дата / битый JSONL) — пустой
+/// выхлоп без кандидатов.
+fn early_fail(error: &str, bad: Option<usize>) -> (FactsOutcome, Vec<FactEntry>) {
+    (
+        FactsOutcome {
+            ok: false,
+            error: Some(error.into()),
+            bad,
+            trivial: None,
+            new: vec![],
+            dup: vec![],
+            conflict: vec![],
+            published: None,
+        },
+        vec![],
+    )
+}
 
-    let raw = chat(EXTRACT_SYSTEM, text).await?;
-    let (objs, bad) = parse_jsonl(&raw);
-    if bad > 0 {
-        return Ok((
-            FactsOutcome {
-                ok: false,
-                error: Some("bad_jsonl".into()),
-                bad: Some(bad),
-                trivial: None,
-                new: vec![],
-                dup: vec![],
-                conflict: vec![],
-                published: None,
-            },
-            vec![],
-        ));
-    }
-
-    let candidates: Vec<Candidate> = objs
-        .iter()
+/// Кандидаты из LLM-выхлопа: санитайзинг, лимиты длин, нормализация тегов
+/// и confidence; слабые записи отбрасываются.
+fn parse_candidates(objs: &[serde_json::Value]) -> Vec<Candidate> {
+    objs.iter()
         .filter_map(|o| {
             let st = sanitize(o.get("statement")?.as_str()?.trim());
             let title = sanitize(o.get("title")?.as_str()?.trim());
@@ -265,7 +230,162 @@ async fn run_facts_inner(
             })
         })
         .take(MAX_FACTS_PER_CALL)
+        .collect()
+}
+
+/// Дедуп одного кандидата против индекса: tombstone → точный хит →
+/// шинглы+вердикты → новая запись (с конфликтом или без). Мутирует индекс,
+/// итог прогона и пул на публикацию.
+async fn classify_candidate(
+    f: Candidate,
+    index: &mut crate::fact_index::FactIndex,
+    removed: &std::collections::HashSet<String>,
+    source: &str,
+    date: &str,
+    outcome: &mut FactsOutcome,
+    affine_facts: &mut Vec<FactEntry>,
+) -> Result<()> {
+    let s = sha1_norm(&f.statement);
+    if removed.contains(&s) {
+        return Ok(()); // tombstone: удалённый dreaming'ом мусор не воскрешаем
+    }
+    if let Some(existing) = index.get_mut(&s) {
+        index_touch(existing, source);
+        affine_facts.push(indexed_to_fact(existing));
+        outcome.dup.push(existing.slug.clone());
+        return Ok(());
+    }
+    let js = shingles(&f.statement);
+    let mut scored: Vec<(f32, String)> = index
+        .iter()
+        .map(|(k, v)| (jaccard(&js, &v.shingles), k.clone()))
+        .filter(|(sim, _)| *sim >= JACCARD_THRESHOLD)
         .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let olds: Vec<(String, String)> = scored
+        .into_iter()
+        .take(5)
+        .filter_map(|(_, k)| index.get_mut(&k).map(|v| (k, v.statement.clone())))
+        .collect();
+
+    let mut verd: HashMap<String, String> = HashMap::new();
+    if !olds.is_empty() {
+        let pairs: Vec<(&Candidate, &String)> = olds.iter().map(|(_, st)| (&f, st)).collect();
+        let keys: Vec<String> = olds.iter().map(|(k, _)| k.clone()).collect();
+        let vmap = verdicts(&pairs).await?;
+        for (i, k) in keys.iter().enumerate() {
+            verd.insert(
+                k.clone(),
+                vmap.get(&i).cloned().unwrap_or_else(|| "distinct".into()),
+            );
+        }
+    }
+    let conflict_k = verd
+        .iter()
+        .find(|(_, v)| v.as_str() == "conflict")
+        .map(|(k, _)| k.clone());
+    let dup_k = verd
+        .iter()
+        .find(|(_, v)| v.as_str() == "duplicate")
+        .map(|(k, _)| k.clone());
+
+    if let (Some(dk), None) = (dup_k, &conflict_k) {
+        if let Some(dup) = index.get_mut(&dk) {
+            index_touch(dup, source);
+            affine_facts.push(indexed_to_fact(dup));
+            outcome.dup.push(dup.slug.clone());
+        }
+        return Ok(());
+    }
+
+    let slug = unique_slug(index, &slugify(&f.title));
+    let conflict_slug = conflict_k
+        .as_ref()
+        .and_then(|k| index.get_mut(k).map(|v| v.slug.clone()));
+    if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
+        if let Some(old) = index.get_mut(ck) {
+            mark_conflict(old, &s, source);
+            affine_facts.push(indexed_to_fact(old));
+        }
+        outcome.conflict.push(ConflictPair {
+            slug: slug.clone(),
+            with: cslug.clone(),
+        });
+    }
+    index.insert_new(
+        s.clone(),
+        crate::fact_index::IndexedFact {
+            slug: slug.clone(),
+            title: f.title.clone(),
+            statement: f.statement.clone(),
+            date: date.to_string(),
+            sources: vec![source.to_string()],
+            shingles: js,
+            conflicts: Vec::new(),
+            status: if conflict_k.is_some() {
+                "conflict"
+            } else {
+                "accepted"
+            }
+            .into(),
+            tags: f.tags.clone(),
+            confidence: format!("{:.2}", f.confidence),
+        },
+    );
+    affine_facts.push(FactEntry {
+        slug: slug.clone(),
+        date: date.to_string(),
+        title: f.title.clone(),
+        statement: f.statement.clone(),
+        tags: f.tags.clone(),
+        confidence: format!("{:.2}", f.confidence),
+        sources: vec![source.to_string()],
+        status: if conflict_k.is_some() {
+            "conflict"
+        } else {
+            "accepted"
+        }
+        .into(),
+    });
+    outcome.new.push(NewFact {
+        slug,
+        title: f.title.clone(),
+    });
+    Ok(())
+}
+
+async fn run_facts_inner(
+    text: &str,
+    source: &str,
+    date: &str,
+    stdin: bool,
+) -> Result<(FactsOutcome, Vec<FactEntry>)> {
+    if !valid_date(date) {
+        return Ok(early_fail("bad_date", None));
+    }
+    if stdin && text.chars().count() < MIN_DIGEST_CHARS {
+        return Ok((
+            FactsOutcome {
+                ok: true,
+                trivial: Some(true),
+                error: None,
+                bad: None,
+                new: vec![],
+                dup: vec![],
+                conflict: vec![],
+                published: None,
+            },
+            vec![],
+        ));
+    }
+
+    let raw = chat(EXTRACT_SYSTEM, text).await?;
+    let (objs, bad) = parse_jsonl(&raw);
+    if bad > 0 {
+        return Ok(early_fail("bad_jsonl", Some(bad)));
+    }
+
+    let candidates = parse_candidates(&objs);
 
     // Пустой валидный выхлоп — тоже результат (нет фактов), ok:true.
     let mut outcome = FactsOutcome {
@@ -290,112 +410,16 @@ async fn run_facts_inner(
     let mut affine_facts: Vec<FactEntry> = Vec::new();
 
     for f in candidates {
-        let s = sha1_norm(&f.statement);
-        if removed.contains(&s) {
-            continue; // tombstone: удалённый dreaming'ом мусор не воскрешаем
-        }
-        if let Some(existing) = index.get_mut(&s) {
-            index_touch(existing, source);
-            affine_facts.push(indexed_to_fact(existing));
-            outcome.dup.push(existing.slug.clone());
-            continue;
-        }
-        let js = shingles(&f.statement);
-        let mut scored: Vec<(f32, String)> = index
-            .iter()
-            .map(|(k, v)| (jaccard(&js, &v.shingles), k.clone()))
-            .filter(|(sim, _)| *sim >= JACCARD_THRESHOLD)
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let olds: Vec<(String, String)> = scored
-            .into_iter()
-            .take(5)
-            .filter_map(|(_, k)| index.get_mut(&k).map(|v| (k, v.statement.clone())))
-            .collect();
-
-        let mut verd: HashMap<String, String> = HashMap::new();
-        if !olds.is_empty() {
-            let pairs: Vec<(&Candidate, &String)> = olds.iter().map(|(_, st)| (&f, st)).collect();
-            let keys: Vec<String> = olds.iter().map(|(k, _)| k.clone()).collect();
-            let vmap = verdicts(&pairs).await?;
-            for (i, k) in keys.iter().enumerate() {
-                verd.insert(
-                    k.clone(),
-                    vmap.get(&i).cloned().unwrap_or_else(|| "distinct".into()),
-                );
-            }
-        }
-        let conflict_k = verd
-            .iter()
-            .find(|(_, v)| v.as_str() == "conflict")
-            .map(|(k, _)| k.clone());
-        let dup_k = verd
-            .iter()
-            .find(|(_, v)| v.as_str() == "duplicate")
-            .map(|(k, _)| k.clone());
-
-        if let (Some(dk), None) = (dup_k, &conflict_k) {
-            if let Some(dup) = index.get_mut(&dk) {
-                index_touch(dup, source);
-                affine_facts.push(indexed_to_fact(dup));
-                outcome.dup.push(dup.slug.clone());
-            }
-            continue;
-        }
-
-        let slug = unique_slug(&index, &slugify(&f.title));
-        let conflict_slug = conflict_k
-            .as_ref()
-            .and_then(|k| index.get_mut(k).map(|v| v.slug.clone()));
-        if let (Some(ck), Some(cslug)) = (&conflict_k, &conflict_slug) {
-            if let Some(old) = index.get_mut(ck) {
-                mark_conflict(old, &s, source);
-                affine_facts.push(indexed_to_fact(old));
-            }
-            outcome.conflict.push(ConflictPair {
-                slug: slug.clone(),
-                with: cslug.clone(),
-            });
-        }
-        index.insert_new(
-            s.clone(),
-            crate::fact_index::IndexedFact {
-                slug: slug.clone(),
-                title: f.title.clone(),
-                statement: f.statement.clone(),
-                date: date.to_string(),
-                sources: vec![source.to_string()],
-                shingles: js,
-                conflicts: Vec::new(),
-                status: if conflict_k.is_some() {
-                    "conflict"
-                } else {
-                    "accepted"
-                }
-                .into(),
-                tags: f.tags.clone(),
-                confidence: format!("{:.2}", f.confidence),
-            },
-        );
-        affine_facts.push(FactEntry {
-            slug: slug.clone(),
-            date: date.to_string(),
-            title: f.title.clone(),
-            statement: f.statement.clone(),
-            tags: f.tags.clone(),
-            confidence: format!("{:.2}", f.confidence),
-            sources: vec![source.to_string()],
-            status: if conflict_k.is_some() {
-                "conflict"
-            } else {
-                "accepted"
-            }
-            .into(),
-        });
-        outcome.new.push(NewFact {
-            slug,
-            title: f.title.clone(),
-        });
+        classify_candidate(
+            f,
+            &mut index,
+            &removed,
+            source,
+            date,
+            &mut outcome,
+            &mut affine_facts,
+        )
+        .await?;
     }
 
     // Persist the dedup index inside the critical section: concurrent runs
@@ -802,5 +826,46 @@ pub fn read_text(use_stdin: bool, args: &[String]) -> Result<String> {
         Err(anyhow!(
             "нет текста: укажите --stdin или передайте текст аргументом"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_candidates_sanitizes_and_caps() {
+        let objs = vec![
+            // короче STMT_MIN_CHARS → отбрасывается
+            json!({"statement": "short", "title": "t", "tags": [], "confidence": 0.9}),
+            json!({"statement": "Достаточно длинное утверждение для факта", "title": "Valid Title",
+                   "tags": ["Rust-Lang", "с русским", "x"], "confidence": 9.0}),
+        ];
+        let out = parse_candidates(&objs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Valid Title");
+        // не-ascii тег выпадает, дефис сохраняется
+        assert_eq!(out[0].tags, vec!["rust-lang".to_string(), "x".to_string()]);
+        // невалидный confidence (9.0 вне 0.1..=1.0) → дефолт 0.6
+        assert_eq!(out[0].confidence, 0.6);
+    }
+
+    #[test]
+    fn parse_candidates_takes_max_per_call() {
+        let objs: Vec<_> = (0..(MAX_FACTS_PER_CALL + 3))
+            .map(|i| {
+                json!({"statement": format!("Утверждение номер {i} достаточно длинное"), "title": format!("T{i}"),
+                       "tags": [], "confidence": 0.8})
+            })
+            .collect();
+        assert_eq!(parse_candidates(&objs).len(), MAX_FACTS_PER_CALL);
+    }
+
+    #[test]
+    fn read_text_joins_args_or_reads_stdin() {
+        let args = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(read_text(false, &args).unwrap(), "a b");
+        assert!(read_text(false, &[]).is_err());
     }
 }

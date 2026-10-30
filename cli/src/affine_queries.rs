@@ -550,33 +550,49 @@ fn tolerant_cell_text(value: &serde_json::Value) -> String {
 /// Render canvas: mindmap trees (get_mindmap) + standalone shapes, text and
 /// connectors with endpoints resolved to shape texts. Mindmap member shapes
 /// are excluded from the standalone list to avoid double listing.
-async fn render_canvas(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-    doc_id: &str,
-    canvas: &serde_json::Value,
-) -> Option<String> {
-    let elements = canvas.get("surfaceElements").and_then(|e| e.as_array())?;
-    let mut mindmap_ids: Vec<String> = Vec::new();
-    let mut shapes_by_id: std::collections::BTreeMap<String, (String, String)> =
-        std::collections::BTreeMap::new();
-    let mut texts: Vec<String> = Vec::new();
-    let mut connectors: Vec<(String, String, String)> = Vec::new(); // from, to, label
+/// Собранные элементы канвы для рендера: сбор и рендер разнесены, чтобы
+/// каждый шаг читался отдельно.
+struct CanvasIndex {
+    mindmap_ids: Vec<String>,
+    /// id → (shapeType, text)
+    shapes_by_id: std::collections::BTreeMap<String, (String, String)>,
+    texts: Vec<String>,
+    /// (from, to, label)
+    connectors: Vec<(String, String, String)>,
+}
+
+impl CanvasIndex {
+    fn is_empty(&self) -> bool {
+        self.mindmap_ids.is_empty()
+            && self.shapes_by_id.is_empty()
+            && self.texts.is_empty()
+            && self.connectors.is_empty()
+    }
+}
+
+fn collect_canvas_elements(elements: &[serde_json::Value]) -> CanvasIndex {
+    let mut idx = CanvasIndex {
+        mindmap_ids: Vec::new(),
+        shapes_by_id: std::collections::BTreeMap::new(),
+        texts: Vec::new(),
+        connectors: Vec::new(),
+    };
     for el in elements {
         let id = el.get("id").and_then(|i| i.as_str()).unwrap_or_default();
         match el.get("type").and_then(|t| t.as_str()) {
-            Some("mindmap") => mindmap_ids.push(id.to_string()),
+            Some("mindmap") => idx.mindmap_ids.push(id.to_string()),
             Some("shape") => {
                 let shape_type = el
                     .get("shapeType")
                     .and_then(|t| t.as_str())
                     .unwrap_or("shape");
                 let text = el.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                shapes_by_id.insert(id.to_string(), (shape_type.to_string(), text.to_string()));
+                idx.shapes_by_id
+                    .insert(id.to_string(), (shape_type.to_string(), text.to_string()));
             }
             Some("text") => {
                 if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
-                    texts.push(t.to_string());
+                    idx.texts.push(t.to_string());
                 }
             }
             Some("connector") => {
@@ -593,25 +609,22 @@ async fn render_canvas(
                     .and_then(|s| s.as_str())
                     .or_else(|| el.get("labelText").and_then(|s| s.as_str()))
                     .unwrap_or("");
-                connectors.push((from.to_string(), to.to_string(), label.to_string()));
+                idx.connectors
+                    .push((from.to_string(), to.to_string(), label.to_string()));
             }
             _ => {}
         }
     }
-    if mindmap_ids.is_empty()
-        && shapes_by_id.is_empty()
-        && texts.is_empty()
-        && connectors.is_empty()
-    {
-        return None;
-    }
-    let mut out = String::from("### 🎨 Канва\n\n");
-    let mut member_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    idx
+}
 
-    // Canvas mindmap elements carry their member ids in `children` — seed
-    // member_ids from there so shapes do not duplicate even when the
-    // get_mindmap call fails.
-    let canvas_mindmap_members: std::collections::BTreeMap<&str, Vec<String>> = elements
+/// Canvas mindmap elements carry their member ids in `children` — the map
+/// seeds member_ids so shapes do not duplicate even when the get_mindmap
+/// call fails. Key: mindmap id; value: the mindmap id + its children keys.
+fn canvas_mindmap_members(
+    elements: &[serde_json::Value],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    elements
         .iter()
         .filter_map(|el| {
             let id = el.get("id").and_then(|i| i.as_str())?;
@@ -624,73 +637,127 @@ async fn render_canvas(
                     ids.push(cid.clone());
                 }
             }
-            Some((id, ids))
+            Some((id.to_string(), ids))
         })
-        .collect();
-    for mm_id in &mindmap_ids {
-        match client
-            .call_tool(
-                "get_mindmap",
-                json!({"workspaceId": cfg.workspace, "docId": doc_id, "mindmapId": mm_id}),
-            )
-            .await
-        {
-            Ok(mm) => {
-                if let Some(ids) = canvas_mindmap_members.get(mm_id.as_str()) {
-                    member_ids.extend(ids.iter().cloned());
-                }
-                let root_id = mm
-                    .get("rootId")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or_default();
-                let nodes = mm.get("nodes").and_then(|n| n.as_array());
-                let mut text_by_id: std::collections::BTreeMap<String, String> =
-                    std::collections::BTreeMap::new();
-                let mut children_by_parent: std::collections::BTreeMap<String, Vec<String>> =
-                    std::collections::BTreeMap::new();
-                if let Some(nodes) = nodes {
-                    for n in nodes {
-                        let Some(nid) = n.get("nodeId").and_then(|i| i.as_str()) else {
-                            continue;
-                        };
-                        member_ids.insert(nid.to_string());
-                        if let Some(t) = n.get("text").and_then(|t| t.as_str()) {
-                            text_by_id.insert(nid.to_string(), t.to_string());
-                        }
-                        let parent = n.get("parentId").and_then(|p| p.as_str());
-                        if let Some(parent) = parent {
-                            children_by_parent
-                                .entry(parent.to_string())
-                                .or_default()
-                                .push(nid.to_string());
-                        }
-                    }
-                }
-                if !root_id.is_empty() {
-                    member_ids.insert(root_id.to_string());
-                }
-                out.push_str(&format!(
-                    "**Майндмап** ({} узлов):\n{}\n",
-                    text_by_id.len(),
-                    render_tree(
-                        root_id,
-                        &text_by_id,
-                        &children_by_parent,
-                        0,
-                        &mut std::collections::BTreeSet::new(),
-                    )
-                ));
+        .collect()
+}
+
+/// Один майндмап канвы: get_mindmap + дерево. Пишет id узлов в member_ids
+/// (узлы майндмапа = шейпы, их не надо дублировать списком шейпов);
+/// ошибка чтения → пустая строка, рендер канвы продолжается.
+async fn render_canvas_mindmap(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+    mm_id: &str,
+    canvas_members: Option<&Vec<String>>,
+    member_ids: &mut std::collections::BTreeSet<String>,
+) -> String {
+    let mm = match client
+        .call_tool(
+            "get_mindmap",
+            json!({"workspaceId": cfg.workspace, "docId": doc_id, "mindmapId": mm_id}),
+        )
+        .await
+    {
+        Ok(mm) => mm,
+        Err(e) => {
+            eprintln!("affine: майндмап {mm_id} не прочитан ({e:#})");
+            if let Some(ids) = canvas_members {
+                member_ids.extend(ids.iter().cloned());
             }
-            Err(e) => {
-                eprintln!("affine: майндмап {mm_id} не прочитан ({e:#})");
-                if let Some(ids) = canvas_mindmap_members.get(mm_id.as_str()) {
-                    member_ids.extend(ids.iter().cloned());
-                }
+            return String::new();
+        }
+    };
+    if let Some(ids) = canvas_members {
+        member_ids.extend(ids.iter().cloned());
+    }
+    let root_id = mm
+        .get("rootId")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default();
+    let mut text_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut children_by_parent: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if let Some(nodes) = mm.get("nodes").and_then(|n| n.as_array()) {
+        for n in nodes {
+            let Some(nid) = n.get("nodeId").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            member_ids.insert(nid.to_string());
+            if let Some(t) = n.get("text").and_then(|t| t.as_str()) {
+                text_by_id.insert(nid.to_string(), t.to_string());
+            }
+            if let Some(parent) = n.get("parentId").and_then(|p| p.as_str()) {
+                children_by_parent
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(nid.to_string());
             }
         }
     }
+    if !root_id.is_empty() {
+        member_ids.insert(root_id.to_string());
+    }
+    format!(
+        "**Майндмап** ({} узлов):\n{}\n",
+        text_by_id.len(),
+        render_tree(
+            root_id,
+            &text_by_id,
+            &children_by_parent,
+            0,
+            &mut std::collections::BTreeSet::new(),
+        )
+    )
+}
 
-    for (id, (shape_type, text)) in &shapes_by_id {
+/// Подпись конца коннектора: текст шейпа → текст канвы → сырой id.
+fn connector_endpoint_label(
+    id: &str,
+    shapes_by_id: &std::collections::BTreeMap<String, (String, String)>,
+    texts_by_id: &std::collections::BTreeMap<&str, &str>,
+) -> String {
+    shapes_by_id
+        .get(id)
+        .map(|(_, t)| t.clone())
+        .filter(|t| !t.is_empty())
+        .or_else(|| texts_by_id.get(id).map(|t| t.to_string()))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| id.to_string())
+}
+
+async fn render_canvas(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    doc_id: &str,
+    canvas: &serde_json::Value,
+) -> Option<String> {
+    let elements = canvas.get("surfaceElements").and_then(|e| e.as_array())?;
+    let idx = collect_canvas_elements(elements);
+    if idx.is_empty() {
+        return None;
+    }
+    let mut out = String::from("### 🎨 Канва\n\n");
+    let mut member_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    let canvas_members = canvas_mindmap_members(elements);
+    for mm_id in &idx.mindmap_ids {
+        out.push_str(
+            &render_canvas_mindmap(
+                client,
+                cfg,
+                doc_id,
+                mm_id,
+                canvas_members.get(mm_id),
+                &mut member_ids,
+            )
+            .await,
+        );
+    }
+
+    for (id, (shape_type, text)) in &idx.shapes_by_id {
         if member_ids.contains(id) {
             continue; // mindmap node shapes are already in the tree
         }
@@ -701,7 +768,7 @@ async fn render_canvas(
         };
         out.push_str(&format!("- [{shape_type}] {label}\n"));
     }
-    for t in &texts {
+    for t in &idx.texts {
         out.push_str(&format!("- 📝 {t}\n"));
     }
     let texts_by_id: std::collections::BTreeMap<&str, &str> = elements
@@ -712,21 +779,9 @@ async fn render_canvas(
             Some((id, t))
         })
         .collect();
-    for (from, to, label) in &connectors {
-        let from_t = shapes_by_id
-            .get(from)
-            .map(|(_, t)| t.clone())
-            .filter(|t| !t.is_empty())
-            .or_else(|| texts_by_id.get(from.as_str()).map(|t| t.to_string()))
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| from.clone());
-        let to_t = shapes_by_id
-            .get(to)
-            .map(|(_, t)| t.clone())
-            .filter(|t| !t.is_empty())
-            .or_else(|| texts_by_id.get(to.as_str()).map(|t| t.to_string()))
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| to.clone());
+    for (from, to, label) in &idx.connectors {
+        let from_t = connector_endpoint_label(from, &idx.shapes_by_id, &texts_by_id);
+        let to_t = connector_endpoint_label(to, &idx.shapes_by_id, &texts_by_id);
         if label.is_empty() {
             out.push_str(&format!("- 🔗 {from_t} → {to_t}\n"));
         } else {
@@ -1159,5 +1214,71 @@ mod rich_render_tests {
             "a b"
         );
         assert_eq!(tolerant_cell_text(&serde_json::json!(null)), "");
+    }
+}
+
+#[cfg(test)]
+mod canvas_index_tests {
+    use super::{canvas_mindmap_members, collect_canvas_elements, connector_endpoint_label};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn collects_shapes_texts_and_connectors() {
+        let elements = vec![
+            json!({"id": "mm1", "type": "mindmap", "children": {"n1": {}, "n2": {}}}),
+            json!({"id": "s1", "type": "shape", "shapeType": "rect", "text": "Box"}),
+            json!({"id": "t1", "type": "text", "text": "Note"}),
+            json!({"id": "c1", "type": "connector", "source": {"id": "s1"}, "target": {"id": "t1"}, "label": "uses"}),
+            json!({"id": "x", "type": "group"}),
+        ];
+        let idx = collect_canvas_elements(&elements);
+        assert_eq!(idx.mindmap_ids, vec!["mm1".to_string()]);
+        assert_eq!(
+            idx.shapes_by_id["s1"],
+            ("rect".to_string(), "Box".to_string())
+        );
+        assert_eq!(idx.texts, vec!["Note".to_string()]);
+        assert_eq!(
+            idx.connectors[0],
+            ("s1".to_string(), "t1".to_string(), "uses".to_string())
+        );
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn empty_canvas_index_is_empty() {
+        assert!(collect_canvas_elements(&[]).is_empty());
+    }
+
+    #[test]
+    fn mindmap_members_include_children_keys() {
+        let elements = vec![json!({"id": "mm", "type": "mindmap", "children": {"a": {}, "b": {}}})];
+        let map = canvas_mindmap_members(&elements);
+        assert_eq!(
+            map["mm"],
+            vec!["mm".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn connector_label_prefers_shape_text_then_canvas_text_then_id() {
+        let mut shapes: BTreeMap<String, (String, String)> = BTreeMap::new();
+        shapes.insert("s".to_string(), ("rect".to_string(), "Shape".to_string()));
+        let mut texts: BTreeMap<&str, &str> = BTreeMap::new();
+        texts.insert("t", "Canvas text");
+        assert_eq!(connector_endpoint_label("s", &shapes, &texts), "Shape");
+        assert_eq!(
+            connector_endpoint_label("t", &shapes, &texts),
+            "Canvas text"
+        );
+        // у шейпа пустой текст → фоллбек на текст канвы
+        shapes.insert("e".to_string(), ("rect".to_string(), String::new()));
+        texts.insert("e", "Fallback");
+        assert_eq!(connector_endpoint_label("e", &shapes, &texts), "Fallback");
+        assert_eq!(
+            connector_endpoint_label("unknown", &shapes, &texts),
+            "unknown"
+        );
     }
 }

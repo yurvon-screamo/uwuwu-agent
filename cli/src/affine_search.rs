@@ -46,124 +46,64 @@ pub struct SearchOpts {
     pub threshold: f32,
 }
 
-/// Unified semantic search: experience + project docs from the content
-/// cache, facts from the dedup index statements.
-pub async fn search(
-    root: &Path,
-    cache: &ContentCache,
-    index: &FactIndex,
-    query: &str,
-    opts: &SearchOpts,
-    extra_docs: &[(String, String, String, &'static str)],
-) -> Result<Vec<SearchHit>> {
-    let mut embed_cache = load_cache(root)?;
-    let query_vec = embed(MODEL, query).await?;
+/// Документ корпуса семантики: слаг, заголовок, короткое описание,
+/// тело для чанкования и вид (квота выдачи).
+pub struct CorpusDoc {
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub body: String,
+    pub kind: DocKind,
+}
 
-    let mut scored: Vec<SearchHit> = Vec::new();
-    let mut embed_calls = 0usize;
-
-    let mut docs: Vec<(String, String, String, String, DocKind)> = Vec::new();
+/// Articles + project docs + fact statements — the cache-backed corpus.
+fn collect_corpus(cache: &ContentCache, index: &FactIndex) -> Vec<CorpusDoc> {
+    let mut docs: Vec<CorpusDoc> = Vec::new();
     for (slug, doc) in cache
         .docs_by_kind(&DocKind::Experience)
         .into_iter()
         .chain(cache.docs_by_kind(&DocKind::Project))
     {
-        docs.push((
-            slug.clone(),
-            doc.title.clone(),
-            first_line(&doc.markdown),
-            doc.markdown.clone(),
-            doc.kind.clone(),
-        ));
+        docs.push(CorpusDoc {
+            slug: slug.clone(),
+            title: doc.title.clone(),
+            description: first_line(&doc.markdown),
+            body: doc.markdown.clone(),
+            kind: doc.kind.clone(),
+        });
     }
     for (_, fact) in index.iter() {
-        docs.push((
-            format!("facts/{}", fact.slug),
-            fact.title.clone(),
-            fact.statement.chars().take(140).collect(),
-            fact.statement.clone(),
-            DocKind::Daily,
-        ));
+        docs.push(CorpusDoc {
+            slug: format!("facts/{}", fact.slug),
+            title: fact.title.clone(),
+            description: fact.statement.chars().take(140).collect(),
+            body: fact.statement.clone(),
+            kind: DocKind::Daily,
+        });
     }
+    docs
+}
 
-    // тела задач/кронов по тегам: дерево их не видит — живой источник
-    let extra: Vec<(String, String, String, String, DocKind)> = extra_docs
+/// Тела задач/кронов по тегам: дерево их не видит — живой источник.
+fn extras_to_corpus(extra_docs: &[(String, String, String, &'static str)]) -> Vec<CorpusDoc> {
+    extra_docs
         .iter()
-        .map(|(_id, title, body, kind)| {
-            (
-                format!("task/{title}"),
-                title.clone(),
-                first_line(body),
-                body.clone(),
-                match *kind {
-                    "cron" => DocKind::Cron,
-                    _ => DocKind::Task,
-                },
-            )
+        .map(|(_id, title, body, kind)| CorpusDoc {
+            slug: format!("task/{title}"),
+            title: title.clone(),
+            description: first_line(body),
+            body: body.clone(),
+            kind: match *kind {
+                "cron" => DocKind::Cron,
+                _ => DocKind::Task,
+            },
         })
-        .collect();
-    // extras (свежие тела задач/кронов) — первыми в очередь эмбеддинга:
-    // бюджет прогона не должен съедаться до их пула
-    let mut ordered = extra;
-    ordered.extend(docs);
-    let docs = ordered;
+        .collect()
+}
 
-    for (slug, title, description, body, kind) in docs {
-        let chunks = chunk_markdown(&body);
-        let mut best: Option<f32> = None;
-        let mut uncached = false;
-        for chunk in &chunks {
-            let key = content_key(chunk);
-            let vector = match embed_cache.vectors.get(&key) {
-                Some(v) => v.clone(),
-                None => {
-                    if embed_calls >= MAX_EMBEDS_PER_RUN {
-                        uncached = true;
-                        continue;
-                    }
-                    let v = embed(MODEL, chunk).await?;
-                    embed_cache.vectors.insert(key, v.clone());
-                    embed_calls += 1;
-                    if embed_calls.is_multiple_of(25) {
-                        let _ = save_cache(root, &embed_cache);
-                    }
-                    v
-                }
-            };
-            let score = cosine(&query_vec, &vector);
-            if best.is_none_or(|b| score > b) {
-                best = Some(score);
-            }
-        }
-        if uncached && best.is_none() {
-            continue; // not indexed yet — the next search continues indexing
-        }
-        if let Some(score) = best {
-            if score >= opts.threshold {
-                scored.push(SearchHit {
-                    score,
-                    slug,
-                    title,
-                    description,
-                    body,
-                    kind,
-                });
-            }
-        }
-    }
-    if embed_calls >= MAX_EMBEDS_PER_RUN {
-        eprintln!(
-            "affine: embedding budget reached ({MAX_EMBEDS_PER_RUN}) — indexing continues on the next search"
-        );
-    }
-    save_cache(root, &embed_cache)?;
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // section split mirrors the legacy unified search limits
+/// Section split mirrors the legacy unified search limits: every kind has
+/// its own quota and they do not compete with each other.
+fn apply_quotas(scored: Vec<SearchHit>, opts: &SearchOpts) -> Vec<SearchHit> {
     let mut out = Vec::new();
     let mut exp = 0;
     let mut facts = 0;
@@ -198,7 +138,85 @@ pub async fn search(
             }
         }
     }
-    Ok(out)
+    out
+}
+
+/// Unified semantic search: experience + project docs from the content
+/// cache, facts from the dedup index statements.
+pub async fn search(
+    root: &Path,
+    cache: &ContentCache,
+    index: &FactIndex,
+    query: &str,
+    opts: &SearchOpts,
+    extra_docs: &[(String, String, String, &'static str)],
+) -> Result<Vec<SearchHit>> {
+    let mut embed_cache = load_cache(root)?;
+    let query_vec = embed(MODEL, query).await?;
+
+    let mut scored: Vec<SearchHit> = Vec::new();
+    let mut embed_calls = 0usize;
+
+    // extras (свежие тела задач/кронов) — первыми в очередь эмбеддинга:
+    // бюджет прогона не должен съедаться до их пула
+    let mut docs = extras_to_corpus(extra_docs);
+    docs.extend(collect_corpus(cache, index));
+
+    for doc in docs {
+        let chunks = chunk_markdown(&doc.body);
+        let mut best: Option<f32> = None;
+        let mut uncached = false;
+        for chunk in &chunks {
+            let key = content_key(chunk);
+            let vector = match embed_cache.vectors.get(&key) {
+                Some(v) => v.clone(),
+                None => {
+                    if embed_calls >= MAX_EMBEDS_PER_RUN {
+                        uncached = true;
+                        continue;
+                    }
+                    let v = embed(MODEL, chunk).await?;
+                    embed_cache.vectors.insert(key, v.clone());
+                    embed_calls += 1;
+                    if embed_calls.is_multiple_of(25) {
+                        let _ = save_cache(root, &embed_cache);
+                    }
+                    v
+                }
+            };
+            let score = cosine(&query_vec, &vector);
+            if best.is_none_or(|b| score > b) {
+                best = Some(score);
+            }
+        }
+        if uncached && best.is_none() {
+            continue; // not indexed yet — the next search continues indexing
+        }
+        if let Some(score) = best {
+            if score >= opts.threshold {
+                scored.push(SearchHit {
+                    score,
+                    slug: doc.slug,
+                    title: doc.title,
+                    description: doc.description,
+                    body: doc.body,
+                    kind: doc.kind,
+                });
+            }
+        }
+    }
+    if embed_calls >= MAX_EMBEDS_PER_RUN {
+        eprintln!(
+            "affine: embedding budget reached ({MAX_EMBEDS_PER_RUN}) — indexing continues on the next search"
+        );
+    }
+    save_cache(root, &embed_cache)?;
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(apply_quotas(scored, opts))
 }
 
 /// Paragraph-bundled chunks around CHUNK_TARGET_CHARS.
@@ -301,5 +319,59 @@ mod tests {
     fn content_key_changes_with_length() {
         assert_ne!(content_key("ab"), content_key("abab"));
         assert_eq!(content_key("x"), content_key("x"));
+    }
+
+    #[test]
+    fn quotas_are_enforced_per_kind() {
+        let hit = |slug: &str, kind: DocKind| SearchHit {
+            score: 1.0,
+            slug: slug.into(),
+            title: String::new(),
+            description: String::new(),
+            body: String::new(),
+            kind,
+        };
+        let scored = vec![
+            hit("f1", DocKind::Daily),
+            hit("f2", DocKind::Daily),
+            hit("f3", DocKind::Daily),
+            hit("a1", DocKind::Project),
+            hit("a2", DocKind::Project),
+            hit("t1", DocKind::Task),
+            hit("c1", DocKind::Cron),
+            hit("e1", DocKind::Experience),
+        ];
+        let opts = SearchOpts {
+            experience: 1,
+            facts: 2,
+            access: 1,
+            tasks: 1,
+            threshold: 0.0,
+        };
+        let out = apply_quotas(scored, &opts);
+        let slugs: Vec<&str> = out.iter().map(|h| h.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["f1", "f2", "a1", "t1", "e1"]);
+    }
+
+    #[test]
+    fn extras_become_task_and_cron_corpus() {
+        let extras = vec![
+            (
+                "id1".to_string(),
+                "Do thing".to_string(),
+                "body".to_string(),
+                "task",
+            ),
+            (
+                "id2".to_string(),
+                "Every day".to_string(),
+                "body2".to_string(),
+                "cron",
+            ),
+        ];
+        let corpus = extras_to_corpus(&extras);
+        assert_eq!(corpus[0].slug, "task/Do thing");
+        assert!(matches!(corpus[0].kind, DocKind::Task));
+        assert!(matches!(corpus[1].kind, DocKind::Cron));
     }
 }
