@@ -21,6 +21,18 @@ pub mod request;
 pub mod sofa;
 pub mod wiki;
 
+// Отдельные тест-файлы (сиблинги модулей): объявление здесь обязательно —
+// cargo не подхватывает src/*_tests.rs сам. Однажды потерялись рефакторингом
+// и 23 теста молча не бегали (llvm-cov: 0% при живых файлах).
+#[cfg(test)]
+mod affine_collect_tests;
+#[cfg(test)]
+mod affine_sse_tests;
+#[cfg(test)]
+mod affine_store_tests;
+#[cfg(test)]
+mod affine_tables_tests;
+
 use std::path::PathBuf;
 
 pub fn wiki_root() -> PathBuf {
