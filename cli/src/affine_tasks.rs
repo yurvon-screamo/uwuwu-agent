@@ -1203,7 +1203,6 @@ pub async fn replace_body(
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod cron_tests {
     use super::*;
 
