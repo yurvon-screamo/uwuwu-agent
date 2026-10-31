@@ -403,6 +403,44 @@ impl RowPatch {
 /// Прочитать все строки доски. Заголовки линкованных строк резолвятся
 /// из контент-кэша (sync уже принёс тела задач) и только при промахе —
 /// get_doc-ом: без кэша list делал бы N round-trip-ов до Сингапура.
+/// Разобрать одну строку доски из read_database_cells-ответа.
+/// Возвращает строку и Some(linkedDocId), когда заголовок не разрешён:
+/// linked-строки носят заголовок на слинкованной странице (ячейка
+/// «title» — LinkedPage-ссылка из одного пробела) — резолв по кэшу/сети
+/// делает вызывающий.
+fn parse_task_row(r: &Value) -> (TaskRow, Option<String>) {
+    let cells = r.get("cells").cloned().unwrap_or(Value::Null);
+    let cell = |k: &str| -> String {
+        cells
+            .get(k)
+            .and_then(|c| c.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let linked = first_str(r, &["linkedDocId"]).unwrap_or_default();
+    let title = r
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or(" ")
+        .trim()
+        .to_string();
+    let unresolved = (title.is_empty() && !linked.is_empty()).then(|| linked.clone());
+    (
+        TaskRow {
+            row_id: first_str(r, &["rowBlockId", "rowId", "id"]).unwrap_or_default(),
+            title,
+            body_doc: linked,
+            status: cell("Status"),
+            pr: cell("PR"),
+            branch: cell("Branch"),
+            schedule: cell("Schedule"),
+            last_run: cell("Last Run"),
+        },
+        unresolved,
+    )
+}
+
 pub async fn read_rows(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -431,28 +469,10 @@ pub async fn read_rows(
         .unwrap_or_default();
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let cells = r.get("cells").cloned().unwrap_or(Value::Null);
-        let cell = |k: &str| -> String {
-            cells
-                .get(k)
-                .and_then(|c| c.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        let linked = first_str(&r, &["linkedDocId"]).unwrap_or_default();
-        let mut title = r
-            .get("title")
-            .and_then(|t| t.as_str())
-            .unwrap_or(" ")
-            .trim()
-            .to_string();
-        // linked rows carry their title on the linked page, not the
-        // cell: the "title" cell is a single-space LinkedPage reference,
-        // blank after trim — resolve from the cache, network on miss
-        if title.is_empty() && !linked.is_empty() {
-            title = cache_titles.get(&linked).cloned().unwrap_or_default();
-            if title.is_empty() {
+        let (mut row, unresolved) = parse_task_row(&r);
+        if let Some(linked) = unresolved {
+            row.title = cache_titles.get(&linked).cloned().unwrap_or_default();
+            if row.title.is_empty() {
                 if let Ok(doc) = client
                     .call_tool(
                         "get_doc",
@@ -460,7 +480,7 @@ pub async fn read_rows(
                     )
                     .await
                 {
-                    title = doc
+                    row.title = doc
                         .get("title")
                         .and_then(|t| t.as_str())
                         .unwrap_or_default()
@@ -468,16 +488,7 @@ pub async fn read_rows(
                 }
             }
         }
-        out.push(TaskRow {
-            row_id: first_str(&r, &["rowBlockId", "rowId", "id"]).unwrap_or_default(),
-            title,
-            body_doc: linked,
-            status: cell("Status"),
-            pr: cell("PR"),
-            branch: cell("Branch"),
-            schedule: cell("Schedule"),
-            last_run: cell("Last Run"),
-        });
+        out.push(row);
     }
     Ok(out)
 }
@@ -1200,6 +1211,82 @@ pub async fn replace_body(
         );
     }
     convert_embed_fences(client, cfg, body_doc).await
+}
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+
+    #[test]
+    fn parse_task_row_maps_cells_to_taskrow() {
+        let r = serde_json::json!({
+            "rowBlockId": "r1",
+            "title": "Сделать хорошо",
+            "cells": {
+                "Status": {"value": "In Progress"},
+                "PR": {"value": "https://github.com/x/pull/1"},
+                "Branch": {"value": "feat/x"},
+                "Schedule": {"value": "5m"},
+                "Last Run": {"value": "12:30"},
+            }
+        });
+        let (row, unresolved) = parse_task_row(&r);
+        assert_eq!(row.row_id, "r1");
+        assert_eq!(row.title, "Сделать хорошо");
+        assert_eq!(row.status, "In Progress");
+        assert_eq!(row.pr, "https://github.com/x/pull/1");
+        assert_eq!(row.branch, "feat/x");
+        assert_eq!(row.schedule, "5m");
+        assert_eq!(row.last_run, "12:30");
+        assert!(row.body_doc.is_empty());
+        assert!(unresolved.is_none());
+    }
+
+    #[test]
+    fn parse_task_row_flags_linked_title_for_external_resolution() {
+        // linked-строка: title-ячейка — LinkedPage-ссылка (пробел после trim),
+        // настоящий заголовок живёт на слинкованной странице
+        let r = serde_json::json!({
+            "rowBlockId": "r2",
+            "title": " ",
+            "linkedDocId": "doc-abc",
+            "cells": {"Status": {"value": "Todo"}}
+        });
+        let (row, unresolved) = parse_task_row(&r);
+        assert!(row.title.is_empty());
+        assert_eq!(row.body_doc, "doc-abc");
+        assert_eq!(unresolved.as_deref(), Some("doc-abc"));
+    }
+
+    #[test]
+    fn parse_task_row_row_id_falls_back_through_aliases() {
+        let with_row_id = serde_json::json!({"rowId": "legacy", "title": "t"});
+        assert_eq!(parse_task_row(&with_row_id).0.row_id, "legacy");
+        let with_plain_id = serde_json::json!({"id": "plain", "title": "t"});
+        assert_eq!(parse_task_row(&with_plain_id).0.row_id, "plain");
+        // rowBlockId приоритетнее остальных
+        let both = serde_json::json!({"rowBlockId": "modern", "rowId": "legacy", "title": "t"});
+        assert_eq!(parse_task_row(&both).0.row_id, "modern");
+    }
+
+    #[test]
+    fn task_type_parses_en_and_ru_aliases() {
+        assert!(TaskType::parse("dev").is_some());
+        assert!(TaskType::parse("Разработка").is_some());
+        assert!(TaskType::parse("SPIKE").is_some());
+        assert!(TaskType::parse("баг").is_some());
+        assert!(TaskType::parse("мусор").is_none());
+    }
+
+    #[test]
+    fn body_templates_differ_by_type_and_fill_user_text() {
+        let dev = TaskType::Dev.body_template("T", "сделай X");
+        let spike = TaskType::Spike.body_template("T", "");
+        assert!(dev.contains("## Постановка\nсделай X"));
+        assert!(dev.contains("## Проверка"));
+        assert!(spike.contains("## Контекст\n<текст постановки>"));
+        assert!(spike.contains("## Границы"));
+    }
 }
 
 #[cfg(test)]

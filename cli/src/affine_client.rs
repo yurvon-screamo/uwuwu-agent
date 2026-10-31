@@ -316,3 +316,75 @@ enum GatewayError {
     /// сессия отклонена шлюзом — нужен полный handshake и повтор вызова
     StaleSession(anyhow::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_returns_structured_content() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"structuredContent": {"ok": true, "answer": 42}}
+        });
+        let out = AffineClient::tool_result("search", &body).unwrap();
+        assert_eq!(out["answer"], 42);
+    }
+
+    #[test]
+    fn tool_result_surfaces_rpc_error() {
+        // error внутри result (top-level JSON-RPC error ловит raw_post раньше)
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"error": {"code": -32601, "message": "method not found"}}
+        });
+        let err = AffineClient::tool_result("nope", &body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool nope failed"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_result_surfaces_gateway_ok_false_convention() {
+        // шлюз отвечает логические фейлы как ok:false внутри успешного RPC
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"ok": false, "error": "инцидент батча"}
+        });
+        let err = AffineClient::tool_result("add_database_row", &body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("инцидент батча"), "got: {err}");
+    }
+
+    #[test]
+    fn text_payload_parses_json_blob_and_flags_nested_ok_false() {
+        let payload = json!({
+            "content": [{"type": "text", "text": "{\"ok\": false, \"error\": \"внутри блоба\"}"}]
+        });
+        let err = AffineClient::text_payload(&payload)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("text payload") && err.contains("внутри блоба"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn text_payload_parses_json_data_and_wraps_plain_text() {
+        let data = json!({"content": [{"type": "text", "text": "{\"answer\": 7}"}]});
+        assert_eq!(AffineClient::text_payload(&data).unwrap()["answer"], 7);
+        let plain = json!({"content": [{"type": "text", "text": "просто текст"}]});
+        assert_eq!(
+            AffineClient::text_payload(&plain).unwrap(),
+            json!("просто текст")
+        );
+    }
+
+    #[test]
+    fn text_payload_requires_content_text() {
+        let no_content = json!({"result": {}});
+        assert!(AffineClient::text_payload(&no_content).is_err());
+    }
+}
