@@ -1203,7 +1203,8 @@ pub async fn replace_body(
 }
 
 #[cfg(test)]
-mod embed_tests {
+#[cfg(test)]
+mod cron_tests {
     use super::*;
 
     #[test]
@@ -1245,6 +1246,11 @@ mod embed_tests {
         assert!(with_prompt.contains("## Что делать\n\nделай так"));
         assert!(with_prompt.contains("Расписание: `5m`"));
     }
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
 
     #[test]
     fn parse_fences() {

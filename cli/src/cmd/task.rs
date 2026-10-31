@@ -29,7 +29,20 @@ pub(crate) async fn run(
             r#type: ty,
             stdin,
             attach,
-        } => create(&mut client, cfg, &board, &title, ty, stdin, attach).await,
+        } => {
+            create(
+                &mut client,
+                cfg,
+                &board,
+                CreateArgs {
+                    title,
+                    ty,
+                    stdin,
+                    attach,
+                },
+            )
+            .await
+        }
         TaskSub::List {
             status,
             project: proj_override,
@@ -47,58 +60,104 @@ pub(crate) async fn run(
                 cfg,
                 root,
                 &project,
-                id,
-                affine_tasks::RowPatch {
-                    status,
-                    title,
-                    pr,
-                    branch,
+                EditArgs {
+                    id,
+                    patch: affine_tasks::RowPatch {
+                        status,
+                        title,
+                        pr,
+                        branch,
+                    },
                 },
             )
             .await
         }
         TaskSub::Thread { id } => thread(&mut client, cfg, root, &project, id).await,
         TaskSub::Comment { id, stdin, text } => {
-            comment(&mut client, cfg, root, &project, id, stdin, text).await
+            comment(
+                &mut client,
+                cfg,
+                root,
+                &project,
+                CommentArgs { id, stdin, text },
+            )
+            .await
         }
-        TaskSub::Close { id, note } => close_task(&mut client, cfg, root, &project, id, note).await,
+        TaskSub::Close { id, note } => {
+            close_task(&mut client, cfg, root, &project, CloseArgs { id, note }).await
+        }
         TaskSub::Body { id, md, replace } => {
-            body(&mut client, cfg, root, &project, id, md, replace).await
+            body(
+                &mut client,
+                cfg,
+                root,
+                &project,
+                BodyArgs { id, md, replace },
+            )
+            .await
         }
     }
+}
+
+/// Аргументы субкоманд task: один struct на команду (зеркало clap-варианта)
+/// вместо россыпи параметров хендлера.
+struct CreateArgs {
+    title: String,
+    ty: Option<String>,
+    stdin: bool,
+    attach: Vec<std::path::PathBuf>,
+}
+
+struct EditArgs {
+    id: String,
+    patch: affine_tasks::RowPatch,
+}
+
+struct CommentArgs {
+    id: String,
+    stdin: bool,
+    text: Vec<String>,
+}
+
+struct CloseArgs {
+    id: String,
+    note: Option<String>,
+}
+
+struct BodyArgs {
+    id: String,
+    md: Option<String>,
+    replace: bool,
 }
 
 async fn create(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     board: &affine_tasks::Board,
-    title: &str,
-    ty: Option<String>,
-    stdin: bool,
-    attach: Vec<std::path::PathBuf>,
+    args: CreateArgs,
 ) -> anyhow::Result<()> {
-    let task_type =
-        affine_tasks::TaskType::parse(ty.as_deref().unwrap_or("dev")).with_context(|| {
+    let task_type = affine_tasks::TaskType::parse(args.ty.as_deref().unwrap_or("dev"))
+        .with_context(|| {
             format!(
                 "--type '{}': ожидался dev|spike|bug",
-                ty.as_deref().unwrap_or("")
+                args.ty.as_deref().unwrap_or("")
             )
         })?;
-    let body = if stdin {
+    let body = if args.stdin {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
         buf
     } else {
         String::new()
     };
-    let row = affine_tasks::create_task(client, cfg, board, title, &body, task_type).await?;
+    let row = affine_tasks::create_task(client, cfg, board, &args.title, &body, task_type).await?;
     println!("создана: {}", row.title);
     println!("  строка: {}", row.row_id);
     println!("  тело:   {}", row.body_doc);
     // аттачи — после «создана»: сбой не прячет id задачи,
     // ретрай create осознан (задача уже существует)
-    if !attach.is_empty() {
-        crate::affine_blob::attach_files(cfg, &row.body_doc, &attach).await?;
+    if !args.attach.is_empty() {
+        crate::affine_blob::attach_files(cfg, &row.body_doc, &args.attach).await?;
     }
     Ok(())
 }
@@ -172,11 +231,10 @@ async fn edit(
     cfg: &AffineConfig,
     root: &std::path::Path,
     project: &str,
-    id: String,
-    patch: affine_tasks::RowPatch,
+    args: EditArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
-    affine_tasks::edit_row(client, cfg, &board, &row, &patch).await?;
+    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    affine_tasks::edit_row(client, cfg, &board, &row, &args.patch).await?;
     println!("обновлено: {}", row.title);
     Ok(())
 }
@@ -227,12 +285,10 @@ async fn comment(
     cfg: &AffineConfig,
     root: &std::path::Path,
     project: &str,
-    id: String,
-    stdin: bool,
-    text: Vec<String>,
+    args: CommentArgs,
 ) -> anyhow::Result<()> {
-    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
-    let body = facts::read_text(stdin, &text)?;
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let body = facts::read_text(args.stdin, &args.text)?;
     if body.trim().is_empty() {
         anyhow::bail!("пустой коммент");
     }
@@ -246,16 +302,15 @@ async fn close_task(
     cfg: &AffineConfig,
     root: &std::path::Path,
     project: &str,
-    id: String,
-    note: Option<String>,
+    args: CloseArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     let patch = affine_tasks::RowPatch {
         status: Some("Done".into()),
         ..Default::default()
     };
     affine_tasks::edit_row(client, cfg, &board, &row, &patch).await?;
-    if let Some(note) = note {
+    if let Some(note) = args.note {
         affine_tasks::comment_task(client, cfg, &row, &note).await?;
     }
     println!("закрыта: {}", row.title);
@@ -267,15 +322,13 @@ async fn body(
     cfg: &AffineConfig,
     root: &std::path::Path,
     project: &str,
-    id: String,
-    md: Option<String>,
-    replace: bool,
+    args: BodyArgs,
 ) -> anyhow::Result<()> {
-    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
+    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     if row.body_doc.is_empty() {
         anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
     }
-    let text = match &md {
+    let text = match &args.md {
         Some(path) => std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?,
         None => {
             let mut buf = String::new();
@@ -283,7 +336,7 @@ async fn body(
             buf
         }
     };
-    if replace {
+    if args.replace {
         let n_diagrams = affine_tasks::replace_body(client, cfg, &row.body_doc, &text).await?;
         println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
     } else {
