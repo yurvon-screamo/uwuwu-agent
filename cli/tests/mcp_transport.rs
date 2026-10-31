@@ -97,7 +97,11 @@ fn serve(
     }
     let req = String::from_utf8_lossy(&buf).to_string();
     log.lock().unwrap().push(req.clone());
-    // echo id запроса в шаблон ответа (у уведомлений id нет — {ID} не встречается)
+    // echo id запроса в шаблон ответа (у уведомлений id нет — {ID} не встречается).
+    // Инвариант порядка: serde_json без preserve_order сериализует ключи
+    // объекта алфавитно (BTreeMap), а "id" < "jsonrpc" < "method" — top-level
+    // id встречается в теле первым. Смена сериализации потребует честного
+    // JSON-парсинга вместо split.
     let id = req
         .split("\"id\":")
         .nth(1)
@@ -138,12 +142,26 @@ fn test_cfg(mock: &MockGateway) -> AffineConfig {
 
 /// HOME → временный каталог на время замыкания: изоляция общего
 /// session-файла от реальной машины (все тесты файла — serial).
+/// Drop-guard: реальный HOME восстанавливается и при панике тела теста.
+struct TempHome {
+    real: String,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        std::env::set_var("HOME", &self.real);
+    }
+}
+
 fn with_temp_home(f: impl FnOnce()) {
-    let real = std::env::var("HOME").unwrap_or_default();
-    let dir = tempfile::TempDir::new().unwrap();
-    std::env::set_var("HOME", dir.path());
+    let guard = TempHome {
+        real: std::env::var("HOME").unwrap_or_default(),
+        _dir: tempfile::TempDir::new().unwrap(),
+    };
+    std::env::set_var("HOME", guard._dir.path());
     f();
-    std::env::set_var("HOME", real);
+    drop(guard);
 }
 
 fn session_file() -> std::path::PathBuf {
