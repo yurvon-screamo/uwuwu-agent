@@ -25,6 +25,8 @@ const DB_PATH = process.env.UWUWU_DREAMER_DB
 // тулзы живут в этом же репо (демон — dreamer/, аудит — tools/)
 const AUDIT_PATH = process.env.UWUWU_DREAMER_AUDIT
   ?? resolve(import.meta.dir, "../tools/opencode_audit.py")
+const WIKI_OPS_PATH = process.env.UWUWU_DREAMER_WIKIOPS
+  ?? resolve(import.meta.dir, "../tools/wiki_ops.py")
 
 const TICK_SEC = Number(process.env.UWUWU_DREAMER_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_DREAMER_ONCE === "1"
@@ -35,6 +37,9 @@ const IDLE_MS = Number(process.env.UWUWU_DREAMER_IDLE_MIN ?? 30) * 60_000
 const BACKLOG_DAYS = Number(process.env.UWUWU_DREAMER_BACKLOG_DAYS ?? 3)
 /** дример живёт не дольше — потом failed → retry */
 const RUN_TIMEOUT_MS = Number(process.env.UWUWU_DREAMER_RUN_TIMEOUT_MIN ?? 120) * 60_000
+/** после спавна прогон нельзя закрыть без ответа раньше этого окна
+ *  (гонка «спавн → появление сессии в /api/session/active») */
+const GRACE_MS = 3 * 60_000
 const MAX_ATTEMPTS = 3
 /** одновременных дримеров: throttle инфраструктуры, не фильтр значимости */
 const CONCURRENCY = Number(process.env.UWUWU_DREAMER_CONCURRENCY ?? 1)
@@ -169,7 +174,7 @@ function dreamerTimedOut(db: Database, dreamerSes: string): boolean {
   const row = db
     .query(`SELECT time_updated FROM session_v2 WHERE id = ?`)
     .get(dreamerSes) as { time_updated: number } | null
-  if (row === null) return false // сессии нет в БД — решает sessionAlive
+  if (row === null) return false // сессии нет в БД — прогон закрыт реконсилиацией
   return Date.now() - row.time_updated > RUN_TIMEOUT_MS
 }
 
@@ -208,17 +213,35 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
   // ——— реконсилиация живых прогонов (не зависит от idle-списка: оживание
   //     анализируемой сессии не должно мешать закрыть прогон по факту) ———
   const running = Object.entries(state.sessions)
-    .filter(([, t]) => t.status === "running" || (t.status === "pending" && t.dreamerSes !== null))
+    .filter(([, t]) => t.status === "running")
   for (const [sid, tracked] of running) {
     if (tracked.dreamerSes === null) continue
+    // young-run grace: между спавном и попаданием сессии в /active есть окно —
+    // не закрываем прогон без ответа раньше GRACE_MS (гонка «спавн → active»)
+    if (Date.now() - tracked.at < GRACE_MS) continue
     const session = fetchSessionById(db, sid)
-    if (session === null) continue
+    if (session === null) {
+      // исходная сессия удалена из опенкода: анализировать нечего, ретраить
+      // нечего — гасим дримера (если жив) и закрываем прогон, иначе слот
+      // зависнет навсегда и (при concurrency=1) остановит всю очередь
+      await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+      tracked.status = "done"
+      tracked.at = Date.now()
+      log(`прогон ${sid.slice(0, 8)}: исходная сессия удалена — прогон закрыт`)
+      saveState(state)
+      continue
+    }
     const finished = await sessionFinished(tracked.dreamerSes)
     if (finished === null) continue
     const timedOut = !finished && dreamerTimedOut(db, tracked.dreamerSes)
     if (!finished && !timedOut) continue
     const replied = hasAssistantReply(db, tracked.dreamerSes)
     const result = applyRunOutcome(tracked, session, { replied, dead: finished, timedOut }, MAX_ATTEMPTS)
+    if (result === "failed") {
+      // зависший дример может доплывать и писать в вики вне контроля state —
+      // гасим перед retry-спавном нового
+      await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+    }
     log(`прогон ${sid.slice(0, 8)} → ${result} (replied=${replied}${timedOut ? ", timeout" : ""})`)
     saveState(state)
   }
@@ -234,6 +257,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
       sessionId: cand.session.id,
       sessionTitle: cand.session.title,
       auditPath: AUDIT_PATH,
+      wikiOpsPath: WIKI_OPS_PATH,
       dbPath: DB_PATH,
     })
     if (DRY_RUN) {

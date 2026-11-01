@@ -132,7 +132,8 @@ impl MigrationMap {
 }
 
 /// Frontmatter fields the migration cares about, parsed from the simple
-/// `key: value` / `key: [a, b]` lines used by experience and fact files.
+/// `key: value` / `key: [a, b]` lines used by experience articles and
+/// legacy daily-bucket files.
 #[derive(Default)]
 pub struct Frontmatter {
     pub title: Option<String>,

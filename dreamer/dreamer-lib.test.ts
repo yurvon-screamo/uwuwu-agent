@@ -167,9 +167,10 @@ describe("hasAssistantReply", () => {
 
 describe("dreamerPrompt / isValidTracked", () => {
   test("промпт содержит входы", () => {
-    const p = dreamerPrompt({ sessionId: "ses_abc", sessionTitle: "тема", auditPath: "/a/opencode_audit.py", dbPath: "/b/opencode.db" })
+    const p = dreamerPrompt({ sessionId: "ses_abc", sessionTitle: "тема", auditPath: "/a/opencode_audit.py", wikiOpsPath: "/a/wiki_ops.py", dbPath: "/b/opencode.db" })
     expect(p).toContain("ses_abc")
     expect(p).toContain("opencode_audit.py")
+    expect(p).toContain("wiki_ops.py")
     expect(p).toContain("opencode.db")
     expect(p).toContain("bash")
   })

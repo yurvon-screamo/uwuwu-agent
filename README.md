@@ -6,7 +6,7 @@
 
 ```
 opencodereview/ правила ревью
-agents/        субагенты: code-quality-reviewer, developer, dreamer, office-coworker
+agents/        субагенты: code-quality-reviewer, developer, dreamer
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)

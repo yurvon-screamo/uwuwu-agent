@@ -115,7 +115,8 @@ function isCovered(tracked: TrackedSession, session: SessionRow): boolean {
 /**
  * Кандидаты на спавн дримера: idle-корневые сессии, которые
  * не обработаны / ожили после прошлого прогона / не исчерпали ретраи.
- * Порядок — по time_updated (старые вперёд).
+ * Порядок входа — свежие вперёд (осознанно: недавняя сессия анализируется
+ * точнее — контекст и git-стейт ещё актуальны; FIFO жертвовал бы свежестью).
  */
 export function pickCandidates(
   sessions: SessionRow[],
@@ -235,6 +236,7 @@ export interface PromptInput {
   sessionId: string
   sessionTitle: string | null
   auditPath: string
+  wikiOpsPath: string
   dbPath: string
 }
 
@@ -250,6 +252,7 @@ export function dreamerPrompt(input: PromptInput): string {
     `Входы:`,
     `- дамп сессии: python3 "${input.auditPath}" session ${input.sessionId} --compact --db "${input.dbPath}"`,
     `- БД опенкода (readonly, при необходимости прямых SELECT): ${input.dbPath}`,
+    `- тулза вики (абсолютный путь — cwd у тебя чужой проект): "${input.wikiOpsPath}"`,
     ``,
     `Действуй строго по своей методике. Заверши структурированным отчётом`,
     `(обязательна строка о выполненных bash-командах: git/python3/… или причина отказа).`,
