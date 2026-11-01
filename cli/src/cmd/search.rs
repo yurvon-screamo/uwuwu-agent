@@ -29,11 +29,11 @@ pub(crate) async fn run(cfg: &AffineConfig, cmd: SearchCmd) -> anyhow::Result<()
         None
     };
 
-    let server_res = server_search(cfg, &query, limit.max(10)).await;
+    let server_res = server_search(cfg, &query, limit).await;
     let mut printed = 0usize;
     match server_res {
         Some(Ok(hits)) => {
-            for h in &hits {
+            for h in hits.iter().take(limit) {
                 println!(
                     "server\t{}",
                     if h.title.is_empty() { "-" } else { &h.title }
