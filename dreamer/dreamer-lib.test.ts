@@ -3,7 +3,8 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import {
   applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions, fetchSessionById,
-  hasAssistantReply, idleBefore, isValidTracked, markBacklog, pickCandidates,
+  hasAssistantReply, hasAssistantReplySince, idleBefore, isValidTracked, markBacklog,
+  normalizeTracked, pickCandidates, wakeupPrompt,
   type SessionRow, type TrackedSession,
 } from "./dreamer-lib"
 
@@ -68,12 +69,12 @@ describe("fetchRootSessions", () => {
 
 describe("pickCandidates", () => {
   const tracked = (over: Partial<TrackedSession>): TrackedSession => ({
-    status: "done", lastProcessedUpdate: 999, attempts: 0, dreamerSes: null, at: 0, ...over,
+    status: "done", lastProcessedUpdate: 999, attempts: 0, dreamerSes: null, wokenAt: 0, at: 0, ...over,
   })
   test("новая сессия", () => {
     const st = emptyState()
     const c = pickCandidates([sess("ses_root_idle")], st, 3)
-    expect(c).toEqual([{ session: sess("ses_root_idle"), reason: "new", resetAttempts: false }])
+    expect(c).toEqual([{ session: sess("ses_root_idle"), reason: "new", action: "spawn", resetAttempts: false }])
   })
   test("done и не ожила — не кандидат", () => {
     const st = emptyState()
@@ -133,7 +134,7 @@ describe("markBacklog", () => {
 })
 
 describe("applyRunOutcome", () => {
-  const base = (): TrackedSession => ({ status: "running", lastProcessedUpdate: 500, attempts: 1, dreamerSes: "ses_d1", at: 0 })
+  const base = (): TrackedSession => ({ status: "running", lastProcessedUpdate: 500, attempts: 1, dreamerSes: "ses_d1", wokenAt: 0, at: 0 })
   const s = sess("ses_root_idle")
   test("живой прогон — keep", () => {
     expect(applyRunOutcome(base(), s, { replied: false, dead: false, timedOut: false }, 3)).toBe("keep")
@@ -179,5 +180,52 @@ describe("dreamerPrompt / isValidTracked", () => {
     expect(isValidTracked({ status: "done", lastProcessedUpdate: 1, attempts: 0, dreamerSes: null, at: 1 })).toBe(true)
     expect(isValidTracked({ status: "bogus" })).toBe(false)
     expect(isValidTracked(null)).toBe(false)
+  })
+})
+
+describe("wakeup-модель (1 сессия = 1 дример)", () => {
+  const tracked = (over: Partial<TrackedSession>): TrackedSession => ({
+    status: "done", lastProcessedUpdate: 1, attempts: 0, dreamerSes: null, wokenAt: 0, at: 0, ...over,
+  })
+
+  test("revived с dreamerSes → wakeup, без → spawn", () => {
+    const st = emptyState()
+    st.sessions["ses_root_idle"] = tracked({ dreamerSes: "ses_d1", lastProcessedUpdate: 1 })
+    const st2 = emptyState()
+    st2.sessions["ses_root_idle"] = tracked({ dreamerSes: null, lastProcessedUpdate: 1 })
+    expect(pickCandidates([sess("ses_root_idle")], st, 3)[0]?.action).toBe("wakeup")
+    expect(pickCandidates([sess("ses_root_idle")], st2, 3)[0]?.action).toBe("spawn")
+  })
+
+  test("retry с dreamerSes → wakeup той же сессии", () => {
+    const st = emptyState()
+    st.sessions["ses_root_idle"] = tracked({ status: "failed", attempts: 1, dreamerSes: "ses_d1", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    const c = pickCandidates([sess("ses_root_idle")], st, 3)
+    expect(c[0]?.reason).toBe("retry")
+    expect(c[0]?.action).toBe("wakeup")
+  })
+
+  test("normalizeTracked: старый state без wokenAt → 0", () => {
+    const n = normalizeTracked({ status: "done", lastProcessedUpdate: 5, attempts: 0, dreamerSes: null, at: 1 })
+    expect(n?.wokenAt).toBe(0)
+    expect(normalizeTracked({ status: "bogus" })).toBeNull()
+  })
+})
+
+describe("hasAssistantReplySince / wakeupPrompt", () => {
+  test("ответ после границы считается, до — нет", () => {
+    insMsg("ses_d_w", "assistant")
+    db.query("UPDATE session_message SET time_created = 1000 WHERE session_id = 'ses_d_w'").run()
+    expect(hasAssistantReply(db, "ses_d_w")).toBe(true)
+    expect(hasAssistantReplySince(db, "ses_d_w", 1500)).toBe(false)
+    db.query("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('mx2', 'ses_d_w', 'assistant', 99, 2000, 0, '{}')").run()
+    expect(hasAssistantReplySince(db, "ses_d_w", 1500)).toBe(true)
+    expect(hasAssistantReplySince(db, "ses_d_none", 0)).toBe(false)
+  })
+  test("wakeupPrompt содержит границу и инструкцию дельты", () => {
+    const p = wakeupPrompt({ sessionId: "ses_abc", sessionTitle: "т", auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" })
+    expect(p).toContain("2026-11-01T12:00:00.000Z")
+    expect(p).toContain("дельту")
+    expect(p).toContain("не дублируй")
   })
 })

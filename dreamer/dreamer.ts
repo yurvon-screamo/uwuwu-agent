@@ -10,7 +10,8 @@ import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
 import {
   applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions, fetchSessionById,
-  hasAssistantReply, idleBefore, isValidTracked, markBacklog, pickCandidates,
+  hasAssistantReply, hasAssistantReplySince, idleBefore, markBacklog, normalizeTracked,
+  pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
 
@@ -92,7 +93,8 @@ function loadState(): DreamerState {
     out.bootstrapped = (raw as { bootstrapped?: unknown }).bootstrapped === true
     if (sessions !== null && typeof sessions === "object") {
       for (const [k, v] of Object.entries(sessions as Record<string, unknown>)) {
-        if (isValidTracked(v)) out.sessions[k] = v
+        const normalized = normalizeTracked(v as Record<string, unknown>)
+        if (normalized !== null) out.sessions[k] = normalized
         else log(`state: запись ${k.slice(0, 8)} битая — пропущена`)
       }
     }
@@ -169,6 +171,19 @@ async function sessionFinished(sid: string): Promise<boolean | null> {
   }
 }
 
+/** Живость по GET /session/{id}: true = существует (не 404/400).
+ *  Для wakeup-верификации: завершённая idle-сессия тоже «жива» — будить можно. */
+async function sessionAlive(sessionID: string): Promise<boolean | null> {
+  try {
+    await restCall(`/session/${sessionID}`)
+    return true
+  } catch (e) {
+    const status = (e as { status?: number }).status
+    if (status === 404 || status === 400) return false
+    return null
+  }
+}
+
 /** time_updated сессии дримера: живая, но молчащая дольше таймаута = зависла. */
 function dreamerTimedOut(db: Database, dreamerSes: string): boolean {
   const row = db
@@ -192,6 +207,7 @@ function startRun(
     lastProcessedUpdate: timeUpdated,
     attempts,
     dreamerSes: null,
+    wokenAt: 0,
     at: Date.now(),
   }
   state.sessions[sid] = tracked
@@ -210,21 +226,35 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     saveState(state)
   }
 
+  // ——— гигиена инварианта «≤1 дример-сессия на исходную»: исходник удалён
+  //     из опенкода при любом статусе → гасим осиротевшего дримера —
+  //     иначе он навсегда повиснет в опенкоде без потребителя ———
+  for (const [sid, tracked] of Object.entries(state.sessions)) {
+    if (tracked.dreamerSes === null || tracked.status === "running") continue
+    if (fetchSessionById(db, sid) === null) {
+      await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+      tracked.dreamerSes = null
+      tracked.at = Date.now()
+      log(`${sid.slice(0, 8)}: исходная сессия удалена — дример-сессия погашена`)
+      saveState(state)
+    }
+  }
+
   // ——— реконсилиация живых прогонов (не зависит от idle-списка: оживание
   //     анализируемой сессии не должно мешать закрыть прогон по факту) ———
   const running = Object.entries(state.sessions)
     .filter(([, t]) => t.status === "running")
   for (const [sid, tracked] of running) {
     if (tracked.dreamerSes === null) continue
-    // young-run grace: между спавном и попаданием сессии в /active есть окно —
-    // не закрываем прогон без ответа раньше GRACE_MS (гонка «спавн → active»)
+    // young-run grace: между спавном/wakeup и попаданием сессии в /active
+    // есть окно — не закрываем прогон без ответа раньше GRACE_MS
     if (Date.now() - tracked.at < GRACE_MS) continue
     const session = fetchSessionById(db, sid)
     if (session === null) {
-      // исходная сессия удалена из опенкода: анализировать нечего, ретраить
-      // нечего — гасим дримера (если жив) и закрываем прогон, иначе слот
-      // зависнет навсегда и (при concurrency=1) остановит всю очередь
+      // исходная сессия удалена: анализировать нечего — гасим дримера и
+      // закрываем прогон, иначе слот зависнет навсегда (concurrency=1 → стоп очереди)
       await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+      tracked.dreamerSes = null
       tracked.status = "done"
       tracked.at = Date.now()
       log(`прогон ${sid.slice(0, 8)}: исходная сессия удалена — прогон закрыт`)
@@ -235,24 +265,72 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     if (finished === null) continue
     const timedOut = !finished && dreamerTimedOut(db, tracked.dreamerSes)
     if (!finished && !timedOut) continue
-    const replied = hasAssistantReply(db, tracked.dreamerSes)
+    // wakeup-прогон: ответ должен быть ПОЗЖЕ пробуждения (старые — прошлый цикл)
+    const replied = tracked.wokenAt > 0
+      ? hasAssistantReplySince(db, tracked.dreamerSes, tracked.wokenAt)
+      : hasAssistantReply(db, tracked.dreamerSes)
     const result = applyRunOutcome(tracked, session, { replied, dead: finished, timedOut }, MAX_ATTEMPTS)
     if (result === "failed" || result === "gave_up") {
       // зависший дример может доплывать и писать в вики вне контроля state —
       // гасим его (dead-случаи безвредны: 404 → catch)
       await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+      tracked.dreamerSes = null
     }
     log(`прогон ${sid.slice(0, 8)} → ${result} (replied=${replied}${timedOut ? ", timeout" : ""})`)
     saveState(state)
   }
 
-  // ——— кандидаты и спавн ———
+  // ——— кандидаты: wakeup существующей дример-сессии или спавн новой ———
   const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
   const activeRuns = (): number =>
     Object.values(state.sessions).filter((t) => t.status === "running" || t.status === "pending").length
   log(`очередь: ${candidates.length} кандидатов, активных прогонов: ${activeRuns()}`)
   for (const cand of candidates) {
     if (activeRuns() >= CONCURRENCY) break
+    if (DRY_RUN) {
+      log(`DRY_RUN: ${cand.action} дримера над ${cand.session.id.slice(0, 8)} (${cand.reason}) — пропущен`)
+      continue
+    }
+    const prev = state.sessions[cand.session.id]
+
+    if (cand.action === "wakeup" && prev !== undefined && prev.dreamerSes !== null) {
+      const dreamerSes = prev.dreamerSes
+      // верификация живости: либа детерминирована от state, REST — здесь
+      const alive = await sessionAlive(dreamerSes)
+      if (alive === true) {
+        // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
+        // закроет как failed+attempt, восстановления без потерь)
+        prev.status = "running"
+        prev.wokenAt = Date.now()
+        prev.at = prev.wokenAt
+        if (cand.resetAttempts) prev.attempts = 0
+        saveState(state)
+        const prompt = wakeupPrompt({
+          sessionId: cand.session.id,
+          sessionTitle: cand.session.title,
+          auditPath: AUDIT_PATH,
+          wikiOpsPath: WIKI_OPS_PATH,
+          dbPath: DB_PATH,
+          sinceIso: new Date(prev.lastProcessedUpdate).toISOString(),
+        })
+        const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
+        if (!ok) {
+          prev.attempts += 1
+          prev.status = prev.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
+          prev.at = Date.now()
+          log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup-промпт упал (попытка ${prev.attempts})`)
+          saveState(state)
+          continue
+        }
+        log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup дримера ${dreamerSes}`)
+        continue
+      }
+      if (alive === null) continue // неизвестно — не решаем
+      // 404/400: дример-сессия удалена → spawn-fallback (инвариант ≤1 живого)
+      log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
+      prev.dreamerSes = null
+    }
+
     const prompt = dreamerPrompt({
       sessionId: cand.session.id,
       sessionTitle: cand.session.title,
@@ -260,11 +338,6 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
       wikiOpsPath: WIKI_OPS_PATH,
       dbPath: DB_PATH,
     })
-    if (DRY_RUN) {
-      log(`DRY_RUN: спавн дримера над ${cand.session.id.slice(0, 8)} (${cand.reason}) — пропущен`)
-      continue
-    }
-    const prev = state.sessions[cand.session.id]
     const tracked = startRun(state, cand.session.id, cand.session.timeUpdated, cand.resetAttempts ? 0 : (prev?.attempts ?? 0))
     const dreamerSes = await fireDreamer(cand.session.id, cand.session.title ?? "сессия", prompt)
     if (dreamerSes === null) {
