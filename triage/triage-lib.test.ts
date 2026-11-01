@@ -35,6 +35,10 @@ test("classifyUpdate: /start и /help — справка; подпись к фо
     .toEqual({ kind: "req", msg: msg({ text: undefined, caption: " разбери скрин " }), text: "разбери скрин" })
 })
 
+test("classifyUpdate: /reset — пересоздание сессии", () => {
+  expect(classifyUpdate({ update_id: 1, message: msg({ text: "/reset" }) }, "yurvon_screamo").kind).toBe("reset")
+})
+
 test("classifyUpdate: медиа без текста — media", () => {
   expect(classifyUpdate({ update_id: 1, message: msg({ text: undefined, caption: undefined }) }, "yurvon_screamo").kind).toBe("media")
 })
@@ -98,13 +102,14 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState("junk")).toEqual({ offset: 0, queue: [] })
   expect(validState({ offset: 1.5 })).toEqual({ offset: 0, queue: [] }) // нецелый offset — невалиден
   const good = {
-    offset: 12, chatID: 42, session: "ses_dialog", instructionsHash: "a".repeat(64), broken: 1,
+    offset: 12, chatID: 42, session: "ses_dialog", broken: 1, lastResetAt: 5, pausedUntil: 9,
+    defHash: "a".repeat(64), defChangeNotified: true,
     queue: [{ text: "заявка", chatID: 42, msgID: 3, receivedAt: 5, attempts: 2 }],
     run: { sessionID: "ses_dialog", startedAt: 100, req: { text: "в работе", chatID: 42, msgID: 2, receivedAt: 4 } },
   }
   expect(validState(good)).toEqual(good)
   const broken = {
-    offset: -3, session: "nope", instructionsHash: "x".repeat(65), broken: -1,
+    offset: -3, session: "nope", broken: -1, lastResetAt: -5, defHash: "x".repeat(65), defChangeNotified: "yes",
     queue: ["мусор", null, { text: " ", chatID: 1 }, { text: "ок", chatID: 1, msgID: 2, attempts: -1 }],
     run: { sessionID: "nope", startedAt: 1, req: {} },
   }

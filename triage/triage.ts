@@ -11,7 +11,7 @@
 // доставки может задублировать ответ. Poison-защита: 5 неудачных попыток
 // подъёма хода → dead-letter с полным текстом юзеру.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -24,18 +24,20 @@ import {
 
 const HERE = dirname(new URL(import.meta.url).pathname)
 const CFG = join(HERE, "hub.json")        // { token, owner, model? } — секрет, gitignored
-const PROMPT_MD = join(HERE, "prompt.md") // методичка триажа — в git, правится без кода
+const AGENT_DEF_SRC = join(HERE, "agent.md") // нативный деф агента: frontmatter (модель/права) + методичка (системный промпт)
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-triage")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
 /** изолированный cwd сессии диалога: переписка — недоверенный текст,
- *  домашний каталог сессия видеть не должна; AGENTS.md сюда материализует
- *  демон из prompt.md (поведенческий дом сессии).
+ *  домашний каталог сессия видеть не должна; деф агента материализуется
+ *  демон в .opencode/agents/ отсюда (нативный механизм конфигурации).
  *  Модель угроз — осознанный трейд-оф диалоговости: текст владельца идёт
  *  в сессию как есть, без маркеров-границ (единственный авторизованный
- *  юзер; инъекции из пересланного контента сдерживает только
- *  поведенческий фрейминг методички). */
+ *  юзер); сдерживание инструментальное — нативные permissions дефа
+ *  (bash: только uwuwu-cli, edit: deny). */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
+const AGENT_NAME = "triage"
+const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${AGENT_NAME}.md`)
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
@@ -44,6 +46,8 @@ const RUN_TIMEOUT_MS = 15 * 60_000 // ход дольше — отпускаем
 const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных попыток хода подряд
 const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
 const BROKEN_SESSION_RESET = 3 // оборванных финалов подряд → пересоздание сессии
+const RESET_WINDOW_MS = 30 * 60_000 // пересоздания чаще окна = стабильная деградация
+const RESET_PAUSE_MS = 30 * 60_000 // пауза обработки при серии пересозданий
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 const HELP = [
@@ -51,6 +55,7 @@ const HELP = [
   "",
   "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
   "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
+  "/reset — пересоздать сессию с нуля (контекст переписки сбросится; методичка и модель возьмутся актуальные).",
 ].join("\n")
 
 interface Cfg { token: string; owner: string; model?: { providerID: string; id: string } }
@@ -179,27 +184,29 @@ async function sessionMessages(sessionID: string): Promise<Parameters<typeof ext
 
 // ——— вечная сессия диалога ———
 
-/** Материализовать AGENTS.md воркспейса из prompt.md (если изменился) —
- *  сессии, созданные в этом location, подхватывают методичку на старте.
- *  NB (проверено эмпирически): живая сессия AGENTS.md НЕ перечитывает —
- *  замораживается на момент создания; обновления доезжают инъекцией
- *  (refreshInstructions). Атомарно (tmp+rename), как state.json. */
-const syncWorkspaceInstructions = (): void => {
-  mkdirSync(WORKSPACE, { recursive: true })
-  const src = readFileSync(PROMPT_MD, "utf-8")
-  const dst = join(WORKSPACE, "AGENTS.md")
+/** Материализовать нативный деф агента в воркспейс (если изменился) —
+ *  сессии, созданные в этом location с agent:"triage", получают его
+ *  системным промптом + нативными правами. Вызов и на старте демона, и
+ *  перед созданием сессии: правка agent.md в репо подхватывается без
+ *  рестарта (живая сессия — нативным switchAgent в ensureSession).
+ *  Атомарно (tmp+rename). Заодно сносит stale-AGENTS.md прошлой схемы. */
+const syncAgentDef = (): void => {
+  mkdirSync(dirname(AGENT_DEF_DST), { recursive: true })
+  const src = readFileSync(AGENT_DEF_SRC, "utf-8")
   let prev = ""
-  try { prev = readFileSync(dst, "utf-8") } catch {}
+  try { prev = readFileSync(AGENT_DEF_DST, "utf-8") } catch {}
   if (prev !== src) {
-    const tmp = `${dst}.tmp`
+    const tmp = `${AGENT_DEF_DST}.tmp`
     writeFileSync(tmp, src)
-    renameSync(tmp, dst)
-    log(`AGENTS.md воркспейса обновлён (${src.length} байт)`)
+    renameSync(tmp, AGENT_DEF_DST)
+    log(`деф агента ${AGENT_NAME} материализован (${src.length} байт)`)
+  }
+  const staleAgents = join(WORKSPACE, "AGENTS.md")
+  if (existsSync(staleAgents)) {
+    try { rmSync(staleAgents) } catch {}
+    log("stale AGENTS.md воркспейса удалён (схема до нативных дефов)")
   }
 }
-
-const instructionsHash = (): string =>
-  createHash("sha256").update(readFileSync(PROMPT_MD, "utf-8")).digest("hex")
 
 /** Жива ли сессия (404/400 = нет). null = неизвестно, не блокируем. */
 const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
@@ -213,22 +220,48 @@ const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
   }
 }
 
+const defHash = (): string =>
+  createHash("sha256").update(readFileSync(AGENT_DEF_SRC, "utf-8")).digest("hex")
+
 /** Единая сессия диалога: создаётся один раз, переживает рестарты демона
  *  (контекст всей переписки + компакция); пропала (снесли в TUI) — пересоздаём,
- *  контекст теряется: лог + честное уведомление юзеру. */
+ *  контекст теряется: лог + честное уведомление юзеру.
+ *  Системный промпт сессии снапшотится на создании (эмпирика 2.2.5: деф/
+ *  AGENTS.md/switchAgent/instructions-entries живую сессию не меняют) —
+ *  живая сессия нативно следует только модели (switchModel из hub.json);
+ *  изменение дефа → одно уведомление «примени через /reset» (контекст
+ *  теряется — решение за владельцем). */
 const ensureSession = async (): Promise<string> => {
-  let recreated = false
   if (state.session !== undefined) {
     const alive = await sessionAlive(state.session)
-    if (alive === true) return state.session
+    if (alive === true) {
+      try { await restCall(`/session/${state.session}/model`, { method: "POST", body: { model: cfg.model ?? MODEL } }) } catch (e) { log(`switchModel: ${e}`) }
+      const h = defHash()
+      if (h !== state.defHash && state.defChangeNotified !== true && state.chatID !== undefined) {
+        state.defChangeNotified = true
+        save()
+        log(`деф агента изменился — живая сессия работает по старой методичке до /reset`)
+        await send(state.chatID, "ℹ️ Методичка триажа изменилась. Живой диалог продолжает работать по прежней версии — пришли /reset, когда готов пересоздать сессию (контекст переписки сбросится).")
+      }
+      return state.session
+    }
     if (alive === null) return state.session // неизвестно — не пересоздаём
     log(`сессия ${state.session} пропала — пересоздаю (контекст переписки потерян)`)
-    recreated = true
+    await recreateSession(true)
+    return state.session!
   }
+  await recreateSession(false)
+  return state.session!
+}
+
+const recreateSession = async (notify: boolean): Promise<void> => {
+  syncAgentDef()
   const raw = await restCall("/session", {
     method: "POST",
     body: {
       title: SESSION_TITLE,
+      agent: AGENT_NAME,
+      // NB: model из дефа не применяется к primary-сессиям — передаём явно
       model: cfg.model ?? MODEL,
       location: { directory: WORKSPACE },
     },
@@ -236,35 +269,14 @@ const ensureSession = async (): Promise<string> => {
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
   state.session = id
-  // новая сессия стартует с текущим AGENTS.md воркспейса — методичка актуальна
-  state.instructionsHash = instructionsHash()
   state.broken = 0
+  state.defHash = defHash()
+  state.defChangeNotified = undefined
   save()
   log(`сессия диалога: ${id}`)
-  if (recreated && state.chatID !== undefined) {
+  if (notify && state.chatID !== undefined) {
     await send(state.chatID, "ℹ️ Сессия диалога пересоздана — контекст переписки сброшен.")
   }
-  return id
-}
-
-/** Обновление методички в ЖИВОЙ сессии: AGENTS.md заморожен на создании,
- *  поэтому изменение prompt.md доезжает инъекцией (разовый ход, юзер его не
- *  видит — это транспорт, не диалог). */
-const refreshInstructions = async (sessionID: string): Promise<void> => {
-  const h = instructionsHash()
-  if (state.instructionsHash === h) return
-  const src = readFileSync(PROMPT_MD, "utf-8")
-  await restCall(`/session/${sessionID}/prompt`, {
-    method: "POST",
-    body: {
-      text: `[обновление методички ·системное сообщение]\n\n${src.trim()}\n\n[конец ·системное сообщение]\n\nЭто актуальная версия методички — действуй по ней, прежнюю считай отменённой. Ответь одной короткой строкой подтверждения.`,
-    },
-  })
-  state.instructionsHash = h
-  save()
-  log(`методичка обновлена в сессии ${sessionID} (инъекция, ${src.length} байт)`)
-  // подтверждение инъекции не ждём финалом: ход-подтверждение короткий,
-  // следующий промпт юзера встанет за ним в очередь того же диалога
 }
 
 /** Неудача попытки хода: transient или poison. attempts считаем в самой
@@ -332,14 +344,29 @@ const deliverFinal = async (run: RunState): Promise<void> => {
     return
   }
   log(`сессия ${run.sessionID}: ${state.broken} оборванных финалов подряд — пересоздаю`)
+  // СБРОС: все мутации state — ДО любых await (уведомление может упасть/крах):
+  // run снесён сразу, иначе рестарт в окне сочтёт ход подтверждённым по тексту
+  // в старой сессии и съест сообщение из очереди (ломая «обработаю заново»)
   state.broken = 0
   state.session = undefined
-  state.instructionsHash = undefined
+  state.run = undefined
   // сообщение не отработано нормально — вернуть в голову очереди начисто
   state.queue.unshift({ text: run.req.text, chatID: run.req.chatID, msgID: run.req.msgID, receivedAt: run.req.receivedAt })
+  // circuit breaker: пересоздания чаще раза в 30 мин = стабильная деградация
+  // (модель выпилена/контекст не лезет) — пауза обработки, спам-цикл разорван
+  const now = Date.now()
+  const rapid = state.lastResetAt !== undefined && now - state.lastResetAt < RESET_WINDOW_MS
+  state.lastResetAt = now
+  if (rapid) {
+    state.pausedUntil = now + RESET_PAUSE_MS
+    log(`пауза обработки до ${new Date(state.pausedUntil).toISOString()} — серия пересозданий`)
+  }
   save()
   if (state.chatID !== undefined) {
-    await send(state.chatID, "⚠️ Диалог деградировал (3 сбоя подряд) — пересоздаю сессию с чистого листа, сообщение обработаю заново.")
+    const msg = state.pausedUntil !== undefined && state.pausedUntil > now
+      ? "⚠️ Диалог стабильно деградирует — пересоздал сессию и приостановил обработку на 30 мин (сообщение в очереди). Глянь лог uwuwu-triage."
+      : "⚠️ Диалог деградировал (3 сбоя подряд) — пересоздаю сессию с чистого листа, сообщение обработаю заново."
+    await send(state.chatID, msg)
   }
 }
 
@@ -422,7 +449,6 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   state.run = { sessionID, startedAt, req }
   save()
   try {
-    await refreshInstructions(sessionID) // инъекция, если методичка изменилась
     await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text: req.text } })
   } catch (e) {
     state.run = undefined
@@ -464,6 +490,17 @@ const runLoop = async (): Promise<void> => {
         continue
       }
 
+      // circuit breaker: серия пересозданий сессии → пауза (сообщения копятся
+      // в очереди, после истечения пойдут в свежую сессию)
+      if (state.pausedUntil !== undefined) {
+        if (Date.now() < state.pausedUntil) {
+          await sleep(Math.min(state.pausedUntil - Date.now(), 30_000))
+          continue
+        }
+        state.pausedUntil = undefined
+        save()
+      }
+
       const r = await startRun()
       if (r === "idle") await sleep(2000)
     } catch (e) {
@@ -497,6 +534,18 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
   }
   if (out.kind === "help") {
     await send(state.chatID, HELP)
+  } else if (out.kind === "reset") {
+    if (state.run !== undefined) {
+      await send(state.chatID, "⏳ Сейчас разбираю сообщение — пришли /reset после моего ответа.")
+    } else {
+      state.session = undefined
+      state.defChangeNotified = undefined
+      state.pausedUntil = undefined
+      state.broken = 0
+      save()
+      log("сессия диалога сброшена командой /reset")
+      await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог заново (методичка и модель возьмутся актуальные).")
+    }
   } else if (out.kind === "media") {
     await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши словами")
   } else {
@@ -538,7 +587,7 @@ const main = async (): Promise<void> => {
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
-  syncWorkspaceInstructions()
+  syncAgentDef()
   const me = await tg("getMe") as { username?: string }
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }
   log(`uwuwu-triage: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${(cfg.model ?? MODEL).id}, опенкод=${reg.url ?? "?"})`)

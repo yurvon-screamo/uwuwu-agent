@@ -42,6 +42,15 @@ export interface TriageState {
   instructionsHash?: string
   /** подряд оборванных финалов (outcome ≠ succeeded): 3 → пересоздание сессии */
   broken?: number
+  /** ms последнего пересоздания по деградации + пауза обработки до:
+   *  circuit breaker от спам-цикла пересозданий */
+  lastResetAt?: number
+  pausedUntil?: number
+  /** sha256 дефа агента, с которым создана живая сессия (системный промпт
+   *  снапшотится на создании — горячо не обновляется); рассинхрон с агент.md
+   *  → одно уведомление владельцу «примени через /reset» */
+  defHash?: string
+  defChangeNotified?: boolean
   queue: Request[]
   run?: RunState
 }
@@ -65,11 +74,14 @@ export function validState(raw: unknown): TriageState {
   if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
   if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
   if (typeof r.session === "string" && r.session.startsWith("ses_")) out.session = r.session
-  if (typeof r.instructionsHash === "string" && r.instructionsHash.length <= 64) {
-    out.instructionsHash = r.instructionsHash
-  }
+  if (typeof r.defHash === "string" && r.defHash.length <= 64) out.defHash = r.defHash
+  if (r.defChangeNotified === true) out.defChangeNotified = true
   if (Number.isInteger(r.broken) && (r.broken as number) >= 0 && (r.broken as number) <= 99) {
     out.broken = r.broken as number
+  }
+  for (const k of ["lastResetAt", "pausedUntil"] as const) {
+    const v = r[k]
+    if (Number.isFinite(v) && (v as number) >= 0) out[k] = v as number
   }
   if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
   const run = r.run
@@ -92,6 +104,7 @@ export function validState(raw: unknown): TriageState {
 export type UpdateOutcome =
   | { kind: "skip" } // не владелец / бот / не сообщение — тихо
   | { kind: "help"; msg: TgMessage } // /start | /help
+  | { kind: "reset"; msg: TgMessage } // /reset — пересоздать сессию диалога
   | { kind: "media"; msg: TgMessage } // медиа без текста
   | { kind: "req"; msg: TgMessage; text: string }
 
@@ -106,6 +119,7 @@ export function classifyUpdate(u: TgUpdate, owner: string): UpdateOutcome {
   const t = (m.text ?? m.caption ?? "").trim()
   if (t === "") return { kind: "media", msg: m }
   if (t === "/start" || t === "/help") return { kind: "help", msg: m }
+  if (t === "/reset") return { kind: "reset", msg: m }
   return { kind: "req", msg: m, text: t }
 }
 
