@@ -15,15 +15,18 @@ export interface TgUpdate {
   message?: TgMessage
 }
 
-/** Заявка владельца, прошедшая фильтр. */
+/** Заявка владельца, прошедшая фильтр. attempts — число неудачных попыток
+ *  поднять прогон (poison-защита очереди). */
 export interface Request {
   text: string
   chatID: number
   msgID: number
   receivedAt: number // ms
+  attempts?: number
 }
 
-/** Активный прогон триажа (персистится — рестарт демона не теряет прогон). */
+/** Активный прогон триажа (персистится — рестарт демона не теряет прогон).
+ *  startedAt = 0 → сессия создана, промпт ещё не подтверждён (окно спавна). */
 export interface RunState {
   sessionID: string
   startedAt: number // ms, момент отправки prompt
@@ -42,8 +45,10 @@ export interface TriageState {
 const isReq = (v: unknown): v is Request => {
   if (v === null || typeof v !== "object") return false
   const r = v as Record<string, unknown>
+  const attemptsOk = r.attempts === undefined
+    || (Number.isInteger(r.attempts) && (r.attempts as number) >= 0)
   return typeof r.text === "string" && r.text.trim() !== ""
-    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID)
+    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk
 }
 
 /** Санитайз state.json: битые поля отбрасываем, always-on демон не роняем. */
@@ -51,7 +56,7 @@ export function validState(raw: unknown): TriageState {
   const out: TriageState = { offset: 0, queue: [] }
   if (raw === null || typeof raw !== "object") return out
   const r = raw as Record<string, unknown>
-  if (Number.isFinite(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
+  if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
   if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
   if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
   const run = r.run
@@ -126,21 +131,24 @@ export function buildPrompt(instructions: string, text: string, nonce: string): 
   return `${instructions.trim()}\n\n[заявка ·${nonce}]\n${text}\n[конец ·${nonce}]\n\nРазбери заявку по методике и ответь сводкой.`
 }
 
-/** Заголовок сессии: первая содержательная строка заявки. */
+/** Заголовок сессии: первая содержательная строка заявки (без разрыва
+ *  суррогатных пар на границе 60). */
 export function runTitle(text: string): string {
   const first = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l !== "") ?? "заявка"
-  return `📥 ${first.slice(0, 60)}`
+  return `📥 ${first.slice(0, cutSafe(first, 60))}`
 }
 
 // ——— доставка в ТГ ———
 
-const cutSafe = (s: string, end: number): number => {
+/** Граница среза, не рвущая суррогатную пару (4-байтные эмодзи): одиночный
+ *  суррогат в sendMessage = reject TG-API. */
+export const cutSafe = (s: string, end: number): number => {
   if (end >= s.length) return end
   const prev = s.charCodeAt(end - 1)
-  return prev >= 0xd800 && prev <= 0xdbff ? end + 1 : end // не рвать суррогатную пару
+  return prev >= 0xd800 && prev <= 0xdbff ? end + 1 : end
 }
 
-/** Нарезка под лимит ТГ (одиночный суррогат = reject sendMessage). */
+/** Нарезка под лимит ТГ. */
 export function plainChunks(s: string, limit = 3800): string[] {
   const out: string[] = []
   let i = 0
@@ -150,4 +158,20 @@ export function plainChunks(s: string, limit = 3800): string[] {
     i = end
   }
   return out
+}
+
+/** Выравнивание html-частей под куски исходного текста (plain-фолбэк
+ *  доставки): при провале HTML-части досылаем ровно соответствующий кусок
+ *  исходника — уже отправленное не дублируется, теги в чат не утекают. */
+export function alignChunks(htmlParts: string[], source: string): string[] {
+  const total = htmlParts.reduce((s, p) => s + p.length, 0) || 1
+  let pos = 0
+  return htmlParts.map((p) => {
+    let end = pos + Math.ceil((p.length / total) * source.length)
+    if (end > source.length) end = source.length
+    end = cutSafe(source, end)
+    const slice = source.slice(pos, end)
+    pos = end
+    return slice
+  })
 }

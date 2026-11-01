@@ -3,13 +3,21 @@
 // getUpdates, заявка владельца → opencode-сессия триажа (glm-5.3-flash,
 // изолированный workspace), поллинг финала → ответ сводкой в ТГ.
 // Занят → очередь. Запуск: systemd --user (uwuwu-triage.service).
+//
+// Гарантии: заявка не теряется при рестарте в любом месте (убирается из
+// очереди только после подтверждённого промпта; спавн-окно держит её и в
+// очереди, и в state.run). Доставка финала — at-least-once: рестарт посреди
+// доставки может задублировать сводку (дедупликацию заявок делает сам
+// триаж-агент на доске). Poison-защита: 5 неудачных спавнов → dead-letter
+// с полным текстом заявки юзеру.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
+import { acquireLock } from "../lib/single-instance"
 import {
-  buildPrompt, classifyUpdate, extractFinal, plainChunks, runTitle, validState,
+  alignChunks, buildPrompt, classifyUpdate, extractFinal, plainChunks, runTitle, validState,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
@@ -18,15 +26,17 @@ const CFG = join(HERE, "hub.json")        // { token, owner, model? } — сек
 const PROMPT_MD = join(HERE, "prompt.md") // методичка триажа — в git, правится без кода
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-triage")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
 /** изолированный cwd триаж-сессий: заявки — недоверенный текст, домашний
  *  каталог сессии видеть не должен */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
-const POLL_SEC = Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) // опрос финала прогона
+// NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
+const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
 const RUN_TIMEOUT_MS = 15 * 60_000 // прогон дольше — отпускаем и говорим юзеру
+const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных спавнов подряд
+const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 const HELP = [
@@ -43,13 +53,20 @@ const log = (m: string): void => {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// конфиг: при прямом запуске — громкий фейл на отсутствии, при импорте в
-// тестах — пустышка (тесты герметичны, без прод-зависимостей)
-const loadJSON = (p: string, fb: () => unknown): unknown => {
-  try { return JSON.parse(readFileSync(p, "utf-8")) }
-  catch (e) { if (import.meta.main) throw e; return fb() }
+let stopping = false
+// координированный останов: оба цикла доходят до безопасной точки, процесс
+// выходит сам; grace-таймаут в acquireLock — страховка от зависшего drainage
+const loopDone = { run: false, poll: false }
+const maybeExit = (): void => {
+  if (loopDone.run && loopDone.poll) {
+    save()
+    process.exit(0)
+  }
 }
-const cfg = loadJSON(CFG, () => ({ token: "", owner: "" })) as Partial<Cfg>
+
+// конфиг: ошибки чтения не роняем на импорте — main() скажет человечно
+let cfg: Partial<Cfg> = {}
+try { cfg = JSON.parse(readFileSync(CFG, "utf-8")) as Partial<Cfg> } catch {}
 
 // state: терпеливое чтение (битый файл не должен крашить always-on демон)
 // + атомарная запись (tmp+rename) с бэкапом
@@ -68,97 +85,61 @@ const save = (): void => {
   renameSync(tmp, STATE_FILE)
 }
 
-// ——— одиночный инстанс ———
-
-function acquireLock(): boolean {
-  mkdirSync(STATE_DIR, { recursive: true })
-  try {
-    mkdirSync(LOCK_DIR, { recursive: false })
-  } catch {
-    try {
-      const pid = Number(readFileSync(join(LOCK_DIR, "pid"), "utf-8").trim())
-      if (Number.isInteger(pid)) {
-        process.kill(pid, 0)
-        return false
-      }
-    } catch { /* мёртвый lock — захватываем */ }
-    try {
-      rmSync(LOCK_DIR, { recursive: true, force: true })
-      mkdirSync(LOCK_DIR, { recursive: false })
-    } catch {
-      return false
-    }
-  }
-  writeFileSync(join(LOCK_DIR, "pid"), String(process.pid))
-  const release = (): void => {
-    try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch {}
-    process.exit(0)
-  }
-  process.on("SIGTERM", release)
-  process.on("SIGINT", release)
-  return true
-}
-
 // ——— Telegram ———
 
-async function tg(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+async function tg(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
   const res = await fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(params),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   const json = await res.json() as { ok?: boolean; description?: string; parameters?: { retry_after?: number }; result?: unknown }
   if (json.ok !== true) {
     // parameters (retry_after при 429) пробрасываем наверх для ретрая
-    const err = Object.assign(new Error(`TG ${method}: ${json.description ?? "?"}`), { parameters: json.parameters })
-    throw err
+    throw Object.assign(new Error(`TG ${method}: ${json.description ?? "?"}`), { parameters: json.parameters })
   }
   return json.result
 }
 
-/** markdown агента → TG HTML (AST-конверсия), при провале — plain-чанки.
- *  Уже отправленное не дублируется: html-часть с фолбэком выровнена под
- *  соответствующий кусок исходного текста (как в хабе зоопарка). */
-const send = async (chatID: number, text: string): Promise<boolean> => {
-  const post = (part: string, html: boolean) =>
-    tg("sendMessage", { chat_id: chatID, text: part, ...(html ? { parse_mode: "HTML" } : {}) })
-  const attempt = async (part: string, html: boolean): Promise<boolean> => {
-    try {
-      await post(part, html)
-      return true
-    } catch (e) {
-      const wait = Number((e as { parameters?: { retry_after?: number } }).parameters?.retry_after ?? 0)
-      if (wait > 0) {
-        try { await sleep((wait + 1) * 1000); await post(part, html); return true } catch {}
-      }
-      log(`send: ${e}`)
-      return false
+/** Одна попытка отправки: 429 уважаем retry_after (один ретрай). */
+const attemptSend = async (chatID: number, part: string, html: boolean): Promise<boolean> => {
+  const post = () => tg("sendMessage", { chat_id: chatID, text: part, ...(html ? { parse_mode: "HTML" } : {}) })
+  try {
+    await post()
+    return true
+  } catch (e) {
+    const wait = Number((e as { parameters?: { retry_after?: number } }).parameters?.retry_after ?? 0)
+    if (wait > 0) {
+      try { await sleep((wait + 1) * 1000); await post(); return true } catch {}
     }
+    log(`send: ${e}`)
+    return false
   }
+}
+
+/** plain-доставка: нарезка исходника под лимит ТГ. */
+const sendPlain = async (chatID: number, text: string): Promise<boolean> => {
+  for (const c of plainChunks(text)) {
+    if (!(await attemptSend(chatID, c, false))) return false
+  }
+  return true
+}
+
+/** markdown агента → TG HTML (AST-конверсия); упавшая html-часть и всё после
+ *  неё доезжает исходным текстом (куски выровнены) — уже отправленное не
+ *  дублируется, теги в чат не утекают. Ошибки глотает: false = не доставлено
+ *  (никогда не реджектит — вызывающие ветки сами решают, что делать). */
+const send = async (chatID: number, text: string): Promise<boolean> => {
   let html: string[] = []
   try { html = splitMessage(toTelegramHTML(text).text, { format: "html" }) } catch {}
-  if (html.length === 0) {
-    for (const c of plainChunks(text)) if (!(await attempt(c, false))) return false
-    return true
-  }
-  const total = html.reduce((s, p) => s + p.length, 0) || 1
-  let pos = 0
-  const aligned = html.map((p) => {
-    const ratio = Math.ceil((p.length / total) * text.length)
-    let end = pos + ratio
-    if (end > text.length) end = text.length
-    // не рвать суррогатную пару
-    if (end < text.length) {
-      const prev = text.charCodeAt(end - 1)
-      if (prev >= 0xd800 && prev <= 0xdbff) end += 1
-    }
-    const slice = text.slice(pos, end)
-    pos = end
-    return slice
-  })
+  if (html.length === 0) return sendPlain(chatID, text)
+  const aligned = alignChunks(html, text)
   for (let i = 0; i < html.length; i++) {
-    if (await attempt(html[i]!, true)) continue
-    for (let j = i; j < aligned.length; j++) if (!(await attempt(aligned[j]!, false))) return false
+    if (await attemptSend(chatID, html[i]!, true)) continue
+    for (let j = i; j < aligned.length; j++) {
+      if (!(await attemptSend(chatID, aligned[j]!, false))) return false
+    }
     return true
   }
   return true
@@ -186,8 +167,13 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
 
 // ——— прогоны ———
 
-async function fireSession(req: Request): Promise<RunState> {
-  const instructions = readFileSync(PROMPT_MD, "utf-8")
+/** Сессия без побочных эффектов (промпт ещё не отправлялся) — сносим без
+ *  страха: агент ничего не начал. */
+const dropSession = (sid: string): void => {
+  void restCall(`/session/${sid}`, { method: "DELETE" }).catch(() => {})
+}
+
+async function createSession(req: Request): Promise<string> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
@@ -198,24 +184,50 @@ async function fireSession(req: Request): Promise<RunState> {
   })
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
-  const nonce = Math.random().toString(36).slice(2, 8)
-  const ok = await restCall(`/session/${id}/prompt`, {
-    method: "POST",
-    body: { text: buildPrompt(instructions, req.text, nonce) },
-  }).then(() => true).catch(() => false)
-  if (!ok) {
-    await restCall(`/session/${id}`, { method: "DELETE" }).catch(() => {}) // rollback: сессия-сирота
-    throw new Error("prompt не ушёл")
-  }
-  return { sessionID: id, startedAt: Date.now(), req }
+  return id
 }
 
-/** Дождаться финала (поллинг состояния сессии — как reconcile хаба):
- *  outcome выставлен и idle новее старта → прогон завершён. */
+/** Промпт с методичкой; возвращает startedAt (фиксируем ДО отправки — все
+ *  assistant-сообщения прогона будут новее). */
+async function sendPrompt(sessionID: string, req: Request): Promise<number> {
+  const instructions = readFileSync(PROMPT_MD, "utf-8")
+  const nonce = Math.random().toString(36).slice(2, 8)
+  const startedAt = Date.now()
+  await restCall(`/session/${sessionID}/prompt`, {
+    method: "POST",
+    body: { text: buildPrompt(instructions, req.text, nonce) },
+  })
+  return startedAt
+}
+
+/** Неудача спавна/промпта: transient или poison. attempts считаем в самой
+ *  заявке (персист); MAX_SPAWN_ATTEMPTS — dead-letter: снимаем с обработки,
+ *  юзеру уходит полный текст (ничего не теряется молча). */
+async function spawnFail(req: Request, e: unknown): Promise<void> {
+  const attempts = (req.attempts ?? 0) + 1
+  const i = state.queue.findIndex((r) => r.msgID === req.msgID)
+  if (i < 0) {
+    log(`spawnFail: заявка msg${req.msgID} уже не в очереди — игнор`)
+    return
+  }
+  if (attempts >= MAX_SPAWN_ATTEMPTS) {
+    state.queue.splice(i, 1)
+    log(`заявка msg${req.msgID}: ${attempts} неудачных спавнов (${e}) — dead-letter`)
+    await send(req.chatID, `⚠️ Не смог поднять прогон ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
+    return
+  }
+  state.queue[i] = { ...req, attempts }
+  log(`спавн не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
+  await sleep(30_000)
+}
+
+/** Финал прогона → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
+ *  прогон уже отработал (задача на доске есть), теряем только сводку:
+ *  фиксируем полный текст в лог, юзер проверит доску. */
 const deliverFinal = async (run: RunState): Promise<void> => {
   let broken = false
   try {
-    const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string; time?: { idle?: number } }
+    const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string }
     broken = s.outcome !== undefined && s.outcome !== "succeeded"
   } catch { /* статус не достали — попробуем всё равно прочитать сообщения */ }
   let text = ""
@@ -225,101 +237,164 @@ const deliverFinal = async (run: RunState): Promise<void> => {
   } catch {}
   let body = text !== "" ? text : "(пустой ответ)"
   if (broken) body += "\n\n⚠️ прогон оборван — финал мог не доехать"
-  const delivered = await send(run.req.chatID, body)
-  log(`финал ${run.sessionID} (${delivered ? "доставлен" : "НЕ доставлен"}): ${body.slice(0, 80)}`)
+  for (let a = 1; a <= DELIVER_ATTEMPTS; a++) {
+    if (await send(run.req.chatID, body)) {
+      log(`финал ${run.sessionID} (доставлен, попытка ${a}): ${body.slice(0, 80)}`)
+      return
+    }
+    log(`доставка финала ${run.sessionID}: попытка ${a}/${DELIVER_ATTEMPTS} не прошла`)
+    if (a < DELIVER_ATTEMPTS) await sleep(30_000)
+  }
+  log(`финал ${run.sessionID} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
 }
 
-const watchRun = async (run: RunState): Promise<void> => {
+/** Одна проверка сессии: ещё исполняется / завершена / пропала. */
+const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"> => {
+  try {
+    const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string; time?: { idle?: number } }
+    if (s.outcome !== undefined && typeof s.time?.idle === "number" && s.time.idle >= run.startedAt) return "done"
+    return "running"
+  } catch (e) {
+    const status = (e as { status?: number }).status
+    return status === 404 || status === 400 ? "gone" : "running" // неизвестно — не блокируем
+  }
+}
+
+/** Дождаться финала (поллинг состояния сессии — как reconcile хаба):
+ *  outcome выставлен и idle новее старта → прогон завершён. */
+const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   while (true) {
-    let done = false
-    try {
-      const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string; time?: { idle?: number } }
-      if (s.outcome !== undefined && typeof s.time?.idle === "number" && s.time.idle >= run.startedAt) done = true
-    } catch (e) {
-      const status = (e as { status?: number }).status
-      if (status === 404 || status === 400) {
-        await send(run.req.chatID, "⚠️ сессия триажа пропала — заявка не разобрана, продублируй")
-        log(`прогон ${run.sessionID}: сессия пропала`)
-        return
-      }
+    if (stopping) return "stopping"
+    const st = await sessionStatus(run)
+    if (st === "gone") {
+      await send(run.req.chatID, "⚠️ сессия триажа пропала — заявка не разобрана, продублируй")
+      log(`прогон ${run.sessionID}: сессия пропала`)
+      return "done"
     }
-    if (done) return await deliverFinal(run)
+    if (st === "done") {
+      await deliverFinal(run) // критическая секция: stopping не проверяем — доезжаем
+      return "done"
+    }
     if (Date.now() - run.startedAt > RUN_TIMEOUT_MS) {
       await send(run.req.chatID, `⚠️ не дождался финала за ${Math.round(RUN_TIMEOUT_MS / 60_000)} мин — прогон мог зависнуть; задача могла завестись частично, проверь доску`)
       log(`прогон ${run.sessionID}: таймаут — отпустил`)
-      return
+      return "done"
     }
     await sleep(POLL_SEC * 1000)
   }
 }
 
+/** Спавн-фаза: заявку из головы очереди поднять в активный прогон.
+ *  Заявка НЕ шифтится из очереди до подтверждённого промпта — рестарт в
+ *  любой точке окна не теряет её (дубль-прогон нейтрализует дедуп агента).
+ *  "idle" — очередь пуста; "started" — прогон активен; "later" — обработан
+ *  сбой спавна, ретрай уже запланирован (sleep внутри spawnFail). */
+const startRun = async (): Promise<"idle" | "started" | "later"> => {
+  const req = state.queue[0]
+  if (req === undefined) return "idle"
+  await send(req.chatID, "📥 Принял, разбираю…")
+  let sessionID: string
+  try {
+    sessionID = await createSession(req)
+  } catch (e) {
+    await spawnFail(req, e)
+    return "later"
+  }
+  state.run = { sessionID, startedAt: 0, req }
+  save()
+  let startedAt: number
+  try {
+    startedAt = await sendPrompt(sessionID, req)
+  } catch (e) {
+    dropSession(sessionID)
+    state.run = undefined
+    save()
+    await spawnFail(req, e)
+    return "later"
+  }
+  // промпт подтверждён: заявка принята в работу — убираем из очереди
+  const i = state.queue.findIndex((r) => r.msgID === req.msgID)
+  if (i >= 0) state.queue.splice(i, 1)
+  state.run = { sessionID, startedAt, req }
+  const waited = Math.round((Date.now() - req.receivedAt) / 1000)
+  log(`прогон ${sessionID}: ${req.text.slice(0, 60)}${waited > 5 ? ` (ждала в очереди ${waited}с)` : ""}`)
+  save()
+  return "started"
+}
+
 const runLoop = async (): Promise<void> => {
   while (true) {
     try {
-      if (state.run !== undefined) {
-        // рестарт демона во время прогона: продолжаем наблюдать ту же сессию
-        await watchRun(state.run)
+      if (stopping) break
+
+      // рестарт в спавн-окне: сессия есть, промпт не подтверждён. Сессия без
+      // побочных эффектов — сносим; заявка всё ещё в очереди и поднимется заново
+      if (state.run !== undefined && state.run.startedAt === 0) {
+        dropSession(state.run.sessionID)
+        log(`спавн-окно ${state.run.sessionID}: промпт не подтверждён — сессия снесена, заявка перезапустится`)
         state.run = undefined
         save()
+      }
+
+      if (state.run !== undefined) {
+        if (await watchRun(state.run) === "done") {
+          state.run = undefined
+          save()
+        }
         continue
       }
-      const req = state.queue.shift()
-      if (req === undefined) {
-        await sleep(2000)
-        continue
-      }
-      save()
-      await send(req.chatID, "📥 Принял, разбираю…").catch(() => {})
-      try {
-        state.run = await fireSession(req)
-        save()
-        log(`прогон ${state.run.sessionID}: ${req.text.slice(0, 60)}`)
-      } catch (e) {
-        state.queue.unshift(req) // вернуть в голову очереди, порядок не теряем
-        save()
-        log(`спавн не удался: ${e} — заявка возвращена в очередь`)
-        await send(req.chatID, "⚠️ опенкод недоступен — заявка в очереди, ретрай через 30с").catch(() => {})
-        await sleep(30_000)
-      }
+
+      const r = await startRun()
+      if (r === "idle") await sleep(2000)
     } catch (e) {
       log(`runLoop: ${e}`)
       await sleep(5000)
     }
   }
+  loopDone.run = true
+  maybeExit()
 }
 
 // ——— poller ТГ ———
 
+/** Разбор одного апдейта: offset, привязка чата, диспетчеризация. */
+const handleUpdate = async (u: TgUpdate): Promise<void> => {
+  state.offset = u.update_id + 1
+  const out = classifyUpdate(u, cfg.owner ?? "")
+  if (out.kind === "skip") {
+    save()
+    return
+  }
+  // привязка чата: первый личный чат владельца; смена — только вручную
+  // через сброс state.json (осознанное решение, не авто)
+  if (state.chatID === undefined) {
+    state.chatID = out.msg.chat.id
+    log(`chat locked: ${state.chatID}`)
+  } else if (state.chatID !== out.msg.chat.id) {
+    log(`чужой чат ${out.msg.chat.id} — skip`)
+    save()
+    return
+  }
+  if (out.kind === "help") {
+    await send(state.chatID, HELP)
+  } else if (out.kind === "media") {
+    await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши заявку текстом")
+  } else {
+    state.queue.push({ text: out.text, chatID: out.msg.chat.id, msgID: out.msg.message_id, receivedAt: Date.now() })
+    log(`заявка (+${state.queue.length} в очереди): ${out.text.slice(0, 80)}`)
+  }
+  save()
+}
+
 const pollLoop = async (): Promise<void> => {
   while (true) {
+    if (stopping) break
     try {
-      const updates = await tg("getUpdates", { offset: state.offset, timeout: 25, allowed_updates: ["message"] }) as TgUpdate[]
+      // long-poll 25с → таймаут fetch должен его покрывать с запасом
+      const updates = await tg("getUpdates", { offset: state.offset, timeout: 25, allowed_updates: ["message"] }, 35_000) as TgUpdate[]
       for (const u of updates) {
-        state.offset = u.update_id + 1
-        const out = classifyUpdate(u, cfg.owner ?? "")
-        if (out.kind === "skip") {
-          save()
-          continue
-        }
-        // привязка чата: первый личный чат владельца; смена — только вручную
-        // через сброс state.json (осознанное решение, не авто)
-        if (state.chatID === undefined) {
-          state.chatID = out.msg.chat.id
-          log(`chat locked: ${state.chatID}`)
-        } else if (state.chatID !== out.msg.chat.id) {
-          log(`чужой чат ${out.msg.chat.id} — skip`)
-          save()
-          continue
-        }
-        if (out.kind === "help") {
-          await send(state.chatID, HELP).catch(() => {})
-        } else if (out.kind === "media") {
-          await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши заявку текстом").catch(() => {})
-        } else {
-          state.queue.push({ text: out.text, chatID: out.msg.chat.id, msgID: out.msg.message_id, receivedAt: Date.now() })
-          log(`заявка (+${state.queue.length} в очереди): ${out.text.slice(0, 80)}`)
-        }
-        save()
+        if (stopping) break
+        await handleUpdate(u)
       }
     } catch (e) {
       if (String(e).includes("Conflict")) log("poll Conflict: конкурирующий getUpdates (второй экземпляр демона поверх systemd?)")
@@ -327,17 +402,19 @@ const pollLoop = async (): Promise<void> => {
       await sleep(3000)
     }
   }
+  loopDone.poll = true
+  maybeExit()
 }
 
 // ——— main ———
 
 const main = async (): Promise<void> => {
-  if (!acquireLock()) {
-    console.error("другой живой инстанс uwuwu-triage держит lock — выходим")
+  if (cfg.token === undefined || cfg.token === "" || cfg.owner === undefined || cfg.owner === "") {
+    console.error(`hub.json не прочитан или нет token/owner: ${CFG} — заполни по ${HERE}/README.md`)
     process.exit(1)
   }
-  if (cfg.token === undefined || cfg.token === "" || cfg.owner === undefined || cfg.owner === "") {
-    console.error("hub.json: нет token/owner — заполни по README.md")
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {
+    console.error("другой живой инстанс uwuwu-triage держит lock — выходим")
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
