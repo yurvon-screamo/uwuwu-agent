@@ -1,5 +1,5 @@
 // triage-lib.ts — чистые функции uwuwu-triage: разбор ТГ-апдейтов, состояние,
-// извлечение финала прогона, сборка промпта. Без сети и токенов (тестируемо).
+// извлечение финала хода. Без сети и токенов (тестируемо).
 
 export interface TgMessage {
   message_id: number
@@ -15,8 +15,7 @@ export interface TgUpdate {
   message?: TgMessage
 }
 
-/** Заявка владельца, прошедшая фильтр. attempts — число неудачных попыток
- *  поднять прогон (poison-защита очереди). */
+/** Сообщение владельца, прошедшее фильтр. */
 export interface Request {
   text: string
   chatID: number
@@ -25,8 +24,8 @@ export interface Request {
   attempts?: number
 }
 
-/** Активный прогон триажа (персистится — рестарт демона не теряет прогон).
- *  startedAt = 0 → сессия создана, промпт ещё не подтверждён (окно спавна). */
+/** Активный ход в вечной сессии (персистится — рестарт демона не теряет ход).
+ *  startedAt = 0 → промпт ещё не подтверждён (окно отправки). */
 export interface RunState {
   sessionID: string
   startedAt: number // ms, момент отправки prompt
@@ -36,6 +35,8 @@ export interface RunState {
 export interface TriageState {
   offset: number
   chatID?: number
+  /** вечная сессия диалога — единый контекст всей переписки */
+  session?: string
   queue: Request[]
   run?: RunState
 }
@@ -58,6 +59,7 @@ export function validState(raw: unknown): TriageState {
   const r = raw as Record<string, unknown>
   if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
   if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
+  if (typeof r.session === "string" && r.session.startsWith("ses_")) out.session = r.session
   if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
   const run = r.run
   if (run !== null && typeof run === "object") {
@@ -96,7 +98,7 @@ export function classifyUpdate(u: TgUpdate, owner: string): UpdateOutcome {
   return { kind: "req", msg: m, text: t }
 }
 
-// ——— финал прогона ———
+// ——— финал хода ———
 
 export interface SessionMsg {
   type?: string
@@ -104,11 +106,8 @@ export interface SessionMsg {
   content?: { type?: string; text?: string }[]
 }
 
-/** Финал прогона: сообщения API отдаёт DESC — берём первое assistant-сообщение
- *  новее старта прогона, текст = склейка его text-частей. "" = финала нет.
- *  (Ранняя assistant-реплика между тулами — «думает вслух», не финал: их
- *  пропускаем только если они старше startedAt; первый же новый assistant —
- *  ответ хода, у триаж-агента ход один.) */
+/** Финал хода: сообщения API отдаёт DESC — берём первое assistant-сообщение
+ *  новее старта хода, текст = склейка его text-частей. "" = финала нет. */
 export function extractFinal(msgs: SessionMsg[], startedAt: number): string {
   for (const m of msgs) {
     if (m.type !== "assistant") continue
@@ -123,20 +122,24 @@ export function extractFinal(msgs: SessionMsg[], startedAt: number): string {
   return ""
 }
 
-// ——— промпт ———
-
-/** Промпт прогона: методичка + заявка в одноразовых маркерах. Текст заявки —
- *  недоверенный вход: маркеры с nonce нельзя подделать изнутри заявки. */
-export function buildPrompt(instructions: string, text: string, nonce: string): string {
-  return `${instructions.trim()}\n\n[заявка ·${nonce}]\n${text}\n[конец ·${nonce}]\n\nРазбери заявку по методике и ответь сводкой.`
+/** Дошёл ли наш промпт до сессии: user-сообщение новее границы → его
+ *  время создания (точный startedAt хода: ответы строго после него), иначе
+ *  null. Нужно после рестарта в окне «run персистнут, промпт мог не уйти»:
+ *  не дошёл → честный re-prompt, дошёл → ждём финал без ложной пустоты. */
+export function promptLandedAt(msgs: SessionMsg[], sinceMs: number): number | null {
+  let found: number | null = null
+  for (const m of msgs) {
+    if (m.type !== "user") continue
+    const t = m.time?.created ?? 0
+    if (t >= sinceMs && (found === null || t < found)) found = t
+  }
+  return found
 }
 
-/** Заголовок сессии: первая содержательная строка заявки (без разрыва
- *  суррогатных пар на границе 60). */
-export function runTitle(text: string): string {
-  const first = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l !== "") ?? "заявка"
-  return `📥 ${first.slice(0, cutSafe(first, 60))}`
-}
+// ——— заголовок ———
+
+/** Заголовок вечной сессии диалога. */
+export const SESSION_TITLE = "📥 Триаж uwuwu"
 
 // ——— доставка в ТГ ———
 

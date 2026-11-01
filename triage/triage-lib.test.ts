@@ -1,11 +1,11 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, buildPrompt, classifyUpdate, extractFinal, plainChunks, runTitle, validState,
-  type TgMessage, type TgUpdate,
+  alignChunks, classifyUpdate, extractFinal, plainChunks, promptLandedAt, validState,
+  type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
-const msg = (over: Partial<TgMessage>): TgMessage => ({
+const msg = (over: Partial<NonNullable<TgUpdate["message"]>>): NonNullable<TgUpdate["message"]> => ({
   message_id: 1,
   date: 0,
   chat: { id: 42, type: "private" },
@@ -39,7 +39,7 @@ test("classifyUpdate: медиа без текста — media", () => {
   expect(classifyUpdate({ update_id: 1, message: msg({ text: undefined, caption: undefined }) }, "yurvon_screamo").kind).toBe("media")
 })
 
-// ——— extractFinal ———
+// ——— extractFinal / promptLandedAt ———
 
 const M = 1_000_000
 test("extractFinal: первое assistant новее старта из DESC-списка", () => {
@@ -64,55 +64,16 @@ test("extractFinal: ничего новее старта — пустая стр
   expect(extractFinal(msgs, 2 * M)).toBe("")
 })
 
-// ——— buildPrompt / runTitle ———
-
-test("buildPrompt: методичка + заявка в маркерах с nonce", () => {
-  const p = buildPrompt("МЕТОДИКА", "текст заявки с [заявка ·подделка] внутри", "abc123")
-  expect(p.startsWith("МЕТОДИКА")).toBe(true)
-  expect(p).toContain("[заявка ·abc123]\nтекст заявки")
-  expect(p).toContain("[конец ·abc123]")
-})
-
-test("runTitle: первая содержательная строка, до 60 символов, с префиксом", () => {
-  expect(runTitle("\n\n  Сделать отчёт\nдетали")).toBe("📥 Сделать отчёт")
-  expect(runTitle("x".repeat(100)).length).toBe("📥 ".length + 60)
-  expect(runTitle("")).toBe("📥 заявка")
-})
-
-test("runTitle: граница 60 не рвёт суррогатную пару", () => {
-  const first = "x".repeat(59) + "😀" // пара на индексах 59-60
-  const t = runTitle(first)
-  expect(t.endsWith("😀")).toBe(true) // пара доехала целиком (граница +1)
-  expect(t.length).toBe("📥 ".length + 61)
-})
-
-// ——— alignChunks ———
-
-test("alignChunks: куски покрывают исходник без потерь и дублей", () => {
-  const src = "aaaa\n\nbbbb **жирный** cccc".repeat(30)
-  const parts = ["<b>x</b>".repeat(40), "plain".repeat(60), "<i>y</i>".repeat(20)]
-  const aligned = alignChunks(parts, src)
-  expect(aligned.join("")).toBe(src)
-})
-
-test("alignChunks: границы не рвут суррогатные пары исходника", () => {
-  const src = `привет ${"😀".repeat(200)} пока`
-  const aligned = alignChunks(["ab", "cd", "ef", "gh", "ij"], src)
-  for (const c of aligned) {
-    for (let i = 0; i < c.length; i++) {
-      const code = c.charCodeAt(i)
-      if (code >= 0xd800 && code <= 0xdbff) {
-        expect(i + 1).toBeLessThan(c.length)
-        const next = c.charCodeAt(i + 1)
-        expect(next >= 0xdc00 && next <= 0xdfff).toBe(true)
-        i++
-      }
-    }
-  }
-})
-
-test("alignChunks: пустой исходник — пустые куски по числу частей", () => {
-  expect(alignChunks(["a", "b"], "")).toEqual(["", ""])
+test("promptLandedAt: время самого раннего user-сообщения новее границы; нет — null", () => {
+  const msgs: SessionMsg[] = [
+    { type: "assistant", time: { created: 30 * M }, content: [] },
+    { type: "user", time: { created: 20 * M }, content: [] },
+    { type: "user", time: { created: 21 * M }, content: [] },
+    { type: "user", time: { created: 5 * M }, content: [] },
+  ]
+  expect(promptLandedAt(msgs, 10 * M)).toBe(20 * M)
+  expect(promptLandedAt(msgs, 50 * M)).toBe(null)
+  expect(promptLandedAt([], 0)).toBe(null)
 })
 
 // ——— validState ———
@@ -122,18 +83,22 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState("junk")).toEqual({ offset: 0, queue: [] })
   expect(validState({ offset: 1.5 })).toEqual({ offset: 0, queue: [] }) // нецелый offset — невалиден
   const good = {
-    offset: 12, chatID: 42,
+    offset: 12, chatID: 42, session: "ses_dialog",
     queue: [{ text: "заявка", chatID: 42, msgID: 3, receivedAt: 5, attempts: 2 }],
-    run: { sessionID: "ses_abc", startedAt: 100, req: { text: "в работе", chatID: 42, msgID: 2, receivedAt: 4 } },
+    run: { sessionID: "ses_dialog", startedAt: 100, req: { text: "в работе", chatID: 42, msgID: 2, receivedAt: 4 } },
   }
   expect(validState(good)).toEqual(good)
-  const broken = { offset: -3, queue: ["мусор", null, { text: " ", chatID: 1 }, { text: "ок", chatID: 1, msgID: 2, attempts: -1 }], run: { sessionID: "nope", startedAt: 1, req: {} } }
+  const broken = {
+    offset: -3, session: "nope",
+    queue: ["мусор", null, { text: " ", chatID: 1 }, { text: "ок", chatID: 1, msgID: 2, attempts: -1 }],
+    run: { sessionID: "nope", startedAt: 1, req: {} },
+  }
   expect(validState(broken)).toEqual({ offset: 0, queue: [] })
-  // спавн-окно: run с startedAt=0 (промпт не подтверждён) — валиден и персистится
+  // окно отправки: run с startedAt=0 (промпт не подтверждён) — валиден и персистится
   expect(validState({ run: { sessionID: "ses_x", startedAt: 0, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 } } }).run?.startedAt).toBe(0)
 })
 
-// ——— plainChunks ———
+// ——— plainChunks / alignChunks ———
 
 test("plainChunks: короткий текст — один чанк", () => {
   expect(plainChunks("привет")).toEqual(["привет"])
@@ -161,4 +126,31 @@ test("plainChunks: нарезка по лимиту без разрыва сур
 test("plainChunks: лимит на стыке пары сдвигает границу (+1)", () => {
   const s = "ab😀cd" // суррогатная пара на индексах 2-3
   expect(plainChunks(s, 3)).toEqual(["ab😀", "cd"]) // разрез внутрь пары → граница +1
+})
+
+test("alignChunks: куски покрывают исходник без потерь и дублей", () => {
+  const src = "aaaa\n\nbbbb **жирный** cccc".repeat(30)
+  const parts = ["<b>x</b>".repeat(40), "plain".repeat(60), "<i>y</i>".repeat(20)]
+  const aligned = alignChunks(parts, src)
+  expect(aligned.join("")).toBe(src)
+})
+
+test("alignChunks: границы не рвут суррогатные пары исходника", () => {
+  const src = `привет ${"😀".repeat(200)} пока`
+  const aligned = alignChunks(["ab", "cd", "ef", "gh", "ij"], src)
+  for (const c of aligned) {
+    for (let i = 0; i < c.length; i++) {
+      const code = c.charCodeAt(i)
+      if (code >= 0xd800 && code <= 0xdbff) {
+        expect(i + 1).toBeLessThan(c.length)
+        const next = c.charCodeAt(i + 1)
+        expect(next >= 0xdc00 && next <= 0xdfff).toBe(true)
+        i++
+      }
+    }
+  }
+})
+
+test("alignChunks: пустой исходник — пустые куски по числу частей", () => {
+  expect(alignChunks(["a", "b"], "")).toEqual(["", ""])
 })

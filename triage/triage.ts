@@ -1,15 +1,15 @@
 // triage.ts — uwuwu-triage: входная точка задач через Telegram.
 // Standalone bun-демон (не плагин — опыт opencode-tg-hub-daemon): long-poll
-// getUpdates, заявка владельца → opencode-сессия триажа (glm-5.3-flash,
-// изолированный workspace), поллинг финала → ответ сводкой в ТГ.
+// getUpdates, сообщения владельца → ОДНА вечная opencode-сессия диалога
+// (glm-5.3-flash, изолированный workspace с AGENTS.md-методичкой) — память
+// диалога = контекст сессии (компакция рулит), финал хода → ответ в ТГ.
 // Занят → очередь. Запуск: systemd --user (uwuwu-triage.service).
 //
-// Гарантии: заявка не теряется при рестарте в любом месте (убирается из
-// очереди только после подтверждённого промпта; спавн-окно держит её и в
+// Гарантии: сообщение не теряется при рестарте в любом месте (уходит из
+// очереди только после подтверждённого промпта; окно отправки держит его и в
 // очереди, и в state.run). Доставка финала — at-least-once: рестарт посреди
-// доставки может задублировать сводку (дедупликацию заявок делает сам
-// триаж-агент на доске). Poison-защита: 5 неудачных спавнов → dead-letter
-// с полным текстом заявки юзеру.
+// доставки может задублировать ответ. Poison-защита: 5 неудачных попыток
+// подъёма хода → dead-letter с полным текстом юзеру.
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -17,7 +17,7 @@ import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import {
-  alignChunks, buildPrompt, classifyUpdate, extractFinal, plainChunks, runTitle, validState,
+  alignChunks, classifyUpdate, extractFinal, plainChunks, promptLandedAt, SESSION_TITLE, validState,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
@@ -27,23 +27,24 @@ const PROMPT_MD = join(HERE, "prompt.md") // методичка триажа —
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-triage")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
-/** изолированный cwd триаж-сессий: заявки — недоверенный текст, домашний
- *  каталог сессии видеть не должен */
+/** изолированный cwd сессии диалога: переписка — недоверенный текст,
+ *  домашний каталог сессия видеть не должна; AGENTS.md сюда материализует
+ *  демон из prompt.md (поведенческий дом сессии) */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
-const RUN_TIMEOUT_MS = 15 * 60_000 // прогон дольше — отпускаем и говорим юзеру
-const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных спавнов подряд
+const RUN_TIMEOUT_MS = 15 * 60_000 // ход дольше — отпускаем и говорим юзеру
+const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных попыток хода подряд
 const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 const HELP = [
   "📥 Триаж uwuwu — входная точка задач.",
   "",
-  "Кидай описание задачи одним сообщением: определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
-  "Заявки разбираются по очереди: пока думаю над предыдущей, новые ждут.",
+  "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
+  "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
 ].join("\n")
 
 interface Cfg { token: string; owner: string; model?: { providerID: string; id: string } }
@@ -165,42 +166,74 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   return j.data ?? j
 }
 
-// ——— прогоны ———
-
-/** Сессия без побочных эффектов (промпт ещё не отправлялся) — сносим без
- *  страха: агент ничего не начал. */
-const dropSession = (sid: string): void => {
-  void restCall(`/session/${sid}`, { method: "DELETE" }).catch(() => {})
+async function sessionMessages(sessionID: string): Promise<Parameters<typeof extractFinal>[0]> {
+  const msgs = await restCall(`/session/${sessionID}/message`)
+  return Array.isArray(msgs) ? msgs as Parameters<typeof extractFinal>[0] : []
 }
 
-async function createSession(req: Request): Promise<string> {
+// ——— вечная сессия диалога ———
+
+/** Материализовать AGENTS.md воркспейса из prompt.md (если изменился) —
+ *  сессии, созданные в этом location, подхватывают методичку автоматически. */
+const syncWorkspaceInstructions = (): void => {
+  mkdirSync(WORKSPACE, { recursive: true })
+  const src = readFileSync(PROMPT_MD, "utf-8")
+  const dst = join(WORKSPACE, "AGENTS.md")
+  let prev = ""
+  try { prev = readFileSync(dst, "utf-8") } catch {}
+  if (prev !== src) {
+    writeFileSync(dst, src)
+    log(`AGENTS.md воркспейса обновлён (${src.length} байт)`)
+  }
+}
+
+/** Жива ли сессия (404/400 = нет). null = неизвестно, не блокируем. */
+const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
+  try {
+    await restCall(`/session/${sessionID}`)
+    return true
+  } catch (e) {
+    const status = (e as { status?: number }).status
+    if (status === 404 || status === 400) return false
+    return null
+  }
+}
+
+/** Единая сессия диалога: создаётся один раз, переживает рестарты демона
+ *  (контекст всей переписки + компакция); пропала (снесли в TUI) — пересоздаём,
+ *  память теряется осознанно, юзеру не врём об этом молча — лог+сообщение. */
+const ensureSession = async (): Promise<string> => {
+  if (state.session !== undefined) {
+    const alive = await sessionAlive(state.session)
+    if (alive === true) return state.session
+    if (alive === null) return state.session // неизвестно — не пересоздаём
+    log(`сессия ${state.session} пропала — пересоздаю (контекст переписки потерян)`)
+  }
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: runTitle(req.text),
+      title: SESSION_TITLE,
       model: cfg.model ?? MODEL,
       location: { directory: WORKSPACE },
     },
   })
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
+  state.session = id
+  save()
+  log(`сессия диалога: ${id}`)
   return id
 }
 
-/** Промпт с методичкой; возвращает startedAt (фиксируем ДО отправки — все
- *  assistant-сообщения прогона будут новее). */
-async function sendPrompt(sessionID: string, req: Request): Promise<number> {
-  const instructions = readFileSync(PROMPT_MD, "utf-8")
-  const nonce = Math.random().toString(36).slice(2, 8)
+/** Ход: сообщение владельца в вечную сессию; startedAt фиксируем ДО
+ *  отправки (ответы хода будут строго новее). */
+async function sendPrompt(sessionID: string, text: string): Promise<number> {
   const startedAt = Date.now()
-  await restCall(`/session/${sessionID}/prompt`, {
-    method: "POST",
-    body: { text: buildPrompt(instructions, req.text, nonce) },
-  })
+  await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text } })
   return startedAt
 }
 
-/** Неудача спавна/промпта: transient или poison. attempts считаем в самой
+/** Неудача попытки хода: transient или poison. attempts считаем в самой
  *  заявке (персист — иначе рестарт в 30с-паузе откатит счётчик и crash-loop
  *  никогда не доедет до dead-letter); MAX_SPAWN_ATTEMPTS — dead-letter:
  *  снимаем и персистим ДО отправки (рестарт не воскресит заявку и не
@@ -217,20 +250,20 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
     state.queue.splice(i, 1)
     save()
     // текст заявки — в лог ДО отправки: крах посреди send не потеряет его молча
-    log(`заявка msg${req.msgID}: ${attempts} неудачных спавнов (${e}) — dead-letter, текст: ${req.text}`)
-    const ok = await send(req.chatID, `⚠️ Не смог поднять прогон ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
+    log(`заявка msg${req.msgID}: ${attempts} неудачных попыток хода (${e}) — dead-letter, текст: ${req.text}`)
+    const ok = await send(req.chatID, `⚠️ Не смог поднять ход ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
     if (!ok) log(`dead-letter msg${req.msgID} НЕ доставлен (текст заявки выше в этом логе)`)
     return
   }
   state.queue[i] = { ...req, attempts }
   save()
-  log(`спавн не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
+  log(`ход не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
   await send(req.chatID, `⚠️ Прогон не поднялся (попытка ${attempts} из ${MAX_SPAWN_ATTEMPTS - 1}: ${e instanceof Error ? e.message : String(e)}) — ретрай через 30с`)
   await sleep(30_000)
 }
 
-/** Финал прогона → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
- *  прогон уже отработал (задача на доске есть), теряем только сводку:
+/** Финал хода → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
+ *  ход уже отработал (задача на доске есть), теряем только ответ:
  *  фиксируем полный текст в лог, юзер проверит доску. */
 const deliverFinal = async (run: RunState): Promise<void> => {
   let broken = false
@@ -239,10 +272,7 @@ const deliverFinal = async (run: RunState): Promise<void> => {
     broken = s.outcome !== undefined && s.outcome !== "succeeded"
   } catch { /* статус не достали — попробуем всё равно прочитать сообщения */ }
   let text = ""
-  try {
-    const msgs = await restCall(`/session/${run.sessionID}/message`)
-    if (Array.isArray(msgs)) text = extractFinal(msgs as Parameters<typeof extractFinal>[0], run.startedAt)
-  } catch {}
+  try { text = extractFinal(await sessionMessages(run.sessionID), run.startedAt) } catch {}
   let body = text !== "" ? text : "(пустой ответ)"
   if (broken) body += "\n\n⚠️ прогон оборван — финал мог не доехать"
   for (let a = 1; a <= DELIVER_ATTEMPTS; a++) {
@@ -268,15 +298,15 @@ const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"
   }
 }
 
-/** Дождаться финала (поллинг состояния сессии — как reconcile хаба):
- *  outcome выставлен и idle новее старта → прогон завершён. */
+/** Дождаться финала хода (поллинг состояния сессии — как reconcile хаба):
+ *  outcome выставлен и idle новее старта хода → ход завершён. */
 const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   while (true) {
     if (stopping) return "stopping"
     const st = await sessionStatus(run)
     if (st === "gone") {
-      await send(run.req.chatID, "⚠️ сессия триажа пропала — заявка не разобрана, продублируй")
-      log(`прогон ${run.sessionID}: сессия пропала`)
+      await send(run.req.chatID, "⚠️ сессия триажа пропала — сообщение не разобрано, продублируй")
+      log(`ход ${run.sessionID}: сессия пропала`)
       return "done"
     }
     if (st === "done") {
@@ -284,27 +314,41 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
       return "done"
     }
     if (Date.now() - run.startedAt > RUN_TIMEOUT_MS) {
-      await send(run.req.chatID, `⚠️ не дождался финала за ${Math.round(RUN_TIMEOUT_MS / 60_000)} мин — прогон мог зависнуть; задача могла завестись частично, проверь доску`)
-      log(`прогон ${run.sessionID}: таймаут — отпустил`)
+      await send(run.req.chatID, `⚠️ Не дождался ответа за ${Math.round(RUN_TIMEOUT_MS / 60_000)} мин — ход мог зависнуть; задача могла завестись частично, проверь доску`)
+      log(`ход ${run.sessionID}: таймаут — отпустил`)
       return "done"
     }
     await sleep(POLL_SEC * 1000)
   }
 }
 
-/** Спавн-фаза: заявку из головы очереди поднять в активный прогон.
+/** Рестарт в окне отправки: ход персистнут (startedAt=0), промпт мог дойти
+ *  или нет. Дошёл (user-сообщение в сессии новее прихода заявки) → доигрываем
+ *  с точным startedAt; нет → ход сносим, заявка в очереди поднимется заново. */
+const recoverPendingRun = async (run: RunState): Promise<void> => {
+  let landed: number | null = null
+  try { landed = promptLandedAt(await sessionMessages(run.sessionID), run.req.receivedAt - 2000) } catch {}
+  if (landed !== null) {
+    log(`окно отправки ${run.sessionID}: промпт дошёл (${landed}) — доигрываем`)
+    state.run = { ...run, startedAt: landed }
+    save()
+    return
+  }
+  log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, заявка перезапустится`)
+  state.run = undefined
+  save()
+}
+
+/** Поднять ход: сообщение из головы очереди → активный ход в вечной сессии.
  *  Заявка НЕ шифтится из очереди до подтверждённого промпта — рестарт в
- *  любой точке окна не теряет её (дубль-прогон нейтрализует дедуп агента).
- *  "idle" — очередь пуста; "started" — прогон активен; "later" — обработан
- *  сбой спавна, ретрай уже запланирован (sleep внутри spawnFail). */
+ *  любой точке окна не теряет её. "idle" — очередь пуста; "started" — ход
+ *  активен; "later" — сбой обработан, ретрай запланирован (sleep в spawnFail). */
 const startRun = async (): Promise<"idle" | "started" | "later"> => {
   const req = state.queue[0]
   if (req === undefined) return "idle"
-  // ack — только на первой попытке: при ретраях спавна причины приходят из spawnFail
-  if ((req.attempts ?? 0) === 0) await send(req.chatID, "📥 Принял, разбираю…")
   let sessionID: string
   try {
-    sessionID = await createSession(req)
+    sessionID = await ensureSession()
   } catch (e) {
     await spawnFail(req, e)
     return "later"
@@ -313,20 +357,19 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   save()
   let startedAt: number
   try {
-    startedAt = await sendPrompt(sessionID, req)
+    startedAt = await sendPrompt(sessionID, req.text)
   } catch (e) {
-    dropSession(sessionID)
     state.run = undefined
     save()
     await spawnFail(req, e)
     return "later"
   }
-  // промпт подтверждён: заявка принята в работу — убираем из очереди
+  // промпт подтверждён: сообщение принято в работу — убираем из очереди
   const i = state.queue.findIndex((r) => r.msgID === req.msgID)
   if (i >= 0) state.queue.splice(i, 1)
   state.run = { sessionID, startedAt, req }
   const waited = Math.round((Date.now() - req.receivedAt) / 1000)
-  log(`прогон ${sessionID}: ${req.text.slice(0, 60)}${waited > 5 ? ` (ждала в очереди ${waited}с)` : ""}`)
+  log(`ход ${sessionID}: ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
   save()
   return "started"
 }
@@ -336,13 +379,10 @@ const runLoop = async (): Promise<void> => {
     try {
       if (stopping) break
 
-      // рестарт в спавн-окне: сессия есть, промпт не подтверждён. Сессия без
-      // побочных эффектов — сносим; заявка всё ещё в очереди и поднимется заново
+      // рестарт в окне отправки: доиграть или перезапустить (заявка в очереди)
       if (state.run !== undefined && state.run.startedAt === 0) {
-        dropSession(state.run.sessionID)
-        log(`спавн-окно ${state.run.sessionID}: промпт не подтверждён — сессия снесена, заявка перезапустится`)
-        state.run = undefined
-        save()
+        await recoverPendingRun(state.run)
+        continue
       }
 
       if (state.run !== undefined) {
@@ -387,7 +427,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
   if (out.kind === "help") {
     await send(state.chatID, HELP)
   } else if (out.kind === "media") {
-    await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши заявку текстом")
+    await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши словами")
   } else {
     state.queue.push({ text: out.text, chatID: out.msg.chat.id, msgID: out.msg.message_id, receivedAt: Date.now() })
     log(`заявка (+${state.queue.length} в очереди): ${out.text.slice(0, 80)}`)
@@ -427,10 +467,10 @@ const main = async (): Promise<void> => {
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
-  mkdirSync(WORKSPACE, { recursive: true })
+  syncWorkspaceInstructions()
   const me = await tg("getMe") as { username?: string }
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }
-  log(`uwuwu-triage: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, model=${(cfg.model ?? MODEL).id}, опенкод=${reg.url ?? "?"})`)
+  log(`uwuwu-triage: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${(cfg.model ?? MODEL).id}, опенкод=${reg.url ?? "?"})`)
   void runLoop()
   void pollLoop()
 }
