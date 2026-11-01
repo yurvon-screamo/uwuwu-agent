@@ -4,6 +4,9 @@
 // Сигналы: onStop даёт демону доехать критическую секцию и выйти самому в
 // безопасной точке; вынужденный process.exit — только по истечении grace,
 // чтобы systemd не прибивал зависший drainage вечно.
+//
+// NB: cron/factory/dreamer пока несут собственные копии этой логики —
+// миграция их на общий модуль запланирована отдельно (не в срезе triage).
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -33,6 +36,11 @@ export function acquireLock(opts: {
     }
   }
   writeFileSync(join(lockDir, "pid"), String(process.pid))
+  // лок держим до реального выхода процесса (включая graceful drain):
+  // чистим на exit — после останова не остаётся stale-lock
+  process.once("exit", () => {
+    try { rmSync(lockDir, { recursive: true, force: true }) } catch {}
+  })
   const stopped = { v: false }
   const stop = (): void => {
     if (stopped.v) return

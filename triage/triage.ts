@@ -201,8 +201,11 @@ async function sendPrompt(sessionID: string, req: Request): Promise<number> {
 }
 
 /** Неудача спавна/промпта: transient или poison. attempts считаем в самой
- *  заявке (персист); MAX_SPAWN_ATTEMPTS — dead-letter: снимаем с обработки,
- *  юзеру уходит полный текст (ничего не теряется молча). */
+ *  заявке (персист — иначе рестарт в 30с-паузе откатит счётчик и crash-loop
+ *  никогда не доедет до dead-letter); MAX_SPAWN_ATTEMPTS — dead-letter:
+ *  снимаем и персистим ДО отправки (рестарт не воскресит заявку и не
+ *  задублирует сообщение), юзеру уходит полный текст; недоставка — текст
+ *  заявки в лог (ничего не теряется молча). */
 async function spawnFail(req: Request, e: unknown): Promise<void> {
   const attempts = (req.attempts ?? 0) + 1
   const i = state.queue.findIndex((r) => r.msgID === req.msgID)
@@ -212,12 +215,16 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
   }
   if (attempts >= MAX_SPAWN_ATTEMPTS) {
     state.queue.splice(i, 1)
+    save()
     log(`заявка msg${req.msgID}: ${attempts} неудачных спавнов (${e}) — dead-letter`)
-    await send(req.chatID, `⚠️ Не смог поднять прогон ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
+    const ok = await send(req.chatID, `⚠️ Не смог поднять прогон ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
+    if (!ok) log(`dead-letter msg${req.msgID} НЕ доставлен — текст заявки: ${req.text}`)
     return
   }
   state.queue[i] = { ...req, attempts }
+  save()
   log(`спавн не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
+  await send(req.chatID, `⚠️ Прогон не поднялся (попытка ${attempts} из ${MAX_SPAWN_ATTEMPTS - 1}: ${e instanceof Error ? e.message : String(e)}) — ретрай через 30с`)
   await sleep(30_000)
 }
 
@@ -292,7 +299,8 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
 const startRun = async (): Promise<"idle" | "started" | "later"> => {
   const req = state.queue[0]
   if (req === undefined) return "idle"
-  await send(req.chatID, "📥 Принял, разбираю…")
+  // ack — только на первой попытке: при ретраях спавна причины приходят из spawnFail
+  if ((req.attempts ?? 0) === 0) await send(req.chatID, "📥 Принял, разбираю…")
   let sessionID: string
   try {
     sessionID = await createSession(req)
