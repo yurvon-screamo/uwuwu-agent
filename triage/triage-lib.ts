@@ -37,6 +37,11 @@ export interface TriageState {
   chatID?: number
   /** вечная сессия диалога — единый контекст всей переписки */
   session?: string
+  /** sha256 методички, которую сессия уже получила (AGENTS.md при создании
+   *  или последняя инъекция) — рассинхрон с prompt.md → инъекция обновления */
+  instructionsHash?: string
+  /** подряд оборванных финалов (outcome ≠ succeeded): 3 → пересоздание сессии */
+  broken?: number
   queue: Request[]
   run?: RunState
 }
@@ -60,6 +65,12 @@ export function validState(raw: unknown): TriageState {
   if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
   if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
   if (typeof r.session === "string" && r.session.startsWith("ses_")) out.session = r.session
+  if (typeof r.instructionsHash === "string" && r.instructionsHash.length <= 64) {
+    out.instructionsHash = r.instructionsHash
+  }
+  if (Number.isInteger(r.broken) && (r.broken as number) >= 0 && (r.broken as number) <= 99) {
+    out.broken = r.broken as number
+  }
   if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
   const run = r.run
   if (run !== null && typeof run === "object") {
@@ -122,16 +133,29 @@ export function extractFinal(msgs: SessionMsg[], startedAt: number): string {
   return ""
 }
 
-/** Дошёл ли наш промпт до сессии: user-сообщение новее границы → его
- *  время создания (точный startedAt хода: ответы строго после него), иначе
- *  null. Нужно после рестарта в окне «run персистнут, промпт мог не уйти»:
- *  не дошёл → честный re-prompt, дошёл → ждём финал без ложной пустоты. */
-export function promptLandedAt(msgs: SessionMsg[], sinceMs: number): number | null {
+const textOf = (m: SessionMsg): string =>
+  (m.content ?? [])
+    .filter((p) => p?.type === "text" && typeof p.text === "string")
+    .map((p) => p.text as string)
+    .join("\n")
+    .trim()
+
+/** Дошёл ли наш промпт до сессии: user-сообщение новее границы с ЭТИМ
+ *  текстом (точное или префикс-80 — длинные промпты могли пережать на
+ *  несколько сообщений) → его время создания (точный startedAt хода:
+ *  ответы строго после него), иначе null. Текст — дискриминатор от промпта
+ *  предыдущего хода: быстрый double-text ≤2с ловился бы на голой границе. */
+export function promptLandedAt(msgs: SessionMsg[], sinceMs: number, text: string): number | null {
+  const needle = text.trim()
+  const prefix = needle.slice(0, 80)
   let found: number | null = null
   for (const m of msgs) {
     if (m.type !== "user") continue
     const t = m.time?.created ?? 0
-    if (t >= sinceMs && (found === null || t < found)) found = t
+    if (t < sinceMs) continue
+    const body = textOf(m)
+    if (body !== needle && !body.startsWith(prefix)) continue
+    if (found === null || t < found) found = t
   }
   return found
 }

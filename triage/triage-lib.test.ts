@@ -64,16 +64,31 @@ test("extractFinal: ничего новее старта — пустая стр
   expect(extractFinal(msgs, 2 * M)).toBe("")
 })
 
-test("promptLandedAt: время самого раннего user-сообщения новее границы; нет — null", () => {
+test("promptLandedAt: свой промпт находится по тексту; чужой (double-text ≤2с) не ловится", () => {
+  const T = 10 * M
   const msgs: SessionMsg[] = [
     { type: "assistant", time: { created: 30 * M }, content: [] },
-    { type: "user", time: { created: 20 * M }, content: [] },
-    { type: "user", time: { created: 21 * M }, content: [] },
-    { type: "user", time: { created: 5 * M }, content: [] },
+    { type: "user", time: { created: 9 * M }, content: [{ type: "text", text: "предыдущий вопрос" }] }, // промпт прошлого хода в окне
+    { type: "user", time: { created: 10 * M }, content: [{ type: "text", text: "сделай отчёт" }] },     // наш промпт
   ]
-  expect(promptLandedAt(msgs, 10 * M)).toBe(20 * M)
-  expect(promptLandedAt(msgs, 50 * M)).toBe(null)
-  expect(promptLandedAt([], 0)).toBe(null)
+  expect(promptLandedAt(msgs, 8 * M, "сделай отчёт")).toBe(T)
+  // тот же текст, границы нет — только наш ход матчится
+  expect(promptLandedAt(msgs, 20 * M, "сделай отчёт")).toBe(null)
+  // идентичный текст дважды (ре-дубль юзера) — берём самый ранний в окне: benign
+  const dup: SessionMsg[] = [
+    { type: "user", time: { created: 10 * M }, content: [{ type: "text", text: "ок" }] },
+    { type: "user", time: { created: 11 * M }, content: [{ type: "text", text: "ок" }] },
+  ]
+  expect(promptLandedAt(dup, 8 * M, "ок")).toBe(10 * M)
+})
+
+test("promptLandedAt: длинный промпц матчится по префиксу (пережат на части)", () => {
+  const long = "x".repeat(300)
+  const msgs: SessionMsg[] = [
+    { type: "user", time: { created: 5 * M }, content: [{ type: "text", text: long.slice(0, 200) }] },
+    { type: "user", time: { created: 6 * M }, content: [{ type: "text", text: long.slice(200) }] },
+  ]
+  expect(promptLandedAt(msgs, 0, long)).toBe(5 * M)
 })
 
 // ——— validState ———
@@ -83,13 +98,13 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState("junk")).toEqual({ offset: 0, queue: [] })
   expect(validState({ offset: 1.5 })).toEqual({ offset: 0, queue: [] }) // нецелый offset — невалиден
   const good = {
-    offset: 12, chatID: 42, session: "ses_dialog",
+    offset: 12, chatID: 42, session: "ses_dialog", instructionsHash: "a".repeat(64), broken: 1,
     queue: [{ text: "заявка", chatID: 42, msgID: 3, receivedAt: 5, attempts: 2 }],
     run: { sessionID: "ses_dialog", startedAt: 100, req: { text: "в работе", chatID: 42, msgID: 2, receivedAt: 4 } },
   }
   expect(validState(good)).toEqual(good)
   const broken = {
-    offset: -3, session: "nope",
+    offset: -3, session: "nope", instructionsHash: "x".repeat(65), broken: -1,
     queue: ["мусор", null, { text: " ", chatID: 1 }, { text: "ок", chatID: 1, msgID: 2, attempts: -1 }],
     run: { sessionID: "nope", startedAt: 1, req: {} },
   }

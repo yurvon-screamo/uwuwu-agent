@@ -12,6 +12,7 @@
 // подъёма хода → dead-letter с полным текстом юзеру.
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
@@ -29,7 +30,11 @@ const STATE_FILE = join(STATE_DIR, "state.json")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
 /** изолированный cwd сессии диалога: переписка — недоверенный текст,
  *  домашний каталог сессия видеть не должна; AGENTS.md сюда материализует
- *  демон из prompt.md (поведенческий дом сессии) */
+ *  демон из prompt.md (поведенческий дом сессии).
+ *  Модель угроз — осознанный трейд-оф диалоговости: текст владельца идёт
+ *  в сессию как есть, без маркеров-границ (единственный авторизованный
+ *  юзер; инъекции из пересланного контента сдерживает только
+ *  поведенческий фрейминг методички). */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
@@ -38,6 +43,7 @@ const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5
 const RUN_TIMEOUT_MS = 15 * 60_000 // ход дольше — отпускаем и говорим юзеру
 const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных попыток хода подряд
 const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
+const BROKEN_SESSION_RESET = 3 // оборванных финалов подряд → пересоздание сессии
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 const HELP = [
@@ -174,7 +180,10 @@ async function sessionMessages(sessionID: string): Promise<Parameters<typeof ext
 // ——— вечная сессия диалога ———
 
 /** Материализовать AGENTS.md воркспейса из prompt.md (если изменился) —
- *  сессии, созданные в этом location, подхватывают методичку автоматически. */
+ *  сессии, созданные в этом location, подхватывают методичку на старте.
+ *  NB (проверено эмпирически): живая сессия AGENTS.md НЕ перечитывает —
+ *  замораживается на момент создания; обновления доезжают инъекцией
+ *  (refreshInstructions). Атомарно (tmp+rename), как state.json. */
 const syncWorkspaceInstructions = (): void => {
   mkdirSync(WORKSPACE, { recursive: true })
   const src = readFileSync(PROMPT_MD, "utf-8")
@@ -182,10 +191,15 @@ const syncWorkspaceInstructions = (): void => {
   let prev = ""
   try { prev = readFileSync(dst, "utf-8") } catch {}
   if (prev !== src) {
-    writeFileSync(dst, src)
+    const tmp = `${dst}.tmp`
+    writeFileSync(tmp, src)
+    renameSync(tmp, dst)
     log(`AGENTS.md воркспейса обновлён (${src.length} байт)`)
   }
 }
+
+const instructionsHash = (): string =>
+  createHash("sha256").update(readFileSync(PROMPT_MD, "utf-8")).digest("hex")
 
 /** Жива ли сессия (404/400 = нет). null = неизвестно, не блокируем. */
 const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
@@ -201,13 +215,15 @@ const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
 
 /** Единая сессия диалога: создаётся один раз, переживает рестарты демона
  *  (контекст всей переписки + компакция); пропала (снесли в TUI) — пересоздаём,
- *  память теряется осознанно, юзеру не врём об этом молча — лог+сообщение. */
+ *  контекст теряется: лог + честное уведомление юзеру. */
 const ensureSession = async (): Promise<string> => {
+  let recreated = false
   if (state.session !== undefined) {
     const alive = await sessionAlive(state.session)
     if (alive === true) return state.session
     if (alive === null) return state.session // неизвестно — не пересоздаём
     log(`сессия ${state.session} пропала — пересоздаю (контекст переписки потерян)`)
+    recreated = true
   }
   const raw = await restCall("/session", {
     method: "POST",
@@ -220,17 +236,35 @@ const ensureSession = async (): Promise<string> => {
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
   state.session = id
+  // новая сессия стартует с текущим AGENTS.md воркспейса — методичка актуальна
+  state.instructionsHash = instructionsHash()
+  state.broken = 0
   save()
   log(`сессия диалога: ${id}`)
+  if (recreated && state.chatID !== undefined) {
+    await send(state.chatID, "ℹ️ Сессия диалога пересоздана — контекст переписки сброшен.")
+  }
   return id
 }
 
-/** Ход: сообщение владельца в вечную сессию; startedAt фиксируем ДО
- *  отправки (ответы хода будут строго новее). */
-async function sendPrompt(sessionID: string, text: string): Promise<number> {
-  const startedAt = Date.now()
-  await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text } })
-  return startedAt
+/** Обновление методички в ЖИВОЙ сессии: AGENTS.md заморожен на создании,
+ *  поэтому изменение prompt.md доезжает инъекцией (разовый ход, юзер его не
+ *  видит — это транспорт, не диалог). */
+const refreshInstructions = async (sessionID: string): Promise<void> => {
+  const h = instructionsHash()
+  if (state.instructionsHash === h) return
+  const src = readFileSync(PROMPT_MD, "utf-8")
+  await restCall(`/session/${sessionID}/prompt`, {
+    method: "POST",
+    body: {
+      text: `[обновление методички ·системное сообщение]\n\n${src.trim()}\n\n[конец ·системное сообщение]\n\nЭто актуальная версия методички — действуй по ней, прежнюю считай отменённой. Ответь одной короткой строкой подтверждения.`,
+    },
+  })
+  state.instructionsHash = h
+  save()
+  log(`методичка обновлена в сессии ${sessionID} (инъекция, ${src.length} байт)`)
+  // подтверждение инъекции не ждём финалом: ход-подтверждение короткий,
+  // следующий промпт юзера встанет за ним в очередь того же диалога
 }
 
 /** Неудача попытки хода: transient или poison. attempts считаем в самой
@@ -264,7 +298,10 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
 
 /** Финал хода → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
  *  ход уже отработал (задача на доске есть), теряем только ответ:
- *  фиксируем полный текст в лог, юзер проверит доску. */
+ *  фиксируем полный текст в лог, юзер проверит доску.
+ *  Эскалация деградации: 3 оборванных финала подряд (outcome ≠ succeeded —
+ *  контекст перерос компакцию, модель приказала жить) → сессию пересоздаём
+ *  (модель возьмётся свежая из конфига), текущее сообщение — обратно в очередь. */
 const deliverFinal = async (run: RunState): Promise<void> => {
   let broken = false
   try {
@@ -278,12 +315,32 @@ const deliverFinal = async (run: RunState): Promise<void> => {
   for (let a = 1; a <= DELIVER_ATTEMPTS; a++) {
     if (await send(run.req.chatID, body)) {
       log(`финал ${run.sessionID} (доставлен, попытка ${a}): ${body.slice(0, 80)}`)
-      return
+      break
     }
     log(`доставка финала ${run.sessionID}: попытка ${a}/${DELIVER_ATTEMPTS} не прошла`)
     if (a < DELIVER_ATTEMPTS) await sleep(30_000)
+    else log(`финал ${run.sessionID} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
   }
-  log(`финал ${run.sessionID} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
+  if (!broken) {
+    state.broken = 0
+    save()
+    return
+  }
+  state.broken = (state.broken ?? 0) + 1
+  if (state.broken < BROKEN_SESSION_RESET) {
+    save()
+    return
+  }
+  log(`сессия ${run.sessionID}: ${state.broken} оборванных финалов подряд — пересоздаю`)
+  state.broken = 0
+  state.session = undefined
+  state.instructionsHash = undefined
+  // сообщение не отработано нормально — вернуть в голову очереди начисто
+  state.queue.unshift({ text: run.req.text, chatID: run.req.chatID, msgID: run.req.msgID, receivedAt: run.req.receivedAt })
+  save()
+  if (state.chatID !== undefined) {
+    await send(state.chatID, "⚠️ Диалог деградировал (3 сбоя подряд) — пересоздаю сессию с чистого листа, сообщение обработаю заново.")
+  }
 }
 
 /** Одна проверка сессии: ещё исполняется / завершена / пропала. */
@@ -322,26 +379,32 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   }
 }
 
-/** Рестарт в окне отправки: ход персистнут (startedAt=0), промпт мог дойти
- *  или нет. Дошёл (user-сообщение в сессии новее прихода заявки) → доигрываем
- *  с точным startedAt; нет → ход сносим, заявка в очереди поднимется заново. */
-const recoverPendingRun = async (run: RunState): Promise<void> => {
+/** Рестарт в окне отправки: ход персистнут, сообщение ещё в очереди —
+ *  промпт мог дойти или нет. Дошёл (user-сообщение с ЭТИМ текстом новее
+ *  старта хода) → доигрываем с точным startedAt и забираем из очереди;
+ *  нет → ход сносим, сообщение в очереди поднимется заново. */
+const confirmPendingRun = async (run: RunState): Promise<boolean> => {
+  const inQueue = state.queue.some((r) => r.msgID === run.req.msgID)
+  if (!inQueue) return false // ход подтверждён (message ушло из очереди) — наблюдаем
   let landed: number | null = null
-  try { landed = promptLandedAt(await sessionMessages(run.sessionID), run.req.receivedAt - 2000) } catch {}
+  try { landed = promptLandedAt(await sessionMessages(run.sessionID), run.startedAt - 2000, run.req.text) } catch {}
   if (landed !== null) {
     log(`окно отправки ${run.sessionID}: промпт дошёл (${landed}) — доигрываем`)
+    const i = state.queue.findIndex((r) => r.msgID === run.req.msgID)
+    if (i >= 0) state.queue.splice(i, 1)
     state.run = { ...run, startedAt: landed }
     save()
-    return
+    return false
   }
-  log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, заявка перезапустится`)
+  log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, сообщение перезапустится`)
   state.run = undefined
   save()
+  return true // продолжить цикл (сообщение поднимется заново)
 }
 
 /** Поднять ход: сообщение из головы очереди → активный ход в вечной сессии.
- *  Заявка НЕ шифтится из очереди до подтверждённого промпта — рестарт в
- *  любой точке окна не теряет её. "idle" — очередь пуста; "started" — ход
+ *  Сообщение НЕ шифтится из очереди до подтверждённого промпта — рестарт в
+ *  любой точке окна не теряет его. "idle" — очередь пуста; "started" — ход
  *  активен; "later" — сбой обработан, ретрай запланирован (sleep в spawnFail). */
 const startRun = async (): Promise<"idle" | "started" | "later"> => {
   const req = state.queue[0]
@@ -353,11 +416,14 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
     await spawnFail(req, e)
     return "later"
   }
-  state.run = { sessionID, startedAt: 0, req }
+  // startedAt персистним ДО отправки: крах в мс-окне вокруг POST разрулит
+  // confirmPendingRun по тексту (дошёл/не дошёл) — без ложных пустых финалов
+  const startedAt = Date.now()
+  state.run = { sessionID, startedAt, req }
   save()
-  let startedAt: number
   try {
-    startedAt = await sendPrompt(sessionID, req.text)
+    await refreshInstructions(sessionID) // инъекция, если методичка изменилась
+    await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text: req.text } })
   } catch (e) {
     state.run = undefined
     save()
@@ -367,7 +433,6 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   // промпт подтверждён: сообщение принято в работу — убираем из очереди
   const i = state.queue.findIndex((r) => r.msgID === req.msgID)
   if (i >= 0) state.queue.splice(i, 1)
-  state.run = { sessionID, startedAt, req }
   const waited = Math.round((Date.now() - req.receivedAt) / 1000)
   log(`ход ${sessionID}: ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
   save()
@@ -379,10 +444,16 @@ const runLoop = async (): Promise<void> => {
     try {
       if (stopping) break
 
-      // рестарт в окне отправки: доиграть или перезапустить (заявка в очереди)
-      if (state.run !== undefined && state.run.startedAt === 0) {
-        await recoverPendingRun(state.run)
-        continue
+      if (state.run !== undefined) {
+        // рестарт в окне отправки (startedAt=0 — даже не пытались): сносим,
+        // сообщение в очереди поднимется само
+        if (state.run.startedAt === 0) {
+          state.run = undefined
+          save()
+          continue
+        }
+        // сообщение ещё в очереди → окно отправки: дошёл/не дошёл
+        if (await confirmPendingRun(state.run)) continue
       }
 
       if (state.run !== undefined) {
