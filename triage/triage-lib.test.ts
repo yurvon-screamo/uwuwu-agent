@@ -1,7 +1,7 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, batchReadyAt, classifyUpdate, dropBatch, extractFinal, joinBatch, plainChunks,
+  alignChunks, batchReadyAt, classifyUpdate, composeText, dropBatch, extractFinal, joinBatch, plainChunks,
   promptLandedAt, takeBatch, validState,
   type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
@@ -177,11 +177,21 @@ test("joinBatch: одиночное сообщение не получает msg
   expect(j.attachments).toBeUndefined()
 })
 
-test("joinBatch: вложения батча склеиваются (кап 10)", () => {
-  const items = Array.from({ length: 12 }, (_, i) =>
+test("joinBatch: вложения батча склеиваются (кап 20)", () => {
+  const items = Array.from({ length: 25 }, (_, i) =>
     R({ msgID: i + 1, receivedAt: i, attachments: [{ path: `/m/${i}`, name: `${i}.jpg` }] }))
   const j = joinBatch(items)
-  expect(j.attachments?.length).toBe(10)
+  expect(j.attachments?.length).toBe(20)
+})
+
+// ——— composeText ———
+
+test("composeText: текст + маркеры вложений и неудач", () => {
+  expect(composeText("сделай", [{ path: "/m/1.jpg", name: "1.jpg" }], [])).toBe(
+    "сделай\n[вложение: 1.jpg — файл в ФС: /m/1.jpg]")
+  expect(composeText("", [{ path: "/m/1.jpg", name: "1.jpg" }], ["2.png"])).toBe(
+    "[вложение: 1.jpg — файл в ФС: /m/1.jpg]\n[вложение 2.png не выгрузилось — попроси юзера продублировать]")
+  expect(composeText("чисто", [], [])).toBe("чисто")
 })
 
 // ——— plainChunks / alignChunks ———

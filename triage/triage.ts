@@ -18,7 +18,7 @@ import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import {
-  alignChunks, batchReadyAt, classifyUpdate, dropBatch, extractFinal, joinBatch, plainChunks,
+  alignChunks, batchReadyAt, classifyUpdate, composeText, dropBatch, extractFinal, joinBatch, plainChunks,
   promptLandedAt, SESSION_TITLE, takeBatch, validState,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
@@ -279,22 +279,21 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   }
 }
 
-/** Неудача попытки хода: transient или poison. attempts считаем в самой
- *  заявке (персист — иначе рестарт в 30с-паузе откатит счётчик и crash-loop
- *  никогда не доедет до dead-letter); MAX_SPAWN_ATTEMPTS — dead-letter:
- *  снимаем и персистим ДО отправки (рестарт не воскресит заявку и не
- *  задублирует сообщение), юзеру уходит полный текст; недоставка — текст
- *  заявки в лог (ничего не теряется молча). Батч обрабатывается как один
- *  юнит (msgIDs). */
+/** Неудача попытки хода: transient или poison. Счётчик ведём на
+ *  ПРЕДСТАВИТЕЛЕ батча в очереди (состав не трогаем — склейка пересоберётся
+ *  теми же сообщениями, дублей не будет); MAX_SPAWN_ATTEMPTS — dead-letter:
+ *  весь батч (dropBatch) снимаем и персистим ДО отправки, юзеру уходит
+ *  полный склеенный текст; недоставка — текст в лог. */
 async function spawnFail(req: Request, e: unknown): Promise<void> {
-  const attempts = (req.attempts ?? 0) + 1
-  const i = state.queue.findIndex((r) => (req.msgIDs ?? [req.msgID]).includes(r.msgID))
-  if (i < 0) {
+  const rep = state.queue.find((r) => r.msgID === req.msgID)
+  if (rep === undefined) {
     log(`spawnFail: заявка msg${req.msgID} уже не в очереди — игнор`)
     return
   }
+  const attempts = (rep.attempts ?? 0) + 1
   if (attempts >= MAX_SPAWN_ATTEMPTS) {
     state.queue = dropBatch(state.queue, req)
+    state.firing = undefined
     save()
     // текст заявки — в лог ДО отправки: крах посреди send не потеряет его молча
     log(`заявка msg${req.msgID}: ${attempts} неудачных попыток хода (${e}) — dead-letter, текст: ${req.text}`)
@@ -302,7 +301,7 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
     if (!ok) log(`dead-letter msg${req.msgID} НЕ доставлен (текст заявки выше в этом логе)`)
     return
   }
-  state.queue[i] = { ...req, attempts }
+  rep.attempts = attempts // счётчик на представителе: состав батча в очереди не трогаем
   save()
   log(`ход не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
   await send(req.chatID, `⚠️ Прогон не поднялся (попытка ${attempts} из ${MAX_SPAWN_ATTEMPTS - 1}: ${e instanceof Error ? e.message : String(e)}) — ретрай через 30с`)
@@ -440,6 +439,10 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   const items = takeBatch(state.queue, readyAt)
   if (items.length === 0) return "idle"
   const req = joinBatch(items)
+  // маркер полёта СИНХРОННО, до любых await: edit-ветка видит «уже пошло»
+  // (состав батча в очереди не трогаем — он страховка от потери)
+  state.firing = { at: Date.now(), msgIDs: req.msgIDs ?? [req.msgID] }
+  save()
   let sessionID: string
   try {
     sessionID = await ensureSession()
@@ -473,12 +476,14 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
     }
   } catch (e) {
     state.run = undefined
+    state.firing = undefined
     save()
     await spawnFail(req, e)
     return "later"
   }
   // промпт подтверждён: батч принят в работу — убираем из очереди целиком
   state.queue = dropBatch(state.queue, req)
+  state.firing = undefined
   const waited = Math.round((Date.now() - req.receivedAt) / 1000)
   log(`ход ${sessionID} (${items.length} сообщ.): ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
   save()
@@ -492,9 +497,10 @@ const runLoop = async (): Promise<void> => {
 
       if (state.run !== undefined) {
         // рестарт в окне отправки (startedAt=0 — даже не пытались): сносим,
-        // сообщение в очереди поднимется само
+        // сообщение в очереди поднимется само; заодно стухший firing-маркер
         if (state.run.startedAt === 0) {
           state.run = undefined
+          state.firing = undefined
           save()
           continue
         }
@@ -518,6 +524,13 @@ const runLoop = async (): Promise<void> => {
           continue
         }
         state.pausedUntil = undefined
+        save()
+      }
+
+      // стухший firing-маркер (крах до персиста run): батч цел в очереди
+      // и поднимется заново — edit-ветка не должна вечно говорить «в полёте»
+      if (state.firing !== undefined && state.run === undefined && Date.now() - state.firing.at > 120_000) {
+        state.firing = undefined
         save()
       }
 
@@ -551,7 +564,9 @@ const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<
     try {
       const f = await tg("getFile", { file_id: fileId }) as { file_path?: string }
       if (typeof f.file_path !== "string") throw new Error("нет file_path")
-      const res = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${f.file_path}`)
+      const res = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${f.file_path}`, {
+        signal: AbortSignal.timeout(30_000),
+      })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       mkdirSync(MEDIA_DIR, { recursive: true })
       const local = join(MEDIA_DIR, name)
@@ -625,22 +640,33 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
     await send(state.chatID, "⚠️ Такой тип медиа не разбираю (голос/видео/стикер) — опиши словами или пришли фото/файл")
   } else if (out.kind === "edit") {
     // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
-    const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
-    if (i >= 0) {
-      state.queue[i] = { ...state.queue[i]!, text: out.text }
-      state.lastPushAt = Date.now() // юзер ещё формулирует — окно продлевается
-      log(`edit msg${out.msg.message_id}: текст подменён в очереди`)
+    if (state.firing !== undefined && state.firing.msgIDs.includes(out.msg.message_id)) {
+      log(`edit msg${out.msg.message_id}: батч уже в полёте — правка не принята`)
+      await send(state.chatID, "⏳ Успел раньше меня — сообщение уже у агента. Пришли правку новым сообщением.")
     } else {
-      log(`edit msg${out.msg.message_id}: уже не в очереди — игнор`)
+      const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
+      if (i >= 0) {
+        // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
+        // пересобираем с маркерами (пути в ФС — источник для --attach агента)
+        const hasNewMedia = (Array.isArray(out.msg.photo) && out.msg.photo.length > 0) || out.msg.document?.file_id !== undefined
+        const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
+        const cur = state.queue[i]!
+        const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
+        state.queue[i] = {
+          ...cur,
+          text: composeText(out.text, attachments, dl.failed),
+          ...(attachments.length > 0 ? { attachments } : {}),
+        }
+        state.lastPushAt = Date.now() // юзер ещё формулирует — окно продлевается
+        log(`edit msg${out.msg.message_id}: текст${hasNewMedia ? " + вложения" : ""} подменён в очереди`)
+      } else {
+        log(`edit msg${out.msg.message_id}: уже не в очереди — игнор`)
+      }
     }
   } else {
     // заявка: выгрузить вложения в ФС, пути — в текст (агент приложит к задаче)
     const { attachments, failed } = await downloadAttachment(out.msg)
-    const markers = [
-      ...attachments.map((a) => `[вложение: ${a.name} — файл в ФС: ${a.path}]`),
-      ...failed.map((n) => `[вложение ${n} не выгрузилось — попроси юзера продублировать]`),
-    ]
-    const text = [out.text, ...markers].filter((s) => s !== "").join("\n")
+    const text = composeText(out.text, attachments, failed)
     state.queue.push({
       text,
       chatID: out.msg.chat.id,

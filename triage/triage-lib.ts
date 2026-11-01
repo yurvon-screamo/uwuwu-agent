@@ -61,6 +61,9 @@ export interface TriageState {
   run?: RunState
   /** ms последнего push/редакта в очередь — опора дебаунса батча */
   lastPushAt?: number
+  /** батч в полёте (взят из очереди, промпт ещё не подтверждён): edit-ветка
+   *  отличает «ещё в очереди — можно править» от «уже пошло агенту» */
+  firing?: { at: number; msgIDs: number[] }
 }
 
 // ——— состояние ———
@@ -74,7 +77,7 @@ const isReq = (v: unknown): v is Request => {
     || (Array.isArray(r.msgIDs) && (r.msgIDs as unknown[]).length <= 100
       && (r.msgIDs as unknown[]).every((m) => Number.isInteger(m)))
   const attOk = r.attachments === undefined
-    || (Array.isArray(r.attachments) && (r.attachments as unknown[]).length <= 10
+    || (Array.isArray(r.attachments) && (r.attachments as unknown[]).length <= 20
       && (r.attachments as unknown[]).every((a) => {
         if (a === null || typeof a !== "object") return false
         const x = a as Record<string, unknown>
@@ -99,6 +102,14 @@ export function validState(raw: unknown): TriageState {
   for (const k of ["lastResetAt", "pausedUntil", "lastPushAt"] as const) {
     const v = r[k]
     if (Number.isFinite(v) && (v as number) >= 0) out[k] = v as number
+  }
+  const firing = r.firing
+  if (firing !== null && typeof firing === "object") {
+    const f = firing as Record<string, unknown>
+    if (Number.isFinite(f.at) && (f.at as number) >= 0 && Array.isArray(f.msgIDs)
+      && (f.msgIDs as unknown[]).length <= 100 && (f.msgIDs as unknown[]).every((m) => Number.isInteger(m))) {
+      out.firing = { at: f.at as number, msgIDs: f.msgIDs as number[] }
+    }
   }
   if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
   const run = r.run
@@ -168,6 +179,16 @@ export function takeBatch(queue: Request[], readyAt: number): Request[] {
   return out
 }
 
+/** Текст заявки: слова юзера + маркеры вложений (путь в ФС — источник для
+ *  --attach агента) + маркеры неудач выгрузки. */
+export function composeText(text: string, attachments: Attachment[], failed: string[]): string {
+  return [
+    text,
+    ...attachments.map((a) => `[вложение: ${a.name} — файл в ФС: ${a.path}]`),
+    ...failed.map((n) => `[вложение ${n} не выгрузилось — попроси юзера продублировать]`),
+  ].filter((s) => s !== "").join("\n")
+}
+
 /** Батч как один ход диалога: тексты склеены, вложения объединены, msgIDs —
  *  состав для удаления из очереди одним юнитом (dead-letter/recovery). */
 export function joinBatch(items: Request[]): Request {
@@ -179,9 +200,12 @@ export function joinBatch(items: Request[]): Request {
     msgID: head.msgID,
     receivedAt: head.receivedAt,
     ...(items.length > 1 ? { msgIDs: items.map((i) => i.msgID) } : {}),
-    ...(attachments.length > 0 ? { attachments: attachments.slice(0, 10) } : {}),
+    ...(attachments.length > 0 ? { attachments: attachments.slice(0, ATT_BATCH_MAX) } : {}),
   }
 }
+
+/** Кап вложений батча: маркеры в тексте и files-состав не расходятся. */
+export const ATT_BATCH_MAX = 20
 
 /** Удалить из очереди все сообщения батча (по msgID). */
 export function dropBatch(queue: Request[], req: Request): Request[] {
