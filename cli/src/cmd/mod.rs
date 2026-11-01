@@ -4,8 +4,6 @@
 mod cli;
 mod cron;
 mod docs;
-mod facts;
-mod request;
 mod search;
 mod task;
 
@@ -32,41 +30,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         } => docs::shot(&cfg, &root, slug, out, edgeless).await,
         Commands::Projects => docs::projects(&cfg, &root).await,
         Commands::Refresh => docs::refresh(&cfg, &root).await,
-        Commands::Facts {
-            stdin,
-            source,
-            date,
-            text,
-        } => facts::run(stdin, source, date, text).await,
-        Commands::Request {
-            command,
-            text,
-            stdin,
-            action,
-            target,
-            reason,
-            attach,
-        } => {
-            request::run(
-                &cfg,
-                &root,
-                request::RequestCmd {
-                    command,
-                    text,
-                    stdin,
-                    action,
-                    target,
-                    reason,
-                    attach,
-                },
-            )
-            .await
-        }
         Commands::Search {
             query,
             top,
             tasks,
-            facts,
             access,
             sofa,
             threshold,
@@ -78,7 +45,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     query,
                     top,
                     tasks,
-                    facts,
                     access,
                     sofa,
                     threshold,

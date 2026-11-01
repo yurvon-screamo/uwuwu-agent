@@ -570,7 +570,7 @@ pub async fn create_task(
             .await;
         // cross-machine race: a concurrent create may land the same name.
         // delete_tag works by name only, so duplicates get disarmed by a
-        // name-reset (delete + single re-create) — the #7 requests lesson
+        // name-reset (delete + single re-create) — the duplicate-tag race lesson
         let relist = client
             .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
             .await;

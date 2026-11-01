@@ -8,7 +8,6 @@ pub(crate) struct SearchCmd {
     pub query: String,
     pub top: usize,
     pub tasks: usize,
-    pub facts: usize,
     pub access: usize,
     pub sofa: usize,
     pub threshold: f32,
@@ -23,7 +22,6 @@ pub(crate) async fn run(
         query,
         top,
         tasks,
-        facts,
         access,
         sofa,
         threshold,
@@ -43,7 +41,7 @@ pub(crate) async fn run(
     let printed = print_server_hits(root, &server_res);
     let use_local = !printed;
     let local_fut = async {
-        if !use_local || top + facts + access == 0 {
+        if !use_local || top + access == 0 {
             return Ok(Vec::new());
         }
         // тела задач/кронов — кэш с TTL (живой проход не чаще 5 мин);
@@ -60,15 +58,12 @@ pub(crate) async fn run(
         // упирается в лимит шлюза и сжирает минуту): локальные кэши
         // + tagged-кэш TTL 5 мин. Свежесть дают остальные cli-команды.
         let cache = crate::content_cache::ContentCache::load(root).unwrap_or_default();
-        let index = crate::fact_index::FactIndex::load(root).unwrap_or_default();
         crate::affine_search::search(
             root,
             &cache,
-            &index,
             &query,
             &crate::affine_search::SearchOpts {
                 experience: top,
-                facts,
                 access,
                 tasks,
                 threshold,
@@ -87,18 +82,12 @@ pub(crate) async fn run(
     let hits = local_res?;
     for hit in &hits {
         let kind = match hit.kind {
-            DocKind::Daily => "fact",
             DocKind::Project => "access",
             DocKind::Task => "task",
             DocKind::Cron => "cron",
             _ => "experience",
         };
         println!("{:.3}\t{kind}\t{}\t{}", hit.score, hit.title, hit.slug);
-        if kind == "fact" {
-            for line in hit.body.lines() {
-                println!("    {line}");
-            }
-        }
     }
     let sofa_hits = sofa_res
         .map(|r| {
@@ -198,8 +187,8 @@ pub(crate) async fn grep(
     root: &std::path::Path,
     pattern: String,
 ) -> anyhow::Result<()> {
-    let (_, cache, index) = affine_queries::session(root, cfg).await?;
-    let hits = affine_queries::grep(&cache, &index, &pattern);
+    let (_, cache) = affine_queries::session(root, cfg).await?;
+    let hits = affine_queries::grep(&cache, &pattern);
     if hits.is_empty() {
         println!("  No matches found.");
         return Ok(());

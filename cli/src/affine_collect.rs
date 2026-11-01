@@ -2,10 +2,9 @@
 //! root into migration units. Unreadable/non-UTF8 files surface as errors
 //! instead of migrating as empty documents.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::affine_store::{split_frontmatter, DocToMigrate, FactEntry};
+use crate::affine_store::{split_frontmatter, DocToMigrate};
 
 /// Collected documents plus read errors: a failed read must NOT mark the
 /// slug as migrated (the map only records successful pushes).
@@ -119,51 +118,4 @@ pub fn collect_projects(root: &Path) -> CollectResult<ProjectDocs> {
         items.push(ProjectDocs { name, readme, docs });
     }
     CollectResult { items, errors }
-}
-
-pub fn collect_facts(root: &Path) -> CollectResult<FactEntry> {
-    let paths = collect_md(&root.join("facts"));
-    let mut items = Vec::new();
-    let mut errors = Vec::new();
-    for path in &paths {
-        let content = match read_file(path) {
-            Ok(content) => content,
-            Err(e) => {
-                errors.push(e);
-                continue;
-            }
-        };
-        let slug = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let (fm, statement) = split_frontmatter(&content);
-        items.push(FactEntry {
-            date: fm.updated.clone().unwrap_or_else(|| month_fallback(path)),
-            title: fm.title.unwrap_or_else(|| slug.clone()),
-            statement,
-            tags: fm.tags,
-            confidence: fm.confidence.unwrap_or_else(|| "-".into()),
-            sources: fm.sources,
-            status: fm.status.unwrap_or_default(),
-            slug,
-        });
-    }
-    CollectResult { items, errors }
-}
-
-fn month_fallback(path: &Path) -> String {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .map(|n| format!("{}-01", n.to_string_lossy()))
-        .unwrap_or_else(|| "1970-01-01".into())
-}
-
-pub fn group_by_date(facts: &[FactEntry]) -> BTreeMap<String, Vec<&FactEntry>> {
-    let mut groups: BTreeMap<String, Vec<&FactEntry>> = BTreeMap::new();
-    for fact in facts {
-        groups.entry(fact.date.clone()).or_default().push(fact);
-    }
-    groups
 }

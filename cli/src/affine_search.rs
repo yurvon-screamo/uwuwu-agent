@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::content_cache::{ContentCache, DocKind};
 use crate::embed::embed;
-use crate::fact_index::FactIndex;
 
 const MODEL: &str = "qwen3-embedding:0.6b";
 const CACHE_FILE: &str = "affine_embedding_cache.json";
@@ -39,7 +38,6 @@ pub struct SearchHit {
 
 pub struct SearchOpts {
     pub experience: usize,
-    pub facts: usize,
     pub access: usize,
     /// отдельная квота тел задач/кронов (теги Dev/Spike/Bug/Cron)
     pub tasks: usize,
@@ -56,32 +54,20 @@ pub struct CorpusDoc {
     pub kind: DocKind,
 }
 
-/// Articles + project docs + fact statements — the cache-backed corpus.
-fn collect_corpus(cache: &ContentCache, index: &FactIndex) -> Vec<CorpusDoc> {
-    let mut docs: Vec<CorpusDoc> = Vec::new();
-    for (slug, doc) in cache
+/// Articles + project docs — the cache-backed corpus.
+fn collect_corpus(cache: &ContentCache) -> Vec<CorpusDoc> {
+    cache
         .docs_by_kind(&DocKind::Experience)
         .into_iter()
         .chain(cache.docs_by_kind(&DocKind::Project))
-    {
-        docs.push(CorpusDoc {
+        .map(|(slug, doc)| CorpusDoc {
             slug: slug.clone(),
             title: doc.title.clone(),
             description: first_line(&doc.markdown),
             body: doc.markdown.clone(),
             kind: doc.kind.clone(),
-        });
-    }
-    for (_, fact) in index.iter() {
-        docs.push(CorpusDoc {
-            slug: format!("facts/{}", fact.slug),
-            title: fact.title.clone(),
-            description: fact.statement.chars().take(140).collect(),
-            body: fact.statement.clone(),
-            kind: DocKind::Daily,
-        });
-    }
-    docs
+        })
+        .collect()
 }
 
 /// Тела задач/кронов по тегам: дерево их не видит — живой источник.
@@ -106,17 +92,10 @@ fn extras_to_corpus(extra_docs: &[(String, String, String, &'static str)]) -> Ve
 fn apply_quotas(scored: Vec<SearchHit>, opts: &SearchOpts) -> Vec<SearchHit> {
     let mut out = Vec::new();
     let mut exp = 0;
-    let mut facts = 0;
     let mut access = 0;
     let mut tasks = 0;
     for hit in scored {
         match hit.kind {
-            DocKind::Daily => {
-                if facts < opts.facts {
-                    facts += 1;
-                    out.push(hit);
-                }
-            }
             DocKind::Project => {
                 if access < opts.access {
                     access += 1;
@@ -141,12 +120,10 @@ fn apply_quotas(scored: Vec<SearchHit>, opts: &SearchOpts) -> Vec<SearchHit> {
     out
 }
 
-/// Unified semantic search: experience + project docs from the content
-/// cache, facts from the dedup index statements.
+/// Unified semantic search: experience + project docs from the content cache.
 pub async fn search(
     root: &Path,
     cache: &ContentCache,
-    index: &FactIndex,
     query: &str,
     opts: &SearchOpts,
     extra_docs: &[(String, String, String, &'static str)],
@@ -160,7 +137,7 @@ pub async fn search(
     // extras (свежие тела задач/кронов) — первыми в очередь эмбеддинга:
     // бюджет прогона не должен съедаться до их пула
     let mut docs = extras_to_corpus(extra_docs);
-    docs.extend(collect_corpus(cache, index));
+    docs.extend(collect_corpus(cache));
 
     for doc in docs {
         let chunks = chunk_markdown(&doc.body);
@@ -332,9 +309,6 @@ mod tests {
             kind,
         };
         let scored = vec![
-            hit("f1", DocKind::Daily),
-            hit("f2", DocKind::Daily),
-            hit("f3", DocKind::Daily),
             hit("a1", DocKind::Project),
             hit("a2", DocKind::Project),
             hit("t1", DocKind::Task),
@@ -343,14 +317,13 @@ mod tests {
         ];
         let opts = SearchOpts {
             experience: 1,
-            facts: 2,
             access: 1,
             tasks: 1,
             threshold: 0.0,
         };
         let out = apply_quotas(scored, &opts);
         let slugs: Vec<&str> = out.iter().map(|h| h.slug.as_str()).collect();
-        assert_eq!(slugs, vec!["f1", "f2", "a1", "t1", "e1"]);
+        assert_eq!(slugs, vec!["a1", "t1", "e1"]);
     }
 
     #[test]

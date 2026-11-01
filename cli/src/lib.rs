@@ -2,7 +2,6 @@ pub mod affine_blob;
 pub mod affine_client;
 pub mod affine_collect;
 pub mod affine_docs;
-pub mod affine_publish;
 pub mod affine_queries;
 pub mod affine_search;
 pub mod affine_search_server;
@@ -13,11 +12,8 @@ pub mod affine_tasks;
 pub mod cmd;
 pub mod content_cache;
 pub mod embed;
-pub mod fact_index;
-pub mod facts;
 pub mod log_filter;
 pub mod path;
-pub mod request;
 pub mod sofa;
 pub mod wiki;
 
@@ -58,27 +54,6 @@ pub fn uwuwu_data_dir() -> PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .expect("USERPROFILE or HOME environment variable must be set");
     PathBuf::from(home).join(".uwuwu")
-}
-
-/// Локальная дата дня (как в audit/python: локальные даты, не UTC).
-pub(crate) fn local_today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
-}
-
-/// YYYY-MM-DD или паника слайсинга месяца каталога — валидируем на входе.
-pub(crate) fn valid_date(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.len() != 10 {
-        return false;
-    }
-    if !b.iter().enumerate().all(|(i, c)| match i {
-        4 | 7 => *c == b'-',
-        _ => c.is_ascii_digit(),
-    }) {
-        return false;
-    }
-    let num = |from: usize, to: usize| -> u32 { s[from..to].parse().unwrap_or(0) };
-    (1..=12).contains(&num(5, 7)) && (1..=31).contains(&num(8, 10))
 }
 
 /// UI-URL для ссылок/поиска: env, но устаревший Railway-хост игнорируется

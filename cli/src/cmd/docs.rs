@@ -70,7 +70,7 @@ pub(crate) async fn shot(
 }
 
 pub(crate) async fn projects(cfg: &AffineConfig, root: &std::path::Path) -> anyhow::Result<()> {
-    let (_, cache, _) = affine_queries::session(root, cfg).await?;
+    let (_, cache) = affine_queries::session(root, cfg).await?;
     let rows = affine_queries::projects(&cache);
     if rows.is_empty() {
         println!("No projects found in the workspace.");
@@ -88,12 +88,6 @@ pub(crate) async fn refresh(cfg: &AffineConfig, root: &std::path::Path) -> anyho
     // full refetch: fresh cache replaces the incremental one
     let mut fresh = crate::content_cache::ContentCache::default();
     let report = fresh.sync(&mut client, cfg, root).await?;
-    let mut index = crate::fact_index::FactIndex::load(root)?;
-    affine_queries::sync_fact_buckets(&mut client, cfg, root, &mut index).await?;
-    println!(
-        "synced: {} docs fetched, {} facts in dedup index",
-        report.fetched,
-        index.iter().count()
-    );
+    println!("synced: {} docs fetched", report.fetched);
     Ok(())
 }

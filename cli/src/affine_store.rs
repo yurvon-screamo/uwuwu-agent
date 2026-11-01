@@ -1,7 +1,6 @@
-//! Migration map: local slug → AFFiNE docId, stored in the wiki root next to
-//! the facts sidecars. Powers idempotent migration (rerun skips mapped docs)
-//! and daily-bucket reuse for the facts → journal publish hook.
-//! Plus the frontmatter/section primitives shared by collectors and publisher.
+//! Migration map: local slug → AFFiNE docId, stored in the wiki root.
+//! Powers idempotent migration (rerun skips mapped docs).
+//! Plus the frontmatter/section primitives shared by collectors.
 //!
 //! Slightly over the 200-line module limit: the map struct and the parsing
 //! primitives it travels with form one cohesive storage contract; splitting
@@ -17,9 +16,8 @@ use crate::affine_client::AffineConfig;
 
 const MAP_FILE: &str = "affine_map.json";
 
-/// Container/daily keys are prefixed so they can never collide with slugs.
+/// Container keys are prefixed so they can never collide with slugs.
 const CONTAINER_PREFIX: &str = "__container_";
-const DAILY_PREFIX: &str = "__daily_";
 
 /// AFFiNE doc titles are truncated to keep the sidebar readable.
 pub const AFFINE_DOC_TITLE_MAX_CHARS: usize = 120;
@@ -93,20 +91,15 @@ impl MigrationMap {
             .map(|s| s.as_str())
     }
 
-    pub fn daily_bucket(&self, date: &str) -> Option<&str> {
-        self.entries
-            .get(&format!("{DAILY_PREFIX}{date}"))
-            .map(|s| s.as_str())
-    }
-
     /// True when the docId is already bound to some slug — a recovered doc
     /// owned by another slug must not be re-bound (write recovery guard).
     pub fn owns_doc(&self, doc_id: &str) -> bool {
         self.entries.values().any(|v| v == doc_id)
     }
 
-    /// (slug, docId) pairs suitable for slug tagging: real slugs only,
-    /// facts (value "daily") and service keys excluded.
+    /// (slug, docId) pairs suitable for slug tagging: real slugs only;
+    /// service keys (prefixed `__`, legacy "daily" values from the retired
+    /// daily-bucket pipeline) are excluded.
     pub fn taggable_entries(&self) -> Vec<(String, String)> {
         self.entries
             .iter()
@@ -124,12 +117,7 @@ impl MigrationMap {
             .insert(format!("{CONTAINER_PREFIX}{name}"), doc_id.to_string());
     }
 
-    pub fn put_daily_bucket(&mut self, date: &str, doc_id: &str) {
-        self.entries
-            .insert(format!("{DAILY_PREFIX}{date}"), doc_id.to_string());
-    }
-
-    /// Persist atomically (tmp + rename) — concurrent facts runs may write it.
+    /// Persist atomically (tmp + rename) — concurrent runs may write it.
     pub fn save(&self) -> Result<()> {
         let json =
             serde_json::to_string_pretty(&self.entries).with_context(|| "serialize affine map")?;
@@ -218,42 +206,6 @@ pub struct DocToMigrate {
     pub slug: String,
     pub title: String,
     pub markdown: String,
-}
-
-/// One fact destined for a daily bucket (kept raw; rendering is separate).
-pub struct FactEntry {
-    pub slug: String,
-    pub date: String,
-    pub title: String,
-    pub statement: String,
-    pub tags: Vec<String>,
-    pub confidence: String,
-    pub sources: Vec<String>,
-    /// "accepted" | "conflict" | "" — surfaced in the bucket section meta.
-    pub status: String,
-}
-
-/// Render one fact as a markdown section inside the daily bucket.
-pub fn render_fact_section(fact: &FactEntry) -> String {
-    let tags = if fact.tags.is_empty() {
-        "fact".to_string()
-    } else {
-        fact.tags.join(", ")
-    };
-    let sources = if fact.sources.is_empty() {
-        "-".to_string()
-    } else {
-        fact.sources.join(", ")
-    };
-    let status = if fact.status == "conflict" {
-        " · СТАТУС: КОНФЛИКТ"
-    } else {
-        ""
-    };
-    format!(
-        "## {}\n\n{}\n\n*{} · conf {} · sources: {} · slug: {}{}*\n",
-        fact.title, fact.statement, tags, fact.confidence, sources, fact.slug, status
-    )
 }
 
 /// Extract the host from a gateway URL (no url crate needed): strip the
