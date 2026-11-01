@@ -1,201 +1,21 @@
-//! AFFiNE-backed implementations of the read-side commands: read, projects,
-//! grep and semantic search. Every command syncs its local content cache
-//! from the workspace first, so any machine sees the whole base.
+//! AFFiNE-backed implementations of the read-side commands: read and
+//! projects. Stateless: every command talks to the gateway live — no local
+//! content cache, stale reads are impossible by construction.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
-
-/// Живой сбор тел задач/кронов по тегам — не зависит от дерева
-/// (linked-тела невидимы list_workspace_tree). Cap guards от разросшейся доски.
-/// Кэш тел задач/кронов для поисковой семантики (TTL 300с): 36+ живых
-/// export-вызовов на каждый search — недопустимый множитель через туннель.
-/// Свежий кэш = мгновенно; протухший = один живой проход + сохранение.
-const TAGGED_CACHE_TTL_SECS: u64 = 300;
-
-/// Загрузить tagged-кэш без шлюза (деградация поиска при лежащем MCP).
-pub fn tagged_docs_cache_load(root: &Path) -> Vec<(String, String, String, &'static str)> {
-    read_tagged_cache(root).unwrap_or_default()
-}
-
-fn read_tagged_cache(root: &Path) -> Option<Vec<(String, String, String, &'static str)>> {
-    let raw = std::fs::read_to_string(root.join("tagged_docs_cache.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let rows: Vec<(String, String, String, String)> =
-        serde_json::from_value(v.get("rows")?.clone()).ok()?;
-    Some(
-        rows.into_iter()
-            .map(|(a, b, c, d)| {
-                let kind: &'static str = match d.as_str() {
-                    "cron" => "cron",
-                    _ => "task",
-                };
-                (a, b, c, kind)
-            })
-            .collect(),
-    )
-}
-
-pub async fn tagged_docs_cached(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-    root: &Path,
-) -> Vec<(String, String, String, &'static str)> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let path = root.join("tagged_docs_cache.json");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-            if now.saturating_sub(ts) < TAGGED_CACHE_TTL_SECS {
-                if let Ok(rows) = serde_json::from_value::<Vec<(String, String, String, String)>>(v)
-                {
-                    // типы статические восстанавливаем по 4-му полю
-                    return rows
-                        .into_iter()
-                        .map(|(a, b, c, d)| {
-                            let kind: &'static str = match d.as_str() {
-                                "cron" => "cron",
-                                _ => "task",
-                            };
-                            (a, b, c, kind)
-                        })
-                        .collect();
-                }
-            }
-        }
-    }
-    let rows = tagged_docs(client, cfg).await;
-    // пустой живой проход не кэшируем: моргающий апстрим не должен
-    // губить семантику задач на 5 минут
-    if !rows.is_empty() {
-        let payload = serde_json::json!({
-            "ts": now,
-            "rows": rows.iter()
-                .map(|(a, b, c, d)| (a, b, c, d.to_string()))
-                .collect::<Vec<_>>(),
-        });
-        if let Ok(s) = serde_json::to_string(&payload) {
-            let _ = std::fs::write(&path, s);
-        }
-    }
-    rows
-}
-
-pub async fn tagged_docs(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-) -> Vec<(String, String, String, &'static str)> {
-    const CAP: usize = 60;
-    let mut out: Vec<(String, String, String, &'static str)> = Vec::new();
-    for (tag, kind) in [
-        ("Dev", "task"),
-        ("Spike", "task"),
-        ("Bug", "task"),
-        ("Cron", "cron"),
-    ] {
-        let Ok(r) = client
-            .call_tool(
-                "list_docs_by_tag",
-                json!({"workspaceId": cfg.workspace, "tag": tag}),
-            )
-            .await
-        else {
-            continue;
-        };
-        let docs = r
-            .get("docs")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for d in docs {
-            if out.len() >= CAP {
-                return out;
-            }
-            let id = d
-                .get("id")
-                .or_else(|| d.get("docId"))
-                .and_then(|v| v.as_str());
-            let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let Some(id) = id else { continue };
-            if out.iter().any(|(did, ..)| did == id) {
-                continue;
-            }
-            if let Ok(e) = client
-                .call_tool(
-                    "export_doc_markdown",
-                    json!({"workspaceId": cfg.workspace, "docId": id}),
-                )
-                .await
-            {
-                let md = e.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
-                out.push((id.to_string(), title.to_string(), md.to_string(), kind));
-            }
-        }
-    }
-    out
-}
-
 use crate::affine_docs::{read_markdown, resolve_slug};
-use crate::content_cache::{ContentCache, DocKind};
-
-/// Connect + sync the content cache. Every read command starts here — it is
-/// what makes the CLI multi-PC safe.
-pub async fn session(root: &Path, cfg: &AffineConfig) -> Result<(AffineClient, ContentCache)> {
-    session_with_ttl(root, cfg, 600).await
-}
-
-/// A cache synced within the TTL is reused instead of re-walking the whole
-/// workspace tree on every single read/grep.
-pub async fn session_with_ttl(
-    root: &Path,
-    cfg: &AffineConfig,
-    ttl_secs: u64,
-) -> Result<(AffineClient, ContentCache)> {
-    let mut client = AffineClient::connect(cfg).await?;
-    let mut cache = ContentCache::load(root)?;
-    let tree_blind = crate::content_cache::tree_disabled(root);
-    if !cache.is_fresh(ttl_secs) && !tree_blind {
-        // Слепой tree у ограниченного акка (бот-член: list_workspace_tree пуст)
-        // НЕ должен ронять команду: работаем с локальным кэшем, резолв добирает
-        // через search_docs (resolve_doc_id last resort). Пустой кэш — честная ошибка.
-        match cache.sync(&mut client, cfg, root).await {
-            Ok(report) => {
-                if report.fetched > 0 {
-                    eprintln!("affine: content cache +{} docs", report.fetched);
-                }
-            }
-            Err(e) if cache.iter().count() > 0 => {
-                eprintln!(
-                    "affine: синк пропущен ({e:#}) — работаем с локальным кэшем ({} доков)",
-                    cache.iter().count()
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok((client, cache))
-}
 
 // ---------- read ----------
 
+/// Живое чтение: резолв слага (миграционная map → теги/тайтл через гейт)
+/// → markdown напрямую из афины. Кэша нет — гейт недоступен = честная ошибка.
 pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String> {
-    let (mut client, cache) = session(root, cfg).await?;
-    if let Some(doc) = cache.get(slug) {
-        let mut md = doc.markdown.clone();
-        if let Some(summary) = rich_blocks_section(&mut client, cfg, &doc.doc_id).await {
-            md.push_str(&summary);
-        }
-        return Ok(annotate_blob_links(md));
-    }
-    // cache miss on a fresh doc: resolve by tag and read directly
+    let mut client = AffineClient::connect(cfg).await?;
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
     if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
         let mut md = read_markdown(&mut client, cfg, &doc_id).await?;
@@ -207,13 +27,10 @@ pub async fn read(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<String>
     anyhow::bail!("article not found by slug: '{slug}'")
 }
 
-/// Resolve a slug/title to a doc id (cache → migration map → gateway title
+/// Resolve a slug/title to a doc id (migration map → gateway slug/title
 /// search). Shared by commands that need the id without the markdown body.
 pub async fn resolve_doc_id(root: &Path, cfg: &AffineConfig, slug: &str) -> Result<Option<String>> {
-    let (mut client, cache) = session(root, cfg).await?;
-    if let Some(doc) = cache.get(slug) {
-        return Ok(Some(doc.doc_id.clone()));
-    }
+    let mut client = AffineClient::connect(cfg).await?;
     let mut map = crate::affine_store::MigrationMap::load_for(root, cfg)?;
     if let Some(doc_id) = resolve_slug(&mut client, &mut map, cfg, slug).await? {
         return Ok(Some(doc_id));
@@ -723,76 +540,6 @@ fn render_tree(
     out
 }
 
-// ---------- projects ----------
-
-pub struct ProjectRow {
-    pub name: String,
-    pub docs: usize,
-    pub description: String,
-}
-
-pub fn projects(cache: &ContentCache) -> Vec<ProjectRow> {
-    let mut by_project: BTreeMap<String, (usize, String)> = BTreeMap::new();
-    for (slug, doc) in cache.docs_by_kind(&DocKind::Project) {
-        let project = slug.split('/').next().unwrap_or(slug).to_string();
-        let entry = by_project
-            .entry(project.clone())
-            .or_insert((0, String::new()));
-        entry.0 += 1;
-        if entry.1.is_empty() {
-            entry.1 = first_meaningful_line(&doc.markdown);
-        }
-    }
-    by_project
-        .into_iter()
-        .map(|(name, (docs, description))| ProjectRow {
-            name,
-            docs,
-            description,
-        })
-        .collect()
-}
-
-fn first_meaningful_line(markdown: &str) -> String {
-    markdown
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .unwrap_or("")
-        .chars()
-        .take(120)
-        .collect()
-}
-
-// ---------- grep ----------
-
-pub struct GrepHit {
-    pub slug: String,
-    pub line_number: usize,
-    pub line: String,
-}
-
-pub fn grep(cache: &ContentCache, pattern: &str) -> Vec<GrepHit> {
-    let needle = pattern.to_lowercase();
-    let mut hits = Vec::new();
-    for (slug, doc) in cache
-        .docs_by_kind(&DocKind::Experience)
-        .into_iter()
-        .chain(cache.docs_by_kind(&DocKind::Project))
-    {
-        for (n, line) in doc.markdown.lines().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                hits.push(GrepHit {
-                    slug: slug.clone(),
-                    line_number: n + 1,
-                    line: line.to_string(),
-                });
-            }
-        }
-    }
-    hits
-}
-
 #[cfg(test)]
 mod rich_render_tests {
     use super::{render_tree, tolerant_cell_text};
@@ -862,6 +609,93 @@ mod rich_render_tests {
         );
         assert_eq!(tolerant_cell_text(&serde_json::json!(null)), "");
     }
+}
+
+// ---------- projects ----------
+
+pub struct ProjectRow {
+    pub name: String,
+    pub description: String,
+}
+
+/// Реестр проектов: живой проход по организ-дереву (папка Projects),
+/// описание — первая содержательная строка дока `<Proj> Project (README)`.
+pub async fn projects(client: &mut AffineClient, cfg: &AffineConfig) -> Result<Vec<ProjectRow>> {
+    let resp = client
+        .call_tool("list_organize_nodes", json!({"workspaceId": cfg.workspace}))
+        .await?;
+    let nodes = resp
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let str_field =
+        |n: &serde_json::Value, k: &str| n.get(k).and_then(|v| v.as_str()).map(String::from);
+    let pid = nodes
+        .iter()
+        .find(|n| {
+            str_field(n, "type").as_deref() == Some("folder")
+                && str_field(n, "data").as_deref() == Some("Projects")
+        })
+        .and_then(|n| str_field(n, "id"));
+    let Some(pid) = pid else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for node in &nodes {
+        if str_field(node, "type").as_deref() != Some("folder")
+            || str_field(node, "parentId").as_deref() != Some(pid.as_str())
+        {
+            continue;
+        }
+        let Some(name) = str_field(node, "data") else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let description = project_description(client, cfg, &name).await;
+        out.push(ProjectRow { name, description });
+    }
+    Ok(out)
+}
+
+async fn project_description(client: &mut AffineClient, cfg: &AffineConfig, name: &str) -> String {
+    // README-док ищется точным тайтлом (организ-дерево не несёт тайтлы)
+    let title = format!("{name} Project (README)");
+    let Ok(resp) = client
+        .call_tool(
+            "find_doc_by_title",
+            json!({"workspaceId": cfg.workspace, "title": title, "caseInsensitive": true, "limit": 3}),
+        )
+        .await
+    else {
+        return String::new();
+    };
+    let Some(doc_id) = resp
+        .get("matches")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter(|m| m.get("inTrash").and_then(|t| t.as_bool()) != Some(true))
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .next()
+                .map(String::from)
+        })
+    else {
+        return String::new();
+    };
+    if let Ok(md) = read_markdown(client, cfg, doc_id.as_str()).await {
+        return md
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+    }
+    String::new()
 }
 
 #[cfg(test)]

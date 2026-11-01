@@ -172,7 +172,8 @@ describe("dreamerPrompt / isValidTracked", () => {
     expect(p).toContain("opencode_audit.py")
     expect(p).toContain("wiki_ops.py")
     expect(p).toContain("opencode.db")
-    expect(p).toContain("bash")
+    expect(p).toContain("uwuwu-cli read")
+    expect(p).toContain("одной-двумя строками")
   })
   test("валидация state-записей", () => {
     expect(isValidTracked({ status: "done", lastProcessedUpdate: 1, attempts: 0, dreamerSes: null, at: 1 })).toBe(true)

@@ -29,30 +29,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             edgeless,
         } => docs::shot(&cfg, &root, slug, out, edgeless).await,
         Commands::Projects => docs::projects(&cfg, &root).await,
-        Commands::Refresh => docs::refresh(&cfg, &root).await,
         Commands::Search {
             query,
-            top,
-            tasks,
-            access,
+            limit,
             sofa,
             threshold,
         } => {
             search::run(
                 &cfg,
-                &root,
                 search::SearchCmd {
                     query,
-                    top,
-                    tasks,
-                    access,
+                    limit,
                     sofa,
                     threshold,
                 },
             )
             .await
         }
-        Commands::Grep { pattern } => search::grep(&cfg, &root, pattern).await,
         Commands::Cron { command } => cron::run(&cfg, &root, command).await,
         Commands::Task { command, project } => task::run(&cfg, &root, project, command).await,
     }

@@ -156,31 +156,17 @@ pub(crate) enum Commands {
         )]
         edgeless: bool,
     },
-    /// Unified semantic search: experience + access docs + SOFA.
-    /// AFFiNE is the source; local Ollama embeddings cache per machine.
+    /// Server-side full-text search (AFFiNE Manticore) + optional SOFA.
+    /// Stateless: no local corpus or semantic fallback.
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(
-            long,
-            default_value = "5",
-            help = "experience/ articles limit (0 = off)"
-        )]
-        top: usize,
-        #[arg(long, default_value = "10", help = "task/cron bodies limit (0 = off)")]
-        tasks: usize,
-        #[arg(long, default_value = "5", help = "projects/** docs limit (0 = off)")]
-        access: usize,
+        #[arg(long, default_value = "10", help = "hits limit")]
+        limit: usize,
         #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
         sofa: usize,
         #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
         threshold: f32,
-    },
-    /// Grep: substring search over the AFFiNE content cache
-    /// (experience + project docs).
-    Grep {
-        #[arg(help = "Literal substring pattern")]
-        pattern: String,
     },
     /// Crons on the AFFiNE «Crons» board (durable agent schedules).
     Cron {
@@ -197,7 +183,4 @@ pub(crate) enum Commands {
         #[arg(long, global = true)]
         project: Option<String>,
     },
-    /// Refresh local caches from AFFiNE (content cache, dedup index,
-    /// embeddings stay lazy). Use on a new machine or after heavy edits.
-    Refresh,
 }

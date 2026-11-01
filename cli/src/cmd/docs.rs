@@ -1,4 +1,4 @@
-//! Data-access commands: read, blob, shot, projects, refresh.
+//! Data-access commands: read, blob, shot, projects.
 
 use anyhow::Context as _;
 
@@ -69,25 +69,14 @@ pub(crate) async fn shot(
     Ok(())
 }
 
-pub(crate) async fn projects(cfg: &AffineConfig, root: &std::path::Path) -> anyhow::Result<()> {
-    let (_, cache) = affine_queries::session(root, cfg).await?;
-    let rows = affine_queries::projects(&cache);
+pub(crate) async fn projects(cfg: &AffineConfig, _root: &std::path::Path) -> anyhow::Result<()> {
+    let mut client = crate::affine_client::AffineClient::connect(cfg).await?;
+    let rows = affine_queries::projects(&mut client, cfg).await?;
     if rows.is_empty() {
         println!("No projects found in the workspace.");
     }
     for row in rows {
-        println!("{}\t{} docs\t{}", row.name, row.docs, row.description);
+        println!("{}\t{}", row.name, row.description);
     }
-    Ok(())
-}
-
-pub(crate) async fn refresh(cfg: &AffineConfig, root: &std::path::Path) -> anyhow::Result<()> {
-    // явный refresh — сброс слепого-tree флага: пробуем полный проход
-    crate::content_cache::tree_disabled_clear(root);
-    let mut client = crate::affine_client::AffineClient::connect(cfg).await?;
-    // full refetch: fresh cache replaces the incremental one
-    let mut fresh = crate::content_cache::ContentCache::default();
-    let report = fresh.sync(&mut client, cfg, root).await?;
-    println!("synced: {} docs fetched", report.fetched);
     Ok(())
 }

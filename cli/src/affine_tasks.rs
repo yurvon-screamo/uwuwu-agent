@@ -445,16 +445,8 @@ pub async fn read_rows(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     board: &Board,
-    root: &std::path::Path,
+    _root: &std::path::Path,
 ) -> Result<Vec<TaskRow>> {
-    let cache_titles: std::collections::BTreeMap<String, String> =
-        crate::content_cache::ContentCache::load(root)
-            .map(|c| {
-                c.iter()
-                    .map(|(_, d)| (d.doc_id.clone(), d.title.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
     let resp = client
         .call_tool(
             "read_database_cells",
@@ -471,21 +463,19 @@ pub async fn read_rows(
     for r in rows {
         let (mut row, unresolved) = parse_task_row(&r);
         if let Some(linked) = unresolved {
-            row.title = cache_titles.get(&linked).cloned().unwrap_or_default();
-            if row.title.is_empty() {
-                if let Ok(doc) = client
-                    .call_tool(
-                        "get_doc",
-                        json!({"workspaceId": cfg.workspace, "docId": linked}),
-                    )
-                    .await
-                {
-                    row.title = doc
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                }
+            // заголовок linked-строки живёт в доке-теле — живой get_doc
+            if let Ok(doc) = client
+                .call_tool(
+                    "get_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": linked}),
+                )
+                .await
+            {
+                row.title = doc
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
             }
         }
         out.push(row);

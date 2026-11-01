@@ -106,12 +106,11 @@ Folders handle organization; tags are only for lookup.
 
 **Commands**:
 
-- `search` — two-tier: AFFiNE server-side full-text (Manticore) first, automatic fallback to local semantic search (Ollama `qwen3-embedding:0.6b`)
-- `read` — markdown + rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
+- `search` — server-side AFFiNE full-text (Manticore); stateless, no local fallback; optional `--sofa`
+- `read` — live doc read (slug resolves via migration map → tags/title through the gateway); rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot <slug> [--edgeless]` — doc screenshot via headless chromium (the native render path — AFFiNE has no server-side PNG API)
-- `grep` / `projects` — workspace content via title cache
-- `refresh` — full cache refresh from AFFiNE (new machine entry point, ~800 docs)
+- `projects` — live workspace project registry
 - `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown with ```html_embed diagram fences (Vesper theme, see `skills/visual-diagrams`)
 
 **Infrastructure**: ноут (podman-compose: AFFiNE + pgvector/PG18 + Redis + Manticore + MCP gateway), наружу — rathole-туннель через VPS; Railway-след удалён

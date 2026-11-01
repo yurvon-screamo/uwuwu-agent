@@ -1,6 +1,6 @@
 //! Server-side full-text search via the AFFiNE GraphQL API (Manticore backend).
 //!
-//! Complements the local semantic search: no local Ollama or embedding cache
+//! The single search engine: no local corpus, no semantic fallback
 //! required, always fresh (the workspace indexer feeds Manticore on every
 //! change). Falls back to local search when credentials are absent or the
 //! endpoint fails — see `lib.rs` for the wiring.
