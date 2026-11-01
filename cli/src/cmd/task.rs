@@ -7,7 +7,23 @@ use serde_json::json;
 use super::{resolve_row_any_board, truncate, TaskSub};
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_tasks;
-use crate::{facts, ui_url};
+use crate::ui_url;
+
+/// Текст из stdin (--stdin) или аргументов (общий паттерн task-команд).
+fn read_text(use_stdin: bool, args: &[String]) -> anyhow::Result<String> {
+    if use_stdin {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    } else if !args.is_empty() {
+        Ok(args.join(" "))
+    } else {
+        Err(anyhow::anyhow!(
+            "нет текста: укажите --stdin или передайте текст аргументом"
+        ))
+    }
+}
 
 pub(crate) async fn run(
     cfg: &AffineConfig,
@@ -288,7 +304,7 @@ async fn comment(
     args: CommentArgs,
 ) -> anyhow::Result<()> {
     let (_board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
-    let body = facts::read_text(args.stdin, &args.text)?;
+    let body = read_text(args.stdin, &args.text)?;
     if body.trim().is_empty() {
         anyhow::bail!("пустой коммент");
     }

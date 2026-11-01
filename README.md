@@ -6,10 +6,13 @@
 
 ```
 opencodereview/ правила ревью
-agents/        субагенты: code-quality-reviewer, developer, office-coworker
+agents/        субагенты: code-quality-reviewer, developer, dreamer
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
+factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
+cron/          uwuwu-cron — демон кронов (доска Crons → сессии агентов)
+dreamer/       uwuwu-dreamer — дример: пост-обработка сессий (idle → агент dreamer)
 cli-tools/     atlassian, research
 link.sh        установка симлинками
 opencode.json  главный конфиг опенкода (jsonc)
@@ -62,11 +65,27 @@ CLI:
 `uwuwu-cli cron set --title "…" (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`,
 `cron list / pause / resume / rm`.
 
+### Дример (uwuwu-dreamer)
+
+Агентная пост-обработка сессий — единый контур накопления знаний (заменил
+заявки `request` и qwen-фактизацию `facts`, оба механизма выпилены).
+Демон на каждой ноде поллит `opencode.db` (readonly): уснувшая корневая
+сессия (idle > 30 мин) → дочерняя сессия с агентом **dreamer**
+(`glm-5.3#max`) → автономно: forensic-дамп сессии + git/PR-стейт проекта →
+гигиена проектных доков (устаревшее/дыры), статьи опыта в Experience
+(дедуп через серверный поиск), ADR (Accepted, сразу фактом), инфра-задачи на доске
+uwuwu-проекта с пустым статусом (черновики владельца). Отчёт — в дочерней
+сессии. State: `~/.local/state/uwuwu-dreamer/`.
+
+Запуск: линукс — systemd --user по образцу uwuwu-cron; вин/ручной —
+`cd dreamer && bun install && bun dreamer.ts`. Smoke:
+`UWUWU_DREAMER_ONCE=1 UWUWU_DREAMER_DRY_RUN=1 bun dreamer.ts`.
+
 ### CLI
 
 `uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок, фоллбек Crons); `request` (properties+attach), `facts`, `search`
-(сервер Manticore + семантика), `read/blob/shot` (мультимодальное чтение).
+(id/заголовок, фоллбек Crons); `search` (сервер Manticore + семантика),
+`read/blob/shot` (мультимодальное чтение).
 
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
 share one workspace; locally only operational caches live.
@@ -79,22 +98,19 @@ Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_
 
 - 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …), no direct docs
 - 📁 Projects — 7 project subfolders, each starting with a `<Proj> Project (README)` doc (description carrier for `projects`)
-- 📁 Daily — journal buckets (one per day, facts inside)
-- 📁 Requests — knowledge article queue
+- 📁 Daily — journal buckets (archive of the retired facts pipeline)
+- 📁 Requests — archive of the retired request queue
 
 **Tags** = bare slugs for multi-PC addressing (`axum`, `origa/topology`).
 Folders handle organization; tags are only for lookup.
 
 **Commands**:
 
-- `search` — two-tier: AFFiNE server-side full-text (Manticore) first, automatic fallback to local semantic search (Ollama `qwen3-embedding:0.6b`)
-- `read` — markdown + rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
+- `search` — server-side AFFiNE full-text (Manticore); stateless, no local fallback; optional `--sofa`
+- `read` — live doc read (slug resolves via migration map → tags/title through the gateway); rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot <slug> [--edgeless]` — doc screenshot via headless chromium (the native render path — AFFiNE has no server-side PNG API)
-- `grep` / `projects` — workspace content via title cache
-- `request` — queue as AFFiNE docs (Requests folder, `Request` tag)
-- `facts` — extraction → dedup (cross-PC content-hash) → mandatory daily bucket publish
-- `refresh` — full cache refresh from AFFiNE (new machine entry point, ~800 docs)
+- `projects` — live workspace project registry
 - `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown with ```html_embed diagram fences (Vesper theme, see `skills/visual-diagrams`)
 
 **Infrastructure**: ноут (podman-compose: AFFiNE + pgvector/PG18 + Redis + Manticore + MCP gateway), наружу — rathole-туннель через VPS; Railway-след удалён

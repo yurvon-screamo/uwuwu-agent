@@ -1,5 +1,5 @@
-//! Tests for affine_store: frontmatter parsing, fact section rendering,
-//! table splitting, and the migration map.
+//! Tests for affine_store: frontmatter parsing, table splitting, and the
+//! migration map.
 
 use crate::affine_client::AffineConfig;
 use crate::affine_store::{split_frontmatter, MigrationMap};
@@ -9,19 +9,6 @@ fn cfg(url: &str, workspace: &str) -> AffineConfig {
         url: url.to_string(),
         token: "t".to_string(),
         workspace: workspace.to_string(),
-    }
-}
-
-fn fact_fixture() -> crate::affine_store::FactEntry {
-    crate::affine_store::FactEntry {
-        slug: "affine-port".into(),
-        date: "2026-10-05".into(),
-        title: "Affine port".into(),
-        statement: "Selfhost listens on 3010.".into(),
-        tags: vec!["affine".into()],
-        confidence: "0.9".into(),
-        sources: vec!["manual/2026-10-05".into()],
-        status: "accepted".into(),
     }
 }
 
@@ -61,15 +48,6 @@ fn crlf_frontmatter_is_normalized() {
 }
 
 #[test]
-fn fact_section_contains_meta_and_statement() {
-    let section = crate::affine_store::render_fact_section(&fact_fixture());
-    assert!(section.contains("## Affine port"));
-    assert!(section.contains("Selfhost listens on 3010."));
-    assert!(section.contains("slug: affine-port"));
-    assert!(section.contains("conf 0.9"));
-}
-
-#[test]
 fn map_is_per_gateway_and_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let remote = cfg(
@@ -105,13 +83,11 @@ fn migration_map_roundtrip_and_corruption_is_loud() {
     assert!(map.doc_id("axum").is_none());
     map.put_doc("axum", "doc1");
     map.put_container("Experience", "c1");
-    map.put_daily_bucket("2026-10-23", "d1");
     map.save().unwrap();
 
     let reloaded = MigrationMap::load(dir.path()).unwrap();
     assert_eq!(reloaded.doc_id("axum"), Some("doc1"));
     assert_eq!(reloaded.container("Experience"), Some("c1"));
-    assert_eq!(reloaded.daily_bucket("2026-10-23"), Some("d1"));
 
     std::fs::write(dir.path().join("affine_map.json"), "{not json").unwrap();
     assert!(MigrationMap::load(dir.path()).is_err());

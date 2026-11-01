@@ -1,16 +1,12 @@
 //! CLI surface: clap definitions for uwuwu-cli. Handlers live in the
 //! sibling modules; this module only describes the argument grammar.
 
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
-
-use crate::request;
 
 #[derive(Parser)]
 #[command(name = "uwuwu-cli")]
 #[command(
-    about = "CLI for uwuwu/wiki: semantic search over experience, access docs, facts (AFFiNE-backed)"
+    about = "CLI for uwuwu/wiki: semantic search over experience and access docs (AFFiNE-backed)"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -134,38 +130,9 @@ pub(crate) enum CronSub {
 pub(crate) enum Commands {
     /// List all projects with their description.
     Projects,
-    /// Manage change requests (AFFiNE "Requests" queue). Bare call with
-    /// text/--stdin creates a request; subcommands: list/get/delete.
-    Request {
-        #[command(subcommand)]
-        command: Option<request::RequestSub>,
-        /// Request body text (quick create; multiline → --stdin)
-        #[arg(help = "Request body text (quick create). Note: a text starting with \
-                    'list'/'get'/'delete' is parsed as a subcommand — use --stdin.")]
-        text: Vec<String>,
-        #[arg(long, help = "Read the request body from stdin")]
-        stdin: bool,
-        #[arg(long, value_parser = ["create", "update", "delete"], default_value = "create")]
-        action: String,
-        #[arg(
-            long,
-            help = "Target experience/-relative path (required for quick create)"
-        )]
-        target: Option<String>,
-        #[arg(long, help = "Reason for this request (required for quick create)")]
-        reason: Option<String>,
-        #[arg(
-            long = "attach",
-            value_name = "FILE",
-            help = "Attach a file/image to the created request (repeatable)"
-        )]
-        attach: Vec<PathBuf>,
-    },
-    /// Read a document: <slug> (experience) | facts/<slug> | <project>/<slug> (access) | sofa/<post_id>.
+    /// Read a document: <slug> (experience) | <project>/<slug> (access) | sofa/<post_id>.
     Read {
-        #[arg(
-            help = "Slug: 'axum' | 'facts/<slug>' | '<project>/<slug>' (access) | 'sofa/<post_id>'"
-        )]
+        #[arg(help = "Slug: 'axum' | '<project>/<slug>' (access) | 'sofa/<post_id>'")]
         slug: String,
     },
     /// Download a workspace blob (image/attachment) by key. Keys appear in
@@ -189,49 +156,17 @@ pub(crate) enum Commands {
         )]
         edgeless: bool,
     },
-    /// Unified semantic search: experience + facts + access docs + SOFA.
-    /// AFFiNE is the source; local Ollama embeddings cache per machine.
+    /// Server-side full-text search (AFFiNE Manticore) + optional SOFA.
+    /// Stateless: no local corpus or semantic fallback.
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(
-            long,
-            default_value = "5",
-            help = "experience/ articles limit (0 = off)"
-        )]
-        top: usize,
-        #[arg(long, default_value = "10", help = "task/cron bodies limit (0 = off)")]
-        tasks: usize,
-        #[arg(long, default_value = "10", help = "facts/ limit (0 = off)")]
-        facts: usize,
-        #[arg(long, default_value = "5", help = "projects/** docs limit (0 = off)")]
-        access: usize,
+        #[arg(long, default_value = "10", help = "hits limit")]
+        limit: usize,
         #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
         sofa: usize,
         #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
         threshold: f32,
-    },
-    /// Grep: substring search over the AFFiNE content cache
-    /// (experience + project docs + facts).
-    Grep {
-        #[arg(help = "Literal substring pattern")]
-        pattern: String,
-    },
-    /// Factize raw text: extraction → sanitize → full dedup → AFFiNE daily
-    /// buckets (mandatory publish, FS-free). Single engine for manual input
-    /// and the python orchestrator.
-    Facts {
-        /// Read the fact source text from stdin instead of <text...>
-        #[arg(long)]
-        stdin: bool,
-        /// Source label (default: manual/<today>; orchestrator passes opencode/<date>/<sid>)
-        #[arg(long)]
-        source: Option<String>,
-        /// Fact date YYYY-MM-DD (default: today; bucket grouping)
-        #[arg(long)]
-        date: Option<String>,
-        /// Raw text to factize (ignored with --stdin)
-        text: Vec<String>,
     },
     /// Crons on the AFFiNE «Crons» board (durable agent schedules).
     Cron {
@@ -248,7 +183,4 @@ pub(crate) enum Commands {
         #[arg(long, global = true)]
         project: Option<String>,
     },
-    /// Refresh local caches from AFFiNE (content cache, dedup index,
-    /// embeddings stay lazy). Use on a new machine or after heavy edits.
-    Refresh,
 }

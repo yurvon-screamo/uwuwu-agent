@@ -1,6 +1,6 @@
-//! Tests for affine_collect: FS collectors and date grouping.
+//! Tests for affine_collect: FS collectors.
 
-use crate::affine_collect::{collect_experience, collect_facts, collect_projects, group_by_date};
+use crate::affine_collect::{collect_experience, collect_projects};
 
 fn write(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -31,24 +31,6 @@ fn unreadable_file_is_reported_and_skipped() {
     assert_eq!(result.items.len(), 0);
     assert_eq!(result.errors.len(), 1);
     assert!(result.errors[0].contains("article.md"));
-}
-
-#[test]
-fn facts_group_by_updated_date_with_month_fallback() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        &dir.path().join("facts/2026-06/a.md"),
-        "---\nupdated: 2026-06-02\ntitle: A\n---\n\nStatement A",
-    );
-    write(
-        &dir.path().join("facts/2026-06/b.md"),
-        "---\ntitle: B\n---\n\nStatement B",
-    );
-    let result = collect_facts(dir.path());
-    assert!(result.errors.is_empty());
-    let grouped = group_by_date(&result.items);
-    let dates: Vec<&String> = grouped.keys().collect();
-    assert_eq!(dates, vec!["2026-06-01", "2026-06-02"]);
 }
 
 #[test]
