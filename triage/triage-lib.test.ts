@@ -194,14 +194,15 @@ test("composeText: текст + маркеры вложений и неудач"
   expect(composeText("чисто", [], [])).toBe("чисто")
 })
 
-test("validState: failed-имена с маркером в тексте — валидны; мусорные — нет", () => {
+test("validState: failed-имена — форма важнее маркера, битое поле не роняет заявку", () => {
   const good = {
     offset: 0, chatID: 1,
-    queue: [{ text: "заявка\n[вложение x.png не выгрузилось — попроси юзера продублировать]", chatID: 1, msgID: 1, receivedAt: 1, failed: ["x.png"] }],
+    queue: [{ text: "текст без маркера", chatID: 1, msgID: 1, receivedAt: 1, failed: ["x.png"] }],
   }
-  expect(validState(good).queue[0]?.failed).toEqual(["x.png"])
-  const bad = { offset: 0, chatID: 1, queue: [{ text: "текст без маркера", chatID: 1, msgID: 1, receivedAt: 1, failed: ["x.png"] }] }
-  expect(validState(bad).queue[0]?.failed).toBeUndefined()
+  expect(validState(good).queue[0]?.failed).toEqual(["x.png"]) // заявка жива
+  const bad = { offset: 0, chatID: 1, queue: [{ text: "ок", chatID: 1, msgID: 1, receivedAt: 1, failed: "not-array" }] }
+  expect(validState(bad).queue[0]?.failed).toBeUndefined() // поле отброшено, заявка жива
+  expect(validState(bad).queue.length).toBe(1)
 })
 
 test("joinBatch: failed-имена батча дедупятся и капятся", () => {

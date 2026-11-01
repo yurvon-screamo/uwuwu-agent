@@ -87,13 +87,13 @@ const isReq = (v: unknown): v is Request => {
         return typeof x.path === "string" && x.path.length <= 512
           && typeof x.name === "string" && x.name.length <= 200
       }))
-  const failedOk = r.failed === undefined
-    || (Array.isArray(r.failed) && (r.failed as unknown[]).length <= 10
-      && (r.failed as unknown[]).every((n) => typeof n === "string" && (n as string).length <= 200)
-      && (r.text as string).includes("не выгрузилось"))
   return typeof r.text === "string" && r.text.trim() !== ""
-    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk && msgIDsOk && attOk && failedOk
+    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk && msgIDsOk && attOk
 }
+
+/** Форма failed-поля (стрипится отдельно — битное поле не роняет заявку). */
+const failedShapeOk = (v: unknown): boolean =>
+  Array.isArray(v) && v.length <= 10 && v.every((n) => typeof n === "string" && n.length <= 200)
 
 /** Санитайз state.json: битые поля отбрасываем, always-on демон не роняем. */
 export function validState(raw: unknown): TriageState {
@@ -118,7 +118,17 @@ export function validState(raw: unknown): TriageState {
       out.firing = { at: f.at as number, msgIDs: f.msgIDs as number[] }
     }
   }
-  if (Array.isArray(r.queue)) out.queue = r.queue.filter(isReq)
+  if (Array.isArray(r.queue)) {
+    out.queue = r.queue.filter(isReq).map((q) => {
+      // битный failed — стрип поля, не заявки (ручная правка state.json не
+      // должна стоить юзеру сообщения)
+      if (q.failed !== undefined && !failedShapeOk(q.failed)) {
+        const { failed: _drop, ...rest } = q
+        return rest
+      }
+      return q
+    })
+  }
   const run = r.run
   if (run !== null && typeof run === "object") {
     const rn = run as Record<string, unknown>
