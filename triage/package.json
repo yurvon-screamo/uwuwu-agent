@@ -1,0 +1,11 @@
+{
+  "name": "uwuwu-triage",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "md-to-telegram": "^0.1.1"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.4"
+  }
+}
