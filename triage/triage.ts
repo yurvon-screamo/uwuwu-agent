@@ -1,8 +1,9 @@
 // triage.ts — uwuwu-triage: входная точка задач через Telegram.
 // Standalone bun-демон (не плагин — опыт opencode-tg-hub-daemon): long-poll
 // getUpdates, сообщения владельца → ОДНА вечная opencode-сессия диалога
-// (glm-5.3-flash, изолированный workspace с AGENTS.md-методичкой) — память
-// диалога = контекст сессии (компакция рулит), финал хода → ответ в ТГ.
+// (нативный деф-агент triage: системный промпт + permissions, материализуется
+// демон в workspace/.opencode/agents) — память диалога = контекст сессии
+// (компакция рулит), финал хода → ответ в ТГ.
 // Занят → очередь. Запуск: systemd --user (uwuwu-triage.service).
 //
 // Гарантии: сообщение не теряется при рестарте в любом месте (уходит из
@@ -12,7 +13,6 @@
 // подъёма хода → dead-letter с полным текстом юзеру.
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
@@ -55,7 +55,7 @@ const HELP = [
   "",
   "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
   "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
-  "/reset — пересоздать сессию с нуля (контекст переписки сбросится; методичка и модель возьмутся актуальные).",
+  "/reset — начать диалог заново с чистого контекста (методичка всегда актуальная).",
 ].join("\n")
 
 interface Cfg { token: string; owner: string; model?: { providerID: string; id: string } }
@@ -220,29 +220,21 @@ const sessionAlive = async (sessionID: string): Promise<boolean | null> => {
   }
 }
 
-const defHash = (): string =>
-  createHash("sha256").update(readFileSync(AGENT_DEF_SRC, "utf-8")).digest("hex")
-
 /** Единая сессия диалога: создаётся один раз, переживает рестарты демона
  *  (контекст всей переписки + компакция); пропала (снесли в TUI) — пересоздаём,
  *  контекст теряется: лог + честное уведомление юзеру.
- *  Системный промпт сессии снапшотится на создании (эмпирика 2.2.5: деф/
- *  AGENTS.md/switchAgent/instructions-entries живую сессию не меняют) —
- *  живая сессия нативно следует только модели (switchModel из hub.json);
- *  изменение дефа → одно уведомление «примени через /reset» (контекст
- *  теряется — решение за владельцем). */
+ *  Деф горячий (эмпирика 2.2.5, чистые сессии без отравленной истории):
+ *  сервер перечитывает agent-def на каждом промпте — правка agent.md в репо
+ *  доезжает живой сессии следующим же сообщением (демон материализует деф в
+ *  ensureSession). Гочи проб: не гонять видимость правил в сессии, где модель
+ *  уже отрицала их — история диалога сильнее системного обновления.
+ *  Модель живой сессии нативно следует hub.json (switchModel). */
 const ensureSession = async (): Promise<string> => {
   if (state.session !== undefined) {
     const alive = await sessionAlive(state.session)
     if (alive === true) {
+      syncAgentDef() // правка дефа в репо → живая сессия следующим сообщением
       try { await restCall(`/session/${state.session}/model`, { method: "POST", body: { model: cfg.model ?? MODEL } }) } catch (e) { log(`switchModel: ${e}`) }
-      const h = defHash()
-      if (h !== state.defHash && state.defChangeNotified !== true && state.chatID !== undefined) {
-        state.defChangeNotified = true
-        save()
-        log(`деф агента изменился — живая сессия работает по старой методичке до /reset`)
-        await send(state.chatID, "ℹ️ Методичка триажа изменилась. Живой диалог продолжает работать по прежней версии — пришли /reset, когда готов пересоздать сессию (контекст переписки сбросится).")
-      }
       return state.session
     }
     if (alive === null) return state.session // неизвестно — не пересоздаём
@@ -270,8 +262,6 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
   state.session = id
   state.broken = 0
-  state.defHash = defHash()
-  state.defChangeNotified = undefined
   save()
   log(`сессия диалога: ${id}`)
   if (notify && state.chatID !== undefined) {
@@ -443,6 +433,9 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
     await spawnFail(req, e)
     return "later"
   }
+  // /reset в окне ensureSession мог снести state.session — узкий тип врёт,
+  // runtime-проверка обязательна (иначе ход упадет на /session/undefined/prompt)
+  if (typeof sessionID !== "string" || !sessionID.startsWith("ses_")) return "later"
   // startedAt персистним ДО отправки: крах в мс-окне вокруг POST разрулит
   // confirmPendingRun по тексту (дошёл/не дошёл) — без ложных пустых финалов
   const startedAt = Date.now()
@@ -539,12 +532,11 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       await send(state.chatID, "⏳ Сейчас разбираю сообщение — пришли /reset после моего ответа.")
     } else {
       state.session = undefined
-      state.defChangeNotified = undefined
       state.pausedUntil = undefined
       state.broken = 0
       save()
       log("сессия диалога сброшена командой /reset")
-      await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог заново (методичка и модель возьмутся актуальные).")
+      await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста.")
     }
   } else if (out.kind === "media") {
     await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши словами")
