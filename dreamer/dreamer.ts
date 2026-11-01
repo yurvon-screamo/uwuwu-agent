@@ -237,9 +237,9 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     if (!finished && !timedOut) continue
     const replied = hasAssistantReply(db, tracked.dreamerSes)
     const result = applyRunOutcome(tracked, session, { replied, dead: finished, timedOut }, MAX_ATTEMPTS)
-    if (result === "failed") {
+    if (result === "failed" || result === "gave_up") {
       // зависший дример может доплывать и писать в вики вне контроля state —
-      // гасим перед retry-спавном нового
+      // гасим его (dead-случаи безвредны: 404 → catch)
       await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
     }
     log(`прогон ${sid.slice(0, 8)} → ${result} (replied=${replied}${timedOut ? ", timeout" : ""})`)
