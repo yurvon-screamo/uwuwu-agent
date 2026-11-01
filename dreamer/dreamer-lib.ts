@@ -61,6 +61,29 @@ export function isValidTracked(v: unknown): v is TrackedSession {
   return normalizeTracked(v as Record<string, unknown>) !== null
 }
 
+// ——— пиковое окно провайдера ———
+
+/** "15-19" → часы 15:00–19:00 (локальное время ноды); "" / невалид → нет окна.
+ *  В окно новые запуски (spawn/wakeup) запрещены — очередь копится и
+ *  разряжается после его конца; закрытие уже идущих прогонов не блокируется. */
+export interface PeakWindow { startHour: number; endHour: number }
+
+export function parsePeakWindow(raw: string | undefined): PeakWindow | null {
+  if (raw === undefined) raw = "15-19" // дефолт: пиковое окно провайдера
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(raw.trim())
+  if (m === null) return null
+  const startHour = Number(m[1]), endHour = Number(m[2])
+  if (startHour > 23 || endHour > 23) return null
+  return { startHour, endHour }
+}
+
+export function isInPeakWindow(date: Date, win: PeakWindow): boolean {
+  const h = date.getHours()
+  return win.startHour <= win.endHour
+    ? h >= win.startHour && h < win.endHour
+    : h >= win.startHour || h < win.endHour // окно через полночь
+}
+
 // ——— выборка кандидатов ———
 
 // Завершённость детектим по time_updated + порогу: time_idle не сбрасывается
