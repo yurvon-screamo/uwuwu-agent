@@ -25,6 +25,8 @@ export interface TrackedSession {
   attempts: number
   /** сессия дримера, обслуживающая текущий/последний прогон */
   dreamerSes: string | null
+  /** момент последнего wakeup-промпта; 0 = не было (критерий ответа: после него) */
+  wokenAt: number
   at: number
 }
 
@@ -37,15 +39,26 @@ export interface DreamerState {
 
 export const emptyState = (): DreamerState => ({ sessions: {}, bootstrapped: false })
 
-export function isValidTracked(v: unknown): v is TrackedSession {
-  if (v === null || typeof v !== "object") return false
-  const t = v as Record<string, unknown>
+/** Старый state без wokenAt нормализуется (0 = не было wakeup). */
+export function normalizeTracked(v: Record<string, unknown>): TrackedSession | null {
+  if (v === null || typeof v !== "object") return null
   const statuses = ["pending", "running", "done", "failed", "gave_up", "skipped"]
-  return typeof t.status === "string" && statuses.includes(t.status)
-    && typeof t.lastProcessedUpdate === "number"
-    && typeof t.attempts === "number"
-    && (t.dreamerSes === null || typeof t.dreamerSes === "string")
-    && typeof t.at === "number"
+  if (typeof v.status !== "string" || !statuses.includes(v.status)) return null
+  if (typeof v.lastProcessedUpdate !== "number" || typeof v.attempts !== "number"
+    || typeof v.at !== "number") return null
+  if (v.dreamerSes !== null && typeof v.dreamerSes !== "string") return null
+  return {
+    status: v.status as ProcStatus,
+    lastProcessedUpdate: v.lastProcessedUpdate,
+    attempts: v.attempts,
+    dreamerSes: (v.dreamerSes as string | null) ?? null,
+    wokenAt: typeof v.wokenAt === "number" ? v.wokenAt : 0,
+    at: v.at,
+  }
+}
+
+export function isValidTracked(v: unknown): v is TrackedSession {
+  return normalizeTracked(v as Record<string, unknown>) !== null
 }
 
 // ——— выборка кандидатов ———
@@ -97,9 +110,16 @@ function rowToSession(r: Record<string, unknown>): SessionRow {
 
 export type CandidateReason = "new" | "revived" | "retry" | "stuck-pending"
 
+/** Инвариант владельца: 1 рабочая сессия = 1 дример-сессия. Оживание/ретрай
+ *  будят СУЩЕСТВУЮЩУЮ дример-сессию промптом (wakeup); spawn — только когда
+ *  её нет (первый прогон / dreamerSes потеряна — демон верифицирует живость
+ *  через REST перед промптом, либа от state детерминирована). */
+export type CandidateAction = "spawn" | "wakeup"
+
 export interface Candidate {
   session: SessionRow
   reason: CandidateReason
+  action: CandidateAction
   /** revived-прогон сбрасывает счётчик попыток — это новый цикл работы */
   resetAttempts: boolean
 }
@@ -113,7 +133,9 @@ function isCovered(tracked: TrackedSession, session: SessionRow): boolean {
 }
 
 /**
- * Кандидаты на спавн дримера: idle-корневые сессии, которые
+ * Кандидаты на обработку: idle-корневые сессии, которые не обработаны /
+ * ожили после прошлого прогона / не исчерпали ретраи. action: dreamerSes
+ * есть → wakeup (та же сессия дримера — инвариант 1=1), нет → spawn.
  * не обработаны / ожили после прошлого прогона / не исчерпали ретраи.
  * Порядок входа — свежие вперёд (осознанно: недавняя сессия анализируется
  * точнее — контекст и git-стейт ещё актуальны; FIFO жертвовал бы свежестью).
@@ -124,10 +146,12 @@ export function pickCandidates(
   maxAttempts: number,
 ): Candidate[] {
   const out: Candidate[] = []
+  const action = (dreamerSes: string | null): CandidateAction =>
+    dreamerSes !== null ? "wakeup" : "spawn"
   for (const session of sessions) {
     const tracked = state.sessions[session.id]
     if (tracked === undefined) {
-      out.push({ session, reason: "new", resetAttempts: false })
+      out.push({ session, reason: "new", action: "spawn", resetAttempts: false })
       continue
     }
     if (isCovered(tracked, session)) continue
@@ -137,12 +161,12 @@ export function pickCandidates(
       case "pending":
         if (tracked.dreamerSes === null) {
           // краш демона между записью pending и спавном → повторный спавн
-          out.push({ session, reason: "stuck-pending", resetAttempts: false })
+          out.push({ session, reason: "stuck-pending", action: "spawn", resetAttempts: false })
         }
         break
       case "failed":
         if (tracked.attempts < maxAttempts) {
-          out.push({ session, reason: "retry", resetAttempts: false })
+          out.push({ session, reason: "retry", action: action(tracked.dreamerSes), resetAttempts: false })
         }
         break
       case "done":
@@ -150,7 +174,7 @@ export function pickCandidates(
       case "gave_up":
         // не covered → сессия ожила: новый цикл, попытки с нуля
         // (gave_up — не навсегда: новая активность сессии заслуживает нового прогона)
-        out.push({ session, reason: "revived", resetAttempts: true })
+        out.push({ session, reason: "revived", action: action(tracked.dreamerSes), resetAttempts: true })
         break
     }
   }
@@ -183,6 +207,7 @@ export function markBacklog(db: Database, state: DreamerState, cutoffMs: number)
         lastProcessedUpdate: Number(row.time_updated),
         attempts: 0,
         dreamerSes: null,
+        wokenAt: 0,
         at: Date.now(),
       }
       marked++
@@ -230,6 +255,17 @@ export function hasAssistantReply(db: Database, dreamerSes: string): boolean {
   return (row?.n ?? 0) > 0
 }
 
+/** Ответ ассистента ПОЗЖЕ границы (wakeup: старые ответы — прошлый прогон). */
+export function hasAssistantReplySince(db: Database, dreamerSes: string, sinceMs: number): boolean {
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS n FROM session_message
+       WHERE session_id = ? AND type = 'assistant' AND time_created > ?`,
+    )
+    .get(dreamerSes, sinceMs) as { n: number } | null
+  return (row?.n ?? 0) > 0
+}
+
 // ——— промпт ———
 
 export interface PromptInput {
@@ -257,5 +293,24 @@ export function dreamerPrompt(input: PromptInput): string {
     ``,
     `Действуй строго по своей методике. Заверши одной-двумя строками: что`,
     `записал (тайтлы) / «нечего взять» / причина недоступности вики.`,
+  ].join("\n")
+}
+
+/** Промпт повторного прогона: сессия ожила — будим ту же дример-сессию.
+ *  Граница задаётся явно: дамп не фильтруется по времени, а compaction
+ *  съедает детали старых прогонов — граница остаётся якорем новизны. */
+export function wakeupPrompt(input: PromptInput & { sinceIso: string }): string {
+  const title = input.sessionTitle ?? "(без заголовка)"
+  return [
+    `Дример: повторный прогон — сессия ${input.sessionId} («${title}») ожила после прошлого анализа.`,
+    `Граница прошлого покрытия: ${input.sinceIso} (мс: ${Date.parse(input.sinceIso)}).`,
+    `В дампе новое = сообщения с time_created выше границы; проанализируй дельту по своей методике.`,
+    `Ты помнишь свои прошлые записи этой сессии — не дублируй их, дедуп по своей истории.`,
+    ``,
+    `Входы те же:`,
+    `- дамп: python3 "${input.auditPath}" session ${input.sessionId} --compact --db "${input.dbPath}"`,
+    `- чтение вики: uwuwu-cli read; запись: "${input.wikiOpsPath}"`,
+    ``,
+    `Заверши одной-двумя строками: что дополнительно записал / «в дельте нечего взять».`,
   ].join("\n")
 }
