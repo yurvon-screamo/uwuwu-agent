@@ -216,9 +216,10 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
   if (attempts >= MAX_SPAWN_ATTEMPTS) {
     state.queue.splice(i, 1)
     save()
-    log(`заявка msg${req.msgID}: ${attempts} неудачных спавнов (${e}) — dead-letter`)
+    // текст заявки — в лог ДО отправки: крах посреди send не потеряет его молча
+    log(`заявка msg${req.msgID}: ${attempts} неудачных спавнов (${e}) — dead-letter, текст: ${req.text}`)
     const ok = await send(req.chatID, `⚠️ Не смог поднять прогон ${attempts} раз — заявка снята с обработки, продублируй позже:\n\n${req.text}`)
-    if (!ok) log(`dead-letter msg${req.msgID} НЕ доставлен — текст заявки: ${req.text}`)
+    if (!ok) log(`dead-letter msg${req.msgID} НЕ доставлен (текст заявки выше в этом логе)`)
     return
   }
   state.queue[i] = { ...req, attempts }
