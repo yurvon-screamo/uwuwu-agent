@@ -142,7 +142,7 @@ export function runTitle(text: string): string {
 
 /** Граница среза, не рвущая суррогатную пару (4-байтные эмодзи): одиночный
  *  суррогат в sendMessage = reject TG-API. */
-export const cutSafe = (s: string, end: number): number => {
+const cutSafe = (s: string, end: number): number => {
   if (end >= s.length) return end
   const prev = s.charCodeAt(end - 1)
   return prev >= 0xd800 && prev <= 0xdbff ? end + 1 : end
