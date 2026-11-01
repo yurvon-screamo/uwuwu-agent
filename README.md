@@ -43,7 +43,7 @@ cd uwuwu-agent
 
 ## AFFiNE-first 
 
-Вся база знаний живёт в AFFiNE (Railway): articles/requests/facts через `uwuwu-cli`,
+Вся база знаний живёт в AFFiNE: статьи опыта и проектные доки через `uwuwu-cli`,
 прямой доступ к докам — MCP-шлюз (107 tools).
 
 ### Фабрика разработки (uwuwu-factory)
@@ -114,7 +114,6 @@ Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_
 - 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …), no direct docs
 - 📁 Projects — 7 project subfolders, each starting with a `<Proj> Project (README)` doc (description carrier for `projects`)
 - 📁 Daily — journal buckets (archive of the retired facts pipeline)
-- 📁 Requests — archive of the retired request queue
 
 **Tags** = bare slugs for multi-PC addressing (`axum`, `origa/topology`).
 Folders handle organization; tags are only for lookup.
