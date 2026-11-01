@@ -13,6 +13,8 @@ cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь:
 factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
 cron/          uwuwu-cron — демон кронов (доска Crons → сессии агентов)
 dreamer/       uwuwu-dreamer — дример: пост-обработка сессий (idle → агент dreamer)
+triage/        uwuwu-triage — входная точка задач: TG-бот → триаж → канбан uwuwu
+lib/           общие модули демонов (single-instance лок)
 cli-tools/     atlassian, research
 link.sh        установка симлинками
 opencode.json  главный конфиг опенкода (jsonc)
@@ -64,6 +66,17 @@ spawn → In Progress; новые комменты/правки тела юзе�
 CLI:
 `uwuwu-cli cron set --title "…" (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`,
 `cron list / pause / resume / rm`.
+
+### Триаж (uwuwu-triage)
+
+Входная точка задач: TG-бот (@uwuwu_triage_bot) — заявка владельца текстом →
+демон (long-poll) поднимает сессию триаж-агента (`glm-5.3-flash`, изолированный
+workspace) → классификация (проект/тип) + дедуп → `task create` или коммент в
+существующую → сводка в ТГ. Занят → персистентная очередь; заявка покидает
+очередь только после подтверждённого промпта (рестарт не теряет); poison →
+dead-letter с текстом заявки. Методичка агента — `triage/prompt.md` (в git,
+правится без кода). systemd: `uwuwu-triage.service`. State:
+`~/.local/state/uwuwu-triage/`, лог: `~/.local/share/opencode/log/uwuwu-triage.log`.
 
 ### Дример (uwuwu-dreamer)
 
