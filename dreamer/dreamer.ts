@@ -10,8 +10,8 @@ import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
 import {
   applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions, fetchSessionById,
-  hasAssistantReply, hasAssistantReplySince, idleBefore, markBacklog, normalizeTracked,
-  pickCandidates, wakeupPrompt,
+  hasAssistantReply, hasAssistantReplySince, idleBefore, isInPeakWindow, markBacklog,
+  normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
 
@@ -281,6 +281,15 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
   }
 
   // ——— кандидаты: wakeup существующей дример-сессии или спавн новой ———
+  // Пиковое окно провайдера (дефолт 15:00–19:00 локального времени): новые
+  // запуски запрещены — очередь копится, разряжается после конца окна.
+  // Реконсилиация выше не блокируется: закрыть уже идущий прогон можно и нужно.
+  const peak = parsePeakWindow(process.env.UWUWU_DREAMER_PEAK)
+  if (peak !== null && isInPeakWindow(new Date(), peak)) {
+    const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
+    log(`пиковое окно ${peak.startHour}:00–${peak.endHour}:00: запуски приостановлены (${candidates.length} в очереди)`)
+    return
+  }
   const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
   const activeRuns = (): number =>
     Object.values(state.sessions).filter((t) => t.status === "running" || t.status === "pending").length
