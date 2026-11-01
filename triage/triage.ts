@@ -12,13 +12,14 @@
 // доставки может задублировать ответ. Poison-защита: 5 неудачных попыток
 // подъёма хода → dead-letter с полным текстом юзеру.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import {
-  alignChunks, classifyUpdate, extractFinal, plainChunks, promptLandedAt, SESSION_TITLE, validState,
+  alignChunks, batchReadyAt, classifyUpdate, dropBatch, extractFinal, joinBatch, plainChunks,
+  promptLandedAt, SESSION_TITLE, takeBatch, validState,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
@@ -38,6 +39,10 @@ const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
 const AGENT_NAME = "triage"
 const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${AGENT_NAME}.md`)
+/** выгруженные вложения заявок (скрины/файлы): агент видит их в ФС по путям
+ *  из текста заявки и прикладывает к задаче (--attach) */
+const MEDIA_DIR = join(homedir(), ".local/share/uwuwu-triage/media")
+const MEDIA_TTL_MS = 7 * 24 * 3600_000
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
@@ -48,6 +53,10 @@ const DELIVER_ATTEMPTS = 3 // попытки доставки финала в Т
 const BROKEN_SESSION_RESET = 3 // оборванных финалов подряд → пересоздание сессии
 const RESET_WINDOW_MS = 30 * 60_000 // пересоздания чаще окна = стабильная деградация
 const RESET_PAUSE_MS = 30 * 60_000 // пауза обработки при серии пересозданий
+/** дебаунс батча: поток сообщений склеивается в один ход, юзер получает окно
+ *  на редактирование (edited_message подменяет текст, пока батч в очереди) */
+const BATCH_DELAY_MS = Math.max(0, Number(process.env.UWUWU_TRIAGE_BATCH_MS ?? 60_000) || 60_000)
+const BATCH_MAX_MS = 5 * 60_000 // самое старое сообщение не ждёт дольше
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 const HELP = [
@@ -55,6 +64,7 @@ const HELP = [
   "",
   "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
   "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
+  "Пиши хоть потоком: склею всё в одну заявку через минуту после последнего сообщения (успей отредактировать — правки подхватятся, пока не начал разбирать).",
   "/reset — начать диалог заново с чистого контекста (методичка всегда актуальная).",
 ].join("\n")
 
@@ -274,16 +284,17 @@ const recreateSession = async (notify: boolean): Promise<void> => {
  *  никогда не доедет до dead-letter); MAX_SPAWN_ATTEMPTS — dead-letter:
  *  снимаем и персистим ДО отправки (рестарт не воскресит заявку и не
  *  задублирует сообщение), юзеру уходит полный текст; недоставка — текст
- *  заявки в лог (ничего не теряется молча). */
+ *  заявки в лог (ничего не теряется молча). Батч обрабатывается как один
+ *  юнит (msgIDs). */
 async function spawnFail(req: Request, e: unknown): Promise<void> {
   const attempts = (req.attempts ?? 0) + 1
-  const i = state.queue.findIndex((r) => r.msgID === req.msgID)
+  const i = state.queue.findIndex((r) => (req.msgIDs ?? [req.msgID]).includes(r.msgID))
   if (i < 0) {
     log(`spawnFail: заявка msg${req.msgID} уже не в очереди — игнор`)
     return
   }
   if (attempts >= MAX_SPAWN_ATTEMPTS) {
-    state.queue.splice(i, 1)
+    state.queue = dropBatch(state.queue, req)
     save()
     // текст заявки — в лог ДО отправки: крах посреди send не потеряет его молча
     log(`заявка msg${req.msgID}: ${attempts} неудачных попыток хода (${e}) — dead-letter, текст: ${req.text}`)
@@ -396,36 +407,39 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   }
 }
 
-/** Рестарт в окне отправки: ход персистнут, сообщение ещё в очереди —
- *  промпт мог дойти или нет. Дошёл (user-сообщение с ЭТИМ текстом новее
- *  старта хода) → доигрываем с точным startedAt и забираем из очереди;
- *  нет → ход сносим, сообщение в очереди поднимется заново. */
+/** Рестарт в окне отправки: ход персистнут, батч ещё в очереди — промпт
+ *  мог дойти или нет. Дошёл (user-сообщение с ЭТИМ текстом новее старта
+ *  хода) → доигрываем с точным startedAt и забираем батч из очереди;
+ *  нет → ход сносим, сообщения в очереди поднимутся заново. */
 const confirmPendingRun = async (run: RunState): Promise<boolean> => {
-  const inQueue = state.queue.some((r) => r.msgID === run.req.msgID)
-  if (!inQueue) return false // ход подтверждён (message ушло из очереди) — наблюдаем
+  const ids = run.req.msgIDs ?? [run.req.msgID]
+  const inQueue = state.queue.some((r) => ids.includes(r.msgID))
+  if (!inQueue) return false // ход подтверждён (батч ушёл из очереди) — наблюдаем
   let landed: number | null = null
   try { landed = promptLandedAt(await sessionMessages(run.sessionID), run.startedAt - 2000, run.req.text) } catch {}
   if (landed !== null) {
     log(`окно отправки ${run.sessionID}: промпт дошёл (${landed}) — доигрываем`)
-    const i = state.queue.findIndex((r) => r.msgID === run.req.msgID)
-    if (i >= 0) state.queue.splice(i, 1)
+    state.queue = dropBatch(state.queue, run.req)
     state.run = { ...run, startedAt: landed }
     save()
     return false
   }
-  log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, сообщение перезапустится`)
+  log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, сообщения перезапустятся`)
   state.run = undefined
   save()
-  return true // продолжить цикл (сообщение поднимется заново)
+  return true // продолжить цикл (батч поднимется заново)
 }
 
-/** Поднять ход: сообщение из головы очереди → активный ход в вечной сессии.
- *  Сообщение НЕ шифтится из очереди до подтверждённого промпта — рестарт в
- *  любой точке окна не теряет его. "idle" — очередь пуста; "started" — ход
- *  активен; "later" — сбой обработан, ретрай запланирован (sleep в spawnFail). */
+/** Поднять ход: головной батч из очереди → активный ход в вечной сессии.
+ *  Батч НЕ удаляется из очереди до подтверждённого промпта — рестарт в
+ *  любой точке окна не теряет его. "idle" — очередь пуста/не готова;
+ *  "started" — ход активен; "later" — сбой обработан (sleep в spawnFail). */
 const startRun = async (): Promise<"idle" | "started" | "later"> => {
-  const req = state.queue[0]
-  if (req === undefined) return "idle"
+  const readyAt = batchReadyAt(state.queue, state.lastPushAt ?? 0, BATCH_DELAY_MS, BATCH_MAX_MS)
+  if (readyAt === null) return "idle"
+  const items = takeBatch(state.queue, readyAt)
+  if (items.length === 0) return "idle"
+  const req = joinBatch(items)
   let sessionID: string
   try {
     sessionID = await ensureSession()
@@ -441,19 +455,32 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   const startedAt = Date.now()
   state.run = { sessionID, startedAt, req }
   save()
+  // files-вложение — вижн для мультимодальной модели (путь уже в тексте —
+  // даже без вижна агент приложит файл к задаче); не поддерживается моделью
+  // → ретрай без файлов, текст несёт пути
+  const files = (req.attachments ?? []).map((a) => ({ uri: `file://${a.path}`, name: a.name }))
+  const post = (withFiles: boolean) => restCall(`/session/${sessionID}/prompt`, {
+    method: "POST",
+    body: { text: req.text, ...(withFiles && files.length > 0 ? { files } : {}) },
+  })
   try {
-    await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text: req.text } })
+    try {
+      await post(true)
+    } catch (e) {
+      if (files.length === 0) throw e
+      log(`prompt с files не прошёл (${e}) — ретрай без files`)
+      await post(false)
+    }
   } catch (e) {
     state.run = undefined
     save()
     await spawnFail(req, e)
     return "later"
   }
-  // промпт подтверждён: сообщение принято в работу — убираем из очереди
-  const i = state.queue.findIndex((r) => r.msgID === req.msgID)
-  if (i >= 0) state.queue.splice(i, 1)
+  // промпт подтверждён: батч принят в работу — убираем из очереди целиком
+  state.queue = dropBatch(state.queue, req)
   const waited = Math.round((Date.now() - req.receivedAt) / 1000)
-  log(`ход ${sessionID}: ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
+  log(`ход ${sessionID} (${items.length} сообщ.): ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
   save()
   return "started"
 }
@@ -494,6 +521,14 @@ const runLoop = async (): Promise<void> => {
         save()
       }
 
+      // дебаунс батча: минута тишины после последнего сообщения (поток
+      // склеится, у юзера окно на редактирование); кап — см. batchReadyAt
+      const readyAt = batchReadyAt(state.queue, state.lastPushAt ?? 0, BATCH_DELAY_MS, BATCH_MAX_MS)
+      if (readyAt !== null && Date.now() < readyAt) {
+        await sleep(Math.min(readyAt - Date.now(), 30_000))
+        continue
+      }
+
       const r = await startRun()
       if (r === "idle") await sleep(2000)
     } catch (e) {
@@ -503,6 +538,54 @@ const runLoop = async (): Promise<void> => {
   }
   loopDone.run = true
   maybeExit()
+}
+
+// ——— вложения: ТГ-медиа → ФС (паттерн зоопарка: getFile → download) ———
+
+/** Выгрузить фото/документ из сообщения в MEDIA_DIR. Возвращает вложения и
+ *  маркеры неудач (текст заявки честно скажет агенту, что не выгрузилось). */
+const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<{ attachments: { path: string; name: string }[]; failed: string[] }> => {
+  const out: { attachments: { path: string; name: string }[]; failed: string[] } = { attachments: [], failed: [] }
+  const save = async (fileId: string | undefined, name: string): Promise<void> => {
+    if (fileId === undefined) { out.failed.push(name); return }
+    try {
+      const f = await tg("getFile", { file_id: fileId }) as { file_path?: string }
+      if (typeof f.file_path !== "string") throw new Error("нет file_path")
+      const res = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${f.file_path}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      mkdirSync(MEDIA_DIR, { recursive: true })
+      const local = join(MEDIA_DIR, name)
+      writeFileSync(local, Buffer.from(await res.arrayBuffer()))
+      out.attachments.push({ path: local, name })
+    } catch (e) {
+      log(`вложение ${name}: ${e}`)
+      out.failed.push(name)
+    }
+  }
+  // фото: последний элемент массива = максимальное разрешение
+  const photo = Array.isArray(m.photo) ? m.photo[m.photo.length - 1] : undefined
+  if (photo !== undefined) await save(photo.file_id, `${m.message_id}.jpg`)
+  if (m.document?.file_id !== undefined) {
+    // имя файла из ТГ санитайзим (слэши/управляющие), режем до 80
+    const safe = (m.document.file_name ?? "file").replace(/[/\\\x00-\x1f]/g, "_").slice(0, 80)
+    await save(m.document.file_id, `${m.message_id}_${safe}`)
+  }
+  return out
+}
+
+/** Гигиена вложений: старше TTL — сносим (заявки живут минутами, неделя — запас). */
+const gcMedia = (): void => {
+  try {
+    const entries = readdirSync(MEDIA_DIR)
+    const now = Date.now()
+    for (const e of entries) {
+      const p = join(MEDIA_DIR, e)
+      try {
+        if (now - statSync(p).mtimeMs > MEDIA_TTL_MS) rmSync(p)
+      } catch {}
+    }
+    if (entries.length > 0) log(`gc media: ${entries.length} файлов в каталоге`)
+  } catch { /* каталога нет — ок */ }
 }
 
 // ——— poller ТГ ———
@@ -539,10 +622,34 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста.")
     }
   } else if (out.kind === "media") {
-    await send(state.chatID, "⚠️ медиа без подписи не разбираю — опиши словами")
+    await send(state.chatID, "⚠️ Такой тип медиа не разбираю (голос/видео/стикер) — опиши словами или пришли фото/файл")
+  } else if (out.kind === "edit") {
+    // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
+    const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
+    if (i >= 0) {
+      state.queue[i] = { ...state.queue[i]!, text: out.text }
+      state.lastPushAt = Date.now() // юзер ещё формулирует — окно продлевается
+      log(`edit msg${out.msg.message_id}: текст подменён в очереди`)
+    } else {
+      log(`edit msg${out.msg.message_id}: уже не в очереди — игнор`)
+    }
   } else {
-    state.queue.push({ text: out.text, chatID: out.msg.chat.id, msgID: out.msg.message_id, receivedAt: Date.now() })
-    log(`заявка (+${state.queue.length} в очереди): ${out.text.slice(0, 80)}`)
+    // заявка: выгрузить вложения в ФС, пути — в текст (агент приложит к задаче)
+    const { attachments, failed } = await downloadAttachment(out.msg)
+    const markers = [
+      ...attachments.map((a) => `[вложение: ${a.name} — файл в ФС: ${a.path}]`),
+      ...failed.map((n) => `[вложение ${n} не выгрузилось — попроси юзера продублировать]`),
+    ]
+    const text = [out.text, ...markers].filter((s) => s !== "").join("\n")
+    state.queue.push({
+      text,
+      chatID: out.msg.chat.id,
+      msgID: out.msg.message_id,
+      receivedAt: Date.now(),
+      ...(attachments.length > 0 ? { attachments } : {}),
+    })
+    state.lastPushAt = Date.now()
+    log(`заявка (+${state.queue.length} в очереди${attachments.length > 0 ? `, вложений: ${attachments.length}` : ""}${failed.length > 0 ? `, НЕ выгрузилось: ${failed.length}` : ""}): ${out.text.slice(0, 60)}`)
   }
   save()
 }
@@ -552,7 +659,7 @@ const pollLoop = async (): Promise<void> => {
     if (stopping) break
     try {
       // long-poll 25с → таймаут fetch должен его покрывать с запасом
-      const updates = await tg("getUpdates", { offset: state.offset, timeout: 25, allowed_updates: ["message"] }, 35_000) as TgUpdate[]
+      const updates = await tg("getUpdates", { offset: state.offset, timeout: 25, allowed_updates: ["message", "edited_message"] }, 35_000) as TgUpdate[]
       for (const u of updates) {
         if (stopping) break
         await handleUpdate(u)
@@ -579,6 +686,7 @@ const main = async (): Promise<void> => {
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
+  gcMedia()
   syncAgentDef()
   const me = await tg("getMe") as { username?: string }
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }

@@ -8,20 +8,34 @@ export interface TgMessage {
   from?: { username?: string; is_bot?: boolean }
   text?: string
   caption?: string
+  photo?: { file_id?: string }[]
+  document?: { file_id?: string; file_name?: string }
 }
 
 export interface TgUpdate {
   update_id: number
   message?: TgMessage
+  edited_message?: TgMessage
 }
 
-/** Сообщение владельца, прошедшее фильтр. */
+/** Вложение заявки: файл уже выгружен в ФС (демон), путь — для агента
+ *  (прикладывает к задаче через uwuwu-cli --attach). */
+export interface Attachment {
+  path: string
+  name: string
+}
+
+/** Сообщение владельца, прошедшее фильтр. attempts — число неудачных попыток
+ *  поднять прогон (poison-защита очереди); msgIDs — состав батча (склейка
+ *  потока сообщений) для удаления из очереди одним юнитом. */
 export interface Request {
   text: string
   chatID: number
   msgID: number
   receivedAt: number // ms
   attempts?: number
+  msgIDs?: number[]
+  attachments?: Attachment[]
 }
 
 /** Активный ход в вечной сессии (персистится — рестарт демона не теряет ход).
@@ -45,6 +59,8 @@ export interface TriageState {
   pausedUntil?: number
   queue: Request[]
   run?: RunState
+  /** ms последнего push/редакта в очередь — опора дебаунса батча */
+  lastPushAt?: number
 }
 
 // ——— состояние ———
@@ -54,8 +70,19 @@ const isReq = (v: unknown): v is Request => {
   const r = v as Record<string, unknown>
   const attemptsOk = r.attempts === undefined
     || (Number.isInteger(r.attempts) && (r.attempts as number) >= 0)
+  const msgIDsOk = r.msgIDs === undefined
+    || (Array.isArray(r.msgIDs) && (r.msgIDs as unknown[]).length <= 100
+      && (r.msgIDs as unknown[]).every((m) => Number.isInteger(m)))
+  const attOk = r.attachments === undefined
+    || (Array.isArray(r.attachments) && (r.attachments as unknown[]).length <= 10
+      && (r.attachments as unknown[]).every((a) => {
+        if (a === null || typeof a !== "object") return false
+        const x = a as Record<string, unknown>
+        return typeof x.path === "string" && x.path.length <= 512
+          && typeof x.name === "string" && x.name.length <= 200
+      }))
   return typeof r.text === "string" && r.text.trim() !== ""
-    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk
+    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk && msgIDsOk && attOk
 }
 
 /** Санитайз state.json: битые поля отбрасываем, always-on демон не роняем. */
@@ -69,7 +96,7 @@ export function validState(raw: unknown): TriageState {
   if (Number.isInteger(r.broken) && (r.broken as number) >= 0 && (r.broken as number) <= 99) {
     out.broken = r.broken as number
   }
-  for (const k of ["lastResetAt", "pausedUntil"] as const) {
+  for (const k of ["lastResetAt", "pausedUntil", "lastPushAt"] as const) {
     const v = r[k]
     if (Number.isFinite(v) && (v as number) >= 0) out[k] = v as number
   }
@@ -95,22 +122,71 @@ export type UpdateOutcome =
   | { kind: "skip" } // не владелец / бот / не сообщение — тихо
   | { kind: "help"; msg: TgMessage } // /start | /help
   | { kind: "reset"; msg: TgMessage } // /reset — пересоздать сессию диалога
-  | { kind: "media"; msg: TgMessage } // медиа без текста
-  | { kind: "req"; msg: TgMessage; text: string }
+  | { kind: "media"; msg: TgMessage } // неподдерживаемое медиа (голос/видео/стикер)
+  | { kind: "req"; msg: TgMessage; text: string } // photo/document идут заявкой (text может быть пустым)
+  | { kind: "edit"; msg: TgMessage; text: string } // edited_message от владельца
 
 /** Разбор апдейта. Владелец один (owner по username) — остальные входы тихо
  *  скипаются: бот публичный, чужим не отвечаем и не раскрываем формат. */
 export function classifyUpdate(u: TgUpdate, owner: string): UpdateOutcome {
-  const m = u.message
+  const isEdit = u.message === undefined && u.edited_message !== undefined
+  const m = u.message ?? u.edited_message
   if (m === undefined) return { kind: "skip" }
   if (m.from?.is_bot === true) return { kind: "skip" }
   if (m.from?.username !== owner) return { kind: "skip" }
   if (m.chat.type !== "private") return { kind: "skip" }
   const t = (m.text ?? m.caption ?? "").trim()
-  if (t === "") return { kind: "media", msg: m }
+  const hasAttachment = (Array.isArray(m.photo) && m.photo.length > 0) || m.document?.file_id !== undefined
+  if (isEdit) return t === "" && !hasAttachment ? { kind: "skip" } : { kind: "edit", msg: m, text: t }
+  if (t === "" && !hasAttachment) return { kind: "media", msg: m }
   if (t === "/start" || t === "/help") return { kind: "help", msg: m }
   if (t === "/reset") return { kind: "reset", msg: m }
   return { kind: "req", msg: m, text: t }
+}
+
+// ——— батчинг потока сообщений ———
+
+/** Когда головной батч готов: тишина DELAY после последнего push/редакта
+ *  (поток писел склеивается целиком), но самое старое сообщение не ждёт
+ *  дольше MAX (бесконечный поток не откладывает обработку навсегда).
+ *  null — очередь пуста. */
+export function batchReadyAt(queue: Request[], lastPushAt: number, delayMs: number, maxMs: number): number | null {
+  const head = queue[0]
+  if (head === undefined) return null
+  const last = Math.max(lastPushAt, head.receivedAt)
+  return Math.min(last + delayMs, head.receivedAt + maxMs)
+}
+
+/** Головной батч: всё, что пришло ДО момента готовности (сообщения,
+ *  прилетевшие позже, — следующий батч, батчи не смешиваются). */
+export function takeBatch(queue: Request[], readyAt: number): Request[] {
+  const out: Request[] = []
+  for (const r of queue) {
+    if (r.receivedAt > readyAt) break
+    out.push(r)
+  }
+  return out
+}
+
+/** Батч как один ход диалога: тексты склеены, вложения объединены, msgIDs —
+ *  состав для удаления из очереди одним юнитом (dead-letter/recovery). */
+export function joinBatch(items: Request[]): Request {
+  const head = items[0]!
+  const attachments = items.flatMap((i) => i.attachments ?? [])
+  return {
+    text: items.map((i) => i.text).join("\n\n"),
+    chatID: head.chatID,
+    msgID: head.msgID,
+    receivedAt: head.receivedAt,
+    ...(items.length > 1 ? { msgIDs: items.map((i) => i.msgID) } : {}),
+    ...(attachments.length > 0 ? { attachments: attachments.slice(0, 10) } : {}),
+  }
+}
+
+/** Удалить из очереди все сообщения батча (по msgID). */
+export function dropBatch(queue: Request[], req: Request): Request[] {
+  const ids = new Set(req.msgIDs ?? [req.msgID])
+  return queue.filter((r) => !ids.has(r.msgID))
 }
 
 // ——— финал хода ———

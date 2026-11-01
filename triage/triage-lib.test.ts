@@ -1,8 +1,9 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, classifyUpdate, extractFinal, plainChunks, promptLandedAt, validState,
-  type SessionMsg, type TgUpdate,
+  alignChunks, batchReadyAt, classifyUpdate, dropBatch, extractFinal, joinBatch, plainChunks,
+  promptLandedAt, takeBatch, validState,
+  type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
 const msg = (over: Partial<NonNullable<TgUpdate["message"]>>): NonNullable<TgUpdate["message"]> => ({
@@ -41,6 +42,26 @@ test("classifyUpdate: /reset — пересоздание сессии", () => {
 
 test("classifyUpdate: медиа без текста — media", () => {
   expect(classifyUpdate({ update_id: 1, message: msg({ text: undefined, caption: undefined }) }, "yurvon_screamo").kind).toBe("media")
+})
+
+test("classifyUpdate: фото/документ — заявка даже без текста", () => {
+  const photo = msg({ text: undefined, caption: undefined, photo: [{ file_id: "f1" }, { file_id: "f2" }] })
+  const out = classifyUpdate({ update_id: 1, message: photo }, "yurvon_screamo")
+  expect(out.kind).toBe("req")
+  if (out.kind === "req") expect(out.text).toBe("")
+
+  const doc = msg({ text: undefined, caption: "логи", document: { file_id: "d1", file_name: "app.log" } })
+  const out2 = classifyUpdate({ update_id: 2, message: doc }, "yurvon_screamo")
+  expect(out2.kind).toBe("req")
+  if (out2.kind === "req") expect(out2.text).toBe("логи")
+})
+
+test("classifyUpdate: edited_message — edit с новым текстом", () => {
+  const e = msg({ message_id: 7, text: "поправленный текст" })
+  const out = classifyUpdate({ update_id: 1, edited_message: e }, "yurvon_screamo")
+  expect(out).toEqual({ kind: "edit", msg: e, text: "поправленный текст" })
+  // чужой редact — тихо
+  expect(classifyUpdate({ update_id: 1, edited_message: msg({ text: "x" }) }, "not_owner").kind).toBe("skip")
 })
 
 // ——— extractFinal / promptLandedAt ———
@@ -115,6 +136,52 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState(broken)).toEqual({ offset: 0, queue: [] })
   // окно отправки: run с startedAt=0 (промпт не подтверждён) — валиден и персистится
   expect(validState({ run: { sessionID: "ses_x", startedAt: 0, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 } } }).run?.startedAt).toBe(0)
+})
+
+// ——— батчинг ———
+
+const R = (over: Partial<Request>): Request => ({
+  text: "t", chatID: 1, msgID: 1, receivedAt: 0, ...over,
+})
+
+test("batchReadyAt: тишина DELAY после последнего; кап MAX от самого старого", () => {
+  const delay = 60_000, max = 300_000
+  const q = [R({ msgID: 1, receivedAt: 1000 })]
+  expect(batchReadyAt(q, 1000, delay, max)).toBe(61_000)          // тишина с последнего push
+  expect(batchReadyAt(q, 5000, delay, max)).toBe(65_000)          // push позже — окно сдвигается
+  // бесконечный поток: тишина никогда — но кап отпускает самое старое
+  const stream = [R({ msgID: 1, receivedAt: 1000 }), R({ msgID: 2, receivedAt: 200_000 })]
+  expect(batchReadyAt(stream, 200_000, delay, max)).toBe(260_000) // min(тишина 260_000, кап 301_000)
+  expect(batchReadyAt([], 0, delay, max)).toBe(null)
+})
+
+test("takeBatch/joinBatch/dropBatch: батч = всё до readyAt, склейка и удаление юнитом", () => {
+  const q = [
+    R({ msgID: 1, receivedAt: 1000, text: "первое" }),
+    R({ msgID: 2, receivedAt: 2000, text: "второе", attachments: [{ path: "/m/2.jpg", name: "2.jpg" }] }),
+    R({ msgID: 3, receivedAt: 9000, text: "опоздавшее" }),
+  ]
+  const batch = takeBatch(q, 5000)
+  expect(batch.map((r) => r.msgID)).toEqual([1, 2])
+  const joined = joinBatch(batch)
+  expect(joined.text).toBe("первое\n\nвторое")
+  expect(joined.msgIDs).toEqual([1, 2])
+  expect(joined.attachments).toEqual([{ path: "/m/2.jpg", name: "2.jpg" }])
+  const rest = dropBatch(q, joined)
+  expect(rest.map((r) => r.msgID)).toEqual([3]) // опоздавшее — следующий батч
+})
+
+test("joinBatch: одиночное сообщение не получает msgIDs/attachments", () => {
+  const j = joinBatch([R({ text: "соло" })])
+  expect(j.msgIDs).toBeUndefined()
+  expect(j.attachments).toBeUndefined()
+})
+
+test("joinBatch: вложения батча склеиваются (кап 10)", () => {
+  const items = Array.from({ length: 12 }, (_, i) =>
+    R({ msgID: i + 1, receivedAt: i, attachments: [{ path: `/m/${i}`, name: `${i}.jpg` }] }))
+  const j = joinBatch(items)
+  expect(j.attachments?.length).toBe(10)
 })
 
 // ——— plainChunks / alignChunks ———
