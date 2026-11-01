@@ -194,6 +194,24 @@ test("composeText: текст + маркеры вложений и неудач"
   expect(composeText("чисто", [], [])).toBe("чисто")
 })
 
+test("validState: failed-имена с маркером в тексте — валидны; мусорные — нет", () => {
+  const good = {
+    offset: 0, chatID: 1,
+    queue: [{ text: "заявка\n[вложение x.png не выгрузилось — попроси юзера продублировать]", chatID: 1, msgID: 1, receivedAt: 1, failed: ["x.png"] }],
+  }
+  expect(validState(good).queue[0]?.failed).toEqual(["x.png"])
+  const bad = { offset: 0, chatID: 1, queue: [{ text: "текст без маркера", chatID: 1, msgID: 1, receivedAt: 1, failed: ["x.png"] }] }
+  expect(validState(bad).queue[0]?.failed).toBeUndefined()
+})
+
+test("joinBatch: failed-имена батча дедупятся и капятся", () => {
+  const items = [
+    R({ msgID: 1, text: "a\n[вложение x не выгрузилось — попроси юзера продублировать]", failed: ["x"] }),
+    R({ msgID: 2, text: "b\n[вложение x не выгрузилось — попроси юзера продублировать]", failed: ["x", "y"] }),
+  ]
+  expect(joinBatch(items).failed).toEqual(["x", "y"])
+})
+
 // ——— plainChunks / alignChunks ———
 
 test("plainChunks: короткий текст — один чанк", () => {

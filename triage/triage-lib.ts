@@ -36,6 +36,9 @@ export interface Request {
   attempts?: number
   msgIDs?: number[]
   attachments?: Attachment[]
+  /** имена вложений, НЕ выгрузившихся при приёме (маркеры в тексте
+   *  пересобираются при правке — знание о неудаче переживает edit) */
+  failed?: string[]
 }
 
 /** Активный ход в вечной сессии (персистится — рестарт демона не теряет ход).
@@ -84,8 +87,12 @@ const isReq = (v: unknown): v is Request => {
         return typeof x.path === "string" && x.path.length <= 512
           && typeof x.name === "string" && x.name.length <= 200
       }))
+  const failedOk = r.failed === undefined
+    || (Array.isArray(r.failed) && (r.failed as unknown[]).length <= 10
+      && (r.failed as unknown[]).every((n) => typeof n === "string" && (n as string).length <= 200)
+      && (r.text as string).includes("не выгрузилось"))
   return typeof r.text === "string" && r.text.trim() !== ""
-    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk && msgIDsOk && attOk
+    && Number.isFinite(r.chatID) && Number.isFinite(r.msgID) && attemptsOk && msgIDsOk && attOk && failedOk
 }
 
 /** Санитайз state.json: битые поля отбрасываем, always-on демон не роняем. */
@@ -194,6 +201,7 @@ export function composeText(text: string, attachments: Attachment[], failed: str
 export function joinBatch(items: Request[]): Request {
   const head = items[0]!
   const attachments = items.flatMap((i) => i.attachments ?? [])
+  const failed = [...new Set(items.flatMap((i) => i.failed ?? []))]
   return {
     text: items.map((i) => i.text).join("\n\n"),
     chatID: head.chatID,
@@ -201,6 +209,7 @@ export function joinBatch(items: Request[]): Request {
     receivedAt: head.receivedAt,
     ...(items.length > 1 ? { msgIDs: items.map((i) => i.msgID) } : {}),
     ...(attachments.length > 0 ? { attachments: attachments.slice(0, ATT_BATCH_MAX) } : {}),
+    ...(failed.length > 0 ? { failed: failed.slice(0, 10) } : {}),
   }
 }
 

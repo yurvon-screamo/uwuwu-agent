@@ -302,6 +302,7 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
     return
   }
   rep.attempts = attempts // счётчик на представителе: состав батча в очереди не трогаем
+  state.firing = undefined // полёт не состоялся, батч в очереди — правки снова можно
   save()
   log(`ход не удался (${e}) — ретрай ${attempts}/${MAX_SPAWN_ATTEMPTS - 1} через 30с`)
   await send(req.chatID, `⚠️ Прогон не поднялся (попытка ${attempts} из ${MAX_SPAWN_ATTEMPTS - 1}: ${e instanceof Error ? e.message : String(e)}) — ретрай через 30с`)
@@ -425,6 +426,7 @@ const confirmPendingRun = async (run: RunState): Promise<boolean> => {
   }
   log(`окно отправки ${run.sessionID}: промпт не дошёл — ход снесён, сообщения перезапустятся`)
   state.run = undefined
+  state.firing = undefined // полёт не состоялся — edit-ветка снова честно примет правки
   save()
   return true // продолжить цикл (батч поднимется заново)
 }
@@ -652,10 +654,12 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
         const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
         const cur = state.queue[i]!
         const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
+        const failed = hasNewMedia ? dl.failed : (cur.failed ?? [])
         state.queue[i] = {
           ...cur,
-          text: composeText(out.text, attachments, dl.failed),
+          text: composeText(out.text, attachments, failed),
           ...(attachments.length > 0 ? { attachments } : {}),
+          ...(failed.length > 0 ? { failed } : {}),
         }
         state.lastPushAt = Date.now() // юзер ещё формулирует — окно продлевается
         log(`edit msg${out.msg.message_id}: текст${hasNewMedia ? " + вложения" : ""} подменён в очереди`)
@@ -673,6 +677,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       msgID: out.msg.message_id,
       receivedAt: Date.now(),
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(failed.length > 0 ? { failed } : {}),
     })
     state.lastPushAt = Date.now()
     log(`заявка (+${state.queue.length} в очереди${attachments.length > 0 ? `, вложений: ${attachments.length}` : ""}${failed.length > 0 ? `, НЕ выгрузилось: ${failed.length}` : ""}): ${out.text.slice(0, 60)}`)
