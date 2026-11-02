@@ -126,12 +126,12 @@ def main() -> int:
     sub.add_parser("fetch")
     sub.add_parser("report")
     args = p.parse_args()
-    try:
-        return {"fetch": cmd_fetch, "report": cmd_report}[args.cmd](args)
-    except McpError as e:
-        print(f"!! {e}", file=sys.stderr)
-        return 2
+    return {"fetch": cmd_fetch, "report": cmd_report}[args.cmd](args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

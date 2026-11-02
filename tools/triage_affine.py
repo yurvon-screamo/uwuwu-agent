@@ -577,14 +577,14 @@ def main() -> int:
     c.add_argument("date")
     c.add_argument("--keep", required=True, help="slug1,slug2,…")
     args = p.parse_args()
-    try:
-        return {"sections": cmd_sections, "apply": cmd_apply, "corpus": cmd_corpus}[
-            args.cmd
-        ](args)
-    except McpError as e:
-        print(f"!! {e}", file=sys.stderr)
-        return 2
+    return {"sections": cmd_sections, "apply": cmd_apply, "corpus": cmd_corpus}[
+        args.cmd
+    ](args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

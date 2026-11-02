@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -176,25 +178,52 @@ def t_mcp_call_non_json_body_raises() -> None:
 
 
 def t_call_prefixes_tool_name_on_both_paths() -> None:
-    """wiki_ops.call ре-рейзит McpError с именем инструмента."""
-    # arrange: обе ветки call() — первичная и после пере-handshake
-    error_resp = ({"error": {"code": -32000, "message": "boom"}}, "sid")
-    orig = wiki_ops.mcp_call
-    wiki_ops.mcp_call = lambda *a, **kw: error_resp
+    """wiki_ops.call ре-рейзит McpError с именем инструмента — обе ветки:
+    первичный вызов (400 → пере-handshake) и повтор после него."""
+    # arrange: сценарий tools/call(400) → initialize(ок) → notifications →
+    # tools/call(ошибка контракта); состояние wiki_ops изолируем от машины
+    class StaleSessionError(urllib.error.HTTPError):
+        def __init__(self) -> None:
+            super().__init__("http://fake/mcp", 400, "stale", {}, None)
+
+    sequence: list[str] = []
+
+    def fake_mcp_call(method: str, params: dict, sid=None, notify=False):
+        sequence.append(method)
+        if len(sequence) == 1:  # первичный tools/call — сессия протухла
+            raise StaleSessionError()
+        if method == "initialize":  # пере-handshake — успех
+            return {"result": {"ok": True}}, "fresh-sid"
+        if notify:  # notifications/initialized
+            return {}, "fresh-sid"
+        return {"error": {"code": -32000, "message": "boom"}}, "fresh-sid"
+
+    orig_call = wiki_ops.mcp_call
+    orig_session_file = wiki_ops.SESSION_FILE
+    orig_live_sid = wiki_ops._live_sid
+    wiki_ops.mcp_call = fake_mcp_call
+    wiki_ops.SESSION_FILE = Path("/tmp/opencode/test-mcp-errors/fake-session.txt")
+    wiki_ops._live_sid = None
     try:
         wiki_ops.call("sid", "append_markdown", {})
     except wiki_ops.McpError as e:
+        # assert: префикс инструмента на повторе после пере-handshake
         assert str(e).startswith("append_markdown:"), str(e)
         assert "шлюз вернул ошибку" in str(e), str(e)
+        assert len(sequence) == 4, f"обе ветки не пройдены: {sequence}"
     except SystemExit as e:
         raise AssertionError("SystemExit вместо McpError (старый контракт)") from e
     else:
         raise AssertionError("ошибка шлюза прошла молча")
     finally:
-        wiki_ops.mcp_call = orig
+        wiki_ops.mcp_call = orig_call
+        wiki_ops.SESSION_FILE = orig_session_file
+        wiki_ops._live_sid = orig_live_sid
 
 
-def run_cli(script: str, argv: list[str], port: int, extra_env: dict) -> subprocess.CompletedProcess:
+def run_cli(
+    script: str, argv: list[str], port: int, extra_env: dict
+) -> subprocess.CompletedProcess:
     env = {**os.environ, "UWUWU_AFFINE_URL": f"http://127.0.0.1:{port}/mcp", **extra_env}
     return subprocess.run(
         [sys.executable, str(TOOLS / script), *argv],
@@ -231,8 +260,9 @@ def t_e2e_wiki_ops_empty_body_exits_2_with_stderr(port: int) -> None:
 
 def t_e2e_triage_apply_rpc_error_exits_2_with_stderr(port: int) -> None:
     """E2E: triage_affine apply (dry-run) при ошибке шлюза → rc=2 + stderr."""
-    # arrange: фейковый контент-кэш с бакетом будущей даты
+    # arrange: чистый фейковый контент-кэш (без протухшего состояния прошлых прогонов)
     fake_wiki = Path("/tmp/opencode/test-mcp-errors/wiki")
+    shutil.rmtree(fake_wiki, ignore_errors=True)
     fake_wiki.mkdir(parents=True, exist_ok=True)
     (fake_wiki / "affine_content_cache.json").write_text(
         json.dumps({"2099-01-01": {"doc_id": "fakeDoc123", "markdown": "## s1\nтекст"}}),
@@ -268,11 +298,24 @@ def main() -> int:
     try:
         for name, fn in TESTS:
             check(name, fn)
-        for mode, name, fn in [
-            ("rpc_error", "e2e wiki_ops: jsonrpc error → rc2/stderr", t_e2e_wiki_ops_rpc_error_exits_2_with_stderr),
-            ("empty", "e2e wiki_ops: пустое тело → rc2/stderr", t_e2e_wiki_ops_empty_body_exits_2_with_stderr),
-            ("rpc_error", "e2e triage apply: ошибка шлюза → rc2/stderr", t_e2e_triage_apply_rpc_error_exits_2_with_stderr),
-        ]:
+        e2e = [
+            (
+                "rpc_error",
+                "e2e wiki_ops: jsonrpc error → rc2/stderr",
+                t_e2e_wiki_ops_rpc_error_exits_2_with_stderr,
+            ),
+            (
+                "empty",
+                "e2e wiki_ops: пустое тело → rc2/stderr",
+                t_e2e_wiki_ops_empty_body_exits_2_with_stderr,
+            ),
+            (
+                "rpc_error",
+                "e2e triage apply: ошибка шлюза → rc2/stderr",
+                t_e2e_triage_apply_rpc_error_exits_2_with_stderr,
+            ),
+        ]
+        for mode, name, fn in e2e:
             global FAKE_MODE
             FAKE_MODE = mode
             check(name, lambda fn=fn, port=port: fn(port))

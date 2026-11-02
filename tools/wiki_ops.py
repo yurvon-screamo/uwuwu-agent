@@ -146,33 +146,36 @@ def close(sid: str) -> None:
         pass
 
 
-def call(sid: str, name: str, args: dict) -> dict:
-    """tools/call с восстановлением протухшей сессии: 400/404 → один
-    пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
-    call(старый_sid,...) продолжают работать. McpError ре-рейзится с
-    префиксом имени инструмента — погибший шаг серии виден в логе обвязки
-    (обе ветки: первичный вызов и повтор после пере-handshake)."""
-    global _live_sid
-    effective = _live_sid or sid
+def _call_tool(sid: str, name: str, args: dict) -> dict:
+    """tools/call + валидация ответа. McpError ре-рейзится с префиксом имени
+    инструмента — погибший шаг серии виден в логе обвязки. Ошибка handshake
+    (initialize при пере-handshake) сюда не заворачивается и уходит без
+    префикса — атрибуция места отказа честная."""
     try:
-        try:
-            r, _ = mcp_call(
-                "tools/call", {"name": name, "arguments": args}, effective
-            )
-        except urllib.error.HTTPError as e:
-            if e.code not in (400, 404):
-                raise
-            e.close()  # отпустить соединение до повторного запроса
-            print(
-                "wiki-ops: сессия протухла — пере-handshake",
-                file=sys.stderr,
-                flush=True,
-            )
-            _live_sid = _handshake()
-            r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, _live_sid)
+        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, sid)
         return mcp_result(r)
     except McpError as e:
         raise McpError(f"{name}: {e}") from e
+
+
+def call(sid: str, name: str, args: dict) -> dict:
+    """tools/call с восстановлением протухшей сессии: 400/404 → один
+    пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
+    call(старый_sid,...) продолжают работать. Ошибки контракта приходят с
+    префиксом имени инструмента (см. _call_tool)."""
+    global _live_sid
+    effective = _live_sid or sid
+    try:
+        return _call_tool(effective, name, args)
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 404):
+            raise
+        e.close()  # отпустить соединение до повторного запроса
+        print(
+            "wiki-ops: сессия протухла — пере-handshake", file=sys.stderr, flush=True
+        )
+        _live_sid = _handshake()
+        return _call_tool(_live_sid, name, args)
 
 
 def deep_md(o):
@@ -544,23 +547,23 @@ def main() -> int:
     om.add_argument("docId")
     om.add_argument("--to", required=True)
     a = p.parse_args()
-    try:
-        return {
-            "create": cmd_create,
-            "move": cmd_move,
-            "append": cmd_append,
-            "replace": cmd_replace,
-            "export": cmd_export,
-            "find": cmd_find,
-            "children": cmd_children,
-            "orgls": cmd_orgls,
-            "embed": cmd_embed,
-            "org": cmd_org,
-        }[a.cmd](a)
-    except McpError as e:
-        print(f"!! {e}", file=sys.stderr)
-        return 2
+    return {
+        "create": cmd_create,
+        "move": cmd_move,
+        "append": cmd_append,
+        "replace": cmd_replace,
+        "export": cmd_export,
+        "find": cmd_find,
+        "children": cmd_children,
+        "orgls": cmd_orgls,
+        "embed": cmd_embed,
+        "org": cmd_org,
+    }[a.cmd](a)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)
