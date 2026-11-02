@@ -12,7 +12,7 @@ use anyhow::{bail, Context as _, Result};
 use serde_json::json;
 
 use crate::affine_client::{AffineClient, AffineConfig};
-use crate::affine_tasks::{read_rows, Board, TaskRow};
+use crate::affine_tasks::{read_rows, Board, TaskCx, TaskRow};
 
 /// Ребёнок дока-доски (list_children).
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +81,11 @@ pub async fn board_children(
     Ok(parse_children(&resp))
 }
 
+/// Дети дока-доски через контекст задач.
+async fn board_children_cx(cx: &mut TaskCx<'_>) -> Result<Vec<BoardChild>> {
+    board_children(cx.client, cx.cfg, cx.board).await
+}
+
 /// Точное сравнение тайтлов: trim, без фолдинга регистра.
 fn same_title(a: &str, b: &str) -> bool {
     a.trim() == b.trim()
@@ -104,14 +109,8 @@ fn free_candidates<'a>(
 
 /// Резолв существующего тела: строки доски по тайтлу ПЕРВЕЙ детей
 /// (семантика юзера сформулирована на строках; дети — механизм поиска сирот).
-pub async fn resolve_existing_body(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-    board: &Board,
-    root: &std::path::Path,
-    title: &str,
-) -> Result<ExistingBody> {
-    let rows = read_rows(client, cfg, board, root).await?;
+pub async fn resolve_existing_body(cx: &mut TaskCx<'_>, title: &str) -> Result<ExistingBody> {
+    let rows = read_rows(cx.client, cx.cfg, cx.board, cx.root).await?;
     let titled: Vec<&TaskRow> = rows
         .iter()
         .filter(|r| same_title(&r.title, title))
@@ -122,7 +121,7 @@ pub async fn resolve_existing_body(
             row_count: titled.len(),
         });
     }
-    let children = board_children(client, cfg, board).await?;
+    let children = board_children_cx(cx).await?;
     let free = free_candidates(&children, &rows, title);
     match free.len() {
         0 => Ok(ExistingBody::None),
@@ -158,16 +157,8 @@ pub fn child_by_prefix<'a>(children: &'a [BoardChild], id: &str) -> Result<&'a B
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::row;
     use serde_json::json;
-
-    fn row(row_id: &str, body: &str, title: &str) -> TaskRow {
-        TaskRow {
-            row_id: row_id.into(),
-            body_doc: body.into(),
-            title: title.into(),
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn parse_children_maps_fields_and_trims_titles() {

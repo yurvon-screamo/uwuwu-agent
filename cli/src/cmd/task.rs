@@ -180,8 +180,13 @@ async fn create(
     } else {
         String::new()
     };
-    let (row, outcome) =
-        affine_tasks::create_task(client, cfg, board, root, &args.title, &body, task_type).await?;
+    let mut cx = affine_tasks::TaskCx {
+        client,
+        cfg,
+        board,
+        root,
+    };
+    let (row, outcome) = affine_tasks::create_task(&mut cx, &args.title, &body, task_type).await?;
     match outcome {
         affine_tasks::CreateOutcome::Created => println!("создана: {}", row.title),
         affine_tasks::CreateOutcome::Recovered => {
@@ -206,7 +211,13 @@ async fn rm(
     board: &affine_tasks::Board,
     id: &str,
 ) -> anyhow::Result<()> {
-    let report = affine_tasks::rm_task(client, cfg, board, root, id).await?;
+    let mut cx = affine_tasks::TaskCx {
+        client,
+        cfg,
+        board,
+        root,
+    };
+    let report = affine_tasks::rm_task(&mut cx, id).await?;
     if report.row_deleted {
         println!("строка удалена: {} ({})", report.title, report.doc_id);
     } else {

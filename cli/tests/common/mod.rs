@@ -16,7 +16,7 @@ pub const CALL_OK: &str =
 
 /// Один шаг сценария: HTTP-статус, заголовок mcp-session-id (у initialize)
 /// и шаблон тела ({ID} → id запроса).
-pub struct Step(pub u16, pub Option<&'static str>, pub &'static str);
+pub struct Step(pub u16, pub Option<&'static str>, pub String);
 
 pub struct MockGateway {
     addr: std::net::SocketAddr,
@@ -76,6 +76,7 @@ fn serve(
     Step(status, sid, tpl): Step,
     log: &std::sync::Mutex<Vec<String>>,
 ) {
+    let tpl: &str = &tpl;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();

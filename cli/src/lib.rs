@@ -9,10 +9,13 @@ pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
 pub mod affine_tasks;
+
 pub mod cmd;
 pub mod log_filter;
 pub mod path;
 pub mod sofa;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod wiki;
 
 // Отдельные тест-файлы (сиблинги модулей): объявление здесь обязательно —

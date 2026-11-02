@@ -93,7 +93,8 @@ async fn rm_orphan(
     cron_boards: &[String],
     id: &str,
 ) -> anyhow::Result<String> {
-    let mut last_err = String::from("сирота не найдена");
+    // ошибки всех досок в отчёт: сирота может лежать на любой крон-доске
+    let mut misses: Vec<String> = Vec::new();
     for board_title in cron_boards {
         let Ok(board) = affine_tasks::find_board_by_title(client, cfg, board_title).await else {
             continue;
@@ -111,10 +112,13 @@ async fn rm_orphan(
                     .await;
                 return Ok(child.title.clone());
             }
-            Err(e) => last_err = format!("{board_title}: {e}"),
+            Err(e) => misses.push(format!("{board_title}: {e}")),
         }
     }
-    anyhow::bail!("{last_err}")
+    anyhow::bail!(
+        "сирота «{id}» не найдена ни на одной крон-доске: {}",
+        misses.join("; ")
+    )
 }
 
 struct SetArgs {
@@ -156,9 +160,14 @@ async fn set(
         String::new()
     };
     let body_md = affine_tasks::cron_body_stub(&args.title, &schedule, &prompt);
+    let mut cx = affine_tasks::TaskCx {
+        client,
+        cfg,
+        board: &board,
+        root,
+    };
     let (row, outcome) =
-        affine_tasks::create_cron(client, cfg, &board, root, &args.title, &schedule, &body_md)
-            .await?;
+        affine_tasks::create_cron(&mut cx, &args.title, &schedule, &body_md).await?;
     match outcome {
         affine_tasks::CreateOutcome::Created => println!("крон поставлен: {}", row.title),
         affine_tasks::CreateOutcome::Recovered => {

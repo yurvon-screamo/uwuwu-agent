@@ -11,8 +11,8 @@ use uwuwu_cli::affine_client::AffineClient;
 fn handshake_saves_session_file_and_reuse_skips_initialize() {
     with_temp_home(|| {
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -32,9 +32,9 @@ fn handshake_saves_session_file_and_reuse_skips_initialize() {
 fn call_tool_returns_structured_content() {
     with_temp_home(|| {
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(200, None, CALL_OK),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(200, None, CALL_OK.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -53,9 +53,9 @@ fn gateway_ok_false_convention_fails_fast_without_retry() {
     with_temp_home(|| {
         let rejected = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"инцидент"}}"#;
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(200, None, rejected),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(200, None, rejected.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -75,10 +75,10 @@ fn gateway_ok_false_convention_fails_fast_without_retry() {
 fn transport_5xx_is_retried_and_then_succeeds() {
     with_temp_home(|| {
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(500, None, "gateway hiccup"),
-            Step(200, None, CALL_OK),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(500, None, "gateway hiccup".to_string()),
+            Step(200, None, CALL_OK.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -96,12 +96,12 @@ fn transport_5xx_is_retried_and_then_succeeds() {
 fn stale_session_400_triggers_rehandshake_and_retry() {
     with_temp_home(|| {
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(400, None, "session rejected"),
-            Step(200, Some("sess-B"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(200, None, CALL_OK),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(400, None, "session rejected".to_string()),
+            Step(200, Some("sess-B"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(200, None, CALL_OK.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -125,9 +125,9 @@ fn empty_body_is_reported_as_unparsable_not_panicked() {
     // живой инцидент сессии: шлюз ответил 200 с пустым телом
     with_temp_home(|| {
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(200, None, ""),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(200, None, String::new()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -147,9 +147,9 @@ fn rpc_error_id_mismatch_is_rejected_by_sse_parser() {
         // тело с ЧУЖИМ id — parse_response должен отвергнуть
         let wrong_id = r#"{"jsonrpc":"2.0","id":999,"result":{"structuredContent":{}}}"#;
         let mock = MockGateway::start(vec![
-            Step(200, Some("sess-A"), INIT),
-            Step(202, None, NOTIFIED),
-            Step(200, None, wrong_id),
+            Step(200, Some("sess-A"), INIT.to_string()),
+            Step(202, None, NOTIFIED.to_string()),
+            Step(200, None, wrong_id.to_string()),
         ]);
         let cfg = test_cfg(&mock);
         let rt = tokio::runtime::Runtime::new().unwrap();

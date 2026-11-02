@@ -1,19 +1,24 @@
 //! Интеграционные тесты идемпотентного создания (task create / cron set)
 //! и task rm против mock-шлюза из tests/common.
 //! Сценарии перечисляют RPC в фактическом порядке вызовов: мок
-//! последовательный — каждый запрос снимает следующий Step.
+//! последовательный, каждый запрос снимает следующий Step. Все тесты —
+//! serial: with_temp_home мутирует глобальный HOME.
 
 mod common;
 
 use common::{test_cfg, with_temp_home, MockGateway, Step, INIT, NOTIFIED};
 use std::path::Path;
-use uwuwu_cli::affine_client::AffineClient;
-use uwuwu_cli::affine_tasks::{create_cron, create_task, rm_task, Board, CreateOutcome, TaskType};
+use uwuwu_cli::affine_client::{AffineClient, AffineConfig};
+use uwuwu_cli::affine_tasks::{
+    create_cron, create_task, rm_task, Board, CreateOutcome, TaskCx, TaskType,
+};
 
 fn rpc(sc: String) -> Step {
-    let body = format!(r#"{{"jsonrpc":"2.0","id":{{ID}},"result":{{"structuredContent":{sc}}}}}"#);
-    let leaked = Box::leak(body.into_boxed_str());
-    Step(200, None, leaked)
+    Step(
+        200,
+        None,
+        format!(r#"{{"jsonrpc":"2.0","id":{{ID}},"result":{{"structuredContent":{sc}}}}}"#),
+    )
 }
 
 fn rows_json(rows: Vec<String>) -> String {
@@ -38,7 +43,10 @@ fn child_json(doc_id: &str, title: &str, in_trash: bool) -> String {
 }
 
 fn handshake() -> Vec<Step> {
-    vec![Step(200, Some("sess-A"), INIT), Step(202, None, NOTIFIED)]
+    vec![
+        Step(200, Some("sess-A"), INIT.to_string()),
+        Step(202, None, NOTIFIED.to_string()),
+    ]
 }
 
 const REPLACE_OK: &str = r#"{"ok":true}"#;
@@ -52,6 +60,21 @@ const TRASH_OK: &str = r#"{"ok":true,"previouslyInTrash":false,"inTrash":true}"#
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
+}
+
+fn task_cx<'a>(client: &'a mut AffineClient, cfg: &'a AffineConfig) -> TaskCx<'a> {
+    let board = Board {
+        doc_id: "board-1".into(),
+        db_id: "db-1".into(),
+    };
+    // board живёт до конца теста — утекает осознанно ( tempdir-стиль фикстур)
+    let board: &'static Board = Box::leak(Box::new(board));
+    TaskCx {
+        client,
+        cfg,
+        board,
+        root: Path::new("/tmp"),
+    }
 }
 
 #[test]
@@ -73,20 +96,10 @@ fn retry_recovers_orphan_without_second_doc() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
-        let out = rt.block_on(create_task(
-            &mut client,
-            &cfg,
-            &board,
-            Path::new("/tmp"),
-            "Тайтл",
-            "",
-            TaskType::Dev,
-        ));
-        let (row, outcome) = out.unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let (row, outcome) = rt
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
+            .unwrap();
         assert_eq!(outcome, CreateOutcome::Recovered);
         assert_eq!(row.body_doc, "doc-orphan");
         assert!(!mock.called("create_doc_from_markdown"));
@@ -109,20 +122,9 @@ fn duplicate_is_explicit_error_not_silent_reuse() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let err = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap_err()
             .to_string();
         assert!(err.contains("дубль"), "got: {err}");
@@ -143,20 +145,9 @@ fn duplicate_by_row_title_even_if_body_is_not_a_child() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let err = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap_err()
             .to_string();
         assert!(err.contains("дубль"), "got: {err}");
@@ -187,20 +178,9 @@ fn linked_child_is_never_orphaned() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let (_, outcome) = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Старое",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Старое", "", TaskType::Dev))
             .unwrap();
         assert_eq!(outcome, CreateOutcome::Created);
         assert!(!mock.called("replace_doc_with_markdown"));
@@ -233,20 +213,9 @@ fn busy_candidate_excluded_orphan_still_recovered() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let (row, outcome) = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Старое",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Старое", "", TaskType::Dev))
             .unwrap();
         assert_eq!(outcome, CreateOutcome::Recovered);
         assert_eq!(row.body_doc, "doc-U");
@@ -275,20 +244,9 @@ fn ambiguous_bodies_are_explicit_error() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let err = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap_err()
             .to_string();
         assert!(err.contains("несколько тел"), "got: {err}");
@@ -313,20 +271,9 @@ fn fresh_create_regression() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let (row, outcome) = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap();
         assert_eq!(outcome, CreateOutcome::Created);
         assert_eq!(row.body_doc, "doc-new");
@@ -359,20 +306,9 @@ fn trashed_child_does_not_block_fresh_create() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let (_, outcome) = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap();
         assert_eq!(outcome, CreateOutcome::Created);
     });
@@ -394,24 +330,71 @@ fn replace_failure_aborts_before_commit() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let err = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
             .unwrap_err()
             .to_string();
         assert!(err.contains("инцидент"), "got: {err}");
         assert!(!mock.called("add_database_row"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn fresh_create_surfaces_queue_timeout_honestly() {
+    with_temp_home(|| {
+        // create_doc вернул structuredContent ok:false (WRITE_QUEUE_TIMEOUT):
+        // исход неоднозначен — ошибка обязана назвать код, а не «тело создано»
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![])));
+        steps.push(rpc(
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":true}"#
+                .into(),
+        ));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
+        assert!(err.contains("не подтвердился"), "got: {err}");
+        assert!(!err.contains("тело создано"), "got: {err}");
+        assert!(!mock.called("add_database_row"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn row_commit_surfaces_queue_timeout_instead_of_fake_success() {
+    with_temp_home(|| {
+        // ok:false на КОММИТ-шаге (add_database_row) — наружу не может уйти
+        // «создана» с пустой строкой: это воспроизводит класс инцидента
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![])));
+        steps.push(rpc(DOC_NEW.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long"}"#.into(),
+        ));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
+        assert!(err.contains("add_database_row"), "got: {err}");
     });
 }
 
@@ -422,19 +405,8 @@ fn run_cron_create(
     let cfg = test_cfg(mock);
     let rt = runtime();
     let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-    let board = Board {
-        doc_id: "board-1".into(),
-        db_id: "db-1".into(),
-    };
-    rt.block_on(create_cron(
-        &mut client,
-        &cfg,
-        &board,
-        Path::new("/tmp"),
-        title,
-        "5m",
-        "# Крон\n",
-    ))
+    let mut cx = task_cx(&mut client, &cfg);
+    rt.block_on(create_cron(&mut cx, title, "5m", "# Крон\n"))
 }
 
 #[test]
@@ -475,6 +447,8 @@ fn cron_set_duplicate_is_error() {
         let mock = MockGateway::start(steps);
         let err = run_cron_create(&mock, "Крон Т").unwrap_err().to_string();
         assert!(err.contains("дубль"), "got: {err}");
+        // сущность в сообщении — крон, не задача
+        assert!(err.contains("крон с тайтлом"), "got: {err}");
         assert!(!mock.called("create_doc_from_markdown"));
         assert!(!mock.called("add_database_row"));
     });
@@ -492,17 +466,32 @@ fn rm_row_path_deletes_row_and_trashes_body() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
-        let report = rt
-            .block_on(rm_task(&mut client, &cfg, &board, Path::new("/tmp"), "r1"))
-            .unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let report = rt.block_on(rm_task(&mut cx, "r1")).unwrap();
         assert!(report.row_deleted && report.body_trashed);
         assert!(!report.was_in_trash);
         assert!(mock.called("delete_database_row"));
         assert!(mock.called("trash_doc"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn rm_row_commit_failure_is_explicit_not_silent() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Задача", "doc-1")])));
+        steps.push(rpc(
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long"}"#.into(),
+        ));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt.block_on(rm_task(&mut cx, "r1")).unwrap_err().to_string();
+        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
+        assert!(!mock.called("trash_doc"));
     });
 }
 
@@ -522,19 +511,8 @@ fn rm_orphan_path_trashes_body_without_row() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
-        let report = rt
-            .block_on(rm_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "doc-orph",
-            ))
-            .unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let report = rt.block_on(rm_task(&mut cx, "doc-orph")).unwrap();
         assert!(!report.row_deleted);
         assert!(report.body_trashed);
         assert!(!mock.called("delete_database_row"));
@@ -555,61 +533,12 @@ fn rm_ambiguous_prefix_is_error() {
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
+        let mut cx = task_cx(&mut client, &cfg);
         let err = rt
-            .block_on(rm_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "doc-1",
-            ))
+            .block_on(rm_task(&mut cx, "doc-1"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("неоднозначно"), "got: {err}");
         assert!(!mock.called("trash_doc"));
-    });
-}
-
-#[test]
-#[serial_test::serial]
-fn fresh_create_surfaces_queue_timeout_honestly() {
-    with_temp_home(|| {
-        // create_doc вернул structuredContent ok:false (WRITE_QUEUE_TIMEOUT):
-        // исход неоднозначен — ошибка обязана назвать код, а не «тело создано»
-        let mut steps = handshake();
-        steps.push(rpc(rows_json(vec![])));
-        steps.push(rpc(children_json(vec![])));
-        steps.push(rpc(
-            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":true}"#
-                .into(),
-        ));
-        let mock = MockGateway::start(steps);
-        let cfg = test_cfg(&mock);
-        let rt = runtime();
-        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
-        let board = Board {
-            doc_id: "board-1".into(),
-            db_id: "db-1".into(),
-        };
-        let err = rt
-            .block_on(create_task(
-                &mut client,
-                &cfg,
-                &board,
-                Path::new("/tmp"),
-                "Тайтл",
-                "",
-                TaskType::Dev,
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
-        assert!(err.contains("не подтвердился"), "got: {err}");
-        assert!(!err.contains("тело создано"), "got: {err}");
-        assert!(!mock.called("add_database_row"));
     });
 }
