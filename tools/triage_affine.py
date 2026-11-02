@@ -232,6 +232,15 @@ class McpError(RuntimeError):
     Exit-код — забота CLI-точки входа (main() переводит в rc=2)."""
 
 
+class NonJsonResponseError(McpError):
+    """Ответ шлюза не распарсился в JSON (обрыв тела/потока, мусор вместо
+    SSE-события). Отдельный класс: wiki_ops.call() классифицирует его как
+    Ambiguous (класс affine_client.rs) — чтение ретраится, записи уходит
+    честное «операция могла примениться»."""
+
+    pass
+
+
 def mcp_call(
     method: str, params: dict, sid: str | None = None, notify: bool = False
 ) -> tuple[object, str]:
@@ -266,7 +275,7 @@ def mcp_call(
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as e:
-        raise McpError(
+        raise NonJsonResponseError(
             f"MCP {method}: не-JSON ответ (status {r.status}, "
             f"{len(body)} байт): {body[:200]!r}"
         ) from e

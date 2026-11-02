@@ -204,34 +204,45 @@ fn test_cfg(mock: &MockGateway) -> AffineConfig {
     }
 }
 
-/// HOME → временный каталог на время замыкания: изоляция общего
-/// session-файла и lock-файла от реальной машины (все тесты файла — serial).
-/// Бэкоф зажат в ноль (UWUWU_RETRY_BASE_MS=0) — ретраи мгновенны.
-/// Drop-guard: реальный env восстанавливается и при панике тела теста.
+/// HOME → временный каталог + пин env на время замыкания: изоляция общего
+/// session/lock-файлов и retry-бюджета от реальной машины и соседних тестов
+/// (все тесты файла — serial; guard восстанавливает env и при панике тела).
+/// Бэкоф зажат в ноль, попытки — дефольные 3 ретрая: ассерты на «failed
+/// after 3 retries» не зависят от внешнего env.
 struct TempHome {
-    real: String,
-    real_base: Option<String>,
+    real_home: String,
+    saved: Vec<(&'static str, Option<String>)>,
     _dir: tempfile::TempDir,
 }
 
 impl Drop for TempHome {
     fn drop(&mut self) {
-        std::env::set_var("HOME", &self.real);
-        match &self.real_base {
-            Some(v) => std::env::set_var("UWUWU_RETRY_BASE_MS", v),
-            None => std::env::remove_var("UWUWU_RETRY_BASE_MS"),
+        std::env::set_var("HOME", &self.real_home);
+        for (key, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
 
 fn with_temp_home(f: impl FnOnce()) {
     let guard = TempHome {
-        real: std::env::var("HOME").unwrap_or_default(),
-        real_base: std::env::var("UWUWU_RETRY_BASE_MS").ok(),
+        real_home: std::env::var("HOME").unwrap_or_default(),
+        saved: [
+            "UWUWU_RETRY_BASE_MS",
+            "UWUWU_RETRY_ATTEMPTS",
+            "UWUWU_CALL_TIMEOUT_SECS",
+        ]
+        .map(|k| (k, std::env::var(k).ok()))
+        .into(),
         _dir: tempfile::TempDir::new().unwrap(),
     };
     std::env::set_var("HOME", guard._dir.path());
     std::env::set_var("UWUWU_RETRY_BASE_MS", "0");
+    std::env::set_var("UWUWU_RETRY_ATTEMPTS", "3");
+    std::env::remove_var("UWUWU_CALL_TIMEOUT_SECS");
     f();
     drop(guard);
 }
@@ -527,6 +538,9 @@ fn timeout_read_retries_write_fails_fast() {
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed after 3 retries"), "got: {err}");
+        // В ЖУРНАЛЕ только первая попытка вызова: однопоточный мок спит в
+        // serve(hanging), ретраи копятся в TCP-backlog без accept — их в
+        // счётчике не видно. Исчерпание попыток доказывает текст ошибки.
         assert_eq!(mock.request_count(), 3, "read: init+notify+1 висящий вызов");
 
         // запись: тот же зависший шлюз — одна попытка, честная ошибка

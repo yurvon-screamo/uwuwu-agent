@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -43,6 +44,7 @@ from triage_affine import (
     MCP_TOKEN,
     MCP_URL,
     McpError,
+    NonJsonResponseError,
     WORKSPACE,
     get_md,
     jitter_unit,
@@ -81,49 +83,80 @@ def _save_session(sid: str) -> None:
         pass  # сохранить не смогли — сессия живёт до idle-timeout шлюза
 
 
+class _HandshakeRetry(Exception):
+    """Транзиентный отказ initialize (HTTP 429/5xx, connect-ошибка) —
+    попытка повторяется на бэкоф-планировщике."""
+
+
+def _handshake_verdict(e: Exception) -> None:
+    """Вердикт по отказу initialize (зеркально initialize_once в
+    affine_client.rs): ретраится только транзиентное (HTTP 429/5xx,
+    connect-ошибки); таймаут НЕ ретраится — осиротевшая сессия жрёт слот
+    шлюза до idle-timeout; остальное уходит как есть. Всегда рейзит."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        raise e
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (429, 502, 503):
+            raise _HandshakeRetry(str(e)[:60]) from e
+        raise e
+    if isinstance(e, urllib.error.URLError):
+        if not _is_timeout_reason(e):
+            raise _HandshakeRetry(str(e)[:60]) from e
+        raise e
+    raise e
+
+
+def _handshake_once(client_name: str) -> str:
+    """Одна попытка initialize+initialized; успех → живой sid (НЕ закрыт),
+    недонародившаяся сессия закрывается; вердикт по отказу — у
+    _handshake_verdict (он всегда рейзит)."""
+    sid = None
+    try:
+        resp, sid = mcp_call(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": client_name, "version": "1"},
+            },
+        )
+        mcp_result(resp)  # McpError здесь = фатально, не ретраим
+        mcp_call("notifications/initialized", {}, sid, notify=True)
+        return sid
+    except Exception as e:  # noqa: BLE001 — вердикт ниже рейзит всегда
+        if sid:
+            close(sid)
+        _handshake_verdict(e)
+        raise  # недостижимо: verdict всегда рейзит; страховка типизатору
+
+
+def _is_timeout_reason(e: urllib.error.URLError) -> bool:
+    return isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError))
+
+
 def _handshake(client_name: str = "wiki-ops", publish: bool = True) -> str:
-    """Сессия с ретраями транзиентного (HTTP 429/5xx, URLError/timeout) на
-    общем бэкоф-планировщике; McpError от mcp_result (isError/JSON-RPC
-    error) — фатально, сразу наверх с причиной. publish=False — приватная
-    сессия: общий файл не пишем. ВСЕ пути пере-handshake'а наследуют режим
-    старта — иначе private-процесс подменил бы общую сессию своей.
-    client_name виден на уровне ПРОТОКОЛА (initialize.clientInfo,
-    MCP-трейс/инспектор); stdout шлюза логирует только UUID сессий."""
+    """Сессия с ретраями транзиентного (HTTP 429/5xx, connect-ошибки) на
+    общем бэкоф-планировщике; McpError/таймаут — фатально. publish=False —
+    приватная сессия: общий файл не пишем. ВСЕ пути пере-handshake'а
+    наследуют режим старта — иначе private-процесс подменил бы общую
+    сессию своей. client_name виден на уровне ПРОТОКОЛА
+    (initialize.clientInfo, MCP-трейс/инспектор); stdout шлюза логирует
+    только UUID сессий."""
+    last: Exception | None = None
     for attempt in range(HANDSHAKE_TRIES):
-        sid = None
+        if attempt:
+            _retry_wait("handshake", attempt, HANDSHAKE_TRIES - 1, str(last)[:60], None)
         try:
-            resp, sid = mcp_call(
-                "initialize",
-                {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {"name": client_name, "version": "1"},
-                },
-            )
-            mcp_result(resp)  # McpError здесь = фатально, не ретраим
-            mcp_call("notifications/initialized", {}, sid, notify=True)
-            if publish:
-                _save_session(sid)
-            return sid
-        except McpError:
-            if sid:
-                close(sid)
-            raise
-        except urllib.error.HTTPError as e:
-            if sid:
-                close(sid)
-            if e.code not in (429, 502, 503):
-                raise
-            _retry_wait(
-                "handshake", attempt, HANDSHAKE_TRIES - 1, str(e)[:60], _retry_after_secs(e)
-            )
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
-            if sid:
-                close(sid)
-            _retry_wait("handshake", attempt, HANDSHAKE_TRIES - 1, str(e)[:60], None)
-        # успешный путь: sid возвращается живым — close только в НЕУСПЕШНЫХ ветках
-        # (finally закрыл бы сессию и при return — call после session ловил 404)
-    raise RuntimeError("unreachable")
+            sid = _handshake_once(client_name)
+        except _HandshakeRetry as e:
+            last = e
+            continue
+        if publish:
+            _save_session(sid)
+        return sid
+    raise McpError(
+        f"handshake не удался за {HANDSHAKE_TRIES} попыток: {last}"
+    ) from last
 
 
 def session(client_name: str = "wiki-ops") -> str:
@@ -255,24 +288,113 @@ def _validated(name: str, r: object) -> dict:
 # новый read-тулз теряет ретраи, но запись никогда не дублируется).
 _READ_PREFIXES = ("get_", "list_", "search_", "find_", "read_", "export_", "analyze_")
 
+# Обрыв/потеря ответа (класс Ambiguous в affine_client.rs): ответ мог не
+# дойти — чтение ретраится, запись получает честное «могла примениться».
+_AMBIGUOUS_EXC = (
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+    http.client.IncompleteRead,
+    NonJsonResponseError,
+)
+
+# Классифицируемые отказы попытки (остальные летят наверх как есть).
+_CALL_CATCH = (
+    urllib.error.HTTPError,
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    NonJsonResponseError,
+    ConnectionError,
+    http.client.IncompleteRead,
+)
+
 
 def _is_read(name: str) -> bool:
     return name.startswith(_READ_PREFIXES)
 
 
-def _ok_false(r: object) -> tuple[str, bool] | None:
-    """(detail, retryable), если ответ несёт шлюзовую конвенцию логического
-    фейла ok:false — в structuredContent, в result верхнего уровня или
-    внутри content[0].text-блоба (зеркально affine_client.rs). Вызывается
-    ДО mcp_result, который любой ok:false превращает в McpError без флага.
-    retryable:true = шлюз гарантирует, что запрос НЕ применён (контракт,
-    задача W9etJF1FVm) — такой сбой ретраится и на записи."""
-    if not isinstance(r, dict):
-        return None
-    result = r.get("result")
-    if not isinstance(result, dict):
-        return None
-    candidates: list[object] = [result.get("structuredContent"), result]
+def _ambiguous_exc(e: Exception) -> bool:
+    if isinstance(e, urllib.error.URLError):
+        return _is_timeout_reason(e)
+    return isinstance(e, _AMBIGUOUS_EXC)
+
+
+def _call_failure_action(
+    e: Exception, name: str, stale_tried: bool
+) -> tuple[str, Exception | float | None, str]:
+    """Классификация отказа попытки — зеркально GatewayError в
+    affine_client.rs. Возвращает (action, payload, reason):
+    "stale" — один пере-handshake и повтор; "retry" — повтор на бэкофе
+    (payload = Retry-After или None); "fatal" — payload = исключение для
+    ре-рейза (запись при Ambiguous получает честное «могла примениться»)."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (400, 404):
+            if stale_tried:
+                return (
+                    "fatal",
+                    McpError(f"{name}: сессия снова отвергнута ({e.code})"),
+                    str(e),
+                )
+            e.close()  # отпустить соединение до повторного запроса
+            return ("stale", None, "сессия протухла")
+        if e.code in (429, 502, 503):
+            return ("retry", _retry_after_secs(e), f"HTTP {e.code}")
+        return ("fatal", e, str(e))
+    if _ambiguous_exc(e):
+        if not _is_read(name):
+            return (
+                "fatal",
+                McpError(
+                    f"{name}: таймаут/обрыв ответа шлюза — операция могла "
+                    "примениться, проверь результат перед повтором"
+                ),
+                str(e)[:60],
+            )
+        return ("retry", None, str(e)[:60])
+    return ("fatal", e, str(e)[:60])
+
+
+def _attempt_call(
+    effective: str, name: str, args: dict, stale_tried: bool, retries: int, attempt: int
+) -> tuple[str, object, str]:
+    """Одна попытка tools/call с полной классификацией исхода
+    (зеркально итерации retry-цикла call_tool в affine_client.rs):
+    ("ok", result, "") — валидный ответ (ok:false не было);
+    ("retry", retry_after|None, reason) — повторить;
+    ("stale", None, reason) — пере-handshake выполнен, повторить;
+    ("fatal", exc, reason) — рейзить exc (ok:false, 4xx, запись при
+    таймауте с честным «могла примениться»)."""
+    try:
+        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, effective)
+    except _CALL_CATCH as e:
+        action, payload, why = _call_failure_action(e, name, stale_tried)
+        if action == "stale":
+            global _live_sid
+            print(
+                "wiki-ops: сессия протухла — пере-handshake",
+                file=sys.stderr,
+                flush=True,
+            )
+            _live_sid = _handshake(publish=_lock_fd is not None)
+            return ("stale", None, why)
+        if action == "fatal":
+            return ("fatal", payload, why)
+        return ("retry", payload if isinstance(payload, float) else None, why)
+    failure = _ok_false(r)
+    if failure is None:
+        return ("ok", r, "")
+    detail, retryable = failure
+    if retryable and attempt < retries:
+        return ("retry", None, detail)
+    return ("fatal", McpError(f"{name}: {detail}"), detail)
+
+
+def _ok_false_candidates(result: dict) -> list:
+    """Кандидаты на шлюзовую конвенцию ok:false — порядок зеркален
+    tool_failure в affine_client.rs: structuredContent, result верхнего
+    уровня, распарсенные content[0].text-блобы."""
+    candidates = [result.get("structuredContent"), result]
     for c in result.get("content") or []:
         if isinstance(c, dict) and isinstance(c.get("text"), str):
             try:
@@ -280,13 +402,31 @@ def _ok_false(r: object) -> tuple[str, bool] | None:
             except json.JSONDecodeError:
                 continue
             candidates.append(inner)
-    for cand in candidates:
+    return candidates
+
+
+def _ok_false(r: object) -> tuple[str, bool] | None:
+    """(detail, retryable), если ответ несёт шлюзовую конвенцию логического
+    фейла ok:false. Вызывается ДО mcp_result, который любой ok:false
+    превращает в McpError без флага. retryable:true = шлюз гарантирует,
+    что запрос НЕ применён (контракт, задача W9etJF1FVm) — такой сбой
+    ретраится и на записи."""
+    if not isinstance(r, dict):
+        return None
+    result = r.get("result")
+    if not isinstance(result, dict):
+        return None
+    for cand in _ok_false_candidates(result):
         if isinstance(cand, dict) and cand.get("ok") is False:
-            detail = cand.get("error") or "unknown tool error"
-            if not isinstance(detail, str):
-                detail = json.dumps(detail, ensure_ascii=False)
-            return (detail, cand.get("retryable") is True)
+            return _fail_detail(cand)
     return None
+
+
+def _fail_detail(cand: dict) -> tuple[str, bool]:
+    detail = cand.get("error") or "unknown tool error"
+    if not isinstance(detail, str):
+        detail = json.dumps(detail, ensure_ascii=False)
+    return (detail, cand.get("retryable") is True)
 
 
 def call(sid: str, name: str, args: dict) -> dict:
@@ -300,65 +440,31 @@ def call(sid: str, name: str, args: dict) -> dict:
     effective = _live_sid or sid
     retries = _retry_retries()
     stale_tried = False
-    pause_override: float | None = None  # stale-повтор — без бэкоф-паузы
-    retry_after: float | None = None  # Retry-After последнего 429/503
+    retry_after: float | None = None
     reason = ""
     for attempt in range(retries + 1):
         if attempt:
-            if pause_override is not None:
-                pause = pause_override
-            else:
-                pause = _backoff_pause(attempt - 1, retry_after)
-            pause_override = None
+            pause = _backoff_pause(attempt - 1, retry_after)
             retry_after = None
-            if pause > 0:
-                print(
-                    f"wiki-ops: повтор {attempt}/{retries} через {pause:.0f}s: {reason[:60]}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(pause)
-        try:
-            r, _ = mcp_call(
-                "tools/call", {"name": name, "arguments": args}, effective
+            print(
+                f"wiki-ops: повтор {attempt}/{retries} через {pause:.0f}s: {reason[:60]}",
+                file=sys.stderr,
+                flush=True,
             )
-        except urllib.error.HTTPError as e:
-            if e.code in (400, 404) and not stale_tried:
-                # сессия протухла: полный handshake в РЕЖИМЕ СТАРТА (shared
-                # публикует в общий файл, private — нет) и повтор
-                stale_tried = True
-                e.close()  # отпустить соединение до повторного запроса
-                print(
-                    "wiki-ops: сессия протухла — пере-handshake",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                effective = _handshake(publish=_lock_fd is not None)
-                _live_sid = effective
-                pause_override = 0.0
-                reason = "сессия протухла"
-                continue
-            if e.code in (429, 502, 503):
-                reason = f"HTTP {e.code}"
-                retry_after = _retry_after_secs(e)
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
-            if not _is_read(name):
-                raise McpError(
-                    f"{name}: таймаут/обрыв ответа шлюза — операция могла "
-                    "примениться, проверь результат перед повтором"
-                ) from e
-            reason = str(e)[:60]
-            continue
-        failure = _ok_false(r)
-        if failure is not None:
-            detail, retryable = failure
-            if retryable and attempt < retries:
-                reason = detail
-                continue
-            raise McpError(f"{name}: {detail}")
-        return _validated(name, r)
+            time.sleep(pause)
+        status, value, why = _attempt_call(
+            effective, name, args, stale_tried, retries, attempt
+        )
+        if status == "ok":
+            return _validated(name, value)
+        if status == "fatal":
+            raise value from None
+        if status == "stale":
+            stale_tried = True
+            effective = _live_sid
+        elif isinstance(value, float):
+            retry_after = value
+        reason = why
     raise McpError(
         f"{name}: шлюз не ответил за {retries + 1} попыток ({reason}) — "
         "если шлюз лежит целиком, держи паузу 120-180с между попытками"

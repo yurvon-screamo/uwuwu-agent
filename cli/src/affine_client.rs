@@ -228,16 +228,27 @@ impl SessionLock {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .read(true)
             .open(path)
-            .ok()?;
+        {
+            Ok(f) => f,
+            // ошибка ФС — не «лок занят»: молча все стали бы private
+            // (handshake-шторм); предупреждаем и всё же работаем приватно
+            Err(e) => {
+                eprintln!(
+                    "uwuwu-cli: не смог открыть {}: {e} — работаю без лока",
+                    path.display()
+                );
+                return None;
+            }
+        };
         match file.try_lock_exclusive() {
             Ok(true) => Some(Self(file)),
-            // Ok(false) = лок занят другим процессом
+            // Ok(false) = лок занят другим процессом — штатный private-путь
             _ => None,
         }
     }
@@ -449,7 +460,7 @@ impl AffineClient {
                 "params": {"name": name, "arguments": arguments}
             });
             match self.raw_post(body, call_id).await {
-                Ok(resp) => match Self::tool_failure(name, &resp) {
+                Ok(resp) => match Self::tool_failure(&resp) {
                     // повторяемого сбоя нет — извлекаем результат
                     None => return Self::tool_result(name, &resp),
                     Some((detail, true)) => {
@@ -498,33 +509,28 @@ impl AffineClient {
         ))
     }
 
-    /// ok:false — шлюзовая конвенция логических фейлов. Проверяем в ОБОИХ
-    /// местах: поле result верхнего уровня и внутри content[0].text-блоба.
+    /// ok:false — шлюзовая конвенция логических фейлов. Кандидаты в порядке
+    /// зеркала python `_ok_false`: structuredContent, result верхнего
+    /// уровня, content[0].text-блоб. Возвращает ГОЛЫЙ detail — префикс
+    /// «tool {name} failed:» навешивает call_tool (один раз, без наслоений).
     /// retryable:true = шлюз классифицировал сбой как транзиентный; контракт
     /// (задача W9etJF1FVm): true ⇒ запрос гарантированно не применён.
-    fn tool_failure(name: &str, body: &Value) -> Option<(String, bool)> {
+    fn tool_failure(body: &Value) -> Option<(String, bool)> {
         let payload = body.get("result")?;
-        if payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some((
-                format!("tool {name} failed: {}", ok_false_detail(payload)),
-                payload
-                    .get("retryable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            ));
+        if let Some(sc) = payload.get("structuredContent") {
+            if is_ok_false(sc) {
+                return Some((ok_false_detail(sc), retryable_flag(sc)));
+            }
+        }
+        if is_ok_false(payload) {
+            return Some((ok_false_detail(payload), retryable_flag(payload)));
         }
         let text = payload.get("content")?.get(0)?.get("text")?.as_str()?;
         let parsed = serde_json::from_str::<Value>(text).ok()?;
-        if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        if is_ok_false(&parsed) {
             return Some((
-                format!(
-                    "tool {name} failed (text payload): {}",
-                    ok_false_detail(&parsed)
-                ),
-                parsed
-                    .get("retryable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                format!("text payload; {}", ok_false_detail(&parsed)),
+                retryable_flag(&parsed),
             ));
         }
         None
@@ -657,35 +663,6 @@ impl AffineClient {
     }
 }
 
-impl Drop for AffineClient {
-    fn drop(&mut self) {
-        // приватная сессия умирает вместе с процессом — вернём слот шлюзу
-        // (best-effort, вне рантайма пропускаем); shared-сессию НЕ закрываем:
-        // она опубликована в общем файле для следующих запусков
-        if self.shared_lock.is_none() && !self.session.is_empty() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let url = self.url.clone();
-                let token = self.token.clone();
-                let sid = self.session.clone();
-                handle.spawn(async move {
-                    let _ = delete_session_slot(&url, &token, &sid).await;
-                });
-            }
-        }
-    }
-}
-
-async fn delete_session_slot(url: &str, token: &str, sid: &str) -> Result<()> {
-    let http = http_client(Duration::from_secs(5))?;
-    http.delete(url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("mcp-session-id", sid)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -698,6 +675,16 @@ fn uwuwu_dir() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".uwuwu"))
         .unwrap_or_else(|_| PathBuf::from(".uwuwu"))
+}
+
+fn is_ok_false(v: &Value) -> bool {
+    v.get("ok").and_then(|x| x.as_bool()) == Some(false)
+}
+
+fn retryable_flag(v: &Value) -> bool {
+    v.get("retryable")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
 }
 
 fn ok_false_detail(v: &Value) -> String {
@@ -930,31 +917,43 @@ mod tests {
     }
 
     #[test]
-    fn tool_failure_detects_retryable_in_both_payload_shapes() {
-        // top-level structuredContent
+    fn tool_failure_detects_retryable_in_all_payload_shapes() {
+        // top-level result
         let body = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"ok": false, "error": "перегрузка", "retryable": true}
         });
-        let (detail, retryable) = AffineClient::tool_failure("list_docs", &body).unwrap();
+        let (detail, retryable) = AffineClient::tool_failure(&body).unwrap();
         assert!(detail.contains("перегрузка") && retryable);
-        // text-blob
+        // structuredContent — зеркало python _ok_false: проверяется ПЕРВЫМ,
+        // иначе tool_result отдал бы отказ как данные
+        let sc = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"structuredContent": {"ok": false, "error": "гонка sc", "retryable": true}}
+        });
+        let (detail, retryable) = AffineClient::tool_failure(&sc).unwrap();
+        assert!(detail.contains("гонка sc") && retryable);
+        // text-blob — detail помечен формой ответа, префикса "tool … failed" нет
         let blob = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"content": [{"type": "text", "text": "{\"ok\": false, \"error\": \"гонка\", \"retryable\": true}"}]}
         });
-        let (detail, retryable) = AffineClient::tool_failure("read_doc", &blob).unwrap();
+        let (detail, retryable) = AffineClient::tool_failure(&blob).unwrap();
         assert!(detail.contains("text payload") && detail.contains("гонка") && retryable);
+        assert!(
+            !detail.contains("tool "),
+            "префикс навешивает call_tool: {detail}"
+        );
         // без флага — не ретраим
         let plain = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"ok": false, "error": "нет прав"}
         });
-        let (_, retryable) = AffineClient::tool_failure("list_docs", &plain).unwrap();
+        let (_, retryable) = AffineClient::tool_failure(&plain).unwrap();
         assert!(!retryable);
         // успешный ответ — None
         let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "answer": 1}});
-        assert!(AffineClient::tool_failure("list_docs", &ok).is_none());
+        assert!(AffineClient::tool_failure(&ok).is_none());
     }
 
     #[test]
@@ -962,7 +961,7 @@ mod tests {
         // смоделированные «процессы»: разные seed — разные базы
         let mut a = XorShift64::seeded(0xDEAD_BEEF);
         let mut b = XorShift64::seeded(0xDEAD_BEEF + 1);
-        let base_of = |rng: &mut XorShift64| rng.next_u64() % (1u64 << 52) | 1;
+        let base_of = |rng: &mut XorShift64| (rng.next_u64() % (1u64 << 52)) | 1;
         let (base_a, base_b) = (base_of(&mut a), base_of(&mut b));
         assert_ne!(base_a, base_b);
         // JS-safe: шлюз на JS, id > 2^53 теряют точность (живой 400)
