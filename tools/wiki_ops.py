@@ -266,6 +266,11 @@ _WRITE_TRUSTED_CODES = frozenset({"WRITE_QUEUE_TIMEOUT", "WRITE_QUEUE_FULL", "ra
 
 
 def _is_read(name: str) -> bool:
+    # мутация под read-префиксом: read_all_notifications гоняет GraphQL-мутацию
+    # readAllNotifications — при «чтении» клиент ретраил бы её безусловно по
+    # флагу шлюза (ADR-006, третий небезопасный путь аудита)
+    if name == "read_all_notifications":
+        return False
     return name.startswith(_READ_PREFIXES)
 
 
@@ -309,6 +314,22 @@ def _retry_trusted(name: str, retryable: bool, code: str | None) -> bool:
     ничего не применяет — флаг доверяем при любом коде; запись — только
     кодам, при которых шлюз гарантированно не применял запрос."""
     return retryable and (_is_read(name) or code in _WRITE_TRUSTED_CODES)
+
+
+def _handle_ok_false(name: str, failure: tuple[str, bool, str | None],
+                     attempt: int, retries: int) -> str:
+    """Исход ok:false-фейла: строка-причина для ретрая или McpError.
+    Отдельная функция — call() держит qlty-лимит сложности."""
+    detail, retryable, code = failure
+    if _retry_trusted(name, retryable, code) and attempt < retries:
+        return detail
+    if retryable and not _retry_trusted(name, retryable, code):
+        raise McpError(
+            f"{name}: {detail} — retryable:true от шлюза для записи "
+            f"не доверяется (код \"{code}\" вне whitelist, операция могла "
+            "примениться; см. ADR-006 uwuwu)"
+        )
+    raise McpError(f"{name}: {detail}")
 
 
 def call(sid: str, name: str, args: dict) -> dict:
@@ -376,17 +397,8 @@ def call(sid: str, name: str, args: dict) -> dict:
             continue
         failure = _ok_false(r)
         if failure is not None:
-            detail, retryable, code = failure
-            if _retry_trusted(name, retryable, code) and attempt < retries:
-                reason = detail
-                continue
-            if retryable and not _retry_trusted(name, retryable, code):
-                raise McpError(
-                    f"{name}: {detail} — retryable:true от шлюза для записи "
-                    f"не доверяется (код {code!r} вне whitelist, операция могла "
-                    "примениться; см. ADR-006 uwuwu)"
-                )
-            raise McpError(f"{name}: {detail}")
+            reason = _handle_ok_false(name, failure, attempt, retries)
+            continue
         return _validated(name, r)
     raise McpError(
         f"{name}: шлюз не ответил за {retries + 1} попыток ({reason}) — "

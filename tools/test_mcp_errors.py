@@ -169,6 +169,124 @@ def t_retry_trusted_whitelist_by_op_kind() -> None:
     # чтение — доверяем при любом коде, но не при retryable:false
     assert wiki_ops._retry_trusted("list_docs", True, "DOCUMENT_MOVE_PARTIAL")
     assert not wiki_ops._retry_trusted("list_docs", False, "WRITE_QUEUE_TIMEOUT")
+    # мутация под read-префиксом — запись: флаг шлюза не доверяется
+    # (регрессия третьего пути аудита, ADR-006)
+    assert not wiki_ops._is_read("read_all_notifications")
+    assert not wiki_ops._retry_trusted(
+        "read_all_notifications", True, "notification_update_failed"
+    )
+
+
+def _isolated_call_state() -> dict:
+    """Снапшот модульного состояния wiki_ops для мок-тестов call()."""
+    return {
+        "mcp_call": wiki_ops.mcp_call,
+        "SESSION_FILE": wiki_ops.SESSION_FILE,
+        "_live_sid": wiki_ops._live_sid,
+        "_backoff_pause": wiki_ops._backoff_pause,
+        "_retry_retries": wiki_ops._retry_retries,
+    }
+
+
+def _restore_call_state(snap: dict) -> None:
+    wiki_ops.mcp_call = snap["mcp_call"]
+    wiki_ops.SESSION_FILE = snap["SESSION_FILE"]
+    wiki_ops._live_sid = snap["_live_sid"]
+    wiki_ops._backoff_pause = snap["_backoff_pause"]
+    wiki_ops._retry_retries = snap["_retry_retries"]
+
+
+def t_call_write_untrusted_retryable_fails_fast_without_retry() -> None:
+    """Сквозной: запись + ok:false retryable:true вне whitelist → McpError
+    с подсказкой на первой же попытке, ретрая нет."""
+    snap = _isolated_call_state()
+    calls: list[str] = []
+
+    def fake_mcp_call(method: str, params: dict, sid=None, notify=False):
+        if notify:
+            return {}, "fresh-sid"
+        assert method == "tools/call"
+        calls.append(str(params["name"]))
+        return {
+            "result": {"ok": False, "error": "частично применено",
+                       "retryable": True, "code": "DOCUMENT_MOVE_PARTIAL"}
+        }, "fresh-sid"
+
+    wiki_ops.mcp_call = fake_mcp_call
+    wiki_ops.SESSION_FILE = Path("/tmp/opencode/test-mcp-errors/fake-session.txt")
+    wiki_ops._live_sid = None
+    wiki_ops._backoff_pause = lambda *a: 0
+    wiki_ops._retry_retries = lambda: 3
+    try:
+        wiki_ops.call("sid", "move_doc", {})
+    except wiki_ops.McpError as e:
+        assert "не доверяется" in str(e) and "DOCUMENT_MOVE_PARTIAL" in str(e), str(e)
+        assert calls == ["move_doc"], f"ретрай не должен был случиться: {calls}"
+    else:
+        raise AssertionError("недоверенный retryable:true у записи прошёл молча")
+    finally:
+        _restore_call_state(snap)
+
+
+def t_call_write_untrusted_retryable_for_read_prefixed_mutation() -> None:
+    """Регрессия High из ревью: read_all_notifications — мутация, её
+    notification_update_failed+retryable:true НЕ доверяется как «чтение»."""
+    snap = _isolated_call_state()
+    calls: list[str] = []
+
+    def fake_mcp_call(method: str, params: dict, sid=None, notify=False):
+        if notify:
+            return {}, "fresh-sid"
+        calls.append(str(params["name"]))
+        return {
+            "result": {"ok": False, "error": "мутация не подтверждена",
+                       "retryable": True, "code": "notification_update_failed"}
+        }, "fresh-sid"
+
+    wiki_ops.mcp_call = fake_mcp_call
+    wiki_ops.SESSION_FILE = Path("/tmp/opencode/test-mcp-errors/fake-session.txt")
+    wiki_ops._live_sid = None
+    wiki_ops._backoff_pause = lambda *a: 0
+    wiki_ops._retry_retries = lambda: 3
+    try:
+        wiki_ops.call("sid", "read_all_notifications", {})
+    except wiki_ops.McpError as e:
+        assert "не доверяется" in str(e), str(e)
+        assert calls == ["read_all_notifications"], calls
+    else:
+        raise AssertionError("мутация ретраилась как чтение")
+    finally:
+        _restore_call_state(snap)
+
+
+def t_call_write_trusted_queue_timeout_is_retried() -> None:
+    """Сквозной: запись + WRITE_QUEUE_TIMEOUT retryable:true → один ретрай →
+    второй вызов успешен."""
+    snap = _isolated_call_state()
+    calls: list[str] = []
+
+    def fake_mcp_call(method: str, params: dict, sid=None, notify=False):
+        if notify:
+            return {}, "fresh-sid"
+        calls.append(str(params["name"]))
+        if len(calls) == 1:
+            return {
+                "result": {"ok": False, "error": "waited too long in the queue.",
+                           "retryable": True, "code": "WRITE_QUEUE_TIMEOUT"}
+            }, "fresh-sid"
+        return {"result": {"ok": True, "applied": True}}, "fresh-sid"
+
+    wiki_ops.mcp_call = fake_mcp_call
+    wiki_ops.SESSION_FILE = Path("/tmp/opencode/test-mcp-errors/fake-session.txt")
+    wiki_ops._live_sid = None
+    wiki_ops._backoff_pause = lambda *a: 0
+    wiki_ops._retry_retries = lambda: 3
+    try:
+        out = wiki_ops.call("sid", "create_doc", {})
+        assert out.get("applied") is True, out
+        assert calls == ["create_doc", "create_doc"], calls
+    finally:
+        _restore_call_state(snap)
 
 
 def t_jsonrpc_error_raises_with_payload() -> None:
@@ -326,6 +444,9 @@ TESTS = [
     ("ok:false → McpError", t_ok_false_refusal_raises),
     ("_ok_false: retryable+code во всех формах", t_ok_false_extracts_retryable_and_code_from_all_shapes),
     ("_retry_trusted: whitelist по типу операции", t_retry_trusted_whitelist_by_op_kind),
+    ("call(): запись + недоверенный retryable → fail-fast", t_call_write_untrusted_retryable_fails_fast_without_retry),
+    ("call(): read_all_notifications — мутация, флаг не доверяется", t_call_write_untrusted_retryable_for_read_prefixed_mutation),
+    ("call(): WRITE_QUEUE_TIMEOUT у записи — ретрай", t_call_write_trusted_queue_timeout_is_retried),
     ("jsonrpc error → McpError с payload", t_jsonrpc_error_raises_with_payload),
     ("валидный result проходит", t_successful_result_passes_through),
     ("mcp_call не-JSON → McpError", t_mcp_call_non_json_body_raises),
