@@ -397,19 +397,32 @@ def cmd_embed(a) -> int:
         close(sid)
 
 
+def _org_nodes(sid: str) -> list:
+    """Ноды organize-дерева из list_organize_nodes. Контракт шлюза: JSON в
+    content[0].text (общий для orgls/org/unlink — правится в одном месте).
+    Неожиданная форма (нет/не список nodes) — McpError, не голый KeyError:
+    форма ответа — часть контракта шлюза, как не-JSON в mcp_call."""
+    res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
+    text = next(
+        (
+            c["text"]
+            for c in (res.get("content", []) if isinstance(res, dict) else [])
+            if isinstance(c, dict) and isinstance(c.get("text"), str)
+        ),
+        None,
+    )
+    data = json.loads(text) if text else {}
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, list):
+        raise McpError(f"list_organize_nodes: в ответе нет nodes: {str(res)[:200]}")
+    return nodes
+
+
 def cmd_orgls(a) -> int:
     """Список organize-папок (id + имя + parent) — для поиска folderId."""
     sid = session()
     try:
-        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        nodes = _org_nodes(sid)
         for n in nodes:
             if n.get("type") == "folder":
                 print(n["id"], n.get("data"))
@@ -422,15 +435,7 @@ def cmd_org(a) -> int:
     """Перенести doc-линк в organize-папку: org <docId> --to <folderId>."""
     sid = session()
     try:
-        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        nodes = _org_nodes(sid)
         link = next(
             (n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId),
             None,
@@ -455,15 +460,7 @@ def cmd_unlink(a) -> int:
     сайдбара копию, оставляя канон). Тело дока при этом живо и ищется."""
     sid = session()
     try:
-        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        nodes = _org_nodes(sid)
         links = [
             n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId
         ]
@@ -476,7 +473,7 @@ def cmd_unlink(a) -> int:
                 "delete_organize_link",
                 {"workspaceId": WORKSPACE, "nodeId": link["id"]},
             )
-            print("unlinked", link["id"])
+            print("unlinked", link["id"], "(parent", link.get("parentId"), ")")
         return 0
     finally:
         close(sid)
