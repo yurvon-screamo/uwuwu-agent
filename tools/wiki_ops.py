@@ -287,7 +287,15 @@ def _validate_parent(sid: str, parent: str) -> int | None:
             file=sys.stderr,
         )
         return 2
-    if _doc_exists(res) is False:
+    exists = _doc_exists(res)
+    if exists is None:
+        print(
+            "read_doc не дал exists-вердикт (схема шлюза изменилась?) — "
+            "валидация --parent недоступна, откажись от --parent или повтори",
+            file=sys.stderr,
+        )
+        return 2
+    if exists is False:
         print(
             f"parent-док {parent} не существует (read_doc: exists:false)",
             file=sys.stderr,
@@ -510,8 +518,8 @@ def cmd_embed(a) -> int:
         close(sid)
 
 
-def cmd_orgls(a) -> int:
-    """Список organize-папок (id + имя + parent) — для поиска folderId."""
+def cmd_orgls(_a) -> int:
+    """Список organize-папок (id + имя) — для поиска folderId."""
     sid = session()
     try:
         for n in _organize_nodes(sid):
@@ -578,6 +586,13 @@ def cmd_link(a) -> int:
         except (urllib.error.URLError, TimeoutError) as e:  # noqa: S5754 — сетевой транзиент до мутации: rc=2, не наш валидационный rc=1
             print(
                 f"!! шлюз недоступен (транзиент): {str(e)[:150]} — повтори",
+                file=sys.stderr,
+            )
+            return 2
+        if _doc_exists(target) is None:
+            print(
+                "read_doc не дал exists-вердикт (схема шлюза изменилась?) — "
+                "линк не создаём: проверь docId или повтори",
                 file=sys.stderr,
             )
             return 2
@@ -735,12 +750,17 @@ def main() -> int:
         print(f"!! {e}", file=sys.stderr)
         return 2
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-        # URLError — сбои соединения, ConnectionError/TimeoutError — сбой/таймаут
-        # на стадии чтения (ConnectionResetError, socket.timeout): все сетевые,
-        # на них McpError не наматывается — ловим сырыми. rc=2 = «шлюз/сеть»,
-        # единая точка rc-семантики вместо traceback'а в CLI-обвязках
-        print(f"!! шлюз/сеть недоступны (транзиент): {str(e)[:200]}", file=sys.stderr)
-        print("!! ТАЙМАУТ ≠ ПРОВАЛ: мутация могла дожить — проверь результат перед повтором", file=sys.stderr)
+        # URLError — сбои соединения (HTTP-коды в т.ч. детерминированные),
+        # ConnectionError/TimeoutError — обрыв/таймаут на стадии чтения
+        # (ConnectionResetError, socket.timeout): все сетевые, McpError на
+        # них не наматывается — ловим сырыми. rc=2 = «шлюз/сеть», единая
+        # точка rc-семантики вместо traceback'а в CLI-обвязках
+        print(f"!! шлюз/сеть: {str(e)[:200]}", file=sys.stderr)
+        print(
+            "!! если это был таймаут — мутация могла дожить до успеха: "
+            "проверь результат перед повтором",
+            file=sys.stderr,
+        )
         return 2
 
 
