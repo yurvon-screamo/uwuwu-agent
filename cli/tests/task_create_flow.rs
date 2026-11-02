@@ -55,6 +55,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[test]
+#[serial_test::serial]
 fn retry_recovers_orphan_without_second_doc() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -99,6 +100,7 @@ fn retry_recovers_orphan_without_second_doc() {
 }
 
 #[test]
+#[serial_test::serial]
 fn duplicate_is_explicit_error_not_silent_reuse() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -132,6 +134,7 @@ fn duplicate_is_explicit_error_not_silent_reuse() {
 }
 
 #[test]
+#[serial_test::serial]
 fn duplicate_by_row_title_even_if_body_is_not_a_child() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -164,6 +167,7 @@ fn duplicate_by_row_title_even_if_body_is_not_a_child() {
 }
 
 #[test]
+#[serial_test::serial]
 fn linked_child_is_never_orphaned() {
     with_temp_home(|| {
         // строка «Новое» заняла тело doc-1; ретрай со старым тайтлом «Старое»
@@ -211,6 +215,7 @@ fn linked_child_is_never_orphaned() {
 }
 
 #[test]
+#[serial_test::serial]
 fn busy_candidate_excluded_orphan_still_recovered() {
     with_temp_home(|| {
         // два ребёнка со старым тайтлом: один занят живой строкой, один свободен
@@ -257,6 +262,7 @@ fn busy_candidate_excluded_orphan_still_recovered() {
 }
 
 #[test]
+#[serial_test::serial]
 fn ambiguous_bodies_are_explicit_error() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -293,6 +299,7 @@ fn ambiguous_bodies_are_explicit_error() {
 }
 
 #[test]
+#[serial_test::serial]
 fn fresh_create_regression() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -334,6 +341,7 @@ fn fresh_create_regression() {
 }
 
 #[test]
+#[serial_test::serial]
 fn trashed_child_does_not_block_fresh_create() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -371,6 +379,7 @@ fn trashed_child_does_not_block_fresh_create() {
 }
 
 #[test]
+#[serial_test::serial]
 fn replace_failure_aborts_before_commit() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -429,6 +438,7 @@ fn run_cron_create(
 }
 
 #[test]
+#[serial_test::serial]
 fn cron_set_recovers_orphan() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -457,6 +467,7 @@ fn cron_set_recovers_orphan() {
 }
 
 #[test]
+#[serial_test::serial]
 fn cron_set_duplicate_is_error() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -470,6 +481,7 @@ fn cron_set_duplicate_is_error() {
 }
 
 #[test]
+#[serial_test::serial]
 fn rm_row_path_deletes_row_and_trashes_body() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -495,6 +507,7 @@ fn rm_row_path_deletes_row_and_trashes_body() {
 }
 
 #[test]
+#[serial_test::serial]
 fn rm_orphan_path_trashes_body_without_row() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -529,6 +542,7 @@ fn rm_orphan_path_trashes_body_without_row() {
 }
 
 #[test]
+#[serial_test::serial]
 fn rm_ambiguous_prefix_is_error() {
     with_temp_home(|| {
         let mut steps = handshake();
@@ -561,6 +575,7 @@ fn rm_ambiguous_prefix_is_error() {
 }
 
 #[test]
+#[serial_test::serial]
 fn fresh_create_surfaces_queue_timeout_honestly() {
     with_temp_home(|| {
         // create_doc вернул structuredContent ok:false (WRITE_QUEUE_TIMEOUT):
