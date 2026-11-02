@@ -8,7 +8,7 @@
 opencodereview/ правила ревью
 agents/        субагенты: code-quality-reviewer, developer, dreamer
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        31 скиллов (см. ниже)
+skills/        31 скилл (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
 cron/          uwuwu-cron — демон кронов (доска Crons → сессии агентов)
