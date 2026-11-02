@@ -16,6 +16,7 @@ call() тогда сам пере-handshake'ится (400/404 → один ре�
   replace <docId> <файл.md> [--stub]             — заменить контент (--stub: без длиновой защиты)
   export <docId>                                 — живой markdown дока в stdout
   find <подстрока тайтла>                        — docId по тайтлу (живой поиск по дереву)
+  unlink <docId>                                 — снять organize-линк(и) дока из папок (дедуп: убирает из сайдбара; из поиска док уходит только в корзину)
 """
 
 from __future__ import annotations
@@ -448,6 +449,39 @@ def cmd_org(a) -> int:
         close(sid)
 
 
+def cmd_unlink(a) -> int:
+    """Снять organize-линк(и) дока: unlink <docId>. Док может быть слинкован
+    в несколько папок — снимаются все его линки (дедуп-кейс: убираем из
+    сайдбара копию, оставляя канон). Тело дока при этом живо и ищется."""
+    sid = session()
+    try:
+        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
+
+        def get_text(o):
+            if isinstance(o, dict):
+                for c in o.get("content", []):
+                    if isinstance(c, dict) and "text" in c:
+                        return c["text"]
+
+        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        links = [
+            n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId
+        ]
+        if not links:
+            print("линк дока не найден в organize", file=sys.stderr)
+            return 1
+        for link in links:
+            call(
+                sid,
+                "delete_organize_link",
+                {"workspaceId": WORKSPACE, "nodeId": link["id"]},
+            )
+            print("unlinked", link["id"])
+        return 0
+    finally:
+        close(sid)
+
+
 def cmd_children(a) -> int:
     sid = session()
     try:
@@ -546,6 +580,8 @@ def main() -> int:
     om = sub.add_parser("org")
     om.add_argument("docId")
     om.add_argument("--to", required=True)
+    u = sub.add_parser("unlink")
+    u.add_argument("docId")
     a = p.parse_args()
     return {
         "create": cmd_create,
@@ -558,6 +594,7 @@ def main() -> int:
         "orgls": cmd_orgls,
         "embed": cmd_embed,
         "org": cmd_org,
+        "unlink": cmd_unlink,
     }[a.cmd](a)
 
 
