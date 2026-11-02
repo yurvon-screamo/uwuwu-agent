@@ -420,6 +420,7 @@ const confirmPendingRun = async (run: RunState): Promise<boolean> => {
   if (!inQueue) return false // ход подтверждён (батч ушёл из очереди) — наблюдаем
   let landed: number | null = null
   try { landed = promptLandedAt(await sessionMessages(run.sessionID), run.startedAt - 2000, run.req.text) } catch {}
+  if (state.run !== run) return true // /reset снёс ход в окне await — не трогаем очередь
   if (landed !== null) {
     log(`окно отправки ${run.sessionID}: промпт дошёл (${landed}) — доигрываем`)
     state.queue = dropBatch(state.queue, run.req)
