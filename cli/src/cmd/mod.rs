@@ -2,6 +2,9 @@
 //! Shared row/cron resolution lives here because task and cron both use it.
 
 mod cli;
+// сиблинг-тесты грамматики: без объявления cargo их молча не подхватывает
+#[cfg(test)]
+mod cli_tests;
 mod cron;
 mod docs;
 mod search;

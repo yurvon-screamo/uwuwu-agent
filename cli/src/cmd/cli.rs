@@ -90,6 +90,8 @@ pub(crate) enum TaskSub {
         /// Rich-контент (embed-диаграммы) не переживает — пересоздай фенсами.
         #[arg(long)]
         replace: bool,
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
     },
 }
 

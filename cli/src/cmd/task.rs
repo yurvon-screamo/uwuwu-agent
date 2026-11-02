@@ -102,13 +102,23 @@ pub(crate) async fn run(
         TaskSub::Close { id, note } => {
             close_task(&mut client, cfg, root, &project, CloseArgs { id, note }).await
         }
-        TaskSub::Body { id, md, replace } => {
+        TaskSub::Body {
+            id,
+            md,
+            replace,
+            stdin,
+        } => {
             body(
                 &mut client,
                 cfg,
                 root,
                 &project,
-                BodyArgs { id, md, replace },
+                BodyArgs {
+                    id,
+                    md,
+                    replace,
+                    stdin,
+                },
             )
             .await
         }
@@ -144,6 +154,7 @@ struct BodyArgs {
     id: String,
     md: Option<String>,
     replace: bool,
+    stdin: bool,
 }
 
 async fn create(
@@ -344,9 +355,12 @@ async fn body(
     if row.body_doc.is_empty() {
         anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
     }
-    let text = match &args.md {
-        Some(path) => std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?,
-        None => {
+    let text = match args.md {
+        // clap запрещает --stdin вместе с --md; guard фиксирует запрет и здесь
+        Some(path) if !args.stdin => {
+            std::fs::read_to_string(&path).with_context(|| format!("--md {path}"))?
+        }
+        _ => {
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
             buf
