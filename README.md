@@ -22,11 +22,11 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (29)
+## Скиллы (28)
 
 - **Architect (1)**: architect-ui-ux
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
-- **Workflows (5)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review · flow-timesheet
+- **Workflows (4)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review
 - **Office (4)**: docx · pdf · pptx · xlsx
 - **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
 - **Integrations (2)**: hf-cli · use-railway
