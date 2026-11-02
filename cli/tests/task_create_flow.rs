@@ -559,3 +559,42 @@ fn rm_ambiguous_prefix_is_error() {
         assert!(!mock.called("trash_doc"));
     });
 }
+
+#[test]
+fn fresh_create_surfaces_queue_timeout_honestly() {
+    with_temp_home(|| {
+        // create_doc вернул structuredContent ok:false (WRITE_QUEUE_TIMEOUT):
+        // исход неоднозначен — ошибка обязана назвать код, а не «тело создано»
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![])));
+        steps.push(rpc(
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":true}"#
+                .into(),
+        ));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
+        assert!(err.contains("не подтвердился"), "got: {err}");
+        assert!(!err.contains("тело создано"), "got: {err}");
+        assert!(!mock.called("add_database_row"));
+    });
+}
