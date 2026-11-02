@@ -57,6 +57,7 @@ spawn → In Progress; новые комменты/правки тела юзе�
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
 `factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
 Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
+
 ### Кроны (uwuwu-cron)
 
 Кроны распределены по проектам: крон живёт на доске **«Кроны <Proj>»** в папке
@@ -69,7 +70,7 @@ spawn → In Progress; новые комменты/правки тела юзе�
 
 CLI:
 `uwuwu-cli cron set --title "…" [--project <proj>] (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`
-(без `--project` целится в глобальную «Crons» — сейчас её нет, будет ошибка),
+(без `--project` целится в глобальную «Crons» — сейчас её нет, `set` упадёт с ошибкой),
 `cron list / pause / resume / rm`.
 
 ### Триаж (uwuwu-triage)
