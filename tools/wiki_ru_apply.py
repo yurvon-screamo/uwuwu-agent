@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE
+from triage_affine import McpError, WORKSPACE
 from wiki_ops import call, close, session
 
 
@@ -55,4 +55,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

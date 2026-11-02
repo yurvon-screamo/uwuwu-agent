@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from triage_affine import McpError
 from wiki_ops import call, close, deep_md, session
 
 WS = "81475705-028a-4153-a8f5-f06e402ee31e"
@@ -171,7 +172,7 @@ def main() -> int:
                 )
                 print(f"⊕ эмбед likec4-{a.view} вставлен")
                 break
-            except SystemExit as e:
+            except McpError as e:
                 print(f"ретрай {attempt + 1}: {str(e)[:60]}")
                 time.sleep(120)
         else:
@@ -182,4 +183,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

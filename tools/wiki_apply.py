@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE, get_md
+from triage_affine import McpError, WORKSPACE, get_md
 from wiki_ops import call, session
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
@@ -141,4 +141,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

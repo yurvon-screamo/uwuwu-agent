@@ -201,6 +201,16 @@ def cmd_sections(args: argparse.Namespace) -> int:
     return 0
 
 
+class McpError(RuntimeError):
+    """Ошибка контракта MCP-вызова: JSON-RPC error / isError / ok:false /
+    пустой или не-JSON ответ шлюза.
+
+    Обычное исключение (не SystemExit): обвязки с `except Exception` его
+    ловят и ретраят — инцидент 31.10 (крон «Разбор очереди заявок») был
+    как раз о том, что sys.exit(2) умирал молча посреди серии мутаций.
+    Exit-код — забота CLI-точки входа (main() переводит в rc=2)."""
+
+
 def mcp_call(
     method: str, params: dict, sid: str | None = None, notify: bool = False
 ) -> tuple[object, str]:
@@ -229,20 +239,21 @@ def mcp_call(
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as e:
-        print(
-            f"!! MCP {method}: не-JSON ответ (status {r.status}, "
-            f"{len(body)} байт): {body[:200]!r}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2) from e
+        raise McpError(
+            f"MCP {method}: не-JSON ответ (status {r.status}, "
+            f"{len(body)} байт): {body[:200]!r}"
+        ) from e
     return parsed, sid or ""
 
 
 def mcp_result(resp: object) -> dict:
-    """Валидированный result: JSON-RPC error / isError / ok:false → exit ДО мутаций."""
+    """Валидированный result: JSON-RPC error / isError / ok:false / пустой
+    ответ → McpError — обычное исключение, его видят ретраи обвязок;
+    exit-код выставляет CLI-точка входа."""
     if not isinstance(resp, dict) or "error" in resp or "result" not in resp:
-        print(f"!! шлюз вернул ошибку: {json.dumps(resp, ensure_ascii=False)[:300]}")
-        sys.exit(2)
+        raise McpError(
+            f"шлюз вернул ошибку: {json.dumps(resp, ensure_ascii=False)[:300]}"
+        )
     result = resp["result"]
     if not isinstance(result, dict):
         return {}
@@ -252,10 +263,10 @@ def mcp_result(resp: object) -> dict:
             if isinstance(c, dict) and c.get("text"):
                 detail = c["text"]
                 break
-        print(
-            f"!! инструмент отказал: {detail or json.dumps(result, ensure_ascii=False)[:300]}"
+        raise McpError(
+            f"инструмент отказал: "
+            f"{detail or json.dumps(result, ensure_ascii=False)[:300]}"
         )
-        sys.exit(2)
     return result
 
 
@@ -572,4 +583,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)
