@@ -324,9 +324,10 @@ def _handle_ok_false(name: str, failure: tuple[str, bool, str | None],
     if _retry_trusted(name, retryable, code) and attempt < retries:
         return detail
     if retryable and not _retry_trusted(name, retryable, code):
+        shown = f'"{code}"' if code else "<нет кода>"
         raise McpError(
             f"{name}: {detail} — retryable:true от шлюза для записи "
-            f"не доверяется (код \"{code}\" вне whitelist, операция могла "
+            f"не доверяется (код {shown} вне whitelist, операция могла "
             "примениться; см. ADR-006 uwuwu)"
         )
     raise McpError(f"{name}: {detail}")
