@@ -10,11 +10,18 @@ call() тогда сам пере-handshake'ится (400/404 → один ре�
 опции ставь ДО `--`: wiki_ops.py move --parent <id> -- -GnAmdAk45.
 
 Команды:
-  create <тайтл> <файл.md> [--parent <docId>]   — создать док (опц. сразу под родителя), печатает docId
-  move <docId> --parent <docId>                  — перенести под родителя
-  append <docId> <файл.md>                       — дописать markdown в конец дока
-  replace <docId> <файл.md> [--stub]             — заменить контент (--stub: без длиновой защиты)
-  export <docId>                                 — живой markdown дока в stdout
+  create <тайтл> <файл.md> [--parent <docId>]   — создать док (опц. под родителя-ДОК, печатает docId;
+                                                --parent валидируется ДО создания: organize-папка или
+                                                несуществующий док → отказ без создания сироты)
+  link <docId> --folder <folderId>              — прилинковать док в organize-папку (для свежесозданного
+                                                дока; идемпотентен)
+  org <docId> --to <folderId>                   — переместить СУЩЕСТВУЮЩИЙ organize-линк в другую папку
+  move <docId> --parent <docId>                 — перенести под родителя (doc-в-док)
+  append <docId> <файл.md>                      — дописать markdown в конец дока
+  replace <docId> <файл.md> [--stub]            — заменить контент (--stub: без длиновой защиты)
+  export <docId>                                — живой markdown дока в stdout
+  orgls                                         — organize-папки (id + имя)
+  children <folderId|docId>                     — дети: organize-папки (folder/doc-линки) или doc-дети дерева
   find <подстрока тайтла>                        — docId по тайтлу (живой поиск по дереву)
 """
 
@@ -210,10 +217,77 @@ def deep_md(o):
     return None
 
 
+def _organize_nodes(sid: str) -> list[dict]:
+    """Список organize-нод воркспейса ({id, parentId, type: folder|doc,
+    data: имя папки | docId-цель линка, index}). Единственный листинг,
+    отражающий organize-структуру: list_workspace_tree её не видит."""
+    res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
+    return json.loads(_content_text(res) or "{}")["nodes"]
+
+
+def _content_text(res: object) -> str | None:
+    """Первый content[].text из MCP-ответа (обёртки шлюза кладут JSON-полезную
+    нагрузку именно там)."""
+    if not isinstance(res, dict):
+        return None
+    for c in res.get("content", []):
+        if isinstance(c, dict) and "text" in c:
+            return c["text"]
+    return None
+
+
+def _tree_node(n: dict, doc_id: str) -> dict | None:
+    """Узел дерева workspace по docId (рекурсия по children)."""
+    if n["docId"] == doc_id:
+        return n
+    for ch in n.get("children", []):
+        found = _tree_node(ch, doc_id)
+        if found:
+            return found
+    return None
+
+
+def _validate_parent(sid: str, parent: str) -> int | None:
+    """Валидация --parent ДО создания дока: вернуть exit-код отказа (0/None =
+    ок) либо напечатать причину. Организе-папка по node.id → подсказка link;
+    несуществующий docId шлюз помечает exists:false в УСПЕШНОМ ответе
+    read_doc (isError нет!); tool-отказ (в т.ч. флейк «space:load-doc
+    timeout») не считается «не существует» — печатаем обе интерпретации."""
+    nodes = _organize_nodes(sid)
+    if any(n.get("type") == "folder" and n.get("id") == parent for n in nodes):
+        print(
+            f"--parent {parent} — organize-ПАПКА (folderId), не docId: "
+            "вложенность док-в-док так не строится. Создай без --parent, "
+            f"затем: link <docId> --folder {parent}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        res = call(sid, "read_doc", {"workspaceId": WORKSPACE, "docId": parent})
+    except SystemExit:
+        print(
+            "read_doc --parent упал с отказом шлюза (см. выше): parent-док "
+            "не существует ЛИБО шлюз флейкнул — проверь и повтори",
+            file=sys.stderr,
+        )
+        return 1
+    if isinstance(res, dict) and res.get("exists") is False:
+        print(
+            f"parent-док {parent} не существует (read_doc: exists:false)",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
 def cmd_create(a) -> int:
     md = Path(a.file).read_text(encoding="utf-8")
     sid = session()
     try:
+        if a.parent:
+            veto = _validate_parent(sid, a.parent)
+            if veto:
+                return veto
         res = call(
             sid,
             "create_doc_from_markdown",
@@ -224,13 +298,21 @@ def cmd_create(a) -> int:
             print("!! create не дал docId", file=sys.stderr)
             return 2
         did = m.group(1)
+        print(did)  # до move: падение move не оставит docId неизвестным
         if a.parent:
-            call(
-                sid,
-                "move_doc",
-                {"workspaceId": WORKSPACE, "docId": did, "toParentDocId": a.parent},
-            )
-        print(did)
+            try:
+                call(
+                    sid,
+                    "move_doc",
+                    {"workspaceId": WORKSPACE, "docId": did, "toParentDocId": a.parent},
+                )
+            except SystemExit:
+                print(
+                    f"doc {did} СОЗДАН, но move под {a.parent} упал (см. выше); "
+                    f"повтор: move {did} --parent {a.parent}",
+                    file=sys.stderr,
+                )
+                return 2
         return 0
     finally:
         close(sid)
@@ -407,16 +489,7 @@ def cmd_orgls(a) -> int:
     """Список organize-папок (id + имя + parent) — для поиска folderId."""
     sid = session()
     try:
-        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        nodes = json.loads(get_text(res) or "{}")["nodes"]
-        for n in nodes:
+        for n in _organize_nodes(sid):
             if n.get("type") == "folder":
                 print(n["id"], n.get("data"))
         return 0
@@ -425,24 +498,22 @@ def cmd_orgls(a) -> int:
 
 
 def cmd_org(a) -> int:
-    """Перенести doc-линк в organize-папку: org <docId> --to <folderId>."""
+    """Перенести doc-линк в organize-папку: org <docId> --to <folderId>.
+    Перемещает ТОЛЬКО существующий линк — у свежесозданного дока линка нет:
+    сначала link <docId> --folder <folderId>."""
     sid = session()
     try:
-        res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        nodes = json.loads(get_text(res) or "{}")["nodes"]
+        nodes = _organize_nodes(sid)
         link = next(
             (n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId),
             None,
         )
         if not link:
-            print("линк дока не найден в organize", file=sys.stderr)
+            print(
+                "линк дока не найден в organize — для свежесозданного дока "
+                f"сначала: link {a.docId} --folder <folderId>",
+                file=sys.stderr,
+            )
             return 1
         call(
             sid,
@@ -455,41 +526,91 @@ def cmd_org(a) -> int:
         close(sid)
 
 
-def cmd_children(a) -> int:
+def cmd_link(a) -> int:
+    """Прилинковать док в organize-папку: link <docId> --folder <folderId>
+    (обёртка gateway add_organize_link — единственный способ организовать
+    свежесозданный док, у которого линка в organize ещё нет).
+    Идемпотентен: линк уже в этой папке — «уже здесь», exit 0; в другой —
+    предупреждение «нужен org», exit 1."""
     sid = session()
     try:
-        res = call(sid, "list_workspace_tree", {"workspaceId": WORKSPACE, "depth": 4})
-
-        def get_text(o):
-            if isinstance(o, dict):
-                for c in o.get("content", []):
-                    if isinstance(c, dict) and "text" in c:
-                        return c["text"]
-
-        tree = json.loads(get_text(res) or "{}")
-
-        def node(n, d):
-            if n["docId"] == d:
-                return n
-            for ch in n.get("children", []):
-                r = node(ch, d)
-                if r:
-                    return r
-
-        for root in tree.get("tree", []):
-            nd = node(root, a.docId)
-            if nd is not None:
-                for c in nd.get("children", []):
-                    t = c.get("title") or ""
-                    print(
-                        c["docId"],
-                        json.loads(f'"{t}"') if "\\u" in t else t,
-                    )
+        nodes = _organize_nodes(sid)
+        if not any(n.get("type") == "folder" and n.get("id") == a.folder for n in nodes):
+            print(f"папка {a.folder} не найдена в organize (см. orgls)", file=sys.stderr)
+            return 1
+        existing = next(
+            (n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId),
+            None,
+        )
+        if existing:
+            if existing.get("parentId") == a.folder:
+                print(f"уже здесь (линк в {a.folder})")
                 return 0
-        print("не найден", file=sys.stderr)
-        return 1
+            print(
+                f"линк уже существует в {existing.get('parentId')} — "
+                f"перемещение: org {a.docId} --to {a.folder}",
+                file=sys.stderr,
+            )
+            return 1
+        call(
+            sid,
+            "add_organize_link",
+            {
+                "workspaceId": WORKSPACE,
+                "folderId": a.folder,
+                "type": "doc",
+                "targetId": a.docId,
+            },
+        )
+        print("linked")
+        return 0
     finally:
         close(sid)
+
+
+def cmd_children(a) -> int:
+    """Дети узла: children <folderId> — organize-дети папки (подпапки и
+    doc-линки, порядок index); children <docId> — doc-дети из дерева
+    воркспейса (format docId title). Режим печатается маркером
+    «# mode: …» — id папки и id дока синтаксически неразличимы."""
+    sid = session()
+    try:
+        nodes = _organize_nodes(sid)
+        if any(n.get("type") == "folder" and n.get("id") == a.id for n in nodes):
+            print(f"# mode: organize {a.id}")
+            kids = sorted(
+                (n for n in nodes if n.get("parentId") == a.id),
+                key=lambda n: n.get("index", 0),
+            )
+            for n in kids:
+                if n.get("type") == "folder":
+                    print("folder", n["id"], n.get("data"))
+                else:
+                    print("doc", n.get("data"))
+            return 0
+        return _children_doc(sid, a.id)
+    finally:
+        close(sid)
+
+
+def _children_doc(sid: str, doc_id: str) -> int:
+    """doc-дети из list_workspace_tree (ветка docId)."""
+    res = call(sid, "list_workspace_tree", {"workspaceId": WORKSPACE, "depth": 4})
+    print(f"# mode: doc {doc_id}")
+    tree = json.loads(_content_text(res) or "{}")
+    for root in tree.get("tree", []):
+        nd = _tree_node(root, doc_id)
+        if nd is None:
+            continue
+        for c in nd.get("children", []):
+            t = c.get("title") or ""
+            print(c["docId"], json.loads(f'"{t}"') if "\\u" in t else t)
+        return 0
+    print(
+        "не найден — id не folder-node и не doc с детьми в дереве воркспейса",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def cmd_find(a) -> int:
@@ -543,8 +664,6 @@ def main() -> int:
     e.add_argument("docId")
     f = sub.add_parser("find")
     f.add_argument("query")
-    ch = sub.add_parser("children")
-    ch.add_argument("docId")
     sub.add_parser("orgls")
     emb = sub.add_parser("embed")
     emb.add_argument("docId")
@@ -553,6 +672,11 @@ def main() -> int:
     om = sub.add_parser("org")
     om.add_argument("docId")
     om.add_argument("--to", required=True)
+    lk = sub.add_parser("link")
+    lk.add_argument("docId")
+    lk.add_argument("--folder", required=True)
+    ch = sub.add_parser("children")
+    ch.add_argument("id")
     a = p.parse_args()
     return {
         "create": cmd_create,
@@ -565,6 +689,7 @@ def main() -> int:
         "orgls": cmd_orgls,
         "embed": cmd_embed,
         "org": cmd_org,
+        "link": cmd_link,
     }[a.cmd](a)
 
 
