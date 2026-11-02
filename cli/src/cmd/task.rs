@@ -102,13 +102,23 @@ pub(crate) async fn run(
         TaskSub::Close { id, note } => {
             close_task(&mut client, cfg, root, &project, CloseArgs { id, note }).await
         }
-        TaskSub::Body { id, md, replace } => {
+        TaskSub::Body {
+            id,
+            md,
+            replace,
+            replace_section,
+        } => {
             body(
                 &mut client,
                 cfg,
                 root,
                 &project,
-                BodyArgs { id, md, replace },
+                BodyArgs {
+                    id,
+                    md,
+                    replace,
+                    replace_section,
+                },
             )
             .await
         }
@@ -144,6 +154,7 @@ struct BodyArgs {
     id: String,
     md: Option<String>,
     replace: bool,
+    replace_section: Option<String>,
 }
 
 async fn create(
@@ -355,6 +366,14 @@ async fn body(
     if args.replace {
         let n_diagrams = affine_tasks::replace_body(client, cfg, &row.body_doc, &text).await?;
         println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
+    } else if let Some(heading) = &args.replace_section {
+        let (n_deleted, n_diagrams) =
+            crate::affine_body::replace_body_section(client, cfg, &row.body_doc, heading, &text)
+                .await?;
+        println!(
+            "секция заменена: {} · «{heading}» (блоков удалено: {n_deleted}, диаграмм: {n_diagrams})",
+            row.title
+        );
     } else {
         let (n_diagrams, n_deleted) =
             affine_tasks::append_body_markdown(client, cfg, &row.body_doc, &text).await?;
