@@ -5,8 +5,7 @@
 // безопасной точке; вынужденный process.exit — только по истечении grace,
 // чтобы systemd не прибивал зависший drainage вечно.
 //
-// NB: cron/factory/dreamer пока несут собственные копии этой логики —
-// миграция их на общий модуль запланирована отдельно (не в срезе triage).
+// Пользователи: triage, cron, factory, dreamer — свои копии лока удалены.
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
