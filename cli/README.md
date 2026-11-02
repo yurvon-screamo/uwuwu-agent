@@ -13,8 +13,18 @@ CLI заявку/фактизацию/кэш не содержит (механи
 
 ```bash
 cd cli
-cargo build --release
-cargo install --path .   # или cp target/release/uwuwu-cli ~/.local/bin/
+cargo install --path .   # единственный путь установки: бинарь в ~/.cargo/bin
+```
+
+**Каноничный путь бинаря — `~/.cargo/bin/uwuwu-cli`, копия ровно одна.**
+Установка/обновление — только `cargo install --path .`. Не копируй артефакт
+вручную в `~/.local/bin`: он в PATH стоит раньше `~/.cargo/bin` и молча
+затенит свежий бинарь (обновления перестанут применяться). Смок после
+установки:
+
+```bash
+which uwuwu-cli   # → ~/.cargo/bin/uwuwu-cli (единственная копия)
+uwuwu-cli --help  # грамматика актуальна
 ```
 
 Локальная Ollama больше не нужна (семантический фоллбек выпилен вместе с
