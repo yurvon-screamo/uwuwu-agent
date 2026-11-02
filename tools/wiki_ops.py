@@ -238,14 +238,30 @@ def _content_text(res: object) -> str | None:
     return None
 
 
+def _doc_exists(res: object) -> bool | None:
+    """Существует ли док по ответу read_doc. Шлюз кладёт verdict в
+    structuredContent.exists (дублирует в content[].text-JSON) НА УРОВНЕ
+    result, не на верхнем уровне — несуществующий docId приходит УСПЕХОМ
+    с exists:false (isError нет). None = вердикта в ответе нет."""
+    if not isinstance(res, dict):
+        return None
+    doc = res.get("structuredContent")
+    if not isinstance(doc, dict):
+        try:
+            doc = json.loads(_content_text(res) or "{}")
+        except json.JSONDecodeError:
+            return None
+    exists = doc.get("exists") if isinstance(doc, dict) else None
+    return exists if isinstance(exists, bool) else None
+
+
 def _validate_parent(sid: str, parent: str) -> int | None:
     """Валидация --parent ДО создания дока: вернуть exit-код отказа (0/None =
     ок) либо напечатать причину. Организе-папка по node.id → подсказка link;
     несуществующий docId шлюз помечает exists:false в УСПЕШНОМ ответе
     read_doc (isError нет!); отказ шлюза (McpError — в т.ч. флейк
-    «space:load-doc timeout») не считается «не существует» — печатаем обе
-    интерпретации; HTTP 503/сокет-таймаут (URLError) пролетают как
-    транзиентные — сироты нет в любом исходе."""
+    «space:load-doc timeout») и сетевые транзиенты (HTTP 503/сокет-таймаут)
+    не считаются «не существует» — честный rc=2, сироты нет в любом исходе."""
     nodes = _organize_nodes(sid)
     if any(n.get("type") == "folder" and n.get("id") == parent for n in nodes):
         print(
@@ -263,8 +279,15 @@ def _validate_parent(sid: str, parent: str) -> int | None:
             f"ЛИБО шлюз флейкнул — проверь и повтори (отказ: {str(e)[:200]})",
             file=sys.stderr,
         )
-        return 1
-    if isinstance(res, dict) and res.get("exists") is False:
+        return 2
+    except (urllib.error.URLError, TimeoutError) as e:  # noqa: S5754 — сетевой транзиент до всякой мутации: rc=2 (отказ шлюза), не наш валидационный rc=1
+        print(
+            f"!! шлюз недоступен (транзиент): {str(e)[:150]} — "
+            "валидация --parent не прошла, повтори",
+            file=sys.stderr,
+        )
+        return 2
+    if _doc_exists(res) is False:
         print(
             f"parent-док {parent} не существует (read_doc: exists:false)",
             file=sys.stderr,
@@ -307,7 +330,7 @@ def cmd_create(a) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            except urllib.error.URLError as e:  # noqa: S5754 — тот же частичный успех для транзиентов (HTTP 503/сокет-таймаут, сервер мог дожить до успеха)
+            except (urllib.error.URLError, TimeoutError) as e:  # noqa: S5754 — тот же частичный успех для сетевых транзиентов (503/сокет-таймаут: сервер мог дожить до успеха)
                 print(
                     f"doc {did} СОЗДАН, но move под {a.parent} оборван по сети "
                     f"({str(e)[:120]}); ТАЙМАУТ ≠ ПРОВАЛ — проверь position "
@@ -551,8 +574,14 @@ def cmd_link(a) -> int:
                 "проверь docId и повтори",
                 file=sys.stderr,
             )
-            return 1
-        if isinstance(target, dict) and target.get("exists") is False:
+            return 2
+        except (urllib.error.URLError, TimeoutError) as e:  # noqa: S5754 — сетевой транзиент до мутации: rc=2, не наш валидационный rc=1
+            print(
+                f"!! шлюз недоступен (транзиент): {str(e)[:150]} — повтори",
+                file=sys.stderr,
+            )
+            return 2
+        if _doc_exists(target) is False:
             print(
                 f"док {a.docId} не существует (read_doc: exists:false) — "
                 "висячий линк не создаём",
@@ -573,16 +602,33 @@ def cmd_link(a) -> int:
                 file=sys.stderr,
             )
             return 1
-        call(
-            sid,
-            "add_organize_link",
-            {
-                "workspaceId": WORKSPACE,
-                "folderId": a.folder,
-                "type": "doc",
-                "targetId": a.docId,
-            },
-        )
+        try:
+            call(
+                sid,
+                "add_organize_link",
+                {
+                    "workspaceId": WORKSPACE,
+                    "folderId": a.folder,
+                    "type": "doc",
+                    "targetId": a.docId,
+                },
+            )
+        except McpError as e:  # noqa: S5754 — мутация оборвана отказом шлюза: она могла дожить, печатаем рецепт проверки
+            print(
+                f"add_organize_link не прошёл ({str(e)[:180]}); ТАЙМАУТ/ОТКАЗ ≠ "
+                f"ПРОВАЛ — проверь orgls перед повтором link {a.docId} "
+                f"--folder {a.folder}",
+                file=sys.stderr,
+            )
+            return 2
+        except (urllib.error.URLError, TimeoutError) as e:  # noqa: S5754 — сетевой обрыв мутации: сервер мог дожить до успеха
+            print(
+                f"add_organize_link оборван по сети ({str(e)[:120]}); "
+                "ТАЙМАУТ ≠ ПРОВАЛ — проверь orgls перед повтором: "
+                f"link {a.docId} --folder {a.folder}",
+                file=sys.stderr,
+            )
+            return 2
         print("linked")
         return 0
     finally:
@@ -691,8 +737,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except McpError as e:
-        print(f"!! {e}", file=sys.stderr)
-        sys.exit(2)
+    # McpError → rc=2 переведён внутрь main() — единая точка rc-семантики
+    sys.exit(main())

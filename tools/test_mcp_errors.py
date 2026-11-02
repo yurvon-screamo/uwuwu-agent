@@ -188,7 +188,9 @@ def t_call_prefixes_tool_name_on_both_paths() -> None:
 
     sequence: list[str] = []
 
-    def fake_mcp_call(method: str, params: dict, sid=None, notify=False):
+    def fake_mcp_call(
+        method: str, params: dict, sid=None, notify=False, timeout=None
+    ):
         sequence.append(method)
         if len(sequence) == 1:  # первичный tools/call — сессия протухла
             raise StaleSessionError()
@@ -244,7 +246,7 @@ def assert_gateway_error_to_stderr(proc: subprocess.CompletedProcess) -> None:
 def t_e2e_wiki_ops_rpc_error_exits_2_with_stderr(port: int) -> None:
     """E2E: jsonrpc error в 200 → wiki_ops CLI: rc=2 + сообщение в stderr."""
     # act
-    proc = run_cli("wiki_ops.py", ["find", "zzz-no-such-doc"], port, {})
+    proc = run_cli("wiki_ops.py", ["orgls"], port, {})
     # assert
     assert_gateway_error_to_stderr(proc)
 
@@ -252,7 +254,7 @@ def t_e2e_wiki_ops_rpc_error_exits_2_with_stderr(port: int) -> None:
 def t_e2e_wiki_ops_empty_body_exits_2_with_stderr(port: int) -> None:
     """E2E: пустое тело в 200 (подпись инцидента) → rc=2 + stderr."""
     # act
-    proc = run_cli("wiki_ops.py", ["find", "zzz-no-such-doc"], port, {})
+    proc = run_cli("wiki_ops.py", ["orgls"], port, {})
     # assert
     assert_gateway_error_to_stderr(proc)
     assert "{}" in proc.stderr, f"payload пустого ответа потерян; stderr={proc.stderr[-300:]}"
