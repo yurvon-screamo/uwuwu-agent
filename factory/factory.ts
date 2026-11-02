@@ -19,6 +19,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeF
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "./mcp"
+import { REVIEWER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   newUserComments,
@@ -35,6 +36,7 @@ import {
   reviewCommentsPrompt,
   reviewReturnPrompt,
   routeTask,
+  worktreeByBranch,
   type ReviewKind,
   type FactoryState,
   type TaskComment,
@@ -80,7 +82,7 @@ const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 /** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника */
-const REVIEWER = { agent: "code-quality-reviewer", model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
+const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
@@ -328,7 +330,6 @@ interface SessionSpec {
   directory: string
   title: string
   agent?: string
-  parentID?: string
   model?: { providerID: string; id: string }
 }
 
@@ -340,7 +341,6 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
       model: spec.model ?? MODEL,
       location: { directory: spec.directory },
       ...(spec.agent !== undefined ? { agent: spec.agent } : {}),
-      ...(spec.parentID !== undefined ? { parentID: spec.parentID } : {}),
     },
   })
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
@@ -516,12 +516,7 @@ async function restartTask(
 async function resolveWorktree(local: string, branch: string): Promise<string> {
   if (branch === "") return ""
   try {
-    const out = await sh(["git", "-C", local, "worktree", "list", "--porcelain"])
-    let worktree = ""
-    for (const line of out.split("\n")) {
-      if (line.startsWith("working tree ")) worktree = line.slice("working tree ".length)
-      else if (line.startsWith("branch ") && line.endsWith(branch) && worktree !== "") return worktree
-    }
+    return worktreeByBranch(await sh(["git", "-C", local, "worktree", "list", "--porcelain"]), branch)
   } catch { /* git недоступен — ревьюверу останется cfg.local/PR */ }
   return ""
 }
@@ -566,7 +561,104 @@ async function failReview(
   if (attempts >= MAX_ATTEMPTS) {
     await setCells(board, task.rowId, { Status: "Needs attention" })
     await notify(tracked,
-      `[factory] ревьювер не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH} и напиши комментарий — попробую снова.`)
+      `[factory] ревьювер не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH}; ` +
+      "чтобы перезапустить ревью — переставь ревью-статус (счётчик попыток обнулится).")
+  }
+}
+
+interface ReviewDeps {
+  row: TaskRef
+  tracked: TrackedTask
+  project: string
+  cfg: ProjectCfg
+  board: BoardIds
+  state: FactoryState
+  fresh: TaskComment[]
+  consumeComments: () => void
+  refreshBodyBaseline: () => Promise<void>
+}
+
+/** Исполнение решения routeTask. Возвращает "skip-rest", когда этот тик по
+ *  задаче закончен целиком (рестарт девелопера — его запись state заменена). */
+async function dispatchReviewAction(
+  action: ReturnType<typeof routeTask>, d: ReviewDeps,
+): Promise<"skip-rest" | undefined> {
+  const shortId = d.row.rowId.slice(0, 8)
+  switch (action.t) {
+    case "spawn-reviewer": {
+      // новый вход в ревью-статус = свежая попытка (сброс счётчика фейлов):
+      // юзер/дев переустановили статус после Needs attention
+      const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind
+      const seed = entering ? 0 : d.tracked.reviewAttempts ?? 0
+      try {
+        await startReview(d.row, d.project, d.cfg, d.state, action.kind, d.tracked)
+        d.consumeComments()
+        await d.refreshBodyBaseline()
+        saveState(d.state)
+      } catch (e) {
+        await failReview(d.row, d.board, d.tracked, d.state, seed, e)
+      }
+      return undefined
+    }
+    case "rerun-reviewer": {
+      const worktree = action.kind === "result" ? await resolveWorktree(d.cfg.local, d.row.branch) : ""
+      const ok = await promptSession(
+        d.tracked.reviewSessionID ?? "",
+        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree, pr: d.row.pr }),
+      )
+      if (ok) {
+        d.consumeComments()
+        await d.refreshBodyBaseline()
+        saveState(d.state)
+      } else {
+        log(`задача ${shortId}: доревью-промпт не ушёл — следующий тик перепроверит сессию`)
+      }
+      return undefined
+    }
+    case "comments-to-reviewer": {
+      const ok = await promptSession(d.tracked.reviewSessionID ?? "", reviewCommentsPrompt(d.row.rowId, d.fresh))
+      if (ok) {
+        d.consumeComments()
+        saveState(d.state)
+      } else {
+        log(`задача ${shortId}: комменты ревьюверу не ушли — граница не сдвинута`)
+      }
+      return undefined
+    }
+    case "return-to-dev": {
+      const devLiveness = d.tracked.sessionID === "" ? "dead" : await sessionLiveness(d.tracked.sessionID)
+      if (devLiveness === "alive") {
+        const ok = await promptSession(d.tracked.sessionID, reviewReturnPrompt(d.row.rowId))
+        if (!ok) log(`задача ${shortId}: возврат из ревью — промпт девелоперу не ушёл`)
+        return undefined
+      }
+      if (devLiveness === "unknown") {
+        // транзиентная ошибка REST — не плодим дубли сессий, следующий тик перепроверит
+        log(`задача ${shortId}: возврат из ревью, живость девелопера неизвестна — пропуск`)
+        return undefined
+      }
+      // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
+      // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер.
+      // startTask заменяет запись state — дальше по циклу не идём:
+      // свежая сессия уже получила spawn-промпт со всем контекстом
+      const savedReview = d.tracked.reviewSessionID
+      const savedReviewAttempts = d.tracked.reviewAttempts
+      try {
+        await startTask(d.row, d.project, d.cfg, d.state, d.tracked.attempts)
+        const reborn = d.state.tasks[d.row.rowId]
+        if (reborn !== undefined && savedReview !== undefined) {
+          reborn.reviewSessionID = savedReview
+          reborn.reviewAttempts = savedReviewAttempts
+          saveState(d.state)
+        }
+        log(`задача ${shortId}: возврат из ревью при мёртвом девелопере — рестарт сессии`)
+      } catch (e) {
+        await registerFailure(d.row, d.project, d.board, d.state, d.tracked.attempts, e)
+      }
+      return "skip-rest"
+    }
+    case "noop":
+      return undefined
   }
 }
 
@@ -590,7 +682,8 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
-    // запись (девелопер неизвестен) + спавн ревьювера
+    // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
+    // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
     const comments = (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID))
     const last = comments.length > 0
       ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
@@ -600,6 +693,8 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       bodyDoc: task.bodyDoc, title: task.title, project: projectName,
       lastCommentAt: last?.createdAt ?? 0, lastCommentId: last?.id ?? "",
       createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
+      lastStatus: task.status,
+      bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
     }
     state.tasks[task.rowId] = entry
     try {
@@ -656,72 +751,11 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       if (updated !== null) tracked.bodyUpdated = updated
     }
 
-    switch (action.t) {
-      case "spawn-reviewer": {
-        const seed = tracked.reviewAttempts ?? 0
-        try {
-          await startReview(row, tracked.project || projectName, cfg, state, action.kind, tracked)
-          consumeComments()
-          await refreshBodyBaseline()
-          saveState(state)
-        } catch (e) {
-          await failReview(row, board, tracked, state, seed, e)
-        }
-        break
-      }
-      case "rerun-reviewer": {
-        const worktree = action.kind === "result" ? await resolveWorktree(cfg.local, row.branch) : ""
-        const ok = await promptSession(
-          tracked.reviewSessionID ?? "",
-          reviewRerunPrompt(rowId, action.kind, { branch: row.branch, worktree, pr: row.pr }),
-        )
-        if (ok) {
-          consumeComments()
-          await refreshBodyBaseline()
-          saveState(state)
-        } else {
-          log(`задача ${rowId.slice(0, 8)}: доревью-промпт не ушёл — следующий тик перепроверит сессию`)
-        }
-        break
-      }
-      case "comments-to-reviewer": {
-        const ok = await promptSession(tracked.reviewSessionID ?? "", reviewCommentsPrompt(rowId, fresh))
-        if (ok) {
-          consumeComments()
-          saveState(state)
-        } else {
-          log(`задача ${rowId.slice(0, 8)}: комменты ревьюверу не ушли — граница не сдвинута`)
-        }
-        break
-      }
-      case "return-to-dev": {
-        const devLiveness = tracked.sessionID === "" ? "dead" : await sessionLiveness(tracked.sessionID)
-        if (devLiveness === "alive") {
-          const ok = await promptSession(tracked.sessionID, reviewReturnPrompt(rowId))
-          if (!ok) log(`задача ${rowId.slice(0, 8)}: возврат из ревью — промпт девелоперу не ушёл`)
-        } else {
-          // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
-          // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер
-          const savedReview = tracked.reviewSessionID
-          const savedReviewAttempts = tracked.reviewAttempts
-          try {
-            await startTask(row, tracked.project || projectName, cfg, state, tracked.attempts)
-            const reborn = state.tasks[rowId]
-            if (reborn !== undefined && savedReview !== undefined) {
-              reborn.reviewSessionID = savedReview
-              reborn.reviewAttempts = savedReviewAttempts
-              saveState(state)
-            }
-            log(`задача ${rowId.slice(0, 8)}: возврат из ревью при мёртвом девелопере — рестарт сессии`)
-          } catch (e) {
-            await registerFailure(row, tracked.project || projectName, board, state, tracked.attempts, e)
-          }
-        }
-        break
-      }
-      case "noop":
-        break
-    }
+    const skipRest = await dispatchReviewAction(action, {
+      row, tracked, project: tracked.project || projectName, cfg, board, state, fresh,
+      consumeComments, refreshBodyBaseline,
+    })
+    if (skipRest === "skip-rest") continue
 
     // запоминаем наблюдённый статус — граница перехода для след. тика
     if (tracked.lastStatus !== row.status) {

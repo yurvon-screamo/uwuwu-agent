@@ -9,6 +9,7 @@ import {
   isUserComment,
   snapshotText,
   worktreePaths,
+  worktreeByBranch,
   isValidTracked,
   reviewKindOf,
   reviewSpawnPrompt,
@@ -305,5 +306,36 @@ describe("isValidTracked: ревью-поля", () => {
     expect(isValidTracked({ ...base, reviewSessionID: "junk" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: "1" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: 2 })).toBe(true)
+  })
+})
+
+describe("worktreeByBranch", () => {
+  const porcelain = [
+    "worktree /home/x/origa",
+    "HEAD abc",
+    "branch refs/heads/master",
+    "",
+    "worktree /home/x/origa-wt-commits",
+    "HEAD def",
+    "branch refs/heads/work/auto-atomic-commits",
+    "",
+    "worktree /home/x/origa-wt-x",
+    "HEAD 123",
+    "branch refs/heads/fix-x",
+    "",
+  ].join("\n")
+  test("точное совпадение имени ветки", () => {
+    expect(worktreeByBranch(porcelain, "fix-x")).toBe("/home/x/origa-wt-x")
+    expect(worktreeByBranch(porcelain, "work/auto-atomic-commits")).toBe("/home/x/origa-wt-commits")
+    expect(worktreeByBranch(porcelain, "master")).toBe("/home/x/origa")
+  })
+  test("суффикс-подстрока чужой ветки не матчится", () => {
+    expect(worktreeByBranch(porcelain, "commits")).toBe("")
+    expect(worktreeByBranch(porcelain, "x")).toBe("")
+    expect(worktreeByBranch(porcelain, "auto-atomic-commits")).toBe("")
+  })
+  test("пустая ветка и отсутствие ветки — пустой результат", () => {
+    expect(worktreeByBranch(porcelain, "")).toBe("")
+    expect(worktreeByBranch("worktree /a\nHEAD z\nbare", "nope")).toBe("")
   })
 })

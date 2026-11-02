@@ -61,6 +61,19 @@ export const REVIEW_RESULT_STATUS = "Ревью результата"
 
 export type ReviewKind = "plan" | "result"
 
+/** Ворктри задачи по Branch-ячейке из `git worktree list --porcelain`.
+ *  Точное сравнение refs/heads/<branch> — суффикс-матч ловил чужие ветки
+ *  (commits совпадал с auto-atomic-commits). */
+export function worktreeByBranch(porcelain: string, branch: string): string {
+  if (branch === "") return ""
+  let worktree = ""
+  for (const line of porcelain.split("\n")) {
+    if (line.startsWith("worktree ")) worktree = line.slice("worktree ".length)
+    else if (line === `branch refs/heads/${branch}` && worktree !== "") return worktree
+  }
+  return ""
+}
+
 /** Ревью-статус → вид ревью; null — обычный статус (мяч у девелопера/юзера). */
 export function reviewKindOf(status: string): ReviewKind | null {
   if (status === REVIEW_PLAN_STATUS) return "plan"
