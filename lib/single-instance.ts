@@ -56,6 +56,15 @@ export function acquireLock(opts: {
  *  onStop лока взводит флаг; тик доезжает, цикл видит isStopping() и выходит
  *  сам. sleep() режет интервал на шаги по 0.5с — SIGTERM между тиками даёт
  *  чистый выход за шаг, а не через grace-килл (оптимизация латентности). */
+export interface Drain {
+  /** Взвести флаг останова (передавать как onStop лока). */
+  stop(): void
+  /** Флаг останова взведён — циклу пора на чистый выход. */
+  isStopping(): boolean
+  /** Сон до totalMs с выходом сразу после взведения флага. */
+  sleep(totalMs: number): Promise<void>
+}
+
 export function makeDrain(): Drain {
   let stopping = false
   return {
@@ -67,13 +76,4 @@ export function makeDrain(): Drain {
       }
     },
   }
-}
-
-export interface Drain {
-  /** Взвести флаг останова (передавать как onStop лока). */
-  stop(): void
-  /** Флаг останова взведён — циклу пора на чистый выход. */
-  isStopping(): boolean
-  /** Сон до totalMs с выходом сразу после взведения флага. */
-  sleep(totalMs: number): Promise<void>
 }

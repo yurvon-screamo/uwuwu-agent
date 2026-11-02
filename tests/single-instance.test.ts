@@ -91,7 +91,7 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
     await a.proc.exited
     expect(existsSync(join(a.stateDir, "lock"))).toBeTrue() // stale остался
 
-    // общий stateDir: mkdir падает, pid-проверка даёт ESRCH — ветка перехвата
+    // общий stateDir: mkdir lockDir даёт EEXIST от stale, pid мёртв (ESRCH) — ветка перехвата
     const b = await spawnChild("hold", a.stateDir)
     children.push(b)
     expect(existsSync(b.ready)).toBeTrue()
