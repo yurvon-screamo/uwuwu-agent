@@ -47,7 +47,6 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
-const RUN_TIMEOUT_MS = 15 * 60_000 // ход дольше — отпускаем и говорим юзеру
 const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных попыток хода подряд
 const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
 const BROKEN_SESSION_RESET = 3 // оборванных финалов подряд → пересоздание сессии
@@ -65,7 +64,7 @@ const HELP = [
   "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
   "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
   "Пиши хоть потоком: склею всё в одну заявку через минуту после последнего сообщения (успей отредактировать — правки подхватятся, пока не начал разбирать).",
-  "/reset — начать диалог заново с чистого контекста (методичка всегда актуальная).",
+  "/reset — стоп-кран: сбросить сессию и висящий ход, начать диалог с чистого контекста.",
 ].join("\n")
 
 interface Cfg { token: string; owner: string; model?: { providerID: string; id: string } }
@@ -384,7 +383,8 @@ const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"
 }
 
 /** Дождаться финала хода (поллинг состояния сессии — как reconcile хаба):
- *  outcome выставлен и idle новее старта хода → ход завершён. */
+ *  outcome выставлен и idle новее старта хода → ход завершён. Таймаута нет:
+ *  ход живёт столько, сколько живёт; стоп-кран один и ручной — /reset. */
 const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   while (true) {
     if (stopping) return "stopping"
@@ -396,11 +396,6 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
     }
     if (st === "done") {
       await deliverFinal(run) // критическая секция: stopping не проверяем — доезжаем
-      return "done"
-    }
-    if (Date.now() - run.startedAt > RUN_TIMEOUT_MS) {
-      await send(run.req.chatID, `⚠️ Не дождался ответа за ${Math.round(RUN_TIMEOUT_MS / 60_000)} мин — ход мог зависнуть; задача могла завестись частично, проверь доску`)
-      log(`ход ${run.sessionID}: таймаут — отпустил`)
       return "done"
     }
     await sleep(POLL_SEC * 1000)
@@ -628,16 +623,17 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
   if (out.kind === "help") {
     await send(state.chatID, HELP)
   } else if (out.kind === "reset") {
-    if (state.run !== undefined) {
-      await send(state.chatID, "⏳ Сейчас разбираю сообщение — пришли /reset после моего ответа.")
-    } else {
-      state.session = undefined
-      state.pausedUntil = undefined
-      state.broken = 0
-      save()
-      log("сессия диалога сброшена командой /reset")
-      await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста.")
-    }
+    // стоп-кран: работает ВСЕГДА, включая висящий ход (очередь при этом
+    // сохраняется — сообщения поднимутся в новой сессии)
+    const wasRunning = state.run !== undefined
+    state.run = undefined
+    state.firing = undefined
+    state.session = undefined
+    state.pausedUntil = undefined
+    state.broken = 0
+    save()
+    log(`сессия диалога сброшена /reset${wasRunning ? " (сброшен и активный ход)" : ""}`)
+    await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста (очередь сообщений сохранена).")
   } else if (out.kind === "media") {
     await send(state.chatID, "⚠️ Такой тип медиа не разбираю (голос/видео/стикер) — опиши словами или пришли фото/файл")
   } else if (out.kind === "edit") {
