@@ -98,7 +98,7 @@ export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): 
     .query(
       `SELECT id, title, directory, agent, parent_id, time_created, time_updated
        FROM session_v2
-       WHERE COALESCE(agent, '') != 'dreamer'
+       WHERE COALESCE(agent, '') NOT IN ('dreamer', 'code-quality-reviewer')
          AND parent_id IS NULL
          AND time_updated < ?
        ORDER BY time_updated DESC
@@ -216,7 +216,7 @@ export function markBacklog(db: Database, state: DreamerState, cutoffMs: number)
   const rows = db
     .query(
       `SELECT id, time_updated FROM session_v2
-       WHERE COALESCE(agent, '') != 'dreamer'
+       WHERE COALESCE(agent, '') NOT IN ('dreamer', 'code-quality-reviewer')
          AND parent_id IS NULL
          AND time_updated < ?`,
     )
