@@ -1,4 +1,4 @@
-﻿﻿# uwuwu-dreamer: автозапуск на Windows через Task Scheduler.
+﻿# uwuwu-dreamer: автозапуск на Windows через Task Scheduler.
 #
 # Регистрирует задачу "\UWUWU\Dreamer": вечный тик каждую минуту (TimeTrigger
 # с Repetition, старт от момента установки) + старт при логоне юзера.
@@ -23,6 +23,11 @@
 # Дубли не страшны и на других слоях: IgnoreNew в самой задаче, а single-instance
 # lock в dreamer.ts отсекает запуски ВНЕ задачи (ручные, параллельные) — второй
 # инстанс тихо выходит (exit 1).
+#
+# Наблюдаемость: в стационаре (демон жив) LastTaskResult задачи — постоянный
+# 0x800710E0: каждый минутный тик отсекается IgnoreNew. Это НОРМА, не ошибка —
+# не хорони живого демона по этому коду; здоровье проверяй по процессу
+# (bun.exe с dreamer.ts) и свежести ~/.local/share/opencode/log/uwuwu-dreamer.log.
 #
 # Использование:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-autostart.ps1          # зарегистрировать
