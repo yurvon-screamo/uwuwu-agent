@@ -13,6 +13,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeF
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "./mcp"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -60,7 +61,6 @@ const PROJECTS: Record<string, ProjectCfg> = {
 }
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-factory")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
@@ -87,36 +87,10 @@ function rotateLog(): void {
   } catch {}
 }
 
-// ——— одиночный инстанс: lock-каталог + pid, самоосвобождение по SIGTERM ———
+// ——— одиночный инстанс ———
 
-function acquireLock(): boolean {
-  mkdirSync(STATE_DIR, { recursive: true })
-  try {
-    mkdirSync(LOCK_DIR, { recursive: false })
-  } catch {
-    try {
-      const pid = Number(readFileSync(join(LOCK_DIR, "pid"), "utf-8").trim())
-      if (Number.isInteger(pid)) {
-        process.kill(pid, 0)
-        return false
-      }
-    } catch { /* pid-файла нет или процесс мёртв — захватываем брошенный lock */ }
-    try {
-      rmSync(LOCK_DIR, { recursive: true, force: true })
-      mkdirSync(LOCK_DIR, { recursive: false })
-    } catch {
-      return false
-    }
-  }
-  writeFileSync(join(LOCK_DIR, "pid"), String(process.pid))
-  const release = (): void => {
-    try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch {}
-    process.exit(0)
-  }
-  process.on("SIGTERM", release)
-  process.on("SIGINT", release)
-  return true
-}
+// onStop лока взводит флаг: проход доезжает до границы, новую работу не спавним
+const drain = makeDrain()
 
 // ——— состояние (валидация + атомарная запись) ———
 
@@ -399,6 +373,8 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 // ——— жизненный цикл задачи ———
 
 async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
+  // стоп-сигнал: не спавним новую работу — задача доедет при следующем старте
+  if (drain.isStopping()) return
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
   // сессия стартует в основном чекауте репо
   // тайтл: линкованная строка несёт заголовок в доке-теле — деривируем из него
@@ -633,7 +609,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
 let tickCount = 0
 
 async function main(): Promise<void> {
-  if (!acquireLock()) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
   }
@@ -645,6 +621,7 @@ async function main(): Promise<void> {
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {
     for (const [name, cfg] of Object.entries(PROJECTS)) {
+      if (drain.isStopping()) break
       try {
         await tickProject(state, name, cfg)
       } catch (e) {
@@ -657,7 +634,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    await new Promise((r) => setTimeout(r, POLL_SEC * 1000))
+    if (drain.isStopping()) {
+      log("стоп-сигнал: проход доехал — выходим")
+      process.exit(0)
+    }
+    await drain.sleep(POLL_SEC * 1000)
   }
 }
 

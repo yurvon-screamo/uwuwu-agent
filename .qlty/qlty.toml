@@ -97,3 +97,10 @@ name = "shellcheck"
 
 [[plugin]]
 name = "trufflehog"
+
+[[plugin]]
+name = "biome"
+# lint-only: fmt-драйвер переформатирует репо целиком — не в этом срезе
+drivers = [
+  "lint",
+]
