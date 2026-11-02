@@ -74,6 +74,14 @@ name = "osv-scanner"
 name = "radarlint-python"
 mode = "comment"
 
+# Тест-харнесс MCP-контракта: bandit не применим (assert — механика
+# проверок B101, subprocess/tmp — e2e-инфраструктура B404/B603/B108);
+# radarlint S5754 требует bare raise в except — тест переводит SystemExit
+# старого контракта в ясный провал теста, bare raise здесь неверен
+[[exclude]]
+plugins = ["bandit", "radarlint-python"]
+file_patterns = ["tools/test_mcp_errors.py"]
+
 [[plugin]]
 name = "ripgrep"
 mode = "comment"

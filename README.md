@@ -8,7 +8,7 @@
 opencodereview/ правила ревью
 agents/        субагенты: code-quality-reviewer, developer, dreamer
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        29 скиллов (см. ниже)
+skills/        31 скилл (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.cargo/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
 cron/          uwuwu-cron — демон кронов (доски «Кроны <Proj>» → сессии агентов)
@@ -22,14 +22,15 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (28)
+## Скиллы (31)
 
 - **Architect (1)**: architect-ui-ux
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
 - **Workflows (4)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review
 - **Office (4)**: docx · pdf · pptx · xlsx
 - **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
-- **Integrations (2)**: hf-cli · use-railway
+- **Visual (1)**: visual-diagrams
+- **Integrations (4)**: bunny-cli · hf-cli · stitch · use-railway
 
 ## Установка
 

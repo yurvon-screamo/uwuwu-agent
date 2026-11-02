@@ -30,7 +30,15 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import MCP_TOKEN, MCP_URL, WORKSPACE, get_md, mcp_call, mcp_result
+from triage_affine import (
+    MCP_TOKEN,
+    MCP_URL,
+    McpError,
+    WORKSPACE,
+    get_md,
+    mcp_call,
+    mcp_result,
+)
 
 RETRIES = 8
 PAUSE = 120
@@ -59,10 +67,10 @@ def _save_session(sid: str) -> None:
 
 def _handshake(client_name: str = "wiki-ops") -> str:
     """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
-    (HTTP 503, URLError/timeout); фатальные SystemExit от mcp_result
-    (isError/JSON-RPC error) — сразу наверх с причиной. client_name виден
-    на уровне ПРОТОКОЛА (initialize.clientInfo, MCP-трейс/инспектор);
-    stdout шлюза логирует только UUID сессий."""
+    (HTTP 503, URLError/timeout); McpError от mcp_result
+    (isError/JSON-RPC error) — фатально, сразу наверх с причиной.
+    client_name виден на уровне ПРОТОКОЛА (initialize.clientInfo,
+    MCP-трейс/инспектор); stdout шлюза логирует только UUID сессий."""
     for attempt in range(RETRIES):
         sid = None
         try:
@@ -74,11 +82,11 @@ def _handshake(client_name: str = "wiki-ops") -> str:
                     "clientInfo": {"name": client_name, "version": "1"},
                 },
             )
-            mcp_result(resp)  # SystemExit здесь = фатально, не ретраим
+            mcp_result(resp)  # McpError здесь = фатально, не ретраим
             mcp_call("notifications/initialized", {}, sid, notify=True)
             _save_session(sid)
             return sid
-        except SystemExit:
+        except McpError:
             if sid:
                 close(sid)
             raise
@@ -138,14 +146,27 @@ def close(sid: str) -> None:
         pass
 
 
+def _call_tool(sid: str, name: str, args: dict) -> dict:
+    """tools/call + валидация ответа. McpError ре-рейзится с префиксом имени
+    инструмента — погибший шаг серии виден в логе обвязки. Ошибка handshake
+    (initialize при пере-handshake) сюда не заворачивается и уходит без
+    префикса — атрибуция места отказа честная."""
+    try:
+        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, sid)
+        return mcp_result(r)
+    except McpError as e:
+        raise McpError(f"{name}: {e}") from e
+
+
 def call(sid: str, name: str, args: dict) -> dict:
     """tools/call с восстановлением протухшей сессии: 400/404 → один
     пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
-    call(старый_sid,...) продолжают работать."""
+    call(старый_sid,...) продолжают работать. Ошибки контракта приходят с
+    префиксом имени инструмента (см. _call_tool)."""
     global _live_sid
     effective = _live_sid or sid
     try:
-        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, effective)
+        return _call_tool(effective, name, args)
     except urllib.error.HTTPError as e:
         if e.code not in (400, 404):
             raise
@@ -154,8 +175,7 @@ def call(sid: str, name: str, args: dict) -> dict:
             "wiki-ops: сессия протухла — пере-handshake", file=sys.stderr, flush=True
         )
         _live_sid = _handshake()
-        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, _live_sid)
-    return mcp_result(r)
+        return _call_tool(_live_sid, name, args)
 
 
 def deep_md(o):
@@ -542,4 +562,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)
