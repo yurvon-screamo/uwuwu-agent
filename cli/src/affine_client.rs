@@ -69,9 +69,11 @@ impl AffineConfig {
 
 /// Повторяемость операции по имени тулзы. Чтение идемпотентно — ретраится
 /// всегда; запись ретраится только когда шлюз ГАРАНТИРОВАННО не применял
-/// запрос (отказ до обработки, 429/5xx, ok:false+retryable). Таймаут/обрыв
-/// для записи — Fatal: ответ потерян, операция могла примениться, повтор
-/// продублировал бы контент (идемпотентность create — отдельная задача).
+/// запрос: отказ до обработки (429/5xx, WRITE_QUEUE_*), rate_limited;
+/// ok:false+retryable:true на записи доверяется только этим кодам (ADR-006).
+/// Таймаут/обрыв для записи — Fatal: ответ потерян, операция могла
+/// примениться, повтор продублировал бы контент (идемпотентность create —
+/// отдельная задача).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OpKind {
     Read,
@@ -90,6 +92,29 @@ fn op_kind(tool: &str) -> OpKind {
     } else {
         OpKind::Write
     }
+}
+
+/// ok:false-фейл шлюза: человекочитаемый detail + флаг + код классификации.
+struct ToolFailure {
+    detail: String,
+    retryable: bool,
+    code: Option<String>,
+}
+
+/// Коды, при которых шлюз по построению НЕ применял запрос к AFFiNE, поэтому
+/// ok:false+retryable:true на записи доверяем (ADR-006): WRITE_QUEUE_* —
+/// операция ждала в per-scope очереди и не была отправлена; rate_limited —
+/// отклонено лимитером до обработки. Остальные true-коды для записи не
+/// доверяются: DOCUMENT_MOVE_PARTIAL — частично применён; doc_trash_failed/
+/// doc_restore_failed по socket-таймауту и notification_update_failed —
+/// могли примениться. Неизвестный код = не доверяем (safe default: новый
+/// safe-код апстрима теряет ретрай, но запись не дублируется). Список
+/// синхронен _WRITE_TRUSTED_CODES в tools/wiki_ops.py.
+fn write_retryable_trusted(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("WRITE_QUEUE_TIMEOUT") | Some("WRITE_QUEUE_FULL") | Some("rate_limited")
+    )
 }
 
 /// Конфиг повторов из env; мусорное значение → warning + дефолт, значения
@@ -418,7 +443,8 @@ impl AffineClient {
 
     /// Call a gateway tool; returns its structured output (or the parsed
     /// text payload when the server sent no structuredContent).
-    /// Ретраи: транспорт (connect/429/5xx) и ok:false+retryable — всегда;
+    /// Ретраи: транспорт (connect/429/5xx) — всегда; ok:false+retryable —
+    /// чтению всегда, записи только при доверенном коде (ADR-006);
     /// таймаут/обрыв — только чтение (запись могла примениться).
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
         let retry = RetryConfig::from_env();
@@ -452,11 +478,27 @@ impl AffineClient {
                 Ok(resp) => match Self::tool_failure(name, &resp) {
                     // повторяемого сбоя нет — извлекаем результат
                     None => return Self::tool_result(name, &resp),
-                    Some((detail, true)) => {
-                        last_err = Some(anyhow!("tool {name} failed: {detail}"));
-                    }
-                    Some((detail, false)) => {
-                        return Err(anyhow!("tool {name} failed: {detail}"));
+                    Some(failure) => {
+                        let trusted = match op {
+                            OpKind::Read => failure.retryable,
+                            OpKind::Write => {
+                                failure.retryable
+                                    && write_retryable_trusted(failure.code.as_deref())
+                            }
+                        };
+                        if trusted {
+                            last_err = Some(anyhow!("tool {name} failed: {}", failure.detail));
+                        } else if failure.retryable {
+                            return Err(anyhow!(
+                                "tool {name} failed: {} — retryable:true от шлюза для записи \
+                                 не доверяется (код {:?} вне whitelist, операция могла примениться; \
+                                 см. ADR-006 uwuwu)",
+                                failure.detail,
+                                failure.code.as_deref().unwrap_or("<нет кода>")
+                            ));
+                        } else {
+                            return Err(anyhow!("tool {name} failed: {}", failure.detail));
+                        }
                     }
                 },
                 Err(GatewayError::StaleSession(e)) if !stale_retried => {
@@ -499,33 +541,44 @@ impl AffineClient {
     }
 
     /// ok:false — шлюзовая конвенция логических фейлов. Проверяем в ОБОИХ
-    /// местах: поле result верхнего уровня и внутри content[0].text-блоба.
-    /// retryable:true = шлюз классифицировал сбой как транзиентный; контракт
-    /// (задача W9etJF1FVm): true ⇒ запрос гарантированно не применён.
-    fn tool_failure(name: &str, body: &Value) -> Option<(String, bool)> {
+    /// местах: поле result верхнего уровня и внутри content[0].text-блоба
+    /// (шлюз строит их из одного объекта — расхождений не бывает).
+    /// retryable:true трактуется по op_kind: чтению доверяем всегда, записи —
+    /// только при коде из whitelist (ADR-006): у части write-путей шлюза
+    /// (частичный move, trash по socket-таймауту) флаг true означает «мог
+    /// примениться», и клиентский повтор продублировал бы контент.
+    fn tool_failure(name: &str, body: &Value) -> Option<ToolFailure> {
         let payload = body.get("result")?;
         if payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some((
-                format!("tool {name} failed: {}", ok_false_detail(payload)),
-                payload
+            return Some(ToolFailure {
+                detail: format!("tool {name} failed: {}", ok_false_detail(payload)),
+                retryable: payload
                     .get("retryable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
-            ));
+                code: payload
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            });
         }
         let text = payload.get("content")?.get(0)?.get("text")?.as_str()?;
         let parsed = serde_json::from_str::<Value>(text).ok()?;
         if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some((
-                format!(
+            return Some(ToolFailure {
+                detail: format!(
                     "tool {name} failed (text payload): {}",
                     ok_false_detail(&parsed)
                 ),
-                parsed
+                retryable: parsed
                     .get("retryable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
-            ));
+                code: parsed
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            });
         }
         None
     }
@@ -934,27 +987,57 @@ mod tests {
         // top-level structuredContent
         let body = json!({
             "jsonrpc": "2.0", "id": 1,
-            "result": {"ok": false, "error": "перегрузка", "retryable": true}
+            "result": {"ok": false, "error": "перегрузка", "retryable": true, "code": "upstream_unavailable"}
         });
-        let (detail, retryable) = AffineClient::tool_failure("list_docs", &body).unwrap();
-        assert!(detail.contains("перегрузка") && retryable);
+        let f = AffineClient::tool_failure("list_docs", &body).unwrap();
+        assert!(f.detail.contains("перегрузка") && f.retryable);
+        assert_eq!(f.code.as_deref(), Some("upstream_unavailable"));
         // text-blob
         let blob = json!({
             "jsonrpc": "2.0", "id": 1,
-            "result": {"content": [{"type": "text", "text": "{\"ok\": false, \"error\": \"гонка\", \"retryable\": true}"}]}
+            "result": {"content": [{"type": "text", "text": "{\"ok\": false, \"error\": \"гонка\", \"retryable\": true, \"code\": \"WRITE_QUEUE_TIMEOUT\"}"}]}
         });
-        let (detail, retryable) = AffineClient::tool_failure("read_doc", &blob).unwrap();
-        assert!(detail.contains("text payload") && detail.contains("гонка") && retryable);
+        let f = AffineClient::tool_failure("read_doc", &blob).unwrap();
+        assert!(f.detail.contains("text payload") && f.detail.contains("гонка") && f.retryable);
+        assert_eq!(f.code.as_deref(), Some("WRITE_QUEUE_TIMEOUT"));
         // без флага — не ретраим
         let plain = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"ok": false, "error": "нет прав"}
         });
-        let (_, retryable) = AffineClient::tool_failure("list_docs", &plain).unwrap();
-        assert!(!retryable);
+        let f = AffineClient::tool_failure("list_docs", &plain).unwrap();
+        assert!(!f.retryable && f.code.is_none());
         // успешный ответ — None
         let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "answer": 1}});
         assert!(AffineClient::tool_failure("list_docs", &ok).is_none());
+    }
+
+    #[test]
+    fn write_retryable_trusted_only_for_gateway_guaranteed_codes() {
+        // доверенные: запрос гарантированно не применён (ADR-006)
+        for code in ["WRITE_QUEUE_TIMEOUT", "WRITE_QUEUE_FULL", "rate_limited"] {
+            assert!(
+                write_retryable_trusted(Some(code)),
+                "{code} должен быть доверенным"
+            );
+        }
+        // нарушители гарантии (аудит шлюза 3.10.2/3.11.0)
+        for code in [
+            "DOCUMENT_MOVE_PARTIAL",
+            "doc_trash_failed",
+            "doc_restore_failed",
+            "notification_update_failed",
+            "tool_error",
+            "upstream_unavailable",
+        ] {
+            assert!(
+                !write_retryable_trusted(Some(code)),
+                "{code} не должен быть доверенным"
+            );
+        }
+        // неизвестный код / его отсутствие — не доверяем
+        assert!(!write_retryable_trusted(Some("future_upstream_code")));
+        assert!(!write_retryable_trusted(None));
     }
 
     #[test]
@@ -962,7 +1045,7 @@ mod tests {
         // смоделированные «процессы»: разные seed — разные базы
         let mut a = XorShift64::seeded(0xDEAD_BEEF);
         let mut b = XorShift64::seeded(0xDEAD_BEEF + 1);
-        let base_of = |rng: &mut XorShift64| rng.next_u64() % (1u64 << 52) | 1;
+        let base_of = |rng: &mut XorShift64| (rng.next_u64() % (1u64 << 52)) | 1;
         let (base_a, base_b) = (base_of(&mut a), base_of(&mut b));
         assert_ne!(base_a, base_b);
         // JS-safe: шлюз на JS, id > 2^53 теряют точность (живой 400)
