@@ -651,19 +651,25 @@ def main() -> int:
     ch = sub.add_parser("children")
     ch.add_argument("id")
     a = p.parse_args()
-    return {
-        "create": cmd_create,
-        "move": cmd_move,
-        "append": cmd_append,
-        "replace": cmd_replace,
-        "export": cmd_export,
-        "find": cmd_find,
-        "children": cmd_children,
-        "orgls": cmd_orgls,
-        "embed": cmd_embed,
-        "org": cmd_org,
-        "link": cmd_link,
-    }[a.cmd](a)
+    try:
+        return {
+            "create": cmd_create,
+            "move": cmd_move,
+            "append": cmd_append,
+            "replace": cmd_replace,
+            "export": cmd_export,
+            "find": cmd_find,
+            "children": cmd_children,
+            "orgls": cmd_orgls,
+            "embed": cmd_embed,
+            "org": cmd_org,
+            "link": cmd_link,
+        }[a.cmd](a)
+    except McpError as e:
+        # контракт docstring McpError: exit-код — забота CLI-точки входа;
+        # 2 = отказ шлюза (в отличие от 1 — наших валидационных отказов до мутаций)
+        print(f"!! {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
