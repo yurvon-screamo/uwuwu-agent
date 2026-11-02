@@ -1,4 +1,5 @@
 pub mod affine_blob;
+pub mod affine_children;
 pub mod affine_client;
 pub mod affine_collect;
 pub mod affine_docs;

@@ -65,7 +65,9 @@ impl MockGateway {
 
     /// Хоть один запрос вызова указанного тулла.
     pub fn called(&self, tool: &str) -> bool {
-        self.requests().iter().any(|r| r.contains(&format!("\"{tool}\"")))
+        self.requests()
+            .iter()
+            .any(|r| r.contains(&format!("\"{tool}\"")))
     }
 }
 

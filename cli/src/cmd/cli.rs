@@ -93,6 +93,12 @@ pub(crate) enum TaskSub {
         #[arg(long)]
         replace: bool,
     },
+    /// Удалить задачу: строка вниз + тело в трэш (восстановимо restore_doc).
+    /// Тело без строки (сирота упавшего create) — трэш по docId.
+    Rm {
+        #[arg(help = "row-id / doc-id / префикс")]
+        id: String,
+    },
 }
 
 /// Кроны на доске Crons: агентские отложенные/периодические работы.

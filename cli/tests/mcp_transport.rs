@@ -2,9 +2,7 @@
 
 mod common;
 
-use common::{
-    session_file, test_cfg, with_temp_home, MockGateway, Step, CALL_OK, INIT, NOTIFIED,
-};
+use common::{session_file, test_cfg, with_temp_home, MockGateway, Step, CALL_OK, INIT, NOTIFIED};
 use serde_json::json;
 use uwuwu_cli::affine_client::AffineClient;
 

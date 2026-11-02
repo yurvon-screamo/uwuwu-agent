@@ -49,6 +49,7 @@ pub(crate) async fn run(
             create(
                 &mut client,
                 cfg,
+                root,
                 &board,
                 CreateArgs {
                     title,
@@ -102,6 +103,7 @@ pub(crate) async fn run(
         TaskSub::Close { id, note } => {
             close_task(&mut client, cfg, root, &project, CloseArgs { id, note }).await
         }
+        TaskSub::Rm { id } => rm(&mut client, cfg, root, &board, &id).await,
         TaskSub::Body {
             id,
             md,
@@ -160,6 +162,7 @@ struct BodyArgs {
 async fn create(
     client: &mut AffineClient,
     cfg: &AffineConfig,
+    root: &std::path::Path,
     board: &affine_tasks::Board,
     args: CreateArgs,
 ) -> anyhow::Result<()> {
@@ -177,14 +180,42 @@ async fn create(
     } else {
         String::new()
     };
-    let row = affine_tasks::create_task(client, cfg, board, &args.title, &body, task_type).await?;
-    println!("создана: {}", row.title);
+    let (row, outcome) =
+        affine_tasks::create_task(client, cfg, board, root, &args.title, &body, task_type).await?;
+    match outcome {
+        affine_tasks::CreateOutcome::Created => println!("создана: {}", row.title),
+        affine_tasks::CreateOutcome::Recovered => {
+            println!("достроена после сбоя (сирота доски): {}", row.title)
+        }
+    }
     println!("  строка: {}", row.row_id);
     println!("  тело:   {}", row.body_doc);
     // аттачи — после «создана»: сбой не прячет id задачи,
     // ретрай create осознан (задача уже существует)
     if !args.attach.is_empty() {
         crate::affine_blob::attach_files(cfg, &row.body_doc, &args.attach).await?;
+    }
+    Ok(())
+}
+
+/// task rm: строка вниз + тело в трэш (сирота без строки — только трэш).
+async fn rm(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    board: &affine_tasks::Board,
+    id: &str,
+) -> anyhow::Result<()> {
+    let report = affine_tasks::rm_task(client, cfg, board, root, id).await?;
+    if report.row_deleted {
+        println!("строка удалена: {} ({})", report.title, report.doc_id);
+    } else {
+        println!("сирота в трэше: {} ({})", report.title, report.doc_id);
+    }
+    if report.was_in_trash {
+        println!("  тело уже было в трэше");
+    } else if report.body_trashed {
+        println!("  тело отправлено в трэш (восстановимо: restore_doc)");
     }
     Ok(())
 }

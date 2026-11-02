@@ -1,0 +1,561 @@
+//! Интеграционные тесты идемпотентного создания (task create / cron set)
+//! и task rm против mock-шлюза из tests/common.
+//! Сценарии перечисляют RPC в фактическом порядке вызовов: мок
+//! последовательный — каждый запрос снимает следующий Step.
+
+mod common;
+
+use common::{test_cfg, with_temp_home, MockGateway, Step, INIT, NOTIFIED};
+use std::path::Path;
+use uwuwu_cli::affine_client::AffineClient;
+use uwuwu_cli::affine_tasks::{create_cron, create_task, rm_task, Board, CreateOutcome, TaskType};
+
+fn rpc(sc: String) -> Step {
+    let body = format!(r#"{{"jsonrpc":"2.0","id":{{ID}},"result":{{"structuredContent":{sc}}}}}"#);
+    let leaked = Box::leak(body.into_boxed_str());
+    Step(200, None, leaked)
+}
+
+fn rows_json(rows: Vec<String>) -> String {
+    format!(r#"{{"ok":true,"rows":[{}]}}"#, rows.join(","))
+}
+
+fn row_json(row_id: &str, title: &str, linked: &str) -> String {
+    let linked_field = if linked.is_empty() {
+        String::new()
+    } else {
+        format!(r#","linkedDocId":"{linked}""#)
+    };
+    format!(r#"{{"rowBlockId":"{row_id}","title":"{title}"{linked_field}}}"#)
+}
+
+fn children_json(children: Vec<String>) -> String {
+    format!(r#"{{"ok":true,"children":[{}]}}"#, children.join(","))
+}
+
+fn child_json(doc_id: &str, title: &str, in_trash: bool) -> String {
+    format!(r#"{{"docId":"{doc_id}","title":"{title}","inTrash":{in_trash}}}"#)
+}
+
+fn handshake() -> Vec<Step> {
+    vec![Step(200, Some("sess-A"), INIT), Step(202, None, NOTIFIED)]
+}
+
+const REPLACE_OK: &str = r#"{"ok":true}"#;
+const REPLACE_FAIL: &str = r#"{"ok":false,"error":"инцидент"}"#;
+const TAGS_HAVE_DEV: &str = r#"{"tags":[{"name":"Dev"}]}"#;
+const TAG_OK: &str = r#"{"ok":true}"#;
+const NEW_ROW: &str = r#"{"rowBlockId":"row-1"}"#;
+const DOC_NEW: &str = r#"{"docId":"doc-new"}"#;
+const DELETE_OK: &str = r#"{"ok":true}"#;
+const TRASH_OK: &str = r#"{"ok":true,"previouslyInTrash":false,"inTrash":true}"#;
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().unwrap()
+}
+
+#[test]
+fn retry_recovers_orphan_without_second_doc() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-orphan",
+            "Тайтл",
+            false,
+        )])));
+        steps.push(rpc(REPLACE_OK.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let out = rt.block_on(create_task(
+            &mut client,
+            &cfg,
+            &board,
+            Path::new("/tmp"),
+            "Тайтл",
+            "",
+            TaskType::Dev,
+        ));
+        let (row, outcome) = out.unwrap();
+        assert_eq!(outcome, CreateOutcome::Recovered);
+        assert_eq!(row.body_doc, "doc-orphan");
+        assert!(!mock.called("create_doc_from_markdown"));
+        let add_row = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("add_database_row"))
+            .unwrap();
+        assert!(add_row.contains("doc-orphan"), "row request: {add_row}");
+    });
+}
+
+#[test]
+fn duplicate_is_explicit_error_not_silent_reuse() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Тайтл", "doc-1")])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("дубль"), "got: {err}");
+        assert!(err.contains("r1") && err.contains("doc-1"), "got: {err}");
+        assert!(!mock.called("list_children"));
+        assert!(!mock.called("create_doc_from_markdown"));
+        assert!(!mock.called("add_database_row"));
+    });
+}
+
+#[test]
+fn duplicate_by_row_title_even_if_body_is_not_a_child() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Тайтл", "")])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("дубль"), "got: {err}");
+        assert!(err.contains("без тела"), "got: {err}");
+        assert!(!mock.called("list_children"));
+        assert!(!mock.called("create_doc_from_markdown"));
+    });
+}
+
+#[test]
+fn linked_child_is_never_orphaned() {
+    with_temp_home(|| {
+        // строка «Новое» заняла тело doc-1; ретрай со старым тайтлом «Старое»
+        // НЕ должен тронуть занятое тело — свежее создание
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Новое", "doc-1")])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-1",
+            "Старое",
+            false,
+        )])));
+        steps.push(rpc(DOC_NEW.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let (_, outcome) = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Старое",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap();
+        assert_eq!(outcome, CreateOutcome::Created);
+        assert!(!mock.called("replace_doc_with_markdown"));
+        let add_row = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("add_database_row"))
+            .unwrap();
+        assert!(add_row.contains("doc-new"), "row request: {add_row}");
+        assert!(!add_row.contains("doc-1"), "row request: {add_row}");
+    });
+}
+
+#[test]
+fn busy_candidate_excluded_orphan_still_recovered() {
+    with_temp_home(|| {
+        // два ребёнка со старым тайтлом: один занят живой строкой, один свободен
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Новое", "doc-T")])));
+        steps.push(rpc(children_json(vec![
+            child_json("doc-T", "Старое", false),
+            child_json("doc-U", "Старое", false),
+        ])));
+        steps.push(rpc(REPLACE_OK.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let (row, outcome) = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Старое",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap();
+        assert_eq!(outcome, CreateOutcome::Recovered);
+        assert_eq!(row.body_doc, "doc-U");
+        let replace = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("replace_doc_with_markdown"))
+            .unwrap();
+        assert!(replace.contains("doc-U"), "replace request: {replace}");
+        assert!(!replace.contains("doc-T"), "replace request: {replace}");
+        assert!(!mock.called("create_doc_from_markdown"));
+    });
+}
+
+#[test]
+fn ambiguous_bodies_are_explicit_error() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![
+            child_json("doc-A", "Тайтл", false),
+            child_json("doc-B", "Тайтл", false),
+        ])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("несколько тел"), "got: {err}");
+        assert!(err.contains("doc-A") && err.contains("doc-B"), "got: {err}");
+        assert!(!mock.called("create_doc_from_markdown"));
+        assert!(!mock.called("add_database_row"));
+    });
+}
+
+#[test]
+fn fresh_create_regression() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![])));
+        steps.push(rpc(DOC_NEW.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let (row, outcome) = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap();
+        assert_eq!(outcome, CreateOutcome::Created);
+        assert_eq!(row.body_doc, "doc-new");
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|r| r.contains("create_doc_from_markdown"))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn trashed_child_does_not_block_fresh_create() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-dead",
+            "Тайтл",
+            true,
+        )])));
+        steps.push(rpc(DOC_NEW.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let (_, outcome) = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap();
+        assert_eq!(outcome, CreateOutcome::Created);
+    });
+}
+
+#[test]
+fn replace_failure_aborts_before_commit() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-orphan",
+            "Тайтл",
+            false,
+        )])));
+        steps.push(rpc(REPLACE_FAIL.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(create_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "Тайтл",
+                "",
+                TaskType::Dev,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("инцидент"), "got: {err}");
+        assert!(!mock.called("add_database_row"));
+    });
+}
+
+fn run_cron_create(
+    mock: &MockGateway,
+    title: &str,
+) -> Result<(uwuwu_cli::affine_tasks::TaskRow, CreateOutcome), anyhow::Error> {
+    let cfg = test_cfg(mock);
+    let rt = runtime();
+    let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+    let board = Board {
+        doc_id: "board-1".into(),
+        db_id: "db-1".into(),
+    };
+    rt.block_on(create_cron(
+        &mut client,
+        &cfg,
+        &board,
+        Path::new("/tmp"),
+        title,
+        "5m",
+        "# Крон\n",
+    ))
+}
+
+#[test]
+fn cron_set_recovers_orphan() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-orphan",
+            "Крон Т",
+            false,
+        )])));
+        steps.push(rpc(REPLACE_OK.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(NEW_ROW.into()));
+        let mock = MockGateway::start(steps);
+        let (row, outcome) = run_cron_create(&mock, "Крон Т").unwrap();
+        assert_eq!(outcome, CreateOutcome::Recovered);
+        assert_eq!(row.body_doc, "doc-orphan");
+        let add_row = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("add_database_row"))
+            .unwrap();
+        assert!(add_row.contains("doc-orphan"), "row request: {add_row}");
+        assert!(add_row.contains("Schedule") && add_row.contains("active"));
+        assert!(!mock.called("create_doc_from_markdown"));
+    });
+}
+
+#[test]
+fn cron_set_duplicate_is_error() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Крон Т", "doc-1")])));
+        let mock = MockGateway::start(steps);
+        let err = run_cron_create(&mock, "Крон Т").unwrap_err().to_string();
+        assert!(err.contains("дубль"), "got: {err}");
+        assert!(!mock.called("create_doc_from_markdown"));
+        assert!(!mock.called("add_database_row"));
+    });
+}
+
+#[test]
+fn rm_row_path_deletes_row_and_trashes_body() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json("r1", "Задача", "doc-1")])));
+        steps.push(rpc(DELETE_OK.into()));
+        steps.push(rpc(TRASH_OK.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let report = rt
+            .block_on(rm_task(&mut client, &cfg, &board, Path::new("/tmp"), "r1"))
+            .unwrap();
+        assert!(report.row_deleted && report.body_trashed);
+        assert!(!report.was_in_trash);
+        assert!(mock.called("delete_database_row"));
+        assert!(mock.called("trash_doc"));
+    });
+}
+
+#[test]
+fn rm_orphan_path_trashes_body_without_row() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-orph",
+            "Мусор",
+            false,
+        )])));
+        steps.push(rpc(TRASH_OK.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let report = rt
+            .block_on(rm_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "doc-orph",
+            ))
+            .unwrap();
+        assert!(!report.row_deleted);
+        assert!(report.body_trashed);
+        assert!(!mock.called("delete_database_row"));
+    });
+}
+
+#[test]
+fn rm_ambiguous_prefix_is_error() {
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![
+            child_json("doc-1a", "Один", false),
+            child_json("doc-1b", "Два", false),
+        ])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let board = Board {
+            doc_id: "board-1".into(),
+            db_id: "db-1".into(),
+        };
+        let err = rt
+            .block_on(rm_task(
+                &mut client,
+                &cfg,
+                &board,
+                Path::new("/tmp"),
+                "doc-1",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("неоднозначно"), "got: {err}");
+        assert!(!mock.called("trash_doc"));
+    });
+}

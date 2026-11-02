@@ -2,11 +2,15 @@
 //!
 //! Модель (см. док «Фабрика разработки на AFFiNE»): задача = строка
 //! database в доске проекта (`Задачи <Proj>`) + линкованный док-тело с
-//! тегом «Task». Комменты — нативные комменты афины к доку-телу.
+//! тегом-типом (Dev/Spike/Bug; у кронов — Cron). Комменты — нативные
+//! комменты афины к доку-телу. Создание идемпотентно: ретрай после
+//! таймаута достраивает сироту (тело без строки), а не плодит дубли
+//! (см. affine_children::resolve_existing_body).
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::{json, Value};
 
+use crate::affine_children::{resolve_existing_body, ExistingBody};
 use crate::affine_client::{AffineClient, AffineConfig};
 
 /// Тип задачи — тег на теле. Определяет шаблон тела и пайп агента.
@@ -514,29 +518,158 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
     )
 }
 
-/// Создать задачу: док-тело (тег «Task») + строка Todo, слинкованная с телом.
-pub async fn create_task(
+/// Исход создания задачи/крона: свежий или достройка прерванного.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// создано с нуля
+    Created,
+    /// найдена сирота от упавшей попытки — достроена (тело перезаписано
+    /// свежим шаблоном, строка добавлена)
+    Recovered,
+}
+
+/// Сообщение о дубле: row-id и doc-id тела обязательны — ретраящий агент
+/// по ним находит уже созданную задачу (исход «таймаут на commit-point»).
+fn duplicate_message(title: &str, row: &TaskRow, row_count: usize) -> String {
+    let body = if row.body_doc.is_empty() {
+        "без тела".to_string()
+    } else {
+        format!("тело {}", row.body_doc)
+    };
+    let many = if row_count > 1 {
+        format!(" (строк с этим тайтлом: {row_count})")
+    } else {
+        String::new()
+    };
+    format!(
+        "дубль: задача с тайтлом «{title}» уже существует (строка {}, {body}){many} — создание не выполнялось",
+        row.row_id
+    )
+}
+
+/// Заменить тело дока markdown-ом целиком, без конвертации фенсов
+/// (в отличие от replace_body: стартовые шаблоны фенсов не содержат,
+/// свежий путь create_doc_from_markdown их тоже не конвертит).
+async fn replace_doc_raw(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    body_doc: &str,
+    md: &str,
+) -> Result<()> {
+    let resp = client
+        .call_tool(
+            "replace_doc_with_markdown",
+            json!({"workspaceId": cfg.workspace, "docId": body_doc, "markdown": md}),
+        )
+        .await
+        .context("replace_doc_with_markdown")?;
+    if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        bail!(
+            "replace_doc_with_markdown: {}",
+            resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Строка доски, линкованная с телом; Title обязателен, остальное — extra.
+async fn add_linked_row(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     board: &Board,
     title: &str,
-    body_markdown: &str,
-    task_type: TaskType,
+    body_doc: &str,
+    mut extra_cells: serde_json::Map<String, Value>,
 ) -> Result<TaskRow> {
-    // 1. док-тело — ребёнок доски; стартовый костяк по типу задачи
-    let md = task_type.body_template(title, body_markdown);
+    extra_cells.insert("Title".into(), json!(title));
     let resp = client
         .call_tool(
-            "create_doc_from_markdown",
-            json!({"workspaceId": cfg.workspace, "title": title, "markdown": md, "parentDocId": board.doc_id}),
+            "add_database_row",
+            json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
+                   "databaseBlockId": board.db_id,
+                   "cells": extra_cells,
+                   "linkedDocId": body_doc}),
         )
         .await
-        .context("create_doc_from_markdown")?;
-    let body_doc = first_str(&resp, &["docId", "id"])
-        .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
+        .context("add_database_row")?;
+    let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
+    Ok(TaskRow {
+        row_id,
+        title: title.to_string(),
+        body_doc: body_doc.to_string(),
+        ..Default::default()
+    })
+}
 
-    // 2. тег типа (идемпотентно)
-    let tag = task_type.tag();
+/// Создать задачу: док-тело (тег типа) + строка Todo, слинкованная с телом.
+/// Идемпотентно: сирота от упавшей попытки достраивается (Recovered),
+/// живая задача с тем же тайтлом — явная ошибка дубля.
+pub async fn create_task(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    board: &Board,
+    root: &std::path::Path,
+    title: &str,
+    body_markdown: &str,
+    task_type: TaskType,
+) -> Result<(TaskRow, CreateOutcome)> {
+    match resolve_existing_body(client, cfg, board, root, title).await? {
+        ExistingBody::Exists { row, row_count } => {
+            bail!("{}", duplicate_message(title, &row, row_count))
+        }
+        ExistingBody::Ambiguous { doc_ids } => bail!(
+            "на доске несколько тел с тайтлом «{title}» — чисти вручную: {}",
+            doc_ids.join(", ")
+        ),
+        ExistingBody::Orphan { doc_id } => {
+            // достройка: тело — свежий шаблон текущих аргументов, коммит — строка
+            let md = task_type.body_template(title, body_markdown);
+            replace_doc_raw(client, cfg, &doc_id, &md).await?;
+            ensure_task_tag(client, cfg, task_type.tag()).await?;
+            let _ = client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": doc_id, "tag": task_type.tag()}),
+                )
+                .await;
+            let row =
+                add_linked_row(client, cfg, board, title, &doc_id, serde_json::Map::new()).await?;
+            Ok((row, CreateOutcome::Recovered))
+        }
+        ExistingBody::None => {
+            // 1. док-тело — ребёнок доски; стартовый костяк по типу задачи
+            let md = task_type.body_template(title, body_markdown);
+            let resp = client
+                .call_tool(
+                    "create_doc_from_markdown",
+                    json!({"workspaceId": cfg.workspace, "title": title, "markdown": md, "parentDocId": board.doc_id}),
+                )
+                .await
+                .context("create_doc_from_markdown")?;
+            let body_doc = first_str(&resp, &["docId", "id"])
+                .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
+
+            // 2. тег типа (идемпотентно)
+            ensure_task_tag(client, cfg, task_type.tag()).await?;
+            let _ = client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": task_type.tag()}),
+                )
+                .await;
+
+            // 3. строка в Todo, слинкованная с телом
+            let row = add_linked_row(client, cfg, board, title, &body_doc, serde_json::Map::new())
+                .await?;
+            // пустой статус = черновик юзера; Design = спавн агента
+            Ok((row, CreateOutcome::Created))
+        }
+    }
+}
+
+/// Обеспечить существование workspace-тега (идемпотентно, с разрядкой гонки
+/// дубликатов — урок duplicate-tag race).
+async fn ensure_task_tag(client: &mut AffineClient, cfg: &AffineConfig, tag: &str) -> Result<()> {
     let tags = client
         .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
         .await;
@@ -597,32 +730,158 @@ pub async fn create_task(
             }
         }
     }
-    let _ = client
-        .call_tool(
-            "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": tag}),
-        )
-        .await;
+    Ok(())
+}
 
-    // 3. строка в Todo, слинкованная с телом
+/// Создать крон: док-тело (тег Cron) + строка доски с расписанием.
+/// Идемпотентность та же, что у create_task (affine_children).
+pub async fn create_cron(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    board: &Board,
+    root: &std::path::Path,
+    title: &str,
+    schedule: &str,
+    body_md: &str,
+) -> Result<(TaskRow, CreateOutcome)> {
+    match resolve_existing_body(client, cfg, board, root, title).await? {
+        ExistingBody::Exists { row, row_count } => {
+            bail!("{}", duplicate_message(title, &row, row_count))
+        }
+        ExistingBody::Ambiguous { doc_ids } => bail!(
+            "на доске несколько тел с тайтлом «{title}» — чисти вручную: {}",
+            doc_ids.join(", ")
+        ),
+        ExistingBody::Orphan { doc_id } => {
+            replace_doc_raw(client, cfg, &doc_id, body_md).await?;
+            let _ = client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": doc_id, "tag": CRON_TAG}),
+                )
+                .await;
+            let row = add_linked_row(
+                client,
+                cfg,
+                board,
+                title,
+                &doc_id,
+                json!({"Schedule": schedule, "Status": "active"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .await?;
+            Ok((row, CreateOutcome::Recovered))
+        }
+        ExistingBody::None => {
+            let resp = client
+                .call_tool(
+                    "create_doc_from_markdown",
+                    json!({"workspaceId": cfg.workspace, "title": title, "markdown": body_md, "parentDocId": board.doc_id}),
+                )
+                .await
+                .context("create_doc_from_markdown")?;
+            let body_doc = first_str(&resp, &["docId", "id"])
+                .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
+            // add_tag_to_doc создаёт опцию тега при нужде; у Cron нет истории
+            // гонки дубликатов — fire-and-forget, осознанная асимметрия с task
+            let _ = client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": CRON_TAG}),
+                )
+                .await;
+            let row = add_linked_row(
+                client,
+                cfg,
+                board,
+                title,
+                &body_doc,
+                json!({"Schedule": schedule, "Status": "active"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .await?;
+            Ok((row, CreateOutcome::Created))
+        }
+    }
+}
+
+/// Отчёт rm: что именно удалено (строка канбана невосстановима — печатаем).
+#[derive(Clone, Debug)]
+pub struct RmReport {
+    pub title: String,
+    pub doc_id: String,
+    pub row_deleted: bool,
+    pub body_trashed: bool,
+    /// из ответа trash_doc (previouslyInTrash); на сироте-пути док мог быть
+    /// в трэше ещё до rm
+    pub was_in_trash: bool,
+}
+
+async fn trash_body(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    body_doc: &str,
+) -> Result<(bool, bool)> {
+    if body_doc.is_empty() {
+        return Ok((false, false));
+    }
     let resp = client
         .call_tool(
-            "add_database_row",
-            json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
-                   "databaseBlockId": board.db_id,
-                   "cells": {"Title": title},
-                   "linkedDocId": body_doc}),
+            "trash_doc",
+            json!({"workspaceId": cfg.workspace, "docId": body_doc}),
         )
         .await
-        .context("add_database_row")?;
-    let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
+        .context("trash_doc")?;
+    let was = resp
+        .get("previouslyInTrash")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok((true, was))
+}
 
-    Ok(TaskRow {
-        row_id,
-        title: title.to_string(),
-        body_doc,
-        status: String::new(), // пустой статус = черновик юзера; Design = спавн агента
-        ..Default::default()
+/// Удалить задачу: строка вниз + тело в трэш. Путь сироты (тело без строки —
+/// мусор от упавшего create): единственный префикс-матч среди детей доски.
+pub async fn rm_task(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    board: &Board,
+    root: &std::path::Path,
+    id: &str,
+) -> Result<RmReport> {
+    let rows = read_rows(client, cfg, board, root).await?;
+    if let Ok(row) = resolve_row(&rows, id) {
+        if !row.row_id.is_empty() {
+            client
+                .call_tool(
+                    "delete_database_row",
+                    json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
+                           "databaseBlockId": board.db_id, "rowBlockId": row.row_id}),
+                )
+                .await
+                .context("delete_database_row")?;
+        }
+        let (body_trashed, was_in_trash) = trash_body(client, cfg, &row.body_doc).await?;
+        return Ok(RmReport {
+            title: row.title.clone(),
+            doc_id: row.body_doc.clone(),
+            row_deleted: true,
+            body_trashed,
+            was_in_trash,
+        });
+    }
+    let children = crate::affine_children::board_children(client, cfg, board).await?;
+    let child = crate::affine_children::child_by_prefix(&children, id)?;
+    let (body_trashed, was_in_trash) = trash_body(client, cfg, &child.doc_id).await?;
+    Ok(RmReport {
+        title: child.title.clone(),
+        doc_id: child.doc_id.clone(),
+        row_deleted: false,
+        body_trashed,
+        was_in_trash,
     })
 }
 
