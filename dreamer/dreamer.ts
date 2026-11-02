@@ -6,7 +6,7 @@
 // — задача \UWUWU\Dreamer: старт при логоне + повтор каждую минуту, живой
 // инстанс отсекается IgnoreNew). Тик: 1 мин.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
@@ -16,10 +16,10 @@ import {
   normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-dreamer")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-dreamer.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
@@ -56,34 +56,8 @@ const log = (m: string): void => {
 
 // ——— одиночный инстанс ———
 
-function acquireLock(): boolean {
-  mkdirSync(STATE_DIR, { recursive: true })
-  try {
-    mkdirSync(LOCK_DIR, { recursive: false })
-  } catch {
-    try {
-      const pid = Number(readFileSync(join(LOCK_DIR, "pid"), "utf-8").trim())
-      if (Number.isInteger(pid)) {
-        process.kill(pid, 0)
-        return false
-      }
-    } catch { /* мёртвый lock — захватываем */ }
-    try {
-      rmSync(LOCK_DIR, { recursive: true, force: true })
-      mkdirSync(LOCK_DIR, { recursive: false })
-    } catch {
-      return false
-    }
-  }
-  writeFileSync(join(LOCK_DIR, "pid"), String(process.pid))
-  const release = (): void => {
-    try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch {}
-    process.exit(0)
-  }
-  process.on("SIGTERM", release)
-  process.on("SIGINT", release)
-  return true
-}
+// onStop лока взводит флаг: тик доезжает до конца, новых прогонов не открываем
+const drain = makeDrain()
 
 // ——— состояние ———
 
@@ -298,6 +272,8 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
   log(`очередь: ${candidates.length} кандидатов, активных прогонов: ${activeRuns()}`)
   for (const cand of candidates) {
     if (activeRuns() >= CONCURRENCY) break
+    // стоп-сигнал: не открываем новые прогоны и wakeup'ы — очередь доедет при следующем старте
+    if (drain.isStopping()) break
     if (DRY_RUN) {
       log(`DRY_RUN: ${cand.action} дримера над ${cand.session.id.slice(0, 8)} (${cand.reason}) — пропущен`)
       continue
@@ -369,7 +345,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  if (!acquireLock()) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-dreamer держит lock — выходим")
     process.exit(1)
   }
@@ -398,7 +374,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    await new Promise((r) => setTimeout(r, TICK_SEC * 1000))
+    if (drain.isStopping()) {
+      log("стоп-сигнал: тик доехал — выходим")
+      process.exit(0)
+    }
+    await drain.sleep(TICK_SEC * 1000)
   }
 }
 

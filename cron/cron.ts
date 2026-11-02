@@ -6,10 +6,11 @@
 // после срабатывания → fired (paused — только явное решение юзера).
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../factory/mcp"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   due, isOneShot, isValidTracked, parseSchedule, firePrompt,
   type CronRow, type CronState,
@@ -17,7 +18,6 @@ import {
 
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOCK_DIR = join(STATE_DIR, "lock")
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 
 /** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
@@ -41,34 +41,8 @@ const log = (m: string): void => {
 
 // ——— одиночный инстанс ———
 
-function acquireLock(): boolean {
-  mkdirSync(STATE_DIR, { recursive: true })
-  try {
-    mkdirSync(LOCK_DIR, { recursive: false })
-  } catch {
-    try {
-      const pid = Number(readFileSync(join(LOCK_DIR, "pid"), "utf-8").trim())
-      if (Number.isInteger(pid)) {
-        process.kill(pid, 0)
-        return false
-      }
-    } catch { /* мёртвый lock — захватываем */ }
-    try {
-      rmSync(LOCK_DIR, { recursive: true, force: true })
-      mkdirSync(LOCK_DIR, { recursive: false })
-    } catch {
-      return false
-    }
-  }
-  writeFileSync(join(LOCK_DIR, "pid"), String(process.pid))
-  const release = (): void => {
-    try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch {}
-    process.exit(0)
-  }
-  process.on("SIGTERM", release)
-  process.on("SIGINT", release)
-  return true
-}
+// onStop лока взводит флаг: тик доезжает до конца, новых сессий не спавним
+const drain = makeDrain()
 
 // ——— состояние ———
 
@@ -294,6 +268,8 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     }
 
     if (!due(sched, lastFired, now)) continue
+    // стоп-сигнал: не спавним новую работу — крон доедет при следующем старте
+    if (drain.isStopping()) break
 
     const body = await cronBody(row.bodyDoc)
     // linked-строки несут заголовок в теле: деривируем из первой строки
@@ -320,7 +296,7 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
 }
 
 async function main(): Promise<void> {
-  if (!acquireLock()) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-cron держит lock — выходим")
     process.exit(1)
   }
@@ -349,7 +325,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    await new Promise((r) => setTimeout(r, TICK_SEC * 1000))
+    if (drain.isStopping()) {
+      log("стоп-сигнал: тик доехал — выходим")
+      process.exit(0)
+    }
+    await drain.sleep(TICK_SEC * 1000)
   }
 }
 
