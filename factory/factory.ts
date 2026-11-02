@@ -1,12 +1,18 @@
-// uwuwu-factory — будильник фабрики разработки на AFFiNE.
-// Вся логика пайпа — у агента (глобальный AGENTS.md, раздел «Работа над
-// задачей»). Демон делает ровно три вещи:
+// uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью на AFFiNE.
+// Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
+// задачей»). Демон делает четыре вещи:
 //   1. Design на доске (пустой статус = черновик юзера, не трогаем) →
-//      сессия в чекауте репо + короткий spawn-промпт (ворктри/ветку
+//      сессия девелопера в чекауте репо + короткий spawn-промпт (ворктри/ветку
 //      создаёт сам агент)
-//   2. новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин,
+//   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
+//      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
+//      задачи; от дримера исключён фильтром по agent); возврат статуса
+//      из ревью → wakeup девелопера; комменты юзера в ревью-статусах —
+//      ревьюверу
+//   3. новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин,
 //      коммент юзера → рестарт)
-//   3. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка ворктри
+//   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
+//      state + термин живой ревью-сессии
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
@@ -23,7 +29,13 @@ import {
   wakeupPrompt,
   bodyEditPrompt,
   isValidTracked,
-  snapshotText,
+  reviewKindOf,
+  reviewSpawnPrompt,
+  reviewRerunPrompt,
+  reviewCommentsPrompt,
+  reviewReturnPrompt,
+  routeTask,
+  type ReviewKind,
   type FactoryState,
   type TaskComment,
   type TaskRef,
@@ -67,6 +79,8 @@ const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
+/** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника */
+const REVIEWER = { agent: "code-quality-reviewer", model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
@@ -289,7 +303,7 @@ async function commentTask(bodyDoc: string, text: string): Promise<boolean> {
 async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string; password?: string }
   const base = (reg.url ?? "").replace("0.0.0.0", "127.0.0.1")
-  const auth = "Basic " + Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")
+  const auth = `Basic ${Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")}`
   let res: Response
   try {
     res = await fetch(`${base}/api${path}`, {
@@ -310,13 +324,23 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   return (j as { data?: unknown }).data ?? j
 }
 
-async function createSession(worktree: string, title: string): Promise<string | null> {
+interface SessionSpec {
+  directory: string
+  title: string
+  agent?: string
+  parentID?: string
+  model?: { providerID: string; id: string }
+}
+
+async function createSession(spec: SessionSpec): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: `📋 ${title.replace(/[\r\n]+/g, " ").slice(0, 60)}`,
-      model: { providerID: MODEL.providerID, id: MODEL.id },
-      location: { directory: worktree },
+      title: spec.title.replace(/[\r\n]+/g, " ").slice(0, 64),
+      model: spec.model ?? MODEL,
+      location: { directory: spec.directory },
+      ...(spec.agent !== undefined ? { agent: spec.agent } : {}),
+      ...(spec.parentID !== undefined ? { parentID: spec.parentID } : {}),
     },
   })
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
@@ -347,18 +371,6 @@ async function sessionLiveness(sessionID: string): Promise<Liveness> {
   }
 }
 
-/** Последний тип сообщения сессии: "idle" = агент закончил и ждёт. */
-async function lastMessageType(sessionID: string): Promise<string | null> {
-  try {
-    const msgs = await restCall(`/session/${sessionID}/message`) as { data?: unknown[] } | unknown[]
-    const arr = (msgs as { data?: unknown[] }).data ?? (msgs as unknown[])
-    if (!Array.isArray(arr) || arr.length === 0) return null
-    return (arr[arr.length - 1] as { type?: unknown }).type as string | null
-  } catch {
-    return null
-  }
-}
-
 /** updatedAt тела (ISO) или null. */
 async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
   if (bodyDoc === "") return null
@@ -386,7 +398,10 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
   if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
 
   // имя сессии «проект: тайтл» — осмысленно в списке сессий опенкода
-  const sessionID = await createSession(cfg.local, `${projectName}: ${title}`)
+  const sessionID = await createSession({
+    directory: cfg.local,
+    title: `📋 ${projectName}: ${title}`,
+  })
   if (sessionID === null) throw new Error("сессия не создалась")
 
   const sent = await promptSession(
@@ -424,9 +439,13 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, агент ведёт сам (попыток до этого: ${attemptsSeed})`)
 }
 
-/** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает. */
+/** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает.
+ *  Живая ревью-сессия задачи — терминируем (разовая чистка, не watchdog). */
 async function finishTask(rowId: string, tracked: TrackedTask, state: FactoryState): Promise<void> {
   log(`задача ${rowId.slice(0, 8)}: Done — чистка state`)
+  if (tracked.reviewSessionID !== undefined && tracked.reviewSessionID !== "") {
+    await restCall(`/session/${tracked.reviewSessionID}`, { method: "DELETE" }).catch(() => {})
+  }
   delete state.tasks[rowId]
   saveState(state)
 }
@@ -439,7 +458,7 @@ async function notify(task: TrackedTask, body: string): Promise<void> {
 }
 
 async function registerFailure(
-  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, seed: number, err: unknown,
+  task: TaskRef, projectName: string, board: BoardIds, state: FactoryState, seed: number, err: unknown,
 ): Promise<void> {
   const attempts = seed + 1
   const prev = state.tasks[task.rowId]
@@ -474,11 +493,80 @@ async function restartTask(
   tracked.lastCommentAt = last.createdAt
   tracked.lastCommentId = last.id
   tracked.sessionID = "" // карантин до успеха старта
+  // ревью-сессию переживаем рестартом девелопера (1 задача = 1 ревьювер)
+  const savedReview = tracked.reviewSessionID
+  const savedReviewAttempts = tracked.reviewAttempts
   saveState(state)
   try {
     await startTask(task, projectName, cfg, state, seed)
+    const reborn = state.tasks[task.rowId]
+    if (reborn !== undefined && savedReview !== undefined) {
+      reborn.reviewSessionID = savedReview
+      reborn.reviewAttempts = savedReviewAttempts
+      saveState(state)
+    }
   } catch (e) {
-    await registerFailure(task, projectName, cfg, board, state, seed, e)
+    await registerFailure(task, projectName, board, state, seed, e)
+  }
+}
+
+// ——— ревьювер: спавн/будильник на ревью-статусах ———
+
+/** Ворктри задачи по Branch-ячейке (для result-ревью в контексте ветки). */
+async function resolveWorktree(local: string, branch: string): Promise<string> {
+  if (branch === "") return ""
+  try {
+    const out = await sh(["git", "-C", local, "worktree", "list", "--porcelain"])
+    let worktree = ""
+    for (const line of out.split("\n")) {
+      if (line.startsWith("working tree ")) worktree = line.slice("working tree ".length)
+      else if (line.startsWith("branch ") && line.endsWith(branch) && worktree !== "") return worktree
+    }
+  } catch { /* git недоступен — ревьюверу останется cfg.local/PR */ }
+  return ""
+}
+
+/** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
+ *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
+ *  нужен cwd ворктри; от дримера сессию исключает фильтр по agent. Выбрасывает
+ *  при фейле. */
+async function startReview(
+  task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState,
+  kind: ReviewKind, tracked: TrackedTask,
+): Promise<void> {
+  const worktree = kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
+  const ctx = { branch: task.branch, worktree, pr: task.pr }
+  const sessionID = await createSession({
+    directory: worktree !== "" ? worktree : cfg.local,
+    title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
+    agent: REVIEWER.agent,
+    model: REVIEWER.model,
+  })
+  if (sessionID === null) throw new Error("ревью-сессия не создалась")
+  const sent = await promptSession(sessionID, reviewSpawnPrompt(task.rowId, projectName, kind, ctx))
+  if (!sent) {
+    await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
+    throw new Error("ревью-промпт не ушёл")
+  }
+  tracked.reviewSessionID = sessionID
+  tracked.reviewAttempts = 0
+  saveState(state)
+  log(`задача ${task.rowId.slice(0, 8)}: ревью-сессия ${sessionID} (${kind})`)
+}
+
+/** Эскалация фейлов спавна ревьювера: 3 подряд → Needs attention. */
+async function failReview(
+  task: TaskRef, board: BoardIds, tracked: TrackedTask, state: FactoryState, seed: number, err: unknown,
+): Promise<void> {
+  const attempts = seed + 1
+  tracked.reviewAttempts = attempts
+  tracked.reviewSessionID = ""
+  saveState(state)
+  log(`задача ${task.rowId.slice(0, 8)}: ревью-старт не удался (попытка ${attempts}) — ${err}`)
+  if (attempts >= MAX_ATTEMPTS) {
+    await setCells(board, task.rowId, { Status: "Needs attention" })
+    await notify(tracked,
+      `[factory] ревьювер не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH} и напиши комментарий — попробую снова.`)
   }
 }
 
@@ -486,15 +574,40 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
 
-  // 1. новые Design-задачи (пустой статус = черновик юзера, не трогаем)
+  // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
+  //    (пустой статус = черновик юзера, не трогаем)
   const started = new Set<string>()
-  for (const task of untrackedTasks(rows.filter((r) => r.status === "Design"), state)) {
-    try {
-      await startTask(task, projectName, cfg, state, 0)
-      started.add(task.rowId)
-    } catch (e) {
-      await registerFailure(task, projectName, cfg, board, state, 0, e)
+  const spawnable = rows.filter((r) => r.status === "Design" || reviewKindOf(r.status) !== null)
+  for (const task of untrackedTasks(spawnable, state)) {
+    const kind = reviewKindOf(task.status)
+    if (kind === null) {
+      try {
+        await startTask(task, projectName, cfg, state, 0)
+        started.add(task.rowId)
+      } catch (e) {
+        await registerFailure(task, projectName, board, state, 0, e)
+      }
+      continue
     }
+    // ревью-статус без state (даунтайм демона при переходе) — карантинная
+    // запись (девелопер неизвестен) + спавн ревьювера
+    const comments = (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID))
+    const last = comments.length > 0
+      ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
+      : null
+    const entry: TrackedTask = {
+      sessionID: "", worktree: "", branch: "",
+      bodyDoc: task.bodyDoc, title: task.title, project: projectName,
+      lastCommentAt: last?.createdAt ?? 0, lastCommentId: last?.id ?? "",
+      createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
+    }
+    state.tasks[task.rowId] = entry
+    try {
+      await startReview(task, projectName, cfg, state, kind, entry)
+    } catch (e) {
+      await failReview(task, board, entry, state, 0, e)
+    }
+    started.add(task.rowId)
   }
 
   // 2. активные этой доски (state общий на все проекты)
@@ -509,9 +622,6 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       await finishTask(rowId, tracked, state)
       continue
     }
-    // юзер закрыл руками через UI/фильтр — доводим статус до конца? нет:
-    // Done ставим только мы (по мержу), но исчезновение In Progress с доски =
-    // удаление строки — уже обработано выше.
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
     if (row.status === "Done") {
@@ -520,34 +630,116 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // юзер ПЕРЕВЁЛ живую задачу в Design = «вернись к утряске» — мягкий
-    // wakeup (НЕ рестарт: рестарт плодил дубли сессий и убивал контекст;
-    // агент жив, поведение edge — только на переход)
-    if (row.status === "Design" && tracked.sessionID !== "" && (tracked.lastStatus ?? "") !== "Design") {
-      log(`задача ${rowId.slice(0, 8)}: юзер вернул в Design — wakeup на перепланирование`)
-      await promptSession(
-        tracked.sessionID,
-        `[factory] Юзер вернул задачу ${rowId} в Design: перепланируй — перечитай тело/комменты (task get),` +
-          ` уточни вопросы, согласуй новый план; статус Design/In Progress дальше двигай по контракту.`,
-      )
+    // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
+    const comments = await taskComments(tracked.bodyDoc)
+    const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
+    const reviewerLiveness = tracked.reviewSessionID === undefined || tracked.reviewSessionID === ""
+      ? "dead"
+      : await sessionLiveness(tracked.reviewSessionID)
+    const action = routeTask({
+      status: row.status,
+      lastStatus: tracked.lastStatus ?? "",
+      reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
+      freshComments: fresh,
+    })
+    let commentsConsumed = false
+    const consumeComments = (): void => {
+      const lastComment = fresh[fresh.length - 1]
+      if (lastComment === undefined) return
+      tracked.lastCommentAt = lastComment.createdAt
+      tracked.lastCommentId = lastComment.id
+      commentsConsumed = true
     }
+    /** базлайн тела: дев правил тело перед передачей мяча — этим не будить */
+    const refreshBodyBaseline = async (): Promise<void> => {
+      const updated = await bodyUpdatedAt(tracked.bodyDoc)
+      if (updated !== null) tracked.bodyUpdated = updated
+    }
+
+    switch (action.t) {
+      case "spawn-reviewer": {
+        const seed = tracked.reviewAttempts ?? 0
+        try {
+          await startReview(row, tracked.project || projectName, cfg, state, action.kind, tracked)
+          consumeComments()
+          await refreshBodyBaseline()
+          saveState(state)
+        } catch (e) {
+          await failReview(row, board, tracked, state, seed, e)
+        }
+        break
+      }
+      case "rerun-reviewer": {
+        const worktree = action.kind === "result" ? await resolveWorktree(cfg.local, row.branch) : ""
+        const ok = await promptSession(
+          tracked.reviewSessionID ?? "",
+          reviewRerunPrompt(rowId, action.kind, { branch: row.branch, worktree, pr: row.pr }),
+        )
+        if (ok) {
+          consumeComments()
+          await refreshBodyBaseline()
+          saveState(state)
+        } else {
+          log(`задача ${rowId.slice(0, 8)}: доревью-промпт не ушёл — следующий тик перепроверит сессию`)
+        }
+        break
+      }
+      case "comments-to-reviewer": {
+        const ok = await promptSession(tracked.reviewSessionID ?? "", reviewCommentsPrompt(rowId, fresh))
+        if (ok) {
+          consumeComments()
+          saveState(state)
+        } else {
+          log(`задача ${rowId.slice(0, 8)}: комменты ревьюверу не ушли — граница не сдвинута`)
+        }
+        break
+      }
+      case "return-to-dev": {
+        const devLiveness = tracked.sessionID === "" ? "dead" : await sessionLiveness(tracked.sessionID)
+        if (devLiveness === "alive") {
+          const ok = await promptSession(tracked.sessionID, reviewReturnPrompt(rowId))
+          if (!ok) log(`задача ${rowId.slice(0, 8)}: возврат из ревью — промпт девелоперу не ушёл`)
+        } else {
+          // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
+          // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер
+          const savedReview = tracked.reviewSessionID
+          const savedReviewAttempts = tracked.reviewAttempts
+          try {
+            await startTask(row, tracked.project || projectName, cfg, state, tracked.attempts)
+            const reborn = state.tasks[rowId]
+            if (reborn !== undefined && savedReview !== undefined) {
+              reborn.reviewSessionID = savedReview
+              reborn.reviewAttempts = savedReviewAttempts
+              saveState(state)
+            }
+            log(`задача ${rowId.slice(0, 8)}: возврат из ревью при мёртвом девелопере — рестарт сессии`)
+          } catch (e) {
+            await registerFailure(row, tracked.project || projectName, board, state, tracked.attempts, e)
+          }
+        }
+        break
+      }
+      case "noop":
+        break
+    }
+
     // запоминаем наблюдённый статус — граница перехода для след. тика
     if (tracked.lastStatus !== row.status) {
       tracked.lastStatus = row.status
       saveState(state)
     }
 
-    const comments = await taskComments(tracked.bodyDoc)
-    const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
+    // ——— пайп девелопера: комменты/тело/живость (комменты мог съесть ревьювер) ———
+    const devFresh = commentsConsumed ? [] : fresh
 
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
-      if (fresh.length === 0) continue
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
+      if (devFresh.length === 0) continue
+      await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue
     }
 
-    if (fresh.length === 0) {
+    if (devFresh.length === 0) {
       // юзер молчит, но сессия могла умереть посреди прогона
       const quiet = await sessionLiveness(tracked.sessionID)
       if (quiet === "dead") {
@@ -567,22 +759,23 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     }
     if (liveness === "dead") {
       log(`задача ${rowId.slice(0, 8)}: сессия умерла — перезапуск`)
-      await restartTask(row, tracked.project || projectName, cfg, board, state, fresh)
+      await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue
     }
 
-    // будильник правок ТЕЛА — немедленно, без отложений: любое изменение
-    // с базлайна = wakeup, атрибуция на агенте (знает, что писал сам:
-    // чужое учтёт, своё пропустит молча). Есть свежие комменты — они
-    // разбудят тем же тиком (агент перечитает тело сам), базлайн двигаем
+    // будильник правок ТЕЛА — немедленно, без отложений; в ревью-статусе
+    // адресат — ревьювер (мяч у него), иначе девелопер
     const updated = await bodyUpdatedAt(tracked.bodyDoc)
     const bodyChanged = updated !== null
       && (tracked.bodyUpdated ?? "") !== ""
       && updated > (tracked.bodyUpdated ?? "")
     if (bodyChanged) {
-      if (fresh.length === 0) {
-        log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно`)
-        if (await promptSession(tracked.sessionID, bodyEditPrompt(rowId))) {
+      const target = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
+        ? tracked.reviewSessionID ?? ""
+        : tracked.sessionID
+      if (devFresh.length === 0) {
+        log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно (${target === tracked.sessionID ? "девелопер" : "ревьювер"})`)
+        if (await promptSession(target, bodyEditPrompt(rowId))) {
           tracked.bodyUpdated = updated
           saveState(state)
         }
@@ -593,11 +786,11 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       saveState(state)
     }
 
-    log(`задача ${rowId.slice(0, 8)}: ${fresh.length} новых коммент(ов) → сессия`)
-    if (await promptSession(tracked.sessionID, wakeupPrompt(rowId, fresh))) {
-      const last = fresh[fresh.length - 1]
-      tracked.lastCommentAt = last.createdAt
-      tracked.lastCommentId = last.id
+    log(`задача ${rowId.slice(0, 8)}: ${devFresh.length} новых коммент(ов) → сессия`)
+    if (await promptSession(tracked.sessionID, wakeupPrompt(rowId, devFresh))) {
+      const lastComment = devFresh[devFresh.length - 1]
+      tracked.lastCommentAt = lastComment.createdAt
+      tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
       saveState(state)
     } else {
