@@ -131,6 +131,46 @@ def t_ok_false_refusal_raises() -> None:
         raise AssertionError("ok:false прошёл молча")
 
 
+def t_ok_false_extracts_retryable_and_code_from_all_shapes() -> None:
+    """_ok_false достаёт retryable+code из structuredContent, result
+    верхнего уровня и text-блоба; без полей — False/None."""
+    # structuredContent
+    d, retryable, code = wiki_ops._ok_false(
+        {"result": {"structuredContent": {"ok": False, "error": "перегрузка",
+                                          "retryable": True, "code": "WRITE_QUEUE_TIMEOUT"}}}
+    )
+    assert (d, retryable, code) == ("перегрузка", True, "WRITE_QUEUE_TIMEOUT"), (d, retryable, code)
+    # text-блоб
+    d, retryable, code = wiki_ops._ok_false(
+        {"result": {"content": [{"type": "text",
+                                 "text": json.dumps({"ok": False, "error": "частично",
+                                                     "retryable": True,
+                                                     "code": "DOCUMENT_MOVE_PARTIAL"})}]}}
+    )
+    assert (d, retryable, code) == ("частично", True, "DOCUMENT_MOVE_PARTIAL"), (d, retryable, code)
+    # result верхнего уровня без полей
+    d, retryable, code = wiki_ops._ok_false({"result": {"ok": False, "error": "нет прав"}})
+    assert (d, retryable, code) == ("нет прав", False, None), (d, retryable, code)
+    # не ok:false — None
+    assert wiki_ops._ok_false({"result": {"ok": True}}) is None
+    assert wiki_ops._ok_false({}) is None
+
+
+def t_retry_trusted_whitelist_by_op_kind() -> None:
+    """ADR-006: чтению retryable доверяем при любом коде; записи — только
+    WRITE_QUEUE_* / rate_limited; неизвестный код и его отсутствие — нет."""
+    trusted_codes = ("WRITE_QUEUE_TIMEOUT", "WRITE_QUEUE_FULL", "rate_limited")
+    for code in trusted_codes:
+        assert wiki_ops._retry_trusted("create_doc", True, code), code
+    for code in ("DOCUMENT_MOVE_PARTIAL", "doc_trash_failed",
+                 "notification_update_failed", "tool_error", "future_code"):
+        assert not wiki_ops._retry_trusted("create_doc", True, code), code
+    assert not wiki_ops._retry_trusted("create_doc", True, None)
+    # чтение — доверяем при любом коде, но не при retryable:false
+    assert wiki_ops._retry_trusted("list_docs", True, "DOCUMENT_MOVE_PARTIAL")
+    assert not wiki_ops._retry_trusted("list_docs", False, "WRITE_QUEUE_TIMEOUT")
+
+
 def t_jsonrpc_error_raises_with_payload() -> None:
     """JSON-RPC error → McpError с payload ошибки."""
     try:
@@ -284,6 +324,8 @@ TESTS = [
     ("except Exception ловит ошибку шлюза", t_except_exception_catches_gateway_error),
     ("isError-отказ несёт детали", t_tool_refusal_carries_detail),
     ("ok:false → McpError", t_ok_false_refusal_raises),
+    ("_ok_false: retryable+code во всех формах", t_ok_false_extracts_retryable_and_code_from_all_shapes),
+    ("_retry_trusted: whitelist по типу операции", t_retry_trusted_whitelist_by_op_kind),
     ("jsonrpc error → McpError с payload", t_jsonrpc_error_raises_with_payload),
     ("валидный result проходит", t_successful_result_passes_through),
     ("mcp_call не-JSON → McpError", t_mcp_call_non_json_body_raises),

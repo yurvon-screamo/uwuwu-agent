@@ -8,7 +8,8 @@ flock на ~/.uwuwu/mcp-session.lock: лок наш → шарим и публи
 общий файл; лок чужой → private-сессия, файл не читаем и не пишем. JSON-RPC
 id — случайная база + счётчик (общая сессия с коллизией id давала кросс-ток
 ответов, задача IyzxmFdujA). call() ретраит транзиентные сбои шлюза
-(429/5xx/сеть, ok:false+retryable) с экспоненциальным бэкофом; таймаут на
+(429/5xx/сеть; ok:false+retryable — чтению всегда, записи только кодам
+_WRITE_TRUSTED_CODES, ADR-006) с экспоненциальным бэкофом; таймаут на
 записи НЕ ретраится — операция могла примениться. close() в finally трогает
 только осиротевшие сессии — общую не инвалидирует.
 Гоча argparse: docId с ВЕДУЩИМ дефисом (напр. -GnAmdAk45) парсится как флаг —
@@ -255,38 +256,59 @@ def _validated(name: str, r: object) -> dict:
 # новый read-тулз теряет ретраи, но запись никогда не дублируется).
 _READ_PREFIXES = ("get_", "list_", "search_", "find_", "read_", "export_", "analyze_")
 
+# Коды, при которых шлюз по построению НЕ применял запрос: WRITE_QUEUE_* —
+# ждало в очереди и не диспеттилось; rate_limited — отклонено до обработки.
+# Остальные true-коды для записи не доверяются (частичный move, trash по
+# socket-таймауту и т.п. — операция могла примениться). Неизвестный код =
+# не доверяем. Список синхронен write_retryable_trusted() в
+# cli/src/affine_client.rs; обоснование — ADR-006 (uwuwu).
+_WRITE_TRUSTED_CODES = frozenset({"WRITE_QUEUE_TIMEOUT", "WRITE_QUEUE_FULL", "rate_limited"})
+
 
 def _is_read(name: str) -> bool:
     return name.startswith(_READ_PREFIXES)
 
 
-def _ok_false(r: object) -> tuple[str, bool] | None:
-    """(detail, retryable), если ответ несёт шлюзовую конвенцию логического
-    фейла ok:false — в structuredContent, в result верхнего уровня или
-    внутри content[0].text-блоба (зеркально affine_client.rs). Вызывается
-    ДО mcp_result, который любой ok:false превращает в McpError без флага.
-    retryable:true = шлюз гарантирует, что запрос НЕ применён (контракт,
-    задача W9etJF1FVm) — такой сбой ретраится и на записи."""
+def _ok_false_candidates(result: dict) -> list[object]:
+    """Места, где шлюз может нести ok:false-пейлоад: structuredContent,
+    result верхнего уровня и распарсенные content[0].text-блобы."""
+    candidates: list[object] = [result.get("structuredContent"), result]
+    for c in result.get("content") or []:
+        if isinstance(c, dict) and isinstance(c.get("text"), str):
+            try:
+                candidates.append(json.loads(c["text"]))
+            except json.JSONDecodeError:
+                pass  # не-JSON блоб — не ok:false-пейлоад
+    return candidates
+
+
+def _ok_false(r: object) -> tuple[str, bool, str | None] | None:
+    """(detail, retryable, code), если ответ несёт шлюзовую конвенцию
+    логического фейла ok:false — в structuredContent, в result верхнего
+    уровня или внутри content[0].text-блоба (зеркально affine_client.rs).
+    Вызывается ДО mcp_result, который любой ok:false превращает в McpError
+    без флага. retryable:true трактуется по типу операции: чтению доверяем
+    всегда, записи — только кодам _WRITE_TRUSTED_CODES (ADR-006)."""
     if not isinstance(r, dict):
         return None
     result = r.get("result")
     if not isinstance(result, dict):
         return None
-    candidates: list[object] = [result.get("structuredContent"), result]
-    for c in result.get("content") or []:
-        if isinstance(c, dict) and isinstance(c.get("text"), str):
-            try:
-                inner = json.loads(c["text"])
-            except json.JSONDecodeError:
-                continue
-            candidates.append(inner)
-    for cand in candidates:
+    for cand in _ok_false_candidates(result):
         if isinstance(cand, dict) and cand.get("ok") is False:
             detail = cand.get("error") or "unknown tool error"
             if not isinstance(detail, str):
                 detail = json.dumps(detail, ensure_ascii=False)
-            return (detail, cand.get("retryable") is True)
+            code = cand.get("code")
+            return (detail, cand.get("retryable") is True, code if isinstance(code, str) else None)
     return None
+
+
+def _retry_trusted(name: str, retryable: bool, code: str | None) -> bool:
+    """Доверие ok:false+retryable:true по типу операции (ADR-006): чтение
+    ничего не применяет — флаг доверяем при любом коде; запись — только
+    кодам, при которых шлюз гарантированно не применял запрос."""
+    return retryable and (_is_read(name) or code in _WRITE_TRUSTED_CODES)
 
 
 def call(sid: str, name: str, args: dict) -> dict:
@@ -294,8 +316,9 @@ def call(sid: str, name: str, args: dict) -> dict:
     пере-handshake → повтор) и ретраями с бэкофом: HTTP 429/5xx и сетевые
     отказы — всегда; таймаут/обрыв — только чтение (запись могла
     примениться — честная ошибка без ретрая); ok:false+retryable:true —
-    ретрай. Обновлённый sid живёт в модуле — последующие
-    call(старый_sid,...) продолжают работать."""
+    ретрай чтению всегда, записи только при доверенном коде из
+    _WRITE_TRUSTED_CODES (ADR-006). Обновлённый sid живёт в модуле —
+    последующие call(старый_sid,...) продолжают работать."""
     global _live_sid
     effective = _live_sid or sid
     retries = _retry_retries()
@@ -353,10 +376,16 @@ def call(sid: str, name: str, args: dict) -> dict:
             continue
         failure = _ok_false(r)
         if failure is not None:
-            detail, retryable = failure
-            if retryable and attempt < retries:
+            detail, retryable, code = failure
+            if _retry_trusted(name, retryable, code) and attempt < retries:
                 reason = detail
                 continue
+            if retryable and not _retry_trusted(name, retryable, code):
+                raise McpError(
+                    f"{name}: {detail} — retryable:true от шлюза для записи "
+                    f"не доверяется (код {code!r} вне whitelist, операция могла "
+                    "примениться; см. ADR-006 uwuwu)"
+                )
             raise McpError(f"{name}: {detail}")
         return _validated(name, r)
     raise McpError(
