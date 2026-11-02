@@ -4,7 +4,9 @@
 // в stdout (двойной сигнал). Готовность — файл ready после захвата.
 import { writeFileSync } from "node:fs"
 
-const { acquireLock } = await import(process.env.LIB_PATH!)
+const libPath = process.env.LIB_PATH
+if (libPath === undefined || libPath === "") throw new Error("LIB_PATH не задан")
+const { acquireLock } = await import(libPath)
 
 const [mode, stateDir, ready, stopFlag] = process.argv.slice(2)
 
