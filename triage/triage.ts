@@ -384,13 +384,21 @@ const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"
 
 /** Дождаться финала хода (поллинг состояния сессии — как reconcile хаба):
  *  outcome выставлен и idle новее старта хода → ход завершён. Таймаута нет:
- *  ход живёт столько, сколько живёт; стоп-кран один и ручной — /reset. */
+ *  ход живёт столько, сколько живёт; стоп-кран один и ручной — /reset
+ *  (чистит state.run → эта петля обязана выйти, не блокируя runLoop). */
 const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   while (true) {
     if (stopping) return "stopping"
+    if (state.run !== run) {
+      // ход снесли (/reset): финал не доставляем, очередь свободна
+      log(`ход ${run.sessionID}: сброшен (/reset) — перестаю наблюдать`)
+      return "done"
+    }
     const st = await sessionStatus(run)
     if (st === "gone") {
-      await send(run.req.chatID, "⚠️ сессия триажа пропала — сообщение не разобрано, продублируй")
+      if (state.run === run) {
+        await send(run.req.chatID, "⚠️ сессия триажа пропала — сообщение не разобрано, продублируй")
+      }
       log(`ход ${run.sessionID}: сессия пропала`)
       return "done"
     }
