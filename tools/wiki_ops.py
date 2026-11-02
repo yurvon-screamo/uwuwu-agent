@@ -20,6 +20,7 @@ call() тогда сам пере-handshake'ится (400/404 → один ре�
   append <docId> <файл.md>                      — дописать markdown в конец дока
   replace <docId> <файл.md> [--stub]            — заменить контент (--stub: без длиновой защиты)
   export <docId>                                — живой markdown дока в stdout
+  embed <docId> [--html файл] [--name id]        — вставить/заменить embed_html-диаграмму (replace по маркеру ⁂ diagram:<id>)
   orgls                                         — organize-папки (id + имя)
   children <folderId>                           — organize-дети папки (folder/doc-линки, порядок index)
   find <…>                                      — ВЫПИЛЕН: шлюз не отдаёт doc-дерево; docId по тайтлу — uwuwu-cli search
@@ -241,8 +242,10 @@ def _validate_parent(sid: str, parent: str) -> int | None:
     """Валидация --parent ДО создания дока: вернуть exit-код отказа (0/None =
     ок) либо напечатать причину. Организе-папка по node.id → подсказка link;
     несуществующий docId шлюз помечает exists:false в УСПЕШНОМ ответе
-    read_doc (isError нет!); tool-отказ (в т.ч. флейк «space:load-doc
-    timeout») не считается «не существует» — печатаем обе интерпретации."""
+    read_doc (isError нет!); отказ шлюза (McpError — в т.ч. флейк
+    «space:load-doc timeout») не считается «не существует» — печатаем обе
+    интерпретации; HTTP 503/сокет-таймаут (URLError) пролетают как
+    транзиентные — сироты нет в любом исходе."""
     nodes = _organize_nodes(sid)
     if any(n.get("type") == "folder" and n.get("id") == parent for n in nodes):
         print(
@@ -254,10 +257,10 @@ def _validate_parent(sid: str, parent: str) -> int | None:
         return 1
     try:
         res = call(sid, "read_doc", {"workspaceId": WORKSPACE, "docId": parent})
-    except SystemExit:
+    except McpError as e:  # noqa: S5754 — перехват осознанный: отказ read_doc классифицируем и печатаем подсказку, не пробрасываем traceback в CLI-обвязки
         print(
-            "read_doc --parent упал с отказом шлюза (см. выше): parent-док "
-            "не существует ЛИБО шлюз флейкнул — проверь и повтори",
+            "read_doc --parent упал с отказом шлюза: parent-док не существует "
+            f"ЛИБО шлюз флейкнул — проверь и повтори (отказ: {str(e)[:200]})",
             file=sys.stderr,
         )
         return 1
@@ -296,10 +299,19 @@ def cmd_create(a) -> int:
                     "move_doc",
                     {"workspaceId": WORKSPACE, "docId": did, "toParentDocId": a.parent},
                 )
-            except SystemExit:
+            except McpError as e:  # noqa: S5754 — частичный успех: docId уже напечатан, печатаем рецепт восстановления вместо traceback
                 print(
-                    f"doc {did} СОЗДАН, но move под {a.parent} упал (см. выше); "
-                    f"повтор: move {did} --parent {a.parent}",
+                    f"doc {did} СОЗДАН, но move под {a.parent} не прошёл "
+                    f"({str(e)[:200]}); проверь и повтори: move {did} "
+                    f"--parent {a.parent}",
+                    file=sys.stderr,
+                )
+                return 2
+            except urllib.error.URLError as e:  # noqa: S5754 — тот же частичный успех для транзиентов (HTTP 503/сокет-таймаут, сервер мог дожить до успеха)
+                print(
+                    f"doc {did} СОЗДАН, но move под {a.parent} оборван по сети "
+                    f"({str(e)[:120]}); ТАЙМАУТ ≠ ПРОВАЛ — проверь position "
+                    f"(export {did}) перед повтором: move {did} --parent {a.parent}",
                     file=sys.stderr,
                 )
                 return 2
@@ -520,8 +532,9 @@ def cmd_link(a) -> int:
     """Прилинковать док в organize-папку: link <docId> --folder <folderId>
     (обёртка gateway add_organize_link — единственный способ организовать
     свежесозданный док, у которого линка в organize ещё нет).
-    Идемпотентен: линк уже в этой папке — «уже здесь», exit 0; в другой —
-    предупреждение «нужен org», exit 1."""
+    Идемпотентен (инвариант шлюза: один линк на док — вердикты ниже
+    опираются на первый найденный линк): линк уже в этой папке —
+    «уже здесь», exit 0; в другой — предупреждение «нужен org», exit 1."""
     sid = session()
     try:
         nodes = _organize_nodes(sid)
@@ -591,7 +604,7 @@ def cmd_children(a) -> int:
         print(f"# mode: organize {a.id}")
         kids = sorted(
             (n for n in nodes if n.get("parentId") == a.id),
-            key=lambda n: n.get("index", 0),
+            key=lambda n: n.get("index") or 0,  # index может отсутствовать или быть null
         )
         for n in kids:
             if n.get("type") == "folder":
