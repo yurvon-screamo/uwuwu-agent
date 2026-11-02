@@ -84,14 +84,14 @@ pub(crate) enum TaskSub {
     Body {
         #[arg(help = "row-id / doc-id / префикс / подстрока заголовка")]
         id: String,
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
         #[arg(long, help = "Файл с markdown (иначе stdin)")]
         md: Option<String>,
         /// Заменить тело ЦЕЛИКОМ (агент читает task get, правит, шлёт новое).
         /// Rich-контент (embed-диаграммы) не переживает — пересоздай фенсами.
         #[arg(long)]
         replace: bool,
-        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
-        stdin: bool,
     },
 }
 
