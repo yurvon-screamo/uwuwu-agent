@@ -734,6 +734,14 @@ def main() -> int:
         # 2 = отказ шлюза (в отличие от 1 — наших валидационных отказов до мутаций)
         print(f"!! {e}", file=sys.stderr)
         return 2
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        # URLError — сбои соединения, ConnectionError/TimeoutError — сбой/таймаут
+        # на стадии чтения (ConnectionResetError, socket.timeout): все сетевые,
+        # на них McpError не наматывается — ловим сырыми. rc=2 = «шлюз/сеть»,
+        # единая точка rc-семантики вместо traceback'а в CLI-обвязках
+        print(f"!! шлюз/сеть недоступны (транзиент): {str(e)[:200]}", file=sys.stderr)
+        print("!! ТАЙМАУТ ≠ ПРОВАЛ: мутация могла дожить — проверь результат перед повтором", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
