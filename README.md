@@ -56,7 +56,7 @@ spawn → In Progress; новые комменты/правки тела юзе�
 Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
 `factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
-
+Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 ### Кроны (uwuwu-cron)
 
 Доска «Crons» (папка в сайдбаре): Schedule (cron-expr | `5m/2h/1d` | разовое `09:30`),
