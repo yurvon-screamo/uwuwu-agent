@@ -21,8 +21,8 @@ call() тогда сам пере-handshake'ится (400/404 → один ре�
   replace <docId> <файл.md> [--stub]            — заменить контент (--stub: без длиновой защиты)
   export <docId>                                — живой markdown дока в stdout
   orgls                                         — organize-папки (id + имя)
-  children <folderId|docId>                     — дети: organize-папки (folder/doc-линки) или doc-дети дерева
-  find <подстрока тайтла>                        — docId по тайтлу (живой поиск по дереву)
+  children <folderId>                           — organize-дети папки (folder/doc-линки, порядок index)
+  find <…>                                      — ВЫПИЛЕН: шлюз не отдаёт doc-дерево; docId по тайтлу — uwuwu-cli search
 """
 
 from __future__ import annotations
@@ -220,7 +220,8 @@ def deep_md(o):
 def _organize_nodes(sid: str) -> list[dict]:
     """Список organize-нод воркспейса ({id, parentId, type: folder|doc,
     data: имя папки | docId-цель линка, index}). Единственный листинг,
-    отражающий organize-структуру: list_workspace_tree её не видит."""
+    отражающий organize-структуру: list_workspace_tree шлюза возвращает
+    те же organize-ноды (без docId/title — doc-дерева в транспорте нет)."""
     res = call(sid, "list_organize_nodes", {"workspaceId": WORKSPACE})
     return json.loads(_content_text(res) or "{}")["nodes"]
 
@@ -233,17 +234,6 @@ def _content_text(res: object) -> str | None:
     for c in res.get("content", []):
         if isinstance(c, dict) and "text" in c:
             return c["text"]
-    return None
-
-
-def _tree_node(n: dict, doc_id: str) -> dict | None:
-    """Узел дерева workspace по docId (рекурсия по children)."""
-    if n["docId"] == doc_id:
-        return n
-    for ch in n.get("children", []):
-        found = _tree_node(ch, doc_id)
-        if found:
-            return found
     return None
 
 
@@ -568,77 +558,47 @@ def cmd_link(a) -> int:
         close(sid)
 
 
-def cmd_children(a) -> int:
-    """Дети узла: children <folderId> — organize-дети папки (подпапки и
-    doc-линки, порядок index); children <docId> — doc-дети из дерева
-    воркспейса (format docId title). Режим печатается маркером
-    «# mode: …» — id папки и id дока синтаксически неразличимы."""
-    sid = session()
-    try:
-        nodes = _organize_nodes(sid)
-        if any(n.get("type") == "folder" and n.get("id") == a.id for n in nodes):
-            print(f"# mode: organize {a.id}")
-            kids = sorted(
-                (n for n in nodes if n.get("parentId") == a.id),
-                key=lambda n: n.get("index", 0),
-            )
-            for n in kids:
-                if n.get("type") == "folder":
-                    print("folder", n["id"], n.get("data"))
-                else:
-                    print("doc", n.get("data"))
-            return 0
-        return _children_doc(sid, a.id)
-    finally:
-        close(sid)
-
-
-def _children_doc(sid: str, doc_id: str) -> int:
-    """doc-дети из list_workspace_tree (ветка docId)."""
-    res = call(sid, "list_workspace_tree", {"workspaceId": WORKSPACE, "depth": 4})
-    print(f"# mode: doc {doc_id}")
-    tree = json.loads(_content_text(res) or "{}")
-    for root in tree.get("tree", []):
-        nd = _tree_node(root, doc_id)
-        if nd is None:
-            continue
-        for c in nd.get("children", []):
-            t = c.get("title") or ""
-            print(c["docId"], json.loads(f'"{t}"') if "\\u" in t else t)
-        return 0
+def cmd_find(_a) -> int:
+    """ВЫПИЛЕН: list_workspace_tree шлюза возвращает organize-ноды
+    ({id, parentId, type, data, index}) — полей docId/title в ответе нет,
+    поиск по тайтлу в этом транспорте невозможен в принципе (живой тест
+    02.11.2026: 353KB ответа, 0 docId, 0 title). Заглушка ради честной
+    миграции вызовов: docId по тайтлу ищет uwuwu-cli search (Manticore)."""
     print(
-        "не найден — id не folder-node и не doc с детьми в дереве воркспейса",
+        "find выпилен: list_workspace_tree шлюза не содержит docId/title "
+        "(только organize-ноды). docId по тайтлу: uwuwu-cli search \"<запрос>\" "
+        "(серверный полнотекст, env UWUWU_AFFINE_UI_URL/EMAIL/PASSWORD)",
         file=sys.stderr,
     )
     return 1
 
 
-def cmd_find(a) -> int:
+def cmd_children(a) -> int:
+    """Организе-дети папки: children <folderId> (подпапки + doc-линки,
+    порядок index, маркер «# mode: organize»). Doc-дети (док-в-док)
+    НЕ поддерживаются: list_workspace_tree шлюза отдаёт organize-ноды
+    без docId/title — doc-дерево в этом транспорте недоступно."""
     sid = session()
     try:
-        res = call(sid, "list_workspace_tree", {"workspaceId": WORKSPACE, "depth": 4})
-        s = json.dumps(res)
-        pat = re.compile(
-            r'"docId"\s*:\s*"([^"]+)"[^}]{0,300}?"title"\s*:\s*"((?:[^"\\]|\\.)*'
-            + re.escape(a.query)
-            + r'(?:[^"\\]|\\.)*)"',
-            re.IGNORECASE,
+        nodes = _organize_nodes(sid)
+        if not any(n.get("type") == "folder" and n.get("id") == a.id for n in nodes):
+            print(
+                f"{a.id} — не organize-папка (см. orgls); doc-дети недоступны: "
+                "шлюз не отдаёт doc-дерево (list_workspace_tree = organize-ноды)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"# mode: organize {a.id}")
+        kids = sorted(
+            (n for n in nodes if n.get("parentId") == a.id),
+            key=lambda n: n.get("index", 0),
         )
-        hits = pat.findall(s)
-        if not hits:  # порядок полей наоборот
-            hits = [
-                (d, t)
-                for t, d in re.findall(
-                    r'"title"\s*:\s*"((?:[^"\\]|\\.)*'
-                    + re.escape(a.query)
-                    + r'(?:[^"\\]|\\.)*)"[^}]{0,300}?"docId"\s*:\s*"([^"]+)"',
-                    s,
-                    re.IGNORECASE,
-                )
-            ]
-        for did, t in hits[:10]:
-            print(did, json.loads(f'"{t}"') if "\\u" in t else t)
-        return 0 if hits else 1
+        for n in kids:
+            if n.get("type") == "folder":
+                print("folder", n["id"], n.get("data"))
+            else:
+                print("doc", n.get("data"))
+        return 0
     finally:
         close(sid)
 
