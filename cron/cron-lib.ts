@@ -121,14 +121,14 @@ export function due(sched: Sched, lastFiredAt: number, now: Date): boolean {
     case "at": {
       if (sched.day !== undefined && (now.getDate() !== sched.day || now.getMonth() + 1 !== (sched.month ?? now.getMonth() + 1))) return false
       // догон: минута наступила (в т.ч. пропущена из-за дауна демона) —
-      // стреляем поздно один раз, авто-paused прикроет повтор
+      // стреляем поздно один раз, fired-статус прикроет повтор
       const scheduled = new Date(now.getFullYear(), now.getMonth(), now.getDate(), sched.hour, sched.minute)
       return now.getTime() >= scheduled.getTime() && minuteStart(now) > lastFiredAt
     }
   }
 }
 
-/** Разовое расписание (at) отработало → крон уходит в paused. */
+/** Разовое расписание (at): после срабатывания демон ставит Status → fired. */
 export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
