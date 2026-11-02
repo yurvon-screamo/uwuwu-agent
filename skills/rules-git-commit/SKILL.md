@@ -1,41 +1,36 @@
 ---
 name: rules-git-commit
-description: Rules for committing and pushing in Git.
+description: Automatic atomic commits — the agent commits by itself as it works; push only with the PR.
 ---
 
-## Basic Rules
+## Concept
 
-* Commit changes only if the user requested it, do not make this decision yourself.
-* If you are not sure which branch to commit to, it is better to ask the user rather than trying to guess.
-* If changes were made for different purposes, it is better to commit them as separate commits.
+Commits are automatic and atomic: finished a meaningful step — commit immediately, without asking the user. Monster-commits and piling all task changes into one commit are forbidden.
 
-## WORKFLOW
+## When to commit
 
-1. **Goal analysis**: Analyze the actual modifications via `git diff`.
-2. **Staging**: Stage the required files or all changes (`git add .`).
-3. **Message formation**: Create a commit message in the format: `<type-emoji>(<scope>): <subject>`. Emojis and types:
-    - ✨ `feature`: new functionality
-    - 🐛 `fix`: bug fix
-    - 📝 `docs`: documentation
-    - 💄 `style`: formatting, missing semicolons, etc. (without changing logic)
-    - ♻️ `refactor`: code refactoring
-    - ✅ `test`: adding or fixing tests
-    - 🔧 `chore`: updating build tasks, package configurations, etc.
-4. **Commit and push**: Execute the commit (`git commit -m "..."`) and push the changes to the remote repository (`git push`).
+- **Atom = a completed meaningful plan step**: implementation + its tests, fix + test, refactor, docs edit. One step — one commit.
+- The repo in every commit is working: build/lint/tests pass. No WIP or broken states — finish the step to green, then commit.
+- Step not finished — don't commit.
 
-## CRITICAL RESTRICTIONS
+## How to commit
 
-**ABSOLUTELY FORBIDDEN:**
-- Create new files or directories (outside the context of preparing a commit).
-- Fork repositories.
-- Use `cherry-pick`, `rebase`, `reset`.
-- Delete branches or files.
-- Perform any destructive operations or logic changes not related to the staging and commit process.
-- Perform any actions that cannot be undone.
+1. Stage explicitly: `git add <files of the step>`. Mass staging is forbidden (`git add .`, `git add -A/--all/-u`, `git commit -a`).
+2. Message `<type-emoji>(<scope>): <subject>` in English; the subject (after `: `) is ≤72 chars.
+   Types: ✨ feature (new functionality) · 🐛 fix · 📝 docs (user-facing docs) · 💄 style (formatting, no logic change) · ♻️ refactor · ✅ test · 🔧 chore. Prompt/policy edits that change agent behavior are ✨ or 🐛, not 📝.
+3. `git commit -m "…"`; never bypass pre-commit hooks (`--no-verify` is forbidden).
 
-**COMMIT AND PUSH ONLY.**
+## Amending
 
-## LANGUAGE RULES
+Mistake in your own commits: **before push** — amend or otherwise restructure your own not-yet-pushed commits (the only history-editing exception). **After push** — never amend or rewrite; make a fix commit instead.
 
-- **Communication**: Respond to the user in the same language they addressed you in.
-- **Commit messages**: ALWAYS written strictly in **ENGLISH**.
+## Push
+
+Push is not automatic: only when creating the PR and chasing review fixes.
+
+## Prohibitions
+
+- Direct commits to master/main — work on a feature branch (worktree).
+- `rebase`, `reset`, `cherry-pick`, force-push, branch/file deletion, fork — except restructuring your own unpushed commits (see Amending).
+- Anything irreversible or destructive beyond staging and committing.
+- Secrets, junk (caches/tmp/artifacts), changes outside the current step.
