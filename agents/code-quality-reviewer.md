@@ -17,6 +17,9 @@ model: zai-coding-plan/glm-5.3
 tool:
   edit: false
   write: false
+permission:
+  task:
+    "code-quality-reviewer": "deny"
 ---
 
 @code-quality-reviewer

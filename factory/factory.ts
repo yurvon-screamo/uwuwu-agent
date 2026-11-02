@@ -81,7 +81,9 @@ const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
-/** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника */
+/** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника.
+ *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
+ *  синхронно: модель сессии спавна главнее для фабричных сессий. */
 const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
@@ -560,6 +562,10 @@ async function failReview(
   log(`задача ${task.rowId.slice(0, 8)}: ревью-старт не удался (попытка ${attempts}) — ${err}`)
   if (attempts >= MAX_ATTEMPTS) {
     await setCells(board, task.rowId, { Status: "Needs attention" })
+    // lastStatus — сразу за доской: если юзер переставит ревью-статус быстрее
+    // тика, entering-проверка всё равно посчитает это новым входом (seed=0)
+    tracked.lastStatus = "Needs attention"
+    saveState(state)
     await notify(tracked,
       `[factory] ревьювер не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH}; ` +
       "чтобы перезапустить ревью — переставь ревью-статус (счётчик попыток обнулится).")
@@ -766,6 +772,29 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     // ——— пайп девелопера: комменты/тело/живость (комменты мог съесть ревьювер) ———
     const devFresh = commentsConsumed ? [] : fresh
 
+    // будильник правок ТЕЛА без комментов — до карантинных веток: адресат
+    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине)
+    if (devFresh.length === 0) {
+      const updated = await bodyUpdatedAt(tracked.bodyDoc)
+      const bodyChanged = updated !== null
+        && (tracked.bodyUpdated ?? "") !== ""
+        && updated > (tracked.bodyUpdated ?? "")
+      if (bodyChanged) {
+        const inReview = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
+        const target = inReview ? tracked.reviewSessionID ?? "" : tracked.sessionID
+        if (target !== "") {
+          log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно (${inReview ? "ревьювер" : "девелопер"})`)
+          if (await promptSession(target, bodyEditPrompt(rowId))) {
+            tracked.bodyUpdated = updated
+            saveState(state)
+          }
+          continue
+        }
+        // таргета нет (дев в карантине, ревью-сессии тоже) — базлайн не двигаем:
+        // добудим адресата на следующем тике
+      }
+    }
+
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
       if (devFresh.length === 0) continue
@@ -797,26 +826,15 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
 
-    // будильник правок ТЕЛА — немедленно, без отложений; в ревью-статусе
-    // адресат — ревьювер (мяч у него), иначе девелопер
-    const updated = await bodyUpdatedAt(tracked.bodyDoc)
-    const bodyChanged = updated !== null
-      && (tracked.bodyUpdated ?? "") !== ""
-      && updated > (tracked.bodyUpdated ?? "")
-    if (bodyChanged) {
-      const target = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
-        ? tracked.reviewSessionID ?? ""
-        : tracked.sessionID
-      if (devFresh.length === 0) {
-        log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно (${target === tracked.sessionID ? "девелопер" : "ревьювер"})`)
-        if (await promptSession(target, bodyEditPrompt(rowId))) {
-          tracked.bodyUpdated = updated
-          saveState(state)
-        }
-        continue
-      }
-      // комменты ниже разбудят той же пачкой — тело агент перечитает сам
-      tracked.bodyUpdated = updated
+    // правка ТЕЛА при наличии комментов: wakeup-комменты ниже разбудят той
+    // же пачкой — тело агент перечитает сам, двигаем только базлайн
+    const updatedWithComments = await bodyUpdatedAt(tracked.bodyDoc)
+    if (
+      updatedWithComments !== null &&
+      (tracked.bodyUpdated ?? "") !== "" &&
+      updatedWithComments > (tracked.bodyUpdated ?? "")
+    ) {
+      tracked.bodyUpdated = updatedWithComments
       saveState(state)
     }
 
