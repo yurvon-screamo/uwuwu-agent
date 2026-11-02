@@ -3,7 +3,8 @@
 // опенкода с агентом dreamer (glm-5.3#max), который автономно обновляет вики
 // (гигиена доков, опыт, инфра-задачи). Замена механизма заявок и qwen-фактизации.
 // Запуск: systemd --user (линукс) или Task Scheduler (вин: dreamer/win-autostart.ps1
-// — задача \UWUWU\Dreamer, старт при логоне, рестарт при падении). Тик: 1 мин.
+// — задача \UWUWU\Dreamer: старт при логоне + повтор каждую минуту, живой
+// инстанс отсекается IgnoreNew). Тик: 1 мин.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
