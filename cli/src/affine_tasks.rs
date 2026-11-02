@@ -663,13 +663,7 @@ pub async fn create_task(
             // ok:false внутри structuredContent (WRITE_QUEUE_TIMEOUT и т.п.):
             // применился ли док — неизвестно; ретрай безопасен, резолв выше
             // найдёт сироту и достроит
-            if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
-                bail!(
-                    "create_doc_from_markdown не подтвердился ({}): {}",
-                    resp.get("code").and_then(|c| c.as_str()).unwrap_or("?"),
-                    resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
-                );
-            }
+            require_ok("create_doc_from_markdown", &resp)?;
             let body_doc = first_str(&resp, &["docId", "id"])
                 .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
 
@@ -808,15 +802,7 @@ pub async fn create_cron(
                 )
                 .await
                 .context("create_doc_from_markdown")?;
-            // ok:false внутри structuredContent: применился ли док — неизвестно;
-            // ретрай безопасен, резолв выше найдёт сироту и достроит
-            if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
-                bail!(
-                    "create_doc_from_markdown не подтвердился ({}): {}",
-                    resp.get("code").and_then(|c| c.as_str()).unwrap_or("?"),
-                    resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
-                );
-            }
+            require_ok("create_doc_from_markdown", &resp)?;
             let body_doc = first_str(&resp, &["docId", "id"])
                 .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
             // add_tag_to_doc создаёт опцию тега при нужде; у Cron нет истории
