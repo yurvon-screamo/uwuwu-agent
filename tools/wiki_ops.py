@@ -541,6 +541,24 @@ def cmd_link(a) -> int:
         if not any(n.get("type") == "folder" and n.get("id") == a.folder for n in nodes):
             print(f"папка {a.folder} не найдена в organize (см. orgls)", file=sys.stderr)
             return 1
+        try:
+            target = call(
+                sid, "read_doc", {"workspaceId": WORKSPACE, "docId": a.docId}
+            )
+        except McpError as e:  # noqa: S5754 — отказ до мутации: линк не создаём
+            print(
+                f"read_doc {a.docId} упал ({str(e)[:150]}) — линк не создаём: "
+                "проверь docId и повтори",
+                file=sys.stderr,
+            )
+            return 1
+        if isinstance(target, dict) and target.get("exists") is False:
+            print(
+                f"док {a.docId} не существует (read_doc: exists:false) — "
+                "висячий линк не создаём",
+                file=sys.stderr,
+            )
+            return 1
         existing = next(
             (n for n in nodes if n.get("type") == "doc" and n.get("data") == a.docId),
             None,
