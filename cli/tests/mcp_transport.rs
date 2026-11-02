@@ -459,6 +459,32 @@ fn write_retryable_queue_timeout_is_retried() {
 
 #[test]
 #[serial_test::serial]
+fn write_retryable_trusted_codes_are_retried_on_wire() {
+    with_temp_home(|| {
+        // остальные два доверенных кода whitelist — тот же путь, что и
+        // WRITE_QUEUE_TIMEOUT: запрос гарантированно не применён (ADR-006)
+        let full = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"Write queue for scope is full.","code":"WRITE_QUEUE_FULL","retryable":true}}"#;
+        let limited = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"rate limit exceeded","code":"rate_limited","retryable":true}}"#;
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::basic(200, None, limited),
+            Step::basic(200, None, full),
+            Step::basic(200, None, CALL_OK),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let out = rt
+            .block_on(client.call_tool("create_doc", json!({})))
+            .unwrap();
+        assert_eq!(out["answer"], 42);
+        assert_eq!(mock.request_count(), 5);
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn write_retryable_untrusted_code_fails_fast_without_retry() {
     with_temp_home(|| {
         // DOCUMENT_MOVE_PARTIAL — операция частично применена, флаг шлюза

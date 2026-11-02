@@ -87,6 +87,13 @@ fn op_kind(tool: &str) -> OpKind {
     const READ: &[&str] = &[
         "get_", "list_", "search_", "find_", "read_", "export_", "analyze_",
     ];
+    // мутация под read-префиксом: read_all_notifications гоняет GraphQL-мутацию
+    // readAllNotifications — на фейл шлюз эмитит notification_update_failed с
+    // retryable:true, при «чтении» клиент ретраил бы её безусловно (ADR-006,
+    // третий небезопасный путь аудита)
+    if tool == "read_all_notifications" {
+        return OpKind::Write;
+    }
     if READ.iter().any(|p| tool.starts_with(p)) {
         OpKind::Read
     } else {
@@ -491,10 +498,14 @@ impl AffineClient {
                         } else if failure.retryable {
                             return Err(anyhow!(
                                 "tool {name} failed: {} — retryable:true от шлюза для записи \
-                                 не доверяется (код {:?} вне whitelist, операция могла примениться; \
+                                 не доверяется (код {} вне whitelist, операция могла примениться; \
                                  см. ADR-006 uwuwu)",
                                 failure.detail,
-                                failure.code.as_deref().unwrap_or("<нет кода>")
+                                failure
+                                    .code
+                                    .as_deref()
+                                    .map(|c| format!("\"{c}\""))
+                                    .unwrap_or_else(|| "<нет кода>".to_owned())
                             ));
                         } else {
                             return Err(anyhow!("tool {name} failed: {}", failure.detail));
@@ -924,6 +935,7 @@ mod tests {
             "upload_blob",
             "publish_doc",
             "revoke_doc",
+            "read_all_notifications",
         ] {
             assert_eq!(op_kind(t), OpKind::Write, "{t} должен быть Write");
         }
