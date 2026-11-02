@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """wiki_ops — CLI-хелпер MCP-операций над доками AFFiNE (для сабагентов).
 
-Сессия переиспользуется через ~/.uwuwu/mcp-session.txt (общая с uwuwu-cli):
-initialize = sign-in афины 4-7с, платим только когда сохранённая протухла —
-call() тогда сам пере-handshake'ится (400/404 → один ретрай). 503-ретраи
-транзиентов с паузами сохранены; close() в finally трогает только
-осиротевшие сессии — общую не инвалидирует.
+Сессия: последовательные запуски шарят ~/.uwuwu/mcp-session.txt с uwuwu-cli
+(initialize = sign-in афины 4-7с — платим только когда сохранённая протухла,
+call() сам пере-handshake'ится: 400/404 → один ретрай). Эксклюзивность —
+flock на ~/.uwuwu/mcp-session.lock: лок наш → шарим и публикуем handshake в
+общий файл; лок чужой → private-сессия, файл не читаем и не пишем. JSON-RPC
+id — случайная база + счётчик (общая сессия с коллизией id давала кросс-ток
+ответов, задача IyzxmFdujA). call() ретраит транзиентные сбои шлюза
+(429/5xx/сеть, ok:false+retryable) с экспоненциальным бэкофом; таймаут на
+записи НЕ ретраится — операция могла примениться. close() в finally трогает
+только осиротевшие сессии — общую не инвалидирует.
 Гоча argparse: docId с ВЕДУЩИМ дефисом (напр. -GnAmdAk45) парсится как флаг —
 опции ставь ДО `--`: wiki_ops.py move --parent <id> -- -GnAmdAk45.
 
@@ -21,8 +26,12 @@ call() тогда сам пере-handshake'ится (400/404 → один ре�
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
 import json
+import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -36,18 +45,25 @@ from triage_affine import (
     McpError,
     WORKSPACE,
     get_md,
+    jitter_unit,
     mcp_call,
     mcp_result,
 )
 
-RETRIES = 8
-PAUSE = 120
+# Ретраи handshake: листовой цикл, транзиентное повторяемо (зеркально
+# affine_client.rs: HANDSHAKE_TRIES, тот же бэкоф-планировщик).
+HANDSHAKE_TRIES = 3
 
 # Общая сессия с uwuwu-cli (Rust): initialize = sign-in афины 4-7с на каждый
-# запуск — главный источник латентности python-тулз. Файл разделяемый;
-# протухшую сессию call() пере-handshake'ит сам (паттерн affine_client.rs).
+# запуск — главный источник латентности python-тулз. Файл разделяемый под
+# lock'ом ~/.uwuwu/mcp-session.lock; протухшую сессию call() пере-handshake'ит
+# сам (паттерн affine_client.rs).
 SESSION_FILE = Path.home() / ".uwuwu" / "mcp-session.txt"
+# Lock-файл НИКОГДА не удаляется и не перезаписывается: session-файл
+# переписывается handshake'ами, лок на нём ломался бы сменой inode.
+LOCK_FILE = Path.home() / ".uwuwu" / "mcp-session.lock"
 _live_sid: str | None = None
+_lock_fd: int | None = None
 
 
 def _load_saved_session() -> str:
@@ -65,13 +81,15 @@ def _save_session(sid: str) -> None:
         pass  # сохранить не смогли — сессия живёт до idle-timeout шлюза
 
 
-def _handshake(client_name: str = "wiki-ops") -> str:
-    """Сессия с СЕЛЕКТИВНЫМИ ретраями: повторяем только транзиентное
-    (HTTP 503, URLError/timeout); McpError от mcp_result
-    (isError/JSON-RPC error) — фатально, сразу наверх с причиной.
+def _handshake(client_name: str = "wiki-ops", publish: bool = True) -> str:
+    """Сессия с ретраями транзиентного (HTTP 429/5xx, URLError/timeout) на
+    общем бэкоф-планировщике; McpError от mcp_result (isError/JSON-RPC
+    error) — фатально, сразу наверх с причиной. publish=False — приватная
+    сессия: общий файл не пишем. ВСЕ пути пере-handshake'а наследуют режим
+    старта — иначе private-процесс подменил бы общую сессию своей.
     client_name виден на уровне ПРОТОКОЛА (initialize.clientInfo,
     MCP-трейс/инспектор); stdout шлюза логирует только UUID сессий."""
-    for attempt in range(RETRIES):
+    for attempt in range(HANDSHAKE_TRIES):
         sid = None
         try:
             resp, sid = mcp_call(
@@ -84,7 +102,8 @@ def _handshake(client_name: str = "wiki-ops") -> str:
             )
             mcp_result(resp)  # McpError здесь = фатально, не ретраим
             mcp_call("notifications/initialized", {}, sid, notify=True)
-            _save_session(sid)
+            if publish:
+                _save_session(sid)
             return sid
         except McpError:
             if sid:
@@ -93,38 +112,116 @@ def _handshake(client_name: str = "wiki-ops") -> str:
         except urllib.error.HTTPError as e:
             if sid:
                 close(sid)
-            if e.code != 503:
+            if e.code not in (429, 502, 503):
                 raise
-            _retry_wait(attempt, e)
-        except urllib.error.URLError as e:
+            _retry_wait(
+                "handshake", attempt, HANDSHAKE_TRIES - 1, str(e)[:60], _retry_after_secs(e)
+            )
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
             if sid:
                 close(sid)
-            _retry_wait(attempt, e)
+            _retry_wait("handshake", attempt, HANDSHAKE_TRIES - 1, str(e)[:60], None)
         # успешный путь: sid возвращается живым — close только в НЕУСПЕШНЫХ ветках
         # (finally закрыл бы сессию и при return — call после session ловил 404)
     raise RuntimeError("unreachable")
 
 
 def session(client_name: str = "wiki-ops") -> str:
-    """Переиспользовать сохранённую сессию (общая с uwuwu-cli), иначе
-    полный handshake. Протухшая сессия ловится в call() и обновляется.
+    """Переиспользовать сохранённую сессию (общая с uwuwu-cli) под локом,
+    иначе полный handshake: лок наш → shared (публикуем в общий файл),
+    лок чужой → private (своя сессия, файл не трогаем вовсе — он
+    принадлежит живому процессу). Протухшая сессия ловится в call().
     client_name — идентичность создателя на уровне протокола initialize
     (MCP-трейс); в stdout-логах шлюза её нет, там только UUID."""
+    global _live_sid
     if _live_sid:
         return _live_sid
-    saved = _load_saved_session()
-    if saved:
-        return saved
-    return _handshake(client_name)
+    if _acquire_session_lock():
+        saved = _load_saved_session()
+        if saved:
+            return saved
+        _live_sid = _handshake(client_name, publish=True)
+        return _live_sid
+    _live_sid = _handshake(client_name, publish=False)
+    return _live_sid
 
 
-def _retry_wait(attempt: int, e: Exception) -> None:
+def _acquire_session_lock() -> bool:
+    """flock на выделенном lock-файле до конца процесса (ядерная семантика:
+    крэш освобождает лок сам). True — мы владелец общей сессии."""
+    global _lock_fd
+    if _lock_fd is not None:
+        return True
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)  # лок занят живым процессом — работаем приватно
+        return False
+    _lock_fd = fd
+    return True
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """Env-оверрайд с валидацией: мусор → warning + дефолт, значения клампятся."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(lo, min(hi, int(raw.strip())))
+    except ValueError:
+        print(
+            f"wiki-ops: {name}={raw!r} не число — беру дефолт {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+
+
+def _retry_retries() -> int:
+    return _env_int("UWUWU_RETRY_ATTEMPTS", 3, 0, 12)
+
+
+def _retry_base_ms() -> int:
+    return _env_int("UWUWU_RETRY_BASE_MS", 1000, 0, 60000)
+
+
+_RETRY_AFTER_CAP_S = 30.0  # 503 с «спи 10 минут» не спим дольше полминуты
+_BACKOFF_CAP_S = 20.0
+
+
+def _backoff_pause(attempt: int, retry_after: float | None) -> float:
+    """Пауза повтора: Retry-After шлюза приоритетен (кламп 30с — длинный
+    outage клиент не переживает, честнее ошибка с подсказкой), иначе
+    base·2^attempt с клампом 20с и full jitter. Зеркально affine_client.rs."""
+    if retry_after is not None:
+        return min(retry_after, _RETRY_AFTER_CAP_S)
+    delay = min((_retry_base_ms() / 1000.0) * (2**attempt), _BACKOFF_CAP_S)
+    return jitter_unit() * delay
+
+
+def _retry_after_secs(e: urllib.error.HTTPError) -> float | None:
+    raw = e.headers.get("Retry-After") if e.headers else None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_wait(
+    what: str, attempt: int, retries: int, reason: str, retry_after: float | None
+) -> None:
+    pause = _backoff_pause(attempt, retry_after)
     print(
-        f"шлюз занят/недоступен ({attempt + 1}/{RETRIES}): {str(e)[:60]}; пауза {PAUSE}с",
+        f"wiki-ops: {what}: повтор {attempt + 1}/{retries} через {pause:.0f}s: {reason}",
         file=sys.stderr,
         flush=True,
     )
-    time.sleep(PAUSE)
+    time.sleep(pause)
 
 
 def close(sid: str) -> None:
@@ -146,36 +243,137 @@ def close(sid: str) -> None:
         pass
 
 
-def _call_tool(sid: str, name: str, args: dict) -> dict:
-    """tools/call + валидация ответа. McpError ре-рейзится с префиксом имени
-    инструмента — погибший шаг серии виден в логе обвязки. Ошибка handshake
-    (initialize при пере-handshake) сюда не заворачивается и уходит без
-    префикса — атрибуция места отказа честная."""
+def _validated(name: str, r: object) -> dict:
+    """mcp_result с префиксом имени инструмента (см. докстринг call)."""
     try:
-        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, sid)
         return mcp_result(r)
     except McpError as e:
         raise McpError(f"{name}: {e}") from e
 
 
+# Чтения — закрытый список префиксов; всё остальное = write (safe default:
+# новый read-тулз теряет ретраи, но запись никогда не дублируется).
+_READ_PREFIXES = ("get_", "list_", "search_", "find_", "read_", "export_", "analyze_")
+
+
+def _is_read(name: str) -> bool:
+    return name.startswith(_READ_PREFIXES)
+
+
+def _ok_false(r: object) -> tuple[str, bool] | None:
+    """(detail, retryable), если ответ несёт шлюзовую конвенцию логического
+    фейла ok:false — в structuredContent, в result верхнего уровня или
+    внутри content[0].text-блоба (зеркально affine_client.rs). Вызывается
+    ДО mcp_result, который любой ok:false превращает в McpError без флага.
+    retryable:true = шлюз гарантирует, что запрос НЕ применён (контракт,
+    задача W9etJF1FVm) — такой сбой ретраится и на записи."""
+    if not isinstance(r, dict):
+        return None
+    result = r.get("result")
+    if not isinstance(result, dict):
+        return None
+    candidates: list[object] = [result.get("structuredContent"), result]
+    for c in result.get("content") or []:
+        if isinstance(c, dict) and isinstance(c.get("text"), str):
+            try:
+                inner = json.loads(c["text"])
+            except json.JSONDecodeError:
+                continue
+            candidates.append(inner)
+    for cand in candidates:
+        if isinstance(cand, dict) and cand.get("ok") is False:
+            detail = cand.get("error") or "unknown tool error"
+            if not isinstance(detail, str):
+                detail = json.dumps(detail, ensure_ascii=False)
+            return (detail, cand.get("retryable") is True)
+    return None
+
+
 def call(sid: str, name: str, args: dict) -> dict:
-    """tools/call с восстановлением протухшей сессии: 400/404 → один
-    пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
-    call(старый_sid,...) продолжают работать. Ошибки контракта приходят с
-    префиксом имени инструмента (см. _call_tool)."""
+    """tools/call с восстановлением протухшей сессии (400/404 → один
+    пере-handshake → повтор) и ретраями с бэкофом: HTTP 429/5xx и сетевые
+    отказы — всегда; таймаут/обрыв — только чтение (запись могла
+    примениться — честная ошибка без ретрая); ok:false+retryable:true —
+    ретрай. Обновлённый sid живёт в модуле — последующие
+    call(старый_sid,...) продолжают работать."""
     global _live_sid
     effective = _live_sid or sid
-    try:
-        return _call_tool(effective, name, args)
-    except urllib.error.HTTPError as e:
-        if e.code not in (400, 404):
+    retries = _retry_retries()
+    stale_tried = False
+    pause_override: float | None = None  # stale-повтор — без бэкоф-паузы
+    retry_after: float | None = None  # Retry-After последнего 429/503
+    reason = ""
+    for attempt in range(retries + 1):
+        if attempt:
+            if pause_override is not None:
+                pause = pause_override
+            else:
+                pause = _backoff_pause(attempt - 1, retry_after)
+            pause_override = None
+            retry_after = None
+            if pause > 0:
+                print(
+                    f"wiki-ops: повтор {attempt}/{retries} через {pause:.0f}s: {reason[:60]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(pause)
+        try:
+            r, _ = mcp_call(
+                "tools/call", {"name": name, "arguments": args}, effective
+            )
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 404) and not stale_tried:
+                # сессия протухла: полный handshake в РЕЖИМЕ СТАРТА (shared
+                # публикует в общий файл, private — нет) и повтор
+                stale_tried = True
+                e.close()  # отпустить соединение до повторного запроса
+                print(
+                    "wiki-ops: сессия протухла — пере-handshake",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                effective = _handshake(publish=_lock_fd is not None)
+                _live_sid = effective
+                pause_override = 0.0
+                reason = "сессия протухла"
+                continue
+            if e.code in (429, 502, 503):
+                reason = f"HTTP {e.code}"
+                retry_after = _retry_after_secs(e)
+                continue
             raise
-        e.close()  # отпустить соединение до повторного запроса
-        print(
-            "wiki-ops: сессия протухла — пере-handshake", file=sys.stderr, flush=True
-        )
-        _live_sid = _handshake()
-        return _call_tool(_live_sid, name, args)
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            if not _is_read(name):
+                raise McpError(
+                    f"{name}: таймаут/обрыв ответа шлюза — операция могла "
+                    "примениться, проверь результат перед повтором"
+                ) from e
+            reason = str(e)[:60]
+            continue
+        failure = _ok_false(r)
+        if failure is not None:
+            detail, retryable = failure
+            if retryable and attempt < retries:
+                reason = detail
+                continue
+            raise McpError(f"{name}: {detail}")
+        return _validated(name, r)
+    raise McpError(
+        f"{name}: шлюз не ответил за {retries + 1} попыток ({reason}) — "
+        "если шлюз лежит целиком, держи паузу 120-180с между попытками"
+    )
+
+
+def _cleanup_private_session() -> None:
+    """Private-сессия (старт при чужом локе или mid-run пере-handshake в
+    private-режиме) умирает вместе с процессом — вернём слот шлюзу.
+    Shared-сессию НЕ закрываем: она опубликована в общем файле."""
+    if _live_sid and _lock_fd is None:
+        close(_live_sid)
+
+
+atexit.register(_cleanup_private_session)
 
 
 def deep_md(o):

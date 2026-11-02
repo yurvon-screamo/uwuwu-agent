@@ -28,13 +28,34 @@ dual-agreement P 0.973 на корпусе 1078) → ручной вердикт
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
+
+
+def jitter_unit() -> float:
+    """[0, 1) от xorshift64* на времени+pid: full-jitter пауз ретраев и база
+    JSON-RPC id без random (bandit B311) — криптостойкость не нужна, нужен
+    разброс между процессами. Зеркально XorShift64 в affine_client.rs."""
+    mask = (1 << 64) - 1
+    x = (time.time_ns() ^ (os.getpid() << 32)) & mask
+    x = x or 0x9E37_79B9_7F4A_7C15
+    x ^= x >> 12
+    x ^= (x << 25) & mask
+    x ^= x >> 27
+    return ((x * 0x2545_F491_4F6C_DD1D) & mask) / float(1 << 64)
+
+
+# JSON-RPC id: случайная база на процесс + счётчик (см. комментарий в mcp_call).
+# База клампится в JS-safe диапазон (< 2^52): шлюз на JS, бо́льшие id теряют
+# точность при парсинге — отсюда 400/ломаный матчинг ответов.
+_rpc_id = itertools.count(int(jitter_unit() * (1 << 52)) + 1)
 
 WIKI = Path(os.environ.get("UWUWU_WIKI", str(Path.home() / ".uwuwu")))
 CACHE = WIKI / "affine_content_cache.json"
@@ -221,7 +242,13 @@ def mcp_call(
         headers["mcp-session-id"] = sid
     payload: dict = {"jsonrpc": "2.0", "method": method, "params": params}
     if not notify:
-        payload["id"] = 1  # notification не имеет id (JSON-RPC 2.0)
+        # случайная база + счётчик: шлюз матчит ответ по (session, id), и у
+        # процессов на общей сессии (см. ~/.uwuwu/mcp-session.txt) жёсткий
+        # id=1 сталкивался — ответы кросс-доставлялись чужому соединению
+        # (задача IyzxmFdujA). Прямые initialize-последовательности ниже по
+        # файлу получают уникальные id автоматически, retry-обёртка им не
+        # нужна (единичный стартовый вызов).
+        payload["id"] = next(_rpc_id)
     req = urllib.request.Request(
         MCP_URL, data=json.dumps(payload).encode(), headers=headers
     )
