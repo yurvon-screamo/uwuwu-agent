@@ -11,7 +11,7 @@ plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (
 skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.local/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
-cron/          uwuwu-cron — демон кронов (доска Crons → сессии агентов)
+cron/          uwuwu-cron — демон кронов (доски «Кроны <Proj>» → сессии агентов)
 dreamer/       uwuwu-dreamer — дример: пост-обработка сессий (idle → агент dreamer)
 triage/        uwuwu-triage — входная точка задач: TG-бот → триаж → канбан uwuwu
 lib/           общие модули демонов (single-instance лок)
@@ -57,14 +57,20 @@ spawn → In Progress; новые комменты/правки тела юзе�
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
 `factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
 Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
+
 ### Кроны (uwuwu-cron)
 
-Доска «Crons» (папка в сайдбаре): Schedule (cron-expr | `5m/2h/1d` | разовое `09:30`),
-промпт = тело-док. Демон (тик 1 мин) поднимает сессию агента по расписанию —
-отчёты комментами 🤖 в тело; разовые → авто-`fired`.
+Кроны распределены по проектам: крон живёт на доске **«Кроны <Proj>»** в папке
+проекта (создаётся руками: kanban-доска + колонки Schedule/Status/Last Run).
+Строка = крон: Schedule (cron-expr | `5m/2h/1d` | разовое `09:30`), промпт =
+тело-док строки. Демон (тик 1 мин) поллит все существующие крон-доски (нет
+доски — тихо скип): наступило расписание → OpenCode-сессия с промптом из тела →
+отчёты комментами 🤖 в тело; разовые → авто-`fired`. Глобальная доска «Crons» —
+легаси: лежит в трэше, не используется.
 
 CLI:
-`uwuwu-cli cron set --title "…" (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`,
+`uwuwu-cli cron set --title "…" [--project <proj>] (--in 10m | --every 30m | --at 09:30 | --cron '*/5 * * * *') [--stdin]`
+(без `--project` целится в глобальную «Crons» — сейчас её нет, `set` упадёт с ошибкой),
 `cron list / pause / resume / rm`.
 
 ### Триаж (uwuwu-triage)
@@ -101,7 +107,7 @@ uwuwu-проекта с пустым статусом (черновики вла
 ### CLI
 
 `uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок, фоллбек Crons); `search` (сервер Manticore + семантика),
+(id/заголовок; фоллбек — крон-доски проектов); `search` (сервер Manticore + семантика),
 `read/blob/shot` (мультимодальное чтение).
 
 The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
