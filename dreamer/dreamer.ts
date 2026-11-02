@@ -16,7 +16,7 @@ import {
   normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
-import { acquireLock } from "../lib/single-instance"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-dreamer")
 const STATE_FILE = join(STATE_DIR, "state.json")
@@ -56,18 +56,8 @@ const log = (m: string): void => {
 
 // ——— одиночный инстанс ———
 
-// взводится onStop лока: тик доезжает до конца, новых прогонов не открываем
-let stopping = false
-
-/** Сон между тиками с прерыванием по стоп-сигналу: SIGTERM между тиками —
- *  чистый выход за шаг сна, а не через 15с grace-килла. Оптимизация
- *  латентности останова, не корректности. */
-async function sleepTick(): Promise<void> {
-  const total = TICK_SEC * 1000
-  for (let waited = 0; waited < total && !stopping; waited += 500) {
-    await new Promise((r) => setTimeout(r, Math.min(500, total - waited)))
-  }
-}
+// onStop лока взводит флаг: тик доезжает до конца, новых прогонов не открываем
+const drain = makeDrain()
 
 // ——— состояние ———
 
@@ -283,7 +273,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
   for (const cand of candidates) {
     if (activeRuns() >= CONCURRENCY) break
     // стоп-сигнал: не открываем новые прогоны и wakeup'ы — очередь доедет при следующем старте
-    if (stopping) break
+    if (drain.isStopping()) break
     if (DRY_RUN) {
       log(`DRY_RUN: ${cand.action} дримера над ${cand.session.id.slice(0, 8)} (${cand.reason}) — пропущен`)
       continue
@@ -355,7 +345,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-dreamer держит lock — выходим")
     process.exit(1)
   }
@@ -384,11 +374,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    if (stopping) {
+    if (drain.isStopping()) {
       log("стоп-сигнал: тик доехал — выходим")
       process.exit(0)
     }
-    await sleepTick()
+    await drain.sleep(TICK_SEC * 1000)
   }
 }
 

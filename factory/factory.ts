@@ -13,7 +13,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeF
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "./mcp"
-import { acquireLock } from "../lib/single-instance"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -89,18 +89,8 @@ function rotateLog(): void {
 
 // ——— одиночный инстанс ———
 
-// взводится onStop лока: проход доезжает до границы, новую работу не спавним
-let stopping = false
-
-/** Сон между проходами с прерыванием по стоп-сигналу: SIGTERM между тиками —
- *  чистый выход за шаг сна, а не через 15с grace-килла. Оптимизация
- *  латентности останова, не корректности. */
-async function sleepTick(): Promise<void> {
-  const total = POLL_SEC * 1000
-  for (let waited = 0; waited < total && !stopping; waited += 500) {
-    await new Promise((r) => setTimeout(r, Math.min(500, total - waited)))
-  }
-}
+// onStop лока взводит флаг: проход доезжает до границы, новую работу не спавним
+const drain = makeDrain()
 
 // ——— состояние (валидация + атомарная запись) ———
 
@@ -384,7 +374,7 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
   // стоп-сигнал: не спавним новую работу — задача доедет при следующем старте
-  if (stopping) return
+  if (drain.isStopping()) return
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
   // сессия стартует в основном чекауте репо
   // тайтл: линкованная строка несёт заголовок в доке-теле — деривируем из него
@@ -619,7 +609,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
 let tickCount = 0
 
 async function main(): Promise<void> {
-  if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
   }
@@ -631,7 +621,7 @@ async function main(): Promise<void> {
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {
     for (const [name, cfg] of Object.entries(PROJECTS)) {
-      if (stopping) break
+      if (drain.isStopping()) break
       try {
         await tickProject(state, name, cfg)
       } catch (e) {
@@ -644,11 +634,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    if (stopping) {
+    if (drain.isStopping()) {
       log("стоп-сигнал: проход доехал — выходим")
       process.exit(0)
     }
-    await sleepTick()
+    await drain.sleep(POLL_SEC * 1000)
   }
 }
 

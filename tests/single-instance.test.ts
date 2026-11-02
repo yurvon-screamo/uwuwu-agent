@@ -48,7 +48,7 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
   const children: Child[] = []
   afterAll(() => {
     for (const c of children) {
-      c.proc.kill("SIGKILL")
+      try { c.proc.kill("SIGKILL") } catch { /* уже мёртв */ }
       try { rmSync(c.dir, { recursive: true, force: true }) } catch {}
     }
   })
@@ -57,11 +57,13 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
     const a = await spawnChild("hold")
     children.push(a)
     const b = await spawnChild("guard", a.stateDir)
+    children.push(b)
     expect(await b.proc.exited).toBe(3)
   })
 
   test("SIGTERM — onStop вызван, выход 0, лок убран", async () => {
     const a = await spawnChild("hold")
+    children.push(a)
     a.proc.kill("SIGTERM")
     expect(await a.proc.exited).toBe(0)
     expect(existsSync(a.stopFlag)).toBeTrue()
@@ -69,8 +71,12 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
   })
 
   test("двойной SIGTERM — onStop один раз, без крэша", async () => {
+    // второй сигнал с зазором: синхронные kill коалесцирует ядро, и guard
+    // lib не поучаствовал бы; зазор доставляет оба — инвариант держит guard
     const a = await spawnChild("counted")
+    children.push(a)
     a.proc.kill("SIGTERM")
+    await new Promise((r) => setTimeout(r, 30))
     a.proc.kill("SIGTERM")
     expect(await a.proc.exited).toBe(0)
     const stdout = await new Response(a.proc.stdout).text()
@@ -80,27 +86,32 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
 
   test("мёртвый лок (kill -9) перехватывается", async () => {
     const a = await spawnChild("hold")
+    children.push(a)
     a.proc.kill("SIGKILL")
     await a.proc.exited
     expect(existsSync(join(a.stateDir, "lock"))).toBeTrue() // stale остался
 
-    const b = await spawnChild("hold") // перехват: захват удался
+    // общий stateDir: mkdir падает, pid-проверка даёт ESRCH — ветка перехвата
+    const b = await spawnChild("hold", a.stateDir)
     children.push(b)
     expect(existsSync(b.ready)).toBeTrue()
   })
 
   test("обычный выход — лок убран, следующий захватывает", async () => {
     const a = await spawnChild("quit")
+    children.push(a)
     expect(await a.proc.exited).toBe(0)
     expect(existsSync(join(a.stateDir, "lock"))).toBeFalse()
 
-    const b = await spawnChild("hold")
+    // общий stateDir: повторный захват чистого каталога
+    const b = await spawnChild("hold", a.stateDir)
     children.push(b)
     expect(existsSync(b.ready)).toBeTrue()
   })
 
   test("exit(1) — лок тоже убран (чистка на exit)", async () => {
     const a = await spawnChild("quit1")
+    children.push(a)
     expect(await a.proc.exited).toBe(1)
     expect(existsSync(join(a.stateDir, "lock"))).toBeFalse()
   })

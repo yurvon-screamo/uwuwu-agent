@@ -51,3 +51,29 @@ export function acquireLock(opts: {
   process.on("SIGINT", stop)
   return true
 }
+
+/** Drain-примитив тик-демонов: флаг останова + прерываемый сон.
+ *  onStop лока взводит флаг; тик доезжает, цикл видит isStopping() и выходит
+ *  сам. sleep() режет интервал на шаги по 0.5с — SIGTERM между тиками даёт
+ *  чистый выход за шаг, а не через grace-килл (оптимизация латентности). */
+export function makeDrain(): Drain {
+  let stopping = false
+  return {
+    stop: (): void => { stopping = true },
+    isStopping: (): boolean => stopping,
+    sleep: async (totalMs: number): Promise<void> => {
+      for (let waited = 0; waited < totalMs && !stopping; waited += 500) {
+        await new Promise((r) => setTimeout(r, Math.min(500, totalMs - waited)))
+      }
+    },
+  }
+}
+
+export interface Drain {
+  /** Взвести флаг останова (передавать как onStop лока). */
+  stop(): void
+  /** Флаг останова взведён — циклу пора на чистый выход. */
+  isStopping(): boolean
+  /** Сон до totalMs с выходом сразу после взведения флага. */
+  sleep(totalMs: number): Promise<void>
+}

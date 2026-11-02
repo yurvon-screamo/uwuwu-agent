@@ -10,7 +10,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../factory/mcp"
-import { acquireLock } from "../lib/single-instance"
+import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   due, isOneShot, isValidTracked, parseSchedule, firePrompt,
   type CronRow, type CronState,
@@ -41,18 +41,8 @@ const log = (m: string): void => {
 
 // ——— одиночный инстанс ———
 
-// взводится onStop лока: тик доезжает до конца, новых сессий не спавним
-let stopping = false
-
-/** Сон между тиками с прерыванием по стоп-сигналу: SIGTERM между тиками —
- *  чистый выход за шаг сна, а не через 15с grace-килла. Оптимизация
- *  латентности останова, не корректности. */
-async function sleepTick(): Promise<void> {
-  const total = TICK_SEC * 1000
-  for (let waited = 0; waited < total && !stopping; waited += 500) {
-    await new Promise((r) => setTimeout(r, Math.min(500, total - waited)))
-  }
-}
+// onStop лока взводит флаг: тик доезжает до конца, новых сессий не спавним
+const drain = makeDrain()
 
 // ——— состояние ———
 
@@ -279,7 +269,7 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
 
     if (!due(sched, lastFired, now)) continue
     // стоп-сигнал: не спавним новую работу — крон доедет при следующем старте
-    if (stopping) break
+    if (drain.isStopping()) break
 
     const body = await cronBody(row.bodyDoc)
     // linked-строки несут заголовок в теле: деривируем из первой строки
@@ -306,7 +296,7 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
 }
 
 async function main(): Promise<void> {
-  if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {
+  if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-cron держит lock — выходим")
     process.exit(1)
   }
@@ -335,11 +325,11 @@ async function main(): Promise<void> {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
     }
-    if (stopping) {
+    if (drain.isStopping()) {
       log("стоп-сигнал: тик доехал — выходим")
       process.exit(0)
     }
-    await sleepTick()
+    await drain.sleep(TICK_SEC * 1000)
   }
 }
 
