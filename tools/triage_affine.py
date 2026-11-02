@@ -212,7 +212,11 @@ class McpError(RuntimeError):
 
 
 def mcp_call(
-    method: str, params: dict, sid: str | None = None, notify: bool = False
+    method: str,
+    params: dict,
+    sid: str | None = None,
+    notify: bool = False,
+    timeout: int = 120,
 ) -> tuple[object, str]:
     headers = dict(MCP_HEADERS)
     if MCP_TOKEN:
@@ -225,7 +229,10 @@ def mcp_call(
     req = urllib.request.Request(
         MCP_URL, data=json.dumps(payload).encode(), headers=headers
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
+    # timeout выше 120с нужен мутациям: шлюз на organize/trash-операциях
+    # ходит 240s+ — обрыв по клиентскому таймауту при серверном успехе
+    # плодит дубли при повторе
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         sid = sid or r.headers.get("mcp-session-id")
         body = r.read().decode()
     if not body.strip():
@@ -311,6 +318,7 @@ def live_bucket_markdown(date: str) -> tuple[str, str]:
             "arguments": {"workspaceId": WORKSPACE, "docId": doc_id},
         },
         sid,
+        timeout=300,
     )
     res = mcp_result(resp)
 
@@ -448,6 +456,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 },
             },
             sid,
+            timeout=300,
         )
         mcp_result(resp)
         q_appended = len(quarantined)
@@ -463,6 +472,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
             },
         },
         sid,
+        timeout=300,
     )
     mcp_result(resp)
 
@@ -512,6 +522,7 @@ def quarantine_doc(date: str, sid: str) -> str:
             "arguments": {"workspaceId": WORKSPACE, "title": title, "markdown": header},
         },
         sid,
+        timeout=300,
     )
     res = mcp_result(resp)
     # строгий регекс по сериализованному ответу: порядок-зависимый обход dict

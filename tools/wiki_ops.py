@@ -146,13 +146,17 @@ def close(sid: str) -> None:
         pass
 
 
-def _call_tool(sid: str, name: str, args: dict) -> dict:
+def _call_tool(sid: str, name: str, args: dict, timeout: int = 300) -> dict:
     """tools/call + валидация ответа. McpError ре-рейзится с префиксом имени
     инструмента — погибший шаг серии виден в логе обвязки. Ошибка handshake
     (initialize при пере-handshake) сюда не заворачивается и уходит без
-    префикса — атрибуция места отказа честная."""
+    префикса — атрибуция места отказа честная. timeout=300: organize- и
+    trash-операции шлюза ходят 240s+ — клиентский обрыв на дефолтных 120с
+    при дожившем до успеха сервере плодит дубли при повторе."""
     try:
-        r, _ = mcp_call("tools/call", {"name": name, "arguments": args}, sid)
+        r, _ = mcp_call(
+            "tools/call", {"name": name, "arguments": args}, sid, timeout=timeout
+        )
         return mcp_result(r)
     except McpError as e:
         raise McpError(f"{name}: {e}") from e
@@ -162,7 +166,10 @@ def call(sid: str, name: str, args: dict) -> dict:
     """tools/call с восстановлением протухшей сессии: 400/404 → один
     пере-handshake → повтор. Обновлённый sid живёт в модуле — последующие
     call(старый_sid,...) продолжают работать. Ошибки контракта приходят с
-    префиксом имени инструмента (см. _call_tool)."""
+    префиксом имени инструмента (см. _call_tool). Таймаут 300с: organize-
+    операции шлюза ходят 240s+; ТАЙМАУТ ≠ ПРОВАЛ — сервер мог дожить до
+    успеха, перед повтором мутации проверь результат (orgls/search), иначе
+    дубли."""
     global _live_sid
     effective = _live_sid or sid
     try:
