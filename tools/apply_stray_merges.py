@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from triage_affine import McpError
 from wiki_ops import call, close, deep_md, session
 
 WS = "81475705-028a-4153-a8f5-f06e402ee31e"
@@ -113,4 +114,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        sys.exit(2)

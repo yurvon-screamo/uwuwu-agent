@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_affine import WORKSPACE, get_md
+from triage_affine import McpError, WORKSPACE, get_md
 from wiki_ops import call, session as wiki_ops_session  # локальная session() делегирует
 
 AUDIT = Path("/tmp/opencode/wiki-audit")
@@ -67,7 +67,7 @@ def cmd_fetch(_: argparse.Namespace) -> int:
                 {"workspaceId": WORKSPACE, "docId": did},
             )
             known[did] = {"title": title, "markdown": get_md(res) or ""}
-        except SystemExit:
+        except McpError:
             print(f"  !! {did} ({title}): export отказал, пропускаю", flush=True)
             known[did] = {"title": title, "markdown": "", "error": True}
         if i % 25 == 0 or i == len(todo):
@@ -126,7 +126,11 @@ def main() -> int:
     sub.add_parser("fetch")
     sub.add_parser("report")
     args = p.parse_args()
-    return {"fetch": cmd_fetch, "report": cmd_report}[args.cmd](args)
+    try:
+        return {"fetch": cmd_fetch, "report": cmd_report}[args.cmd](args)
+    except McpError as e:
+        print(f"!! {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
