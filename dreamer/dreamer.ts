@@ -2,7 +2,9 @@
 // Поллит opencode.db (readonly): уснувшая корневая сессия → дочерняя сессия
 // опенкода с агентом dreamer (glm-5.3#max), который автономно обновляет вики
 // (гигиена доков, опыт, инфра-задачи). Замена механизма заявок и qwen-фактизации.
-// Запуск: systemd --user (линукс) или `bun dreamer.ts` (вин/ручной). Тик: 1 мин.
+// Запуск: systemd --user (линукс) или Task Scheduler (вин: dreamer/win-autostart.ps1
+// — задача \UWUWU\Dreamer: старт при логоне + повтор каждую минуту, живой
+// инстанс отсекается IgnoreNew). Тик: 1 мин.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"

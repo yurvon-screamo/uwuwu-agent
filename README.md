@@ -92,7 +92,9 @@ uwuwu-проекта с пустым статусом (черновики вла
 дримера wakeup-промптом (контекст прошлых записей сохраняется). Отчёт —
 финальная строка. State: `~/.local/state/uwuwu-dreamer/`.
 
-Запуск: линукс — systemd --user по образцу uwuwu-cron; вин/ручной —
+Запуск: линукс — systemd --user по образцу uwuwu-cron; вин —
+`dreamer/win-autostart.ps1` (задача `\UWUWU\Dreamer`: старт при логоне +
+повтор каждую минуту, живой инстанс отсекается IgnoreNew); ручной —
 `cd dreamer && bun install && bun dreamer.ts`. Smoke:
 `UWUWU_DREAMER_ONCE=1 UWUWU_DREAMER_DRY_RUN=1 bun dreamer.ts`.
 
