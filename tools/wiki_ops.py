@@ -341,6 +341,10 @@ def _call_failure_action(
         if e.code in (429, 502, 503):
             return ("retry", _retry_after_secs(e), f"HTTP {e.code}")
         return ("fatal", e, str(e))
+    if isinstance(e, urllib.error.URLError) and not _is_timeout_reason(e):
+        # connect-отказ (рестарт контейнера, dns): шлюз заведомо не отвечал —
+        # ретраим как транспорт для обоих типов, зеркально GatewayError::Transport
+        return ("retry", None, str(e)[:60])
     if _ambiguous_exc(e):
         if not _is_read(name):
             return (
@@ -435,7 +439,11 @@ def call(sid: str, name: str, args: dict) -> dict:
     отказы — всегда; таймаут/обрыв — только чтение (запись могла
     примениться — честная ошибка без ретрая); ok:false+retryable:true —
     ретрай. Обновлённый sid живёт в модуле — последующие
-    call(старый_sid,...) продолжают работать."""
+    call(старый_sid,...) продолжают работать.
+    Осознанная расходимость с Rust-зеркалом: повторная протухшая сессия
+    ПОСЛЕ пере-handshake'а здесь — fail fast («снова отвергнута»), в
+    affine_client.rs — дожимаются оставшиеся попытки. Не уравнивать
+    вслепую: python-цепочки длиннее, бессмысленные добивания дороже."""
     global _live_sid
     effective = _live_sid or sid
     retries = _retry_retries()

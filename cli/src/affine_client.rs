@@ -481,6 +481,9 @@ impl AffineClient {
                         .context("пере-handshake после stale-сессии")?;
                     last_err = Some(e);
                 }
+                // осознанная расходимость с python-зеркалом (wiki_ops.call):
+                // здесь stale после пере-handshake дожимает попытки, там —
+                // fail fast; не уравнивать вслепую
                 Err(GatewayError::StaleSession(e)) => last_err = Some(e),
                 Err(GatewayError::Transport { err, retry_after }) => {
                     last_err = Some(err);
