@@ -8,12 +8,16 @@ pub mod affine_docs;
 pub mod affine_gql;
 pub mod affine_queries;
 pub mod affine_search_server;
+pub mod affine_snapshot;
 pub mod affine_sse;
 pub mod affine_store;
 pub mod affine_tables;
 pub mod affine_tasks;
+pub mod affine_titles;
 pub mod cmd;
 pub mod log_filter;
+#[cfg(test)]
+pub(crate) mod mock_ui;
 pub mod path;
 pub mod sofa;
 pub mod wiki;

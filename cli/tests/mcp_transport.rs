@@ -9,6 +9,7 @@ use common::{session_file, test_cfg, with_temp_home, MockGateway, Step, CALL_OK,
 use serde_json::json;
 use std::time::{Duration, Instant};
 use uwuwu_cli::affine_client::AffineClient;
+use uwuwu_cli::affine_tasks;
 
 #[test]
 #[serial_test::serial]
@@ -465,5 +466,72 @@ fn concurrent_connect_goes_private_and_shared_file_stays_intact() {
             5,
             "C переиспользовал сессию без handshake"
         );
+    });
+}
+
+/// read_rows — контракт числа вызовов: ровно один read_database_cells,
+/// ноль get_doc на заголовки линкованных строк (N+1 доминанта задачи
+/// e87hxo4QdK). Исчерпание сценария валит ЛЮБОЙ лишний вызов, финальный
+/// call_tool-зонд должен упасть — иначе сценарий не покрывает хвост.
+#[test]
+#[serial_test::serial]
+fn read_rows_makes_exactly_one_cells_call_and_no_title_get_doc() {
+    with_temp_home(|| {
+        let cells = json!({
+            "ok": true,
+            "rows": [
+                {"rowBlockId": "r1", "title": " ", "linkedDocId": "doc-abc",
+                 "cells": {"Status": {"value": "Todo"}, "PR": {"value": ""}}},
+                {"rowBlockId": "r2", "title": "обычная строка", "linkedDocId": "",
+                 "cells": {"Status": {"value": "In Progress"}}},
+            ]
+        })
+        .to_string();
+        let cells_tpl =
+            format!(r#"{{"jsonrpc":"2.0","id":{{ID}},"result":{{"structuredContent":{cells}}}}}"#);
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::owned(200, None, cells_tpl),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        {
+            let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+            let board = uwuwu_cli::affine_tasks::Board {
+                doc_id: "board-doc".into(),
+                db_id: "db-block".into(),
+            };
+            let rows = rt
+                .block_on(affine_tasks::read_rows(
+                    &mut client,
+                    &cfg,
+                    &board,
+                    std::path::Path::new("/tmp"),
+                ))
+                .unwrap();
+
+            // сырые строки: linked-тайтл НЕ резолвится сетью
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows[0].title.is_empty(),
+                "linked-строка остаётся без тайтла"
+            );
+            assert_eq!(rows[0].body_doc, "doc-abc");
+            assert_eq!(rows[0].status, "Todo");
+            assert_eq!(rows[1].title, "обычная строка");
+
+            // ровно 3 запроса: initialize + notification + read_database_cells
+            assert_eq!(
+                mock.request_count(),
+                3,
+                "read_rows не должен делать вызовов кроме read_database_cells"
+            );
+            // зонд: сценарий исчерпан — любой дополнительный вызов валится
+            assert!(rt
+                .block_on(client.call_tool("get_doc", json!({"docId": "doc-abc"})))
+                .is_err());
+            assert_eq!(mock.request_count(), 3, "зонд не должен был дойти до шлюза");
+        }
     });
 }

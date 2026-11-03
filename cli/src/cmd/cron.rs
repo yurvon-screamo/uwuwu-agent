@@ -58,7 +58,9 @@ pub(crate) async fn run(
         }
         CronSub::Rm { id } => {
             match resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await {
-                Ok((board, row)) => {
+                Ok((board, mut row)) => {
+                    // тайтл эха — до удаления строки/тела (O(1)-дозаголовок)
+                    let title = super::row_display_title(cfg, &mut row).await;
                     client
                         .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
                         .await
@@ -79,7 +81,7 @@ pub(crate) async fn run(
                             );
                         }
                     }
-                    println!("крон удалён: {}", row.title);
+                    println!("крон удалён: {title}");
                     Ok(())
                 }
                 // однозначное «не найдено» на всех читаемых досках —
@@ -203,7 +205,8 @@ async fn list(
         // тоже видны — молчаливые пропуски читаются как баг
         match affine_tasks::board_lookup(client, cfg, board_title).await {
             Ok(affine_tasks::BoardFind::Found(board)) => {
-                let rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
+                let mut rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
+                super::fill_display_titles(cfg, &mut rows).await;
                 summary.push(format!("{board_title}: {}", rows.len()));
                 for r in &rows {
                     println!(
@@ -213,7 +216,7 @@ async fn list(
                         r.cron_schedule_of(),
                         r.last_run_display(),
                         &r.row_id[..r.row_id.len().min(12)],
-                        truncate(&r.title, 36)
+                        truncate(&super::display_title(r), 36)
                     );
                 }
             }

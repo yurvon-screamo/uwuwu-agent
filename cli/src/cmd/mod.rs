@@ -9,12 +9,16 @@ mod cron;
 mod docs;
 mod search;
 mod task;
+#[cfg(test)]
+mod title_tests;
 
 use clap::Parser as _;
 
 pub(crate) use cli::{Cli, Commands, CronSub, TaskSub};
 
 use crate::affine_client::{AffineClient, AffineConfig};
+use crate::affine_gql::AffineUi;
+use crate::affine_search_server::ServerSearchConfig;
 use crate::affine_tasks;
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -55,7 +59,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 }
 
 /// Резолв строки по id/заголовку: сперва доска проекта, затем доска Crons
-/// (крон-агенты комментят свои тела через тот же task comment).
+/// (крон-агенты комментят свои тела через тот же task comment). id-матч
+/// идёт без сети; для матчинга по подстроке заголовка доска дозаголоввается
+/// одним батч-запросом (affine_titles) — тот же паттерн на крон-досках.
 pub(crate) async fn resolve_row_any_board(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -64,11 +70,14 @@ pub(crate) async fn resolve_row_any_board(
     id: &str,
 ) -> anyhow::Result<(affine_tasks::Board, affine_tasks::TaskRow)> {
     let board = affine_tasks::find_board(client, cfg, project).await?;
-    let rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
-    if let Ok(row) = affine_tasks::resolve_row(&rows, id) {
-        return Ok((board, row.clone()));
+    let mut rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
+    let mut decisive: Option<anyhow::Error> = None;
+    if let Some(row) = resolve_row_on_board(cfg, &mut rows, id).await? {
+        return Ok((board, row));
     }
-    // фоллбек: крон-доски (Crons + «Кроны <proj>» всех проектов)
+    // фоллбек: крон-доски (Crons + «Кроны <proj>» всех проектов); решающая
+    // диагностика (неоднозначный префикс) запоминается — если нигде не
+    // нашлось, юзер получит её, а не дезинформирующее «не найдена»
     for bt in affine_tasks::cron_board_titles(client, cfg).await? {
         if bt == "Crons" {
             continue;
@@ -76,18 +85,62 @@ pub(crate) async fn resolve_row_any_board(
         let Ok(board) = affine_tasks::find_board_by_title(client, cfg, &bt).await else {
             continue;
         };
-        let Ok(rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
+        let Ok(mut rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
             continue;
         };
-        if let Ok(row) = affine_tasks::resolve_row(&rows, id) {
-            return Ok((board, row.clone()));
+        match resolve_row_on_board(cfg, &mut rows, id).await {
+            Ok(Some(row)) => return Ok((board, row)),
+            Ok(None) => {}
+            Err(e) if decisive.is_none() => decisive = Some(e),
+            Err(_) => {}
         }
     }
     let cron_board = affine_tasks::find_board_by_title(client, cfg, "Crons").await?;
-    let cron_rows = affine_tasks::read_rows(client, cfg, &cron_board, root).await?;
-    let row = affine_tasks::resolve_row(&cron_rows, id)
-        .map_err(|e| anyhow::anyhow!("{e} (искали на доске проекта и всех крон-досках)"))?;
-    Ok((cron_board, row.clone()))
+    let mut cron_rows = affine_tasks::read_rows(client, cfg, &cron_board, root).await?;
+    match resolve_row_on_board(cfg, &mut cron_rows, id).await? {
+        Some(row) => Ok((cron_board, row)),
+        None => match decisive {
+            Some(e) => Err(e.context("искали на доске проекта и всех крон-досках")),
+            None => anyhow::bail!(
+                "задача '{id}' не найдена (искали на доске проекта и всех крон-досках)"
+            ),
+        },
+    }
+}
+
+/// id-матч без сети; промах → один батч-дозаголовок доски и повтор
+/// (title-подстрока). Ok(None) — доска не сматчилась; Err — решающая
+/// диагностика (неоднозначный префикс), её доносим до юзера, не маскируем.
+async fn resolve_row_on_board(
+    cfg: &AffineConfig,
+    rows: &mut [affine_tasks::TaskRow],
+    id: &str,
+) -> anyhow::Result<Option<affine_tasks::TaskRow>> {
+    match affine_tasks::classify_row(rows, id) {
+        affine_tasks::RowMatch::One(row) => return Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous { by_id: true } => {
+            return Err(anyhow::anyhow!(
+                "'{id}' неоднозначно по id — уточни префикс"
+            ));
+        }
+        affine_tasks::RowMatch::Ambiguous { by_id: false } => {
+            return Err(anyhow::anyhow!(
+                "'{id}' неоднозначно по заголовку — уточни или используй id"
+            ));
+        }
+        affine_tasks::RowMatch::NotFound => {}
+    }
+    fill_display_titles(cfg, rows).await;
+    match affine_tasks::classify_row(rows, id) {
+        affine_tasks::RowMatch::One(row) => Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous { by_id: true } => Err(anyhow::anyhow!(
+            "'{id}' неоднозначно по id — уточни префикс"
+        )),
+        affine_tasks::RowMatch::Ambiguous { by_id: false } => Err(anyhow::anyhow!(
+            "'{id}' неоднозначно по заголовку — уточни или используй id"
+        )),
+        affine_tasks::RowMatch::NotFound => Ok(None),
+    }
 }
 
 /// Найти крон на любой крон-доске (Crons + «Кроны <proj>» проектов).
@@ -143,15 +196,13 @@ pub(crate) async fn resolve_cron_any_board(
                 continue;
             }
         };
-        match affine_tasks::classify_row(&rows, id) {
-            affine_tasks::RowMatch::One(row) => return Ok((board, row.clone())),
-            affine_tasks::RowMatch::Ambiguous { .. } => {
-                return Err(CronResolveFail::Other(anyhow::anyhow!(
-                    "«{id}» неоднозначно на доске «{board_title}» — уточни id"
-                )));
-            }
-            affine_tasks::RowMatch::NotFound => {
-                last_err = format!("{board_title}: нет");
+        let mut rows = rows;
+        match resolve_row_on_board(cfg, &mut rows, id).await {
+            Ok(Some(row)) => return Ok((board, row)),
+            Ok(None) => last_err = format!("{board_title}: нет"),
+            Err(e) => {
+                // неоднозначность — решающая диагностика, не «не найдено»
+                return Err(CronResolveFail::Other(e));
             }
         }
     }
@@ -159,6 +210,77 @@ pub(crate) async fn resolve_cron_any_board(
         details: last_err,
         all_readable: read_failures == 0,
     })
+}
+
+/// Заголовок строки для показа: пустой → плейсхолдер с id тела.
+pub(crate) fn display_title(row: &affine_tasks::TaskRow) -> String {
+    if !row.title.is_empty() {
+        row.title.clone()
+    } else if !row.body_doc.is_empty() {
+        format!("(тело {})", row.body_doc)
+    } else {
+        "(без тела)".to_string()
+    }
+}
+
+/// Дозаголовок одной строки для показа/функций — ровно она, O(1).
+/// Лучшее усилие: без UI-кредов или при сбое — плейсхолдер.
+pub(crate) async fn row_display_title(
+    cfg: &AffineConfig,
+    row: &mut affine_tasks::TaskRow,
+) -> String {
+    if row.title.is_empty() && !row.body_doc.is_empty() {
+        if let Ok(ui) = connect_ui().await {
+            let _ = affine_tasks::resolve_titles(&ui, cfg, std::slice::from_mut(row)).await;
+        }
+    }
+    display_title(row)
+}
+
+/// Строгий дозаголовок (reply docTitle): тайтл обязан быть — иначе Err.
+pub(crate) async fn require_row_title(
+    ui: &AffineUi,
+    cfg: &AffineConfig,
+    row: &mut affine_tasks::TaskRow,
+) -> anyhow::Result<String> {
+    if row.title.is_empty() && !row.body_doc.is_empty() {
+        affine_tasks::resolve_titles(ui, cfg, std::slice::from_mut(row)).await?;
+    }
+    if row.title.is_empty() {
+        anyhow::bail!("заголовок задачи недоступен — docTitle ответа не может быть пустым");
+    }
+    Ok(row.title.clone())
+}
+
+/// Дозаголовки набора строк одним батчем — лучшее усилие для показа:
+/// нет UI-кредов или сбой запроса → остаются плейсхолдеры.
+pub(crate) async fn fill_display_titles(cfg: &AffineConfig, rows: &mut [affine_tasks::TaskRow]) {
+    let needs = rows
+        .iter()
+        .any(|r| r.title.is_empty() && !r.body_doc.is_empty());
+    if !needs {
+        return;
+    }
+    let Some(config) = ServerSearchConfig::from_env() else {
+        return;
+    };
+    let Ok(ui) = AffineUi::connect(&config).await else {
+        eprintln!("uwuwu-cli: UI GraphQL недоступен — заголовки показываю плейсхолдерами");
+        return;
+    };
+    if let Err(e) = affine_tasks::resolve_titles(&ui, cfg, rows).await {
+        eprintln!("uwuwu-cli: батч-тайтлы не удались ({e:#}) — показываю плейсхолдеры");
+    }
+}
+
+/// UI GraphQL клиент: Err без кредов (честная ошибка для функциональных путей).
+pub(crate) async fn connect_ui() -> anyhow::Result<AffineUi> {
+    let Some(config) = ServerSearchConfig::from_env() else {
+        anyhow::bail!(
+            "нужны UI-креды афины (UWUWU_AFFINE_UI_URL/_EMAIL/_PASSWORD) для заголовков задач"
+        );
+    };
+    AffineUi::connect(&config).await
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
