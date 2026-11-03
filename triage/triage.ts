@@ -17,7 +17,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
-import { mcpConfigured, tool as mcpTool } from "../lib/affine-mcp"
+import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt,
@@ -693,7 +693,7 @@ async function refreshBoards(): Promise<BoardRef[]> {
       if (typeof d.title !== "string" || !d.title.startsWith("Задачи ")) continue
       const db = await mcpTool<{ blocks?: { id?: string; flavour?: string }[] }>("read_doc", { docId })
       const dbId = (db.blocks ?? []).find(
-        (b) => b.flavour === "affine:database" || b.flavour === "affine:data_view",
+        (b) => b.flavour === "platform:database",
       )?.id
       if (typeof dbId === "string" && dbId !== "") boards.push({ project, docId, dbId })
       break // доска проекта одна — первый doc «Задачи …» в папке
@@ -832,7 +832,7 @@ const queueReadyDrafts = async (): Promise<void> => {
 
 const draftLoop = async (): Promise<void> => {
   if (!mcpConfigured()) {
-    log("вотчер черновиков off: нет UWUWU_AFFINE_* — ТГ-ветка работает как раньше")
+    log("вотчер черновиков off: нет UWUWU_SIYUAN_* — ТГ-ветка работает как раньше")
     loopDone.draft = true
     maybeExit()
     return

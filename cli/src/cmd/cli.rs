@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "uwuwu-cli")]
 #[command(
-    about = "CLI for uwuwu/wiki: semantic search over experience and access docs (AFFiNE-backed)"
+    about = "CLI for uwuwu/wiki: доступ агентам к платформе uwuwu (SiYuan)"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -155,21 +155,19 @@ pub(crate) enum CronSub {
 pub(crate) enum Commands {
     /// List all projects with their description.
     Projects,
-    /// Read a document: <slug> (experience) | <project>/<slug> (access) | sofa/<post_id>.
+    /// Read a document by slug (последний сегмент = заголовок дока) | sofa/<post_id>.
     Read {
-        #[arg(help = "Slug: 'axum' | '<project>/<slug>' (access) | 'sofa/<post_id>'")]
+        #[arg(help = "Slug: заголовок дока | sofa/<post_id>")]
         slug: String,
     },
-    /// Download a workspace blob (image/attachment) by key. Keys appear in
-    /// read output as affine://blob/<key>.
+    /// Download a workspace asset (image/attachment) by key from assets/.
     Blob {
         #[arg(help = "Blob key, e.g. pixel.png")]
         key: String,
         #[arg(long, help = "Output file ('-' = stdout). Default: <key> in cwd")]
         out: Option<String>,
     },
-    /// Screenshot an AFFiNE doc page (incl. edgeless: mindmaps, canvas) to
-    /// PNG via headless chromium — the visual view of interactive content.
+    /// (не портирован на SiYuan v1)
     Shot {
         #[arg(help = "Doc slug or title (same addressing as read)")]
         slug: String,
@@ -181,8 +179,7 @@ pub(crate) enum Commands {
         )]
         edgeless: bool,
     },
-    /// Server-side full-text search (AFFiNE Manticore) + optional SOFA.
-    /// Stateless: no local corpus or semantic fallback.
+    /// Полнотекстовый поиск по блокам SiYuan + опционально SOFA.
     Search {
         #[arg(help = "Search query")]
         query: String,
@@ -193,14 +190,13 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
         threshold: f32,
     },
-    /// Crons on the AFFiNE «Crons» board (durable agent schedules).
+    /// Кроны: строки доски «Кроны <Proj>» (SiYuan database).
     Cron {
         #[command(subcommand)]
         command: CronSub,
     },
-    /// Kanban tasks on AFFiNE («Задачи <Proj>» boards): create/list/get/
-    /// edit/comment/close. Body doc gets the type tag; comments are
-    /// native AFFiNE comments on the body.
+    /// Канбан-задачи («Задачи <Proj>» SiYuan database): create/list/get/
+    /// edit/comment/close; комменты — секция тел задач.
     Task {
         #[command(subcommand)]
         command: TaskSub,

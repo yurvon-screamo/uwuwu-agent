@@ -57,3 +57,4 @@ hub.json
 tools/.venv-triage/
 tools/*.npz
 .backups/
+.worktrees/

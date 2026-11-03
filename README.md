@@ -42,9 +42,9 @@ cd uwuwu-agent
 
 `link.sh` бэкапит существующие конфиги (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После — перезапустить opencode.
 
-## AFFiNE-first 
+## SiYuan-first 
 
-Вся база знаний живёт в AFFiNE: статьи опыта и проектные доки через `uwuwu-cli`,
+Вся база знаний живёт в SiYuan: статьи опыта и проектные доки через `uwuwu-cli`,
 прямой доступ к докам — MCP-шлюз (107 tools).
 
 ### Фабрика разработки (uwuwu-factory)
@@ -116,12 +116,14 @@ uwuwu-проекта с пустым статусом (черновики вла
 (id/заголовок; фоллбек — крон-доски проектов); `search` (сервер Manticore + семантика),
 `read/blob/shot` (мультимодальное чтение).
 
-The CLI is fully AFFiNE-backed — no filesystem knowledge base. All machines
-share one workspace; locally only operational caches live.
+Платформа — SiYuan (с 04.11.2026; до этого — закрытая платформа-предшественник). CLI ходит в
+kernel SiYuan (REST + встроенный MCP), единый воркспейс на всех машинах.
 
-**Production**: `https://affine.uwuwu.net` (UI) / MCP gateway — контейнер в compose ноут-афины (`127.0.0.1:8000/mcp`, снаружи `https://affine.uwuwu.net/mcp`)
+**Production**: контейнер `siyuan-demo` на ноуте (`127.0.0.1:6806`), публично —
+`https://siyuan-relay-production.up.railway.app` (Railway-релей + rathole-туннель)
 
-Required env: `UWUWU_AFFINE_URL`, `UWUWU_AFFINE_TOKEN`, `UWUWU_AFFINE_WORKSPACE_ID`.
+Required env: `UWUWU_BACKEND=siyuan` (деф. включён глобально), `UWUWU_SIYUAN_URL`,
+`UWUWU_SIYUAN_TOKEN` (или `UWUWU_SIYUAN_WS` с conf.json).
 
 **Workspace structure**:
 
@@ -134,13 +136,13 @@ Folders handle organization; tags are only for lookup.
 
 **Commands**:
 
-- `search` — server-side AFFiNE full-text (Manticore); stateless, no local fallback; optional `--sofa`
+- `search` — полнотекст по блокам SiYuan (SQL kernel API); optional `--sofa`
 - `read` — live doc read (slug resolves via migration map → tags/title through the gateway); rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
 - `blob <key>` — download workspace blobs (images/attachments)
-- `shot <slug> [--edgeless]` — doc screenshot via headless chromium (the native render path — AFFiNE has no server-side PNG API)
+- `shot` — не портирован на SiYuan v1 (headless chromium + Access Auth Code при необходимости)
 - `projects` — live workspace project registry
 - `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown with ```html_embed diagram fences (Vesper theme, see `skills/visual-diagrams`)
 
-**Infrastructure**: ноут (podman-compose: AFFiNE + pgvector/PG18 + Redis + Manticore + MCP gateway), наружу — rathole-туннель через VPS; Railway-след удалён
+**Infrastructure**: ноут (docker: siyuan-demo :6806, воркспейс ~/siyuan-demo-ws), наружу — Railway-релей + rathole (временно дефолт-домен Railway из-за бага сертов)
 
 - Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.

@@ -48,7 +48,7 @@
 - workspace сессий: `~/.local/share/uwuwu-triage/workspace` (пустой, изоляция)
 
 Env для `uwuwu-cli` внутри сессий наследуется от opencode-сервера, не от демона.
-Env MCP-шлюза (`UWUWU_AFFINE_URL/TOKEN/WORKSPACE_ID`) нужен самому демону
+Env платформы (`UWUWU_SIYUAN_TOKEN` или `UWUWU_SIYUAN_WS`) нужен самому демону
 для вотчера: нет env → вотчер off постоянно, ТГ живёт. Kill-switch:
 `UWUWU_TRIAGE_WATCH_SEC=0`; тик по умолчанию 60 c.
 

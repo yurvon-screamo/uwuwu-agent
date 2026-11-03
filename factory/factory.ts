@@ -1,4 +1,4 @@
-// uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью на AFFiNE.
+// uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью (SiYuan).
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
 //   1. Design на доске (Draft = черновик на валидации триажа, пустой =
@@ -19,7 +19,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import * as mcp from "../lib/affine-mcp"
+import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
@@ -158,7 +158,7 @@ async function sh(cmd: string[], opts: { cwd?: string } = {}): Promise<string> {
   return out.trim()
 }
 
-// ——— доска AFFiNE ———
+// ——— доска (SiYuan database) ———
 
 interface BoardIds { docId: string; dbId: string }
 
@@ -172,7 +172,7 @@ async function findBoard(title: string): Promise<BoardIds> {
   }
   if (docId === "") throw new Error(`доска «${title}» не найдена`)
   const doc = await mcp.tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
-  const dbId = doc.blocks?.find((b) => b.flavour === "affine:database" || b.flavour === "affine:data_view")?.id
+  const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id
   if (dbId === undefined) throw new Error(`в «${title}» нет database-блока`)
   return { docId, dbId }
 }
@@ -863,7 +863,7 @@ async function main(): Promise<void> {
   // env шлюза обязателен на старте (раньше это делал process.exit на импорте
   // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
   if (!mcp.mcpConfigured()) {
-    console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+    console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {

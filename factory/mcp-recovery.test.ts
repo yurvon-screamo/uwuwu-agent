@@ -1,9 +1,9 @@
 // Живой тест: протухшая сессия восстанавливается одним ретраем.
-// Требует UWUWU_AFFINE_* env; помечен skipIf при их отсутствии.
+// Живой тест адаптера; помечен skipIf без env.
 import { describe, expect, test } from "bun:test"
-import * as mcp from "../lib/affine-mcp"
+import * as mcp from "../lib/platform"
 
-const hasEnv = (process.env.UWUWU_AFFINE_TOKEN ?? "") !== ""
+const hasEnv = (process.env.UWUWU_SIYUAN_TOKEN ?? process.env.UWUWU_SIYUAN_WS ?? "") !== ""
 
 describe("mcp session recovery", () => {
   test.skipIf(!hasEnv)("битая сессия → handshake + ретрай проходят", async () => {

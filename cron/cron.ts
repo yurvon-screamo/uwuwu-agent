@@ -1,4 +1,4 @@
-// uwuwu-cron — демон кронов на AFFiNE.
+// uwuwu-cron — демон кронов (SiYuan).
 // Поллит все крон-доски: глобальную «Crons» + «Кроны <Proj>» по папкам Projects
 // (собираются динамически, отсутствующие доски тихо скипаются): строка = крон
 // (Schedule/Status/Last Run, промпт в теле). Наступило расписание → OpenCode-сессия
@@ -9,7 +9,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import * as mcp from "../lib/affine-mcp"
+import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   due, isOneShot, isValidTracked, parseSchedule, firePrompt,
@@ -107,7 +107,7 @@ async function findBoard(title: string): Promise<BoardIds | null> {
   }
   if (docId === undefined) return null
   const doc = await mcp.tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
-  const dbId = doc.blocks?.find((b) => b.flavour === "affine:database" || b.flavour === "affine:data_view")?.id
+  const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id
   if (dbId === undefined) return null
   return { docId, dbId }
 }
@@ -299,7 +299,7 @@ async function main(): Promise<void> {
   // env шлюза обязателен на старте (раньше это делал process.exit на импорте
   // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
   if (!mcp.mcpConfigured()) {
-    console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+    console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
