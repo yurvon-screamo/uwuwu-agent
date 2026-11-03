@@ -1533,7 +1533,7 @@ pub async fn append_body_markdown(
 
 /// code[language=html_embed …] → маркер ¶ + embed_html, code — снести.
 /// Возвращает число вставленных диаграмм.
-async fn convert_embed_fences(
+pub(crate) async fn convert_embed_fences(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     body_doc: &str,
