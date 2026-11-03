@@ -19,9 +19,10 @@ import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/affine-mcp"
 import {
-  alignChunks, batchReadyAt, classifyUpdate, composeDraftPrompt, composeText, draftReady, dropBatch,
-  extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt, SESSION_TITLE, takeBatch, validState,
-  DRAFT_MAX_TURNS,
+  alignChunks, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  draftReady, dropBatch, extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt,
+  SESSION_TITLE, takeBatch, validState,
+  DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
@@ -492,7 +493,7 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   if (readyAt === null) return "idle"
   const items = takeBatch(state.queue, readyAt)
   if (items.length === 0) return "idle"
-  const req = joinBatch(items)
+  const req = joinBatch(capDraftBatch(items, DRAFT_BATCH_MAX))
   // маркер полёта СИНХРОННО, до любых await: edit-ветка видит «уже пошло»
   // (состав батча в очереди не трогаем — он страховка от потери)
   state.firing = { at: Date.now(), msgIDs: req.msgIDs ?? [req.msgID] }

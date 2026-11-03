@@ -1,9 +1,9 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, batchReadyAt, classifyUpdate, composeDraftPrompt, composeText, draftReady, dropBatch,
-  DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal, joinBatch, plainChunks,
-  parseWatchSec, promptLandedAt, takeBatch, validState,
+  alignChunks, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  draftReady, dropBatch, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal,
+  joinBatch, plainChunks, parseWatchSec, promptLandedAt, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
@@ -361,4 +361,14 @@ test("validState: черновики персистятся; битые поля
   expect(cleaned.drafts).toBeUndefined()
   expect(cleaned.draftSkip).toBeUndefined()
   expect(cleaned.nextDraftMsgID).toBeUndefined()
+})
+
+test("capDraftBatch: ТГ не режется, черновики — порцией; порядок ТГ-первым", () => {
+  const tg = (id: number): Request => R({ chatID: 42, msgID: id })
+  const draft = (id: number): Request => R({ chatID: 0, msgID: id, drafts: [{ project: "p", rowId: `r${id}`, docId: "d", title: "t" }] })
+  const batch = capDraftBatch([tg(1), draft(2), tg(3), draft(4), draft(5), draft(6), draft(7), draft(8)], 5)
+  expect(batch.map((b) => b.msgID)).toEqual([1, 3, 2, 4, 5, 6, 7]) // ТГ все, черновики первые 5
+  expect(capDraftBatch([draft(1), draft(2)], 5).length).toBe(2)
+  expect(capDraftBatch([tg(1), tg(2)], 5).map((b) => b.msgID)).toEqual([1, 2])
+  expect(capDraftBatch([], 5)).toEqual([])
 })
