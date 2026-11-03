@@ -88,12 +88,14 @@ async function mcpRpc(method: string, params: Record<string, unknown>): Promise<
 }
 
 export async function connect(): Promise<void> {
+  if (mcpReady) return // сессия уже инициализирована (демоны зовут connect повторно)
   await mcpRpc("initialize", {
     protocolVersion: "2025-03-26",
     capabilities: {},
     clientInfo: { name: "uwuwu-daemon", version: "1.0" },
   })
   await mcpRpc("notifications/initialized", {})
+  mcpReady = true
 }
 
 let mcpReady = false
@@ -101,7 +103,6 @@ let mcpReady = false
 async function mcpToolCall(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (!mcpReady) {
     await connect()
-    mcpReady = true
   }
   const r = await mcpRpc("tools/call", { name, arguments: args })
   if (r.isError === true) throw new Error(`tool ${name}: ${JSON.stringify(r.content)}`)
