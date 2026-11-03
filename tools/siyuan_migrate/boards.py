@@ -55,23 +55,34 @@ def threads_for(sid: str, body_doc: str) -> list[dict]:
 
 def comment_md(nodes: list[dict]) -> str:
     lines = ["", "## Комменты (миграция из афины)", ""]
-    def text_of(content: dict) -> str:
+    def text_of(content) -> str:
+        if isinstance(content, str):
+            return content
         if isinstance(content, dict):
             body = content.get("body") or content.get("text") or ""
             if isinstance(body, list):
                 return " ".join(str(x) for x in body)
             return str(body)
+        if isinstance(content, list):
+            return " ".join(text_of(x) for x in content)
         return str(content or "")
-    for node in sorted(nodes, key=lambda n: str((n.get("content") or {}).get("createDate", ""))):
-        c = node.get("content") or {}
-        who = (node.get("user") or {}).get("name") or (node.get("user") or {}).get("id") or "?"
-        when = str(c.get("createDate") or "")[:16].replace("T", " ")
-        body = text_of(c).strip()
+    def created_of(node: dict) -> str:
+        c = node.get("content")
+        if isinstance(c, dict):
+            return str(c.get("createDate") or "")[:16].replace("T", " ")
+        return ""
+    for node in sorted(nodes, key=created_of):
+        c = node.get("content") if isinstance(node.get("content"), dict) else {}
+        who = (node.get("user") or {}).get("name") if isinstance(node.get("user"), dict) else None
+        who = who or "?"
+        when = created_of(node)
+        body = text_of(node.get("content")).strip()
         lines.append(f"- **{who}** ({when}): {body}")
         for rep in node.get("replies") or []:
-            rwho = (rep.get("user") or {}).get("name") or (rep.get("user") or {}).get("id") or "?"
+            ru = rep.get("user") if isinstance(rep.get("user"), dict) else {}
+            rwho = ru.get("name") or "?"
             rwhen = ts(rep.get("created") or 0)
-            rbody = text_of(rep.get("content") or {}).strip()
+            rbody = text_of(rep.get("content")).strip()
             lines.append(f"  - **{rwho}** ({rwhen}): {rbody}")
         if node.get("resolved"):
             lines.append("  - *(тред резолвнут)*")
@@ -201,16 +212,28 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str, 
     proj = board["title"][len(prefix):]
     hpath = f"/{proj}/{board['title']}"
     doc_id = ""
+    nb_id = ""
     if sy_http is not None:
         try:
-            found = sy_http.sql(
-                f"select id from blocks where type='d' and hpath='{hpath}' limit 1")
-            if found:
-                doc_id = found[0]["id"]
+            # авторитетный резолв через filetree API (SQL-индекс лагает)
+            for nb in sy_http.ls_notebooks():
+                if nb.get("name") == target_nb:
+                    nb_id = nb.get("id", "")
+                    break
+            if nb_id:
+                doc_id = sy_http.get_doc_id_by_path(nb_id, hpath) or ""
         except Exception:
             pass
     if not doc_id:
-        doc = sy.tool("document", {"action": "create", "notebook": target_nb, "parentID": "",
+        # родитель = док проекта /{proj} (не корень ноутбука)
+        parent_id = ""
+        if sy_http is not None and nb_id:
+            try:
+                parent_id = sy_http.get_doc_id_by_path(nb_id, f"/{proj}") or ""
+            except Exception:
+                parent_id = ""
+        doc = sy.tool("document", {"action": "create", "notebook": target_nb,
+                                   "parentID": parent_id,
                                    "title": board["title"], "content": f"# {board['title']}\n"})
         if isinstance(doc, str):
             m = re.search(r"[0-9]{14}-[a-z0-9]+", doc)

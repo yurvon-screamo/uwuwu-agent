@@ -103,7 +103,11 @@ class SiYuan:
 
     # --- search/sql ---
     def sql(self, stmt: str) -> list[dict]:
-        return self._post("/api/query/sql", {"stmt": stmt}).get("data") or []
+        data = self._post("/api/query/sql", {"stmt": stmt})
+        # ядро отдаёт data либо списком напрямую, либо {data: [...]}
+        if isinstance(data, list):
+            return data
+        return data.get("data") or []
 
     def version(self) -> str:
         return str(self._post("/api/system/version", {}, attempts=2))
