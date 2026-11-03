@@ -368,6 +368,15 @@ Apply in order — stop when the brief is satisfied:
 - Brand logo or wordmark
 - Existing legal / consent / cookie copy
 
+### Redline Mode (remediation of an AI-looking screen)
+
+For screens that already exist and read as vibecoded slop (purple gradients, glows, emoji labels, uneven spacing, shouty copy). This is a repair workflow, not a redesign: the features, content and section order stay; sizes, colors, words and images become deliberate.
+
+1. **Look at the rendered screen** (screenshot, not just code) and **audit**: list every slop sign with where it lives. Verdict: **heavy slop** (many signs) → full flow below; **light slop** (a designed screen with a few signs) → fix only what the audit found, take the direction from the existing brand, bigger ideas go into the report as suggestions; **no slop** → say so plainly, suggest at most 2-3 small refinements with exact values, and never change a good screen just to make it different
+2. **Set the direction before editing** (complements Step 0b/0c): **Product** (what it does, for whom, one plain sentence) · **Character** (2-3 concrete words; clean/modern/sleek/minimal/premium are banned - they fit every template) · **World** (the material the product belongs to - it tints neutrals, accent and visuals) · **Moments** (the 1-2 places that carry rich color/detail) · **Signature** (one small detail only this product would have, used consistently)
+3. **Fix in passes, in order:** spacing → color → icons → copy → type → layout → details → visuals → motion. Finish a pass across the whole screen before the next; copy precedes type/layout (headline length decides its size and place)
+4. **Check against the audit list** and the Pre-Flight below; render and compare. **Report** the direction and what each pass changed
+
 ---
 
 ## Icons & Fonts
@@ -443,6 +452,10 @@ Run this before delivering code. **If any box fails, the output is not done.**
 - [ ] Copy Self-Audit: no grammatically broken or AI-hallucinated phrases?
 - [ ] No fake-precise numbers without real data or mock label?
 - [ ] Quotes <= 3 lines body, clean attribution?
+- [ ] Interface copy grammar: no trailing periods on labels/buttons, no exclamation marks, no greeting headlines, changes cite their base (`+12% vs last month`)?
+- [ ] Numbers: one format per screen with `tabular-nums`?
+- [ ] Spacing on a 4px scale, equal things equal sizes, no one-off values?
+- [ ] Template check: swap the product name for another product's - would the screen still fit? If yes, push the direction harder in copy, visual and signature detail
 
 ### Motion (see `rules-ui` → Motion & Animation)
 - [ ] Every animation motivated (hierarchy / storytelling / feedback / state transition)?
@@ -482,5 +495,9 @@ If a single checkbox cannot be honestly ticked, the page is not done. Fix it bef
 
 ## References
 
-- `rules-ui` — Design Engineering Directives, Layout Discipline, Image & Visual Asset Strategy, AI Tells (forbidden patterns), Motion & Animation, Dark Mode Protocol, Performance & Accessibility, Common Pitfalls
+- `rules-ui` — Design Engineering Directives, Layout Discipline, Image & Visual Asset Strategy, Dashboard & Chart Hygiene, AI Tells (forbidden patterns), Motion & Animation, Dark Mode Protocol, Performance & Accessibility, Common Pitfalls
 - `rules-text-writing` — copywriting rules, anti-AI-cliché dictionary
+
+## Credits
+
+The Redline Mode workflow and the direction framework (Product / Character / World / Moments / Signature) are partially based on [unslop](https://github.com/heydamir/unslop) by Damir Sokolovsky (@heydamir), CC BY 4.0.

@@ -260,16 +260,27 @@ impl SessionLock {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .read(true)
             .open(path)
-            .ok()?;
+        {
+            Ok(f) => f,
+            // ошибка ФС — не «лок занят»: молча все стали бы private
+            // (handshake-шторм); предупреждаем и всё же работаем приватно
+            Err(e) => {
+                eprintln!(
+                    "uwuwu-cli: не смог открыть {}: {e} — работаю без лока",
+                    path.display()
+                );
+                return None;
+            }
+        };
         match file.try_lock_exclusive() {
             Ok(true) => Some(Self(file)),
-            // Ok(false) = лок занят другим процессом
+            // Ok(false) = лок занят другим процессом — штатный private-путь
             _ => None,
         }
     }
@@ -482,7 +493,7 @@ impl AffineClient {
                 "params": {"name": name, "arguments": arguments}
             });
             match self.raw_post(body, call_id).await {
-                Ok(resp) => match Self::tool_failure(name, &resp) {
+                Ok(resp) => match Self::tool_failure(&resp) {
                     // повторяемого сбоя нет — извлекаем результат
                     None => return Self::tool_result(name, &resp),
                     Some(failure) => {
@@ -523,6 +534,9 @@ impl AffineClient {
                         .context("пере-handshake после stale-сессии")?;
                     last_err = Some(e);
                 }
+                // осознанная расходимость с python-зеркалом (wiki_ops.call):
+                // здесь stale после пере-handshake дожимает попытки, там —
+                // fail fast; не уравнивать вслепую
                 Err(GatewayError::StaleSession(e)) => last_err = Some(e),
                 Err(GatewayError::Transport { err, retry_after }) => {
                     last_err = Some(err);
@@ -551,47 +565,42 @@ impl AffineClient {
         ))
     }
 
-    /// ok:false — шлюзовая конвенция логических фейлов. Проверяем в ОБОИХ
-    /// местах: поле result верхнего уровня и внутри content[0].text-блоба
-    /// (шлюз строит их из одного объекта — расхождений не бывает).
+    /// ok:false — шлюзовая конвенция логических фейлов. Кандидаты в порядке
+    /// зеркала python `_ok_false`: structuredContent, result верхнего
+    /// уровня, content[0].text-блоб (шлюз строит их из одного объекта).
+    /// Возвращает голый detail — префикс «tool {name} failed:» навешивает
+    /// call_tool (один раз, без наслоений).
     /// retryable:true трактуется по op_kind: чтению доверяем всегда, записи —
     /// только при коде из whitelist (ADR-006): у части write-путей шлюза
     /// (частичный move, trash по socket-таймауту) флаг true означает «мог
     /// примениться», и клиентский повтор продублировал бы контент.
-    fn tool_failure(name: &str, body: &Value) -> Option<ToolFailure> {
+    fn tool_failure(body: &Value) -> Option<ToolFailure> {
         let payload = body.get("result")?;
-        if payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some(ToolFailure {
-                detail: format!("tool {name} failed: {}", ok_false_detail(payload)),
-                retryable: payload
-                    .get("retryable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                code: payload
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned),
-            });
+        if let Some(sc) = payload.get("structuredContent") {
+            if is_ok_false(sc) {
+                return Some(Self::tool_failure_payload(sc, ""));
+            }
+        }
+        if is_ok_false(payload) {
+            return Some(Self::tool_failure_payload(payload, ""));
         }
         let text = payload.get("content")?.get(0)?.get("text")?.as_str()?;
         let parsed = serde_json::from_str::<Value>(text).ok()?;
-        if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            return Some(ToolFailure {
-                detail: format!(
-                    "tool {name} failed (text payload): {}",
-                    ok_false_detail(&parsed)
-                ),
-                retryable: parsed
-                    .get("retryable")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                code: parsed
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned),
-            });
+        if is_ok_false(&parsed) {
+            return Some(Self::tool_failure_payload(&parsed, "text payload; "));
         }
         None
+    }
+
+    /// Пейлоад ok:false → ToolFailure: detail (голый, помечен формой ответа),
+    /// флаг и код классификации шлюза — последний консультирует whitelist
+    /// доверия у записей (ADR-006).
+    fn tool_failure_payload(v: &Value, marker: &str) -> ToolFailure {
+        ToolFailure {
+            detail: format!("{marker}{}", ok_false_detail(v)),
+            retryable: retryable_flag(v),
+            code: v.get("code").and_then(|x| x.as_str()).map(str::to_owned),
+        }
     }
 
     fn tool_result(name: &str, body: &Value) -> Result<Value> {
@@ -721,35 +730,6 @@ impl AffineClient {
     }
 }
 
-impl Drop for AffineClient {
-    fn drop(&mut self) {
-        // приватная сессия умирает вместе с процессом — вернём слот шлюзу
-        // (best-effort, вне рантайма пропускаем); shared-сессию НЕ закрываем:
-        // она опубликована в общем файле для следующих запусков
-        if self.shared_lock.is_none() && !self.session.is_empty() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let url = self.url.clone();
-                let token = self.token.clone();
-                let sid = self.session.clone();
-                handle.spawn(async move {
-                    let _ = delete_session_slot(&url, &token, &sid).await;
-                });
-            }
-        }
-    }
-}
-
-async fn delete_session_slot(url: &str, token: &str, sid: &str) -> Result<()> {
-    let http = http_client(Duration::from_secs(5))?;
-    http.delete(url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("mcp-session-id", sid)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -762,6 +742,16 @@ fn uwuwu_dir() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".uwuwu"))
         .unwrap_or_else(|_| PathBuf::from(".uwuwu"))
+}
+
+fn is_ok_false(v: &Value) -> bool {
+    v.get("ok").and_then(|x| x.as_bool()) == Some(false)
+}
+
+fn retryable_flag(v: &Value) -> bool {
+    v.get("retryable")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
 }
 
 fn ok_false_detail(v: &Value) -> String {
@@ -995,33 +985,47 @@ mod tests {
     }
 
     #[test]
-    fn tool_failure_detects_retryable_in_both_payload_shapes() {
-        // top-level structuredContent
+    fn tool_failure_detects_retryable_in_all_payload_shapes() {
+        // top-level result
         let body = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"ok": false, "error": "перегрузка", "retryable": true, "code": "upstream_unavailable"}
         });
-        let f = AffineClient::tool_failure("list_docs", &body).unwrap();
+        let f = AffineClient::tool_failure(&body).unwrap();
         assert!(f.detail.contains("перегрузка") && f.retryable);
         assert_eq!(f.code.as_deref(), Some("upstream_unavailable"));
-        // text-blob
+        // structuredContent — зеркало python _ok_false: проверяется ПЕРВЫМ,
+        // иначе tool_result отдал бы отказ как данные
+        let sc = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"structuredContent": {"ok": false, "error": "гонка sc", "retryable": true, "code": "WRITE_QUEUE_TIMEOUT"}}
+        });
+        let f = AffineClient::tool_failure(&sc).unwrap();
+        assert!(f.detail.contains("гонка sc") && f.retryable);
+        assert_eq!(f.code.as_deref(), Some("WRITE_QUEUE_TIMEOUT"));
+        // text-blob — detail помечен формой ответа, префикса "tool … failed" нет
         let blob = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"content": [{"type": "text", "text": "{\"ok\": false, \"error\": \"гонка\", \"retryable\": true, \"code\": \"WRITE_QUEUE_TIMEOUT\"}"}]}
         });
-        let f = AffineClient::tool_failure("read_doc", &blob).unwrap();
+        let f = AffineClient::tool_failure(&blob).unwrap();
         assert!(f.detail.contains("text payload") && f.detail.contains("гонка") && f.retryable);
         assert_eq!(f.code.as_deref(), Some("WRITE_QUEUE_TIMEOUT"));
+        assert!(
+            !f.detail.contains("tool "),
+            "префикс навешивает call_tool: {}",
+            f.detail
+        );
         // без флага — не ретраим
         let plain = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": {"ok": false, "error": "нет прав"}
         });
-        let f = AffineClient::tool_failure("list_docs", &plain).unwrap();
+        let f = AffineClient::tool_failure(&plain).unwrap();
         assert!(!f.retryable && f.code.is_none());
         // успешный ответ — None
         let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "answer": 1}});
-        assert!(AffineClient::tool_failure("list_docs", &ok).is_none());
+        assert!(AffineClient::tool_failure(&ok).is_none());
     }
 
     #[test]

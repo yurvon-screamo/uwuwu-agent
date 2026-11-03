@@ -74,13 +74,15 @@ name = "osv-scanner"
 name = "radarlint-python"
 mode = "comment"
 
-# Тест-харнесс MCP-контракта: bandit не применим (assert — механика
-# проверок B101, subprocess/tmp — e2e-инфраструктура B404/B603/B108);
-# radarlint S5754 требует bare raise в except — тест переводит SystemExit
-# старого контракта в ясный провал теста, bare raise здесь неверен
+# Тест-харнесс MCP-контракта (test_mcp_errors) и organize-команд wiki_ops
+# (test_wiki_ops_unlink): bandit не применим (assert — механика проверок
+# B101, subprocess/tmp — e2e-инфраструктура B404/B603/B108); radarlint
+# S5754 требует bare raise в except — тест переводит SystemExit старого
+# контракта в ясный провал теста, bare raise здесь неверен; S1186 —
+# пустые методы моков (close) и есть реализация «ничего не делать»
 [[exclude]]
 plugins = ["bandit", "radarlint-python"]
-file_patterns = ["tools/test_mcp_errors.py"]
+file_patterns = ["tools/test_mcp_errors.py", "tools/test_wiki_ops_unlink.py"]
 
 [[plugin]]
 name = "ripgrep"
@@ -97,3 +99,10 @@ name = "shellcheck"
 
 [[plugin]]
 name = "trufflehog"
+
+[[plugin]]
+name = "biome"
+# lint-only: fmt-драйвер переформатирует репо целиком — не в этом срезе
+drivers = [
+  "lint",
+]

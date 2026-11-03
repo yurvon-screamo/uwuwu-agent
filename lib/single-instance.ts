@@ -5,8 +5,7 @@
 // безопасной точке; вынужденный process.exit — только по истечении grace,
 // чтобы systemd не прибивал зависший drainage вечно.
 //
-// NB: cron/factory/dreamer пока несут собственные копии этой логики —
-// миграция их на общий модуль запланирована отдельно (не в срезе triage).
+// Пользователи: triage, cron, factory, dreamer — свои копии лока удалены.
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -51,4 +50,30 @@ export function acquireLock(opts: {
   process.on("SIGTERM", stop)
   process.on("SIGINT", stop)
   return true
+}
+
+/** Drain-примитив тик-демонов: флаг останова + прерываемый сон.
+ *  onStop лока взводит флаг; тик доезжает, цикл видит isStopping() и выходит
+ *  сам. sleep() режет интервал на шаги по 0.5с — SIGTERM между тиками даёт
+ *  чистый выход за шаг, а не через grace-килл (оптимизация латентности). */
+export interface Drain {
+  /** Взвести флаг останова (передавать как onStop лока). */
+  stop(): void
+  /** Флаг останова взведён — циклу пора на чистый выход. */
+  isStopping(): boolean
+  /** Сон до totalMs с выходом сразу после взведения флага. */
+  sleep(totalMs: number): Promise<void>
+}
+
+export function makeDrain(): Drain {
+  let stopping = false
+  return {
+    stop: (): void => { stopping = true },
+    isStopping: (): boolean => stopping,
+    sleep: async (totalMs: number): Promise<void> => {
+      for (let waited = 0; waited < totalMs && !stopping; waited += 500) {
+        await new Promise((r) => setTimeout(r, Math.min(500, totalMs - waited)))
+      }
+    },
+  }
 }

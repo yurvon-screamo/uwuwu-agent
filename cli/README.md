@@ -13,8 +13,14 @@ CLI заявку/фактизацию/кэш не содержит (механи
 
 ```bash
 cd cli
-cargo build --release
-cargo install --path .   # или cp target/release/uwuwu-cli ~/.local/bin/
+cargo install --path .
+```
+
+**Канон бинаря — `~/.cargo/bin/uwuwu-cli` (дефолтный `$CARGO_HOME/bin`), копия ровно одна**; установка/обновление — только `cargo install --path .`. Не копируй артефакт вручную в `~/.local/bin`: он в PATH стоит раньше `~/.cargo/bin` и молча затенит свежий бинарь — обновления перестанут применяться. Смок после установки:
+
+```bash
+which -a uwuwu-cli  # ровно одна строка: ~/.cargo/bin/uwuwu-cli
+uwuwu-cli --help    # грамматика актуальна
 ```
 
 Локальная Ollama больше не нужна (семантический фоллбек выпилен вместе с
@@ -29,7 +35,7 @@ cargo install --path .   # или cp target/release/uwuwu-cli ~/.local/bin/
 | `blob <key> [--out f]` | скачать blob (ключи видны в read как `affine://blob/<key>`) |
 | `shot <slug> [--edgeless]` | скриншот дока через headless chromium |
 | `search "…" [--limit N --sofa N]` | серверный полнотекстовый (Manticore): title/snippet/UI-ссылка с docId; SOFA опционально |
-| `task create/list/get/edit/comment/thread/body/close --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные комменты |
+| `task create/list/get/edit/comment/thread/body/close --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>` |
 | `cron set/list/pause/resume/rm` | кроны агентов (доска «Crons» / «Кроны <Proj>») |
 
 ## Architecture
@@ -44,6 +50,8 @@ cli/
     affine_queries.rs    # read-сторона: живой резолв слагов, read, rich-рендер, projects
     affine_docs.rs       # markdown-чтение, резолв слагов (map → tags → title)
     affine_search_server.rs # серверный полнотекстовый поиск (Manticore) — единственный
+    affine_comments.rs   # треды комментов: парсинг replies, snapshot, резолв префиксов
+    affine_gql.rs        # прямой GraphQL афины: createReply (гейтвей reply не экспонирует)
     affine_tasks.rs      # канбан-доски: строки, тела, комменты
     affine_blob.rs       # blob-загрузка, скриншоты (chromium)
     affine_store.rs      # миграционная map (slug→docId), frontmatter
@@ -69,6 +77,6 @@ stateless by design.
 | `UWUWU_AFFINE_TOKEN` | — | токен бота (обязательно) |
 | `UWUWU_AFFINE_WORKSPACE_ID` | — | id воркспейса (обязательно) |
 | `UWUWU_AFFINE_UI_URL` | `https://affine.uwuwu.net` | UI-хост: ссылки + серверный поиск |
-| `UWUWU_AFFINE_EMAIL`/`_PASSWORD` | — | креды бота: серверный поиск, blob, shot |
+| `UWUWU_AFFINE_EMAIL`/`_PASSWORD` | — | креды бота: серверный поиск, blob, shot, ответы в треды |
 | `UWUWU_WIKI` / `WIKI_ROOT` | `~/.uwuwu` | миграционная map (адресация слагов) |
 | `RUST_LOG` | `info` | tracing filter (stderr) |

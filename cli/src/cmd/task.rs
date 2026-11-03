@@ -6,6 +6,8 @@ use serde_json::json;
 
 use super::{resolve_row_any_board, truncate, TaskSub};
 use crate::affine_client::{AffineClient, AffineConfig};
+use crate::affine_comments::{self, first_line, short_id};
+use crate::affine_gql;
 use crate::affine_tasks;
 use crate::ui_url;
 
@@ -89,26 +91,46 @@ pub(crate) async fn run(
             .await
         }
         TaskSub::Thread { id } => thread(&mut client, cfg, root, &project, id).await,
-        TaskSub::Comment { id, stdin, text } => {
+        TaskSub::Comment {
+            id,
+            reply,
+            stdin,
+            text,
+        } => {
             comment(
                 &mut client,
                 cfg,
                 root,
                 &project,
-                CommentArgs { id, stdin, text },
+                CommentArgs {
+                    id,
+                    reply,
+                    stdin,
+                    text,
+                },
             )
             .await
         }
         TaskSub::Close { id, note } => {
             close_task(&mut client, cfg, root, &project, CloseArgs { id, note }).await
         }
-        TaskSub::Body { id, md, replace } => {
+        TaskSub::Body {
+            id,
+            md,
+            replace,
+            stdin,
+        } => {
             body(
                 &mut client,
                 cfg,
                 root,
                 &project,
-                BodyArgs { id, md, replace },
+                BodyArgs {
+                    id,
+                    md,
+                    replace,
+                    stdin,
+                },
             )
             .await
         }
@@ -131,6 +153,7 @@ struct EditArgs {
 
 struct CommentArgs {
     id: String,
+    reply: Option<String>,
     stdin: bool,
     text: Vec<String>,
 }
@@ -144,6 +167,7 @@ struct BodyArgs {
     id: String,
     md: Option<String>,
     replace: bool,
+    stdin: bool,
 }
 
 async fn create(
@@ -263,37 +287,69 @@ async fn thread(
     id: String,
 ) -> anyhow::Result<()> {
     let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
-    let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
-        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
-    let comments = affine_tasks::thread_comments(client, cfg, &row).await?;
-    if comments.is_empty() {
+    let bot = bot_user_id();
+    let threads = affine_tasks::thread_comments(client, cfg, &row).await?;
+    if threads.is_empty() {
         println!("комментов нет");
         return Ok(());
     }
-    let mut topic = 0usize;
-    for (text, user_id, created, resolved) in &comments {
-        let is_bot = *user_id == bot_user_id
-            || text.trim_start().starts_with("🤖")
-            || text.trim_start().starts_with("[factory]");
-        let time = chrono_like_hhmm(*created);
-        let mark = if *resolved { " [✓]" } else { "" };
-        if !is_bot {
-            topic += 1;
-            println!();
-            println!("── тема {topic} · {time} · ЮЗЕР{mark}:");
-            for line in text.lines() {
-                println!("  {line}");
-            }
-        } else {
-            println!("     ↳ {time} агент:");
-            for line in text.lines() {
-                println!("       {line}");
-            }
+    print!("{}", render_threads(&threads, &bot));
+    println!("тем: {}", threads.len());
+    Ok(())
+}
+
+/// Бот-аккаунт воркспейса (env), fallback — текущий канонический бот.
+fn bot_user_id() -> String {
+    std::env::var("UWUWU_BOT_USER_ID")
+        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into())
+}
+
+/// Автор лейблом: юзер или агент (бот-аккаунт или агентский маркер в тексте).
+fn is_bot_author(user_id: &str, text: &str, bot_user_id: &str) -> bool {
+    user_id == bot_user_id
+        || text.trim_start().starts_with("🤖")
+        || text.trim_start().starts_with("[factory]")
+}
+
+/// Лейбл автора: АГЕНТ/ЮЗЕР (для replies — в нижнем регистре).
+fn author_label(user_id: &str, text: &str, bot_user_id: &str) -> &'static str {
+    if is_bot_author(user_id, text, bot_user_id) {
+        "АГЕНТ"
+    } else {
+        "ЮЗЕР"
+    }
+}
+
+fn render_threads(threads: &[affine_comments::CommentThread], bot_user_id: &str) -> String {
+    let mut out = String::new();
+    for thread in threads {
+        let who = author_label(&thread.user_id, &thread.text, bot_user_id);
+        let mark = if thread.resolved { " [✓]" } else { "" };
+        out.push_str(&format!(
+            "\n── #{} · {} · {who}{mark}:\n",
+            short_id(&thread.id),
+            chrono_like_hhmm(thread.created),
+        ));
+        push_indented(&mut out, &thread.text, "  ");
+        for reply in &thread.replies {
+            let who = author_label(&reply.user_id, &reply.text, bot_user_id).to_lowercase();
+            out.push_str(&format!(
+                "     ↳ {} {who}:\n",
+                chrono_like_hhmm(reply.created)
+            ));
+            push_indented(&mut out, &reply.text, "       ");
         }
     }
-    println!();
-    println!("тем: {topic}");
-    Ok(())
+    out.push('\n');
+    out
+}
+
+fn push_indented(out: &mut String, text: &str, indent: &str) {
+    for line in text.lines() {
+        out.push_str(indent);
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 async fn comment(
@@ -308,8 +364,41 @@ async fn comment(
     if body.trim().is_empty() {
         anyhow::bail!("пустой коммент");
     }
-    affine_tasks::comment_task(client, cfg, &row, &body).await?;
-    println!("коммент отправлен: {}", truncate(&body, 60));
+    match &args.reply {
+        Some(prefix) => reply_in_thread(client, cfg, &row, prefix, &body).await,
+        None => {
+            affine_tasks::comment_task(client, cfg, &row, &body).await?;
+            println!("коммент отправлен: {}", truncate(&body, 60));
+            Ok(())
+        }
+    }
+}
+
+/// Ответ в существующий тред: GraphQL createReply напрямую в афину
+/// (гейтвей reply не экспонирует). Якорь не нужен — нативная ветка.
+async fn reply_in_thread(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    row: &affine_tasks::TaskRow,
+    prefix: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    let Some(ss) = crate::affine_search_server::ServerSearchConfig::from_env() else {
+        anyhow::bail!(
+            "нужны UI-креды афины (UWUWU_AFFINE_UI_URL/_EMAIL/_PASSWORD) для ответа в тред"
+        );
+    };
+    let threads = affine_tasks::thread_comments(client, cfg, row).await?;
+    let thread = affine_comments::resolve_thread_prefix(&threads, prefix)?;
+    affine_gql::AffineReplies::connect(&ss)
+        .await?
+        .create_reply(&thread.id, body, &row.title)
+        .await?;
+    println!(
+        "ответ в тред #{} отправлен: {}",
+        short_id(&thread.id),
+        truncate(body, 60)
+    );
     Ok(())
 }
 
@@ -344,9 +433,12 @@ async fn body(
     if row.body_doc.is_empty() {
         anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
     }
-    let text = match &args.md {
-        Some(path) => std::fs::read_to_string(path).with_context(|| format!("--md {path}"))?,
-        None => {
+    let text = match args.md {
+        // clap запрещает --stdin вместе с --md; guard фиксирует запрет и здесь
+        Some(path) if !args.stdin => {
+            std::fs::read_to_string(&path).with_context(|| format!("--md {path}"))?
+        }
+        _ => {
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
             buf
@@ -397,14 +489,34 @@ async fn print_body_and_comments(
             }
         }
     }
-    let comments = affine_tasks::recent_comments(client, cfg, row, 5).await?;
-    if !comments.is_empty() {
+    let threads = affine_tasks::recent_comments(client, cfg, row, 5).await?;
+    if !threads.is_empty() {
         println!("Комменты:");
-        for (text, _) in comments {
-            println!("  • {}", truncate(&text, 90));
-        }
+        print!("{}", render_threads_brief(&threads, &bot_user_id()));
     }
     Ok(())
+}
+
+/// Краткий рендер для карточки: по строке на коммент/reply, усечка 90.
+fn render_threads_brief(threads: &[affine_comments::CommentThread], bot_user_id: &str) -> String {
+    let mut out = String::new();
+    for thread in threads {
+        let who = author_label(&thread.user_id, &thread.text, bot_user_id);
+        let mark = if thread.resolved { " [✓]" } else { "" };
+        out.push_str(&format!(
+            "  • #{} {who}{mark}: {}\n",
+            short_id(&thread.id),
+            truncate(first_line(&thread.text), 90),
+        ));
+        for reply in &thread.replies {
+            let who = author_label(&reply.user_id, &reply.text, bot_user_id).to_lowercase();
+            out.push_str(&format!(
+                "      ↳ {who}: {}\n",
+                truncate(first_line(&reply.text), 90),
+            ));
+        }
+    }
+    out
 }
 
 /// Выгрузить картинки тела (`affine://blob/<key>` в markdown) в
@@ -548,5 +660,74 @@ mod tests {
         let rendered = chrono_like_hhmm(86_400_000);
         assert!(rendered.contains(':'));
         assert_eq!(chrono_like_hhmm(0), "—");
+    }
+
+    fn thread(
+        id: &str,
+        user: &str,
+        text: &str,
+        replies: Vec<affine_comments::CommentReply>,
+    ) -> affine_comments::CommentThread {
+        affine_comments::CommentThread {
+            id: id.into(),
+            text: text.into(),
+            user_id: user.into(),
+            created: 86_400_000,
+            resolved: false,
+            replies,
+        }
+    }
+
+    fn reply(user: &str, text: &str) -> affine_comments::CommentReply {
+        affine_comments::CommentReply {
+            id: "r".into(),
+            text: text.into(),
+            user_id: user.into(),
+            created: 86_400_000,
+        }
+    }
+
+    #[test]
+    fn render_threads_shows_nested_replies_with_ids() {
+        let threads = vec![
+            thread(
+                "aaaa1111-2222",
+                "user-x",
+                "вопрос юзера",
+                vec![reply("bot-y", "ответ агента")],
+            ),
+            thread("bbbb3333-4444", "bot-y", "🤖 статус", vec![]),
+        ];
+
+        let rendered = render_threads(&threads, "bot-y");
+
+        assert!(rendered.contains("#aaaa1111"), "{rendered}");
+        assert!(rendered.contains("ЮЗЕР:"), "{rendered}");
+        assert!(rendered.contains("↳"), "reply missing: {rendered}");
+        assert!(rendered.contains("АГЕНТ:"), "bot thread head: {rendered}");
+    }
+
+    #[test]
+    fn render_threads_brief_is_one_line_per_comment() {
+        let threads = vec![thread(
+            "aaaa1111-2222",
+            "user-x",
+            "первая строка\nвторая строка",
+            vec![reply("bot-y", "ответ")],
+        )];
+
+        let rendered = render_threads_brief(&threads, "bot-y");
+
+        let non_empty: Vec<&str> = rendered.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(non_empty.len(), 2, "{rendered}");
+        assert!(non_empty[0].contains("первая строка"));
+        assert!(!non_empty[0].contains("вторая"));
+    }
+
+    #[test]
+    fn bot_author_detected_by_user_id_or_marker() {
+        assert!(is_bot_author("bot-y", "текст", "bot-y"));
+        assert!(is_bot_author("human", "🤖 привет", "bot-y"));
+        assert!(!is_bot_author("human", "обычный текст", "bot-y"));
     }
 }
