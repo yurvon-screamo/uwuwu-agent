@@ -53,36 +53,66 @@ def threads_for(sid: str, body_doc: str) -> list[dict]:
     return out
 
 
+def _blocksuite_text(content) -> str:
+    """AFFiNE comment content → текст: snapshot.blocks.children[].text.delta[].insert."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(_blocksuite_text(x) for x in content)
+    if not isinstance(content, dict):
+        return ""
+    # уже готовый текст-узел
+    if "delta" in content and isinstance(content["delta"], list):
+        return "".join(str(d.get("insert", "")) for d in content["delta"] if isinstance(d, dict))
+    parts = []
+    snapshot = content.get("snapshot") or {}
+    blocks = snapshot.get("blocks") or {}
+    def walk_block(b):
+        if not isinstance(b, dict):
+            return
+        # blocksuite: текст в props.text.delta
+        props = b.get("props") or {}
+        t = props.get("text") if isinstance(props, dict) else None
+        if isinstance(t, dict) and isinstance(t.get("delta"), list):
+            parts.append("".join(str(d.get("insert", "")) for d in t["delta"] if isinstance(d, dict)))
+        for c in b.get("children", []) or []:
+            walk_block(c)
+    walk_block(blocks)
+    if parts:
+        return "\n".join(p for p in parts if p.strip())
+    body = content.get("body") or content.get("text") or ""
+    if isinstance(body, list):
+        return " ".join(str(x) for x in body)
+    return str(body)
+
+
 def comment_md(nodes: list[dict]) -> str:
     lines = ["", "## Комменты (миграция из афины)", ""]
-    def text_of(content) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, dict):
-            body = content.get("body") or content.get("text") or ""
-            if isinstance(body, list):
-                return " ".join(str(x) for x in body)
-            return str(body)
-        if isinstance(content, list):
-            return " ".join(text_of(x) for x in content)
-        return str(content or "")
+
     def created_of(node: dict) -> str:
         c = node.get("content")
         if isinstance(c, dict):
+            cd = (c.get("snapshot") or {}).get("meta", {}).get("createDate")
+            if cd:
+                try:
+                    import datetime as _dt
+                    return _dt.datetime.fromtimestamp(cd / 1000).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pass
             return str(c.get("createDate") or "")[:16].replace("T", " ")
         return ""
+
     for node in sorted(nodes, key=created_of):
-        c = node.get("content") if isinstance(node.get("content"), dict) else {}
-        who = (node.get("user") or {}).get("name") if isinstance(node.get("user"), dict) else None
-        who = who or "?"
+        who = node.get("user") or {}
+        who = who.get("name") if isinstance(who, dict) else None
         when = created_of(node)
-        body = text_of(node.get("content")).strip()
-        lines.append(f"- **{who}** ({when}): {body}")
+        body = _blocksuite_text(node.get("content")).strip()
+        lines.append(f"- **{who or '?'}** ({when}): {body}")
         for rep in node.get("replies") or []:
             ru = rep.get("user") if isinstance(rep.get("user"), dict) else {}
             rwho = ru.get("name") or "?"
             rwhen = ts(rep.get("created") or 0)
-            rbody = text_of(rep.get("content")).strip()
+            rbody = _blocksuite_text(rep.get("content")).strip()
             lines.append(f"  - **{rwho}** ({rwhen}): {rbody}")
         if node.get("resolved"):
             lines.append("  - *(тред резолвнут)*")
