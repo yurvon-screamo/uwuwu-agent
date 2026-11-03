@@ -19,7 +19,9 @@ use crate::affine_gql::AffineUi;
 fn validate_doc_id(id: &str) -> Result<()> {
     if !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         Ok(())
     } else {
@@ -40,7 +42,9 @@ fn build_titles_request(workspace: &str, doc_ids: &[String]) -> Result<Value> {
         .enumerate()
         .map(|(i, _)| format!("d{i}: doc(docId: $v{i}) {{ id title }}"))
         .collect();
-    let var_defs: Vec<String> = (0..doc_ids.len()).map(|i| format!("$v{i}: String!")).collect();
+    let var_defs: Vec<String> = (0..doc_ids.len())
+        .map(|i| format!("$v{i}: String!"))
+        .collect();
     let mut variables = json!({ "w": workspace });
     for (i, id) in doc_ids.iter().enumerate() {
         variables[format!("v{i}")] = json!(id);

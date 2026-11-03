@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::affine_snapshot;
 use crate::affine_search_server::ServerSearchConfig;
+use crate::affine_snapshot;
 
 /// Transport failure is retried once with this pause — the UI API shares the
 /// tunnel with the gateway, one transient reset is normal under load.
@@ -90,16 +90,14 @@ impl AffineUi {
             Ok(resp) => resp,
             Err(first) => {
                 tokio::time::sleep(TRANSPORT_RETRY_PAUSE).await;
-                let retried = send()
-                    .await
-                    .map_err(|second| anyhow::anyhow!("affine graphql: {first}; retry: {second}"))?;
+                let retried = send().await.map_err(|second| {
+                    anyhow::anyhow!("affine graphql: {first}; retry: {second}")
+                })?;
                 retried.error_for_status()?
             }
         };
         let resp = resp.error_for_status()?;
-        resp.json()
-            .await
-            .context("affine graphql response json")
+        resp.json().await.context("affine graphql response json")
     }
 }
 
