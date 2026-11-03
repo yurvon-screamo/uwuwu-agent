@@ -22,7 +22,7 @@ import {
   alignChunks, batchReadyAt, classifyUpdate, composeDraftPrompt, composeText, draftReady, dropBatch,
   extractFinal, joinBatch, plainChunks, promptLandedAt, SESSION_TITLE, takeBatch, validState,
   DRAFT_MAX_TURNS,
-  type DraftRef, type DraftTrack, type Request, type RunState, type TgUpdate, type TriageState,
+  type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
 const HERE = dirname(new URL(import.meta.url).pathname)

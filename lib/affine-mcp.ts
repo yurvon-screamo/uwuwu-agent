@@ -120,7 +120,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     rpc("tools/call", { name, arguments: { workspaceId: WORKSPACE, ...args } }, sid)
   try {
     return (await call(session)) as T
-  } catch (e) {
+  } catch {
     // протухшая сессия (редеплой шлюза) ИЛИ транспортный сбой
     // (отравленный keep-alive сокет у долгоживущего процесса) —
     // обе лечатся полной пересборкой сессии = новое соединение
