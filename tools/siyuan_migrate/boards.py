@@ -255,21 +255,11 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str, 
         except Exception:
             pass
     if not doc_id:
-        # родитель = док проекта /{proj} (не корень ноутбука)
-        parent_id = ""
-        if sy_http is not None and nb_id:
-            try:
-                parent_id = sy_http.get_doc_id_by_path(nb_id, f"/{proj}") or ""
-            except Exception:
-                parent_id = ""
-        doc = sy.tool("document", {"action": "create", "notebook": target_nb,
-                                   "parentID": parent_id,
-                                   "title": board["title"], "content": f"# {board['title']}\n"})
-        if isinstance(doc, str):
-            m = re.search(r"[0-9]{14}-[a-z0-9]+", doc)
-            doc_id = m.group(0) if m else ""
-        elif isinstance(doc, dict):
-            doc_id = doc.get("id") or doc.get("data", {}).get("id") or ""
+        # ИНВАРИАНТ: док доски создаётся только импортом/восстановлением,
+        # migrate_board не плодит доки. Нет дока — ошибка.
+        stats = {"board": board["title"], "doc": "", "rows": 0, "db": "",
+                 "error": f"board doc {hpath} not found — recreated by import stage"}
+        return stats
     stats = {"board": board["title"], "doc": doc_id, "rows": 0, "db": ""}
     if not doc_id:
         return stats
