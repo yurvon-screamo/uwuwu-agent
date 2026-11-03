@@ -116,42 +116,100 @@ async fn resolve_row_on_board(
     rows: &mut [affine_tasks::TaskRow],
     id: &str,
 ) -> anyhow::Result<Option<affine_tasks::TaskRow>> {
-    match affine_tasks::resolve_row_match(rows, id) {
-        affine_tasks::RowMatch::Found(row) => return Ok(Some(row.clone())),
-        affine_tasks::RowMatch::Ambiguous(msg) => return Err(anyhow::anyhow!("{msg}")),
+    match affine_tasks::classify_row(rows, id) {
+        affine_tasks::RowMatch::One(row) => return Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous { by_id: true } => {
+            return Err(anyhow::anyhow!(
+                "'{id}' неоднозначно по id — уточни префикс"
+            ));
+        }
+        affine_tasks::RowMatch::Ambiguous { by_id: false } => {
+            return Err(anyhow::anyhow!(
+                "'{id}' неоднозначно по заголовку — уточни или используй id"
+            ));
+        }
         affine_tasks::RowMatch::NotFound => {}
     }
     fill_display_titles(cfg, rows).await;
-    match affine_tasks::resolve_row_match(rows, id) {
-        affine_tasks::RowMatch::Found(row) => Ok(Some(row.clone())),
-        affine_tasks::RowMatch::Ambiguous(msg) => Err(anyhow::anyhow!("{msg}")),
+    match affine_tasks::classify_row(rows, id) {
+        affine_tasks::RowMatch::One(row) => Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous { by_id: true } => Err(anyhow::anyhow!(
+            "'{id}' неоднозначно по id — уточни префикс"
+        )),
+        affine_tasks::RowMatch::Ambiguous { by_id: false } => Err(anyhow::anyhow!(
+            "'{id}' неоднозначно по заголовку — уточни или используй id"
+        )),
         affine_tasks::RowMatch::NotFound => Ok(None),
     }
 }
 
 /// Найти крон на любой крон-доске (Crons + «Кроны <proj>» проектов).
+/// Исход резолва крона на крон-досках. Важен для разрушительного `cron rm`:
+/// сирота-путь допустим только при однозначном «не найдено» на ВСЕХ читаемых
+/// досках (неоднозначность и read-сбои — жёсткая ошибка, не «не найдено»).
+#[derive(Debug)]
+pub(crate) enum CronResolveFail {
+    NotFound { details: String, all_readable: bool },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for CronResolveFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { details, .. } => write!(f, "не найден ({details})"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CronResolveFail {}
+
 pub(crate) async fn resolve_cron_any_board(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     board_titles: &[String],
     root: &std::path::Path,
     id: &str,
-) -> anyhow::Result<(affine_tasks::Board, affine_tasks::TaskRow)> {
+) -> Result<(affine_tasks::Board, affine_tasks::TaskRow), CronResolveFail> {
     let mut last_err = String::new();
+    // read_failures считают только транспортные/протокольные сбои; отсутствующая
+    // доска («Crons» в трэше, «Кроны <proj>» не создана) — норма воркспейса
+    let mut read_failures = 0usize;
     for board_title in board_titles {
-        let Ok(board) = affine_tasks::find_board_by_title(client, cfg, board_title).await else {
-            continue;
+        let board = match affine_tasks::find_board_typed(client, cfg, board_title).await {
+            affine_tasks::BoardAccess::Found(board) => board,
+            affine_tasks::BoardAccess::Absent => {
+                last_err = format!("{board_title}: доски нет");
+                continue;
+            }
+            affine_tasks::BoardAccess::Failed(e) => {
+                read_failures += 1;
+                last_err = format!("{board_title}: доска не читается ({e})");
+                continue;
+            }
         };
-        let Ok(mut rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
-            continue;
+        let rows = match affine_tasks::read_rows(client, cfg, &board, root).await {
+            Ok(r) => r,
+            Err(e) => {
+                read_failures += 1;
+                last_err = format!("{board_title}: строки не читаются ({e})");
+                continue;
+            }
         };
+        let mut rows = rows;
         match resolve_row_on_board(cfg, &mut rows, id).await {
             Ok(Some(row)) => return Ok((board, row)),
-            Ok(None) => last_err = format!("задача '{id}' не найдена"),
-            Err(e) => last_err = format!("{e}"),
+            Ok(None) => last_err = format!("{board_title}: нет"),
+            Err(e) => {
+                // неоднозначность — решающая диагностика, не «не найдено»
+                return Err(CronResolveFail::Other(e));
+            }
         }
     }
-    anyhow::bail!("крон «{id}» не найден на крон-досках ({last_err})")
+    Err(CronResolveFail::NotFound {
+        details: last_err,
+        all_readable: read_failures == 0,
+    })
 }
 
 /// Заголовок строки для показа: пустой → плейсхолдер с id тела.

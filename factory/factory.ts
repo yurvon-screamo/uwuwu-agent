@@ -1,7 +1,8 @@
 // uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью на AFFiNE.
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
-//   1. Design на доске (пустой статус = черновик юзера, не трогаем) →
+//   1. Design на доске (Draft = черновик на валидации триажа, пустой =
+//      легаси-черновик юзера — оба не трогаем) →
 //      сессия девелопера в чекауте репо + короткий spawn-промпт (ворктри/ветку
 //      создаёт сам агент)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
@@ -18,7 +19,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import * as mcp from "./mcp"
+import * as mcp from "../lib/affine-mcp"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
@@ -678,7 +679,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const rows = await readTasks(board)
 
   // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
-  //    (пустой статус = черновик юзера, не трогаем)
+  //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
   const started = new Set<string>()
   const spawnable = rows.filter((r) => r.status === "Design" || reviewKindOf(r.status) !== null)
   for (const task of untrackedTasks(spawnable, state)) {
@@ -859,6 +860,12 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
 let tickCount = 0
 
 async function main(): Promise<void> {
+  // env шлюза обязателен на старте (раньше это делал process.exit на импорте
+  // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
+  if (!mcp.mcpConfigured()) {
+    console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
