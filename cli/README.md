@@ -1,6 +1,6 @@
 # uwuwu-cli
 
-CLI для базы знаний uwuwu (AFFiNE-backed): живое чтение доков, серверный
+CLI для базы знаний uwuwu (SiYuan-бекенд): живое чтение доков, полнотекстовый
 поиск, канбан-задачи, кроны. Rust + clap + MCP-шлюз афины. **Stateless**:
 локального контент-кэша нет — каждая команда ходит в афину живьём, стейл-
 чтения невозможны по построению (гейт недоступен → честная ошибка).
@@ -32,7 +32,7 @@ uwuwu-cli --help    # грамматика актуальна
 | --- | --- |
 | `projects` | реестр проектов (живой проход по организ-дереву, описания из README-доков) |
 | `read <slug>` | живое чтение: слаг → миграционная map → теги/тайтл через гейт; rich-контент (базы/майндмапы/канва) рендерится в текст |
-| `blob <key> [--out f]` | скачать blob (ключи видны в read как `affine://blob/<key>`) |
+| `blob <key> [--out f]` | скачать ассет из assets/ воркспейса SiYuan |
 | `shot <slug> [--edgeless]` | скриншот дока через headless chromium |
 | `search "…" [--limit N --sofa N]` | серверный полнотекстовый (Manticore): title/snippet/UI-ссылка с docId; SOFA опционально |
 | `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; новая строка всегда в статусе **Draft** («задачи в пустоту не заводим» — триаж валидирует и переводит в Todo); rm снимает строку и трэшит тело (сироту — по docId), **только Draft-строки** — живую задачу перед удалением переведи в Draft (`task edit <id> --status Draft`) |
@@ -46,18 +46,11 @@ cli/
   src/
     lib.rs               # модули + run()
     main.rs              # thin binary entry
-    affine_client.rs     # MCP-шлюз: JSON-RPC over SSE, re-handshake, retry
-    affine_queries.rs    # read-сторона: живой резолв слагов, read, rich-рендер, projects
-    affine_docs.rs       # markdown-чтение, резолв слагов (map → tags → title)
-    affine_search_server.rs # серверный полнотекстовый поиск (Manticore) — единственный
-    affine_children.rs   # резолв существующего тела: строки+дети доски → сирота/дубль/чисто
-    affine_comments.rs   # треды комментов: парсинг replies, snapshot, резолв префиксов
-    affine_gql.rs        # прямой GraphQL афины: createReply (гейтвей reply не экспонирует)
-    affine_tasks.rs      # канбан-доски: строки, тела, комменты; идемпотентный create (task+cron), rm
-    affine_blob.rs       # blob-загрузка, скриншоты (chromium)
-    affine_store.rs      # миграционная map (slug→docId), frontmatter
-    affine_collect.rs    # FS-коллекторы миграции
-    sofa.rs              # SOFA — публичная база агентов
+| файл | роль |
+| --- | --- |
+| `siyuan.rs` | клиент SiYuan kernel (REST) + встроенный MCP (database) |
+| `siyuan_task.rs` | таск-модель: доски/строки/тела/комменты |
+| `cmd/sy_dispatch.rs` | хендлеры всех команд (единственный бекенд) |
     cmd/                 # clap-грамматика + диспетчер команд
   tests/
     common/mod.rs        # mock-шлюз (сценарные шаги) + изоляция HOME
@@ -68,7 +61,6 @@ cli/
 ## How search works
 
 Серверный полнотекстовый поиск афины (Manticore): свежий индекс всего
-воркспейса, env `UWUWU_AFFINE_UI_URL`/`_EMAIL`/`_PASSWORD`. Выдача:
 title, snippet, UI-ссылка с docId. Локального корпуса/семантики нет —
 stateless by design.
 
@@ -76,10 +68,6 @@ stateless by design.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `UWUWU_AFFINE_URL` | — | MCP-шлюз AFFiNE (обязательно) |
-| `UWUWU_AFFINE_TOKEN` | — | токен бота (обязательно) |
-| `UWUWU_AFFINE_WORKSPACE_ID` | — | id воркспейса (обязательно) |
-| `UWUWU_AFFINE_UI_URL` | `https://affine.uwuwu.net` | UI-хост: ссылки + серверный поиск |
-| `UWUWU_AFFINE_EMAIL`/`_PASSWORD` | — | креды бота: серверный поиск, blob, shot, ответы в треды |
+| `UWUWU_SIYUAN_URL` | `http://127.0.0.1:6806` | kernel SiYuan (REST+MCP) |
 | `UWUWU_WIKI` / `WIKI_ROOT` | `~/.uwuwu` | миграционная map (адресация слагов) |
 | `RUST_LOG` | `info` | tracing filter (stderr) |

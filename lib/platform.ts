@@ -1,6 +1,6 @@
-// lib/affine-mcp.ts — адаптер платформы.
+// lib/platform.ts — клиент платформы uwuwu (SiYuan).
 //
-// С 04.11.2026 бекенд — SiYuan (катовор с AFFiNE). Файл сохраняет экспортный
+// С 04.11.2026 бекенд — SiYuan (миграция с платформы-предшественника). Файл сохраняет экспортный
 // контракт (mcpConfigured/connect/tool), но разговаривает с SiYuan kernel
 // (REST) и его встроенным MCP (database-операции). Шейпы ответов эмулируют
 // прежние афин-тулзы, чтобы cron/factory/triage работали без правок.
@@ -224,7 +224,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return {
         blocks: rows.map((b) => ({
           id: b.id,
-          flavour: b.type === "av" ? "affine:database" : b.type === "d" ? "affine:page" : "affine:paragraph",
+          flavour: b.type === "av" ? "platform:database" : b.type === "d" ? "platform:page" : "platform:paragraph",
         })),
       } as T
     }

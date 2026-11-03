@@ -1,7 +1,7 @@
 //! Parse-тесты грамматики `task body`: явный --stdin, конфликт с --md,
 //! дефолт без флагов. Чистый clap-парсинг — без сети и env.
 
-use super::{Cli, Commands, TaskSub};
+use super::cli::{Cli, Commands, TaskSub};
 use clap::Parser as _;
 
 fn parse_command(args: &[&str]) -> clap::error::Result<Commands> {

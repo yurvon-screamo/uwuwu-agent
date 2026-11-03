@@ -1,5 +1,5 @@
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
-// Задача = строка канбана AFFiNE (rowBlockId) + док-тело (bodyDocId).
+// Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
 
 export interface TaskRef {
@@ -54,7 +54,7 @@ export interface FactoryState {
 /** Комменты агента — с этим префиксом, чтобы не петлить себя. */
 export const AGENT_MARK = "🤖"
 
-// ——— ревью-статусы фабрики: имена = контракт с колонками досок AFFiNE ———
+// ——— ревью-статусы фабрики: имена = контракт со Status-колонками досок ———
 
 export const REVIEW_PLAN_STATUS = "Ревью плана"
 export const REVIEW_RESULT_STATUS = "Ревью результата"
