@@ -19,6 +19,8 @@ pub mod log_filter;
 #[cfg(test)]
 pub(crate) mod mock_ui;
 pub mod path;
+pub mod siyuan;
+pub mod siyuan_task;
 pub mod sofa;
 pub mod wiki;
 

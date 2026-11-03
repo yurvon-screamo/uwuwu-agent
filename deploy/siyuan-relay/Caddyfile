@@ -1,0 +1,8 @@
+:8080 {
+	reverse_proxy 127.0.0.1:7331 {
+		flush_interval -1
+	}
+	request_body {
+		max_size 100m
+	}
+}
