@@ -44,6 +44,7 @@ ins({ id: "ses_root_fresh", title: "живая", updated: NOW - 1000 })         
 ins({ id: "ses_dreamer", agent: "dreamer", updated: NOW - IDLE - 1 })         // сам дример
 ins({ id: "ses_child", parent: "ses_root_idle", updated: NOW - IDLE - 1 })    // сабагент
 ins({ id: "ses_noagent", agent: null, updated: NOW - IDLE - 1 })              // NULL-агент — кандидат
+ins({ id: "ses_reviewer", agent: "code-quality-reviewer", updated: NOW - IDLE - 1 }) // ревьювер фабрики — не фактологизируем
 
 afterAll(() => db.close())
 
@@ -60,6 +61,9 @@ describe("fetchRootSessions", () => {
   })
   test("NULL-агент не выпадает (COALESCE)", () => {
     expect(rows.some((r) => r.id === "ses_noagent")).toBe(true)
+  })
+  test("ревьювер фабрики не фактологизируется", () => {
+    expect(rows.some((r) => r.id === "ses_reviewer")).toBe(false)
   })
   test("fetchSessionById", () => {
     expect(fetchSessionById(db, "ses_root_idle")?.title).toBe("работа")
