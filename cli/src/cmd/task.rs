@@ -7,7 +7,6 @@ use serde_json::json;
 use super::{resolve_row_any_board, truncate, TaskSub};
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_comments::{self, first_line, short_id};
-use crate::affine_gql;
 use crate::affine_tasks;
 use crate::ui_url;
 
@@ -66,7 +65,9 @@ pub(crate) async fn run(
             status,
             project: proj_override,
         } => list(cfg, root, project, status, proj_override).await,
-        TaskSub::Get { id } => get(&mut client, cfg, root, &project, id).await,
+        TaskSub::Get { id, no_body } => {
+            get(&mut client, cfg, root, &project, GetArgs { id, no_body }).await
+        }
         TaskSub::Edit {
             id,
             status,
@@ -146,6 +147,11 @@ struct CreateArgs {
     ty: Option<String>,
     stdin: bool,
     attach: Vec<std::path::PathBuf>,
+}
+
+struct GetArgs {
+    id: String,
+    no_body: bool,
 }
 
 struct EditArgs {
@@ -260,8 +266,8 @@ async fn list(
         .await
         .with_context(|| format!("доска проекта «{project}» не найдена"))?;
     let rows = affine_tasks::read_rows(&mut client, cfg, &board, root).await?;
-    let filtered: Vec<_> = rows
-        .iter()
+    let mut filtered: Vec<affine_tasks::TaskRow> = rows
+        .into_iter()
         .filter(|r| {
             status
                 .as_deref()
@@ -269,6 +275,8 @@ async fn list(
                 .unwrap_or(true)
         })
         .collect();
+    // тайтлы только показанных строк, одним батч-запросом
+    super::fill_display_titles(cfg, &mut filtered).await;
     if filtered.is_empty() {
         println!("Задач нет.");
     }
@@ -278,7 +286,7 @@ async fn list(
             "{:<13} {:<12} {:<34} {}",
             r.status,
             &r.row_id[..r.row_id.len().min(12)],
-            truncate(&r.title, 32),
+            truncate(&super::display_title(r), 32),
             r.pr
         );
     }
@@ -290,10 +298,12 @@ async fn get(
     cfg: &AffineConfig,
     root: &std::path::Path,
     project: &str,
-    id: String,
+    args: GetArgs,
 ) -> anyhow::Result<()> {
-    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
-    println!("Задача:   {}", row.title);
+    let (_board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    // шапка: тайтл нужной строки O(1)-запросом, сбой → плейсхолдер
+    let title = super::row_display_title(cfg, &mut row).await;
+    println!("Задача:   {title}");
     println!("Статус:   {}", row.status);
     if !row.pr.is_empty() {
         println!("PR:       {}", row.pr);
@@ -303,7 +313,7 @@ async fn get(
     }
     println!("Строка:   {}", row.row_id);
     if !row.body_doc.is_empty() {
-        print_body_and_comments(client, cfg, &row).await?;
+        print_body_and_comments(client, cfg, &row, !args.no_body).await?;
     }
     Ok(())
 }
@@ -315,9 +325,12 @@ async fn edit(
     project: &str,
     args: EditArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     affine_tasks::edit_row(client, cfg, &board, &row, &args.patch).await?;
-    println!("обновлено: {}", row.title);
+    println!(
+        "обновлено: {}",
+        super::row_display_title(cfg, &mut row).await
+    );
     Ok(())
 }
 
@@ -418,6 +431,8 @@ async fn comment(
 
 /// Ответ в существующий тред: GraphQL createReply напрямую в афину
 /// (гейтвей reply не экспонирует). Якорь не нужен — нативная ветка.
+/// docTitle — функциональный заголовок строки: строгий дозаголовок,
+/// без него честная ошибка (пустой docTitle в снапшот недопустим).
 async fn reply_in_thread(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -425,17 +440,14 @@ async fn reply_in_thread(
     prefix: &str,
     body: &str,
 ) -> anyhow::Result<()> {
-    let Some(ss) = crate::affine_search_server::ServerSearchConfig::from_env() else {
-        anyhow::bail!(
-            "нужны UI-креды афины (UWUWU_AFFINE_UI_URL/_EMAIL/_PASSWORD) для ответа в тред"
-        );
-    };
-    let threads = affine_tasks::thread_comments(client, cfg, row).await?;
+    let ui = super::connect_ui()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#} для ответа в тред"))?;
+    let mut row = row.clone();
+    let doc_title = super::require_row_title(&ui, cfg, &mut row).await?;
+    let threads = affine_tasks::thread_comments(client, cfg, &row).await?;
     let thread = affine_comments::resolve_thread_prefix(&threads, prefix)?;
-    affine_gql::AffineReplies::connect(&ss)
-        .await?
-        .create_reply(&thread.id, body, &row.title)
-        .await?;
+    ui.create_reply(&thread.id, body, &doc_title).await?;
     println!(
         "ответ в тред #{} отправлен: {}",
         short_id(&thread.id),
@@ -451,7 +463,7 @@ async fn close_task(
     project: &str,
     args: CloseArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     let patch = affine_tasks::RowPatch {
         status: Some("Done".into()),
         ..Default::default()
@@ -460,7 +472,7 @@ async fn close_task(
     if let Some(note) = args.note {
         affine_tasks::comment_task(client, cfg, &row, &note).await?;
     }
-    println!("закрыта: {}", row.title);
+    println!("закрыта: {}", super::row_display_title(cfg, &mut row).await);
     Ok(())
 }
 
@@ -471,9 +483,10 @@ async fn body(
     project: &str,
     args: BodyArgs,
 ) -> anyhow::Result<()> {
-    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (_board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let title = super::row_display_title(cfg, &mut row).await;
     if row.body_doc.is_empty() {
-        anyhow::bail!("у задачи «{}» нет тела-дока", row.title);
+        anyhow::bail!("у задачи «{title}» нет тела-дока");
     }
     let text = match args.md {
         // clap запрещает --stdin вместе с --md; guard фиксирует запрет и здесь
@@ -488,30 +501,41 @@ async fn body(
     };
     if args.replace {
         let n_diagrams = affine_tasks::replace_body(client, cfg, &row.body_doc, &text).await?;
-        println!("тело заменено: {} (диаграмм: {n_diagrams})", row.title);
+        println!("тело заменено: {title} (диаграмм: {n_diagrams})");
     } else {
         let (n_diagrams, n_deleted) =
             affine_tasks::append_body_markdown(client, cfg, &row.body_doc, &text).await?;
-        println!(
-            "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
-            row.title
-        );
+        println!("тело дописано: {title} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})");
     }
     Ok(())
 }
 
-/// Тело целиком + свежие комменты: task get — единственный cli-путь
-/// агента к содержимому; картинки из markdown выгружаются рядом.
+/// Детали задачи: ссылка на тело всегда; экспорт markdown и картинки —
+/// только без --no-body; комменты — всегда (быстрая проверка статуса).
 async fn print_body_and_comments(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     row: &affine_tasks::TaskRow,
+    include_body: bool,
 ) -> anyhow::Result<()> {
     let ui = ui_url();
     println!(
         "Тело:     {ui}/workspace/{}/{}",
         cfg.workspace, row.body_doc
     );
+    if include_body {
+        print_body_markdown(client, cfg, row).await?;
+    }
+    print_comments_brief(client, cfg, row).await?;
+    Ok(())
+}
+
+/// Экспорт тела markdown + выгрузка картинок в /tmp/uwuwu-task-<row>/.
+async fn print_body_markdown(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    row: &affine_tasks::TaskRow,
+) -> anyhow::Result<()> {
     if let Ok(e) = client
         .call_tool(
             "export_doc_markdown",
@@ -531,6 +555,15 @@ async fn print_body_and_comments(
             }
         }
     }
+    Ok(())
+}
+
+/// Свежие комменты карточки — краткий рендер.
+async fn print_comments_brief(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    row: &affine_tasks::TaskRow,
+) -> anyhow::Result<()> {
     let threads = affine_tasks::recent_comments(client, cfg, row, 5).await?;
     if !threads.is_empty() {
         println!("Комменты:");

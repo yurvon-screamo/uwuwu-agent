@@ -43,6 +43,9 @@ pub(crate) enum TaskSub {
     Get {
         #[arg(help = "row-id / doc-id / уникальный префикс")]
         id: String,
+        /// Быстрая проверка статуса: без экспорта тела и картинок
+        #[arg(long = "no-body")]
+        no_body: bool,
     },
     /// Правка колонок строки
     Edit {

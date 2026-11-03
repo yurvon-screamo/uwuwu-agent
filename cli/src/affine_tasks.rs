@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use crate::affine_children::{resolve_existing_body, ExistingBody};
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_comments;
+use crate::affine_gql::AffineUi;
+use crate::affine_titles;
 
 /// Тип задачи — тег на теле. Определяет шаблон тела и пайп агента.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,14 +442,11 @@ impl RowPatch {
     }
 }
 
-/// Прочитать все строки доски. Заголовки линкованных строк резолвятся
-/// из контент-кэша (sync уже принёс тела задач) и только при промахе —
-/// get_doc-ом: без кэша list делал бы N round-trip-ов до Сингапура.
 /// Разобрать одну строку доски из read_database_cells-ответа.
-/// Возвращает строку и Some(linkedDocId), когда заголовок не разрешён:
-/// linked-строки носят заголовок на слинкованной странице (ячейка
-/// «title» — LinkedPage-ссылка из одного пробела) — резолв по кэшу/сети
-/// делает вызывающий.
+/// Возвращает строку и Some(linkedDocId): заголовок линкованной строки
+/// живёт на слинкованной странице (ячейка «title» — LinkedPage-ссылка),
+/// сетевой резолв заголовков делает вызывающий — батчем через UI GraphQL
+/// (affine_titles), никогда по одному get_doc на строку.
 fn parse_task_row(r: &Value) -> (TaskRow, Option<String>) {
     let cells = r.get("cells").cloned().unwrap_or(Value::Null);
     let cell = |k: &str| -> String {
@@ -481,6 +480,10 @@ fn parse_task_row(r: &Value) -> (TaskRow, Option<String>) {
     )
 }
 
+/// Прочитать все строки доски: ровно один `read_database_cells`, ноль
+/// сетевых резолвов заголовков. Заголовок линкованной строки остаётся
+/// пустым — дозаголовок (батч UI GraphQL или O(1) одиночный) делает
+/// вызывающий там, где title нужен для показа или функции.
 pub async fn read_rows(
     client: &mut AffineClient,
     cfg: &AffineConfig,
@@ -499,28 +502,33 @@ pub async fn read_rows(
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let (mut row, unresolved) = parse_task_row(&r);
-        if let Some(linked) = unresolved {
-            // заголовок linked-строки живёт в доке-теле — живой get_doc
-            if let Ok(doc) = client
-                .call_tool(
-                    "get_doc",
-                    json!({"workspaceId": cfg.workspace, "docId": linked}),
-                )
-                .await
-            {
-                row.title = doc
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-            }
+    Ok(rows.iter().map(|r| parse_task_row(r).0).collect())
+}
+
+/// Дозаголовки линкованных строк одним батч-запросом к UI GraphQL.
+/// Промах/сбой отдельного заголовка → пустой title → плейсхолдер
+/// вызывающего; сбой всего запроса → Err.
+pub async fn resolve_titles(ui: &AffineUi, cfg: &AffineConfig, rows: &mut [TaskRow]) -> Result<()> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in rows.iter() {
+        if row.title.is_empty() && !row.body_doc.is_empty() && !ids.contains(&row.body_doc) {
+            ids.push(row.body_doc.clone());
         }
-        out.push(row);
     }
-    Ok(out)
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let titles = affine_titles::fetch_titles(ui, &cfg.workspace, &ids).await?;
+    for row in rows.iter_mut() {
+        if row.title.is_empty() && !row.body_doc.is_empty() {
+            row.title = titles
+                .get(&row.body_doc)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
+        }
+    }
+    Ok(())
 }
 
 /// Найти строку по id (row id или doc-тела) или уникальному префиксу.
@@ -1781,5 +1789,63 @@ mod embed_tests {
     #[test]
     fn marker_format() {
         assert_eq!(diagram_marker("arch"), "⁂ diagram:arch");
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn linked_row(row_id: &str, body_doc: &str) -> TaskRow {
+        TaskRow {
+            row_id: row_id.into(),
+            title: String::new(),
+            body_doc: body_doc.into(),
+            status: "Todo".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_row_matches_by_row_id_prefix_without_titles() {
+        let rows = vec![
+            linked_row("e87hxo4QdK", "doc-body-1"),
+            linked_row("W55taMHu0D", "doc-body-2"),
+        ];
+
+        let row = resolve_row(&rows, "e87h").expect("id-префикс резолвится");
+
+        assert_eq!(row.row_id, "e87hxo4QdK");
+    }
+
+    #[test]
+    fn resolve_row_matches_by_body_doc_id_without_titles() {
+        let rows = vec![linked_row("r1", "5HuB9qRLOF")];
+
+        let row = resolve_row(&rows, "5HuB").expect("body-doc префикс резолвится");
+
+        assert_eq!(row.row_id, "r1");
+    }
+
+    #[test]
+    fn resolve_row_substring_needs_titles_and_fails_without_them() {
+        let rows = vec![linked_row("r1", "doc-1")];
+
+        let err = resolve_row(&rows, "таймаут");
+
+        assert!(err
+            .map_err(|e| e.to_string())
+            .err()
+            .is_some_and(|msg| msg.contains("не найдена")));
+    }
+
+    #[test]
+    fn resolve_row_substring_matches_after_title_fill() {
+        let mut rows = vec![linked_row("r1", "doc-1")];
+        rows[0].title = "task list/get таймаутят".into();
+
+        let row = resolve_row(&rows, "ТАЙМАУТ").expect("подстрока без регистра");
+
+        assert_eq!(row.row_id, "r1");
     }
 }
