@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use serde_json::json;
 
-use super::{resolve_cron_any_board, truncate, CronSub};
+use super::{resolve_cron_any_board, truncate, CronResolveFail, CronSub};
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_tasks;
 
@@ -29,6 +29,7 @@ pub(crate) async fn run(
             set(
                 &mut client,
                 cfg,
+                root,
                 SetArgs {
                     title,
                     r#in,
@@ -45,29 +46,59 @@ pub(crate) async fn run(
         CronSub::Pause { id } | CronSub::Resume { id } => {
             let status = if is_pause { "paused" } else { "active" };
             let (board, row) =
-                resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await?;
+                match resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await {
+                    Ok(pair) => pair,
+                    Err(super::CronResolveFail::Other(e)) => return Err(e),
+                    Err(fail) => anyhow::bail!("крон «{id}» {fail}"),
+                };
             let patch = affine_tasks::RowPatch::cron_status(status);
             affine_tasks::edit_row(&mut client, cfg, &board, &row, &patch).await?;
             println!("статус: {status}");
             Ok(())
         }
         CronSub::Rm { id } => {
-            let (board, row) =
-                resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await?;
-            client
-                .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
-                .await
-                .context("delete_database_row")?;
-            if !row.body_doc.is_empty() {
-                let _ = client
-                    .call_tool(
-                        "trash_doc",
-                        json!({"workspaceId": cfg.workspace, "docId": row.body_doc}),
-                    )
-                    .await;
+            match resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await {
+                Ok((board, row)) => {
+                    client
+                        .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
+                        .await
+                        .context("delete_database_row")?;
+                    if !row.body_doc.is_empty() {
+                        // честный трэш: строка уже удалена, но ложное «удалён»
+                        // при живом теле-призраке недопустимо — предупреждение
+                        let mut cx = affine_tasks::TaskCx {
+                            client: &mut client,
+                            cfg,
+                            board: &board,
+                            root,
+                        };
+                        if let Err(e) = affine_tasks::trash_body(&mut cx, &row.body_doc).await {
+                            eprintln!(
+                                "внимание: строка удалена, но тело {} НЕ утрэшено: {e}",
+                                row.body_doc
+                            );
+                        }
+                    }
+                    println!("крон удалён: {}", row.title);
+                    Ok(())
+                }
+                // однозначное «не найдено» на всех читаемых досках —
+                // безопасно идти в сирота-путь (тело крона без строки)
+                Err(CronResolveFail::NotFound {
+                    details,
+                    all_readable: true,
+                }) => match affine_tasks::rm_cron_orphan(&mut client, cfg, &cron_boards, &id).await
+                {
+                    Ok(title) => {
+                        println!("крон-сирота в трэше: {title}");
+                        Ok(())
+                    }
+                    Err(orphan_err) => {
+                        anyhow::bail!("крон «{id}» не найден ({details}); {orphan_err}")
+                    }
+                },
+                Err(fail) => Err(anyhow::anyhow!("{fail}")),
             }
-            println!("крон удалён: {}", row.title);
-            Ok(())
         }
     }
 }
@@ -82,7 +113,12 @@ struct SetArgs {
     stdin: bool,
 }
 
-async fn set(client: &mut AffineClient, cfg: &AffineConfig, args: SetArgs) -> anyhow::Result<()> {
+async fn set(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    root: &std::path::Path,
+    args: SetArgs,
+) -> anyhow::Result<()> {
     let board = match args.project.as_deref() {
         Some(proj) => {
             let board_title = format!("Кроны {proj}");
@@ -106,43 +142,23 @@ async fn set(client: &mut AffineClient, cfg: &AffineConfig, args: SetArgs) -> an
         String::new()
     };
     let body_md = affine_tasks::cron_body_stub(&args.title, &schedule, &prompt);
-    let resp = client
-        .call_tool(
-            "create_doc_from_markdown",
-            json!({"workspaceId": cfg.workspace, "title": args.title, "markdown": body_md, "parentDocId": board.doc_id}),
-        )
-        .await
-        .context("create_doc_from_markdown")?;
-    let body = resp
-        .get("docId")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let _ = client
-        .call_tool(
-            "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": body, "tag": affine_tasks::CRON_TAG}),
-        )
-        .await;
-    let row = client
-        .call_tool(
-            "add_database_row",
-            json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
-                   "databaseBlockId": board.db_id,
-                   "cells": {"Title": args.title, "Schedule": schedule, "Status": "active"},
-                   "linkedDocId": body}),
-        )
-        .await
-        .context("add_database_row")?;
-    println!("крон поставлен: {}", args.title);
+    let mut cx = affine_tasks::TaskCx {
+        client,
+        cfg,
+        board: &board,
+        root,
+    };
+    let (row, outcome) =
+        affine_tasks::create_cron(&mut cx, &args.title, &schedule, &body_md).await?;
+    match outcome {
+        affine_tasks::CreateOutcome::Created => println!("крон поставлен: {}", row.title),
+        affine_tasks::CreateOutcome::Recovered => {
+            println!("крон достроен после сбоя (сирота доски): {}", row.title)
+        }
+    }
     println!("  расписание: {schedule}");
-    println!(
-        "  строка: {}",
-        row.get("rowBlockId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-    );
-    println!("  тело:   {body}");
+    println!("  строка: {}", row.row_id);
+    println!("  тело:   {}", row.body_doc);
     Ok(())
 }
 

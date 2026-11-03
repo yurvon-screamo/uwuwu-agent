@@ -35,8 +35,8 @@ uwuwu-cli --help    # грамматика актуальна
 | `blob <key> [--out f]` | скачать blob (ключи видны в read как `affine://blob/<key>`) |
 | `shot <slug> [--edgeless]` | скриншот дока через headless chromium |
 | `search "…" [--limit N --sofa N]` | серверный полнотекстовый (Manticore): title/snippet/UI-ссылка с docId; SOFA опционально |
-| `task create/list/get/edit/comment/thread/body/close --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>` |
-| `cron set/list/pause/resume/rm` | кроны агентов (доска «Crons» / «Кроны <Proj>») |
+| `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; rm снимает строку и трэшит тело (сироту — по docId) |
+| `cron set/list/pause/resume/rm` | кроны агентов (доска «Crons» / «Кроны <Proj>»); set идемпотентен как task create, rm трэшит сироту без строки |
 
 ## Architecture
 
@@ -50,16 +50,19 @@ cli/
     affine_queries.rs    # read-сторона: живой резолв слагов, read, rich-рендер, projects
     affine_docs.rs       # markdown-чтение, резолв слагов (map → tags → title)
     affine_search_server.rs # серверный полнотекстовый поиск (Manticore) — единственный
+    affine_children.rs   # резолв существующего тела: строки+дети доски → сирота/дубль/чисто
     affine_comments.rs   # треды комментов: парсинг replies, snapshot, резолв префиксов
     affine_gql.rs        # прямой GraphQL афины: createReply (гейтвей reply не экспонирует)
-    affine_tasks.rs      # канбан-доски: строки, тела, комменты
+    affine_tasks.rs      # канбан-доски: строки, тела, комменты; идемпотентный create (task+cron), rm
     affine_blob.rs       # blob-загрузка, скриншоты (chromium)
     affine_store.rs      # миграционная map (slug→docId), frontmatter
     affine_collect.rs    # FS-коллекторы миграции
     sofa.rs              # SOFA — публичная база агентов
     cmd/                 # clap-грамматика + диспетчер команд
   tests/
+    common/mod.rs        # mock-шлюз (сценарные шаги) + изоляция HOME
     mcp_transport.rs     # интеграция: контракт MCP-транспорта vs mock-гейтвей
+    task_create_flow.rs  # интеграция: идемпотентность create, rm — против mock-гейтвея
 ```
 
 ## How search works
