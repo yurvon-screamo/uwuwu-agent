@@ -2,8 +2,8 @@
 import { test, expect } from "bun:test"
 import {
   alignChunks, batchReadyAt, classifyUpdate, composeDraftPrompt, composeText, draftReady, dropBatch,
-  DRAFT_CAP_MS, DRAFT_QUIET_MS, extractFinal, joinBatch, plainChunks,
-  promptLandedAt, takeBatch, validState,
+  DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal, joinBatch, plainChunks,
+  parseWatchSec, promptLandedAt, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
@@ -287,6 +287,31 @@ test("draftReady: тишина по sighting'у и по телу; кап отп�
   expect(draftReady(track({ seenAt: now - 1000, updatedAt: 0 }), now)).toBe(false)
   // кап: сколько бы ни обновлялось тело — принудительно готов
   expect(draftReady(track({ seenAt: 0, updatedAt: DRAFT_CAP_MS - 1000 }), DRAFT_CAP_MS + 1)).toBe(true)
+})
+
+test("draftReady: повторная отправка — кулдаун от последнего хода + тишина тела", () => {
+  const turnAt = DRAFT_CAP_MS + 60_000 // ход случился сразу после капа
+  const afterTurn = (now: number, updatedAt = turnAt): DraftTrack =>
+    track({ seenAt: 0, updatedAt, turns: 1, lastTurnAt: turnAt })
+  // сразу после хода — не готов (не спамим триаж)…
+  expect(draftReady(afterTurn(turnAt + 60_000), turnAt + 60_000)).toBe(false)
+  // …и кап seenAt больше не форсит повторы (он только для первой отправки)
+  expect(draftReady(afterTurn(turnAt + 120_000), turnAt + 120_000)).toBe(false)
+  // кулдаун истёк, но тело опять правили — ждём тишину
+  const cooled = turnAt + DRAFT_REPOST_COOLDOWN_MS
+  expect(draftReady(afterTurn(cooled, cooled - 1000), cooled)).toBe(false)
+  // кулдаун + тишина тела — готов
+  expect(draftReady(afterTurn(cooled, turnAt), cooled)).toBe(true)
+})
+
+test("parseWatchSec: 0 — kill-switch (не съедается falsy-дефолтом); мусор — дефолт", () => {
+  expect(parseWatchSec(undefined)).toBe(60)
+  expect(parseWatchSec("")).toBe(60)
+  expect(parseWatchSec("  ")).toBe(60)
+  expect(parseWatchSec("0")).toBe(0)
+  expect(parseWatchSec("30")).toBe(30)
+  expect(parseWatchSec("abc")).toBe(60)
+  expect(parseWatchSec("-5")).toBe(-5) // отрицательный — тоже off (≤0 в вотчере)
 })
 
 test("composeDraftPrompt: только метаданные, длинный заголовок режется", () => {

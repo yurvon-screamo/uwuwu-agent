@@ -1027,20 +1027,20 @@ pub async fn rm_cron_orphan(
 /// мержа в мастер-задачу); живые задачи инструментом не сносятся. Сироты
 /// без строки — отдельный путь rm_task, без guard'а. Статус берётся из
 /// того же read_rows, что и резолв (резолв → guard → delete без пауз).
+/// Текст отказа без рецепта обхода: сообщение читает LLM-агент.
 fn ensure_removable_draft(row: &TaskRow) -> Result<()> {
     if row.status == TASK_DRAFT_STATUS {
         return Ok(());
     }
     let shown = if row.status.is_empty() {
-        "(пустой — легаси)"
+        "пустой (легаси)"
     } else {
         &row.status
     };
     anyhow::bail!(
-        "«{}» в статусе {} — rm только для Draft-черновиков (перевод: task edit {} --status Draft)",
+        "«{}» в статусе {} — rm только для Draft-черновиков; живые задачи не удаляются",
         row.title,
-        shown,
-        row.row_id
+        shown
     )
 }
 

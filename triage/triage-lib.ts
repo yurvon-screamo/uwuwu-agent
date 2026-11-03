@@ -65,6 +65,8 @@ export interface DraftTrack {
   updatedAt: number
   /** сколько ходов сессии уже обрабатывали этот черновик (anti-loop) */
   turns: number
+  /** ms последнего хода, включавшего этот черновик (кулдаун повторной отправки) */
+  lastTurnAt?: number
 }
 
 /** Активный ход в вечной сессии (персистится — рестарт демона не теряет ход).
@@ -143,8 +145,10 @@ const isDraftTrack = (v: unknown): v is DraftTrack => {
     typeof x[k] === "string" && (x[k] as string).length <= cap
   const ms = (k: string): boolean =>
     Number.isFinite(x[k]) && (x[k] as number) >= 0
+  const lastTurnOk = x.lastTurnAt === undefined
+    || (Number.isFinite(x.lastTurnAt) && (x.lastTurnAt as number) >= 0)
   return str("project", 64) && str("docId", 128) && str("title", 300)
-    && ms("seenAt") && ms("updatedAt")
+    && ms("seenAt") && ms("updatedAt") && lastTurnOk
     && Number.isInteger(x.turns) && (x.turns as number) >= 0 && (x.turns as number) <= 999
 }
 
@@ -321,18 +325,36 @@ export function dropBatch(queue: Request[], req: Request): Request[] {
 
 // ——— черновики задач (вотчер досок) ———
 
+/** Тик вотчера черновиков, сек. «0» — kill-switch (вотчер off); мусор и
+ *  отсутствие env — дефолт. Отдельная функция: наивный `Number(v) || 60`
+ *  съедал легитимный kill-switch 0 (falsy → дефолт). */
+export function parseWatchSec(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 60
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : 60
+}
+
 /** Буфер тишины по телу черновика: автор (агент/юзер) дописывает тело после
  *  создания строки — не забирать полуписьмо. */
 export const DRAFT_QUIET_MS = 2 * 60_000
-/** Кап с первого sighting'а: принудительная отправка, сколько бы ни писали. */
+/** Кап с первого sighting'а: принудительная первая отправка, сколько бы ни писали. */
 export const DRAFT_CAP_MS = 10 * 60_000
+/** Кулдаун между повторными отправками черновика, оставшегося в Draft:
+ *  5 холостых оборотов × 10 мин ≈ час — false-alarm активному автору не приходит. */
+export const DRAFT_REPOST_COOLDOWN_MS = 10 * 60_000
 /** Холостых оборотов (черновик остался в Draft после хода) → skip-list. */
 export const DRAFT_MAX_TURNS = 5
 
-/** Черновик готов к отправке: тишина по телу и по sighting'у; кап — принудительно. */
+/** Черновик готов к отправке. Первая: тишина по sighting'у и по телу, кап
+ *  принудительно. Повторная (после хода триажа, оставившего Draft): кулдаун
+ *  от последнего хода + свежая тишина тела — автору дают дописать. */
 export function draftReady(t: DraftTrack, now: number): boolean {
-  if (now - t.seenAt >= DRAFT_CAP_MS) return true
-  return now - t.seenAt >= DRAFT_QUIET_MS && now - t.updatedAt >= DRAFT_QUIET_MS
+  if (t.turns === 0) {
+    if (now - t.seenAt >= DRAFT_CAP_MS) return true
+    return now - t.seenAt >= DRAFT_QUIET_MS && now - t.updatedAt >= DRAFT_QUIET_MS
+  }
+  return now - (t.lastTurnAt ?? 0) >= DRAFT_REPOST_COOLDOWN_MS
+    && now - t.updatedAt >= DRAFT_QUIET_MS
 }
 
 /** Промпт по черновику — ТОЛЬКО метаданные: тело в промпт не попадает,

@@ -20,7 +20,7 @@ import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/affine-mcp"
 import {
   alignChunks, batchReadyAt, classifyUpdate, composeDraftPrompt, composeText, draftReady, dropBatch,
-  extractFinal, joinBatch, plainChunks, promptLandedAt, SESSION_TITLE, takeBatch, validState,
+  extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt, SESSION_TITLE, takeBatch, validState,
   DRAFT_MAX_TURNS,
   type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
@@ -65,9 +65,9 @@ const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 // ——— вотчер черновиков досок (Draft → очередь) ———
 
-/** тик вотчера; 0 = kill-switch (вотчер полностью выключен). env нет →
+/** Тик вотчера; 0 = kill-switch (вотчер полностью выключен). env нет →
  *  вотчер off постоянно, ТГ-ветка живёт как раньше. */
-const WATCH_SEC = Number(process.env.UWUWU_TRIAGE_WATCH_SEC ?? 60) || 60
+const WATCH_SEC = parseWatchSec(process.env.UWUWU_TRIAGE_WATCH_SEC)
 /** refresh кэша досок (органи-дерево): часы, не минуты — проход дорогой */
 const BOARD_REFRESH_MS = 6 * 3600_000
 
@@ -359,13 +359,15 @@ const deliverFinal = async (run: RunState): Promise<void> => {
     }
   }
   if (!broken) {
-    // черновики: учёт оборота (anti-loop: 5 холостых → skip-list в вотчере);
-    // на re-queue пути ниже не считаем — работа будет переделана заново
+    // черновики: учёт оборота (anti-loop: 5 холостых → skip-list в вотчере)
+    // + lastTurnAt (кулдаун повторной отправки); на re-queue пути не считаем
     let turnsChanged = false
+    const now = Date.now()
     for (const d of run.req.drafts ?? []) {
       const t = state.drafts?.[d.rowId]
       if (t !== undefined) {
         t.turns++
+        t.lastTurnAt = now
         turnsChanged = true
       }
     }
@@ -807,6 +809,9 @@ const queueReadyDrafts = async (): Promise<void> => {
       log(`черновик ${rowId}: ${t.turns} холостых оборотов — skip-list`)
       if (state.chatID !== undefined) {
         await send(state.chatID, `⚠️ Черновик ${t.project} ${rowId} «${t.title.slice(0, 60)}» застрял в Draft (${t.turns} разборов) — глянь доску.`)
+      } else {
+        // чат не залочен (владелец ни разу не писал боту): сигнал не потерять
+        log(`skip-уведомление НЕ доставлено: chatID не залочен — черновик ${rowId} в skip-list`)
       }
       continue
     }
