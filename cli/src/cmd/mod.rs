@@ -8,6 +8,7 @@ mod cli_tests;
 mod cron;
 mod docs;
 mod search;
+mod sy_dispatch;
 mod task;
 #[cfg(test)]
 mod title_tests;
@@ -24,6 +25,10 @@ use crate::affine_tasks;
 pub(crate) async fn run() -> anyhow::Result<()> {
     crate::init_tracing();
     let cli = Cli::parse();
+    // SiYuan-бекенд (UWUWU_BACKEND=siyuan): те же команды, другой storage
+    if sy_dispatch::enabled() {
+        return sy_dispatch::dispatch(cli.command).await;
+    }
     let root = crate::wiki_root();
     let cfg = AffineConfig::from_env()?;
 

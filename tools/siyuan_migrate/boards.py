@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -36,8 +37,12 @@ def threads_for(sid: str, body_doc: str) -> list[dict]:
         if cursor:
             args["after"] = cursor
         r = wiki_ops.call(sid, "list_comments", args)
-        sc = r.get("structuredContent", r)
-        edges = (sc.get("edges") or [])
+        sc = r.get("structuredContent") if isinstance(r, dict) else None
+        if sc is None and isinstance(r, dict):
+            sc = r
+        if not isinstance(sc, dict):
+            sc = {}
+        edges = sc.get("edges") or []
         for e in edges:
             node = e.get("node") or {}
             out.append(node)
@@ -89,18 +94,25 @@ class SiYuanMcp:
     def _rpc(self, method: str, params: dict) -> dict:
         import urllib.request
 
-        self.idc += 1
+        is_notification = method.startswith("notifications/")
+        if not is_notification:
+            self.idc += 1
+        payload = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not is_notification:
+            payload["id"] = self.idc
         h = dict(self.headers)
         if self.sid:
             h["Mcp-Session-Id"] = self.sid
         req = urllib.request.Request(
-            self.url, data=json.dumps({"jsonrpc": "2.0", "id": self.idc, "method": method, "params": params}).encode(),
+            self.url, data=json.dumps(payload).encode(),
             headers=h, method="POST",
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
             if not self.sid:
                 self.sid = resp.headers.get("mcp-session-id") or ""
             raw = resp.read().decode()
+        if not raw.strip():
+            return {}  # нотификации возвращают 202 с пустым телом
         # SSE: последняя строка data:
         data_lines = [ln[5:] for ln in raw.splitlines() if ln.startswith("data:")]
         payload = json.loads(data_lines[-1] if data_lines else raw)
@@ -128,15 +140,26 @@ class SiYuanMcp:
             return text
 
 
-def find_boards(manifest: dict) -> list[dict]:
+def find_boards(manifest: dict, node_to_doc: dict | None = None) -> list[dict]:
     boards = []
-    for doc_id, info in manifest["docs"].items():
+    for node_id, info in manifest["docs"].items():
         if not info.get("ok"):
             continue
         name = Path(info["path"]).stem
         if name.startswith("Задачи ") or name.startswith("Кроны "):
-            boards.append({"doc_id": doc_id, "title": name, "path": info["path"]})
+            real_doc = (node_to_doc or {}).get(node_id, node_id)
+            boards.append({"doc_id": real_doc, "title": name, "path": info["path"]})
     return boards
+
+
+def build_node_to_doc() -> dict:
+    """id строки дерева → настоящий docId (для доков data=docId)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import wiki_ops
+    sid = wiki_ops.session("siyuan-migrate-boards")
+    r = wiki_ops.call(sid, "list_organize_nodes", {"workspaceId": WS})
+    nodes = r.get("structuredContent", r).get("nodes", [])
+    return {n["id"]: str(n.get("data") or n["id"]) for n in nodes if n.get("type") == "doc"}
 
 
 def read_board_rows(sid: str, board_doc: str) -> list[dict]:
@@ -151,57 +174,107 @@ def read_board_rows(sid: str, board_doc: str) -> list[dict]:
     return r.get("rows") or r.get("structuredContent", {}).get("rows") or []
 
 
-def parse_row(row: dict) -> dict:
+def parse_row(row: dict, doc_titles: dict | None = None) -> dict:
     cells = row.get("cells") or {}
     def cell(k):
         c = cells.get(k) or {}
         v = c.get("value")
         return v if isinstance(v, str) else ""
+    title = (row.get("title") or "").strip()
+    linked = row.get("linkedDocId") or ""
+    if not title and linked and doc_titles:
+        title = (doc_titles.get(linked) or "").strip()
     return {
         "row_id": row.get("rowBlockId") or row.get("rowId") or row.get("id") or "",
-        "title": (row.get("title") or "").strip(),
-        "body_doc": row.get("linkedDocId") or "",
+        "title": title,
+        "body_doc": linked,
         "status": cell("Status"),
         "pr": cell("PR"),
         "branch": cell("Branch"),
     }
 
 
-def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str) -> dict:
-    """Create doc + database + kanban view in SiYuan."""
-    # 1. carrier doc
-    doc = sy.tool("document", {"action": "create", "notebook": target_nb, "parentID": "",
-                               "title": board["title"], "content": f"# {board['title']}\n"})
-    doc_id = doc.get("id") or ""
+def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str, sy_http=None) -> dict:
+    """Database + kanban view внутри импортированного дока /{proj}/<title>."""
+    # проект из «Задачи <proj>» / «Кроны <proj>»
+    prefix = "Задачи " if board["title"].startswith("Задачи ") else "Кроны "
+    proj = board["title"][len(prefix):]
+    hpath = f"/{proj}/{board['title']}"
+    doc_id = ""
+    if sy_http is not None:
+        try:
+            found = sy_http.sql(
+                f"select id from blocks where type='d' and hpath='{hpath}' limit 1")
+            if found:
+                doc_id = found[0]["id"]
+        except Exception:
+            pass
     if not doc_id:
-        # док мог уже существовать — найдём по заголовку
-        found = sy.tool("sql", {"action": "query",
-                                "stmt": f"select id from blocks where type='d' and content='{board['title']}' limit 1"})
-        rows_ = found.get("rows") or found.get("data") or []
-        doc_id = (rows_[0].get("id") if rows_ else "") if isinstance(rows_, list) else ""
+        doc = sy.tool("document", {"action": "create", "notebook": target_nb, "parentID": "",
+                                   "title": board["title"], "content": f"# {board['title']}\n"})
+        if isinstance(doc, str):
+            m = re.search(r"[0-9]{14}-[a-z0-9]+", doc)
+            doc_id = m.group(0) if m else ""
+        elif isinstance(doc, dict):
+            doc_id = doc.get("id") or doc.get("data", {}).get("id") or ""
     stats = {"board": board["title"], "doc": doc_id, "rows": 0, "db": ""}
     if not doc_id:
         return stats
-    time.sleep(1.5)
-    # 2. database
-    created = sy.tool("database", {"action": "create", "parentID": doc_id, "name": board["title"]})
-    av = created.get("data", {}).get("avID") or created.get("avID") or ""
+    time.sleep(2)  # дать индексу догнать
+    # database уже встроена?
+    av = ""
+    carrier = ""
+    if sy_http is not None:
+        try:
+            blocks = sy_http.sql(
+                f"select id, markdown from blocks where root_id='{doc_id}' and type='i' and markdown like '%avID%' limit 5")
+            for b in blocks or []:
+                m = re.search(r'avID="([0-9]{14}-[a-z0-9]+)"', b.get("markdown", "") or "")
+                if m:
+                    av = m.group(1)
+                    carrier = b.get("id", "")
+                    break
+        except Exception:
+            pass
+    if not av:
+        created = sy.tool("database", {"action": "create", "parentID": doc_id, "name": board["title"]})
+        data = created.get("data", created)
+        av = data.get("avID") or created.get("avID") or ""
+        carrier = data.get("blockID") or created.get("blockID") or ""
     stats["db"] = av
     if not av:
         return stats
-    # 3. keys: Status (select) + Branch/PR (text)
-    k_status = sy.tool("database", {"action": "key_add", "id": av, "name": "Status", "type": "select"})
-    key_status = k_status.get("data", {}).get("key", {}).get("id") or k_status.get("key", {}).get("id") or ""
-    sy.tool("database", {"action": "key_add", "id": av, "name": "Branch", "type": "text"})
-    sy.tool("database", {"action": "key_add", "id": av, "name": "PR", "type": "text"})
+    # существующие строки (идемпотентность)
+    existing = set()
+    try:
+        rr = sy._rpc("tools/call", {"name": "database",
+                                    "arguments": {"action": "render", "id": av, "blockID": carrier or doc_id}})
+        for row in (rr.get("structuredContent", {}).get("data", {}).get("view", {}).get("rows", []) or []):
+            for c in row.get("cells", []):
+                v = c.get("value", {})
+                if v.get("type") == "block":
+                    existing.add((v.get("block", {}) or {}).get("content", ""))
+    except Exception:
+        pass
+    # 3. keys: Status (select) + Branch/PR (text) — только для свежей database
+    if not existing:
+        k_status = sy.tool("database", {"action": "key_add", "id": av, "name": "Status", "type": "select"})
+        key_status = k_status.get("data", {}).get("key", {}).get("id") or k_status.get("key", {}).get("id") or ""
+        sy.tool("database", {"action": "key_add", "id": av, "name": "Branch", "type": "text"})
+        sy.tool("database", {"action": "key_add", "id": av, "name": "PR", "type": "text"})
+    else:
+        # существующая database: найти ключ Status
+        kbr = sy.tool("database", {"action": "keys", "id": av})
+        keys = (kbr.get("data", {}) or {}).get("keys") or kbr.get("keys") or []
+        key_status = next((k["id"] for k in keys if k.get("name") == "Status"), "")
     # опции статусов
     statuses = sorted({r["status"] for r in rows if r["status"]})
     if statuses and key_status:
         sy.tool("database", {"action": "key_update", "id": av, "keyID": key_status,
                              "config": {"options": [{"name": s} for s in statuses]}})
-    # 4. rows
+    # 4. rows (существующие скипаем — идемпотентность)
     for r in rows:
-        if not r["title"]:
+        if not r["title"] or r["title"] in existing:
             continue
         item = sy.tool("database", {"action": "item_add", "id": av, "detached": True, "content": r["title"]})
         iid = (item.get("data", {}) or {}).get("itemID") or item.get("itemID") or ""
@@ -211,7 +284,7 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str) 
         time.sleep(0.4)
         if r["status"] and key_status:
             sy.tool("database", {"action": "item_update", "id": av, "keyID": key_status, "itemID": iid,
-                                 "value": {"select": {"content": r["status"]}}})
+                                 "value": {"mSelect": [{"content": r["status"]}]}})
         if r["branch"]:
             kbr = sy.tool("database", {"action": "keys", "id": av})
             keys = (kbr.get("data", {}) or {}).get("keys") or kbr.get("keys") or []
@@ -220,10 +293,10 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str) 
                 sy.tool("database", {"action": "item_update", "id": av, "keyID": kb, "itemID": iid,
                                      "value": {"text": {"content": r["branch"]}}})
         time.sleep(0.4)
-    # 5. kanban view
+    # 5. kanban view (blockID = блок-носитель database, не док)
     if key_status:
         try:
-            sy.tool("database", {"action": "view_add", "id": av, "blockID": doc_id,
+            sy.tool("database", {"action": "view_add", "id": av, "blockID": carrier or doc_id,
                                  "name": "Канбан", "layout": "kanban"})
         except Exception as e:  # noqa: BLE001
             stats["view_err"] = str(e)[:120]
@@ -258,7 +331,7 @@ def main() -> int:
     a = ap.parse_args()
 
     manifest = json.loads(Path(a.manifest).read_text())
-    boards = find_boards(manifest)
+    boards = find_boards(manifest, build_node_to_doc())
     if a.only:
         boards = [b for b in boards if a.only in b["title"]]
     print(f"boards found: {[b['title'] for b in boards]}")
@@ -272,10 +345,16 @@ def main() -> int:
     nb_id = sy_http.ensure_notebook(a.nb)
 
     sid = wiki_ops.session("siyuan-migrate-boards")
+    # docId → title (для линк-строк: title живёт в теле-доке)
+    n2d = build_node_to_doc()
+    doc_titles = {}
+    for node, info in manifest["docs"].items():
+        if info.get("ok"):
+            doc_titles[n2d.get(node, node)] = Path(info["path"]).stem
     report = []
     for b in boards:
-        rows = [parse_row(r) for r in read_board_rows(sid, b["doc_id"])]
-        stats = migrate_board(sy_mcp, b, rows, nb_id)
+        rows = [parse_row(r, doc_titles) for r in read_board_rows(sid, b["doc_id"])]
+        stats = migrate_board(sy_mcp, b, rows, nb_id, sy_http)
         if a.comments:
             moved = 0
             for r in rows:
