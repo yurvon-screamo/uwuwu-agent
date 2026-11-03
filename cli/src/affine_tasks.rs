@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::affine_children::{resolve_existing_body, ExistingBody};
 use crate::affine_client::{AffineClient, AffineConfig};
+use crate::affine_comments;
 
 /// Тип задачи — тег на теле. Определяет шаблон тела и пайп агента.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -984,13 +985,14 @@ pub async fn comment_task(
     Ok(first_str(&resp, &["commentId", "id"]).unwrap_or_default())
 }
 
-/// Последние комменты тела задачи (свежие первыми).
+/// Треды тела задачи: верхнеуровневые комменты с вложенными reply,
+/// свежие первыми (окно limit) — для карточки задачи.
 pub async fn recent_comments(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     row: &TaskRow,
     limit: usize,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<affine_comments::CommentThread>> {
     if row.body_doc.is_empty() {
         return Ok(Vec::new());
     }
@@ -1001,35 +1003,9 @@ pub async fn recent_comments(
         )
         .await
         .context("list_comments")?;
-    let mut out = Vec::new();
-    if let Some(edges) = resp.get("edges").and_then(|e| e.as_array()) {
-        for e in edges {
-            let node = e.get("node").cloned().unwrap_or(Value::Null);
-            let content = node.get("content").cloned().unwrap_or(Value::Null);
-            let preview = content
-                .get("preview")
-                .and_then(|p| p.as_str())
-                .unwrap_or_default()
-                .to_string();
-            // fresh comments may carry an empty preview — walk the
-            // snapshot blocks for the actual text deltas
-            let preview = if preview.trim().is_empty() {
-                snapshot_text(&content)
-            } else {
-                preview
-            };
-            let resolved = node
-                .get("resolved")
-                .and_then(|r| r.as_bool())
-                .unwrap_or(false);
-            let marker = if resolved { "[✓] " } else { "" };
-            out.push((
-                format!("{marker}{preview}"),
-                first_str(&node, &["id"]).unwrap_or_default(),
-            ));
-        }
-    }
-    Ok(out)
+    let mut threads = affine_comments::parse_comment_connection(&resp);
+    threads.sort_by_key(|t| std::cmp::Reverse(t.created));
+    Ok(threads)
 }
 
 fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
@@ -1038,45 +1014,17 @@ fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
         .map(String::from)
 }
 
-/// Concatenate all text deltas from a comment's snapshot block tree.
-fn snapshot_text(content: &Value) -> String {
-    fn walk(node: &Value, out: &mut String) {
-        if let Some(delta) = node
-            .get("props")
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.get("delta"))
-            .and_then(|d| d.as_array())
-        {
-            for d in delta {
-                if let Some(ins) = d.get("insert").and_then(|i| i.as_str()) {
-                    out.push_str(ins);
-                }
-            }
-        }
-        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
-            for ch in children {
-                walk(ch, out);
-            }
-        }
-    }
-    let mut out = String::new();
-    if let Some(blocks) = content.get("snapshot").and_then(|s| s.get("blocks")) {
-        walk(blocks, &mut out);
-    }
-    out.trim().to_string()
-}
-
-/// Все комменты тела задачи хронологически: (текст, userId, ms-таймстамп, resolved).
-/// userId — автор (бот vs юзер), createDate — из снапшота (надёжный порядок).
+/// Все треды тела задачи хронологически (по createDate верхнеуровневых
+/// комментов); replies вложены в свои треды.
 pub async fn thread_comments(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     row: &TaskRow,
-) -> Result<Vec<(String, String, i64, bool)>> {
+) -> Result<Vec<affine_comments::CommentThread>> {
     if row.body_doc.is_empty() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
+    let mut threads = Vec::new();
     let mut cursor = String::new();
     for _page in 0..10 {
         let mut args = json!({"workspaceId": cfg.workspace, "docId": row.body_doc, "first": 50});
@@ -1087,11 +1035,7 @@ pub async fn thread_comments(
             .call_tool("list_comments", args)
             .await
             .context("list_comments")?;
-        let edges = resp
-            .get("edges")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
+        threads.extend(affine_comments::parse_comment_connection(&resp));
         let has_next = resp
             .pointer("/pageInfo/hasNextPage")
             .and_then(|h| h.as_bool())
@@ -1101,40 +1045,12 @@ pub async fn thread_comments(
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string();
-        for e in &edges {
-            let node = e.get("node").cloned().unwrap_or(Value::Null);
-            let content = node.get("content").cloned().unwrap_or(Value::Null);
-            let preview = content
-                .get("preview")
-                .and_then(|p| p.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let preview = if preview.trim().is_empty() {
-                snapshot_text(&content)
-            } else {
-                preview
-            };
-            let created = content
-                .pointer("/snapshot/meta/createDate")
-                .and_then(|c| c.as_i64())
-                .unwrap_or(0);
-            let resolved = node
-                .get("resolved")
-                .and_then(|r| r.as_bool())
-                .unwrap_or(false);
-            let user_id = node
-                .pointer("/user/id")
-                .and_then(|u| u.as_str())
-                .unwrap_or_default()
-                .to_string();
-            out.push((preview, user_id, created, resolved));
-        }
         if !has_next || cursor.is_empty() {
             break;
         }
     }
-    out.sort_by_key(|(_, _, created, _)| *created);
-    Ok(out)
+    threads.sort_by_key(|t| t.created);
+    Ok(threads)
 }
 
 // ——— кроны (доска Crons) ———

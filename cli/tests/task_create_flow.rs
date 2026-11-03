@@ -14,7 +14,7 @@ use uwuwu_cli::affine_tasks::{
 };
 
 fn rpc(sc: String) -> Step {
-    Step(
+    Step::owned(
         200,
         None,
         format!(r#"{{"jsonrpc":"2.0","id":{{ID}},"result":{{"structuredContent":{sc}}}}}"#),
@@ -44,8 +44,8 @@ fn child_json(doc_id: &str, title: &str, in_trash: bool) -> String {
 
 fn handshake() -> Vec<Step> {
     vec![
-        Step(200, Some("sess-A"), INIT.to_string()),
-        Step(202, None, NOTIFIED.to_string()),
+        Step::basic(200, Some("sess-A"), INIT),
+        Step::basic(202, None, NOTIFIED),
     ]
 }
 
@@ -333,9 +333,10 @@ fn replace_failure_aborts_before_commit() {
         let mut cx = task_cx(&mut client, &cfg);
         let err = rt
             .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("инцидент"), "got: {err}");
+            .unwrap_err();
+        // .context прячет деталь гейта из to_string — ассертим цепочку anyhow
+        let chain = format!("{err:#}");
+        assert!(chain.contains("инцидент"), "got: {chain}");
         assert!(!mock.called("add_database_row"));
     });
 }
@@ -344,15 +345,18 @@ fn replace_failure_aborts_before_commit() {
 #[serial_test::serial]
 fn fresh_create_surfaces_queue_timeout_honestly() {
     with_temp_home(|| {
-        // create_doc вернул structuredContent ok:false (WRITE_QUEUE_TIMEOUT):
-        // исход неоднозначен — ошибка обязана назвать код, а не «тело создано»
+        // create_doc вернул structuredContent ok:false retryable:true
+        // (WRITE_QUEUE_TIMEOUT): клиент исчерпывает ретраи (0..=3 → 4 попытки),
+        // наружу — честная ошибка про ретраи и деталь гейта, не «тело создано»
         let mut steps = handshake();
         steps.push(rpc(rows_json(vec![])));
         steps.push(rpc(children_json(vec![])));
-        steps.push(rpc(
-            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":true}"#
-                .into(),
-        ));
+        for _ in 0..4 {
+            steps.push(rpc(
+                r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":true}"#
+                    .into(),
+            ));
+        }
         let mock = MockGateway::start(steps);
         let cfg = test_cfg(&mock);
         let rt = runtime();
@@ -360,11 +364,12 @@ fn fresh_create_surfaces_queue_timeout_honestly() {
         let mut cx = task_cx(&mut client, &cfg);
         let err = rt
             .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
-        assert!(err.contains("не подтвердился"), "got: {err}");
-        assert!(!err.contains("тело создано"), "got: {err}");
+            .unwrap_err();
+        // .context прячет retry-деталь из to_string — ассертим цепочку anyhow
+        let chain = format!("{err:#}");
+        assert!(chain.contains("failed after 3 retries"), "got: {chain}");
+        assert!(chain.contains("waited too long"), "got: {chain}");
+        assert!(!chain.contains("тело создано"), "got: {chain}");
         assert!(!mock.called("add_database_row"));
     });
 }
@@ -381,8 +386,11 @@ fn row_commit_surfaces_queue_timeout_instead_of_fake_success() {
         steps.push(rpc(DOC_NEW.into()));
         steps.push(rpc(TAGS_HAVE_DEV.into()));
         steps.push(rpc(TAG_OK.into()));
+        // retryable:false — немедленный фейл коммит-шага: никакого ложного
+        // «создана» с пустой строкой и никаких последующих записей
         steps.push(rpc(
-            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long"}"#.into(),
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":false}"#
+                .into(),
         ));
         let mock = MockGateway::start(steps);
         let cfg = test_cfg(&mock);
@@ -391,10 +399,11 @@ fn row_commit_surfaces_queue_timeout_instead_of_fake_success() {
         let mut cx = task_cx(&mut client, &cfg);
         let err = rt
             .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
-        assert!(err.contains("add_database_row"), "got: {err}");
+            .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("add_database_row"), "got: {chain}");
+        assert!(chain.contains("waited too long"), "got: {chain}");
+        assert!(!chain.contains("тело создано"), "got: {chain}");
     });
 }
 
@@ -481,16 +490,21 @@ fn rm_row_commit_failure_is_explicit_not_silent() {
     with_temp_home(|| {
         let mut steps = handshake();
         steps.push(rpc(rows_json(vec![row_json("r1", "Задача", "doc-1")])));
+        // retryable:false — коммит удаления упал сразу: деструктив (trash)
+        // не должен идти за упавшим delete
         steps.push(rpc(
-            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long"}"#.into(),
+            r#"{"ok":false,"code":"WRITE_QUEUE_TIMEOUT","error":"waited too long","retryable":false}"#
+                .into(),
         ));
         let mock = MockGateway::start(steps);
         let cfg = test_cfg(&mock);
         let rt = runtime();
         let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
         let mut cx = task_cx(&mut client, &cfg);
-        let err = rt.block_on(rm_task(&mut cx, "r1")).unwrap_err().to_string();
-        assert!(err.contains("WRITE_QUEUE_TIMEOUT"), "got: {err}");
+        let err = rt.block_on(rm_task(&mut cx, "r1")).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("delete_database_row"), "got: {chain}");
+        assert!(chain.contains("waited too long"), "got: {chain}");
         assert!(!mock.called("trash_doc"));
     });
 }
