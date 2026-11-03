@@ -5,7 +5,7 @@ ALWAYS RESPOND IN RUSSIAN.
 > **Стек платформы (с 04.11.2026): SiYuan.** Хранилище uwuwu — смигрировано с AFFiNE.
 > Все команды uwuwu-cli те же; бекенд включён глобально через `UWUWU_BACKEND=siyuan`
 > (env в environment.d). Инстанс: ноут-контейнер `siyuan-demo` (:6806), публично
-> https://siyuan.uwuwu.net (Bunny→Railway-релей→rathole→ноут). АФА ОСТАНОВЛЕНА —
+> https://siyuan-relay-production.up.railway.app (дефолт-домен Railway: временно, баг сертов; siyuan.uwuwu.net вернём после починки). АФА ОСТАНОВЛЕНА —
 > писать в неё нельзя; при ошибках «backend not ported» смотри ограничения ниже.
 
 - Provide the user with a working solution only, unless the plan explicitly requires otherwise
@@ -94,7 +94,7 @@ SKILLS rules:
 
 ## uwuwu (база знаний, SiYuan-бекенд)
 
-- **UI**: `https://siyuan.uwuwu.net` (Bunny PullZone → Railway siyuan-relay → rathole `rathole-siyuan.service` → ноут `127.0.0.1:6806`, контейнер `siyuan-demo`, воркспейс `~/siyuan-demo-ws`). Код доступа — Access Auth Code (spike123 до смены владельцем).
+- **UI (публично)**: `https://siyuan-relay-production.up.railway.app` (временно — баг выдачи сертов; канонический `siyuan.uwuwu.net` вернём после починки Bunny/Railway). Цепочка: Railway siyuan-relay → rathole `rathole-siyuan.service` → ноут `127.0.0.1:6806` (контейнер `siyuan-demo`, воркспейс `~/siyuan-demo-ws`). Локально: `http://127.0.0.1:6806` / `http://192.168.32.235:6806` (LAN). Код доступа — Access Auth Code (spike123 до смены владельцем).
 - **Канбаны/доски/базы ведёт владелец** — агентам не трогать без явного поручения.
 - **Структура воркспейса**: 📁 Experience (только 33 подпапки по темам, прямых доков нет) / 📁 Projects (7 проектов) / 📁 Daily (дейли-бакеты — архив). Контейнерных доков нет — доки привязаны к папкам напрямую.
 - **Кроны агентов** — распределённые: `uwuwu-cli cron set --title "…" [--project <proj>] (--in 10m|--every 30m|--at "09:30"|--cron '*/5 * * * *') [--stdin]` · `list/pause/resume/rm`. Крон живёт на доске **«Кроны <Proj>»** в папке проекта (доску делает юзер руками: kanban + колонки Schedule/Status/Last Run); без `--project` — глобальная доска «Crons» (сейчас в трэше, не используется). Демон поллит все существующие. Единственный механизм (сессионные умирают с сессией).
