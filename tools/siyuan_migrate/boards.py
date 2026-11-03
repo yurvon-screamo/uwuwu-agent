@@ -346,12 +346,18 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str, 
     return stats
 
 
-def append_comments(sy_http, body_title: str, md: str) -> bool:
-    """Find doc by title in SiYuan and append comments section."""
-    rows = sy_http.sql(f"select id from blocks where type='d' and content = '{body_title.replace(chr(39), chr(39)*2)}' limit 3")
-    if not rows:
+def append_comments(sy_http, nb_id: str, body_hpath: str, md: str) -> bool:
+    """Точное тело по hpath; идемпотентно: секция уже есть — скип."""
+    doc_id = sy_http.get_doc_id_by_path(nb_id, body_hpath) or ""
+    if not doc_id:
         return False
-    doc_id = rows[0]["id"]
+    # идемпотентность: секция уже в теле — не дублируем
+    try:
+        chk = sy_http.sql(f"select count(*) as n from blocks where root_id='{doc_id}' and content like '%Комменты (миграция из афины)%'")
+        if chk and chk[0].get("n", 0) > 0:
+            return True
+    except Exception:
+        pass
     import urllib.request
     body = json.dumps({"dataType": "markdown", "data": md, "parentID": doc_id}).encode()
     req = urllib.request.Request("http://127.0.0.1:6806/api/block/appendBlock",
@@ -386,6 +392,7 @@ def main() -> int:
     from .siyuan_client import SiYuan
     sy_http = SiYuan(a.url, token)
     nb_id = sy_http.ensure_notebook(a.nb)
+    nb_main = nb_id
 
     sid = wiki_ops.session("siyuan-migrate-boards")
     # docId → title (для линк-строк: title живёт в теле-доке)
@@ -411,7 +418,7 @@ def main() -> int:
                 if not nodes:
                     continue
                 try:
-                    if append_comments(sy_http, r["title"], comment_md(nodes)):
+                    if append_comments(sy_http, nb_main, f"{b['hpath']}/{r['title']}", comment_md(nodes)):
                         moved += 1
                 except Exception as e:  # noqa: BLE001
                     print(f"comments append FAIL {r['title'][:30]}: {e}")
