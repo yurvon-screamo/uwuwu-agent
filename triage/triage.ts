@@ -19,7 +19,7 @@ import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
-  alignChunks, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  alignChunks, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt,
   SESSION_TITLE, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
@@ -55,9 +55,6 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
 const MAX_SPAWN_ATTEMPTS = 5 // dead-letter после N неудачных попыток хода подряд
 const DELIVER_ATTEMPTS = 3 // попытки доставки финала в ТГ
-const BROKEN_SESSION_RESET = 3 // оборванных финалов подряд → пересоздание сессии
-const RESET_WINDOW_MS = 30 * 60_000 // пересоздания чаще окна = стабильная деградация
-const RESET_PAUSE_MS = 30 * 60_000 // пауза обработки при серии пересозданий
 /** дебаунс батча: поток сообщений склеивается в один ход, юзер получает окно
  *  на редактирование (edited_message подменяет текст, пока батч в очереди) */
 const BATCH_DELAY_MS = Math.max(0, Number(process.env.UWUWU_TRIAGE_BATCH_MS ?? 60_000) || 60_000)
@@ -284,7 +281,6 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
   if (typeof id !== "string" || !id.startsWith("ses_")) throw new Error("сессия не поднялась")
   state.session = id
-  state.broken = 0
   save()
   log(`сессия диалога: ${id}`)
   if (notify && state.chatID !== undefined) {
@@ -331,9 +327,9 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
 /** Финал хода → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
  *  ход уже отработал (задача на доске есть), теряем только ответ:
  *  фиксируем полный текст в лог, юзер проверит доску.
- *  Эскалация деградации: 3 оборванных финала подряд (outcome ≠ succeeded —
- *  контекст перерос компакцию, модель приказала жить) → сессию пересоздаём
- *  (модель возьмётся свежая из конфига), текущее сообщение — обратно в очередь. */
+ *  Оборванный финал (outcome ≠ succeeded) — только пометка юзеру: ход
+ *  завершён, сообщение не переигрывается и сессия не пересоздаётся
+ *  (одна вечная сессия; сброс контекста — только ручной /reset). */
 const deliverFinal = async (run: RunState): Promise<void> => {
   let broken = false
   try {
@@ -359,60 +355,9 @@ const deliverFinal = async (run: RunState): Promise<void> => {
       else log(`финал ${run.sessionID} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
     }
   }
-  if (!broken) {
-    // черновики: учёт оборота (anti-loop: 5 холостых → skip-list в вотчере)
-    // + lastTurnAt (кулдаун повторной отправки); на re-queue пути не считаем
-    let turnsChanged = false
-    const now = Date.now()
-    for (const d of run.req.drafts ?? []) {
-      const t = state.drafts?.[d.rowId]
-      if (t !== undefined) {
-        t.turns++
-        t.lastTurnAt = now
-        turnsChanged = true
-      }
-    }
-    if (turnsChanged) save()
-    state.broken = 0
-    save()
-    return
-  }
-  state.broken = (state.broken ?? 0) + 1
-  if (state.broken < BROKEN_SESSION_RESET) {
-    save()
-    return
-  }
-  log(`сессия ${run.sessionID}: ${state.broken} оборванных финалов подряд — пересоздаю`)
-  // СБРОС: все мутации state — ДО любых await (уведомление может упасть/крах):
-  // run снесён сразу, иначе рестарт в окне сочтёт ход подтверждённым по тексту
-  // в старой сессии и съест сообщение из очереди (ломая «обработаю заново»)
-  state.broken = 0
-  state.session = undefined
-  state.run = undefined
-  // сообщение не отработано нормально — вернуть в голову очереди начисто
-  state.queue.unshift({
-    text: run.req.text,
-    chatID: run.req.chatID,
-    msgID: run.req.msgID,
-    receivedAt: run.req.receivedAt,
-    ...(run.req.drafts !== undefined ? { drafts: run.req.drafts } : {}),
-  })
-  // circuit breaker: пересоздания чаще раза в 30 мин = стабильная деградация
-  // (модель выпилена/контекст не лезет) — пауза обработки, спам-цикл разорван
-  const now = Date.now()
-  const rapid = state.lastResetAt !== undefined && now - state.lastResetAt < RESET_WINDOW_MS
-  state.lastResetAt = now
-  if (rapid) {
-    state.pausedUntil = now + RESET_PAUSE_MS
-    log(`пауза обработки до ${new Date(state.pausedUntil).toISOString()} — серия пересозданий`)
-  }
-  save()
-  if (state.chatID !== undefined) {
-    const msg = state.pausedUntil !== undefined && state.pausedUntil > now
-      ? "⚠️ Диалог стабильно деградирует — пересоздал сессию и приостановил обработку на 30 мин (сообщение в очереди). Глянь лог uwuwu-triage."
-      : "⚠️ Диалог деградировал (3 сбоя подряд) — пересоздаю сессию с чистого листа, сообщение обработаю заново."
-    await send(state.chatID, msg)
-  }
+  // учёт оборота черновиков — при любом исходе хода (anti-loop:
+  // DRAFT_MAX_TURNS холостых → skip-list в вотчере)
+  if (applyTurns(state.drafts, run.req.drafts?.map((d) => d.rowId), Date.now())) save()
 }
 
 /** Одна проверка сессии: ещё исполняется / завершена / пропала. */
@@ -570,17 +515,6 @@ const runLoop = async (): Promise<void> => {
           save()
         }
         continue
-      }
-
-      // circuit breaker: серия пересозданий сессии → пауза (сообщения копятся
-      // в очереди, после истечения пойдут в свежую сессию)
-      if (state.pausedUntil !== undefined) {
-        if (Date.now() < state.pausedUntil) {
-          await sleep(Math.min(state.pausedUntil - Date.now(), 30_000))
-          continue
-        }
-        state.pausedUntil = undefined
-        save()
       }
 
       // стухший firing-маркер (крах до персиста run): батч цел в очереди
@@ -900,8 +834,6 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
     state.run = undefined
     state.firing = undefined
     state.session = undefined
-    state.pausedUntil = undefined
-    state.broken = 0
     save()
     log(`сессия диалога сброшена /reset${wasRunning ? " (сброшен и активный ход)" : ""}`)
     await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста (очередь сообщений сохранена).")

@@ -1,7 +1,7 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  alignChunks, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal,
   joinBatch, plainChunks, parseWatchSec, promptLandedAt, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
@@ -124,19 +124,32 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState("junk")).toEqual({ offset: 0, queue: [] })
   expect(validState({ offset: 1.5 })).toEqual({ offset: 0, queue: [] }) // нецелый offset — невалиден
   const good = {
-    offset: 12, chatID: 42, session: "ses_dialog", broken: 1, lastResetAt: 5, pausedUntil: 9,
+    offset: 12, chatID: 42, session: "ses_dialog",
     queue: [{ text: "заявка", chatID: 42, msgID: 3, receivedAt: 5, attempts: 2 }],
     run: { sessionID: "ses_dialog", startedAt: 100, req: { text: "в работе", chatID: 42, msgID: 2, receivedAt: 4 } },
   }
   expect(validState(good)).toEqual(good)
-  const broken = {
-    offset: -3, session: "nope", broken: -1, lastResetAt: -5,
+  const junk = {
+    offset: -3, session: "nope",
     queue: ["мусор", null, { text: " ", chatID: 1 }, { text: "ок", chatID: 1, msgID: 2, attempts: -1 }],
     run: { sessionID: "nope", startedAt: 1, req: {} },
   }
-  expect(validState(broken)).toEqual({ offset: 0, queue: [] })
+  expect(validState(junk)).toEqual({ offset: 0, queue: [] })
   // окно отправки: run с startedAt=0 (промпт не подтверждён) — валиден и персистится
   expect(validState({ run: { sessionID: "ses_x", startedAt: 0, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 } } }).run?.startedAt).toBe(0)
+})
+
+test("validState: легаси-поля деградации (broken/lastResetAt/pausedUntil) стрипаются при любом значении", () => {
+  // state.json, писанный старой версией демона: механизм удалён — поля уходят
+  // молча (санитайзер строит out заново), откат на старый код безопасен
+  const legacy = {
+    offset: 7, session: "ses_dialog", broken: 2, lastResetAt: 100, pausedUntil: 200,
+    queue: [{ text: "t", chatID: 1, msgID: 1, receivedAt: 0 }],
+  }
+  expect(validState(legacy)).toEqual({
+    offset: 7, session: "ses_dialog",
+    queue: [{ text: "t", chatID: 1, msgID: 1, receivedAt: 0 }],
+  })
 })
 
 // ——— батчинг ———
@@ -302,6 +315,26 @@ test("draftReady: повторная отправка — кулдаун от п
   expect(draftReady(afterTurn(cooled, cooled - 1000), cooled)).toBe(false)
   // кулдаун + тишина тела — готов
   expect(draftReady(afterTurn(cooled, turnAt), cooled)).toBe(true)
+})
+
+test("applyTurns: оборот считается по известным rowId при любом исходе хода", () => {
+  const drafts: Record<string, DraftTrack> = {
+    r1: track({}),                      // первый ход
+    r2: track({ turns: 3, lastTurnAt: 100 }), // повторный
+  }
+  // broken-финал идёт тем же путём: учёт не зависит от исхода
+  expect(applyTurns(drafts, ["r1", "r2", "gone"], 500)).toBe(true)
+  expect(drafts.r1).toEqual(track({ turns: 1, lastTurnAt: 500 }))
+  expect(drafts.r2).toEqual(track({ turns: 4, lastTurnAt: 500 }))
+})
+
+test("applyTurns: неизвестные rowId и пустые входы состояние не трогают", () => {
+  const drafts: Record<string, DraftTrack> = { r1: track({}) }
+  expect(applyTurns(drafts, ["gone"], 500)).toBe(false)
+  expect(drafts.r1).toEqual(track({}))
+  expect(applyTurns(undefined, ["r1"], 500)).toBe(false)
+  expect(applyTurns(drafts, undefined, 500)).toBe(false)
+  expect(applyTurns(drafts, [], 500)).toBe(false)
 })
 
 test("parseWatchSec: 0 — kill-switch (не съедается falsy-дефолтом); мусор — дефолт", () => {
