@@ -64,8 +64,8 @@ pub(crate) async fn run(
             status,
             project: proj_override,
         } => list(cfg, root, project, status, proj_override).await,
-        TaskSub::Get { id } => {
-            get(&mut client, cfg, root, &project, GetArgs { id }).await
+        TaskSub::Get { id, no_body } => {
+            get(&mut client, cfg, root, &project, GetArgs { id, no_body }).await
         }
         TaskSub::Edit {
             id,
@@ -149,6 +149,7 @@ struct CreateArgs {
 
 struct GetArgs {
     id: String,
+    no_body: bool,
 }
 
 struct EditArgs {
@@ -270,7 +271,7 @@ async fn get(
     }
     println!("Строка:   {}", row.row_id);
     if !row.body_doc.is_empty() {
-        print_body_and_comments(client, cfg, &row, true).await?;
+        print_body_and_comments(client, cfg, &row, !args.no_body).await?;
     }
     Ok(())
 }
