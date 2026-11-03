@@ -317,6 +317,17 @@ export function joinBatch(items: Request[]): Request {
 /** Кап вложений батча: маркеры в тексте и files-состав не расходятся. */
 export const ATT_BATCH_MAX = 20
 
+/** Порция черновиков в батче: ТГ-заявки не режем (старое поведение), а
+ *  черновиков берём максимум `max` — накопившийся бэклог (29 шт.) одним
+ *  ходом деградирует вечную сессию (контекст/компакция). Невошедшие
+ *  черновики остаются в очереди — следующий ход. */
+export function capDraftBatch(items: Request[], max: number): Request[] {
+  return [
+    ...items.filter((i) => i.chatID !== 0),
+    ...items.filter((i) => i.chatID === 0).slice(0, Math.max(0, max)),
+  ]
+}
+
 /** Удалить из очереди все сообщения батча (по msgID). */
 export function dropBatch(queue: Request[], req: Request): Request[] {
   const ids = new Set(req.msgIDs ?? [req.msgID])
@@ -344,6 +355,8 @@ export const DRAFT_CAP_MS = 10 * 60_000
 export const DRAFT_REPOST_COOLDOWN_MS = 10 * 60_000
 /** Холостых оборотов (черновик остался в Draft после хода) → skip-list. */
 export const DRAFT_MAX_TURNS = 5
+/** Черновиков в одном ходе: бэклок идёт порциями, монстр-ход деградирует сессию. */
+export const DRAFT_BATCH_MAX = 5
 
 /** Черновик готов к отправке. Первая: тишина по sighting'у и по телу, кап
  *  принудительно. Повторная (после хода триажа, оставившего Draft): кулдаун
