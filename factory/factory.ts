@@ -18,7 +18,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import * as mcp from "./mcp"
+import * as mcp from "../lib/affine-mcp"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
@@ -859,6 +859,12 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
 let tickCount = 0
 
 async function main(): Promise<void> {
+  // env шлюза обязателен на старте (раньше это делал process.exit на импорте
+  // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
+  if (!mcp.mcpConfigured()) {
+    console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)

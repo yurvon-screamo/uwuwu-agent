@@ -1,15 +1,21 @@
-// mcp.ts — минимальный JSON-RPC клиент MCP-шлюза AFFiNE для демона.
-// Сессия одна на процесс; tool-ошибки ({ok:false} внутри HTTP 200) — исключения.
-// Протухшая сессия (шлюз редеплоился → 404) — сброс + один ретрай: демон
-// long-running, слепнуть навсегда нельзя.
+// affine-mcp.ts — минимальный JSON-RPC клиент MCP-шлюза AFFiNE для демонов
+// (фабрика, триаж). Сессия одна на процесс; tool-ошибки ({ok:false} внутри
+// HTTP 200) — исключения. Протухшая сессия (шлюз редеплоился → 404) —
+// сброс + один ретрай: демон long-running, слепнуть навсегда нельзя.
+// Конфигурация ленивая: модуль без env не роняет импорт — демон сам решает,
+// фатально ли отсутствие шлюза (фабрика: exit на старте; триаж: вотчер off).
 
 const URL_ = process.env.UWUWU_AFFINE_URL ?? "http://127.0.0.1:8000/mcp"
 const TOKEN = process.env.UWUWU_AFFINE_TOKEN ?? ""
 const WORKSPACE = process.env.UWUWU_AFFINE_WORKSPACE_ID ?? ""
 
-if (TOKEN === "" || WORKSPACE === "") {
-  console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
-  process.exit(1)
+/** env шлюза на месте — иначе tool/connect честно откажут. */
+export const mcpConfigured = (): boolean => TOKEN !== "" && WORKSPACE !== ""
+
+const requireConfigured = (): void => {
+  if (!mcpConfigured()) {
+    throw new Error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+  }
 }
 
 let session: string | null = null
@@ -70,6 +76,7 @@ async function rpc(method: string, params: unknown, sid: string): Promise<unknow
 }
 
 async function handshake(): Promise<string> {
+  requireConfigured()
   const res = await fetch(URL_, {
     method: "POST",
     headers: {
@@ -81,7 +88,7 @@ async function handshake(): Promise<string> {
       jsonrpc: "2.0",
       id: ++nextId,
       method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "uwuwu-factory", version: "0.1.0" } },
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "uwuwu-daemon", version: "0.1.0" } },
     }),
     signal: AbortSignal.timeout(60_000),
   })
@@ -102,10 +109,12 @@ async function handshake(): Promise<string> {
 }
 
 export async function connect(): Promise<void> {
+  requireConfigured()
   session = await handshake()
 }
 
 export async function tool<T = Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> {
+  requireConfigured()
   if (session === null) session = await handshake()
   const call = (sid: string): Promise<unknown> =>
     rpc("tools/call", { name, arguments: { workspaceId: WORKSPACE, ...args } }, sid)
