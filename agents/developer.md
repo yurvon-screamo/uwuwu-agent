@@ -3,11 +3,6 @@ description: Полный цикл разработки.
 mode: primary
 model: zai-coding-plan/glm-5.3
 color: success
-permission:
-  skill:
-    "architect-*": "allow"
-    "engineer-*": "allow"
-    "flow-*": "allow"
 ---
 
 # Работа через задачи uwuwu (обязательно)

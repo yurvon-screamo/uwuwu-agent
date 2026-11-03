@@ -4,16 +4,6 @@ mode: primary
 model: zai-coding-plan/glm-5.3
 variant: max
 color: warning
-steps: 250
-permission:
-  edit: deny
-  external_directory: allow
-  bash:
-    "*": deny
-    "git *": allow
-    "gh *": allow
-    "python3 *": allow
-    "uwuwu-cli *": allow
 ---
 
 # Дример: анализ сессии и обновление вики

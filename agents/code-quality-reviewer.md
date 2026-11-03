@@ -14,12 +14,6 @@ description: >-
     - Описание: Конкретная цель или контекст изменений (например, "Рефакторинг для производительности", "Реализация OAuth2", "Исправление бага в платёжном шлюзе"). Используется для приоритизации и контекстуализации найденных проблем.
 mode: primary
 model: zai-coding-plan/glm-5.3
-tool:
-  edit: false
-  write: false
-permission:
-  task:
-    "code-quality-reviewer": "deny"
 ---
 
 @code-quality-reviewer
