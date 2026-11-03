@@ -70,6 +70,15 @@ Always implement full cycles:
 - **COPY SELF-AUDIT (mandatory before ship):** Re-read every visible string. Flag: grammatically broken, unclear referents, AI-hallucinated cute wordplay, forced metaphors. Rewrite every flagged string
 - **Fake-precise numbers are banned** unless from real data or explicitly labeled as mock
 
+### Interface Copy Grammar
+
+- **No trailing periods** on headlines, labels, buttons, captions. Multi-sentence paragraphs keep theirs
+- **No exclamation marks in interface text.** Never `!!`
+- **No greeting headlines** (`Welcome back, Name! 👋`). The title names the context: page name or period (`October 2026`)
+- **Short labels.** `Search`, not `Search anything...`
+- **Every change cites its base.** `+12% vs last month`, `3 fewer vs last month` — never a bare `+12%`
+- **Numbers: one format per screen, `tabular-nums`.** `$48,210` and `$124,860` — not one with cents and one without. Mock data looks real (plausible values), never `[X]` or `123456`
+
 ---
 
 ## Layout Discipline (Hard Rules)
@@ -113,6 +122,16 @@ Failing any of these is shipping broken work.
 
 The pattern "left big headline + right small explainer paragraph" as a section header is **banned as default**. If you need both a headline and an explainer, stack them vertically (headline on top, body below, max-width 65ch).
 
+### Spacing Rhythm & App Density
+
+- **4px grid everywhere.** Margins, paddings, gaps, fixed heights are multiples of 4. No one-off values like `mt-[13px]` or `py-[11px]` — step back onto the scale
+- **Same thing, same size.** All rows in a list share one height and one gap; sibling cards share one padding
+- **Space shows grouping.** Space inside a group is smaller than space between groups — a list reads as one block, sections read as separate
+- **Things line up.** Icons sit in one column, labels start on one line, numbers right-align in one column. Nothing is nudged off the line with a stray translate
+- **Padding follows density:** compact panels/sidebars ~16, cards 20-24, page edges 24-32; sections 32-64 (landing 80-128)
+- **Navigation is the densest part of an app.** Rows 32-36 tall with 2-4 between them; a section label sits closer to its items than to the section above (like 24 above, 8 below). Measure the sidebar after styling - it is where spacing breaks most often
+- **App shell proportions:** sidebar 240-280, fluid content capped ~1440-1600, page as long as its content. Never shrink an app into a narrow centered column
+
 ### Other
 
 - **Mobile collapse must be explicit per section.** For every multi-column layout, declare the `< 768px` fallback
@@ -141,6 +160,20 @@ Landing pages and portfolios are **visual products**. Text-only pages with fake-
 **LOGO-ONLY rule:** logo wall = logos and nothing else. Do NOT print industry / category labels below each logo.
 
 **Div-based fake screenshots are banned.** A "product preview" built from styled `<div>` rectangles is the #1 LLM-design Tell.
+
+---
+
+## Dashboard & Chart Hygiene
+
+Dashboards and data surfaces fail differently from landing pages. Richness goes into the data, not the chrome.
+
+- **One main chart per screen**, clearly the biggest and most cared-for. Anything else showing data is smaller and different in kind (a ranked list with thin bars, a short table) - never a second chart of the same size
+- **One accent per chart.** The thing that matters (current month, tracked line, plan that grew) gets the accent; everything else sits in neutral steps. Several hues only when the chart truly must tell series apart - and then one leads
+- **Muted grid, mono labels.** No rainbow bars inside one series, no glowing bars, no uppercase day labels. Placeholder noise is replaced with data that tells something real
+- **Stat cards are numbers:** a label, a big figure, a change with its base. No sparklines, tallies or mini-bars added to fill - they read as decoration
+- **Vary the grid rhythm:** a few compact stats in a row above one wide chart, or a wide chart next to a narrow list. Equal cards side by side with identical content read as a template
+- **Pick the chart type for the data:** trend = line, comparison = bars, share = stacked bar or list-with-bars, single goal = progress bar
+- **Active state is a small surface step with a hairline highlight**, not a gradient with a glow. Hover and focus states exist and stay inside the palette; visible focus ring for keyboard users
 
 ---
 
@@ -439,3 +472,9 @@ See `rules-performance` for the full Core Web Vitals targets (LCP/INP/CLS), opti
 | **Max-width** | Same `max-w-6xl` or `max-w-7xl` throughout | Mix different container widths |
 | **Theme colors** | Use directly (`bg-primary`) | Wrap in `var()` |
 | **Transitions** | `transition-colors duration-200` | Instant changes or >500ms |
+
+---
+
+## Credits
+
+Spacing rhythm, app-density, numbers and chart-hygiene blocks are partially based on [unslop](https://github.com/heydamir/unslop) by Damir Sokolovsky (@heydamir), CC BY 4.0.
