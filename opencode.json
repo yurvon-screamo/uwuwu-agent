@@ -5,10 +5,10 @@
       "template": "Сформулируй это в виде ряда гиркин сценариев на русском, чтобы мы точно поняли друг друга."
     },
     "fast": {
-      "template": "Юзер считает это простой задачей, не вызывай код ревьювера, действуй самостоятельно. Если ты счиатешь что юзер ошибается и задача все таки требует ревью, то делай как считаешь нужным"
+      "template": "Юзер считает это простой задачей, действуй без задачи в uwuwu task."
     },
     "goal": {
-      "template": "goal: $ARGUMENTS\n(Пользователь ушёл — действуй полностью самостоятельно, не жди указаний и вопросов. Не забудь код-ревью перед завершением — это важно.)",
+      "template": "goal: $ARGUMENTS\n(Пользователь ушёл — действуй полностью самостоятельно, не жди указаний и вопросов.)",
       "description": "GOAL-режим: агент работает автономно до достижения цели, судья проверяет по фактам"
     },
     "search": {
@@ -39,41 +39,6 @@
       "action": "todowrite",
       "effect": "deny",
       "resource": "*"
-    },
-    {
-      "action": "subagent",
-      "effect": "deny",
-      "resource": "*"
-    },
-    {
-      "action": "subagent",
-      "effect": "allow",
-      "resource": "general"
-    },
-    {
-      "action": "skill",
-      "effect": "deny",
-      "resource": "flow-*"
-    },
-    {
-      "action": "skill",
-      "effect": "deny",
-      "resource": "engineer-*"
-    },
-    {
-      "action": "skill",
-      "effect": "deny",
-      "resource": "office-coworker-*"
-    },
-    {
-      "action": "skill",
-      "effect": "allow",
-      "resource": "rules-*"
-    },
-    {
-      "action": "skill",
-      "effect": "allow",
-      "resource": "tool-*"
     }
   ],
   "plugins": []

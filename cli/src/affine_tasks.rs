@@ -2,12 +2,17 @@
 //!
 //! Модель (см. док «Фабрика разработки на AFFiNE»): задача = строка
 //! database в доске проекта (`Задачи <Proj>`) + линкованный док-тело с
-//! тегом «Task». Комменты — нативные комменты афины к доку-телу.
+//! тегом-типом (Dev/Spike/Bug; у кронов — Cron). Комменты — нативные
+//! комменты афины к доку-телу. Создание идемпотентно: ретрай после
+//! таймаута достраивает сироту (тело без строки), а не плодит дубли
+//! (см. affine_children::resolve_existing_body).
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::{json, Value};
 
+use crate::affine_children::{resolve_existing_body, ExistingBody};
 use crate::affine_client::{AffineClient, AffineConfig};
+use crate::affine_comments;
 
 /// Тип задачи — тег на теле. Определяет шаблон тела и пайп агента.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,6 +339,41 @@ pub async fn find_board_by_title(
     }
 }
 
+/// Доступ к доске по тайтлу с дискриминацией «доски нет» vs «не читается»:
+/// стационарное отсутствие (нет тайтла, в трэше, не найдена в дереве) —
+/// нормальное состояние воркспейса; транспортный сбой чтения — транзиентный
+/// отказ, на его фоне вердикт «не найдено» не выдаётся.
+pub enum BoardAccess {
+    Found(Board),
+    /// доски с таким тайтлом нет (или она в трэше) — стационарно
+    Absent,
+    /// транспортный/протокольный сбой чтения
+    Failed(anyhow::Error),
+}
+
+pub async fn find_board_typed(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    title: &str,
+) -> BoardAccess {
+    match board_lookup(client, cfg, title).await {
+        Ok(BoardFind::Found(board)) => BoardAccess::Found(board),
+        // Trashed — стационарно: доски нет в живом воркспейсе
+        Ok(BoardFind::Trashed) => BoardAccess::Absent,
+        // поиск слепнет — дерево (канон-путь досок проектов), как в
+        // find_board_by_title: Missing без дерева — НЕ вердикт
+        Ok(BoardFind::Missing) => match find_board_by_title_tree(client, cfg, title).await {
+            Ok(board) => BoardAccess::Found(board),
+            // наш собственный вердикт «обошли дерево — нет такой доски»
+            Err(tree_err) if tree_err.to_string().contains("не найдена в дереве") => {
+                BoardAccess::Absent
+            }
+            Err(e) => BoardAccess::Failed(e),
+        },
+        Err(search_err) => BoardAccess::Failed(search_err),
+    }
+}
+
 /// Доска из дока: найти database-блок (affine:database / affine:data_view).
 async fn board_from_doc(
     client: &mut AffineClient,
@@ -485,7 +525,20 @@ pub async fn read_rows(
 
 /// Найти строку по id (row id или doc-тела) или уникальному префиксу.
 /// Ведущие дефисы row-id игнорируются с обеих сторон (кли-аргументы).
-pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
+/// Классификация резолва строки: важна для разрушительных операций —
+/// «неоднозначно» и «не найдено» ведут к разным веткам (сирота-путь
+/// допустим только после однозначного «не найдено»).
+pub(crate) enum RowMatch<'a> {
+    One(&'a TaskRow),
+    /// строка не найдена ни по id, ни по тайтлу
+    NotFound,
+    /// несколько строк под один префикс/тайтл
+    Ambiguous {
+        by_id: bool,
+    },
+}
+
+pub(crate) fn classify_row<'a>(rows: &'a [TaskRow], id: &str) -> RowMatch<'a> {
     let needle = id.trim_start_matches('-');
     let by_id: Vec<&TaskRow> = rows
         .iter()
@@ -494,51 +547,232 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
         })
         .collect();
     if by_id.len() == 1 {
-        return Ok(by_id[0]);
+        return RowMatch::One(by_id[0]);
     }
-    if by_id.is_empty() {
-        let lower = needle.to_lowercase();
-        let by_title: Vec<&TaskRow> = rows
-            .iter()
-            .filter(|r| r.title.to_lowercase().contains(&lower))
-            .collect();
-        return match by_title.len() {
-            1 => Ok(by_title[0]),
-            0 => bail!("задача '{id}' не найдена"),
-            n => bail!("'{id}' неоднозначно ({n} по заголовку) — уточни или используй id"),
-        };
+    if !by_id.is_empty() {
+        return RowMatch::Ambiguous { by_id: true };
     }
-    bail!(
-        "'{id}' неоднозначно ({} по id) — уточни префикс",
-        by_id.len()
+    let lower = needle.to_lowercase();
+    let by_title: Vec<&TaskRow> = rows
+        .iter()
+        .filter(|r| r.title.to_lowercase().contains(&lower))
+        .collect();
+    match by_title.len() {
+        1 => RowMatch::One(by_title[0]),
+        0 => RowMatch::NotFound,
+        _ => RowMatch::Ambiguous { by_id: false },
+    }
+}
+
+pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
+    match classify_row(rows, id) {
+        RowMatch::One(row) => Ok(row),
+        RowMatch::NotFound => bail!("задача '{id}' не найдена"),
+        RowMatch::Ambiguous { by_id: true } => bail!("'{id}' неоднозначно по id — уточни префикс"),
+        RowMatch::Ambiguous { by_id: false } => {
+            bail!("'{id}' неоднозначно по заголовку — уточни или используй id")
+        }
+    }
+}
+
+/// Исход создания задачи/крона: свежий или достройка прерванного.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// создано с нуля
+    Created,
+    /// найдена сирота от упавшей попытки — достроена (тело перезаписано
+    /// свежим шаблоном, строка добавлена)
+    Recovered,
+}
+
+/// Контекст операций над доской задач: шлюз + конфиг + доска + корень wiki.
+/// Ходят связкой во всех новых API (create_task/create_cron/rm_task) —
+/// вместо россыпи из 4-5 параметров в каждой сигнатуре.
+pub struct TaskCx<'a> {
+    pub client: &'a mut AffineClient,
+    pub cfg: &'a AffineConfig,
+    pub board: &'a Board,
+    pub root: &'a std::path::Path,
+}
+
+/// Defense-in-depth: ok:false обычно перехватывается транспортом
+/// (affine_client::tool_failure — retryable → ретраи, иначе Err) и до
+/// вызывающего не доходит; барьер страхует от дрейфа конвенции. Не копируй
+/// вслепую в каждый вызов — транспорт уже владеет этим контрактом.
+fn require_ok(tool: &str, resp: &Value) -> Result<()> {
+    if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        bail!(
+            "{tool} не подтвердился ({}): {}",
+            resp.get("code").and_then(|c| c.as_str()).unwrap_or("?"),
+            resp.get("error").and_then(|e| e.as_str()).unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Сообщение о дубле: row-id и doc-id тела обязательны — ретрающий агент
+/// по ним находит уже созданную задачу (исход «таймаут на commit-point»).
+fn duplicate_message(entity: &str, title: &str, row: &TaskRow, row_count: usize) -> String {
+    let body = if row.body_doc.is_empty() {
+        "без тела".to_string()
+    } else {
+        format!("тело {}", row.body_doc)
+    };
+    let many = if row_count > 1 {
+        format!(" (строк с этим тайтлом: {row_count})")
+    } else {
+        String::new()
+    };
+    format!(
+        "дубль: {entity} с тайтлом «{title}» уже существует (строка {}, {body}){many} — создание не выполнялось",
+        row.row_id
     )
 }
 
-/// Создать задачу: док-тело (тег «Task») + строка Todo, слинкованная с телом.
+/// Стартовый статус строки задачи: черновик на валидации. Триаж переводит
+/// в Todo (или мержит и удаляет строку), владелец ставит Design.
+pub const TASK_DRAFT_STATUS: &str = "Draft";
+
+/// Ячейки строки новой задачи (Title добавляет add_linked_row): статус —
+/// всегда Draft, «задачи в пустоту не заводим».
+fn draft_cells() -> serde_json::Map<String, Value> {
+    json!({"Status": TASK_DRAFT_STATUS})
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Заменить тело дока markdown-ом целиком, без конвертации фенсов
+/// (в отличие от replace_body: стартовые шаблоны фенсов не содержат,
+/// свежий путь create_doc_from_markdown их тоже не конвертит).
+async fn replace_doc_raw(cx: &mut TaskCx<'_>, body_doc: &str, md: &str) -> Result<()> {
+    let resp = cx
+        .client
+        .call_tool(
+            "replace_doc_with_markdown",
+            json!({"workspaceId": cx.cfg.workspace, "docId": body_doc, "markdown": md}),
+        )
+        .await
+        .context("replace_doc_with_markdown")?;
+    require_ok("replace_doc_with_markdown", &resp)
+}
+
+/// Строка доски, линкованная с телом; Title обязателен, остальное — extra.
+/// Коммит-шаг создания: ok:false (WRITE_QUEUE_TIMEOUT и т.п.) обязан ронять
+/// операцию, иначе наружу уходит «создана» без строки — ложный успех.
+async fn add_linked_row(
+    cx: &mut TaskCx<'_>,
+    title: &str,
+    body_doc: &str,
+    mut extra_cells: serde_json::Map<String, Value>,
+) -> Result<TaskRow> {
+    extra_cells.insert("Title".into(), json!(title));
+    let resp = cx
+        .client
+        .call_tool(
+            "add_database_row",
+            json!({"workspaceId": cx.cfg.workspace, "docId": cx.board.doc_id,
+                   "databaseBlockId": cx.board.db_id,
+                   "cells": extra_cells,
+                   "linkedDocId": body_doc}),
+        )
+        .await
+        .context("add_database_row")?;
+    require_ok("add_database_row", &resp)?;
+    let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
+    if row_id.is_empty() {
+        // симметрично rm_task: пустой идентификатор = ложный успех
+        anyhow::bail!("add_database_row: строка создана, но rowId не возвращён");
+    }
+    let status = extra_cells
+        .get("Status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(TaskRow {
+        row_id,
+        title: title.to_string(),
+        body_doc: body_doc.to_string(),
+        status,
+        ..Default::default()
+    })
+}
+
+/// Создать задачу: док-тело (тег типа) + строка Draft, слинкованная с телом.
+/// Идемпотентно: сирота от упавшей попытки достраивается (Recovered),
+/// живая задача с тем же тайтлом — явная ошибка дубля.
 pub async fn create_task(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-    board: &Board,
+    cx: &mut TaskCx<'_>,
     title: &str,
     body_markdown: &str,
     task_type: TaskType,
-) -> Result<TaskRow> {
-    // 1. док-тело — ребёнок доски; стартовый костяк по типу задачи
-    let md = task_type.body_template(title, body_markdown);
-    let resp = client
-        .call_tool(
-            "create_doc_from_markdown",
-            json!({"workspaceId": cfg.workspace, "title": title, "markdown": md, "parentDocId": board.doc_id}),
-        )
-        .await
-        .context("create_doc_from_markdown")?;
-    let body_doc = first_str(&resp, &["docId", "id"])
-        .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
+) -> Result<(TaskRow, CreateOutcome)> {
+    match resolve_existing_body(cx, title).await? {
+        ExistingBody::Exists { row, row_count } => {
+            bail!("{}", duplicate_message("задача", title, &row, row_count))
+        }
+        ExistingBody::Ambiguous { doc_ids } => bail!(
+            "на доске несколько тел с тайтлом «{title}» — чисти вручную: {}",
+            doc_ids.join(", ")
+        ),
+        ExistingBody::Orphan { doc_id } => {
+            // достройка: тело — свежий шаблон текущих аргументов, коммит — строка
+            let md = task_type.body_template(title, body_markdown);
+            replace_doc_raw(cx, &doc_id, &md).await?;
+            ensure_task_tag(cx, task_type.tag()).await?;
+            let _ = cx
+                .client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": doc_id, "tag": task_type.tag()}),
+                )
+                .await;
+            let row = add_linked_row(cx, title, &doc_id, draft_cells()).await?;
+            Ok((row, CreateOutcome::Recovered))
+        }
+        ExistingBody::None => {
+            // 1. док-тело — ребёнок доски; стартовый костяк по типу задачи
+            let md = task_type.body_template(title, body_markdown);
+            let resp = cx
+                .client
+                .call_tool(
+                    "create_doc_from_markdown",
+                    json!({"workspaceId": cx.cfg.workspace, "title": title, "markdown": md, "parentDocId": cx.board.doc_id}),
+                )
+                .await
+                .context("create_doc_from_markdown")?;
+            // ok:false внутри structuredContent (WRITE_QUEUE_TIMEOUT и т.п.):
+            // применился ли док — неизвестно; ретрай безопасен, резолв выше
+            // найдёт сироту и достроит
+            require_ok("create_doc_from_markdown", &resp)?;
+            let body_doc = first_str(&resp, &["docId", "id"])
+                .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
 
-    // 2. тег типа (идемпотентно)
-    let tag = task_type.tag();
-    let tags = client
-        .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
+            // 2. тег типа (идемпотентно)
+            ensure_task_tag(cx, task_type.tag()).await?;
+            let _ = cx
+                .client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": body_doc, "tag": task_type.tag()}),
+                )
+                .await;
+
+            // 3. строка Draft, слинкованная с телом
+            let row = add_linked_row(cx, title, &body_doc, draft_cells()).await?;
+            // Draft = черновик на валидации: триаж переводит в Todo /
+            // мержит и удаляет; Todo → Design — владелец (спавн фабрики)
+            Ok((row, CreateOutcome::Created))
+        }
+    }
+}
+
+/// Обеспечить существование workspace-тега (идемпотентно, с разрядкой гонки
+/// дубликатов — урок duplicate-tag race).
+async fn ensure_task_tag(cx: &mut TaskCx<'_>, tag: &str) -> Result<()> {
+    let tags = cx
+        .client
+        .call_tool("list_tags", json!({"workspaceId": cx.cfg.workspace}))
         .await;
     let has_tag = tags
         .ok()
@@ -552,17 +786,19 @@ pub async fn create_task(
         })
         .unwrap_or(false);
     if !has_tag {
-        let _ = client
+        let _ = cx
+            .client
             .call_tool(
                 "create_tag",
-                json!({"workspaceId": cfg.workspace, "tag": tag}),
+                json!({"workspaceId": cx.cfg.workspace, "tag": tag}),
             )
             .await;
         // cross-machine race: a concurrent create may land the same name.
         // delete_tag works by name only, so duplicates get disarmed by a
         // name-reset (delete + single re-create) — the duplicate-tag race lesson
-        let relist = client
-            .call_tool("list_tags", json!({"workspaceId": cfg.workspace}))
+        let relist = cx
+            .client
+            .call_tool("list_tags", json!({"workspaceId": cx.cfg.workspace}))
             .await;
         if let Ok(relist) = relist {
             if relist.get("ok").and_then(|o| o.as_bool()) == Some(false) {
@@ -581,49 +817,296 @@ pub async fn create_task(
                 })
                 .unwrap_or(0);
             if dup > 1 {
-                let _ = client
+                let _ = cx
+                    .client
                     .call_tool(
                         "delete_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": tag}),
+                        json!({"workspaceId": cx.cfg.workspace, "tag": tag}),
                     )
                     .await;
-                let _ = client
+                let _ = cx
+                    .client
                     .call_tool(
                         "create_tag",
-                        json!({"workspaceId": cfg.workspace, "tag": tag}),
+                        json!({"workspaceId": cx.cfg.workspace, "tag": tag}),
                     )
                     .await;
                 eprintln!("affine: гонка тега {tag} разряжена (name-reset)");
             }
         }
     }
-    let _ = client
-        .call_tool(
-            "add_tag_to_doc",
-            json!({"workspaceId": cfg.workspace, "docId": body_doc, "tag": tag}),
-        )
-        .await;
+    Ok(())
+}
 
-    // 3. строка в Todo, слинкованная с телом
-    let resp = client
+/// Создать крон: док-тело (тег Cron) + строка доски с расписанием.
+/// Идемпотентность та же, что у create_task (affine_children).
+pub async fn create_cron(
+    cx: &mut TaskCx<'_>,
+    title: &str,
+    schedule: &str,
+    body_md: &str,
+) -> Result<(TaskRow, CreateOutcome)> {
+    match resolve_existing_body(cx, title).await? {
+        ExistingBody::Exists { row, row_count } => {
+            bail!("{}", duplicate_message("крон", title, &row, row_count))
+        }
+        ExistingBody::Ambiguous { doc_ids } => bail!(
+            "на доске несколько тел с тайтлом «{title}» — чисти вручную: {}",
+            doc_ids.join(", ")
+        ),
+        ExistingBody::Orphan { doc_id } => {
+            replace_doc_raw(cx, &doc_id, body_md).await?;
+            let _ = cx
+                .client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": doc_id, "tag": CRON_TAG}),
+                )
+                .await;
+            let row = add_linked_row(
+                cx,
+                title,
+                &doc_id,
+                json!({"Schedule": schedule, "Status": "active"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .await?;
+            Ok((row, CreateOutcome::Recovered))
+        }
+        ExistingBody::None => {
+            let resp = cx
+                .client
+                .call_tool(
+                    "create_doc_from_markdown",
+                    json!({"workspaceId": cx.cfg.workspace, "title": title, "markdown": body_md, "parentDocId": cx.board.doc_id}),
+                )
+                .await
+                .context("create_doc_from_markdown")?;
+            require_ok("create_doc_from_markdown", &resp)?;
+            let body_doc = first_str(&resp, &["docId", "id"])
+                .ok_or_else(|| anyhow!("тело создано, но docId не возвращён: {resp:.120}"))?;
+            // add_tag_to_doc создаёт опцию тега при нужде; у Cron нет истории
+            // гонки дубликатов — fire-and-forget, осознанная асимметрия с task
+            let _ = cx
+                .client
+                .call_tool(
+                    "add_tag_to_doc",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": body_doc, "tag": CRON_TAG}),
+                )
+                .await;
+            let row = add_linked_row(
+                cx,
+                title,
+                &body_doc,
+                json!({"Schedule": schedule, "Status": "active"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .await?;
+            Ok((row, CreateOutcome::Created))
+        }
+    }
+}
+
+/// Отчёт rm: что именно удалено (строка канбана невосстановима — печатаем).
+#[derive(Clone, Debug)]
+pub struct RmReport {
+    pub title: String,
+    pub doc_id: String,
+    pub row_deleted: bool,
+    pub body_trashed: bool,
+    /// из ответа trash_doc (previouslyInTrash); на сироте-пути док мог быть
+    /// в трэше ещё до rm
+    pub was_in_trash: bool,
+}
+
+pub(crate) async fn trash_body(cx: &mut TaskCx<'_>, body_doc: &str) -> Result<(bool, bool)> {
+    if body_doc.is_empty() {
+        return Ok((false, false));
+    }
+    let resp = cx
+        .client
         .call_tool(
-            "add_database_row",
-            json!({"workspaceId": cfg.workspace, "docId": board.doc_id,
-                   "databaseBlockId": board.db_id,
-                   "cells": {"Title": title},
-                   "linkedDocId": body_doc}),
+            "trash_doc",
+            json!({"workspaceId": cx.cfg.workspace, "docId": body_doc}),
         )
         .await
-        .context("add_database_row")?;
-    let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
+        .context("trash_doc")?;
+    require_ok("trash_doc", &resp)?;
+    // previouslyInTrash проверен живым прогоном на гейте 3.10.2 (ответ несёт
+    // поле всегда; деградация в false ниже — на случай будущих версий)
+    let was = resp
+        .get("previouslyInTrash")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok((true, was))
+}
 
-    Ok(TaskRow {
-        row_id,
-        title: title.to_string(),
-        body_doc,
-        status: String::new(), // пустой статус = черновик юзера; Design = спавн агента
-        ..Default::default()
-    })
+/// Трэш крон-сироты (тело без строки) по крон-доскам. Матч должен быть
+/// уникален ПО ВСЕМ доскам: первый попавшийся префикс молча трэшил бы тело
+/// чужого крона. Read-сбои досок не дают вердикта «не найдено».
+pub async fn rm_cron_orphan(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    cron_boards: &[String],
+    id: &str,
+) -> Result<String> {
+    let mut hits: Vec<(String, String, String)> = Vec::new(); // (board, doc_id, title)
+    let mut misses: Vec<String> = Vec::new();
+    let mut failed_boards = 0usize;
+    for board_title in cron_boards {
+        // Absent (нет такой доски) — норма: не мешает вердикту «уникально».
+        // Failed — частичная видимость: трэшить на ней нельзя, иначе
+        // кросс-досочная неоднозначность может остаться незамеченной
+        match find_board_typed(client, cfg, board_title).await {
+            BoardAccess::Found(board) => {
+                let children =
+                    match crate::affine_children::board_children(client, cfg, &board).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            failed_boards += 1;
+                            misses.push(format!("{board_title}: дети не читаются ({e})"));
+                            continue;
+                        }
+                    };
+                match crate::affine_children::child_by_prefix(&children, id) {
+                    Ok(child) => hits.push((
+                        board_title.clone(),
+                        child.doc_id.clone(),
+                        child.title.clone(),
+                    )),
+                    Err(e) => misses.push(format!("{board_title}: {e}")),
+                }
+            }
+            BoardAccess::Absent => misses.push(format!("{board_title}: доски нет")),
+            BoardAccess::Failed(e) => {
+                failed_boards += 1;
+                misses.push(format!("{board_title}: доска не читается ({e})"));
+            }
+        }
+    }
+    if failed_boards > 0 {
+        anyhow::bail!(
+            "сирота «{id}»: {failed_boards} крон-доски не читаются — трэш при неполной видимости не выполняется; {}",
+            misses.join("; ")
+        );
+    }
+    if hits.len() > 1 {
+        anyhow::bail!(
+            "«{id}» неоднозначно ({} досок): {} — уточни id",
+            hits.len(),
+            hits.iter()
+                .map(|(b, d, t)| format!("{b}:{d} «{t}»"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    match hits.pop() {
+        Some((_, doc_id, title)) => {
+            let resp = client
+                .call_tool(
+                    "trash_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+                )
+                .await
+                .context("trash_doc")?;
+            require_ok("trash_doc", &resp)?;
+            Ok(title)
+        }
+        None => anyhow::bail!(
+            "сирота «{id}» не найдена ни на одной крон-доске: {}",
+            misses.join("; ")
+        ),
+    }
+}
+
+/// Guard rm: удалять можно только Draft-черновики (их чистит триаж после
+/// мержа в мастер-задачу); живые задачи инструментом не сносятся. Сироты
+/// без строки — отдельный путь rm_task, без guard'а. Статус берётся из
+/// того же read_rows, что и резолв (резолв → guard → delete без пауз).
+/// Текст отказа без рецепта обхода: сообщение читает LLM-агент.
+fn ensure_removable_draft(row: &TaskRow) -> Result<()> {
+    if row.status == TASK_DRAFT_STATUS {
+        return Ok(());
+    }
+    let shown = if row.status.is_empty() {
+        "пустой (легаси)"
+    } else {
+        &row.status
+    };
+    anyhow::bail!(
+        "«{}» в статусе {} — rm только для Draft-черновиков; живые задачи не удаляются",
+        row.title,
+        shown
+    )
+}
+
+/// Удалить задачу: строка вниз + тело в трэш. Путь сироты (тело без строки —
+/// мусор от упавшего create): единственный префикс-матч среди детей доски.
+pub async fn rm_task(cx: &mut TaskCx<'_>, id: &str) -> Result<RmReport> {
+    let rows = read_rows(cx.client, cx.cfg, cx.board, cx.root).await?;
+    // разрушительная операция: ветвление строго по классификации.
+    // «Неоднозначно» — жёсткая ошибка ДО любых трэшей: сирота-путь допустим
+    // только после однозначного «не найдено» (иначе префикс, матчящий две
+    // строки, утрэшил бы тело живой задачи)
+    match classify_row(&rows, id) {
+        RowMatch::One(row) => {
+            // row_deleted в отчёте обязан означать фактический delete: строка
+            // канбана невосстановима, ложное «удалена» хуже честной ошибки
+            if row.row_id.is_empty() {
+                anyhow::bail!(
+                    "у задачи «{}» нет row-id — удалять нечего, чисти доску руками",
+                    row.title
+                );
+            }
+            ensure_removable_draft(row)?;
+            let resp = cx
+                .client
+                .call_tool(
+                    "delete_database_row",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": cx.board.doc_id,
+                           "databaseBlockId": cx.board.db_id, "rowBlockId": row.row_id}),
+                )
+                .await
+                .context("delete_database_row")?;
+            require_ok("delete_database_row", &resp)?;
+            let (body_trashed, was_in_trash) = trash_body(cx, &row.body_doc).await.map_err(|e| {
+                // строка УЖЕ удалена — разрушительная часть выполнена;
+                // symmetric с cron rm: событие должно быть видно юзеру
+                eprintln!(
+                    "внимание: строка {} уже удалена, но тело {} НЕ утрэшено: {e}",
+                    row.row_id, row.body_doc
+                );
+                e
+            })?;
+            Ok(RmReport {
+                title: row.title.clone(),
+                doc_id: row.body_doc.clone(),
+                row_deleted: true,
+                body_trashed,
+                was_in_trash,
+            })
+        }
+        RowMatch::Ambiguous { by_id } => anyhow::bail!(
+            "'{id}' неоднозначно (по {}) — уточни id: разрушительная операция по неоднозначному резолву не выполняется",
+            if by_id { "id" } else { "заголовку" }
+        ),
+        RowMatch::NotFound => {
+            let children = crate::affine_children::board_children(cx.client, cx.cfg, cx.board).await?;
+            let child = crate::affine_children::child_by_prefix(&children, id)?;
+            let (body_trashed, was_in_trash) = trash_body(cx, &child.doc_id).await?;
+            Ok(RmReport {
+                title: child.title.clone(),
+                doc_id: child.doc_id.clone(),
+                row_deleted: false,
+                body_trashed,
+                was_in_trash,
+            })
+        }
+    }
 }
 
 /// Обновить ячейки строки (Status/Title/PR/Branch — только непустые).
@@ -703,13 +1186,14 @@ pub async fn comment_task(
     Ok(first_str(&resp, &["commentId", "id"]).unwrap_or_default())
 }
 
-/// Последние комменты тела задачи (свежие первыми).
+/// Треды тела задачи: верхнеуровневые комменты с вложенными reply,
+/// свежие первыми (окно limit) — для карточки задачи.
 pub async fn recent_comments(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     row: &TaskRow,
     limit: usize,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<affine_comments::CommentThread>> {
     if row.body_doc.is_empty() {
         return Ok(Vec::new());
     }
@@ -720,35 +1204,9 @@ pub async fn recent_comments(
         )
         .await
         .context("list_comments")?;
-    let mut out = Vec::new();
-    if let Some(edges) = resp.get("edges").and_then(|e| e.as_array()) {
-        for e in edges {
-            let node = e.get("node").cloned().unwrap_or(Value::Null);
-            let content = node.get("content").cloned().unwrap_or(Value::Null);
-            let preview = content
-                .get("preview")
-                .and_then(|p| p.as_str())
-                .unwrap_or_default()
-                .to_string();
-            // fresh comments may carry an empty preview — walk the
-            // snapshot blocks for the actual text deltas
-            let preview = if preview.trim().is_empty() {
-                snapshot_text(&content)
-            } else {
-                preview
-            };
-            let resolved = node
-                .get("resolved")
-                .and_then(|r| r.as_bool())
-                .unwrap_or(false);
-            let marker = if resolved { "[✓] " } else { "" };
-            out.push((
-                format!("{marker}{preview}"),
-                first_str(&node, &["id"]).unwrap_or_default(),
-            ));
-        }
-    }
-    Ok(out)
+    let mut threads = affine_comments::parse_comment_connection(&resp);
+    threads.sort_by_key(|t| std::cmp::Reverse(t.created));
+    Ok(threads)
 }
 
 fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
@@ -757,45 +1215,17 @@ fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
         .map(String::from)
 }
 
-/// Concatenate all text deltas from a comment's snapshot block tree.
-fn snapshot_text(content: &Value) -> String {
-    fn walk(node: &Value, out: &mut String) {
-        if let Some(delta) = node
-            .get("props")
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.get("delta"))
-            .and_then(|d| d.as_array())
-        {
-            for d in delta {
-                if let Some(ins) = d.get("insert").and_then(|i| i.as_str()) {
-                    out.push_str(ins);
-                }
-            }
-        }
-        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
-            for ch in children {
-                walk(ch, out);
-            }
-        }
-    }
-    let mut out = String::new();
-    if let Some(blocks) = content.get("snapshot").and_then(|s| s.get("blocks")) {
-        walk(blocks, &mut out);
-    }
-    out.trim().to_string()
-}
-
-/// Все комменты тела задачи хронологически: (текст, userId, ms-таймстамп, resolved).
-/// userId — автор (бот vs юзер), createDate — из снапшота (надёжный порядок).
+/// Все треды тела задачи хронологически (по createDate верхнеуровневых
+/// комментов); replies вложены в свои треды.
 pub async fn thread_comments(
     client: &mut AffineClient,
     cfg: &AffineConfig,
     row: &TaskRow,
-) -> Result<Vec<(String, String, i64, bool)>> {
+) -> Result<Vec<affine_comments::CommentThread>> {
     if row.body_doc.is_empty() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
+    let mut threads = Vec::new();
     let mut cursor = String::new();
     for _page in 0..10 {
         let mut args = json!({"workspaceId": cfg.workspace, "docId": row.body_doc, "first": 50});
@@ -806,11 +1236,7 @@ pub async fn thread_comments(
             .call_tool("list_comments", args)
             .await
             .context("list_comments")?;
-        let edges = resp
-            .get("edges")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
+        threads.extend(affine_comments::parse_comment_connection(&resp));
         let has_next = resp
             .pointer("/pageInfo/hasNextPage")
             .and_then(|h| h.as_bool())
@@ -820,40 +1246,12 @@ pub async fn thread_comments(
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string();
-        for e in &edges {
-            let node = e.get("node").cloned().unwrap_or(Value::Null);
-            let content = node.get("content").cloned().unwrap_or(Value::Null);
-            let preview = content
-                .get("preview")
-                .and_then(|p| p.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let preview = if preview.trim().is_empty() {
-                snapshot_text(&content)
-            } else {
-                preview
-            };
-            let created = content
-                .pointer("/snapshot/meta/createDate")
-                .and_then(|c| c.as_i64())
-                .unwrap_or(0);
-            let resolved = node
-                .get("resolved")
-                .and_then(|r| r.as_bool())
-                .unwrap_or(false);
-            let user_id = node
-                .pointer("/user/id")
-                .and_then(|u| u.as_str())
-                .unwrap_or_default()
-                .to_string();
-            out.push((preview, user_id, created, resolved));
-        }
         if !has_next || cursor.is_empty() {
             break;
         }
     }
-    out.sort_by_key(|(_, _, created, _)| *created);
-    Ok(out)
+    threads.sort_by_key(|t| t.created);
+    Ok(threads)
 }
 
 // ——— кроны (доска Crons) ———
@@ -920,14 +1318,21 @@ pub fn validate_schedule(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::row;
 
-    fn row(row_id: &str, body: &str, title: &str) -> TaskRow {
-        TaskRow {
-            row_id: row_id.into(),
-            body_doc: body.into(),
-            title: title.into(),
-            ..Default::default()
-        }
+    #[test]
+    fn duplicate_message_names_entity_and_counts_rows() {
+        let msg = duplicate_message("крон", "Т", &row("r1", "doc-9", "Т"), 1);
+        assert!(msg.contains("крон с тайтлом"), "got: {msg}");
+        assert!(
+            msg.contains("строка r1") && msg.contains("тело doc-9"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("строк с этим тайтлом"), "got: {msg}");
+        let many = duplicate_message("задача", "Т", &row("r1", "", "Т"), 3);
+        assert!(many.contains("задача с тайтлом"), "got: {many}");
+        assert!(many.contains("без тела"), "got: {many}");
+        assert!(many.contains("строк с этим тайтлом: 3"), "got: {many}");
     }
 
     #[test]
@@ -945,6 +1350,27 @@ mod tests {
     fn resolve_ambiguous() {
         let rows = vec![row("ab1", "", ""), row("ab2", "", "")];
         assert!(resolve_row(&rows, "ab").is_err());
+    }
+
+    #[test]
+    fn rm_guard_passes_draft_and_refuses_others() {
+        let draft = row("r1", "doc-1", "Черновик");
+        assert!(ensure_removable_draft(&TaskRow {
+            status: TASK_DRAFT_STATUS.into(),
+            ..draft
+        })
+        .is_ok());
+        let design = row("r2", "doc-2", "Живая");
+        let err = ensure_removable_draft(&TaskRow {
+            status: "Design".into(),
+            ..design
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("только для Draft"), "got: {err}");
+        let legacy = row("r3", "doc-3", "Легаси");
+        let err = ensure_removable_draft(&legacy).unwrap_err().to_string();
+        assert!(err.contains("легаси"), "got: {err}");
     }
 }
 

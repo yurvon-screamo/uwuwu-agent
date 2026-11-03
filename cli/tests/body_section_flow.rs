@@ -41,7 +41,10 @@ fn run_replace(
 }
 
 fn base_steps() -> Vec<Step> {
-    vec![Step(200, Some("sess-A"), INIT), Step(202, None, NOTIFIED)]
+    vec![
+        Step::basic(200, Some("sess-A"), INIT),
+        Step::basic(202, None, NOTIFIED),
+    ]
 }
 
 #[test]
@@ -50,10 +53,10 @@ fn replace_flow_calls_read_delete_append_with_placement_after_heading() {
     with_temp_home(|| {
         // Arrange: шаги = init, notified, read_doc, delete, append, read_doc(фенсы)
         let mut steps = base_steps();
-        steps.push(Step(200, None, READ_DOC));
-        steps.push(Step(200, None, DELETE_OK));
-        steps.push(Step(200, None, APPEND_OK));
-        steps.push(Step(200, None, READ_DOC));
+        steps.push(Step::basic(200, None, READ_DOC));
+        steps.push(Step::basic(200, None, DELETE_OK));
+        steps.push(Step::basic(200, None, APPEND_OK));
+        steps.push(Step::basic(200, None, READ_DOC));
 
         // Act
         let (result, mock) = run_replace(steps, "новый текст");
@@ -61,7 +64,7 @@ fn replace_flow_calls_read_delete_append_with_placement_after_heading() {
         // Assert: замена прошла, контент заменился без диаграмм
         assert_eq!(result.unwrap(), (1, 0));
         let calls: Vec<Value> = mock
-            .request_bodies()
+            .requests()
             .iter()
             .filter_map(|raw| serde_json::from_str(raw.split("\r\n\r\n").nth(1)?).ok())
             .filter(|r| tool_name(r).is_some())
@@ -94,18 +97,18 @@ fn delete_ok_false_aborts_before_append() {
     with_temp_home(|| {
         // Arrange: первый же delete отвечает логическим отказом
         let mut steps = base_steps();
-        steps.push(Step(200, None, READ_DOC));
-        steps.push(Step(200, None, DELETE_FAIL));
+        steps.push(Step::basic(200, None, READ_DOC));
+        steps.push(Step::basic(200, None, DELETE_FAIL));
 
         // Act
         let (result, mock) = run_replace(steps, "новый текст");
 
-        // Assert: честная ошибка, append не состоялся
-        let err = result.unwrap_err().to_string();
+        // Assert: честная ошибка (контекст + причина в цепочке), append не состоялся
+        let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("blocked"), "got: {err}");
         assert!(err.contains("0 блоков"), "got: {err}");
         let has_append = mock
-            .request_bodies()
+            .requests()
             .iter()
             .any(|raw| raw.contains("\"name\":\"append_markdown\""));
         assert!(!has_append);
@@ -118,20 +121,20 @@ fn append_ok_false_error_reports_cleared_section_without_insert() {
     with_temp_home(|| {
         // Arrange: удаления прошли, append отвечает логическим отказом
         let mut steps = base_steps();
-        steps.push(Step(200, None, READ_DOC));
-        steps.push(Step(200, None, DELETE_OK));
-        steps.push(Step(200, None, APPEND_FAIL));
+        steps.push(Step::basic(200, None, READ_DOC));
+        steps.push(Step::basic(200, None, DELETE_OK));
+        steps.push(Step::basic(200, None, APPEND_FAIL));
 
         // Act
         let (result, mock) = run_replace(steps, "новый текст");
 
         // Assert: ошибка говорит, что секция уже пуста и контент не вставлен;
         // конвертация фенсов (второй read_doc) не выполнялась
-        let err = result.unwrap_err().to_string();
+        let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("секция уже очищена"), "got: {err}");
         assert!(err.contains("disk full"), "got: {err}");
         let read_count = mock
-            .request_bodies()
+            .requests()
             .iter()
             .filter(|raw| raw.contains("\"name\":\"read_doc\""))
             .count();
@@ -145,8 +148,8 @@ fn empty_markdown_clears_section_without_append() {
     with_temp_home(|| {
         // Arrange: пустой replacement — только чтение и удаление
         let mut steps = base_steps();
-        steps.push(Step(200, None, READ_DOC));
-        steps.push(Step(200, None, DELETE_OK));
+        steps.push(Step::basic(200, None, READ_DOC));
+        steps.push(Step::basic(200, None, DELETE_OK));
 
         // Act
         let (result, mock) = run_replace(steps, "   \n");
@@ -154,7 +157,7 @@ fn empty_markdown_clears_section_without_append() {
         // Assert: секция очищена, append не вызывался
         assert_eq!(result.unwrap(), (1, 0));
         let has_append = mock
-            .request_bodies()
+            .requests()
             .iter()
             .any(|raw| raw.contains("\"name\":\"append_markdown\""));
         assert!(!has_append);

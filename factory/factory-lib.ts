@@ -41,6 +41,10 @@ export interface TrackedTask {
   lastCommentId: string
   createdAt: number
   attempts: number
+  /** сессия ревьювера (1 на задачу; "" — нет или умерла) */
+  reviewSessionID?: string
+  /** неудачные спавны ревьювера подряд (эскалация до Needs attention) */
+  reviewAttempts?: number
 }
 
 export interface FactoryState {
@@ -49,6 +53,33 @@ export interface FactoryState {
 
 /** Комменты агента — с этим префиксом, чтобы не петлить себя. */
 export const AGENT_MARK = "🤖"
+
+// ——— ревью-статусы фабрики: имена = контракт с колонками досок AFFiNE ———
+
+export const REVIEW_PLAN_STATUS = "Ревью плана"
+export const REVIEW_RESULT_STATUS = "Ревью результата"
+
+export type ReviewKind = "plan" | "result"
+
+/** Ворктри задачи по Branch-ячейке из `git worktree list --porcelain`.
+ *  Точное сравнение refs/heads/<branch> — суффикс-матч ловил чужие ветки
+ *  (commits совпадал с auto-atomic-commits). */
+export function worktreeByBranch(porcelain: string, branch: string): string {
+  if (branch === "") return ""
+  let worktree = ""
+  for (const line of porcelain.split("\n")) {
+    if (line.startsWith("worktree ")) worktree = line.slice("worktree ".length)
+    else if (line === `branch refs/heads/${branch}` && worktree !== "") return worktree
+  }
+  return ""
+}
+
+/** Ревью-статус → вид ревью; null — обычный статус (мяч у девелопера/юзера). */
+export function reviewKindOf(status: string): ReviewKind | null {
+  if (status === REVIEW_PLAN_STATUS) return "plan"
+  if (status === REVIEW_RESULT_STATUS) return "result"
+  return null
+}
 
 /** Юзерский коммент: не наш (🤖), не служебный ([factory]). */
 export function isUserComment(c: TaskComment, botUserId?: string): boolean {
@@ -125,10 +156,13 @@ export function spawnPrompt(rowId: string, project: string, repo: string): strin
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-    "пока ждёшь ответа). План утрясан и вопросов нет → сам поставь Status: In Progress и реализуй.",
-    "Репо — текущий каталог: сам создай worktree+ветку от origin/master с осмысленным",
-    "именем (по сути задачи, не id); статусы двигай task edit'ом. Без пустого шума в",
-    "комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
+    "пока ждёшь ответа). План утрясан → план в тело → статус «Ревью плана» → конец хода:",
+    "ревью проводит отдельный праймари-агент фабрики, вердикт придёт wakeup'ом.",
+    "После approve плана создай worktree+ветку от origin/master (имя по сути задачи, не id),",
+    "заполни Branch-ячейку и реализуй. Код + self-check + PR (gh pr create, URL в PR-ячейку) +",
+    "отчёт в тело → статус «Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом:",
+    "request_changes → устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
+    "Без пустого шума в комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
     "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
@@ -156,6 +190,129 @@ export function wakeupPrompt(rowId: string, comments: TaskComment[]): string {
     "",
     "Отреагируй по пайпу: ответь/исправь. Ответ пользователю — uwuwu-cli task comment, не текст в сессии.",
   ].join("\n")
+}
+
+// ——— промпты ревьювера (праймари-агент на ревью-статусах) ———
+
+export interface ReviewContext {
+  branch: string
+  worktree: string
+  pr: string
+}
+
+/** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
+export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext): string {
+  const lines = [
+    `[factory] Задача ${rowId} (проект ${project}): ревью ${kind === "plan" ? "плана" : "результата"}.`,
+    "",
+    "Ты — праймари-агент code-quality-reviewer, фабрика назначила тебя судьёй этой задачи",
+    "(1 задача = 1 твоя сессия; повторные раунды правок придут сюда же wakeup'ом).",
+    "Работай по секции «Ревью задач фабрики uwuwu» своей методики:",
+    "",
+    `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи и треды комментов.`,
+    kind === "plan"
+      ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
+      : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
+    ...(kind === "result"
+      ? ["   origin/master + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.",]
+      : []),
+    ...(ctx.worktree !== "" ? [`   Ворктри задачи: ${ctx.worktree}`] : []),
+    ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
+    ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
+    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
+    "   вердикт-строка «Статус: approve|request_changes» обязательна.",
+    "4. Статус после вердикта (uwuwu-cli task edit):",
+    kind === "plan"
+      ? "   approve → In Progress · request_changes → Design"
+      : "   approve → Review · request_changes → In Progress",
+    "5. Вопросы юзеру — комментом без смены статуса; код и тело задачи не правь.",
+  ]
+  return lines.join("\n")
+}
+
+/** Будильник ревьювера: девелопер завершил раунд, статус снова ревью-статус. */
+export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewContext): string {
+  const status = kind === "plan" ? REVIEW_PLAN_STATUS : REVIEW_RESULT_STATUS
+  return [
+    `[factory] Задача ${rowId}: девелопер завершил раунд — статус снова «${status}».`,
+    "",
+    "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
+    "проверь устранение своих прошлых замечаний, отчёт комментом,",
+    `статус по вердикту (${kind === "plan" ? "approve → In Progress · request_changes → Design" : "approve → Review · request_changes → In Progress"}).`,
+    ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
+    ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
+  ].join("\n")
+}
+
+/** Будильник ревьювера: свежие комменты юзера в ревью-статусе. */
+export function reviewCommentsPrompt(rowId: string, comments: TaskComment[]): string {
+  const quoted = comments.map((c) => c.text.trim()).join("\n---\n")
+  return [
+    `[factory] В задаче ${rowId} (ревью-статус) новые комментарии от пользователя:`,
+    "",
+    quoted,
+    "",
+    "Ответь/учти по своему протоколу ревью: ответ юзеру — uwuwu-cli task comment.",
+  ].join("\n")
+}
+
+/** Будильник девелоперу: задача вернулась к разработке (вердикт ревьювера
+ *  или ручной перевод владельца в Design). */
+export function reviewReturnPrompt(rowId: string): string {
+  return [
+    `[factory] Задача ${rowId} вернулась к разработке — статус сменил ревьювер (вердикт) или владелец.`,
+    "",
+    "Перечитай uwuwu-cli task get + треды и действуй по пайпу:",
+    "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
+    "- план approved → реализуй;",
+    "- результат approved → мяч у юзера, от тебя ничего не требуется;",
+    "- владелец вернул в Design → перепланируй и снова «Ревью плана».",
+  ].join("\n")
+}
+
+// ——— маршрутизация: одно решение на тик (чистая функция для тестов) ———
+
+export interface RouteFacts {
+  /** статус строки сейчас */
+  status: string
+  /** последний наблюдённый статус (граница edge-триггеров) */
+  lastStatus: string
+  /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем решением noop) */
+  reviewerAlive: boolean | null
+  /** свежие комменты юзера */
+  freshComments: TaskComment[]
+}
+
+export type RouteAction =
+  | { t: "spawn-reviewer"; kind: ReviewKind }
+  | { t: "rerun-reviewer"; kind: ReviewKind }
+  | { t: "comments-to-reviewer" }
+  | { t: "return-to-dev" }
+  | { t: "noop" }
+
+/** Решение по задаче на один тик. Приоритет порядка: спавн ревьювера →
+ *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → возврат
+ *  девелоперу (из ревью-статуса или ручной перевод в Design) → noop. */
+export function routeTask(f: RouteFacts): RouteAction {
+  const kind = reviewKindOf(f.status)
+  if (kind !== null) {
+    // null (liveness неизвестна) трактуем как «жива»: не плодим спавны на
+    // транзиентных ошибках REST — следующий тик перепроверит
+    if (f.reviewerAlive === false) return { t: "spawn-reviewer", kind }
+    if (reviewKindOf(f.lastStatus) !== kind) return { t: "rerun-reviewer", kind }
+    if (f.freshComments.length > 0) return { t: "comments-to-reviewer" }
+    return { t: "noop" }
+  }
+  // возврат мяча девелоперу: из ревью-статуса по вердикту ревьювера…
+  if (reviewKindOf(f.lastStatus) !== null &&
+      (f.status === "Design" || f.status === "In Progress")) {
+    return { t: "return-to-dev" }
+  }
+  // …или ручной перевод живой задачи в Design («перепланируй»)
+  if (f.status === "Design" && f.lastStatus !== "Design" && f.lastStatus !== "") {
+    return { t: "return-to-dev" }
+  }
+  return { t: "noop" }
 }
 
 /** Ветка и путь ворктри для задачи (row-id может начинаться с дефиса). */
@@ -188,6 +345,11 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   ) return false
   if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
+  if (
+    t.reviewSessionID !== undefined &&
+    !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
+  ) return false
+  if (t.reviewAttempts !== undefined && typeof t.reviewAttempts !== "number") return false
   const sesOk = t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))
   if (!sesOk) return false
   if (t.worktree === "" && t.branch === "") return true

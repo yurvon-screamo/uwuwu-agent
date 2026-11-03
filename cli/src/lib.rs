@@ -1,8 +1,11 @@
 pub mod affine_blob;
 pub mod affine_body;
+pub mod affine_children;
 pub mod affine_client;
 pub mod affine_collect;
+pub mod affine_comments;
 pub mod affine_docs;
+pub mod affine_gql;
 pub mod affine_queries;
 pub mod affine_search_server;
 pub mod affine_sse;
@@ -21,11 +24,15 @@ pub mod wiki;
 #[cfg(test)]
 mod affine_collect_tests;
 #[cfg(test)]
+mod affine_comments_tests;
+#[cfg(test)]
 mod affine_sse_tests;
 #[cfg(test)]
 mod affine_store_tests;
 #[cfg(test)]
 mod affine_tables_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::path::PathBuf;
 
