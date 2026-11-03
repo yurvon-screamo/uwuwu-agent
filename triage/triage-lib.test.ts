@@ -291,7 +291,7 @@ test("draftReady: тишина по sighting'у и по телу; кап отп�
 
 test("draftReady: повторная отправка — кулдаун от последнего хода + тишина тела", () => {
   const turnAt = DRAFT_CAP_MS + 60_000 // ход случился сразу после капа
-  const afterTurn = (now: number, updatedAt = turnAt): DraftTrack =>
+  const afterTurn = (_now: number, updatedAt = turnAt): DraftTrack =>
     track({ seenAt: 0, updatedAt, turns: 1, lastTurnAt: turnAt })
   // сразу после хода — не готов (не спамим триаж)…
   expect(draftReady(afterTurn(turnAt + 60_000), turnAt + 60_000)).toBe(false)
