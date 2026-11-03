@@ -82,12 +82,6 @@ export interface TriageState {
   chatID?: number
   /** вечная сессия диалога — единый контекст всей переписки */
   session?: string
-  /** подряд оборванных финалов (outcome ≠ succeeded): 3 → пересоздание сессии */
-  broken?: number
-  /** ms последнего пересоздания по деградации + пауза обработки до:
-   *  circuit breaker от спам-цикла пересозданий */
-  lastResetAt?: number
-  pausedUntil?: number
   queue: Request[]
   run?: RunState
   /** ms последнего push/редакта в очередь — опора дебаунса батча */
@@ -164,12 +158,8 @@ export function validState(raw: unknown): TriageState {
   if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
   if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
   if (typeof r.session === "string" && r.session.startsWith("ses_")) out.session = r.session
-  if (Number.isInteger(r.broken) && (r.broken as number) >= 0 && (r.broken as number) <= 99) {
-    out.broken = r.broken as number
-  }
-  for (const k of ["lastResetAt", "pausedUntil", "lastPushAt"] as const) {
-    const v = r[k]
-    if (Number.isFinite(v) && (v as number) >= 0) out[k] = v as number
+  if (Number.isFinite(r.lastPushAt) && (r.lastPushAt as number) >= 0) {
+    out.lastPushAt = r.lastPushAt as number
   }
   const firing = r.firing
   if (firing !== null && typeof firing === "object") {
@@ -368,6 +358,28 @@ export function draftReady(t: DraftTrack, now: number): boolean {
   }
   return now - (t.lastTurnAt ?? 0) >= DRAFT_REPOST_COOLDOWN_MS
     && now - t.updatedAt >= DRAFT_QUIET_MS
+}
+
+/** Учёт оборота хода по черновикам (anti-loop) — при любом исходе хода,
+ *  включая оборванный финал: иначе re-поставленный вотчером черновик
+ *  никогда не наберёт DRAFT_MAX_TURNS и ходы зациклятся. Инкрементит turns
+ *  и ставит lastTurnAt только по известным rowId (заявка могла ссылаться
+ *  на черновик, сошедший с трекера). true = состояние изменилось. */
+export function applyTurns(
+  drafts: Record<string, DraftTrack> | undefined,
+  rowIds: string[] | undefined,
+  now: number,
+): boolean {
+  if (drafts === undefined || rowIds === undefined) return false
+  let changed = false
+  for (const rowId of rowIds) {
+    const t = drafts[rowId]
+    if (t === undefined) continue
+    t.turns++
+    t.lastTurnAt = now
+    changed = true
+  }
+  return changed
 }
 
 /** Промпт по черновику — ТОЛЬКО метаданные: тело в промпт не попадает,
