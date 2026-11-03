@@ -35,7 +35,7 @@ uwuwu-cli --help    # грамматика актуальна
 | `blob <key> [--out f]` | скачать blob (ключи видны в read как `affine://blob/<key>`) |
 | `shot <slug> [--edgeless]` | скриншот дока через headless chromium |
 | `search "…" [--limit N --sofa N]` | серверный полнотекстовый (Manticore): title/snippet/UI-ссылка с docId; SOFA опционально |
-| `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; rm снимает строку и трэшит тело (сироту — по docId) |
+| `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; новая строка всегда в статусе **Draft** («задачи в пустоту не заводим» — триаж валидирует и переводит в Todo); rm снимает строку и трэшит тело (сироту — по docId), **только Draft-строки** — живые задачи не сносятся |
 | `cron set/list/pause/resume/rm` | кроны агентов (доска «Crons» / «Кроны <Proj>»); set идемпотентен как task create, rm трэшит сироту без строки |
 
 ## Architecture

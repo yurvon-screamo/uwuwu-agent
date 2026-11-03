@@ -16,7 +16,8 @@ pub(crate) struct Cli {
 /// Сабкоманды uwuwu-cli task.
 #[derive(clap::Subcommand)]
 pub(crate) enum TaskSub {
-    /// Создать задачу: док-тело (тег «Task») + строка Todo
+    /// Создать задачу: док-тело (тег «Task») + строка Draft — черновик
+    /// на валидации триажем (Todo/Design ставят триаж и владелец)
     Create {
         #[arg(long, help = "Заголовок задачи")]
         title: String,
@@ -100,6 +101,7 @@ pub(crate) enum TaskSub {
         replace: bool,
     },
     /// Удалить задачу: строка вниз + тело в трэш (восстановимо restore_doc).
+    /// Только Draft-черновики (их чистит триаж); живые задачи — отказ.
     /// Тело без строки (сирота упавшего create) — трэш по docId.
     Rm {
         #[arg(help = "row-id / doc-id / префикс")]

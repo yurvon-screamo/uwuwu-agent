@@ -629,6 +629,19 @@ fn duplicate_message(entity: &str, title: &str, row: &TaskRow, row_count: usize)
     )
 }
 
+/// Стартовый статус строки задачи: черновик на валидации. Триаж переводит
+/// в Todo (или мержит и удаляет строку), владелец ставит Design.
+pub const TASK_DRAFT_STATUS: &str = "Draft";
+
+/// Ячейки строки новой задачи (Title добавляет add_linked_row): статус —
+/// всегда Draft, «задачи в пустоту не заводим».
+fn draft_cells() -> serde_json::Map<String, Value> {
+    json!({"Status": TASK_DRAFT_STATUS})
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Заменить тело дока markdown-ом целиком, без конвертации фенсов
 /// (в отличие от replace_body: стартовые шаблоны фенсов не содержат,
 /// свежий путь create_doc_from_markdown их тоже не конвертит).
@@ -671,10 +684,16 @@ async fn add_linked_row(
         // симметрично rm_task: пустой идентификатор = ложный успех
         anyhow::bail!("add_database_row: строка создана, но rowId не возвращён");
     }
+    let status = extra_cells
+        .get("Status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     Ok(TaskRow {
         row_id,
         title: title.to_string(),
         body_doc: body_doc.to_string(),
+        status,
         ..Default::default()
     })
 }
@@ -708,7 +727,7 @@ pub async fn create_task(
                     json!({"workspaceId": cx.cfg.workspace, "docId": doc_id, "tag": task_type.tag()}),
                 )
                 .await;
-            let row = add_linked_row(cx, title, &doc_id, serde_json::Map::new()).await?;
+            let row = add_linked_row(cx, title, &doc_id, draft_cells()).await?;
             Ok((row, CreateOutcome::Recovered))
         }
         ExistingBody::None => {
@@ -739,9 +758,10 @@ pub async fn create_task(
                 )
                 .await;
 
-            // 3. строка в Todo, слинкованная с телом
-            let row = add_linked_row(cx, title, &body_doc, serde_json::Map::new()).await?;
-            // пустой статус = черновик юзера; Design = спавн агента
+            // 3. строка Draft, слинкованная с телом
+            let row = add_linked_row(cx, title, &body_doc, draft_cells()).await?;
+            // Draft = черновик на валидации: триаж переводит в Todo /
+            // мержит и удаляет; Todo → Design — владелец (спавн фабрики)
             Ok((row, CreateOutcome::Created))
         }
     }
@@ -1003,6 +1023,27 @@ pub async fn rm_cron_orphan(
     }
 }
 
+/// Guard rm: удалять можно только Draft-черновики (их чистит триаж после
+/// мержа в мастер-задачу); живые задачи инструментом не сносятся. Сироты
+/// без строки — отдельный путь rm_task, без guard'а. Статус берётся из
+/// того же read_rows, что и резолв (резолв → guard → delete без пауз).
+fn ensure_removable_draft(row: &TaskRow) -> Result<()> {
+    if row.status == TASK_DRAFT_STATUS {
+        return Ok(());
+    }
+    let shown = if row.status.is_empty() {
+        "(пустой — легаси)"
+    } else {
+        &row.status
+    };
+    anyhow::bail!(
+        "«{}» в статусе {} — rm только для Draft-черновиков (перевод: task edit {} --status Draft)",
+        row.title,
+        shown,
+        row.row_id
+    )
+}
+
 /// Удалить задачу: строка вниз + тело в трэш. Путь сироты (тело без строки —
 /// мусор от упавшего create): единственный префикс-матч среди детей доски.
 pub async fn rm_task(cx: &mut TaskCx<'_>, id: &str) -> Result<RmReport> {
@@ -1021,6 +1062,7 @@ pub async fn rm_task(cx: &mut TaskCx<'_>, id: &str) -> Result<RmReport> {
                     row.title
                 );
             }
+            ensure_removable_draft(row)?;
             let resp = cx
                 .client
                 .call_tool(
@@ -1308,6 +1350,27 @@ mod tests {
     fn resolve_ambiguous() {
         let rows = vec![row("ab1", "", ""), row("ab2", "", "")];
         assert!(resolve_row(&rows, "ab").is_err());
+    }
+
+    #[test]
+    fn rm_guard_passes_draft_and_refuses_others() {
+        let draft = row("r1", "doc-1", "Черновик");
+        assert!(ensure_removable_draft(&TaskRow {
+            status: TASK_DRAFT_STATUS.into(),
+            ..draft
+        })
+        .is_ok());
+        let design = row("r2", "doc-2", "Живая");
+        let err = ensure_removable_draft(&TaskRow {
+            status: "Design".into(),
+            ..design
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("только для Draft"), "got: {err}");
+        let legacy = row("r3", "doc-3", "Легаси");
+        let err = ensure_removable_draft(&legacy).unwrap_err().to_string();
+        assert!(err.contains("легаси"), "got: {err}");
     }
 }
 
