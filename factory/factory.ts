@@ -1,7 +1,8 @@
 // uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью на AFFiNE.
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
-//   1. Design на доске (пустой статус = черновик юзера, не трогаем) →
+//   1. Design на доске (Draft = черновик на валидации триажа, пустой =
+//      легаси-черновик юзера — оба не трогаем) →
 //      сессия девелопера в чекауте репо + короткий spawn-промпт (ворктри/ветку
 //      создаёт сам агент)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
@@ -678,7 +679,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const rows = await readTasks(board)
 
   // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
-  //    (пустой статус = черновик юзера, не трогаем)
+  //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
   const started = new Set<string>()
   const spawnable = rows.filter((r) => r.status === "Design" || reviewKindOf(r.status) !== null)
   for (const task of untrackedTasks(spawnable, state)) {
