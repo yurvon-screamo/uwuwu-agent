@@ -60,6 +60,12 @@ pub(crate) enum TaskSub {
     Comment {
         #[arg(help = "row-id / doc-id / префикс")]
         id: String,
+        #[arg(
+            long,
+            value_name = "THREAD_ID",
+            help = "Ответить в тред: префикс id верхнеуровневого коммента (id — в task thread)"
+        )]
+        reply: Option<String>,
         #[arg(long, help = "Текст из stdin")]
         stdin: bool,
         #[arg(trailing_var_arg = true, help = "Текст коммента")]

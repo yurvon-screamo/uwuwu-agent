@@ -1,7 +1,9 @@
 pub mod affine_blob;
 pub mod affine_client;
 pub mod affine_collect;
+pub mod affine_comments;
 pub mod affine_docs;
+pub mod affine_gql;
 pub mod affine_queries;
 pub mod affine_search_server;
 pub mod affine_sse;
@@ -19,6 +21,8 @@ pub mod wiki;
 // и 23 теста молча не бегали (llvm-cov: 0% при живых файлах).
 #[cfg(test)]
 mod affine_collect_tests;
+#[cfg(test)]
+mod affine_comments_tests;
 #[cfg(test)]
 mod affine_sse_tests;
 #[cfg(test)]
