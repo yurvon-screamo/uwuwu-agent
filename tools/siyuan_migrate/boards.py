@@ -397,7 +397,7 @@ def main() -> int:
     report = []
     for b in boards:
         rows = [parse_row(r, doc_titles) for r in read_board_rows(sid, b["doc_id"])]
-        stats = migrate_board(sy_mcp, b, rows, nb_id, sy_http)
+        stats = migrate_board(sy_mcp, b, rows, a.nb, sy_http)
         if a.comments:
             moved = 0
             for r in rows:
