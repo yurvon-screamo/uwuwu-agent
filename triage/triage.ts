@@ -711,13 +711,20 @@ async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{
     rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
   }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
-  return (r.rows ?? [])
-    .filter((row) => typeof row.rowBlockId === "string" && row.cells?.Status?.value === "Draft")
-    .map((row) => ({
-      rowId: row.rowBlockId as string,
-      docId: typeof row.linkedDocId === "string" ? row.linkedDocId : "",
-      title: (row.title ?? "").trim(),
-    }))
+  const out: DraftRow[] = []
+  for (const row of r.rows ?? []) {
+    if (typeof row.rowBlockId !== "string" || row.cells?.Status?.value !== "Draft") continue
+    const docId = typeof row.linkedDocId === "string" ? row.linkedDocId : ""
+    let title = (row.title ?? "").trim()
+    // заголовок линкованной строки живёт в доке-теле (read_database_cells
+    // отдаёт пустоту) — доставали для промпта/skip-уведомления
+    if (title === "" && docId !== "") {
+      const d = await mcpTool<{ title?: string }>("get_doc", { docId }).catch(() => null)
+      title = typeof d?.title === "string" ? d.title.trim() : ""
+    }
+    out.push({ rowId: row.rowBlockId, docId, title })
+  }
+  return out
 }
 
 /** ms последнего обновления тела черновика (буфер тишины); null — не достали. */
