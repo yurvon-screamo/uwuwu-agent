@@ -15,6 +15,16 @@ from pathlib import Path
 from .siyuan_client import SiYuan
 
 
+def ensure_path(sy: SiYuan, nb: str, parts: tuple[str, ...]) -> None:
+    """createDocWithMd не создаёт промежуточные папки — строим по сегментам."""
+    for i in range(1, len(parts) + 1):
+        hpath = "/" + "/".join(parts[:i])
+        if not sy.doc_exists(nb, hpath):
+            if i < len(parts):
+                sy.create_doc_with_md(nb, hpath, f"# {parts[i-1]}\n")
+            # лист создаст вызывающий со своим контентом
+
+
 def import_tree(src: Path, sy: SiYuan, dry_run: bool = False, limit: int = 0) -> dict:
     stats = {"docs": 0, "skipped": 0, "failed": 0, "notebooks": {}}
     tops = sorted(p for p in src.iterdir() if p.is_dir())
@@ -36,6 +46,7 @@ def import_tree(src: Path, sy: SiYuan, dry_run: bool = False, limit: int = 0) ->
                 continue
             md = f.read_text(encoding="utf-8")
             try:
+                ensure_path(sy, nb, tuple(rel.parts))
                 sy.create_doc_with_md(nb, hpath, md)
                 stats["docs"] += 1
             except Exception as e:  # noqa: BLE001

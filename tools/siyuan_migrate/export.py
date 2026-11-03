@@ -40,10 +40,11 @@ def build_tree(nodes: list[dict]) -> dict:
 
 def walk(children: dict, parent: str | None, path: list[str], out: list[dict]):
     for n in children.get(parent, []):
-        title = sanitize(str(n.get("data") or n["id"]))
-        p = path + [title]
+        data = str(n.get("data") or "")
+        p = path + [sanitize(data if n["type"] == "folder" else data)]
         if n["type"] == "doc":
-            out.append({"id": n["id"], "path": p})
+            # для doc-нод: id = id строки дерева, data = НАСТОЯЩИЙ docId
+            out.append({"id": n["id"], "doc_id": data, "path": p})
         walk(children, n["id"], p, out)
 
 
@@ -112,7 +113,7 @@ def main() -> int:
         if args.limit and done >= args.limit:
             break
         try:
-            title, md = export_doc(sid, d["id"])
+            title, md = export_doc(sid, d["doc_id"])
             # последний сегмент пути = заголовок дока (tree даёт id, title — из экспорта)
             d["path"][-1] = sanitize(title)
             base = "/".join(d["path"])

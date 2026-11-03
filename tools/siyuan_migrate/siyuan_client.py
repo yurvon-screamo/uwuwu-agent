@@ -22,7 +22,7 @@ class SiYuan:
         return cls(base_url, conf["api"]["token"])
 
     def _post(self, path: str, payload: dict | list, raw: bytes | None = None,
-              content_type: str = "application/json", attempts: int = 4) -> dict:
+              content_type: str = "application/json", attempts: int = 6) -> dict:
         if raw is not None:
             body = raw
         else:
@@ -38,6 +38,9 @@ class SiYuan:
                 if data.get("code") == 0:
                     return data.get("data", {})
                 last = f"code={data.get('code')} msg={data.get('msg')}"
+                if "metadata is not ready" in str(data.get("msg")):
+                    time.sleep(2.0 + i)  # ядро индексирует свежий ноутбук — дать время
+                    continue
             except Exception as e:  # noqa: BLE001
                 last = str(e)
             time.sleep(1.5 * (i + 1))
