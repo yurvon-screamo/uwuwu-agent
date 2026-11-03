@@ -9,9 +9,10 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import wiki_ops
+import affine_source as wiki_ops
 from siyuan_migrate.boards import (build_node_to_doc, comment_md,
                                    parse_row, read_board_rows, threads_for)
 from siyuan_migrate.siyuan_client import SiYuan

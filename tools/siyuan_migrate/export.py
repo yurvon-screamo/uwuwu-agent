@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 socket.setdefaulttimeout(90)  # зависший MCP-вызов не должен stall'ить экспорт
 
-import wiki_ops  # noqa: E402
+import affine_source as wiki_ops
 
 WS = "81475705-028a-4153-a8f5-f06e402ee31e"
 BLOB_RE = re.compile(r"affine://blob/([A-Za-z0-9_.\-]+)")

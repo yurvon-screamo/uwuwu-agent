@@ -204,11 +204,13 @@ pub async fn create(
     if rows.iter().any(|r| r.title == title) {
         bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
     }
-    let item = sy.db_item_add(&board.av_id, title).await?;
-    let sk = status_key(sy, &board.av_id).await?;
-    sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
+    // тело сначала, затем СТРОКА ПРИВЯЗАНАЯ к нему (blockID): клик по карточке
+    // открывает документ; detached-строки не создаём
     let body_path = format!("{}/{}", board.hpath, title);
     let body = sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx)).await?;
+    let item = sy.db_item_add_bound(&board.av_id, &body).await?;
+    let sk = status_key(sy, &board.av_id).await?;
+    sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
     // тип — тег в теле
     if !ty.is_empty() {
         let _ = sy.append_block_md(&body, &format!("\n#{ty}\n")).await;

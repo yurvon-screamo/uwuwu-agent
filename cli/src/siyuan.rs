@@ -340,6 +340,21 @@ impl SiYuan {
             .to_string())
     }
 
+    /// Строка, привязанная к блоку-доку (blockID): клик по карточке открывает документ.
+    pub async fn db_item_add_bound(&self, av_id: &str, block_id: &str) -> Result<String> {
+        let v = self
+            .mcp_tool(
+                "database",
+                json!({ "action": "item_add", "id": av_id, "blockID": block_id }),
+            )
+            .await?;
+        Ok(v
+            .pointer("/data/itemID")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
     pub async fn db_item_set_status(&self, av_id: &str, key_id: &str, item_id: &str, status: &str) -> Result<()> {
         self.mcp_tool(
             "database",

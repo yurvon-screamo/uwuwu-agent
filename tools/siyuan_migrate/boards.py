@@ -16,8 +16,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import wiki_ops  # noqa: E402
+import affine_source as wiki_ops
 
 WS = "81475705-028a-4153-a8f5-f06e402ee31e"
 
@@ -195,8 +196,7 @@ def find_boards(manifest: dict, node_to_doc: dict | None = None) -> list[dict]:
 
 def build_node_to_doc() -> dict:
     """id строки дерева → настоящий docId (для доков data=docId)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    import wiki_ops
+    import affine_source as wiki_ops
     sid = wiki_ops.session("siyuan-migrate-boards")
     r = wiki_ops.call(sid, "list_organize_nodes", {"workspaceId": WS})
     nodes = r.get("structuredContent", r).get("nodes", [])

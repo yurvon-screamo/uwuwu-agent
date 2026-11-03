@@ -10,14 +10,19 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import wiki_ops
+import affine_source as wiki_ops
 from siyuan_migrate.boards import (WS, SiYuanMcp, build_node_to_doc, comment_md,
                                    parse_row, read_board_rows, threads_for)
 from siyuan_migrate.siyuan_client import SiYuan
 
 WS_ID = WS
+
+
+def path_safe(t: str) -> str:
+    return t.replace("/", "∕")
 
 
 def export_body(sid, doc_id, attempts=3):
@@ -150,7 +155,7 @@ def main():
                         pass
                     time.sleep(0.2)
             # тело (создание терпеливо: холодный индекс после рестарта контейнера)
-            body_h = f"{board_h}/{title}"
+            body_h = f"{board_h}/{path_safe(title)}"
             if not sy.get_doc_id_by_path(nb, body_h):
                 if md is None and body_doc:
                     _, md = export_body(sid, body_doc)
