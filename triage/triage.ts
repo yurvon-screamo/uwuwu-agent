@@ -493,7 +493,8 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   if (readyAt === null) return "idle"
   const items = takeBatch(state.queue, readyAt)
   if (items.length === 0) return "idle"
-  const req = joinBatch(capDraftBatch(items, DRAFT_BATCH_MAX))
+  const batch = capDraftBatch(items, DRAFT_BATCH_MAX)
+  const req = joinBatch(batch)
   // маркер полёта СИНХРОННО, до любых await: edit-ветка видит «уже пошло»
   // (состав батча в очереди не трогаем — он страховка от потери)
   state.firing = { at: Date.now(), msgIDs: req.msgIDs ?? [req.msgID] }
@@ -540,7 +541,7 @@ const startRun = async (): Promise<"idle" | "started" | "later"> => {
   state.queue = dropBatch(state.queue, req)
   state.firing = undefined
   const waited = Math.round((Date.now() - req.receivedAt) / 1000)
-  log(`ход ${sessionID} (${items.length} сообщ.): ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
+  log(`ход ${sessionID} (${batch.length} сообщ.): ${req.text.slice(0, 60)}${waited > 5 ? ` (ждало в очереди ${waited}с)` : ""}`)
   save()
   return "started"
 }
