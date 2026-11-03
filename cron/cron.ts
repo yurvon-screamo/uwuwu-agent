@@ -9,7 +9,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import * as mcp from "../factory/mcp"
+import * as mcp from "../lib/affine-mcp"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
   due, isOneShot, isValidTracked, parseSchedule, firePrompt,
@@ -296,6 +296,12 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
 }
 
 async function main(): Promise<void> {
+  // env шлюза обязателен на старте (раньше это делал process.exit на импорте
+  // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
+  if (!mcp.mcpConfigured()) {
+    console.error("mcp: нужны UWUWU_AFFINE_TOKEN и UWUWU_AFFINE_WORKSPACE_ID")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-cron держит lock — выходим")
     process.exit(1)

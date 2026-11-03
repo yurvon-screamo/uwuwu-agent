@@ -1,7 +1,7 @@
 // Живой тест: протухшая сессия восстанавливается одним ретраем.
 // Требует UWUWU_AFFINE_* env; помечен skipIf при их отсутствии.
 import { describe, expect, test } from "bun:test"
-import * as mcp from "./mcp"
+import * as mcp from "../lib/affine-mcp"
 
 const hasEnv = (process.env.UWUWU_AFFINE_TOKEN ?? "") !== ""
 

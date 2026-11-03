@@ -26,12 +26,18 @@ fn rows_json(rows: Vec<String>) -> String {
 }
 
 fn row_json(row_id: &str, title: &str, linked: &str) -> String {
+    row_json_status(row_id, title, linked, "Draft")
+}
+
+fn row_json_status(row_id: &str, title: &str, linked: &str, status: &str) -> String {
     let linked_field = if linked.is_empty() {
         String::new()
     } else {
         format!(r#","linkedDocId":"{linked}""#)
     };
-    format!(r#"{{"rowBlockId":"{row_id}","title":"{title}"{linked_field}}}"#)
+    format!(
+        r#"{{"rowBlockId":"{row_id}","title":"{title}"{linked_field},"cells":{{"Status":{{"value":"{status}"}}}}}}"#
+    )
 }
 
 fn children_json(children: Vec<String>) -> String {
@@ -277,6 +283,16 @@ fn fresh_create_regression() {
             .unwrap();
         assert_eq!(outcome, CreateOutcome::Created);
         assert_eq!(row.body_doc, "doc-new");
+        assert_eq!(row.status, "Draft");
+        let add_row = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("add_database_row"))
+            .unwrap();
+        assert!(
+            add_row.contains(r#""Status":"Draft""#),
+            "row request: {add_row}"
+        );
         assert_eq!(
             mock.requests()
                 .iter()
@@ -579,6 +595,55 @@ fn rm_ambiguous_row_prefix_is_error_no_trash() {
             .to_string();
         assert!(err.contains("неоднозначно"), "got: {err}");
         assert!(!mock.called("trash_doc"));
+        assert!(!mock.called("delete_database_row"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn rm_refuses_non_draft_row_without_deleting() {
+    // guard разрушительной операции: rm только для Draft-черновиков —
+    // живая задача (Todo/Design/…) инструментом не сносится
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json_status(
+            "r1",
+            "Живая",
+            "doc-1",
+            "Design",
+        )])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt.block_on(rm_task(&mut cx, "r1")).unwrap_err().to_string();
+        assert!(err.contains("только для Draft"), "got: {err}");
+        assert!(err.contains("Design"), "got: {err}");
+        assert!(!mock.called("delete_database_row"));
+        assert!(!mock.called("trash_doc"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn rm_refuses_legacy_empty_status_row() {
+    // пустой статус — легаси-черновик юзера: тоже под guard'ом
+    with_temp_home(|| {
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![row_json_status(
+            "r1",
+            "Легаси",
+            "doc-1",
+            "",
+        )])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt.block_on(rm_task(&mut cx, "r1")).unwrap_err().to_string();
+        assert!(err.contains("только для Draft"), "got: {err}");
         assert!(!mock.called("delete_database_row"));
     });
 }
