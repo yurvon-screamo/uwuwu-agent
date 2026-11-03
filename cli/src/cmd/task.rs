@@ -287,16 +287,21 @@ async fn thread(
     id: String,
 ) -> anyhow::Result<()> {
     let (_board, row) = resolve_row_any_board(client, cfg, root, project, &id).await?;
-    let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
-        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
+    let bot = bot_user_id();
     let threads = affine_tasks::thread_comments(client, cfg, &row).await?;
     if threads.is_empty() {
         println!("комментов нет");
         return Ok(());
     }
-    print!("{}", render_threads(&threads, &bot_user_id));
+    print!("{}", render_threads(&threads, &bot));
     println!("тем: {}", threads.len());
     Ok(())
+}
+
+/// Бот-аккаунт воркспейса (env), fallback — текущий канонический бот.
+fn bot_user_id() -> String {
+    std::env::var("UWUWU_BOT_USER_ID")
+        .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into())
 }
 
 /// Автор лейблом: юзер или агент (бот-аккаунт или агентский маркер в тексте).
@@ -306,14 +311,19 @@ fn is_bot_author(user_id: &str, text: &str, bot_user_id: &str) -> bool {
         || text.trim_start().starts_with("[factory]")
 }
 
+/// Лейбл автора: АГЕНТ/ЮЗЕР (для replies — в нижнем регистре).
+fn author_label(user_id: &str, text: &str, bot_user_id: &str) -> &'static str {
+    if is_bot_author(user_id, text, bot_user_id) {
+        "АГЕНТ"
+    } else {
+        "ЮЗЕР"
+    }
+}
+
 fn render_threads(threads: &[affine_comments::CommentThread], bot_user_id: &str) -> String {
     let mut out = String::new();
     for thread in threads {
-        let who = if is_bot_author(&thread.user_id, &thread.text, bot_user_id) {
-            "АГЕНТ"
-        } else {
-            "ЮЗЕР"
-        };
+        let who = author_label(&thread.user_id, &thread.text, bot_user_id);
         let mark = if thread.resolved { " [✓]" } else { "" };
         out.push_str(&format!(
             "\n── #{} · {} · {who}{mark}:\n",
@@ -322,11 +332,7 @@ fn render_threads(threads: &[affine_comments::CommentThread], bot_user_id: &str)
         ));
         push_indented(&mut out, &thread.text, "  ");
         for reply in &thread.replies {
-            let who = if is_bot_author(&reply.user_id, &reply.text, bot_user_id) {
-                "агент"
-            } else {
-                "юзер"
-            };
+            let who = author_label(&reply.user_id, &reply.text, bot_user_id).to_lowercase();
             out.push_str(&format!(
                 "     ↳ {} {who}:\n",
                 chrono_like_hhmm(reply.created)
@@ -485,10 +491,8 @@ async fn print_body_and_comments(
     }
     let threads = affine_tasks::recent_comments(client, cfg, row, 5).await?;
     if !threads.is_empty() {
-        let bot_user_id = std::env::var("UWUWU_BOT_USER_ID")
-            .unwrap_or_else(|_| "df415887-98cc-4147-b5df-b6c71d8afeae".into());
         println!("Комменты:");
-        print!("{}", render_threads_brief(&threads, &bot_user_id));
+        print!("{}", render_threads_brief(&threads, &bot_user_id()));
     }
     Ok(())
 }
@@ -497,11 +501,7 @@ async fn print_body_and_comments(
 fn render_threads_brief(threads: &[affine_comments::CommentThread], bot_user_id: &str) -> String {
     let mut out = String::new();
     for thread in threads {
-        let who = if is_bot_author(&thread.user_id, &thread.text, bot_user_id) {
-            "АГЕНТ"
-        } else {
-            "ЮЗЕР"
-        };
+        let who = author_label(&thread.user_id, &thread.text, bot_user_id);
         let mark = if thread.resolved { " [✓]" } else { "" };
         out.push_str(&format!(
             "  • #{} {who}{mark}: {}\n",
@@ -509,11 +509,7 @@ fn render_threads_brief(threads: &[affine_comments::CommentThread], bot_user_id:
             truncate(first_line(&thread.text), 90),
         ));
         for reply in &thread.replies {
-            let who = if is_bot_author(&reply.user_id, &reply.text, bot_user_id) {
-                "агент"
-            } else {
-                "юзер"
-            };
+            let who = author_label(&reply.user_id, &reply.text, bot_user_id).to_lowercase();
             out.push_str(&format!(
                 "      ↳ {who}: {}\n",
                 truncate(first_line(&reply.text), 90),

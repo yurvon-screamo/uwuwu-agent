@@ -1,7 +1,7 @@
-//! Tests for affine_comments: nested thread parsing, snapshot building,
-//! thread-id prefix resolution.
+//! Tests for affine_comments: nested thread parsing, thread-id prefix
+//! resolution. Snapshot building is covered in affine_gql tests.
 
-use crate::affine_comments::{parse_comment_connection, resolve_thread_prefix, text_to_snapshot};
+use crate::affine_comments::{parse_comment_connection, resolve_thread_prefix};
 use serde_json::{json, Value};
 
 fn comment_node(id: &str, user_id: &str, text: &str, replies: Value) -> Value {
@@ -94,31 +94,26 @@ fn empty_connection_yields_no_threads() {
 }
 
 #[test]
-fn plain_text_becomes_blocksuite_page_snapshot() {
-    let snapshot = text_to_snapshot("ответ агента", "abc123xyz0", 1793000000000i64);
+fn reply_created_falls_back_to_created_at_scalar() {
+    let mut rep = reply_node("r-1", "bot", "ответ");
+    rep["content"]["snapshot"] = json!({"meta": {}});
+    rep["createdAt"] = json!("2026-11-02T11:31:45.080+00:00");
+    let resp = json!({"edges": [comment_node("c-1", "user-a", "тема", json!([rep]))]});
 
-    let s = &snapshot["snapshot"];
-    assert_eq!(s["type"], "page");
-    assert_eq!(s["meta"]["id"], "abc123xyz0");
-    assert_eq!(s["meta"]["createDate"], 1793000000000i64);
-    assert_eq!(s["blocks"]["flavour"], "affine:page");
-    let note = &s["blocks"]["children"][0];
-    assert_eq!(note["flavour"], "affine:note");
-    let paragraph = &note["children"][0];
-    assert_eq!(paragraph["flavour"], "affine:paragraph");
-    assert_eq!(
-        paragraph["props"]["text"]["delta"][0]["insert"],
-        "ответ агента"
-    );
+    let threads = parse_comment_connection(&resp);
+
+    assert_eq!(threads[0].replies[0].created, 1_793_619_105_080);
 }
 
 #[test]
-fn empty_text_snapshot_has_empty_delta() {
-    let snapshot = text_to_snapshot("", "abc123xyz0", 1793000000000i64);
+fn reply_created_falls_back_to_parent_time() {
+    let mut rep = reply_node("r-1", "bot", "ответ");
+    rep["content"]["snapshot"] = json!({"meta": {}});
+    let resp = json!({"edges": [comment_node("c-1", "user-a", "тема", json!([rep]))]});
 
-    let delta =
-        &snapshot["snapshot"]["blocks"]["children"][0]["children"][0]["props"]["text"]["delta"];
-    assert_eq!(delta.as_array().map(Vec::len), Some(0));
+    let threads = parse_comment_connection(&resp);
+
+    assert_eq!(threads[0].replies[0].created, threads[0].created);
 }
 
 fn sample_threads() -> Vec<crate::affine_comments::CommentThread> {

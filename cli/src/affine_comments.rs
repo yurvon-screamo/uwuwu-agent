@@ -1,11 +1,10 @@
 //! Comment threads: AFFiNE stores top-level comments with nested replies
 //! (postgres `replies`, GraphQL `createReply`). The gateway's list_comments
 //! returns replies nested in each comment node; this module parses that
-//! shape into threads, builds BlockSuite snapshots for new content, and
-//! resolves thread-id prefixes.
+//! shape into threads and resolves thread-id prefixes.
 
 use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// A reply nested in a comment thread.
 #[derive(Debug)]
@@ -42,23 +41,17 @@ pub fn parse_comment_connection(resp: &Value) -> Vec<CommentThread> {
 
 fn parse_thread(node: &Value) -> CommentThread {
     let content = node.get("content").cloned().unwrap_or(Value::Null);
+    let created = comment_created(node, &content, 0);
     let replies = node
         .get("replies")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().map(parse_reply).collect())
+        .map(|arr| arr.iter().map(|n| parse_reply(n, created)).collect())
         .unwrap_or_default();
     CommentThread {
-        id: first_str(node, &["id"]),
+        id: str_field(node, &["id"]),
         text: comment_text(&content),
-        user_id: node
-            .pointer("/user/id")
-            .and_then(|u| u.as_str())
-            .unwrap_or_default()
-            .into(),
-        created: content
-            .pointer("/snapshot/meta/createDate")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0),
+        user_id: str_field(node.pointer("/user").unwrap_or(&Value::Null), &["id"]),
+        created,
         resolved: node
             .get("resolved")
             .and_then(|r| r.as_bool())
@@ -67,20 +60,31 @@ fn parse_thread(node: &Value) -> CommentThread {
     }
 }
 
-fn parse_reply(node: &Value) -> CommentReply {
+fn parse_reply(node: &Value, parent_created: i64) -> CommentReply {
+    let content = node.get("content").cloned().unwrap_or(Value::Null);
     CommentReply {
-        id: first_str(node, &["id"]),
-        text: comment_text(&node.get("content").cloned().unwrap_or(Value::Null)),
-        user_id: node
-            .pointer("/user/id")
-            .and_then(|u| u.as_str())
-            .unwrap_or_default()
-            .into(),
-        created: node
-            .pointer("/content/snapshot/meta/createDate")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0),
+        id: str_field(node, &["id"]),
+        text: comment_text(&content),
+        user_id: str_field(node.pointer("/user").unwrap_or(&Value::Null), &["id"]),
+        created: comment_created(node, &content, parent_created),
     }
+}
+
+/// Reply/comment creation time, ms: snapshot createDate, else the GraphQL
+/// `createdAt` scalar (RFC3339), else the parent's time (ordering hint).
+fn comment_created(node: &Value, content: &Value, fallback: i64) -> i64 {
+    if let Some(ms) = content
+        .pointer("/snapshot/meta/createDate")
+        .and_then(|c| c.as_i64())
+    {
+        return ms;
+    }
+    if let Some(iso) = node.get("createdAt").and_then(|c| c.as_str()) {
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(iso) {
+            return ts.timestamp_millis();
+        }
+    }
+    fallback
 }
 
 /// Comment text: non-empty preview wins, otherwise walk the snapshot deltas.
@@ -116,40 +120,6 @@ fn snapshot_text(content: &Value) -> String {
         walk(blocks, &mut out);
     }
     out.trim().to_string()
-}
-
-/// Plain text → BlockSuite snapshot (page → note → paragraph), the shape the
-/// gateway's normalizeCommentContent produces and the AFFiNE comment editor
-/// renders. Newlines stay inside a single delta insert, like the gateway.
-pub fn text_to_snapshot(text: &str, meta_id: &str, create_date_ms: i64) -> Value {
-    let delta = if text.is_empty() {
-        vec![]
-    } else {
-        vec![json!({"insert": text})]
-    };
-    json!({
-        "snapshot": {
-            "type": "page",
-            "meta": {"id": meta_id, "title": "", "createDate": create_date_ms, "tags": []},
-            "blocks": {
-                "type": "block", "id": "page", "flavour": "affine:page", "version": 2,
-                "props": {"title": {"$blocksuite:internal:text$": true, "delta": []}},
-                "children": [{
-                    "type": "block", "id": "note", "flavour": "affine:note", "version": 1,
-                    "props": {"displayMode": "both"},
-                    "children": [{
-                        "type": "block", "id": "paragraph", "flavour": "affine:paragraph",
-                        "version": 1,
-                        "props": {
-                            "type": "text", "collapsed": false,
-                            "text": {"$blocksuite:internal:text$": true, "delta": delta},
-                        },
-                        "children": [],
-                    }],
-                }],
-            },
-        }
-    })
 }
 
 /// Resolve a thread by id prefix; dashes are ignored (same convention as
@@ -201,7 +171,7 @@ pub(crate) fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default()
 }
 
-fn first_str(v: &Value, keys: &[&str]) -> String {
+fn str_field(v: &Value, keys: &[&str]) -> String {
     keys.iter()
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
         .unwrap_or_default()

@@ -228,8 +228,10 @@ async function commentPage(bodyDoc: string, after: string): Promise<{
 
 /** ВСЕ комменты тела с relay-пагинацией (без досылки мост слепнет на
  *  задачах с длинной историей: 50-окно роняет свежие комменты).
- *  Разворачивает и треды (replies ноды) — ответ юзера тредом виден
- *  с якорем «тред-ответ на …». */
+ *  Разворачивает нативные треды афины (replies ноды) в плоский список —
+ *  reply юзера помечается префиксом «(тред-ответ на «…»)», чтобы агент
+ *  видел контекст в ленте; сам ответ агента в тред идёт через
+ *  `task comment --reply` (uwuwu-cli). */
 async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
   if (bodyDoc === "") return []
   const out: TaskComment[] = []
@@ -249,7 +251,7 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
         createdAt: created,
         ...(typeof userId === "string" ? { userId } : {}),
       })
-      // тред-ответы: отдельные комменты с якорем родителя
+      // тред-ответы (нативные replies афины): префикс-якорь родителя для контекста
       const replies = (n as { replies?: unknown }).replies
       if (Array.isArray(replies)) {
         const parentHead = text.replace(/^\(в ответ на: [^)]*\)\s*/, "").slice(0, 60)
@@ -258,10 +260,13 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
           if (typeof r.id !== "string") continue
           const repText = commentText(r.content)
           const repUser = r.user?.id
+          // GraphQL отдаёт createdAt ISO-строкой; число — только в snapshot
+          const repCreated =
+            typeof r.createdAt === "string" ? Date.parse(r.createdAt) : created + 1
           out.push({
             id: r.id,
             text: `(тред-ответ на «${parentHead}…») ${repText}`,
-            createdAt: typeof r.createdAt === "number" ? r.createdAt : created + 1,
+            createdAt: Number.isNaN(repCreated) ? created + 1 : repCreated,
             ...(typeof repUser === "string" ? { userId: repUser } : {}),
           })
         }
