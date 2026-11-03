@@ -490,7 +490,20 @@ pub async fn read_rows(
 
 /// Найти строку по id (row id или doc-тела) или уникальному префиксу.
 /// Ведущие дефисы row-id игнорируются с обеих сторон (кли-аргументы).
-pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
+/// Классификация резолва строки: важна для разрушительных операций —
+/// «неоднозначно» и «не найдено» ведут к разным веткам (сирота-путь
+/// допустим только после однозначного «не найдено»).
+pub(crate) enum RowMatch<'a> {
+    One(&'a TaskRow),
+    /// строка не найдена ни по id, ни по тайтлу
+    NotFound,
+    /// несколько строк под один префикс/тайтл
+    Ambiguous {
+        by_id: bool,
+    },
+}
+
+pub(crate) fn classify_row<'a>(rows: &'a [TaskRow], id: &str) -> RowMatch<'a> {
     let needle = id.trim_start_matches('-');
     let by_id: Vec<&TaskRow> = rows
         .iter()
@@ -499,24 +512,32 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
         })
         .collect();
     if by_id.len() == 1 {
-        return Ok(by_id[0]);
+        return RowMatch::One(by_id[0]);
     }
-    if by_id.is_empty() {
-        let lower = needle.to_lowercase();
-        let by_title: Vec<&TaskRow> = rows
-            .iter()
-            .filter(|r| r.title.to_lowercase().contains(&lower))
-            .collect();
-        return match by_title.len() {
-            1 => Ok(by_title[0]),
-            0 => bail!("задача '{id}' не найдена"),
-            n => bail!("'{id}' неоднозначно ({n} по заголовку) — уточни или используй id"),
-        };
+    if !by_id.is_empty() {
+        return RowMatch::Ambiguous { by_id: true };
     }
-    bail!(
-        "'{id}' неоднозначно ({} по id) — уточни префикс",
-        by_id.len()
-    )
+    let lower = needle.to_lowercase();
+    let by_title: Vec<&TaskRow> = rows
+        .iter()
+        .filter(|r| r.title.to_lowercase().contains(&lower))
+        .collect();
+    match by_title.len() {
+        1 => RowMatch::One(by_title[0]),
+        0 => RowMatch::NotFound,
+        _ => RowMatch::Ambiguous { by_id: false },
+    }
+}
+
+pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
+    match classify_row(rows, id) {
+        RowMatch::One(row) => Ok(row),
+        RowMatch::NotFound => bail!("задача '{id}' не найдена"),
+        RowMatch::Ambiguous { by_id: true } => bail!("'{id}' неоднозначно по id — уточни префикс"),
+        RowMatch::Ambiguous { by_id: false } => {
+            bail!("'{id}' неоднозначно по заголовку — уточни или используй id")
+        }
+    }
 }
 
 /// Исход создания задачи/крона: свежий или достройка прерванного.
@@ -539,9 +560,10 @@ pub struct TaskCx<'a> {
     pub root: &'a std::path::Path,
 }
 
-/// ok:false внутри structuredContent шлюз пропускает как данные (конвенция
-/// разобрана только на wrapper-уровне и в text-пейлоадах) — write-RPC обязан
-/// всплывать логический провал с кодом, иначе отчёты врут об успехе.
+/// Defense-in-depth: ok:false обычно перехватывается транспортом
+/// (affine_client::tool_failure — retryable → ретраи, иначе Err) и до
+/// вызывающего не доходит; барьер страхует от дрейфа конвенции. Не копируй
+/// вслепую в каждый вызов — транспорт уже владеет этим контрактом.
 fn require_ok(tool: &str, resp: &Value) -> Result<()> {
     if resp.get("ok").and_then(|o| o.as_bool()) == Some(false) {
         bail!(
@@ -610,6 +632,10 @@ async fn add_linked_row(
         .context("add_database_row")?;
     require_ok("add_database_row", &resp)?;
     let row_id = first_str(&resp, &["rowBlockId", "rowId", "id"]).unwrap_or_default();
+    if row_id.is_empty() {
+        // симметрично rm_task: пустой идентификатор = ложный успех
+        anyhow::bail!("add_database_row: строка создана, но rowId не возвращён");
+    }
     Ok(TaskRow {
         row_id,
         title: title.to_string(),
@@ -842,7 +868,7 @@ pub struct RmReport {
     pub was_in_trash: bool,
 }
 
-async fn trash_body(cx: &mut TaskCx<'_>, body_doc: &str) -> Result<(bool, bool)> {
+pub(crate) async fn trash_body(cx: &mut TaskCx<'_>, body_doc: &str) -> Result<(bool, bool)> {
     if body_doc.is_empty() {
         return Ok((false, false));
     }
@@ -864,48 +890,124 @@ async fn trash_body(cx: &mut TaskCx<'_>, body_doc: &str) -> Result<(bool, bool)>
     Ok((true, was))
 }
 
+/// Трэш крон-сироты (тело без строки) по крон-доскам. Матч должен быть
+/// уникален ПО ВСЕМ доскам: первый попавшийся префикс молча трэшил бы тело
+/// чужого крона. Read-сбои досок не дают вердикта «не найдено».
+pub async fn rm_cron_orphan(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    cron_boards: &[String],
+    id: &str,
+) -> Result<String> {
+    let mut hits: Vec<(String, String, String)> = Vec::new(); // (board, doc_id, title)
+    let mut misses: Vec<String> = Vec::new();
+    for board_title in cron_boards {
+        let board = match find_board_by_title(client, cfg, board_title).await {
+            Ok(b) => b,
+            Err(e) => {
+                misses.push(format!("{board_title}: доска не читается ({e})"));
+                continue;
+            }
+        };
+        let children = match crate::affine_children::board_children(client, cfg, &board).await {
+            Ok(c) => c,
+            Err(e) => {
+                misses.push(format!("{board_title}: дети не читаются ({e})"));
+                continue;
+            }
+        };
+        match crate::affine_children::child_by_prefix(&children, id) {
+            Ok(child) => hits.push((
+                board_title.clone(),
+                child.doc_id.clone(),
+                child.title.clone(),
+            )),
+            Err(e) => misses.push(format!("{board_title}: {e}")),
+        }
+    }
+    if hits.len() > 1 {
+        anyhow::bail!(
+            "«{id}» неоднозначно ({} досок): {} — уточни id",
+            hits.len(),
+            hits.iter()
+                .map(|(b, d, t)| format!("{b}:{d} «{t}»"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    match hits.pop() {
+        Some((_, doc_id, title)) => {
+            let resp = client
+                .call_tool(
+                    "trash_doc",
+                    json!({"workspaceId": cfg.workspace, "docId": doc_id}),
+                )
+                .await
+                .context("trash_doc")?;
+            require_ok("trash_doc", &resp)?;
+            Ok(title)
+        }
+        None => anyhow::bail!(
+            "сирота «{id}» не найдена ни на одной крон-доске: {}",
+            misses.join("; ")
+        ),
+    }
+}
+
 /// Удалить задачу: строка вниз + тело в трэш. Путь сироты (тело без строки —
 /// мусор от упавшего create): единственный префикс-матч среди детей доски.
 pub async fn rm_task(cx: &mut TaskCx<'_>, id: &str) -> Result<RmReport> {
     let rows = read_rows(cx.client, cx.cfg, cx.board, cx.root).await?;
-    if let Ok(row) = resolve_row(&rows, id) {
-        // row_deleted в отчёте обязан означать фактический delete: строка
-        // канбана невосстановима, ложное «удалена» хуже честной ошибки
-        if row.row_id.is_empty() {
-            anyhow::bail!(
-                "у задачи «{}» нет row-id — удалять нечего, чисти доску руками",
-                row.title
-            );
+    // разрушительная операция: ветвление строго по классификации.
+    // «Неоднозначно» — жёсткая ошибка ДО любых трэшей: сирота-путь допустим
+    // только после однозначного «не найдено» (иначе префикс, матчящий две
+    // строки, утрэшил бы тело живой задачи)
+    match classify_row(&rows, id) {
+        RowMatch::One(row) => {
+            // row_deleted в отчёте обязан означать фактический delete: строка
+            // канбана невосстановима, ложное «удалена» хуже честной ошибки
+            if row.row_id.is_empty() {
+                anyhow::bail!(
+                    "у задачи «{}» нет row-id — удалять нечего, чисти доску руками",
+                    row.title
+                );
+            }
+            let resp = cx
+                .client
+                .call_tool(
+                    "delete_database_row",
+                    json!({"workspaceId": cx.cfg.workspace, "docId": cx.board.doc_id,
+                           "databaseBlockId": cx.board.db_id, "rowBlockId": row.row_id}),
+                )
+                .await
+                .context("delete_database_row")?;
+            require_ok("delete_database_row", &resp)?;
+            let (body_trashed, was_in_trash) = trash_body(cx, &row.body_doc).await?;
+            Ok(RmReport {
+                title: row.title.clone(),
+                doc_id: row.body_doc.clone(),
+                row_deleted: true,
+                body_trashed,
+                was_in_trash,
+            })
         }
-        let resp = cx
-            .client
-            .call_tool(
-                "delete_database_row",
-                json!({"workspaceId": cx.cfg.workspace, "docId": cx.board.doc_id,
-                       "databaseBlockId": cx.board.db_id, "rowBlockId": row.row_id}),
-            )
-            .await
-            .context("delete_database_row")?;
-        require_ok("delete_database_row", &resp)?;
-        let (body_trashed, was_in_trash) = trash_body(cx, &row.body_doc).await?;
-        return Ok(RmReport {
-            title: row.title.clone(),
-            doc_id: row.body_doc.clone(),
-            row_deleted: true,
-            body_trashed,
-            was_in_trash,
-        });
+        RowMatch::Ambiguous { by_id } => anyhow::bail!(
+            "'{id}' неоднозначно (по {}) — уточни id: разрушительная операция по неоднозначному резолву не выполняется",
+            if by_id { "id" } else { "заголовку" }
+        ),
+        RowMatch::NotFound => {
+            let children = crate::affine_children::board_children(cx.client, cx.cfg, cx.board).await?;
+            let child = crate::affine_children::child_by_prefix(&children, id)?;
+            let (body_trashed, was_in_trash) = trash_body(cx, &child.doc_id).await?;
+            Ok(RmReport {
+                title: child.title.clone(),
+                doc_id: child.doc_id.clone(),
+                row_deleted: false,
+                body_trashed,
+                was_in_trash,
+            })
+        }
     }
-    let children = crate::affine_children::board_children(cx.client, cx.cfg, cx.board).await?;
-    let child = crate::affine_children::child_by_prefix(&children, id)?;
-    let (body_trashed, was_in_trash) = trash_body(cx, &child.doc_id).await?;
-    Ok(RmReport {
-        title: child.title.clone(),
-        doc_id: child.doc_id.clone(),
-        row_deleted: false,
-        body_trashed,
-        was_in_trash,
-    })
 }
 
 /// Обновить ячейки строки (Status/Title/PR/Branch — только непустые).

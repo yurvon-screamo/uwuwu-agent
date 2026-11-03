@@ -556,3 +556,108 @@ fn rm_ambiguous_prefix_is_error() {
         assert!(!mock.called("trash_doc"));
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn rm_ambiguous_row_prefix_is_error_no_trash() {
+    with_temp_home(|| {
+        // High-сценарий ревью: префикс «abc» матчит body_doc одной строки и
+        // row_id другой → неоднозначность должна ронять rm ДО любых трэшей
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![
+            row_json("r1", "Т1", "abczz"),
+            row_json("abc2", "Т2", ""),
+        ])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt
+            .block_on(rm_task(&mut cx, "abc"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("неоднозначно"), "got: {err}");
+        assert!(!mock.called("trash_doc"));
+        assert!(!mock.called("delete_database_row"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn create_without_row_id_is_explicit_error_not_fake_success() {
+    with_temp_home(|| {
+        // add_database_row вернул ok:true без rowBlockId — «создана» с пустой
+        // строкой недопустима (симметрия с rm_task)
+        let mut steps = handshake();
+        steps.push(rpc(rows_json(vec![])));
+        steps.push(rpc(children_json(vec![])));
+        steps.push(rpc(DOC_NEW.into()));
+        steps.push(rpc(TAGS_HAVE_DEV.into()));
+        steps.push(rpc(TAG_OK.into()));
+        steps.push(rpc(r#"{"ok":true}"#.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let mut cx = task_cx(&mut client, &cfg);
+        let err = rt
+            .block_on(create_task(&mut cx, "Тайтл", "", TaskType::Dev))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rowId не возвращён"), "got: {err}");
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn cron_orphan_prefix_ambiguous_across_boards_is_error() {
+    with_temp_home(|| {
+        // один префикс на двух крон-досках — трэшить «первый попавшийся» нельзя
+        let mut steps = handshake();
+        // доска 1: find + read_doc + list_children
+        steps.push(rpc(
+            r#"{"ok":true,"matches":[{"id":"cron-b1","title":"Crons","inTrash":false}]}"#.into(),
+        ));
+        steps.push(rpc(
+            r#"{"ok":true,"blocks":[{"id":"cron-db1","flavour":"affine:database"}]}"#.into(),
+        ));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-x",
+            "Крон X",
+            false,
+        )])));
+        // доска 2: find + read_doc + list_children
+        steps.push(rpc(
+            r#"{"ok":true,"matches":[{"id":"cron-b2","title":"Кроны origa","inTrash":false}]}"#
+                .into(),
+        ));
+        steps.push(rpc(
+            r#"{"ok":true,"blocks":[{"id":"cron-db2","flavour":"affine:database"}]}"#.into(),
+        ));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-x2",
+            "Крон Y",
+            false,
+        )])));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let err = rt
+            .block_on(uwuwu_cli::affine_tasks::rm_cron_orphan(
+                &mut client,
+                &cfg,
+                &["Crons".to_string(), "Кроны origa".to_string()],
+                "doc-x",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("неоднозначно"), "got: {err}");
+        assert!(
+            err.contains("doc-x") && err.contains("doc-x2"),
+            "got: {err}"
+        );
+        assert!(!mock.called("trash_doc"));
+    });
+}

@@ -3,8 +3,7 @@
 use anyhow::Context as _;
 use serde_json::json;
 
-use super::{resolve_cron_any_board, truncate, CronSub};
-use crate::affine_children::{board_children, child_by_prefix};
+use super::{resolve_cron_any_board, truncate, CronResolveFail, CronSub};
 use crate::affine_client::{AffineClient, AffineConfig};
 use crate::affine_tasks;
 
@@ -47,7 +46,11 @@ pub(crate) async fn run(
         CronSub::Pause { id } | CronSub::Resume { id } => {
             let status = if is_pause { "paused" } else { "active" };
             let (board, row) =
-                resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await?;
+                match resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await {
+                    Ok(pair) => pair,
+                    Err(super::CronResolveFail::Other(e)) => return Err(e),
+                    Err(fail) => anyhow::bail!("крон «{id}» {fail}"),
+                };
             let patch = affine_tasks::RowPatch::cron_status(status);
             affine_tasks::edit_row(&mut client, cfg, &board, &row, &patch).await?;
             println!("статус: {status}");
@@ -61,64 +64,43 @@ pub(crate) async fn run(
                         .await
                         .context("delete_database_row")?;
                     if !row.body_doc.is_empty() {
-                        let _ = client
-                            .call_tool(
-                                "trash_doc",
-                                json!({"workspaceId": cfg.workspace, "docId": row.body_doc}),
-                            )
-                            .await;
+                        // честный трэш: строка уже удалена, но ложное «удалён»
+                        // при живом теле-призраке недопустимо — предупреждение
+                        let mut cx = affine_tasks::TaskCx {
+                            client: &mut client,
+                            cfg,
+                            board: &board,
+                            root,
+                        };
+                        if let Err(e) = affine_tasks::trash_body(&mut cx, &row.body_doc).await {
+                            eprintln!(
+                                "внимание: строка удалена, но тело {} НЕ утрэшено: {e}",
+                                row.body_doc
+                            );
+                        }
                     }
                     println!("крон удалён: {}", row.title);
                     Ok(())
                 }
-                Err(row_err) => {
-                    // сирота: тело крона без строки (упавший cron set)
-                    match rm_orphan(&mut client, cfg, &cron_boards, &id).await {
-                        Ok(title) => {
-                            println!("крон-сирота в трэше: {title}");
-                            Ok(())
-                        }
-                        Err(orphan_err) => Err(anyhow::anyhow!("{row_err}; {orphan_err}")),
+                // однозначное «не найдено» на всех читаемых досках —
+                // безопасно идти в сирота-путь (тело крона без строки)
+                Err(CronResolveFail::NotFound {
+                    details,
+                    all_readable: true,
+                }) => match affine_tasks::rm_cron_orphan(&mut client, cfg, &cron_boards, &id).await
+                {
+                    Ok(title) => {
+                        println!("крон-сирота в трэше: {title}");
+                        Ok(())
                     }
-                }
+                    Err(orphan_err) => {
+                        anyhow::bail!("крон «{id}» не найден ({details}); {orphan_err}")
+                    }
+                },
+                Err(fail) => Err(anyhow::anyhow!("{fail}")),
             }
         }
     }
-}
-
-/// Трэш тела-сироты по крон-доскам: единственный префикс-матч среди детей.
-async fn rm_orphan(
-    client: &mut AffineClient,
-    cfg: &AffineConfig,
-    cron_boards: &[String],
-    id: &str,
-) -> anyhow::Result<String> {
-    // ошибки всех досок в отчёт: сирота может лежать на любой крон-доске
-    let mut misses: Vec<String> = Vec::new();
-    for board_title in cron_boards {
-        let Ok(board) = affine_tasks::find_board_by_title(client, cfg, board_title).await else {
-            continue;
-        };
-        let Ok(children) = board_children(client, cfg, &board).await else {
-            continue;
-        };
-        match child_by_prefix(&children, id) {
-            Ok(child) => {
-                let _ = client
-                    .call_tool(
-                        "trash_doc",
-                        json!({"workspaceId": cfg.workspace, "docId": child.doc_id}),
-                    )
-                    .await;
-                return Ok(child.title.clone());
-            }
-            Err(e) => misses.push(format!("{board_title}: {e}")),
-        }
-    }
-    anyhow::bail!(
-        "сирота «{id}» не найдена ни на одной крон-доске: {}",
-        misses.join("; ")
-    )
 }
 
 struct SetArgs {
