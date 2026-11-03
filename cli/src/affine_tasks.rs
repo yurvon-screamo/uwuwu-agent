@@ -339,6 +339,41 @@ pub async fn find_board_by_title(
     }
 }
 
+/// Доступ к доске по тайтлу с дискриминацией «доски нет» vs «не читается»:
+/// стационарное отсутствие (нет тайтла, в трэше, не найдена в дереве) —
+/// нормальное состояние воркспейса; транспортный сбой чтения — транзиентный
+/// отказ, на его фоне вердикт «не найдено» не выдаётся.
+pub enum BoardAccess {
+    Found(Board),
+    /// доски с таким тайтлом нет (или она в трэше) — стационарно
+    Absent,
+    /// транспортный/протокольный сбой чтения
+    Failed(anyhow::Error),
+}
+
+pub async fn find_board_typed(
+    client: &mut AffineClient,
+    cfg: &AffineConfig,
+    title: &str,
+) -> BoardAccess {
+    match board_lookup(client, cfg, title).await {
+        Ok(BoardFind::Found(board)) => BoardAccess::Found(board),
+        // Trashed — стационарно: доски нет в живом воркспейсе
+        Ok(BoardFind::Trashed) => BoardAccess::Absent,
+        // поиск слепнет — дерево (канон-путь досок проектов), как в
+        // find_board_by_title: Missing без дерева — НЕ вердикт
+        Ok(BoardFind::Missing) => match find_board_by_title_tree(client, cfg, title).await {
+            Ok(board) => BoardAccess::Found(board),
+            // наш собственный вердикт «обошли дерево — нет такой доски»
+            Err(tree_err) if tree_err.to_string().contains("не найдена в дереве") => {
+                BoardAccess::Absent
+            }
+            Err(e) => BoardAccess::Failed(e),
+        },
+        Err(search_err) => BoardAccess::Failed(search_err),
+    }
+}
+
 /// Доска из дока: найти database-блок (affine:database / affine:data_view).
 async fn board_from_doc(
     client: &mut AffineClient,
@@ -901,29 +936,43 @@ pub async fn rm_cron_orphan(
 ) -> Result<String> {
     let mut hits: Vec<(String, String, String)> = Vec::new(); // (board, doc_id, title)
     let mut misses: Vec<String> = Vec::new();
+    let mut failed_boards = 0usize;
     for board_title in cron_boards {
-        let board = match find_board_by_title(client, cfg, board_title).await {
-            Ok(b) => b,
-            Err(e) => {
+        // Absent (нет такой доски) — норма: не мешает вердикту «уникально».
+        // Failed — частичная видимость: трэшить на ней нельзя, иначе
+        // кросс-досочная неоднозначность может остаться незамеченной
+        match find_board_typed(client, cfg, board_title).await {
+            BoardAccess::Found(board) => {
+                let children =
+                    match crate::affine_children::board_children(client, cfg, &board).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            failed_boards += 1;
+                            misses.push(format!("{board_title}: дети не читаются ({e})"));
+                            continue;
+                        }
+                    };
+                match crate::affine_children::child_by_prefix(&children, id) {
+                    Ok(child) => hits.push((
+                        board_title.clone(),
+                        child.doc_id.clone(),
+                        child.title.clone(),
+                    )),
+                    Err(e) => misses.push(format!("{board_title}: {e}")),
+                }
+            }
+            BoardAccess::Absent => misses.push(format!("{board_title}: доски нет")),
+            BoardAccess::Failed(e) => {
+                failed_boards += 1;
                 misses.push(format!("{board_title}: доска не читается ({e})"));
-                continue;
             }
-        };
-        let children = match crate::affine_children::board_children(client, cfg, &board).await {
-            Ok(c) => c,
-            Err(e) => {
-                misses.push(format!("{board_title}: дети не читаются ({e})"));
-                continue;
-            }
-        };
-        match crate::affine_children::child_by_prefix(&children, id) {
-            Ok(child) => hits.push((
-                board_title.clone(),
-                child.doc_id.clone(),
-                child.title.clone(),
-            )),
-            Err(e) => misses.push(format!("{board_title}: {e}")),
         }
+    }
+    if failed_boards > 0 {
+        anyhow::bail!(
+            "сирота «{id}»: {failed_boards} крон-доски не читаются — трэш при неполной видимости не выполняется; {}",
+            misses.join("; ")
+        );
     }
     if hits.len() > 1 {
         anyhow::bail!(
@@ -982,7 +1031,15 @@ pub async fn rm_task(cx: &mut TaskCx<'_>, id: &str) -> Result<RmReport> {
                 .await
                 .context("delete_database_row")?;
             require_ok("delete_database_row", &resp)?;
-            let (body_trashed, was_in_trash) = trash_body(cx, &row.body_doc).await?;
+            let (body_trashed, was_in_trash) = trash_body(cx, &row.body_doc).await.map_err(|e| {
+                // строка УЖЕ удалена — разрушительная часть выполнена;
+                // symmetric с cron rm: событие должно быть видно юзеру
+                eprintln!(
+                    "внимание: строка {} уже удалена, но тело {} НЕ утрэшено: {e}",
+                    row.row_id, row.body_doc
+                );
+                e
+            })?;
             Ok(RmReport {
                 title: row.title.clone(),
                 doc_id: row.body_doc.clone(),

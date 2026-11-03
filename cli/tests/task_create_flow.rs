@@ -661,3 +661,44 @@ fn cron_orphan_prefix_ambiguous_across_boards_is_error() {
         assert!(!mock.called("trash_doc"));
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn cron_orphan_path_reachable_when_board_absent() {
+    with_temp_home(|| {
+        // Common-фикс ревью раунда 2: отсутствующая доска («Crons» в трэше,
+        // «Кроны <proj>» не создана) — норма воркспейса, НЕ read-сбой:
+        // сирота-путь обязан срабатывать, второй тайтл читается и матчится
+        let mut steps = handshake();
+        // доска 1 «Crons»: тайтла нет (Absent), дерево тоже пусто
+        steps.push(rpc(r#"{"ok":true,"matches":[]}"#.into()));
+        steps.push(rpc(r#"{"ok":true,"nodes":[]}"#.into()));
+        // доска 2 «Кроны origa»: живая, сирота в детях
+        steps.push(rpc(
+            r#"{"ok":true,"matches":[{"id":"cron-b2","title":"Кроны origa","inTrash":false}]}"#
+                .into(),
+        ));
+        steps.push(rpc(
+            r#"{"ok":true,"blocks":[{"id":"cron-db2","flavour":"affine:database"}]}"#.into(),
+        ));
+        steps.push(rpc(children_json(vec![child_json(
+            "doc-x2",
+            "Крон Y",
+            false,
+        )])));
+        steps.push(rpc(TRASH_OK.into()));
+        let mock = MockGateway::start(steps);
+        let cfg = test_cfg(&mock);
+        let rt = runtime();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let outcome = rt.block_on(uwuwu_cli::affine_tasks::rm_cron_orphan(
+            &mut client,
+            &cfg,
+            &["Crons".to_string(), "Кроны origa".to_string()],
+            "doc-x2",
+        ));
+        let title = outcome.unwrap_or_else(|e| panic!("err: {e}"));
+        assert_eq!(title, "Крон Y");
+        assert!(mock.called("trash_doc"));
+    });
+}

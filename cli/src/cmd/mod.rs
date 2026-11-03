@@ -119,12 +119,21 @@ pub(crate) async fn resolve_cron_any_board(
     id: &str,
 ) -> Result<(affine_tasks::Board, affine_tasks::TaskRow), CronResolveFail> {
     let mut last_err = String::new();
+    // read_failures считают только транспортные/протокольные сбои; отсутствующая
+    // доска («Crons» в трэше, «Кроны <proj>» не создана) — норма воркспейса
     let mut read_failures = 0usize;
     for board_title in board_titles {
-        let Ok(board) = affine_tasks::find_board_by_title(client, cfg, board_title).await else {
-            read_failures += 1;
-            last_err = format!("{board_title}: доска не найдена/не читается");
-            continue;
+        let board = match affine_tasks::find_board_typed(client, cfg, board_title).await {
+            affine_tasks::BoardAccess::Found(board) => board,
+            affine_tasks::BoardAccess::Absent => {
+                last_err = format!("{board_title}: доски нет");
+                continue;
+            }
+            affine_tasks::BoardAccess::Failed(e) => {
+                read_failures += 1;
+                last_err = format!("{board_title}: доска не читается ({e})");
+                continue;
+            }
         };
         let rows = match affine_tasks::read_rows(client, cfg, &board, root).await {
             Ok(r) => r,
