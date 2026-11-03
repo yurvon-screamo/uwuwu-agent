@@ -5,17 +5,22 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use sha1::{Digest, Sha1};
+use std::time::Duration;
 
+use crate::affine_snapshot;
 use crate::affine_search_server::ServerSearchConfig;
 
-pub struct AffineReplies {
+/// Transport failure is retried once with this pause — the UI API shares the
+/// tunnel with the gateway, one transient reset is normal under load.
+const TRANSPORT_RETRY_PAUSE: Duration = Duration::from_secs(1);
+
+pub struct AffineUi {
     http: reqwest::Client,
     ui_url: String,
 }
 
-impl AffineReplies {
-    /// One reply session: sign in with email/password, keep the cookie jar.
+impl AffineUi {
+    /// One session: sign in with email/password, keep the cookie jar.
     pub async fn connect(config: &ServerSearchConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .cookie_store(true)
@@ -50,38 +55,19 @@ impl AffineReplies {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let meta_id = affine_snapshot::snapshot_meta_id(comment_id, now_ms);
         let body = json!({
             "query": "mutation CreateReply($input: ReplyCreateInput!) { createReply(input: $input) { id commentId } }",
             "variables": {
                 "input": {
                     "commentId": comment_id,
-                    "content": text_to_snapshot(text, &snapshot_meta_id(comment_id, now_ms), now_ms),
+                    "content": affine_snapshot::text_to_snapshot(text, &meta_id, now_ms),
                     "docMode": "page",
                     "docTitle": doc_title,
                 }
             }
         });
-        let resp = self
-            .http
-            .post(format!("{}/graphql", self.ui_url))
-            .json(&body)
-            .send()
-            .await
-            .context("affine createReply request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("affine createReply HTTP {status}: {}", cut(&text, 200));
-        }
-        let payload: Value = resp.json().await.context("createReply response json")?;
-        if let Some(errs) = payload.get("errors").and_then(|v| v.as_array()) {
-            let msg = errs
-                .first()
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown graphql error");
-            return Err(anyhow::anyhow!("affine createReply: {msg}"));
-        }
+        let payload = self.query(&body).await?;
         payload
             .pointer("/data/createReply/id")
             .and_then(|id| id.as_str())
@@ -93,56 +79,28 @@ impl AffineReplies {
                 )
             })
     }
-}
 
-/// Plain text → BlockSuite snapshot (page → note → paragraph), the shape the
-/// gateway's normalizeCommentContent produces and the AFFiNE comment editor
-/// renders. Newlines stay inside a single delta insert, like the gateway.
-fn text_to_snapshot(text: &str, meta_id: &str, create_date_ms: i64) -> Value {
-    let delta = if text.is_empty() {
-        vec![]
-    } else {
-        vec![json!({"insert": text})]
-    };
-    json!({
-        "snapshot": {
-            "type": "page",
-            "meta": {"id": meta_id, "title": "", "createDate": create_date_ms, "tags": []},
-            "blocks": {
-                "type": "block", "id": "page", "flavour": "affine:page", "version": 2,
-                "props": {"title": {"$blocksuite:internal:text$": true, "delta": []}},
-                "children": [{
-                    "type": "block", "id": "note", "flavour": "affine:note", "version": 1,
-                    "props": {"displayMode": "both"},
-                    "children": [{
-                        "type": "block", "id": "paragraph", "flavour": "affine:paragraph",
-                        "version": 1,
-                        "props": {
-                            "type": "text", "collapsed": false,
-                            "text": {"$blocksuite:internal:text$": true, "delta": delta},
-                        },
-                        "children": [],
-                    }],
-                }],
-            },
-        }
-    })
-}
-
-/// 10-char alphanumeric id for the snapshot meta (the gateway generates a
-/// similar secureAffineId); derived from comment id + clock, enough for a
-/// per-comment meta label.
-fn snapshot_meta_id(comment_id: &str, now_ms: i64) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(comment_id.as_bytes());
-    hasher.update(now_ms.to_le_bytes());
-    let digest = hasher.finalize();
-    let alphabet: Vec<u8> = (b'a'..=b'z').chain(b'0'..=b'9').collect();
-    digest
-        .iter()
-        .map(|b| alphabet[(*b % 36) as usize] as char)
-        .take(10)
-        .collect()
+    /// POST a full request body (query + variables), one transport retry.
+    /// Returns the raw payload — callers check `errors` themselves (partial
+    /// data with errors is possible in GraphQL).
+    pub(crate) async fn query(&self, body: &Value) -> Result<Value> {
+        let url = format!("{}/graphql", self.ui_url);
+        let send = || async { self.http.post(&url).json(body).send().await };
+        let resp = match send().await {
+            Ok(resp) => resp,
+            Err(first) => {
+                tokio::time::sleep(TRANSPORT_RETRY_PAUSE).await;
+                let retried = send()
+                    .await
+                    .map_err(|second| anyhow::anyhow!("affine graphql: {first}; retry: {second}"))?;
+                retried.error_for_status()?
+            }
+        };
+        let resp = resp.error_for_status()?;
+        resp.json()
+            .await
+            .context("affine graphql response json")
+    }
 }
 
 fn cut(s: &str, max_chars: usize) -> String {
@@ -154,34 +112,6 @@ fn cut(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plain_text_becomes_blocksuite_page_snapshot() {
-        let snapshot = text_to_snapshot("ответ агента", "abc123xyz0", 1793000000000i64);
-
-        let s = &snapshot["snapshot"];
-        assert_eq!(s["type"], "page");
-        assert_eq!(s["meta"]["id"], "abc123xyz0");
-        assert_eq!(s["meta"]["createDate"], 1793000000000i64);
-        assert_eq!(s["blocks"]["flavour"], "affine:page");
-        let note = &s["blocks"]["children"][0];
-        assert_eq!(note["flavour"], "affine:note");
-        let paragraph = &note["children"][0];
-        assert_eq!(paragraph["flavour"], "affine:paragraph");
-        assert_eq!(
-            paragraph["props"]["text"]["delta"][0]["insert"],
-            "ответ агента"
-        );
-    }
-
-    #[test]
-    fn empty_text_snapshot_has_empty_delta() {
-        let snapshot = text_to_snapshot("", "abc123xyz0", 1793000000000i64);
-
-        let delta =
-            &snapshot["snapshot"]["blocks"]["children"][0]["children"][0]["props"]["text"]["delta"];
-        assert_eq!(delta.as_array().map(Vec::len), Some(0));
-    }
 
     #[test]
     fn cut_truncates_long_strings_with_ellipsis() {

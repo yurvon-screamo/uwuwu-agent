@@ -390,7 +390,7 @@ async fn reply_in_thread(
     };
     let threads = affine_tasks::thread_comments(client, cfg, row).await?;
     let thread = affine_comments::resolve_thread_prefix(&threads, prefix)?;
-    affine_gql::AffineReplies::connect(&ss)
+    affine_gql::AffineUi::connect(&ss)
         .await?
         .create_reply(&thread.id, body, &row.title)
         .await?;
