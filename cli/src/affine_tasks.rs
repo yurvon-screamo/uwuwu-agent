@@ -495,6 +495,23 @@ pub async fn resolve_titles(ui: &AffineUi, cfg: &AffineConfig, rows: &mut [TaskR
 /// Найти строку по id (row id или doc-тела) или уникальному префиксу.
 /// Ведущие дефисы row-id игнорируются с обеих сторон (кли-аргументы).
 pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
+    match resolve_row_match(rows, id) {
+        RowMatch::Found(row) => Ok(row),
+        RowMatch::NotFound => bail!("задача '{id}' не найдена"),
+        RowMatch::Ambiguous(msg) => bail!("{msg}"),
+    }
+}
+
+/// Машина матчинга без кложа в Result: вызывающий отличает «не нашлась
+/// вообще» (норма для перебора досок) от решающей диагностики (неоднозначный
+/// префикс — её надо донести до юзера, не маскировать «не найдена»).
+pub enum RowMatch<'a> {
+    Found(&'a TaskRow),
+    NotFound,
+    Ambiguous(String),
+}
+
+pub fn resolve_row_match<'a>(rows: &'a [TaskRow], id: &str) -> RowMatch<'a> {
     let needle = id.trim_start_matches('-');
     let by_id: Vec<&TaskRow> = rows
         .iter()
@@ -503,7 +520,7 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
         })
         .collect();
     if by_id.len() == 1 {
-        return Ok(by_id[0]);
+        return RowMatch::Found(by_id[0]);
     }
     if by_id.is_empty() {
         let lower = needle.to_lowercase();
@@ -512,15 +529,17 @@ pub fn resolve_row<'a>(rows: &'a [TaskRow], id: &str) -> Result<&'a TaskRow> {
             .filter(|r| r.title.to_lowercase().contains(&lower))
             .collect();
         return match by_title.len() {
-            1 => Ok(by_title[0]),
-            0 => bail!("задача '{id}' не найдена"),
-            n => bail!("'{id}' неоднозначно ({n} по заголовку) — уточни или используй id"),
+            1 => RowMatch::Found(by_title[0]),
+            0 => RowMatch::NotFound,
+            n => RowMatch::Ambiguous(format!(
+                "'{id}' неоднозначно ({n} по заголовку) — уточни или используй id"
+            )),
         };
     }
-    bail!(
+    RowMatch::Ambiguous(format!(
         "'{id}' неоднозначно ({} по id) — уточни префикс",
         by_id.len()
-    )
+    ))
 }
 
 /// Создать задачу: док-тело (тег «Task») + строка Todo, слинкованная с телом.

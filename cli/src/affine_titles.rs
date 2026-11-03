@@ -179,4 +179,78 @@ mod tests {
 
         assert!(err.is_err());
     }
+
+    /// Сетевой контракт: живой POST до mock UI API, промах → None в мапе.
+    #[test]
+    fn fetch_titles_posts_one_batch_and_maps_placeholders() {
+        let batch = json!({
+            "data": {"workspace": {
+                "d0": {"id": "AAA111", "title": "Задача про таймауты"},
+                "d1": {"id": "MISSING", "title": null},
+            }}
+        })
+        .to_string();
+        let mock = crate::mock_ui::MockUi::start(vec![
+            crate::mock_ui::UiStep::ok("{}".into()),
+            crate::mock_ui::UiStep::ok(batch),
+        ]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ui = AffineUi::connect(&mock.config()).await.expect("sign-in");
+            let titles = fetch_titles(&ui, "ws-test", &["AAA111".into(), "MISSING".into()])
+                .await
+                .expect("batch resolves");
+
+            assert_eq!(titles["AAA111"].as_deref(), Some("Задача про таймауты"));
+            assert_eq!(titles["MISSING"], None);
+        });
+        assert_eq!(mock.request_count(), 2, "sign-in + один батч-POST");
+    }
+
+    /// Ретрай: первый /graphql отвечает 5xx — второй должен пройти.
+    #[test]
+    fn fetch_titles_retries_once_on_server_error() {
+        let batch = json!({
+            "data": {"workspace": {"d0": {"id": "AAA111", "title": "Т"}}}
+        })
+        .to_string();
+        let mock = crate::mock_ui::MockUi::start(vec![
+            crate::mock_ui::UiStep::ok("{}".into()),
+            crate::mock_ui::UiStep::status(500, "boom".into()),
+            crate::mock_ui::UiStep::ok(batch),
+        ]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ui = AffineUi::connect(&mock.config()).await.expect("sign-in");
+            let titles = fetch_titles(&ui, "ws-test", &["AAA111".into()])
+                .await
+                .expect("retry спасает от 5xx");
+
+            assert_eq!(titles["AAA111"].as_deref(), Some("Т"));
+        });
+        assert_eq!(
+            mock.request_count(),
+            3,
+            "sign-in + упавший 5xx + успешный повтор"
+        );
+    }
+
+    /// Исчерпание ретрая: оба POST — 5xx → честная ошибка, не паника.
+    #[test]
+    fn fetch_titles_fails_after_exhausted_retries() {
+        let mock = crate::mock_ui::MockUi::start(vec![
+            crate::mock_ui::UiStep::ok("{}".into()),
+            crate::mock_ui::UiStep::status(500, "boom".into()),
+            crate::mock_ui::UiStep::status(500, "boom again".into()),
+        ]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ui = AffineUi::connect(&mock.config()).await.expect("sign-in");
+
+            assert!(fetch_titles(&ui, "ws-test", &["AAA111".into()])
+                .await
+                .is_err());
+        });
+        assert_eq!(mock.request_count(), 3, "ровно одна повторная попытка");
+    }
 }

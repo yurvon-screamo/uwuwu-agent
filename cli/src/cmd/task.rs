@@ -283,9 +283,12 @@ async fn edit(
     project: &str,
     args: EditArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     affine_tasks::edit_row(client, cfg, &board, &row, &args.patch).await?;
-    println!("обновлено: {}", super::display_title(&row));
+    println!(
+        "обновлено: {}",
+        super::row_display_title(cfg, &mut row).await
+    );
     Ok(())
 }
 
@@ -418,7 +421,7 @@ async fn close_task(
     project: &str,
     args: CloseArgs,
 ) -> anyhow::Result<()> {
-    let (board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
     let patch = affine_tasks::RowPatch {
         status: Some("Done".into()),
         ..Default::default()
@@ -427,7 +430,7 @@ async fn close_task(
     if let Some(note) = args.note {
         affine_tasks::comment_task(client, cfg, &row, &note).await?;
     }
-    println!("закрыта: {}", super::display_title(&row));
+    println!("закрыта: {}", super::row_display_title(cfg, &mut row).await);
     Ok(())
 }
 
@@ -438,9 +441,10 @@ async fn body(
     project: &str,
     args: BodyArgs,
 ) -> anyhow::Result<()> {
-    let (_board, row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let (_board, mut row) = resolve_row_any_board(client, cfg, root, project, &args.id).await?;
+    let title = super::row_display_title(cfg, &mut row).await;
     if row.body_doc.is_empty() {
-        anyhow::bail!("у задачи «{}» нет тела-дока", super::display_title(&row));
+        anyhow::bail!("у задачи «{title}» нет тела-дока");
     }
     let text = match args.md {
         // clap запрещает --stdin вместе с --md; guard фиксирует запрет и здесь
@@ -455,17 +459,11 @@ async fn body(
     };
     if args.replace {
         let n_diagrams = affine_tasks::replace_body(client, cfg, &row.body_doc, &text).await?;
-        println!(
-            "тело заменено: {} (диаграмм: {n_diagrams})",
-            super::display_title(&row)
-        );
+        println!("тело заменено: {title} (диаграмм: {n_diagrams})");
     } else {
         let (n_diagrams, n_deleted) =
             affine_tasks::append_body_markdown(client, cfg, &row.body_doc, &text).await?;
-        println!(
-            "тело дописано: {} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})",
-            super::display_title(&row)
-        );
+        println!("тело дописано: {title} (диаграмм: {n_diagrams}, заменено/удалено: {n_deleted})");
     }
     Ok(())
 }

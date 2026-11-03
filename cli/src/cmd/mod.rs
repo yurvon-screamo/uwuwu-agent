@@ -71,10 +71,13 @@ pub(crate) async fn resolve_row_any_board(
 ) -> anyhow::Result<(affine_tasks::Board, affine_tasks::TaskRow)> {
     let board = affine_tasks::find_board(client, cfg, project).await?;
     let mut rows = affine_tasks::read_rows(client, cfg, &board, root).await?;
-    if let Some(row) = resolve_row_on_board(cfg, &mut rows, id).await {
+    let mut decisive: Option<anyhow::Error> = None;
+    if let Some(row) = resolve_row_on_board(cfg, &mut rows, id).await? {
         return Ok((board, row));
     }
-    // фоллбек: крон-доски (Crons + «Кроны <proj>» всех проектов)
+    // фоллбек: крон-доски (Crons + «Кроны <proj>» всех проектов); решающая
+    // диагностика (неоднозначный префикс) запоминается — если нигде не
+    // нашлось, юзер получит её, а не дезинформирующее «не найдена»
     for bt in affine_tasks::cron_board_titles(client, cfg).await? {
         if bt == "Crons" {
             continue;
@@ -85,32 +88,45 @@ pub(crate) async fn resolve_row_any_board(
         let Ok(mut rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
             continue;
         };
-        if let Some(row) = resolve_row_on_board(cfg, &mut rows, id).await {
-            return Ok((board, row));
+        match resolve_row_on_board(cfg, &mut rows, id).await {
+            Ok(Some(row)) => return Ok((board, row)),
+            Ok(None) => {}
+            Err(e) if decisive.is_none() => decisive = Some(e),
+            Err(_) => {}
         }
     }
     let cron_board = affine_tasks::find_board_by_title(client, cfg, "Crons").await?;
     let mut cron_rows = affine_tasks::read_rows(client, cfg, &cron_board, root).await?;
-    resolve_row_on_board(cfg, &mut cron_rows, id)
-        .await
-        .map(|row| (cron_board, row))
-        .ok_or_else(|| {
-            anyhow::anyhow!("задача '{id}' не найдена (искали на доске проекта и всех крон-досках)")
-        })
+    match resolve_row_on_board(cfg, &mut cron_rows, id).await? {
+        Some(row) => Ok((cron_board, row)),
+        None => match decisive {
+            Some(e) => Err(e.context("искали на доске проекта и всех крон-досках")),
+            None => anyhow::bail!(
+                "задача '{id}' не найдена (искали на доске проекта и всех крон-досках)"
+            ),
+        },
+    }
 }
 
 /// id-матч без сети; промах → один батч-дозаголовок доски и повтор
-/// (title-подстрока). None — строки доски не матчатся и без тайтлов.
+/// (title-подстрока). Ok(None) — доска не сматчилась; Err — решающая
+/// диагностика (неоднозначный префикс), её доносим до юзера, не маскируем.
 async fn resolve_row_on_board(
     cfg: &AffineConfig,
     rows: &mut [affine_tasks::TaskRow],
     id: &str,
-) -> Option<affine_tasks::TaskRow> {
-    if let Ok(row) = affine_tasks::resolve_row(rows, id) {
-        return Some(row.clone());
+) -> anyhow::Result<Option<affine_tasks::TaskRow>> {
+    match affine_tasks::resolve_row_match(rows, id) {
+        affine_tasks::RowMatch::Found(row) => return Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous(msg) => return Err(anyhow::anyhow!("{msg}")),
+        affine_tasks::RowMatch::NotFound => {}
     }
     fill_display_titles(cfg, rows).await;
-    affine_tasks::resolve_row(rows, id).ok().cloned()
+    match affine_tasks::resolve_row_match(rows, id) {
+        affine_tasks::RowMatch::Found(row) => Ok(Some(row.clone())),
+        affine_tasks::RowMatch::Ambiguous(msg) => Err(anyhow::anyhow!("{msg}")),
+        affine_tasks::RowMatch::NotFound => Ok(None),
+    }
 }
 
 /// Найти крон на любой крон-доске (Crons + «Кроны <proj>» проектов).
@@ -129,10 +145,11 @@ pub(crate) async fn resolve_cron_any_board(
         let Ok(mut rows) = affine_tasks::read_rows(client, cfg, &board, root).await else {
             continue;
         };
-        if let Some(row) = resolve_row_on_board(cfg, &mut rows, id).await {
-            return Ok((board, row));
+        match resolve_row_on_board(cfg, &mut rows, id).await {
+            Ok(Some(row)) => return Ok((board, row)),
+            Ok(None) => last_err = format!("задача '{id}' не найдена"),
+            Err(e) => last_err = format!("{e}"),
         }
-        last_err = format!("задача '{id}' не найдена");
     }
     anyhow::bail!("крон «{id}» не найден на крон-досках ({last_err})")
 }

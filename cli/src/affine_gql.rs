@@ -80,14 +80,22 @@ impl AffineUi {
             })
     }
 
-    /// POST a full request body (query + variables), one transport retry.
-    /// Returns the raw payload — callers check `errors` themselves (partial
-    /// data with errors is possible in GraphQL).
+    /// POST a full request body (query + variables), one retry on transport
+    /// failures and HTTP 5xx. Returns the raw payload — callers check
+    /// `errors` themselves (partial data with errors is possible in GraphQL).
     pub(crate) async fn query(&self, body: &Value) -> Result<Value> {
         let url = format!("{}/graphql", self.ui_url);
         let send = || async { self.http.post(&url).json(body).send().await };
         let resp = match send().await {
-            Ok(resp) => resp,
+            Ok(resp) if resp.status().is_server_error() => {
+                let status = resp.status();
+                tokio::time::sleep(TRANSPORT_RETRY_PAUSE).await;
+                let retried = send().await.map_err(|second| {
+                    anyhow::anyhow!("affine graphql: HTTP {status}; retry: {second}")
+                })?;
+                retried.error_for_status()?
+            }
+            Ok(resp) => resp.error_for_status()?,
             Err(first) => {
                 tokio::time::sleep(TRANSPORT_RETRY_PAUSE).await;
                 let retried = send().await.map_err(|second| {
@@ -96,7 +104,6 @@ impl AffineUi {
                 retried.error_for_status()?
             }
         };
-        let resp = resp.error_for_status()?;
         resp.json().await.context("affine graphql response json")
     }
 }
@@ -117,5 +124,32 @@ mod tests {
 
         assert_eq!(cut(&long, 200).chars().count(), 201);
         assert!(cut("коротко", 200).ends_with("коротко"));
+    }
+
+    /// Контракт docTitle: create_reply обязан нести НЕПУСТОЙ docTitle
+    /// в теле запроса — тихий пустой заголовок в снапшоте недопустим.
+    #[test]
+    fn create_reply_sends_non_empty_doc_title() {
+        let mock = crate::mock_ui::MockUi::start(vec![
+            crate::mock_ui::UiStep::ok("{}".into()),
+            crate::mock_ui::UiStep::ok(
+                json!({"data": {"createReply": {"id": "rep-1", "commentId": "c-1"}}}).to_string(),
+            ),
+        ]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ui = AffineUi::connect(&mock.config()).await.expect("sign-in");
+            let reply_id = ui
+                .create_reply("c-1", "ответ агента", "Задача про таймауты")
+                .await
+                .expect("reply created");
+
+            assert_eq!(reply_id, "rep-1");
+            let bodies = mock.request_bodies();
+            let graphql = &bodies[1];
+            assert!(graphql.contains(r#""docTitle":"Задача про таймауты""#));
+            assert!(graphql.contains(r#""insert":"ответ агента""#));
+        });
+        assert_eq!(mock.request_count(), 2);
     }
 }

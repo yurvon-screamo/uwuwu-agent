@@ -52,8 +52,10 @@ pub(crate) async fn run(
             Ok(())
         }
         CronSub::Rm { id } => {
-            let (board, row) =
+            let (board, mut row) =
                 resolve_cron_any_board(&mut client, cfg, &cron_boards, root, &id).await?;
+            // тайтл эха — до удаления строки/тела
+            let title = super::row_display_title(cfg, &mut row).await;
             client
                 .call_tool("delete_database_row", json!({"workspaceId": cfg.workspace, "docId": board.doc_id, "databaseBlockId": board.db_id, "rowBlockId": row.row_id}))
                 .await
@@ -66,7 +68,7 @@ pub(crate) async fn run(
                     )
                     .await;
             }
-            println!("крон удалён: {}", super::display_title(&row));
+            println!("крон удалён: {title}");
             Ok(())
         }
     }

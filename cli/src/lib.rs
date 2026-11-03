@@ -14,6 +14,8 @@ pub mod affine_tasks;
 pub mod affine_titles;
 pub mod cmd;
 pub mod log_filter;
+#[cfg(test)]
+pub(crate) mod mock_ui;
 pub mod path;
 pub mod sofa;
 pub mod wiki;
