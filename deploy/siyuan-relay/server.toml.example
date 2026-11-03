@@ -1,0 +1,5 @@
+[server]
+bind_addr = "0.0.0.0:8333"
+[server.services.siyuan]
+bind_addr = "127.0.0.1:7331"
+token = "<рельный-токен: см. ~/.config/rathole/siyuan-client.toml>"
