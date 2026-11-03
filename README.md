@@ -6,11 +6,11 @@
 
 ```
 opencodereview/ правила ревью
-agents/        субагенты: code-quality-reviewer, developer, dreamer
+agents/        агенты: developer, dreamer, code-quality-reviewer (праймари — ревью-статусы фабрики)
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        31 скилл (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.cargo/bin/uwuwu-cli)
-factory/       uwuwu-factory — будильник разработки (Design → спавн агента)
+factory/       uwuwu-factory — будильник разработки + маршрутизатор ревью
 cron/          uwuwu-cron — демон кронов (доски «Кроны <Proj>» → сессии агентов)
 dreamer/       uwuwu-dreamer — дример: пост-обработка сессий (idle → агент dreamer)
 triage/        uwuwu-triage — входная точка задач: TG-бот → триаж → канбан uwuwu
@@ -51,12 +51,17 @@ cd uwuwu-agent
 
 Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa),
 тела задач = доки с тегом Dev/Spike/Bug, диалог = нативные комменты.
-Демон — **только будильник** (systemd, тик 3 мин): Todo → worktree+OpenCode-сессия+короткий
-spawn → In Progress; новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин
-→ рестарт по комменту); Done (мерж-крон агента / Spike / руки) → чистка ворктри.
+Демон — **будильник + маршрутизатор ревью** (systemd, тик 3 мин): Design → OpenCode-сессия
+девелопера + короткий spawn; «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
+(праймари-агент `code-quality-reviewer`, 1 сессия на задачу, cwd = ворктри задачи);
+возврат статуса из ревью → wakeup девелопера; комменты юзера в ревью-статусах → ревьюверу;
+новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин → рестарт по комменту);
+Done (мерж-крон агента / Spike / руки) → чистка state + термин ревью-сессии.
+Решение маршрутизации — чистая функция `routeTask` (factory-lib, покрыта тестами).
 Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
 `factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
+Имена ревью-статусов — контракт с колонками досок: константы `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`.
 Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
 ### Кроны (uwuwu-cron)
