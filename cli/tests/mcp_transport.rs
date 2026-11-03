@@ -446,6 +446,105 @@ fn retryable_inside_text_blob_is_retried() {
 
 #[test]
 #[serial_test::serial]
+fn write_retryable_queue_timeout_is_retried() {
+    with_temp_home(|| {
+        // WRITE_QUEUE_TIMEOUT — запрос ждал в очереди и не диспеттился:
+        // шлюз гарантирует неприменение, запись ретраится (ADR-006)
+        let queued = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"Write for scope waited too long in the queue.","code":"WRITE_QUEUE_TIMEOUT","retryable":true}}"#;
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::basic(200, None, queued),
+            Step::basic(200, None, CALL_OK),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let out = rt
+            .block_on(client.call_tool("create_doc", json!({})))
+            .unwrap();
+        assert_eq!(out["answer"], 42);
+        assert_eq!(mock.request_count(), 4);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn write_retryable_trusted_codes_are_retried_on_wire() {
+    with_temp_home(|| {
+        // остальные два доверенных кода whitelist — тот же путь, что и
+        // WRITE_QUEUE_TIMEOUT: запрос гарантированно не применён (ADR-006)
+        let full = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"Write queue for scope is full.","code":"WRITE_QUEUE_FULL","retryable":true}}"#;
+        let limited = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"rate limit exceeded","code":"rate_limited","retryable":true}}"#;
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::basic(200, None, limited),
+            Step::basic(200, None, full),
+            Step::basic(200, None, CALL_OK),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let out = rt
+            .block_on(client.call_tool("create_doc", json!({})))
+            .unwrap();
+        assert_eq!(out["answer"], 42);
+        assert_eq!(mock.request_count(), 5);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn write_retryable_untrusted_code_fails_fast_without_retry() {
+    with_temp_home(|| {
+        // DOCUMENT_MOVE_PARTIAL — операция частично применена, флаг шлюза
+        // нарушает гарантию: клиент НЕ доверяет его записи — Fatal без ретрая
+        let partial = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"The document move did not reach a complete state.","code":"DOCUMENT_MOVE_PARTIAL","retryable":true}}"#;
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::basic(200, None, partial),
+            // этот шаг не должен быть запрошен — ретрая нет
+            Step::basic(200, None, CALL_OK),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let err = rt
+            .block_on(client.call_tool("move_doc", json!({})))
+            .unwrap_err();
+        assert!(err.to_string().contains("не доверяется"), "{err}");
+        // INIT + notified + единственный вызов — ретрая не было
+        assert_eq!(mock.request_count(), 3);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn read_retryable_untrusted_code_is_still_retried() {
+    with_temp_home(|| {
+        // чтение не применяет ничего — флаг доверяется при любом коде
+        let flaky = r#"{"jsonrpc":"2.0","id":{ID},"result":{"ok":false,"error":"upstream boom","code":"upstream_unavailable","retryable":true}}"#;
+        let mock = MockGateway::start(vec![
+            Step::basic(200, Some("sess-A"), INIT),
+            Step::basic(202, None, NOTIFIED),
+            Step::basic(200, None, flaky),
+            Step::basic(200, None, CALL_OK),
+        ]);
+        let cfg = test_cfg(&mock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = rt.block_on(AffineClient::connect(&cfg)).unwrap();
+        let out = rt
+            .block_on(client.call_tool("list_docs", json!({})))
+            .unwrap();
+        assert_eq!(out["answer"], 42);
+        assert_eq!(mock.request_count(), 4);
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn empty_body_on_write_is_fatal_without_retry() {
     // живой инцидент сессии: шлюз ответил 200 с пустым телом. Запись:
     // ответ потерян, операция могла примениться — без ретраев.
