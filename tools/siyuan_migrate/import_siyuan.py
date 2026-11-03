@@ -25,8 +25,18 @@ def ensure_path(sy: SiYuan, nb: str, parts: tuple[str, ...]) -> None:
             # лист создаст вызывающий со своим контентом
 
 
-def import_tree(src: Path, sy: SiYuan, dry_run: bool = False, limit: int = 0) -> dict:
+def import_tree(src: Path, sy: SiYuan, dry_run: bool = False, limit: int = 0,
+                asset_map: dict | None = None) -> dict:
     stats = {"docs": 0, "skipped": 0, "failed": 0, "notebooks": {}}
+
+    def rewrite(md: str) -> str:
+        if not asset_map:
+            return md
+        for key, dest in asset_map.items():
+            if dest:
+                md = md.replace(f"assets/{key}", dest)
+        return md
+
     tops = sorted(p for p in src.iterdir() if p.is_dir())
     for top in tops:
         nb_name = top.name
@@ -44,7 +54,7 @@ def import_tree(src: Path, sy: SiYuan, dry_run: bool = False, limit: int = 0) ->
             if sy.doc_exists(nb, hpath):
                 stats["skipped"] += 1
                 continue
-            md = f.read_text(encoding="utf-8")
+            md = rewrite(f.read_text(encoding="utf-8"))
             try:
                 ensure_path(sy, nb, tuple(rel.parts))
                 sy.create_doc_with_md(nb, hpath, md)
@@ -89,10 +99,20 @@ def main() -> int:
     if a.assets:
         mf = Path(Path(a.src).parent / "export" / "manifest.json")
         blobs = json.loads(mf.read_text())["blobs"] if mf.exists() else {}
-        print(import_assets(blobs, Path(a.assets), sy))
+        res = import_assets(blobs, Path(a.assets), sy)
+        # сохранить карту ключ→путь для рерайта ссылок при импорте доков
+        map_path = Path(a.src) / "_asset_map.json"
+        map_path.write_text(json.dumps(res["map"], ensure_ascii=False, indent=1))
+        print(res, "| map →", map_path)
         return 0
 
-    stats = import_tree(Path(a.src), sy, dry_run=a.dry_run, limit=a.limit)
+    amap = {}
+    amap_path = Path(a.src) / "_asset_map.json"
+    if amap_path.exists():
+        amap = json.loads(amap_path.read_text())
+        print(f"asset map: {len(amap)} entries")
+
+    stats = import_tree(Path(a.src), sy, dry_run=a.dry_run, limit=a.limit, asset_map=amap)
     print(json.dumps(stats, ensure_ascii=False, indent=1))
     return 0
 
