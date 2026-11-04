@@ -1,9 +1,9 @@
 // triage-lib.test.ts — тесты чистых функций uwuwu-triage (bun test, без сети)
 import { test, expect } from "bun:test"
 import {
-  alignChunks, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal,
-  joinBatch, plainChunks, parseWatchSec, promptLandedAt, takeBatch, validState,
+  alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal,
+  joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, stripDraftAcks, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
@@ -404,4 +404,96 @@ test("capDraftBatch: ТГ не режется, черновики — порци
   expect(capDraftBatch([draft(1), draft(2)], 5).length).toBe(2)
   expect(capDraftBatch([tg(1), tg(2)], 5).map((b) => b.msgID)).toEqual([1, 2])
   expect(capDraftBatch([], 5)).toEqual([])
+})
+
+// ——— seen/ack: парсер канала исхода ———
+
+test("parseDraftAcks: пары на одной и нескольких строках, позиция любая", () => {
+  expect(parseDraftAcks("итог\nмерж (пишется)" )).toEqual({}) // без маркера — пусто
+  expect(parseDraftAcks("итог хода\ndraft-ack: r1=пишется r2=todo\ndraft-ack: r3=merge")).toEqual({
+    r1: "пишется", r2: "todo", r3: "merge",
+  })
+  // маркер в середине строки (markdown-список) тоже ловится
+  expect(parseDraftAcks("- draft-ack: r1=обсуждение")).toEqual({ r1: "обсуждение" })
+})
+
+test("parseDraftAcks: нормализация токенов — бэктики, жирный, регистр, пробелы", () => {
+  expect(parseDraftAcks("draft-ack: `r1`=`ПИШЕТСЯ`, **r2**=Todo; r3 = 'обсуждение'")).toEqual({
+    r1: "пишется", r2: "todo", r3: "обсуждение",
+  })
+})
+
+test("parseDraftAcks: неизвестный вердикт и кривая пара — игнор (не ack)", () => {
+  // «в обсуждении» не существует: псевдонимов нет, канон один — фолбэк анти-петли
+  expect(parseDraftAcks("draft-ack: r1=в обсуждении r2=garbage r3= r4")).toEqual({})
+  expect(parseDraftAcks("draft-ack: =пишется r5=")).toEqual({})
+})
+
+test("parseDraftAcks: повтор rowId — last-wins (агент передумал в ходе)", () => {
+  const acks = parseDraftAcks("draft-ack: r1=todo\ndraft-ack: r1=пишется")
+  expect(acks).toEqual({ r1: "пишется" })
+})
+
+test("stripDraftAcks: ack-строки уходят, остальной текст без потерь", () => {
+  const final = "Разобрал черновики:\n- r1 в Todo\n- r2 пишется\ndraft-ack: r1=todo r2=пишется"
+  expect(stripDraftAcks(final)).toBe("Разобрал черновики:\n- r1 в Todo\n- r2 пишется")
+  expect(stripDraftAcks("draft-ack: r1=todo")).toBe("")
+  expect(stripDraftAcks("без ack")).toBe("без ack")
+})
+
+// ——— seen/ack: гейтинг и жизненный цикл ———
+
+test("draftReady: терминальный ack глушит при любых оборотах и тишинах", () => {
+  const late = 10 * DRAFT_CAP_MS // кулдауны и капы давно истекли
+  expect(draftReady(track({ seenAt: 0, updatedAt: 0, ack: { verdict: "пишется", updatedAt: 0, at: 0 } }), late)).toBe(false)
+  expect(draftReady(track({ seenAt: 0, updatedAt: 0, turns: 3, lastTurnAt: 0, ack: { verdict: "обсуждение", updatedAt: 0, at: 0 } }), late)).toBe(false)
+})
+
+test("draftReady: не-терминальный ack поведение не меняет (фолбэк анти-петли)", () => {
+  const now = DRAFT_CAP_MS + 1
+  for (const verdict of ["todo", "merge", "rm"] as const) {
+    expect(draftReady(track({ seenAt: 0, updatedAt: 0, ack: { verdict, updatedAt: 0, at: 0 } }), now)).toBe(true)
+  }
+  expect(DRAFT_ACK_TERMINAL).toEqual(["пишется", "обсуждение"])
+})
+
+test("applyBodyDelta: без дельты состояние не трогается; дельта против ack-версии снимает ack и сбрасывает цикл", () => {
+  const acked = track({ seenAt: 0, updatedAt: 100, turns: 2, lastTurnAt: 90, ack: { verdict: "пишется", updatedAt: 100, at: 120 } })
+  expect(applyBodyDelta(acked, 100)).toBe(false) // тело не менялось
+  expect(acked.ack).toBeDefined()
+  // автор дописал тело → ровно один перевыв: ack снят, обороты с нуля
+  expect(applyBodyDelta(acked, 200)).toBe(true)
+  expect(acked).toEqual(track({ seenAt: 0, updatedAt: 200, turns: 0 }))
+})
+
+test("applyBodyDelta: дельта без ack и с не-терминальным ack — ack жив", () => {
+  const plain = track({ updatedAt: 1 })
+  expect(applyBodyDelta(plain, 2)).toBe(true)
+  expect(plain.updatedAt).toBe(2)
+  const inert = track({ updatedAt: 1, ack: { verdict: "todo", updatedAt: 1, at: 5 } })
+  expect(applyBodyDelta(inert, 2)).toBe(true)
+  expect(inert.ack?.verdict).toBe("todo")
+})
+
+test("setDraftAck: ack + версия тела синхронно; повтор тех же данных — без save", () => {
+  const t = track({ updatedAt: 10 })
+  expect(setDraftAck(t, "пишется", 50, 60)).toBe(true)
+  expect(t).toEqual(track({ updatedAt: 50, ack: { verdict: "пишется", updatedAt: 50, at: 60 } }))
+  expect(setDraftAck(t, "пишется", 50, 70)).toBe(false) // тот же вердикт и версия — save не нужен
+})
+
+test("validState: валидный ack персистится, битый стрипится — трек жив", () => {
+  const good = {
+    offset: 0, queue: [],
+    drafts: { r1: track({ ack: { verdict: "пишется", updatedAt: 5, at: 6 } }) },
+  }
+  expect(validState(good)).toEqual(good)
+  const broken = {
+    offset: 0, queue: [],
+    // сырой state.json (вне типизации): рука/старый демон могли записать мусор
+    drafts: { r1: { ...track({}), ack: { verdict: "в обсуждении", updatedAt: 5, at: 6 } } },
+  }
+  const cleaned = validState(broken)
+  expect(cleaned.drafts?.r1).toBeDefined() // трек жив
+  expect(cleaned.drafts?.r1.ack).toBeUndefined() // поле отброшено
 })
