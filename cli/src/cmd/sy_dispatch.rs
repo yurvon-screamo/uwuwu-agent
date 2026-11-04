@@ -585,7 +585,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        let with_binding = with_binding;
         Mock::given(method("POST"))
             .and(path("/mcp"))
             .respond_with(move |req: &wiremock::Request| {
@@ -639,10 +638,15 @@ mod tests {
         write_body_via_cli(&server).await.unwrap();
 
         assert_eq!(create_calls.load(Ordering::SeqCst), 0, "createDocWithMd не должен вызываться");
-        let appends = append_bodies.lock().unwrap();
-        assert_eq!(appends.len(), 1, "один appendBlock в привязанный док");
-        assert!(appends[0].contains("маркер-контент"), "контент в appendBlock");
-        assert!(appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")), "append в привязанный док, не в сироту");
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert_eq!(appends.len(), 1, "один appendBlock в привязанный док");
+            assert!(appends[0].contains("маркер-контент"), "контент в appendBlock");
+            assert!(
+                appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")),
+                "append в привязанный док, не в сироту"
+            );
+        }
     }
 
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
