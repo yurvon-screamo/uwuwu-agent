@@ -10,6 +10,7 @@
 use crate::siyuan::SiYuan;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 
 pub struct SyBoard {
     pub doc_id: String,
@@ -72,6 +73,7 @@ fn extract_av_id(md: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+#[derive(Debug)]
 pub struct SyTask {
     pub item_id: String,
     pub title: String,
@@ -81,16 +83,62 @@ pub struct SyTask {
     pub body_doc: Option<String>,
 }
 
-/// Строки доски через MCP database render.
+/// Лимит страниц render при пагинации: страховка от зависания на битом
+/// rowCount (100×50 = 5000 строк — запас ×50 от текущих досок); достижение
+/// капа — громкая ошибка, не тихая усечка.
+const MAX_RENDER_PAGES: u64 = 100;
+
+/// Строки доски через MCP database render (постранично, страница = 50 строк).
 pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
-    let v = sy.db_render(&board.av_id, &board.block_id).await?;
-    // structuredContent = {action, data:{...}} — берём data
-    let data = v.get("data").unwrap_or(&v);
-    let keys = data
-        .pointer("/view/columns")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let mut keys: Vec<Value> = Vec::new();
+    let mut row_count: Option<u64> = None;
+    let mut items_all: Vec<Value> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut page: u64 = 1;
+    loop {
+        let v = sy.db_render(&board.av_id, &board.block_id, page).await?;
+        // structuredContent = {action, data:{...}} — берём data
+        let data = v.get("data").unwrap_or(&v);
+        if page == 1 {
+            keys = data
+                .pointer("/view/columns")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            row_count = data.pointer("/view/rowCount").and_then(|r| r.as_u64());
+        }
+        let items = data
+            .pointer("/view/rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            // терминация всегда: rowCount невалиден (0/отсутствует) или устарел
+            // вниз при конкурентных удалениях — счётчик не используется
+            break;
+        }
+        for it in items {
+            // дедуп по id: дрейф страниц при конкурентных правках доски даёт
+            // дубль строки на стыке, а тот сломал бы resolve id-first
+            // («неоднозначный id»); пустые id не дедупятся
+            let id = it.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            if !id.is_empty() && !seen_ids.insert(id.to_string()) {
+                continue;
+            }
+            items_all.push(it);
+        }
+        // счётчик терминации — уникальные строки (после дедупа, до фильтра тайтлов)
+        if row_count.is_some_and(|rc| rc > 0 && items_all.len() as u64 >= rc) {
+            break;
+        }
+        page += 1;
+        if page > MAX_RENDER_PAGES {
+            bail!(
+                "read_rows: превышен кап {MAX_RENDER_PAGES} страниц render — доска усечена: собрано {} строк, rowCount сервера {row_count:?}",
+                items_all.len()
+            );
+        }
+    }
     let key_name = |id: &str| -> String {
         keys.iter()
             .find(|k| k.get("id").and_then(|i| i.as_str()) == Some(id))
@@ -98,13 +146,8 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
             .unwrap_or("")
             .to_string()
     };
-    let items = data
-        .pointer("/view/rows")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
     let mut out = Vec::new();
-    for it in items {
+    for it in items_all {
         let mut t = SyTask {
             item_id: it.get("id").and_then(|i| i.as_str()).unwrap_or("").into(),
             title: String::new(),

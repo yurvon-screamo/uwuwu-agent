@@ -317,11 +317,12 @@ impl SiYuan {
             .await
     }
 
-    /// Строки database (render): items с клетками.
-    pub async fn db_render(&self, av_id: &str, block_id: &str) -> Result<Value> {
+    /// Строки database (render): items с клетками; page с 1 (серверный
+    /// pageSize — 50, отсюда пагинация).
+    pub async fn db_render(&self, av_id: &str, block_id: &str, page: u64) -> Result<Value> {
         self.mcp_tool(
             "database",
-            json!({ "action": "render", "id": av_id, "blockID": block_id }),
+            json!({ "action": "render", "id": av_id, "blockID": block_id, "page": page }),
         )
         .await
     }
@@ -371,5 +372,22 @@ impl SiYuan {
     pub async fn remove_doc(&self, doc_id: &str) -> Result<()> {
         self.post("/api/filetree/removeDocByID", json!({ "id": doc_id })).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl SiYuan {
+    /// Тестовый конструктор: поля client/mcp_sid приватны для siyuan,
+    /// сиблинг-модуль siyuan_task_tests соберёт только через него.
+    pub(crate) fn for_tests(base: String) -> Self {
+        Self {
+            base,
+            token: "test-token".into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("test reqwest client"),
+            mcp_sid: std::sync::Mutex::new(None),
+        }
     }
 }

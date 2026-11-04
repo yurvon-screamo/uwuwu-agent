@@ -11,6 +11,9 @@ pub mod siyuan;
 pub mod sofa;
 pub mod siyuan_task;
 
+#[cfg(test)]
+mod siyuan_task_tests;
+
 use std::path::PathBuf;
 
 pub fn wiki_root() -> PathBuf {
