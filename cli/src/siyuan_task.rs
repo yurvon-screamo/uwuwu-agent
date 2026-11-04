@@ -10,6 +10,7 @@
 use crate::siyuan::SiYuan;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// Валидный хит db_search: имя доски совпадает точно, анкор — по hPath
 /// (первый сегмент — имя ноутбука) или как OR-страховка по blockID == doc_id.
@@ -31,6 +32,27 @@ pub struct SyBoard {
     pub block_id: String,
     pub hpath: String,
     pub notebook: String,
+}
+
+impl SyBoard {
+    /// Путь тела-саб-дока: единственная точка вклейки тайтла в hpath.
+    /// '/' в тайтле заменяется на '∕' (U+2215) — SiYuan трактует '/' как
+    /// разделитель сегментов и не создаёт отсутствующих родителей
+    /// (createDocWithMd отвечает «document metadata is not ready»).
+    pub fn body_hpath(&self, title: &str) -> String {
+        format!("{}/{}", self.hpath, path_safe(title))
+    }
+}
+
+/// Тайтл → безопасный сегмент hpath (конвенция миграции bind_rows.py: '/' → U+2215).
+pub(crate) fn path_safe(title: &str) -> String {
+    title.replace('/', "\u{2215}")
+}
+
+/// Каноническая форма тайтла для сравнения: ∕ ≡ / (регистр не важен).
+/// Юзер ищет «RU/EN» с ASCII-слэшем и находит строку с ∕ из миграции/санитайза.
+pub(crate) fn normalize_title(title: &str) -> String {
+    path_safe(title).to_lowercase()
 }
 
 /// Доска проекта: док /<project>/Задачи <project> + database-блок.
@@ -101,7 +123,7 @@ fn extract_av_id(md: &str) -> Option<String> {
     Some(rest[1..1 + value_end].to_string())
 }
 
-
+#[derive(Debug)]
 pub struct SyTask {
     pub item_id: String,
     pub title: String,
@@ -111,30 +133,85 @@ pub struct SyTask {
     pub body_doc: Option<String>,
 }
 
-/// Строки доски через MCP database render.
+/// Лимит страниц render при пагинации: страховка от зависания на битом
+/// rowCount (100×50 = 5000 строк — запас ×50 от текущих досок); достижение
+/// капа — громкая ошибка, не тихая усечка.
+const MAX_RENDER_PAGES: u64 = 100;
+
+/// Вид доски после полной постраничной выборки render: колонки + уникальные
+/// items всех страниц.
+struct BoardView {
+    columns: Vec<Value>,
+    items: Vec<Value>,
+}
+
+/// Полная выборка доски по страницам render: терминация по валидному rowCount
+/// или пустой странице, дедуп по id, кап страниц с громкой ошибкой.
+async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
+    let mut view = BoardView { columns: Vec::new(), items: Vec::new() };
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut row_count: Option<u64> = None;
+    let mut page: u64 = 1;
+    loop {
+        let v = sy.db_render(&board.av_id, &board.block_id, page).await?;
+        // structuredContent = {action, data:{...}} — берём data
+        let data = v.get("data").unwrap_or(&v);
+        if page == 1 {
+            view.columns = data
+                .pointer("/view/columns")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            row_count = data.pointer("/view/rowCount").and_then(|r| r.as_u64());
+        }
+        let items = data
+            .pointer("/view/rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            // терминация всегда: rowCount невалиден (0/отсутствует) или устарел
+            // вниз при конкурентных удалениях — счётчик не используется
+            break;
+        }
+        for it in items {
+            // дедуп по id: дрейф страниц при конкурентных правках доски даёт
+            // дубль строки на стыке, а тот сломал бы resolve id-first
+            // («неоднозначный id»); пустые id не дедупятся
+            let id = it.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            if !id.is_empty() && !seen_ids.insert(id.to_string()) {
+                continue;
+            }
+            view.items.push(it);
+        }
+        // счётчик терминации — уникальные строки (после дедупа, до фильтра тайтлов)
+        if row_count.is_some_and(|rc| rc > 0 && view.items.len() as u64 >= rc) {
+            break;
+        }
+        page += 1;
+        if page > MAX_RENDER_PAGES {
+            bail!(
+                "read_rows: превышен кап {MAX_RENDER_PAGES} страниц render — доска усечена: собрано {} строк, rowCount сервера {row_count:?}",
+                view.items.len()
+            );
+        }
+    }
+    Ok(view)
+}
+
+/// Строки доски через MCP database render (полная выборка, постранично).
 pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
-    let v = sy.db_render(&board.av_id, &board.block_id).await?;
-    // structuredContent = {action, data:{...}} — берём data
-    let data = v.get("data").unwrap_or(&v);
-    let keys = data
-        .pointer("/view/columns")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let view = collect_board_view(sy, board).await?;
     let key_name = |id: &str| -> String {
-        keys.iter()
+        view.columns
+            .iter()
             .find(|k| k.get("id").and_then(|i| i.as_str()) == Some(id))
             .and_then(|k| k.get("name").and_then(|n| n.as_str()))
             .unwrap_or("")
             .to_string()
     };
-    let items = data
-        .pointer("/view/rows")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
     let mut out = Vec::new();
-    for it in items {
+    for it in view.items {
         let mut t = SyTask {
             item_id: it.get("id").and_then(|i| i.as_str()).unwrap_or("").into(),
             title: String::new(),
@@ -187,7 +264,7 @@ fn cell_value(cell: &Value) -> String {
 
 /// Тело задачи: саб-док доски по заголовку.
 pub async fn body_doc_id(sy: &SiYuan, board: &SyBoard, title: &str) -> Result<Option<String>> {
-    let hpath = format!("{}/{}", board.hpath, title);
+    let hpath = board.body_hpath(title);
     sy.doc_id_by_hpath(&board.notebook, &hpath).await
 }
 
@@ -230,13 +307,15 @@ pub async fn create(
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
     // идемпотентность: строка или тело с таким заголовком уже есть?
+    // сравнение через нормализацию: ретрай с любым написанием слэша — дубль
     let rows = read_rows(sy, &board).await?;
-    if rows.iter().any(|r| r.title == title) {
+    let canon = normalize_title(title);
+    if rows.iter().any(|r| normalize_title(&r.title) == canon) {
         bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
     }
     // тело сначала, затем СТРОКА ПРИВЯЗАНАЯ к нему (blockID): клик по карточке
     // открывает документ; detached-строки не создаём
-    let body_path = format!("{}/{}", board.hpath, title);
+    let body_path = board.body_hpath(title);
     let body = sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx)).await?;
     let item = sy.db_item_add_bound(&board.av_id, &body).await?;
     let sk = status_key(sy, &board.av_id).await?;
@@ -272,7 +351,7 @@ pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTas
     }
     let by_title: Vec<&SyTask> = rows
         .iter()
-        .filter(|r| r.title.to_lowercase().contains(&needle.to_lowercase()))
+        .filter(|r| normalize_title(&r.title).contains(&normalize_title(needle)))
         .collect();
     if by_title.len() == 1 {
         return Ok(by_title[0].clone_shallow());
@@ -357,11 +436,58 @@ pub async fn find_board_cron(sy: &SiYuan, project: &str) -> Result<SyBoard> {
     find_board_titled(sy, project, &format!("Кроны {project}")).await
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn probe_board() -> SyBoard {
+        SyBoard {
+            doc_id: "board-doc".into(),
+            av_id: "board-av".into(),
+            block_id: "board-block".into(),
+            hpath: "/uwuwu/Задачи uwuwu".into(),
+            notebook: "projects-nb".into(),
+        }
+    }
+
+    #[test]
+    fn path_safe_replaces_slash_with_division_slash() {
+        assert_eq!(path_safe("вынести сборки из /tmp на /home"), "вынести сборки из \u{2215}tmp на \u{2215}home");
+    }
+
+    #[test]
+    fn path_safe_leaves_text_without_slash_untouched() {
+        assert_eq!(path_safe("обычный тайтл (v2)"), "обычный тайтл (v2)");
+        assert_eq!(path_safe("уже ∕ санитизирован"), "уже ∕ санитизирован");
+    }
+
+    #[test]
+    fn body_hpath_composes_board_hpath_with_sanitized_title() {
+        let board = probe_board();
+        assert_eq!(
+            board.body_hpath("KO/VI: убрать оверрейсы"),
+            "/uwuwu/Задачи uwuwu/KO\u{2215}VI: убрать оверрейсы"
+        );
+    }
+
+    #[test]
+    fn body_hpath_is_idempotent_on_sanitized_title() {
+        let board = probe_board();
+        let title = "Deploy: up\u{2215}down gateway";
+        assert_eq!(board.body_hpath(title), board.body_hpath(&path_safe(title)));
+    }
+
+    #[test]
+    fn normalize_title_matches_ascii_slash_needle_against_division_slash_title() {
+        assert_eq!(normalize_title("Пилот RU\u{2215}EN"), normalize_title("пилот ru/en"));
+    }
+
+    #[test]
+    fn normalize_title_keeps_distinct_titles_distinct() {
+        assert_ne!(normalize_title("a/b"), normalize_title("a\u{2215}b/c"));
+        assert_ne!(normalize_title("a/b"), normalize_title("ab"));
+    }
 
     #[test]
     fn extract_av_id_reads_dash_case_attribute_view_block() {
