@@ -205,13 +205,6 @@ impl SiYuan {
             .await
     }
 
-    /// Блоки верхнего уровня дока (дети документ-блока). Через MCP block
-    /// get_children, не SQL: индекс blocks отстаёт от мутаций.
-    async fn top_level_block_ids(&self, doc_id: &str) -> Result<Vec<String>> {
-        let text = self.block_children_text(doc_id).await?;
-        Ok(parse_block_ids(&text))
-    }
-
     pub async fn delete_block(&self, block_id: &str) -> Result<()> {
         self.post("/api/block/deleteBlock", json!({ "id": block_id })).await?;
         Ok(())
