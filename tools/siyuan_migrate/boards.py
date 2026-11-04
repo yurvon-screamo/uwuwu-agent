@@ -1,6 +1,6 @@
 """Stage 4: migrate AFFiNE kanban boards («Задачи <Proj>», «Кроны <Proj>») into SiYuan.
 
-- Board rows → SiYuan database (Status select + Branch/PR text keys) + kanban view
+- Board rows → SiYuan database (Status select + Branch text + PR url keys) + kanban view
 - Task comments (threads+replies) → appended «Комменты (миграция)» section
   into the corresponding body doc in SiYuan (matched by title)
 
@@ -299,12 +299,12 @@ def migrate_board(sy: SiYuanMcp, board: dict, rows: list[dict], target_nb: str, 
                     existing.add((v.get("block", {}) or {}).get("content", ""))
     except Exception:
         pass
-    # 3. keys: Status (select) + Branch/PR (text) — только для свежей database
+    # 3. keys: Status (select) + Branch (text) + PR (url) — только для свежей database
     if not existing:
         k_status = sy.tool("database", {"action": "key_add", "id": av, "name": "Status", "type": "select"})
         key_status = k_status.get("data", {}).get("key", {}).get("id") or k_status.get("key", {}).get("id") or ""
         sy.tool("database", {"action": "key_add", "id": av, "name": "Branch", "type": "text"})
-        sy.tool("database", {"action": "key_add", "id": av, "name": "PR", "type": "text"})
+        sy.tool("database", {"action": "key_add", "id": av, "name": "PR", "type": "url"})
     else:
         # существующая database: найти ключ Status
         kbr = sy.tool("database", {"action": "keys", "id": av})
