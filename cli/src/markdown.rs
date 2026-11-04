@@ -1,6 +1,7 @@
-//! Текстовые утилиты markdown-экспорта/реимпорта SiYuan: обёртки экспорта,
-//! секции, нормализация. Используются перезаписью тел (dispatch) и guard'ом
-//! (скелет-сравнение пустышек).
+//! Текстовые утилиты markdown-экспорта/реимпорта SiYuan: обёртки экспорта
+//! и нормализация. Используются перезаписью тел (dispatch) и guard'ом
+//! (скелет-сравнение пустышек); секционная логика живёт в dispatch
+//! (поверх примитивов md_heading).
 
 /// Снять экспортную обёртку дока: YAML frontmatter и рендер-строку имени
 /// (`# <имя дока>` первой строкой поверх блоков — она не блок; без strip
@@ -23,35 +24,6 @@ pub(crate) fn strip_frontmatter(md: &str) -> String {
         Some((_, after)) => after.trim_start_matches('\n').to_string(),
         None => md.to_string(),
     }
-}
-
-/// Секция «## X» в markdown: заменить содержимое, заголовок сохранить.
-pub(crate) fn replace_md_section(md: &str, section: &str, content: &str) -> String {
-    let mut out = String::new();
-    let mut in_section = false;
-    let mut replaced = false;
-    let needle = format!("## {section}");
-    for line in md.lines() {
-        if line.starts_with("## ") {
-            in_section = line.trim() == needle;
-            if in_section {
-                out.push_str(&needle);
-                out.push('\n');
-                out.push_str(content.trim());
-                out.push('\n');
-                replaced = true;
-                continue;
-            }
-        }
-        if !in_section {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str(&format!("\n## {section}\n{content}\n"));
-    }
-    out
 }
 
 /// Каноническая форма для сравнения контента: пробельные run'ы (включая
@@ -92,22 +64,6 @@ mod tests {
     fn strip_export_wrapper_keeps_body_without_name_prefix() {
         let md = "# другой заголовок\nтекст\n";
         assert_eq!(strip_export_wrapper(md, "таск"), "# другой заголовок\nтекст\n");
-    }
-
-    #[test]
-    fn replace_md_section_replaces_body_keeps_heading() {
-        let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let out = replace_md_section(md, "А", "новое содержимое\n");
-        assert!(out.contains("## А\nновое содержимое"));
-        assert!(out.contains("## Б\nвторое"));
-    }
-
-    #[test]
-    fn replace_md_section_appends_missing_section() {
-        let md = "## А\nпервое\n";
-        let out = replace_md_section(md, "Новая", "контент");
-        assert!(out.contains("## Новая\nконтент"));
-        assert!(out.contains("## А\nпервое"));
     }
 
     #[test]

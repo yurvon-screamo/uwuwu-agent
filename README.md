@@ -122,8 +122,9 @@ kernel SiYuan (REST + встроенный MCP), единый воркспейс
 **Production**: контейнер `siyuan-demo` на ноуте (`127.0.0.1:6806`), публично —
 `https://siyuan-relay-production.up.railway.app` (Railway-релей + rathole-туннель)
 
-Required env: `UWUWU_BACKEND=siyuan` (деф. включён глобально), `UWUWU_SIYUAN_URL`,
-`UWUWU_SIYUAN_TOKEN` (или `UWUWU_SIYUAN_WS` с conf.json).
+Required env: `UWUWU_SIYUAN_URL`,
+`UWUWU_SIYUAN_TOKEN` (или `UWUWU_SIYUAN_WS` с conf.json). Бекенд один — SiYuan kernel API
+(сменный `UWUWU_BACKEND` выпилен PR #32, ADR-014).
 
 **Workspace structure**:
 

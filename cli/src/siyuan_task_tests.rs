@@ -245,3 +245,60 @@ async fn dedup_page_drift() {
     ids.dedup();
     assert_eq!(ids.len(), 105, "все item_id уникальны");
 }
+
+/// Секция «## Комменты» лениво создаётся перед первым комментом: тело без
+/// секции получает заголовок (1 append), повторный вызов не дублирует его.
+/// Гэп ADR-014: комменты писались голыми буллетами без секции — thread
+/// отвечал «комментов нет» при живых комментах.
+#[tokio::test]
+async fn comment_creates_comments_section_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const DOC_ID: &str = "20261104120000-abcdefg";
+    let server = MockServer::start().await;
+    let export_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let calls = export_calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/export/exportMdContent"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = if n == 0 {
+                "# Таск\n\n## Постановка\nтело\n".to_string()
+            } else {
+                "# Таск\n\n## Постановка\nтело\n\n## Комменты\n- **AGENTS**: строка\n".to_string()
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "code": 0, "msg": "", "data": { "content": content } }))
+        })
+        .mount(&server)
+        .await;
+
+    let appends_log = appends.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/block/appendBlock"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            appends_log
+                .lock()
+                .expect("appends lock")
+                .push(body.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string());
+            ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "", "data": null }))
+        })
+        .mount(&server)
+        .await;
+
+    let sy = SiYuan::for_tests(server.uri());
+    crate::siyuan_task::ensure_comments_section(&sy, DOC_ID)
+        .await
+        .expect("первый вызов: секция создана");
+    crate::siyuan_task::ensure_comments_section(&sy, DOC_ID)
+        .await
+        .expect("повторный вызов: без дубля заголовка");
+
+    let appends = appends.lock().expect("appends lock");
+    assert_eq!(appends.len(), 1, "заголовок секции append'ится ровно один раз");
+    assert_eq!(appends[0], "## Комменты");
+}
