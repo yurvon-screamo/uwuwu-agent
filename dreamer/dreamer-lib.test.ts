@@ -44,7 +44,7 @@ ins({ id: "ses_root_fresh", title: "живая", updated: NOW - 1000 })         
 ins({ id: "ses_dreamer", agent: "dreamer", updated: NOW - IDLE - 1 })         // сам дример
 ins({ id: "ses_child", parent: "ses_root_idle", updated: NOW - IDLE - 1 })    // сабагент
 ins({ id: "ses_noagent", agent: null, updated: NOW - IDLE - 1 })              // NULL-агент — кандидат
-ins({ id: "ses_reviewer", agent: "code-quality-reviewer", updated: NOW - IDLE - 1 }) // ревьювер фабрики — не фактологизируем
+ins({ id: "ses_reviewer", agent: "code-quality-reviewer", updated: NOW - IDLE - 1 }) // ревьювер фабрики — кандидат наравне с девелоперскими
 
 afterAll(() => db.close())
 
@@ -57,13 +57,13 @@ const sess = (id: string): SessionRow => {
 describe("fetchRootSessions", () => {
   const rows = fetchRootSessions(db, before)
   test("idle-фильтр и exclusions", () => {
-    expect(rows.map((r) => r.id).sort()).toEqual(["ses_noagent", "ses_root_idle"])
+    expect(rows.map((r) => r.id).sort()).toEqual(["ses_noagent", "ses_reviewer", "ses_root_idle"])
   })
   test("NULL-агент не выпадает (COALESCE)", () => {
     expect(rows.some((r) => r.id === "ses_noagent")).toBe(true)
   })
-  test("ревьювер фабрики не фактологизируется", () => {
-    expect(rows.some((r) => r.id === "ses_reviewer")).toBe(false)
+  test("ревьювер фабрики — кандидат наравне с девелоперскими", () => {
+    expect(rows.some((r) => r.id === "ses_reviewer")).toBe(true)
   })
   test("fetchSessionById", () => {
     expect(fetchSessionById(db, "ses_root_idle")?.title).toBe("работа")
@@ -131,6 +131,8 @@ describe("markBacklog", () => {
     const marked = markBacklog(db, st, NOW - 1) // cutoff позже её updated
     expect(marked).toBeGreaterThanOrEqual(1)
     expect(st.sessions["ses_root_idle"]?.status).toBe("skipped")
+    // старые ревью-сессии — та же generic-семантика skipped
+    expect(st.sessions["ses_reviewer"]?.status).toBe("skipped")
     const st2 = emptyState()
     expect(markBacklog(db, st2, 0)).toBe(0) // cutoff раньше всех — не трогаем
     expect(st2.sessions["ses_root_idle"]).toBeUndefined()
