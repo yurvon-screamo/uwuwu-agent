@@ -9,6 +9,9 @@
   orgls                              дерево: ноутбуки + подпапки
   find "тайтл"                       поиск дока по заголовку
 
+orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
+молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
+
 Конфиг: UWUWU_SIYUAN_URL (деф. http://127.0.0.1:6806) + UWUWU_SIYUAN_TOKEN
 (или UWUWU_SIYUAN_WS/conf/conf.json).
 """
@@ -23,6 +26,10 @@ from pathlib import Path
 
 URL = None
 TOKEN = None
+
+# Ядро /api/query/sql без явного LIMIT молча отдаёт первые 64 строки stmt
+# (04.11: Experience 859 доков, orgls видел 64). Явный предел обязателен в каждом stmt.
+ORG_LS_LIMIT = 100000
 
 
 def _conf():
@@ -114,9 +121,10 @@ def cmd_replace(a):
 def cmd_orgls(a):
     for nb in notebooks():
         print(f"[{nb['name']}]")
-        rows = post("/api/query/sql", {"stmt": f"select hpath from blocks where type='d' and box='{nb['id']}'"})
+        stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"
+        rows = post("/api/query/sql", {"stmt": stmt})
         rows = rows if isinstance(rows, list) else rows.get("data", [])
-        for r in sorted(rows, key=lambda x: x["hpath"])[:200]:
+        for r in sorted(rows, key=lambda x: x["hpath"]):
             depth = r["hpath"].count("/") - 1
             print("  " * (depth + 1) + r["hpath"].rstrip("/").split("/")[-1])
 
