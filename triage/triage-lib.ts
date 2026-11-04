@@ -463,8 +463,11 @@ export function parseDraftAcks(text: string): Record<string, DraftVerdict> {
     if (at === -1) continue
     const segment = line.slice(at + ACK_LINE_PREFIX.length)
     for (const m of segment.matchAll(/([^\s,;=]+)\s*=\s*([^\s,;=]+)/g)) {
-      const rowId = stripMdEdge(m[1]!)
-      const verdict = DRAFT_VERDICTS.find((v) => v === stripMdEdge(m[2]!).toLowerCase())
+      const rawRowId = m[1]
+      const rawVerdict = m[2]
+      if (rawRowId === undefined || rawVerdict === undefined) continue
+      const rowId = stripMdEdge(rawRowId)
+      const verdict = DRAFT_VERDICTS.find((v) => v === stripMdEdge(rawVerdict).toLowerCase())
       if (rowId !== "" && verdict !== undefined) out[rowId] = verdict
     }
   }
