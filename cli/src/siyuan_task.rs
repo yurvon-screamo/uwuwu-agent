@@ -19,6 +19,27 @@ pub struct SyBoard {
     pub notebook: String,
 }
 
+impl SyBoard {
+    /// Путь тела-саб-дока: единственная точка вклейки тайтла в hpath.
+    /// '/' в тайтле заменяется на '∕' (U+2215) — SiYuan трактует '/' как
+    /// разделитель сегментов и не создаёт отсутствующих родителей
+    /// (createDocWithMd отвечает «document metadata is not ready»).
+    pub fn body_hpath(&self, title: &str) -> String {
+        format!("{}/{}", self.hpath, path_safe(title))
+    }
+}
+
+/// Тайтл → безопасный сегмент hpath (конвенция миграции bind_rows.py: '/' → U+2215).
+pub fn path_safe(title: &str) -> String {
+    title.replace('/', "\u{2215}")
+}
+
+/// Каноническая форма тайтла для сравнения: ∕ ≡ / (регистр не важен).
+/// Юзер ищет «RU/EN» с ASCII-слэшем и находит строку с ∕ из миграции/санитайза.
+pub(crate) fn normalize_title(title: &str) -> String {
+    path_safe(title).to_lowercase()
+}
+
 /// Доска проекта: док /<project>/Задачи <project> + database-блок.
 pub async fn find_board(sy: &SiYuan, project: &str) -> Result<SyBoard> {
     find_board_titled(sy, project, &format!("Задачи {project}")).await
@@ -157,7 +178,7 @@ fn cell_value(cell: &Value) -> String {
 
 /// Тело задачи: саб-док доски по заголовку.
 pub async fn body_doc_id(sy: &SiYuan, board: &SyBoard, title: &str) -> Result<Option<String>> {
-    let hpath = format!("{}/{}", board.hpath, title);
+    let hpath = board.body_hpath(title);
     sy.doc_id_by_hpath(&board.notebook, &hpath).await
 }
 
@@ -200,13 +221,15 @@ pub async fn create(
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
     // идемпотентность: строка или тело с таким заголовком уже есть?
+    // сравнение через нормализацию: ретрай с любым написанием слэша — дубль
     let rows = read_rows(sy, &board).await?;
-    if rows.iter().any(|r| r.title == title) {
+    let canon = normalize_title(title);
+    if rows.iter().any(|r| normalize_title(&r.title) == canon) {
         bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
     }
     // тело сначала, затем СТРОКА ПРИВЯЗАНАЯ к нему (blockID): клик по карточке
     // открывает документ; detached-строки не создаём
-    let body_path = format!("{}/{}", board.hpath, title);
+    let body_path = board.body_hpath(title);
     let body = sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx)).await?;
     let item = sy.db_item_add_bound(&board.av_id, &body).await?;
     let sk = status_key(sy, &board.av_id).await?;
@@ -242,7 +265,7 @@ pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTas
     }
     let by_title: Vec<&SyTask> = rows
         .iter()
-        .filter(|r| r.title.to_lowercase().contains(&needle.to_lowercase()))
+        .filter(|r| normalize_title(&r.title).contains(&normalize_title(needle)))
         .collect();
     if by_title.len() == 1 {
         return Ok(by_title[0].clone_shallow());
@@ -325,4 +348,57 @@ pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&s
 /// Доска кронов: док /<project>/Кроны <project> с database-блоком.
 pub async fn find_board_cron(sy: &SiYuan, project: &str) -> Result<SyBoard> {
     find_board_titled(sy, project, &format!("Кроны {project}")).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_board() -> SyBoard {
+        SyBoard {
+            doc_id: "board-doc".into(),
+            av_id: "board-av".into(),
+            block_id: "board-block".into(),
+            hpath: "/uwuwu/Задачи uwuwu".into(),
+            notebook: "projects-nb".into(),
+        }
+    }
+
+    #[test]
+    fn path_safe_replaces_slash_with_division_slash() {
+        assert_eq!(path_safe("вынести сборки из /tmp на /home"), "вынести сборки из \u{2215}tmp на \u{2215}home");
+    }
+
+    #[test]
+    fn path_safe_leaves_text_without_slash_untouched() {
+        assert_eq!(path_safe("обычный тайтл (v2)"), "обычный тайтл (v2)");
+        assert_eq!(path_safe("уже ∕ санитизирован"), "уже ∕ санитизирован");
+    }
+
+    #[test]
+    fn body_hpath_composes_board_hpath_with_sanitized_title() {
+        let board = probe_board();
+        assert_eq!(
+            board.body_hpath("KO/VI: убрать оверрейсы"),
+            "/uwuwu/Задачи uwuwu/KO\u{2215}VI: убрать оверрейсы"
+        );
+    }
+
+    #[test]
+    fn body_hpath_is_idempotent_on_sanitized_title() {
+        let board = probe_board();
+        let title = "Deploy: up\u{2215}down gateway";
+        assert_eq!(board.body_hpath(title), board.body_hpath(&path_safe(title)));
+    }
+
+    #[test]
+    fn normalize_title_matches_ascii_slash_needle_against_division_slash_title() {
+        assert_eq!(normalize_title("Пилот RU\u{2215}EN"), normalize_title("пилот ru/en"));
+    }
+
+    #[test]
+    fn normalize_title_keeps_distinct_titles_distinct() {
+        assert_ne!(normalize_title("a/b"), normalize_title("a\u{2215}b/c"));
+        assert_ne!(normalize_title("a/b"), normalize_title("ab"));
+    }
 }

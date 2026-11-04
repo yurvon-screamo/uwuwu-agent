@@ -71,7 +71,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             if !no_body {
                 let md = sy
-                    .export_md(&board.notebook, &format!("{}/{}", board.hpath, task.title))
+                    .export_md(&board.notebook, &board.body_hpath(&task.title))
                     .await
                     .unwrap_or_default();
                 println!("\n----- тело -----\n{md}");
@@ -109,7 +109,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
             let md = sy
-                .export_md(&board.notebook, &format!("{}/{}", board.hpath, task.title))
+                .export_md(&board.notebook, &board.body_hpath(&task.title))
                 .await
                 .unwrap_or_default();
             print_threads(&md);
@@ -140,7 +140,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let content = read_body_input(md.as_deref(), stdin)?;
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
-            let body_path = format!("{}/{}", board.hpath, task.title);
+            let body_path = board.body_hpath(&task.title);
             let existing = sy.export_md(&board.notebook, &body_path).await.unwrap_or_default();
             let new_md: String = if replace || replace_section.is_some() {
                 if let Some(section) = &replace_section {
@@ -174,12 +174,14 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             let proj = project.unwrap_or_else(|| "uwuwu".into());
             let board = syt::find_board_cron(&sy, &proj).await?;
             // тело крона = саб-док доски
-            let body_h = format!("{}/{}", board.hpath, title);
+            let body_h = board.body_hpath(&title);
             if syt::body_doc_id(&sy, &board, &title).await?.is_some() {
                 anyhow::bail!("крон «{title}» уже есть");
             }
             let body = sy.create_doc_md(&board.notebook, &body_h, &format!("# {title}\n\n```\n{prompt}\n```\n")).await?;
-            let item = sy.db_item_add(&board.av_id, &title).await?;
+            // content строки крона — тот же санитайз, что и у пути тела:
+            // иначе канбан покажет '/', а имя дока — '∕'
+            let item = sy.db_item_add(&board.av_id, &syt::path_safe(&title)).await?;
             // клетки Schedule/Status/Last Run (текст)
             set_text_cells(&sy, &board.av_id, &item, &[("Schedule", &schedule), ("Status", "active"), ("Last Run", "")]).await?;
             println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
