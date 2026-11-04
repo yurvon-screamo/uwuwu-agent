@@ -3,7 +3,7 @@
 //!
 //! Модель (v1):
 //! - доска «Задачи <Proj>» = док /<project>/Задачи <project> с database-блоком
-//! - строка задачи: Title (primary), Status (select), Branch, PR (text)
+//! - строка задачи: Title (primary), Status (select), Branch (text), PR (url)
 //! - тело задачи = саб-док дока доски: /<project>/Задачи <project>/<title>
 //! - комменты = секция «## Комменты» в теле (строки, реплаи — отступом)
 
@@ -170,19 +170,47 @@ fn cell_value(cell: &Value) -> String {
     if let Some(s) = c.as_str() {
         return s.to_string();
     }
+    // ячейка несёт активный type: после конвертации ключа (text→url) в значении
+    // остаётся stale text.content — читать нужно только поле активного типа
+    let single = |ptr: &str| -> Option<String> {
+        c.pointer(ptr).and_then(|s| s.as_str()).map(String::from)
+    };
+    let by_type = match c.get("type").and_then(|t| t.as_str()) {
+        Some("block") => single("/block/content"),
+        Some("text") => single("/text/content"),
+        Some("url") => single("/url/content"),
+        Some("email") => single("/email/content"),
+        Some("phone") => single("/phone/content"),
+        Some("select") | Some("mSelect") => {
+            return c
+                .get("mSelect")
+                .and_then(|a| a.as_array())
+                .map(|options| select_contents(options))
+                .unwrap_or_default();
+        }
+        _ => None,
+    };
+    if let Some(v) = by_type {
+        return v;
+    }
+    // фоллбек для значений без type: старый порядок указателей
     for ptr in ["/block/content", "/select/content", "/text/content", "/url/content", "/email/content", "/phone/content"] {
-        if let Some(s) = c.pointer(ptr).and_then(|s| s.as_str()) {
-            return s.to_string();
+        if let Some(s) = single(ptr) {
+            return s;
         }
     }
-    if let Some(arr) = c.get("mSelect").and_then(|a| a.as_array()) {
-        return arr
-            .iter()
-            .filter_map(|o| o.get("content").and_then(|x| x.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-    }
-    String::new()
+    c.get("mSelect")
+        .and_then(|a| a.as_array())
+        .map(|options| select_contents(options))
+        .unwrap_or_default()
+}
+
+fn select_contents(options: &[Value]) -> String {
+    options
+        .iter()
+        .filter_map(|o| o.get("content").and_then(|x| x.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Тело задачи: саб-док доски по заголовку.
@@ -320,8 +348,22 @@ pub async fn close(sy: &SiYuan, board: &SyBoard, task: &SyTask, note: Option<&st
     Ok(())
 }
 
+/// Значение PR-ячейки (ключ типа url): пустая строка — очистка, иначе http(s)-ссылка.
+fn pr_cell_value(pr: &str) -> Result<Value> {
+    let pr = pr.trim();
+    if pr.is_empty() {
+        return Ok(serde_json::json!({ "url": { "content": "" } }));
+    }
+    if !pr.starts_with("http://") && !pr.starts_with("https://") {
+        bail!("ключ PR хранит ссылку (url): ожидаю http(s)://…, получено «{pr}» (ветку пиши в --branch)");
+    }
+    Ok(serde_json::json!({ "url": { "content": pr } }))
+}
+
 /// Смена статуса/branch/pr (title-переименование не поддерживаем v1).
 pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&str>, branch: Option<&str>, pr: Option<&str>) -> Result<()> {
+    // валидация PR до любых записей: без частичных обновлений
+    let pr_value = pr.map(pr_cell_value).transpose()?;
     let keys = sy.mcp_tool("database", serde_json::json!({ "action": "keys", "id": board.av_id })).await?;
     let arr = keys
         .pointer("/data/keys")
@@ -338,16 +380,23 @@ pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&s
         let k = find("Status").context("ключ Status не найден")?;
         sy.db_item_set_status(&board.av_id, &k, &task.item_id, st).await?;
     }
-    for (name, val) in [("Branch", branch), ("PR", pr)] {
-        if let Some(v) = val {
-            let k = find(name).context(format!("ключ {name} не найден"))?;
-            sy.mcp_tool(
-                "database",
-                serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
-                        "itemID": task.item_id, "value": { "text": { "content": v } } }),
-            )
-            .await?;
-        }
+    if let Some(v) = branch {
+        let k = find("Branch").context("ключ Branch не найден")?;
+        sy.mcp_tool(
+            "database",
+            serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
+                    "itemID": task.item_id, "value": { "text": { "content": v } } }),
+        )
+        .await?;
+    }
+    if let Some(value) = pr_value {
+        let k = find("PR").context("ключ PR не найден")?;
+        sy.mcp_tool(
+            "database",
+            serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
+                    "itemID": task.item_id, "value": value }),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -425,5 +474,89 @@ mod tests {
         })];
         let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-77");
         assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
+    }
+
+    fn cell_of(value: Value) -> Value {
+        json!({ "value": value })
+    }
+
+    #[test]
+    fn cell_value_prefers_url_over_stale_text_on_url_typed_cell() {
+        // после конвертации ключа text→url в значении остаётся старый text.content
+        let cell = cell_of(json!({
+            "type": "url",
+            "text": { "content": "https://old.example/pull/1" },
+            "url": { "content": "https://new.example/pull/2" }
+        }));
+        assert_eq!(cell_value(&cell), "https://new.example/pull/2");
+    }
+
+    #[test]
+    fn cell_value_returns_empty_for_url_cell_with_unfilled_url() {
+        // до-миграционный артефакт: url пуст, текст застрял в text — честно пусто
+        let cell = cell_of(json!({
+            "type": "url",
+            "text": { "content": "https://old.example/pull/1" },
+            "url": { "content": "" }
+        }));
+        assert_eq!(cell_value(&cell), "");
+    }
+
+    #[test]
+    fn cell_value_reads_text_typed_cell() {
+        let cell = cell_of(json!({ "type": "text", "text": { "content": "feature/x" } }));
+        assert_eq!(cell_value(&cell), "feature/x");
+    }
+
+    #[test]
+    fn cell_value_reads_block_typed_cell() {
+        let cell = cell_of(json!({ "type": "block", "block": { "content": "Заголовок" } }));
+        assert_eq!(cell_value(&cell), "Заголовок");
+    }
+
+    #[test]
+    fn cell_value_joins_multi_select_options() {
+        let cell = cell_of(json!({
+            "type": "mSelect",
+            "mSelect": [{ "content": "Done", "color": "1" }, { "content": "Todo", "color": "2" }]
+        }));
+        assert_eq!(cell_value(&cell), "Done,Todo");
+    }
+
+    #[test]
+    fn cell_value_falls_back_to_pointers_without_type() {
+        let cell = cell_of(json!({ "text": { "content": "без type" } }));
+        assert_eq!(cell_value(&cell), "без type");
+    }
+
+    #[test]
+    fn pr_cell_value_wraps_https_link_into_url_payload() {
+        let v = pr_cell_value("https://github.com/yurvon-screamo/uwuwu-agent/pull/36").unwrap();
+        assert_eq!(v, json!({ "url": { "content": "https://github.com/yurvon-screamo/uwuwu-agent/pull/36" } }));
+    }
+
+    #[test]
+    fn pr_cell_value_accepts_http_link() {
+        let v = pr_cell_value("http://gitea.local/origa/pull/9").unwrap();
+        assert_eq!(v, json!({ "url": { "content": "http://gitea.local/origa/pull/9" } }));
+    }
+
+    #[test]
+    fn pr_cell_value_trims_whitespace_around_link() {
+        let v = pr_cell_value("  https://github.com/a/b/pull/1  ").unwrap();
+        assert_eq!(v, json!({ "url": { "content": "https://github.com/a/b/pull/1" } }));
+    }
+
+    #[test]
+    fn pr_cell_value_empty_string_clears_the_cell() {
+        let v = pr_cell_value("").unwrap();
+        assert_eq!(v, json!({ "url": { "content": "" } }));
+    }
+
+    #[test]
+    fn pr_cell_value_rejects_non_link_input() {
+        let err = pr_cell_value("main").unwrap_err().to_string();
+        assert!(err.contains("http(s)://"), "неожиданное сообщение: {err}");
+        assert!(err.contains("--branch"), "неожиданное сообщение: {err}");
     }
 }
