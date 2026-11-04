@@ -3,7 +3,6 @@
 // рестарт-реконсилиация, промпт дримеру. SQLite — bun:sqlite, всегда readonly.
 
 import type { Database } from "bun:sqlite"
-import { REVIEWER_AGENT_ID } from "../lib/agents"
 
 // ——— типы ———
 
@@ -95,11 +94,15 @@ export function idleBefore(nowMs: number, idleMs: number): number {
 }
 
 export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): SessionRow[] {
+  // Ревью-сессии фабрики (code-quality-reviewer) в пуле опыта наравне с
+  // девелоперскими — осознанная отмена границы ADR-008 владельцем
+  // (uwuwu: «Дример: работа с сессиями ревьюверов», строка 20261104215725-7zngmlj).
+  // Исключён только сам dreamer — его прогоны не анализируют сами себя.
   const rows = db
     .query(
       `SELECT id, title, directory, agent, parent_id, time_created, time_updated
        FROM session_v2
-       WHERE COALESCE(agent, '') NOT IN ('dreamer', '${REVIEWER_AGENT_ID}')
+       WHERE COALESCE(agent, '') != 'dreamer'
          AND parent_id IS NULL
          AND time_updated < ?
        ORDER BY time_updated DESC
@@ -217,7 +220,7 @@ export function markBacklog(db: Database, state: DreamerState, cutoffMs: number)
   const rows = db
     .query(
       `SELECT id, time_updated FROM session_v2
-       WHERE COALESCE(agent, '') NOT IN ('dreamer', '${REVIEWER_AGENT_ID}')
+       WHERE COALESCE(agent, '') != 'dreamer'
          AND parent_id IS NULL
          AND time_updated < ?`,
     )
