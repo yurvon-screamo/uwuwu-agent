@@ -4,13 +4,17 @@
 // (нативный деф-агент triage: системный промпт + permissions, материализуется
 // демон в workspace/.opencode/agents) — память диалога = контекст сессии
 // (компакция рулит), финал хода → ответ в ТГ.
-// Занят → очередь. Запуск: systemd --user (uwuwu-triage.service).
+// Свободен → ход. Занят → после окна дебаунса сообщение вбрасывается в
+// текущий ход (нативный delivery:"steer"), ответы приходят по мере готовности
+// (инкрементально); черновиковый ход без стирта — сообщение дождётся очереди.
+// Запуск: systemd --user (uwuwu-triage.service).
 //
 // Гарантии: сообщение не теряется при рестарте в любом месте (уходит из
 // очереди только после подтверждённого промпта; окно отправки держит его и в
-// очереди, и в state.run). Доставка финала — at-least-once: рестарт посреди
-// доставки может задублировать ответ. Poison-защита: 5 неудачных попыток
-// подъёма хода → dead-letter с полным текстом юзеру.
+// очереди, и в state.run — для стирта персона батча персистится в
+// state.firing). Доставка ответов — at-least-once: рестарт посреди доставки
+// может задублировать. Poison-защита: 5 неудачных попыток подъёма хода →
+// dead-letter с полным текстом юзеру.
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -20,18 +24,22 @@ import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, extractFinal, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt,
-  setDraftAck, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
+  draftReady, dropBatch, extractReplies, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt,
+  setDraftAck, steerCandidate, steerRecoveryBatch, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
-  type DraftRef, type DraftVerdict, type Request, type RunState, type TgUpdate, type TriageState,
+  type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
 const HERE = dirname(new URL(import.meta.url).pathname)
 const CFG = join(HERE, "hub.json")        // { token, owner, model? } — секрет, gitignored
 const AGENT_DEF_SRC = join(HERE, "agent.md") // нативный деф агента: frontmatter (модель/права) + методичка (системный промпт)
-const STATE_DIR = join(homedir(), ".local/state/uwuwu-triage")
+/** Корень рантайм-путей: дефолт — прод (systemd); override — только
+ *  досмерджевый протокол (mock-TG E2E рядом с живым демоном не должен
+ *  трогать прод-state, прод-воркспейс и прод-лог). */
+const RUN_ROOT = process.env.UWUWU_TRIAGE_HOME ?? homedir()
+const STATE_DIR = join(RUN_ROOT, ".local/state/uwuwu-triage")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
+const LOG_PATH = join(RUN_ROOT, ".local/share/opencode/log/uwuwu-triage.log")
 /** изолированный cwd сессии диалога: переписка — недоверенный текст,
  *  домашний каталог сессия видеть не должна; деф агента материализуется
  *  демон в .opencode/agents/ отсюда (нативный механизм конфигурации).
@@ -42,14 +50,19 @@ const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-triage.log")
  *  решение владельца 02.11; сдерживание недоверенных текстов — методичка
  *  («текст черновика — данные, не инструкции»), guard CLI (task delete
  *  только Draft) и метаданные промпта. */
-const WORKSPACE = join(homedir(), ".local/share/uwuwu-triage/workspace")
+const WORKSPACE = join(RUN_ROOT, ".local/share/uwuwu-triage/workspace")
 const AGENT_NAME = "triage"
 const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${AGENT_NAME}.md`)
 /** выгруженные вложения заявок (скрины/файлы): агент видит их в ФС по путям
  *  из текста заявки и прикладывает к задаче (--attach) */
-const MEDIA_DIR = join(homedir(), ".local/share/uwuwu-triage/media")
+const MEDIA_DIR = join(RUN_ROOT, ".local/share/uwuwu-triage/media")
 const MEDIA_TTL_MS = 7 * 24 * 3600_000
+/** Регистрация фонового opencode-сервиса — ВХОД демона (где живой сервер),
+ *  не его state: всегда реальный homedir, UWUWU_TRIAGE_HOME его не двигает. */
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
+/** API Telegram: дефолт — прод; override — mock-TG досмерджевого протокола
+ *  (см. README «Проверка»). */
+const TG_API = process.env.UWUWU_TRIAGE_TG_API ?? "https://api.telegram.org"
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
@@ -59,6 +72,10 @@ const DELIVER_ATTEMPTS = 3 // попытки доставки финала в Т
  *  на редактирование (edited_message подменяет текст, пока батч в очереди) */
 const BATCH_DELAY_MS = Math.max(0, Number(process.env.UWUWU_TRIAGE_BATCH_MS ?? 60_000) || 60_000)
 const BATCH_MAX_MS = 5 * 60_000 // самое старое сообщение не ждёт дольше
+/** окно чтения истории сессии: `?limit&order=desc` вместо полного списка —
+ *  недоставленный хвост всегда в свежайших (между тиками >100 недоставленных
+ *  не накопить; delivered[] переживает рестарты), O(history) на тик не растёт */
+const MSG_WINDOW = 100
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 
 // ——— вотчер черновиков досок (Draft → очередь) ———
@@ -73,7 +90,7 @@ const HELP = [
   "📥 Триаж uwuwu — входная точка задач.",
   "",
   "Пиши как человеку: поздороваться, спросить, что умею, или кинуть описание задачи — определю проект и тип, проверю на дубли и заведу в канбан uwuwu (или дополню существующую) — отвечу сводкой.",
-  "Диалог живёт в одной сессии: помню контекст переписки. Занят — сообщение встанет в очередь.",
+  "Диалог живёт в одной сессии: помню контекст переписки. Занят — после минуты тишины сообщение вбросится в текущий ход, ответ придёт отдельным сообщением, как только будет готов.",
   "Пиши хоть потоком: склею всё в одну заявку через минуту после последнего сообщения (успей отредактировать — правки подхватятся, пока не начал разбирать).",
   "/reset — стоп-кран: сбросить сессию и висящий ход, начать диалог с чистого контекста.",
 ].join("\n")
@@ -119,8 +136,9 @@ const save = (): void => {
 
 // ——— Telegram ———
 
+/** ТГ: дефолт — прод-API; override для mock-TG (досмерджевый протокол). */
 async function tg(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
-  const res = await fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
+  const res = await fetch(`${TG_API}/bot${cfg.token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(params),
@@ -197,9 +215,9 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   return j.data ?? j
 }
 
-async function sessionMessages(sessionID: string): Promise<Parameters<typeof extractFinal>[0]> {
-  const msgs = await restCall(`/session/${sessionID}/message`)
-  return Array.isArray(msgs) ? msgs as Parameters<typeof extractFinal>[0] : []
+async function sessionMessages(sessionID: string): Promise<SessionMsg[]> {
+  const msgs = await restCall(`/session/${sessionID}/message?limit=${MSG_WINDOW}&order=desc`)
+  return Array.isArray(msgs) ? msgs as SessionMsg[] : []
 }
 
 // ——— вечная сессия диалога ———
@@ -372,9 +390,141 @@ const recordDraftAcks = async (drafts: DraftRef[], acks: Record<string, DraftVer
   if (changed) save()
 }
 
-/** Финал хода → ТГ (обязательный канал для черновиков с «обсуждение» —
- *  вопрос владельцу; иначе log-only). Оборванный финал (outcome ≠
- *  succeeded) — только пометка юзеру: ход завершён, сообщение не
+/** Недоставленные готовые ответы хода — в ТГ (инкрементальная доставка,
+ *  каждый тик watchRun; финальный хвост доставит deliverFinal с ретраями).
+ *  Хронология: стоп на первой неудачной отправке — недоставленное ретраится
+ *  следующим тиком, поздние ответы его не обгоняют. Промежуточные сообщения
+ *  из одних draft-ack строк после стрипа пусты — помечаются доставленными
+ *  без отправки (ack-канал демона, владельцу не светит). */
+const deliverNew = async (run: RunState, msgs: SessionMsg[]): Promise<void> => {
+  if (run.req.chatID === 0) return // черновиковый ход: доставка только в финале («обсуждение»)
+  const replies = extractReplies(msgs, run.startedAt, run.delivered ?? [], true)
+  let changed = false
+  for (const r of replies) {
+    if (state.run !== run) return // /reset в окне await — state не трогаем
+    const body = stripDraftAcks(r.text)
+    if (body === "") {
+      run.delivered = [...(run.delivered ?? []), r.id]
+      changed = true
+      log(`ход ${run.sessionID}: ${r.id} — только draft-ack, в ТГ не шлю`)
+      continue
+    }
+    const ok = await send(run.req.chatID, body)
+    if (state.run !== run) return
+    if (!ok) {
+      log(`ход ${run.sessionID}: ${r.id} не доставлен — стоп до следующего тика (хронология)`)
+      return
+    }
+    run.delivered = [...(run.delivered ?? []), r.id]
+    changed = true
+    log(`ход ${run.sessionID}: ответ ${r.id} доставлен посреди хода: ${body.slice(0, 60)}`)
+  }
+  if (changed && state.run === run) save()
+}
+
+/** POST стирта с ретраем без files (паттерн startRun). firing-маркер —
+ *  СИНХРОННО до await (edit-ветка честно скажет «уже у агента»; персона
+ *  батча персистится для краш-восстановления — симметрично run.req старта).
+ *  Успех: граница done хода (run.steerAt) = time.created ответа — сервер
+ *  всю фазу исполнения, начатого стиртом по idle-сессии, отдаёт стухший
+ *  outcome/idle (проба Design); не число — Date.now() (та же машина).
+ *  Неуспех: маркер долой, батч остаётся в очереди — ретрай следующим тиком
+ *  (счётчик не нужен: 404 закроет gone-ветка, трансзиент самолечится). */
+const steerPost = async (run: RunState, batch: Request): Promise<void> => {
+  if (state.run !== run) return
+  state.firing = { at: Date.now(), msgIDs: batch.msgIDs ?? [batch.msgID] }
+  save()
+  const files = (batch.attachments ?? []).map((a) => ({ uri: `file://${a.path}`, name: a.name }))
+  const post = (withFiles: boolean) => restCall(`/session/${run.sessionID}/prompt`, {
+    method: "POST",
+    body: { text: batch.text, delivery: "steer", ...(withFiles && files.length > 0 ? { files } : {}) },
+  })
+  let landed: unknown
+  try {
+    try {
+      landed = await post(true)
+    } catch (e) {
+      if (files.length === 0) throw e
+      log(`стирт с files не прошёл (${e}) — ретрай без files`)
+      landed = await post(false)
+    }
+  } catch (e) {
+    if (state.run === run) {
+      state.firing = undefined
+      save()
+    }
+    log(`стирт не прошёл (${e}) — батч в очереди, ретрай следующим тиком`)
+    return
+  }
+  if (state.run !== run) return // /reset в окне POST — батч остаётся в очереди, поднимется новым ходом
+  const t = (landed as { time?: { created?: unknown } } | undefined)?.time?.created
+  run.steerAt = typeof t === "number" && Number.isFinite(t) && t > 0 ? t : Date.now()
+  state.queue = dropBatch(state.queue, batch)
+  state.firing = undefined
+  save()
+  log(`стирт ${run.sessionID} (${batch.msgIDs?.length ?? 1} сообщ., граница done ${run.steerAt}): ${batch.text.slice(0, 60)}`)
+}
+
+/** Вброс ТГ-батча в активный ход. Порядок проверок — контракт (ревью
+ *  Common#2): краш-восстановление по персистентному firing ПЕРВИЧНО (точная
+ *  персона стиртованного батча из msgIDs; пересборка по готовности могла бы
+ *  прицепить сообщения, пришедшие до рестарта), затем обычный кандидат по
+ *  дебаунсу; landed-дедуп раньше всякого POST. Граница дедупа — момент
+ *  готовности/полёта батча (firing.at / readyAt, минус 2с скью), НЕ startedAt:
+ *  повтор юзером того же текста внутри хода дедупом не ловится. */
+const steerStep = async (run: RunState, msgs: SessionMsg[]): Promise<void> => {
+  if (run.req.chatID === 0) return // черновиковый ход — вброс не критичен (юзкейс 3)
+
+  if (state.firing !== undefined) {
+    // маркер при активном ходе — всегда след стирта прошлой жизни демона:
+    // старт-маркер к этому моменту вычищен (дозрел до run и сброшен в
+    // startRun, либо снесён вместе с run startedAt=0 в runLoop)
+    const batch = steerRecoveryBatch(state.queue, state.firing.msgIDs)
+    if (batch === null) {
+      log(`стирт: firing-маркер без персоны в очереди — чищу`)
+      state.firing = undefined
+      save()
+      return
+    }
+    const landed = promptLandedAt(msgs, state.firing.at - 2000, batch.text)
+    if (landed !== null) {
+      // POST прошлой жизни долетел, save не пережил: дроп ТОЧНОЙ персоны,
+      // граница done восстанавливается из момента приземления
+      if (state.run === run) {
+        run.steerAt = landed
+        state.queue = dropBatch(state.queue, batch)
+        state.firing = undefined
+        save()
+        log(`стирт (краш-окно): приземлился ${landed} — батч дропнут, наблюдение продолжается`)
+      }
+      return
+    }
+    log(`стирт (краш-окно): маркер без приземления — ретрай той же персоной`)
+    await steerPost(run, batch)
+    return
+  }
+
+  const cand = steerCandidate(state.queue, state.lastPushAt ?? 0, BATCH_DELAY_MS, BATCH_MAX_MS)
+  if (cand === null || Date.now() < cand.readyAt) return
+  const landed = promptLandedAt(msgs, cand.readyAt - 2000, cand.batch.text)
+  if (landed !== null) {
+    // дедуп рестарт-окна без маркера (страховка; в живом процессе приземление
+    // без firing невозможен — маркер персистится ДО POST)
+    if (state.run === run) {
+      run.steerAt = landed
+      state.queue = dropBatch(state.queue, cand.batch)
+      save()
+      log(`стирт: батч уже в сессии (${landed}) — дроп без повторного POST`)
+    }
+    return
+  }
+  await steerPost(run, cand.batch)
+}
+
+/** Финал хода: хвост недоставленных ответов — обязательный канал (ретраи);
+ *  acks парсятся по ВСЕМ assistant-текстам хода (промежуточные сообщения
+ *  переживают инкрементальную доставку и рестарты). Оборванный финал
+ *  (outcome ≠ succeeded) — пометка юзеру: ход завершён, сообщение не
  *  переигрывается и сессия не пересоздаётся (одна вечная сессия; сброс
  *  контекста — только ручной /reset). */
 const deliverFinal = async (run: RunState): Promise<void> => {
@@ -383,16 +533,20 @@ const deliverFinal = async (run: RunState): Promise<void> => {
     const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string }
     broken = s.outcome !== undefined && s.outcome !== "succeeded"
   } catch { /* статус не достали — попробуем всё равно прочитать сообщения */ }
-  let text = ""
-  try { text = extractFinal(await sessionMessages(run.sessionID), run.startedAt) } catch {}
-  const acks = parseDraftAcks(text)
+  let msgs: SessionMsg[] = []
+  try { msgs = await sessionMessages(run.sessionID) } catch {}
+  const repliesAll = extractReplies(msgs, run.startedAt, [], false)
+  const acks = parseDraftAcks(repliesAll.map((r) => r.text).join("\n"))
   const batchDrafts = run.req.drafts ?? []
-  let body = text !== "" ? stripDraftAcks(text) : "(пустой ответ)"
-  if (broken) body += "\n\n⚠️ прогон оборван — финал мог не доехать"
+  const BROKEN_MARK = "\n\n⚠️ прогон оборван — финал мог не доехать"
   if (run.req.chatID === 0) {
-    // черновики досок: сырой финал (с ack-строками) — в лог, доска —
-    // источник истины; но исход «обсуждение» глушит перевывы — вопрос
-    // владельцу обязан доехать в ТГ
+    // черновики досок: последний reply (методичка требует итог/вопрос в нём)
+    // — в лог с ack-строками, доска — источник истины; исход «обсуждение»
+    // глушит перевывы — вопрос владельцу обязан доехать в ТГ
+    const last = repliesAll.at(-1)
+    const text = last?.text ?? ""
+    let body = text !== "" ? stripDraftAcks(text) : "(пустой ответ)"
+    if (broken) body += BROKEN_MARK
     log(`финал ${run.sessionID} (черновики, без ТГ): ${(text !== "" ? text : "(пустой ответ)").slice(0, 200)}`)
     const hasDiscussion = batchDrafts.some((d) => acks[d.rowId] === "обсуждение")
     if (hasDiscussion) {
@@ -403,7 +557,23 @@ const deliverFinal = async (run: RunState): Promise<void> => {
       }
     }
   } else {
-    await deliverWithRetries(run.req.chatID, body, `финал ${run.sessionID}`)
+    const tail = extractReplies(msgs, run.startedAt, run.delivered ?? [], false)
+      .map((r: Reply) => stripDraftAcks(r.text))
+      .filter((body) => body !== "")
+    const deliveredAny = (run.delivered ?? []).length > 0
+    if (tail.length === 0 && !deliveredAny) {
+      // за весь ход не доставлено ничего и хвоста нет — честный пустой ответ
+      await deliverWithRetries(run.req.chatID, `(пустой ответ)${broken ? BROKEN_MARK : ""}`, `финал ${run.sessionID}`)
+    } else {
+      for (let i = 0; i < tail.length; i++) {
+        const body = broken && i === tail.length - 1 ? tail[i]! + BROKEN_MARK : tail[i]!
+        await deliverWithRetries(run.req.chatID, body, `хвост ${run.sessionID} (${i + 1}/${tail.length})`)
+      }
+      if (broken && tail.length === 0) {
+        // всё доставлено посреди хода, но прогон оборван — пометка отдельно
+        await deliverWithRetries(run.req.chatID, `⚠️ прогон оборван — финал мог не доехать`, `финал ${run.sessionID} (пометка)`)
+      }
+    }
   }
   logAckParse(batchDrafts, acks)
   await recordDraftAcks(batchDrafts, acks)
@@ -412,11 +582,15 @@ const deliverFinal = async (run: RunState): Promise<void> => {
   if (applyTurns(state.drafts, batchDrafts.map((d) => d.rowId), Date.now())) save()
 }
 
-/** Одна проверка сессии: ещё исполняется / завершена / пропала. */
+/** Одна проверка сессии: ещё исполняется / завершена / пропала. Граница
+ *  «done» — idle новее старта хода И последнего приземлившегося стирта:
+ *  исполнение, начатое стиртом по idle-сессии, отдает стухший outcome и
+ *  старый idle до своего завершения (проба Design). */
 const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"> => {
   try {
     const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string; time?: { idle?: number } }
-    if (s.outcome !== undefined && typeof s.time?.idle === "number" && s.time.idle >= run.startedAt) return "done"
+    const boundary = Math.max(run.startedAt, run.steerAt ?? 0)
+    if (s.outcome !== undefined && typeof s.time?.idle === "number" && s.time.idle >= boundary) return "done"
     return "running"
   } catch (e) {
     const status = (e as { status?: number }).status
@@ -425,15 +599,29 @@ const sessionStatus = async (run: RunState): Promise<"running" | "done" | "gone"
 }
 
 /** Дождаться финала хода (поллинг состояния сессии — как reconcile хаба):
- *  outcome выставлен и idle новее старта хода → ход завершён. Таймаута нет:
- *  ход живёт столько, сколько живёт; стоп-кран один и ручной — /reset
- *  (чистит state.run → эта петля обязана выйти, не блокируя runLoop). */
+ *  outcome выставлен и idle новее границы (старт/стирт) → ход завершён.
+ *  Таймаута нет: ход живёт столько, сколько живёт; стоп-кран один и ручной —
+ *  /reset (чистит state.run → эта петля обязана выйти, не блокируя runLoop).
+ *  Каждый тик: один GET сообщений (окно MSG_WINDOW) → инкрементальная
+ *  доставка готовых ответов → попытка стирта → статус сессии. */
 const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
   while (true) {
     if (stopping) return "stopping"
     if (state.run !== run) {
       // ход снесли (/reset): финал не доставляем, очередь свободна
       log(`ход ${run.sessionID}: сброшен (/reset) — перестаю наблюдать`)
+      return "done"
+    }
+    let msgs: SessionMsg[] = []
+    try {
+      msgs = await sessionMessages(run.sessionID)
+    } catch (e) {
+      log(`ход ${run.sessionID}: сообщения не достали (${e}) — тик без доставки`)
+    }
+    await deliverNew(run, msgs)
+    await steerStep(run, msgs)
+    if (state.run !== run) {
+      log(`ход ${run.sessionID}: сброшен (/reset) посреди тика — перестаю наблюдать`)
       return "done"
     }
     const st = await sessionStatus(run)
@@ -449,7 +637,7 @@ const watchRun = async (run: RunState): Promise<"done" | "stopping"> => {
       return "done"
     }
     if (st === "done") {
-      await deliverFinal(run) // критическая секция: stopping не проверяем — доезжаем
+      if (state.run === run) await deliverFinal(run) // критическая секция: stopping не проверяем — доезжаем
       return "done"
     }
     await sleep(POLL_SEC * 1000)
@@ -606,7 +794,7 @@ const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<
     try {
       const f = await tg("getFile", { file_id: fileId }) as { file_path?: string }
       if (typeof f.file_path !== "string") throw new Error("нет file_path")
-      const res = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${f.file_path}`, {
+      const res = await fetch(`${TG_API}/file/bot${cfg.token}/${f.file_path}`, {
         signal: AbortSignal.timeout(30_000),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
