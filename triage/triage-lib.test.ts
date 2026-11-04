@@ -3,7 +3,7 @@ import { test, expect } from "bun:test"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractReplies,
-  joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
+  inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
   steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
@@ -300,6 +300,22 @@ test("steerRecoveryBatch: точная персона по msgIDs из firing, �
   expect(batch?.text).toBe("x\n\ny")
   expect(steerRecoveryBatch(q, [777])).toBeNull() // персона ушла из очереди — маркер стух
   expect(steerRecoveryBatch([], [1])).toBeNull()
+})
+
+test("inboxToSessionMsgs: user-записи с payload.text мапятся; мусор стрипится почастино", () => {
+  const entries = [
+    { type: "user", id: "msg_i1", time: { created: 5 * M }, payload: { text: "вброс посреди хода" }, delivery: "steer" },
+    { type: "compaction", id: "msg_c", time: { created: 6 * M } },
+    { type: "user", id: "msg_i2", time: { created: 7 * M }, payload: {} }, // без текста
+    { type: "user", id: "msg_i3", payload: { text: "без времени" } },
+    "мусор",
+    null,
+  ]
+  const msgs = inboxToSessionMsgs(entries)
+  expect(msgs).toEqual([{ id: "msg_i1", type: "user", time: { created: 5 * M }, text: "вброс посреди хода" }])
+  // и результат сразу пригоден для promptLandedAt (дедуп рестарт-окна)
+  expect(promptLandedAt(msgs, 4 * M, "вброс посреди хода")).toBe(5 * M)
+  expect(inboxToSessionMsgs([])).toEqual([])
 })
 
 test("joinBatch: одиночное сообщение не получает msgIDs/attachments", () => {

@@ -414,6 +414,32 @@ export function steerRecoveryBatch(queue: Request[], msgIDs: number[]): Request 
   return items.length > 0 ? joinBatch(items) : null
 }
 
+/** Признанные (admitted), но ещё не потреблённые стирты: эндпоинт /inbox
+ *  показывает их раньше, чем они материализуются в /message (потребление —
+ *  следующим шагом агент-лупа). Без этого дедуп рестарт-окна слеп в краше
+ *  «POST приземлился — save не пережил» и пере-POST-ил бы уже приземлённый
+ *  стирт (эмпирика 2.2.5: ответ POST = admission, /message отдаёт сообщение
+ *  только после потребления). Мусор стрипится почастино. */
+export function inboxToSessionMsgs(entries: unknown[]): SessionMsg[] {
+  const out: SessionMsg[] = []
+  for (const e of entries) {
+    if (e === null || typeof e !== "object") continue
+    const x = e as Record<string, unknown>
+    if (x.type !== "user") continue
+    const payload = x.payload as Record<string, unknown> | undefined
+    const text = payload?.text
+    const created = (x.time as { created?: unknown } | undefined)?.created
+    if (typeof text !== "string" || text.trim() === "" || typeof created !== "number" || !Number.isFinite(created)) continue
+    out.push({
+      id: typeof x.id === "string" ? x.id : undefined,
+      type: "user",
+      time: { created },
+      text,
+    })
+  }
+  return out
+}
+
 // ——— черновики задач (вотчер досок) ———
 
 /** Тик вотчера черновиков, сек. «0» — kill-switch (вотчер off); мусор и
