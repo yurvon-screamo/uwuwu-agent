@@ -461,6 +461,202 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::replace_md_section;
     use super::strip_frontmatter;
+    use super::task_run;
+    use crate::cmd::cli::TaskSub;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BOARD_DOC: &str = "board-doc";
+    const AV_ID: &str = "av-1";
+    const CARRIER: &str = "block-1";
+    const TITLE_KEY: &str = "key-1";
+    const ROW_ID: &str = "item-1";
+    const BOUND_DOC: &str = "doc-bound";
+    const ORPHAN_DOC: &str = "doc-orphan";
+
+    fn render_rows(with_binding: bool) -> serde_json::Value {
+        let mut block = serde_json::json!({ "content": "таск", "refSubtype": "d" });
+        if with_binding {
+            block["id"] = serde_json::json!(BOUND_DOC);
+        }
+        serde_json::json!({
+            "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
+            "rows": [{
+                "id": ROW_ID,
+                "cells": [{ "value": { "keyID": TITLE_KEY, "type": "block", "block": block } }]
+            }]
+        })
+    }
+
+    /// Ответ MCP tools/call(database render) как текст content[0].
+    fn mcp_render_response(with_binding: bool) -> String {
+        let payload = serde_json::json!({ "action": "render", "data": { "view": render_rows(with_binding) } });
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "content": [{ "type": "text", "text": payload.to_string() }] }
+        })
+        .to_string()
+    }
+
+    /// Минимальный мок kernel API SiYuan для body-пути: SQL-роутер по stmt,
+    /// MCP initialize/render. Счётчики: createDocWithMd (инвариант == 0)
+    /// и тела appendBlock (факт записи в привязанный док).
+    async fn mock_siyuan(
+        title_doc_ids: Vec<String>,
+        with_binding: bool,
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let server = MockServer::start().await;
+        let create_calls = Arc::new(AtomicUsize::new(0));
+        let append_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let sql_create = create_calls.clone();
+        let sql_append = append_bodies.clone();
+        let title_docs = title_doc_ids.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+                let data = if stmt.contains("type='av'") {
+                    serde_json::json!([{ "id": CARRIER, "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"{AV_ID}\"></div>") }])
+                } else if stmt.contains(&format!("id='{BOUND_DOC}'")) {
+                    serde_json::json!([{ "id": BOUND_DOC }])
+                } else if stmt.contains("hpath like") {
+                    serde_json::json!([{ "id": BOUND_DOC }, { "id": ORPHAN_DOC }])
+                } else {
+                    serde_json::json!([])
+                };
+                let _ = &sql_create;
+                let _ = &sql_append;
+                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        let create_for_mount = create_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/createDocWithMd"))
+            .respond_with(move |_req: &wiremock::Request| {
+                create_for_mount.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(r#"{"code":-1,"msg":"createDocWithMd must not be called"}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let appends = append_bodies.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(move |req: &wiremock::Request| {
+                appends
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req.body).to_string());
+                ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let ids = title_docs.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = if hpath.ends_with("/таск") {
+                    serde_json::json!(ids)
+                } else {
+                    serde_json::json!([BOARD_DOC])
+                };
+                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/notebook/lsNotebooks"))
+            .respond_with(|_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": { "notebooks": [{ "id": "nb-1", "name": "Projects" }] } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        let with_binding = with_binding;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-1")
+                } else if body.contains("notifications/initialized") {
+                    ResponseTemplate::new(200)
+                } else if body.contains("tools/call") {
+                    ResponseTemplate::new(200).set_body_string(mcp_render_response(with_binding))
+                } else {
+                    ResponseTemplate::new(200).set_body_string(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        (server, create_calls, append_bodies)
+    }
+
+    async fn write_body_via_cli(server: &MockServer) -> anyhow::Result<()> {
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new()?;
+        std::fs::write(md.path(), "маркер-контент\n")?;
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: None,
+            },
+        )
+        .await
+    }
+
+    /// BDD-сценарий задачи: bound-строка + док-сирота с тем же заголовком →
+    /// контент попадает в привязанное тело, docId ответа = привязанный,
+    /// новых доков не создаётся (сирота стоит ПЕРВОЙ в ответе getIDsByHPath).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_writes_into_bound_doc_and_never_creates_docs() {
+        let (server, create_calls, append_bodies) =
+            mock_siyuan(vec![ORPHAN_DOC.to_string(), BOUND_DOC.to_string()], true).await;
+        write_body_via_cli(&server).await.unwrap();
+
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0, "createDocWithMd не должен вызываться");
+        let appends = append_bodies.lock().unwrap();
+        assert_eq!(appends.len(), 1, "один appendBlock в привязанный док");
+        assert!(appends[0].contains("маркер-контент"), "контент в appendBlock");
+        assert!(appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")), "append в привязанный док, не в сироту");
+    }
+
+    /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
+    /// явная ошибка со списком docId, не молчаливая запись в «первый».
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_errors_listing_duplicates_for_detached_row() {
+        let (server, _create, _append) =
+            mock_siyuan(vec![ORPHAN_DOC.to_string(), "doc-b".to_string()], false).await;
+        let err = write_body_via_cli(&server).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("несколько доков"), "суть ошибки: {msg}");
+        assert!(msg.contains(ORPHAN_DOC) && msg.contains("doc-b"), "список docId в ошибке: {msg}");
+    }
 
     #[test]
     fn strip_frontmatter_cuts_leading_yaml_block() {

@@ -41,3 +41,4 @@ debug = "line-tables-only"
 [dev-dependencies]
 tempfile = "3"
 serial_test = "4"
+wiremock = "0.6"
