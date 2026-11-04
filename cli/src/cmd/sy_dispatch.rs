@@ -272,10 +272,19 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         project,
         frags.len()
     );
+    // один render и одна выборка саб-доков на весь батч: транспортный сбой
+    // здесь — громкая ошибка, а не ярлык «фантом» на кандидате
+    let subdoc_ids = syt::board_subdoc_ids(sy, &board).await?;
     let mut planned: Vec<(&str, syt::SyTask, Verdict)> = Vec::new();
+    let mut seen_items: Vec<String> = Vec::new();
     for frag in &frags {
-        match syt::resolve(sy, &board, frag).await {
-            Ok(task) => {
+        match syt::match_needle(&rows_before, &subdoc_ids, frag) {
+            syt::NeedleMatch::Found(task) => {
+                if seen_items.contains(&task.item_id) {
+                    println!("  [дубль        ] «{frag}» — та же строка, что и earlier фрагмент ({}), учтена один раз", task.item_id);
+                    continue;
+                }
+                seen_items.push(task.item_id.clone());
                 let verdict = row_verdict(sy, &board, &chain, &task).await?;
                 let hint = if verdict.is_auto_removable() {
                     "снос с --yes (пустышка, владелец не нужен)"
@@ -289,7 +298,12 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
                 println!("  [{:<13}] «{}» (строка {}) — {}", verdict.label(), task.title, task.item_id, hint);
                 planned.push((frag, task, verdict));
             }
-            Err(_) => println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю"),
+            syt::NeedleMatch::NotFound => {
+                println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю")
+            }
+            syt::NeedleMatch::Ambiguous { reason, matches } => {
+                println!("  [Ambiguous]   «{frag}» — неоднозначный {reason}: {matches} совпадений, уточни фрагмент; не трогаю")
+            }
         }
     }
 

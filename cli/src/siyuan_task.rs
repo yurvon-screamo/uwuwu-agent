@@ -497,56 +497,85 @@ enum RowInsertCheck {
     Missing,
 }
 
-/// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
-pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
+/// Исход матчинга фрагмента по готовым строкам render (без I/O).
+#[derive(Clone, Debug)]
+pub(crate) enum NeedleMatch {
+    Found(SyTask),
+    /// Ни id, ни docId-префикс, ни подстрока тайтла не совпали.
+    NotFound,
+    /// Фрагмент матчит несколько строк: «id», «doc-id» или «подстрока».
+    Ambiguous { reason: &'static str, matches: usize },
+}
+
+/// Матчинг фрагмента по готовым строкам: та же семантика, что у resolve()
+/// (id: равенство/префикс/суффикс → docId-префикс по саб-докам → подстрока
+/// нормализованного тайтла). `subdoc_ids` — docId саб-доков доски (одна
+/// выборка на доску, не на фрагмент).
+pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str) -> NeedleMatch {
     let needle = needle.trim_start_matches('-');
-    let rows = read_rows(sy, board).await?;
     let by_id: Vec<&SyTask> = rows
         .iter()
         .filter(|r| r.item_id == needle || r.item_id.starts_with(needle) || r.item_id.ends_with(needle))
         .collect();
     if by_id.len() == 1 {
-        return Ok(by_id[0].clone());
+        return NeedleMatch::Found(by_id[0].clone());
     }
     if !by_id.is_empty() {
-        bail!("неоднозначный id: {} совпадений", by_id.len());
+        return NeedleMatch::Ambiguous { reason: "id", matches: by_id.len() };
     }
-    // тело по префиксу docId: одна выборка саб-доков доски вместо запроса на строку
-    let like = board.hpath.replace('\'', "''");
-    let subdocs = sy
-        .sql(&format!(
-            "select id from blocks where type='d' and hpath like '{like}/%' limit 500"
-        ))
-        .await?;
     let mut by_doc_prefix: Vec<&SyTask> = Vec::new();
-    for r in &rows {
+    for r in rows {
         let Some(doc) = r.body_doc.as_deref() else {
             continue;
         };
-        if subdocs
-            .iter()
-            .any(|s| s.get("id").and_then(|i| i.as_str()) == Some(doc) && doc.starts_with(needle))
-        {
+        if subdoc_ids.iter().any(|s| s == doc) && doc.starts_with(needle) {
             by_doc_prefix.push(r);
         }
     }
     if by_doc_prefix.len() == 1 {
-        return Ok(by_doc_prefix[0].clone());
+        return NeedleMatch::Found(by_doc_prefix[0].clone());
     }
     if by_doc_prefix.len() > 1 {
-        bail!("неоднозначный doc-id префикс: {} совпадений", by_doc_prefix.len());
+        return NeedleMatch::Ambiguous { reason: "doc-id", matches: by_doc_prefix.len() };
     }
     let by_title: Vec<&SyTask> = rows
         .iter()
         .filter(|r| normalize_title(&r.title).contains(&normalize_title(needle)))
         .collect();
     if by_title.len() == 1 {
-        return Ok(by_title[0].clone());
+        return NeedleMatch::Found(by_title[0].clone());
     }
     if by_title.len() > 1 {
-        bail!("неоднозначная подстрока: {} совпадений", by_title.len());
+        return NeedleMatch::Ambiguous { reason: "подстрока", matches: by_title.len() };
     }
-    bail!("задача «{needle}» не найдена")
+    NeedleMatch::NotFound
+}
+
+/// docId саб-доков доски (для docId-префикс матчинга фрагментов).
+pub(crate) async fn board_subdoc_ids(sy: &SiYuan, board: &SyBoard) -> Result<Vec<String>> {
+    let like = board.hpath.replace('\'', "''");
+    let subdocs = sy
+        .sql(&format!(
+            "select id from blocks where type='d' and hpath like '{like}/%' limit 500"
+        ))
+        .await?;
+    Ok(subdocs
+        .into_iter()
+        .filter_map(|s| s.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect())
+}
+
+/// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
+pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
+    let rows = read_rows(sy, board).await?;
+    let subdoc_ids = board_subdoc_ids(sy, board).await?;
+    match match_needle(&rows, &subdoc_ids, needle) {
+        NeedleMatch::Found(task) => Ok(task),
+        NeedleMatch::NotFound => bail!("задача «{needle}» не найдена"),
+        NeedleMatch::Ambiguous { reason, matches } => {
+            bail!("неоднозначный {reason}: {matches} совпадений")
+        }
+    }
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).
@@ -933,5 +962,55 @@ mod tests {
         let err = pr_cell_value("main").unwrap_err().to_string();
         assert!(err.contains("http(s)://"), "неожиданное сообщение: {err}");
         assert!(err.contains("--branch"), "неожиданное сообщение: {err}");
+    }
+
+    fn needle_row(item_id: &str, title: &str) -> SyTask {
+        SyTask {
+            item_id: item_id.to_string(),
+            title: title.to_string(),
+            status: "Todo".into(),
+            branch: String::new(),
+            pr: String::new(),
+            schedule: String::new(),
+            body_doc: None,
+        }
+    }
+
+    #[test]
+    fn match_needle_classifies_found_not_found_and_ambiguous() {
+        let rows = vec![
+            needle_row("20261104000001-livexx1", "живая задача"),
+            needle_row("20261104000002-dedxxx2", "мёртвая строка"),
+            needle_row("20261104000003-dra0003", "живой черновик"),
+        ];
+        use NeedleMatch::*;
+
+        assert!(matches!(match_needle(&rows, &[], "мёртвая"), Found(_)), "подстрока одна → Found");
+        assert!(matches!(match_needle(&rows, &[], "несуществующая"), NotFound), "мимо всего → NotFound");
+        let ambiguous = match_needle(&rows, &[], "жив");
+        assert!(
+            matches!(ambiguous, Ambiguous { reason: "подстрока", matches: 2 }),
+            "два тайтла с «жив» → неоднозначно: {ambiguous:?}"
+        );
+        let dup_title = vec![needle_row("item-a", "таск"), needle_row("item-b", "таск")];
+        assert!(
+            matches!(match_needle(&dup_title, &[], "таск"), Ambiguous { reason: "подстрока", matches: 2 }),
+            "дубль тайтла → неоднозначно"
+        );
+        let dup_id = vec![needle_row("20261104000009-aaaaaa1", "таск А"), needle_row("20261104000009-aaaaaa2", "таск Б")];
+        assert!(
+            matches!(match_needle(&dup_id, &[], "20261104000009"), Ambiguous { reason: "id", matches: 2 }),
+            "дубль id-префикса → неоднозначно по id"
+        );
+    }
+
+    #[test]
+    fn match_needle_prefers_unique_id_match_over_title_collision() {
+        let rows = vec![
+            needle_row("20261104000001-alivex1", "таск А"),
+            needle_row("20261104000002-alivex2", "таск Б"),
+        ];
+        // фрагмент совпадает с префиксом ОДНОГО id → Found даже при тайтл-коллизии
+        assert!(matches!(match_needle(&rows, &[], "20261104000001"), NeedleMatch::Found(_)));
     }
 }

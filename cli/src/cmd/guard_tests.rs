@@ -57,6 +57,7 @@ struct Kernel {
     put_file_calls: AtomicUsize,
     remove_doc_calls: AtomicUsize,
     item_add_calls: AtomicUsize,
+    item_update_calls: AtomicUsize,
     boards_file_missing: AtomicUsize,
     post_check_drop_all: AtomicUsize,
     undo_journal: Mutex<HashMap<String, Vec<u8>>>,
@@ -71,6 +72,7 @@ impl Kernel {
             put_file_calls: AtomicUsize::new(0),
             remove_doc_calls: AtomicUsize::new(0),
             item_add_calls: AtomicUsize::new(0),
+            item_update_calls: AtomicUsize::new(0),
             boards_file_missing: AtomicUsize::new(0),
             post_check_drop_all: AtomicUsize::new(0),
             undo_journal: Mutex::new(HashMap::new()),
@@ -344,6 +346,7 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                     return mcp_text(serde_json::json!({ "action": "item_add", "data": { "itemID": "item-restored" } }));
                 }
                 if body.contains("\"database\"") && body.contains("\"item_update\"") {
+                    kernel.item_update_calls.fetch_add(1, Ordering::SeqCst);
                     return mcp_text(serde_json::json!({ "action": "item_update", "data": null }));
                 }
                 if body.contains("\"block\"") && body.contains("\"get\"") {
@@ -547,8 +550,8 @@ async fn undo_restores_row_and_repeats_as_noop() {
             "item_id": "item-old",
             "title": "мёртвая строка",
             "status": "Todo",
-            "branch": "",
-            "pr": "",
+            "branch": "cli/task-clean-guard",
+            "pr": "https://github.com/yurvon-screamo/uwuwu-agent/pull/50",
             "extra_text_cells": [],
             "body_doc": "20261104000002-dedxxx2",
             "body_hpath": "/uwuwu/Задачи uwuwu/мёртвая строка",
@@ -576,6 +579,9 @@ async fn undo_restores_row_and_repeats_as_noop() {
         kernel.added.lock().unwrap().iter().any(|(id, title, _)| id == "item-restored" && title == "мёртвая строка"),
         "восстановленная строка отдаётся render'ом"
     );
+    // Status (mSelect) + Branch (text) + PR (url) — три item_update по клеткам
+    let updates = kernel.counter(&kernel.item_update_calls);
+    assert!(updates >= 2, "Branch/PR клетки восстанавливаются item_update: {updates}");
 
     task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()) })
         .await

@@ -2,7 +2,7 @@
 //! сносом, undo-журнал в воркспейсе (data/assets/undo/), сверка состава
 //! доски до/после. Инцидент 04.11: индекс ядра в деградацию врёт — решение
 //! о сносе принимается только при согласии независимых источников
-//! (FS-файл тела через os.Stat ядра, SQL по id, полный пагинированный
+//! (FS-файл тела через getFile ядра — прямое чтение с диска, SQL по id, полный пагинированный
 //! render, док по тайтлу).
 
 use crate::markdown::{collapse_whitespace, strip_export_wrapper};
@@ -192,9 +192,17 @@ impl Journal {
     }
 
     fn file_name(&self) -> String {
-        // в имени только ts+project+kind (колонки в RFC3339 недопустимы
-        // в имени файла); читаемость списка важнее тайтла внутри
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        // имя детерминировано содержимым (created, не Utc::now: повторный
+        // save того же журнала даёт то же имя); колонки в RFC3339 в имени
+        // файла недопустимы — переформатируем
+        let stamp = chrono::DateTime::parse_from_rfc3339(&self.created)
+            .map(|t| t.format("%Y%m%dT%H%M%S").to_string())
+            .unwrap_or_else(|_| {
+                self.created
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            });
         format!("{stamp}-{}-{}.json", self.project, self.kind)
     }
 
@@ -228,15 +236,20 @@ impl Journal {
     }
 
     /// Список журналов: имя файла → журнал, отсортирован по имени
-    /// (ts-префикс имени = хронология).
+    /// (ts-префикс имени = хронология). Битый журнал (частичная запись при
+    /// падении) не глушится молча — предупреждение: именно его владельцу,
+    /// возможно, и нужно восстановить.
     pub(crate) async fn list(sy: &SiYuan) -> Result<Vec<(String, Journal)>> {
         let mut out = Vec::new();
         for name in sy.list_dir(UNDO_DIR).await? {
             if !name.ends_with(".json") {
                 continue;
             }
-            if let Ok(journal) = Journal::load(sy, &name).await {
-                out.push((name, journal));
+            match Journal::load(sy, &name).await {
+                Ok(journal) => out.push((name, journal)),
+                Err(err) => eprintln!(
+                    "предупреждение: undo-журнал {name} не читается ({err}) — в списке пропущен"
+                ),
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
