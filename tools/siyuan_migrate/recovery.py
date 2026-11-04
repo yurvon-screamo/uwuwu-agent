@@ -21,6 +21,11 @@ from siyuan_migrate.siyuan_client import SiYuan
 WS_ID = WS
 
 
+def is_pr_link(pr: str) -> bool:
+    """PR-ячейка — ключ типа url: принимает только http(s)-ссылки (как cli edit --pr)."""
+    return pr.startswith(("http://", "https://"))
+
+
 def path_safe(t: str) -> str:
     return t.replace("/", "∕")
 
@@ -146,14 +151,21 @@ def main():
                 except Exception as e:
                     print("status fail", str(e)[:60])
                 time.sleep(0.2)
-            for kname, kval in (("Branch", base["branch"]), ("PR", base["pr"])):
-                if kval and keys.get(kname):
-                    try:
-                        mcp.tool("database", {"action": "item_update", "id": av, "keyID": keys[kname],
-                                                 "itemID": item_id, "value": {"text": {"content": kval}}})
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
+            for kname in ("Branch", "PR"):
+                kval = base["branch"] if kname == "Branch" else base["pr"]
+                if not kval or not keys.get(kname):
+                    continue
+                if kname == "PR" and not is_pr_link(kval):
+                    # PR-ячейка — ключ типа url: не-ссылка оставила бы осиротевшую ячейку
+                    print(f"PR skip (ожидаю http(s)://…): {kval[:40]}")
+                    continue
+                value = {"text": {"content": kval}} if kname == "Branch" else {"url": {"content": kval}}
+                try:
+                    mcp.tool("database", {"action": "item_update", "id": av, "keyID": keys[kname],
+                                             "itemID": item_id, "value": value})
+                except Exception:
+                    pass
+                time.sleep(0.2)
             # тело (создание терпеливо: холодный индекс после рестарта контейнера)
             body_h = f"{board_h}/{path_safe(title)}"
             if not sy.get_doc_id_by_path(nb, body_h):

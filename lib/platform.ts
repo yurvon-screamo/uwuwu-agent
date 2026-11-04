@@ -14,6 +14,10 @@ import { join } from "node:path"
 
 const SIYUAN_URL = process.env.UWUWU_SIYUAN_URL || "http://127.0.0.1:6806"
 
+// Ядро /api/query/sql без явного LIMIT молча отдаёт первые 64 строки stmt
+// (см. tests/platform-sql-limit.test.ts) — граница обязательна в каждом stmt.
+const SQL_LIMIT = 100000
+
 function siyuanToken(): string {
   const t = process.env.UWUWU_SIYUAN_TOKEN
   if (t && t !== "") return t
@@ -220,7 +224,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "read_doc": {
       const docId = String(args.docId ?? "")
       const rows = await sql<{ id: string; type: string }>(
-        `select id, type from blocks where root_id='${docId}'`)
+        `select id, type from blocks where root_id='${docId}' limit ${SQL_LIMIT}`)
       return {
         blocks: rows.map((b) => ({
           id: b.id,
@@ -284,7 +288,10 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return { edges, pageInfo: { hasNextPage: false, endCursor: "" } } as T
     }
     case "list_organize_nodes": {
-      // синтез организ-дерева из ноутбука Projects (folder = проект, docs = дети)
+      // Синтез организ-дерева афин-шейпа из доков SiYuan. Потребители ждут:
+      // проекты — folder-узлы глубины 1 (data = тайтл), доски и доки глубже —
+      // doc-узлы (data = doc id): cron.ts cronBoardTitles, factory/cron
+      // boardViaOrganize, triage.ts refreshBoards (tests/platform-organize.test.ts).
       const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
         "/api/notebook/lsNotebooks", {})
       const nodes: Record<string, unknown>[] = []
@@ -292,12 +299,19 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
         if (nb.closed || !nb.id || !nb.name) continue
         nodes.push({ id: nb.id, parentId: null, type: "folder", data: nb.name })
         const docs = await sql<{ id: string; content: string; hpath: string }>(
-          `select id, content, hpath from blocks where type='d' and box='${nb.id}'`)
-        const byHpath = new Map<string, string>() // hpath → folderNodeId (doc id)
+          `select id, content, hpath from blocks where type='d' and box='${nb.id}' limit ${SQL_LIMIT}`)
+        const nodeByHpath = new Map<string, string>() // hpath → id узла-контейнера
         for (const d of docs.sort((a, b) => a.hpath.split("/").length - b.hpath.split("/").length)) {
-          const parent = d.hpath.split("/").slice(0, -1).join("/")
-          nodes.push({ id: d.id, parentId: byHpath.get(parent) ?? nb.id, type: "doc", data: d.content })
-          byHpath.set(d.hpath, d.id)
+          const parentHpath = d.hpath.split("/").slice(0, -1).join("/")
+          // hpath "/proj" (2 сегмента) — глубина 1: проект-контейнер; глубже — доски/доки
+          const isProjectLevel = d.hpath.split("/").length === 2
+          nodes.push({
+            id: d.id,
+            parentId: nodeByHpath.get(parentHpath) ?? nb.id,
+            type: isProjectLevel ? "folder" : "doc",
+            data: isProjectLevel ? d.content : d.id,
+          })
+          nodeByHpath.set(d.hpath, d.id)
         }
       }
       return { nodes } as T

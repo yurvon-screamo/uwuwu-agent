@@ -1,5 +1,6 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
+use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, TaskSub};
 use crate::siyuan::SiYuan;
 use crate::siyuan_task as syt;
@@ -14,7 +15,11 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
         }
         Commands::Cron { command } => cron_run(command).await,
         Commands::Search { query, limit, .. } => search_run(&query, limit).await,
-        Commands::Read { slug } => read_run(&slug).await,
+        Commands::Read { slug } => {
+            let md = read_markdown(&slug).await?;
+            print!("{md}");
+            Ok(())
+        }
         Commands::Blob { key, out } => blob_run(&key, out).await,
         Commands::Projects => projects_run().await,
         Commands::Shot { .. } => Err(anyhow!(
@@ -146,11 +151,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let content = read_body_input(md.as_deref(), stdin)?;
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
-            let body_path = format!("{}/{}", board.hpath, task.title);
+            let body_path = board.body_hpath(&task.title);
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
             let doc = match doc {
                 Some(doc_id) => {
-                    write_body_in_place(&sy, &doc_id, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                    write_body_in_place(&sy, &doc_id, &task.title, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
                     doc_id
                 }
                 None => {
@@ -181,12 +186,14 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             let proj = project.unwrap_or_else(|| "uwuwu".into());
             let board = syt::find_board_cron(&sy, &proj).await?;
             // тело крона = саб-док доски
-            let body_h = format!("{}/{}", board.hpath, title);
+            let body_h = board.body_hpath(&title);
             if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
                 anyhow::bail!("крон «{title}» уже есть");
             }
             let body = sy.create_doc_md(&board.notebook, &body_h, &format!("# {title}\n\n```\n{prompt}\n```\n")).await?;
-            let item = sy.db_item_add(&board.av_id, &title).await?;
+            // content строки крона — тот же санитайз, что и у пути тела:
+            // иначе канбан покажет '/', а имя дока — '∕'
+            let item = sy.db_item_add(&board.av_id, &syt::path_safe(&title)).await?;
             // клетки Schedule/Status/Last Run (текст)
             set_text_cells(&sy, &board.av_id, &item, &[("Schedule", &schedule), ("Status", "active"), ("Last Run", "")]).await?;
             println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
@@ -289,33 +296,17 @@ pub(crate) async fn search_run(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn read_run(slug: &str) -> Result<()> {
+/// Слаг → markdown дока (stdout печатает dispatch). Формы: `sofa/<post_id>`,
+/// `<project>/<doc>`, `<topic>/<doc>`, слаг Daily, одиночный заголовок
+/// (если однозначен) — резолв в `read_resolve`.
+pub async fn read_markdown(slug: &str) -> Result<String> {
+    if let Some(post_id) = slug.strip_prefix("sofa/") {
+        let post = crate::sofa::get(post_id).await?;
+        return Ok(format!("# {}\n\n{}\n", post.title, post.body));
+    }
     let sy = SiYuan::from_env()?;
-    if let Some(rest) = slug.strip_prefix("sofa/") {
-        let post = crate::sofa::get(rest).await?;
-        println!("# {}\n\n{}", post.title, post.body);
-        return Ok(());
-    }
-    let title = slug.rsplit('/').next().unwrap_or(slug);
-    let rows = sy
-        .sql(&format!(
-            "select hpath, box from blocks where type='d' and content = '{}' limit 5",
-            title.replace('\'', "''")
-        ))
-        .await?;
-    if let Some(r) = rows.first() {
-        let hpath = r.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
-        let box_id = r.get("box").and_then(|b| b.as_str()).unwrap_or("");
-        for nb in sy.notebooks().await? {
-            if nb.get("id").and_then(|i| i.as_str()) == Some(box_id) {
-                let name = nb.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let md = sy.export_md(name, hpath).await?;
-                print!("{md}");
-                return Ok(());
-            }
-        }
-    }
-    Err(anyhow!("док «{slug}» не найден"))
+    let doc_id = read_resolve::resolve(&sy, slug).await?;
+    sy.export_md_by_id(&doc_id).await
 }
 
 pub(crate) async fn blob_run(key: &str, out: Option<String>) -> Result<()> {
@@ -352,6 +343,7 @@ pub(crate) async fn projects_run() -> Result<()> {
 async fn write_body_in_place(
     sy: &SiYuan,
     doc_id: &str,
+    doc_title: &str,
     rewrite: bool,
     section: Option<&str>,
     content: &str,
@@ -360,12 +352,23 @@ async fn write_body_in_place(
         return sy.append_block_md(doc_id, content).await;
     }
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
-    let existing = strip_frontmatter(&existing_raw);
+    let existing = strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match section {
         Some(section) => replace_md_section(&existing, section, content),
         None => content.to_string(),
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
+}
+
+/// Снять экспортную обёртку дока: YAML frontmatter и рендер-строку имени
+/// (`# <имя дока>` первой строкой поверх блоков — она не блок; без strip
+/// реимпортируется реальным heading-блоком и множится на каждый rewrite).
+fn strip_export_wrapper(md: &str, doc_title: &str) -> String {
+    let body = strip_frontmatter(md).trim_start().to_string();
+    match body.strip_prefix(&format!("# {doc_title}")) {
+        Some(rest) => rest.trim_start_matches('\n').to_string(),
+        None => body,
+    }
 }
 
 /// YAML frontmatter из начала markdown (--- ... ---) — live-атрибуты дока.
@@ -492,7 +495,9 @@ mod tests {
 
     /// Ответ MCP tools/call(database render) как текст content[0].
     fn mcp_render_response(with_binding: bool) -> String {
-        let payload = serde_json::json!({ "action": "render", "data": { "view": render_rows(with_binding) } });
+        let mut view = render_rows(with_binding);
+        view["rowCount"] = serde_json::json!(1);
+        let payload = serde_json::json!({ "action": "render", "data": { "view": view } });
         serde_json::json!({
             "jsonrpc": "2.0", "id": 2,
             "result": { "content": [{ "type": "text", "text": payload.to_string() }] }
@@ -507,12 +512,20 @@ mod tests {
         title_doc_ids: Vec<String>,
         with_binding: bool,
     ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        mock_siyuan_with_export(title_doc_ids, with_binding, String::new()).await
+    }
+
+    /// Расширенный мок: с экспортом дока (обёртка frontmatter + имя) для
+    /// rewrite-пути (replace/--replace-section).
+    async fn mock_siyuan_with_export(
+        title_doc_ids: Vec<String>,
+        with_binding: bool,
+        export_content: String,
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
         let server = MockServer::start().await;
         let create_calls = Arc::new(AtomicUsize::new(0));
         let append_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let sql_create = create_calls.clone();
-        let sql_append = append_bodies.clone();
         let title_docs = title_doc_ids.clone();
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
@@ -528,8 +541,6 @@ mod tests {
                 } else {
                     serde_json::json!([])
                 };
-                let _ = &sql_create;
-                let _ = &sql_append;
                 ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
             })
             .mount(&server)
@@ -598,7 +609,21 @@ mod tests {
                 } else if body.contains("notifications/initialized") {
                     ResponseTemplate::new(200)
                 } else if body.contains("tools/call") {
-                    ResponseTemplate::new(200).set_body_string(mcp_render_response(with_binding))
+                    if body.contains("\"block\"") && body.contains("\"get\"") {
+                        // doc_block_exists: живой bound-док → NodeDocument
+                        ResponseTemplate::new(200).set_body_string(
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ID: {BOUND_DOC}\nType: NodeDocument\nHPath: /uwuwu/Задачи uwuwu/таск"}}]}}}}"#
+                            ),
+                        )
+                    } else if body.contains("\"block\"") && body.contains("get_children") {
+                        // overwrite: док пуст → doc_content_is_empty → append
+                        ResponseTemplate::new(200).set_body_string(
+                            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":""}]}}"#,
+                        )
+                    } else {
+                        ResponseTemplate::new(200).set_body_string(mcp_render_response(with_binding))
+                    }
                 } else {
                     ResponseTemplate::new(200).set_body_string(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#)
                 }
@@ -646,6 +671,45 @@ mod tests {
                 appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")),
                 "append в привязанный док, не в сироту"
             );
+        }
+    }
+
+    /// Rewrite-путь (--replace-section): existing-экспорт несёт обёртку
+    /// (frontmatter + рендер-строка имени дока) — после перезаписи НИ имя,
+    /// НИ frontmatter не реимпортируются реальными блоками (симптом
+    /// «--replace-section множит заголовки»).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replace_section_rewrites_without_name_and_frontmatter_blocks() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\n## Проверка\nстарое тело секции\n".to_string();
+        let (server, create_calls, append_bodies) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое содержимое секции\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: Some("Проверка".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0);
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert_eq!(appends.len(), 1, "один appendBlock пересборки");
+            let payload = &appends[0];
+            assert!(payload.contains("новое содержимое секции"), "новая секция в appendBlock");
+            assert!(!payload.contains("# таск"), "имя дока не реимпортируется блоком");
+            assert!(!payload.contains("title: таск"), "frontmatter не реимпортируется блоком");
+            assert!(!payload.contains("старое тело секции"), "старая секция заменена");
         }
     }
 

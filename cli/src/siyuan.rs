@@ -45,12 +45,16 @@ impl SiYuan {
         })
     }
 
-    /// Прямая сборка клиента (тесты с мок-сервером; from_env — рабочий путь).
-    pub fn at(base: &str, token: &str) -> Self {
+    /// Тестовый конструктор: поля client/mcp_sid приватны для siyuan,
+    /// сиблинг-модуль siyuan_task_tests соберёт только через него.
+    pub(crate) fn for_tests(base: String) -> Self {
         Self {
-            base: base.to_string(),
-            token: token.to_string(),
-            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().expect("reqwest client"),
+            base,
+            token: "test-token".into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("test reqwest client"),
             mcp_sid: std::sync::Mutex::new(None),
         }
     }
@@ -125,6 +129,23 @@ impl SiYuan {
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .into())
+    }
+
+    /// Первый док по hPath (для read-команд; дубли пути — легаси-ситуация).
+    pub async fn doc_id_by_hpath(&self, notebook: &str, hpath: &str) -> Result<Option<String>> {
+        let v = self
+            .post(
+                "/api/filetree/getIDsByHPath",
+                json!({ "notebook": notebook, "path": hpath }),
+            )
+            .await;
+        match v {
+            Ok(data) => {
+                let ids = data.as_array().cloned().unwrap_or_default();
+                Ok(ids.first().and_then(|i| i.as_str()).map(|s| s.to_string()))
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Все доки по hPath; индекс ядра может отдать несколько id на путь (дубли).
@@ -210,24 +231,25 @@ impl SiYuan {
         Ok(())
     }
 
-    /// Экспорт дока в markdown по hPath (read-команды; задачи идут по docId).
-    pub async fn export_md(&self, notebook: &str, hpath: &str) -> Result<String> {
+    /// Экспорт дока в markdown по hPath. `notebook_id` — **ИД** ноутбука
+    /// (формат 20261103224312-fbrf5fp, как возвращает `ensure_notebook`),
+    /// не имя: kernel getIDsByHPath принимает только ID (см. `siyuan_id`).
+    pub async fn export_md(&self, notebook_id: &str, hpath: &str) -> Result<String> {
+        crate::siyuan_id::ensure_node_id(notebook_id, "notebook_id")?;
         let id = self
-            .doc_ids_by_hpath(notebook, hpath)
+            .doc_id_by_hpath(notebook_id, hpath)
             .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("док {hpath} не найден в ноутбуке {notebook}"))?;
+            .ok_or_else(|| anyhow!("док {hpath} не найден в ноутбуке {notebook_id}"))?;
         self.export_md_by_id(&id).await
     }
 
-    /// Экспорт дока в markdown по docId.
+    /// Экспорт дока в markdown по docId (exportMdContent).
     pub async fn export_md_by_id(&self, doc_id: &str) -> Result<String> {
+        crate::siyuan_id::ensure_node_id(doc_id, "doc_id")?;
         let v = self
             .post("/api/export/exportMdContent", json!({ "id": doc_id }))
             .await?;
-        Ok(v
-            .pointer("/content")
+        Ok(v.pointer("/content")
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string())
@@ -399,11 +421,12 @@ impl SiYuan {
             .await
     }
 
-    /// Строки database (render): items с клетками; page/pageSize — ядро пагинирует (деф. 50).
-    pub async fn db_render(&self, av_id: &str, block_id: &str, page: u32, page_size: u32) -> Result<Value> {
+    /// Строки database (render): items с клетками; page с 1 (серверный
+    /// pageSize — 50, отсюда пагинация).
+    pub async fn db_render(&self, av_id: &str, block_id: &str, page: u64) -> Result<Value> {
         self.mcp_tool(
             "database",
-            json!({ "action": "render", "id": av_id, "blockID": block_id, "page": page, "pageSize": page_size }),
+            json!({ "action": "render", "id": av_id, "blockID": block_id, "page": page }),
         )
         .await
     }
