@@ -275,8 +275,11 @@ pub async fn dead_bound_doc_ids(sy: &SiYuan, rows: &[SyTask]) -> Result<HashSet<
         return Ok(HashSet::new());
     }
     let list = bound.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(",");
+    // явный limit: у ядра дефолт-лимит 64 строки — без него хвост выглядит мёртвым
     let live = sy
-        .sql(&format!("select id from blocks where type='d' and id in ({list})"))
+        .sql(&format!(
+            "select id from blocks where type='d' and id in ({list}) limit 500"
+        ))
         .await?;
     let live_set: HashSet<String> = live
         .iter()
