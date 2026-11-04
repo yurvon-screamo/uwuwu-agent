@@ -220,7 +220,7 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
             let name = key_name(kid);
             let value = cell_value(&cell);
             match name.as_str() {
-                "Primary Key" | "Title" | "Название" => t.title = value,
+                "Primary Key" | "Title" | "Название" | "Первичный ключ" => t.title = value,
                 "Status" | "Статус" => t.status = value,
                 "Branch" => t.branch = value,
                 "PR" | "Pr" => t.pr = value,
