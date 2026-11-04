@@ -98,6 +98,14 @@ export interface RunState {
   sessionID: string
   startedAt: number // ms, момент отправки prompt
   req: Request
+  /** msg-id assistant-сообщений, уже доставленных в ТГ в этом ходе:
+   *  дедуп инкрементальной доставки при повторных тиках и рестартах */
+  delivered?: string[]
+  /** time.created последнего приземлившегося стирта (из ответа POST /prompt).
+   *  Граница «done» в sessionStatus: сервер всю фазу исполнения, начатого
+   *  стиртом по idle-сессии, отдаёт стухший outcome и старый time.idle —
+   *  без этой границы ход был бы объявлен готовым в первый тик. */
+  steerAt?: number
 }
 
 export interface TriageState {
@@ -249,11 +257,24 @@ export function validState(raw: unknown): TriageState {
     const rn = run as Record<string, unknown>
     if (typeof rn.sessionID === "string" && rn.sessionID.startsWith("ses_")
         && Number.isFinite(rn.startedAt) && isReq(rn.req)) {
-      out.run = {
+      const outRun: RunState = {
         sessionID: rn.sessionID,
         startedAt: rn.startedAt as number,
         req: rn.req as Request,
       }
+      // битый delivered — почастичный стрип: невалидные id выбрасываются,
+      // валидные остаются (полная потеря переотправила бы ВСЕ ответы хода);
+      // при переполнении остаются свежайшие (старьё доставлено давно)
+      if (Array.isArray(rn.delivered)) {
+        const ids = (rn.delivered as unknown[])
+          .filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 128)
+          .slice(-100)
+        if (ids.length > 0) outRun.delivered = ids
+      }
+      if (typeof rn.steerAt === "number" && Number.isFinite(rn.steerAt) && rn.steerAt >= 0) {
+        outRun.steerAt = rn.steerAt
+      }
+      out.run = outRun
     }
   }
   return out
@@ -361,6 +382,62 @@ export function capDraftBatch(items: Request[], max: number): Request[] {
 export function dropBatch(queue: Request[], req: Request): Request[] {
   const ids = new Set(req.msgIDs ?? [req.msgID])
   return queue.filter((r) => !ids.has(r.msgID))
+}
+
+// ——— стирт: вброс сообщения владельца в активный ход ———
+
+/** Кандидат на стирт: ТГ-подмножество очереди (черновики досок в стирт не
+ *  входят — дождутся конца хода в очереди), тот же дебаунс, что у старта
+ *  (тишина delayMs, кап maxMs от самого старого). null — ТГ-батча нет. */
+export function steerCandidate(
+  queue: Request[],
+  lastPushAt: number,
+  delayMs: number,
+  maxMs: number,
+): { batch: Request; readyAt: number } | null {
+  const tg = queue.filter((r) => r.chatID !== 0)
+  const readyAt = batchReadyAt(tg, lastPushAt, delayMs, maxMs)
+  if (readyAt === null) return null
+  const items = takeBatch(tg, readyAt)
+  if (items.length === 0) return null
+  return { batch: joinBatch(items), readyAt }
+}
+
+/** Батч краш-восстановления по персистентному firing-маркеру: точная персона
+ *  стиртованного батча (msgIDs), НЕ пересборка по готовности — новое сообщение,
+ *  пришедшее до рестарта, могло бы прицепиться к дедупу и быть потеряно или
+ *  уйти агенту дважды вместе со стиртованным. null — персоны в очереди нет
+ *  (маркер стух без батча). Порядок — как в очереди. */
+export function steerRecoveryBatch(queue: Request[], msgIDs: number[]): Request | null {
+  const ids = new Set(msgIDs)
+  const items = queue.filter((r) => ids.has(r.msgID))
+  return items.length > 0 ? joinBatch(items) : null
+}
+
+/** Признанные (admitted), но ещё не потреблённые стирты: эндпоинт /inbox
+ *  показывает их раньше, чем они материализуются в /message (потребление —
+ *  следующим шагом агент-лупа). Без этого дедуп рестарт-окна слеп в краше
+ *  «POST приземлился — save не пережил» и пере-POST-ил бы уже приземлённый
+ *  стирт (эмпирика 2.2.5: ответ POST = admission, /message отдаёт сообщение
+ *  только после потребления). Мусор стрипится почастино. */
+export function inboxToSessionMsgs(entries: unknown[]): SessionMsg[] {
+  const out: SessionMsg[] = []
+  for (const e of entries) {
+    if (e === null || typeof e !== "object") continue
+    const x = e as Record<string, unknown>
+    if (x.type !== "user") continue
+    const payload = x.payload as Record<string, unknown> | undefined
+    const text = payload?.text
+    const created = (x.time as { created?: unknown } | undefined)?.created
+    if (typeof text !== "string" || text.trim() === "" || typeof created !== "number" || !Number.isFinite(created)) continue
+    out.push({
+      id: typeof x.id === "string" ? x.id : undefined,
+      type: "user",
+      time: { created },
+      text,
+    })
+  }
+  return out
 }
 
 // ——— черновики задач (вотчер досок) ———
@@ -510,33 +587,59 @@ export function applyBodyDelta(t: DraftTrack, updatedAt: number): boolean {
 // ——— финал хода ———
 
 export interface SessionMsg {
+  id?: string
   type?: string
-  time?: { created?: number }
+  time?: { created?: number; completed?: number }
+  /** user-сообщения: API отдаёт текст верхним уровнем (Session.Message.User
+   *  в 2.2.5, content отсутствует) */
+  text?: string
   content?: { type?: string; text?: string }[]
 }
 
-/** Финал хода: сообщения API отдаёт DESC — берём первое assistant-сообщение
- *  новее старта хода, текст = склейка его text-частей. "" = финала нет. */
-export function extractFinal(msgs: SessionMsg[], startedAt: number): string {
-  for (const m of msgs) {
-    if (m.type !== "assistant") continue
-    if ((m.time?.created ?? 0) < startedAt) break // дальше только старьё
-    const text = (m.content ?? [])
-      .filter((p) => p?.type === "text" && typeof p.text === "string")
-      .map((p) => p.text as string)
-      .join("\n")
-      .trim()
-    if (text !== "") return text
-  }
-  return ""
+/** Готовый ответ агента: склейка text-частей одного assistant-сообщения. */
+export interface Reply {
+  id: string
+  text: string
+  at: number // ms time.created
 }
 
-const textOf = (m: SessionMsg): string =>
-  (m.content ?? [])
+/** Ответы хода по порядку (ASC): assistant-сообщения новее sinceMs с непустым
+ *  текстом, не из delivered (дедуп инкрементальной доставки). completedOnly
+ *  отсекает незавершённые (стрим идёт); для хвоста финала — false: оборванный
+ *  ход доставляет частичный текст, как до инкрементальной доставки. API отдаёт
+ *  DESC — реверсим. */
+export function extractReplies(
+  msgs: SessionMsg[],
+  sinceMs: number,
+  delivered: readonly string[] = [],
+  completedOnly = true,
+): Reply[] {
+  const seen = new Set(delivered)
+  const out: Reply[] = []
+  for (const m of msgs) {
+    if (m.type !== "assistant") continue
+    if (completedOnly && m.time?.completed === undefined) continue
+    const at = m.time?.created ?? 0
+    if (at < sinceMs) continue
+    if (m.id === undefined || seen.has(m.id)) continue
+    const text = textOf(m)
+    if (text === "") continue
+    out.push({ id: m.id, text, at })
+  }
+  return out.reverse()
+}
+
+/** Текст сообщения сессии: user-сообщения API отдаёт текстом верхнего уровня
+ *  (Session.Message.User, 2.2.5 — content у них отсутствует), assistant —
+ *  content-частями. Читаем обе формы — promptLandedAt без этого не матчится. */
+const textOf = (m: SessionMsg): string => {
+  if (typeof m.text === "string" && m.text.trim() !== "") return m.text.trim()
+  return (m.content ?? [])
     .filter((p) => p?.type === "text" && typeof p.text === "string")
     .map((p) => p.text as string)
     .join("\n")
     .trim()
+}
 
 /** Дошёл ли наш промпт до сессии: user-сообщение новее границы с ЭТИМ
  *  текстом (точное или префикс-80 — длинные промпты могли пережать на

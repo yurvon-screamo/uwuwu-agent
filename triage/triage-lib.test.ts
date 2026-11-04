@@ -2,8 +2,9 @@
 import { test, expect } from "bun:test"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractFinal,
-  joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, stripDraftAcks, takeBatch, validState,
+  draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractReplies,
+  inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
+  steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
 
@@ -65,29 +66,61 @@ test("classifyUpdate: edited_message — edit с новым текстом", () 
   expect(classifyUpdate({ update_id: 1, edited_message: msg({ text: "x" }) }, "not_owner").kind).toBe("skip")
 })
 
-// ——— extractFinal / promptLandedAt ———
+// ——— extractReplies / promptLandedAt ———
 
 const M = 1_000_000
-test("extractFinal: первое assistant новее старта из DESC-списка", () => {
-  const msgs = [
-    { type: "assistant", time: { created: 3 * M }, content: [{ type: "text", text: "Сводка" }] },
-    { type: "user", time: { created: 2 * M }, content: [] },
-    { type: "assistant", time: { created: 1 * M }, content: [{ type: "text", text: "старьё" }] },
-  ]
-  expect(extractFinal(msgs, 2 * M)).toBe("Сводка")
+const am = (id: string, created: number, text: string, completed?: number): SessionMsg => ({
+  id, type: "assistant", time: { created, ...(completed !== undefined ? { completed } : {}) },
+  content: [{ type: "text", text }],
 })
 
-test("extractFinal: склейка text-частей; пустой text-парт не мешает", () => {
-  const msgs = [{
-    type: "assistant", time: { created: 5 * M },
+test("extractReplies: ответы хода по возрастанию из DESC-списка; старьё и user мимо", () => {
+  const msgs: SessionMsg[] = [
+    am("msg_c", 3 * M, "второй ответ", 3 * M),
+    { type: "user", time: { created: 2 * M }, content: [] },
+    am("msg_b", 2.5 * M, "первый ответ", 2.5 * M),
+    am("msg_a", 1 * M, "старьё", 1 * M),
+  ]
+  expect(extractReplies(msgs, 2 * M)).toEqual([
+    { id: "msg_b", text: "первый ответ", at: 2.5 * M },
+    { id: "msg_c", text: "второй ответ", at: 3 * M },
+  ])
+})
+
+test("extractReplies: склейка text-частей; пустой text-парт и tool-часть не мешают", () => {
+  const msgs: SessionMsg[] = [{
+    id: "msg_1", type: "assistant", time: { created: 5 * M, completed: 6 * M },
     content: [{ type: "text", text: "часть 1" }, { type: "tool", text: "ignored" }, { type: "text", text: "часть 2" }],
   }]
-  expect(extractFinal(msgs, 0)).toBe("часть 1\nчасть 2")
+  expect(extractReplies(msgs, 0).map((r) => r.text)).toEqual(["часть 1\nчасть 2"])
 })
 
-test("extractFinal: ничего новее старта — пустая строка", () => {
-  const msgs = [{ type: "assistant", time: { created: 1 * M }, content: [{ type: "text", text: "старьё" }] }]
-  expect(extractFinal(msgs, 2 * M)).toBe("")
+test("extractReplies: без completed — фильтр по умолчанию; с completedOnly=false — частичный текст доезжает", () => {
+  // вход как у API — DESC (свежие первыми)
+  const msgs: SessionMsg[] = [
+    am("msg_aborted", 7 * M, "оборванный частичный"),
+    am("msg_stream", 6 * M, "пишется"),
+    am("msg_done", 5 * M, "готов", 5 * M),
+  ]
+  expect(extractReplies(msgs, 0).map((r) => r.id)).toEqual(["msg_done"])
+  expect(extractReplies(msgs, 0, [], false).map((r) => r.id)).toEqual(["msg_done", "msg_stream", "msg_aborted"])
+})
+
+test("extractReplies: delivered-дедуп; сообщения без id не доставляются", () => {
+  const msgs: SessionMsg[] = [
+    am("msg_b", 3 * M, "второй", 3 * M),
+    am("msg_a", 2 * M, "первый", 2 * M),
+    { type: "assistant", time: { created: 2.5 * M, completed: 2.5 * M }, content: [{ type: "text", text: "без id" }] },
+  ]
+  expect(extractReplies(msgs, 0, ["msg_a"]).map((r) => r.id)).toEqual(["msg_b"])
+})
+
+test("extractReplies: сообщение из одних tool-частей (пустой текст) не ответ", () => {
+  const msgs: SessionMsg[] = [
+    { id: "msg_t", type: "assistant", time: { created: 2 * M, completed: 2 * M }, content: [{ type: "tool", text: "x" }] },
+    am("msg_a", 3 * M, "текст", 3 * M),
+  ]
+  expect(extractReplies(msgs, 0).map((r) => r.id)).toEqual(["msg_a"])
 })
 
 test("promptLandedAt: свой промпт находится по тексту; чужой (double-text ≤2с) не ловится", () => {
@@ -117,6 +150,16 @@ test("promptLandedAt: длинный промпц матчится по преф
   expect(promptLandedAt(msgs, 0, long)).toBe(5 * M)
 })
 
+test("promptLandedAt: user-сообщение 2.2.5 с текстом верхнего уровня (без content) матчится", () => {
+  // живая форма GET /message: {id, time, text, type} — content у user нет
+  const msgs: SessionMsg[] = [
+    { id: "msg_u2", type: "user", time: { created: 11 * M }, text: "Сколько будет семь минус три?" },
+    { id: "msg_u1", type: "user", time: { created: 10 * M }, text: "сделай отчёт" },
+  ]
+  expect(promptLandedAt(msgs, 10 * M - 2000, "Сколько будет семь минус три?")).toBe(11 * M)
+  expect(promptLandedAt(msgs, 12 * M, "Сколько будет семь минус три?")).toBe(null)
+})
+
 // ——— validState ———
 
 test("validState: мусор → дефолты; полный раундтрип сохраняется", () => {
@@ -137,6 +180,45 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState(junk)).toEqual({ offset: 0, queue: [] })
   // окно отправки: run с startedAt=0 (промпт не подтверждён) — валиден и персистится
   expect(validState({ run: { sessionID: "ses_x", startedAt: 0, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 } } }).run?.startedAt).toBe(0)
+})
+
+test("validState: run.delivered персистится; битые id стрипятся почастино — ход жив", () => {
+  const good = {
+    offset: 0, chatID: 1, queue: [],
+    run: { sessionID: "ses_x", startedAt: 5, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: ["msg_a", "msg_b"], steerAt: 9 },
+  }
+  expect(validState(good)).toEqual(good)
+  const dirty = {
+    offset: 0, chatID: 1,
+    run: {
+      sessionID: "ses_x", startedAt: 5, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 },
+      delivered: ["msg_a", 42, null, "", "x".repeat(200), "msg_b"],
+      steerAt: "мусор",
+    },
+  }
+  const cleanedRun = validState(dirty).run
+  expect(cleanedRun?.delivered).toEqual(["msg_a", "msg_b"]) // мусор выброшен, валидные остались
+  expect(cleanedRun?.steerAt).toBeUndefined() // битая граница стрипится, ход остаётся
+})
+
+test("validState: delivered >100 — остаются свежайшие (старьё доставлено давно)", () => {
+  const ids = Array.from({ length: 150 }, (_, i) => `msg_${i}`)
+  const out = validState({
+    offset: 0, chatID: 1,
+    run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: ids },
+  }).run
+  expect(out?.delivered).toEqual(ids.slice(-100))
+  // пустой после стрипа — поле долой, не пустой массив (42 — не строка-ид)
+  const onlyJunk = validState({
+    offset: 0, chatID: 1,
+    run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: [42] },
+  }).run
+  expect(onlyJunk?.delivered).toBeUndefined()
+  const notArray = validState({
+    offset: 0, chatID: 1,
+    run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: "не-массив" },
+  }).run
+  expect(notArray?.delivered).toBeUndefined()
 })
 
 test("validState: легаси-поля деградации (broken/lastResetAt/pausedUntil) стрипаются при любом значении", () => {
@@ -183,6 +265,57 @@ test("takeBatch/joinBatch/dropBatch: батч = всё до readyAt, склей�
   expect(joined.attachments).toEqual([{ path: "/m/2.jpg", name: "2.jpg" }])
   const rest = dropBatch(q, joined)
   expect(rest.map((r) => r.msgID)).toEqual([3]) // опоздавшее — следующий батч
+})
+
+// ——— стирт: кандидат и краш-восстановление ———
+
+test("steerCandidate: только ТГ-подмножество, черновики не входят в батч", () => {
+  const draft = R({ chatID: 0, msgID: -1, receivedAt: 0, text: "[черновик задачи]" })
+  const tg1 = R({ msgID: 7, receivedAt: 0, text: "вброс" })
+  const tg2 = R({ msgID: 8, receivedAt: 1000, text: "дополнение" })
+  const cand = steerCandidate([draft, tg1, tg2], 1000, 60_000, 300_000)
+  expect(cand?.batch.msgIDs).toEqual([7, 8]) // персона — только ТГ
+  expect(cand?.batch.text).toBe("вброс\n\nдополнение")
+  expect(steerCandidate([draft], 0, 60_000, 300_000)).toBeNull() // чисто черновая очередь — стирта нет
+  expect(steerCandidate([], 0, 60_000, 300_000)).toBeNull()
+})
+
+test("steerCandidate: тот же дебаунс — неготовое ТГ-сообщение не кандидет", () => {
+  const q = [R({ msgID: 1, receivedAt: 50_000 })]
+  // тишина 60с с последнего пуша — не готово (receivedAt+60с в будущем):
+  // readyAt считается, готовность проверяет демон сравнением с Date.now()
+  const cand = steerCandidate(q, 50_000, 60_000, 300_000)
+  expect(cand).not.toBeNull()
+  expect(cand?.readyAt).toBe(110_000)
+})
+
+test("steerRecoveryBatch: точная персона по msgIDs из firing, порядок очереди", () => {
+  const q = [
+    R({ msgID: 5, receivedAt: 0, text: "x" }),
+    R({ msgID: 9, receivedAt: 1, text: "y" }),
+    R({ msgID: 2, receivedAt: 2, text: "новое после краха" }),
+  ]
+  const batch = steerRecoveryBatch(q, [9, 5]) // стиртованная персона: 5 и 9, третье — не прицепится
+  expect(batch?.msgIDs).toEqual([5, 9])
+  expect(batch?.text).toBe("x\n\ny")
+  expect(steerRecoveryBatch(q, [777])).toBeNull() // персона ушла из очереди — маркер стух
+  expect(steerRecoveryBatch([], [1])).toBeNull()
+})
+
+test("inboxToSessionMsgs: user-записи с payload.text мапятся; мусор стрипится почастино", () => {
+  const entries = [
+    { type: "user", id: "msg_i1", time: { created: 5 * M }, payload: { text: "вброс посреди хода" }, delivery: "steer" },
+    { type: "compaction", id: "msg_c", time: { created: 6 * M } },
+    { type: "user", id: "msg_i2", time: { created: 7 * M }, payload: {} }, // без текста
+    { type: "user", id: "msg_i3", payload: { text: "без времени" } },
+    "мусор",
+    null,
+  ]
+  const msgs = inboxToSessionMsgs(entries)
+  expect(msgs).toEqual([{ id: "msg_i1", type: "user", time: { created: 5 * M }, text: "вброс посреди хода" }])
+  // и результат сразу пригоден для promptLandedAt (дедуп рестарт-окна)
+  expect(promptLandedAt(msgs, 4 * M, "вброс посреди хода")).toBe(5 * M)
+  expect(inboxToSessionMsgs([])).toEqual([])
 })
 
 test("joinBatch: одиночное сообщение не получает msgIDs/attachments", () => {
