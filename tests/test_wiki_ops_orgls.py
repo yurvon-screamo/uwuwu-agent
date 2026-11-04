@@ -134,7 +134,7 @@ class LiveWorkspaceInvariant(unittest.TestCase):
                                   f"корень «{root['name']}» отсутствует в orgls")
                 total = wiki_ops.post(
                     "/api/query/sql",
-                    {"stmt": f"select count(*) c from blocks where type='d' and box='{nb['id']}' limit 1"})
+                    {"stmt": f"select count(*) c from blocks where type='d' and box='{nb['id']}' limit 1"})  # nosec B608 — id ноутбука из kernel API, не пользовательский ввод
                 self.assertEqual(len(doc_names), total[0]["c"],
                                  f"строки-документы ({len(doc_names)}) != count(*) ({total[0]['c']})")
         self.assertGreaterEqual(len(sections.get("Experience", [])), EXPERIENCE_MIN_DOCS)
