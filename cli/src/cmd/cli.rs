@@ -5,9 +5,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "uwuwu-cli")]
-#[command(
-    about = "CLI for uwuwu/wiki: доступ агентам к платформе uwuwu (SiYuan)"
-)]
+#[command(about = "CLI for uwuwu/wiki: доступ агентам к платформе uwuwu (SiYuan)")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -155,9 +153,11 @@ pub(crate) enum CronSub {
 pub(crate) enum Commands {
     /// List all projects with their description.
     Projects,
-    /// Read a document by slug (последний сегмент = заголовок дока) | sofa/<post_id>.
+    /// Read a document by slug: полный hpath (`<project>/<doc>`,
+    /// `<topic>/<doc>`, слаг Daily) или одиночный заголовок (если однозначен;
+    /// иначе — перечень кандидатов) | sofa/<post_id>.
     Read {
-        #[arg(help = "Slug: заголовок дока | sofa/<post_id>")]
+        #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
     },
     /// Download a workspace asset (image/attachment) by key from assets/.
