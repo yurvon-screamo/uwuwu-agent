@@ -84,19 +84,23 @@ systemctl --user daemon-reload && systemctl --user enable --now uwuwu-triage
 ```bash
 # изолированный рантайм демона (state/воркспейс/лог/медиа — в песочнице)
 export UWUWU_TRIAGE_HOME=/tmp/uwuwu-triage-e2e
-# mock-TG: поднимает эмуляцию api.telegram.org и по скрипту сыплет апдейты
-bun triage/mock-tg.ts --port 8099 --script triage/mock-scenario.jsonl &
+# mock-TG: эмуляция api.telegram.org; апдейты — через админ-канал
+bun triage/mock-tg.ts --port 8099 --log /tmp/uwuwu-triage-e2e/mock-tg-sent.jsonl &
 export UWUWU_TRIAGE_TG_API=http://127.0.0.1:8099
-# конфиг демона в песочнице (token — любой, owner — юзер из скрипта)
-# ускоренные тайминги: дебаунс 2с, поллинг 1с
+# апдейт владельца снаружи (оркестрация сценария): сообщение от owner в чат 42
+curl -s -X POST http://127.0.0.1:8099/admin/push -H 'content-type: application/json' -d '{
+  "update": { "message": { "message_id": 11, "chat": { "id": 42, "type": "private" },
+             "from": { "username": "owner", "is_bot": false }, "text": "текст заявки" } } }'
+# конфиг демона в песочнице (worktree triage/hub.json, gitignored: token — любой,
+# owner — юзер из апдейта); ускоренные тайминги: дебаунс 2с, поллинг 1с
 UWUWU_TRIAGE_BATCH_MS=2000 UWUWU_TRIAGE_POLL_SEC=1 bun triage/triage.ts
 ```
 
 - `UWUWU_TRIAGE_HOME` — корень state/воркспейса/лога/медиа демона (дефолт —
   homedir, прод); `UWUWU_TRIAGE_TG_API` — база TG-API (дефолт —
   `https://api.telegram.org`). Оба — тестовые крюки, в systemd-юнит не задаются.
-- Сценарии протокола (скрипт апдейтов для mock-tg; проверка — по логу демона,
-  `sendMessage`-записям mock и сообщениям сессии):
+- Сценарии протокола (оркестрация — последовательные `/admin/push` + ожидания;
+  проверка — по логу демона, `sendMessage`-записям mock и сообщениям сессии):
   a. **стирт посреди хода** — ответ отдельным ТГ-сообщением до финала, финал доезжает, дублей нет;
   b. **стирт в гэпе** (сразу после серверного завершения хода) — ответ доезжает (граница `steerAt`), финал прежнего хода не задваивается;
   c. **kill -9 в окне стирта** (маркер персистнут, POST долетел/не долетел) + рестарт — нет дублей и потерь, ответ доезжает (`steerAt` восстановлен);

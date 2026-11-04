@@ -584,8 +584,8 @@ const deliverFinal = async (run: RunState): Promise<void> => {
       // за весь ход не доставлено ничего и хвоста нет — честный пустой ответ
       await deliverWithRetries(run.req.chatID, `(пустой ответ)${broken ? BROKEN_MARK : ""}`, `финал ${run.sessionID}`)
     } else {
-      for (let i = 0; i < tail.length; i++) {
-        const body = broken && i === tail.length - 1 ? tail[i]! + BROKEN_MARK : tail[i]!
+      for (const [i, part] of tail.entries()) {
+        const body = broken && i === tail.length - 1 ? part + BROKEN_MARK : part
         await deliverWithRetries(run.req.chatID, body, `хвост ${run.sessionID} (${i + 1}/${tail.length})`)
       }
       if (broken && tail.length === 0) {
