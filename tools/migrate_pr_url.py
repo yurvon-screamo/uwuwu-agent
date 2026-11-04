@@ -89,11 +89,9 @@ def _rpc(method: str, params: dict | None = None) -> dict:
         if method.startswith("notifications/"):
             return {}
         text = resp.read().decode()
-    for line in text.splitlines():
-        if line.startswith("data: "):
-            text = line[6:]
-            break
-    payload = json.loads(text)
+    data_lines = [line[6:] for line in text.splitlines() if line.startswith("data: ")]
+    # SSE допускает разбиение события на несколько data-строк — соединяем
+    payload = json.loads("\n".join(data_lines) if data_lines else text)
     if "error" in payload:
         raise RuntimeError(f"mcp {method}: {payload['error']}")
     result = payload.get("result", {})
@@ -156,22 +154,24 @@ def pr_key_of(av_id: str) -> dict | None:
     return next((key for key in keys if key.get("name") == "PR"), None)
 
 
-def render_page(av_id: str, block_id: str, page: int) -> tuple[list[dict], dict]:
-    """PR-ячейки одной страницы render + view (для rowCount/rows)."""
+def render_page(av_id: str, block_id: str, page: int) -> tuple[list[tuple[str, dict]], dict]:
+    """(item_id, PR-значение) одной страницы render + view (для rowCount/rows)."""
     data = _db("render", id=av_id, blockID=block_id, page=page, pageSize=PAGE_SIZE).get("data") or {}
     view = data.get("view") or {}
     key_names = {c.get("id"): c.get("name") for c in view.get("columns") or []}
-    cells: list[dict] = []
+    cells: list[tuple[str, dict]] = []
     for row in view.get("rows") or []:
+        # itemID для item_update — id строки; kernel GetBlockValue матчит v.BlockID == itemID
+        row_id = row.get("id") or (row.get("cells") or [{}])[0].get("value", {}).get("blockID", "")
         for cell in row.get("cells") or []:
             value = cell.get("value") or {}
             if key_names.get(value.get("keyID")) == "PR":
-                cells.append(value)
+                cells.append((row_id, value))
     return cells, view
 
 
-def render_all(av_id: str, block_id: str) -> list[dict]:
-    """Значения PR-ячеек всех строк, по страницам render."""
+def render_all(av_id: str, block_id: str) -> list[tuple[str, dict]]:
+    """(item_id, PR-значение) всех строк, по страницам render."""
     cells: list[dict] = []
     page = 1
     while True:
@@ -183,9 +183,9 @@ def render_all(av_id: str, block_id: str) -> list[dict]:
         page += 1
 
 
-def snapshot_cell(value: dict) -> dict:
+def snapshot_cell(item_id: str, value: dict) -> dict:
     return {
-        "row": value.get("id"),
+        "row": item_id,
         "type": value.get("type"),
         "text": (value.get("text") or {}).get("content", ""),
         "url": (value.get("url") or {}).get("content", ""),
@@ -200,7 +200,7 @@ def collect_boards() -> list[dict]:
         key = pr_key_of(block["av_id"])
         if not key:
             continue
-        cells = [snapshot_cell(v) for v in render_all(block["av_id"], block["block_id"])]
+        cells = [snapshot_cell(item_id, v) for item_id, v in render_all(block["av_id"], block["block_id"])]
         root_rows = _sql(_sql_by_id("root_id", block["block_id"]))
         root = root_rows[0]["root_id"] if root_rows else ""
         boards.append({
@@ -259,7 +259,7 @@ def verify(boards: list[dict]) -> list[str]:
     """Повторный render: каждая заполненная ячейка — url-тип со прежним значением."""
     mismatches: list[str] = []
     for board in boards:
-        after = {v.get("id"): snapshot_cell(v) for v in render_all(board["av_id"], board["block_id"])}
+        after = {item_id: snapshot_cell(item_id, v) for item_id, v in render_all(board["av_id"], board["block_id"])}
         for before in board["cells"]:
             if not before["text"] and not before["url"]:
                 continue
@@ -275,26 +275,36 @@ def verify(boards: list[dict]) -> list[str]:
     return mismatches
 
 
+def dry_run(boards: list[dict], backup_dir: Path) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    report = {b["av_id"]: b["cells"] for b in boards}
+    (backup_dir / "dryrun-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1))
+    for b in boards:
+        stale = sum(1 for c in b["cells"] if c["type"] == "url" and c["url"] == "" and c["text"])
+        suffix = f", осиротевших {stale}" if stale else ""
+        print(f"  {b['doc']} [{b['key']['type']}] ячеек {len(b['cells'])}{suffix}")
+    print("dry-run: снапшот в", backup_dir)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="только отчёт, без изменений")
     parser.add_argument("--backup-dir", default=None, help="каталог бэкапа (деф. ~/siyuan-backups/av-pr-url-<ts>)")
+    parser.add_argument("--only", metavar="AV_ID", help="мигрировать только эту database (smoke/точечный прогон)")
     args = parser.parse_args()
 
     boards = collect_boards()
+    if args.only:
+        boards = [b for b in boards if b["av_id"] == args.only]
+        if not boards:
+            print(f"database {args.only} не найдена или без ключа PR", file=sys.stderr)
+            return 2
     filled = sum(1 for b in boards for c in b["cells"] if c["text"] or c["url"])
     print(f"досок с ключом PR: {len(boards)}, заполненных ячеек: {filled}")
 
     if args.dry_run:
         backup_dir = Path(args.backup_dir) if args.backup_dir else Path.home() / "siyuan-backups/av-pr-url-dryrun"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        report = {b["av_id"]: b["cells"] for b in boards}
-        (backup_dir / "dryrun-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1))
-        for b in boards:
-            stale = sum(1 for c in b["cells"] if c["type"] == "url" and c["url"] == "" and c["text"])
-            suffix = f", осиротевших {stale}" if stale else ""
-            print(f"  {b['doc']} [{b['key']['type']}] ячеек {len(b['cells'])}{suffix}")
-        print("dry-run: снапшот в", backup_dir)
+        dry_run(boards, backup_dir)
         return 0
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
