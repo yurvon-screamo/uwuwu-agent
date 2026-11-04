@@ -5,7 +5,6 @@
 //! PR #30/#31 в yurvon-screamo/uwuwu-agent).
 
 pub mod cmd;
-pub mod log_filter;
 pub mod markdown;
 pub mod md_heading;
 pub mod path;
@@ -50,8 +49,7 @@ pub fn ui_url() -> String {
 }
 
 pub(crate) fn init_tracing() {
-    let base = std::env::var("RUST_LOG").unwrap_or_else(|_| log_filter::DEFAULT_BASE.to_string());
-    let filter = log_filter::build(&base);
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "uwuwu_cli=info,warn".into());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
