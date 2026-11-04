@@ -1,5 +1,6 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
+use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, TaskSub};
 use crate::siyuan::SiYuan;
 use crate::siyuan_task as syt;
@@ -14,7 +15,11 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
         }
         Commands::Cron { command } => cron_run(command).await,
         Commands::Search { query, limit, .. } => search_run(&query, limit).await,
-        Commands::Read { slug } => read_run(&slug).await,
+        Commands::Read { slug } => {
+            let md = read_markdown(&slug).await?;
+            print!("{md}");
+            Ok(())
+        }
         Commands::Blob { key, out } => blob_run(&key, out).await,
         Commands::Projects => projects_run().await,
         Commands::Shot { .. } => Err(anyhow!(
@@ -282,33 +287,17 @@ pub(crate) async fn search_run(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn read_run(slug: &str) -> Result<()> {
+/// Слаг → markdown дока (stdout печатает dispatch). Формы: `sofa/<post_id>`,
+/// `<project>/<doc>`, `<topic>/<doc>`, слаг Daily, одиночный заголовок
+/// (если однозначен) — резолв в `read_resolve`.
+pub async fn read_markdown(slug: &str) -> Result<String> {
+    if let Some(post_id) = slug.strip_prefix("sofa/") {
+        let post = crate::sofa::get(post_id).await?;
+        return Ok(format!("# {}\n\n{}\n", post.title, post.body));
+    }
     let sy = SiYuan::from_env()?;
-    if let Some(rest) = slug.strip_prefix("sofa/") {
-        let post = crate::sofa::get(rest).await?;
-        println!("# {}\n\n{}", post.title, post.body);
-        return Ok(());
-    }
-    let title = slug.rsplit('/').next().unwrap_or(slug);
-    let rows = sy
-        .sql(&format!(
-            "select hpath, box from blocks where type='d' and content = '{}' limit 5",
-            title.replace('\'', "''")
-        ))
-        .await?;
-    if let Some(r) = rows.first() {
-        let hpath = r.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
-        let box_id = r.get("box").and_then(|b| b.as_str()).unwrap_or("");
-        for nb in sy.notebooks().await? {
-            if nb.get("id").and_then(|i| i.as_str()) == Some(box_id) {
-                let name = nb.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let md = sy.export_md(name, hpath).await?;
-                print!("{md}");
-                return Ok(());
-            }
-        }
-    }
-    Err(anyhow!("док «{slug}» не найден"))
+    let doc_id = read_resolve::resolve(&sy, slug).await?;
+    sy.export_md_by_id(&doc_id).await
 }
 
 pub(crate) async fn blob_run(key: &str, out: Option<String>) -> Result<()> {

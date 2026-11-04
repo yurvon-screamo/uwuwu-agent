@@ -156,17 +156,25 @@ impl SiYuan {
         Ok(())
     }
 
-    /// Экспорт дока в markdown по hPath.
-    pub async fn export_md(&self, notebook: &str, hpath: &str) -> Result<String> {
+    /// Экспорт дока в markdown по hPath. `notebook_id` — **ИД** ноутбука
+    /// (формат 20261103224312-fbrf5fp, как возвращает `ensure_notebook`),
+    /// не имя: kernel getIDsByHPath принимает только ID (см. `siyuan_id`).
+    pub async fn export_md(&self, notebook_id: &str, hpath: &str) -> Result<String> {
+        crate::siyuan_id::ensure_node_id(notebook_id, "notebook_id")?;
         let id = self
-            .doc_id_by_hpath(notebook, hpath)
+            .doc_id_by_hpath(notebook_id, hpath)
             .await?
-            .ok_or_else(|| anyhow!("док {hpath} не найден в ноутбуке {notebook}"))?;
+            .ok_or_else(|| anyhow!("док {hpath} не найден в ноутбуке {notebook_id}"))?;
+        self.export_md_by_id(&id).await
+    }
+
+    /// Экспорт дока в markdown по docId (exportMdContent).
+    pub async fn export_md_by_id(&self, doc_id: &str) -> Result<String> {
+        crate::siyuan_id::ensure_node_id(doc_id, "doc_id")?;
         let v = self
-            .post("/api/export/exportMdContent", json!({ "id": id }))
+            .post("/api/export/exportMdContent", json!({ "id": doc_id }))
             .await?;
-        Ok(v
-            .pointer("/content")
+        Ok(v.pointer("/content")
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string())
