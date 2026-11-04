@@ -2,6 +2,7 @@
 
 use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, TaskSub};
+use crate::md_heading;
 use crate::siyuan::SiYuan;
 use crate::siyuan_task as syt;
 use anyhow::{anyhow, Result};
@@ -354,7 +355,11 @@ async fn write_body_in_place(
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
     let existing = strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match section {
-        Some(section) => replace_md_section(&existing, section, content),
+        Some(section) => {
+            let (md, edit) = replace_md_section(&existing, section, content);
+            report_section_edit(section, edit);
+            md
+        }
         None => content.to_string(),
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
@@ -383,52 +388,149 @@ fn strip_frontmatter(md: &str) -> String {
     }
 }
 
-/// Секция «## X» в markdown: заменить содержимое, заголовок сохранить.
-fn replace_md_section(md: &str, section: &str, content: &str) -> String {
+/// Итог секционной правки: заменено (со счётчиком удалённых дублей) или добавлено.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionEdit {
+    Replaced { duplicates_removed: usize },
+    Appended,
+}
+
+/// Секция «## X» в markdown: содержимое первого вхождения заменяется,
+/// заголовок пишется байт-в-байт (двойные пробелы и ^block-id живы); одноимённые
+/// дубли удаляются вместе с контентом — хилинг заманженных прод-тел, счётчик
+/// попадает в SectionEdit. Граница секции — заголовок уровня ≤ 2 вне кодового
+/// фенса: gherkin-фенсы bug-шаблонов несут строки «# …», фенс-трекинг обязателен,
+/// иначе новая граница резала бы их (регрессия относительно кода до уровня-aware).
+/// Секция не найдена — append в конец с нормализованным заголовком; пустой ввод
+/// очищает секцию (контракт); пустая строка перед следующим заголовком восстанавливается.
+fn replace_md_section(md: &str, section: &str, content: &str) -> (String, SectionEdit) {
+    let want = md_heading::normalize_heading_text(section);
     let mut out = String::new();
-    let mut in_section = false;
+    let mut fenced = false;
+    let mut dropping = false; // контент секции/дубля до границы не копируется
     let mut replaced = false;
-    let needle = format!("## {section}");
+    let mut duplicates_removed = 0usize;
     for line in md.lines() {
-        if line.starts_with("## ") {
-            in_section = line.trim() == needle;
-            if in_section {
-                out.push_str(&needle);
+        if md_heading::toggles_fence(line) {
+            fenced = !fenced;
+            if !dropping {
+                out.push_str(line);
                 out.push('\n');
-                out.push_str(content.trim());
-                out.push('\n');
-                replaced = true;
-                continue;
+            }
+            continue;
+        }
+        if !fenced {
+            if let Some((level, text)) = md_heading::heading_of(line) {
+                if level == 2 && text == want {
+                    if !replaced {
+                        push_heading_block(&mut out, line, content);
+                        replaced = true;
+                    } else {
+                        duplicates_removed += 1;
+                    }
+                    dropping = true;
+                    continue;
+                }
+                if level <= 2 {
+                    dropping = false;
+                    push_blank_line(&mut out);
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
             }
         }
-        if !in_section {
+        if !dropping {
             out.push_str(line);
             out.push('\n');
         }
     }
     if !replaced {
-        out.push_str(&format!("\n## {section}\n{content}\n"));
+        let heading = format!("## {}", md_heading::normalize_heading_text(section));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&heading);
+        out.push('\n');
+        if !content.trim().is_empty() {
+            out.push_str(content.trim());
+            out.push('\n');
+        }
+        return (out, SectionEdit::Appended);
     }
-    out
+    (out, SectionEdit::Replaced { duplicates_removed })
+}
+
+/// Блок секции: заголовок исходной строкой + новый контент (пустой — очистка).
+fn push_heading_block(out: &mut String, heading_line: &str, content: &str) {
+    push_blank_line(out);
+    out.push_str(heading_line);
+    out.push('\n');
+    if !content.trim().is_empty() {
+        out.push_str(content.trim());
+        out.push('\n');
+    }
+}
+
+/// Пустая строка между блоками: не в начале вывода и не задвоенная.
+fn push_blank_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+}
+
+/// Пометка секционной правки в stdout: append и хилинг дублей — не тихие.
+fn report_section_edit(section: &str, edit: SectionEdit) {
+    match edit {
+        SectionEdit::Appended => println!("секция «{section}» не найдена — добавлена в конец"),
+        SectionEdit::Replaced { duplicates_removed } if duplicates_removed > 0 => {
+            println!("удалён дубль секции «{section}» ×{duplicates_removed}");
+        }
+        SectionEdit::Replaced { .. } => {}
+    }
 }
 
 fn print_threads(md: &str) {
+    println!("{}", collect_threads(md).trim_end());
+}
+
+/// Секции «## Комменты» тела: текст выдачи thread либо «комментов нет».
+/// Матч нормализованный (двойные пробелы не теряют ответы), секция длится до
+/// заголовка уровня ≤ 2 вне фенсов, дубли печатаются обе — read-путь не роняет.
+fn collect_threads(md: &str) -> String {
+    let mut out = String::new();
     let mut printing = false;
+    let mut fenced = false;
     for line in md.lines() {
-        if line.starts_with("## ") {
-            printing = line.starts_with("## Комменты");
+        if md_heading::toggles_fence(line) {
+            fenced = !fenced;
             if printing {
-                println!("{line}");
+                out.push_str(line);
+                out.push('\n');
             }
             continue;
         }
+        if !fenced {
+            if let Some((level, text)) = md_heading::heading_of(line) {
+                if level <= 2 {
+                    printing = level == 2 && text == "Комменты";
+                    if printing {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    continue;
+                }
+            }
+        }
         if printing {
-            println!("{line}");
+            out.push_str(line);
+            out.push('\n');
         }
     }
-    if !printing {
-        println!("комментов нет");
+    if out.is_empty() {
+        out.push_str("комментов нет\n");
     }
+    out
 }
 
 fn read_body_input(md_file: Option<&str>, stdin: bool) -> Result<String> {
@@ -462,7 +564,9 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::collect_threads;
     use super::replace_md_section;
+    use super::SectionEdit;
     use super::strip_frontmatter;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
@@ -758,16 +862,151 @@ mod tests {
     #[test]
     fn replace_md_section_replaces_body_keeps_heading() {
         let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let out = replace_md_section(md, "А", "новое содержимое\n");
+        let (out, edit) = replace_md_section(md, "А", "новое содержимое\n");
         assert!(out.contains("## А\nновое содержимое"));
         assert!(out.contains("## Б\nвторое"));
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
     }
 
     #[test]
     fn replace_md_section_appends_missing_section() {
         let md = "## А\nпервое\n";
-        let out = replace_md_section(md, "Новая", "контент");
+        let (out, edit) = replace_md_section(md, "Новая", "контент");
         assert!(out.contains("## Новая\nконтент"));
         assert!(out.contains("## А\nпервое"));
+        assert_eq!(edit, SectionEdit::Appended);
+    }
+
+    #[test]
+    fn replaces_first_and_removes_duplicate_sections() {
+        let md = "# Таск\n\n## Причина\nпервое вхождение\n\n## Причина\nвторое вхождение\n\n## Фикс\nправка\n";
+        let (out, edit) = replace_md_section(md, "Причина", "новый механизм\n");
+        assert_eq!(out.matches("## Причина").count(), 1, "секция остаётся одна");
+        assert!(!out.contains("первое вхождение"), "старый контент первого удалён");
+        assert!(!out.contains("второе вхождение"), "контент дубля удалён");
+        assert!(out.contains("## Фикс\nправка"), "соседняя секция не тронута");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 1 });
+    }
+
+    #[test]
+    fn ends_section_at_higher_level_heading() {
+        let md = "## А\nстарое\n# Заголовок H1\nхвост тайтла\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "А", "новое\n");
+        assert!(out.contains("# Заголовок H1"), "h1 переживает replace");
+        assert!(out.contains("хвост тайтла"), "контент после h1 переживает replace");
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn h3_stays_inside_section() {
+        let md = "## А\nввод\n### Подсекция\nдетали подсекции\n\n## Б\nвторое\n### Б-под\nб-детали\n";
+        let (out, _) = replace_md_section(md, "А", "новое\n");
+        assert!(
+            !out.contains("детали подсекции"),
+            "h3 не рвёт диапазон: контент под h3 заменяется вместе с секцией"
+        );
+        assert!(out.contains("### Б-под\nб-детали"), "h3 чужой секции не тронут");
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn normalizes_heading_and_argument() {
+        let md = "##  Постановка\nстарое\n";
+        let (out, edit) = replace_md_section(md, " Постановка ", "новое\n");
+        assert!(out.contains("новое"), "матч по нормализованному тексту");
+        assert_eq!(out.matches("##").count(), 1, "без append-дубля секции");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+    }
+
+    #[test]
+    fn heading_preserved_byte_for_byte() {
+        let md = "##  Причина ^20261104120000-ab12cd\nстарое\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "Причина", "новое\n");
+        assert!(
+            out.contains("##  Причина ^20261104120000-ab12cd\nновое"),
+            "заматченный заголовок пишется исходной строкой (пробелы и ^id живы)"
+        );
+        assert_eq!(out.matches("##").count(), 2, "без append-дубля");
+    }
+
+    #[test]
+    fn matches_heading_with_block_id_suffix() {
+        let md = "## Причина ^20261104120000-ab12cd\nстарое\n\n## Б\nвторое\n";
+        let (out, edit) = replace_md_section(md, "Причина", "новое\n");
+        assert!(out.contains("новое"), "суффикс ^id не мешает матчу");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+    }
+
+    #[test]
+    fn fenced_h2_does_not_bound_section() {
+        let md = "## А\nстарое\n```md\n## Фейк внутри фенса\n```\nхвост секции\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "А", "новое\n");
+        assert!(!out.contains("Фейк"), "h2 внутри фенса — контент секции, заменяется");
+        assert!(!out.contains("хвост секции"), "секция длится сквозь фенс");
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn hash_line_inside_fence_survives() {
+        let md = "## Сценарий (BDD)\nстарое\n```gherkin\nСценарий: x\n  Дано y\n  Тогда z  # факт\n```\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "Сценарий (BDD)", "новое\n");
+        assert!(out.contains("## Б\nвторое"), "граница секции — настоящий заголовок Б");
+        assert_eq!(out.matches("## Б").count(), 1, "секция Б не задвоена");
+        assert!(!out.contains("# факт"), "старый контент секции заменён целиком");
+    }
+
+    #[test]
+    fn empty_content_clears_section() {
+        let md = "## А\nстарое\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "А", "");
+        assert!(out.contains("## А"), "заголовок сохранён");
+        assert!(!out.contains("старое"), "контент очищен пустым вводом");
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn blank_line_restored_before_next_heading() {
+        let md = "## А\nстарое\n\n## Б\nвторое\n";
+        let (out, _) = replace_md_section(md, "А", "новое\n");
+        assert!(out.contains("новое\n\n## Б"), "пустая строка между секциями восстановлена");
+    }
+
+    #[test]
+    fn collect_threads_prints_normalized_section() {
+        let md = "## Постановка\nтело\n\n##  Комменты\n- **AGENTS**: вопрос\n";
+        let out = collect_threads(md);
+        assert!(out.contains("##  Комменты"), "заголовок с двойным пробелом матчится");
+        assert!(out.contains("- **AGENTS**: вопрос"));
+        assert!(!out.contains("тело"));
+    }
+
+    #[test]
+    fn collect_threads_ends_at_h1_boundary() {
+        let md = "## Комменты\n- коммент\n# Тег\nтекст после тега\n";
+        let out = collect_threads(md);
+        assert!(out.contains("- коммент"));
+        assert!(!out.contains("# Тег"), "h1 закрывает секцию");
+        assert!(!out.contains("текст после тега"));
+    }
+
+    #[test]
+    fn collect_threads_prints_both_duplicate_sections() {
+        let md = "## Комменты\n- первый\n\n## Комменты\n- второй\n";
+        let out = collect_threads(md);
+        assert!(out.contains("- первый"));
+        assert!(out.contains("- второй"), "дубли секций печатаются обе — read-путь ничего не роняет");
+    }
+
+    #[test]
+    fn collect_threads_prints_hash_tag_inside_section() {
+        let md = "## Комменты\n- коммент\n#bug\n- коммент после тега\n";
+        let out = collect_threads(md);
+        assert!(out.contains("#bug"), "#bug без пробела — не заголовок, секцию не закрывает");
+        assert!(out.contains("- коммент после тега"));
+    }
+
+    #[test]
+    fn collect_threads_reports_empty() {
+        assert_eq!(collect_threads("## А\nтело\n").trim_end(), "комментов нет");
     }
 }
