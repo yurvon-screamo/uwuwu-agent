@@ -101,75 +101,6 @@ fn extract_av_id(md: &str) -> Option<String> {
     Some(rest[1..1 + value_end].to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn extract_av_id_reads_dash_case_attribute_view_block() {
-        let md = r#"<div data-type="NodeAttributeView" data-av-id="20261104093449-q2h9ju2" data-av-type="kanban"></div>"#;
-        assert_eq!(extract_av_id(md).as_deref(), Some("20261104093449-q2h9ju2"));
-    }
-
-    #[test]
-    fn extract_av_id_reads_camel_case_carrier_block() {
-        let md = r#"<div avID="20261104000238-96ch3l2"></div>"#;
-        assert_eq!(extract_av_id(md).as_deref(), Some("20261104000238-96ch3l2"));
-    }
-
-    #[test]
-    fn extract_av_id_returns_none_without_av_marker() {
-        let md = r#"<div data-type="NodeDocument"></div>"#;
-        assert_eq!(extract_av_id(md), None);
-    }
-
-    #[test]
-    fn pick_search_hit_takes_exact_name_and_hpath() {
-        let results = vec![json!({
-            "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
-            "hPath": "Projects/1xgames/Задачи 1xgames"
-        })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
-        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
-    }
-
-    #[test]
-    fn pick_search_hit_skips_foreign_first_hit() {
-        let results = vec![
-            json!({
-                "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
-                "hPath": "Projects/1xgames/Кроны 1xgames"
-            }),
-            json!({
-                "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
-                "hPath": "Projects/1xgames/Задачи 1xgames"
-            }),
-        ];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
-        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
-    }
-
-    #[test]
-    fn pick_search_hit_returns_none_without_valid_hits() {
-        let results = vec![json!({
-            "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
-            "hPath": "Projects/1xgames/Кроны 1xgames"
-        })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
-        assert_eq!(hit, None);
-    }
-
-    #[test]
-    fn pick_search_hit_accepts_hit_anchored_by_block_id() {
-        let results = vec![json!({
-            "avID": "av-9", "avName": "Задачи 1xgames", "blockID": "doc-77",
-            "hPath": "Другой/путь"
-        })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-77");
-        assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
-    }
-}
 
 pub struct SyTask {
     pub item_id: String,
@@ -424,4 +355,75 @@ pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&s
 /// Доска кронов: док /<project>/Кроны <project> с database-блоком.
 pub async fn find_board_cron(sy: &SiYuan, project: &str) -> Result<SyBoard> {
     find_board_titled(sy, project, &format!("Кроны {project}")).await
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_av_id_reads_dash_case_attribute_view_block() {
+        let md = r#"<div data-type="NodeAttributeView" data-av-id="20261104093449-q2h9ju2" data-av-type="kanban"></div>"#;
+        assert_eq!(extract_av_id(md).as_deref(), Some("20261104093449-q2h9ju2"));
+    }
+
+    #[test]
+    fn extract_av_id_reads_camel_case_carrier_block() {
+        let md = r#"<div avID="20261104000238-96ch3l2"></div>"#;
+        assert_eq!(extract_av_id(md).as_deref(), Some("20261104000238-96ch3l2"));
+    }
+
+    #[test]
+    fn extract_av_id_returns_none_without_av_marker() {
+        let md = r#"<div data-type="NodeDocument"></div>"#;
+        assert_eq!(extract_av_id(md), None);
+    }
+
+    #[test]
+    fn pick_search_hit_takes_exact_name_and_hpath() {
+        let results = vec![json!({
+            "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
+            "hPath": "Projects/1xgames/Задачи 1xgames"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
+    }
+
+    #[test]
+    fn pick_search_hit_skips_foreign_first_hit() {
+        let results = vec![
+            json!({
+                "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
+                "hPath": "Projects/1xgames/Кроны 1xgames"
+            }),
+            json!({
+                "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
+                "hPath": "Projects/1xgames/Задачи 1xgames"
+            }),
+        ];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
+    }
+
+    #[test]
+    fn pick_search_hit_returns_none_without_valid_hits() {
+        let results = vec![json!({
+            "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
+            "hPath": "Projects/1xgames/Кроны 1xgames"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn pick_search_hit_accepts_hit_anchored_by_block_id() {
+        let results = vec![json!({
+            "avID": "av-9", "avName": "Задачи 1xgames", "blockID": "doc-77",
+            "hPath": "Другой/путь"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-77");
+        assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
+    }
 }
