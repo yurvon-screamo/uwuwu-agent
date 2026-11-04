@@ -19,11 +19,11 @@ import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
-  alignChunks, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, extractFinal, joinBatch, plainChunks, parseWatchSec, promptLandedAt,
-  SESSION_TITLE, takeBatch, validState,
+  alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
+  draftReady, dropBatch, extractFinal, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt,
+  setDraftAck, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
-  type Request, type RunState, type TgUpdate, type TriageState,
+  type DraftRef, type DraftVerdict, type Request, type RunState, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
 const HERE = dirname(new URL(import.meta.url).pathname)
@@ -324,12 +324,59 @@ async function spawnFail(req: Request, e: unknown): Promise<void> {
   await sleep(30_000)
 }
 
-/** Финал хода → ТГ, с ретраями доставки. ТГ лежит дольше всех попыток —
- *  ход уже отработал (задача на доске есть), теряем только ответ:
- *  фиксируем полный текст в лог, юзер проверит доску.
- *  Оборванный финал (outcome ≠ succeeded) — только пометка юзеру: ход
- *  завершён, сообщение не переигрывается и сессия не пересоздаётся
- *  (одна вечная сессия; сброс контекста — только ручной /reset). */
+/** Доставка текста в ТГ с ретраями: ТГ лежит дольше всех попыток — ход уже
+ *  отработал (задача на доске есть), теряем только ответ: фиксируем полный
+ *  текст в лог, юзер проверит доску. */
+const deliverWithRetries = async (chatID: number, body: string, label: string): Promise<void> => {
+  for (let a = 1; a <= DELIVER_ATTEMPTS; a++) {
+    if (await send(chatID, body)) {
+      log(`${label} (доставлен, попытка ${a}): ${body.slice(0, 80)}`)
+      return
+    }
+    log(`${label}: попытка ${a}/${DELIVER_ATTEMPTS} не прошла`)
+    if (a < DELIVER_ATTEMPTS) await sleep(30_000)
+  }
+  log(`${label} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
+}
+
+/** Разбор ack логируется на каждом черновичном ходе: канал недоверенный
+ *  (LLM-финал), без этой строки эффект seen-ack ненаблюдаем. */
+const logAckParse = (drafts: DraftRef[], acks: Record<string, DraftVerdict>): void => {
+  if (drafts.length === 0) return
+  const missing = drafts.filter((d) => acks[d.rowId] === undefined).map((d) => d.rowId)
+  if (missing.length === drafts.length) {
+    log(`draft-ack: не найден (${drafts.length} черновиков) — фолбэк анти-петли`)
+    return
+  }
+  const parsed = drafts
+    .filter((d) => acks[d.rowId] !== undefined)
+    .map((d) => `${d.rowId}=${acks[d.rowId]}`)
+    .join(", ")
+  const tail = missing.length > 0 ? `; нет ack: ${missing.join(", ")}` : ""
+  log(`draft-ack: распознано ${drafts.length - missing.length}/${drafts.length} (${parsed})${tail}`)
+}
+
+/** Ack черновиков батча: свежий snapshot версии тела (MCP-сбой — фолбэк на
+ *  трекер, самолечится дельтой следующего тика) + вердикт из финала. */
+const recordDraftAcks = async (drafts: DraftRef[], acks: Record<string, DraftVerdict>): Promise<void> => {
+  if (state.drafts === undefined) return
+  const now = Date.now()
+  let changed = false
+  for (const d of drafts) {
+    const verdict = acks[d.rowId]
+    const t = state.drafts[d.rowId]
+    if (verdict === undefined || t === undefined) continue
+    const fresh = await docUpdatedAt(d.docId).catch(() => null)
+    if (setDraftAck(t, verdict, fresh ?? t.updatedAt, now)) changed = true
+  }
+  if (changed) save()
+}
+
+/** Финал хода → ТГ (обязательный канал для черновиков с «обсуждение» —
+ *  вопрос владельцу; иначе log-only). Оборванный финал (outcome ≠
+ *  succeeded) — только пометка юзеру: ход завершён, сообщение не
+ *  переигрывается и сессия не пересоздаётся (одна вечная сессия; сброс
+ *  контекста — только ручной /reset). */
 const deliverFinal = async (run: RunState): Promise<void> => {
   let broken = false
   try {
@@ -338,26 +385,31 @@ const deliverFinal = async (run: RunState): Promise<void> => {
   } catch { /* статус не достали — попробуем всё равно прочитать сообщения */ }
   let text = ""
   try { text = extractFinal(await sessionMessages(run.sessionID), run.startedAt) } catch {}
-  let body = text !== "" ? text : "(пустой ответ)"
+  const acks = parseDraftAcks(text)
+  const batchDrafts = run.req.drafts ?? []
+  let body = text !== "" ? stripDraftAcks(text) : "(пустой ответ)"
   if (broken) body += "\n\n⚠️ прогон оборван — финал мог не доехать"
   if (run.req.chatID === 0) {
-    // ЕДИНАЯ ТОЧКА «нет ТГ-доставки» (черновики досок): финал только в лог,
-    // доска — источник истины; аварии доезжают до ТГ через dead-letter
-    log(`финал ${run.sessionID} (черновики, без ТГ): ${body.slice(0, 200)}`)
-  } else {
-    for (let a = 1; a <= DELIVER_ATTEMPTS; a++) {
-      if (await send(run.req.chatID, body)) {
-        log(`финал ${run.sessionID} (доставлен, попытка ${a}): ${body.slice(0, 80)}`)
-        break
+    // черновики досок: сырой финал (с ack-строками) — в лог, доска —
+    // источник истины; но исход «обсуждение» глушит перевывы — вопрос
+    // владельцу обязан доехать в ТГ
+    log(`финал ${run.sessionID} (черновики, без ТГ): ${(text !== "" ? text : "(пустой ответ)").slice(0, 200)}`)
+    const hasDiscussion = batchDrafts.some((d) => acks[d.rowId] === "обсуждение")
+    if (hasDiscussion) {
+      if (state.chatID !== undefined) {
+        await deliverWithRetries(state.chatID, body, `финал ${run.sessionID} (черновики: обсуждение)`)
+      } else {
+        log(`обсуждение НЕ доставлено: chatID не залочен — черновик ждёт ответа на доске`)
       }
-      log(`доставка финала ${run.sessionID}: попытка ${a}/${DELIVER_ATTEMPTS} не прошла`)
-      if (a < DELIVER_ATTEMPTS) await sleep(30_000)
-      else log(`финал ${run.sessionID} НЕ доставлен (ТГ недоступен?) — текст: ${body}`)
     }
+  } else {
+    await deliverWithRetries(run.req.chatID, body, `финал ${run.sessionID}`)
   }
+  logAckParse(batchDrafts, acks)
+  await recordDraftAcks(batchDrafts, acks)
   // учёт оборота черновиков — при любом исходе хода (anti-loop:
   // DRAFT_MAX_TURNS холостых → skip-list в вотчере)
-  if (applyTurns(state.drafts, run.req.drafts?.map((d) => d.rowId), Date.now())) save()
+  if (applyTurns(state.drafts, batchDrafts.map((d) => d.rowId), Date.now())) save()
 }
 
 /** Одна проверка сессии: ещё исполняется / завершена / пропала. */
@@ -733,10 +785,8 @@ const queueReadyDrafts = async (): Promise<void> => {
   for (const [rowId, t] of Object.entries(state.drafts ?? {})) {
     if (inFlight.has(rowId) || state.draftSkip?.[rowId] !== undefined) continue
     const upd = await docUpdatedAt(t.docId).catch(() => null)
-    if (upd !== null && upd !== t.updatedAt) {
-      t.updatedAt = upd
-      save()
-    }
+    // дельта тела снимает терминальный ack и даёт свежий цикл (seen-ack)
+    if (upd !== null && applyBodyDelta(t, upd)) save()
     if (!draftReady(t, now)) continue
     if (t.turns >= DRAFT_MAX_TURNS) {
       state.draftSkip = state.draftSkip ?? {}
