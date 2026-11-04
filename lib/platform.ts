@@ -14,6 +14,10 @@ import { join } from "node:path"
 
 const SIYUAN_URL = process.env.UWUWU_SIYUAN_URL || "http://127.0.0.1:6806"
 
+// Ядро /api/query/sql без явного LIMIT молча отдаёт первые 64 строки stmt
+// (см. tests/platform-sql-limit.test.ts) — граница обязательна в каждом stmt.
+const SQL_LIMIT = 100000
+
 function siyuanToken(): string {
   const t = process.env.UWUWU_SIYUAN_TOKEN
   if (t && t !== "") return t
@@ -220,7 +224,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "read_doc": {
       const docId = String(args.docId ?? "")
       const rows = await sql<{ id: string; type: string }>(
-        `select id, type from blocks where root_id='${docId}'`)
+        `select id, type from blocks where root_id='${docId}' limit ${SQL_LIMIT}`)
       return {
         blocks: rows.map((b) => ({
           id: b.id,
@@ -292,7 +296,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
         if (nb.closed || !nb.id || !nb.name) continue
         nodes.push({ id: nb.id, parentId: null, type: "folder", data: nb.name })
         const docs = await sql<{ id: string; content: string; hpath: string }>(
-          `select id, content, hpath from blocks where type='d' and box='${nb.id}'`)
+          `select id, content, hpath from blocks where type='d' and box='${nb.id}' limit ${SQL_LIMIT}`)
         const byHpath = new Map<string, string>() // hpath → folderNodeId (doc id)
         for (const d of docs.sort((a, b) => a.hpath.split("/").length - b.hpath.split("/").length)) {
           const parent = d.hpath.split("/").slice(0, -1).join("/")
