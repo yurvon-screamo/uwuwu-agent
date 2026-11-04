@@ -82,44 +82,44 @@ describe("pickCandidates", () => {
   })
   test("done и не ожила — не кандидат", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)).toEqual([])
   })
   test("done и ожила — revived со сбросом попыток", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ lastProcessedUpdate: 1 })
+    st.sessions.ses_root_idle = tracked({ lastProcessedUpdate: 1 })
     const c = pickCandidates([sess("ses_root_idle")], st, 3)
     expect(c[0]?.reason).toBe("revived")
     expect(c[0]?.resetAttempts).toBe(true)
   })
   test("gave_up и ожила — тоже revived (не навсегда)", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "gave_up", attempts: 3, lastProcessedUpdate: 1 })
+    st.sessions.ses_root_idle = tracked({ status: "gave_up", attempts: 3, lastProcessedUpdate: 1 })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)[0]?.reason).toBe("revived")
   })
   test("failed attempts<max — retry", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "failed", attempts: 2, lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ status: "failed", attempts: 2, lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)[0]?.reason).toBe("retry")
   })
   test("failed attempts=max — тишина", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "failed", attempts: 3, lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ status: "failed", attempts: 3, lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)).toEqual([])
   })
   test("running — не кандидат (реконсилиация отдельно)", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "running", dreamerSes: "ses_d1", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ status: "running", dreamerSes: "ses_d1", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)).toEqual([])
   })
   test("pending без dreamerSes — stuck-pending (краш до спавна)", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "pending", dreamerSes: null })
+    st.sessions.ses_root_idle = tracked({ status: "pending", dreamerSes: null })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)[0]?.reason).toBe("stuck-pending")
   })
   test("skipped и не ожила — не кандидат", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "skipped", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ status: "skipped", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)).toEqual([])
   })
 })
@@ -130,12 +130,12 @@ describe("markBacklog", () => {
     // ses_root_idle: timeUpdated = NOW - IDLE - 1
     const marked = markBacklog(db, st, NOW - 1) // cutoff позже её updated
     expect(marked).toBeGreaterThanOrEqual(1)
-    expect(st.sessions["ses_root_idle"]?.status).toBe("skipped")
+    expect(st.sessions.ses_root_idle?.status).toBe("skipped")
     // старые ревью-сессии — та же generic-семантика skipped
-    expect(st.sessions["ses_reviewer"]?.status).toBe("skipped")
+    expect(st.sessions.ses_reviewer?.status).toBe("skipped")
     const st2 = emptyState()
     expect(markBacklog(db, st2, 0)).toBe(0) // cutoff раньше всех — не трогаем
-    expect(st2.sessions["ses_root_idle"]).toBeUndefined()
+    expect(st2.sessions.ses_root_idle).toBeUndefined()
   })
 })
 
@@ -196,16 +196,16 @@ describe("wakeup-модель (1 сессия = 1 дример)", () => {
 
   test("revived с dreamerSes → wakeup, без → spawn", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ dreamerSes: "ses_d1", lastProcessedUpdate: 1 })
+    st.sessions.ses_root_idle = tracked({ dreamerSes: "ses_d1", lastProcessedUpdate: 1 })
     const st2 = emptyState()
-    st2.sessions["ses_root_idle"] = tracked({ dreamerSes: null, lastProcessedUpdate: 1 })
+    st2.sessions.ses_root_idle = tracked({ dreamerSes: null, lastProcessedUpdate: 1 })
     expect(pickCandidates([sess("ses_root_idle")], st, 3)[0]?.action).toBe("wakeup")
     expect(pickCandidates([sess("ses_root_idle")], st2, 3)[0]?.action).toBe("spawn")
   })
 
   test("retry с dreamerSes → wakeup той же сессии", () => {
     const st = emptyState()
-    st.sessions["ses_root_idle"] = tracked({ status: "failed", attempts: 1, dreamerSes: "ses_d1", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
+    st.sessions.ses_root_idle = tracked({ status: "failed", attempts: 1, dreamerSes: "ses_d1", lastProcessedUpdate: sess("ses_root_idle").timeUpdated })
     const c = pickCandidates([sess("ses_root_idle")], st, 3)
     expect(c[0]?.reason).toBe("retry")
     expect(c[0]?.action).toBe("wakeup")

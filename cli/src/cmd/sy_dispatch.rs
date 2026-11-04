@@ -2,10 +2,13 @@
 
 use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, TaskSub};
+use crate::markdown;
 use crate::md_heading;
 use crate::siyuan::SiYuan;
+use crate::siyuan_guard as guard;
+use crate::siyuan_guard::{Journal, JournalRow, Probe, Verdict};
 use crate::siyuan_task as syt;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
@@ -134,20 +137,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             println!("закрыта: {}", task.title);
             Ok(())
         }
-        TaskSub::Rm { id } => {
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
-            sy.mcp_tool(
-                "database",
-                json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
-            )
-            .await?;
-            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
-                let _ = sy.remove_doc(&doc).await;
-            }
-            println!("удалена: {}", task.title);
-            Ok(())
-        }
+        TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
+        TaskSub::Clean { ids, yes, live } => task_clean(&sy, project, &ids, yes, live.as_deref()).await,
+        TaskSub::Undo { journal } => task_undo(&sy, project, journal.as_deref()).await,
         TaskSub::Body { id, replace, replace_section, md, stdin } => {
             let content = read_body_input(md.as_deref(), stdin)?;
             let board = syt::find_board(&sy, project).await?;
@@ -172,6 +164,373 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             println!("тело обновлено: {body_path} ({doc})");
             Ok(())
         }
+    }
+}
+
+// ——— guard: rm-вердикт, батч-снос, undo ———
+
+/// Вердикт строки по независимым источникам: FS .sy тела, SQL по id,
+/// док по тайтлу; для Draft с живым телом — экспорт против скелетов.
+/// `chain` — цепочка doc-id доски (пути FS-проб).
+async fn row_verdict(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    chain: &[String],
+    task: &syt::SyTask,
+) -> Result<Verdict> {
+    let title_ids = syt::body_doc_by_title(sy, board, &task.title).await?;
+    let fs = guard::probe_body_fs(sy, board, chain, task).await;
+    let sql = guard::probe_body_sql(sy, task).await;
+    let draft_body_export = match (fs, task.body_doc.as_deref()) {
+        (Probe::Found, Some(doc)) if task.status.eq_ignore_ascii_case("draft") => {
+            sy.export_md_by_id(doc).await.ok()
+        }
+        _ => None,
+    };
+    let evidence =
+        guard::evidence_from_sources(task, title_ids.len(), fs, sql, draft_body_export.as_deref());
+    Ok(guard::verdict(&evidence))
+}
+
+/// Строка undo-журнала: клетки + экспорт тела ДО сноса (None — тела нет).
+async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> Result<JournalRow> {
+    let body_md = match task.body_doc.as_deref() {
+        Some(doc) => sy.export_md_by_id(doc).await.ok(),
+        None => None,
+    };
+    let extra_text_cells = if task.schedule.is_empty() {
+        Vec::new()
+    } else {
+        vec![("Schedule".to_string(), task.schedule.clone())]
+    };
+    Ok(JournalRow {
+        item_id: task.item_id.clone(),
+        title: task.title.clone(),
+        status: task.status.clone(),
+        branch: task.branch.clone(),
+        pr: task.pr.clone(),
+        extra_text_cells,
+        body_doc: task.body_doc.clone(),
+        body_hpath: board.body_hpath(&task.title),
+        body_md,
+    })
+}
+
+/// rm одной задачи под guard'ом: вердикт по источникам, отказ для живых
+/// не-Draft (задекларированный контракт команды), write-ahead журнал.
+async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
+    let board = syt::find_board(sy, project).await?;
+    let chain = guard::board_doc_chain(sy, &board).await?;
+    let task = syt::resolve(sy, &board, id).await?;
+    match row_verdict(sy, &board, &chain, &task).await? {
+        Verdict::Divergent => bail!(
+            "состояние строки «{}» неясно (FS/SQL-проба не состоялась) — rm отклонён, повтори позже",
+            task.title
+        ),
+        Verdict::Live if !task.status.eq_ignore_ascii_case("draft") => bail!(
+            "задача «{}» жива (статус «{}», тело существует): rm только для Draft-черновиков; \
+             живую закрывай task close, owner-approved снос — task clean --yes --live",
+            task.title, task.status
+        ),
+        _ => {}
+    }
+    let mut journal = Journal::new(project, "rm", &board);
+    journal.rows.push(journal_row(sy, &board, &task).await?);
+    let journal_path = journal.save(sy).await?;
+    sy.mcp_tool(
+        "database",
+        json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
+    )
+    .await?;
+    if let Some(doc) = syt::task_body_doc(sy, &board, &task).await? {
+        let _ = sy.remove_doc(&doc).await;
+    }
+    println!("удалена: {} (undo-журнал: {journal_path})", task.title);
+    Ok(())
+}
+
+/// Батч-снос строк под guard'ом: dry-run дефолт, гейт ack на весь батч,
+/// write-ahead журнал, один item_remove массивом, пост-чек состава.
+async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Option<&str>) -> Result<()> {
+    let frags: Vec<String> = ids
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(String::from)
+        .collect();
+    if frags.is_empty() {
+        bail!("--ids обязателен: кандидаты через запятую (row-id/префикс/подстрока)");
+    }
+    let board = syt::find_board(sy, project).await?;
+    let chain = guard::board_doc_chain(sy, &board).await?;
+    guard::control_probe_board(sy, &board, &chain).await?;
+    let rows_before = syt::read_rows(sy, &board).await?;
+
+    println!(
+        "guard план{} — доска «{}» ({}), кандидатов: {}",
+        if yes { " (--yes)" } else { " (dry-run)" },
+        board.hpath,
+        project,
+        frags.len()
+    );
+    // один render и одна выборка саб-доков на весь батч: транспортный сбой
+    // здесь — громкая ошибка, а не ярлык «фантом» на кандидате
+    let subdoc_ids = syt::board_subdoc_ids(sy, &board).await?;
+    let mut planned: Vec<(&str, syt::SyTask, Verdict)> = Vec::new();
+    let mut seen_items: Vec<String> = Vec::new();
+    for frag in &frags {
+        match syt::match_needle(&rows_before, &subdoc_ids, frag) {
+            syt::NeedleMatch::Found(task) => {
+                if seen_items.contains(&task.item_id) {
+                    println!("  [дубль        ] «{frag}» — та же строка, что и earlier фрагмент ({}), учтена один раз", task.item_id);
+                    continue;
+                }
+                seen_items.push(task.item_id.clone());
+                let verdict = row_verdict(sy, &board, &chain, &task).await?;
+                let hint = if verdict.is_auto_removable() {
+                    "снос с --yes (пустышка, владелец не нужен)"
+                } else if verdict.is_removable() {
+                    "снос с --yes (не-Draft: подтверждение владельца по процедуре)"
+                } else if verdict.needs_live_ack() {
+                    "защищена: снос только с --live"
+                } else {
+                    "не трогаю"
+                };
+                println!("  [{:<13}] «{}» (строка {}) — {}", verdict.label(), task.title, task.item_id, hint);
+                planned.push((frag, task, verdict));
+            }
+            syt::NeedleMatch::NotFound => {
+                println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю")
+            }
+            syt::NeedleMatch::Ambiguous { reason, matches } => {
+                println!("  [Ambiguous]   «{frag}» — неоднозначный {reason}: {matches} совпадений, уточни фрагмент; не трогаю")
+            }
+        }
+    }
+
+    let live_frags: Vec<String> = live
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(String::from)
+        .collect();
+    for frag in &live_frags {
+        let matched = planned.iter().any(|(_, task, _)| guard::frag_matches(frag, task));
+        if !matched {
+            println!("предупреждение: --live «{frag}» не матчит ни одну строку плана (опечатка?)");
+        }
+    }
+
+    let mut removable: Vec<(&syt::SyTask, Verdict)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for (_, task, verdict) in &planned {
+        let acked = live_frags.iter().any(|f| guard::frag_matches(f, task));
+        if verdict.is_removable() || (verdict.needs_live_ack() && acked) {
+            removable.push((task, *verdict));
+        } else if verdict.needs_live_ack() {
+            refused.push(format!("«{}» — Live: нужен --live <фрагмент> или исключи из --ids", task.title));
+        } else {
+            refused.push(format!("«{}» — {}: не трогаю", task.title, verdict.label()));
+        }
+    }
+
+    if !yes {
+        println!("dry-run: мутаций нет. Исполнение — повтор с --yes (журнал и пост-чек включатся сами).");
+        return Ok(());
+    }
+    if !refused.is_empty() {
+        bail!("батч отклонён ЦЕЛИКОМ, ноль мутаций:\n  - {}", refused.join("\n  - "));
+    }
+    if removable.is_empty() {
+        println!("сносить нечего: ни один кандидат не в вердиктах сноса");
+        return Ok(());
+    }
+
+    // write-ahead: журнал обязан лежать в воркспейсе до первой мутации
+    let mut journal = Journal::new(project, "clean", &board);
+    for (task, _) in &removable {
+        journal.rows.push(journal_row(sy, &board, task).await?);
+    }
+    let journal_path = journal.save(sy).await?;
+
+    let item_ids: Vec<&str> = removable.iter().map(|(t, _)| t.item_id.as_str()).collect();
+    sy.mcp_tool(
+        "database",
+        json!({ "action": "item_remove", "id": board.av_id, "itemIDs": item_ids }),
+    )
+    .await?;
+    // тела: DraftSkeleton — пустой скелет в трэш; Live — тело НЕ трогается
+    // (восстановимый сирота, практика спасения строк 04.11); Dead — тела нет
+    for (task, verdict) in &removable {
+        if *verdict == Verdict::DraftSkeleton {
+            if let Some(doc) = task.body_doc.as_deref() {
+                let _ = sy.remove_doc(doc).await;
+            }
+        }
+    }
+
+    let rows_after = syt::read_rows(sy, &board).await?;
+    let before_titles: Vec<String> = rows_before.iter().map(|r| r.title.clone()).collect();
+    let after_titles: Vec<String> = rows_after.iter().map(|r| r.title.clone()).collect();
+    let removed_titles: Vec<String> = removable.iter().map(|(t, _)| t.title.clone()).collect();
+    let extra = guard::extra_missing_titles(&before_titles, &after_titles, &removed_titles);
+    if !extra.is_empty() {
+        bail!(
+            "ПОСТ-ЧЕК: с доски пропали строки ВНЕ плана ({:?}) — возможна потеря живых задач; \
+             восстановление — task undo {} --project {project}",
+            extra, journal_path
+        );
+    }
+    println!(
+        "снесено строк: {}; undo-журнал: {journal_path}; пост-чек: состав доски ок",
+        removable.len()
+    );
+    Ok(())
+}
+
+/// Undo: список журналов или идемпотентное восстановление строк.
+/// Тайтл уже на доске → no-op; id строк меняются — карта в выводе.
+async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Result<()> {
+    let Some(name) = journal_name else {
+        let journals = Journal::list(sy).await?;
+        if journals.is_empty() {
+            println!("undo-журналов нет ({})", guard::UNDO_DIR);
+            return Ok(());
+        }
+        println!("undo-журналы ({}):", guard::UNDO_DIR);
+        for (name, journal) in &journals {
+            println!("  {name}  {} [{}, {} строк(а)]", journal.created, journal.kind, journal.rows.len());
+        }
+        println!("восстановление: task undo <имя> --project <проект журнала>");
+        return Ok(());
+    };
+    let journal = Journal::load(sy, name).await?;
+    if journal.project != project {
+        bail!("журнал принадлежит проекту «{}», а --project «{project}»", journal.project);
+    }
+    let board = match journal.kind.as_str() {
+        "cron-rm" => syt::find_board_cron(sy, project).await?,
+        _ => syt::find_board(sy, project).await?,
+    };
+    if board.av_id != journal.av_id {
+        bail!(
+            "доска пересоздана (av {} ≠ {} из журнала) — авто-undo невозможен, восстанавливай вручную",
+            board.av_id, journal.av_id
+        );
+    }
+    let chain = guard::board_doc_chain(sy, &board).await?;
+    guard::control_probe_board(sy, &board, &chain).await?;
+    let rows = syt::read_rows(sy, &board).await?;
+    let mut restored = 0usize;
+    for row in &journal.rows {
+        let present = rows
+            .iter()
+            .any(|r| syt::normalize_title(&r.title) == syt::normalize_title(&row.title));
+        if present {
+            println!("  пропущен (тайтл уже на доске): {}", row.title);
+            continue;
+        }
+        let body_doc = restore_journal_body(sy, &board, row).await?;
+        let item = if body_doc.is_empty() {
+            sy.db_item_add(&board.av_id, &syt::path_safe(&row.title)).await?
+        } else {
+            sy.db_item_add_bound(&board.av_id, &body_doc).await?
+        };
+        restore_journal_cells(sy, &board, &journal.kind, &item, row).await?;
+        println!(
+            "  восстановлена: «{}» — строка {item} (была {}), тело {}",
+            row.title,
+            row.item_id,
+            if body_doc.is_empty() { "—".to_string() } else { body_doc.clone() }
+        );
+        restored += 1;
+    }
+    println!(
+        "undo: восстановлено {restored}/{}; id строк сменились — старые ссылки обнови (коммент «старый id → новый id»)",
+        journal.rows.len()
+    );
+    Ok(())
+}
+
+/// Тело для восстановленной строки: живое переиспользуется, отсутствующее
+/// пересоздаётся из журнала (docId меняется); без тела — detached-строка.
+async fn restore_journal_body(sy: &SiYuan, board: &syt::SyBoard, row: &JournalRow) -> Result<String> {
+    let Some(md) = row.body_md.as_deref() else {
+        return Ok(String::new());
+    };
+    if let Some(doc) = row.body_doc.as_deref() {
+        if syt::doc_block_exists(sy, doc).await {
+            return Ok(doc.to_string());
+        }
+    }
+    let ids = syt::body_doc_by_title(sy, board, &row.title).await?;
+    match ids.as_slice() {
+        [] => {
+            let clean_md = markdown::strip_export_wrapper(md, &row.title);
+            sy.create_doc_md(&board.notebook, &row.body_hpath, &clean_md).await
+        }
+        [only] => Ok(only.clone()),
+        many => bail!(
+            "несколько доков с заголовком «{}»: {} — вычисти дубли, потом повтори undo",
+            row.title,
+            many.join(", ")
+        ),
+    }
+}
+
+/// Клетки восстановленной строки: крон-доски — текстовые ячейки
+/// (Schedule/Status), задачные — Status (mSelect) + Branch + PR (url).
+async fn restore_journal_cells(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    kind: &str,
+    item: &str,
+    row: &JournalRow,
+) -> Result<()> {
+    if kind == "cron-rm" {
+        // у кронов Status — текстовая ячейка; Schedule идёт из extra
+        let mut cells: Vec<(&str, &str)> = Vec::new();
+        if !row.status.is_empty() {
+            cells.push(("Status", row.status.as_str()));
+        }
+        for (name, value) in &row.extra_text_cells {
+            cells.push((name.as_str(), value.as_str()));
+        }
+        return set_text_cells(sy, &board.av_id, item, &cells).await;
+    }
+    if !row.status.is_empty() {
+        let sk = syt::status_key(sy, &board.av_id).await?;
+        sy.db_item_set_status(&board.av_id, &sk, item, &row.status).await?;
+    }
+    if !row.branch.is_empty() {
+        set_text_cells(sy, &board.av_id, item, &[("Branch", row.branch.as_str())]).await?;
+    }
+    if row.pr.is_empty() {
+        return Ok(());
+    }
+    let keys = sy.mcp_tool("database", json!({ "action": "keys", "id": board.av_id })).await?;
+    let pr_key = keys
+        .pointer("/data/keys")
+        .or_else(|| keys.get("keys"))
+        .and_then(|k| k.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|k| k.get("name").and_then(|n| n.as_str()) == Some("PR"))
+                .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
+        });
+    match pr_key {
+        Some(key) => {
+            let value = syt::pr_cell_value(&row.pr)?;
+            sy.mcp_tool(
+                "database",
+                json!({ "action": "item_update", "id": board.av_id, "keyID": key,
+                        "itemID": item, "value": value }),
+            )
+            .await?;
+            Ok(())
+        }
+        None => bail!("ключ PR не найден на доске — PR «{}» не восстановлен", row.pr),
     }
 }
 
@@ -208,6 +567,10 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
                 Err(_) => syt::find_board(&sy, "uwuwu").await?,
             };
             let task = syt::resolve(&sy, &board, &id).await?;
+            // undo-журнал до мутации: Schedule в extra-клетках, промпт — body_md
+            let mut journal = Journal::new("uwuwu", "cron-rm", &board);
+            journal.rows.push(journal_row(&sy, &board, &task).await?);
+            let journal_path = journal.save(&sy).await?;
             sy.mcp_tool(
                 "database",
                 json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
@@ -216,7 +579,7 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
                 let _ = sy.remove_doc(&doc).await;
             }
-            println!("крон удалён: {}", task.title);
+            println!("крон удалён: {} (undo-журнал: {journal_path})", task.title);
             Ok(())
         }
     }
@@ -353,7 +716,7 @@ async fn write_body_in_place(
         return sy.append_block_md(doc_id, content).await;
     }
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
-    let existing = strip_export_wrapper(&existing_raw, doc_title);
+    let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match section {
         Some(section) => {
             let (md, edit) = replace_md_section(&existing, section, content);
@@ -363,29 +726,6 @@ async fn write_body_in_place(
         None => content.to_string(),
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
-}
-
-/// Снять экспортную обёртку дока: YAML frontmatter и рендер-строку имени
-/// (`# <имя дока>` первой строкой поверх блоков — она не блок; без strip
-/// реимпортируется реальным heading-блоком и множится на каждый rewrite).
-fn strip_export_wrapper(md: &str, doc_title: &str) -> String {
-    let body = strip_frontmatter(md).trim_start().to_string();
-    match body.strip_prefix(&format!("# {doc_title}")) {
-        Some(rest) => rest.trim_start_matches('\n').to_string(),
-        None => body,
-    }
-}
-
-/// YAML frontmatter из начала markdown (--- ... ---) — live-атрибуты дока.
-fn strip_frontmatter(md: &str) -> String {
-    let rest = match md.strip_prefix("---\n") {
-        Some(rest) => rest,
-        None => return md.to_string(),
-    };
-    match rest.split_once("\n---") {
-        Some((_, after)) => after.trim_start_matches('\n').to_string(),
-        None => md.to_string(),
-    }
 }
 
 /// Итог секционной правки: заменено (со счётчиком удалённых дублей) или добавлено.
@@ -567,7 +907,6 @@ mod tests {
     use super::collect_threads;
     use super::replace_md_section;
     use super::SectionEdit;
-    use super::strip_frontmatter;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -841,23 +1180,8 @@ mod tests {
         assert!(msg.contains(ORPHAN_DOC) && msg.contains("doc-b"), "список docId в ошибке: {msg}");
     }
 
-    #[test]
-    fn strip_frontmatter_cuts_leading_yaml_block() {
-        let md = "---\ntitle: т\ndate: x\n---\n\n# Заголовок\n\nтекст\n";
-        assert_eq!(strip_frontmatter(md), "# Заголовок\n\nтекст\n");
-    }
 
-    #[test]
-    fn strip_frontmatter_keeps_markdown_without_frontmatter() {
-        let md = "# Обычный док\n\n---\n\nhr внутри текста\n";
-        assert_eq!(strip_frontmatter(md), md);
-    }
 
-    #[test]
-    fn strip_frontmatter_keeps_unterminated_block() {
-        let md = "---\ntitle: без закрывашки\n";
-        assert_eq!(strip_frontmatter(md), md);
-    }
 
     #[test]
     fn replace_md_section_replaces_body_keeps_heading() {

@@ -9,6 +9,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// Результат чтения файла воркспейса через файловый API ядра.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileFetch {
+    /// Файл существует, содержимое прочитано.
+    Bytes(Vec<u8>),
+    /// Файла нет (kernel отдал код 404 — прямое чтение ФС мимо, индекс не участвует).
+    Missing,
+    /// Проба не состоялась (транспорт/доступ) — состояние неизвестно.
+    Failed(String),
+}
+
 pub struct SiYuan {
     pub base: String,
     pub token: String,
@@ -267,20 +278,102 @@ impl SiYuan {
         self.sql(&stmt).await
     }
 
-    /// Скачать файл из воркспейса (assets/…).
+    /// Скачать файл из воркспейса (assets/…). Путь относительно data/
+    /// (конвенция blob-команды: `assets/<key>`).
     pub async fn download_file(&self, path: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/api/file/getFile?path={}", self.base, path.replace(' ', "%20"));
+        match self.fetch_workspace_file(&format!("data/{path}")).await {
+            FileFetch::Bytes(bytes) => Ok(bytes),
+            FileFetch::Missing => bail!("getFile {path}: файла нет в data/"),
+            FileFetch::Failed(err) => bail!("getFile {path}: {err}"),
+        }
+    }
+
+    /// Чтение файла воркспейса, контракт ядра 3.8.9: POST JSON
+    /// `{"path": …}` от корня воркспейса. 200 = сырые байты файла
+    /// (ядро читает файл с диска, индекс не участвует); код 404 = файла нет; прочее
+    /// или транспортная ошибка = Failed (проба не состоялась).
+    /// Без ретраев post(): проба живости должна быть быстрой и честной.
+    pub async fn fetch_workspace_file(&self, path: &str) -> FileFetch {
         let resp = self
             .client
-            .get(&url)
+            .post(format!("{}/api/file/getFile", self.base))
             .header("Authorization", format!("Token {}", self.token))
+            .json(&json!({ "path": path }))
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => return FileFetch::Failed(e.to_string()),
+        };
+        match resp.status().as_u16() {
+            200 => match resp.bytes().await {
+                Ok(bytes) => FileFetch::Bytes(bytes.to_vec()),
+                Err(e) => FileFetch::Failed(e.to_string()),
+            },
+            status => {
+                let envelope: Value = serde_json::from_slice(&resp.bytes().await.unwrap_or_default())
+                    .unwrap_or(Value::Null);
+                if envelope.get("code").and_then(|c| c.as_i64()) == Some(404) {
+                    FileFetch::Missing
+                } else {
+                    FileFetch::Failed(format!("HTTP {status}: {envelope}"))
+                }
+            }
+        }
+    }
+
+    /// Запись файла в воркспейс, контракт ядра 3.8.9: POST multipart
+    /// (`path` от корня воркспейса + поле file). Ядро само создаёт
+    /// недостающие директории.
+    pub async fn put_workspace_file(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let filename = path.rsplit('/').next().unwrap_or(path).to_string();
+        let form = reqwest::multipart::Form::new()
+            .text("path", path.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(filename),
+            );
+        let resp = self
+            .client
+            .post(format!("{}/api/file/putFile", self.base))
+            .header("Authorization", format!("Token {}", self.token))
+            .multipart(form)
             .send()
             .await
-            .context("file request")?;
-        if !resp.status().is_success() {
-            bail!("getFile {path}: HTTP {}", resp.status());
+            .context("putFile request")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() && body.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(());
         }
-        Ok(resp.bytes().await?.to_vec())
+        bail!("putFile {path}: HTTP {status}, {}", body)
+    }
+
+    /// Список файлов директории воркспейса (POST JSON, контракт 3.8.9),
+    /// путь от корня воркспейса. Несуществующая директория — пустой список.
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
+        let data = self
+            .post("/api/file/readDir", json!({ "path": path }))
+            .await?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect())
+    }
+
+    /// FS-путь файла дока: data/<ноутбук>/<предки…>/<docId>.sy — ядро
+    /// хранит дерево по блок-id, не по hpath (проба не зависит от индекса
+    /// и тайтл-санитизации).
+    pub fn doc_file_path(notebook_id: &str, ancestor_docs: &[&str], doc_id: &str) -> String {
+        let mut path = format!("data/{notebook_id}");
+        for ancestor in ancestor_docs {
+            path.push('/');
+            path.push_str(ancestor);
+        }
+        format!("{path}/{doc_id}.sy")
     }
 
     // ---------- MCP: database (доски) ----------
@@ -330,8 +423,8 @@ impl SiYuan {
         // streamable-http: последняя строка data:; пустое тело = нотификация (202)
         let payload = text
             .lines()
-            .filter_map(|l| l.strip_prefix("data: "))
-            .last()
+            .rev()
+            .find_map(|l| l.strip_prefix("data: "))
             .unwrap_or(&text);
         if payload.trim().is_empty() {
             return Ok(Value::Null);
@@ -525,7 +618,11 @@ impl SiYuan {
 
 #[cfg(test)]
 mod tests {
-    use super::{doc_content_is_empty, parse_block_ids};
+    use super::{doc_content_is_empty, parse_block_ids, FileFetch};
+    use crate::siyuan::SiYuan;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parse_block_ids_reads_trailing_kernel_ids() {
@@ -567,5 +664,106 @@ mod tests {
             &["20261104130857-b9drqmf".into(), "20261104131412-wbpz3sx".into()],
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
+    }
+
+    #[test]
+    fn doc_file_path_joins_notebook_ancestors_and_doc_id() {
+        let got = SiYuan::doc_file_path("20261103224312-fbrf5fp", &["20261103233646-vzgad8m"], "20261104215722-1p0eetv");
+        assert_eq!(got, "data/20261103224312-fbrf5fp/20261103233646-vzgad8m/20261104215722-1p0eetv.sy");
+        assert_eq!(
+            SiYuan::doc_file_path("nb-1", &[], "20261103224557-4yurg8d"),
+            "data/nb-1/20261103224557-4yurg8d.sy"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_workspace_file_reads_raw_bytes_on_http_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let wants = body.get("path").and_then(|p| p.as_str()) == Some("data/nb/doc.sy");
+                let (status, payload) = if wants {
+                    (200, b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec())
+                } else {
+                    (202, br#"{"code":404,"msg":"file does not exist"}"#.to_vec())
+                };
+                ResponseTemplate::new(status).set_body_bytes(payload)
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        assert_eq!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Bytes(b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec()));
+        assert_eq!(sy.fetch_workspace_file("data/nb/other.sy").await, FileFetch::Missing);
+    }
+
+    #[tokio::test]
+    async fn fetch_workspace_file_reports_failure_on_transport_error() {
+        // несуществующий порт = соединение не состоялось → Failed, не Missing
+        let sy = SiYuan::for_tests("http://127.0.0.1:9".into());
+        assert!(matches!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn put_workspace_file_roundtrips_via_get_file() {
+        let server = MockServer::start().await;
+        let stored: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stored_put = stored.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/file/putFile"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                let ok = body.contains("name=\"path\"") && body.contains("data/assets/undo/j.json");
+                if ok {
+                    *stored_put.lock().unwrap() = req.body.clone();
+                }
+                ResponseTemplate::new(200).set_body_string(if ok { r#"{"code":0,"msg":"","data":null}"# } else { r#"{"code":-1}"# })
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let bytes = stored.lock().unwrap().clone();
+                ResponseTemplate::new(200).set_body_bytes(bytes)
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.put_workspace_file("data/assets/undo/j.json", b"{\"k\":1}").await.unwrap();
+        let read_back = sy.fetch_workspace_file("data/assets/undo/j.json").await;
+        assert!(matches!(read_back, FileFetch::Bytes(_)));
+        if let FileFetch::Bytes(bytes) = read_back {
+            assert!(bytes.windows(7).any(|w| w == b"{\"k\":1}"), "контент в multipart-теле: {bytes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_returns_entry_names() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/readDir"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let data = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
+                    serde_json::json!([
+                        { "name": "20261104-clean.json", "isDir": false, "isSymlink": false, "updated": 1 },
+                        { "name": "sub", "isDir": true, "isSymlink": false, "updated": 1 }
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let names = sy.list_dir("data/assets/undo").await.unwrap();
+        assert_eq!(names, vec!["20261104-clean.json".to_string(), "sub".to_string()]);
+        assert!(sy.list_dir("data/assets/nowhere").await.unwrap().is_empty());
     }
 }
