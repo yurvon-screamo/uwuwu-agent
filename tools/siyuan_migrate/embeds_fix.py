@@ -83,7 +83,11 @@ def main():
             for it in items:
                 md += f"\n```html\n{it['html']}\n```\n"
                 changed = True
-        # пересоздать док с тем же hpath
+        # пересоздать док с тем же hpath; гард: database внутри — НЕ пересоздавать
+        has_av = sy.sql(f"select count(*) as n from blocks where root_id='{doc}' and type='av'")
+        if has_av and has_av[0].get("n", 0) > 0:
+            print("SKIP-recreate (database внутри):", hpath[:50])
+            continue
         try:
             hpath_real = next(r["hpath"] for r in rows if r["id"] == doc)
             sy._post("/api/filetree/removeDocByID", {"id": doc})

@@ -63,6 +63,15 @@ def main():
                     changed += 1
                     break
         if changed:
+            # гард: док с database-блоком НЕ пересоздавать (убьёт доску) — только append
+            has_av = sy.sql(f"select count(*) as n from blocks where root_id='{doc}' and type='av'")
+            if has_av and has_av[0].get("n", 0) > 0:
+                try:
+                    sy._post("/api/block/appendBlock", {"dataType": "markdown", "data": "\n(восстановленные эмбеды — см. ниже)\n", "parentID": doc})
+                    print("SKIP-recreate (database внутри):", hpath[:50])
+                    continue
+                except Exception:
+                    continue
             try:
                 sy._post("/api/filetree/removeDocByID", {"id": doc})
                 time.sleep(1)
