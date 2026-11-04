@@ -597,6 +597,17 @@ mod tests {
             .await;
 
         Mock::given(method("POST"))
+            .and(path("/api/export/exportMdContent"))
+            .respond_with(move |_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": { "hPath": "/uwuwu/Задачи uwuwu/таск", "content": export_content } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
             .and(path("/mcp"))
             .respond_with(move |req: &wiremock::Request| {
                 let body = String::from_utf8_lossy(&req.body);

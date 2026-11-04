@@ -47,6 +47,7 @@ impl SiYuan {
 
     /// Тестовый конструктор: поля client/mcp_sid приватны для siyuan,
     /// сиблинг-модуль siyuan_task_tests соберёт только через него.
+    #[cfg(test)]
     pub(crate) fn for_tests(base: String) -> Self {
         Self {
             base,
