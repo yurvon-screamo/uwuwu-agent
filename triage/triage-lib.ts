@@ -564,6 +564,9 @@ export interface SessionMsg {
   id?: string
   type?: string
   time?: { created?: number; completed?: number }
+  /** user-сообщения: API отдаёт текст верхним уровнем (Session.Message.User
+   *  в 2.2.5, content отсутствует) */
+  text?: string
   content?: { type?: string; text?: string }[]
 }
 
@@ -593,23 +596,24 @@ export function extractReplies(
     const at = m.time?.created ?? 0
     if (at < sinceMs) continue
     if (m.id === undefined || seen.has(m.id)) continue
-    const text = (m.content ?? [])
-      .filter((p) => p?.type === "text" && typeof p.text === "string")
-      .map((p) => p.text as string)
-      .join("\n")
-      .trim()
+    const text = textOf(m)
     if (text === "") continue
     out.push({ id: m.id, text, at })
   }
   return out.reverse()
 }
 
-const textOf = (m: SessionMsg): string =>
-  (m.content ?? [])
+/** Текст сообщения сессии: user-сообщения API отдаёт текстом верхнего уровня
+ *  (Session.Message.User, 2.2.5 — content у них отсутствует), assistant —
+ *  content-частями. Читаем обе формы — promptLandedAt без этого не матчится. */
+const textOf = (m: SessionMsg): string => {
+  if (typeof m.text === "string" && m.text.trim() !== "") return m.text.trim()
+  return (m.content ?? [])
     .filter((p) => p?.type === "text" && typeof p.text === "string")
     .map((p) => p.text as string)
     .join("\n")
     .trim()
+}
 
 /** Дошёл ли наш промпт до сессии: user-сообщение новее границы с ЭТИМ
  *  текстом (точное или префикс-80 — длинные промпты могли пережать на

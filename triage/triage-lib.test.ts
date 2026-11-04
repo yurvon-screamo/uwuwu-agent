@@ -150,6 +150,16 @@ test("promptLandedAt: длинный промпц матчится по преф
   expect(promptLandedAt(msgs, 0, long)).toBe(5 * M)
 })
 
+test("promptLandedAt: user-сообщение 2.2.5 с текстом верхнего уровня (без content) матчится", () => {
+  // живая форма GET /message: {id, time, text, type} — content у user нет
+  const msgs: SessionMsg[] = [
+    { id: "msg_u2", type: "user", time: { created: 11 * M }, text: "Сколько будет семь минус три?" },
+    { id: "msg_u1", type: "user", time: { created: 10 * M }, text: "сделай отчёт" },
+  ]
+  expect(promptLandedAt(msgs, 10 * M - 2000, "Сколько будет семь минус три?")).toBe(11 * M)
+  expect(promptLandedAt(msgs, 12 * M, "Сколько будет семь минус три?")).toBe(null)
+})
+
 // ——— validState ———
 
 test("validState: мусор → дефолты; полный раундтрип сохраняется", () => {

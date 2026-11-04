@@ -24,8 +24,8 @@ import { acquireLock } from "../lib/single-instance"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, extractReplies, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt,
-  setDraftAck, steerCandidate, steerRecoveryBatch, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
+  draftReady, dropBatch, extractReplies, inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec,
+  promptLandedAt, setDraftAck, steerCandidate, steerRecoveryBatch, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
   type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
 } from "./triage-lib"
@@ -219,6 +219,25 @@ async function sessionMessages(sessionID: string): Promise<SessionMsg[]> {
   const msgs = await restCall(`/session/${sessionID}/message?limit=${MSG_WINDOW}&order=desc`)
   return Array.isArray(msgs) ? msgs as SessionMsg[] : []
 }
+
+/** Признанные (admitted) входы сессии: стирты между admission и потреблением
+ *  агент-лупом в /message ещё не видны — рестарт в этом окне без inbox-чека
+ *  пере-POST-ил бы уже приземлённый стирт. Сбой чтения — дедуп живёт по
+ *  /message (краш-окно сузится, но не сломается). */
+async function sessionInbox(sessionID: string): Promise<SessionMsg[]> {
+  try {
+    const entries = await restCall(`/session/${sessionID}/inbox`)
+    return inboxToSessionMsgs(Array.isArray(entries) ? entries as unknown[] : [])
+  } catch (e) {
+    log(`inbox ${sessionID} не достали (${e}) — дедуп по /message`)
+    return []
+  }
+}
+
+/** Дедуп стирта: приземление ищем и в /message (потреблённые), и в inbox
+ *  (признанные, ещё не потреблённые). */
+const steerLandedAt = async (run: RunState, msgs: SessionMsg[], sinceMs: number, text: string): Promise<number | null> =>
+  promptLandedAt(msgs, sinceMs, text) ?? promptLandedAt(await sessionInbox(run.sessionID), sinceMs, text)
 
 // ——— вечная сессия диалога ———
 
@@ -486,7 +505,7 @@ const steerStep = async (run: RunState, msgs: SessionMsg[]): Promise<void> => {
       save()
       return
     }
-    const landed = promptLandedAt(msgs, state.firing.at - 2000, batch.text)
+    const landed = await steerLandedAt(run, msgs, state.firing.at - 2000, batch.text)
     if (landed !== null) {
       // POST прошлой жизни долетел, save не пережил: дроп ТОЧНОЙ персоны,
       // граница done восстанавливается из момента приземления
@@ -506,7 +525,7 @@ const steerStep = async (run: RunState, msgs: SessionMsg[]): Promise<void> => {
 
   const cand = steerCandidate(state.queue, state.lastPushAt ?? 0, BATCH_DELAY_MS, BATCH_MAX_MS)
   if (cand === null || Date.now() < cand.readyAt) return
-  const landed = promptLandedAt(msgs, cand.readyAt - 2000, cand.batch.text)
+  const landed = await steerLandedAt(run, msgs, cand.readyAt - 2000, cand.batch.text)
   if (landed !== null) {
     // дедуп рестарт-окна без маркера (страховка; в живом процессе приземление
     // без firing невозможен — маркер персистится ДО POST)
