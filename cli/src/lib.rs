@@ -6,6 +6,7 @@
 
 pub mod cmd;
 pub mod log_filter;
+pub mod md_heading;
 pub mod path;
 pub mod siyuan;
 pub mod siyuan_id;

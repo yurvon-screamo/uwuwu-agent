@@ -546,16 +546,31 @@ pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTas
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).
+/// Секция создаётся лениво перед первым комментом: шаблоны тел её не содержат,
+/// исторические тела комментились голыми буллетами без секции (thread отвечал
+/// «комментов нет» при живых комментах — гэп ADR-014).
 pub async fn comment(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
+    ensure_comments_section(sy, &body).await?;
     let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M");
     let line = match reply_to {
         Some(_) => format!("\n  - **{author}** ({ts}): {text}"),
         None => format!("\n- **{author}** ({ts}): {text}"),
     };
     sy.append_block_md(&body, &line).await?;
+    Ok(())
+}
+
+/// Секция «Комменты» в теле? Если нет — заголовок append'ится первым блоком.
+/// Экспорт без ретраев: сбой read честно валит коммент, вместо риска задвоить
+/// заголовок (write-пути при флаке шлюза никогда не ретраются в лоб).
+pub(crate) async fn ensure_comments_section(sy: &SiYuan, doc_id: &str) -> Result<()> {
+    let md = sy.export_md_by_id(doc_id).await?;
+    if !crate::md_heading::has_h2_section(&md, "Комменты") {
+        sy.append_block_md(doc_id, "## Комменты").await?;
+    }
     Ok(())
 }
 
