@@ -11,6 +11,20 @@ use crate::siyuan::SiYuan;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+/// Валидный хит db_search: имя доски совпадает точно, анкор — по hPath
+/// (первый сегмент — имя ноутбука) или как OR-страховка по blockID == doc_id.
+fn pick_search_hit(results: &[Value], expect_hpath: &str, title: &str, doc_id: &str) -> Option<(String, String)> {
+    results.iter().find_map(|hit| {
+        let av_name = hit.get("avName").and_then(|n| n.as_str()).unwrap_or("");
+        let av_id = hit.get("avID").and_then(|a| a.as_str()).unwrap_or("");
+        let block_id = hit.get("blockID").and_then(|b| b.as_str()).unwrap_or("");
+        let hpath = hit.get("hPath").and_then(|h| h.as_str()).unwrap_or("");
+        let anchored = hpath == expect_hpath || block_id == doc_id;
+        (av_name == title && anchored && !av_id.is_empty())
+            .then(|| (av_id.to_string(), block_id.to_string()))
+    })
+}
+
 pub struct SyBoard {
     pub doc_id: String,
     pub av_id: String,
@@ -30,7 +44,7 @@ impl SyBoard {
 }
 
 /// Тайтл → безопасный сегмент hpath (конвенция миграции bind_rows.py: '/' → U+2215).
-pub fn path_safe(title: &str) -> String {
+pub(crate) fn path_safe(title: &str) -> String {
     title.replace('/', "\u{2215}")
 }
 
@@ -52,10 +66,11 @@ pub async fn find_board_titled(sy: &SiYuan, project: &str, title: &str) -> Resul
         .doc_id_by_hpath(&nb, &hpath)
         .await?
         .ok_or_else(|| anyhow!("доска «{title}» не найдена ({hpath})"))?;
-    // database-блок внутри дока: markdown несёт <div avID="..." ...>
+    // database-блок внутри дока: av-блок ядра (data-av-id=) или legacy i-носитель (avID=)
     let rows = sy
         .sql(&format!(
-            "select id, markdown from blocks where root_id='{doc_id}' and type='i' and markdown like '%avID=%' limit 5"
+            "select id, markdown from blocks where root_id='{doc_id}' \
+             and (type='av' or (type='i' and markdown like '%avID=%')) limit 5"
         ))
         .await?;
     let mut av_id = String::new();
@@ -69,29 +84,44 @@ pub async fn find_board_titled(sy: &SiYuan, project: &str, title: &str) -> Resul
         }
     }
     if av_id.is_empty() {
-        // fallback: MCP db_search по имени
+        // fallback: MCP db_search по имени; первый хит не доверяем —
+        // несвежий индекс отдаёт фаззи-хиты чужих досок
         let v = sy.db_search(title).await?;
-        let hit = v
+        let results = v
             .pointer("/data/results")
             .and_then(|r| r.as_array())
-            .and_then(|a| a.first())
             .cloned()
-            .ok_or_else(|| anyhow!("database-блок доски «{title}» не найден"))?;
-        block_id = hit.get("blockID").and_then(|b| b.as_str()).unwrap_or("").into();
-        av_id = hit.get("avID").and_then(|a| a.as_str()).unwrap_or("").into();
-    }
-    if av_id.is_empty() {
-        bail!("database доски «{title}» не найден (doc {doc_id})");
+            .unwrap_or_default();
+        let expect_hpath = format!("Projects{hpath}");
+        match pick_search_hit(&results, &expect_hpath, title, &doc_id) {
+            Some((av, block)) => {
+                av_id = av;
+                block_id = block;
+            }
+            None => bail!(
+                "database доски «{title}» не найден: поиск вернул {} хит(ов), валидного нет (ожидался hPath «{expect_hpath}»)",
+                results.len()
+            ),
+        }
     }
     Ok(SyBoard { doc_id, av_id, block_id, hpath, notebook: nb })
 }
 
 fn extract_av_id(md: &str) -> Option<String> {
-    let idx = md.find("avID=")?;
-    let rest = &md[idx + 6..];
-    let end = rest.find(['"', '\''])?;
-    Some(rest[..end].to_string())
+    let markers = [("data-av-id=", "data-av-id=".len()), ("avID=", "avID=".len())];
+    let (idx, marker_len) = markers
+        .iter()
+        .filter_map(|(marker, len)| md.find(marker).map(|pos| (pos, *len)))
+        .min_by_key(|(pos, _)| *pos)?;
+    let rest = md[idx + marker_len..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value_end = rest[1..].find(quote)?;
+    Some(rest[1..1 + value_end].to_string())
 }
+
 
 pub struct SyTask {
     pub item_id: String,
@@ -142,7 +172,7 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
             let name = key_name(kid);
             let value = cell_value(&cell);
             match name.as_str() {
-                "Primary Key" | "Title" | "Название" => t.title = value,
+                "Primary Key" | "Title" | "Название" | "Первичный ключ" => t.title = value,
                 "Status" | "Статус" => t.status = value,
                 "Branch" => t.branch = value,
                 "PR" | "Pr" => t.pr = value,
@@ -353,6 +383,7 @@ pub async fn find_board_cron(sy: &SiYuan, project: &str) -> Result<SyBoard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn probe_board() -> SyBoard {
         SyBoard {
@@ -400,5 +431,69 @@ mod tests {
     fn normalize_title_keeps_distinct_titles_distinct() {
         assert_ne!(normalize_title("a/b"), normalize_title("a\u{2215}b/c"));
         assert_ne!(normalize_title("a/b"), normalize_title("ab"));
+    }
+
+    #[test]
+    fn extract_av_id_reads_dash_case_attribute_view_block() {
+        let md = r#"<div data-type="NodeAttributeView" data-av-id="20261104093449-q2h9ju2" data-av-type="kanban"></div>"#;
+        assert_eq!(extract_av_id(md).as_deref(), Some("20261104093449-q2h9ju2"));
+    }
+
+    #[test]
+    fn extract_av_id_reads_camel_case_carrier_block() {
+        let md = r#"<div avID="20261104000238-96ch3l2"></div>"#;
+        assert_eq!(extract_av_id(md).as_deref(), Some("20261104000238-96ch3l2"));
+    }
+
+    #[test]
+    fn extract_av_id_returns_none_without_av_marker() {
+        let md = r#"<div data-type="NodeDocument"></div>"#;
+        assert_eq!(extract_av_id(md), None);
+    }
+
+    #[test]
+    fn pick_search_hit_takes_exact_name_and_hpath() {
+        let results = vec![json!({
+            "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
+            "hPath": "Projects/1xgames/Задачи 1xgames"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
+    }
+
+    #[test]
+    fn pick_search_hit_skips_foreign_first_hit() {
+        let results = vec![
+            json!({
+                "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
+                "hPath": "Projects/1xgames/Кроны 1xgames"
+            }),
+            json!({
+                "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
+                "hPath": "Projects/1xgames/Задачи 1xgames"
+            }),
+        ];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
+    }
+
+    #[test]
+    fn pick_search_hit_returns_none_without_valid_hits() {
+        let results = vec![json!({
+            "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
+            "hPath": "Projects/1xgames/Кроны 1xgames"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn pick_search_hit_accepts_hit_anchored_by_block_id() {
+        let results = vec![json!({
+            "avID": "av-9", "avName": "Задачи 1xgames", "blockID": "doc-77",
+            "hPath": "Другой/путь"
+        })];
+        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-77");
+        assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
     }
 }
