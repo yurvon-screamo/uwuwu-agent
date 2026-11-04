@@ -13,7 +13,8 @@ import { dirname } from "node:path"
 
 const arg = (name: string, def: string): string => {
   const i = process.argv.indexOf(name)
-  return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1]! : def
+  const value = i >= 0 ? process.argv[i + 1] : undefined
+  return value ?? def
 }
 const PORT = Number(arg("--port", "8099"))
 const SENT_LOG = arg("--log", "/tmp/uwuwu-triage-e2e/mock-tg-sent.jsonl")

@@ -186,9 +186,9 @@ test("validState: run.delivered персистится; битые id стрип
       steerAt: "мусор",
     },
   }
-  const cleaned = validState(dirty).run!
-  expect(cleaned.delivered).toEqual(["msg_a", "msg_b"]) // мусор выброшен, валидные остались
-  expect(cleaned.steerAt).toBeUndefined() // битая граница стрипится, ход остаётся
+  const cleanedRun = validState(dirty).run
+  expect(cleanedRun?.delivered).toEqual(["msg_a", "msg_b"]) // мусор выброшен, валидные остались
+  expect(cleanedRun?.steerAt).toBeUndefined() // битая граница стрипится, ход остаётся
 })
 
 test("validState: delivered >100 — остаются свежайшие (старьё доставлено давно)", () => {
@@ -196,17 +196,19 @@ test("validState: delivered >100 — остаются свежайшие (ста
   const out = validState({
     offset: 0, chatID: 1,
     run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: ids },
-  }).run!
-  expect(out.delivered).toEqual(ids.slice(-100))
+  }).run
+  expect(out?.delivered).toEqual(ids.slice(-100))
   // пустой после стрипа — поле долой, не пустой массив (42 — не строка-ид)
-  expect(validState({
+  const onlyJunk = validState({
     offset: 0, chatID: 1,
     run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: [42] },
-  }).run!.delivered).toBeUndefined()
-  expect(validState({
+  }).run
+  expect(onlyJunk?.delivered).toBeUndefined()
+  const notArray = validState({
     offset: 0, chatID: 1,
     run: { sessionID: "ses_x", startedAt: 1, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 }, delivered: "не-массив" },
-  }).run!.delivered).toBeUndefined()
+  }).run
+  expect(notArray?.delivered).toBeUndefined()
 })
 
 test("validState: легаси-поля деградации (broken/lastResetAt/pausedUntil) стрипаются при любом значении", () => {
@@ -270,10 +272,11 @@ test("steerCandidate: только ТГ-подмножество, чернови
 
 test("steerCandidate: тот же дебаунс — неготовое ТГ-сообщение не кандидет", () => {
   const q = [R({ msgID: 1, receivedAt: 50_000 })]
-  // тишина 60с с последнего пуша — не готово (receivedAt+60с в будущем)
-  expect(steerCandidate(q, 50_000, 60_000, 300_000)).not.toBeNull() // readyAt считается, готовность проверяет демон по Date.now()
-  const cand = steerCandidate(q, 50_000, 60_000, 300_000)!
-  expect(cand.readyAt).toBe(110_000)
+  // тишина 60с с последнего пуша — не готово (receivedAt+60с в будущем):
+  // readyAt считается, готовность проверяет демон сравнением с Date.now()
+  const cand = steerCandidate(q, 50_000, 60_000, 300_000)
+  expect(cand).not.toBeNull()
+  expect(cand?.readyAt).toBe(110_000)
 })
 
 test("steerRecoveryBatch: точная персона по msgIDs из firing, порядок очереди", () => {
