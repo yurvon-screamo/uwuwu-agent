@@ -2,6 +2,7 @@
 
 use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, TaskSub};
+use crate::markdown;
 use crate::siyuan::SiYuan;
 use crate::siyuan_task as syt;
 use anyhow::{anyhow, Result};
@@ -352,64 +353,12 @@ async fn write_body_in_place(
         return sy.append_block_md(doc_id, content).await;
     }
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
-    let existing = strip_export_wrapper(&existing_raw, doc_title);
+    let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match section {
-        Some(section) => replace_md_section(&existing, section, content),
+        Some(section) => markdown::replace_md_section(&existing, section, content),
         None => content.to_string(),
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
-}
-
-/// Снять экспортную обёртку дока: YAML frontmatter и рендер-строку имени
-/// (`# <имя дока>` первой строкой поверх блоков — она не блок; без strip
-/// реимпортируется реальным heading-блоком и множится на каждый rewrite).
-fn strip_export_wrapper(md: &str, doc_title: &str) -> String {
-    let body = strip_frontmatter(md).trim_start().to_string();
-    match body.strip_prefix(&format!("# {doc_title}")) {
-        Some(rest) => rest.trim_start_matches('\n').to_string(),
-        None => body,
-    }
-}
-
-/// YAML frontmatter из начала markdown (--- ... ---) — live-атрибуты дока.
-fn strip_frontmatter(md: &str) -> String {
-    let rest = match md.strip_prefix("---\n") {
-        Some(rest) => rest,
-        None => return md.to_string(),
-    };
-    match rest.split_once("\n---") {
-        Some((_, after)) => after.trim_start_matches('\n').to_string(),
-        None => md.to_string(),
-    }
-}
-
-/// Секция «## X» в markdown: заменить содержимое, заголовок сохранить.
-fn replace_md_section(md: &str, section: &str, content: &str) -> String {
-    let mut out = String::new();
-    let mut in_section = false;
-    let mut replaced = false;
-    let needle = format!("## {section}");
-    for line in md.lines() {
-        if line.starts_with("## ") {
-            in_section = line.trim() == needle;
-            if in_section {
-                out.push_str(&needle);
-                out.push('\n');
-                out.push_str(content.trim());
-                out.push('\n');
-                replaced = true;
-                continue;
-            }
-        }
-        if !in_section {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str(&format!("\n## {section}\n{content}\n"));
-    }
-    out
 }
 
 fn print_threads(md: &str) {
@@ -462,8 +411,6 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_md_section;
-    use super::strip_frontmatter;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -735,39 +682,5 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("несколько доков"), "суть ошибки: {msg}");
         assert!(msg.contains(ORPHAN_DOC) && msg.contains("doc-b"), "список docId в ошибке: {msg}");
-    }
-
-    #[test]
-    fn strip_frontmatter_cuts_leading_yaml_block() {
-        let md = "---\ntitle: т\ndate: x\n---\n\n# Заголовок\n\nтекст\n";
-        assert_eq!(strip_frontmatter(md), "# Заголовок\n\nтекст\n");
-    }
-
-    #[test]
-    fn strip_frontmatter_keeps_markdown_without_frontmatter() {
-        let md = "# Обычный док\n\n---\n\nhr внутри текста\n";
-        assert_eq!(strip_frontmatter(md), md);
-    }
-
-    #[test]
-    fn strip_frontmatter_keeps_unterminated_block() {
-        let md = "---\ntitle: без закрывашки\n";
-        assert_eq!(strip_frontmatter(md), md);
-    }
-
-    #[test]
-    fn replace_md_section_replaces_body_keeps_heading() {
-        let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let out = replace_md_section(md, "А", "новое содержимое\n");
-        assert!(out.contains("## А\nновое содержимое"));
-        assert!(out.contains("## Б\nвторое"));
-    }
-
-    #[test]
-    fn replace_md_section_appends_missing_section() {
-        let md = "## А\nпервое\n";
-        let out = replace_md_section(md, "Новая", "контент");
-        assert!(out.contains("## Новая\nконтент"));
-        assert!(out.contains("## А\nпервое"));
     }
 }
