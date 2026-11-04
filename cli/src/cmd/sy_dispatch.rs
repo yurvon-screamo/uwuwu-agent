@@ -170,9 +170,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
 
 /// Вердикт строки по независимым источникам: FS .sy тела, SQL по id,
 /// док по тайтлу; для Draft с живым телом — экспорт против скелетов.
-async fn row_verdict(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> Result<Verdict> {
+/// `chain` — цепочка doc-id доски (пути FS-проб).
+async fn row_verdict(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    chain: &[String],
+    task: &syt::SyTask,
+) -> Result<Verdict> {
     let title_ids = syt::body_doc_by_title(sy, board, &task.title).await?;
-    let fs = guard::probe_body_fs(sy, board, task).await;
+    let fs = guard::probe_body_fs(sy, board, chain, task).await;
     let sql = guard::probe_body_sql(sy, task).await;
     let draft_body_export = match (fs, task.body_doc.as_deref()) {
         (Probe::Found, Some(doc)) if task.status.eq_ignore_ascii_case("draft") => {
@@ -213,8 +219,9 @@ async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> R
 /// не-Draft (задекларированный контракт команды), write-ahead журнал.
 async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
     let board = syt::find_board(sy, project).await?;
+    let chain = guard::board_doc_chain(sy, &board).await?;
     let task = syt::resolve(sy, &board, id).await?;
-    match row_verdict(sy, &board, &task).await? {
+    match row_verdict(sy, &board, &chain, &task).await? {
         Verdict::Divergent => bail!(
             "состояние строки «{}» неясно (FS/SQL-проба не состоялась) — rm отклонён, повтори позже",
             task.title
@@ -254,21 +261,22 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         bail!("--ids обязателен: кандидаты через запятую (row-id/префикс/подстрока)");
     }
     let board = syt::find_board(sy, project).await?;
-    guard::control_probe_board(sy, &board).await?;
+    let chain = guard::board_doc_chain(sy, &board).await?;
+    guard::control_probe_board(sy, &board, &chain).await?;
     let rows_before = syt::read_rows(sy, &board).await?;
 
     println!(
-        "guard план{} — доска «{}/{}, кандидатов: {}",
+        "guard план{} — доска «{}» ({}), кандидатов: {}",
         if yes { " (--yes)" } else { " (dry-run)" },
-        project,
         board.hpath,
+        project,
         frags.len()
     );
     let mut planned: Vec<(&str, syt::SyTask, Verdict)> = Vec::new();
     for frag in &frags {
         match syt::resolve(sy, &board, frag).await {
             Ok(task) => {
-                let verdict = row_verdict(sy, &board, &task).await?;
+                let verdict = row_verdict(sy, &board, &chain, &task).await?;
                 let hint = if verdict.is_auto_removable() {
                     "снос с --yes (пустышка, владелец не нужен)"
                 } else if verdict.is_removable() {
@@ -396,7 +404,8 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
             board.av_id, journal.av_id
         );
     }
-    guard::control_probe_board(sy, &board).await?;
+    let chain = guard::board_doc_chain(sy, &board).await?;
+    guard::control_probe_board(sy, &board, &chain).await?;
     let rows = syt::read_rows(sy, &board).await?;
     let mut restored = 0usize;
     for row in &journal.rows {

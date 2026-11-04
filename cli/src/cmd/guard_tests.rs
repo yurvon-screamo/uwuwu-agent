@@ -166,19 +166,21 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             move |req: &Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let file = body.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                if file == format!("data/{NB}/{BOARD_DOC}.sy") && kernel.counter(&kernel.boards_file_missing) > 0 {
+                if file == format!("data/{NB}/folder-doc/{BOARD_DOC}.sy") && kernel.counter(&kernel.boards_file_missing) > 0 {
                     return missing_file();
                 }
                 match file.as_str() {
-                    "data/nb-1/board-doc/20261104000001-livexx1.sy"
-                    | "data/nb-1/board-doc/20261104000005-skelxx5.sy"
-                    | "data/nb-1/board-doc/20261104000006-drlxx06.sy" => {
+                    "data/nb-1/folder-doc/board-doc/20261104000001-livexx1.sy"
+                    | "data/nb-1/folder-doc/board-doc/20261104000005-skelxx5.sy"
+                    | "data/nb-1/folder-doc/board-doc/20261104000006-drlxx06.sy" => {
                         ResponseTemplate::new(200).set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec())
                     }
-                    "data/nb-1/board-doc/20261104000004-divxx04.sy" => {
+                    "data/nb-1/folder-doc/board-doc/20261104000004-divxx04.sy" => {
                         ResponseTemplate::new(500).set_body_string(r#"{"code":-1,"msg":"boom"}"#)
                     }
-                    "data/nb-1/board-doc.sy" => ResponseTemplate::new(200).set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec()),
+                    "data/nb-1/folder-doc/board-doc.sy" => {
+                        ResponseTemplate::new(200).set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec())
+                    }
                     _ => {
                         let seeded = kernel.undo_journal.lock().unwrap().get(&file).cloned();
                         match seeded {
@@ -199,6 +201,7 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
             let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let data = match hpath {
+                "/uwuwu" => serde_json::json!(["folder-doc"]),
                 "/uwuwu/Задачи uwuwu" => serde_json::json!([BOARD_DOC]),
                 "/uwuwu/Задачи uwuwu/живая задача" => serde_json::json!(["20261104000001-livexx1"]),
                 "/uwuwu/Задачи uwuwu/скелет-черновик" => serde_json::json!(["20261104000005-skelxx5"]),

@@ -268,13 +268,14 @@ pub(crate) fn evidence_from_sources(
     }
 }
 
-/// FS-проба тела строки: docId известен — путь по id (индекс и тайтлы
-/// не участвуют); detached-строка — проба невозможна.
-pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, task: &SyTask) -> Probe {
+/// FS-проба тела строки: docId известен — путь по id-цепочке доски
+/// (индекс и тайтлы не участвуют); detached-строка — проба невозможна.
+pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, chain: &[String], task: &SyTask) -> Probe {
     let Some(doc) = task.body_doc.as_deref() else {
         return Probe::NotPossible;
     };
-    let path = SiYuan::doc_file_path(&board.notebook, &[&board.doc_id], doc);
+    let ancestors: Vec<&str> = chain.iter().map(String::as_str).collect();
+    let path = SiYuan::doc_file_path(&board.notebook, &ancestors, doc);
     match sy.fetch_workspace_file(&path).await {
         FileFetch::Bytes(_) => Probe::Found,
         FileFetch::Missing => Probe::Absent,
@@ -310,8 +311,9 @@ pub(crate) async fn probe_body_sql(sy: &SiYuan, task: &SyTask) -> Probe {
 /// Контрольная проба доски: файл самого док-доски обязан существовать.
 /// Мисс — резолв доски подозрителен (find_board мог соврать), все FS-пробы
 /// тел были бы ложно мертвы → аборт без мутаций.
-pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard) -> Result<()> {
-    let path = SiYuan::doc_file_path(&board.notebook, &[], &board.doc_id);
+pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard, chain: &[String]) -> Result<()> {
+    let ancestors: Vec<&str> = chain[..chain.len().saturating_sub(1)].iter().map(String::as_str).collect();
+    let path = SiYuan::doc_file_path(&board.notebook, &ancestors, &board.doc_id);
     match sy.fetch_workspace_file(&path).await {
         FileFetch::Bytes(_) => Ok(()),
         FileFetch::Missing => bail!(
@@ -319,6 +321,29 @@ pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard) -> Result<
         ),
         FileFetch::Failed(err) => bail!("контрольная проба доски не состоялась: {err}"),
     }
+}
+
+/// Цепочка doc-id от корня ноутбука до дока доски: getIDsByHPath отдаёт id
+/// последнего сегмента пути — идём по префиксам hpath. Хвост цепочки обязан
+/// совпасть с doc_id доски (расхождение = резолв доски расходится с деревом).
+pub(crate) async fn board_doc_chain(sy: &SiYuan, board: &SyBoard) -> Result<Vec<String>> {
+    let segments: Vec<&str> = board.hpath.split('/').filter(|s| !s.is_empty()).collect();
+    let mut chain = Vec::with_capacity(segments.len());
+    for i in 1..=segments.len() {
+        let prefix = format!("/{}", segments[..i].join("/"));
+        let ids = sy.doc_ids_by_hpath(&board.notebook, &prefix).await?;
+        let Some(id) = ids.first() else {
+            bail!("цепочка доков доски оборвана на «{prefix}»: деревья по пути нет");
+        };
+        chain.push(id.clone());
+    }
+    if chain.last().map(String::as_str) != Some(board.doc_id.as_str()) {
+        bail!(
+            "цепочка доков ({:?}) не сходится с доской {} — резолв доски расходится с деревом",
+            chain, board.doc_id
+        );
+    }
+    Ok(chain)
 }
 
 /// Пост-чек: лишние пропажи тайтлов. Ожидание: после = до − план.
