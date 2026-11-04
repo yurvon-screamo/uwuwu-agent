@@ -32,6 +32,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::List { status, .. } => {
             let board = syt::find_board(&sy, project).await?;
             let rows = syt::read_rows(&sy, &board).await?;
+            let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
             let mut filtered: Vec<_> = rows
                 .into_iter()
                 .filter(|r| {
@@ -47,12 +48,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
             filtered.sort_by(|a, b| a.status.cmp(&b.status));
             for r in &filtered {
+                let marker = match r.body_doc.as_deref() {
+                    Some(b) if dead_bound.contains(b) => " (!)",
+                    _ => "",
+                };
                 println!(
-                    "{:<13} {:<12} {:<34} {}",
+                    "{:<13} {:<12} {:<34} {}{}",
                     r.status,
                     &r.item_id[..r.item_id.len().min(12)],
                     truncate(&r.title, 32),
-                    r.pr
+                    r.pr,
+                    marker
                 );
             }
             Ok(())
@@ -70,10 +76,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 println!("PR:       {}", task.pr);
             }
             if !no_body {
-                let md = sy
-                    .export_md(&board.notebook, &format!("{}/{}", board.hpath, task.title))
-                    .await
-                    .unwrap_or_default();
+                let md = match syt::task_body_doc(&sy, &board, &task).await? {
+                    Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
+                    None => String::new(),
+                };
                 println!("\n----- тело -----\n{md}");
             }
             Ok(())
@@ -108,10 +114,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Thread { id } => {
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
-            let md = sy
-                .export_md(&board.notebook, &format!("{}/{}", board.hpath, task.title))
-                .await
-                .unwrap_or_default();
+            let md = match syt::task_body_doc(&sy, &board, &task).await? {
+                Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
+                None => String::new(),
+            };
             print_threads(&md);
             Ok(())
         }
@@ -130,8 +136,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
             )
             .await?;
-            if let Some(oid) = syt::body_doc_id(&sy, &board, &task.title).await? {
-                let _ = sy.remove_doc(&oid).await;
+            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
+                let _ = sy.remove_doc(&doc).await;
             }
             println!("удалена: {}", task.title);
             Ok(())
@@ -141,22 +147,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
             let body_path = format!("{}/{}", board.hpath, task.title);
-            let existing = sy.export_md(&board.notebook, &body_path).await.unwrap_or_default();
-            let new_md: String = if replace || replace_section.is_some() {
-                if let Some(section) = &replace_section {
-                    replace_md_section(&existing, section, &content)
-                } else {
-                    content.clone()
+            let doc = syt::task_body_doc(&sy, &board, &task).await?;
+            let doc = match doc {
+                Some(doc_id) => {
+                    write_body_in_place(&sy, &doc_id, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                    doc_id
                 }
-            } else {
-                format!("{existing}\n{content}")
+                None => {
+                    // тела нет вовсе: создаю по заголовку (не привязываю — itemID строки неприкосновенен)
+                    let initial = if replace || replace_section.is_some() {
+                        content.clone()
+                    } else {
+                        content.trim_start().to_string()
+                    };
+                    sy.create_doc_md(&board.notebook, &body_path, &initial).await?
+                }
             };
-            let old = syt::body_doc_id(&sy, &board, &task.title).await?;
-            if let Some(oid) = old {
-                sy.remove_doc(&oid).await?;
-            }
-            let nid = sy.create_doc_md(&board.notebook, &body_path, &new_md).await?;
-            println!("тело обновлено: {body_path} ({nid})");
+            println!("тело обновлено: {body_path} ({doc})");
             Ok(())
         }
     }
@@ -175,7 +182,7 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             let board = syt::find_board_cron(&sy, &proj).await?;
             // тело крона = саб-док доски
             let body_h = format!("{}/{}", board.hpath, title);
-            if syt::body_doc_id(&sy, &board, &title).await?.is_some() {
+            if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
                 anyhow::bail!("крон «{title}» уже есть");
             }
             let body = sy.create_doc_md(&board.notebook, &body_h, &format!("# {title}\n\n```\n{prompt}\n```\n")).await?;
@@ -198,8 +205,8 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
                 json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
             )
             .await?;
-            if let Some(oid) = syt::body_doc_id(&sy, &board, &task.title).await? {
-                let _ = sy.remove_doc(&oid).await;
+            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
+                let _ = sy.remove_doc(&doc).await;
             }
             println!("крон удалён: {}", task.title);
             Ok(())
@@ -339,6 +346,40 @@ pub(crate) async fn projects_run() -> Result<()> {
 
 // ——— утилиты ———
 
+/// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
+/// append — один appendBlock; replace/replace-section — экспорт по id,
+/// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
+async fn write_body_in_place(
+    sy: &SiYuan,
+    doc_id: &str,
+    rewrite: bool,
+    section: Option<&str>,
+    content: &str,
+) -> Result<()> {
+    if !rewrite {
+        return sy.append_block_md(doc_id, content).await;
+    }
+    let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
+    let existing = strip_frontmatter(&existing_raw);
+    let new_md = match section {
+        Some(section) => replace_md_section(&existing, section, content),
+        None => content.to_string(),
+    };
+    sy.overwrite_doc_md(doc_id, &new_md).await
+}
+
+/// YAML frontmatter из начала markdown (--- ... ---) — live-атрибуты дока.
+fn strip_frontmatter(md: &str) -> String {
+    let rest = match md.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => return md.to_string(),
+    };
+    match rest.split_once("\n---") {
+        Some((_, after)) => after.trim_start_matches('\n').to_string(),
+        None => md.to_string(),
+    }
+}
+
 /// Секция «## X» в markdown: заменить содержимое, заголовок сохранить.
 fn replace_md_section(md: &str, section: &str, content: &str) -> String {
     let mut out = String::new();
@@ -414,4 +455,44 @@ fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_md_section;
+    use super::strip_frontmatter;
+
+    #[test]
+    fn strip_frontmatter_cuts_leading_yaml_block() {
+        let md = "---\ntitle: т\ndate: x\n---\n\n# Заголовок\n\nтекст\n";
+        assert_eq!(strip_frontmatter(md), "# Заголовок\n\nтекст\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_keeps_markdown_without_frontmatter() {
+        let md = "# Обычный док\n\n---\n\nhr внутри текста\n";
+        assert_eq!(strip_frontmatter(md), md);
+    }
+
+    #[test]
+    fn strip_frontmatter_keeps_unterminated_block() {
+        let md = "---\ntitle: без закрывашки\n";
+        assert_eq!(strip_frontmatter(md), md);
+    }
+
+    #[test]
+    fn replace_md_section_replaces_body_keeps_heading() {
+        let md = "## А\nстарое\n\n## Б\nвторое\n";
+        let out = replace_md_section(md, "А", "новое содержимое\n");
+        assert!(out.contains("## А\nновое содержимое"));
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn replace_md_section_appends_missing_section() {
+        let md = "## А\nпервое\n";
+        let out = replace_md_section(md, "Новая", "контент");
+        assert!(out.contains("## Новая\nконтент"));
+        assert!(out.contains("## А\nпервое"));
+    }
 }

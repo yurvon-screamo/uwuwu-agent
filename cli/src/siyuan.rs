@@ -45,6 +45,16 @@ impl SiYuan {
         })
     }
 
+    /// Прямая сборка клиента (тесты с мок-сервером; from_env — рабочий путь).
+    pub fn at(base: &str, token: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            token: token.to_string(),
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().expect("reqwest client"),
+            mcp_sid: std::sync::Mutex::new(None),
+        }
+    }
+
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         let mut last = String::new();
         for attempt in 0..4u32 {
@@ -117,24 +127,21 @@ impl SiYuan {
             .into())
     }
 
-    /// Существование дока по hPath; возвращает docId, если найден.
-    pub async fn doc_id_by_hpath(&self, notebook: &str, hpath: &str) -> Result<Option<String>> {
-        let v = self
+    /// Все доки по hPath; индекс ядра может отдать несколько id на путь (дубли).
+    pub async fn doc_ids_by_hpath(&self, notebook: &str, hpath: &str) -> Result<Vec<String>> {
+        let data = self
             .post(
                 "/api/filetree/getIDsByHPath",
                 json!({ "notebook": notebook, "path": hpath }),
             )
-            .await;
-        match v {
-            Ok(data) => {
-                let ids = data.as_array().cloned().unwrap_or_default();
-                Ok(ids
-                    .first()
-                    .and_then(|i| i.as_str())
-                    .map(|s| s.to_string()))
-            }
-            Err(_) => Ok(None),
-        }
+            .await?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|i| i.as_str().map(String::from))
+            .collect())
     }
 
     pub async fn create_doc_md(&self, notebook: &str, hpath: &str, markdown: &str) -> Result<String> {
@@ -156,14 +163,50 @@ impl SiYuan {
         Ok(())
     }
 
-    /// Экспорт дока в markdown по hPath.
+    /// docId неизменен: контент перезаписывается на месте (привязка строк-канбана живёт).
+    pub async fn overwrite_doc_md(&self, doc_id: &str, markdown: &str) -> Result<()> {
+        for block_id in self.top_level_block_ids(doc_id).await? {
+            self.delete_block(&block_id).await?;
+        }
+        if !markdown.trim().is_empty() {
+            self.append_block_md(doc_id, markdown).await?;
+        }
+        Ok(())
+    }
+
+    /// Блоки верхнего уровня дока (дети документ-блока; вложенные удалятся с родителем).
+    async fn top_level_block_ids(&self, doc_id: &str) -> Result<Vec<String>> {
+        let rows = self
+            .sql(&format!(
+                "select id from blocks where root_id='{doc_id}' and parent_id='{doc_id}' and type!='d'"
+            ))
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect())
+    }
+
+    pub async fn delete_block(&self, block_id: &str) -> Result<()> {
+        self.post("/api/block/deleteBlock", json!({ "id": block_id })).await?;
+        Ok(())
+    }
+
+    /// Экспорт дока в markdown по hPath (read-команды; задачи идут по docId).
     pub async fn export_md(&self, notebook: &str, hpath: &str) -> Result<String> {
         let id = self
-            .doc_id_by_hpath(notebook, hpath)
+            .doc_ids_by_hpath(notebook, hpath)
             .await?
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("док {hpath} не найден в ноутбуке {notebook}"))?;
+        self.export_md_by_id(&id).await
+    }
+
+    /// Экспорт дока в markdown по docId.
+    pub async fn export_md_by_id(&self, doc_id: &str) -> Result<String> {
         let v = self
-            .post("/api/export/exportMdContent", json!({ "id": id }))
+            .post("/api/export/exportMdContent", json!({ "id": doc_id }))
             .await?;
         Ok(v
             .pointer("/content")
