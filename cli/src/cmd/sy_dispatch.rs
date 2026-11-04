@@ -37,6 +37,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::List { status, .. } => {
             let board = syt::find_board(&sy, project).await?;
             let rows = syt::read_rows(&sy, &board).await?;
+            let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
             let mut filtered: Vec<_> = rows
                 .into_iter()
                 .filter(|r| {
@@ -52,12 +53,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
             filtered.sort_by(|a, b| a.status.cmp(&b.status));
             for r in &filtered {
+                let marker = match r.body_doc.as_deref() {
+                    Some(b) if dead_bound.contains(b) => " (!)",
+                    _ => "",
+                };
                 println!(
-                    "{:<13} {:<12} {:<34} {}",
+                    "{:<13} {:<12} {:<34} {}{}",
                     r.status,
                     &r.item_id[..r.item_id.len().min(12)],
                     truncate(&r.title, 32),
-                    r.pr
+                    r.pr,
+                    marker
                 );
             }
             Ok(())
@@ -75,10 +81,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 println!("PR:       {}", task.pr);
             }
             if !no_body {
-                let md = sy
-                    .export_md(&board.notebook, &board.body_hpath(&task.title))
-                    .await
-                    .unwrap_or_default();
+                let md = match syt::task_body_doc(&sy, &board, &task).await? {
+                    Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
+                    None => String::new(),
+                };
                 println!("\n----- тело -----\n{md}");
             }
             Ok(())
@@ -113,10 +119,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Thread { id } => {
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
-            let md = sy
-                .export_md(&board.notebook, &board.body_hpath(&task.title))
-                .await
-                .unwrap_or_default();
+            let md = match syt::task_body_doc(&sy, &board, &task).await? {
+                Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
+                None => String::new(),
+            };
             print_threads(&md);
             Ok(())
         }
@@ -135,8 +141,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
             )
             .await?;
-            if let Some(oid) = syt::body_doc_id(&sy, &board, &task.title).await? {
-                let _ = sy.remove_doc(&oid).await;
+            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
+                let _ = sy.remove_doc(&doc).await;
             }
             println!("удалена: {}", task.title);
             Ok(())
@@ -146,22 +152,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let board = syt::find_board(&sy, project).await?;
             let task = syt::resolve(&sy, &board, &id).await?;
             let body_path = board.body_hpath(&task.title);
-            let existing = sy.export_md(&board.notebook, &body_path).await.unwrap_or_default();
-            let new_md: String = if replace || replace_section.is_some() {
-                if let Some(section) = &replace_section {
-                    replace_md_section(&existing, section, &content)
-                } else {
-                    content.clone()
+            let doc = syt::task_body_doc(&sy, &board, &task).await?;
+            let doc = match doc {
+                Some(doc_id) => {
+                    write_body_in_place(&sy, &doc_id, &task.title, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                    doc_id
                 }
-            } else {
-                format!("{existing}\n{content}")
+                None => {
+                    // тела нет вовсе: создаю по заголовку (не привязываю — itemID строки неприкосновенен)
+                    let initial = if replace || replace_section.is_some() {
+                        content.clone()
+                    } else {
+                        content.trim_start().to_string()
+                    };
+                    sy.create_doc_md(&board.notebook, &body_path, &initial).await?
+                }
             };
-            let old = syt::body_doc_id(&sy, &board, &task.title).await?;
-            if let Some(oid) = old {
-                sy.remove_doc(&oid).await?;
-            }
-            let nid = sy.create_doc_md(&board.notebook, &body_path, &new_md).await?;
-            println!("тело обновлено: {body_path} ({nid})");
+            println!("тело обновлено: {body_path} ({doc})");
             Ok(())
         }
     }
@@ -180,7 +187,7 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             let board = syt::find_board_cron(&sy, &proj).await?;
             // тело крона = саб-док доски
             let body_h = board.body_hpath(&title);
-            if syt::body_doc_id(&sy, &board, &title).await?.is_some() {
+            if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
                 anyhow::bail!("крон «{title}» уже есть");
             }
             let body = sy.create_doc_md(&board.notebook, &body_h, &format!("# {title}\n\n```\n{prompt}\n```\n")).await?;
@@ -205,8 +212,8 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
                 json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
             )
             .await?;
-            if let Some(oid) = syt::body_doc_id(&sy, &board, &task.title).await? {
-                let _ = sy.remove_doc(&oid).await;
+            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
+                let _ = sy.remove_doc(&doc).await;
             }
             println!("крон удалён: {}", task.title);
             Ok(())
@@ -330,6 +337,52 @@ pub(crate) async fn projects_run() -> Result<()> {
 
 // ——— утилиты ———
 
+/// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
+/// append — один appendBlock; replace/replace-section — экспорт по id,
+/// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
+async fn write_body_in_place(
+    sy: &SiYuan,
+    doc_id: &str,
+    doc_title: &str,
+    rewrite: bool,
+    section: Option<&str>,
+    content: &str,
+) -> Result<()> {
+    if !rewrite {
+        return sy.append_block_md(doc_id, content).await;
+    }
+    let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
+    let existing = strip_export_wrapper(&existing_raw, doc_title);
+    let new_md = match section {
+        Some(section) => replace_md_section(&existing, section, content),
+        None => content.to_string(),
+    };
+    sy.overwrite_doc_md(doc_id, &new_md).await
+}
+
+/// Снять экспортную обёртку дока: YAML frontmatter и рендер-строку имени
+/// (`# <имя дока>` первой строкой поверх блоков — она не блок; без strip
+/// реимпортируется реальным heading-блоком и множится на каждый rewrite).
+fn strip_export_wrapper(md: &str, doc_title: &str) -> String {
+    let body = strip_frontmatter(md).trim_start().to_string();
+    match body.strip_prefix(&format!("# {doc_title}")) {
+        Some(rest) => rest.trim_start_matches('\n').to_string(),
+        None => body,
+    }
+}
+
+/// YAML frontmatter из начала markdown (--- ... ---) — live-атрибуты дока.
+fn strip_frontmatter(md: &str) -> String {
+    let rest = match md.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => return md.to_string(),
+    };
+    match rest.split_once("\n---") {
+        Some((_, after)) => after.trim_start_matches('\n').to_string(),
+        None => md.to_string(),
+    }
+}
+
 /// Секция «## X» в markdown: заменить содержимое, заголовок сохранить.
 fn replace_md_section(md: &str, section: &str, content: &str) -> String {
     let mut out = String::new();
@@ -405,4 +458,316 @@ fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_md_section;
+    use super::strip_frontmatter;
+    use super::task_run;
+    use crate::cmd::cli::TaskSub;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BOARD_DOC: &str = "board-doc";
+    const AV_ID: &str = "av-1";
+    const CARRIER: &str = "block-1";
+    const TITLE_KEY: &str = "key-1";
+    const ROW_ID: &str = "item-1";
+    const BOUND_DOC: &str = "doc-bound";
+    const ORPHAN_DOC: &str = "doc-orphan";
+
+    fn render_rows(with_binding: bool) -> serde_json::Value {
+        let mut block = serde_json::json!({ "content": "таск", "refSubtype": "d" });
+        if with_binding {
+            block["id"] = serde_json::json!(BOUND_DOC);
+        }
+        serde_json::json!({
+            "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
+            "rows": [{
+                "id": ROW_ID,
+                "cells": [{ "value": { "keyID": TITLE_KEY, "type": "block", "block": block } }]
+            }]
+        })
+    }
+
+    /// Ответ MCP tools/call(database render) как текст content[0].
+    fn mcp_render_response(with_binding: bool) -> String {
+        let mut view = render_rows(with_binding);
+        view["rowCount"] = serde_json::json!(1);
+        let payload = serde_json::json!({ "action": "render", "data": { "view": view } });
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "content": [{ "type": "text", "text": payload.to_string() }] }
+        })
+        .to_string()
+    }
+
+    /// Минимальный мок kernel API SiYuan для body-пути: SQL-роутер по stmt,
+    /// MCP initialize/render. Счётчики: createDocWithMd (инвариант == 0)
+    /// и тела appendBlock (факт записи в привязанный док).
+    async fn mock_siyuan(
+        title_doc_ids: Vec<String>,
+        with_binding: bool,
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        mock_siyuan_with_export(title_doc_ids, with_binding, String::new()).await
+    }
+
+    /// Расширенный мок: с экспортом дока (обёртка frontmatter + имя) для
+    /// rewrite-пути (replace/--replace-section).
+    async fn mock_siyuan_with_export(
+        title_doc_ids: Vec<String>,
+        with_binding: bool,
+        export_content: String,
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let server = MockServer::start().await;
+        let create_calls = Arc::new(AtomicUsize::new(0));
+        let append_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let title_docs = title_doc_ids.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+                let data = if stmt.contains("type='av'") {
+                    serde_json::json!([{ "id": CARRIER, "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"{AV_ID}\"></div>") }])
+                } else if stmt.contains(&format!("id='{BOUND_DOC}'")) {
+                    serde_json::json!([{ "id": BOUND_DOC }])
+                } else if stmt.contains("hpath like") {
+                    serde_json::json!([{ "id": BOUND_DOC }, { "id": ORPHAN_DOC }])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        let create_for_mount = create_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/createDocWithMd"))
+            .respond_with(move |_req: &wiremock::Request| {
+                create_for_mount.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(r#"{"code":-1,"msg":"createDocWithMd must not be called"}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let appends = append_bodies.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(move |req: &wiremock::Request| {
+                appends
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req.body).to_string());
+                ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let ids = title_docs.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = if hpath.ends_with("/таск") {
+                    serde_json::json!(ids)
+                } else {
+                    serde_json::json!([BOARD_DOC])
+                };
+                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/notebook/lsNotebooks"))
+            .respond_with(|_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": { "notebooks": [{ "id": "nb-1", "name": "Projects" }] } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/export/exportMdContent"))
+            .respond_with(move |_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": { "hPath": "/uwuwu/Задачи uwuwu/таск", "content": export_content } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-1")
+                } else if body.contains("notifications/initialized") {
+                    ResponseTemplate::new(200)
+                } else if body.contains("tools/call") {
+                    if body.contains("\"block\"") && body.contains("\"get\"") {
+                        // doc_block_exists: живой bound-док → NodeDocument
+                        ResponseTemplate::new(200).set_body_string(
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ID: {BOUND_DOC}\nType: NodeDocument\nHPath: /uwuwu/Задачи uwuwu/таск"}}]}}}}"#
+                            ),
+                        )
+                    } else if body.contains("\"block\"") && body.contains("get_children") {
+                        // overwrite: док пуст → doc_content_is_empty → append
+                        ResponseTemplate::new(200).set_body_string(
+                            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":""}]}}"#,
+                        )
+                    } else {
+                        ResponseTemplate::new(200).set_body_string(mcp_render_response(with_binding))
+                    }
+                } else {
+                    ResponseTemplate::new(200).set_body_string(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        (server, create_calls, append_bodies)
+    }
+
+    async fn write_body_via_cli(server: &MockServer) -> anyhow::Result<()> {
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new()?;
+        std::fs::write(md.path(), "маркер-контент\n")?;
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: None,
+            },
+        )
+        .await
+    }
+
+    /// BDD-сценарий задачи: bound-строка + док-сирота с тем же заголовком →
+    /// контент попадает в привязанное тело, docId ответа = привязанный,
+    /// новых доков не создаётся (сирота стоит ПЕРВОЙ в ответе getIDsByHPath).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_writes_into_bound_doc_and_never_creates_docs() {
+        let (server, create_calls, append_bodies) =
+            mock_siyuan(vec![ORPHAN_DOC.to_string(), BOUND_DOC.to_string()], true).await;
+        write_body_via_cli(&server).await.unwrap();
+
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0, "createDocWithMd не должен вызываться");
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert_eq!(appends.len(), 1, "один appendBlock в привязанный док");
+            assert!(appends[0].contains("маркер-контент"), "контент в appendBlock");
+            assert!(
+                appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")),
+                "append в привязанный док, не в сироту"
+            );
+        }
+    }
+
+    /// Rewrite-путь (--replace-section): existing-экспорт несёт обёртку
+    /// (frontmatter + рендер-строка имени дока) — после перезаписи НИ имя,
+    /// НИ frontmatter не реимпортируются реальными блоками (симптом
+    /// «--replace-section множит заголовки»).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replace_section_rewrites_without_name_and_frontmatter_blocks() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\n## Проверка\nстарое тело секции\n".to_string();
+        let (server, create_calls, append_bodies) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое содержимое секции\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: Some("Проверка".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0);
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert_eq!(appends.len(), 1, "один appendBlock пересборки");
+            let payload = &appends[0];
+            assert!(payload.contains("новое содержимое секции"), "новая секция в appendBlock");
+            assert!(!payload.contains("# таск"), "имя дока не реимпортируется блоком");
+            assert!(!payload.contains("title: таск"), "frontmatter не реимпортируется блоком");
+            assert!(!payload.contains("старое тело секции"), "старая секция заменена");
+        }
+    }
+
+    /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
+    /// явная ошибка со списком docId, не молчаливая запись в «первый».
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_errors_listing_duplicates_for_detached_row() {
+        let (server, _create, _append) =
+            mock_siyuan(vec![ORPHAN_DOC.to_string(), "doc-b".to_string()], false).await;
+        let err = write_body_via_cli(&server).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("несколько доков"), "суть ошибки: {msg}");
+        assert!(msg.contains(ORPHAN_DOC) && msg.contains("doc-b"), "список docId в ошибке: {msg}");
+    }
+
+    #[test]
+    fn strip_frontmatter_cuts_leading_yaml_block() {
+        let md = "---\ntitle: т\ndate: x\n---\n\n# Заголовок\n\nтекст\n";
+        assert_eq!(strip_frontmatter(md), "# Заголовок\n\nтекст\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_keeps_markdown_without_frontmatter() {
+        let md = "# Обычный док\n\n---\n\nhr внутри текста\n";
+        assert_eq!(strip_frontmatter(md), md);
+    }
+
+    #[test]
+    fn strip_frontmatter_keeps_unterminated_block() {
+        let md = "---\ntitle: без закрывашки\n";
+        assert_eq!(strip_frontmatter(md), md);
+    }
+
+    #[test]
+    fn replace_md_section_replaces_body_keeps_heading() {
+        let md = "## А\nстарое\n\n## Б\nвторое\n";
+        let out = replace_md_section(md, "А", "новое содержимое\n");
+        assert!(out.contains("## А\nновое содержимое"));
+        assert!(out.contains("## Б\nвторое"));
+    }
+
+    #[test]
+    fn replace_md_section_appends_missing_section() {
+        let md = "## А\nпервое\n";
+        let out = replace_md_section(md, "Новая", "контент");
+        assert!(out.contains("## Новая\nконтент"));
+        assert!(out.contains("## А\nпервое"));
+    }
 }
