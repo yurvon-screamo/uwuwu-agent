@@ -360,11 +360,11 @@ impl SiYuan {
             .await
     }
 
-    /// Строки database (render): items с клетками.
-    pub async fn db_render(&self, av_id: &str, block_id: &str) -> Result<Value> {
+    /// Строки database (render): items с клетками; page/pageSize — ядро пагинирует (деф. 50).
+    pub async fn db_render(&self, av_id: &str, block_id: &str, page: u32, page_size: u32) -> Result<Value> {
         self.mcp_tool(
             "database",
-            json!({ "action": "render", "id": av_id, "blockID": block_id }),
+            json!({ "action": "render", "id": av_id, "blockID": block_id, "page": page, "pageSize": page_size }),
         )
         .await
     }

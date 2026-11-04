@@ -115,28 +115,40 @@ pub struct SyTask {
     pub body_doc: Option<String>,
 }
 
-/// Строки доски через MCP database render.
+/// Строки доски через MCP database render. Ядро пагинирует (дефолт 50):
+/// читаем pageSize=500 одним вызовом; полная страница — добираем следующую,
+/// дедуп по itemID на случай перекрытия страниц при конкурентных вставках.
 pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
-    let v = sy.db_render(&board.av_id, &board.block_id).await?;
-    // structuredContent = {action, data:{...}} — берём data
-    let data = v.get("data").unwrap_or(&v);
-    let keys = data
-        .pointer("/view/columns")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let items = data
-        .pointer("/view/rows")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+    const PAGE_SIZE: u32 = 500;
+    const MAX_PAGES: u32 = 20;
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
-    for it in &items {
-        if let Some(t) = parse_render_row(it, &keys) {
-            out.push(t);
+    for page in 1..=MAX_PAGES {
+        let v = sy.db_render(&board.av_id, &board.block_id, page, PAGE_SIZE).await?;
+        let data = v.get("data").unwrap_or(&v);
+        let keys = data
+            .pointer("/view/columns")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let items = data
+            .pointer("/view/rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let returned = items.len();
+        for it in &items {
+            if let Some(t) = parse_render_row(it, &keys) {
+                if seen.insert(t.item_id.clone()) || t.item_id.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+        if returned < PAGE_SIZE as usize {
+            return Ok(out);
         }
     }
-    Ok(out)
+    bail!("доска «{}» не читается целиком: >{} строк за {} страниц", board.hpath, MAX_PAGES * PAGE_SIZE, MAX_PAGES)
 }
 
 /// Строка render → SyTask. Title из primary-клетки; body_doc — docId из
@@ -324,14 +336,53 @@ pub async fn create(
     // открывает документ; detached-строки не создаём
     let body_path = format!("{}/{}", board.hpath, title);
     let body = sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx)).await?;
-    let item = sy.db_item_add_bound(&board.av_id, &body).await?;
+    // вставка строки сразу после createDocWithMd ненадёжна (репро 04.11 08:27):
+    // success-ответ item_add не гарантирует строку в render — verify по itemID
+    // с ретраем ×1; дедуп по тайтлу не даёт ретраю минтить вторую строку
     let sk = status_key(sy, &board.av_id).await?;
+    let mut item = sy.db_item_add_bound(&board.av_id, &body).await?;
     sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
-    // тип — тег в теле
-    if !ty.is_empty() {
-        let _ = sy.append_block_md(&body, &format!("\n#{ty}\n")).await;
+    for attempt in 0..=1u8 {
+        let rows = read_rows(sy, &board).await?;
+        match check_row_insert(&rows, &item, title) {
+            RowInsertCheck::Confirmed => {
+                // тип — тег в теле
+                if !ty.is_empty() {
+                    let _ = sy.append_block_md(&body, &format!("\n#{ty}\n")).await;
+                }
+                return Ok((item, body));
+            }
+            RowInsertCheck::DuplicateTitle => bail!(
+                "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
+            ),
+            RowInsertCheck::Missing if attempt == 0 => {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                item = sy.db_item_add_bound(&board.av_id, &body).await?;
+                sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
+            }
+            RowInsertCheck::Missing => bail!(
+                "строка задачи «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); задача видна только как док"
+            ),
+        }
     }
-    Ok((item, body))
+    unreachable!("цикл verify завершается return или bail")
+}
+
+/// Итог вставки строки: id найден / тайтл занят другой строкой / строки нет.
+fn check_row_insert(rows: &[SyTask], item: &str, title: &str) -> RowInsertCheck {
+    if rows.iter().any(|r| r.item_id == item) {
+        return RowInsertCheck::Confirmed;
+    }
+    if rows.iter().any(|r| r.title == title) {
+        return RowInsertCheck::DuplicateTitle;
+    }
+    RowInsertCheck::Missing
+}
+
+enum RowInsertCheck {
+    Confirmed,
+    DuplicateTitle,
+    Missing,
 }
 
 /// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
@@ -582,5 +633,37 @@ mod tests {
         let keys = vec![json!({ "id": "key-1", "name": "Primary Key" })];
         let row = json!({ "id": "row-3", "cells": [] });
         assert!(parse_render_row(&row, &keys).is_none());
+    }
+
+    fn sy_task(item_id: &str, title: &str, body_doc: Option<&str>) -> SyTask {
+        SyTask {
+            item_id: item_id.to_string(),
+            title: title.to_string(),
+            status: String::new(),
+            branch: String::new(),
+            pr: String::new(),
+            body_doc: body_doc.map(String::from),
+        }
+    }
+
+    #[test]
+    fn check_row_insert_confirms_inserted_row_by_item_id() {
+        let rows = vec![
+            sy_task("item-1", "первая", Some("doc-1")),
+            sy_task("item-2", "вторая", Some("doc-2")),
+        ];
+        assert!(matches!(check_row_insert(&rows, "item-2", "новая"), RowInsertCheck::Confirmed));
+    }
+
+    #[test]
+    fn check_row_insert_reports_duplicate_title_not_inserted_id() {
+        let rows = vec![sy_task("item-x", "задача", Some("doc-x"))];
+        assert!(matches!(check_row_insert(&rows, "item-y", "задача"), RowInsertCheck::DuplicateTitle));
+    }
+
+    #[test]
+    fn check_row_insert_reports_missing_row() {
+        let rows = vec![sy_task("item-1", "другая", Some("doc-1"))];
+        assert!(matches!(check_row_insert(&rows, "item-9", "новая"), RowInsertCheck::Missing));
     }
 }
