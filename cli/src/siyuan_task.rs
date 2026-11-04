@@ -132,6 +132,8 @@ pub struct SyTask {
     pub status: String,
     pub branch: String,
     pub pr: String,
+    /// Крон-доски: значение колонки Schedule (на задачных досках пусто).
+    pub schedule: String,
     pub body_doc: Option<String>,
 }
 
@@ -229,6 +231,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         status: String::new(),
         branch: String::new(),
         pr: String::new(),
+        schedule: String::new(),
         body_doc: None,
     };
     for cell in it.get("cells").and_then(|c| c.as_array()).cloned().unwrap_or_default() {
@@ -248,6 +251,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             }
             "Status" | "Статус" => t.status = value,
             "Branch" => t.branch = value,
+            "Schedule" => t.schedule = value,
             "PR" | "Pr" => t.pr = value,
             _ => {}
         }
@@ -325,7 +329,7 @@ fn choose_body_doc(bound: Option<&str>, bound_is_live: bool, title_doc_ids: &[St
 /// Живость дока через MCP block get, не SQL: индекс blocks отстаёт от
 /// createDocWithMd — в окне лага SQL «не находит» свежий док и скидывает
 /// строку на title-fallback с ложным предупреждением (репро ревью 04.11).
-async fn doc_block_exists(sy: &SiYuan, doc_id: &str) -> bool {
+pub(crate) async fn doc_block_exists(sy: &SiYuan, doc_id: &str) -> bool {
     let Ok(text) = sy
         .mcp_tool_text("block", serde_json::json!({ "action": "get", "id": doc_id }))
         .await
@@ -389,7 +393,7 @@ pub async fn dead_bound_doc_ids(sy: &SiYuan, rows: &[SyTask]) -> Result<HashSet<
 }
 
 /// ключ Status в database.
-async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
+pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
     let v = sy.mcp_tool("database", serde_json::json!({ "action": "keys", "id": av })).await?;
     let keys = v
         .pointer("/data/keys")
@@ -570,7 +574,7 @@ pub async fn close(sy: &SiYuan, board: &SyBoard, task: &SyTask, note: Option<&st
 }
 
 /// Значение PR-ячейки (ключ типа url): пустая строка — очистка, иначе http(s)-ссылка.
-fn pr_cell_value(pr: &str) -> Result<Value> {
+pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
     let pr = pr.trim();
     if pr.is_empty() {
         return Ok(serde_json::json!({ "url": { "content": "" } }));
@@ -821,6 +825,7 @@ mod tests {
             status: String::new(),
             branch: String::new(),
             pr: String::new(),
+            schedule: String::new(),
             body_doc: body_doc.map(String::from),
         }
     }

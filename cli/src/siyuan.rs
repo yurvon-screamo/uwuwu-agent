@@ -423,8 +423,8 @@ impl SiYuan {
         // streamable-http: последняя строка data:; пустое тело = нотификация (202)
         let payload = text
             .lines()
-            .filter_map(|l| l.strip_prefix("data: "))
-            .last()
+            .rev()
+            .find_map(|l| l.strip_prefix("data: "))
             .unwrap_or(&text);
         if payload.trim().is_empty() {
             return Ok(Value::Null);
