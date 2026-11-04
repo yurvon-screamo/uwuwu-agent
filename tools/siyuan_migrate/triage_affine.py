@@ -284,15 +284,17 @@ def mcp_call(
 
 def mcp_result(resp: object) -> dict:
     """Валидированный result: JSON-RPC error / isError / ok:false / пустой
-    ответ → McpError — обычное исключение, его видят ретраи обвязок;
-    exit-код выставляет CLI-точка входа."""
+    ответ / не-dict result → McpError — обычное исключение, его видят
+    ретраи обвязок; exit-код выставляет CLI-точка входа."""
     if not isinstance(resp, dict) or "error" in resp or "result" not in resp:
         raise McpError(
             f"шлюз вернул ошибку: {json.dumps(resp, ensure_ascii=False)[:300]}"
         )
     result = resp["result"]
     if not isinstance(result, dict):
-        return {}
+        raise McpError(
+            f"шлюз вернул не-dict result: {json.dumps(result, ensure_ascii=False)[:300]}"
+        )
     if result.get("isError") or result.get("ok") is False:
         detail = ""
         for c in result.get("content", []):
