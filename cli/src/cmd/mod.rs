@@ -9,7 +9,6 @@ mod cli_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
-#[cfg(test)]
 mod fallback_tests;
 #[cfg(test)]
 mod kernel_tests;
