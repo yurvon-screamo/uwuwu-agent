@@ -147,6 +147,8 @@ pub struct SyTask {
     pub pr: String,
     /// Крон-доски: значение колонки Schedule (на задачных досках пусто).
     pub schedule: String,
+    /// Крон-доски: значение колонки Last Run (пишет демон после тика).
+    pub last_run: String,
     pub body_doc: Option<String>,
 }
 
@@ -245,6 +247,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         branch: String::new(),
         pr: String::new(),
         schedule: String::new(),
+        last_run: String::new(),
         body_doc: None,
     };
     for cell in it.get("cells").and_then(|c| c.as_array()).cloned().unwrap_or_default() {
@@ -265,6 +268,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             "Status" | "Статус" => t.status = value,
             "Branch" => t.branch = value,
             "Schedule" => t.schedule = value,
+            "Last Run" => t.last_run = value,
             "PR" | "Pr" => t.pr = value,
             _ => {}
         }
@@ -407,6 +411,15 @@ pub async fn dead_bound_doc_ids(sy: &SiYuan, rows: &[SyTask]) -> Result<HashSet<
 
 /// ключ Status в database.
 pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    keys.iter()
+        .find(|(name, _)| name == "Status")
+        .map(|(_, id)| id.clone())
+        .ok_or_else(|| anyhow!("ключ Status не найден в database"))
+}
+
+/// Колонки database: (имя → id) в порядке объявления на доске.
+pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, String)>> {
     let v = sy.mcp_tool("database", serde_json::json!({ "action": "keys", "id": av })).await?;
     let keys = v
         .pointer("/data/keys")
@@ -414,10 +427,45 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
         .and_then(|k| k.as_array())
         .cloned()
         .unwrap_or_default();
-    keys.iter()
-        .find(|k| k.get("name").and_then(|n| n.as_str()) == Some("Status"))
-        .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
-        .ok_or_else(|| anyhow!("ключ Status не найден в database"))
+    Ok(keys
+        .iter()
+        .filter_map(|k| {
+            let id = k.get("id").and_then(|i| i.as_str()).map(String::from)?;
+            let name = k.get("name").and_then(|n| n.as_str()).map(String::from)?;
+            Some((name, id))
+        })
+        .collect())
+}
+
+/// id колонок крон-доски, обязательных для работы демона: Schedule/Status/Last Run.
+/// Громкий отказ с перечнем недостающих — ДО любых мутаций (строка без
+/// Schedule демону не видна, тело без строки — сирота).
+pub(crate) fn require_cron_keys(keys: &[(String, String)], board_hpath: &str) -> Result<CronKeys> {
+    let id_of = |name: &str| keys.iter().find(|(n, _)| n == name).map(|(_, id)| id.clone());
+    let required = ["Schedule", "Status", "Last Run"];
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|name| id_of(name).is_none())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "на доске {board_hpath} нет колонок: {} — крон не поставлен (колонки добавляет владелец доски)",
+            missing.join(", ")
+        );
+    }
+    Ok(CronKeys {
+        schedule: id_of("Schedule").expect("проверено выше"),
+        status: id_of("Status").expect("проверено выше"),
+        last_run: id_of("Last Run").expect("проверено выше"),
+    })
+}
+
+/// id обязательных колонок крон-доски (см. require_cron_keys).
+pub(crate) struct CronKeys {
+    pub schedule: String,
+    pub status: String,
+    pub last_run: String,
 }
 
 pub fn body_template(title: &str, ty: &str, ctx: &str) -> String {
@@ -494,7 +542,7 @@ pub async fn create(
 }
 
 /// Итог вставки строки: id найден / тайтл занят другой строкой / строки нет.
-fn check_row_insert(rows: &[SyTask], item: &str, title: &str) -> RowInsertCheck {
+pub(crate) fn check_row_insert(rows: &[SyTask], item: &str, title: &str) -> RowInsertCheck {
     if rows.iter().any(|r| r.item_id == item) {
         return RowInsertCheck::Confirmed;
     }
@@ -504,7 +552,7 @@ fn check_row_insert(rows: &[SyTask], item: &str, title: &str) -> RowInsertCheck 
     RowInsertCheck::Missing
 }
 
-enum RowInsertCheck {
+pub(crate) enum RowInsertCheck {
     Confirmed,
     DuplicateTitle,
     Missing,
@@ -1062,6 +1110,7 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             schedule: String::new(),
+            last_run: String::new(),
             body_doc: body_doc.map(String::from),
         }
     }
@@ -1179,6 +1228,7 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             schedule: String::new(),
+            last_run: String::new(),
             body_doc: None,
         }
     }

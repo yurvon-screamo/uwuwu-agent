@@ -45,7 +45,7 @@ uwuwu-cli --help    # грамматика актуальна
 | `shot <slug> [--edgeless]` | скриншот дока через headless chromium |
 | `search "…" [--limit N --sofa N]` | серверный полнотекстовый (SQL like по блокам SiYuan): title/snippet/UI-ссылка с docId; SOFA опционально |
 | `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, нативные треды комментов — ответ в тред: `comment <id> --reply <префикс>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; новая строка всегда в статусе **Draft** («задачи в пустоту не заводим» — триаж валидирует и переводит в Todo); rm снимает строку и трэшит тело (сироту — по docId), **только Draft-строки** — живую задачу перед удалением переведи в Draft (`task edit <id> --status Draft`) |
-| `cron set/list/pause/resume/rm` | кроны агентов (доска «Crons» / «Кроны <Proj>»); set идемпотентен как task create, rm трэшит сироту без строки |
+| `cron set/list/pause/resume/rm` | кроны агентов (доска «Кроны <Proj>», деф. uwuwu; `--project` у всей семьи); set требует колонки Schedule/Status/Last Run — нет колонки → громкий отказ до мутаций (без сирот); строка привязана к телу (промпт), Status — mSelect, дубль-тайтл — отказ; list печатает SCHEDULE и LAST RUN; rm трэшит сироту без строки |
 
 ## Architecture
 

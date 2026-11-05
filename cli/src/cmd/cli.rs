@@ -175,22 +175,33 @@ pub(crate) enum CronSub {
         #[arg(long, help = "Промпт из stdin (иначе заглушка)")]
         stdin: bool,
     },
-    /// Все кроны доски
-    List,
+    /// Все кроны доски (--project → «Кроны <proj>», деф. uwuwu)
+    List {
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
+    },
+    /// Остановить (Status=paused)
+    Pause {
     /// Остановить (Status=paused)
     Pause {
         #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
         id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
     },
     /// Запустить обратно (Status=active)
     Resume {
         #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
         id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
     },
     /// Удалить крон (строка + тело в трэш)
     Rm {
         #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
         id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
     },
 }
 

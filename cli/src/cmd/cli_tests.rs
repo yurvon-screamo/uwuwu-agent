@@ -118,7 +118,7 @@ fn cron_pause_hyphen_leading_id_parses() {
         panic!("expected cron subcommand");
     };
     match command {
-        super::cli::CronSub::Pause { id } => assert_eq!(id, "-abc123"),
+        super::cli::CronSub::Pause { id, .. } => assert_eq!(id, "-abc123"),
         _other => panic!("expected cron pause"),
     }
 }
