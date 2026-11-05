@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Ядро в волне деградации индекса: последующие вызовы post() в этом процессе
-/// падают сразу, не долбя ядро. Волна кормится ретраями (репро 04.11: серии
-/// с шагом ~2–3с — это post()-ретраи), поэтому после финального bail окно
-/// держит процесс от повторных попыток. Внутрипроцессный эффект осознанно:
-/// против межпроцессных агентских повторов работает сам текст хинта.
-static WAVE_COOLDOWN_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// Ядро в волне деградации индекса: последующие вызовы post() падают сразу,
+/// не долбя ядро. Волна кормится ретраями (репро 04.11: серии с шагом ~2–3с —
+/// это post()-ретраи), поэтому после финального bail окно держит от повторных
+/// попыток. Поле инстанса, а не процесс-статик: CLI = один инстанс на процесс,
+/// семантика та же (внутрипроцессная), а тесты изолированы структурно —
+/// герметичность свиты не зависит от порядка/параллельности.
 const WAVE_COOLDOWN_SECS: u64 = 90;
 /// Ретраи на «metadata is not ready»: начальная попытка + до двух ретраев
 /// (штатный лаг индекса после крупных вставок пробивается вторым-третьим),
@@ -29,14 +29,6 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn arm_wave_cooldown() {
-    WAVE_COOLDOWN_UNTIL.store(now_unix_secs() + WAVE_COOLDOWN_SECS, Ordering::Relaxed);
-}
-
-fn wave_cooldown_active() -> bool {
-    WAVE_COOLDOWN_UNTIL.load(Ordering::Relaxed) > now_unix_secs()
 }
 
 /// Паузы ретраев post(): `metadata_backoffs` — паузы на «metadata is not ready»
@@ -81,6 +73,8 @@ pub struct SiYuan {
     client: reqwest::Client,
     // MCP-сессия (ленивая)
     mcp_sid: std::sync::Mutex<Option<String>>,
+    /// 90s fail-fast окно волны (unix-secs истечения; 0 = не армировано).
+    wave_cooldown_until: AtomicU64,
 }
 
 /// Корень воркспейса (FS-пробы doctor'а, конфиг-фоллбек токена):
@@ -129,6 +123,7 @@ impl SiYuan {
                 .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()?,
             mcp_sid: std::sync::Mutex::new(None),
+            wave_cooldown_until: AtomicU64::new(0),
         })
     }
 
@@ -144,7 +139,17 @@ impl SiYuan {
                 .build()
                 .expect("test reqwest client"),
             mcp_sid: std::sync::Mutex::new(None),
+            wave_cooldown_until: AtomicU64::new(0),
         }
+    }
+
+    fn arm_wave_cooldown(&self) {
+        self.wave_cooldown_until
+            .store(now_unix_secs() + WAVE_COOLDOWN_SECS, Ordering::Relaxed);
+    }
+
+    fn wave_cooldown_active(&self) -> bool {
+        self.wave_cooldown_until.load(Ordering::Relaxed) > now_unix_secs()
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
@@ -158,7 +163,7 @@ impl SiYuan {
     /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
     /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
     async fn post_with_pacing(&self, path: &str, body: Value, pacing: RetryPacing) -> Result<Value> {
-        if wave_cooldown_active() {
+        if self.wave_cooldown_active() {
             bail!("POST {path}: пропущено — {WAVE_HINT} (окно fail-fast активно)");
         }
         let mut last = String::new();
@@ -190,7 +195,7 @@ impl SiYuan {
                                 continue;
                             }
                             None => {
-                                arm_wave_cooldown();
+                                self.arm_wave_cooldown();
                                 bail!("POST {path}: {last} — {WAVE_HINT}");
                             }
                         }
@@ -771,19 +776,12 @@ impl SiYuan {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing,
-        WAVE_COOLDOWN_UNTIL,
-    };
+    use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing};
     use crate::siyuan::SiYuan;
     use serde_json::json;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn reset_wave_cooldown() {
-        WAVE_COOLDOWN_UNTIL.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
 
     fn metadata_error_template() -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(
@@ -792,9 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn metadata_not_ready_bails_after_three_requests_with_wave_hint() {
-        reset_wave_cooldown();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/block/appendBlock"))
@@ -815,9 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn transient_metadata_lag_recovers_on_retry_without_arming_cooldown() {
-        reset_wave_cooldown();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/block/appendBlock"))
@@ -843,9 +837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn wave_cooldown_fails_fast_subsequent_calls_after_final_bail() {
-        reset_wave_cooldown();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
@@ -868,9 +860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn non_metadata_errors_do_not_arm_wave_cooldown() {
-        reset_wave_cooldown();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
@@ -1027,10 +1017,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_block_ids_survives_non_ascii_paren_text() {
-        // Репро doctor'ом: 22 байта с кириллицей внутри скобок текста —
-        // байт-срезы раньше паниковали на char boundary.
-        let text = "- [p] сноска (ыыыыыыыыыыыыы-x-yz) и (20261105101010-abc1234)\n";
+    fn parse_block_ids_survives_trailing_multibyte_paren_text() {
+        // Паник-фикстура doctor'ом: кириллический кандидат — ПОСЛЕДНЯЯ скобка
+        // строки, ровно 22 байта (5«ы»=10б + abc=3б + «ы» на байтах 13–14 + 7б хвоста):
+        // байт 14 — continuation «ы» → старые байт-срезы candidate[..14] паниковали.
+        let text = "- [p] сноска (ыыыыыabcы-x-yzab)\n- [p] реальный (20261105101010-abc1234)\n";
         let ids = parse_block_ids(text);
         assert_eq!(ids, vec!["20261105101010-abc1234".to_string()]);
     }
