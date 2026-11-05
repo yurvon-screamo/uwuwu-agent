@@ -13,7 +13,7 @@ import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
-  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt,
+  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -22,9 +22,6 @@ import {
 const STATE_DIR_RAW = process.env.UWUWU_CRON_STATE_DIR
 const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-cron"))
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
-  ? join(STATE_DIR, "uwuwu-cron.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 
 /** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
 function formatLocal(d: Date): string {
@@ -35,6 +32,13 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
+/** Путь лога: env-override (тесты тика пишут в tmp — os.homedir() в Bun
+ *  не следует за runtime-подменой process.env.HOME, HOME-изоляция не работает);
+ *  дефолт — sandbox-логика: в песочнице лог живёт в state-каталоге
+ *  (прод-лог не засоряется смоук-тиками). */
+const LOG_PATH = process.env.UWUWU_CRON_LOG ?? (sandboxedStateDir(STATE_DIR_RAW)
+  ? join(STATE_DIR, "uwuwu-cron.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log"))
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
 /** DRY_RUN: полный цикл решений по реальным крон-доскам (чтение), спавны
@@ -75,6 +79,14 @@ function loadState(): CronState {
 }
 
 function saveState(state: CronState): void {
+  // инвариант «DRY_RUN ⇒ ни одной записи» держится на уровне API, не только
+  // main()-гарда: прямой вызов tickBoard (тесты) в обход main не должен иметь
+  // возможности тронуть прод-state (прод-кейс 06.11: DRY_RUN-тест без
+  // UWUWU_CRON_STATE_DIR перезаписал прод-state.json тестовой записью)
+  if (DRY_RUN) {
+    log(`DRY_RUN: saveState (${Object.keys(state.crons).length} кронов) — пропущен`)
+    return
+  }
   mkdirSync(STATE_DIR, { recursive: true })
   if (existsSync(STATE_FILE)) {
     try { copyFileSync(STATE_FILE, `${STATE_FILE}.bak`) } catch {}
@@ -193,12 +205,6 @@ async function setCells(board: BoardIds, rowId: string, cells: Record<string, st
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
-async function cronBody(bodyDoc: string): Promise<string> {
-  if (bodyDoc === "") return ""
-  const r = await mcp.tool<{ markdown?: string }>("export_doc_markdown", { docId: bodyDoc })
-  return r.markdown ?? ""
-}
-
 // ——— opencode REST ———
 
 async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
@@ -259,7 +265,8 @@ async function tick(state: CronState): Promise<void> {
   }
 }
 
-async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
+/** Экспорт для юнит-тестов тика (демон стартует только как entry — import.meta.main). */
+export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
   const rows = await readCrons(board)
 
   for (const row of rows) {
@@ -295,25 +302,61 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // стоп-сигнал: не спавним новую работу — крон доедет при следующем старте
     if (drain.isStopping()) break
 
-    const body = await cronBody(row.bodyDoc)
-    // linked-строки несут заголовок в теле: деривируем из первой строки
-    const title = row.title !== "" ? row.title
-      : body.split("\n")[0]?.replace(/^#+\s*/, "").trim() || `крон ${row.rowId.slice(0, 8)}`
     // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
     // агенту не нужно угадывать (глобальная доска «Crons» не используется)
     const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
-    // срез доски прочитан в начале тика — перед спавном строка перепроверяется
+    // срез доски прочитан в начале тика — перед спавном строка перепроверяется;
+    // резолв+валидация тела стоят в гейтовом окне ПОСЛЕ перепроверки: коммент
+    // отказа не уйдёт в доску по уже снятой/паузнутой строке
     const gate = fireGate(await readCrons(board), row.rowId)
     if (gate !== "fire") {
-      log(`крон «${title}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
+      log(`крон «${row.title || row.rowId.slice(0, 8)}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
       continue
     }
-    // DRY_RUN: до спавна — расписание признано due, гейт пройден; сессию не создаём
+    const resolved = await resolveBody(mcp.tool, board.docId, row)
+    // linked-строки несут заголовок в теле: деривируем из первой содержательной строки
+    const title = row.title !== "" ? row.title
+      : titleFromBody(resolved.kind === "ok" ? resolved.markdown : "") || `крон ${row.rowId.slice(0, 8)}`
+    if (resolved.kind === "infra") {
+      // сбой ядра ≠ вердикт «тела нет»: state/Last Run/one-shot не трогаем —
+      // ретрай следующим тиком (пропущенная cron-минута ждёт следующей
+      // матчера-минуты, семантика классического cron)
+      log(`крон «${title}»: тело не разрешено (сбой ядра?) — ${resolved.error} — ретрай следующим тиком`)
+      continue
+    }
+    if (resolved.kind === "refuse") {
+      // отказ вместо спавна: коммент причины с дедупом (только при смене),
+      // lastFiredAt/Last Run фиксируем — иначе ретрай каждым тиком = спам.
+      // Коммент — в док доски, НЕ в тело: коммент в опустошённом теле делал
+      // его «непустым», и следующий цикл файрил мусор (e2e 05.11)
+      log(`крон «${title}»: отказ — ${resolved.reason}`)
+      if (state.crons[row.rowId]?.lastRefusal !== resolved.reason) {
+        if (DRY_RUN) {
+          log(`DRY_RUN: крон «${row.title || row.rowId.slice(0, 8)}» — коммент отказа пропущен`)
+        } else {
+          await mcp.tool("create_comment", {
+            docId: board.docId,
+            content: `крон «${row.title || row.rowId.slice(0, 8)}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
+          })
+        }
+      }
+      state.crons[row.rowId] = {
+        sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString(), lastRefusal: resolved.reason,
+      }
+      saveState(state)
+      await setCells(board, row.rowId, { "Last Run": formatLocal(now) })
+      if (isOneShot(sched)) {
+        await setCells(board, row.rowId, { Status: "fired" })
+        log(`крон «${title}»: разовый — отказ, fired`)
+      }
+      continue
+    }
+    // DRY_RUN: до спавна — расписание признано due, гейт пройден, тело валидно; сессию не создаём
     if (DRY_RUN) {
-      log(`DRY_RUN: крон «${title}» — сессия не спавнилась (промпт ${firePrompt({ ...row, title }, body, project).length} байт)`)
+      log(`DRY_RUN: крон «${title}» — сессия не спавнилась (промпт ${firePrompt({ ...row, title }, resolved.markdown, project).length} байт)`)
       continue
     }
-    const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
+    const sessionID = await fireSession(title, firePrompt({ ...row, title }, resolved.markdown, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)
       continue
@@ -385,4 +428,4 @@ async function main(): Promise<void> {
   }
 }
 
-void main()
+if (import.meta.main) void main()
