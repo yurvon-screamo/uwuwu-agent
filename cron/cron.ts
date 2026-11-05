@@ -191,7 +191,7 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   const text = await res.text()
   if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}: ${text.slice(0, 120)}`), { status: res.status })
   if (text.trim() === "") return {}
-  const j: unknown = JSON.parse(text)
+  const j: unknown = mcp.parseJsonContract(text, `opencode ${path}: HTTP ${res.status}`)
   return (j as { data?: unknown }).data ?? j
 }
 
@@ -329,7 +329,8 @@ async function main(): Promise<void> {
       consecutiveFails = 0
     } catch (e) {
       consecutiveFails++
-      log(`tick (${consecutiveFails} подряд): ${e}`)
+      // стек целиком: сообщение без фреймов не локализует, какой лега тика упал
+      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? e.stack : String(e)}`)
       if (consecutiveFails >= 5) {
         // отравленное соединение/пул: свежий процесс чище вечных ретраев
         log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")

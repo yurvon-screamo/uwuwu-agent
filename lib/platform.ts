@@ -53,8 +53,9 @@ const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
- *  маскирующего причину (прод-кейс 04.11: «Unexpected identifier "session"» = 404 ядра). */
-function parseJsonContract(text: string, context: string): unknown {
+ *  маскирующего причину (прод-кейс 04.11: «Unexpected identifier "session"» = 404 ядра).
+ *  Экспорт: тот же контракт у транспорта opencode API в cron.ts. */
+export function parseJsonContract(text: string, context: string): unknown {
   try {
     return JSON.parse(text)
   } catch {
