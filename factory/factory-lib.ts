@@ -432,7 +432,9 @@ export type StallVerdict =
  *  вовсе) = потерянный/зависший ход — активный ход рождает сообщения на
  *  каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
  *  пропуск тика: оба → none. Повторный сигнал в эпизоде глушится флагом
- *  (silent); сброс флага — дело демона (смена статуса / активность). */
+ *  (silent); сброс флага — дело демона: смена статуса — штатный путь
+ *  (пере-вход в In Progress = новый эпизод), none-вердикт при стоявшем
+ *  флаге — эпизод завершён. */
 export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.status !== "In Progress") return { t: "none" }
   if (f.sessionAlive !== true) return { t: "none" }
@@ -451,7 +453,7 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   const text = [
     `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
     `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
-    "Напиши комментарий — это разбудит агента; или переставь статус руками.",
+    "Напиши комментарий в задачу — это разбудит агента; или переведи строку в Design — фабрика перешлёт агенту промпт возврата.",
   ].join(" ")
   return { t: "signal", text }
 }

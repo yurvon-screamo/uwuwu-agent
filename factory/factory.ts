@@ -970,7 +970,11 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
         if (activity === "invalid") {
           log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
         } else {
-          const branchInWorktree = (await resolveWorktree(cfg.local, row.branch)) !== ""
+          // git только когда вердикт может стать signal: предварительный чек
+          // застоя — решение остаётся в stallVerdict, ветка в facts нужна
+          // лишь для текста сигнала
+          const stalled = activity === null || Date.now() - activity > STALL_MS
+          const branchInWorktree = stalled && (await resolveWorktree(cfg.local, row.branch)) !== ""
           const verdict = stallVerdict({
             status: row.status,
             sessionAlive: true,
@@ -984,15 +988,26 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
             // эскалация как у registerFailure/failReview: коммент + Needs
             // attention; lastStatus сразу за доской (как в failReview)
             log(`задача ${rowId.slice(0, 8)}: In Progress при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
-            await setCells(board, rowId, { Status: "Needs attention" })
-            tracked.stallSignaled = true
-            tracked.lastStatus = "Needs attention"
-            saveState(state)
-            await notify(tracked, verdict.text)
+            if (DRY_RUN) {
+              // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
+              // без флага анти-спам в песочнице не работает — сигнал повторялся
+              // бы каждые 2 тика (расхождение с продом задокументировано логом)
+              log(`DRY_RUN: эскалация Needs attention + коммент — пропущены`)
+            } else {
+              await setCells(board, rowId, { Status: "Needs attention" })
+              tracked.stallSignaled = true
+              tracked.lastStatus = "Needs attention"
+              saveState(state)
+              await notify(tracked, verdict.text)
+            }
           } else if (verdict.t === "none" && tracked.stallSignaled === true) {
             delete tracked.stallSignaled
             saveState(state)
-            log(`задача ${rowId.slice(0, 8)}: активность сессии вернулась — флаг застоя снят`)
+            // до этой ветки штатный путь «возврат в In Progress» не доходит —
+            // флаг снимает сброс на смене статуса выше; здесь — эпизод,
+            // завершённый без смены статуса (наш сигнал поставил Needs attention,
+            // rollback-окно старого кода), формулировка обобщённая
+            log(`задача ${rowId.slice(0, 8)}: эпизод застоя завершён — флаг снят (статус вне In Progress или активность вернулась)`)
           }
         }
       }
