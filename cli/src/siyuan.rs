@@ -30,6 +30,13 @@ pub struct SiYuan {
 
 impl SiYuan {
     pub fn from_env() -> Result<Self> {
+        Self::from_env_with_timeout(120)
+    }
+
+    /// Конфигурация from_env с другим таймаутом клиента: kernel-пробы зовутся
+    /// с коротким (деф. 10s), чтобы тихий вис ядра различался быстро;
+    /// штатные команды держат 120s.
+    pub fn from_env_with_timeout(timeout_secs: u64) -> Result<Self> {
         let base = std::env::var("UWUWU_SIYUAN_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:6806".into());
         let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
@@ -51,7 +58,9 @@ impl SiYuan {
         Ok(Self {
             base,
             token,
-            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .build()?,
             mcp_sid: std::sync::Mutex::new(None),
         })
     }
@@ -102,6 +111,43 @@ impl SiYuan {
             tokio::time::sleep(std::time::Duration::from_millis(800 * (attempt as u64 + 1))).await;
         }
         bail!("POST {path}: {last}")
+    }
+
+    /// One-shot POST без ретраев: полный конверт ядра `{code,msg,data}`.
+    /// Проба должна быть быстрой и честной — сырое сообщение ядра видно
+    /// на первом ответе (штатный post() маскирует сбой 4 ретраями с бэкоффом).
+    /// Контракт ошибок: транспорт → контекст; тело не JSON → bail со
+    /// сниппетом; HTTP не-success → статус + тело (auth-отказ ядра:
+    /// 401 + `{"code":-1,"msg":"Auth failed…"}`); конверт code≠0 → code/msg.
+    pub async fn post_probe(&self, path: &str, body: Value) -> Result<Value> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, path))
+            .header("Authorization", format!("Token {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("kernel {path}: транспорт недоступен"))?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let envelope: Value = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "kernel {path}: HTTP {status}, тело не JSON: {}",
+                body_snippet(&raw)
+            )
+        })?;
+        if !status.is_success() {
+            bail!("kernel {path}: HTTP {status}, {}", body_snippet(&raw));
+        }
+        let code = envelope.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            bail!(
+                "kernel {path}: code={} msg={}",
+                code,
+                envelope.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
+            );
+        }
+        Ok(envelope)
     }
 
     // ---------- REST: ядро ----------
@@ -566,6 +612,16 @@ impl SiYuan {
 }
 
 
+/// Голова тела ответа для сообщений об ошибках: диагностика без простыни.
+fn body_snippet(raw: &str) -> String {
+    const SNIPPET_CHARS: usize = 200;
+    let mut head: String = raw.chars().take(SNIPPET_CHARS).collect();
+    if raw.chars().count() > SNIPPET_CHARS {
+        head.push('…');
+    }
+    head
+}
+
 /// id блоков из markdown-дампа get_children (строки вида `- [p] текст (20261104-x)`).
 /// id распознаётся по форме ядерного id: 14 цифр, дефис, 7 alnum.
 pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
@@ -618,11 +674,105 @@ impl SiYuan {
 
 #[cfg(test)]
 mod tests {
-    use super::{doc_content_is_empty, parse_block_ids, FileFetch};
+    use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch};
     use crate::siyuan::SiYuan;
+    use serde_json::json;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn body_snippet_truncates_long_bodies() {
+        let long = "x".repeat(500);
+        let snippet = body_snippet(&long);
+        assert_eq!(snippet.chars().count(), 201);
+        assert!(snippet.ends_with('…'));
+        assert_eq!(body_snippet("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn post_probe_returns_full_envelope_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":0,"msg":"","data":[{"n":71621}],"limit":64,"truncated":false}"#,
+            ))
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let envelope = sy
+            .post_probe(
+                "/api/query/sql",
+                json!({ "stmt": "select count(*) as n from blocks" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(envelope.pointer("/data/0/n"), Some(&json!(71621)));
+        assert_eq!(envelope.get("limit"), Some(&json!(64)));
+    }
+
+    #[tokio::test]
+    async fn post_probe_fails_without_retries_on_nonzero_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"code":10201,"msg":"metadata is not ready"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post_probe("/api/query/sql", json!({ "stmt": "select 1" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("10201") && err.contains("metadata is not ready"), "{err}");
+        // expect(1): ровно один запрос — если бы проба ретраила, мок упал бы на съёмке
+    }
+
+    #[tokio::test]
+    async fn post_probe_reports_auth_failure_with_status_and_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"code":-1,"msg":"Auth failed: invalid token"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post_probe("/api/query/sql", json!({ "stmt": "select 1" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("401") && err.contains("Auth failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn post_probe_reports_non_json_body_with_snippet() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post_probe("/api/query/sql", json!({ "stmt": "select 1" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("не JSON") && err.contains("<html>login</html>"), "{err}");
+    }
 
     #[test]
     fn parse_block_ids_reads_trailing_kernel_ids() {
