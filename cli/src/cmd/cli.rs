@@ -278,16 +278,23 @@ pub(crate) enum Commands {
         )]
         edgeless: bool,
     },
-    /// Полнотекстовый поиск по блокам SiYuan + опционально SOFA.
+    /// Универсальный поиск: полнотекст (SQL) + семантика (локальный
+    /// эмбеддинг-индекс) — top-n по каждому методу; опционально SOFA.
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(long, default_value = "10", help = "hits limit")]
+        #[arg(long, default_value = "10", help = "hits limit per method")]
         limit: usize,
-        #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
+        #[arg(long, default_value = "0", help = "SOFA public limit (0 = off)")]
         sofa: usize,
-        #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
+        #[arg(long, default_value = "0.35", help = "semantic cosine threshold (0..1)")]
         threshold: f32,
+    },
+    /// Локальный эмбеддинг-индекс (семантическая половина поиска):
+    /// обслуживание — полный пересбор и статус.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticSub,
     },
     /// Кроны: строки доски «Кроны <Proj>» (SiYuan database).
     Cron {
@@ -328,4 +335,14 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
     },
+}
+
+/// Сабкоманды uwuwu-cli semantic.
+#[derive(Subcommand)]
+pub(crate) enum SemanticSub {
+    /// Полный пересбор индекса (первичная инициализация ~55–70 мин
+    /// или смена модели/размерности). Прогресс — в stderr.
+    Rebuild,
+    /// Состояние индекса: чанки, модель, watermark, очередь дельты.
+    Status,
 }
