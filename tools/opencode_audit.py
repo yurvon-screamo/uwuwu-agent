@@ -882,9 +882,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _fill_global_defaults(args: argparse.Namespace) -> None:
-    """Дозаполнить дефолты глобальных опций, подавленные SUPPRESS'ом."""
+    """Дозаполнить дефолты глобальных опций, подавленные SUPPRESS'ом.
+
+    dest вычисляется как в argparse — из первого *длинного* флага спеки
+    (и только если длинных нет, из первого короткого), чтобы форма спеки
+    не могла рассинхронить вычисление с реальным dest'ом argparse'а.
+    """
     for opt_args, kwargs in _global_option_specs():
-        dest = opt_args[0].lstrip("-").replace("-", "_")
+        long_opts = [a for a in opt_args if a.startswith("--")]
+        first = long_opts[0] if long_opts else opt_args[0]
+        dest = first.lstrip("-").replace("-", "_")
         if not hasattr(args, dest):
             setattr(args, dest, kwargs["default"])
 

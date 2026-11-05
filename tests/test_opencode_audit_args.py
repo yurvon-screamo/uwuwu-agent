@@ -75,6 +75,20 @@ class GlobalArgsOrderTest(unittest.TestCase):
         self.assertTrue(args.compact)
         self.assertEqual(args.db, audit.DEFAULT_DB)
 
+    def test_mixed_form_flags_before_and_after(self):
+        # часть флагов до сабкоманды, часть после — ровно класс «вольные
+        # вызовы агентов», ради которого делалась устойчивость парсера
+        args = audit.parse_cli_args(["--compact", "session", "ses_1", "--db", "fixtures/x.db"])
+        self.assertEqual(args.db, Path("fixtures/x.db"))
+        self.assertTrue(args.compact)
+        self.assertEqual(args.session_id, "ses_1")
+
+    def test_repeated_flag_last_wins(self):
+        # повторный флаг — last-wins, консистентно с семантикой argparse
+        args = audit.parse_cli_args(["--db", "fixtures/one.db", "session", "ses_1", "--db", "fixtures/two.db"])
+        self.assertEqual(args.db, Path("fixtures/two.db"))
+        self.assertEqual(args.session_id, "ses_1")
+
     def test_help_lists_globals(self):
         # main- и sub-help живы, глобальные опции видны в обоих
         self.assertIn("--db", audit.build_parser().format_help())
