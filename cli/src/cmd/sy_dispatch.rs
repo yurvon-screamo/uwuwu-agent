@@ -83,7 +83,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
@@ -100,6 +100,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     None => String::new(),
                 };
                 println!("\n----- тело -----\n{md}");
+                let assets = save_body_assets(&sy, &md, &task.item_id).await;
+                if !assets.is_empty() {
+                    println!("Аттачи:");
+                    for path in assets {
+                        println!("  {path}");
+                    }
+                }
             }
             Ok(())
         }
@@ -116,22 +123,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if title.is_some() {
                 anyhow::bail!("siyuan-бекенд: переименование задачи не поддерживается (переименуй саб-док в UI)");
             }
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::edit(&sy, &board, &task, status.as_deref(), branch.as_deref(), pr.as_deref()).await?;
             println!("обновлено: {}", task.title);
             Ok(())
         }
         TaskSub::Comment { id, reply, stdin, text } => {
-            let msg = collect_text(stdin, text)?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let msg = guarded_comment_text(stdin, &text)?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             println!("коммент отправлен: {}", truncate(&msg, 60));
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
@@ -141,7 +148,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
@@ -149,10 +156,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
         TaskSub::Clean { ids, yes, live } => task_clean(&sy, project, &ids, yes, live.as_deref()).await,
-        TaskSub::Undo { journal } => task_undo(&sy, project, journal.as_deref()).await,
+        TaskSub::Undo { journal, list } => {
+            // --list сильнее позиционного (задаём список, имя не теряем — тест фиксирует)
+            let name = if list { None } else { journal.as_deref() };
+            task_undo(&sy, project, name).await
+        }
         TaskSub::Body { id, replace, replace_section, md, stdin } => {
             let content = read_body_input(md.as_deref(), stdin)?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let body_path = board.body_hpath(&task.title);
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
@@ -1062,7 +1073,7 @@ fn read_stdin() -> Result<String> {
     Ok(s)
 }
 
-fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
+fn collect_text(stdin: bool, text: &[String]) -> Result<String> {
     if stdin {
         read_stdin()
     } else {
@@ -1070,17 +1081,161 @@ fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
     }
 }
 
+/// Подкоманды task/cron: токен текста, совпадающий с именем, — почти наверняка
+/// перепутанный вызов, а не контент (факт ses_e7b5a366: «list» ушёл юзеру
+/// комментом вместо чтения треда). Токены сравниваются целиком: «get:» или
+/// «get-задача» — контент.
+const TASK_SUB_NAMES: &[&str] = &[
+    "create", "list", "get", "edit", "comment", "thread", "close", "body", "rm", "clean", "undo",
+    "set", "pause", "resume",
+];
+
+/// Токен выглядит как флаг: `--…` всегда; одиночный дефис — только перед
+/// буквой (`-n`, `-Prb`), чтобы не трогать markdown-буллеты («- пункт») и
+/// отрицательные числа («-5»).
+fn looks_like_flag(token: &str) -> bool {
+    if token.starts_with("--") {
+        return true;
+    }
+    token
+        .strip_prefix('-')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_alphabetic())
+}
+
+/// Текст коммента + гвард до сети: подозрительный позиционный текст — отказ
+/// с подсказкой вместо тихой отправки юзеру. Сама валидация —
+/// validate_comment_text (тестируется на строках, stdin не нужен).
+fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
+    let msg = collect_text(stdin, text)?;
+    validate_comment_text(stdin, &msg)?;
+    Ok(msg)
+}
+
+/// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
+/// токенов отклоняются имена подкоманд и флагоподобные токены. stdin не
+/// гвардится на подкоманды и флаги: явное намерение, глотание туда невозможно.
+fn validate_comment_text(stdin: bool, msg: &str) -> Result<()> {
+    if msg.trim().is_empty() {
+        bail!("пустой текст коммента — передай --stdin или текст позиционным аргументом");
+    }
+    if stdin {
+        return Ok(());
+    }
+    let tokens: Vec<&str> = msg.split_whitespace().collect();
+    if let Some(first) = tokens.first().filter(|t| TASK_SUB_NAMES.contains(t)) {
+        bail!(
+            "«{first}» — имя подкоманды task/cron, а не текст коммента \
+             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\" или --stdin)"
+        );
+    }
+    if let Some(flag) = tokens.iter().find(|t| looks_like_flag(t)) {
+        bail!(
+            "токен «{flag}» похож на флаг: после текста коммента флаги глотаются как текст \
+             (trailing_var_arg) — пиши флаги до <id> или используй --stdin"
+        );
+    }
+    Ok(())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Asset-ссылки markdown-тела `](assets/…)` в порядке появления без дублей:
+/// путь до `)` или пробела, percent-decode %XX (SiYuan кодирует пробелы и
+/// юникод в именах аттачей). HTML-формы `<img src=…>` в экспорте не встречались.
+fn collect_asset_refs(md: &str) -> Vec<String> {
+    const PREFIX: &str = "](assets/";
+    let mut out = Vec::new();
+    let mut rest = md;
+    while let Some(pos) = rest.find(PREFIX) {
+        rest = &rest[pos + PREFIX.len()..];
+        let raw: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ')')
+            .collect();
+        rest = rest.strip_prefix(raw.as_str()).unwrap_or(rest);
+        let key = percent_decode(&raw);
+        if !key.is_empty() && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// %XX → байты (имена аттачей SiYuan percent-кодирует); невалидные
+/// последовательности копируются как есть.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Ключ asset-ссылки безопасен: ни один сегмент пути не пуст, «.» или «..» —
+/// такие ключи («assets/../../etc») не скачиваются вовсе, до сетевого вызова.
+fn asset_key_is_safe(key: &str) -> bool {
+    key.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Выгрузить asset-аттачи тела в /tmp/uwuwu-task-<row-id>/ (полный row-id —
+/// контракт AGENTS.md; таймстамп-голова давала бы коллизии каталогов задач
+/// одного дня). Оригинальные имена файлов; максимум 10; сбой одного аттача —
+/// тихий пропуск (остаёмся на ссылках, как в аффин-контракте). Ключи с
+/// точечными сегментами (../) не скачиваются вовсе.
+async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
+    const MAX_ASSETS: usize = 10;
+    let refs = collect_asset_refs(md);
+    let safe: Vec<&String> = refs.iter().filter(|key| asset_key_is_safe(key)).collect();
+    if safe.is_empty() {
+        return Vec::new();
+    }
+    let dir = format!("/tmp/uwuwu-task-{row_id}");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for key in safe.into_iter().take(MAX_ASSETS) {
+        let Ok(bytes) = sy.download_file(&format!("assets/{key}")).await else {
+            continue;
+        };
+        // ядро молча отдаёт 200+0 байт для отсутствующего файла (контракт 3.8.9):
+        // пустой ответ = файла нет, локальный пустыш не пишем
+        if bytes.is_empty() {
+            continue;
+        }
+        let name = key.rsplit('/').next().unwrap_or(key);
+        let path = format!("{dir}/{name}");
+        if std::fs::write(&path, &bytes).is_ok() {
+            out.push(path);
+        }
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
+    use super::asset_key_is_safe;
+    use super::collect_asset_refs;
     use super::collect_threads;
     use super::replace_md_section;
+    use super::save_body_assets;
+    use super::validate_comment_text;
     use super::SectionEdit;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
+    use crate::siyuan::SiYuan;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -1507,5 +1662,141 @@ mod tests {
     #[test]
     fn collect_threads_reports_empty() {
         assert_eq!(collect_threads("## А\nтело\n").trim_end(), "комментов нет");
+    }
+
+    #[test]
+    fn comment_guard_rejects_subcommand_name_as_text() {
+        let err = validate_comment_text(false, "list").expect_err("«list» — подкоманда, не текст");
+        assert!(err.to_string().contains("подкоманд"), "суть отказа: {err}");
+        assert!(err.to_string().contains("task get/thread"), "подсказка чтения: {err}");
+    }
+
+    #[test]
+    fn comment_guard_rejects_flag_swallowed_after_text() {
+        let err = validate_comment_text(false, "текст --project x")
+            .expect_err("флаг после текста глотается trailing_var_arg");
+        assert!(err.to_string().contains("флаг"), "суть отказа: {err}");
+        assert!(err.to_string().contains("--stdin"), "обход указан: {err}");
+    }
+
+    #[test]
+    fn comment_guard_rejects_dash_prefixed_word() {
+        let err = validate_comment_text(false, "-n").expect_err("-n выглядит как флаг");
+        assert!(err.to_string().contains("флаг"), "суть отказа: {err}");
+    }
+
+    #[test]
+    fn comment_guard_allows_markdown_bullets() {
+        validate_comment_text(false, "- пункт один\n- ещё пункт").expect("markdown-буллет — контент, не флаг");
+    }
+
+    #[test]
+    fn comment_guard_allows_minus_number_and_lone_dash() {
+        validate_comment_text(false, "-5 баллов").expect("отрицательное число — контент");
+        validate_comment_text(false, "-").expect("одиночный дефис — контент");
+    }
+
+    #[test]
+    fn comment_guard_rejects_empty_text() {
+        let err = validate_comment_text(false, "").expect_err("пустой коммент — всегда баг");
+        assert!(err.to_string().contains("пустой"), "суть отказа: {err}");
+        validate_comment_text(true, "   ").expect_err("пустой stdin-коммент тоже отказан");
+    }
+
+    #[test]
+    fn comment_guard_skips_stdin_source() {
+        validate_comment_text(true, "--не-флаг-а-текст").expect("stdin — явное намерение, не гвардим");
+        validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
+    }
+
+    #[test]
+    fn collect_asset_refs_extracts_unique_assets_in_order() {
+        let md = "![а](assets/first.png)\nтекст [файл](assets/second.htm) ![а](assets/first.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["first.png", "second.htm"]);
+    }
+
+    #[test]
+    fn collect_asset_refs_percent_decodes_names() {
+        let md = "![ф](assets/%D0%B8%D0%BC%D1%8F%20я.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["имя я.png"]);
+    }
+
+    #[test]
+    fn collect_asset_refs_ignores_non_asset_links() {
+        let md = "[сайт](https://example.com/x.png) [внутр](/Projects/doc) ![п](assets/ok.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["ok.png"]);
+    }
+
+    #[tokio::test]
+    async fn save_body_assets_downloads_with_original_names_and_skips_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                if path == "data/assets/assets-self-test/img.png" {
+                    ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
+                } else {
+                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        const ROW: &str = "20261105090000-assette1";
+        let md = "![и](assets/assets-self-test/img.png) ![нет](assets/assets-self-test/gone.png)\n";
+        let saved = save_body_assets(&sy, md, ROW).await;
+
+        assert_eq!(saved.len(), 1, "доступный аттач сохранён, Missing — тихо пропущен: {saved:?}");
+        assert!(saved[0].ends_with("/img.png"), "оригинальное имя файла: {saved:?}");
+        let bytes = std::fs::read(&saved[0]).expect("файл записан");
+        assert_eq!(bytes, b"png-bytes");
+        std::fs::remove_dir_all(format!("/tmp/uwuwu-task-{ROW}")).expect("тест прибрал за себя");
+    }
+
+    #[tokio::test]
+    async fn save_body_assets_never_downloads_traversal_keys() {
+        let server = MockServer::start().await;
+        let file_calls = Arc::new(AtomicUsize::new(0));
+        let calls = file_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(move |req: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                if path == "data/assets/ok.png" {
+                    ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
+                } else {
+                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        const ROW: &str = "20261105090000-travers";
+        let md = "![x](assets/../../etc) ![y](assets/..) ![z](assets/./x) ![ok](assets/ok.png)\n";
+        let saved = save_body_assets(&sy, md, ROW).await;
+
+        assert_eq!(saved.len(), 1, "только безопасный ключ скачан: {saved:?}");
+        assert_eq!(
+            file_calls.load(Ordering::SeqCst),
+            1,
+            "точечные сегменты (../ и ./) не скачиваются вовсе — один getFile за ok.png"
+        );
+        std::fs::remove_dir_all(format!("/tmp/uwuwu-task-{ROW}")).expect("тест прибрал за себя");
+    }
+
+    #[test]
+    fn asset_key_is_safe_rejects_any_dot_segment() {
+        assert!(!asset_key_is_safe("../../etc"));
+        assert!(!asset_key_is_safe("sub/./x"));
+        assert!(!asset_key_is_safe("a/../b"));
+        assert!(!asset_key_is_safe(""));
+        assert!(asset_key_is_safe("img.png"));
+        assert!(asset_key_is_safe("sub/dir/file.htm"));
     }
 }

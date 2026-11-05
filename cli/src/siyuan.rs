@@ -340,6 +340,22 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Одноразовый appendBlock без слепых ретраев: неидемпотентная запись при
+    /// потерянном ответе на ретрае дублируется — контрольный повтор делает
+    /// вызывающий код (confirm-чтение), транспорт честно сообщает один сбой.
+    /// Wave-гейт как у post(): окно fail-fast не пробивается записью.
+    pub async fn append_block_md_once(&self, doc_id: &str, markdown: &str) -> Result<()> {
+        if self.wave_cooldown_active() {
+            bail!("POST /api/block/appendBlock: пропущено — {WAVE_HINT} (окно fail-fast активно)");
+        }
+        self.post_probe(
+            "/api/block/appendBlock",
+            json!({ "dataType": "markdown", "data": markdown, "parentID": doc_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// docId неизменен: контент перезаписывается на месте (привязка строк-канбана живёт).
     /// Очистка детей верифицируется повторным get_children; пустой док ядра —
     /// один ZWJ-параграф (SiYuan не оставляет док без блока).
@@ -494,7 +510,9 @@ impl SiYuan {
     }
 
     /// Список файлов директории воркспейса (POST JSON, контракт 3.8.9),
-    /// путь от корня воркспейса. Несуществующая директория — пустой список.
+    /// путь от корня воркспейса. Несуществующая директория — честная ошибка
+    /// ядра (code=404 «path does not exist», проба ls 05.11); benign-консьюмерам
+    /// (undo --list на фреш-воркспейсе) — try_list_dir.
     pub async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let data = self
             .post("/api/file/readDir", json!({ "path": path }))
@@ -506,6 +524,43 @@ impl SiYuan {
             .into_iter()
             .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect())
+    }
+
+    /// Список файлов директории с таксономией отсутствия: None — директории
+    /// нет (ядро: code=404 «path does not exist», проба ls 05.11), Err —
+    /// остальные сбои (транспорт/не JSON/code≠0). One-shot, без ретраев:
+    /// benign-чтение не должно молотить волну.
+    pub async fn try_list_dir(&self, path: &str) -> Result<Option<Vec<String>>> {
+        let resp = self
+            .client
+            .post(format!("{}/api/file/readDir", self.base))
+            .header("Authorization", format!("Token {}", self.token))
+            .json(&json!({ "path": path }))
+            .send()
+            .await
+            .context("kernel /api/file/readDir: транспорт недоступен")?;
+        let status = resp.status();
+        let envelope: Value = resp.json().await.unwrap_or(Value::Null);
+        let code = envelope.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() || code != 0 {
+            bail!(
+                "kernel /api/file/readDir: HTTP {status}, code={code} msg={}",
+                envelope.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
+            );
+        }
+        Ok(Some(
+            envelope
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| entry.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect(),
+        ))
     }
 
     /// FS-путь файла дока: data/<ноутбук>/<предки…>/<docId>.sy — ядро
@@ -1109,15 +1164,16 @@ mod tests {
             .and(path("/api/file/readDir"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let data = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
-                    serde_json::json!([
+                // правда ядра (проба 05.11): несуществующий путь — 404-конверт top-level
+                let envelope = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
+                    serde_json::json!({ "code": 0, "data": [
                         { "name": "20261104-clean.json", "isDir": false, "isSymlink": false, "updated": 1 },
                         { "name": "sub", "isDir": true, "isSymlink": false, "updated": 1 }
-                    ])
+                    ] })
                 } else {
-                    serde_json::json!([])
+                    serde_json::json!({ "code": 404, "msg": "path does not exist" })
                 };
-                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+                ResponseTemplate::new(200).set_body_string(envelope.to_string())
             })
             .mount(&server)
             .await;
@@ -1125,6 +1181,34 @@ mod tests {
 
         let names = sy.list_dir("data/assets/undo").await.unwrap();
         assert_eq!(names, vec!["20261104-clean.json".to_string(), "sub".to_string()]);
-        assert!(sy.list_dir("data/assets/nowhere").await.unwrap().is_empty());
+        let err = sy
+            .list_dir("data/assets/nowhere")
+            .await
+            .expect_err("list_dir честен: несуществующая директория — ошибка ядра, не пустой список");
+        assert!(err.to_string().contains("path does not exist"), "суть отказа: {err}");
+    }
+
+    #[tokio::test]
+    async fn try_list_dir_missing_dir_is_none_existing_dir_has_names() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/readDir"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let envelope = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
+                    serde_json::json!({ "code": 0, "data": [{ "name": "j.json" }] })
+                } else {
+                    serde_json::json!({ "code": 404, "msg": "path does not exist" })
+                };
+                ResponseTemplate::new(200).set_body_string(envelope.to_string())
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let names = sy.try_list_dir("data/assets/undo").await.unwrap().expect("директория есть");
+        assert_eq!(names, vec!["j.json".to_string()]);
+        let missing = sy.try_list_dir("data/assets/nowhere").await.unwrap();
+        assert!(missing.is_none(), "нет директории — None, не ошибка");
     }
 }

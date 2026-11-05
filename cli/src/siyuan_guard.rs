@@ -238,10 +238,14 @@ impl Journal {
     /// Список журналов: имя файла → журнал, отсортирован по имени
     /// (ts-префикс имени = хронология). Битый журнал (частичная запись при
     /// падении) не глушится молча — предупреждение: именно его владельцу,
-    /// возможно, и нужно восстановить.
+    /// возможно, и нужно восстановить. Директории нет (фреш-воркспейс) —
+    /// журналов нет, не ошибка.
     pub(crate) async fn list(sy: &SiYuan) -> Result<Vec<(String, Journal)>> {
         let mut out = Vec::new();
-        for name in sy.list_dir(UNDO_DIR).await? {
+        let Some(names) = sy.try_list_dir(UNDO_DIR).await? else {
+            return Ok(out);
+        };
+        for name in names {
             if !name.ends_with(".json") {
                 continue;
             }
