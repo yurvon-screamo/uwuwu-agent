@@ -290,11 +290,11 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
-    // привязка строки к док-телу: value.block.id (у detached-строк поля
-    // нет → null) — раньше связка терялась (null) и весь wakeup-контур
-    // фабрики (комменты/правки тела) работал по пустому bodyDoc. Готча:
-    // value.blockID — это id самой строки, не привязка; без refSubtype-guard —
-    // контракт CLI parse_render_row
+    // Привязка строки к док-телу: value.block.id Primary Key-ячейки — docId
+    // тела (у detached-строк поля нет → null). Готча: value.blockID — это
+    // id самой строки, не привязка. Извлечение безусловное — контракт CLI
+    // parse_render_row (siyuan_task.rs): guard на refSubtype терял бы
+    // легаси-строки, не прогнанные ядром через NormalizeBlockRefSubtype
     let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
