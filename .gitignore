@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+# ...и симлинки на соседние чекауты (tsc в ворктри без своей установки)
+node_modules
 
 # Memory data (stored separately in ~/uwuwu-memory-content)
 memory/content/

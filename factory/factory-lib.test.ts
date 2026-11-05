@@ -507,3 +507,18 @@ describe("formatPassSummary: одна строка о проходе", () => {
     expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, наблюдение=0")
   })
 })
+
+describe("parseProjects: семантическая валидация", () => {
+  const fallback: Record<string, ProjectCfg> = {
+    uwuwu: { board: "Задачи uwuwu", repo: "r", local: "/l" },
+  }
+
+  test("пустое поле — отказ с именем проекта", () => {
+    const raw = JSON.stringify({ test: { board: "  ", repo: "r", local: "/l" } })
+    expect(() => parseProjects(raw, fallback)).toThrow(/test.*пустыми/)
+  })
+
+  test("пустой объект — отказ: демон без проектов молча не работает", () => {
+    expect(() => parseProjects("{}", fallback)).toThrow(/пуст/)
+  })
+})

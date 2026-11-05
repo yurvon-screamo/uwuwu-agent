@@ -471,7 +471,13 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
     if (typeof c.board !== "string" || typeof c.repo !== "string" || typeof c.local !== "string") {
       throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local обязательны и строки`)
     }
+    if (c.board.trim() === "" || c.repo.trim() === "" || c.local.trim() === "") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local не могут быть пустыми`)
+    }
     out[name] = { board: c.board, repo: c.repo, local: c.local }
+  }
+  if (Object.keys(out).length === 0) {
+    throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")
   }
   return out
 }
@@ -479,11 +485,12 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
 // ——— сводка прохода ———
 
 export interface PassCounters {
-  /** спавн девелоперов (Design-волна) */
+  /** спавн девелоперов (Design-утряска + fast-track In Progress) */
   devSpawned: number
   /** спавн/рестарт ревьюверов */
   reviewSpawned: number
-  /** неспавненные будильники: wakeup по комментам/телу, реран ревью */
+  /** доставки промптов за тик: спавн/реран ревьювера, комменты ревьюверу,
+   *  возврат девелоперу, wakeup по комментам/правкам тела */
   wakeups: number
   /** чистки state (Done / строка исчезла) */
   cleanups: number

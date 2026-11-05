@@ -731,8 +731,12 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const devWave = untracked.filter((t) => reviewKindOf(t.status) === null)
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
+      if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
       try {
         await startTask(task, projectName, cfg, state, 0, kickoffModeOf(task.status))
+        // инвариант против drain-отмены внутри startTask (молчаливый return):
+        // сессия есть ⇔ в state появилась запись — иначе спавном не считаем
+        if (state.tasks[task.rowId] === undefined) return
         started.add(task.rowId)
         counters.devSpawned++
       } catch (e) {
@@ -766,6 +770,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       counters.reviewSpawned++
     } catch (e) {
       await failReview(task, board, entry, state, 0, e)
+      counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
     }
     started.add(task.rowId)
   }
