@@ -108,10 +108,13 @@ def cmd_append(a):
 
 
 def cmd_replace(a):
+    doc_id = a.docId.strip()
+    if not DOC_ID_RE.fullmatch(doc_id):
+        raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     md = Path(a.file).read_text()
     # найти док → пересоздать
-    rows = post("/api/query/sql", {"stmt": f"select hpath, box from blocks where type='d' and id='{a.docId}'"})
-    rows = rows if isinstance(rows, list) else rows.get("data", [])
+    stmt = f"select hpath, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
+    rows = _sql_rows(stmt)
     if not rows:
         raise RuntimeError("док не найден")
     hpath, box = rows[0]["hpath"], rows[0]["box"]
