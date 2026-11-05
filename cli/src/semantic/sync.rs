@@ -17,7 +17,7 @@
 use crate::siyuan::SiYuan;
 use anyhow::Result;
 use serde_json::Value;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::ollama::OllamaClient;
 use super::store::{ChunkMeta, ChunkRecord, Store};
@@ -40,6 +40,9 @@ pub struct SyncOptions {
     /// (rebuild: Some("0") — с нуля).
     pub since: Option<String>,
     pub deadline: Option<Instant>,
+    /// Пауза между kernel-страницами (rebuild): не душить прод-ядро
+    /// keyset-сканами (поисковый путь — None, там 1–3 запроса в бюджете).
+    pub page_delay: Option<Duration>,
     /// Прогресс-коллбэк после каждого записанного батча (счётчик embedded).
     pub on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
 }
@@ -52,6 +55,7 @@ pub struct SyncReport {
     pub budget_exhausted: bool,
 }
 
+#[derive(Clone)]
 pub struct KernelRow {
     pub meta: ChunkMeta,
     pub content: String,
@@ -62,9 +66,13 @@ pub(crate) fn sql_literal(value: &str) -> String {
 }
 
 /// Страница дельты: keyset по (updated, id), старейшие первыми.
+/// Страница дельты: keyset по (updated, id), старейшие первыми. Лёгкие
+/// колонки без content — полный скан blocks не таскает мегабайты текста
+/// (ядро без индекса по updated; тяжёлый content достаётся точечно по
+/// PK в fetch_by_ids — бережём прод-ядро от 13-минутных смертей).
 pub(crate) fn delta_page_stmt(cursor_updated: &str, cursor_id: &str) -> String {
     format!(
-        "select id, root_id, box, hpath, content, updated from blocks \
+        "select id, root_id, box, hpath, updated from blocks \
          where type in {types} \
          and (updated > {u} or (updated = {u} and id > {i})) \
          order by updated asc, id asc limit {page}",
@@ -167,10 +175,25 @@ pub async fn delta_sync(
             break;
         }
         let page_len = rows.len();
-        let mut pending: Vec<KernelRow> = Vec::with_capacity(EMBED_BATCH);
+        // Точечный fetch content по PK: тяжёлый текст не проходит
+        // через полный keyset-скан.
+        let page_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let full_rows = fetch_by_ids(sy, &page_ids).await?;
+        let by_id: std::collections::HashMap<String, KernelRow> = full_rows
+            .into_iter()
+            .map(|row| (row.meta.block_id.clone(), row))
+            .collect();
 
+        let mut pending: Vec<KernelRow> = Vec::with_capacity(EMBED_BATCH);
         for row in &rows {
-            let Some(kernel_row) = parse_kernel_row(row, true) else {
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(kernel_row) = by_id.get(id) else {
+                // Блок исчез между сканом и fetch'ем — prune поймает reconcile'ом.
                 continue;
             };
             cursor_updated = kernel_row.meta.updated.clone();
@@ -179,7 +202,7 @@ pub async fn delta_sync(
                 report.skipped_short += 1;
                 continue;
             }
-            pending.push(kernel_row);
+            pending.push(kernel_row.clone());
             if pending.len() == EMBED_BATCH {
                 if !budget_left(opts.deadline) {
                     report.budget_exhausted = true;
@@ -203,9 +226,12 @@ pub async fn delta_sync(
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
             // на крайний курсор (включая пропущенные по длине строки);
-            // set_meta — с MAX-гвардом, как у батчевых записей.
+            // запись — с MAX-гвардом (только вперёд).
             store.advance_watermark(&cursor_updated)?;
             break;
+        }
+        if let Some(delay) = opts.page_delay {
+            tokio::time::sleep(delay).await;
         }
     }
     Ok(report)

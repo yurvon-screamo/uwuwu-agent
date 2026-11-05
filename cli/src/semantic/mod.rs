@@ -115,6 +115,7 @@ pub async fn search_half(
         &sync::SyncOptions {
             since: None,
             deadline: Some(deadline),
+            page_delay: None,
             on_batch: None,
         },
     )
@@ -213,6 +214,7 @@ pub async fn rebuild(
     let opts = sync::SyncOptions {
         since: if resume { None } else { Some("0".to_string()) },
         deadline: None,
+        page_delay: Some(Duration::from_millis(200)),
         on_batch,
     };
     let report = sync::delta_sync(sy, &ollama, &mut store, &opts).await?;

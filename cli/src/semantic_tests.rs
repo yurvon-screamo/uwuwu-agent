@@ -200,6 +200,7 @@ fn opts_no_deadline() -> sync::SyncOptions {
     sync::SyncOptions {
         since: None,
         deadline: None,
+        page_delay: None,
         on_batch: None,
     }
 }
@@ -336,15 +337,22 @@ async fn delta_pages_through_equal_timestamp_run_without_loss() {
         captured.len()
     );
     for stmt in captured.iter() {
-        assert!(
-            stmt.contains("order by updated asc, id asc"),
-            "ORDER BY: {stmt}"
-        );
-        assert!(
-            stmt.contains(&format!("limit {}", sync::PAGE)),
-            "LIMIT: {stmt}"
-        );
-        assert!(stmt.contains("(updated >"), "keyset: {stmt}");
+        if stmt.contains("(updated >") {
+            // дельта-скан: keyset по (updated, id), без content в выборке
+            assert!(
+                stmt.contains("order by updated asc, id asc"),
+                "ORDER BY: {stmt}"
+            );
+            assert!(
+                stmt.contains(&format!("limit {}", sync::PAGE)),
+                "LIMIT: {stmt}"
+            );
+            assert!(!stmt.contains(", content,"), "скан не таскает content: {stmt}");
+        } else {
+            // точечный fetch по PK
+            assert!(stmt.contains("order by"), "ORDER BY: {stmt}");
+            assert!(stmt.contains("limit"), "LIMIT: {stmt}");
+        }
     }
 }
 
@@ -424,6 +432,7 @@ async fn delta_deadline_exhausted_embeds_nothing() {
         &sync::SyncOptions {
             since: None,
             deadline: Some(Instant::now() - Duration::from_millis(1)),
+            page_delay: None,
             on_batch: None,
         },
     )
