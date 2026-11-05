@@ -295,7 +295,7 @@ export interface MediaFile {
 /** Имя файла вложения: message_id-префикс гарантирует уникальность внутри
  *  батча (два безымянных видео форварда-альбома не перезаписывают друг
  *  друга), слэши и управляющие символы имени — санитизируются. */
-export function attachmentName(messageId: number, fileName: string | undefined, fallback: string): string {
+function attachmentName(messageId: number, fileName: string | undefined, fallback: string): string {
   const raw = fileName !== undefined && fileName.trim() !== "" ? fileName : fallback
   const safe = raw.replace(/[/\\]/g, "_").replace(/\p{Cc}/gu, "_").slice(0, 80)
   return `${messageId}_${safe}`
