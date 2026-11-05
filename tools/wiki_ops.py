@@ -81,14 +81,6 @@ def post(path: str, body: dict, attempts: int = 6):
     raise RuntimeError(f"POST {path}: {last}")
 
 
-def doc_id_by_path(nb: str, hpath: str) -> str | None:
-    try:
-        r = post("/api/filetree/getIDsByHPath", {"notebook": nb, "path": hpath}, attempts=2)
-        return (r[0] if isinstance(r, list) and r else None)
-    except Exception:
-        return None
-
-
 def notebooks() -> list[dict]:
     return [nb for nb in post("/api/notebook/lsNotebooks", {}).get("notebooks", [])
             if not nb.get("closed")]
