@@ -83,6 +83,16 @@ pub struct SiYuan {
     mcp_sid: std::sync::Mutex<Option<String>>,
 }
 
+/// Корень воркспейса (FS-пробы doctor'а, конфиг-фоллбек токена):
+/// UWUWU_SIYUAN_WS, иначе ~/siyuan-demo-ws.
+pub(crate) fn workspace_root() -> PathBuf {
+    std::env::var("UWUWU_SIYUAN_WS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("siyuan-demo-ws")
+        })
+}
+
 impl SiYuan {
     pub fn from_env() -> Result<Self> {
         Self::from_env_with_timeout(120)
@@ -97,12 +107,14 @@ impl SiYuan {
         let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
-                let ws = std::env::var("UWUWU_SIYUAN_WS").unwrap_or_else(|_| {
-                    format!("{}/siyuan-demo-ws", std::env::var("HOME").unwrap_or_default())
-                });
+                let ws = workspace_root();
                 let conf: Value = serde_json::from_str(
-                    &std::fs::read_to_string(PathBuf::from(&ws).join("conf/conf.json"))
-                        .with_context(|| format!("нет conf/conf.json в {ws} (задай UWUWU_SIYUAN_TOKEN)"))?,
+                    &std::fs::read_to_string(ws.join("conf/conf.json")).with_context(|| {
+                        format!(
+                            "нет conf/conf.json в {} (задай UWUWU_SIYUAN_TOKEN)",
+                            ws.display()
+                        )
+                    })?,
                 )?;
                 conf.pointer("/api/token")
                     .and_then(|v| v.as_str())
@@ -1009,6 +1021,7 @@ mod tests {
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
     }
+
 
     #[test]
     fn doc_file_path_joins_notebook_ancestors_and_doc_id() {
