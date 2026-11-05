@@ -8,6 +8,53 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// Ядро в волне деградации индекса: последующие вызовы post() падают сразу,
+/// не долбя ядро. Волна кормится ретраями (репро 04.11: серии с шагом ~2–3с —
+/// это post()-ретраи), поэтому после финального bail окно держит от повторных
+/// попыток. Поле инстанса, а не процесс-статик: CLI = один инстанс на процесс,
+/// семантика та же (внутрипроцессная), а тесты изолированы структурно —
+/// герметичность свиты не зависит от порядка/параллельности.
+const WAVE_COOLDOWN_SECS: u64 = 90;
+/// Ретраи на «metadata is not ready»: начальная попытка + до двух ретраев
+/// (штатный лаг индекса после крупных вставок пробивается вторым-третьим),
+/// затем bail с хинтом — не 4×~10с как прежде.
+const METADATA_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+const WAVE_HINT: &str = "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями";
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Паузы ретраев post(): `metadata_backoffs` — паузы на «metadata is not ready»
+/// (исчерпание = bail с хинтом + окно волны), `other_step_ms` — шаг прочих
+/// ошибок (800·(n+1)ms, как прежде; окно НЕ армится).
+struct RetryPacing {
+    metadata_backoffs: Vec<Duration>,
+    other_step_ms: u64,
+}
+
+impl RetryPacing {
+    fn production() -> Self {
+        Self {
+            metadata_backoffs: METADATA_RETRY_BACKOFFS.to_vec(),
+            other_step_ms: 800,
+        }
+    }
+
+    #[cfg(test)]
+    fn instant() -> Self {
+        Self {
+            metadata_backoffs: vec![Duration::from_millis(5), Duration::from_millis(5)],
+            other_step_ms: 1,
+        }
+    }
+}
 
 /// Результат чтения файла воркспейса через файловый API ядра.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +73,18 @@ pub struct SiYuan {
     client: reqwest::Client,
     // MCP-сессия (ленивая)
     mcp_sid: std::sync::Mutex<Option<String>>,
+    /// 90s fail-fast окно волны (unix-secs истечения; 0 = не армировано).
+    wave_cooldown_until: AtomicU64,
+}
+
+/// Корень воркспейса (FS-пробы doctor'а, конфиг-фоллбек токена):
+/// UWUWU_SIYUAN_WS, иначе ~/siyuan-demo-ws.
+pub(crate) fn workspace_root() -> PathBuf {
+    std::env::var("UWUWU_SIYUAN_WS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("siyuan-demo-ws")
+        })
 }
 
 impl SiYuan {
@@ -42,12 +101,14 @@ impl SiYuan {
         let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
-                let ws = std::env::var("UWUWU_SIYUAN_WS").unwrap_or_else(|_| {
-                    format!("{}/siyuan-demo-ws", std::env::var("HOME").unwrap_or_default())
-                });
+                let ws = workspace_root();
                 let conf: Value = serde_json::from_str(
-                    &std::fs::read_to_string(PathBuf::from(&ws).join("conf/conf.json"))
-                        .with_context(|| format!("нет conf/conf.json в {ws} (задай UWUWU_SIYUAN_TOKEN)"))?,
+                    &std::fs::read_to_string(ws.join("conf/conf.json")).with_context(|| {
+                        format!(
+                            "нет conf/conf.json в {} (задай UWUWU_SIYUAN_TOKEN)",
+                            ws.display()
+                        )
+                    })?,
                 )?;
                 conf.pointer("/api/token")
                     .and_then(|v| v.as_str())
@@ -62,6 +123,7 @@ impl SiYuan {
                 .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()?,
             mcp_sid: std::sync::Mutex::new(None),
+            wave_cooldown_until: AtomicU64::new(0),
         })
     }
 
@@ -77,11 +139,35 @@ impl SiYuan {
                 .build()
                 .expect("test reqwest client"),
             mcp_sid: std::sync::Mutex::new(None),
+            wave_cooldown_until: AtomicU64::new(0),
         }
     }
 
+    fn arm_wave_cooldown(&self) {
+        self.wave_cooldown_until
+            .store(now_unix_secs() + WAVE_COOLDOWN_SECS, Ordering::Relaxed);
+    }
+
+    fn wave_cooldown_active(&self) -> bool {
+        self.wave_cooldown_until.load(Ordering::Relaxed) > now_unix_secs()
+    }
+
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        self.post_with_pacing(path, body, RetryPacing::production())
+            .await
+    }
+
+    /// post() с инъекцией ретрай-пауз — тесты зовут с мгновенным пейсингом,
+    /// штатный post() с production-константами выше.
+    /// Прочие ошибки (транспорт, code≠0) ретраются как прежде, 4 попытки,
+    /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
+    /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
+    async fn post_with_pacing(&self, path: &str, body: Value, pacing: RetryPacing) -> Result<Value> {
+        if self.wave_cooldown_active() {
+            bail!("POST {path}: пропущено — {WAVE_HINT} (окно fail-fast активно)");
+        }
         let mut last = String::new();
+        let mut metadata_attempts = 0usize;
         for attempt in 0..4u32 {
             let resp = self
                 .client
@@ -102,13 +188,25 @@ impl SiYuan {
                         v.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
                     );
                     if last.contains("metadata is not ready") {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500 + attempt as u64 * 1000)).await;
-                        continue;
+                        match pacing.metadata_backoffs.get(metadata_attempts) {
+                            Some(backoff) => {
+                                metadata_attempts += 1;
+                                tokio::time::sleep(*backoff).await;
+                                continue;
+                            }
+                            None => {
+                                self.arm_wave_cooldown();
+                                bail!("POST {path}: {last} — {WAVE_HINT}");
+                            }
+                        }
                     }
                 }
                 Err(e) => last = e.to_string(),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(800 * (attempt as u64 + 1))).await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                pacing.other_step_ms * (attempt as u64 + 1),
+            ))
+            .await;
         }
         bail!("POST {path}: {last}")
     }
@@ -279,7 +377,7 @@ impl SiYuan {
         }
     }
 
-    async fn block_children_text(&self, doc_id: &str) -> Result<String> {
+    pub(crate) async fn block_children_text(&self, doc_id: &str) -> Result<String> {
         self.mcp_tool_text("block", json!({ "action": "get_children", "id": doc_id }))
             .await
     }
@@ -629,7 +727,11 @@ pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
     for line in children_text.lines() {
         let Some(open) = line.rfind('(') else { continue };
         let candidate = line[open + 1..].trim_end_matches(')');
+        // Кандидат — произвольный текст после последней '('; срезы по байтам
+        // паникуют на не-ASCII (репро doctor'ом: 22-байтный текст с кириллицей).
         let is_block_id = candidate.len() == 22
+            && candidate.is_char_boundary(14)
+            && candidate.is_char_boundary(15)
             && candidate[..14].chars().all(|c| c.is_ascii_digit())
             && candidate.as_bytes()[14] == b'-'
             && candidate[15..].chars().all(|c| c.is_ascii_alphanumeric());
@@ -674,12 +776,110 @@ impl SiYuan {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch};
+    use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing};
     use crate::siyuan::SiYuan;
     use serde_json::json;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn metadata_error_template() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(
+            json!({"code": -1, "msg": "commit tx failed: document metadata is not ready"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn metadata_not_ready_bails_after_three_requests_with_wave_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(metadata_error_template())
+            .expect(3)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
+            .await
+            .expect_err("persistent metadata error must bail");
+
+        let text = err.to_string();
+        assert!(text.contains("metadata is not ready"));
+        assert!(text.contains("uwuwu-cli doctor"));
+    }
+
+    #[tokio::test]
+    async fn transient_metadata_lag_recovers_on_retry_without_arming_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(metadata_error_template())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0, "data": ""})))
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
+            .await
+            .expect("retry after transient lag must succeed");
+
+        // Окно не армировано: следующий вызов доходит до мока.
+        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
+            .await
+            .expect("cooldown must stay disarmed after successful retry");
+    }
+
+    #[tokio::test]
+    async fn wave_cooldown_fails_fast_subsequent_calls_after_final_bail() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(metadata_error_template())
+            .expect(3)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let first = sy
+            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .await;
+        assert!(first.is_err(), "persistent wave must bail");
+
+        let second = sy
+            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .await;
+        assert!(second.is_err(), "cooldown must fail fast the next call");
+        assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
+    }
+
+    #[tokio::test]
+    async fn non_metadata_errors_do_not_arm_wave_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": -1, "msg": "не найдено"})))
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        assert!(sy
+            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .await
+            .is_err());
+
+        // Окно не армировано: следующий вызов доходит до мока (4+ запросов суммарно).
+        assert!(sy
+            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .await
+            .is_err());
+    }
 
     #[test]
     fn body_snippet_truncates_long_bodies() {
@@ -815,6 +1015,17 @@ mod tests {
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
     }
+
+    #[test]
+    fn parse_block_ids_survives_trailing_multibyte_paren_text() {
+        // Паник-фикстура doctor'ом: кириллический кандидат — ПОСЛЕДНЯЯ скобка
+        // строки, ровно 22 байта (5«ы»=10б + abc=3б + «ы» на байтах 13–14 + 7б хвоста):
+        // байт 14 — continuation «ы» → старые байт-срезы candidate[..14] паниковали.
+        let text = "- [p] сноска (ыыыыыabcы-x-yzab)\n- [p] реальный (20261105101010-abc1234)\n";
+        let ids = parse_block_ids(text);
+        assert_eq!(ids, vec!["20261105101010-abc1234".to_string()]);
+    }
+
 
     #[test]
     fn doc_file_path_joins_notebook_ancestors_and_doc_id() {
