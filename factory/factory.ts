@@ -41,6 +41,11 @@ import {
   routeTask,
   rowMissingAction,
   worktreeByBranch,
+  runBatch,
+  parseProjects,
+  formatPassSummary,
+  type PassCounters,
+  type ProjectCfg,
   type ReviewKind,
   type FactoryState,
   type KickoffMode,
@@ -50,13 +55,11 @@ import {
 } from "./factory-lib"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
-export interface ProjectCfg {
-  board: string
-  repo: string
-  local: string
-}
+// ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
+// здесь только прод-дефолт
+export type { ProjectCfg }
 
-const PROJECTS: Record<string, ProjectCfg> = {
+const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
   uwuwu: {
     board: "Задачи uwuwu",
     repo: "yurvon-screamo/uwuwu-agent",
@@ -93,11 +96,19 @@ const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-pl
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
+/** параллельность Design-волны: create+prompt+liveness ≈ 5 сетевых шагов
+ *  на задачу — 4 дорожки держат волну из ~10 задач в пределах полутика */
+const SPAWN_WAVE_CONCURRENCY = 4
 /** бот-аккаунт афины: его комменты — не сигналы юзера */
 const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6c71d8afeae"
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
+}
+
+/** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
 
 function rotateLog(): void {
@@ -431,6 +442,16 @@ async function startTask(
   )
   if (!sent) throw new Error("spawn-промпт не ушёл")
 
+  // живость сразу после спавна: «фиктивные sessionID» (create ок, сессии
+  // нет) не попадают в state и не считаются активными — throw уводит в
+  // registerFailure, ретрай следующим тиком; осиротевшую сессию гасим
+  const liveness = await sessionLiveness(sessionID)
+  if (liveness === "dead") {
+    await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
+    throw new Error("сессия мертва сразу после спавна")
+  }
+  // unknown (транзиент REST) — пишем state как раньше: stage-2 перепроверит
+
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
   // newUserComments идёт по юзерскому списку)
@@ -691,6 +712,9 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const rows = await readTasks(board)
   // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
   log(`проход ${projectName}: строк ${rows.length}`)
+  const counters: PassCounters = {
+    devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0, watched: 0, failures: [],
+  }
 
   // 1. новые задачи: Design → девелопер (утряска), In Progress без state →
   //    девелопер (fast-track владельца: сразу реализация), ревью-статус → ревьювер
@@ -698,17 +722,33 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const started = new Set<string>()
   const spawnable = rows.filter(
     (r) => r.status === "Design" || r.status === "In Progress" || reviewKindOf(r.status) !== null)
-  for (const task of untrackedTasks(spawnable, state)) {
-    const kind = reviewKindOf(task.status)
-    if (kind === null) {
+  const untracked = untrackedTasks(spawnable, state)
+
+  // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
+  // и fast-track In Progress владельца) получают сессии за ОДИН проход
+  // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
+  // растягивали волну из 4 задач на 12+ минут)
+  const devWave = untracked.filter((t) => reviewKindOf(t.status) === null)
+  if (devWave.length > 0 && !drain.isStopping()) {
+    await runBatch(devWave, async (task) => {
+      if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
       try {
         await startTask(task, projectName, cfg, state, 0, kickoffModeOf(task.status))
+        // инвариант против drain-отмены внутри startTask (молчаливый return):
+        // сессия есть ⇔ в state появилась запись — иначе спавном не считаем
+        if (state.tasks[task.rowId] === undefined) return
         started.add(task.rowId)
+        counters.devSpawned++
       } catch (e) {
         await registerFailure(task, projectName, board, state, 0, e)
+        counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
       }
-      continue
-    }
+    }, SPAWN_WAVE_CONCURRENCY)
+  }
+
+  for (const task of untracked.filter((t) => reviewKindOf(t.status) !== null)) {
+    const kind = reviewKindOf(task.status)
+    if (kind === null) continue // защищённость от перефильтра выше
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
     // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
     // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
@@ -727,8 +767,10 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     state.tasks[task.rowId] = entry
     try {
       await startReview(task, projectName, cfg, state, kind, entry)
+      counters.reviewSpawned++
     } catch (e) {
       await failReview(task, board, entry, state, 0, e)
+      counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
     }
     started.add(task.rowId)
   }
@@ -754,6 +796,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     } else if (missing === "clean") {
       log(`задача ${rowId.slice(0, 8)}: строки нет в скане 2 прохода подряд (с ${tracked.missingSince}) — чистка`)
       await finishTask(rowId, tracked, state)
+      counters.cleanups++
       continue
     }
     if (row === undefined) continue // mark: маршрутизировать нечего
@@ -762,6 +805,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if (row.status === "Done") {
       log(`задача ${rowId.slice(0, 8)}: Done (закрыта агентом/юзером) — чистка`)
       await finishTask(rowId, tracked, state)
+      counters.cleanups++
       continue
     }
 
@@ -795,6 +839,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       row, tracked, project: tracked.project || projectName, cfg, board, state, fresh,
       consumeComments, refreshBodyBaseline,
     })
+    if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
     if (skipRest === "skip-rest") continue
 
     // запоминаем наблюдённый статус — граница перехода для след. тика
@@ -821,6 +866,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
           if (await promptSession(target, bodyEditPrompt(rowId))) {
             tracked.bodyUpdated = updated
             saveState(state)
+            counters.wakeups++
           }
           continue
         }
@@ -879,10 +925,16 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
       saveState(state)
+      counters.wakeups++
     } else {
       log(`задача ${rowId.slice(0, 8)}: промпт не ушёл — граница комментов не сдвинута`)
     }
   }
+
+  // сводка прохода: «молчаливые тики» видны — что сделано и сколько живых
+  counters.watched = Object.values(state.tasks)
+    .filter((t) => (t.project || "uwuwu") === projectName).length
+  log(formatPassSummary(projectName, counters))
 }
 
 let tickCount = 0
@@ -894,6 +946,15 @@ async function main(): Promise<void> {
     console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
+  // env-оверрайд проектов: валидируем ДО лока — невалидный конфиг не должен
+  // даже притворяться демоном (тестовые доски для ONCE-прогонов)
+  let projects: Record<string, ProjectCfg>
+  try {
+    projects = parseProjects(process.env.UWUWU_FACTORY_PROJECTS_JSON, DEFAULT_PROJECTS)
+  } catch (e) {
+    console.error(errText(e))
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
@@ -901,11 +962,11 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(PROJECTS).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {
-    for (const [name, cfg] of Object.entries(PROJECTS)) {
+    for (const [name, cfg] of Object.entries(projects)) {
       if (drain.isStopping()) break
       try {
         await tickProject(state, name, cfg)

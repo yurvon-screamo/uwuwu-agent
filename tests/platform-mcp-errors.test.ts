@@ -4,35 +4,48 @@
 // одним re-handshake, без цикла. Живое ядро не нужно — fetch скриптуется.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import * as mcp from "../lib/platform"
+const { __test } = mcp
 
 const originalFetch = globalThis.fetch
 
 interface McpCall {
   method: string
   hasSession: boolean
+  sessionId: string
+  /** page из arguments tools/call (database render); 0 — не render-вызов */
+  page: number
 }
 
 const AV_ID = "20260101000000-abcdef"
 
 /** Скриптованный fetch: REST-лега ядра (/api/query/sql) отвечает кодом 0,
- *  лега /mcp — по скрипту; mcp-вызовы фиксируются (method/hasSession). */
-function scriptMcp(respond: (call: number, c: McpCall) => Response): { calls: McpCall[] } {
+ *  лега /mcp — по скрипту; mcp-вызовы фиксируются (method/sessionId).
+ *  Сигнатура вызова (AbortSignal) доступна через recorded.init. */
+function scriptMcp(respond: (call: number, c: McpCall) => Response): { calls: McpCall[]; inits: (RequestInit | undefined)[] } {
   const calls: McpCall[] = []
+  const inits: (RequestInit | undefined)[] = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
+    inits.push(init)
     if (url.includes("/api/query/sql")) {
       // markdown с data-av-id — контракт avIdOfBlock (REST-лега read_database_cells)
       return new Response(JSON.stringify({ code: 0, msg: "", data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }] }), { status: 200 })
     }
     if (!url.includes("/mcp")) throw new Error(`mock: неожиданный путь ${url}`)
-    const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string }
+    const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string, params?: { arguments?: { page?: number } } }
     const headers = (init?.headers ?? {}) as Record<string, string>
-    const hasSession = Object.keys(headers).some((h) => h.toLowerCase() === "mcp-session-id")
+    const sessionId = Object.entries(headers).find(([h]) => h.toLowerCase() === "mcp-session-id")?.[1] ?? ""
     const call = calls.length
-    calls.push({ method: payload.method ?? "?", hasSession })
-    return respond(call, { method: payload.method ?? "?", hasSession })
+    const info: McpCall = {
+      method: payload.method ?? "?",
+      hasSession: sessionId !== "",
+      sessionId,
+      page: payload.params?.arguments?.page ?? 0,
+    }
+    calls.push(info)
+    return respond(call, info)
   }) as typeof fetch
-  return { calls }
+  return { calls, inits }
 }
 
 const jsonrpc = (result: unknown, sessionId?: string): Response =>
@@ -111,6 +124,44 @@ describe("mcpRpc: протухшая сессия (рестарт ядра)", ()
     expect(err?.message).toContain("HTTP 404")
     expect(calls.map((c) => c.method)).toEqual(["initialize", "notifications/initialized", "tools/call"])
   })
+
+  test("параллельные вызовы при экспирации — один recovery на пачку, оба проходят", async () => {
+    // спавн-волна фабрики бьёт по ядру пачкой: все вызовы со старой сессией
+    // получают 404 одновременно — handshake один, оба ретрая идут с новой
+    let initialized = 0
+    const rowPage = (page: number): Response =>
+      jsonrpc(page === 1
+        ? { structuredContent: { data: { view: { rows: [{ id: "rowX", cells: [] }], rowCount: 1 } } } }
+        : { structuredContent: { data: { view: { rows: [] } } } })
+    const { calls } = scriptMcp((_call, c) => {
+      if (c.method === "initialize") {
+        initialized++
+        return jsonrpc({}, `s${initialized}`)
+      }
+      if (c.method === "notifications/initialized") return new Response("", { status: 200 })
+      return c.sessionId === "s1" ? new Response("session not found", { status: 404 }) : rowPage(c.page)
+    })
+
+    const [a, b] = await Promise.all([
+      readCells() as Promise<{ rows?: { rowBlockId?: string }[] }>,
+      readCells() as Promise<{ rows?: { rowBlockId?: string }[] }>,
+    ])
+
+    expect(a.rows?.map((row) => row.rowBlockId)).toEqual(["rowX"])
+    expect(b.rows?.map((row) => row.rowBlockId)).toEqual(["rowX"])
+    // один стартовый handshake + один recovery — не по handshake на вызов
+    expect(calls.filter((c) => c.method === "initialize")).toHaveLength(2)
+    expect(calls.filter((c) => c.method === "tools/call" && c.sessionId === "s2").length).toBeGreaterThanOrEqual(2)
+  })
+
+  test("kernel-вызовы несут AbortSignal — зависший TCP не держит тик", async () => {
+    // контракт таймаута: и REST-лега, и /mcp уходят с signal
+    const { inits } = scriptMcp(handshake("s1", pagedRender(jsonrpc)))
+    await readCells()
+    for (const init of inits) {
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+    }
+  })
 })
 
 describe("mcpRpc: честные ошибки вместо молчаливых пустых результатов", () => {
@@ -158,3 +209,39 @@ describe("mcpRpc: честные ошибки вместо молчаливых 
   })
 })
 
+
+describe("mcpRpc: вложенная экспирация во время recovery-handshake", () => {
+  test("404 на notifications/initialized — описательная ошибка, не вечное ожидание", async () => {
+    // initialize ок (выдал s2), но initialized с новой сессией отклонён —
+    // ядро умер прямо посреди handshake; recovery не должен звать сам себя
+    const { calls } = scriptMcp((_call, c) => {
+      if (c.method === "initialize") return jsonrpc({}, "s2")
+      if (c.method === "notifications/initialized") return new Response("session not found", { status: 404 })
+      return new Response("??", { status: 200 })
+    })
+    const err = await readCells().then(() => null, (e: Error) => e)
+    expect(err).not.toBeNull()
+    expect(err?.message).toContain("во время recovery-handshake")
+    // никакого повторного initialize — цикл не завёлся
+    expect(calls.filter((c) => c.method === "initialize")).toHaveLength(1)
+  })
+})
+
+describe("parseKernelTimeoutMs: валидация env UWUWU_KERNEL_TIMEOUT_MS", () => {
+  test("число-строка — миллисекунды", () => {
+    expect(__test.parseKernelTimeoutMs("30000")).toBe(30000)
+  })
+  test("отсутствие env — дефолт 15 s; пустая строка — отказ (Number('')=0)", () => {
+    expect(__test.parseKernelTimeoutMs(undefined)).toBe(15_000)
+    expect(() => __test.parseKernelTimeoutMs("")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("   ")).toThrow(/положительное число/)
+  })
+  test("пустое значение env (Number('')=0) — отказ, а не мгновенный таймаут", () => {
+    expect(() => __test.parseKernelTimeoutMs("")).toThrow(/положительное число/)
+  })
+  test("не-число и ноль/отрицательное — отказ", () => {
+    expect(() => __test.parseKernelTimeoutMs("abc")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("0")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("-5")).toThrow(/положительное число/)
+  })
+})

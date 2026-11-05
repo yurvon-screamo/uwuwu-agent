@@ -35,6 +35,21 @@ const TOKEN = siyuanToken()
 
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
+/** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
+ *  останавливать тик демона — класс «клиентские висы» (прод-контур).
+ *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
+ *  мгновенный таймаут каждого вызова (тихая слепота контура); NaN — RangeError. */
+function parseKernelTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined) return 15_000
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`UWUWU_KERNEL_TIMEOUT_MS: ожидалось положительное число миллисекунд, получено «${raw}»`)
+  }
+  return n
+}
+
+const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_MS)
+
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
@@ -55,6 +70,7 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         method: "POST",
         headers: { Authorization: `Token ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
       })
       const text = await r.text()
       const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
@@ -103,7 +119,12 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const hasSession = mcpSession !== ""
   if (hasSession) headers["Mcp-Session-Id"] = mcpSession
-  const r = await fetch(SIYUAN_URL + "/mcp", { method: "POST", headers, body: JSON.stringify(payload) })
+  const r = await fetch(`${SIYUAN_URL}/mcp`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+  })
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
   const text = await r.text()
@@ -121,43 +142,79 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   return (msg.result ?? {}) as Record<string, unknown>
 }
 
-/** Re-handshake после отклонённой сессии: чистим состояние и initialize заново.
- *  reentrant-guard: вложенный отказ во время handshake — описательная ошибка, не рекурсия. */
-let recovering = false
+/** Re-handshake после отклонённой сессии: чистим состояние и initialize
+ *  заново. Single-flight: параллельные вызовы пачки словят 404 одновременно
+ *  — все ждут ОДИН recovery (общий промис), лишних initialize нет; вызовы,
+ *  начавшиеся во время восстановления, ретраятся после него же. */
+let recovery: Promise<void> | null = null
 
-async function recoverMcpSession(): Promise<void> {
-  if (recovering) throw new Error("mcp: сессия отклонена и во время re-handshake — ядро недоступно")
-  recovering = true
-  try {
-    mcpSession = ""
-    mcpReady = false
-    await connect()
-  } finally {
-    recovering = false
+function recoverMcpSession(): Promise<void> {
+  if (recovery === null) {
+    recovery = (async () => {
+      mcpSession = ""
+      mcpReady = false
+      try {
+        await connect()
+      } finally {
+        recovery = null
+      }
+    })()
   }
+  return recovery
 }
 
 /** Один ретрай на протухшую сессию: тик лечится на месте вместо 5 падений
- *  подряд и само-рестарта демона (прод-кейс 04.11). */
-async function mcpRpc(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+ *  подряд и само-рестарта демона (прод-кейс 04.11).
+ *  recover:false — для вызовов САМОГО handshake: отказ сессии внутри
+ *  recovery не должен снова звать recovery (общий промис ещё in-flight —
+ *  вышло бы вечное ожидание самого себя); вместо этого описательная ошибка
+ *  отвергает recovery-промис — ждущие пачки получают её, следующий тик
+ *  ретраит с чистого состояния. */
+async function mcpRpc(
+  method: string,
+  params: Record<string, unknown>,
+  opts: { recover?: boolean } = {},
+): Promise<Record<string, unknown>> {
   try {
     return await mcpRpcOnce(method, params)
   } catch (e) {
     if (!(e instanceof StaleMcpSessionError)) throw e
+    if (opts.recover === false) {
+      throw new Error(`mcp ${method}: сессия отклонена во время recovery-handshake — ядро недоступен (${e.message})`)
+    }
     await recoverMcpSession()
     return mcpRpcOnce(method, params)
   }
 }
 
-export async function connect(): Promise<void> {
-  if (mcpReady) return // сессия уже инициализирована (демоны зовут connect повторно)
-  await mcpRpc("initialize", {
-    protocolVersion: "2025-03-26",
-    capabilities: {},
-    clientInfo: { name: "uwuwu-daemon", version: "1.0" },
-  })
-  await mcpRpc("notifications/initialized", {})
-  mcpReady = true
+/** Handshake single-flight: демоны зовут connect() повторно, а во время
+ *  recovery новые вызывающие собираются в один handshake — лишних
+ *  initialize-циклов на пачке параллельных вызовов нет. */
+let connecting: Promise<void> | null = null
+
+export function connect(): Promise<void> {
+  if (mcpReady) return Promise.resolve() // сессия уже инициализирована
+  if (connecting === null) {
+    const handshake = (async () => {
+      // recover:false — см. mcpRpc: вложенный отказ сессии во время
+      // handshake = описательная ошибка, не рекурсивный recovery
+      await mcpRpc("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "uwuwu-daemon", version: "1.0" },
+      }, { recover: false })
+      await mcpRpc("notifications/initialized", {}, { recover: false })
+      mcpReady = true
+    })()
+    // сброс слота по завершении — без вмешательства в доставку ошибки awaiter'ам
+    handshake
+      .finally(() => {
+        if (connecting === handshake) connecting = null
+      })
+      .catch(() => {})
+    connecting = handshake
+  }
+  return connecting
 }
 
 let mcpReady = false
@@ -181,7 +238,7 @@ async function avKeys(avId: string): Promise<Map<string, string>> {
   const hit = keyCache.get(avId)
   if (hit) return hit
   const r = await mcpToolCall("database", { action: "keys", id: avId })
-  const keys = ((r.data as { keys?: { id?: string; name?: string }[] }) ?? {}).keys ?? []
+  const keys = (r.data as { keys?: { id?: string; name?: string }[] })?.keys ?? []
   const m = new Map<string, string>()
   for (const k of keys) if (k.id && k.name) m.set(k.name, k.id)
   keyCache.set(avId, m)
@@ -215,11 +272,16 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
+    // Primary Key-ячанка строки: линк на док-тело (refSubtype "d") —
+    // doc-id тела; раньше связка терялась (null) и весь wakeup-контур
+    // фабрики (комменты/правки тела) работал по пустому bodyDoc
+    let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
       const col = nameOf.get(v.keyID ?? "") ?? ""
       if (v.type === "block") {
         title = v.block?.content ?? ""
+        if (v.block?.refSubtype === "d" && v.block.id) linkedDocId = v.block.id
         continue
       }
       let value = ""
@@ -227,7 +289,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
       else if (v.text) value = v.text.content ?? ""
       if (col !== "") cells[col] = { value }
     }
-    rows.push({ rowBlockId: row.id ?? "", linkedDocId: null, title, cells })
+    rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })
   }
   return { rows }
 }
@@ -333,7 +395,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
           })
           continue
         }
-        const rep = line.match(/^  - \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
+        const rep = line.match(/^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
         if (rep && edges.length > 0) {
           const node = edges[edges.length - 1].node as { replies?: Record<string, unknown>[] }
           node.replies = node.replies ?? []
@@ -379,6 +441,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
 export const __test = {
   commentToSnapshot,
   SIYUAN_URL,
+  parseKernelTimeoutMs,
   /** Живая проба одной страницы render (page с 1) — независимый источник
    *  rowCount ядра для живого теста полноты выборки. */
   renderBoardPage: async (blockId: string, page: number): Promise<BoardViewPage> => {
