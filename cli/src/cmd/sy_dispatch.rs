@@ -887,6 +887,7 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
 /// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
 /// append — один appendBlock; replace/replace-section — экспорт по id,
 /// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
+/// Отказ гарда секции — Err до overwrite: экспорт read-only, ядро не тронуто.
 async fn write_body_in_place(
     sy: &SiYuan,
     doc_id: &str,
@@ -902,7 +903,7 @@ async fn write_body_in_place(
     let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match section {
         Some(section) => {
-            let (md, edit) = replace_md_section(&existing, section, content);
+            let (md, edit) = replace_md_section(&existing, section, content)?;
             report_section_edit(section, edit);
             md
         }
@@ -924,15 +925,25 @@ pub(crate) enum SectionEdit {
 /// попадает в SectionEdit. Граница секции — заголовок уровня ≤ 2 вне кодового
 /// фенса: gherkin-фенсы bug-шаблонов несут строки «# …», фенс-трекинг обязателен,
 /// иначе новая граница резала бы их (регрессия относительно кода до уровня-aware).
-/// Секция не найдена — append в конец с нормализованным заголовком; пустой ввод
-/// очищает секцию (контракт); пустая строка перед следующим заголовком восстанавливается.
-fn replace_md_section(md: &str, section: &str, content: &str) -> (String, SectionEdit) {
-    let want = md_heading::normalize_heading_text(section);
+/// Запрос нормализован от собственного ATX-префикса: «## Решение» матчит
+/// секцию «Решение» (иначе want нёс бы хэши, матч не сходился, а append
+/// писал мусор «## ## Решение»). Гард уровня: h2-матча нет, но тёзка «X» есть
+/// на уровне 1 или ≥ 3 — Err с уровнем и байт-точной строкой (первой по
+/// порядку): иначе контент молча аппендится новой ##-секцией в конец — дубль
+/// (ожог ###-правок). Тёзка в фенсе не заголовок — гард молчит; при живом
+/// h2-матче тёзка игнорируется. Секция не найдена вовсе — append в конец
+/// с нормализованным заголовком; пустой ввод очищает секцию (контракт);
+/// пустая строка перед следующим заголовком восстанавливается.
+fn replace_md_section(md: &str, section: &str, content: &str) -> Result<(String, SectionEdit)> {
+    let want = md_heading::normalize_heading_query(section);
     let mut out = String::new();
     let mut fenced = false;
     let mut dropping = false; // контент секции/дубля до границы не копируется
     let mut replaced = false;
     let mut duplicates_removed = 0usize;
+    // Тёзка на чужом уровне: собирается в тот же проход, гард стреляет
+    // только если h2-матча не было; первая по порядку — детерминизм ошибки.
+    let mut twin: Option<(usize, &str)> = None;
     for line in md.lines() {
         if md_heading::toggles_fence(line) {
             fenced = !fenced;
@@ -954,6 +965,9 @@ fn replace_md_section(md: &str, section: &str, content: &str) -> (String, Sectio
                     dropping = true;
                     continue;
                 }
+                if text == want && twin.is_none() {
+                    twin = Some((level, line));
+                }
                 if level <= 2 {
                     dropping = false;
                     push_blank_line(&mut out);
@@ -969,7 +983,13 @@ fn replace_md_section(md: &str, section: &str, content: &str) -> (String, Sectio
         }
     }
     if !replaced {
-        let heading = format!("## {}", md_heading::normalize_heading_text(section));
+        if let Some((level, twin_line)) = twin {
+            bail!(
+                "секция «{section}» на уровне ## не найдена, но есть тёзка на уровне h{level}: «{twin_line}»; \
+                 --replace-section матчит только ## — правь через содержащую ##-секцию или полный task body --replace"
+            );
+        }
+        let heading = format!("## {want}");
         if !out.is_empty() {
             out.push('\n');
         }
@@ -979,9 +999,9 @@ fn replace_md_section(md: &str, section: &str, content: &str) -> (String, Sectio
             out.push_str(content.trim());
             out.push('\n');
         }
-        return (out, SectionEdit::Appended);
+        return Ok((out, SectionEdit::Appended));
     }
-    (out, SectionEdit::Replaced { duplicates_removed })
+    Ok((out, SectionEdit::Replaced { duplicates_removed }))
 }
 
 /// Блок секции: заголовок исходной строкой + новый контент (пустой — очистка).
@@ -1246,8 +1266,8 @@ mod tests {
     const CARRIER: &str = "block-1";
     const TITLE_KEY: &str = "key-1";
     const ROW_ID: &str = "item-1";
-    const BOUND_DOC: &str = "doc-bound";
-    const ORPHAN_DOC: &str = "doc-orphan";
+    const BOUND_DOC: &str = "20261105120000-boundd1";
+    const ORPHAN_DOC: &str = "20261105090000-orphan1";
 
     fn render_rows(with_binding: bool) -> serde_json::Value {
         let mut block = serde_json::json!({ "content": "таск", "refSubtype": "d" });
@@ -1281,20 +1301,23 @@ mod tests {
     async fn mock_siyuan(
         title_doc_ids: Vec<String>,
         with_binding: bool,
-    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
         mock_siyuan_with_export(title_doc_ids, with_binding, String::new()).await
     }
 
     /// Расширенный мок: с экспортом дока (обёртка frontmatter + имя) для
-    /// rewrite-пути (replace/--replace-section).
+    /// rewrite-пути (replace/--replace-section). Четвёртый элемент — счётчик
+    /// deleteBlock: overwrite-путь удаляет блоки «штормом», no-write-тесты
+    /// ассертят его пустоту против именно опасного вызова.
     async fn mock_siyuan_with_export(
         title_doc_ids: Vec<String>,
         with_binding: bool,
         export_content: String,
-    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
         let server = MockServer::start().await;
         let create_calls = Arc::new(AtomicUsize::new(0));
         let append_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let delete_calls = Arc::new(AtomicUsize::new(0));
 
         let title_docs = title_doc_ids.clone();
         Mock::given(method("POST"))
@@ -1334,6 +1357,16 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&req.body).to_string());
+                ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let deletes = delete_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/block/deleteBlock"))
+            .respond_with(move |_req: &wiremock::Request| {
+                deletes.fetch_add(1, Ordering::SeqCst);
                 ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
             })
             .mount(&server)
@@ -1415,7 +1448,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        (server, create_calls, append_bodies)
+        (server, create_calls, append_bodies, delete_calls)
     }
 
     async fn write_body_via_cli(server: &MockServer) -> anyhow::Result<()> {
@@ -1442,7 +1475,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn body_writes_into_bound_doc_and_never_creates_docs() {
-        let (server, create_calls, append_bodies) =
+        let (server, create_calls, append_bodies, _deletes) =
             mock_siyuan(vec![ORPHAN_DOC.to_string(), BOUND_DOC.to_string()], true).await;
         write_body_via_cli(&server).await.unwrap();
 
@@ -1466,7 +1499,7 @@ mod tests {
     #[serial_test::serial]
     async fn replace_section_rewrites_without_name_and_frontmatter_blocks() {
         let export = "---\ntitle: таск\n---\n\n# таск\n\n## Проверка\nстарое тело секции\n".to_string();
-        let (server, create_calls, append_bodies) =
+        let (server, create_calls, append_bodies, _deletes) =
             mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -1497,12 +1530,48 @@ mod tests {
         }
     }
 
+    /// Гард уровня на мок-ядре: тёзка «Подсекция» только на ### → task_run
+    /// возвращает Err с уровнем и строкой, записи в ядро нет — ни appendBlock
+    /// пересборки, ни deleteBlock-шторма overwrite_doc_md (тот, что валил ядро).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replace_section_twin_other_level_refuses_without_kernel_write() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\n## Родитель\nввод\n### Подсекция\nдетали\n".to_string();
+        let (server, create_calls, append_bodies, delete_calls) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое содержимое\n").unwrap();
+        let err = task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: Some("Подсекция".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("h3") && msg.contains("### Подсекция"), "суть отказа: {msg}");
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0, "доки не создаются");
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(appends.is_empty(), "appendBlock не вызывался: {:?}", *appends);
+        }
+        assert_eq!(delete_calls.load(Ordering::SeqCst), 0, "deleteBlock-шторма нет — ядро не тронуто");
+    }
+
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
     /// явная ошибка со списком docId, не молчаливая запись в «первый».
     #[tokio::test]
     #[serial_test::serial]
     async fn body_errors_listing_duplicates_for_detached_row() {
-        let (server, _create, _append) =
+        let (server, _create, _append, _deletes) =
             mock_siyuan(vec![ORPHAN_DOC.to_string(), "doc-b".to_string()], false).await;
         let err = write_body_via_cli(&server).await.unwrap_err();
         let msg = err.to_string();
@@ -1516,7 +1585,7 @@ mod tests {
     #[test]
     fn replace_md_section_replaces_body_keeps_heading() {
         let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let (out, edit) = replace_md_section(md, "А", "новое содержимое\n");
+        let (out, edit) = replace_md_section(md, "А", "новое содержимое\n").unwrap();
         assert!(out.contains("## А\nновое содержимое"));
         assert!(out.contains("## Б\nвторое"));
         assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
@@ -1525,7 +1594,7 @@ mod tests {
     #[test]
     fn replace_md_section_appends_missing_section() {
         let md = "## А\nпервое\n";
-        let (out, edit) = replace_md_section(md, "Новая", "контент");
+        let (out, edit) = replace_md_section(md, "Новая", "контент").unwrap();
         assert!(out.contains("## Новая\nконтент"));
         assert!(out.contains("## А\nпервое"));
         assert_eq!(edit, SectionEdit::Appended);
@@ -1534,7 +1603,7 @@ mod tests {
     #[test]
     fn replaces_first_and_removes_duplicate_sections() {
         let md = "# Таск\n\n## Причина\nпервое вхождение\n\n## Причина\nвторое вхождение\n\n## Фикс\nправка\n";
-        let (out, edit) = replace_md_section(md, "Причина", "новый механизм\n");
+        let (out, edit) = replace_md_section(md, "Причина", "новый механизм\n").unwrap();
         assert_eq!(out.matches("## Причина").count(), 1, "секция остаётся одна");
         assert!(!out.contains("первое вхождение"), "старый контент первого удалён");
         assert!(!out.contains("второе вхождение"), "контент дубля удалён");
@@ -1545,7 +1614,7 @@ mod tests {
     #[test]
     fn ends_section_at_higher_level_heading() {
         let md = "## А\nстарое\n# Заголовок H1\nхвост тайтла\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "А", "новое\n");
+        let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(out.contains("# Заголовок H1"), "h1 переживает replace");
         assert!(out.contains("хвост тайтла"), "контент после h1 переживает replace");
         assert!(out.contains("## Б\nвторое"));
@@ -1554,7 +1623,7 @@ mod tests {
     #[test]
     fn h3_stays_inside_section() {
         let md = "## А\nввод\n### Подсекция\nдетали подсекции\n\n## Б\nвторое\n### Б-под\nб-детали\n";
-        let (out, _) = replace_md_section(md, "А", "новое\n");
+        let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(
             !out.contains("детали подсекции"),
             "h3 не рвёт диапазон: контент под h3 заменяется вместе с секцией"
@@ -1566,7 +1635,7 @@ mod tests {
     #[test]
     fn normalizes_heading_and_argument() {
         let md = "##  Постановка\nстарое\n";
-        let (out, edit) = replace_md_section(md, " Постановка ", "новое\n");
+        let (out, edit) = replace_md_section(md, " Постановка ", "новое\n").unwrap();
         assert!(out.contains("новое"), "матч по нормализованному тексту");
         assert_eq!(out.matches("##").count(), 1, "без append-дубля секции");
         assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
@@ -1575,7 +1644,7 @@ mod tests {
     #[test]
     fn heading_preserved_byte_for_byte() {
         let md = "##  Причина ^20261104120000-ab12cd\nстарое\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "Причина", "новое\n");
+        let (out, _) = replace_md_section(md, "Причина", "новое\n").unwrap();
         assert!(
             out.contains("##  Причина ^20261104120000-ab12cd\nновое"),
             "заматченный заголовок пишется исходной строкой (пробелы и ^id живы)"
@@ -1586,7 +1655,7 @@ mod tests {
     #[test]
     fn matches_heading_with_block_id_suffix() {
         let md = "## Причина ^20261104120000-ab12cd\nстарое\n\n## Б\nвторое\n";
-        let (out, edit) = replace_md_section(md, "Причина", "новое\n");
+        let (out, edit) = replace_md_section(md, "Причина", "новое\n").unwrap();
         assert!(out.contains("новое"), "суффикс ^id не мешает матчу");
         assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
     }
@@ -1594,7 +1663,7 @@ mod tests {
     #[test]
     fn fenced_h2_does_not_bound_section() {
         let md = "## А\nстарое\n```md\n## Фейк внутри фенса\n```\nхвост секции\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "А", "новое\n");
+        let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(!out.contains("Фейк"), "h2 внутри фенса — контент секции, заменяется");
         assert!(!out.contains("хвост секции"), "секция длится сквозь фенс");
         assert!(out.contains("## Б\nвторое"));
@@ -1603,7 +1672,7 @@ mod tests {
     #[test]
     fn hash_line_inside_fence_survives() {
         let md = "## Сценарий (BDD)\nстарое\n```gherkin\nСценарий: x\n  Дано y\n  Тогда z  # факт\n```\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "Сценарий (BDD)", "новое\n");
+        let (out, _) = replace_md_section(md, "Сценарий (BDD)", "новое\n").unwrap();
         assert!(out.contains("## Б\nвторое"), "граница секции — настоящий заголовок Б");
         assert_eq!(out.matches("## Б").count(), 1, "секция Б не задвоена");
         assert!(!out.contains("# факт"), "старый контент секции заменён целиком");
@@ -1612,7 +1681,7 @@ mod tests {
     #[test]
     fn empty_content_clears_section() {
         let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "А", "");
+        let (out, _) = replace_md_section(md, "А", "").unwrap();
         assert!(out.contains("## А"), "заголовок сохранён");
         assert!(!out.contains("старое"), "контент очищен пустым вводом");
         assert!(out.contains("## Б\nвторое"));
@@ -1621,8 +1690,103 @@ mod tests {
     #[test]
     fn blank_line_restored_before_next_heading() {
         let md = "## А\nстарое\n\n## Б\nвторое\n";
-        let (out, _) = replace_md_section(md, "А", "новое\n");
+        let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(out.contains("новое\n\n## Б"), "пустая строка между секциями восстановлена");
+    }
+
+    // ——— гард уровня: h2-матча нет, тёзка на уровне 1 или ≥3 → отказ, записи нет ———
+
+    #[test]
+    fn h3_twin_refuses_with_level_and_byte_line() {
+        let md = "## Родитель\nввод\n### Подсекция\nдетали подсекции\n";
+        let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("h3"), "уровень тёзки в ошибке: {msg}");
+        assert!(msg.contains("### Подсекция"), "байт-точная строка заголовка: {msg}");
+        assert!(msg.contains("--replace"), "рецепт обхода в ошибке: {msg}");
+    }
+
+    #[test]
+    fn h1_twin_refuses_replacement() {
+        let md = "# Подсекция\nтело тайтла\n";
+        let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("h1"), "h1-тёзка гардится тем же правилом: {msg}");
+    }
+
+    #[test]
+    fn twin_detection_is_normalized_double_space_and_block_id() {
+        // регулярный прод-экспорт несёт двойные пробелы и ^block-id: детект
+        // тёзки по сырой строке промолчал бы ровно на этом случае
+        let md = "## Родитель\nввод\n###  Подсекция ^20261105230000-ab12cd\nдетали\n";
+        let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("###  Подсекция ^20261105230000-ab12cd"),
+            "байт-точная строка с пробелами и ^id: {msg}"
+        );
+    }
+
+    #[test]
+    fn twin_inside_fence_appends_instead_of_guard() {
+        let md = "## Родитель\n```md\n### Подсекция\n```\nхвост\n";
+        let (out, edit) = replace_md_section(md, "Подсекция", "новое\n").unwrap();
+        assert!(
+            out.contains("## Подсекция\nновое"),
+            "тёзка в фенсе — не заголовок, гард молчит: легитимный append"
+        );
+        assert_eq!(edit, SectionEdit::Appended);
+    }
+
+    #[test]
+    fn h2_match_wins_over_h3_twin_without_guard() {
+        let md = "## Подсекция\nстарое\n\n## Другое\nввод\n### Подсекция\nдетали\n";
+        let (out, edit) = replace_md_section(md, "Подсекция", "новое\n").unwrap();
+        assert!(out.contains("## Подсекция\nновое"), "h2-матч заменён на месте");
+        assert!(out.contains("### Подсекция\nдетали"), "###-тёзка вне секции не тронута");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 }, "гард не стреляет при живом h2");
+    }
+
+    #[test]
+    fn first_twin_in_document_order_named_in_error() {
+        let md = "### Подсекция\nверхняя\n\n# Подсекция\nнижняя\n";
+        let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("h3"), "первая тёзка по порядку — детерминизм: {msg}");
+        assert!(msg.contains("### Подсекция"), "строка первой тёзки: {msg}");
+        assert!(!msg.contains("h1"), "вторая тёзка не упоминается: {msg}");
+    }
+
+    // ——— нормализация запроса: ATX-префикс в --replace-section срезается ———
+
+    #[test]
+    fn prefixed_h3_query_refuses_instead_of_garbage_append() {
+        // факт 06.11 (задача 20261104072048): запрос «### Замечания…» при живой
+        // h3-секции → раньше not-found append «## ### Замечания…» в хвост тела
+        let md = "## Финальный отчёт\nввод\n### Замечания и неочевидные решения\nдетали\n\n## Комменты\n- строка\n";
+        let err = replace_md_section(md, "### Замечания и неочевидные решения", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("h3"), "запрос с префиксом матчит тёзку после среза хэшей: {msg}");
+        assert!(msg.contains("### Замечания и неочевидные решения"), "байт-точная строка: {msg}");
+    }
+
+    #[test]
+    fn prefixed_h2_query_matches_live_section() {
+        let md = "## X\nстарое\n\n## Б\nвторое\n";
+        let (out, edit) = replace_md_section(md, "## X", "новое\n").unwrap();
+        assert!(out.contains("## X\nновое"), "запрос «## X» матчит живую секцию «X»");
+        assert!(out.contains("## Б\nвторое"));
+        assert_eq!(out.matches("## X").count(), 1, "без дубля секции");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+    }
+
+    #[test]
+    fn prefixed_query_appends_clean_heading() {
+        let md = "## А\nтело\n";
+        let (out, edit) = replace_md_section(md, "### Новая", "контент").unwrap();
+        assert!(out.contains("## Новая\nконтент"), "append пишет чистый заголовок без хэшей запроса");
+        assert!(!out.contains("## ###"), "двойного префикса в теле нет: {out}");
+        assert_eq!(edit, SectionEdit::Appended);
     }
 
     #[test]
