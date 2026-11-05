@@ -887,9 +887,6 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
 /// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
 /// append — один appendBlock; replace/replace-section — экспорт по id,
 /// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
-/// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
-/// append — один appendBlock; replace/replace-section — экспорт по id,
-/// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
 /// Отказ гарда секции — Err до overwrite: экспорт read-only, ядро не тронуто.
 async fn write_body_in_place(
     sy: &SiYuan,
@@ -1543,7 +1540,7 @@ mod tests {
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
         let md = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(md.path(), "новое содержимое\n").unwrap();
-        let result = task_run(
+        let err = task_run(
             "uwuwu",
             TaskSub::Body {
                 id: "таск".into(),
@@ -1553,16 +1550,9 @@ mod tests {
                 replace_section: Some("Подсекция".into()),
             },
         )
-        .await;
+        .await
+        .unwrap_err();
 
-        match &result {
-            Err(e) => eprintln!("DEBUG err: {e}"),
-            Ok(_) => {
-                let appends = append_bodies.lock().unwrap();
-                eprintln!("DEBUG ok, APPENDS: {appends:?}, DELETES: {}", delete_calls.load(Ordering::SeqCst));
-            }
-        }
-        let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("h3") && msg.contains("### Подсекция"), "суть отказа: {msg}");
         assert_eq!(create_calls.load(Ordering::SeqCst), 0, "доки не создаются");
