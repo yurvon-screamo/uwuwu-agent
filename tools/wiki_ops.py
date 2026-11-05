@@ -5,7 +5,12 @@ kernel-транспорт (post, конфиг, константы) без выи
 
 Команды (совместимы с прежним интерфейсом дример-агентов):
   export <docId>                     markdown дока по id
-  create "Заголовок" <файл> --parent <hpath>   создать док (ноутбук Projects)
+  create "Заголовок" <файл> --parent <путь>   создать док; ноутбук резолвится по первому
+                                   сегменту пути: имя ноутбука (/Projects/uwuwu/ADR →
+                                   Projects + hpath /uwuwu/ADR, /Experience/cli →
+                                   Experience + hpath /cli) или корневая папка ровно
+                                   одного ноутбука (/uwuwu/ADR → Projects, /affine →
+                                   Experience); пустой --parent → Projects (легаси)
   append <docId> --md <файл> [--force]         дописать markdown-блоки в конец
   replace <docId> --md <файл>        заменить док целиком
   delete <docId> [--force]           снести док в корзину SiYuan (восстановимо)
@@ -35,6 +40,12 @@ export и appendBlock идут attempts=1, единственный ретрай
 
 orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
 молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
+
+post(): «metadata is not ready» — ≤3 попытки (+2s/+5s) → различимый bail с
+хинтом (дисциплина ADR-027: волна гаснет отходом клиента, ретраи — её топливо);
+транспортные ошибки — ретраи с бэкоффом (sleep-free на последней попытке);
+прочие code≠0 — перманентный отказ ядра, KernelRefused немедленно (ретраи
+бессмысленны, см. класс ниже).
 
 Конфиг: UWUWU_SIYUAN_URL (деф. http://127.0.0.1:6806) + UWUWU_SIYUAN_TOKEN
 (или UWUWU_SIYUAN_WS/conf/conf.json).
@@ -72,6 +83,16 @@ FENCE_RE = re.compile(r"^\s*```")
 # (thematic break «---» без pipe — не он).
 SEPARATOR_ROW_RE = re.compile(r"(?=.*\|)[\s|:\-]*-[\s|:\-]*")
 
+# «metadata is not ready»: ≤3 попытки с паузами +2s/+5s → различимый bail с хинтом.
+# Дисциплина ADR-027 (uwuwu-cli): волна деградации гаснет отходом клиента — слепые
+# ретраи питают волну, но полный запрет ретраев убивает выживание на транзиентном
+# лаге индекса после крупных вставок. Арит-окно инстанса не переносится: wiki_ops
+# выполняет одну write-операцию на процесс — межвызовного долбления нет.
+# Guard-луп append это не обходит: его шаги идут attempts=1 (bail-счётчик внутри
+# одного post() не достигает порога), бюджет ретраев держит сам луп.
+METADATA_BAIL_ATTEMPTS = 3
+METADATA_BAIL_BACKOFF = (2, 5)
+
 
 class KernelRefused(RuntimeError):
     """Ядро ответило бизнес-отказом (code≠0 без «metadata is not ready»).
@@ -97,9 +118,31 @@ def _conf():
     TOKEN = tok
 
 
+def _metadata_hint(api_path: str) -> str:
+    # Хинт различимого bail'а (ADR-027). Причины metadata-not-ready зависят от пути:
+    # createDocWithMd падает и на отсутствующем родителе/спецсимволах тайтла
+    # (опыт /cli/SiYuan createDocWithMd…), прочие пути — почти всегда волна.
+    if api_path.endswith("createDocWithMd"):
+        return ("если это create/replace — путь-родитель не существует в целевом ноутбуке "
+                "(createDocWithMd не создаёт родителей) или в тайтле спецсимволы («/», «=», …); "
+                "иначе — волна деградации ядра: uwuwu-cli doctor")
+    return "вероятна волна деградации ядра: uwuwu-cli doctor"
+
+
+def _metadata_step(path: str, last: str, tries: int, i: int, attempts: int) -> None:
+    """Шаг «metadata is not ready»: bail при исчерпании попыток, иначе пауза
+    (кроме последней итерации цикла — без сна перед финальным отказом)."""
+    if tries >= METADATA_BAIL_ATTEMPTS:
+        raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
+                           f"{tries} попыток; {_metadata_hint(path)}")
+    if i < attempts - 1:
+        time.sleep(METADATA_BAIL_BACKOFF[tries - 1])
+
+
 def post(path: str, body: dict, attempts: int = 6):
     _conf()
     last = "?"
+    metadata_tries = 0
     for i in range(attempts):
         req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
                                      headers={"Authorization": f"Token {TOKEN}",
@@ -116,8 +159,8 @@ def post(path: str, body: dict, attempts: int = 6):
             return d.get("data")
         last = f"code={d.get('code')} msg={d.get('msg')}"
         if "metadata is not ready" in str(d.get("msg")):
-            if i < attempts - 1:
-                time.sleep(2 + i)
+            metadata_tries += 1
+            _metadata_step(path, last, metadata_tries, i, attempts)
             continue
         raise KernelRefused(f"POST {path}: {last}")
     raise RuntimeError(f"POST {path}: {last}")
@@ -135,12 +178,61 @@ def cmd_export(a):
 
 def cmd_create(a):
     md = Path(a.file).read_text()
-    nb = next((n["id"] for n in notebooks() if n["name"] == "Projects"), None)
-    if not nb:
-        raise RuntimeError("ноутбук Projects не найден")
-    hpath = a.parent.rstrip("/") + "/" + a.title.strip("/")
-    post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
-    print(f"создан: {hpath}")
+    nb_id, nb_name, prefix = _resolve_parent(a.parent)
+    hpath = prefix.rstrip("/") + "/" + a.title.strip("/")
+    post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
+    print(f"создан: [{nb_name}] {hpath}")
+
+
+def _normalize_parent(parent: str) -> str:
+    # Дикие формы из живых инцидентов: «Experience/tools» без ведущего слэша,
+    # «/affine/» с хвостовой, задвоенные слэши.
+    normalized = re.sub(r"/{2,}", "/", parent.strip())
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized.rstrip("/") or "/"
+
+
+def _workspace_roots(nbs: list[dict]) -> dict[str, list[str]]:
+    """Имена корневых доков каждого открытого ноутбука (для резолва первого сегмента)."""
+    roots: dict[str, list[str]] = {}
+    for nb in nbs:
+        files = post("/api/filetree/listDocsByPath", {"notebook": nb["id"], "path": "/"}).get("files") or []
+        roots[nb["name"]] = [f["name"] for f in files]
+    return roots
+
+
+def _resolve_parent(parent: str) -> tuple[str, str, str]:
+    """--parent → (notebook_id, notebook_name, hpath-префикс дока).
+
+    Первый сегмент пути резолвится в ноутбук: точное имя ноутбука (hpath — остаток
+    пути) либо имя корневого дока ровно одного ноутбука (hpath — путь как есть).
+    Неоднозначный корень и неизвестный префикс — RuntimeError с вариантами.
+    Пустой путь — легаси-дефолт Projects (пустой --parent у старых вызовов).
+    """
+    normalized = _normalize_parent(parent)
+    nbs = notebooks()
+    by_name = {nb["name"]: nb["id"] for nb in nbs}
+    if normalized == "/":
+        if "Projects" not in by_name:
+            raise RuntimeError("ноутбук Projects не найден — легаси-дефолт пустого --parent недоступен")
+        return by_name["Projects"], "Projects", "/"
+    parts = normalized[1:].split("/", 1)
+    first = parts[0]
+    rest = "/" + parts[1] if len(parts) > 1 else "/"
+    if first in by_name:
+        return by_name[first], first, rest
+    owners = sorted(name for name, names in _workspace_roots(nbs).items() if first in names)
+    if len(owners) == 1:
+        return by_name[owners[0]], owners[0], normalized
+    if owners:
+        options = " или ".join(f"/{o}/{first}" for o in owners)
+        raise RuntimeError(f"корневая папка «{first}» есть в нескольких ноутбуках "
+                           f"({', '.join(owners)}) — уточни: {options}")
+    names = ", ".join(sorted(by_name))
+    raise RuntimeError(f"неизвестный префикс «{normalized}»: первый сегмент --parent должен быть "
+                       f"именем ноутбука ({names}) или его корневой папкой (состав — orgls); "
+                       f"примеры: /Experience/cli, /uwuwu/ADR")
 
 
 def _export_content(doc_id: str) -> str:

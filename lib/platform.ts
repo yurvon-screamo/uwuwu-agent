@@ -290,16 +290,18 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
-    // Primary Key-ячанка строки: линк на док-тело (refSubtype "d") —
-    // doc-id тела; раньше связка терялась (null) и весь wakeup-контур
-    // фабрики (комменты/правки тела) работал по пустому bodyDoc
+    // Привязка строки к док-телу: value.block.id Primary Key-ячейки — docId
+    // тела (у detached-строк поля нет → null). Готча: value.blockID — это
+    // id самой строки, не привязка. Извлечение безусловное — контракт CLI
+    // parse_render_row (siyuan_task.rs): guard на refSubtype терял бы
+    // легаси-строки, не прогнанные ядром через NormalizeBlockRefSubtype
     let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
       const col = nameOf.get(v.keyID ?? "") ?? ""
       if (v.type === "block") {
         title = v.block?.content ?? ""
-        if (v.block?.refSubtype === "d" && v.block.id) linkedDocId = v.block.id
+        linkedDocId = v.block?.id ?? null
         continue
       }
       let value = ""
@@ -351,10 +353,12 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     }
     case "get_doc": {
       const docId = String(args.docId ?? "")
-      const rows = await sql<{ id: string; content: string; updated: string }>(
-        `select id, content, updated from blocks where type='d' and id='${docId}' limit 1`)
+      const rows = await sql<{ id: string; content: string; updated: string; box?: string; hpath?: string }>(
+        `select id, content, updated, box, hpath from blocks where type='d' and id='${docId}' limit 1`)
       const d = rows[0]
-      return (d ? { id: d.id, title: d.content, updatedAt: d.updated } : { id: docId, title: "", updatedAt: "" }) as T
+      return (d
+        ? { id: d.id, title: d.content, updatedAt: d.updated, box: d.box ?? "", hpath: d.hpath ?? "" }
+        : { id: docId, title: "", updatedAt: "", box: "", hpath: "" }) as T
     }
     case "read_doc": {
       const docId = String(args.docId ?? "")
@@ -371,6 +375,15 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "doc_ids_by_hpath": {
+      // FS-истина файлового дерева: без лага SQL-индекса (паритет CLI
+      // doc_ids_by_hpath); заголовки с '/' санитайзит вызывающий (pathSafe)
+      const data = await post<unknown>("/api/filetree/getIDsByHPath", {
+        notebook: String(args.notebook ?? ""), path: String(args.path ?? ""),
+      })
+      const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
+      return { ids } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {
