@@ -3,7 +3,12 @@
 
 Команды (совместимы с прежним интерфейсом дример-агентов):
   export <docId>                     markdown дока по id
-  create "Заголовок" <файл> --parent <hpath>   создать док (ноутбук Projects)
+  create "Заголовок" <файл> --parent <путь>   создать док; ноутбук резолвится по первому
+                                   сегменту пути: имя ноутбука (/Projects/uwuwu/ADR →
+                                   Projects + hpath /uwuwu/ADR, /Experience/cli →
+                                   Experience + hpath /cli) или корневая папка ровно
+                                   одного ноутбука (/uwuwu/ADR → Projects, /affine →
+                                   Experience); пустой --parent → Projects (легаси)
   append <docId> --md <файл>         дописать markdown-блоки в конец
   replace <docId> --md <файл>        заменить док целиком
   delete <docId> [--force]           снести док в корзину SiYuan (восстановимо)
@@ -93,12 +98,61 @@ def cmd_export(a):
 
 def cmd_create(a):
     md = Path(a.file).read_text()
-    nb = next((n["id"] for n in notebooks() if n["name"] == "Projects"), None)
-    if not nb:
-        raise RuntimeError("ноутбук Projects не найден")
-    hpath = a.parent.rstrip("/") + "/" + a.title.strip("/")
-    post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
-    print(f"создан: {hpath}")
+    nb_id, nb_name, prefix = _resolve_parent(a.parent)
+    hpath = prefix.rstrip("/") + "/" + a.title.strip("/")
+    post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
+    print(f"создан: [{nb_name}] {hpath}")
+
+
+def _normalize_parent(parent: str) -> str:
+    # Дикие формы из живых инцидентов: «Experience/tools» без ведущего слэша,
+    # «/affine/» с хвостовой, задвоенные слэши.
+    normalized = re.sub(r"/{2,}", "/", parent.strip())
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized.rstrip("/") or "/"
+
+
+def _workspace_roots(nbs: list[dict]) -> dict[str, list[str]]:
+    """Имена корневых доков каждого открытого ноутбука (для резолва первого сегмента)."""
+    roots: dict[str, list[str]] = {}
+    for nb in nbs:
+        files = post("/api/filetree/listDocsByPath", {"notebook": nb["id"], "path": "/"}).get("files") or []
+        roots[nb["name"]] = [f["name"] for f in files]
+    return roots
+
+
+def _resolve_parent(parent: str) -> tuple[str, str, str]:
+    """--parent → (notebook_id, notebook_name, hpath-префикс дока).
+
+    Первый сегмент пути резолвится в ноутбук: точное имя ноутбука (hpath — остаток
+    пути) либо имя корневого дока ровно одного ноутбука (hpath — путь как есть).
+    Неоднозначный корень и неизвестный префикс — RuntimeError с вариантами.
+    Пустой путь — легаси-дефолт Projects (пустой --parent у старых вызовов).
+    """
+    normalized = _normalize_parent(parent)
+    nbs = notebooks()
+    by_name = {nb["name"]: nb["id"] for nb in nbs}
+    if normalized == "/":
+        if "Projects" not in by_name:
+            raise RuntimeError("ноутбук Projects не найден — легаси-дефолт пустого --parent недоступен")
+        return by_name["Projects"], "Projects", "/"
+    parts = normalized[1:].split("/", 1)
+    first = parts[0]
+    rest = "/" + parts[1] if len(parts) > 1 else "/"
+    if first in by_name:
+        return by_name[first], first, rest
+    owners = sorted(name for name, names in _workspace_roots(nbs).items() if first in names)
+    if len(owners) == 1:
+        return by_name[owners[0]], owners[0], normalized
+    if owners:
+        options = " или ".join(f"/{o}/{first}" for o in owners)
+        raise RuntimeError(f"корневая папка «{first}» есть в нескольких ноутбуках "
+                           f"({', '.join(owners)}) — уточни: {options}")
+    names = ", ".join(sorted(by_name))
+    raise RuntimeError(f"неизвестный префикс «{normalized}»: первый сегмент --parent должен быть "
+                       f"именем ноутбука ({names}) или его корневой папкой (состав — orgls); "
+                       f"примеры: /Experience/cli, /uwuwu/ADR")
 
 
 def cmd_append(a):
