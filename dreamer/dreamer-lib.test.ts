@@ -191,6 +191,19 @@ describe("dreamerPrompt / isValidTracked", () => {
     expect(p).toContain("uwuwu-cli read")
     expect(p).toContain("одной-двумя строками")
   })
+  test("дамп-команда: глобальные флаги ДО сабкоманды (argparse их после — не принимает)", () => {
+    // Регресс 20261104072029: форма `session <id> --compact --db <путь>` падала
+    // с `unrecognized arguments` — опции объявлены до subparsers.
+    for (const p of [
+      dreamerPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db" }),
+      wakeupPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" }),
+    ]) {
+      const cmd = p.split("\n").find((l) => l.includes("python3 \"/a.py\""))
+      expect(cmd).toBeDefined()
+      expect(cmd).toContain(`--db "/b.db" --compact session ses_abc`)
+      expect(cmd).not.toContain(`session ses_abc --`)
+    }
+  })
   test("валидация state-записей", () => {
     expect(isValidTracked({ status: "done", lastProcessedUpdate: 1, attempts: 0, dreamerSes: null, at: 1 })).toBe(true)
     expect(isValidTracked({ status: "bogus" })).toBe(false)

@@ -8,12 +8,16 @@ pub mod cmd;
 pub mod markdown;
 pub mod md_heading;
 pub mod path;
+pub mod semantic;
 pub mod siyuan;
 pub mod siyuan_id;
 pub mod siyuan_doctor;
 pub mod siyuan_guard;
 pub mod sofa;
 pub mod siyuan_task;
+
+#[cfg(test)]
+mod semantic_tests;
 
 #[cfg(test)]
 mod siyuan_task_tests;

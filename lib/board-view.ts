@@ -18,6 +18,8 @@ export interface RenderRow {
       keyID?: string
       type?: string
       block?: { id?: string; content?: string; refSubtype?: string }
+      /** render живого ядра несёт isDetached у detached-строк (fixtures) */
+      isDetached?: boolean
       mSelect?: { content?: string }[]
       text?: { content?: string }
     }
