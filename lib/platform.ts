@@ -375,6 +375,24 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "doc_exists": {
+      // Живость дока через MCP block get (не SQL): индекс blocks отстаёт от
+      // свежих доков, filetree/block — FS-истина. Ядро отвечает isError
+      // «was not found» за подтверждённо отсутствующий блок — это вердикт
+      // «дока нет»; прочие ошибки кидаются наверх как инфра-сбой
+      // (паритет CLI doc_block_exists). Известная хрупкость: матч по тексту
+      // ошибки ядра — смена формулировки при апгрейде ядра даст вечный
+      // infra-ретрай (крон перестаёт файрить, но и не сжигается: следить за
+      // логом «тело не разрешено» после апгрейдов SiYuan).
+      const docId = String(args.docId ?? "")
+      const r = await mcpRpc("tools/call", { name: "block", arguments: { action: "get", id: docId } })
+      const text = (r.content as { text?: string }[] | undefined)?.[0]?.text ?? ""
+      if (r.isError === true) {
+        if (text.includes("was not found")) return { exists: false } as T
+        throw new Error(`tool block: ${JSON.stringify(r.content)}`)
+      }
+      return { exists: text.includes("Type: NodeDocument") } as T
+    }
     case "doc_ids_by_hpath": {
       // FS-истина файлового дерева: без лага SQL-индекса (паритет CLI
       // doc_ids_by_hpath); заголовки с '/' санитайзит вызывающий (pathSafe)
