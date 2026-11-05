@@ -302,7 +302,10 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       // свежих доков, filetree/block — FS-истина. Ядро отвечает isError
       // «was not found» за подтверждённо отсутствующий блок — это вердикт
       // «дока нет»; прочие ошибки кидаются наверх как инфра-сбой
-      // (паритет CLI doc_block_exists).
+      // (паритет CLI doc_block_exists). Известная хрупкость: матч по тексту
+      // ошибки ядра — смена формулировки при апгрейде ядра даст вечный
+      // infra-ретрай (крон перестаёт файрить, но и не сжигается: следить за
+      // логом «тело не разрешено» после апгрейдов SiYuan).
       const docId = String(args.docId ?? "")
       const r = await mcpRpc("tools/call", { name: "block", arguments: { action: "get", id: docId } })
       const text = (r.content as { text?: string }[] | undefined)?.[0]?.text ?? ""

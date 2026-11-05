@@ -13,7 +13,7 @@ import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  bodyRenderIssue, chooseBodyDoc, due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, pathSafe, titleFromBody,
+  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -170,64 +170,6 @@ async function setCells(board: BoardIds, rowId: string, cells: Record<string, st
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
-// ——— резолв тела крона ———
-
-type BodyResolution =
-  | { kind: "ok"; docId: string; markdown: string }
-  | { kind: "refuse"; reason: string }
-  | { kind: "infra"; error: string }
-
-/** Вердикт по рендеру тела: unsupported-комментарии/пустота → refuse. */
-function renderVerdict(docId: string, markdown: string): BodyResolution {
-  const issue = bodyRenderIssue(markdown)
-  if (issue !== null) {
-    return { kind: "refuse", reason: `${issue} (docId ${docId})` }
-  }
-  return { kind: "ok", docId, markdown }
-}
-
-/** Док-тело крона: привязка строки (id-first), мёртвая/отсутствующая →
- *  title-fallback по hpath доски (контракт CLI choose_body_doc). Сбоям ядра
- *  (infra) вердикт не выносится: refuse — только при подтверждённом
- *  отсутствии/пустоте тела, иначе слот крона сжигался бы минутным сбоями. */
-async function resolveBody(board: BoardIds, row: CronRow): Promise<BodyResolution> {
-  try {
-    if (row.bodyDoc !== "") {
-      const exported = await mcp.tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: row.bodyDoc })
-      if (exported.exists === true) {
-        return renderVerdict(row.bodyDoc, exported.markdown ?? "")
-      }
-      // export глотает любые ошибки в exists:false — мёртвую привязку
-      // отличаем от сбоя ядра пробой block get (FS-истина)
-      const live = await mcp.tool<{ exists?: boolean }>("doc_exists", { docId: row.bodyDoc })
-      if (live.exists === true) {
-        return { kind: "infra", error: `export дока ${row.bodyDoc} дал exists:false при живом блоке` }
-      }
-    }
-    if (row.title === "") {
-      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback" }
-    }
-    const info = await mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId })
-    const byTitle = await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-      notebook: info.box ?? "", path: `${info.hpath ?? ""}/${pathSafe(row.title)}`,
-    })
-    const choice = chooseBodyDoc(row.bodyDoc, false, byTitle.ids ?? [])
-    if (choice.kind === "duplicates") {
-      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI` }
-    }
-    if (choice.kind === "missing") {
-      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет` }
-    }
-    const exported = await mcp.tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: choice.docId })
-    if (exported.exists !== true) {
-      return { kind: "infra", error: `title-fallback док ${choice.docId}: export дал exists:false` }
-    }
-    return renderVerdict(choice.docId, exported.markdown ?? "")
-  } catch (e) {
-    return { kind: "infra", error: String(e) }
-  }
-}
-
 // ——— opencode REST ———
 
 async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
@@ -288,7 +230,8 @@ async function tick(state: CronState): Promise<void> {
   }
 }
 
-async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
+/** Экспорт для юнит-тестов тика (демон стартует только как entry — import.meta.main). */
+export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
   const rows = await readCrons(board)
 
   for (const row of rows) {
@@ -335,7 +278,7 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
       log(`крон «${row.title || row.rowId.slice(0, 8)}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
       continue
     }
-    const resolved = await resolveBody(board, row)
+    const resolved = await resolveBody(mcp.tool, board.docId, row)
     // linked-строки несут заголовок в теле: деривируем из первой содержательной строки
     const title = row.title !== "" ? row.title
       : titleFromBody(resolved.kind === "ok" ? resolved.markdown : "") || `крон ${row.rowId.slice(0, 8)}`
@@ -433,4 +376,4 @@ async function main(): Promise<void> {
   }
 }
 
-void main()
+if (import.meta.main) void main()

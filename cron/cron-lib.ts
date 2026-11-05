@@ -215,6 +215,72 @@ export function titleFromBody(body: string): string {
   return ""
 }
 
+// ——— резолв тела крона (оркестрация над инжектируемым платформенным tool) ———
+
+/** Структурный тип платформенного tool (инжект — юнит-тесты без ядра). */
+export type PlatformTool = <T = Record<string, unknown>>(name: string, args: Record<string, unknown>) => Promise<T>
+
+export type BodyResolution =
+  | { kind: "ok"; docId: string; markdown: string }
+  | { kind: "refuse"; reason: string }
+  | { kind: "infra"; error: string }
+
+/** Вердикт по рендеру тела: unsupported-комментарии/пустота → refuse. */
+function renderVerdict(docId: string, markdown: string): BodyResolution {
+  const issue = bodyRenderIssue(markdown)
+  if (issue !== null) {
+    return { kind: "refuse", reason: `${issue} (docId ${docId})` }
+  }
+  return { kind: "ok", docId, markdown }
+}
+
+/** Док-тело крона: привязка строки (id-first), мёртвая/отсутствующая →
+ *  title-fallback по hpath доски (контракт CLI choose_body_doc). Сбоям ядра
+ *  (infra) вердикт не выносится: refuse — только при подтверждённом
+ *  отсутствии/пустоте тела, иначе слот крона сжигался бы минутными сбоями. */
+export async function resolveBody(tool: PlatformTool, boardDocId: string, row: CronRow): Promise<BodyResolution> {
+  try {
+    if (row.bodyDoc !== "") {
+      const exported = await tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: row.bodyDoc })
+      if (exported.exists === true) {
+        return renderVerdict(row.bodyDoc, exported.markdown ?? "")
+      }
+      // export глотает любые ошибки в exists:false — мёртвую привязку
+      // отличаем от сбоя ядра пробой block get (FS-истина)
+      const live = await tool<{ exists?: boolean }>("doc_exists", { docId: row.bodyDoc })
+      if (live.exists === true) {
+        return { kind: "infra", error: `export дока ${row.bodyDoc} дал exists:false при живом блоке` }
+      }
+    }
+    if (row.title === "") {
+      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback" }
+    }
+    const info = await tool<{ box?: string; hpath?: string }>("get_doc", { docId: boardDocId })
+    // SQL-лаг индекса молча даёт пустые box/hpath — fallback с пустым
+    // notebook «подтвердил бы отсутствие» ложно: это infra, не вердикт
+    if ((info.box ?? "") === "" || (info.hpath ?? "") === "") {
+      return { kind: "infra", error: `доска ${boardDocId} без box/hpath в индексе (лаг SQL?)` }
+    }
+    const byTitle = await tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+      notebook: info.box, path: `${info.hpath}/${pathSafe(row.title)}`,
+    })
+    const choice = chooseBodyDoc(row.bodyDoc, false, byTitle.ids ?? [])
+    if (choice.kind === "duplicates") {
+      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI` }
+    }
+    if (choice.kind === "missing") {
+      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет` }
+    }
+    const exported = await tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: choice.docId })
+    if (exported.exists !== true) {
+      return { kind: "infra", error: `title-fallback док ${choice.docId}: export дал exists:false` }
+    }
+    return renderVerdict(choice.docId, exported.markdown ?? "")
+  } catch (e) {
+    return { kind: "infra", error: String(e) }
+  }
+}
+
 // ——— промпты ———
 
 export function sanitizeBoundary(text: string): string {
