@@ -36,6 +36,16 @@ export const mcpConfigured = (): boolean => TOKEN !== ""
 
 // ——— ядро: REST ———
 
+/** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
+ *  маскирующего причину (прод-кейс 04.11: «Unexpected identifier "session"» = 404 ядра). */
+function parseJsonContract(text: string, context: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`${context}: не-JSON: ${text.slice(0, 120)}`)
+  }
+}
+
 async function post<T = Record<string, unknown>>(path: string, body: Record<string, unknown>, attempts = 4): Promise<T> {
   let last = "?"
   for (let i = 0; i < attempts; i++) {
@@ -45,7 +55,8 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         headers: { Authorization: `Token ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
       })
-      const d = (await r.json()) as { code?: number; msg?: string; data?: unknown }
+      const text = await r.text()
+      const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
       if (d.code === 0) return (d.data ?? {}) as T
       last = `code=${d.code} msg=${d.msg}`
       if (String(d.msg).includes("metadata is not ready")) {
@@ -70,7 +81,17 @@ async function sql<T = Record<string, unknown>>(stmt: string): Promise<T[]> {
 
 let mcpSession = ""
 
-async function mcpRpc(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+/** 404 на /mcp при отправленной сессии: ядро её отклонило (рестарт ядра
+ *  инвалидирует Mcp-Session-Id). Условие по статусу+заголовку, не по тексту
+ *  тела ядра — формулировку может сменить апгрейд. */
+class StaleMcpSessionError extends Error {}
+
+/** Не-JSON-ответ ядра с HTTP-статусом и сниппетом тела — вместо маскирующего SyntaxError. */
+function mcpHttpError(method: string, status: number, text: string): Error {
+  return new Error(`mcp ${method}: HTTP ${status}: ${text.slice(0, 120)}`)
+}
+
+async function mcpRpcOnce(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const isNotification = method.startsWith("notifications/")
   const payload: Record<string, unknown> = { jsonrpc: "2.0", method, params }
   if (!isNotification) payload.id = Date.now() % 100000
@@ -79,16 +100,52 @@ async function mcpRpc(method: string, params: Record<string, unknown>): Promise<
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
   }
-  if (mcpSession !== "") headers["Mcp-Session-Id"] = mcpSession
+  const hasSession = mcpSession !== ""
+  if (hasSession) headers["Mcp-Session-Id"] = mcpSession
   const r = await fetch(SIYUAN_URL + "/mcp", { method: "POST", headers, body: JSON.stringify(payload) })
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
   const text = await r.text()
+  if (r.status === 404 && hasSession) throw new StaleMcpSessionError(mcpHttpError(method, r.status, text).message)
   if (text.trim() === "") return {}
   const dataLines = text.split("\n").filter((l) => l.startsWith("data: "))
-  const parsed = JSON.parse(dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(5) : text)
-  if (parsed.error) throw new Error(`mcp ${method}: ${JSON.stringify(parsed.error)}`)
-  return (parsed.result ?? {}) as Record<string, unknown>
+  const parsed = parseJsonContract(dataLines.length > 0 ? dataLines[dataLines.length - 1].slice(5) : text, mcpHttpError(method, r.status, text).message)
+  const msg = parsed as { code?: unknown; msg?: unknown; jsonrpc?: unknown; error?: { code?: unknown; message?: unknown }; result?: unknown }
+  // kernel-конверт ошибки поверх jsonrpc (401 «Auth failed [session]» и пр.):
+  // без этой проверки молча превращался в пустой результат {}
+  if (msg.jsonrpc === undefined && typeof msg.code === "number" && msg.code !== 0) {
+    throw new Error(`mcp ${method}: kernel code=${msg.code} msg=${msg.msg}`)
+  }
+  if (msg.error) throw new Error(`mcp ${method}: ${JSON.stringify(msg.error)}`)
+  return (msg.result ?? {}) as Record<string, unknown>
+}
+
+/** Re-handshake после отклонённой сессии: чистим состояние и initialize заново.
+ *  reentrant-guard: вложенный отказ во время handshake — описательная ошибка, не рекурсия. */
+let recovering = false
+
+async function recoverMcpSession(): Promise<void> {
+  if (recovering) throw new Error("mcp: сессия отклонена и во время re-handshake — ядро недоступно")
+  recovering = true
+  try {
+    mcpSession = ""
+    mcpReady = false
+    await connect()
+  } finally {
+    recovering = false
+  }
+}
+
+/** Один ретрай на протухшую сессию: тик лечится на месте вместо 5 падений
+ *  подряд и само-рестарта демона (прод-кейс 04.11). */
+async function mcpRpc(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  try {
+    return await mcpRpcOnce(method, params)
+  } catch (e) {
+    if (!(e instanceof StaleMcpSessionError)) throw e
+    await recoverMcpSession()
+    return mcpRpcOnce(method, params)
+  }
 }
 
 export async function connect(): Promise<void> {
@@ -112,7 +169,7 @@ async function mcpToolCall(name: string, args: Record<string, unknown>): Promise
   if (r.isError === true) throw new Error(`tool ${name}: ${JSON.stringify(r.content)}`)
   if (r.structuredContent !== undefined) return r.structuredContent as Record<string, unknown>
   const text = (r.content as { text?: string }[] | undefined)?.[0]?.text ?? "{}"
-  return JSON.parse(text) as Record<string, unknown>
+  return parseJsonContract(text, `tool ${name}: content`) as Record<string, unknown>
 }
 
 // ——— кэш ключей database (имя → keyID) ———

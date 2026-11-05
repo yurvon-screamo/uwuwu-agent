@@ -133,6 +133,16 @@ export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
 
+/** Решение по свежему срезу доски прямо перед спавном: строка могла быть снята
+ *  (cron rm/clean) или паузнута, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
+ *  (живой кейс 05.11: файр по строке, снятой в ходе тика) сужается до окна
+ *  render → POST. */
+export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "paused" {
+  const row = rows.find((r) => r.rowId === rowId)
+  if (row === undefined) return "removed"
+  return row.status === "active" ? "fire" : "paused"
+}
+
 export function minuteStart(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()).getTime()
 }
@@ -154,7 +164,8 @@ export function sanitizeBoundary(text: string): string {
   return text.replace(/^\s*===.*$/gm, "≡")
 }
 
-/** Промпт срабатывания: тело крона + контракт доложить. */
+/** Промпт срабатывания: тело крона + тихий протокол тика
+ *  (коммент — только исключение; факт тика демон пишет в Last Run сам). */
 export function firePrompt(row: CronRow, body: string, project: string): string {
   return [
     `Ты — исполнитель крон-задачи «${row.title.replace(/[\r\n]+/g, " ")}» (расписание: ${row.schedule}).`,
@@ -165,11 +176,11 @@ export function firePrompt(row: CronRow, body: string, project: string): string 
     "",
     "ПРАВИЛА:",
     "1. Выполни задачу из тела. Это периодическая проверка/работа — работай автономно.",
-    "2. Доложи результат ОДНИМ комментарием в док задачи:",
-    `   uwuwu-cli task comment ${row.rowId} --project ${project} "<отчёт: что проверил, статус, аномалии>"`,
+    "2. Здоровый тик — тихий: никаких отчётных комментов и доков-отчётов; факт тика демон сам пишет в Last Run доски. Правки и записи, которые предписывает само тело крона (обновить док, заполнить ячейку), — нормальны; запрещён только шум ради отчёта.",
+    "3. Коммент — ТОЛЬКО исключение (падение проверки, блокер, вопрос человеку):",
+    `   uwuwu-cli task comment ${row.rowId} --project ${project} "<что случилось; для вопроса — явно ЧТО РЕШИТЬ>"`,
     "   Пиши от себя (коммент идёт с бот-аккаунта, автор и так виден).",
-    "3. Если нашёл проблему, требующую человека — напиши явно ЧТО РЕШИТЬ в том же комменте.",
-    "4. Если задача разовая и завершена полностью — добавь в конце коммента: [DONE].",
+    "4. Коммент не ушёл (строка/тело сняты в полёте) — повторов и запасных мест нет: заверши ход молча.",
   ].join("\n")
 }
 
@@ -184,6 +195,7 @@ export function cronBodyStub(title: string, schedule: string): string {
     "(опиши работу агента)",
     "",
     "## Комменты",
-    "_Отчёты агента приходят комментами (uwuwu-cli task comment) в эту секцию._",
+    "_Здоровый тик тихий (факт тика — в Last Run). Коммент — только исключение:_",
+    "_падение/блокер/вопрос владельцу (uwuwu-cli task comment) — в эту секцию._",
   ].join("\n")
 }

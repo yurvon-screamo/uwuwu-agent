@@ -2,8 +2,9 @@
 // Поллит все крон-доски: глобальную «Crons» + «Кроны <Proj>» по папкам Projects
 // (собираются динамически, отсутствующие доски тихо скипаются): строка = крон
 // (Schedule/Status/Last Run, промпт в теле). Наступило расписание → OpenCode-сессия
-// с промптом из тела → агент работает и докладывает комментом; разовые (at)
-// после срабатывания → fired (paused — только явное решение юзера).
+// с промптом из тела; здоровый тик тихий (факт — ячейка Last Run, коммент агента —
+// только исключение); разовые (at) после срабатывания → fired (paused — только
+// явное решение юзера).
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
@@ -12,7 +13,7 @@ import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  due, isOneShot, isValidTracked, parseSchedule, firePrompt,
+  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -278,13 +279,19 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
     // агенту не нужно угадывать (глобальная доска «Crons» не используется)
     const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
+    // срез доски прочитан в начале тика — перед спавном строка перепроверяется
+    const gate = fireGate(await readCrons(board), row.rowId)
+    if (gate !== "fire") {
+      log(`крон «${title}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
+      continue
+    }
     const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)
       continue
     }
-    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента;
-    // агент без 🤖-коммента невидим (детекция — следующий срез, если болит)
+    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента
+    // (здоровый тик тихий по контракту промпта; исход видит юзер по Last Run)
     state.crons[row.rowId] = { sessionID, lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
     await setCells(board, row.rowId, { "Last Run": formatLocal(now) })

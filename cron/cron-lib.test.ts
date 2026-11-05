@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked,
-  firePrompt, cronBodyStub, minuteStart,
+  firePrompt, cronBodyStub, minuteStart, fireGate,
 } from "./cron-lib"
 
 describe("parseSchedule", () => {
@@ -90,12 +90,29 @@ describe("isValidTracked", () => {
 
 describe("firePrompt", () => {
   const row = { rowId: "r1", bodyDoc: "d1", title: "Проверка X", schedule: "*/30 * * * *", status: "active", lastRun: "" }
-  test("контракт: коммент с 🤖, [DONE] для разовых, границы", () => {
-    const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь и доложи", "1xgames")
-    expect(p).toContain("uwuwu-cli task comment r1 --project 1xgames")
+  test("тихий тик: без обязательного отчётного коммента и [DONE]", () => {
+    const p = firePrompt(row, "проверь и молчи", "1xgames")
+    expect(p).not.toContain("Доложи результат")
+    expect(p).toContain("Здоровый тик — тихий")
+    expect(p).toContain("демон сам пишет в Last Run")
+    expect(p).not.toContain("[DONE]")
     expect(p).not.toContain("🤖")
-    expect(p).toContain("[DONE]")
+  })
+  test("правки, предписанные телом крона, не запрещены (ревью Common-3)", () => {
+    const p = firePrompt(row, "", "uwuwu")
+    expect(p).toContain("Правки и записи, которые предписывает само тело крона")
+    expect(p).toContain("запрещён только шум ради отчёта")
+  })
+  test("исключение: команда коммента с project и ЧТО РЕШИТЬ", () => {
+    const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь", "1xgames")
+    expect(p).toContain("uwuwu-cli task comment r1 --project 1xgames")
+    expect(p).toContain("ЧТО РЕШИТЬ")
+    expect(p).toContain("ТОЛЬКО исключение")
     expect(p).toContain("≡")
+  })
+  test("строка снята в полёте — завершить ход молча (ревью Common-2/решение владельца)", () => {
+    const p = firePrompt(row, "", "uwuwu")
+    expect(p).toContain("заверши ход молча")
   })
   test("пустое тело — стаб по заголовку", () => {
     expect(firePrompt(row, "", "uwuwu")).toContain("(пусто — отработай по заголовку)")
@@ -108,6 +125,23 @@ describe("cronBodyStub", () => {
     expect(md).toContain("# Проверка Y")
     expect(md).toContain("`5m`")
     expect(md).toContain("## Комменты")
+    expect(md).toContain("только исключение")
+  })
+})
+
+describe("fireGate: файр только по живой активной строке свежего среза", () => {
+  const rows = [
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", status: "active", lastRun: "" },
+    { rowId: "zomb", bodyDoc: "d", title: "T", schedule: "5m", status: "paused", lastRun: "" },
+  ]
+  test("строка снята (cron rm/clean) — removed, файра нет", () => {
+    expect(fireGate(rows, "gone")).toBe("removed")
+  })
+  test("строка паузнута после среза — paused, файра нет", () => {
+    expect(fireGate(rows, "zomb")).toBe("paused")
+  })
+  test("живая активная строка — fire", () => {
+    expect(fireGate(rows, "alive")).toBe("fire")
   })
 })
 
