@@ -14,6 +14,7 @@ use crate::siyuan::{doc_content_is_empty, parse_block_ids, workspace_root, SiYua
 use crate::siyuan_task as syt;
 use serde_json::json;
 
+#[derive(Debug)]
 pub(crate) enum ProbeVerdict {
     Clean,
     Degraded(String),
@@ -38,6 +39,11 @@ impl ProbeOutcome {
 
     fn with_detail(mut self, detail: String) -> Self {
         self.detail = Some(detail);
+        self
+    }
+
+    fn apply_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
         self
     }
 }
@@ -90,6 +96,10 @@ pub(crate) struct WaveScan {
     pub metadata_failures: usize,
 }
 
+/// Порог волнового вердикта: единичные commit-отказы за окно — шум ядра,
+/// не волна (DEGRADED на каждую строчку = exit 1 крона на пустом месте).
+const WAVE_DEGRADED_THRESHOLD: usize = 5;
+
 pub(crate) fn scan_kernel_log_for_waves(log: &str) -> WaveScan {
     WaveScan {
         commit_failures: log.lines().filter(|l| l.contains("commit tx failed")).count(),
@@ -100,9 +110,32 @@ pub(crate) fn scan_kernel_log_for_waves(log: &str) -> WaveScan {
     }
 }
 
-/// Число .sy-документов ноутбука на диске (data/<box>/**).
-pub(crate) fn count_sy_files(box_dir: &std::path::Path) -> std::io::Result<u64> {
-    let mut count = 0u64;
+pub(crate) fn wave_verdict(scan: &WaveScan, since_min: u64) -> (ProbeVerdict, Option<String>) {
+    if scan.commit_failures == 0 {
+        return (ProbeVerdict::Clean, None);
+    }
+    if scan.commit_failures < WAVE_DEGRADED_THRESHOLD {
+        return (
+            ProbeVerdict::Clean,
+            Some(format!(
+                "единичные tx-отказы ({} < {WAVE_DEGRADED_THRESHOLD}) — шум, не волна; при росте — деградация",
+                scan.commit_failures
+            )),
+        );
+    }
+    (
+        ProbeVerdict::Degraded(format!(
+            "«commit tx failed» ×{} (metadata ×{}) за {since_min} мин — ядро в волне; \
+             агентам пауза 2–5 мин, рестарт по ранбуку",
+            scan.commit_failures, scan.metadata_failures
+        )),
+        None,
+    )
+}
+
+/// id .sy-документов ноутбука на диске (data/<box>/**, имя без .sy).
+pub(crate) fn collect_sy_ids(box_dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut ids = Vec::new();
     let mut stack = vec![box_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
@@ -111,11 +144,69 @@ pub(crate) fn count_sy_files(box_dir: &std::path::Path) -> std::io::Result<u64> 
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|ext| ext == "sy") {
-                count += 1;
+                ids.push(
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
             }
         }
     }
-    Ok(count)
+    Ok(ids)
+}
+
+/// Детальный diff списков id при расхождении счётчиков: выборка первых
+/// расхождений каждого направления, хвост — счётчиком.
+pub(crate) fn diff_id_lists(fs_ids: &[String], sql_ids: &[String], cap: usize) -> String {
+    let fs_set: std::collections::HashSet<_> = fs_ids.iter().collect();
+    let sql_set: std::collections::HashSet<_> = sql_ids.iter().collect();
+    let sample = |items: Vec<&String>| -> String {
+        let head: Vec<String> = items.iter().take(cap).map(|s| (*s).clone()).collect();
+        let more = if items.len() > cap {
+            format!(" …+{}", items.len() - cap)
+        } else {
+            String::new()
+        };
+        format!("{}{more}", head.join(", "))
+    };
+    let fs_only: Vec<&String> = fs_ids.iter().filter(|id| !sql_set.contains(*id)).collect();
+    let sql_only: Vec<&String> = sql_ids.iter().filter(|id| !fs_set.contains(*id)).collect();
+    format!(
+        "только ФС [{}]; только SQL [{}]",
+        sample(fs_only),
+        sample(sql_only)
+    )
+}
+
+/// Список id доков ноутбука из SQL: пагинация limit 500 + offset до короткой
+/// страницы (count и выборки иммунны к капу ядра в 64 строки, PR #41).
+async fn sql_doc_ids(sy: &SiYuan, box_id: &str) -> Result<Vec<String>, anyhow::Error> {
+    const PAGE: usize = 500;
+    let mut ids = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let stmt = format!(
+            "select id from blocks where box='{box_id}' and type='d' and id=root_id \
+             order by id limit {PAGE} offset {offset}"
+        );
+        let envelope = sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await?;
+        let page: Vec<String> = envelope
+            .pointer("/data")
+            .and_then(|d| d.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fetched = page.len();
+        ids.extend(page);
+        if fetched < PAGE {
+            return Ok(ids);
+        }
+        offset += fetched;
+    }
 }
 
 /// Вердикт FS↔SQL по паре счётчиков одного ноутбука (count(*) иммунен
@@ -189,18 +280,8 @@ async fn wave_scan_probe(since_min: u64) -> ProbeOutcome {
         Ok(out) => {
             let log = String::from_utf8_lossy(&out.stdout);
             let scan = scan_kernel_log_for_waves(&log);
-            if scan.commit_failures == 0 {
-                ProbeOutcome::new(WAVE, ProbeVerdict::Clean)
-            } else {
-                ProbeOutcome::new(
-                    WAVE,
-                    ProbeVerdict::Degraded(format!(
-                        "«commit tx failed» ×{} (metadata ×{}) за {since_min} мин — ядро в волне; \
-                         агентам пауза 2–5 мин, рестарт по ранбуку",
-                        scan.commit_failures, scan.metadata_failures
-                    )),
-                )
-            }
+            let (verdict, detail) = wave_verdict(&scan, since_min);
+            ProbeOutcome::new(WAVE, verdict).apply_detail(detail)
         }
     }
 }
@@ -224,7 +305,18 @@ async fn board_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
             )
         }
     };
-    let dead = syt::dead_bound_doc_ids(sy, &rows).await.unwrap_or_default();
+    // Молчаливый default на отказе SQL = ложный Clean при живой деградации
+    // («metadata is not ready» на этом вызове — и есть волновой симптом);
+    // для диагностического инструмента честнее SKIP всей пробы.
+    let dead = match syt::dead_bound_doc_ids(sy, &rows).await {
+        Ok(dead) => dead,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD,
+                ProbeVerdict::Skipped(format!("мёртвые привязки не проверены ({e}); доска не верифицирована")),
+            )
+        }
+    };
 
     let mut findings = Vec::new();
     let mut legacy_unbound = 0usize;
@@ -304,29 +396,39 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
     let mut compared = 0usize;
     for (id, name) in open {
         let box_dir = data_dir.join(&id);
-        let fs_count = match count_sy_files(&box_dir) {
-            Ok(count) => count,
+        let fs_ids = match collect_sy_ids(&box_dir) {
+            Ok(ids) => ids,
             Err(e) => {
                 mismatches.push(format!("{name}: FS недоступен ({e})"));
                 continue;
             }
         };
         // id ноутбука генерируется ядром ([0-9a-z-]), кавычек не несёт.
-        let stmt =
-            format!("select count(*) as c from blocks where box='{id}' and type='d' and id=root_id");
+        let stmt = format!(
+            "select count(*) as c from blocks where box='{id}' and type='d' and id=root_id"
+        );
         let sql_count = match sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await {
-            Ok(envelope) => envelope
-                .pointer("/data/0/c")
-                .and_then(|c| c.as_u64())
-                .unwrap_or(u64::MAX),
+            Ok(envelope) => envelope.pointer("/data/0/c").and_then(|c| c.as_u64()),
             Err(e) => {
                 mismatches.push(format!("{name}: SQL недоступен ({e})"));
                 continue;
             }
         };
+        let Some(sql_count) = sql_count else {
+            mismatches.push(format!("{name}: SQL вернул конверт без счётчика"));
+            continue;
+        };
         compared += 1;
-        if let Some(mismatch) = fs_sql_pair_verdict(&name, fs_count, sql_count) {
-            mismatches.push(mismatch);
+        if let Some(mismatch) = fs_sql_pair_verdict(&name, fs_ids.len() as u64, sql_count) {
+            // Оператору нужна локализация сирот, не только факт: детальный
+            // diff списков id (обещание approve-плана раунда 2).
+            match sql_doc_ids(sy, &id).await {
+                Ok(sql_ids) => {
+                    let detail = diff_id_lists(&fs_ids, &sql_ids, 5);
+                    mismatches.push(format!("{mismatch} — {detail}"));
+                }
+                Err(e) => mismatches.push(format!("{mismatch} (детальный diff недоступен: {e})")),
+            }
         }
     }
     if compared == 0 {
@@ -345,8 +447,8 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        count_sy_files, doctor_exit_code, fs_sql_pair_verdict, report, scan_kernel_log_for_waves,
-        ProbeOutcome, ProbeVerdict,
+        collect_sy_ids, diff_id_lists, doctor_exit_code, fs_sql_pair_verdict, report,
+        scan_kernel_log_for_waves, wave_verdict, ProbeOutcome, ProbeVerdict,
     };
     use std::path::Path;
 
@@ -377,20 +479,59 @@ mod tests {
     }
 
     #[test]
-    fn count_sy_files_walks_nested_dirs() {
+    fn collect_sy_ids_walks_nested_dirs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let box_dir = dir.path().join("box");
         std::fs::create_dir_all(box_dir.join("sub/deep")).expect("mkdir");
-        for path in [
-            "a.sy",
-            "sub/b.sy",
-            "sub/deep/c.sy",
-            "notes.txt",
-        ] {
+        for path in ["a.sy", "sub/b.sy", "sub/deep/c.sy", "notes.txt"] {
             std::fs::write(box_dir.join(path), "x").expect("write");
         }
-        assert_eq!(count_sy_files(&box_dir).expect("walk"), 3);
-        assert!(count_sy_files(Path::new("/nonexistent-box-dir")).is_err());
+        let mut ids = collect_sy_ids(&box_dir).expect("walk");
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert!(collect_sy_ids(Path::new("/nonexistent-box-dir")).is_err());
+    }
+
+    #[test]
+    fn diff_id_lists_samples_both_directions_with_tail_count() {
+        let fs: Vec<String> = ["f1", "shared", "f2", "f3"].iter().map(|s| s.to_string()).collect();
+        let sql: Vec<String> = ["shared", "s1", "s2", "s3", "s4", "s5"].iter().map(|s| s.to_string()).collect();
+        let text = diff_id_lists(&fs, &sql, 2);
+        assert!(text.contains("только ФС [f1, f2 …+1]"), "{text}");
+        assert!(text.contains("только SQL [s1, s2 …+3]"), "{text}");
+    }
+
+    #[test]
+    fn diff_id_lists_empty_sides_stay_visible() {
+        let text = diff_id_lists(&[], &["s1".to_string()], 5);
+        assert_eq!(text, "только ФС []; только SQL [s1]");
+    }
+
+    #[test]
+    fn wave_verdict_single_failures_are_noise_not_wave() {
+        let scan = scan_kernel_log_for_waves("commit tx failed: x\n");
+        let (verdict, detail) = wave_verdict(&scan, 30);
+        assert!(matches!(verdict, ProbeVerdict::Clean));
+        assert!(detail.expect("noise note").contains("шум"));
+    }
+
+    #[test]
+    fn wave_verdict_threshold_crossing_is_degradation() {
+        let log = "commit tx failed\n".repeat(5);
+        let scan = scan_kernel_log_for_waves(&log);
+        let (verdict, detail) = wave_verdict(&scan, 30);
+        assert!(matches!(verdict, ProbeVerdict::Degraded(_)));
+        assert!(detail.is_none());
+        let ProbeVerdict::Degraded(msg) = verdict else { unreachable!() };
+        assert!(msg.contains("агентам пауза 2–5 мин"));
+    }
+
+    #[test]
+    fn wave_verdict_clean_log_is_clean_without_detail() {
+        let scan = scan_kernel_log_for_waves("");
+        let (verdict, detail) = wave_verdict(&scan, 30);
+        assert!(matches!(verdict, ProbeVerdict::Clean));
+        assert!(detail.is_none());
     }
 
     /// Недоступное ядро — деградация (exit 1), не «проба не состоялась»:
