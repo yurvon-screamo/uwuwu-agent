@@ -215,11 +215,15 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
+    let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
       const col = nameOf.get(v.keyID ?? "") ?? ""
       if (v.type === "block") {
         title = v.block?.content ?? ""
+        // привязка строки к док-телу: value.block.id (у detached-строк поля
+        // нет → null). Готча: value.blockID — это id самой строки, не привязка
+        linkedDocId = v.block?.id ?? null
         continue
       }
       let value = ""
@@ -227,7 +231,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
       else if (v.text) value = v.text.content ?? ""
       if (col !== "") cells[col] = { value }
     }
-    rows.push({ rowBlockId: row.id ?? "", linkedDocId: null, title, cells })
+    rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })
   }
   return { rows }
 }
@@ -271,10 +275,12 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     }
     case "get_doc": {
       const docId = String(args.docId ?? "")
-      const rows = await sql<{ id: string; content: string; updated: string }>(
-        `select id, content, updated from blocks where type='d' and id='${docId}' limit 1`)
+      const rows = await sql<{ id: string; content: string; updated: string; box?: string; hpath?: string }>(
+        `select id, content, updated, box, hpath from blocks where type='d' and id='${docId}' limit 1`)
       const d = rows[0]
-      return (d ? { id: d.id, title: d.content, updatedAt: d.updated } : { id: docId, title: "", updatedAt: "" }) as T
+      return (d
+        ? { id: d.id, title: d.content, updatedAt: d.updated, box: d.box ?? "", hpath: d.hpath ?? "" }
+        : { id: docId, title: "", updatedAt: "", box: "", hpath: "" }) as T
     }
     case "read_doc": {
       const docId = String(args.docId ?? "")
@@ -291,6 +297,30 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "doc_exists": {
+      // Живость дока через MCP block get (не SQL): индекс blocks отстаёт от
+      // свежих доков, filetree/block — FS-истина. Ядро отвечает isError
+      // «was not found» за подтверждённо отсутствующий блок — это вердикт
+      // «дока нет»; прочие ошибки кидаются наверх как инфра-сбой
+      // (паритет CLI doc_block_exists).
+      const docId = String(args.docId ?? "")
+      const r = await mcpRpc("tools/call", { name: "block", arguments: { action: "get", id: docId } })
+      const text = (r.content as { text?: string }[] | undefined)?.[0]?.text ?? ""
+      if (r.isError === true) {
+        if (text.includes("was not found")) return { exists: false } as T
+        throw new Error(`tool block: ${JSON.stringify(r.content)}`)
+      }
+      return { exists: text.includes("Type: NodeDocument") } as T
+    }
+    case "doc_ids_by_hpath": {
+      // FS-истина файлового дерева: без лага SQL-индекса (паритет CLI
+      // doc_ids_by_hpath); заголовки с '/' санитайзит вызывающий (pathSafe)
+      const data = await post<unknown>("/api/filetree/getIDsByHPath", {
+        notebook: String(args.notebook ?? ""), path: String(args.path ?? ""),
+      })
+      const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
+      return { ids } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {
