@@ -36,7 +36,6 @@ import {
   kickoffModeOf,
   promptForStart,
   prMergeableOf,
-  spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
   isValidTracked,
