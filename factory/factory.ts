@@ -2,9 +2,10 @@
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
 //   1. Design на доске (Draft = черновик на валидации триажа, пустой =
-//      легаси-черновик юзера — оба не трогаем) →
-//      сессия девелопера в чекауте репо + короткий spawn-промпт (ворктри/ветку
-//      создаёт сам агент)
+//      легаси-черновик юзера — оба не трогаем) → сессия девелопера в
+//      чекауте репо + spawn-промпт утряски (ворктри/ветку создаёт сам
+//      агент); In Progress без записи state — fast-track владельца →
+//      implement-промпт (сразу реализация, без Design/план-ревью)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
 //      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
 //      задачи); возврат статуса из ревью → wakeup девелопера; комменты
@@ -26,6 +27,8 @@ import {
   untrackedTasks,
   isUserComment,
   commentText,
+  continuePrompt,
+  kickoffModeOf,
   spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
@@ -45,6 +48,7 @@ import {
   type ProjectCfg,
   type ReviewKind,
   type FactoryState,
+  type KickoffMode,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
@@ -403,7 +407,14 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 // ——— жизненный цикл задачи ———
 
-async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
+/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf)
+ *  или рестарт умершей сессии (нейтральный промпт, стадию не предписываем). */
+type StartKind = KickoffMode | "continue"
+
+async function startTask(
+  task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState,
+  attemptsSeed: number, start: StartKind,
+): Promise<void> {
   // стоп-сигнал: не спавним новую работу — задача доедет при следующем старте
   if (drain.isStopping()) return
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
@@ -425,7 +436,9 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
 
   const sent = await promptSession(
     sessionID,
-    spawnPrompt(task.rowId, projectName, cfg.repo),
+    start === "continue"
+      ? continuePrompt(task.rowId, projectName, cfg.repo)
+      : spawnPrompt(task.rowId, projectName, cfg.repo, start),
   )
   if (!sent) throw new Error("spawn-промпт не ушёл")
 
@@ -462,10 +475,10 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
-    lastStatus: task.status, // спавн из этого статуса (Design) — не рестартить им же
+    lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
   }
   saveState(state)
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, агент ведёт сам (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start} (попыток до этого: ${attemptsSeed})`)
 }
 
 /** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает.
@@ -527,7 +540,7 @@ async function restartTask(
   const savedReviewAttempts = tracked.reviewAttempts
   saveState(state)
   try {
-    await startTask(task, projectName, cfg, state, seed)
+    await startTask(task, projectName, cfg, state, seed, "continue")
     const reborn = state.tasks[task.rowId]
     if (reborn !== undefined && savedReview !== undefined) {
       reborn.reviewSessionID = savedReview
@@ -672,11 +685,11 @@ async function dispatchReviewAction(
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
       // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер.
       // startTask заменяет запись state — дальше по циклу не идём:
-      // свежая сессия уже получила spawn-промпт со всем контекстом
+      // свежая сессия уже получила рестарт-промпт (стадию не предписываем)
       const savedReview = d.tracked.reviewSessionID
       const savedReviewAttempts = d.tracked.reviewAttempts
       try {
-        await startTask(d.row, d.project, d.cfg, d.state, d.tracked.attempts)
+        await startTask(d.row, d.project, d.cfg, d.state, d.tracked.attempts, "continue")
         const reborn = d.state.tasks[d.row.rowId]
         if (reborn !== undefined && savedReview !== undefined) {
           reborn.reviewSessionID = savedReview
@@ -703,20 +716,23 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0, watched: 0, failures: [],
   }
 
-  // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
+  // 1. новые задачи: Design → девелопер (утряска), In Progress без state →
+  //    девелопер (fast-track владельца: сразу реализация), ревью-статус → ревьювер
   //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
   const started = new Set<string>()
-  const spawnable = rows.filter((r) => r.status === "Design" || reviewKindOf(r.status) !== null)
+  const spawnable = rows.filter(
+    (r) => r.status === "Design" || r.status === "In Progress" || reviewKindOf(r.status) !== null)
   const untracked = untrackedTasks(spawnable, state)
 
-  // Design-волна — пачкой параллельно: все ненатрекенные задачи получают
-  // сессии за ОДИН проход (прод-кейс 05.11: последовательный спавн и слепота
-  // страницы 1 растягивали волну из 4 задач на 12+ минут)
+  // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
+  // и fast-track In Progress владельца) получают сессии за ОДИН проход
+  // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
+  // растягивали волну из 4 задач на 12+ минут)
   const devWave = untracked.filter((t) => reviewKindOf(t.status) === null)
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       try {
-        await startTask(task, projectName, cfg, state, 0)
+        await startTask(task, projectName, cfg, state, 0, kickoffModeOf(task.status))
         started.add(task.rowId)
         counters.devSpawned++
       } catch (e) {
