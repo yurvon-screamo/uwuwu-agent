@@ -102,6 +102,23 @@ export function isUserComment(c: TaskComment, botUserId?: string): boolean {
   return body.trim() !== ""
 }
 
+/** Самоисцеление трека: пустой bodyDoc в state (след спавна до-фиксного
+ *  кода или сбоя маппинга) принимает итоговый резолв строки — трек снова
+ *  видит комменты/правки тела. Вход — row.bodyDoc (пост-fallback readTasks,
+ *  единственная точка резолва: тик не дублирует логику). Непустой трек не
+ *  перезаписывается — state выигрывает, adopt идемпотентен. */
+export function adoptBodyDoc(tracked: TrackedTask, row: TaskRef): string | null {
+  if (tracked.bodyDoc === "" && row.bodyDoc !== "") return row.bodyDoc
+  return null
+}
+
+/** Тайтл строки → безопасный сегмент hpath саб-дока доски (паритет CLI
+ *  path_safe: '/' → U+2215 — SiYuan трактует '/' как разделитель сегментов;
+ *  конвенция миграции bind_rows.py). */
+export function pathSafe(title: string): string {
+  return title.replaceAll("/", "\u{2215}")
+}
+
 /** Новые юзерские комменты после lastSeen, по порядку создания. */
 export function newUserComments(
   comments: TaskComment[],
