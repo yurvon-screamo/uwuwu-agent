@@ -83,7 +83,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
@@ -116,7 +116,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if title.is_some() {
                 anyhow::bail!("siyuan-бекенд: переименование задачи не поддерживается (переименуй саб-док в UI)");
             }
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::edit(&sy, &board, &task, status.as_deref(), branch.as_deref(), pr.as_deref()).await?;
             println!("обновлено: {}", task.title);
@@ -124,14 +124,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Comment { id, reply, stdin, text } => {
             let msg = collect_text(stdin, text)?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             println!("коммент отправлен: {}", truncate(&msg, 60));
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
@@ -141,7 +141,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
@@ -152,7 +152,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Undo { journal } => task_undo(&sy, project, journal.as_deref()).await,
         TaskSub::Body { id, replace, replace_section, md, stdin } => {
             let content = read_body_input(md.as_deref(), stdin)?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let body_path = board.body_hpath(&task.title);
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
