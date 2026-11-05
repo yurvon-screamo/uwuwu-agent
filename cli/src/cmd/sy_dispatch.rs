@@ -43,6 +43,13 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
+    // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
+    // проглоченный trailing_var_arg'ом (`task comment <id> "текст" --project X`
+    // → project=None), маскируется под «флаг не передан» (крон-сессия 04.11).
+    // stdin здесь НЕ читается — его читает ровно одна ветка ниже.
+    if let TaskSub::Comment { stdin, text, .. } = &command {
+        pre_guard_positional_comment(*stdin, text)?;
+    }
     if project.is_empty() {
         anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
     }
@@ -1110,6 +1117,19 @@ fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
     let msg = collect_text(stdin, text)?;
     validate_comment_text(stdin, &msg)?;
     Ok(msg)
+}
+
+/// Пред-гвард позиционного текста коммента: выполняется в task_run ДО bail по
+/// пустому --project, чтобы проглоченный trailing_var_arg'ом флаг
+/// (`task comment <id> "текст" --project X`) не маскировался под «--project не
+/// передан». stdin — no-op: его содержимое недоступно до чтения, читает его
+/// ровно одна ветка (двойное чтение дало бы EOF → ложный «пустой текст»).
+/// Позиционная валидация чистая и идемпотентна — повтор в Comment-ветке безвреден.
+fn pre_guard_positional_comment(stdin: bool, text: &[String]) -> Result<()> {
+    if stdin {
+        return Ok(());
+    }
+    validate_comment_text(false, &text.join(" "))
 }
 
 /// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
