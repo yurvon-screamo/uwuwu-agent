@@ -260,6 +260,12 @@ fn human_ts(raw: Option<String>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+/// Тестовый вход в backlog_size (иначе приватен для semantic_tests).
+#[cfg(test)]
+pub(crate) async fn status_backlog_for_tests(sy: &SiYuan, store: &Store) -> u64 {
+    backlog_size(sy, store).await.expect("backlog")
+}
+
 /// Размер очереди: строки ядра над watermark (без content; явный LIMIT).
 async fn backlog_size(sy: &SiYuan, store: &Store) -> Result<u64> {
     let Some(mark) = store.meta("watermark")? else {
@@ -269,7 +275,7 @@ async fn backlog_size(sy: &SiYuan, store: &Store) -> Result<u64> {
         "select count(*) as c from blocks \
          where type in {types} and updated > {u} limit 1",
         types = sync::TARGET_TYPES_SQL,
-        u = mark.replace('\'', "''"),
+        u = sync::sql_literal(&mark),
     );
     let rows = sy.sql(&stmt).await?;
     Ok(rows

@@ -42,6 +42,20 @@ impl KernelMock {
 
     fn handle(&self, stmt: &str) -> Vec<Value> {
         let blocks = self.blocks.lock().unwrap();
+        if stmt.contains("count(*)") {
+            // честный count: только строки над watermark-предикатом
+            let after = stmt
+                .split("updated > '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("0")
+                .to_string();
+            let count = blocks
+                .iter()
+                .filter(|b| b["updated"].as_str().unwrap_or("").as_bytes() > after.as_bytes())
+                .count();
+            return vec![json!({ "c": count })];
+        }
         if stmt.contains("updated > '") {
             // дельта: keyset по (updated, id)
             let (u, i) = delta_cursor(stmt).expect("курсор дельты парсится");
@@ -83,9 +97,6 @@ impl KernelMock {
             page.sort_by_key(|b| b["id"].as_str().unwrap_or("").to_string());
             page.truncate(sync::PAGE);
             return page;
-        }
-        if stmt.contains("count(*)") {
-            return vec![json!({ "c": blocks.len() })];
         }
         panic!("kernel mock: нераспознанный stmt: {stmt}");
     }
@@ -862,4 +873,23 @@ fn advance_watermark_is_monotonic() {
         Some(T1),
         "watermark должен расти только вперёд"
     );
+}
+
+#[tokio::test]
+async fn backlog_size_counts_only_rows_above_watermark() {
+    // Регрессия: литерал watermark без кавычек делал строковое updated
+    // числом и count отдавал «все строки ядра».
+    let blocks = vec![
+        block("a1", "20261103230000", "первый чанк с длинным содержанием для индексации", "/d"),
+        block("a2", "20261104000000", "второй чанк с длинным содержанием для индексации", "/d"),
+    ];
+    let (server, _) = kernel_server_blocks_only(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+    store.set_meta("watermark", "20261103235900").unwrap();
+
+    let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
+
+    assert_eq!(backlog, 1, "над watermark только вторая строка");
 }
