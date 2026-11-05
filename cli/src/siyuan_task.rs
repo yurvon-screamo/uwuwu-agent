@@ -605,6 +605,11 @@ pub(crate) async fn edit_title_with_pacing(
     pacing: TitleSyncPacing,
 ) -> Result<String> {
     let new_title = prepare_new_title(raw_title)?;
+    // no-op короткое замыкание: тайтл уже текущий — ядро не трогаем (повтор
+    // команды и скриптовые повторы проходят без походов и без дедуп-проверок)
+    if normalize_title(&new_title) == normalize_title(&task.title) {
+        return Ok(new_title);
+    }
     let Some(doc) = task.body_doc.as_deref() else {
         bail!(
             "строка «{}» без тела (detached) — переименуй в UI: renameDoc требует привязанный док",
@@ -621,10 +626,14 @@ pub(crate) async fn edit_title_with_pacing(
         bail!("тайтл «{new_title}» занят другой строкой доски — дубль");
     }
     let orphan_ids = body_doc_by_title(sy, board, &new_title).await?;
-    if !orphan_ids.is_empty() {
+    // собственный док не сирота: после неподтвердившегося синка (rename прошёл,
+    // клетка лагает) повтор находит УЖЕ переименованный собственный док —
+    // исключение собственного docId и делает повтор идемпотентным
+    let foreign_orphans: Vec<&str> = orphan_ids.iter().map(String::as_str).filter(|id| *id != doc).collect();
+    if !foreign_orphans.is_empty() {
         bail!(
             "док с заголовком «{new_title}» уже существует ({}): вычисти сироту в UI или выбери другой тайтл",
-            orphan_ids.join(", ")
+            foreign_orphans.join(", ")
         );
     }
     let chain = board_doc_chain(sy, board).await?;

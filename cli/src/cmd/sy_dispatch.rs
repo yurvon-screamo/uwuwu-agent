@@ -210,7 +210,12 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
             let doc = match doc {
                 Some(doc_id) => {
-                    write_body_in_place(&sy, &doc_id, &task.title, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                    // attach-only вызов (пустой контент без rewrite) не делает
+                    // пустой appendBlock: опора на недокументированную реакцию
+                    // ядра на пустой data — референсы дописываются сами
+                    if replace || replace_section.is_some() || !content.trim().is_empty() {
+                        write_body_in_place(&sy, &doc_id, &task.title, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                    }
                     doc_id
                 }
                 None => {
@@ -2034,6 +2039,9 @@ mod tests {
                 let data = match hpath {
                     "/uwuwu" => serde_json::json!([CHAIN_ROOT]),
                     "/uwuwu/Задачи uwuwu" => serde_json::json!([BOARD_DOC]),
+                    // «новый тайтл» отдаёт СОБСТВЕННЫЙ док: happy-путь проверяет
+                    // исключение своего docId из orphan-чека (retry после лага)
+                    "/uwuwu/Задачи uwuwu/новый тайтл" => serde_json::json!([BOUND_DOC]),
                     "/uwuwu/Задачи uwuwu/сирота" => serde_json::json!([ORPHAN_DOC]),
                     _ => serde_json::json!([]),
                 };
@@ -2261,6 +2269,54 @@ mod tests {
 
         assert!(err.to_string().contains("без тела"), "суть: {err}");
         assert!(renames.lock().unwrap().is_empty(), "renameDoc не вызван");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_retry_after_lag_passes_when_own_doc_already_renamed() {
+        // retry после неподтвердившегося синка: rename прошёл (док уже «новый
+        // тайтл», hpath-лукап отдаёт собственный docId), клетка ещё держит
+        // старый тайтл (task.title = «таск»). Повтор обязан пройти, а не
+        // советовать «вычисти сироту» про живое тело
+        let (server, renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        *renamed_to.lock().unwrap() = Some("новый тайтл".into());
+        let mut task = title_task();
+        task.title = "таск".into();
+
+        let result = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &title_board(),
+            &task,
+            "новый тайтл",
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect("retry идемпотентен: собственный док исключён из orphan-чека");
+
+        assert_eq!(result, "новый тайтл");
+        assert_eq!(renames.lock().unwrap().len(), 1, "retry делает свой no-op renameDoc");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_same_title_short_circuits_without_kernel_calls() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        let task = title_task();
+
+        let result = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &title_board(),
+            &task,
+            "таск",
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect("no-op rename — успех");
+
+        assert_eq!(result, "таск");
+        assert!(renames.lock().unwrap().is_empty(), "ядро не трогается");
     }
 
     // ——— create --attach: порядок upload → create → append, пред-чек дедупа ———
@@ -2547,6 +2603,252 @@ mod tests {
         assert!(
             !order.lock().unwrap().contains(&"create"),
             "createDoc не вызван"
+        );
+    }
+
+    // ——— body --attach: порядок upload → контент → референсы; attach-only ———
+
+    /// Мок под body-путь: bound-строка «таск» (resolve id-first), upload и
+    /// appendBlock пишут в общий лог порядка, createDocWithMd фиксируется
+    /// (append-режим не должен его звать).
+    async fn mock_siyuan_for_body() -> (MockServer, Arc<Mutex<Vec<&'static str>>>, Arc<Mutex<Vec<String>>>) {
+        let server = MockServer::start().await;
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with({
+                let order = order.clone();
+                move |req: &wiremock::Request| {
+                    order.lock().unwrap().push("upload");
+                    let body = String::from_utf8_lossy(&req.body);
+                    let name = body
+                        .split("filename=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("f");
+                    let (stem, ext) = match name.rsplit_once('.') {
+                        Some((stem, ext)) => (stem.to_string(), ext.to_string()),
+                        None => (name.to_string(), "bin".to_string()),
+                    };
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "data": { "succFiles": [{ "index": 0, "name": name,
+                                  "path": format!("assets/{stem}-20261106090000-abc1234.{ext}") }] }
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/notebook/lsNotebooks"))
+            .respond_with(|_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    json!({ "code": 0, "data": { "notebooks": [{ "id": "nb-1", "name": "Projects" }] } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+                let data = if stmt.contains("type='av'") {
+                    serde_json::json!([{ "id": CARRIER,
+                        "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"{AV_ID}\"></div>") }])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": data }).to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = if hpath == "/uwuwu/Задачи uwuwu" {
+                    serde_json::json!([BOARD_DOC])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": data }).to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/createDocWithMd"))
+            .respond_with({
+                let order = order.clone();
+                move |_req: &wiremock::Request| {
+                    order.lock().unwrap().push("create");
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":"doc-new"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with({
+                let order = order.clone();
+                let appends = appends.clone();
+                move |req: &wiremock::Request| {
+                    order.lock().unwrap().push("append");
+                    appends
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&req.body).to_string());
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(|req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-1");
+                }
+                if body.contains("notifications/initialized") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("tools/call") {
+                    let payload = if body.contains("\"block\"") && body.contains("\"get\"") {
+                        // doc_block_exists: bound-док жив
+                        format!("ID: {BOUND_DOC}\nType: NodeDocument\nHPath: /uwuwu/Задачи uwuwu/таск")
+                    } else if body.contains("\"render\"") {
+                        let page_done = body.contains("\"page\":2");
+                        let rows = if page_done {
+                            json!([])
+                        } else {
+                            json!([{ "id": ROW_ID, "cells": [{ "value": { "keyID": TITLE_KEY,
+                                "type": "block",
+                                "block": { "content": "таск", "id": BOUND_DOC, "refSubtype": "d" } } }] }])
+                        };
+                        json!({ "action": "render", "data": { "view": {
+                            "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
+                            "rows": rows } } }).to_string()
+                    } else {
+                        json!({ "action": "unknown", "data": null }).to_string()
+                    };
+                    return ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 2,
+                            "result": { "content": [{ "type": "text", "text": payload }] }
+                        })
+                        .to_string(),
+                    );
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#,
+                )
+            })
+            .mount(&server)
+            .await;
+
+        (server, order, appends)
+    }
+
+    async fn body_via_cli(
+        server: &MockServer,
+        md: Option<&std::path::Path>,
+        attach: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: md.map(|p| p.to_string_lossy().into_owned()),
+                replace: false,
+                replace_section: None,
+                attach: attach.to_vec(),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_with_attach_uploads_then_content_then_refs() {
+        let (server, order, appends) = mock_siyuan_for_body().await;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("скрин до.png");
+        std::fs::write(&img, b"png").unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "маркер-контент\n").unwrap();
+
+        body_via_cli(&server, Some(md.path()), &[img])
+            .await
+            .expect("body --attach с контентом ok");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["upload", "append", "append"],
+            "порядок: upload → контент-операция → референсы; createDoc не зовётся"
+        );
+        let appends = appends.lock().unwrap();
+        assert!(appends[0].contains("маркер-контент"), "первый append — контент: {}", appends[0]);
+        assert!(
+            appends[1].contains("![скрин до.png](assets/"),
+            "второй append — референс картинки: {}", appends[1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn body_attach_only_skips_empty_content_write_and_appends_refs() {
+        let (server, order, appends) = mock_siyuan_for_body().await;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("после.png");
+        std::fs::write(&img, b"png").unwrap();
+
+        body_via_cli(&server, None, &[img])
+            .await
+            .expect("attach-only вызов валиден");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["upload", "append"],
+            "пустой контент-оп не делается: без пустого appendBlock перед референсами"
+        );
+        let appends = appends.lock().unwrap();
+        assert_eq!(appends.len(), 1, "единственный append — референсы");
+        assert!(
+            !appends[0].contains("\"data\":\"\""),
+            "в appendBlock не уходит пустой data: {}", appends[0]
+        );
+        let refs_md: String = serde_json::from_str::<serde_json::Value>(&appends[0])
+            .expect("appendBlock body — json")
+            .get("data")
+            .and_then(|d| d.as_str())
+            .expect("data — markdown референсов")
+            .to_string();
+        assert_eq!(
+            collect_asset_refs(&refs_md),
+            vec!["после-20261106090000-abc1234.png".to_string()],
+            "round-trip референса attach-only: {refs_md:?}"
         );
     }
 }
