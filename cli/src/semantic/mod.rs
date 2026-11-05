@@ -189,21 +189,29 @@ pub struct RebuildReport {
     pub elapsed: Duration,
 }
 
-/// Полный пересбор индекса: сброс чанков/меты + дельта-цикл с нуля.
+/// Полный пересбор индекса: сброс чанков/меты + дельта-цикл с нуля;
+/// `resume` — продолжение прерванного прогона от watermark без сброса.
 /// Прогресс — коллбэк после каждого батча (CLI печатает в stderr).
 pub async fn rebuild(
     sy: &SiYuan,
     cfg: &SemanticConfig,
     on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
+    resume: bool,
 ) -> Result<RebuildReport> {
     let started = Instant::now();
     let mut store = Store::open(&cfg.db_path)?;
-    store.clear_for_rebuild()?;
-    store.set_meta("model", &cfg.embed_model)?;
+    if resume {
+        if !cfg.db_path.exists() || store.chunk_count().unwrap_or(0) == 0 {
+            anyhow::bail!("--resume: индекс пуст — продолжать нечего, запускай без --resume");
+        }
+    } else {
+        store.clear_for_rebuild()?;
+        store.set_meta("model", &cfg.embed_model)?;
+    }
 
     let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
     let opts = sync::SyncOptions {
-        since: Some("0".to_string()),
+        since: if resume { None } else { Some("0".to_string()) },
         deadline: None,
         on_batch,
     };

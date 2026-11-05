@@ -179,10 +179,18 @@ fn search_semantic_flag_is_rejected() {
 
 #[test]
 fn semantic_subcommands_parse() {
-    let Commands::Semantic { command } = parse_command(&["semantic", "rebuild"]).unwrap() else {
+    let Commands::Semantic { command } =
+        parse_command(&["semantic", "rebuild"]).unwrap()
+    else {
         panic!("expected semantic");
     };
-    assert!(matches!(command, SemanticSub::Rebuild));
+    assert!(matches!(command, SemanticSub::Rebuild { resume: false }));
+    let Commands::Semantic { command } =
+        parse_command(&["semantic", "rebuild", "--resume"]).unwrap()
+    else {
+        panic!("expected semantic");
+    };
+    assert!(matches!(command, SemanticSub::Rebuild { resume: true }));
     let Commands::Semantic { command } = parse_command(&["semantic", "status"]).unwrap() else {
         panic!("expected semantic");
     };

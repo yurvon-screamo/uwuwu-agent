@@ -792,11 +792,18 @@ pub(crate) async fn semantic_run(command: SemanticSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
     let cfg = crate::semantic::SemanticConfig::from_env();
     match command {
-        SemanticSub::Rebuild => {
-            eprintln!(
-                "Пересбор semantic-индекса: {} через {} (первичный билд ~55–70 мин)",
-                cfg.embed_model, cfg.embed_url
-            );
+        SemanticSub::Rebuild { resume } => {
+            if resume {
+                eprintln!(
+                    "Продолжение semantic-индекса от watermark: {} через {}",
+                    cfg.embed_model, cfg.embed_url
+                );
+            } else {
+                eprintln!(
+                    "Пересбор semantic-индекса: {} через {} (первичный билд ~55–70 мин)",
+                    cfg.embed_model, cfg.embed_url
+                );
+            }
             let batches = std::sync::Mutex::new(0usize);
             let on_batch = std::sync::Arc::new(move |embedded: usize| {
                 let mut count = batches.lock().expect("progress lock");
@@ -805,7 +812,7 @@ pub(crate) async fn semantic_run(command: SemanticSub) -> Result<()> {
                     eprintln!("  чанков записано: {embedded}");
                 }
             });
-            let report = crate::semantic::rebuild(&sy, &cfg, Some(on_batch)).await?;
+            let report = crate::semantic::rebuild(&sy, &cfg, Some(on_batch), resume).await?;
             println!(
                 "Готово: {} чанков за {:.0} мин (пропущено коротких: {})",
                 report.embedded,

@@ -769,3 +769,70 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
         cosine(&vectors[2])
     );
 }
+
+#[tokio::test]
+async fn rebuild_resume_continues_from_watermark_without_reembedding() {
+    // Частичный индекс после сбоя: a0 записан давно (вне overlap-окна),
+    // a1 в секунду сбоя, a2/a3 не доезжали. Watermark = T0.
+    let t_old = "20261104235800"; // T0 − 120 s: за границей overlap
+    let blocks = vec![
+        block("a0", t_old, "нулевой чанк с длинным содержанием для индексации", "/d"),
+        block("a1", T0, "первый чанк с длинным содержанием для индексации", "/d"),
+        block("a2", T1, "второй чанк с длинным содержанием для индексации", "/d"),
+        block("a3", T1, "третий чанк с длинным содержанием для индексации", "/d"),
+    ];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: embed.uri(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+
+    // «Сбой» в секунду T0: записаны a0 и a1, watermark = T0.
+    {
+        let mut store = seeded_store(dir.path());
+        store.set_meta("model", "test-model").unwrap();
+        let partial = ChunkRecord {
+            meta: ChunkMeta {
+                block_id: "a0".into(),
+                root_id: "r".into(),
+                box_id: "b".into(),
+                hpath: "/d".into(),
+                updated: T0.into(),
+            },
+            content: "первый чанк с длинным содержанием для индексации".into(),
+            vec: normalize(vec![1.0, 0.0, 0.0]),
+        };
+        let tx = store.begin().unwrap();
+        Store::upsert_batch(&tx, std::slice::from_ref(&partial), Some(T0)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    crate::semantic::rebuild(&sy, &cfg, None, true).await.expect("resume");
+
+    let embedded = inputs.lock().unwrap();
+    // a0 вне overlap-окна — не переэмбедден; хвост секунды сбоя (a1,
+    // at-least-once) и незаписанные a2/a3 доброшены: 3 инпута, не 4.
+    assert_eq!(embedded.len(), 3, "инпуты: {embedded:?}");
+    assert!(!embedded.iter().any(|c| c.contains("нулевой")));
+}
+
+#[tokio::test]
+async fn rebuild_resume_refuses_empty_index() {
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: server.uri(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    let err = match crate::semantic::rebuild(&sy, &cfg, None, true).await {
+        Ok(_) => panic!("пустой индекс — ожидание отказа resume"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("resume"));
+}
