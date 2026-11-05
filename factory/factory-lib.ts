@@ -376,3 +376,88 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     typeof t.branch === "string" && t.branch.startsWith("work/")
   )
 }
+
+// ——— спавн-волна: пачка с ограничением конкурентности ———
+
+/** Волна Design-спавна одним проходом: последовательный спавн ≈ до 75 s
+ *  на задачу не влезал в тик 180 s. Ошибка одного элемента не останавливает
+ *  остальных (фейл задачи — её регистрация, не обвал пачки); первая ошибка
+ *  перевыбрасывается после завершения всех элементов. */
+export async function runBatch<T>(items: readonly T[], worker: (item: T) => Promise<void>, limit: number): Promise<void> {
+  let next = 0
+  let failure: unknown = null
+  const lane = async (): Promise<void> => {
+    while (true) {
+      const index = next++
+      const item = items[index]
+      if (item === undefined) return
+      try {
+        await worker(item)
+      } catch (e) {
+        failure ??= e
+      }
+    }
+  }
+  const lanes: Promise<void>[] = []
+  for (let i = 0; i < Math.min(limit, items.length); i++) lanes.push(lane())
+  await Promise.all(lanes)
+  if (failure !== null) throw failure
+}
+
+// ——— конфиг проектов (env-оверрайд для тестовых прогонов) ———
+
+export interface ProjectCfg {
+  board: string
+  repo: string
+  local: string
+}
+
+/** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
+ *  доска/чекаут для ONCE-прогона без правки кода. Отсутствие — дефолт;
+ *  невалидный — отказ старта с внятной причиной (не тихий фоллбек). */
+export function parseProjects(raw: string | undefined, fallback: Record<string, ProjectCfg>): Record<string, ProjectCfg> {
+  if (raw === undefined || raw.trim() === "") return fallback
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: не JSON (${e})`)
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("UWUWU_FACTORY_PROJECTS_JSON: ожидался объект { имя: { board, repo, local } }")
+  }
+  const out: Record<string, ProjectCfg> = {}
+  for (const [name, cfg] of Object.entries(parsed as Record<string, unknown>)) {
+    const c = cfg as Partial<ProjectCfg>
+    if (typeof c.board !== "string" || typeof c.repo !== "string" || typeof c.local !== "string") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local обязательны и строки`)
+    }
+    out[name] = { board: c.board, repo: c.repo, local: c.local }
+  }
+  return out
+}
+
+// ——— сводка прохода ———
+
+export interface PassCounters {
+  /** спавн девелоперов (Design-волна) */
+  devSpawned: number
+  /** спавн/рестарт ревьюверов */
+  reviewSpawned: number
+  /** неспавненные будильники: wakeup по комментам/телу, реран ревью */
+  wakeups: number
+  /** чистки state (Done / строка исчезла) */
+  cleanups: number
+  /** задачи под наблюдением на конец прохода (этот проект) */
+  watched: number
+  /** фейлы спавна: короткие «rowId-префикс: причина» */
+  failures: string[]
+}
+
+/** Одна строка лога на проект за тик: «молчаливые тики» должны быть
+ *  видимы — что сделано и что живо (прод-кейс 05.11). */
+export function formatPassSummary(project: string, c: PassCounters): string {
+  const failures = c.failures.length > 0 ? `, фейлы=${c.failures.length} (${c.failures.join("; ")})` : ""
+  return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}, наблюдение=${c.watched}${failures}`
+}
