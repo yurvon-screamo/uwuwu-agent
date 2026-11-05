@@ -19,7 +19,7 @@ export interface TgUpdate {
 }
 
 /** Вложение заявки: файл уже выгружен в ФС (демон), путь — для агента
- *  (прикладывает к задаче через uwuwu-cli --attach). */
+ *  (фиксирует в теле задачи; uwuwu-cli --attach — заглушка SiYuan v1). */
 export interface Attachment {
   path: string
   name: string
@@ -332,8 +332,8 @@ export function takeBatch(queue: Request[], readyAt: number): Request[] {
   return out
 }
 
-/** Текст заявки: слова юзера + маркеры вложений (путь в ФС — источник для
- *  --attach агента) + маркеры неудач выгрузки. */
+/** Текст заявки: слова юзера + маркеры вложений (путь в ФС — агент фиксирует
+ *  его в теле задачи; --attach — заглушка SiYuan v1) + маркеры неудач выгрузки. */
 export function composeText(text: string, attachments: Attachment[], failed: string[]): string {
   return [
     text,

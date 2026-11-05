@@ -54,7 +54,7 @@ const WORKSPACE = join(RUN_ROOT, ".local/share/uwuwu-triage/workspace")
 const AGENT_NAME = "triage"
 const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${AGENT_NAME}.md`)
 /** выгруженные вложения заявок (скрины/файлы): агент видит их в ФС по путям
- *  из текста заявки и прикладывает к задаче (--attach) */
+ *  из текста заявки и фиксирует пути в теле задачи (--attach — заглушка SiYuan v1) */
 const MEDIA_DIR = join(RUN_ROOT, ".local/share/uwuwu-triage/media")
 const MEDIA_TTL_MS = 7 * 24 * 3600_000
 /** Регистрация фонового opencode-сервиса — ВХОД демона (где живой сервер),
@@ -1105,7 +1105,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
       if (i >= 0) {
         // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
-        // пересобираем с маркерами (пути в ФС — источник для --attach агента)
+        // пересобираем с маркерами (пути в ФС — агент фиксирует их в теле задачи; --attach — заглушка)
         const hasNewMedia = (Array.isArray(out.msg.photo) && out.msg.photo.length > 0) || out.msg.document?.file_id !== undefined
         const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
         const cur = state.queue[i]!
