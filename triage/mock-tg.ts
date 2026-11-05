@@ -47,6 +47,11 @@ Bun.serve({
       console.log(`[mock-tg] push update_id=${id}`)
       return json({ ok: true, update_id: id })
     }
+    if (url.pathname.startsWith("/file/bot")) {
+      // выгрузка медиа: демона анализирует только сам факт (файл в ФС),
+      // содержимое фиксированное — getFile всегда отдаёт file_path "mock/no-file"
+      return new Response("mock-media-bytes", { headers: { "content-type": "application/octet-stream" } })
+    }
     if (!url.pathname.startsWith("/bot")) return new Response("not found", { status: 404 })
     const method = url.pathname.slice("/bot".length).split("/").slice(1).join("/")
     const params = raw.trim() === "" ? {} : JSON.parse(raw) as Record<string, unknown>
