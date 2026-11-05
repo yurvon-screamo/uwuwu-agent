@@ -35,6 +35,10 @@ const TOKEN = siyuanToken()
 
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
+/** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
+ *  останавливать тик демона — класс «клиентские висы» (прод-контур). */
+const KERNEL_TIMEOUT_MS = Number(process.env.UWUWU_KERNEL_TIMEOUT_MS ?? 15_000)
+
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
@@ -55,6 +59,7 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         method: "POST",
         headers: { Authorization: `Token ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
       })
       const text = await r.text()
       const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
@@ -103,7 +108,12 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const hasSession = mcpSession !== ""
   if (hasSession) headers["Mcp-Session-Id"] = mcpSession
-  const r = await fetch(SIYUAN_URL + "/mcp", { method: "POST", headers, body: JSON.stringify(payload) })
+  const r = await fetch(SIYUAN_URL + "/mcp", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+  })
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
   const text = await r.text()
@@ -121,20 +131,25 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   return (msg.result ?? {}) as Record<string, unknown>
 }
 
-/** Re-handshake после отклонённой сессии: чистим состояние и initialize заново.
- *  reentrant-guard: вложенный отказ во время handshake — описательная ошибка, не рекурсия. */
-let recovering = false
+/** Re-handshake после отклонённой сессии: чистим состояние и initialize
+ *  заново. Single-flight: параллельные вызовы пачки словят 404 одновременно
+ *  — все ждут ОДИН recovery (общий промис), лишних initialize нет; вызовы,
+ *  начавшиеся во время восстановления, ретраятся после него же. */
+let recovery: Promise<void> | null = null
 
-async function recoverMcpSession(): Promise<void> {
-  if (recovering) throw new Error("mcp: сессия отклонена и во время re-handshake — ядро недоступно")
-  recovering = true
-  try {
-    mcpSession = ""
-    mcpReady = false
-    await connect()
-  } finally {
-    recovering = false
+function recoverMcpSession(): Promise<void> {
+  if (recovery === null) {
+    recovery = (async () => {
+      mcpSession = ""
+      mcpReady = false
+      try {
+        await connect()
+      } finally {
+        recovery = null
+      }
+    })()
   }
+  return recovery
 }
 
 /** Один ретрай на протухшую сессию: тик лечится на месте вместо 5 падений
@@ -149,15 +164,32 @@ async function mcpRpc(method: string, params: Record<string, unknown>): Promise<
   }
 }
 
-export async function connect(): Promise<void> {
-  if (mcpReady) return // сессия уже инициализирована (демоны зовут connect повторно)
-  await mcpRpc("initialize", {
-    protocolVersion: "2025-03-26",
-    capabilities: {},
-    clientInfo: { name: "uwuwu-daemon", version: "1.0" },
-  })
-  await mcpRpc("notifications/initialized", {})
-  mcpReady = true
+/** Handshake single-flight: демоны зовут connect() повторно, а во время
+ *  recovery новые вызывающие собираются в один handshake — лишних
+ *  initialize-циклов на пачке параллельных вызовов нет. */
+let connecting: Promise<void> | null = null
+
+export function connect(): Promise<void> {
+  if (mcpReady) return Promise.resolve() // сессия уже инициализирована
+  if (connecting === null) {
+    const handshake = (async () => {
+      await mcpRpc("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "uwuwu-daemon", version: "1.0" },
+      })
+      await mcpRpc("notifications/initialized", {})
+      mcpReady = true
+    })()
+    // сброс слота по завершении — без вмешательства в доставку ошибки awaiter'ам
+    handshake
+      .finally(() => {
+        if (connecting === handshake) connecting = null
+      })
+      .catch(() => {})
+    connecting = handshake
+  }
+  return connecting
 }
 
 let mcpReady = false
