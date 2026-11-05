@@ -81,8 +81,8 @@ def post(path: str, body: dict, attempts: int = 6):
     raise RuntimeError(f"POST {path}: {last}")
 
 
-def notebooks() -> list[dict]:
-    return [nb for nb in post("/api/notebook/lsNotebooks", {}).get("notebooks", [])
+def notebooks(attempts: int = 6) -> list[dict]:
+    return [nb for nb in post("/api/notebook/lsNotebooks", {}, attempts=attempts).get("notebooks", [])
             if not nb.get("closed")]
 
 
@@ -194,7 +194,13 @@ def cmd_delete(a):
     for _ in range(2):
         if _doc_row(doc_id) is None:
             marker = "да" if stub else "нет (--force)"
-            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {row['box']})")
+            try:
+                # Косметика после успешного сноса: один запрос без ретраев,
+                # отказ ядра не роняет команду — фолбэк на box-id.
+                nb_name = next(n["name"] for n in notebooks(attempts=1) if n["id"] == row["box"])
+            except Exception:
+                nb_name = row["box"]
+            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {nb_name})")
             print(f"  маркер заглушки: {marker}; соседей по пути: {siblings}; дочерних доков: {children}")
             print("  → корзина SiYuan, восстановимо через UI (история данных) до истечения срока хранения")
             return
