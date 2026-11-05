@@ -592,3 +592,24 @@ async fn undo_restores_row_and_repeats_as_noop() {
         "повтор не мутирует доску (тайтл уже на доске → skip)"
     );
 }
+
+#[tokio::test]
+async fn undo_list_on_fresh_workspace_is_empty_not_error() {
+    // фреш-воркспейс: data/assets/undo не существует (ядро — 404-конверт);
+    // список журналов обязан быть бенигн-пустым, не красной ошибкой
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/file/readDir"))
+        .respond_with(|_: &Request| {
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+        })
+        .mount(&server)
+        .await;
+    let sy = crate::siyuan::SiYuan::for_tests(server.uri());
+
+    let journals = crate::siyuan_guard::Journal::list(&sy)
+        .await
+        .expect("нет undo-директории — журналов нет, не ошибка");
+    assert!(journals.is_empty());
+}
