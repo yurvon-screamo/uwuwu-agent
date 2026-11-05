@@ -3,6 +3,11 @@
 // рестарт-реконсилиация, промпт дримеру. SQLite — bun:sqlite, всегда readonly.
 
 import type { Database } from "bun:sqlite"
+import { E2E_SESSION_PREFIX } from "../lib/e2e-tag"
+
+/** LIKE-паттерн исключения e2e-сессий — строится из константы конвенции,
+ *  литерал `[e2e]` в SQL не дублируется. */
+const E2E_SKIP_LIKE = `${E2E_SESSION_PREFIX}%`
 
 // ——— типы ———
 
@@ -98,6 +103,8 @@ export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): 
   // девелоперскими — осознанная отмена границы ADR-008 владельцем
   // (uwuwu: «Дример: работа с сессиями ревьюверов», строка 20261104215725-7zngmlj).
   // Исключён только сам dreamer — его прогоны не анализируют сами себя.
+  // Помеченные e2e-сессии (конвенция lib/e2e-tag.ts) — синтетика, не пост-
+  // обрабатывается: риг 04.11 без маркера породил 30 прогонов на 31 смоке.
   const rows = db
     .query(
       `SELECT id, title, directory, agent, parent_id, time_created, time_updated
@@ -105,10 +112,11 @@ export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): 
        WHERE COALESCE(agent, '') != 'dreamer'
          AND parent_id IS NULL
          AND time_updated < ?
+         AND COALESCE(title, '') NOT LIKE ?
        ORDER BY time_updated DESC
        LIMIT ?`,
     )
-    .all(beforeMs, limit) as Array<Record<string, unknown>>
+    .all(beforeMs, E2E_SKIP_LIKE, limit) as Array<Record<string, unknown>>
   return rows.map(rowToSession)
 }
 
@@ -222,9 +230,10 @@ export function markBacklog(db: Database, state: DreamerState, cutoffMs: number)
       `SELECT id, time_updated FROM session_v2
        WHERE COALESCE(agent, '') != 'dreamer'
          AND parent_id IS NULL
-         AND time_updated < ?`,
+         AND time_updated < ?
+         AND COALESCE(title, '') NOT LIKE ?`,
     )
-    .all(cutoffMs) as Array<{ id: string; time_updated: number }>
+    .all(cutoffMs, E2E_SKIP_LIKE) as Array<{ id: string; time_updated: number }>
   let marked = 0
   for (const row of rows) {
     const sid = String(row.id)

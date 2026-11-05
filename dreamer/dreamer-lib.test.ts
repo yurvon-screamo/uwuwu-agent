@@ -45,6 +45,7 @@ ins({ id: "ses_dreamer", agent: "dreamer", updated: NOW - IDLE - 1 })         //
 ins({ id: "ses_child", parent: "ses_root_idle", updated: NOW - IDLE - 1 })    // сабагент
 ins({ id: "ses_noagent", agent: null, updated: NOW - IDLE - 1 })              // NULL-агент — кандидат
 ins({ id: "ses_reviewer", agent: "code-quality-reviewer", updated: NOW - IDLE - 1 }) // ревьювер фабрики — кандидат наравне с девелоперскими
+ins({ id: "ses_e2e", title: "[e2e] 📥 Триаж uwuwu", updated: NOW - IDLE - 1 }) // синтетика e2e-рига — вне пост-обработки
 
 afterAll(() => db.close())
 
@@ -64,6 +65,9 @@ describe("fetchRootSessions", () => {
   })
   test("ревьювер фабрики — кандидат наравне с девелоперскими", () => {
     expect(rows.some((r) => r.id === "ses_reviewer")).toBe(true)
+  })
+  test("e2e-сессия (префикс [e2e]) — вне пост-обработки", () => {
+    expect(rows.some((r) => r.id === "ses_e2e")).toBe(false)
   })
   test("fetchSessionById", () => {
     expect(fetchSessionById(db, "ses_root_idle")?.title).toBe("работа")
@@ -136,6 +140,11 @@ describe("markBacklog", () => {
     const st2 = emptyState()
     expect(markBacklog(db, st2, 0)).toBe(0) // cutoff раньше всех — не трогаем
     expect(st2.sessions.ses_root_idle).toBeUndefined()
+  })
+  test("e2e-сессия не размечается и в state не попадает", () => {
+    const st = emptyState()
+    markBacklog(db, st, NOW - 1)
+    expect(st.sessions.ses_e2e).toBeUndefined()
   })
 })
 
