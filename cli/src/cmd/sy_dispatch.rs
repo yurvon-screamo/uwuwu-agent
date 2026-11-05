@@ -123,7 +123,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Comment { id, reply, stdin, text } => {
-            let msg = collect_text(stdin, text)?;
+            let msg = guarded_comment_text(stdin, &text)?;
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
@@ -997,6 +997,63 @@ fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
     }
 }
 
+/// Подкоманды task/cron: токен текста, совпадающий с именем, — почти наверняка
+/// перепутанный вызов, а не контент (факт ses_e7b5a366: «list» ушёл юзеру
+/// комментом вместо чтения треда). Токены сравниваются целиком: «get:» или
+/// «get-задача» — контент.
+const TASK_SUB_NAMES: &[&str] = &[
+    "create", "list", "get", "edit", "comment", "thread", "close", "body", "rm", "clean", "undo",
+    "set", "pause", "resume",
+];
+
+/// Токен выглядит как флаг: `--…` всегда; одиночный дефис — только перед
+/// буквой (`-n`, `-Prb`), чтобы не трогать markdown-буллеты («- пункт») и
+/// отрицательные числа («-5»).
+fn looks_like_flag(token: &str) -> bool {
+    if token.starts_with("--") {
+        return true;
+    }
+    token
+        .strip_prefix('-')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_alphabetic())
+}
+
+/// Текст коммента + гвард до сети: подозрительный позиционный текст — отказ
+/// с подсказкой вместо тихой отправки юзеру. Сама валидация —
+/// validate_comment_text (тестируется на строках, stdin не нужен).
+fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
+    let msg = collect_text(stdin, text.to_vec())?;
+    validate_comment_text(stdin, &msg)?;
+    Ok(msg)
+}
+
+/// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
+/// токенов отклоняются имена подкоманд и флагоподобные токены. stdin не
+/// гвардится на подкоманды и флаги: явное намерение, глотание туда невозможно.
+fn validate_comment_text(stdin: bool, msg: &str) -> Result<()> {
+    if msg.trim().is_empty() {
+        bail!("пустой текст коммента — передай --stdin или текст позиционным аргументом");
+    }
+    if stdin {
+        return Ok(());
+    }
+    let tokens: Vec<&str> = msg.split_whitespace().collect();
+    if let Some(first) = tokens.first().filter(|t| TASK_SUB_NAMES.contains(t)) {
+        bail!(
+            "«{first}» — имя подкоманды task/cron, а не текст коммента \
+             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\" или --stdin)"
+        );
+    }
+    if let Some(flag) = tokens.iter().find(|t| looks_like_flag(t)) {
+        bail!(
+            "токен «{flag}» похож на флаг: после текста коммента флаги глотаются как текст \
+             (trailing_var_arg) — пиши флаги до <id> или используй --stdin"
+        );
+    }
+    Ok(())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -1005,6 +1062,7 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::collect_threads;
     use super::replace_md_section;
+    use super::validate_comment_text;
     use super::SectionEdit;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
@@ -1434,5 +1492,50 @@ mod tests {
     #[test]
     fn collect_threads_reports_empty() {
         assert_eq!(collect_threads("## А\nтело\n").trim_end(), "комментов нет");
+    }
+
+    #[test]
+    fn comment_guard_rejects_subcommand_name_as_text() {
+        let err = validate_comment_text(false, "list").expect_err("«list» — подкоманда, не текст");
+        assert!(err.to_string().contains("подкоманд"), "суть отказа: {err}");
+        assert!(err.to_string().contains("task get/thread"), "подсказка чтения: {err}");
+    }
+
+    #[test]
+    fn comment_guard_rejects_flag_swallowed_after_text() {
+        let err = validate_comment_text(false, "текст --project x")
+            .expect_err("флаг после текста глотается trailing_var_arg");
+        assert!(err.to_string().contains("флаг"), "суть отказа: {err}");
+        assert!(err.to_string().contains("--stdin"), "обход указан: {err}");
+    }
+
+    #[test]
+    fn comment_guard_rejects_dash_prefixed_word() {
+        let err = validate_comment_text(false, "-n").expect_err("-n выглядит как флаг");
+        assert!(err.to_string().contains("флаг"), "суть отказа: {err}");
+    }
+
+    #[test]
+    fn comment_guard_allows_markdown_bullets() {
+        validate_comment_text(false, "- пункт один\n- ещё пункт").expect("markdown-буллет — контент, не флаг");
+    }
+
+    #[test]
+    fn comment_guard_allows_minus_number_and_lone_dash() {
+        validate_comment_text(false, "-5 баллов").expect("отрицательное число — контент");
+        validate_comment_text(false, "-").expect("одиночный дефис — контент");
+    }
+
+    #[test]
+    fn comment_guard_rejects_empty_text() {
+        let err = validate_comment_text(false, "").expect_err("пустой коммент — всегда баг");
+        assert!(err.to_string().contains("пустой"), "суть отказа: {err}");
+        validate_comment_text(true, "   ").expect_err("пустой stdin-коммент тоже отказан");
+    }
+
+    #[test]
+    fn comment_guard_skips_stdin_source() {
+        validate_comment_text(true, "--не-флаг-а-текст").expect("stdin — явное намерение, не гвардим");
+        validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
     }
 }
