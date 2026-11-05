@@ -94,7 +94,10 @@ async function cronBoardTitles(): Promise<string[]> {
       .map(n => n.data)
       .filter((d): d is string => typeof d === "string")
     return [GLOBAL_CRON_BOARD, ...projects.map(p => `Кроны ${p}`)]
-  } catch { return [GLOBAL_CRON_BOARD] }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать фоллбеком
+    return [GLOBAL_CRON_BOARD]
+  }
 }
 
 async function findBoard(title: string): Promise<BoardIds | null> {
@@ -130,7 +133,10 @@ async function boardViaOrganize(proj: string, title: string): Promise<string | n
         if (d.title === title) return docId
       }
     }
-  } catch { /* организ недоступен — остаётся null */ }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать null-фоллбеком
+    /* организ недоступен — остаётся null */
+  }
   return null
 }
 
@@ -140,7 +146,10 @@ async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
     try {
       const board = await findBoard(title)
       if (board !== null) out.push({ title, board })
-    } catch { /* доска недоступна — скип тика по ней */ }
+    } catch (e) {
+      if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать скипом доски
+      /* доска недоступна — скип тика по ней */
+    }
   }
   return out
 }

@@ -35,6 +35,12 @@ const TOKEN = siyuanToken()
 
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
+/** Ядро не ответило на транспорте (refused/DNS/таймаут) — отличать от «ядро
+ *  ответило ошибкой»: демоны решают по классу. Прод-кейс 05.11: лежащее ядро
+ *  было невидимо в логе uwuwu-cron — пер-досочные catch-скипы глотали голый
+ *  TypeError, тик «успешно» проходил с пустым списком досок. */
+export class KernelUnavailableError extends Error {}
+
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
  *  останавливать тик демона — класс «клиентские висы» (прод-контур).
  *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
@@ -64,7 +70,7 @@ export function parseJsonContract(text: string, context: string): unknown {
 }
 
 async function post<T = Record<string, unknown>>(path: string, body: Record<string, unknown>, attempts = 4): Promise<T> {
-  let last = "?"
+  let last: string | Error = "?"
   for (let i = 0; i < attempts; i++) {
     try {
       const r = await fetch(SIYUAN_URL + path, {
@@ -72,6 +78,8 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         headers: { Authorization: `Token ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+      }).catch((e: unknown) => {
+        throw new KernelUnavailableError(`siyuan POST ${path}: ядро недоступно (${String(e)})`)
       })
       const text = await r.text()
       const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
@@ -82,11 +90,15 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         continue
       }
     } catch (e) {
-      last = String(e)
+      // класс KernelUnavailableError переживёт цикл — по нему демоны
+      // отличают лежащее ядро; прочие — как раньше, строкой в last
+      last = e instanceof KernelUnavailableError ? e : String(e)
     }
     await new Promise((res) => setTimeout(res, 700 * (i + 1)))
   }
-  throw new Error(`siyuan POST ${path}: ${last}`)
+  // fetch-класс уже свёрстан как Error с контекстом — ре-throw без обёртки;
+  // строковый last (code=… msg=… конверт ядра) — как раньше
+  throw last instanceof Error ? last : new Error(`siyuan POST ${path}: ${last}`)
 }
 
 async function sql<T = Record<string, unknown>>(stmt: string): Promise<T[]> {
@@ -120,12 +132,17 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const hasSession = mcpSession !== ""
   if (hasSession) headers["Mcp-Session-Id"] = mcpSession
-  const r = await fetch(`${SIYUAN_URL}/mcp`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
-  })
+  let r: Response
+  try {
+    r = await fetch(`${SIYUAN_URL}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+    })
+  } catch (e) {
+    throw new KernelUnavailableError(`mcp ${method}: ядро недоступно (${String(e)})`)
+  }
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
   const text = await r.text()
