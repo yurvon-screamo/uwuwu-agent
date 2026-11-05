@@ -2,8 +2,9 @@
 // Поллит все крон-доски: глобальную «Crons» + «Кроны <Proj>» по папкам Projects
 // (собираются динамически, отсутствующие доски тихо скипаются): строка = крон
 // (Schedule/Status/Last Run, промпт в теле). Наступило расписание → OpenCode-сессия
-// с промптом из тела → агент работает и докладывает комментом; разовые (at)
-// после срабатывания → fired (paused — только явное решение юзера).
+// с промптом из тела; здоровый тик тихий (факт — ячейка Last Run, коммент агента —
+// только исключение); разовые (at) после срабатывания → fired (paused — только
+// явное решение юзера).
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
