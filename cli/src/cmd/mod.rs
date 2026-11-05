@@ -12,6 +12,8 @@ mod guard_tests;
 mod fallback_tests;
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod cron_tests;
 
 pub use sy_dispatch::read_markdown;
 

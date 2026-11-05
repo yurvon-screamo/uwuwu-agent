@@ -499,14 +499,20 @@ async fn restore_journal_cells(
     row: &JournalRow,
 ) -> Result<()> {
     if kind == "cron-rm" {
-        // у кронов Status — текстовая ячейка; Schedule идёт из extra
-        let mut cells: Vec<(&str, &str)> = Vec::new();
+        // Status у кронов — mSelect (единый контур с task-путями); Schedule —
+        // текстовая клетка из extra
         if !row.status.is_empty() {
-            cells.push(("Status", row.status.as_str()));
+            let sk = syt::status_key(sy, &board.av_id).await?;
+            sy.db_item_set_status(&board.av_id, &sk, item, &row.status).await?;
         }
-        for (name, value) in &row.extra_text_cells {
-            cells.push((name.as_str(), value.as_str()));
+        if row.extra_text_cells.is_empty() {
+            return Ok(());
         }
+        let cells: Vec<(&str, &str)> = row
+            .extra_text_cells
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
         return set_text_cells(sy, &board.av_id, item, &cells).await;
     }
     if !row.status.is_empty() {
@@ -549,36 +555,66 @@ async fn restore_journal_cells(
 pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
     match command {
-        CronSub::List => cron_list(&sy).await,
+        CronSub::List { project } => cron_list(&sy, &cron_project(project)).await,
         CronSub::Set { title, r#in, every, at, cron_expr, project, stdin } => {
             let schedule = cron_schedule(&r#in, &every, &at, &cron_expr)?;
             let prompt = if stdin { read_stdin()? } else { "<промпт крона>".into() };
-            let proj = project.unwrap_or_else(|| "uwuwu".into());
+            let proj = cron_project(project);
             let board = syt::find_board_cron(&sy, &proj).await?;
-            // тело крона = саб-док доски
-            let body_h = board.body_hpath(&title);
-            if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
-                anyhow::bail!("крон «{title}» уже есть");
+            // колонки — до мутаций: строка без Schedule демону не видна,
+            // а тело/строка, созданные впустую, — сироты (репро 04.11)
+            let keys = syt::board_keys(&sy, &board.av_id).await?;
+            let cron_keys = syt::require_cron_keys(&keys, &board.hpath)?;
+            // дубль-тайтл: живая строка или тело-сирота (дедуп как в task create)
+            let canon = syt::normalize_title(&title);
+            if syt::read_rows(&sy, &board).await?.iter().any(|r| syt::normalize_title(&r.title) == canon) {
+                anyhow::bail!("крон «{title}» уже есть (живая строка на {})", board.hpath);
             }
-            let body = sy.create_doc_md(&board.notebook, &body_h, &format!("# {title}\n\n```\n{prompt}\n```\n")).await?;
-            // content строки крона — тот же санитайз, что и у пути тела:
-            // иначе канбан покажет '/', а имя дока — '∕'
-            let item = sy.db_item_add(&board.av_id, &syt::path_safe(&title)).await?;
-            // клетки Schedule/Status/Last Run (текст)
-            set_text_cells(&sy, &board.av_id, &item, &[("Schedule", &schedule), ("Status", "active"), ("Last Run", "")]).await?;
-            println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
-            Ok(())
+            if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
+                anyhow::bail!("тело крона «{title}» уже есть");
+            }
+            // тело → bound-строка (клик по карточке открывает промпт) →
+            // клетки → verify вставки в render (репро 04.11 08:27: success
+            // item_add не гарантирует строку), паттерн task create
+            let body_h = board.body_hpath(&title);
+            let body = sy.create_doc_md(&board.notebook, &body_h, &cron_body_md(&title, &prompt)).await?;
+            let mut item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
+            for attempt in 0..=1u8 {
+                let rows = syt::read_rows(&sy, &board).await?;
+                match syt::check_row_insert(&rows, &item, &title) {
+                    syt::RowInsertCheck::Confirmed => {
+                        println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
+                        return Ok(());
+                    }
+                    syt::RowInsertCheck::DuplicateTitle => bail!(
+                        "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
+                    ),
+                    syt::RowInsertCheck::Missing if attempt == 0 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
+                    }
+                    syt::RowInsertCheck::Missing => bail!(
+                        "строка крона «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); крон виден только как док"
+                    ),
+                }
+            }
+            unreachable!("цикл verify завершается return или bail")
         }
-        CronSub::Pause { id } => cron_set_status(&sy, &id, "paused", "остановлен").await,
-        CronSub::Resume { id } => cron_set_status(&sy, &id, "active", "запущен").await,
-        CronSub::Rm { id } => {
-            let board = match syt::find_board_cron(&sy, "uwuwu").await {
+        CronSub::Pause { id, project } => {
+            cron_set_status(&sy, &id, "paused", "остановлен", &cron_project(project)).await
+        }
+        CronSub::Resume { id, project } => {
+            cron_set_status(&sy, &id, "active", "запущен", &cron_project(project)).await
+        }
+        CronSub::Rm { id, project } => {
+            let proj = cron_project(project);
+            let board = match syt::find_board_cron(&sy, &proj).await {
                 Ok(b) => b,
-                Err(_) => syt::find_board(&sy, "uwuwu").await?,
+                Err(_) => syt::find_board(&sy, &proj).await?,
             };
             let task = syt::resolve(&sy, &board, &id).await?;
             // undo-журнал до мутации: Schedule в extra-клетках, промпт — body_md
-            let mut journal = Journal::new("uwuwu", "cron-rm", &board);
+            let mut journal = Journal::new(&proj, "cron-rm", &board);
             journal.rows.push(journal_row(&sy, &board, &task).await?);
             let journal_path = journal.save(&sy).await?;
             sy.mcp_tool(
@@ -595,51 +631,88 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     }
 }
 
-async fn cron_list(sy: &SiYuan) -> Result<()> {
-    let board = syt::find_board_cron(sy, "uwuwu").await?;
-    let rows = syt::read_rows(sy, &board).await?;
-    println!("{:<10} {:<12} {:<28} {:<14} LAST RUN", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE");
-    for r in &rows {
-        println!(
-            "{:<10} {:<12} {:<28}",
-            r.status,
-            &r.item_id[..r.item_id.len().min(12)],
-            truncate(&r.title, 26)
-        );
-    }
+/// Дефолтная доска кронов — «Кроны uwuwu».
+fn cron_project(project: Option<String>) -> String {
+    project.unwrap_or_else(|| "uwuwu".into())
+}
+
+fn cron_body_md(title: &str, prompt: &str) -> String {
+    format!("# {title}\n\n```\n{prompt}\n```\n")
+}
+
+/// Bound-строка крона + клетки: Status через mSelect (единый контур с
+/// task-путями), Schedule/Last Run текстом.
+async fn insert_cron_row(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    keys: &syt::CronKeys,
+    body: &str,
+    schedule: &str,
+) -> Result<String> {
+    let item = sy.db_item_add_bound(&board.av_id, body).await?;
+    sy.db_item_set_status(&board.av_id, &keys.status, &item, "active").await?;
+    write_text_cell(sy, &board.av_id, &keys.schedule, &item, schedule).await?;
+    write_text_cell(sy, &board.av_id, &keys.last_run, &item, "").await?;
+    Ok(item)
+}
+
+/// Одна text-клетка (keyID уже валидирован — см. require_cron_keys).
+async fn write_text_cell(sy: &SiYuan, av: &str, key: &str, item: &str, value: &str) -> Result<()> {
+    sy.mcp_tool(
+        "database",
+        json!({ "action": "item_update", "id": av, "keyID": key, "itemID": item,
+                "value": { "text": { "content": value } } }),
+    )
+    .await?;
     Ok(())
 }
 
-async fn cron_set_status(sy: &SiYuan, id: &str, status: &str, verb: &str) -> Result<()> {
-    let board = syt::find_board_cron(sy, "uwuwu").await?;
+async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
+    let board = syt::find_board_cron(sy, project).await?;
+    let rows = syt::read_rows(sy, &board).await?;
+    print!("{}", format_cron_table(&rows));
+    Ok(())
+}
+
+/// Таблица кронов: СТАТУС/СТРОКА/ЗАГОЛОВОК/SCHEDULE/LAST RUN — значения
+/// всех колонок (раньше шапка обещала SCHEDULE/LAST RUN, а строка их не несла).
+pub(crate) fn format_cron_table(rows: &[syt::SyTask]) -> String {
+    let mut out = format!(
+        "{:<10} {:<12} {:<28} {:<14} LAST RUN\n",
+        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE"
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "{:<10} {:<12} {:<28} {:<14} {}\n",
+            r.status,
+            &r.item_id[..r.item_id.len().min(12)],
+            truncate(&r.title, 26),
+            truncate(&r.schedule, 13),
+            r.last_run
+        ));
+    }
+    out
+}
+
+async fn cron_set_status(sy: &SiYuan, id: &str, status: &str, verb: &str, project: &str) -> Result<()> {
+    let board = syt::find_board_cron(sy, project).await?;
     let task = syt::resolve(sy, &board, id).await?;
-    set_text_cells(sy, &board.av_id, &task.item_id, &[("Status", status)]).await?;
+    let key = syt::status_key(sy, &board.av_id).await?;
+    sy.db_item_set_status(&board.av_id, &key, &task.item_id, status).await?;
     println!("крон {verb}: {}", task.title);
     Ok(())
 }
 
+/// Текстовые клетки по именам колонок. Отсутствующая колонка — ошибка:
+/// тихий скип оставлял строки без Schedule — демон не видел расписание
+/// (репро 04.11, задача 20261104220156).
 async fn set_text_cells(sy: &SiYuan, av: &str, item: &str, cells: &[(&str, &str)]) -> Result<()> {
-    let keys = sy.mcp_tool("database", json!({ "action": "keys", "id": av })).await?;
-    let arr = keys
-        .pointer("/data/keys")
-        .or_else(|| keys.get("keys"))
-        .and_then(|k| k.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let find = |name: &str| -> Option<String> {
-        arr.iter()
-            .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(name))
-            .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
-    };
+    let keys = syt::board_keys(sy, av).await?;
     for (name, value) in cells {
-        if let Some(k) = find(name) {
-            sy.mcp_tool(
-                "database",
-                json!({ "action": "item_update", "id": av, "keyID": k, "itemID": item,
-                        "value": { "text": { "content": value } } }),
-            )
-            .await?;
-        }
+        let Some(key) = keys.iter().find(|(n, _)| n == name).map(|(_, id)| id.as_str()) else {
+            anyhow::bail!("колонка «{name}» не найдена на доске {av} — ячейка не записана");
+        };
+        write_text_cell(sy, av, key, item, value).await?;
     }
     Ok(())
 }

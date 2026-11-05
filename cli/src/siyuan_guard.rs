@@ -504,6 +504,7 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             schedule: String::new(),
+            last_run: String::new(),
             body_doc: Some("doc-1".into()),
         }
     }
