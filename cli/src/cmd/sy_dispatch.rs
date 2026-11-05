@@ -100,6 +100,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     None => String::new(),
                 };
                 println!("\n----- тело -----\n{md}");
+                let assets = save_body_assets(&sy, &md, &task.item_id).await;
+                if !assets.is_empty() {
+                    println!("Аттачи:");
+                    for path in assets {
+                        println!("  {path}");
+                    }
+                }
             }
             Ok(())
         }
@@ -1058,14 +1065,98 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Asset-ссылки markdown-тела `](assets/…)` в порядке появления без дублей:
+/// путь до `)` или пробела, percent-decode %XX (SiYuan кодирует пробелы и
+/// юникод в именах аттачей). HTML-формы `<img src=…>` в экспорте не встречались.
+fn collect_asset_refs(md: &str) -> Vec<String> {
+    const PREFIX: &str = "](assets/";
+    let mut out = Vec::new();
+    let mut rest = md;
+    while let Some(pos) = rest.find(PREFIX) {
+        rest = &rest[pos + PREFIX.len()..];
+        let raw: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ')')
+            .collect();
+        rest = rest.strip_prefix(raw.as_str()).unwrap_or(rest);
+        let key = percent_decode(&raw);
+        if !key.is_empty() && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// %XX → байты (имена аттачей SiYuan percent-кодирует); невалидные
+/// последовательности копируются как есть.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Выгрузить asset-аттачи тела в /tmp/uwuwu-task-<row-id>/ (полный row-id —
+/// контракт AGENTS.md; таймстамп-голова давала бы коллизии каталогов задач
+/// одного дня). Оригинальные имена файлов; максимум 10; сбой одного аттача —
+/// тихий пропуск (остаёмся на ссылках, как в аффин-контракте). Ключи с ../
+/// и точечные имена не скачиваются вовсе.
+async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
+    const MAX_ASSETS: usize = 10;
+    let refs = collect_asset_refs(md);
+    let safe: Vec<&String> = refs
+        .iter()
+        .filter(|key| {
+            let name = key.rsplit('/').next().unwrap_or(key);
+            !name.is_empty() && name != "." && name != ".."
+        })
+        .collect();
+    if safe.is_empty() {
+        return Vec::new();
+    }
+    let dir = format!("/tmp/uwuwu-task-{row_id}");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for key in safe.into_iter().take(MAX_ASSETS) {
+        let Ok(bytes) = sy.download_file(&format!("assets/{key}")).await else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let name = key.rsplit('/').next().unwrap_or(key);
+        let path = format!("{dir}/{name}");
+        if std::fs::write(&path, &bytes).is_ok() {
+            out.push(path);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::collect_asset_refs;
     use super::collect_threads;
     use super::replace_md_section;
+    use super::save_body_assets;
     use super::validate_comment_text;
     use super::SectionEdit;
     use super::task_run;
     use crate::cmd::cli::TaskSub;
+    use crate::siyuan::SiYuan;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -1537,5 +1628,61 @@ mod tests {
     fn comment_guard_skips_stdin_source() {
         validate_comment_text(true, "--не-флаг-а-текст").expect("stdin — явное намерение, не гвардим");
         validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
+    }
+
+    #[test]
+    fn collect_asset_refs_extracts_unique_assets_in_order() {
+        let md = "![а](assets/first.png)\nтекст [файл](assets/second.htm) ![а](assets/first.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["first.png", "second.htm"]);
+    }
+
+    #[test]
+    fn collect_asset_refs_percent_decodes_names() {
+        let md = "![ф](assets/%D0%B8%D0%BC%D1%8F%20я.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["имя я.png"]);
+    }
+
+    #[test]
+    fn collect_asset_refs_ignores_non_asset_links() {
+        let md = "[сайт](https://example.com/x.png) [внутр](/Projects/doc) ![п](assets/ok.png)\n";
+        assert_eq!(collect_asset_refs(md), vec!["ok.png"]);
+    }
+
+    #[tokio::test]
+    async fn save_body_assets_downloads_with_original_names_and_skips_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                if path == "data/assets/assets-self-test/img.png" {
+                    ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
+                } else {
+                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        const ROW: &str = "20261105090000-assette1";
+        let md = "![и](assets/assets-self-test/img.png) ![нет](assets/assets-self-test/gone.png)\n";
+        let saved = save_body_assets(&sy, md, ROW).await;
+
+        assert_eq!(saved.len(), 1, "доступный аттач сохранён, Missing — тихо пропущен: {saved:?}");
+        assert!(saved[0].ends_with("/img.png"), "оригинальное имя файла: {saved:?}");
+        let bytes = std::fs::read(&saved[0]).expect("файл записан");
+        assert_eq!(bytes, b"png-bytes");
+        std::fs::remove_dir_all(format!("/tmp/uwuwu-task-{ROW}")).expect("тест прибрал за себя");
+    }
+
+    #[tokio::test]
+    async fn save_body_assets_skips_traversal_names() {
+        let server = MockServer::start().await;
+        let sy = SiYuan::for_tests(server.uri());
+        let md = "![x](assets/../../etc) ![y](assets/ok.png)\n";
+        let saved = save_body_assets(&sy, md, "20261105090000-travers").await;
+        assert!(saved.is_empty(), "ключи с ../ не скачиваются и не пишутся: {saved:?}");
     }
 }
