@@ -925,14 +925,17 @@ pub(crate) enum SectionEdit {
 /// попадает в SectionEdit. Граница секции — заголовок уровня ≤ 2 вне кодового
 /// фенса: gherkin-фенсы bug-шаблонов несут строки «# …», фенс-трекинг обязателен,
 /// иначе новая граница резала бы их (регрессия относительно кода до уровня-aware).
-/// Гард уровня: h2-матча нет, но тёзка «X» есть на уровне 1 или ≥ 3 — Err
-/// с уровнем и байт-точной строкой (первой по порядку): иначе контент молча
-/// аппендится новой ##-секцией в конец — дубль (ожог ###-правок). Тёзка в фенсе
-/// не заголовок — гард молчит; при живом h2-матче тёзка игнорируется. Секция
-/// не найдена вовсе — append в конец с нормализованным заголовком; пустой ввод
-/// очищает секцию (контракт); пустая строка перед следующим заголовком восстанавливается.
+/// Запрос нормализован от собственного ATX-префикса: «## Решение» матчит
+/// секцию «Решение» (иначе want нёс бы хэши, матч не сходился, а append
+/// писал мусор «## ## Решение»). Гард уровня: h2-матча нет, но тёзка «X» есть
+/// на уровне 1 или ≥ 3 — Err с уровнем и байт-точной строкой (первой по
+/// порядку): иначе контент молча аппендится новой ##-секцией в конец — дубль
+/// (ожог ###-правок). Тёзка в фенсе не заголовок — гард молчит; при живом
+/// h2-матче тёзка игнорируется. Секция не найдена вовсе — append в конец
+/// с нормализованным заголовком; пустой ввод очищает секцию (контракт);
+/// пустая строка перед следующим заголовком восстанавливается.
 fn replace_md_section(md: &str, section: &str, content: &str) -> Result<(String, SectionEdit)> {
-    let want = md_heading::normalize_heading_text(section);
+    let want = md_heading::normalize_heading_query(section);
     let mut out = String::new();
     let mut fenced = false;
     let mut dropping = false; // контент секции/дубля до границы не копируется
@@ -986,7 +989,7 @@ fn replace_md_section(md: &str, section: &str, content: &str) -> Result<(String,
                  --replace-section матчит только ## — правь через содержащую ##-секцию или полный task body --replace"
             );
         }
-        let heading = format!("## {}", md_heading::normalize_heading_text(section));
+        let heading = format!("## {want}");
         if !out.is_empty() {
             out.push('\n');
         }
@@ -1752,6 +1755,38 @@ mod tests {
         assert!(msg.contains("h3"), "первая тёзка по порядку — детерминизм: {msg}");
         assert!(msg.contains("### Подсекция"), "строка первой тёзки: {msg}");
         assert!(!msg.contains("h1"), "вторая тёзка не упоминается: {msg}");
+    }
+
+    // ——— нормализация запроса: ATX-префикс в --replace-section срезается ———
+
+    #[test]
+    fn prefixed_h3_query_refuses_instead_of_garbage_append() {
+        // факт 06.11 (задача 20261104072048): запрос «### Замечания…» при живой
+        // h3-секции → раньше not-found append «## ### Замечания…» в хвост тела
+        let md = "## Финальный отчёт\nввод\n### Замечания и неочевидные решения\nдетали\n\n## Комменты\n- строка\n";
+        let err = replace_md_section(md, "### Замечания и неочевидные решения", "новое\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("h3"), "запрос с префиксом матчит тёзку после среза хэшей: {msg}");
+        assert!(msg.contains("### Замечания и неочевидные решения"), "байт-точная строка: {msg}");
+    }
+
+    #[test]
+    fn prefixed_h2_query_matches_live_section() {
+        let md = "## X\nстарое\n\n## Б\nвторое\n";
+        let (out, edit) = replace_md_section(md, "## X", "новое\n").unwrap();
+        assert!(out.contains("## X\nновое"), "запрос «## X» матчит живую секцию «X»");
+        assert!(out.contains("## Б\nвторое"));
+        assert_eq!(out.matches("## X").count(), 1, "без дубля секции");
+        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+    }
+
+    #[test]
+    fn prefixed_query_appends_clean_heading() {
+        let md = "## А\nтело\n";
+        let (out, edit) = replace_md_section(md, "### Новая", "контент").unwrap();
+        assert!(out.contains("## Новая\nконтент"), "append пишет чистый заголовок без хэшей запроса");
+        assert!(!out.contains("## ###"), "двойного префикса в теле нет: {out}");
+        assert_eq!(edit, SectionEdit::Appended);
     }
 
     #[test]
