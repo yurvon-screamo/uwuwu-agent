@@ -58,16 +58,21 @@ class FakeKernel:
     box-scoped соседи), не по точной строке запроса.
     """
 
-    def __init__(self, docs, contents=None, removal_updates_index=True):
+    def __init__(self, docs, contents=None, removal_updates_index=True, notebooks=None):
         self.docs = {d["id"]: dict(d) for d in docs}
         self.contents = contents or {}
         self.removal_updates_index = removal_updates_index
+        self.notebooks = notebooks
         self.removed = []
         self.sql_stmts = []
 
     def post(self, path: str, body: dict, attempts: int = 6):
         if path == "/api/query/sql":
             return self._sql(body["stmt"])
+        if path == "/api/notebook/lsNotebooks":
+            if self.notebooks is None:
+                raise RuntimeError("POST /api/notebook/lsNotebooks: ядро недоступно")
+            return {"notebooks": [dict(nb) for nb in self.notebooks]}
         if path == "/api/export/exportMdContent":
             return {"content": self.contents.get(body["id"], "")}
         if path == "/api/filetree/removeDocByID":
@@ -241,6 +246,30 @@ class ApostropheInHpath(unittest.TestCase):
         self.assertTrue(any("''" in s for s in kernel.sql_stmts),
                         f"hpath без экранирования кавычки: {kernel.sql_stmts}")
         self.assertIn("соседей по пути: 2", output)
+
+
+class TrailNotebookName(unittest.TestCase):
+    """Трейл называет человекочитаемое имя ноутбука; отказ lsNotebooks —
+    фолбэк на box-id, исход успешного сноса не меняется."""
+
+    def test_trail_prints_notebook_name(self):
+        kernel = FakeKernel(
+            docs=[_doc(STUB_ID, "/uwuwu/Ранбуки/РБ", "/20261103224612-e9q7eyv/РБ/РБ.sy")],
+            contents={STUB_ID: STUB_CONTENT},
+            notebooks=[{"id": BOX, "name": "Projects", "closed": False}],
+        )
+        output = run_delete(kernel, STUB_ID)
+        self.assertIn("(ноутбук Projects)", output)
+
+    def test_notebooks_failure_falls_back_to_box_id_without_failing_command(self):
+        kernel = FakeKernel(
+            docs=[_doc(STUB_ID, "/uwuwu/Ранбуки/РБ", "/20261103224612-e9q7eyv/РБ/РБ.sy")],
+            contents={STUB_ID: STUB_CONTENT},
+            notebooks=None,
+        )
+        output = run_delete(kernel, STUB_ID)
+        self.assertIn(f"(ноутбук {BOX})", output)
+        self.assertEqual(kernel.removed, [STUB_ID])
 
 
 class SqlDiscipline(unittest.TestCase):
