@@ -11,15 +11,20 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
-import { acquireLock, makeDrain } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt,
   type CronRow, type CronState,
 } from "./cron-lib"
 
-const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
+// песочница: UWUWU_CRON_STATE_DIR двигает state+lock; в песочнице лог
+// тоже переезжает (прод-лог не засоряется смоук-тиками)
+const STATE_DIR_RAW = process.env.UWUWU_CRON_STATE_DIR
+const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-cron"))
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
+const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
+  ? join(STATE_DIR, "uwuwu-cron.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 
 /** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
 function formatLocal(d: Date): string {
@@ -32,6 +37,11 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
+/** DRY_RUN: полный цикл решений по реальным крон-доскам (чтение), спавны
+ *  и записи ячеек заменяются логом. Требует песочницу state — гард в main().
+ *  Без него песочный state опасен сам по себе: чистый state делает все
+ *  периодические кроны due → реальные спавны на прод-досках. */
+const DRY_RUN = process.env.UWUWU_CRON_DRY_RUN === "1"
 /** пауза между срабатываниями одного крона пока жива его сессия */
 const SESSION_COOLDOWN_MS = 10 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
@@ -167,6 +177,10 @@ async function readCrons(board: BoardIds): Promise<CronRow[]> {
 }
 
 async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
+    return
+  }
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
@@ -285,6 +299,11 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
       log(`крон «${title}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
       continue
     }
+    // DRY_RUN: до спавна — расписание признано due, гейт пройден; сессию не создаём
+    if (DRY_RUN) {
+      log(`DRY_RUN: крон «${title}» — сессия не спавнилась (промпт ${firePrompt({ ...row, title }, body, project).length} байт)`)
+      continue
+    }
     const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)
@@ -312,6 +331,12 @@ async function main(): Promise<void> {
     console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
+  // гард dry-run ДО лока: невалидный режим не должен даже притворяться
+  // демоном (фиктивные записи не должны попадать в прод-state)
+  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+    console.error("DRY_RUN требует UWUWU_CRON_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-cron держит lock — выходим")
     process.exit(1)
@@ -319,7 +344,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
-  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
   let consecutiveFails = 0

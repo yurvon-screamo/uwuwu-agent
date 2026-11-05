@@ -21,7 +21,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -81,13 +81,22 @@ const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
     local: join(homedir(), "true-wash"),
   },
 }
-const STATE_DIR = join(homedir(), ".local/state/uwuwu-factory")
+// песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
+// тоже переезжает (прод-лог не засоряется смоук-тиками)
+const STATE_DIR_RAW = process.env.UWUWU_FACTORY_STATE_DIR
+const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-factory"))
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
+  ? join(STATE_DIR, "uwuwu-factory.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
+/** DRY_RUN: полный цикл решений по реальным доскам (чтение), все мутации
+ *  (спавны, промпты, ячейки, комменты, термин сессий) заменяются логом.
+ *  Требует песочницу state — гард в main(). */
+const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 /** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника.
  *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
@@ -237,6 +246,10 @@ async function readTasks(board: BoardIds): Promise<TaskRef[]> {
 }
 
 async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
+    return
+  }
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
@@ -314,6 +327,10 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
 
 async function commentTask(bodyDoc: string, text: string): Promise<boolean> {
   if (bodyDoc === "") return false
+  if (DRY_RUN) {
+    log(`DRY_RUN: comment → ${bodyDoc.slice(0, 8)}: ${text.slice(0, 80)}`)
+    return true
+  }
   try {
     await mcp.tool("create_comment", { docId: bodyDoc, content: text })
     return true
@@ -371,6 +388,10 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
 }
 
 async function promptSession(sessionID: string, text: string): Promise<boolean> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80)}…`)
+    return true
+  }
   try {
     await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text } })
     return true
@@ -417,6 +438,11 @@ async function startTask(
 ): Promise<void> {
   // стоп-сигнал: не спавним новую работу — задача доедет при следующем старте
   if (drain.isStopping()) return
+  // DRY_RUN: решение о спавне принято (routeTask отлогировал) — сессию не создаём
+  if (DRY_RUN) {
+    log(`DRY_RUN: спавн девелопера над ${task.rowId.slice(0, 8)} (${start}) — пропущен`)
+    return
+  }
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
   // сессия стартует в основном чекауте репо
   // тайтл: линкованная строка несёт заголовок в доке-теле — деривируем из него
@@ -484,6 +510,14 @@ async function startTask(
 /** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает.
  *  Живая ревью-сессия задачи — терминируем (разовая чистка, не watchdog). */
 async function finishTask(rowId: string, tracked: TrackedTask, state: FactoryState): Promise<void> {
+  // DRY_RUN: чистка в песочный state безвредна, но термин реальной
+  // ревью-сессии — side-effect на прод-сервере — не делаем
+  if (DRY_RUN) {
+    log(`DRY_RUN: Done-чистка ${rowId.slice(0, 8)} — state-запись удалена бы, ревью-сессия не терминируется`)
+    delete state.tasks[rowId]
+    saveState(state)
+    return
+  }
   log(`задача ${rowId.slice(0, 8)}: Done — чистка state`)
   if (tracked.reviewSessionID !== undefined && tracked.reviewSessionID !== "") {
     await restCall(`/session/${tracked.reviewSessionID}`, { method: "DELETE" }).catch(() => {})
@@ -570,6 +604,11 @@ async function startReview(
   task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState,
   kind: ReviewKind, tracked: TrackedTask,
 ): Promise<void> {
+  // DRY_RUN: решение о ревью принято — ревьювера не спавним
+  if (DRY_RUN) {
+    log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
+    return
+  }
   const worktree = kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
   const ctx = { branch: task.branch, worktree, pr: task.pr }
   const sessionID = await createSession({
@@ -955,6 +994,12 @@ async function main(): Promise<void> {
     console.error(errText(e))
     process.exit(1)
   }
+  // гард dry-run ДО лока: невалидный режим не должен даже притворяться
+  // демоном (фиктивные записи не должны попадать в прод-state)
+  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+    console.error("DRY_RUN требует UWUWU_FACTORY_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
@@ -962,7 +1007,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {

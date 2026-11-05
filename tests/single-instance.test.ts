@@ -6,6 +6,7 @@ import { describe, expect, test, afterAll } from "bun:test"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 
 const LIB_PATH = resolve(import.meta.dir, "../lib/single-instance.ts")
 const CHILD = join(import.meta.dir, "single-instance-child.ts")
@@ -114,5 +115,37 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
     children.push(a)
     expect(await a.proc.exited).toBe(1)
     expect(existsSync(join(a.stateDir, "lock"))).toBeFalse()
+  })
+
+  test("разные stateDir — локи независимы (песочница ≠ прод)", async () => {
+    const a = await spawnChild("hold")
+    children.push(a)
+    const b = await spawnChild("hold")
+    children.push(b)
+    // оба живы одновременно: песочный лок не видит прод-лок и наоборот
+    expect(existsSync(a.ready)).toBeTrue()
+    expect(existsSync(b.ready)).toBeTrue()
+    expect(existsSync(join(a.stateDir, "lock"))).toBeTrue()
+    expect(existsSync(join(b.stateDir, "lock"))).toBeTrue()
+  })
+})
+
+describe("resolveStateDir / sandboxedStateDir", () => {
+  const fallback = "/home/u/.local/state/uwuwu-factory"
+
+  test("env отсутствует/пустой/whitespace — дефолт (прод-путь)", () => {
+    expect(resolveStateDir(undefined, fallback)).toBe(fallback)
+    expect(resolveStateDir("", fallback)).toBe(fallback)
+    expect(resolveStateDir("   ", fallback)).toBe(fallback)
+    expect(sandboxedStateDir(undefined)).toBeFalse()
+    expect(sandboxedStateDir("")).toBeFalse()
+    expect(sandboxedStateDir("  ")).toBeFalse()
+  })
+
+  test("env задан — переопределение as-is (песочница)", () => {
+    expect(resolveStateDir("/tmp/smoke-factory", fallback)).toBe("/tmp/smoke-factory")
+    expect(resolveStateDir("  /tmp/smoke-factory  ", fallback)).toBe("/tmp/smoke-factory")
+    expect(sandboxedStateDir("/tmp/smoke-factory")).toBeTrue()
+    expect(sandboxedStateDir(" /tmp/smoke-factory ")).toBeTrue()
   })
 })
