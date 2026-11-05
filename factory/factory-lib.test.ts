@@ -2,6 +2,8 @@
 import { describe, expect, test } from "bun:test"
 import {
   commentText,
+  continuePrompt,
+  kickoffModeOf,
   newUserComments,
   bodyEditPrompt,
   spawnPrompt,
@@ -160,6 +162,48 @@ describe("spawnPrompt", () => {
     const p = spawnPrompt("r1", "origa", "yurvon-screamo/origa")
     expect(p).not.toContain("ПАЙП")
     expect(p).not.toContain("=== ТЕЛО ЗАДАЧИ ===")
+  })
+  test("design-режим (дефолт): утряска с «Ревью плана» на месте", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
+    expect(p).toContain("Стадия Design")
+    expect(p).toContain("План утрясан")
+    expect(p).toContain("«Ревью плана»")
+  })
+  test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
+    expect(p).toContain("In Progress")
+    expect(p).toContain("пропускаешь")
+    expect(p).toContain("«Ревью результата»")
+    expect(p).toContain("task get")
+    // предписание план-ревью («План утрясан → … «Ревью плана»») — только в design-режиме
+    expect(p).not.toContain("План утрясан")
+    expect(p).not.toContain("🤖")
+  })
+})
+
+describe("continuePrompt", () => {
+  test("рестарт без предписания стадии, с якорем на пайп AGENTS.md", () => {
+    const p = continuePrompt("r1", "origa", "yurvon-screamo/origa")
+    expect(p).toContain("Задача r1")
+    expect(p).toContain("перезапущена")
+    expect(p).toContain("AGENTS.md")
+    expect(p).toContain("task get")
+    expect(p).not.toContain("Стадия Design")
+    expect(p).not.toContain("«Ревью плана»")
+    expect(p).not.toContain("🤖")
+  })
+})
+
+describe("kickoffModeOf", () => {
+  test("In Progress → implement (стадия реализации)", () => {
+    expect(kickoffModeOf("In Progress")).toBe("implement")
+  })
+  test("остальные статусы → design (safe default)", () => {
+    expect(kickoffModeOf("Design")).toBe("design")
+    expect(kickoffModeOf("Needs attention")).toBe("design")
+    expect(kickoffModeOf("")).toBe("design")
+    expect(kickoffModeOf(REVIEW_PLAN_STATUS)).toBe("design")
+    expect(kickoffModeOf(REVIEW_RESULT_STATUS)).toBe("design")
   })
 })
 
