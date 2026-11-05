@@ -1,7 +1,7 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
 use super::read_resolve;
-use crate::cmd::cli::{Commands, CronSub, KernelSub, TaskSub};
+use crate::cmd::cli::{Commands, CronSub, KernelSub, SemanticSub, TaskSub};
 use crate::markdown;
 use crate::md_heading;
 use crate::siyuan::{FileFetch, SiYuan};
@@ -26,7 +26,10 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
             task_run(&project, command).await
         }
         Commands::Cron { command } => cron_run(command).await,
-        Commands::Search { query, limit, .. } => search_run(&query, limit).await,
+        Commands::Search { query, limit, sofa, threshold } => {
+            search_run(&query, limit, threshold, sofa).await
+        }
+        Commands::Semantic { command } => semantic_run(command).await,
         Commands::Read { slug } => {
             let md = read_markdown(&slug).await?;
             print!("{md}");
@@ -739,9 +742,11 @@ fn cron_schedule(in_: &Option<String>, every: &Option<String>, at: &Option<Strin
 
 // ——— docs/search/blob/projects ———
 
-pub(crate) async fn search_run(query: &str, limit: usize) -> Result<()> {
+pub(crate) async fn search_run(query: &str, limit: usize, threshold: f32, sofa: usize) -> Result<()> {
     let sy = SiYuan::from_env()?;
     println!("Searching for: \"{query}\"\n");
+    // Полнотекстовая секция — формат и состав байт-в-байт прежние:
+    // вывод парсят фабричные агенты (контракт регрессии задачи 20261104072044).
     let rows = sy.search(query, limit).await?;
     for (i, r) in rows.iter().enumerate() {
         let hpath = r.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
@@ -750,6 +755,76 @@ pub(crate) async fn search_run(query: &str, limit: usize) -> Result<()> {
     }
     if rows.is_empty() {
         println!("ничего не найдено");
+    }
+    if sofa > 0 {
+        print_sofa(query, sofa).await;
+    }
+    // Семантическая секция — always-on: отказы маршрута становятся
+    // статусом внутри секции, команда не падает (exit 0).
+    let cfg = crate::semantic::SemanticConfig::from_env();
+    let section = crate::semantic::search_half(&sy, &cfg, query, limit, threshold).await;
+    println!();
+    for line in section {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// SOFA-блок полнотекстовой секции (opt-in): софт-деградация без кред —
+/// предупреждение в stderr, локальный поиск не страдает.
+async fn print_sofa(query: &str, limit: usize) {
+    println!("\nSOFA (публичный):");
+    match crate::sofa::search(query, limit).await {
+        Ok(hits) if hits.is_empty() => println!("ничего не найдено"),
+        Ok(hits) => {
+            for (i, hit) in hits.iter().enumerate() {
+                println!("{}. {} [{}]", i + 1, hit.title, hit.content_type);
+                println!("    {}", hit.url);
+            }
+        }
+        Err(e) => eprintln!("SOFA недоступен (продолжаю локально): {e:#}"),
+    }
+}
+
+/// Обслуживание semantic-индекса: явный пересбор (громкие ошибки —
+/// maintenance-команда) и статус.
+pub(crate) async fn semantic_run(command: SemanticSub) -> Result<()> {
+    let sy = SiYuan::from_env()?;
+    let cfg = crate::semantic::SemanticConfig::from_env();
+    match command {
+        SemanticSub::Rebuild { resume } => {
+            if resume {
+                eprintln!(
+                    "Продолжение semantic-индекса от watermark: {} через {}",
+                    cfg.embed_model, cfg.embed_url
+                );
+            } else {
+                eprintln!(
+                    "Пересбор semantic-индекса: {} через {} (первичный билд ~55–70 мин)",
+                    cfg.embed_model, cfg.embed_url
+                );
+            }
+            let batches = std::sync::Mutex::new(0usize);
+            let on_batch = std::sync::Arc::new(move |embedded: usize| {
+                let mut count = batches.lock().expect("progress lock");
+                *count += 1;
+                if (*count).is_multiple_of(10) {
+                    eprintln!("  чанков записано: {embedded}");
+                }
+            });
+            let report = crate::semantic::rebuild(&sy, &cfg, Some(on_batch), resume).await?;
+            println!(
+                "Готово: {} чанков за {:.0} мин (пропущено коротких: {})",
+                report.embedded,
+                report.elapsed.as_secs_f64() / 60.0,
+                report.skipped_short,
+            );
+        }
+        SemanticSub::Status => {
+            for line in crate::semantic::status(&sy, &cfg).await? {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
