@@ -36,6 +36,7 @@ import {
   reviewCommentsPrompt,
   reviewReturnPrompt,
   routeTask,
+  rowMissingAction,
   worktreeByBranch,
   type ReviewKind,
   type FactoryState,
@@ -675,6 +676,8 @@ async function dispatchReviewAction(
 async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
+  // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
+  log(`проход ${projectName}: строк ${rows.length}`)
 
   // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
   //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
@@ -721,12 +724,24 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if ((tracked.project || "uwuwu") !== projectName) continue
     if (started.has(rowId)) continue // стартован этим тиком — rows устарели
     const row = rows.find((r) => r.rowId === rowId)
-    if (row === undefined) {
-      // строка исчезла с доски — чистим за собой
-      log(`задача ${rowId.slice(0, 8)}: строка исчезла — чистка`)
+    // suspect-механика: необратимую чистку (finishTask = delete state +
+    // DELETE ревью-сессии) страхуем от одиночного промаха скана — строка
+    // должна отсутствовать в двух проходах подряд
+    const missing = rowMissingAction(tracked.missingSince, row !== undefined)
+    if (missing === "clear") {
+      delete tracked.missingSince
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: строка вернулась в скан — suspect-пометка снята`)
+    } else if (missing === "mark") {
+      tracked.missingSince = new Date().toISOString()
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: строки нет в скане — suspect, чистка не раньше следующего прохода`)
+    } else if (missing === "clean") {
+      log(`задача ${rowId.slice(0, 8)}: строки нет в скане 2 прохода подряд (с ${tracked.missingSince}) — чистка`)
       await finishTask(rowId, tracked, state)
       continue
     }
+    if (row === undefined) continue // mark: маршрутизировать нечего
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
     if (row.status === "Done") {
