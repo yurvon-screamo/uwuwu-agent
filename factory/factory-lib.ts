@@ -50,6 +50,10 @@ export interface TrackedTask {
    *  DELETE ревью-сессии) — только при пропаже в двух проходах подряд:
    *  одиночный промах скана не должен терять трекинг (прод-кейс 05.11). */
   missingSince?: string
+  /** сигнал о застое уже отправлен в этом эпизоде In Progress (анти-спам
+   *  «раз за эпизод»; сброс — на смене статуса или при вернувшейся
+   *  активности — делает демон) */
+  stallSignaled?: boolean
 }
 
 export interface FactoryState {
@@ -371,6 +375,87 @@ export function rowMissingAction(missingSince: string | undefined, rowFound: boo
   return missingSince === undefined ? "mark" : "clean"
 }
 
+// ——— сигнал о застое: In Progress, сессия жива, агент молчит ———
+
+/** Чистый парсер UWUWU_FACTORY_STALL_MIN: undefined/пусто → 30; конечное
+ *  число > 0 → оно; иначе (NaN, 0, отрицательное, мусор) → дефолт 30.
+ *  0 исключён — сигнал срабатывал бы на каждой паузе между сообщениями
+ *  (анти-спам не спасёт), NaN исключён — мёртвая фича. */
+export function stallMinutesFromEnv(v: string | undefined): number {
+  if (v === undefined || v.trim() === "") return 30
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : 30
+}
+
+/** Активность сессии по последнему сообщению (список DESC — берём только
+ *  [0]): max числовых полей time (created/streamed/completed). null —
+ *  сообщений нет (= застой: трекнутая сессия минимум с промптом-сообщением).
+ *  "invalid" — ответ не распознаётся (пропуск тика, без ложных сигналов).
+ *  Синтетический idle-маркер и сообщение без completed валидны: достаточно
+ *  одного числового поля времени; отсутствие completed — норма. */
+export function lastActivityOf(msgs: unknown[]): number | null | "invalid" {
+  if (msgs.length === 0) return null
+  const m = msgs[0] as { time?: unknown } | null
+  if (m === null || typeof m !== "object") return "invalid"
+  if (m.time === null || typeof m.time !== "object") return "invalid"
+  const t = m.time as Record<string, unknown>
+  const nums = [t.created, t.streamed, t.completed].filter(
+    (x): x is number => typeof x === "number" && Number.isFinite(x),
+  )
+  if (nums.length === 0) return "invalid"
+  return Math.max(...nums)
+}
+
+export interface StallFacts {
+  /** статус строки сейчас */
+  status: string
+  /** жива ли сессия девелопера (null — liveness неизвестна: пропуск тика) */
+  sessionAlive: boolean | null
+  /** активность последнего сообщения; null — сообщений нет (= застой) */
+  lastActivityAt: number | null
+  /** Branch-ячейка строки (деталь диагноза в тексте сигнала) */
+  branch: string
+  /** ветка нашлась в ворктри по `git worktree list` */
+  branchInWorktree: boolean
+  /** сигнал в этом эпизоде уже был (анти-спам «раз за эпизод») */
+  signaled: boolean
+  now: number
+}
+
+export type StallVerdict =
+  | { t: "none" }
+  | { t: "signal"; text: string }
+  | { t: "silent" }
+
+/** Единственная точка решения о застое (по образцу routeTask): трекнутая
+ *  In Progress при живой сессии, но тишине дольше порога (или без сообщений
+ *  вовсе) = потерянный/зависший ход — активный ход рождает сообщения на
+ *  каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
+ *  пропуск тика: оба → none. Повторный сигнал в эпизоде глушится флагом
+ *  (silent); сброс флага — дело демона (смена статуса / активность). */
+export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
+  if (f.status !== "In Progress") return { t: "none" }
+  if (f.sessionAlive !== true) return { t: "none" }
+  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
+  if (!stalled) return { t: "none" }
+  if (f.signaled) return { t: "silent" }
+  const quietMin = f.lastActivityAt === null
+    ? null
+    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
+  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const branchDiag = f.branch === ""
+    ? "Branch-ячейка пуста — агент умер до создания ветки"
+    : f.branchInWorktree
+      ? `ветка на месте (${f.branch.slice(0, 60)})`
+      : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
+  const text = [
+    `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+    `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
+    "Напиши комментарий — это разбудит агента; или переставь статус руками.",
+  ].join(" ")
+  return { t: "signal", text }
+}
+
 /** Ветка и путь ворктри для задачи (row-id может начинаться с дефиса). */
 export function worktreePaths(root: string, rowId: string): { branch: string; worktree: string } {
   const safe = rowId.replace(/^-+/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || "task"
@@ -402,6 +487,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
+  if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
   if (
     t.reviewSessionID !== undefined &&
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
