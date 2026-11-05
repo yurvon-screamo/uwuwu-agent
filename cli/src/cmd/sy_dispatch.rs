@@ -1709,6 +1709,56 @@ mod tests {
         validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
     }
 
+    // ——— порядок диспетчера: гвард текста раньше bail по --project ———
+
+    /// `task comment <id> …` при пустом --project: оба пути падают до
+    /// SiYuan::from_env (гвард/байл — первые строки task_run), сети нет.
+    fn comment_command(stdin: bool, text: &[&str]) -> TaskSub {
+        TaskSub::Comment {
+            id: "20261104072048-4n1rwdt".into(),
+            reply: None,
+            stdin,
+            text: text.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Факт AGENTS-коммента задачи (крон-сессия 04.11, ×3): `task comment <id>
+    /// "текст" --project X` — флаг проглочен trailing_var_arg'ом → project=None →
+    /// bail «--project обязателен» маскировал причину под «флаг не передан».
+    /// Гвард должен стрелять РАНЬШЕ bail по --project.
+    #[tokio::test]
+    async fn comment_guard_fires_before_project_bail_on_swallowed_flag() {
+        let err = task_run("", comment_command(false, &["текст", "--project", "X"]))
+            .await
+            .expect_err("флаг в позиционном тексте — отказ гварда");
+        let msg = err.to_string();
+        assert!(msg.contains("похож на флаг"), "реальная причина в ошибке: {msg}");
+        assert!(!msg.contains("обязателен"), "маскировка «флаг не передан» недопустима: {msg}");
+    }
+
+    /// Пинну приоритета (замечание ревью плана): подкоманда-как-текст при
+    /// ОТСУТСТВУЮЩЕМ --project — тоже гвард раньше bail («list» вместо
+    /// «--project обязателен»).
+    #[tokio::test]
+    async fn comment_guard_fires_before_project_bail_on_subcommand_token() {
+        let err = task_run("", comment_command(false, &["list"]))
+            .await
+            .expect_err("подкоманда-как-текст — отказ гварда");
+        let msg = err.to_string();
+        assert!(msg.contains("подкоманд"), "сообщение гварда: {msg}");
+        assert!(!msg.contains("обязателен"), "приоритет ошибок сменился обратно: {msg}");
+    }
+
+    /// Контроль: чистый позиционный текст при пустом --project — прежний bail
+    /// (проверка --project не размыта гвардом).
+    #[tokio::test]
+    async fn clean_comment_text_still_bails_on_missing_project() {
+        let err = task_run("", comment_command(false, &["текст"]))
+            .await
+            .expect_err("--project обязателен для чистого текста");
+        assert!(err.to_string().contains("обязателен"), "{err}");
+    }
+
     #[test]
     fn collect_asset_refs_extracts_unique_assets_in_order() {
         let md = "![а](assets/first.png)\nтекст [файл](assets/second.htm) ![а](assets/first.png)\n";
