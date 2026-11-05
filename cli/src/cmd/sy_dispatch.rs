@@ -43,6 +43,16 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
+    // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
+    // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
+    if let TaskSub::Create { title, r#type: ty, stdin, attach, dry_run: true } = command {
+        if !attach.is_empty() {
+            anyhow::bail!("siyuan-бекенд: --attach не поддерживается (вставь картинку в UI)");
+        }
+        let ctx = if stdin { read_stdin()? } else { String::new() };
+        println!("{}", syt::body_template(&title, ty.as_deref().unwrap_or("dev"), &ctx));
+        return Ok(());
+    }
     if project.is_empty() {
         anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
     }
@@ -110,7 +120,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             Ok(())
         }
-        TaskSub::Create { title, r#type: ty, stdin, attach } => {
+        TaskSub::Create { title, r#type: ty, stdin, attach, .. } => {
             if !attach.is_empty() {
                 anyhow::bail!("siyuan-бекенд: --attach не поддерживается (вставь картинку в UI)");
             }
