@@ -91,14 +91,14 @@ describe("isValidTracked", () => {
 describe("firePrompt", () => {
   const row = { rowId: "r1", bodyDoc: "d1", title: "Проверка X", schedule: "*/30 * * * *", status: "active", lastRun: "" }
   test("контракт: коммент с 🤖, [DONE] для разовых, границы", () => {
-    const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь и доложи")
-    expect(p).toContain("uwuwu-cli task comment r1")
+    const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь и доложи", "1xgames")
+    expect(p).toContain("uwuwu-cli task comment r1 --project 1xgames")
     expect(p).not.toContain("🤖")
     expect(p).toContain("[DONE]")
     expect(p).toContain("≡")
   })
   test("пустое тело — стаб по заголовку", () => {
-    expect(firePrompt(row, "")).toContain("(пусто — отработай по заголовку)")
+    expect(firePrompt(row, "", "uwuwu")).toContain("(пусто — отработай по заголовку)")
   })
 })
 
@@ -107,7 +107,7 @@ describe("cronBodyStub", () => {
     const md = cronBodyStub("Проверка Y", "5m")
     expect(md).toContain("# Проверка Y")
     expect(md).toContain("`5m`")
-    expect(md).toContain("## Лог")
+    expect(md).toContain("## Комменты")
   })
 })
 

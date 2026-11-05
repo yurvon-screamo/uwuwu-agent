@@ -124,7 +124,7 @@ kernel SiYuan (REST + встроенный MCP), единый воркспейс
 
 Required env: `UWUWU_SIYUAN_URL`,
 `UWUWU_SIYUAN_TOKEN` (или `UWUWU_SIYUAN_WS` с conf.json). Бекенд один — SiYuan kernel API
-(сменный `UWUWU_BACKEND` выпилен PR #32, ADR-014).
+(сменимый бекенд выпилен PR #32, ADR-014).
 
 **Workspace structure**:
 
