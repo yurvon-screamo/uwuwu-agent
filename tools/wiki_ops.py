@@ -23,13 +23,15 @@ append: идемпотентен при ретраях (инцидент append 
 отсылкой — контрольный export: нормализованный аппенд совпал с нормализованным
 хвостом дока → no-op с репортом «already applied» (rc 0). Нормализация сливает
 только рендер-неразличимое (разбеги пробелов и пустые строки вне code-fence)
-и ядро-стёртое при roundtrip (whitespace у pipe в таблицах — живые пробы
-06.11); ведущий отступ вне fence и код внутри fence сравниваются дословно —
-ложный no-op на структурно разный markdown невозможен, промах guard'а всегда
-даёт видимый дубль, не тихую потерю. Слепых ретраев нет:
+и ядро-стёртое при roundtrip (whitespace у pipe в таблицах, dash-пэддинг
+separator'а — живые пробы 06.11); ведущий отступ вне fence и код внутри fence
+сравниваются дословно — ложный no-op на структурно разный markdown невозможен,
+промах guard'а всегда даёт видимый дубль, не тихую потерю. Слепых ретраев нет:
 export и appendBlock идут attempts=1, единственный ретрай-луп — guard
 (APPEND_ATTEMPTS, backoff; худший случай — конверт прежних 6 слепых attempts).
---force — осознанный повтор идентичного контента в обход guard'а.
+--force — осознанный дубль single-shot: одна отсылка без сверок и ретраев,
+сбой — громкая ошибка, повтор — за оператором (слепой луп за флагом вернул бы
+инцидент ×N).
 
 orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
 молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
@@ -66,6 +68,9 @@ DOC_ID_RE = re.compile(r"^\d{14}-[a-z0-9]{7}$")
 APPEND_ATTEMPTS = 6
 
 FENCE_RE = re.compile(r"^\s*```")
+# Separator таблицы: только pipe/дефисы/двоеточия/пробелы и обязателен pipe
+# (thematic break «---» без pipe — не он).
+SEPARATOR_ROW_RE = re.compile(r"(?=.*\|)[\s|:\-]*-[\s|:\-]*")
 
 
 class KernelRefused(RuntimeError):
@@ -104,13 +109,15 @@ def post(path: str, body: dict, attempts: int = 6):
                 d = json.loads(r.read())
         except Exception as e:
             last = str(e)
-            time.sleep(1 + i)
+            if i < attempts - 1:
+                time.sleep(1 + i)
             continue
         if d.get("code") == 0:
             return d.get("data")
         last = f"code={d.get('code')} msg={d.get('msg')}"
         if "metadata is not ready" in str(d.get("msg")):
-            time.sleep(2 + i)
+            if i < attempts - 1:
+                time.sleep(2 + i)
             continue
         raise KernelRefused(f"POST {path}: {last}")
     raise RuntimeError(f"POST {path}: {last}")
@@ -148,14 +155,16 @@ def _normalized_lines(text: str) -> list[str]:
     внутренние whitespace-разбеги — схлоп до одного пробела (рендер markdown их
     стирает); ведущий отступ строки — дословно (слипание «без отступа»/«с
     отступом» дало бы тихую потерю записи: top-level vs подсписок, параграф vs
-    индет-блок). Строки таблиц (с «|»): whitespace вплотную к pipe — дроп (ядро
-    стирает его при roundtrip, проба 1); separator-строка (только pipe/дефисы/
-    двоеточия) — канонизируется: ядро пэддит дефисы до ширины колонок (живая
-    верификация 06.11: «|-----|» → «| -----|»), скелет двоеточий выравнивания
-    сохраняется, внутренние пробелы ячеек не трогаем — слипаем меньше, чем
-    известно про ядро. Осознанная граница: дроп пустых строк вне fence
-    рендер-различим для tight/loose списков — это слипание вариантов одного
-    текста, нужное для детекции ретрая после разыхивания; не «чинить».
+    индет-блок). Строки таблиц (≥2 pipe): whitespace вплотную к pipe — дроп
+    (ядро стирает его при roundtrip, проба 1); одиночный pipe в прозе («a | b»)
+    идёт по прозаическому правилу — слипание с «a|b» исключено; осознанный
+    остаток — многопipe'овая проза (редка). Separator-строка (только pipe/
+    дефисы/двоеточия) — канонизируется: ядро пэддит дефисы до ширины колонок
+    (живая верификация 06.11: «|-----|» → «| -----|»), скелет двоеточий
+    выравнивания сохраняется, внутренние пробелы ячеек не трогаем — слипаем
+    меньше, чем известно про ядро. Осознанная граница: дроп пустых строк вне
+    fence рендер-различим для tight/loose списков — это слипание вариантов
+    одного текста, нужное для детекции ретрая после разыхивания; не «чинить».
     Внутри code-fence — дословно: пробелы кода семантичны.
     """
     normalized: list[str] = []
@@ -174,14 +183,11 @@ def _normalized_lines(text: str) -> list[str]:
         leading = line[: len(line) - len(line.lstrip())]
         if SEPARATOR_ROW_RE.fullmatch(stripped):
             normalized.append(leading + _canonical_separator(stripped))
-        elif "|" in stripped:
+        elif stripped.count("|") >= 2:
             normalized.append(leading + re.sub(r"\s*\|\s*", "|", stripped))
         else:
             normalized.append(leading + " ".join(stripped.split()))
     return normalized
-
-
-SEPARATOR_ROW_RE = re.compile(r"(?=.*\|)[\s|:\-]*-[\s|:\-]*")
 
 
 def _canonical_separator(row: str) -> str:
@@ -207,18 +213,30 @@ def _tail_already_applied(exported: str, appended: str) -> bool:
     return len(exp) >= len(app) and exp[-len(app):] == app
 
 
+def _append_block(doc_id: str, md: str) -> None:
+    post("/api/block/appendBlock", {"dataType": "markdown", "data": md, "parentID": doc_id},
+         attempts=1)
+
+
 def cmd_append(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     md = Path(a.file).read_text()
+    if a.force:
+        # Осознанный дубль — single-shot: одна отсылка, без сверок и ретраев
+        # (слепой луп за флагом вернул бы инцидент ×N: ядро применило, ответ
+        # потерян, ретрай отправил снова). Сбой — громкая ошибка; повтор —
+        # за осознавшим это оператором.
+        _append_block(doc_id, md)
+        print(f"дописано в {doc_id}")
+        return
     for attempt in range(1, APPEND_ATTEMPTS + 1):
         try:
-            if not a.force and _tail_already_applied(_export_content(doc_id), md):
+            if _tail_already_applied(_export_content(doc_id), md):
                 print(f"already applied: {doc_id} — контент уже в хвосте дока, append не выполнялся")
                 return
-            post("/api/block/appendBlock", {"dataType": "markdown", "data": md, "parentID": doc_id},
-                 attempts=1)
+            _append_block(doc_id, md)
             print(f"дописано в {doc_id}")
             return
         except KernelRefused:
@@ -367,7 +385,8 @@ def main():
     p = sub.add_parser("append")
     p.add_argument("docId")
     p.add_argument("--md", dest="file", required=True)
-    p.add_argument("--force", action="store_true", help="осознанный дубль: обход guard'а уже-применённого")
+    p.add_argument("--force", action="store_true",
+                   help="осознанный дубль single-shot: одна отсылка без guard'а и ретраев")
     p.set_defaults(fn=cmd_append)
     p = sub.add_parser("replace")
     p.add_argument("docId")

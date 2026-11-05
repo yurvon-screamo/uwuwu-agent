@@ -175,6 +175,16 @@ class TailSemantics(unittest.TestCase):
         self.assertEqual(len(kernel.appends), 1)
         self.assertIn("дописано", output)
 
+    def test_force_is_single_shot_without_blind_retries(self):
+        # Инцидент-паттерн не возвращается за флагом: --force при висящем ядре
+        # («применил и уронил ответ» каждый раз) даёт ровно одну отсылку и
+        # громкую ошибку, N копий не получить.
+        kernel = FakeKernel(contents={DOC: "base\n"}, apply_loses_response=True)
+        with self.assertRaises(RuntimeError):
+            run_append(kernel, DOC, "текст\n", force=True)
+        self.assertEqual(len(kernel.appends), 1, "force — single-shot, без ретрай-лупа")
+        self.assertEqual(kernel.contents[DOC].count("текст"), 1)
+
 
 class FailureSemantics(unittest.TestCase):
     """KernelRefused — fail fast; export недоступен — fail-closed; бюджет лупа N=6."""
@@ -265,6 +275,13 @@ class NormalizedLines(unittest.TestCase):
 
     def test_prose_single_space_is_render_meaningful_not_merged(self):
         self.assertNotEqual(wiki_ops._normalized_lines("а б\n"), wiki_ops._normalized_lines("аб\n"))
+
+    def test_prose_single_pipe_goes_prose_rule_not_table_rule(self):
+        # Одиночный pipe в прозе — не табличная строка: «a | b» и «a|b»
+        # рендер-различны и не слипаются (ревью раунд 2, Low).
+        self.assertNotEqual(wiki_ops._normalized_lines("a | b\n"),
+                            wiki_ops._normalized_lines("a|b\n"))
+        self.assertEqual(wiki_ops._normalized_lines("a |  b\n"), ["a | b"])
 
     def test_table_pipe_adjacent_whitespace_removed(self):
         # Проба 1: ядро стирает пробелы у pipe при roundtrip — слипаем как ядро.
@@ -369,6 +386,19 @@ class PostClassification(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 wiki_ops.post("/api/query/sql", {"stmt": "select 1"}, attempts=3)
         self.assertIn("conn refused", str(cm.exception))
+
+    def test_single_attempt_has_no_inner_sleep(self):
+        # attempts=1 — без внутреннего backoff: двойного бэкоффа с guard-лупом
+        # нет, «единственная точка ретраев — луп» абсолютна (ревью раунд 2, Low).
+        def fake_urlopen(req, timeout=60):
+            raise urllib.error.URLError("conn refused")
+
+        sleeps = []
+        with (patch.object(wiki_ops.urllib.request, "urlopen", fake_urlopen),
+              patch.object(wiki_ops.time, "sleep", sleeps.append)):
+            with self.assertRaises(RuntimeError):
+                wiki_ops.post("/api/query/sql", {"stmt": "select 1"}, attempts=1)
+        self.assertEqual(sleeps, [])
 
 
 if __name__ == "__main__":
