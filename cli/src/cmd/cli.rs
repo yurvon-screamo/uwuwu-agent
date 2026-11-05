@@ -169,14 +169,29 @@ pub(crate) enum CronSub {
         #[arg(long, help = "Промпт из stdin (иначе заглушка)")]
         stdin: bool,
     },
-    /// Все кроны доски
-    List,
+    /// Все кроны доски (--project → «Кроны <proj>», деф. uwuwu)
+    List {
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
+    },
     /// Остановить (Status=paused)
-    Pause { id: String },
+    Pause {
+        id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
+    },
     /// Запустить обратно (Status=active)
-    Resume { id: String },
+    Resume {
+        id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
+    },
     /// Удалить крон (строка + тело в трэш)
-    Rm { id: String },
+    Rm {
+        id: String,
+        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        project: Option<String>,
+    },
 }
 
 /// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без
