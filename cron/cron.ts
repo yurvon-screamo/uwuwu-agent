@@ -79,6 +79,14 @@ function loadState(): CronState {
 }
 
 function saveState(state: CronState): void {
+  // инвариант «DRY_RUN ⇒ ни одной записи» держится на уровне API, не только
+  // main()-гарда: прямой вызов tickBoard (тесты) в обход main не должен иметь
+  // возможности тронуть прод-state (прод-кейс 06.11: DRY_RUN-тест без
+  // UWUWU_CRON_STATE_DIR перезаписал прод-state.json тестовой записью)
+  if (DRY_RUN) {
+    log(`DRY_RUN: saveState (${Object.keys(state.crons).length} кронов) — пропущен`)
+    return
+  }
   mkdirSync(STATE_DIR, { recursive: true })
   if (existsSync(STATE_FILE)) {
     try { copyFileSync(STATE_FILE, `${STATE_FILE}.bak`) } catch {}

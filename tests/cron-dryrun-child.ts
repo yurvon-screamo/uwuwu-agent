@@ -2,8 +2,17 @@
 // DRY_RUN — константа модуля демона (печётся на импорте), в общем процессе
 // bun test её не подменить без утечки в соседние тест-файлы. Env задаётся
 // здесь до импорта cron.ts — паттерн single-instance-child.ts.
+// ОБА sandbox-env обязательны ДО импорта: прод-кейс 06.11 (ревью раунд 4,
+// High) — child без UWUWU_CRON_STATE_DIR писал refuse-запись в прод-state
+// демона (saveState в refuse-пути). Теперь инвариант «DRY_RUN ⇒ ни одной
+// записи» держится гардом saveState (cron.ts) — env остаётся страховкой
+// на случай отката гарда: песочница изолирует state+lock независимо.
+import { mkdirSync } from "node:fs"
+
 process.env.UWUWU_CRON_LOG = "/tmp/opencode/cron-dryrun-home/cron-dryrun-child.log"
+process.env.UWUWU_CRON_STATE_DIR = "/tmp/opencode/cron-dryrun-home/state"
 process.env.UWUWU_CRON_DRY_RUN = "1"
+mkdirSync("/tmp/opencode/cron-dryrun-home/state", { recursive: true })
 
 const cron = await import("../cron/cron")
 
