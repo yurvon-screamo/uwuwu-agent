@@ -335,10 +335,12 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     }
     case "get_doc": {
       const docId = String(args.docId ?? "")
-      const rows = await sql<{ id: string; content: string; updated: string }>(
-        `select id, content, updated from blocks where type='d' and id='${docId}' limit 1`)
+      const rows = await sql<{ id: string; content: string; updated: string; box?: string; hpath?: string }>(
+        `select id, content, updated, box, hpath from blocks where type='d' and id='${docId}' limit 1`)
       const d = rows[0]
-      return (d ? { id: d.id, title: d.content, updatedAt: d.updated } : { id: docId, title: "", updatedAt: "" }) as T
+      return (d
+        ? { id: d.id, title: d.content, updatedAt: d.updated, box: d.box ?? "", hpath: d.hpath ?? "" }
+        : { id: docId, title: "", updatedAt: "", box: "", hpath: "" }) as T
     }
     case "read_doc": {
       const docId = String(args.docId ?? "")
@@ -355,6 +357,15 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "doc_ids_by_hpath": {
+      // FS-истина файлового дерева: без лага SQL-индекса (паритет CLI
+      // doc_ids_by_hpath); заголовки с '/' санитайзит вызывающий (pathSafe)
+      const data = await post<unknown>("/api/filetree/getIDsByHPath", {
+        notebook: String(args.notebook ?? ""), path: String(args.path ?? ""),
+      })
+      const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
+      return { ids } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {

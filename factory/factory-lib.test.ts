@@ -15,6 +15,8 @@ import {
   runBatch,
   parseProjects,
   formatPassSummary,
+  adoptBodyDoc,
+  pathSafe,
   type ProjectCfg,
   isValidTracked,
   rowMissingAction,
@@ -30,6 +32,7 @@ import {
   type RouteFacts,
   type TaskComment,
   type TaskRef,
+  type TrackedTask,
 } from "./factory-lib"
 
 const c = (id: string, text: string, at: number): TaskComment => ({ id, text, createdAt: at })
@@ -520,5 +523,68 @@ describe("parseProjects: семантическая валидация", () => {
 
   test("пустой объект — отказ: демон без проектов молча не работает", () => {
     expect(() => parseProjects("{}", fallback)).toThrow(/пуст/)
+  })
+})
+
+describe("adoptBodyDoc: самоисцеление пустого bodyDoc трека", () => {
+  const tracked = (bodyDoc: string): TrackedTask => ({
+    sessionID: "ses_x", worktree: "", branch: "", bodyDoc,
+    title: "Задача", lastCommentAt: 0, lastCommentId: "",
+    createdAt: 1, attempts: 0, project: "t",
+  })
+  const row = (bodyDoc: string): TaskRef => ({
+    rowId: "row1", bodyDoc, title: "Задача", status: "In Progress", pr: "", branch: "",
+  })
+
+  test("пустой трек + резолв строки — тело принято", () => {
+    expect(adoptBodyDoc(tracked(""), row("20261105000000-bodydoc"))).toBe("20261105000000-bodydoc")
+  })
+
+  test("непустой трек не перезаписывается (идемпотентность)", () => {
+    expect(adoptBodyDoc(tracked("20261105000000-old"), row("20261105000000-new"))).toBeNull()
+  })
+
+  test("строка без резолва — adopt не срабатывает", () => {
+    expect(adoptBodyDoc(tracked(""), row(""))).toBeNull()
+  })
+})
+
+// ——— самоисцеление трека (баг «bodyDoc пуст у всех треков») ———
+
+describe("adoptBodyDoc", () => {
+  const tracked = (bodyDoc: string): TrackedTask => ({
+    sessionID: "ses_x", worktree: "", branch: "", bodyDoc, title: "Т",
+    lastCommentAt: 0, lastCommentId: "", createdAt: 1, attempts: 0, project: "t",
+  })
+  const row = (bodyDoc: string): TaskRef => ({
+    rowId: "row1", bodyDoc, title: "Т", status: "In Progress", pr: "", branch: "",
+  })
+
+  test("пустой трек + привязка строки → тело принято", () => {
+    expect(adoptBodyDoc(tracked(""), row("20261105000000-bodydoc"))).toBe("20261105000000-bodydoc")
+  })
+
+  test("непустой трек не перезаписывается (state выигрывает)", () => {
+    expect(adoptBodyDoc(tracked("20261105000000-old"), row("20261105000000-new"))).toBeNull()
+  })
+
+  test("строка без тела — no-op", () => {
+    expect(adoptBodyDoc(tracked(""), row(""))).toBeNull()
+  })
+})
+
+// ——— тайтл → сегмент hpath (фоллбек тела detached-строк) ———
+
+describe("pathSafe", () => {
+  test("'/' заменяется на U+2215 — паритет CLI path_safe", () => {
+    expect(pathSafe("вынести сборки из /tmp на /home")).toBe("вынести сборки из \u{2215}tmp на \u{2215}home")
+  })
+
+  test("тайтл без слэшей не меняется", () => {
+    expect(pathSafe("обычный тайтл (v2)")).toBe("обычный тайтл (v2)")
+  })
+
+  test("уже санитизированный остаётся как есть (идемпотентность)", () => {
+    expect(pathSafe("уже \u{2215} санитизирован")).toBe("уже \u{2215} санитизирован")
   })
 })
