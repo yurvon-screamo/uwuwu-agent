@@ -97,12 +97,15 @@ def post(path: str, body: dict, attempts: int = 6):
             if d.get("code") == 0:
                 return d.get("data")
             last = f"code={d.get('code')} msg={d.get('msg')}"
-            if "metadata is not ready" in str(d.get("msg")):
+            if "metadata is not ready" in str(d.get("msg")) and i < attempts - 1:
                 time.sleep(2 + i)
                 continue
+            # прочий код!=0 не лечится повтором — бессмысленный ре-POST мутации вреден
+            break
         except Exception as e:
             last = str(e)
-        time.sleep(1 + i)
+        if i < attempts - 1:
+            time.sleep(1 + i)
     raise RuntimeError(f"POST {path}: {last}")
 
 
@@ -279,44 +282,87 @@ def _mutate(path: str, body: dict) -> dict:
 
 
 FENCE_RE = re.compile(r"^(`{3,}|~{3,}).*$")
+HEADING_RE = re.compile(r"#{1,6}\s")
+BREAK_RE = re.compile(r"(-{3,}|\*{3,}|_{3,})$")
+QUOTE_RE = re.compile(r">")
+BULLET_RE = re.compile(r"[-*+]\s")
+ORDERED_RE = re.compile(r"\d{1,9}[.)]\s")
+TABLE_RE = re.compile(r"\|")
 
 
 def _is_closing_fence(line: str, fence_char: str) -> bool:
     return line[0] == fence_char and set(line) == {fence_char}
 
 
-def _advance_plain_line(line: str, inside_chunk: bool) -> tuple[int, bool]:
-    """Плоская строка вне кода: пустая закрывает чанк, непустая после разрыва
-    открывает новый. Возвращает (дельта чанков, inside_chunk)."""
-    if not line:
-        return 0, False
-    return (1, True) if not inside_chunk else (0, True)
+def _fence_transition(line: str, in_code: bool, fence_char: str) -> str | None:
+    """'open' / 'close' / None для строки-фенса относительно состояния кода."""
+    if not FENCE_RE.match(line):
+        return None
+    if in_code:
+        return "close" if _is_closing_fence(line, fence_char) else None
+    return "open"
+
+
+def _marker_kind(line: str) -> str | None:
+    """Тип топ-уровневой конструкции-маркера или None (продолжение абзаца)."""
+    if QUOTE_RE.match(line):
+        return "quote"
+    if BULLET_RE.match(line) or ORDERED_RE.match(line):
+        return "list"
+    if TABLE_RE.match(line):
+        return "table"
+    return None
+
+
+def _starts_new_block(raw_line: str, line: str, chunk_kind: str) -> bool:
+    """Новый блок по правилам ядра (Lute): конструкция впритык после абзаца
+    (fence/заголовок/цитата/список/таблица/разрыв — проба ревью 05.11: updateBlock
+    молча выбрасывает хвост таких payload'ов); строки с отступом — продолжение
+    текущего блока (вложенные списки, ленивые переносы)."""
+    if raw_line[:1].isspace():
+        return False
+    if HEADING_RE.match(line) or BREAK_RE.search(line):
+        return True  # заголовок/тематический разрыв начинают новый блок всегда
+    kind = _marker_kind(line)
+    return kind is not None and kind != chunk_kind
 
 
 def _payload_chunk_count(markdown: str) -> int:
-    """Число топ-уровневых блоков в markdown: фрагменты, разделённые пустой строкой;
-    fenced-код держит пустые строки внутри одного блока. Ошибки парсера уходят
-    в безопасную сторону — лишний отказ вместо тихой потери хвоста."""
+    """Число топ-уровневых блоков в markdown: пустая строка ИЛИ конструкция
+    впритык после абзаца начинает новый блок; fenced-код держит пустые строки
+    внутри одного блока; одно-родственные строки (items списка, строки цитаты/
+    таблицы) — один блок. Ошибки парсера уходят в безопасную сторону — лишний
+    отказ вместо тихой потери хвоста."""
     chunk_count = 0
     in_code = False
     fence_char = ""
     inside_chunk = False
+    chunk_kind = ""
     for raw_line in markdown.splitlines():
         line = raw_line.strip()
-        if FENCE_RE.match(line):
-            if not in_code:
-                in_code, fence_char = True, line[0]
-                if not inside_chunk:
-                    chunk_count += 1
-            elif _is_closing_fence(line, fence_char):
-                in_code = False
-            inside_chunk = True
+        transition = _fence_transition(line, in_code, fence_char)
+        if transition == "open":
+            in_code, fence_char = True, line[0]
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, "fence"
+            continue
+        if transition == "close":
+            in_code = False
+            # закрытый fence завершает блок: следующая строка — новый блок
+            inside_chunk, chunk_kind = False, ""
             continue
         if in_code:
-            inside_chunk = True
             continue
-        delta, inside_chunk = _advance_plain_line(line, inside_chunk)
-        chunk_count += delta
+        if not line:
+            inside_chunk, chunk_kind = False, ""
+            continue
+        if _starts_new_block(raw_line, line, chunk_kind):
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, _marker_kind(line) or "paragraph"
+            continue
+        if not inside_chunk:
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, "paragraph"
     return chunk_count
 
 
@@ -401,7 +447,12 @@ def _new_block_ids(resp) -> list[str]:
 
 
 def _read_payload(filename: str) -> str:
-    payload = Path(filename).read_text()
+    try:
+        payload = Path(filename).read_text()
+    except OSError as exc:
+        raise RuntimeError(f"payload недоступен: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"payload не UTF-8: {exc}") from None
     if not payload.strip():
         raise RuntimeError("пустой payload — блок нельзя обновить/вставить пустотой (снос — block-delete)")
     return payload

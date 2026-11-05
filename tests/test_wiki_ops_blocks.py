@@ -89,12 +89,19 @@ class FakeKernel:
         self.sql_stmts.append(stmt)
         all_rows = list(self.docs.values()) + list(self.blocks.values())
         if "count(*)" in stmt:
-            parent = re.search(r"parent_id='([^']+)'", stmt).group(1)
-            return [{"c": sum(1 for r in all_rows if r.get("parent_id") == parent)}]
+            m = re.search(r"parent_id='([^']+)'", stmt)
+            if m is None:
+                raise AssertionError(f"непонятный stmt: {stmt}")
+            return [{"c": sum(1 for r in all_rows if r.get("parent_id") == m.group(1))}]
         if "type='d'" in stmt:
-            doc = self.docs.get(re.search(r"id='([^']+)'", stmt).group(1))
+            m = re.search(r"id='([^']+)'", stmt)
+            if m is None:
+                raise AssertionError(f"непонятный stmt: {stmt}")
+            doc = self.docs.get(m.group(1))
             return [{"hpath": doc["hpath"]}] if doc else []
         m = re.search(r"where id='([^']+)' limit", stmt)
+        if m is None:
+            raise AssertionError(f"непонятный stmt: {stmt}")
         # Реальный индекс: одна таблица blocks для доков и блоков.
         row = self.blocks.get(m.group(1)) or self.docs.get(m.group(1))
         return [dict(row)] if row else []
@@ -153,6 +160,32 @@ class PayloadIsOneBlock(unittest.TestCase):
         self.assertEqual(wiki_ops._payload_chunk_count("```py\n\n\nкод\n\n```"), 1)
         self.assertEqual(wiki_ops._payload_chunk_count("~~~\n\nкод\n~~~"), 1)
         self.assertEqual(wiki_ops._payload_chunk_count("- item один\n- item два"), 1)
+
+    def test_adjacent_block_starts_counted_as_separate_blocks(self):
+        # Проба ревью 05.11: ядро режет payload на блоки без пустой строки и
+        # молча выбрасывает хвост — парсер обязан видеть те же границы.
+        self.assertEqual(wiki_ops._payload_chunk_count("текст абзаца\n- пункт один\n- пункт два"), 2)
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n```python\nx = 1\n```\nхвостик"), 3)
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n# Заголовок"), 2)
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n> цитата"), 2)
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n2. нумерованный"), 2)
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n| a | b |"), 2)
+        # `---` под абзацем — setext-заголовок (1 блок) + «хвост» новым абзацем.
+        self.assertEqual(wiki_ops._payload_chunk_count("текст\n---\nхвост"), 2)
+
+    def test_same_kind_and_nested_lines_stay_one_block(self):
+        self.assertEqual(wiki_ops._payload_chunk_count("- item\n  - вложенный"), 1)
+        self.assertEqual(wiki_ops._payload_chunk_count("> строка раз\n> строка два"), 1)
+        self.assertEqual(wiki_ops._payload_chunk_count("| a | b |\n|---|---|\n| 1 | 2 |"), 1)
+        self.assertEqual(wiki_ops._payload_chunk_count("- item\n    продолжение с отступом"), 1)
+
+    def test_adjacent_list_payload_is_refused_at_command_level(self):
+        # Живой кейс ревью: guard пропускал, updateBlock терял список тихо.
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()])
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", payload="текст абзаца\n- пункт один")
+        self.assertIn("блока(ов)", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
 
     def test_empty_payload_is_refused(self):
         kernel = FakeKernel(blocks=[_block()], docs=[_doc()])
