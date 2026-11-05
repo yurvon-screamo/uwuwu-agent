@@ -338,8 +338,9 @@ async function main(): Promise<void> {
       consecutiveFails = 0
     } catch (e) {
       consecutiveFails++
-      // стек целиком: сообщение без фреймов не локализует, какой лега тика упал
-      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? e.stack : String(e)}`)
+      // сообщение и стек отдельными строками: bun у подклассов Error рендерит
+      // stack без сообщения (прод-кейс 05.11: «tick: Error» без причины)
+      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? ""}` : String(e)}`)
       if (consecutiveFails >= 5) {
         // отравленное соединение/пул: свежий процесс чище вечных ретраев
         log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")
