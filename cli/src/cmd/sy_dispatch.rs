@@ -1026,10 +1026,13 @@ mod tests {
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let data = if hpath.ends_with("/таск") {
+                let data = if hpath == "/uwuwu/Задачи uwuwu" {
+                    serde_json::json!([BOARD_DOC])
+                } else if hpath == "/uwuwu/Задачи uwuwu/таск" {
                     serde_json::json!(ids)
                 } else {
-                    serde_json::json!([BOARD_DOC])
+                    // прочие пути (крон-доски и пр.) в этом сценарии не существуют
+                    serde_json::json!([])
                 };
                 ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
             })
