@@ -174,6 +174,15 @@ def _is_stub(doc_id: str) -> bool:
     return False
 
 
+def _notebook_display_name(box_id: str) -> str:
+    # Косметика для трейла delete: один запрос без ретраев, отказ ядра
+    # не роняет команду после успешного сноса — фолбэк на box-id.
+    try:
+        return next(n["name"] for n in notebooks(attempts=1) if n["id"] == box_id)
+    except Exception:
+        return box_id
+
+
 def cmd_delete(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
@@ -194,13 +203,7 @@ def cmd_delete(a):
     for _ in range(2):
         if _doc_row(doc_id) is None:
             marker = "да" if stub else "нет (--force)"
-            try:
-                # Косметика после успешного сноса: один запрос без ретраев,
-                # отказ ядра не роняет команду — фолбэк на box-id.
-                nb_name = next(n["name"] for n in notebooks(attempts=1) if n["id"] == row["box"])
-            except Exception:
-                nb_name = row["box"]
-            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {nb_name})")
+            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {_notebook_display_name(row['box'])})")
             print(f"  маркер заглушки: {marker}; соседей по пути: {siblings}; дочерних доков: {children}")
             print("  → корзина SiYuan, восстановимо через UI (история данных) до истечения срока хранения")
             return
