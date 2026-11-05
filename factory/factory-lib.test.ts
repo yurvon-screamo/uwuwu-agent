@@ -549,30 +549,6 @@ describe("adoptBodyDoc: самоисцеление пустого bodyDoc тре
   })
 })
 
-// ——— самоисцеление трека (баг «bodyDoc пуст у всех треков») ———
-
-describe("adoptBodyDoc", () => {
-  const tracked = (bodyDoc: string): TrackedTask => ({
-    sessionID: "ses_x", worktree: "", branch: "", bodyDoc, title: "Т",
-    lastCommentAt: 0, lastCommentId: "", createdAt: 1, attempts: 0, project: "t",
-  })
-  const row = (bodyDoc: string): TaskRef => ({
-    rowId: "row1", bodyDoc, title: "Т", status: "In Progress", pr: "", branch: "",
-  })
-
-  test("пустой трек + привязка строки → тело принято", () => {
-    expect(adoptBodyDoc(tracked(""), row("20261105000000-bodydoc"))).toBe("20261105000000-bodydoc")
-  })
-
-  test("непустой трек не перезаписывается (state выигрывает)", () => {
-    expect(adoptBodyDoc(tracked("20261105000000-old"), row("20261105000000-new"))).toBeNull()
-  })
-
-  test("строка без тела — no-op", () => {
-    expect(adoptBodyDoc(tracked(""), row(""))).toBeNull()
-  })
-})
-
 // ——— тайтл → сегмент hpath (фоллбек тела detached-строк) ———
 
 describe("pathSafe", () => {
