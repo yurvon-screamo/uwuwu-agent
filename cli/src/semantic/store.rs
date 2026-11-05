@@ -156,12 +156,28 @@ impl Store {
         }
         drop(stmt);
         if let Some(mark) = watermark {
+            // MAX-семантика: watermark только вперёд. Resume с overlap-окном
+            // переезжает старые секунды плотного булк-корпуса — откат
+            // водяного знака означал бы бесконечный повторный переезд.
             tx.execute(
                 "insert into meta(key, value) values ('watermark', ?1)
-                 on conflict(key) do update set value = excluded.value",
+                 on conflict(key) do update set value = excluded.value
+                 where excluded.value > meta.value",
                 [mark],
             )?;
         }
+        Ok(())
+    }
+
+    /// Watermark только вперёд (MAX-семантика): resume/overlap переезжают
+    /// старые секунды булк-корпуса — откат знака зацикливал бы переезд.
+    pub fn advance_watermark(&self, mark: &str) -> Result<()> {
+        self.conn.execute(
+            "insert into meta(key, value) values ('watermark', ?1)
+             on conflict(key) do update set value = excluded.value
+             where excluded.value > meta.value",
+            [mark],
+        )?;
         Ok(())
     }
 

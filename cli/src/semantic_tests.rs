@@ -836,3 +836,21 @@ async fn rebuild_resume_refuses_empty_index() {
     };
     assert!(err.to_string().contains("resume"));
 }
+
+#[test]
+fn advance_watermark_is_monotonic() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.advance_watermark(T0).unwrap();
+    store.advance_watermark(T1).unwrap();
+    assert_eq!(store.meta("watermark").unwrap().as_deref(), Some(T1));
+
+    // «Откат» из overlap-окна resume не двигает знак назад.
+    store.advance_watermark(T0).unwrap();
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some(T1),
+        "watermark должен расти только вперёд"
+    );
+}

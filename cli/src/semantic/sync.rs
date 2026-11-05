@@ -202,8 +202,9 @@ pub async fn delta_sync(
         }
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
-            // на крайний курсор (включая пропущенные по длине строки).
-            store.set_meta("watermark", &cursor_updated)?;
+            // на крайний курсор (включая пропущенные по длине строки);
+            // set_meta — с MAX-гвардом, как у батчевых записей.
+            store.advance_watermark(&cursor_updated)?;
             break;
         }
     }
