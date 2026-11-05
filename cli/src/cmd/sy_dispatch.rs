@@ -11,6 +11,14 @@ use crate::siyuan_task as syt;
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
+/// Заметка о фоллбеке: строка найдена не на штатной доске задач — прозрачность
+/// пути резолва в выводе команды.
+fn note_fallback_board(origin: syt::ResolveOrigin, board: &syt::SyBoard) {
+    if origin != syt::ResolveOrigin::Tasks {
+        println!("доска: {} (фоллбек)", board.hpath);
+    }
+}
+
 pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Task { command, project } => {
@@ -73,8 +81,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
             println!("Строка:   {}", task.item_id);
@@ -106,23 +114,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if title.is_some() {
                 anyhow::bail!("siyuan-бекенд: переименование задачи не поддерживается (переименуй саб-док в UI)");
             }
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             syt::edit(&sy, &board, &task, status.as_deref(), branch.as_deref(), pr.as_deref()).await?;
             println!("обновлено: {}", task.title);
             Ok(())
         }
         TaskSub::Comment { id, reply, stdin, text } => {
             let msg = collect_text(stdin, text)?;
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             println!("коммент отправлен: {}", truncate(&msg, 60));
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                 None => String::new(),
@@ -131,8 +139,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
             Ok(())
@@ -142,8 +150,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Undo { journal } => task_undo(&sy, project, journal.as_deref()).await,
         TaskSub::Body { id, replace, replace_section, md, stdin } => {
             let content = read_body_input(md.as_deref(), stdin)?;
-            let board = syt::find_board(&sy, project).await?;
-            let task = syt::resolve(&sy, &board, &id).await?;
+            let (board, task, origin) = syt::resolve_on_project(&sy, &project, &id).await?;
+            note_fallback_board(origin, &board);
             let body_path = board.body_hpath(&task.title);
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
             let doc = match doc {
@@ -1018,10 +1026,13 @@ mod tests {
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let data = if hpath.ends_with("/таск") {
+                let data = if hpath == "/uwuwu/Задачи uwuwu" {
+                    serde_json::json!([BOARD_DOC])
+                } else if hpath == "/uwuwu/Задачи uwuwu/таск" {
                     serde_json::json!(ids)
                 } else {
-                    serde_json::json!([BOARD_DOC])
+                    // прочие пути (крон-доски и пр.) в этом сценарии не существуют
+                    serde_json::json!([])
                 };
                 ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
             })

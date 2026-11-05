@@ -155,7 +155,7 @@ export function sanitizeBoundary(text: string): string {
 }
 
 /** Промпт срабатывания: тело крона + контракт доложить. */
-export function firePrompt(row: CronRow, body: string): string {
+export function firePrompt(row: CronRow, body: string, project: string): string {
   return [
     `Ты — исполнитель крон-задачи «${row.title.replace(/[\r\n]+/g, " ")}» (расписание: ${row.schedule}).`,
     "",
@@ -166,7 +166,7 @@ export function firePrompt(row: CronRow, body: string): string {
     "ПРАВИЛА:",
     "1. Выполни задачу из тела. Это периодическая проверка/работа — работай автономно.",
     "2. Доложи результат ОДНИМ комментарием в док задачи:",
-    `   uwuwu-cli task comment ${row.rowId} "<отчёт: что проверил, статус, аномалии>"`,
+    `   uwuwu-cli task comment ${row.rowId} --project ${project} "<отчёт: что проверил, статус, аномалии>"`,
     "   Пиши от себя (коммент идёт с бот-аккаунта, автор и так виден).",
     "3. Если нашёл проблему, требующую человека — напиши явно ЧТО РЕШИТЬ в том же комменте.",
     "4. Если задача разовая и завершена полностью — добавь в конце коммента: [DONE].",
@@ -183,7 +183,7 @@ export function cronBodyStub(title: string, schedule: string): string {
     "## Что делать на каждом срабатывании",
     "(опиши работу агента)",
     "",
-    "## Лог",
-    "_Отчёты агента приходят комментами; история ниже._",
+    "## Комменты",
+    "_Отчёты агента приходят комментами (uwuwu-cli task comment) в эту секцию._",
   ].join("\n")
 }

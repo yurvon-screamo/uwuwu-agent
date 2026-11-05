@@ -275,7 +275,10 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // linked-строки несут заголовок в теле: деривируем из первой строки
     const title = row.title !== "" ? row.title
       : body.split("\n")[0]?.replace(/^#+\s*/, "").trim() || `крон ${row.rowId.slice(0, 8)}`
-    const sessionID = await fireSession(title, firePrompt({ ...row, title }, body))
+    // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
+    // агенту не нужно угадывать (глобальная доска «Crons» не используется)
+    const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
+    const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)
       continue

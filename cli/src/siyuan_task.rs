@@ -26,6 +26,7 @@ fn pick_search_hit(results: &[Value], expect_hpath: &str, title: &str, doc_id: &
     })
 }
 
+#[derive(Clone, Debug)]
 pub struct SyBoard {
     pub doc_id: String,
     pub av_id: String,
@@ -61,14 +62,26 @@ pub async fn find_board(sy: &SiYuan, project: &str) -> Result<SyBoard> {
 }
 
 pub async fn find_board_titled(sy: &SiYuan, project: &str, title: &str) -> Result<SyBoard> {
+    let hpath = format!("/{p}/{title}", p = project);
+    find_board_titled_opt(sy, project, title)
+        .await?
+        .ok_or_else(|| anyhow!("доска «{title}» не найдена ({hpath})"))
+}
+
+/// Доска по тайтлу с таксономией отсутствия: None = дока нет (benign —
+/// доску в воркспейсе не завели); Err = инфра-сбой ядра или битая доска
+/// (database-блок не найден — маскировать нельзя).
+pub async fn find_board_titled_opt(sy: &SiYuan, project: &str, title: &str) -> Result<Option<SyBoard>> {
     let nb = sy.ensure_notebook("Projects").await?;
     let hpath = format!("/{p}/{title}", p = project);
-    let doc_id = sy
+    let Some(doc_id) = sy
         .doc_ids_by_hpath(&nb, &hpath)
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("доска «{title}» не найдена ({hpath})"))?;
+    else {
+        return Ok(None);
+    };
     // database-блок внутри дока: av-блок ядра (data-av-id=) или legacy i-носитель (avID=)
     let rows = sy
         .sql(&format!(
@@ -107,7 +120,7 @@ pub async fn find_board_titled(sy: &SiYuan, project: &str, title: &str) -> Resul
             ),
         }
     }
-    Ok(SyBoard { doc_id, av_id, block_id, hpath, notebook: nb })
+    Ok(Some(SyBoard { doc_id, av_id, block_id, hpath, notebook: nb }))
 }
 
 fn extract_av_id(md: &str) -> Option<String> {
@@ -576,6 +589,146 @@ pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTas
             bail!("неоднозначный {reason}: {matches} совпадений")
         }
     }
+}
+
+/// Где нашлась строка: штатная доска задач или крон-доска (свой/чужой проект).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveOrigin {
+    Tasks,
+    CronProject,
+    CronForeign,
+}
+
+/// Резолв с фоллбеком на крон-доски (контракт AGENTS.md): «Задачи <proj>» →
+/// «Кроны <proj>» → чужие «Кроны %».
+///
+/// Фаза A — точный item-id по доскам в порядке приоритета, первый точный
+/// матч выигрывает (автопуть крон-агента с полным rowId детерминирован).
+/// Фаза B — нечёткий матч (префиксы/подстрока) собирается со всех досок:
+/// матч ровно на одной доске → она (независимо от приоритета); матчи на
+/// нескольких или неоднозначность хоть на одной — громкая ошибка с раскладкой
+/// (тихий wrong-target исключён конструктивно).
+pub async fn resolve_on_project(sy: &SiYuan, project: &str, needle: &str) -> Result<(SyBoard, SyTask, ResolveOrigin)> {
+    let candidates = resolve_candidates(sy, project).await?;
+    if candidates.is_empty() {
+        bail!("доски проекта «{project}» не найдены: нет ни «Задачи {project}», ни «Кроны {project}», чужих крон-досок тоже");
+    }
+    let mut rows_cache: Vec<Option<Vec<SyTask>>> = vec![None; candidates.len()];
+
+    // Фаза A: точный id
+    let exact = needle.trim_start_matches('-');
+    for (idx, (board, origin)) in candidates.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        if let Some(task) = rows.iter().find(|r| r.item_id == exact) {
+            return Ok((board.clone(), task.clone(), *origin));
+        }
+    }
+
+    // Фаза B: нечёткий матч по всем доскам
+    let mut found: Vec<(usize, SyTask)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for (idx, (board, _origin)) in candidates.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        let subdoc_ids = board_subdoc_ids(sy, board).await?;
+        match match_needle(&rows, &subdoc_ids, needle) {
+            NeedleMatch::Found(task) => found.push((idx, task)),
+            NeedleMatch::Ambiguous { reason, matches } => {
+                ambiguous.push(format!("{} ({}: {matches})", board.hpath, reason));
+            }
+            NeedleMatch::NotFound => {}
+        }
+    }
+    if found.len() == 1 && ambiguous.is_empty() {
+        let (idx, task) = found.remove(0);
+        let (board, origin) = candidates.into_iter().nth(idx).expect("idx из той же выборки");
+        return Ok((board, task, origin));
+    }
+
+    let searched: Vec<String> = candidates.iter().map(|(b, _)| b.hpath.clone()).collect();
+    let mut parts: Vec<String> = Vec::new();
+    if !found.is_empty() {
+        let boards: Vec<String> = found.iter().map(|(i, _)| candidates[*i].0.hpath.clone()).collect();
+        parts.push(format!("найдено на: {}", boards.join(", ")));
+    }
+    if !ambiguous.is_empty() {
+        parts.push(format!("неоднозначно на: {}", ambiguous.join("; ")));
+    }
+    if parts.is_empty() {
+        bail!("задача «{needle}» не найдена; обысканы доски: {}", searched.join(", "));
+    }
+    bail!(
+        "задача «{needle}»: {} (обысканы доски: {}) — уточни id",
+        parts.join("; "),
+        searched.join(", ")
+    )
+}
+
+/// Кандидаты досок по приоритету. Отсутствие дока — benign (доски нет);
+/// битая доска / инфра-сбой — громкая ошибка (таксономия find_board_titled_opt).
+async fn resolve_candidates(sy: &SiYuan, project: &str) -> Result<Vec<(SyBoard, ResolveOrigin)>> {
+    let mut out = Vec::new();
+    if let Some(board) = find_board_titled_opt(sy, project, &format!("Задачи {project}")).await? {
+        out.push((board, ResolveOrigin::Tasks));
+    }
+    if let Some(board) = find_board_titled_opt(sy, project, &format!("Кроны {project}")).await? {
+        out.push((board, ResolveOrigin::CronProject));
+    }
+    for board in discover_foreign_cron_boards(sy, project).await? {
+        out.push((board, ResolveOrigin::CronForeign));
+    }
+    Ok(out)
+}
+
+/// Чужие крон-доски: SQL-дискавери доков «Кроны %» одним уровнем под проектами
+/// (кроны живут только там по конвенции). Дубли доков одного проекта после
+/// пересозданий — первый по сортированному hpath.
+async fn discover_foreign_cron_boards(sy: &SiYuan, project: &str) -> Result<Vec<SyBoard>> {
+    let rows = sy
+        .sql("select id, hpath from blocks where type='d' and content like 'Кроны %' limit 200")
+        .await?;
+    let mut hpaths: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("hpath").and_then(|h| h.as_str()).map(String::from))
+        .collect();
+    hpaths.sort();
+    hpaths.dedup();
+    let mut out = Vec::new();
+    let mut seen_projects = HashSet::new();
+    for hpath in hpaths {
+        let Some((other, title)) = foreign_board_parts(&hpath) else { continue };
+        if other == project || !seen_projects.insert(other.clone()) {
+            continue;
+        }
+        if let Some(board) = find_board_titled_opt(sy, &other, &title).await? {
+            out.push(board);
+        }
+    }
+    Ok(out)
+}
+
+/// /<proj>/Кроны <proj> → Some((proj, «Кроны <proj>»)); прочие пути — None
+/// (кроны вглубь иерархии не вкладываются).
+fn foreign_board_parts(hpath: &str) -> Option<(String, String)> {
+    let rest = hpath.strip_prefix('/')?;
+    let (project, title) = rest.split_once('/')?;
+    let expected = format!("Кроны {project}");
+    (title == expected).then_some((project.to_string(), expected))
+}
+
+/// Строки доски с кэшем между фазами: render — самая дорогая операция
+/// резолва, каждая доска читается один раз.
+async fn cached_rows(
+    sy: &SiYuan,
+    board: &SyBoard,
+    cache: &mut [Option<Vec<SyTask>>],
+    idx: usize,
+) -> Result<Vec<SyTask>> {
+    if let Some(rows) = &cache[idx] {
+        return Ok(rows.clone());
+    }
+    let rows = read_rows(sy, board).await?;
+    cache[idx] = Some(rows.clone());
+    Ok(rows)
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).
