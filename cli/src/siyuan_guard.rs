@@ -7,7 +7,7 @@
 
 use crate::markdown::{collapse_whitespace, strip_export_wrapper};
 use crate::siyuan::{FileFetch, SiYuan};
-use crate::siyuan_task::{normalize_title, skeleton_variants, SyBoard, SyTask};
+use crate::siyuan_task::{body_template, normalize_title, SyBoard, SyTask};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -131,8 +131,8 @@ pub(crate) fn verdict(evidence: &RowEvidence) -> Verdict {
 
 /// Тело равно пустому шаблону? Экспортная обёртка снимается, тег-строка
 /// `#dev/#spike/#bug` (её дописывает create) вырезается, пробельные run'ы
-/// схлопываются; сравнение против всех трёх шаблонов (текущий + устаревшие
-/// варианты, см. `body_template_legacy`) — тип задачи живёт в теле, не в строке.
+/// схлопываются; сравнение против всех трёх шаблонов — тип задачи живёт
+/// в теле, не в строке.
 pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
     let stripped = strip_export_wrapper(export_md, title);
     let without_type_tag: String = stripped
@@ -141,11 +141,9 @@ pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
     let normalized = collapse_whitespace(&without_type_tag);
-    ["dev", "spike", "bug"].iter().any(|ty| {
-        skeleton_variants(title, ty)
-            .iter()
-            .any(|variant| collapse_whitespace(variant) == normalized)
-    })
+    ["dev", "spike", "bug"]
+        .iter()
+        .any(|ty| collapse_whitespace(&body_template(title, ty, "")) == normalized)
 }
 
 // ——— undo-журнал: write-ahead в data/assets/undo/ ———
@@ -399,7 +397,7 @@ pub(crate) fn frag_matches(frag: &str, task: &SyTask) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::siyuan_task::{body_template, SyTask};
+    use crate::siyuan_task::SyTask;
 
     fn evidence(
         in_render: bool,
@@ -524,20 +522,6 @@ mod tests {
         for ty in ["dev", "spike", "bug"] {
             let export = skeleton_export("таск", ty);
             assert!(body_is_skeleton(&export, "таск"), "шаблон {ty} должен совпасть");
-        }
-    }
-
-    /// Черновики, созданные по плейсхолдерам до смены 2026-11-05 (конвенция
-    /// живых счётчиков), не должны терять вердикт DraftSkeleton и авто-чистку.
-    #[test]
-    fn body_is_skeleton_matches_legacy_template_before_placeholder_update() {
-        for ty in ["dev", "spike"] {
-            let current = body_template("таск", ty, "");
-            let variants = skeleton_variants("таск", ty);
-            let legacy: Vec<&String> = variants.iter().filter(|variant| **variant != current).collect();
-            assert_eq!(legacy.len(), 1, "у {ty} должен быть ровно один legacy-вариант");
-            let export = format!("---\ntitle: таск\n---\n\n# таск\n\n{}\n\n#{ty}\n", legacy[0]);
-            assert!(body_is_skeleton(&export, "таск"), "старый шаблон {ty} должен совпасть");
         }
     }
 
