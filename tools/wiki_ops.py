@@ -112,38 +112,50 @@ def _metadata_hint(api_path: str) -> str:
     return "вероятна волна деградации ядра: uwuwu-cli doctor"
 
 
+def _post_once(path: str, body: dict) -> tuple[str, object, str]:
+    """Один POST к ядру. Возвращает (kind, data, last):
+    kind — ok | network | metadata | code; last — текст последней ошибки."""
+    req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — схема http/https из UWUWU_SIYUAN_URL
+            d = json.loads(r.read())
+    except Exception as e:
+        return "network", None, str(e)
+    if d.get("code") == 0:
+        return "ok", d.get("data"), ""
+    last = f"code={d.get('code')} msg={d.get('msg')}"
+    if "metadata is not ready" in str(d.get("msg")):
+        return "metadata", None, last
+    return "code", None, last
+
+
+def _retry_sleep(attempt_index: int, attempts: int, seconds: float) -> None:
+    """Пауза перед повтором; на последнем attempt сна нет — raise сразу
+    (terminal-sleep снят по ревью круга 1)."""
+    if attempt_index < attempts - 1:
+        time.sleep(seconds)
+
+
 def post(path: str, body: dict, attempts: int = 6):
     _conf()
     last = "?"
     metadata_tries = 0
     for i in range(attempts):
-        req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
-                                     headers={"Authorization": f"Token {TOKEN}",
-                                              "Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                d = json.loads(r.read())
-        except Exception as e:
-            last = str(e)
-            if i < attempts - 1:
-                time.sleep(1 + i)
-            continue
-        if d.get("code") == 0:
-            return d.get("data")
-        last = f"code={d.get('code')} msg={d.get('msg')}"
-        if "metadata is not ready" in str(d.get("msg")):
+        kind, data, last = _post_once(path, body)
+        if kind == "ok":
+            return data
+        if kind == "metadata":
             metadata_tries += 1
             if metadata_tries >= METADATA_BAIL_ATTEMPTS:
                 raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
                                    f"{metadata_tries} попыток; {_metadata_hint(path)}")
-            if i < attempts - 1:
-                time.sleep(METADATA_BAIL_BACKOFF[metadata_tries - 1])
+            _retry_sleep(i, attempts, METADATA_BAIL_BACKOFF[metadata_tries - 1])
             continue
-        # terminal-sleep снят: последний attempt не спит перед raise;
-        # мутации блочной хирургии single-shot — attempts=1 на call-сайтах,
-        # ретраи прочих код!=0 здесь — пин теста master (PR #83), чтения волной лечатся
-        if i < attempts - 1:
-            time.sleep(1 + i)
+        # code!=0 — ретраи оставлены пином master (PR #83, test_other_error_code_keeps_full_retries:
+        # чтения лечатся волной); мутации блочной хирургии single-shot — attempts=1 на call-сайтах
+        _retry_sleep(i, attempts, 1 + i)
     raise RuntimeError(f"POST {path}: {last}")
 
 
