@@ -669,9 +669,10 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(v.text).toContain("пороге 30 мин")
     expect(v.text).toContain("ветка на месте (work/task-abc)")
     expect(v.text).toContain("комментарий")
-    // совет «что делать» называет рабочий путь будилки (Design будит через
-    // return-to-dev); перевод Needs attention → In Progress — noop маршрутизации
+    // совет «что делать» называет все рабочие пути будилки: коммент, Design
+    // (перепланировка), In Progress (fast-track «поправь» — будит return-to-dev)
     expect(v.text).toContain("Design")
+    expect(v.text).toContain("In Progress")
     expect(v.text).not.toContain("переставь статус")
   })
   test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {

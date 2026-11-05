@@ -518,7 +518,7 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   const text = [
     `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
     `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
-    "Напиши комментарий в задачу — это разбудит агента; или переведи строку в Design — фабрика перешлёт агенту промпт возврата.",
+    "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
   ].join(" ")
   return { t: "signal", text }
 }
