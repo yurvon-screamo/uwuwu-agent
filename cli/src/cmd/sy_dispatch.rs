@@ -1,15 +1,15 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
 use super::read_resolve;
-use crate::cmd::cli::{Commands, CronSub, TaskSub};
+use crate::cmd::cli::{Commands, CronSub, KernelSub, TaskSub};
 use crate::markdown;
 use crate::md_heading;
-use crate::siyuan::SiYuan;
+use crate::siyuan::{FileFetch, SiYuan};
 use crate::siyuan_guard as guard;
 use crate::siyuan_guard::{Journal, JournalRow, Probe, Verdict};
 use crate::siyuan_task as syt;
-use anyhow::{anyhow, bail, Result};
-use serde_json::json;
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
 
 /// Заметка о фоллбеке: строка найдена не на штатной доске задач — прозрачность
 /// пути резолва в выводе команды.
@@ -37,6 +37,8 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
         Commands::Shot { .. } => Err(anyhow!(
             "shot: не портирован на SiYuan (v1) — headless chromium на http://127.0.0.1:6806 с Access Auth Code"
         )),
+        Commands::Kernel { command, timeout } => kernel_run(command, timeout).await,
+        Commands::Doctor { project, since } => doctor_run(&project, since).await,
     }
 }
 
@@ -703,6 +705,95 @@ pub(crate) async fn projects_run() -> Result<()> {
             continue;
         }
         println!("{}", nb.get("name").and_then(|n| n.as_str()).unwrap_or(""));
+    }
+    Ok(())
+}
+
+// ——— kernel: живые пробы ядра (one-shot, без ретраев) ———
+
+/// Имена записей readDir: директории с хвостовым «/».
+pub(crate) fn ls_lines(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry.get("name").and_then(|n| n.as_str()).map(|name| {
+                if entry.get("isDir").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    format!("{name}/")
+                } else {
+                    name.to_string()
+                }
+            })
+        })
+        .collect()
+}
+
+/// doctor: read-only пробы деградации; свой exit-код поверх anyhow-механики
+/// (0 чисто / 1 деградация / 2 пробы не выполнились) — консьюмеры exit-кода
+/// (кроны, вотчдог) различают исходы.
+async fn doctor_run(project: &str, since_min: u64) -> Result<()> {
+    let sy = crate::siyuan::SiYuan::from_env_with_timeout(10)?;
+    let outcomes = crate::siyuan_doctor::run(&sy, project, since_min).await;
+    println!("{}", crate::siyuan_doctor::report(&outcomes));
+    std::process::exit(crate::siyuan_doctor::doctor_exit_code(&outcomes));
+}
+
+async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
+    let sy = SiYuan::from_env_with_timeout(timeout_secs)?;
+    match command {
+        KernelSub::Ping => {
+            sy.post_probe("/api/query/sql", json!({ "stmt": "select 1" })).await?;
+            println!("alive: sql ok");
+        }
+        KernelSub::Sql { stmt } => {
+            let envelope = sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await?;
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        }
+        KernelSub::File { path, out } => match sy.fetch_workspace_file(&path).await {
+            FileFetch::Bytes(bytes) => {
+                let saved = match out.as_deref() {
+                    Some(out) => {
+                        std::fs::write(out, &bytes)
+                            .with_context(|| format!("не удалось записать {out}"))?;
+                        format!(" → {out}")
+                    }
+                    None => String::new(),
+                };
+                println!("Bytes ({} bytes){saved}", bytes.len());
+            }
+            FileFetch::Missing => println!("Missing (kernel 404)"),
+            FileFetch::Failed(err) => bail!("kernel file {path}: {err}"),
+        },
+        KernelSub::Ls { path } => {
+            let envelope = sy.post_probe("/api/file/readDir", json!({ "path": path })).await?;
+            let entries = envelope
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for line in ls_lines(&entries) {
+                println!("{line}");
+            }
+        }
+        KernelSub::Export { doc_id } => {
+            crate::siyuan_id::ensure_node_id(&doc_id, "doc_id")?;
+            let envelope = sy
+                .post_probe("/api/export/exportMdContent", json!({ "id": doc_id }))
+                .await?;
+            let content = envelope
+                .pointer("/data/content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if content.is_empty() {
+                eprintln!("(export пуст: 0 символов — док пуст, деградация индекса или неверный id)");
+            }
+            print!("{content}");
+        }
+        KernelSub::Render { av_id, block_id, page } => {
+            crate::siyuan_id::ensure_node_id(&av_id, "av_id")?;
+            crate::siyuan_id::ensure_node_id(&block_id, "block_id")?;
+            let render = sy.db_render(&av_id, &block_id, page).await?;
+            println!("{}", serde_json::to_string_pretty(&render)?);
+        }
     }
     Ok(())
 }

@@ -10,6 +10,8 @@ mod cli_tests;
 mod guard_tests;
 #[cfg(test)]
 mod fallback_tests;
+#[cfg(test)]
+mod kernel_tests;
 
 pub use sy_dispatch::read_markdown;
 

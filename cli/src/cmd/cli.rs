@@ -179,6 +179,51 @@ pub(crate) enum CronSub {
     Rm { id: String },
 }
 
+/// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без
+/// env-токена (токен берётся из конфигурации cli). One-shot, без ретраев —
+/// сырое состояние ядра видно на первом ответе. Диагностические вердикты
+/// (Bytes/Missing, пустой export/ls) — exit 0; неудача пробы — exit ≠0.
+#[derive(clap::Subcommand)]
+pub(crate) enum KernelSub {
+    /// Живость ядра: авторизуемый sql «select 1» (транспорт+auth+DB;
+    /// version-эндпоинт отвечает и без токена — пробой auth не является)
+    Ping,
+    /// SQL-проба: полный конверт ядра JSON (data + limit/truncated as-is)
+    Sql {
+        #[arg(help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\"")]
+        stmt: String,
+    },
+    /// getFile-проба: Bytes/Missing — диагностические ответы (exit 0),
+    /// Failed — неудача (exit ≠ 0)
+    File {
+        #[arg(help = "Путь от корня воркспейса (data/…)")]
+        path: String,
+        #[arg(long, help = "Записать байты файла в этот путь")]
+        out: Option<String>,
+    },
+    /// readDir-проба: имена записей, директории с «/»
+    Ls {
+        #[arg(help = "Путь от корня воркспейса (data/…)")]
+        path: String,
+    },
+    /// exportMdContent-проба: markdown дока по id (пустой контент виден
+    /// сразу — подсказка в stderr)
+    Export {
+        #[arg(help = "docId или id блока")]
+        doc_id: String,
+    },
+    /// render-проба доски (MCP database render): rowCount/page/itemCount
+    /// as-is — деградация досок и пагинация строк
+    Render {
+        #[arg(help = "av-id доски")]
+        av_id: String,
+        #[arg(help = "blockID дока-носителя доски")]
+        block_id: String,
+        #[arg(long, default_value = "1", help = "Номер страницы")]
+        page: u64,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// List all projects with their description.
@@ -233,5 +278,30 @@ pub(crate) enum Commands {
         /// Project board (обязательно: uwuwu | origa | foilcap | …)
         #[arg(long, global = true)]
         project: Option<String>,
+    },
+    /// Живые kernel-пробы SiYuan: ping/sql/file/ls/export/render —
+    /// диагностика ядра из агентской сессии без env-токена.
+    Kernel {
+        #[command(subcommand)]
+        command: KernelSub,
+        /// Таймаут пробы в секундах (тихий вис должен различаться быстро)
+        #[arg(
+            long,
+            global = true,
+            default_value = "10",
+            value_name = "SECS",
+            help = "Таймаут пробы, сек (штатные команды — 120)"
+        )]
+        timeout: u64,
+    },
+    /// Диагностика деградации ядра SiYuan: kernel/wave/доска/FS↔SQL.
+    /// Exit: 0 чисто, 1 деградация (включая недоступное ядро), 2 пробы не выполнились.
+    Doctor {
+        /// Project board для пробы доски
+        #[arg(long, default_value = "uwuwu")]
+        project: String,
+        /// Окно wave-скана docker logs, минут
+        #[arg(long, default_value = "30", value_name = "MIN")]
+        since: u64,
     },
 }
