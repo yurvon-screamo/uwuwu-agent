@@ -3,10 +3,11 @@ import { test, expect } from "bun:test"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractReplies,
-  inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
+  inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, SESSION_TITLE, setDraftAck, steerCandidate,
   steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
+import { withE2ETag } from "../lib/e2e-tag"
 
 const msg = (over: Partial<NonNullable<TgUpdate["message"]>>): NonNullable<TgUpdate["message"]> => ({
   message_id: 1,
@@ -705,4 +706,10 @@ test("validState: валидный ack персистится, битый стр
   const cleaned = validState(broken)
   expect(cleaned.drafts?.r1).toBeDefined() // трек жив
   expect(cleaned.drafts?.r1.ack).toBeUndefined() // поле отброшено
+})
+
+// ——— e2e-маркер сессии ———
+
+test("withE2ETag: сессия e2e-прогона помечается префиксом конвенции", () => {
+  expect(withE2ETag(SESSION_TITLE)).toBe("[e2e] 📥 Триаж uwuwu")
 })

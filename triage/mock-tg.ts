@@ -48,7 +48,7 @@ Bun.serve({
       return json({ ok: true, update_id: id })
     }
     if (url.pathname.startsWith("/file/bot")) {
-      // выгрузка медиа: демона анализирует только сам факт (файл в ФС),
+      // выгрузка медиа: демон анализирует только сам факт (файл в ФС),
       // содержимое фиксированное — getFile всегда отдаёт file_path "mock/no-file"
       return new Response("mock-media-bytes", { headers: { "content-type": "application/octet-stream" } })
     }

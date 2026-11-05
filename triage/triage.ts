@@ -21,6 +21,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
+import { withE2ETag } from "../lib/e2e-tag"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
@@ -63,6 +64,10 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** API Telegram: дефолт — прод; override — mock-TG досмерджевого протокола
  *  (см. README «Проверка»). */
 const TG_API = process.env.UWUWU_TRIAGE_TG_API ?? "https://api.telegram.org"
+/** Маркер e2e-сессий: сессия диалога создаётся с префиксом `[e2e]`, дример
+ *  пропускает помеченные сессии при пост-обработке (конвенция lib/e2e-tag.ts).
+ *  Тестовый крюк, в systemd-юнит не задаётся. */
+const E2E_SESSIONS = process.env.UWUWU_TRIAGE_E2E === "1"
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
@@ -308,7 +313,7 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: SESSION_TITLE,
+      title: E2E_SESSIONS ? withE2ETag(SESSION_TITLE) : SESSION_TITLE,
       agent: AGENT_NAME,
       // NB: model из дефа не применяется к primary-сессиям — передаём явно
       model: cfg.model ?? MODEL,
