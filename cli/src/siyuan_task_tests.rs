@@ -399,7 +399,7 @@ async fn comment_applied_but_lost_writes_recovered_without_duplicates() {
     let board = test_board();
     let task = test_task();
 
-    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, &draft(None), TS)
         .await
         .expect("записи применены, ответы потеряны — контрольные чтения узнают свои");
 
@@ -426,7 +426,7 @@ async fn comment_precheck_skips_line_already_in_doc() {
     let board = test_board();
     let task = test_task();
 
-    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, &draft(None), TS)
         .await
         .expect("идемпотентный повтор: коммент уже в доке");
 
@@ -445,7 +445,7 @@ async fn comment_precheck_matches_indented_reply_lines() {
     let board = test_board();
     let task = test_task();
 
-    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", Some("20261105-thread"), TS)
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, &draft(Some("20261105-thread")), TS)
         .await
         .expect("реплай-дубль узнаётся по контенту строки без отступа");
 
@@ -460,7 +460,7 @@ async fn comment_honest_failure_when_write_not_applied() {
     let board = test_board();
     let task = test_task();
 
-    let err = crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+    let err = crate::siyuan_task::comment_with_ts(&sy, &board, &task, &draft(None), TS)
         .await
         .expect_err("запись не применена — честный отказ без выдуманного успеха");
     assert!(err.to_string().contains("appendBlock"), "суть сбоя названа: {err}");
@@ -469,6 +469,10 @@ async fn comment_honest_failure_when_write_not_applied() {
         1,
         "один POST, без слепых ретраев"
     );
+}
+
+fn draft<'a>(reply_to: Option<&'a str>) -> crate::siyuan_task::CommentDraft<'a> {
+    crate::siyuan_task::CommentDraft { author: "AGENTS", text: "привет", reply_to }
 }
 
 fn test_board() -> SyBoard {

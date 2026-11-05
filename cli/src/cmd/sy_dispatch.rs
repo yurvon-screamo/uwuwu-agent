@@ -1073,7 +1073,7 @@ fn read_stdin() -> Result<String> {
     Ok(s)
 }
 
-fn collect_text(stdin: bool, text: Vec<String>) -> Result<String> {
+fn collect_text(stdin: bool, text: &[String]) -> Result<String> {
     if stdin {
         read_stdin()
     } else {
@@ -1107,7 +1107,7 @@ fn looks_like_flag(token: &str) -> bool {
 /// с подсказкой вместо тихой отправки юзеру. Сама валидация —
 /// validate_comment_text (тестируется на строках, stdin не нужен).
 fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
-    let msg = collect_text(stdin, text.to_vec())?;
+    let msg = collect_text(stdin, text)?;
     validate_comment_text(stdin, &msg)?;
     Ok(msg)
 }
@@ -1184,21 +1184,21 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Ключ asset-ссылки безопасен: ни один сегмент пути не пуст, «.» или «..» —
+/// такие ключи («assets/../../etc») не скачиваются вовсе, до сетевого вызова.
+fn asset_key_is_safe(key: &str) -> bool {
+    key.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// Выгрузить asset-аттачи тела в /tmp/uwuwu-task-<row-id>/ (полный row-id —
 /// контракт AGENTS.md; таймстамп-голова давала бы коллизии каталогов задач
 /// одного дня). Оригинальные имена файлов; максимум 10; сбой одного аттача —
-/// тихий пропуск (остаёмся на ссылках, как в аффин-контракте). Ключи с ../
-/// и точечные имена не скачиваются вовсе.
+/// тихий пропуск (остаёмся на ссылках, как в аффин-контракте). Ключи с
+/// точечными сегментами (../) не скачиваются вовсе.
 async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
     const MAX_ASSETS: usize = 10;
     let refs = collect_asset_refs(md);
-    let safe: Vec<&String> = refs
-        .iter()
-        .filter(|key| {
-            let name = key.rsplit('/').next().unwrap_or(key);
-            !name.is_empty() && name != "." && name != ".."
-        })
-        .collect();
+    let safe: Vec<&String> = refs.iter().filter(|key| asset_key_is_safe(key)).collect();
     if safe.is_empty() {
         return Vec::new();
     }
@@ -1211,6 +1211,8 @@ async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
         let Ok(bytes) = sy.download_file(&format!("assets/{key}")).await else {
             continue;
         };
+        // ядро молча отдаёт 200+0 байт для отсутствующего файла (контракт 3.8.9):
+        // пустой ответ = файла нет, локальный пустыш не пишем
         if bytes.is_empty() {
             continue;
         }
@@ -1222,9 +1224,9 @@ async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
     }
     out
 }
-
 #[cfg(test)]
 mod tests {
+    use super::asset_key_is_safe;
     use super::collect_asset_refs;
     use super::collect_threads;
     use super::replace_md_section;
@@ -1755,11 +1757,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_body_assets_skips_traversal_names() {
+    async fn save_body_assets_never_downloads_traversal_keys() {
         let server = MockServer::start().await;
+        let file_calls = Arc::new(AtomicUsize::new(0));
+        let calls = file_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/file/getFile"))
+            .respond_with(move |req: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                if path == "data/assets/ok.png" {
+                    ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
+                } else {
+                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
         let sy = SiYuan::for_tests(server.uri());
-        let md = "![x](assets/../../etc) ![y](assets/ok.png)\n";
-        let saved = save_body_assets(&sy, md, "20261105090000-travers").await;
-        assert!(saved.is_empty(), "ключи с ../ не скачиваются и не пишутся: {saved:?}");
+
+        const ROW: &str = "20261105090000-travers";
+        let md = "![x](assets/../../etc) ![y](assets/..) ![z](assets/./x) ![ok](assets/ok.png)\n";
+        let saved = save_body_assets(&sy, md, ROW).await;
+
+        assert_eq!(saved.len(), 1, "только безопасный ключ скачан: {saved:?}");
+        assert_eq!(
+            file_calls.load(Ordering::SeqCst),
+            1,
+            "точечные сегменты (../ и ./) не скачиваются вовсе — один getFile за ok.png"
+        );
+        std::fs::remove_dir_all(format!("/tmp/uwuwu-task-{ROW}")).expect("тест прибрал за себя");
+    }
+
+    #[test]
+    fn asset_key_is_safe_rejects_any_dot_segment() {
+        assert!(!asset_key_is_safe("../../etc"));
+        assert!(!asset_key_is_safe("sub/./x"));
+        assert!(!asset_key_is_safe("a/../b"));
+        assert!(!asset_key_is_safe(""));
+        assert!(asset_key_is_safe("img.png"));
+        assert!(asset_key_is_safe("sub/dir/file.htm"));
     }
 }

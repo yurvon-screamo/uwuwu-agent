@@ -785,21 +785,30 @@ async fn cached_rows(
 /// «комментов нет» при живых комментах — гэп ADR-014).
 pub async fn comment(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
     let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
-    comment_with_ts(sy, board, task, author, text, reply_to, &ts).await
+    let draft = CommentDraft { author, text, reply_to };
+    comment_with_ts(sy, board, task, &draft, &ts).await
+}
+
+/// Черновик коммента: кто, что, в какой тред отвечает.
+pub(crate) struct CommentDraft<'a> {
+    pub author: &'a str,
+    pub text: &'a str,
+    pub reply_to: Option<&'a str>,
 }
 
 /// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
 /// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
 /// поэтому ts вычисляется один раз на вызов.
-pub(crate) async fn comment_with_ts(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>, ts: &str) -> Result<()> {
+pub(crate) async fn comment_with_ts(sy: &SiYuan, board: &SyBoard, task: &SyTask, draft: &CommentDraft<'_>, ts: &str) -> Result<()> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
     ensure_comments_section(sy, &body).await?;
-    let marker = format!("- **{author}** ({ts}): {text}");
-    let line = match reply_to {
-        Some(_) => format!("\n  {marker}"),
-        None => format!("\n{marker}"),
+    let marker = format!("- **{}** ({ts}): {}", draft.author, draft.text);
+    let line = if draft.reply_to.is_some() {
+        format!("\n  {marker}")
+    } else {
+        format!("\n{marker}")
     };
     append_once_confirmed(sy, &body, &line, &marker).await
 }
