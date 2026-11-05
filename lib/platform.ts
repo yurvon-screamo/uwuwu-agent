@@ -36,8 +36,19 @@ const TOKEN = siyuanToken()
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
- *  останавливать тик демона — класс «клиентские висы» (прод-контур). */
-const KERNEL_TIMEOUT_MS = Number(process.env.UWUWU_KERNEL_TIMEOUT_MS ?? 15_000)
+ *  останавливать тик демона — класс «клиентские висы» (прод-контур).
+ *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
+ *  мгновенный таймаут каждого вызова (тихая слепота контура); NaN — RangeError. */
+function parseKernelTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined) return 15_000
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`UWUWU_KERNEL_TIMEOUT_MS: ожидалось положительное число миллисекунд, получено «${raw}»`)
+  }
+  return n
+}
+
+const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_MS)
 
 // ——— ядро: REST ———
 
@@ -153,12 +164,24 @@ function recoverMcpSession(): Promise<void> {
 }
 
 /** Один ретрай на протухшую сессию: тик лечится на месте вместо 5 падений
- *  подряд и само-рестарта демона (прод-кейс 04.11). */
-async function mcpRpc(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+ *  подряд и само-рестарта демона (прод-кейс 04.11).
+ *  recover:false — для вызовов САМОГО handshake: отказ сессии внутри
+ *  recovery не должен снова звать recovery (общий промис ещё in-flight —
+ *  вышло бы вечное ожидание самого себя); вместо этого описательная ошибка
+ *  отвергает recovery-промис — ждущие пачки получают её, следующий тик
+ *  ретраит с чистого состояния. */
+async function mcpRpc(
+  method: string,
+  params: Record<string, unknown>,
+  opts: { recover?: boolean } = {},
+): Promise<Record<string, unknown>> {
   try {
     return await mcpRpcOnce(method, params)
   } catch (e) {
     if (!(e instanceof StaleMcpSessionError)) throw e
+    if (opts.recover === false) {
+      throw new Error(`mcp ${method}: сессия отклонена во время recovery-handshake — ядро недоступен (${e.message})`)
+    }
     await recoverMcpSession()
     return mcpRpcOnce(method, params)
   }
@@ -173,12 +196,14 @@ export function connect(): Promise<void> {
   if (mcpReady) return Promise.resolve() // сессия уже инициализирована
   if (connecting === null) {
     const handshake = (async () => {
+      // recover:false — см. mcpRpc: вложенный отказ сессии во время
+      // handshake = описательная ошибка, не рекурсивный recovery
       await mcpRpc("initialize", {
         protocolVersion: "2025-03-26",
         capabilities: {},
         clientInfo: { name: "uwuwu-daemon", version: "1.0" },
-      })
-      await mcpRpc("notifications/initialized", {})
+      }, { recover: false })
+      await mcpRpc("notifications/initialized", {}, { recover: false })
       mcpReady = true
     })()
     // сброс слота по завершении — без вмешательства в доставку ошибки awaiter'ам
@@ -416,6 +441,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
 export const __test = {
   commentToSnapshot,
   SIYUAN_URL,
+  parseKernelTimeoutMs,
   /** Живая проба одной страницы render (page с 1) — независимый источник
    *  rowCount ядра для живого теста полноты выборки. */
   renderBoardPage: async (blockId: string, page: number): Promise<BoardViewPage> => {

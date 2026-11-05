@@ -4,6 +4,7 @@
 // одним re-handshake, без цикла. Живое ядро не нужно — fetch скриптуется.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import * as mcp from "../lib/platform"
+const { __test } = mcp
 
 const originalFetch = globalThis.fetch
 
@@ -208,3 +209,39 @@ describe("mcpRpc: честные ошибки вместо молчаливых 
   })
 })
 
+
+describe("mcpRpc: вложенная экспирация во время recovery-handshake", () => {
+  test("404 на notifications/initialized — описательная ошибка, не вечное ожидание", async () => {
+    // initialize ок (выдал s2), но initialized с новой сессией отклонён —
+    // ядро умер прямо посреди handshake; recovery не должен звать сам себя
+    const { calls } = scriptMcp((_call, c) => {
+      if (c.method === "initialize") return jsonrpc({}, "s2")
+      if (c.method === "notifications/initialized") return new Response("session not found", { status: 404 })
+      return new Response("??", { status: 200 })
+    })
+    const err = await readCells().then(() => null, (e: Error) => e)
+    expect(err).not.toBeNull()
+    expect(err?.message).toContain("во время recovery-handshake")
+    // никакого повторного initialize — цикл не завёлся
+    expect(calls.filter((c) => c.method === "initialize")).toHaveLength(1)
+  })
+})
+
+describe("parseKernelTimeoutMs: валидация env UWUWU_KERNEL_TIMEOUT_MS", () => {
+  test("число-строка — миллисекунды", () => {
+    expect(__test.parseKernelTimeoutMs("30000")).toBe(30000)
+  })
+  test("отсутствие env — дефолт 15 s; пустая строка — отказ (Number('')=0)", () => {
+    expect(__test.parseKernelTimeoutMs(undefined)).toBe(15_000)
+    expect(() => __test.parseKernelTimeoutMs("")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("   ")).toThrow(/положительное число/)
+  })
+  test("пустое значение env (Number('')=0) — отказ, а не мгновенный таймаут", () => {
+    expect(() => __test.parseKernelTimeoutMs("")).toThrow(/положительное число/)
+  })
+  test("не-число и ноль/отрицательное — отказ", () => {
+    expect(() => __test.parseKernelTimeoutMs("abc")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("0")).toThrow(/положительное число/)
+    expect(() => __test.parseKernelTimeoutMs("-5")).toThrow(/положительное число/)
+  })
+})
