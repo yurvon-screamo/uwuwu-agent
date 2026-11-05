@@ -25,6 +25,10 @@ markdown, у которой на ОДНОЙ строке есть и «⚠️»,
 orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
 молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
 
+post(): «metadata is not ready» — ≤3 попытки (+2s/+5s) → различимый bail с
+хинтом (дисциплина ADR-027: волна гаснет отходом клиента, ретраи — её топливо);
+транспортные ошибки и прочие code≠0 — прежние ретраи.
+
 Конфиг: UWUWU_SIYUAN_URL (деф. http://127.0.0.1:6806) + UWUWU_SIYUAN_TOKEN
 (или UWUWU_SIYUAN_WS/conf/conf.json).
 """
@@ -49,6 +53,14 @@ ORG_LS_LIMIT = 100000
 # Валидация до любых SQL-запросов — инъекция/мусор отсекаются на входе.
 DOC_ID_RE = re.compile(r"^\d{14}-[a-z0-9]{7}$")
 
+# «metadata is not ready»: ≤3 попытки с паузами +2s/+5s → различимый bail с хинтом.
+# Дисциплина ADR-027 (uwuwu-cli): волна деградации гаснет отходом клиента — слепые
+# ретраи питают волну, но полный запрет ретраев убивает выживание на транзиентном
+# лаге индекса после крупных вставок. Арит-окно инстанса не переносится: wiki_ops
+# выполняет одну write-операцию на процесс — межвызовного долбления нет.
+METADATA_BAIL_ATTEMPTS = 3
+METADATA_BAIL_BACKOFF = (2, 5)
+
 
 def _conf():
     global URL, TOKEN
@@ -64,9 +76,21 @@ def _conf():
     TOKEN = tok
 
 
+def _metadata_hint(api_path: str) -> str:
+    # Хинт различимого bail'а (ADR-027). Причины metadata-not-ready зависят от пути:
+    # createDocWithMd падает и на отсутствующем родителе/спецсимволах тайтла
+    # (опыт /cli/SiYuan createDocWithMd…), прочие пути — почти всегда волна.
+    if api_path.endswith("createDocWithMd"):
+        return ("если это create/replace — путь-родитель не существует в целевом ноутбуке "
+                "(createDocWithMd не создаёт родителей) или в тайтле спецсимволы («/», «=», …); "
+                "иначе — волна деградации ядра: uwuwu-cli doctor")
+    return "вероятна волна деградации ядра: uwuwu-cli doctor"
+
+
 def post(path: str, body: dict, attempts: int = 6):
     _conf()
     last = "?"
+    metadata_tries = 0
     for i in range(attempts):
         req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
                                      headers={"Authorization": f"Token {TOKEN}",
@@ -74,14 +98,20 @@ def post(path: str, body: dict, attempts: int = 6):
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 d = json.loads(r.read())
-            if d.get("code") == 0:
-                return d.get("data")
-            last = f"code={d.get('code')} msg={d.get('msg')}"
-            if "metadata is not ready" in str(d.get("msg")):
-                time.sleep(2 + i)
-                continue
         except Exception as e:
             last = str(e)
+            time.sleep(1 + i)
+            continue
+        if d.get("code") == 0:
+            return d.get("data")
+        last = f"code={d.get('code')} msg={d.get('msg')}"
+        if "metadata is not ready" in str(d.get("msg")):
+            metadata_tries += 1
+            if metadata_tries >= METADATA_BAIL_ATTEMPTS:
+                raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
+                                   f"{metadata_tries} попыток; {_metadata_hint(path)}")
+            time.sleep(METADATA_BAIL_BACKOFF[metadata_tries - 1])
+            continue
         time.sleep(1 + i)
     raise RuntimeError(f"POST {path}: {last}")
 

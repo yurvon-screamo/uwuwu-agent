@@ -6,12 +6,15 @@
   2) первый сегмент — имя ноутбука (приоритет 1, hpath = остаток пути) или корневой
      док ровно одного ноутбука (приоритет 2, hpath = путь как есть); неоднозначный
      корень и неизвестный префикс — RuntimeError с вариантами/списком ноутбуков;
-  3) пустой --parent — легаси-дефолт Projects.
+  3) пустой --parent — легаси-дефолт Projects;
+  4) «metadata is not ready» в post(): ровно METADATA_BAIL_ATTEMPTS попыток с паузами
+     +2s/+5s → различимый bail с хинтом; прочие code≠0 и транспорт — прежние 6 ретраев.
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_create.py
 """
 import io
+import json
 import os
 import sys
 import tempfile
@@ -19,6 +22,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -179,6 +183,94 @@ class DefaultsAndErrors(unittest.TestCase):
         message = str(cm.exception)
         self.assertIn("/Projects/patterns", message)
         self.assertIn("/Experience/patterns", message)
+
+
+class FakeResponse:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeTransport:
+    """urlopen-двойник: конверты по очереди (dict) или исключения (Exception);
+
+    список короче числа вызовов — повторяется последний элемент.
+    """
+
+    def __init__(self, envelopes):
+        self.envelopes = envelopes
+        self.requests: list[dict] = []
+
+    def __call__(self, req, timeout=60):
+        index = min(len(self.requests), len(self.envelopes) - 1)
+        self.requests.append(json.loads(req.data.decode()))
+        envelope = self.envelopes[index]
+        if isinstance(envelope, Exception):
+            raise envelope
+        return FakeResponse(json.dumps(envelope).encode())
+
+
+class MetadataBailDiscipline(unittest.TestCase):
+    """post(): metadata-not-ready — ≤3 попытки → различимый bail; прочее — 6 ретраев."""
+
+    def setUp(self):
+        self._url, self._token = wiki_ops.URL, wiki_ops.TOKEN
+        wiki_ops.URL = "http://kernel.invalid"
+        wiki_ops.TOKEN = "test-token"  # nosec B105 — фиктивный токен для urlopen-двойника, не секрет
+        self.addCleanup(self._restore_conf)
+        self.sleeps: list[float] = []
+        sleep_patch = patch.object(wiki_ops.time, "sleep", self.sleeps.append)
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+
+    def _restore_conf(self):
+        wiki_ops.URL, wiki_ops.TOKEN = self._url, self._token
+
+    def _run_post(self, envelopes, path: str) -> tuple[FakeTransport, RuntimeError]:
+        transport = FakeTransport(envelopes)
+        with patch.object(wiki_ops.urllib.request, "urlopen", transport):
+            with self.assertRaises(RuntimeError) as cm:
+                wiki_ops.post(path, {})
+        return transport, cm.exception
+
+    def test_metadata_bails_after_three_attempts_with_hint(self):
+        transport, error = self._run_post([METADATA_ENVELOPE], "/api/filetree/createDocWithMd")
+        self.assertEqual(len(transport.requests), wiki_ops.METADATA_BAIL_ATTEMPTS)
+        self.assertEqual(self.sleeps, [2, 5])
+        message = str(error)
+        self.assertIn("metadata is not ready", message)
+        self.assertIn("uwuwu-cli doctor", message)
+
+    def test_create_hint_names_parent_and_title_causes(self):
+        _, error = self._run_post([METADATA_ENVELOPE], "/api/filetree/createDocWithMd")
+        message = str(error)
+        self.assertIn("родитель", message)
+        self.assertIn("тайтл", message)
+
+    def test_append_hint_is_neutral(self):
+        _, error = self._run_post([METADATA_ENVELOPE], "/api/block/appendBlock")
+        message = str(error)
+        self.assertIn("uwuwu-cli doctor", message)
+        self.assertNotIn("тайтл", message)
+        self.assertNotIn("родитель", message)
+
+    def test_other_error_code_keeps_full_retries(self):
+        transport, error = self._run_post([{"code": -1, "msg": "boom"}], "/api/query/sql")
+        self.assertEqual(len(transport.requests), 6)
+        self.assertNotIn("metadata-bail", str(error))
+
+    def test_transport_error_keeps_full_retries(self):
+        transport, error = self._run_post([OSError("connection reset")], "/api/query/sql")
+        self.assertEqual(len(transport.requests), 6)
+        self.assertIn("connection reset", str(error))
 
 
 if __name__ == "__main__":
