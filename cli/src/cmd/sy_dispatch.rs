@@ -156,7 +156,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
         TaskSub::Clean { ids, yes, live } => task_clean(&sy, project, &ids, yes, live.as_deref()).await,
-        TaskSub::Undo { journal } => task_undo(&sy, project, journal.as_deref()).await,
+        TaskSub::Undo { journal, list } => {
+            // --list сильнее позиционного (задаём список, имя не теряем — тест фиксирует)
+            let name = if list { None } else { journal.as_deref() };
+            task_undo(&sy, project, name).await
+        }
         TaskSub::Body { id, replace, replace_section, md, stdin } => {
             let content = read_body_input(md.as_deref(), stdin)?;
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;

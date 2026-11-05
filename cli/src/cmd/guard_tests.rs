@@ -570,7 +570,7 @@ async fn undo_restores_row_and_repeats_as_noop() {
     // честно no-op по тайтлу
     kernel.remaining.lock().unwrap().retain(|item| *item != "item-dead");
 
-    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()) })
+    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()), list: false })
         .await
         .expect("первый undo восстанавливает");
     let after_first = kernel.counter(&kernel.item_add_calls);
@@ -583,7 +583,7 @@ async fn undo_restores_row_and_repeats_as_noop() {
     let updates = kernel.counter(&kernel.item_update_calls);
     assert!(updates >= 2, "Branch/PR клетки восстанавливаются item_update: {updates}");
 
-    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()) })
+    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()), list: false })
         .await
         .expect("повторный undo — идемпотентный no-op");
     assert_eq!(

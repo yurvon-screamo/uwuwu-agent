@@ -39,7 +39,7 @@ pub(crate) enum TaskSub {
     },
     /// Карточка задачи: колонки + свежие комменты
     Get {
-        #[arg(help = "row-id / doc-id / уникальный префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / уникальный префикс")]
         id: String,
         /// Быстрая проверка статуса: без экспорта тела и картинок
         #[arg(long = "no-body")]
@@ -47,7 +47,7 @@ pub(crate) enum TaskSub {
     },
     /// Правка колонок строки
     Edit {
-        #[arg(help = "row-id / doc-id / префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
         #[arg(long)]
         status: Option<String>,
@@ -62,7 +62,7 @@ pub(crate) enum TaskSub {
     /// позиционный аргумент (или --stdin); читать комменты: task get / task thread.
     /// Токены-подкоманды и флаги в тексте отклоняются гвардом до отправки.
     Comment {
-        #[arg(help = "row-id / doc-id / префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
         #[arg(
             long,
@@ -77,12 +77,12 @@ pub(crate) enum TaskSub {
     },
     /// Цепочки комментов: какая тема, кто что ответил
     Thread {
-        #[arg(help = "row-id / doc-id / префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
     },
     /// Закрыть задачу (Done) с опциональной заметкой
     Close {
-        #[arg(help = "row-id / doc-id / префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
         #[arg(long, help = "Заметка-коммент при закрытии")]
         note: Option<String>,
@@ -92,7 +92,7 @@ pub(crate) enum TaskSub {
     /// именованный фенс заменяет прежнюю диаграмму с этим именем,
     /// пустой (```html_embed имя без тела) — удаляет её.
     Body {
-        #[arg(help = "row-id / doc-id / префикс / подстрока заголовка")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс / подстрока заголовка")]
         id: String,
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
@@ -114,7 +114,7 @@ pub(crate) enum TaskSub {
     /// Тело без строки (сирота упавшего create) — трэш по docId.
     /// Guard: вердикт по независимым источникам, undo-журнал до мутации.
     Rm {
-        #[arg(help = "row-id / doc-id / префикс")]
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
     },
     /// Батч-снос строк канбана с guard'ом: вердикты по независимым
@@ -124,6 +124,7 @@ pub(crate) enum TaskSub {
     Clean {
         #[arg(
             long,
+            allow_hyphen_values = true,
             value_name = "FRAG[,FRAG…]",
             help = "Кандидаты: row-id/doc-id/префикс/подстрока, через запятую"
         )]
@@ -142,7 +143,10 @@ pub(crate) enum TaskSub {
     /// Идемпотентен: тайтл уже на доске → no-op. Меняет id строк (новый
     /// itemID/docID) — карта старый→новый в выводе.
     Undo {
-        /// Без аргумента — список журналов.
+        /// Режим списка: сильнее позиционного (с ним и с голым вызовом).
+        #[arg(long, help = "Список журналов вместо восстановления")]
+        list: bool,
+        /// Без аргумента (или с --list) — список журналов.
         #[arg(help = "Имя журнала (data/assets/undo/<name>) или путь; нет аргумента — список")]
         journal: Option<String>,
     },
@@ -174,11 +178,20 @@ pub(crate) enum CronSub {
     /// Все кроны доски
     List,
     /// Остановить (Status=paused)
-    Pause { id: String },
+    Pause {
+        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
+        id: String,
+    },
     /// Запустить обратно (Status=active)
-    Resume { id: String },
+    Resume {
+        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
+        id: String,
+    },
     /// Удалить крон (строка + тело в трэш)
-    Rm { id: String },
+    Rm {
+        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
+        id: String,
+    },
 }
 
 /// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без

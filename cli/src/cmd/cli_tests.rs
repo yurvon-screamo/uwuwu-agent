@@ -72,3 +72,85 @@ fn body_defaults_to_implicit_stdin() {
     assert!(!stdin);
     assert!(md.is_none());
 }
+
+fn expect_task_id(command: Commands) -> String {
+    let Commands::Task { command, .. } = command else {
+        panic!("expected task subcommand");
+    };
+    match command {
+        TaskSub::Get { id, .. }
+        | TaskSub::Edit { id, .. }
+        | TaskSub::Comment { id, .. }
+        | TaskSub::Thread { id, .. }
+        | TaskSub::Close { id, .. }
+        | TaskSub::Body { id, .. }
+        | TaskSub::Rm { id } => id,
+        _other => panic!("expected id-bearing task subcommand"),
+    }
+}
+
+#[test]
+fn hyphen_leading_id_parses_and_flag_after_id_stays_flag() {
+    let command =
+        parse_command(&["task", "get", "-Prb_FZlCA", "--project", "uwuwu"]).expect("id с ведущим дефисом парсится");
+    let id = expect_task_id(command);
+    assert_eq!(id, "-Prb_FZlCA");
+    // гоча опыта VCm1mFvNdE: allow_hyphen_values не должен съесть настоящий флаг
+    let command =
+        parse_command(&["task", "get", "-Prb_FZlCA", "--no-body", "--project", "uwuwu"]).expect("флаг после id жив");
+    let id = expect_task_id(command);
+    assert_eq!(id, "-Prb_FZlCA");
+}
+
+#[test]
+fn clean_ids_value_parses_with_hyphen_leading_fragments() {
+    let Commands::Task { command: TaskSub::Clean { ids, .. }, .. } =
+        parse_command(&["task", "--project", "uwuwu", "clean", "--ids", "-abc,-def"]).unwrap()
+    else {
+        panic!("expected task clean");
+    };
+    assert_eq!(ids, "-abc,-def");
+}
+
+#[test]
+fn cron_pause_hyphen_leading_id_parses() {
+    let Commands::Cron { command } = parse_command(&["cron", "pause", "-abc123"]).unwrap() else {
+        panic!("expected cron subcommand");
+    };
+    match command {
+        super::cli::CronSub::Pause { id } => assert_eq!(id, "-abc123"),
+        _other => panic!("expected cron pause"),
+    }
+}
+
+fn expect_undo(command: Commands) -> (Option<String>, bool) {
+    let Commands::Task { command: TaskSub::Undo { journal, list }, .. } = command else {
+        panic!("expected task undo");
+    };
+    (journal, list)
+}
+
+#[test]
+fn undo_list_flag_parses_documented_contract() {
+    let command = parse_command(&["task", "--project", "uwuwu", "undo", "--list"]).expect("AGENTS.md: task undo [--list]");
+    let (journal, list) = expect_undo(command);
+    assert!(list, "--list = режим списка");
+    assert!(journal.is_none());
+}
+
+#[test]
+fn undo_list_flag_wins_over_positional() {
+    let command = parse_command(&["task", "--project", "uwuwu", "undo", "журнал.json", "--list"])
+        .expect("--list сильнее позиционного");
+    let (journal, list) = expect_undo(command);
+    assert!(list, "--list побеждает: задаём список, не восстановление");
+    assert_eq!(journal.as_deref(), Some("журнал.json"), "позиционное сохранено (не теряется молча)");
+}
+
+#[test]
+fn undo_journal_alone_means_restore() {
+    let command = parse_command(&["task", "--project", "uwuwu", "undo", "журнал.json"]).unwrap();
+    let (journal, list) = expect_undo(command);
+    assert!(!list, "без --list и с именем — восстановление");
+    assert_eq!(journal.as_deref(), Some("журнал.json"));
+}
