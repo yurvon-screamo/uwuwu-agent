@@ -3,7 +3,7 @@ import { test, expect } from "bun:test"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
   draftReady, dropBatch, DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, extractReplies,
-  inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
+  inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, parseWatchSec, promptLandedAt, setDraftAck, steerCandidate,
   steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
   type DraftTrack, type Request, type SessionMsg, type TgUpdate,
 } from "./triage-lib"
@@ -42,6 +42,36 @@ test("classifyUpdate: /reset — пересоздание сессии", () => {
   expect(classifyUpdate({ update_id: 1, message: msg({ text: "/reset" }) }, "yurvon_screamo").kind).toBe("reset")
 })
 
+test("classifyUpdate: форвард видео без подписи — заявка (баг 03.11: терялся как media)", () => {
+  const video = msg({ text: undefined, caption: undefined, video: { file_id: "v1" } })
+  const out = classifyUpdate({ update_id: 1, message: video }, "yurvon_screamo")
+  expect(out.kind).toBe("req")
+  if (out.kind === "req") expect(out.text).toBe("")
+})
+
+test("classifyUpdate: видео/гифка/кружок/аудио — заявка, подпись становится текстом", () => {
+  const video = msg({ message_id: 1, text: undefined, caption: " разбери пост ", video: { file_id: "v1" } })
+  const out = classifyUpdate({ update_id: 1, message: video }, "yurvon_screamo")
+  expect(out.kind).toBe("req")
+  if (out.kind === "req") expect(out.text).toBe("разбери пост")
+
+  const animation = msg({ message_id: 2, text: undefined, caption: undefined, animation: { file_id: "a1" } })
+  expect(classifyUpdate({ update_id: 2, message: animation }, "yurvon_screamo").kind).toBe("req")
+
+  const videoNote = msg({ message_id: 3, text: undefined, caption: undefined, video_note: { file_id: "n1" } })
+  expect(classifyUpdate({ update_id: 3, message: videoNote }, "yurvon_screamo").kind).toBe("req")
+
+  const audio = msg({ message_id: 4, text: undefined, caption: "трек", audio: { file_id: "au1" } })
+  expect(classifyUpdate({ update_id: 4, message: audio }, "yurvon_screamo").kind).toBe("req")
+})
+
+test("classifyUpdate: голосовое/стикер без подписи — media-bounce (явная деградация)", () => {
+  const voice = { ...msg({ text: undefined, caption: undefined }), voice: { file_id: "vo1" } }
+  expect(classifyUpdate({ update_id: 1, message: voice }, "yurvon_screamo").kind).toBe("media")
+  const sticker = { ...msg({ text: undefined, caption: undefined }), sticker: { file_id: "st1" } }
+  expect(classifyUpdate({ update_id: 2, message: sticker }, "yurvon_screamo").kind).toBe("media")
+})
+
 test("classifyUpdate: медиа без текста — media", () => {
   expect(classifyUpdate({ update_id: 1, message: msg({ text: undefined, caption: undefined }) }, "yurvon_screamo").kind).toBe("media")
 })
@@ -56,6 +86,52 @@ test("classifyUpdate: фото/документ — заявка даже без
   const out2 = classifyUpdate({ update_id: 2, message: doc }, "yurvon_screamo")
   expect(out2.kind).toBe("req")
   if (out2.kind === "req") expect(out2.text).toBe("логи")
+})
+
+// ——— mediaFiles ———
+
+test("mediaFiles: имена с message_id-префиксом, дефолты и санитизация", () => {
+  const named = msg({ message_id: 12, video: { file_id: "v1", file_name: "мой клип.mp4" } })
+  expect(mediaFiles(named)).toEqual([{ fileId: "v1", name: "12_мой клип.mp4" }])
+
+  const unnamed = msg({ message_id: 13, video: { file_id: "v2" } })
+  expect(mediaFiles(unnamed)).toEqual([{ fileId: "v2", name: "13_video.mp4" }])
+
+  const animation = msg({ message_id: 14, animation: { file_id: "a1" } })
+  expect(mediaFiles(animation)).toEqual([{ fileId: "a1", name: "14_animation.mp4" }])
+
+  const note = msg({ message_id: 15, video_note: { file_id: "n1" } })
+  expect(mediaFiles(note)).toEqual([{ fileId: "n1", name: "15.mp4" }])
+
+  const audio = msg({ message_id: 16, audio: { file_id: "au1", file_name: "song.mp3" } })
+  expect(mediaFiles(audio)).toEqual([{ fileId: "au1", name: "16_song.mp3" }])
+
+  const doc = msg({ message_id: 17, document: { file_id: "d1", file_name: "a/b\x01c.log" } })
+  expect(mediaFiles(doc)).toEqual([{ fileId: "d1", name: "17_a_b_c.log" }])
+
+  const docUnnamed = msg({ message_id: 18, document: { file_id: "d2" } })
+  expect(mediaFiles(docUnnamed)).toEqual([{ fileId: "d2", name: "18_file" }])
+
+  const photo = msg({ message_id: 19, photo: [{ file_id: "f1" }, { file_id: "f2" }] })
+  expect(mediaFiles(photo)).toEqual([{ fileId: "f2", name: "19.jpg" }])
+})
+
+test("mediaFiles: два безымянных видео разных сообщений — разные имена (анти-коллизия альбома)", () => {
+  const first = mediaFiles(msg({ message_id: 21, video: { file_id: "v1" } }))
+  const second = mediaFiles(msg({ message_id: 22, video: { file_id: "v2" } }))
+  const names = [...first, ...second].map((f) => f.name)
+  expect(names).toEqual(["21_video.mp4", "22_video.mp4"])
+  expect(new Set(names).size).toBe(names.length)
+})
+
+test("mediaFiles: запись без file_id — не вложение (единое правило для всех типов)", () => {
+  const photo = msg({ message_id: 31, text: undefined, caption: undefined, photo: [{ }] })
+  expect(mediaFiles(photo)).toEqual([])
+  expect(classifyUpdate({ update_id: 1, message: photo }, "yurvon_screamo").kind).toBe("media")
+
+  const doc = msg({ message_id: 32, text: undefined, caption: undefined, document: { file_name: "x.log" } })
+  expect(mediaFiles(doc)).toEqual([])
+  expect(classifyUpdate({ update_id: 2, message: doc }, "yurvon_screamo").kind).toBe("media")
 })
 
 test("classifyUpdate: edited_message — edit с новым текстом", () => {

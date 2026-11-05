@@ -10,6 +10,10 @@ export interface TgMessage {
   caption?: string
   photo?: { file_id?: string }[]
   document?: { file_id?: string; file_name?: string }
+  video?: { file_id?: string; file_name?: string }
+  animation?: { file_id?: string; file_name?: string }
+  video_note?: { file_id?: string }
+  audio?: { file_id?: string; file_name?: string }
 }
 
 export interface TgUpdate {
@@ -282,12 +286,48 @@ export function validState(raw: unknown): TriageState {
 
 // ——— апдейты ТГ ———
 
+/** Медиа-вложение: файл выгружается демоном в MEDIA_DIR под именем `name`. */
+export interface MediaFile {
+  fileId: string
+  name: string
+}
+
+/** Имя файла вложения: message_id-префикс гарантирует уникальность внутри
+ *  батча (два безымянных видео форварда-альбома не перезаписывают друг
+ *  друга), слэши и управляющие символы имени — санитизируются. */
+export function attachmentName(messageId: number, fileName: string | undefined, fallback: string): string {
+  const raw = fileName !== undefined && fileName.trim() !== "" ? fileName : fallback
+  const safe = raw.replace(/[/\\]/g, "_").replace(/\p{Cc}/gu, "_").slice(0, 80)
+  return `${messageId}_${safe}`
+}
+
+/** Медиа-вложения сообщения: что демон выгружает в ФС (photo/document/
+ *  video/animation/video_note/audio). Единый маппинг для классификации и
+ *  выгрузки — записи без file_id вложением не считаются (выгрузка
+ *  невозможна по определению). Голосовые/стикеры не входят: отбиваются
+ *  демоном явно (kind: "media"). */
+export function mediaFiles(m: TgMessage): MediaFile[] {
+  const out: MediaFile[] = []
+  const add = (fileId: string | undefined, name: string): void => {
+    if (fileId !== undefined) out.push({ fileId, name })
+  }
+  // фото: последний элемент массива = максимальное разрешение
+  const photo = Array.isArray(m.photo) ? m.photo[m.photo.length - 1] : undefined
+  add(photo?.file_id, `${m.message_id}.jpg`)
+  add(m.document?.file_id, attachmentName(m.message_id, m.document?.file_name, "file"))
+  add(m.video?.file_id, attachmentName(m.message_id, m.video?.file_name, "video.mp4"))
+  add(m.animation?.file_id, attachmentName(m.message_id, m.animation?.file_name, "animation.mp4"))
+  add(m.video_note?.file_id, `${m.message_id}.mp4`)
+  add(m.audio?.file_id, attachmentName(m.message_id, m.audio?.file_name, "audio.mp3"))
+  return out
+}
+
 export type UpdateOutcome =
   | { kind: "skip" } // не владелец / бот / не сообщение — тихо
   | { kind: "help"; msg: TgMessage } // /start | /help
   | { kind: "reset"; msg: TgMessage } // /reset — пересоздать сессию диалога
-  | { kind: "media"; msg: TgMessage } // неподдерживаемое медиа (голос/видео/стикер)
-  | { kind: "req"; msg: TgMessage; text: string } // photo/document идут заявкой (text может быть пустым)
+  | { kind: "media"; msg: TgMessage } // не-текстовый вход без выгружаемых вложений (голос/стикер и пр.) — bounce владельцу
+  | { kind: "req"; msg: TgMessage; text: string } // текст и/или выгружаемые вложения идут заявкой (text может быть пустым)
   | { kind: "edit"; msg: TgMessage; text: string } // edited_message от владельца
 
 /** Разбор апдейта. Владелец один (owner по username) — остальные входы тихо
@@ -300,7 +340,7 @@ export function classifyUpdate(u: TgUpdate, owner: string): UpdateOutcome {
   if (m.from?.username !== owner) return { kind: "skip" }
   if (m.chat.type !== "private") return { kind: "skip" }
   const t = (m.text ?? m.caption ?? "").trim()
-  const hasAttachment = (Array.isArray(m.photo) && m.photo.length > 0) || m.document?.file_id !== undefined
+  const hasAttachment = mediaFiles(m).length > 0
   if (isEdit) return t === "" && !hasAttachment ? { kind: "skip" } : { kind: "edit", msg: m, text: t }
   if (t === "" && !hasAttachment) return { kind: "media", msg: m }
   if (t === "/start" || t === "/help") return { kind: "help", msg: m }
