@@ -245,3 +245,86 @@ describe("parseKernelTimeoutMs: валидация env UWUWU_KERNEL_TIMEOUT_MS",
     expect(() => __test.parseKernelTimeoutMs("-5")).toThrow(/положительное число/)
   })
 })
+
+describe("KernelUnavailableError: транспорт ядра отделён от ответа ядра", () => {
+  const originalSetTimeout = globalThis.setTimeout
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    globalThis.setTimeout = originalSetTimeout
+  })
+
+  /** fetch всегда падает транспортом; setTimeout без ожидания — ретраи post()
+   *  не растягивают тест (4 попытки с бэкоффом 0.7/1.4/2.1/2.8 с). */
+  const alwaysDown = (): { calls: number } => {
+    const state = { calls: 0 }
+    globalThis.setTimeout = ((fn: () => void) => { fn(); return 0 as unknown as ReturnType<typeof setTimeout> }) as typeof setTimeout
+    globalThis.fetch = (async () => {
+      state.calls++
+      throw new TypeError("fetch failed")
+    }) as typeof fetch
+    return state
+  }
+
+  const errOf = (p: Promise<unknown>): Promise<unknown> => p.then(() => null, (e: unknown) => e)
+
+  test("ядро лежит при handshake — типизированная ошибка с контекстом метода", async () => {
+    alwaysDown()
+    const err = await errOf(mcp.connect())
+    expect(err instanceof mcp.KernelUnavailableError).toBe(true)
+    expect((err as Error).message).toContain("initialize")
+    expect((err as Error).message).toContain("ядро недоступно")
+  })
+
+  test("REST-лега (sql) при лежащем ядре — тот же класс, 4 ретрая сохранены", async () => {
+    const probe = alwaysDown()
+    const err = await errOf(mcp.tool("find_doc_by_title", { title: "x" }))
+    expect(err instanceof mcp.KernelUnavailableError).toBe(true)
+    expect((err as Error).message).toContain("/api/query/sql")
+    expect(probe.calls).toBe(4)
+  })
+
+  test("транспорт упал на tools/call при живой сессии — одна попытка, без retry-цикла", async () => {
+    let mcpCalls = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/query/sql")) {
+        return new Response(JSON.stringify({ code: 0, msg: "", data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }] }), { status: 200 })
+      }
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string }
+      if (payload.method === "initialize") return jsonrpc({}, "sid-t")
+      if (payload.method === "notifications/initialized") return new Response("", { status: 200 })
+      mcpCalls++
+      throw new TypeError("fetch failed")
+    }) as typeof fetch
+    const err = await errOf(readCells())
+    expect(err instanceof mcp.KernelUnavailableError).toBe(true)
+    expect((err as Error).message).toContain("tools/call")
+    expect(mcpCalls).toBe(1)
+  })
+
+  test("404 протухшей сессии → recovery при лежащем ядре — отказ без зависания и цикла", async () => {
+    let n = 0
+    let kernelDown = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      n++
+      if (String(input).includes("/api/query/sql")) {
+        return new Response(JSON.stringify({ code: 0, msg: "", data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }] }), { status: 200 })
+      }
+      if (kernelDown) throw new TypeError("fetch failed") // recovery-рука при лежащем ядре
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string }
+      if (payload.method === "initialize") return jsonrpc({}, "sid-k")
+      if (payload.method === "notifications/initialized") return new Response("", { status: 200 })
+      // tools/call: первый проход успешен (сессия жива), второй — ядро
+      // перезапустилось и легло: 404 на протухшей сессии — последний вздох
+      if (n === 4) return sse({ structuredContent: { view: { rows: [{ id: "rowX", cells: [] }], rowCount: 1 } } })
+      if (n === 5) return sse({ structuredContent: { view: { rows: [] } } })
+      kernelDown = true
+      return new Response("session not found", { status: 404 })
+    }) as typeof fetch
+    await readCells() // сессия поднята, первый вызов прошёл
+    const err = await errOf(readCells())
+    expect(err instanceof mcp.KernelUnavailableError).toBe(true)
+    expect((err as Error).message).toContain("initialize")
+    expect((err as Error).message).toContain("ядро недоступно")
+    expect(n).toBe(7) // 4 (первый проход) + sql + 404 + один initialize recovery
+  })
+})

@@ -104,7 +104,10 @@ async function cronBoardTitles(): Promise<string[]> {
       .map(n => n.data)
       .filter((d): d is string => typeof d === "string")
     return [GLOBAL_CRON_BOARD, ...projects.map(p => `Кроны ${p}`)]
-  } catch { return [GLOBAL_CRON_BOARD] }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать фоллбеком
+    return [GLOBAL_CRON_BOARD]
+  }
 }
 
 async function findBoard(title: string): Promise<BoardIds | null> {
@@ -140,7 +143,10 @@ async function boardViaOrganize(proj: string, title: string): Promise<string | n
         if (d.title === title) return docId
       }
     }
-  } catch { /* организ недоступен — остаётся null */ }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать null-фоллбеком
+    /* организ недоступен — остаётся null */
+  }
   return null
 }
 
@@ -150,7 +156,10 @@ async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
     try {
       const board = await findBoard(title)
       if (board !== null) out.push({ title, board })
-    } catch { /* доска недоступна — скип тика по ней */ }
+    } catch (e) {
+      if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать скипом доски
+      /* доска недоступна — скип тика по ней */
+    }
   }
   return out
 }
@@ -205,7 +214,7 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   const text = await res.text()
   if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}: ${text.slice(0, 120)}`), { status: res.status })
   if (text.trim() === "") return {}
-  const j: unknown = JSON.parse(text)
+  const j: unknown = mcp.parseJsonContract(text, `opencode ${path}: HTTP ${res.status}`)
   return (j as { data?: unknown }).data ?? j
 }
 
@@ -354,7 +363,9 @@ async function main(): Promise<void> {
       consecutiveFails = 0
     } catch (e) {
       consecutiveFails++
-      log(`tick (${consecutiveFails} подряд): ${e}`)
+      // сообщение и стек отдельными строками: bun у подклассов Error рендерит
+      // stack без сообщения (прод-кейс 05.11: «tick: Error» без причины)
+      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? ""}` : String(e)}`)
       if (consecutiveFails >= 5) {
         // отравленное соединение/пул: свежий процесс чище вечных ретраев
         log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")
