@@ -262,6 +262,13 @@ pub(crate) enum Commands {
         #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
     },
+    /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
+    /// прочитать (агенты в начале работы), append — дописать долговременный
+    /// факт (владелец/дример), replace — полная перезапись на месте.
+    Person {
+        #[command(subcommand)]
+        command: PersonSub,
+    },
     /// Download a workspace asset (image/attachment) by key from assets/.
     Blob {
         #[arg(help = "Blob key, e.g. pixel.png")]
@@ -337,6 +344,32 @@ pub(crate) enum Commands {
         /// Окно wave-скана docker logs, минут
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
+    },
+}
+
+/// Персона владельца: приватный SiYuan-док (Experience:/personal/PERSON).
+/// Один инстанс SiYuan на все машины — синков и пуш-политики нет.
+#[derive(Subcommand)]
+pub(crate) enum PersonSub {
+    /// Актуальная персона (markdown). Дока нет — честная ошибка с подсказкой
+    /// создания (не молчаливый пустой вывод).
+    Show,
+    /// Дописать markdown в конец (долговременный факт/секция). Дока нет —
+    /// создать со скелетом (шапка приватности + секции) и сразу с этим
+    /// текстом. Дедуп перед append — на пишущем: прочитай `person show`.
+    Append {
+        #[arg(long, help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(trailing_var_arg = true, help = "Markdown-текст (факт или секция)")]
+        text: Vec<String>,
+    },
+    /// Перезаписать контент целиком на месте (docId стабилен); дока нет —
+    /// создать без скелета (полная ответственность пишущего за контент).
+    Replace {
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(long, help = "Файл с markdown (иначе stdin)")]
+        md: Option<String>,
     },
 }
 
