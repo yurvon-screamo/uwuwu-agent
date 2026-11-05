@@ -111,22 +111,57 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Create { title, r#type: ty, stdin, attach } => {
-            if !attach.is_empty() {
-                anyhow::bail!("siyuan-бекенд: --attach не поддерживается (вставь картинку в UI)");
-            }
+            let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
+            // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
+            // должен грузить ассеты впустую (внутренний чек create остаётся
+            // авторитетным — гонка между чеками ловится им же)
+            if !attach_files.is_empty() {
+                let board = syt::find_board(&sy, project).await?;
+                let rows = syt::read_rows(&sy, &board).await?;
+                let canon = syt::normalize_title(&title);
+                if rows.iter().any(|r| syt::normalize_title(&r.title) == canon) {
+                    anyhow::bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
+                }
+                if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
+                    anyhow::bail!("тело задачи «{title}» уже есть");
+                }
+            }
+            // upload всех до мутаций доски: сбой не оставляет задачу без скрина;
+            // мусор-ассеты возможен только при падении между upload и create
+            let mut uploaded = Vec::new();
+            for file in attach_files {
+                uploaded.push(sy.upload_asset(file).await?);
+            }
             let (item, body) = syt::create(&sy, project, &title, ty.as_deref().unwrap_or("dev"), &ctx).await?;
+            if !uploaded.is_empty() {
+                let refs = attach_refs_md(&uploaded);
+                sy.append_block_md(&body, &refs).await.with_context(|| {
+                    format!(
+                        "задача создана (строка {item}, тело {body}), но референсы не дописаны — \
+                         доложи: task body {item} --attach <файлы>"
+                    )
+                })?;
+            }
             println!("создана: {title}\n  строка: {item}\n  тело:   {body}");
+            if !uploaded.is_empty() {
+                let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
+                println!("  ассеты: {}", paths.join(", "));
+            }
             Ok(())
         }
         TaskSub::Edit { id, status, title, pr, branch } => {
-            if title.is_some() {
-                anyhow::bail!("siyuan-бекенд: переименование задачи не поддерживается (переименуй саб-док в UI)");
-            }
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
+            // валидация PR до rename: без частичных обновлений (тайтл сменился,
+            // а колонки нет — недопустимый разрыв)
+            pr.as_deref().map(syt::pr_cell_value).transpose()?;
+            let final_title = match title.as_deref() {
+                Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
+                None => None,
+            };
             syt::edit(&sy, &board, &task, status.as_deref(), branch.as_deref(), pr.as_deref()).await?;
-            println!("обновлено: {}", task.title);
+            println!("обновлено: {}", final_title.as_deref().unwrap_or(&task.title));
             Ok(())
         }
         TaskSub::Comment { id, reply, stdin, text } => {
@@ -161,11 +196,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let name = if list { None } else { journal.as_deref() };
             task_undo(&sy, project, name).await
         }
-        TaskSub::Body { id, replace, replace_section, md, stdin } => {
-            let content = read_body_input(md.as_deref(), stdin)?;
+        TaskSub::Body { id, replace, replace_section, md, stdin, attach } => {
+            let attach_files = validate_attach_files(&attach)?;
+            let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let body_path = board.body_hpath(&task.title);
+            // upload до записи тела: сбой не оставляет тело без референсов
+            let mut uploaded = Vec::new();
+            for file in attach_files {
+                uploaded.push(sy.upload_asset(file).await?);
+            }
             let doc = syt::task_body_doc(&sy, &board, &task).await?;
             let doc = match doc {
                 Some(doc_id) => {
@@ -182,7 +223,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     sy.create_doc_md(&board.notebook, &body_path, &initial).await?
                 }
             };
+            if !uploaded.is_empty() {
+                let refs = attach_refs_md(&uploaded);
+                sy.append_block_md(&doc, &refs).await.with_context(|| {
+                    format!(
+                        "тело обновлено, но референсы не дописаны — повтори: task body {id} --attach <файлы>"
+                    )
+                })?;
+            }
             println!("тело обновлено: {body_path} ({doc})");
+            if !uploaded.is_empty() {
+                let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
+                println!("ассеты: {}", paths.join(", "));
+            }
             Ok(())
         }
     }
@@ -241,7 +294,7 @@ async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> R
 /// не-Draft (задекларированный контракт команды), write-ahead журнал.
 async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
     let board = syt::find_board(sy, project).await?;
-    let chain = guard::board_doc_chain(sy, &board).await?;
+    let chain = syt::board_doc_chain(sy, &board).await?;
     let task = syt::resolve(sy, &board, id).await?;
     match row_verdict(sy, &board, &chain, &task).await? {
         Verdict::Divergent => bail!(
@@ -283,7 +336,7 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         bail!("--ids обязателен: кандидаты через запятую (row-id/префикс/подстрока)");
     }
     let board = syt::find_board(sy, project).await?;
-    let chain = guard::board_doc_chain(sy, &board).await?;
+    let chain = syt::board_doc_chain(sy, &board).await?;
     guard::control_probe_board(sy, &board, &chain).await?;
     let rows_before = syt::read_rows(sy, &board).await?;
 
@@ -440,7 +493,7 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
             board.av_id, journal.av_id
         );
     }
-    let chain = guard::board_doc_chain(sy, &board).await?;
+    let chain = syt::board_doc_chain(sy, &board).await?;
     guard::control_probe_board(sy, &board, &chain).await?;
     let rows = syt::read_rows(sy, &board).await?;
     let mut restored = 0usize;
@@ -1056,14 +1109,89 @@ fn collect_threads(md: &str) -> String {
     out
 }
 
-fn read_body_input(md_file: Option<&str>, stdin: bool) -> Result<String> {
+fn read_body_input(md_file: Option<&str>, stdin: bool, attach_present: bool) -> Result<String> {
     if let Some(f) = md_file {
         return Ok(std::fs::read_to_string(f)?);
     }
     if stdin {
         return read_stdin();
     }
+    if attach_present {
+        // только аттачи, контента нет — валидный вызов
+        return Ok(String::new());
+    }
     anyhow::bail!("нужно --stdin или --md <файл>")
+}
+
+/// Файлы аттачей: существуют и это файлы — до любых сетевых вызовов.
+fn validate_attach_files(files: &[std::path::PathBuf]) -> Result<&[std::path::PathBuf]> {
+    for file in files {
+        let meta = std::fs::metadata(file)
+            .with_context(|| format!("файл {}: недоступен", file.display()))?;
+        anyhow::ensure!(
+            meta.is_file(),
+            "{} — не файл (директория?)",
+            file.display()
+        );
+    }
+    Ok(files)
+}
+
+/// Расширения, которые SiYuan рендерит картинками; прочие аттачи — ссылки.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "apng", "avif", "bmp", "ico",
+];
+
+/// Сегменты пути → байты вне RFC3986-unreserved → %XX (upper hex); `/`
+/// остаётся литеральным разделителем. Симметрично экспорту ядра (пробелы
+/// %20, кириллица %D0%B8… — фикстура collect_asset_refs) и его читателю:
+/// префикс `](assets/` у читателя литеральный, `%2F` его разорвал бы
+/// (поймано round-trip тестом), сырой пробел/`)` в имени режет ссылку.
+fn percent_encode_asset_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn is_image_name(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .map(|ext| ext.to_lowercase())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+}
+
+/// Markdown-референс ассета в теле: картинка `![имя](assets/…)` или
+/// ссылка `[имя](assets/…)`. Alt-текст без `[`/`]` — не рвать markdown.
+fn asset_ref_md(asset: &crate::siyuan::UploadedAsset) -> String {
+    let alt = asset.original_name.replace(['[', ']'], "");
+    let encoded = percent_encode_asset_path(&asset.asset_path);
+    let prefix = if is_image_name(&asset.original_name) { "!" } else { "" };
+    format!("{prefix}[{alt}]({encoded})")
+}
+
+/// Блок референсов для append-а в тело: ведущая пустая строка отделяет
+/// от контента (шаблона/тега типа), по строке на ассет.
+fn attach_refs_md(assets: &[crate::siyuan::UploadedAsset]) -> String {
+    let mut out = String::from("\n");
+    for asset in assets {
+        out.push_str(&asset_ref_md(asset));
+        out.push('\n');
+    }
+    out
 }
 
 fn read_stdin() -> Result<String> {
@@ -1431,6 +1559,7 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: None,
+                attach: Vec::new(),
             },
         )
         .await
@@ -1480,6 +1609,7 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: Some("Проверка".into()),
+                attach: Vec::new(),
             },
         )
         .await
@@ -1727,6 +1857,76 @@ mod tests {
         assert_eq!(collect_asset_refs(md), vec!["ok.png"]);
     }
 
+    // ——— attach: кодер референсов (симметрия с читателем collect_asset_refs) ———
+
+    use super::asset_ref_md;
+    use super::attach_refs_md;
+    use super::percent_encode_asset_path;
+    use super::validate_attach_files;
+    use crate::siyuan::UploadedAsset;
+
+    fn asset(name: &str, path: &str) -> UploadedAsset {
+        UploadedAsset { original_name: name.into(), asset_path: path.into() }
+    }
+
+    #[test]
+    fn percent_encoding_round_trips_through_reader_on_space_and_cyrillic() {
+        for name in ["скрин 2.png", "имя я.png", "снимок экрана (1).png", "отчёт.pdf"] {
+            let path = format!("assets/{name}");
+            let md = asset_ref_md(&asset(name, &path));
+            let decoded = collect_asset_refs(&md);
+            assert_eq!(decoded, vec![name.to_string()], "round-trip {name}: {md}");
+        }
+    }
+
+    #[test]
+    fn percent_encoding_covers_unreserved_only() {
+        assert_eq!(percent_encode_asset_path("assets/a b.png"), "assets/a%20b.png");
+        assert_eq!(percent_encode_asset_path("assets/а.png"), "assets/%D0%B0.png");
+        assert_eq!(percent_encode_asset_path("assets/ok-_.~1.txt"), "assets/ok-_.~1.txt");
+        assert_eq!(percent_encode_asset_path("assets/x(1).png"), "assets/x%281%29.png");
+    }
+
+    #[test]
+    fn asset_ref_md_renders_image_for_image_extension_and_link_otherwise() {
+        let img = asset_ref_md(&asset("скрин.png", "assets/скрин.png"));
+        assert!(img.starts_with("![скрин.png]("), "картинка: {img}");
+        assert!(img.contains("%D1%81"), "кириллица пути закодирована: {img}");
+        let file = asset_ref_md(&asset("отчёт.pdf", "assets/отчёт.pdf"));
+        assert!(file.starts_with("[отчёт.pdf](") && !file.starts_with("!["), "ссылка: {file}");
+    }
+
+    #[test]
+    fn asset_ref_md_alt_text_without_brackets_keeps_markdown_intact() {
+        let md = asset_ref_md(&asset("weird]name.png", "assets/weird.png"));
+        let decoded = collect_asset_refs(&md);
+        assert_eq!(decoded, vec!["weird.png".to_string()], "ссылка не разорвана: {md}");
+    }
+
+    #[test]
+    fn attach_refs_md_starts_with_blank_line_one_ref_per_line() {
+        let md = attach_refs_md(&[asset("a.png", "assets/a.png"), asset("b.pdf", "assets/b.pdf")]);
+        assert!(md.starts_with("\n"), "пустая строка-разделитель от контента: {md:?}");
+        let lines: Vec<&str> = md.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "по строке на ассет: {md:?}");
+        assert!(lines[0].starts_with("![") && lines[1].starts_with("["));
+    }
+
+    #[test]
+    fn validate_attach_files_bails_on_missing_and_directory_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.png");
+        std::fs::write(&ok, b"x").unwrap();
+        let missing = dir.path().join("нет.png");
+        let err = validate_attach_files(&[ok.clone(), missing])
+            .expect_err("несуществующий файл — отказ");
+        assert!(err.to_string().contains("нет.png"), "суть: {err}");
+        let err = validate_attach_files(&[dir.path().to_path_buf()])
+            .expect_err("директория — отказ");
+        assert!(err.to_string().contains("не файл"), "суть: {err}");
+        assert_eq!(validate_attach_files(&[ok]).unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn save_body_assets_downloads_with_original_names_and_skips_missing() {
         let server = MockServer::start().await;
@@ -1798,5 +1998,555 @@ mod tests {
         assert!(!asset_key_is_safe(""));
         assert!(asset_key_is_safe("img.png"));
         assert!(asset_key_is_safe("sub/dir/file.htm"));
+    }
+
+    // ——— edit_title: renameDoc + verify Title-клетки (stateful render) ———
+
+    use crate::siyuan_task::{edit_title_with_pacing, SyTask, TitleSyncPacing};
+    use serde_json::{json, Value};
+
+    const CHAIN_ROOT: &str = "uwuwu-root";
+    const OTHER_ROW: &str = "item-other";
+    const OTHER_TITLE: &str = "чужой";
+    const ORPHAN_TITLE: &str = "сирота";
+
+    /// Мок под edit_title: id-цепочка доски (board_doc_chain), stateful render
+    /// (renameDoc-маунт кладёт новый тайтл в общее состояние — так живёт
+    /// verify-поллинг), renameDoc-маунт с записью запроса. `stateful_rename`
+    /// = false моделирует «зависшую» клетку: rename проходит, render-состояние
+    /// не меняется.
+    async fn mock_siyuan_for_title(
+        stateful_rename: bool,
+    ) -> (
+        MockServer,
+        Arc<Mutex<Option<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let server = MockServer::start().await;
+        let renamed_to: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let renames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = match hpath {
+                    "/uwuwu" => serde_json::json!([CHAIN_ROOT]),
+                    "/uwuwu/Задачи uwuwu" => serde_json::json!([BOARD_DOC]),
+                    "/uwuwu/Задачи uwuwu/сирота" => serde_json::json!([ORPHAN_DOC]),
+                    _ => serde_json::json!([]),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        let renamed_for_mount = renamed_to.clone();
+        let renames_for_mount = renames.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/renameDoc"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                renames_for_mount.lock().unwrap().push(
+                    body.get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                if stateful_rename {
+                    *renamed_for_mount.lock().unwrap() = Some(
+                        body.get("title")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+                ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+            })
+            .mount(&server)
+            .await;
+
+        let renamed_for_render = renamed_to.clone();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-1");
+                }
+                if body.contains("notifications/initialized") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("tools/call") {
+                    let current = renamed_for_render.lock().unwrap().clone();
+                    let own_title = current.unwrap_or_else(|| "таск".into());
+                    let view = serde_json::json!({
+                        "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
+                        "rows": [
+                            { "id": ROW_ID, "cells": [{ "value": { "keyID": TITLE_KEY,
+                                "type": "block",
+                                "block": { "content": own_title, "id": BOUND_DOC, "refSubtype": "d" } } }] },
+                            { "id": OTHER_ROW, "cells": [{ "value": { "keyID": TITLE_KEY,
+                                "type": "block",
+                                "block": { "content": OTHER_TITLE, "id": ORPHAN_DOC, "refSubtype": "d" } } }] },
+                        ],
+                    });
+                    let page_done = body.contains("\"page\":2");
+                    let rows = if page_done { serde_json::json!([]) } else { view["rows"].clone() };
+                    let payload = serde_json::json!({ "action": "render", "data": { "view": {
+                        "columns": view["columns"], "rows": rows } } });
+                    return ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 2,
+                            "result": { "content": [{ "type": "text", "text": payload.to_string() }] }
+                        })
+                        .to_string(),
+                    );
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#,
+                )
+            })
+            .mount(&server)
+            .await;
+
+        (server, renamed_to, renames)
+    }
+
+    fn title_task() -> SyTask {
+        SyTask {
+            item_id: ROW_ID.into(),
+            title: "таск".into(),
+            status: String::new(),
+            branch: String::new(),
+            pr: String::new(),
+            schedule: String::new(),
+            last_run: String::new(),
+            body_doc: Some(BOUND_DOC.into()),
+        }
+    }
+
+    fn title_board() -> crate::siyuan_task::SyBoard {
+        crate::siyuan_task::SyBoard {
+            doc_id: BOARD_DOC.into(),
+            av_id: AV_ID.into(),
+            block_id: CARRIER.into(),
+            hpath: "/uwuwu/Задачи uwuwu".into(),
+            notebook: "nb-1".into(),
+        }
+    }
+
+    fn set_kernel_url(server: &MockServer) {
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_renames_doc_and_title_cell_confirms() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        let (board, task) = (title_board(), title_task());
+
+        let new_title = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &board,
+            &task,
+            "  новый тайтл  ",
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect("rename + sync ok");
+
+        assert_eq!(new_title, "новый тайтл", "trim применён, без слэшей");
+        let paths = renames.lock().unwrap();
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some(&format!("/{CHAIN_ROOT}/{BOARD_DOC}/{BOUND_DOC}.sy") as &str),
+            "renameDoc по storage-пути из id-цепочки, относительно ноутбука"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_bails_on_row_duplicate_without_rename() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        let (board, task) = (title_board(), title_task());
+
+        let err = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &board,
+            &task,
+            OTHER_TITLE,
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect_err("чужой тайтл — отказ до мутаций");
+
+        assert!(
+            err.to_string().contains("занят другой строкой"),
+            "суть: {err}"
+        );
+        assert!(renames.lock().unwrap().is_empty(), "renameDoc не вызван");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_bails_on_orphan_body_with_target_title() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        let (board, task) = (title_board(), title_task());
+
+        let err = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &board,
+            &task,
+            ORPHAN_TITLE,
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect_err("тело-сирота с целевым тайтлом — отказ");
+
+        assert!(err.to_string().contains("уже существует"), "суть: {err}");
+        assert!(renames.lock().unwrap().is_empty(), "renameDoc не вызван");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_reports_loudly_when_title_cell_never_syncs() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(false).await;
+        set_kernel_url(&server);
+        let (board, task) = (title_board(), title_task());
+
+        let err = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &board,
+            &task,
+            "новый тайтл",
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect_err("клетка не синкалась — громкая ошибка");
+
+        let text = err.to_string();
+        assert!(text.contains("Title-клетка"), "суть: {text}");
+        assert!(text.contains("идемпотентен"), "хинт на повтор: {text}");
+        assert_eq!(renames.lock().unwrap().len(), 1, "renameDoc был один");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn edit_title_refuses_detached_row_before_any_call() {
+        let (server, _renamed_to, renames) = mock_siyuan_for_title(true).await;
+        set_kernel_url(&server);
+        let mut task = title_task();
+        task.body_doc = None;
+
+        let err = edit_title_with_pacing(
+            &SiYuan::for_tests(server.uri()),
+            &title_board(),
+            &task,
+            "новый тайтл",
+            TitleSyncPacing::instant(),
+        )
+        .await
+        .expect_err("detached-строка — отказ");
+
+        assert!(err.to_string().contains("без тела"), "суть: {err}");
+        assert!(renames.lock().unwrap().is_empty(), "renameDoc не вызван");
+    }
+
+    // ——— create --attach: порядок upload → create → append, пред-чек дедупа ———
+
+    /// Мок под полный create-путь: дедуп-пред-чек читает render, createDocWithMd
+    /// и asset/upload пишут в общий лог порядка, render stateful (строка доски
+    /// появляется после item_add — так живёт verify create).
+    async fn mock_siyuan_for_create(
+        initial_row_title: Option<&str>,
+    ) -> (
+        MockServer,
+        Arc<Mutex<Vec<&'static str>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let server = MockServer::start().await;
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let item_added: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let initial_title = initial_row_title.map(String::from);
+
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with({
+                let order = order.clone();
+                move |req: &wiremock::Request| {
+                    order.lock().unwrap().push("upload");
+                    // kernel вставляет stem оригинала в сгенерированный путь:
+                    // assets/<stem>-<timestamp>-<random>.<ext>
+                    let body = String::from_utf8_lossy(&req.body);
+                    let name = body
+                        .split("filename=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("f");
+                    let (stem, ext) = match name.rsplit_once('.') {
+                        Some((stem, ext)) => (stem.to_string(), ext.to_string()),
+                        None => (name.to_string(), "bin".to_string()),
+                    };
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "data": { "succFiles": [{ "index": 0, "name": name,
+                                  "path": format!("assets/{stem}-20261106090000-abc1234.{ext}") }] }
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/notebook/lsNotebooks"))
+            .respond_with(|_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_string(
+                    json!({ "code": 0, "data": { "notebooks": [{ "id": "nb-1", "name": "Projects" }] } })
+                        .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/query/sql"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+                let data = if stmt.contains("type='av'") {
+                    serde_json::json!([{ "id": CARRIER,
+                        "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"{AV_ID}\"></div>") }])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": data }).to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = if hpath == "/uwuwu/Задачи uwuwu" {
+                    serde_json::json!([BOARD_DOC])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200)
+                    .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/createDocWithMd"))
+            .respond_with({
+                let order = order.clone();
+                move |_req: &wiremock::Request| {
+                    order.lock().unwrap().push("create");
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":"doc-new"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with({
+                let order = order.clone();
+                let appends = appends.clone();
+                move |req: &wiremock::Request| {
+                    order.lock().unwrap().push("append");
+                    appends
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&req.body).to_string());
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let order_for_mcp = order.clone();
+        let item_added_for_mcp = item_added.clone();
+        let initial_for_mcp = initial_title.clone();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-1");
+                }
+                if body.contains("notifications/initialized") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("tools/call") {
+                    let action = if body.contains("\"item_add\"") {
+                        *item_added_for_mcp.lock().unwrap() = true;
+                        order_for_mcp.lock().unwrap().push("item_add");
+                        json!({ "action": "item_add", "data": { "itemID": ROW_ID } }).to_string()
+                    } else if body.contains("\"keys\"") {
+                        json!({ "action": "keys",
+                                "data": { "keys": [{ "id": TITLE_KEY, "name": "Status" }] } }).to_string()
+                    } else if body.contains("\"render\"") {
+                        let page_done = body.contains("\"page\":2");
+                        let existing = initial_for_mcp.clone().map(|t| serde_json::json!({
+                            "id": OTHER_ROW,
+                            "cells": [{ "value": { "keyID": TITLE_KEY, "type": "block",
+                                       "block": { "content": t, "id": ORPHAN_DOC, "refSubtype": "d" } } }]
+                        }));
+                        let mut rows: Vec<Value> = Vec::new();
+                        if let Some(row) = existing {
+                            rows.push(row);
+                        }
+                        if *item_added_for_mcp.lock().unwrap() && !page_done {
+                            rows.push(serde_json::json!({
+                                "id": ROW_ID,
+                                "cells": [{ "value": { "keyID": TITLE_KEY, "type": "block",
+                                           "block": { "content": "новая задача", "id": "doc-new", "refSubtype": "d" } } }]
+                            }));
+                        }
+                        let rows = if page_done { json!([]) } else { serde_json::Value::Array(rows) };
+                        json!({ "action": "render", "data": { "view": {
+                            "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
+                            "rows": rows } } }).to_string()
+                    } else {
+                        json!({ "action": "unknown", "data": null }).to_string()
+                    };
+                    return ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 2,
+                            "result": { "content": [{ "type": "text", "text": action }] }
+                        })
+                        .to_string(),
+                    );
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#,
+                )
+            })
+            .mount(&server)
+            .await;
+
+        (server, order, appends)
+    }
+
+    async fn create_via_cli(
+        server: &MockServer,
+        title: &str,
+        attach: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: title.into(),
+                r#type: None,
+                stdin: false,
+                attach: attach.to_vec(),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_attach_uploads_before_creating_and_appends_refs() {
+        let (server, order, appends) = mock_siyuan_for_create(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("скрин 1.png");
+        std::fs::write(&img, b"png").unwrap();
+        let doc = dir.path().join("notes.txt");
+        std::fs::write(&doc, b"txt").unwrap();
+
+        create_via_cli(&server, "новая задача", &[img, doc])
+            .await
+            .expect("create с аттачами ok");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["upload", "upload", "create", "item_add", "append", "append"],
+            "порядок: upload все → createDoc → строка → тег типа → референсы"
+        );
+        let appends = appends.lock().unwrap();
+        assert!(
+            appends[0].contains("#dev"),
+            "первый append — тег типа: {}",
+            appends[0]
+        );
+        let refs_md: String = serde_json::from_str::<serde_json::Value>(&appends[1])
+            .expect("appendBlock body — json")
+            .get("data")
+            .and_then(|d| d.as_str())
+            .expect("data — markdown референсов")
+            .to_string();
+        assert!(
+            refs_md.starts_with('\n'),
+            "ведущая пустая строка: {refs_md:?}"
+        );
+        // round-trip через штатного читателя: закодированные пути декодируются
+        assert_eq!(
+            collect_asset_refs(&refs_md),
+            vec![
+                "скрин 1-20261106090000-abc1234.png".to_string(),
+                "notes-20261106090000-abc1234.txt".to_string(),
+            ],
+            "обе ссылки читаются collect_asset_refs: {refs_md:?}"
+        );
+        assert!(
+            refs_md.contains("![скрин 1.png]("),
+            "картинка по расширению: {refs_md:?}"
+        );
+        assert!(
+            !refs_md.contains("![notes.txt]"),
+            "txt — ссылка, не картинка: {refs_md:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_attach_bails_on_duplicate_title_before_any_upload() {
+        let (server, order, _appends) = mock_siyuan_for_create(Some("новая задача")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("скрин.png");
+        std::fs::write(&img, b"png").unwrap();
+
+        let err = create_via_cli(&server, "новая задача", &[img])
+            .await
+            .expect_err("дубль-тайтл — отказ");
+
+        assert!(
+            err.to_string().contains("уже есть"),
+            "пред-чек дедупа: {err}"
+        );
+        assert!(
+            !order.lock().unwrap().contains(&"upload"),
+            "ни одного upload до отказа"
+        );
+        assert!(
+            !order.lock().unwrap().contains(&"create"),
+            "createDoc не вызван"
+        );
     }
 }

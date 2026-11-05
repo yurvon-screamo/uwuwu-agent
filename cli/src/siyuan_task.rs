@@ -542,6 +542,154 @@ pub async fn create(
 }
 
 /// Итог вставки строки: id найден / тайтл занят другой строкой / строки нет.
+/// Цепочка doc-id от корня ноутбука до дока доски: getIDsByHPath отдаёт id
+/// последнего сегмента пути — идём по префиксам hpath. Хвост цепочки обязан
+/// совпасть с doc_id доски (расхождение = резолв доски расходится с деревом).
+pub(crate) async fn board_doc_chain(sy: &SiYuan, board: &SyBoard) -> Result<Vec<String>> {
+    let segments: Vec<&str> = board.hpath.split('/').filter(|s| !s.is_empty()).collect();
+    let mut chain = Vec::with_capacity(segments.len());
+    for i in 1..=segments.len() {
+        let prefix = format!("/{}", segments[..i].join("/"));
+        let ids = sy.doc_ids_by_hpath(&board.notebook, &prefix).await?;
+        let Some(id) = ids.first() else {
+            bail!("цепочка доков доски оборвана на «{prefix}»: деревьев по пути нет");
+        };
+        chain.push(id.clone());
+    }
+    if chain.last().map(String::as_str) != Some(board.doc_id.as_str()) {
+        bail!(
+            "цепочка доков ({:?}) не сходится с доской {} — резолв доски расходится с деревом",
+            chain,
+            board.doc_id
+        );
+    }
+    Ok(chain)
+}
+
+/// Storage-путь тела дока для filetree-API (renameDoc): `/цепочка/<docId>.sy`
+/// относительно корня ноутбука (kernel сам префиксует `data/<notebook>/`).
+pub(crate) fn body_storage_path(chain: &[String], doc_id: &str) -> String {
+    format!("/{}/{}.sy", chain.join("/"), doc_id)
+}
+
+/// Новый тайтл задачи: trim, клиентский отказ на пустом, санитизация
+/// слэша (path_safe: '/' → U+2215). Сырой '/' при renameDoc делает док
+/// невидимым для hpath-лукапов (проба ядра 06.11: legacyPathUnsupported);
+/// ∕-форма — конвенция доски, дедуп normalize_title покрывает обе формы.
+pub(crate) fn prepare_new_title(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("пустой тайтл — передай непустую строку в --title");
+    }
+    Ok(path_safe(trimmed))
+}
+
+/// Смена заголовка задачи: renameDoc тела (storage path по id-цепочке доски) +
+/// verify Title-клетки по read_rows. Привязка blockID не меняется; Title-клетка
+/// синкается ядром с лагом (проба 06.11: бывает >2 с) — терпеливый поллинг.
+/// Повторный вызов идемпотентен: rename к тому же тайтлу — no-op ядра.
+pub async fn edit_title(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    raw_title: &str,
+) -> Result<String> {
+    edit_title_with_pacing(sy, board, task, raw_title, TitleSyncPacing::production()).await
+}
+
+pub(crate) async fn edit_title_with_pacing(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    raw_title: &str,
+    pacing: TitleSyncPacing,
+) -> Result<String> {
+    let new_title = prepare_new_title(raw_title)?;
+    let Some(doc) = task.body_doc.as_deref() else {
+        bail!(
+            "строка «{}» без тела (detached) — переименуй в UI: renameDoc требует привязанный док",
+            task.title
+        );
+    };
+    // дедуп до мутаций: строки доски и тела-сироты, своя строка исключается
+    let canon = normalize_title(&new_title);
+    let rows = read_rows(sy, board).await?;
+    if rows
+        .iter()
+        .any(|r| r.item_id != task.item_id && normalize_title(&r.title) == canon)
+    {
+        bail!("тайтл «{new_title}» занят другой строкой доски — дубль");
+    }
+    let orphan_ids = body_doc_by_title(sy, board, &new_title).await?;
+    if !orphan_ids.is_empty() {
+        bail!(
+            "док с заголовком «{new_title}» уже существует ({}): вычисти сироту в UI или выбери другой тайтл",
+            orphan_ids.join(", ")
+        );
+    }
+    let chain = board_doc_chain(sy, board).await?;
+    sy.rename_doc(&board.notebook, &body_storage_path(&chain, doc), &new_title)
+        .await?;
+    verify_title_sync(sy, board, task, &new_title, &pacing).await?;
+    Ok(new_title)
+}
+
+/// Title-клетка строки обязана показать новый тайтл: поллинг read_rows с
+/// паузой между попытками. Синк ведёт ядро (blockID-привязка), лаг бывает >2 с;
+/// не разуверился за все попытки → громкая ошибка с хинтом (повтор безопасен).
+async fn verify_title_sync(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    new_title: &str,
+    pacing: &TitleSyncPacing,
+) -> Result<()> {
+    let canon = normalize_title(new_title);
+    for attempt in 0..pacing.attempts {
+        if attempt > 0 {
+            tokio::time::sleep(pacing.poll_delay).await;
+        }
+        let rows = read_rows(sy, board).await?;
+        if rows
+            .iter()
+            .any(|r| r.item_id == task.item_id && normalize_title(&r.title) == canon)
+        {
+            return Ok(());
+        }
+    }
+    bail!(
+        "Title-клетка строки «{}» не обновилась за {:?}×{} попыток (синк ядра отстаёт); \
+         проверь `task get` позже или повтори — rename идемпотентен",
+        task.title,
+        pacing.poll_delay,
+        pacing.attempts
+    )
+}
+
+/// Пейсинг verify-поллинга Title-клетки: производство с запасом на лаг синка,
+/// тесты — мгновенные.
+pub(crate) struct TitleSyncPacing {
+    attempts: u32,
+    poll_delay: std::time::Duration,
+}
+
+impl TitleSyncPacing {
+    fn production() -> Self {
+        Self {
+            attempts: 5,
+            poll_delay: std::time::Duration::from_secs(2),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instant() -> Self {
+        Self {
+            attempts: 3,
+            poll_delay: std::time::Duration::from_millis(1),
+        }
+    }
+}
+
 pub(crate) fn check_row_insert(rows: &[SyTask], item: &str, title: &str) -> RowInsertCheck {
     if rows.iter().any(|r| r.item_id == item) {
         return RowInsertCheck::Confirmed;
@@ -975,6 +1123,26 @@ mod tests {
     fn normalize_title_keeps_distinct_titles_distinct() {
         assert_ne!(normalize_title("a/b"), normalize_title("a\u{2215}b/c"));
         assert_ne!(normalize_title("a/b"), normalize_title("ab"));
+    }
+
+    #[test]
+    fn prepare_new_title_trims_sanitizes_and_bails_on_empty() {
+        assert_eq!(prepare_new_title("  новый тайтл  ").unwrap(), "новый тайтл");
+        assert_eq!(prepare_new_title("а/б").unwrap(), "а\u{2215}б");
+        let err = prepare_new_title("   ").expect_err("пустой тайтл — отказ");
+        assert!(err.to_string().contains("пустой тайтл"), "суть: {err}");
+        let err = prepare_new_title("").expect_err("пустой тайтл — отказ");
+        assert!(err.to_string().contains("пустой тайтл"), "суть: {err}");
+    }
+
+    #[test]
+    fn body_storage_path_joins_chain_and_doc_id_with_sy_suffix() {
+        // chain всегда непуст: board_doc_chain бейлит на оборванном дереве
+        let chain = vec!["root-id".to_string(), "board-id".to_string()];
+        assert_eq!(
+            body_storage_path(&chain, "doc-id"),
+            "/root-id/board-id/doc-id.sy"
+        );
     }
 
     #[test]

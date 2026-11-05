@@ -91,6 +91,8 @@ pub(crate) enum TaskSub {
     /// Фенсы ```html_embed [имя] конвертируются в живые embed_html-диаграммы:
     /// именованный фенс заменяет прежнюю диаграмму с этим именем,
     /// пустой (```html_embed имя без тела) — удаляет её.
+    /// --attach (repeatable) грузит файлы в assets/ и дописывает референсы
+    /// после контент-операции; вызов с одними аттачами (без --stdin/--md) валиден.
     Body {
         #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс / подстрока заголовка")]
         id: String,
@@ -108,6 +110,12 @@ pub(crate) enum TaskSub {
         /// строки заголовка; пустой ввод очищает секцию.
         #[arg(long, value_name = "HEADING", conflicts_with = "replace")]
         replace_section: Option<String>,
+        #[arg(
+            long = "attach",
+            value_name = "FILE",
+            help = "Аттач в конец тела (repeatable)"
+        )]
+        attach: Vec<std::path::PathBuf>,
     },
     /// Удалить задачу: строка вниз + тело в трэш (восстановимо restore_doc).
     /// Только Draft-черновики (их чистит триаж); живые задачи — отказ.
