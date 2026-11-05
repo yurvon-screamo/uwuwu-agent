@@ -2,10 +2,13 @@
 import { describe, expect, test } from "bun:test"
 import {
   commentText,
+  conflictFixPrompt,
   continuePrompt,
   kickoffModeOf,
   newUserComments,
   bodyEditPrompt,
+  promptForStart,
+  prMergeableOf,
   spawnPrompt,
   untrackedTasks,
   isUserComment,
@@ -315,12 +318,74 @@ describe("routeTask", () => {
     expect(routeTask(facts({ status: "Design", lastStatus: "In Progress" })))
       .toEqual({ t: "return-to-dev" })
   })
+  test("фаст-трек трекенной задачи: перевод владельца в In Progress из любого другого статуса → девелоперу", () => {
+    // прод-факт 06.11: трек на «Review» с конфликтным PR, владелец флипает в
+    // In Progress — сигнал «вмешайся и почини»; до фикса маршрутизация молчала
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "Review" })))
+      .toEqual({ t: "return-to-dev" })
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "Needs attention" })))
+      .toEqual({ t: "return-to-dev" })
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "Design" })))
+      .toEqual({ t: "return-to-dev" })
+    // Todo/Draft — тоже fast-track-семантика (любой исходный статус)
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "Todo" })))
+      .toEqual({ t: "return-to-dev" })
+    // флип с комментом владельца — тот же исход: комменты съедает
+    // consumeComments после доставки (двойной промпт не рождается)
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "Review", freshComments: [c("x", "почини", 1)] })))
+      .toEqual({ t: "return-to-dev" })
+  })
   test("спокойные статусы без переходов → noop", () => {
     expect(routeTask(facts({ status: "Design", lastStatus: "Design" }))).toEqual({ t: "noop" })
     expect(routeTask(facts({ status: "Design", lastStatus: "" }))).toEqual({ t: "noop" })
+    // In Progress без смены статуса — не edge: комменты доставляет пайп ниже
     expect(routeTask(facts({ status: "In Progress", lastStatus: "In Progress" }))).toEqual({ t: "noop" })
-    expect(routeTask(facts({ status: "In Progress", lastStatus: "Design", freshComments: [c("x", "привет", 1)] })))
-      .toEqual({ t: "noop" }) // комменты девелоперу доставляет пайп ниже маршрутизации
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "In Progress", freshComments: [c("x", "привет", 1)] })))
+      .toEqual({ t: "noop" })
+    // свежий карантин (фейл спавна, lastStatus не писался) — не считаем переводом
+    expect(routeTask(facts({ status: "In Progress", lastStatus: "" }))).toEqual({ t: "noop" })
+  })
+})
+
+describe("conflictFixPrompt", () => {
+  test("конфликт-kickoff: PR, путь починки и возврат в «Ревью результата», без Design-стадии", () => {
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9")
+    expect(p).toContain("r1")
+    expect(p).toContain("https://github.com/x/pull/9")
+    expect(p).toContain("конфликт")
+    expect(p).toContain(REVIEW_RESULT_STATUS)
+    expect(p).toContain("mergeable")
+    expect(p).not.toContain("Стадия Design")
+    expect(p).not.toContain("Ревью плана")
+  })
+})
+
+describe("promptForStart: единственная точка выбора стартового промпта", () => {
+  const args = ["r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "https://github.com/x/pull/9"] as const
+  test("conflict-fix → конфликт-kickoff", () => {
+    const p = promptForStart("conflict-fix", ...args)
+    expect(p).toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9"))
+  })
+  test("continue → рестарт без предписания стадии", () => {
+    const p = promptForStart("continue", ...args)
+    expect(p).toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent"))
+    expect(p).not.toContain("Стадия Design")
+  })
+  test("implement/design → spawnPrompt соответствующего режима", () => {
+    expect(promptForStart("implement", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
+    expect(promptForStart("design", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
+  })
+})
+
+describe("prMergeableOf: парс gh pr view --json mergeable", () => {
+  test("CONFLICTING/MERGEABLE пробрасываются, остальное и мусор → UNKNOWN", () => {
+    expect(prMergeableOf('{"mergeable":"CONFLICTING"}')).toBe("CONFLICTING")
+    expect(prMergeableOf('{"mergeable":"MERGEABLE"}')).toBe("MERGEABLE")
+    expect(prMergeableOf('{"mergeable":"UNKNOWN"}')).toBe("UNKNOWN")
+    expect(prMergeableOf('{"mergeable":null}')).toBe("UNKNOWN")
+    expect(prMergeableOf("{}")).toBe("UNKNOWN")
+    expect(prMergeableOf("не json")).toBe("UNKNOWN")
+    expect(prMergeableOf("")).toBe("UNKNOWN")
   })
 })
 
@@ -366,6 +431,8 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain("task get")
     expect(p).toContain("замечания ревьювера")
     expect(p).toContain("перепланируй")
+    // фаст-трек владельца — тот же возврат: продолжай/почини без Design
+    expect(p).toContain("In Progress")
   })
 })
 

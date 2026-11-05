@@ -235,6 +235,46 @@ export function continuePrompt(rowId: string, project: string, repo: string): st
   ].join("\n")
 }
 
+/** Конфликт-kickoff: PR ветки задачи конфликтует с master (владелец флипнул
+ *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте). */
+export function conflictFixPrompt(rowId: string, pr: string): string {
+  return [
+    `[factory] Задача ${rowId}: PR ветки конфликтует с master (${pr}).`,
+    "",
+    "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
+    "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
+    "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
+    `в «${REVIEW_RESULT_STATUS}» (uwuwu-cli task edit --status) и заверши ход.`,
+  ].join("\n")
+}
+
+/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf),
+ *  рестарт умершей сессии (continue, стадию не предписываем) или
+ *  конфликт-рестарт (conflict-fix: PR ветки в конфликте с master). */
+export type StartKind = KickoffMode | "continue" | "conflict-fix"
+
+/** Единственная точка выбора стартового промпта по виду старта.
+ *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR). */
+export function promptForStart(
+  start: StartKind, rowId: string, project: string, repo: string, pr: string,
+): string {
+  if (start === "continue") return continuePrompt(rowId, project, repo)
+  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr)
+  return spawnPrompt(rowId, project, repo, start)
+}
+
+/** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.
+ *  Не-JSON, неожиданные значения → UNKNOWN (трактуется как «не конфликт»). */
+export function prMergeableOf(raw: string): "CONFLICTING" | "MERGEABLE" | "UNKNOWN" {
+  try {
+    const j = JSON.parse(raw) as { mergeable?: unknown }
+    if (j.mergeable === "CONFLICTING" || j.mergeable === "MERGEABLE") return j.mergeable
+    return "UNKNOWN"
+  } catch {
+    return "UNKNOWN"
+  }
+}
+
 /** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
 export function bodyEditPrompt(rowId: string): string {
   return [
@@ -331,7 +371,8 @@ export function reviewReturnPrompt(rowId: string): string {
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
     "- результат approved → мяч у юзера, от тебя ничего не требуется;",
-    "- владелец вернул в Design → перепланируй и снова «Ревью плана».",
+    "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
+    "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
 }
 
@@ -375,6 +416,13 @@ export function routeTask(f: RouteFacts): RouteAction {
   }
   // …или ручной перевод живой задачи в Design («перепланируй»)
   if (f.status === "Design" && f.lastStatus !== "Design" && f.lastStatus !== "") {
+    return { t: "return-to-dev" }
+  }
+  // fast-track трекенной задачи: перевод владельца в In Progress из любого
+  // другого статуса — «вмешайся и почини» (конфликт PR, зависший раунд,
+  // форсаж Design-задачи). lastStatus "" — свежий карантин без спавна:
+  // перевода не было, будит только коммент юзера.
+  if (f.status === "In Progress" && f.lastStatus !== "In Progress" && f.lastStatus !== "") {
     return { t: "return-to-dev" }
   }
   return { t: "noop" }
