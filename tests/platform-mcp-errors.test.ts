@@ -41,9 +41,6 @@ const jsonrpc = (result: unknown, sessionId?: string): Response =>
     headers: sessionId !== undefined ? { "mcp-session-id": sessionId } : {},
   })
 
-const callPage = (rows: unknown[]): Response =>
-  jsonrpc({ structuredContent: { view: { rows } } })
-
 const sse = (result: unknown): Response => {
   const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result })
   return new Response(`event: message\ndata: ${payload}\n\n`, { status: 200 })

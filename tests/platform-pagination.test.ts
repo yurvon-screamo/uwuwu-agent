@@ -120,9 +120,9 @@ describe("read_database_cells: полнота доски (живое ядро)",
     const docId = found.matches?.find((m) => m.inTrash !== true)?.id
     expect(docId).toBeTruthy()
     const doc = await tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
-    const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id
-    expect(dbId).toBeTruthy()
-    const probe = await __test.renderBoardPage(dbId!, 1)
+    const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id ?? ""
+    expect(dbId).not.toBe("")
+    const probe = await __test.renderBoardPage(dbId, 1)
     const rowCount = probe.view?.rowCount ?? 0
     expect(rowCount).toBeGreaterThan(0)
 
