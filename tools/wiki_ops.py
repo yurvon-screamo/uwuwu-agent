@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""wiki_ops — операции с доками uwuwu (SiYuan-бекенд).
+"""wiki_ops — операции с доками uwuwu (SiYuan-бекенд). Единый CLI-модуль всех
+wiki-операций агентов; вынос подкоманд в отдельные файлы размазал бы общий
+kernel-транспорт (post, конфиг, константы) без выигрыша в читаемости.
 
 Команды (совместимы с прежним интерфейсом дример-агентов):
   export <docId>                     markdown дока по id
@@ -9,7 +11,7 @@
                                    Experience + hpath /cli) или корневая папка ровно
                                    одного ноутбука (/uwuwu/ADR → Projects, /affine →
                                    Experience); пустой --parent → Projects (легаси)
-  append <docId> --md <файл>         дописать markdown-блоки в конец
+  append <docId> --md <файл> [--force]         дописать markdown-блоки в конец
   replace <docId> --md <файл>        заменить док целиком
   delete <docId> [--force]           снести док в корзину SiYuan (восстановимо)
   orgls                              дерево: ноутбуки + подпапки
@@ -22,12 +24,28 @@ markdown, у которой на ОДНОЙ строке есть и «⚠️»,
 — только с --force. ВНИМАНИЕ: --force сносит subtree, доски и тела задач —
 для тел задач правильный путь uwuwu-cli task rm, а не delete.
 
+append: идемпотентен при ретраях (инцидент append ×4, 02.11). Перед каждой
+отсылкой — контрольный export: нормализованный аппенд совпал с нормализованным
+хвостом дока → no-op с репортом «already applied» (rc 0). Нормализация сливает
+только рендер-неразличимое (разбеги пробелов и пустые строки вне code-fence)
+и ядро-стёртое при roundtrip (whitespace у pipe в таблицах, dash-пэддинг
+separator'а — живые пробы 06.11); ведущий отступ вне fence и код внутри fence
+сравниваются дословно — ложный no-op на структурно разный markdown невозможен,
+промах guard'а всегда даёт видимый дубль, не тихую потерю. Слепых ретраев нет:
+export и appendBlock идут attempts=1, единственный ретрай-луп — guard
+(APPEND_ATTEMPTS, backoff; худший случай — конверт прежних 6 слепых attempts).
+--force — осознанный дубль single-shot: одна отсылка без сверок и ретраев,
+сбой — громкая ошибка, повтор — за оператором (слепой луп за флагом вернул бы
+инцидент ×N).
+
 orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
 молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
 
 post(): «metadata is not ready» — ≤3 попытки (+2s/+5s) → различимый bail с
 хинтом (дисциплина ADR-027: волна гаснет отходом клиента, ретраи — её топливо);
-транспортные ошибки и прочие code≠0 — прежние ретраи.
+транспортные ошибки — ретраи с бэкоффом (sleep-free на последней попытке);
+прочие code≠0 — перманентный отказ ядра, KernelRefused немедленно (ретраи
+бессмысленны, см. класс ниже).
 
 Конфиг: UWUWU_SIYUAN_URL (деф. http://127.0.0.1:6806) + UWUWU_SIYUAN_TOKEN
 (или UWUWU_SIYUAN_WS/conf/conf.json).
@@ -49,22 +67,46 @@ TOKEN = None
 # (04.11: Experience 859 доков, orgls видел 64). Явный предел обязателен в каждом stmt.
 ORG_LS_LIMIT = 100000
 
+# export дока в markdown (cmd_export, _is_stub, _export_content).
+EXPORT_MD_PATH = "/api/export/exportMdContent"
+
 # Формат docId ядра SiYuan: 14 цифр (timestamp) + '-' + 7 символов [a-z0-9].
 # Валидация до любых SQL-запросов — инъекция/мусор отсекаются на входе.
 DOC_ID_RE = re.compile(r"^\d{14}-[a-z0-9]{7}$")
+
+# Бюджет guard-лупа append: единственная точка ретраев (шаги внутри — attempts=1).
+# Худший случай 6×(≤60s urlopen) + backoff — конверт прежних 6 слепых attempts post().
+APPEND_ATTEMPTS = 6
+
+FENCE_RE = re.compile(r"^\s*```")
+# Separator таблицы: только pipe/дефисы/двоеточия/пробелы и обязателен pipe
+# (thematic break «---» без pipe — не он).
+SEPARATOR_ROW_RE = re.compile(r"(?=.*\|)[\s|:\-]*-[\s|:\-]*")
 
 # «metadata is not ready»: ≤3 попытки с паузами +2s/+5s → различимый bail с хинтом.
 # Дисциплина ADR-027 (uwuwu-cli): волна деградации гаснет отходом клиента — слепые
 # ретраи питают волну, но полный запрет ретраев убивает выживание на транзиентном
 # лаге индекса после крупных вставок. Арит-окно инстанса не переносится: wiki_ops
 # выполняет одну write-операцию на процесс — межвызовного долбления нет.
+# Guard-луп append это не обходит: его шаги идут attempts=1 (bail-счётчик внутри
+# одного post() не достигает порога), бюджет ретраев держит сам луп.
 METADATA_BAIL_ATTEMPTS = 3
 METADATA_BAIL_BACKOFF = (2, 5)
+
+
+class KernelRefused(RuntimeError):
+    """Ядро ответило бизнес-отказом (code≠0 без «metadata is not ready»).
+
+    Перманентный отказ (несуществующий родитель и т.п.) — ретраи бессмысленны,
+    падаем немедленно. Транспортные сбои и metadata-warmup ретраятся как прежде.
+    """
 
 
 def _conf():
     global URL, TOKEN
     URL = (URL or __import__("os").environ.get("UWUWU_SIYUAN_URL", "http://127.0.0.1:6806")).rstrip("/")
+    if not URL.startswith(("http://", "https://")):
+        raise RuntimeError(f"UWUWU_SIYUAN_URL должен быть http(s) URL, получено: {URL!r}")
     if TOKEN:
         return
     import os
@@ -87,6 +129,16 @@ def _metadata_hint(api_path: str) -> str:
     return "вероятна волна деградации ядра: uwuwu-cli doctor"
 
 
+def _metadata_step(path: str, last: str, tries: int, i: int, attempts: int) -> None:
+    """Шаг «metadata is not ready»: bail при исчерпании попыток, иначе пауза
+    (кроме последней итерации цикла — без сна перед финальным отказом)."""
+    if tries >= METADATA_BAIL_ATTEMPTS:
+        raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
+                           f"{tries} попыток; {_metadata_hint(path)}")
+    if i < attempts - 1:
+        time.sleep(METADATA_BAIL_BACKOFF[tries - 1])
+
+
 def post(path: str, body: dict, attempts: int = 6):
     _conf()
     last = "?"
@@ -100,19 +152,17 @@ def post(path: str, body: dict, attempts: int = 6):
                 d = json.loads(r.read())
         except Exception as e:
             last = str(e)
-            time.sleep(1 + i)
+            if i < attempts - 1:
+                time.sleep(1 + i)
             continue
         if d.get("code") == 0:
             return d.get("data")
         last = f"code={d.get('code')} msg={d.get('msg')}"
         if "metadata is not ready" in str(d.get("msg")):
             metadata_tries += 1
-            if metadata_tries >= METADATA_BAIL_ATTEMPTS:
-                raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
-                                   f"{metadata_tries} попыток; {_metadata_hint(path)}")
-            time.sleep(METADATA_BAIL_BACKOFF[metadata_tries - 1])
+            _metadata_step(path, last, metadata_tries, i, attempts)
             continue
-        time.sleep(1 + i)
+        raise KernelRefused(f"POST {path}: {last}")
     raise RuntimeError(f"POST {path}: {last}")
 
 
@@ -122,7 +172,7 @@ def notebooks(attempts: int = 6) -> list[dict]:
 
 
 def cmd_export(a):
-    r = post("/api/export/exportMdContent", {"id": a.docId})
+    r = post(EXPORT_MD_PATH, {"id": a.docId})
     print((r or {}).get("content", ""))
 
 
@@ -185,10 +235,111 @@ def _resolve_parent(parent: str) -> tuple[str, str, str]:
                        f"примеры: /Experience/cli, /uwuwu/ADR")
 
 
+def _export_content(doc_id: str) -> str:
+    r = post(EXPORT_MD_PATH, {"id": doc_id}, attempts=1)
+    return (r or {}).get("content", "")
+
+
+def _normalized_lines(text: str) -> list[str]:
+    """Строки текста в хвост-эквивалентной нормализации (контракт из живых проб).
+
+    Вне code-fence: пустые строки — дроп (ядро разыхивает списки, вставляя их);
+    внутренние whitespace-разбеги — схлоп до одного пробела (рендер markdown их
+    стирает); ведущий отступ строки — дословно (слипание «без отступа»/«с
+    отступом» дало бы тихую потерю записи: top-level vs подсписок, параграф vs
+    индет-блок). Строки таблиц (≥2 pipe): whitespace вплотную к pipe — дроп
+    (ядро стирает его при roundtrip, проба 1); одиночный pipe в прозе («a | b»)
+    идёт по прозаическому правилу — слипание с «a|b» исключено; осознанный
+    остаток — многопipe'овая проза (редка). Separator-строка (только pipe/
+    дефисы/двоеточия) — канонизируется: ядро пэддит дефисы до ширины колонок
+    (живая верификация 06.11: «|-----|» → «| -----|»), скелет двоеточий
+    выравнивания сохраняется, внутренние пробелы ячеек не трогаем — слипаем
+    меньше, чем известно про ядро. Осознанная граница: дроп пустых строк вне
+    fence рендер-различим для tight/loose списков — это слипание вариантов
+    одного текста, нужное для детекции ретрая после разыхивания; не «чинить».
+    Внутри code-fence — дословно: пробелы кода семантичны.
+    """
+    normalized: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            normalized.append(line.rstrip())
+            continue
+        if in_fence:
+            normalized.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        if SEPARATOR_ROW_RE.fullmatch(stripped):
+            normalized.append(leading + _canonical_separator(stripped))
+        elif stripped.count("|") >= 2:
+            normalized.append(leading + re.sub(r"\s*\|\s*", "|", stripped))
+        else:
+            normalized.append(leading + " ".join(stripped.split()))
+    return normalized
+
+
+def _canonical_separator(row: str) -> str:
+    """Separator таблицы → «|» + скелет двоеточий каждой колонки + «-».
+
+    Пэддинг дефисов ядром нестабилен (ширина колонок), позиции двоеточий —
+    семантика выравнивания: «:---:» → «:-:», «----------» → «-».
+    """
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    skeleton = []
+    for cell in cells:
+        left = ":" if cell.startswith(":") else ""
+        right = ":" if cell.endswith(":") and len(cell) > 1 else ""
+        skeleton.append(f"{left}-{right}" if cell else "")
+    return "|" + "|".join(skeleton) + "|"
+
+
+def _tail_already_applied(exported: str, appended: str) -> bool:
+    app = _normalized_lines(appended)
+    if not app:
+        return False
+    exp = _normalized_lines(exported)
+    return len(exp) >= len(app) and exp[-len(app):] == app
+
+
+def _append_block(doc_id: str, md: str) -> None:
+    post("/api/block/appendBlock", {"dataType": "markdown", "data": md, "parentID": doc_id},
+         attempts=1)
+
+
 def cmd_append(a):
+    doc_id = a.docId.strip()
+    if not DOC_ID_RE.fullmatch(doc_id):
+        raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     md = Path(a.file).read_text()
-    post("/api/block/appendBlock", {"dataType": "markdown", "data": md, "parentID": a.docId})
-    print(f"дописано в {a.docId}")
+    if a.force:
+        # Осознанный дубль — single-shot: одна отсылка, без сверок и ретраев
+        # (слепой луп за флагом вернул бы инцидент ×N: ядро применило, ответ
+        # потерян, ретрай отправил снова). Сбой — громкая ошибка; повтор —
+        # за осознавшим это оператором.
+        _append_block(doc_id, md)
+        print(f"дописано в {doc_id}")
+        return
+    for attempt in range(1, APPEND_ATTEMPTS + 1):
+        try:
+            if _tail_already_applied(_export_content(doc_id), md):
+                print(f"already applied: {doc_id} — контент уже в хвосте дока, append не выполнялся")
+                return
+            _append_block(doc_id, md)
+            print(f"дописано в {doc_id}")
+            return
+        except KernelRefused:
+            raise
+        except RuntimeError as err:
+            if attempt == APPEND_ATTEMPTS:
+                raise RuntimeError(
+                    f"append в {doc_id} не подтвердился после {APPEND_ATTEMPTS} попыток "
+                    f"(последний сбой: {err}) — проверь контрольным export: wiki_ops export {doc_id}"
+                ) from None
+            time.sleep(attempt)
 
 
 def cmd_replace(a):
@@ -247,7 +398,7 @@ def _siblings_count(box: str, hpath: str) -> int:
 
 def _is_stub(doc_id: str) -> bool:
     # Заглушка дубля: строка-цитата с «⚠️» И словом «канон»/«заглушк» на той же строке.
-    r = post("/api/export/exportMdContent", {"id": doc_id})
+    r = post(EXPORT_MD_PATH, {"id": doc_id})
     content = (r or {}).get("content", "")
     for line in content.splitlines():
         if not line.lstrip().startswith(">"):
@@ -315,16 +466,33 @@ def cmd_find(a):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("export"); p.add_argument("docId"); p.set_defaults(fn=cmd_export)
-    p = sub.add_parser("create"); p.add_argument("title"); p.add_argument("file"); p.add_argument("--parent", default=""); p.set_defaults(fn=cmd_create)
-    p = sub.add_parser("append"); p.add_argument("docId"); p.add_argument("--md", dest="file", required=True); p.set_defaults(fn=cmd_append)
-    p = sub.add_parser("replace"); p.add_argument("docId"); p.add_argument("--md", dest="file", required=True); p.set_defaults(fn=cmd_replace)
+    p = sub.add_parser("export")
+    p.add_argument("docId")
+    p.set_defaults(fn=cmd_export)
+    p = sub.add_parser("create")
+    p.add_argument("title")
+    p.add_argument("file")
+    p.add_argument("--parent", default="")
+    p.set_defaults(fn=cmd_create)
+    p = sub.add_parser("append")
+    p.add_argument("docId")
+    p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--force", action="store_true",
+                   help="осознанный дубль single-shot: одна отсылка без guard'а и ретраев")
+    p.set_defaults(fn=cmd_append)
+    p = sub.add_parser("replace")
+    p.add_argument("docId")
+    p.add_argument("--md", dest="file", required=True)
+    p.set_defaults(fn=cmd_replace)
     p = sub.add_parser("delete")
     p.add_argument("docId")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_delete)
-    p = sub.add_parser("orgls"); p.set_defaults(fn=cmd_orgls)
-    p = sub.add_parser("find"); p.add_argument("title"); p.set_defaults(fn=cmd_find)
+    p = sub.add_parser("orgls")
+    p.set_defaults(fn=cmd_orgls)
+    p = sub.add_parser("find")
+    p.add_argument("title")
+    p.set_defaults(fn=cmd_find)
     a = ap.parse_args()
     try:
         a.fn(a)
