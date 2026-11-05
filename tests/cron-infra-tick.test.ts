@@ -2,14 +2,17 @@
 // раунда 1, Common-2): resolveBody → infra → тик НЕ пишет state, НЕ трогает
 // доску (Last Run/Status → one-shot жив), НЕ спавнит сессию. Сценарий —
 // SQL-лаг индекса доски (get_doc без box/hpath, детач-строка): быстрый
-// infra-путь без ретраев адаптера. HOME подменяется до импорта демона —
-// лог/state изолированы; fetch скриптуется на все транспортные пути.
+// infra-путь без ретраев адаптера. Лог демона изолируется явным env
+// UWUWU_CRON_LOG ДО импорта: os.homedir() в Bun не следует за runtime-
+// подменой process.env.HOME — HOME-изоляция каталога лога не работает
+// (ревью раунда 2). fetch скриптуется на все транспортные пути.
 import { mkdirSync } from "node:fs"
+import { dirname } from "node:path"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
-const TEST_HOME = "/tmp/opencode/cron-tick-home"
-process.env.HOME = TEST_HOME
-mkdirSync(TEST_HOME, { recursive: true })
+const TEST_LOG = "/tmp/opencode/cron-tick-home/cron-test.log"
+process.env.UWUWU_CRON_LOG = TEST_LOG
+mkdirSync(dirname(TEST_LOG), { recursive: true })
 
 const cron = await import("../cron/cron")
 const mcp = await import("../lib/platform")

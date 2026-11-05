@@ -19,7 +19,6 @@ import {
 
 const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 
 /** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
 function formatLocal(d: Date): string {
@@ -30,6 +29,10 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
+/** Путь лога переопределяем env-ом (тесты тика пишут в tmp): os.homedir()
+ *  в Bun не следует за runtime-подменой process.env.HOME — HOME-изоляция
+ *  каталога лога не работает. */
+const LOG_PATH = process.env.UWUWU_CRON_LOG ?? join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
 /** пауза между срабатываниями одного крона пока жива его сессия */
