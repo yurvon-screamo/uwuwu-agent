@@ -116,7 +116,9 @@ uwuwu-проекта с пустым статусом (черновики вла
 ### CLI
 
 `uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок; фоллбек — крон-доски проектов); `search` (сервер Manticore + семантика),
+(id/заголовок; фоллбек — крон-доски проектов); аттачи в тело — `--attach` на `create`/`body`
+(kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
+`edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search` (сервер Manticore + семантика),
 `read/blob/shot` (мультимодальное чтение).
 
 Платформа — SiYuan (с 04.11.2026; до этого — закрытая платформа-предшественник). CLI ходит в
