@@ -722,7 +722,11 @@ pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
     for line in children_text.lines() {
         let Some(open) = line.rfind('(') else { continue };
         let candidate = line[open + 1..].trim_end_matches(')');
+        // Кандидат — произвольный текст после последней '('; срезы по байтам
+        // паникуют на не-ASCII (репро doctor'ом: 22-байтный текст с кириллицей).
         let is_block_id = candidate.len() == 22
+            && candidate.is_char_boundary(14)
+            && candidate.is_char_boundary(15)
             && candidate[..14].chars().all(|c| c.is_ascii_digit())
             && candidate.as_bytes()[14] == b'-'
             && candidate[15..].chars().all(|c| c.is_ascii_alphanumeric());
@@ -1020,6 +1024,15 @@ mod tests {
             &["20261104130857-b9drqmf".into(), "20261104131412-wbpz3sx".into()],
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
+    }
+
+    #[test]
+    fn parse_block_ids_survives_non_ascii_paren_text() {
+        // Репро doctor'ом: 22 байта с кириллицей внутри скобок текста —
+        // байт-срезы раньше паниковали на char boundary.
+        let text = "- [p] сноска (ыыыыыыыыыыыыы-x-yz) и (20261105101010-abc1234)\n";
+        let ids = parse_block_ids(text);
+        assert_eq!(ids, vec!["20261105101010-abc1234".to_string()]);
     }
 
 
