@@ -155,6 +155,39 @@ fn undo_journal_alone_means_restore() {
     assert_eq!(journal.as_deref(), Some("журнал.json"));
 }
 
+// ——— профилактика (тело задачи 20261104072048-4n1rwdt): body/edit/close —
+// строгая грамматика «id + флаги, лишнее — громкая ошибка». У этих сабкоманд
+// нет trailing_var_arg — clap отклоняет лишние позиционные; пинну, чтобы
+// молчаливый swallow не появился здесь задним числом. ———
+
+#[test]
+fn edit_rejects_extra_positional() {
+    let Err(err) = parse_command(&["task", "--project", "uwuwu", "edit", "abc", "--status", "Review", "лишний"])
+    else {
+        panic!("лишний позиционный — ошибка грамматики");
+    };
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::UnknownArgument,
+        "громкая ошибка, не молчаливый swallow: {err}"
+    );
+}
+
+#[test]
+fn close_rejects_extra_positional() {
+    let Err(err) = parse_command(&["task", "--project", "uwuwu", "close", "abc", "лишний"]) else {
+        panic!("лишний позиционный — ошибка грамматики");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+}
+
+#[test]
+fn body_rejects_extra_positional() {
+    let Err(err) = parse_command(&["task", "--project", "uwuwu", "body", "abc", "--replace", "лишний"]) else {
+        panic!("лишний позиционный — ошибка грамматики");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+}
 
 // ——— search / semantic: грамматика always-on dual-режима (20261104072044) ———
 
