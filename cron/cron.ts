@@ -12,7 +12,7 @@ import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  due, isOneShot, isValidTracked, parseSchedule, firePrompt,
+  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -278,6 +278,12 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
     // агенту не нужно угадывать (глобальная доска «Crons» не используется)
     const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
+    // срез доски прочитан в начале тика — перед спавном строка перепроверяется
+    const gate = fireGate(await readCrons(board), row.rowId)
+    if (gate !== "fire") {
+      log(`крон «${title}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
+      continue
+    }
     const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)

@@ -133,6 +133,16 @@ export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
 
+/** Решение по свежему срезу доски прямо перед спавном: строка могла быть снята
+ *  (cron rm/clean) или паузнута, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
+ *  (живой кейс 05.11: файр по строке, снятой в ходе тика) сужается до окна
+ *  render → POST. */
+export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "paused" {
+  const row = rows.find((r) => r.rowId === rowId)
+  if (row === undefined) return "removed"
+  return row.status === "active" ? "fire" : "paused"
+}
+
 export function minuteStart(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()).getTime()
 }

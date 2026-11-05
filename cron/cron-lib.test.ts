@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked,
-  firePrompt, cronBodyStub, minuteStart,
+  firePrompt, cronBodyStub, minuteStart, fireGate,
 } from "./cron-lib"
 
 describe("parseSchedule", () => {
@@ -108,6 +108,22 @@ describe("cronBodyStub", () => {
     expect(md).toContain("# Проверка Y")
     expect(md).toContain("`5m`")
     expect(md).toContain("## Комменты")
+  })
+})
+
+describe("fireGate: файр только по живой активной строке свежего среза", () => {
+  const rows = [
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", status: "active", lastRun: "" },
+    { rowId: "zomb", bodyDoc: "d", title: "T", schedule: "5m", status: "paused", lastRun: "" },
+  ]
+  test("строка снята (cron rm/clean) — removed, файра нет", () => {
+    expect(fireGate(rows, "gone")).toBe("removed")
+  })
+  test("строка паузнута после среза — paused, файра нет", () => {
+    expect(fireGate(rows, "zomb")).toBe("paused")
+  })
+  test("живая активная строка — fire", () => {
+    expect(fireGate(rows, "alive")).toBe("fire")
   })
 })
 
