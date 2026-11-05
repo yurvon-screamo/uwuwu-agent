@@ -41,7 +41,27 @@ const jsonrpc = (result: unknown, sessionId?: string): Response =>
     headers: sessionId !== undefined ? { "mcp-session-id": sessionId } : {},
   })
 
-const callResult = (): Response => jsonrpc({ structuredContent: { view: { rows: [{ id: "rowX", cells: [] }] } } })
+const callPage = (rows: unknown[]): Response =>
+  jsonrpc({ structuredContent: { view: { rows } } })
+
+const sse = (result: unknown): Response => {
+  const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result })
+  return new Response(`event: message\ndata: ${payload}\n\n`, { status: 200 })
+}
+
+/** Скрипт render-страниц (контракт пагинации ядра: page 1 несёт rowCount,
+ *  дальше пустая страница терминирует выборку адаптера); формат ответа
+ *  задаёт wrap (jsonrpc / sse). mcpRpc-тестам не нужна полнота доски —
+ *  одна строка на page 1 достаточно. */
+const pagedRender = (wrap: (result: unknown) => Response): ((call: number) => Response) => {
+  let page = 0
+  return (_call) => {
+    page++
+    return page === 1
+      ? wrap({ structuredContent: { view: { rows: [{ id: "rowX", cells: [] }], rowCount: 1 } } })
+      : wrap({ structuredContent: { view: { rows: [] } } })
+  }
+}
 
 /** Handshake mcp-сессии: initialize → initialized; tools/call — по скрипту. */
 const handshake = (sessionId: string, toolResponder: (call: number, c: McpCall) => Response) =>
@@ -65,7 +85,8 @@ afterEach(() => {
 describe("mcpRpc: протухшая сессия (рестарт ядра)", () => {
   test("404 при сессии в заголовке — один re-handshake, вызов проходит", async () => {
     // первый tools/call с сессией отклоняется 404 → reconnect → успех
-    const { calls } = scriptMcp(handshake("s1", (call) => (call === 2 ? new Response("session not found", { status: 404 }) : callResult())))
+    const render = pagedRender(jsonrpc)
+    const { calls } = scriptMcp(handshake("s1", (call) => (call === 2 ? new Response("session not found", { status: 404 }) : render(call))))
     const r = (await readCells()) as { rows?: { rowBlockId?: string }[] }
     expect(r.rows?.map((row) => row.rowBlockId)).toEqual(["rowX"])
     expect(calls.map((c) => c.method)).toEqual(["initialize", "notifications/initialized", "tools/call", "initialize", "notifications/initialized", "tools/call"])
@@ -129,12 +150,12 @@ describe("mcpRpc: честные ошибки вместо молчаливых 
   })
 
   test("успешный вызов в SSE-обёртке (data:-строки) — парсится как раньше", async () => {
-    scriptMcp((_call, c) => {
+    const render = pagedRender(sse)
+    scriptMcp(handshake("s1", (_call, c) => {
       if (c.method === "initialize") return jsonrpc({}, "s1")
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
-      const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { structuredContent: { view: { rows: [{ id: "rowX", cells: [] }] } } } })
-      return new Response(`event: message\ndata: ${payload}\n\n`, { status: 200 })
-    })
+      return render(0)
+    }))
     const r = (await readCells()) as { rows?: { rowBlockId?: string }[] }
     expect(r.rows?.map((row) => row.rowBlockId)).toEqual(["rowX"])
   })
