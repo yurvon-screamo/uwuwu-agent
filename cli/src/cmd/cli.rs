@@ -294,4 +294,14 @@ pub(crate) enum Commands {
         )]
         timeout: u64,
     },
+    /// Диагностика деградации ядра SiYuan: kernel/wave/доска/FS↔SQL.
+    /// Exit: 0 чисто, 1 деградация (включая недоступное ядро), 2 пробы не выполнились.
+    Doctor {
+        /// Project board для пробы доски
+        #[arg(long, default_value = "uwuwu")]
+        project: String,
+        /// Окно wave-скана docker logs, минут
+        #[arg(long, default_value = "30", value_name = "MIN")]
+        since: u64,
+    },
 }

@@ -30,6 +30,7 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
             "shot: не портирован на SiYuan (v1) — headless chromium на http://127.0.0.1:6806 с Access Auth Code"
         )),
         Commands::Kernel { command, timeout } => kernel_run(command, timeout).await,
+        Commands::Doctor { project, since } => doctor_run(&project, since).await,
     }
 }
 
@@ -716,6 +717,16 @@ pub(crate) fn ls_lines(entries: &[Value]) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// doctor: read-only пробы деградации; свой exit-код поверх anyhow-механики
+/// (0 чисто / 1 деградация / 2 пробы не выполнились) — консьюмеры exit-кода
+/// (кроны, вотчдог) различают исходы.
+async fn doctor_run(project: &str, since_min: u64) -> Result<()> {
+    let sy = crate::siyuan::SiYuan::from_env_with_timeout(10)?;
+    let outcomes = crate::siyuan_doctor::run(&sy, project, since_min).await;
+    println!("{}", crate::siyuan_doctor::report(&outcomes));
+    std::process::exit(crate::siyuan_doctor::doctor_exit_code(&outcomes));
 }
 
 async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
