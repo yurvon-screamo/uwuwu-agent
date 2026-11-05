@@ -35,6 +35,19 @@ fn is_block_id(suffix: &str) -> bool {
     !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Нормализация ЗАПРОСА секции (--replace-section): запрос может нести
+/// собственный ATX-префикс («## Решение», «###  X ^id») — префикс срезается
+/// тем же парсером заголовков. Без этого матч никогда не сходится (хэши
+/// остаются в want), а append кладёт в тело мусор «## ### X» — двойной
+/// префикс (факт 06.11: заголовок h3 из финального отчёта → not-found
+/// append «## ### …» в хвост тела).
+pub(crate) fn normalize_heading_query(raw: &str) -> String {
+    match heading_of(raw.trim()) {
+        Some((_, text)) => text,
+        None => normalize_heading_text(raw),
+    }
+}
+
 /// Строка переключает состояние кодового фенса (открывает/закрывает ```).
 pub(crate) fn toggles_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
@@ -104,6 +117,18 @@ mod tests {
     #[test]
     fn normalize_argument_trims_and_collapses() {
         assert_eq!(normalize_heading_text("  Постановка  "), "Постановка");
+    }
+
+    #[test]
+    fn normalize_query_strips_atx_prefix() {
+        assert_eq!(normalize_heading_query("## Решение"), "Решение");
+        assert_eq!(normalize_heading_query("###  Подсекция ^20261105230000-ab12cd"), "Подсекция");
+    }
+
+    #[test]
+    fn normalize_query_keeps_plain_name_and_hashless_word() {
+        assert_eq!(normalize_heading_query(" Решение "), "Решение");
+        assert_eq!(normalize_heading_query("#bug"), "#bug", "нет пробела после хэшей — не ATX, не срезаем");
     }
 
     #[test]

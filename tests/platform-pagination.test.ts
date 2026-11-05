@@ -117,11 +117,13 @@ describe("read_database_cells: связка строка→тело (linkedDocId
     globalThis.fetch = originalFetch
   })
 
-  /** Строка доски: block-ячейка Primary Key (линк на док-тела) + Status. */
-  const rowOf = (id: string, block: { id?: string; content: string; refSubtype?: string }) => ({
+  /** Строка доски: block-ячейка Primary Key (линк на док-тела) + Status.
+   *  Шейп value — канонический render живого ядра: blockID = id строки,
+   *  block.id = docId тела (≠ blockID), isDetached у detached-строк. */
+  const rowOf = (id: string, block: { id?: string; content: string; refSubtype?: string }, isDetached = false) => ({
     id,
     cells: [
-      { value: { keyID: "k-key", type: "block", block } },
+      { value: { keyID: "k-key", type: "block", blockID: id, isDetached: isDetached || undefined, block } },
       { value: { keyID: "k-status", type: "select", mSelect: [{ content: "Design" }] } },
     ],
   })
@@ -146,7 +148,9 @@ describe("read_database_cells: связка строка→тело (linkedDocId
 
   test("block-ячейка с refSubtype=d даёт doc-id тела, не null", async () => {
     // Arrange: до фикса linkedDocId был хардкодом null — wakeup-контур
-    // фабрики (комменты/правки тела) не находил тело задачи
+    // фабрики (комменты/правки тела) не находил тело задачи.
+    // Фикстура — живой render ядра (доска 20261104000238-96ch3l2, стр. 1):
+    // block.id = docId тела, blockID = id строки, refSubtype "d"
     scriptBoard([rowOf("row1", { id: "20261105000000-bodydoc", content: "Задача один", refSubtype: "d" })])
 
     // Act
@@ -159,10 +163,10 @@ describe("read_database_cells: связка строка→тело (linkedDocId
     expect(r.rows?.[0]?.cells?.Status?.value).toBe("Design")
   })
 
-  test("block-ячейка без линка на док (refSubtype≠d) — linkedDocId null", async () => {
-    // Arrange: строки с текстовым Primary Key (не док-тело) не должны
-    // отдавать случайный block-id
-    scriptBoard([rowOf("row2", { content: "просто текст" })])
+  test("detached-ячейка без block.id — linkedDocId null", async () => {
+    // Arrange: detached-строка живого ядра (20261104092509-xo3dxzn) несёт
+    // block = {content, created, updated} — поля id нет вовсе
+    scriptBoard([rowOf("row2", { content: "просто текст" }, true)])
 
     // Act
     const r = await tool<{ rows?: { linkedDocId?: string | null }[] }>(
@@ -170,6 +174,20 @@ describe("read_database_cells: связка строка→тело (linkedDocId
 
     // Assert
     expect(r.rows?.[0]?.linkedDocId).toBeNull()
+  })
+
+  test("bound-легаси без refSubtype — docId не теряется", async () => {
+    // Arrange: контракт CLI parse_render_row — value.block.id извлекается
+    // безусловно; guard на refSubtype терял бы строки, которые ядро ещё
+    // не прогнало через NormalizeBlockRefSubtype (легаси-данные)
+    scriptBoard([rowOf("row3", { id: "20261105000000-legacydoc", content: "Легаси-строка" })])
+
+    // Act
+    const r = await tool<{ rows?: { linkedDocId?: string | null }[] }>(
+      "read_database_cells", { docId: "doc1", databaseBlockId: "av1" })
+
+    // Assert
+    expect(r.rows?.[0]?.linkedDocId).toBe("20261105000000-legacydoc")
   })
 })
 
