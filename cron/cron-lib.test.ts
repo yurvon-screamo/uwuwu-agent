@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked,
   firePrompt, cronBodyStub, minuteStart, fireGate,
+  bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
 } from "./cron-lib"
 
 describe("parseSchedule", () => {
@@ -114,8 +115,10 @@ describe("firePrompt", () => {
     const p = firePrompt(row, "", "uwuwu")
     expect(p).toContain("заверши ход молча")
   })
-  test("пустое тело — стаб по заголовку", () => {
-    expect(firePrompt(row, "", "uwuwu")).toContain("(пусто — отработай по заголовку)")
+  test("тело уходит в промпт как есть — стаба пустого тела нет (гейт не пускает пустое)", () => {
+    const p = firePrompt(row, "делай работу", "uwuwu")
+    expect(p).toContain("=== ТЕЛО КРОНА ===\nделай работу\n=== КОНЕЦ ТЕЛА ===")
+    expect(p).not.toContain("пусто — отработай по заголовку")
   })
 })
 
@@ -164,3 +167,84 @@ describe("at: догон пропущенной минуты", () => {
     expect(due(s, 0, new Date("2026-10-25T09:29:00"))).toBe(false)
   })
 })
+
+describe("bodyRenderIssue: тело, рендерящееся агенту в пустоту", () => {
+  test("только HTML-комментарии (unsupported-легаси) → причина", () => {
+    const md = "<!-- unsupported: flavour=affine:database -->\n<!-- вторая легаси-строка -->\n"
+    expect(bodyRenderIssue(md)).toBe("тело рендерится в пусто/unsupported-комментарии")
+  })
+  test("frontmatter + комментарии + zero-width → причина", () => {
+    const md = "---\ntitle: x\n---\n<!-- коммент -->\n\u200B\uFEFF"
+    expect(bodyRenderIssue(md)).not.toBeNull()
+  })
+  test("пустая строка → причина", () => {
+    expect(bodyRenderIssue("")).not.toBeNull()
+    expect(bodyRenderIssue("  \n\n")).not.toBeNull()
+  })
+  test("стаб cron set — валидное тело", () => {
+    expect(bodyRenderIssue(cronBodyStub("Проверка Z", "5m"))).toBeNull()
+  })
+  test("av-экспорт доски (таблица) читаем — валиден", () => {
+    const md = "# Доска\n\n| Заголовок | Status |\n| --- | --- |\n| строка | active |\n"
+    expect(bodyRenderIssue(md)).toBeNull()
+  })
+  test("текст за комментариями виден", () => {
+    expect(bodyRenderIssue("<!-- коммент -->\nнастоящая постановка")).toBeNull()
+  })
+})
+
+describe("stripNonContent", () => {
+  test("frontmatter срезается только в начале дока", () => {
+    expect(stripNonContent("---\ntitle: t\n---\nтекст")).toBe("текст")
+    expect(stripNonContent("текст\n---\nне frontmatter\n---\n")).toContain("не frontmatter")
+  })
+})
+
+describe("chooseBodyDoc: паритет CLI choose_body_doc", () => {
+  test("живая привязка → она, заголовок не смотрим", () => {
+    expect(chooseBodyDoc("doc-bound", true, ["doc-a", "doc-b"])).toEqual({ kind: "doc", docId: "doc-bound" })
+  })
+  test("мёртвая привязка → title-fallback на единственный док", () => {
+    expect(chooseBodyDoc("doc-dead", false, ["doc-a"])).toEqual({ kind: "doc", docId: "doc-a" })
+  })
+  test("detached без доков → missing", () => {
+    expect(chooseBodyDoc("", false, [])).toEqual({ kind: "missing" })
+  })
+  test("дубли тел → ошибка со списком", () => {
+    expect(chooseBodyDoc("doc-dead", false, ["doc-a", "doc-b"])).toEqual({ kind: "duplicates", docIds: ["doc-a", "doc-b"] })
+  })
+})
+
+describe("titleFromBody", () => {
+  test("frontmatter и unsupported-мусор в имя не попадают", () => {
+    const md = "---\ntitle: метадата\n---\n<!-- unsupported -->\n# Реальный заголовок\nтекст"
+    expect(titleFromBody(md)).toBe("Реальный заголовок")
+  })
+  test("без заголовка — первая содержательная строка", () => {
+    expect(titleFromBody("первая строка\nвторая")).toBe("первая строка")
+  })
+  test("пусто/мусор → пустая строка", () => {
+    expect(titleFromBody("<!-- only comments -->\u200B")).toBe("")
+    expect(titleFromBody("")).toBe("")
+  })
+})
+
+describe("pathSafe", () => {
+  test("'/' → U+2215 (конвенция CLI path_safe)", () => {
+    expect(pathSafe("RU/EN слэш")).toBe("RU∕EN слэш")
+    expect(pathSafe("без слэша")).toBe("без слэша")
+  })
+})
+
+describe("isValidTracked: lastRefusal", () => {
+  test("опциональная строка — валидна", () => {
+    expect(isValidTracked({ sessionID: "", lastFiredAt: 5, firedAtIso: "x", lastRefusal: "причина" })).toBe(true)
+  })
+  test("старые записи без поля — валидны (обратная совместимость state)", () => {
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, firedAtIso: "x" })).toBe(true)
+  })
+  test("не-строка — битая запись", () => {
+    expect(isValidTracked({ sessionID: "", lastFiredAt: 5, lastRefusal: 42 })).toBe(false)
+  })
+})
+

@@ -13,7 +13,7 @@ import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt,
+  bodyRenderIssue, chooseBodyDoc, due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, pathSafe, titleFromBody,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -170,10 +170,62 @@ async function setCells(board: BoardIds, rowId: string, cells: Record<string, st
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
-async function cronBody(bodyDoc: string): Promise<string> {
-  if (bodyDoc === "") return ""
-  const r = await mcp.tool<{ markdown?: string }>("export_doc_markdown", { docId: bodyDoc })
-  return r.markdown ?? ""
+// ——— резолв тела крона ———
+
+type BodyResolution =
+  | { kind: "ok"; docId: string; markdown: string }
+  | { kind: "refuse"; reason: string; commentDocId: string }
+  | { kind: "infra"; error: string }
+
+/** Вердикт по рендеру тела: unsupported-комментарии/пустота → refuse. */
+function renderVerdict(docId: string, markdown: string): BodyResolution {
+  const issue = bodyRenderIssue(markdown)
+  if (issue !== null) {
+    return { kind: "refuse", reason: `${issue} (docId ${docId})`, commentDocId: docId }
+  }
+  return { kind: "ok", docId, markdown }
+}
+
+/** Док-тело крона: привязка строки (id-first), мёртвая/отсутствующая →
+ *  title-fallback по hpath доски (контракт CLI choose_body_doc). Сбоям ядра
+ *  (infra) вердикт не выносится: refuse — только при подтверждённом
+ *  отсутствии/пустоте тела, иначе слот крона сжигался бы минутным сбоями. */
+async function resolveBody(board: BoardIds, row: CronRow): Promise<BodyResolution> {
+  try {
+    if (row.bodyDoc !== "") {
+      const exported = await mcp.tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: row.bodyDoc })
+      if (exported.exists === true) {
+        return renderVerdict(row.bodyDoc, exported.markdown ?? "")
+      }
+      // export глотает любые ошибки в exists:false — мёртвую привязку
+      // отличаем от сбоя ядра пробой block get (FS-истина)
+      const live = await mcp.tool<{ exists?: boolean }>("doc_exists", { docId: row.bodyDoc })
+      if (live.exists === true) {
+        return { kind: "infra", error: `export дока ${row.bodyDoc} дал exists:false при живом блоке` }
+      }
+    }
+    if (row.title === "") {
+      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback", commentDocId: board.docId }
+    }
+    const info = await mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId })
+    const byTitle = await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+      notebook: info.box ?? "", path: `${info.hpath ?? ""}/${pathSafe(row.title)}`,
+    })
+    const choice = chooseBodyDoc(row.bodyDoc, false, byTitle.ids ?? [])
+    if (choice.kind === "duplicates") {
+      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI`, commentDocId: board.docId }
+    }
+    if (choice.kind === "missing") {
+      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет`, commentDocId: board.docId }
+    }
+    const exported = await mcp.tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: choice.docId })
+    if (exported.exists !== true) {
+      return { kind: "infra", error: `title-fallback док ${choice.docId}: export дал exists:false` }
+    }
+    return renderVerdict(choice.docId, exported.markdown ?? "")
+  } catch (e) {
+    return { kind: "infra", error: String(e) }
+  }
 }
 
 // ——— opencode REST ———
@@ -272,20 +324,50 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     // стоп-сигнал: не спавним новую работу — крон доедет при следующем старте
     if (drain.isStopping()) break
 
-    const body = await cronBody(row.bodyDoc)
-    // linked-строки несут заголовок в теле: деривируем из первой строки
-    const title = row.title !== "" ? row.title
-      : body.split("\n")[0]?.replace(/^#+\s*/, "").trim() || `крон ${row.rowId.slice(0, 8)}`
     // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
     // агенту не нужно угадывать (глобальная доска «Crons» не используется)
     const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
-    // срез доски прочитан в начале тика — перед спавном строка перепроверяется
+    // срез доски прочитан в начале тика — перед спавном строка перепроверяется;
+    // резолв+валидация тела стоят в гейтовом окне ПОСЛЕ перепроверки: коммент
+    // отказа не уйдёт в доску по уже снятой/паузнутой строке
     const gate = fireGate(await readCrons(board), row.rowId)
     if (gate !== "fire") {
-      log(`крон «${title}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
+      log(`крон «${row.title || row.rowId.slice(0, 8)}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
       continue
     }
-    const sessionID = await fireSession(title, firePrompt({ ...row, title }, body, project))
+    const resolved = await resolveBody(board, row)
+    // linked-строки несут заголовок в теле: деривируем из первой содержательной строки
+    const title = row.title !== "" ? row.title
+      : titleFromBody(resolved.kind === "ok" ? resolved.markdown : "") || `крон ${row.rowId.slice(0, 8)}`
+    if (resolved.kind === "infra") {
+      // сбой ядра ≠ вердикт «тела нет»: state/Last Run/one-shot не трогаем —
+      // ретрай следующим тиком (пропущенная cron-минута ждёт следующей
+      // матчера-минуты, семантика классического cron)
+      log(`крон «${title}»: тело не разрешено (сбой ядра?) — ${resolved.error} — ретрай следующим тиком`)
+      continue
+    }
+    if (resolved.kind === "refuse") {
+      // отказ вместо спавна: коммент причины с дедупом (только при смене),
+      // lastFiredAt/Last Run фиксируем — иначе ретрай каждым тиком = спам
+      log(`крон «${title}»: отказ — ${resolved.reason}`)
+      if (state.crons[row.rowId]?.lastRefusal !== resolved.reason) {
+        await mcp.tool("create_comment", {
+          docId: resolved.commentDocId,
+          content: `крон не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
+        })
+      }
+      state.crons[row.rowId] = {
+        sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString(), lastRefusal: resolved.reason,
+      }
+      saveState(state)
+      await setCells(board, row.rowId, { "Last Run": formatLocal(now) })
+      if (isOneShot(sched)) {
+        await setCells(board, row.rowId, { Status: "fired" })
+        log(`крон «${title}»: разовый — отказ, fired`)
+      }
+      continue
+    }
+    const sessionID = await fireSession(title, firePrompt({ ...row, title }, resolved.markdown, project))
     if (sessionID === null) {
       log(`крон «${title}»: сессия не поднялась`)
       continue

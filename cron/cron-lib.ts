@@ -14,6 +14,9 @@ export interface TrackedCron {
   sessionID: string
   lastFiredAt: number
   firedAtIso: string
+  /** Причина последнего отказа (дедуп комментов: коммент — только при смене).
+   *  Сбрасывается при успешном файре. */
+  lastRefusal?: string
 }
 
 export interface CronState {
@@ -154,8 +157,58 @@ export function isValidTracked(v: unknown): v is TrackedCron {
   return (
     (t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))) &&
     typeof t.lastFiredAt === "number" &&
-    (t.firedAtIso === undefined || typeof t.firedAtIso === "string")
+    (t.firedAtIso === undefined || typeof t.firedAtIso === "string") &&
+    (t.lastRefusal === undefined || typeof t.lastRefusal === "string")
   )
+}
+
+// ——— резолв и валидация тела ———
+
+/** Тайтл → безопасный сегмент hpath (конвенция CLI path_safe: '/' → U+2215). */
+export function pathSafe(title: string): string {
+  return title.replace(/\//g, "∕")
+}
+
+/** Снятие YAML-frontmatter, HTML-комментариев и zero-width символов: экспорт
+ *  тела, состоящего только из них, рендерится агенту в пустоту — инцидентный
+ *  класс «тело из unsupported-комментариев → сессия с пустым промптом». */
+export function stripNonContent(md: string): string {
+  let text = md.replace(/^---\n[\s\S]*?\n---\n/, "")
+  text = text.replace(/<!--[\s\S]*?-->/g, "")
+  return text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()
+}
+
+/** Причина, по которой рендер тела непригоден как промпт; null = тело валидно. */
+export function bodyRenderIssue(md: string): string | null {
+  if (stripNonContent(md) === "") {
+    return "тело рендерится в пусто/unsupported-комментарии"
+  }
+  return null
+}
+
+export type BodyChoice =
+  | { kind: "doc"; docId: string }
+  | { kind: "missing" }
+  | { kind: "duplicates"; docIds: string[] }
+
+/** Паритет CLI choose_body_doc: живая привязка → она; мёртвая/отсутствующая →
+ *  fallback по заголовку: 0 доков → нет тела; 1 → он; ≥2 → дубли (ошибка). */
+export function chooseBodyDoc(bound: string, boundLive: boolean, titleDocIds: string[]): BodyChoice {
+  if (bound !== "" && boundLive) return { kind: "doc", docId: bound }
+  if (titleDocIds.length === 0) return { kind: "missing" }
+  const [only] = titleDocIds
+  if (titleDocIds.length === 1 && only !== undefined) return { kind: "doc", docId: only }
+  return { kind: "duplicates", docIds: titleDocIds }
+}
+
+/** Тайтл сессии из тела: первая содержательная строка после стрипа —
+ *  frontmatter и unsupported-мусор в имя сессии не попадают. */
+export function titleFromBody(body: string): string {
+  for (const line of stripNonContent(body).split("\n")) {
+    const t = line.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").trim()
+    if (t !== "") return t
+  }
+  return ""
 }
 
 // ——— промпты ———
@@ -165,13 +218,15 @@ export function sanitizeBoundary(text: string): string {
 }
 
 /** Промпт срабатывания: тело крона + тихий протокол тика
- *  (коммент — только исключение; факт тика демон пишет в Last Run сам). */
+ *  (коммент — только исключение; факт тика демон пишет в Last Run сам).
+ *  Тело непусто по инварианту тика: гейт резолвит и валидирует его до
+ *  спавна — пустое/unsupported-тело не доходит до промпта (refuse). */
 export function firePrompt(row: CronRow, body: string, project: string): string {
   return [
     `Ты — исполнитель крон-задачи «${row.title.replace(/[\r\n]+/g, " ")}» (расписание: ${row.schedule}).`,
     "",
     "=== ТЕЛО КРОНА ===",
-    sanitizeBoundary(body || "(пусто — отработай по заголовку)"),
+    sanitizeBoundary(body),
     "=== КОНЕЦ ТЕЛА ===",
     "",
     "ПРАВИЛА:",
