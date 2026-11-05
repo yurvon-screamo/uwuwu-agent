@@ -215,11 +215,16 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
+    // Primary Key-ячанка строки: линк на док-тело (refSubtype "d") —
+    // doc-id тела; раньше связка терялась (null) и весь wakeup-контур
+    // фабрики (комменты/правки тела) работал по пустому bodyDoc
+    let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
       const col = nameOf.get(v.keyID ?? "") ?? ""
       if (v.type === "block") {
         title = v.block?.content ?? ""
+        if (v.block?.refSubtype === "d" && v.block.id) linkedDocId = v.block.id
         continue
       }
       let value = ""
@@ -227,7 +232,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
       else if (v.text) value = v.text.content ?? ""
       if (col !== "") cells[col] = { value }
     }
-    rows.push({ rowBlockId: row.id ?? "", linkedDocId: null, title, cells })
+    rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })
   }
   return { rows }
 }

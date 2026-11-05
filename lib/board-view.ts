@@ -17,7 +17,7 @@ export interface RenderRow {
     value?: {
       keyID?: string
       type?: string
-      block?: { content?: string }
+      block?: { id?: string; content?: string; refSubtype?: string }
       mSelect?: { content?: string }[]
       text?: { content?: string }
     }
