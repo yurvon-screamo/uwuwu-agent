@@ -290,8 +290,8 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
       log(`крон «${title}»: сессия не поднялась`)
       continue
     }
-    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента;
-    // агент без 🤖-коммента невидим (детекция — следующий срез, если болит)
+    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента
+    // (здоровый тик тихий по контракту промпта; исход видит юзер по Last Run)
     state.crons[row.rowId] = { sessionID, lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
     await setCells(board, row.rowId, { "Last Run": formatLocal(now) })

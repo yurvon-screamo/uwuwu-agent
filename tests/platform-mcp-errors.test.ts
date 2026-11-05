@@ -12,7 +12,6 @@ interface McpCall {
   hasSession: boolean
 }
 
-const SQL_STMT_MATCHER = /blocks where id='(\w+)'/
 const AV_ID = "20260101000000-abcdef"
 
 /** Скриптованный fetch: REST-лега ядра (/api/query/sql) отвечает кодом 0,
@@ -22,11 +21,10 @@ function scriptMcp(respond: (call: number, c: McpCall) => Response): { calls: Mc
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     if (url.includes("/api/query/sql")) {
-      const stmt = String((JSON.parse(String(init?.body ?? "{}")) as { stmt?: string }).stmt ?? "")
+      // markdown с data-av-id — контракт avIdOfBlock (REST-лега read_database_cells)
       return new Response(JSON.stringify({ code: 0, msg: "", data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }] }), { status: 200 })
     }
     if (!url.includes("/mcp")) throw new Error(`mock: неожиданный путь ${url}`)
-    void SQL_STMT_MATCHER // держим matcher видимым для читателя контракта avIdOfBlock
     const payload = JSON.parse(String(init?.body ?? "{}")) as { method?: string }
     const headers = (init?.headers ?? {}) as Record<string, string>
     const hasSession = Object.keys(headers).some((h) => h.toLowerCase() === "mcp-session-id")
@@ -71,7 +69,7 @@ describe("mcpRpc: протухшая сессия (рестарт ядра)", ()
     const r = (await readCells()) as { rows?: { rowBlockId?: string }[] }
     expect(r.rows?.map((row) => row.rowBlockId)).toEqual(["rowX"])
     expect(calls.map((c) => c.method)).toEqual(["initialize", "notifications/initialized", "tools/call", "initialize", "notifications/initialized", "tools/call"])
-    expect(calls[3]!.hasSession).toBe(false) // reconnect идёт с чистой сессией
+    expect(calls[3]?.hasSession).toBe(false) // reconnect идёт с чистой сессией
   })
 
   test("второй 404 подряд — описательная ошибка, без цикла", async () => {
@@ -79,59 +77,59 @@ describe("mcpRpc: протухшая сессия (рестарт ядра)", ()
     const { calls } = scriptMcp(handshake("s1", () => new Response("session not found", { status: 404 })))
     const err = await readCells().then(() => null, (e: Error) => e)
     expect(err).not.toBeNull()
-    expect(err!.message).toContain("HTTP 404")
-    expect(err!.constructor.name).not.toBe("SyntaxError")
+    expect(err?.message).toContain("HTTP 404")
+    expect(err?.constructor.name).not.toBe("SyntaxError")
     expect(calls.filter((c) => c.method === "initialize").length).toBe(2) // ровно один reconnect
   })
 
   test("404 без сессии в заголовке — ошибка без ретрая", async () => {
     // initialize отвечает без mcp-session-id → tools/call уходит без заголовка
-    const { calls } = scriptMcp((call, c) => {
+    const { calls } = scriptMcp((_call, c) => {
       if (c.method === "initialize") return jsonrpc({})
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
       return new Response("session not found", { status: 404 })
     })
     const err = await readCells().then(() => null, (e: Error) => e)
-    expect(err!.message).toContain("HTTP 404")
+    expect(err?.message).toContain("HTTP 404")
     expect(calls.map((c) => c.method)).toEqual(["initialize", "notifications/initialized", "tools/call"])
   })
 })
 
 describe("mcpRpc: честные ошибки вместо молчаливых пустых результатов", () => {
   test("kernel-конверт 401 «Auth failed» — throw, не пустой {}", async () => {
-    scriptMcp((call, c) => {
+    scriptMcp((_call, c) => {
       if (c.method === "initialize") return jsonrpc({}, "s1")
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
       return new Response(JSON.stringify({ code: -1, msg: "Auth failed [session]" }), { status: 401 })
     })
     const err = await readCells().then(() => null, (e: Error) => e)
-    expect(err!.message).toContain("kernel code=-1")
-    expect(err!.message).toContain("Auth failed")
+    expect(err?.message).toContain("kernel code=-1")
+    expect(err?.message).toContain("Auth failed")
   })
 
   test("не-JSON тело при 200 (мусор шлюза) — ошибка со сниппетом", async () => {
-    scriptMcp((call, c) => {
+    scriptMcp((_call, c) => {
       if (c.method === "initialize") return jsonrpc({}, "s1")
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
       return new Response("<html>gateway oops</html>", { status: 200 })
     })
     const err = await readCells().then(() => null, (e: Error) => e)
-    expect(err!.message).toContain("не-JSON")
-    expect(err!.message).toContain("gateway oops")
+    expect(err?.message).toContain("не-JSON")
+    expect(err?.message).toContain("gateway oops")
   })
 
   test("jsonrpc error envelope — как раньше, с текстом ошибки", async () => {
-    scriptMcp((call, c) => {
+    scriptMcp((_call, c) => {
       if (c.method === "initialize") return jsonrpc({}, "s1")
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: 0, message: "method invalid" } }), { status: 200 })
     })
     const err = await readCells().then(() => null, (e: Error) => e)
-    expect(err!.message).toContain("method invalid")
+    expect(err?.message).toContain("method invalid")
   })
 
   test("успешный вызов в SSE-обёртке (data:-строки) — парсится как раньше", async () => {
-    scriptMcp((call, c) => {
+    scriptMcp((_call, c) => {
       if (c.method === "initialize") return jsonrpc({}, "s1")
       if (c.method === "notifications/initialized") return new Response("", { status: 200 })
       const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { structuredContent: { view: { rows: [{ id: "rowX", cells: [] }] } } } })
