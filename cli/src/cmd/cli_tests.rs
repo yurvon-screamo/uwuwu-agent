@@ -1,7 +1,7 @@
 //! Parse-тесты грамматики `task body`: явный --stdin, конфликт с --md,
 //! дефолт без флагов. Чистый clap-парсинг — без сети и env.
 
-use super::cli::{Cli, Commands, TaskSub};
+use super::cli::{Cli, Commands, SemanticSub, TaskSub};
 use clap::Parser as _;
 
 fn parse_command(args: &[&str]) -> clap::error::Result<Commands> {
@@ -187,4 +187,45 @@ fn body_rejects_extra_positional() {
         panic!("лишний позиционный — ошибка грамматики");
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
+}
+
+// ——— search / semantic: грамматика always-on dual-режима (20261104072044) ———
+
+#[test]
+fn search_defaults_are_dual_mode_without_semantic_flag() {
+    let Commands::Search { query, limit, sofa, threshold } =
+        parse_command(&["search", "тема"]).unwrap()
+    else {
+        panic!("expected search");
+    };
+    assert_eq!(query, "тема");
+    assert_eq!(limit, 10, "limit — на метод");
+    assert_eq!(sofa, 0, "SOFA opt-in, дефолт выкл");
+    assert!((threshold - 0.35).abs() < 1e-9, "порог косинуса семантики");
+}
+
+#[test]
+fn search_semantic_flag_is_rejected() {
+    // Решение владельца: поиск универсальный, отдельного флага нет.
+    assert!(parse_command(&["search", "тема", "--semantic"]).is_err());
+}
+
+#[test]
+fn semantic_subcommands_parse() {
+    let Commands::Semantic { command } =
+        parse_command(&["semantic", "rebuild"]).unwrap()
+    else {
+        panic!("expected semantic");
+    };
+    assert!(matches!(command, SemanticSub::Rebuild { resume: false }));
+    let Commands::Semantic { command } =
+        parse_command(&["semantic", "rebuild", "--resume"]).unwrap()
+    else {
+        panic!("expected semantic");
+    };
+    assert!(matches!(command, SemanticSub::Rebuild { resume: true }));
+    let Commands::Semantic { command } = parse_command(&["semantic", "status"]).unwrap() else {
+        panic!("expected semantic");
+    };
+    assert!(matches!(command, SemanticSub::Status));
 }
