@@ -44,6 +44,8 @@ import {
   runBatch,
   parseProjects,
   formatPassSummary,
+  adoptBodyDoc,
+  pathSafe,
   type PassCounters,
   type ProjectCfg,
   type ReviewKind,
@@ -224,7 +226,7 @@ async function boardViaOrganize(title: string): Promise<string | null> {
   return null
 }
 
-async function readTasks(board: BoardIds): Promise<TaskRef[]> {
+export async function readTasks(board: BoardIds): Promise<TaskRef[]> {
   const r = await mcp.tool<{
     rows?: {
       rowBlockId?: string
@@ -233,16 +235,56 @@ async function readTasks(board: BoardIds): Promise<TaskRef[]> {
       cells?: Record<string, { value?: string }>
     }[]
   }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
-  return (r.rows ?? [])
-    .filter((row) => typeof row.rowBlockId === "string")
-    .map((row) => ({
+  const raw = (r.rows ?? []).filter((row) => typeof row.rowBlockId === "string")
+
+  // Фоллбек тела по заголовку для detached-строк (привязки нет) — паритет
+  // CLI body_doc_by_title: саб-док доски по hpath «<доска>/<тайтл>».
+  // FS-истина (getIDsByHPath) — без лага SQL-индекса. 0 → без тела,
+  // 1 → тело, ≥2 → пусто (не угадываем) + агрегированный лог сирот.
+  // get_doc доски — один раз на проход (ленивое замыкание: без detached-
+  // строк доска не читается вовсе).
+  let boardPath: { box: string; hpath: string } | null = null
+  const boardPathOnce = async (): Promise<{ box: string; hpath: string }> => {
+    if (boardPath === null) {
+      const d = await mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId })
+      boardPath = { box: d.box ?? "", hpath: d.hpath ?? "" }
+    }
+    return boardPath
+  }
+  const orphans: string[] = []
+  const rows: TaskRef[] = []
+  for (const row of raw) {
+    const title = (row.title ?? "").trim()
+    let bodyDoc = row.linkedDocId ?? ""
+    if (bodyDoc === "" && title !== "") {
+      try {
+        const bp = await boardPathOnce()
+        const found = bp.box === "" || bp.hpath === ""
+          ? []
+          : (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+              notebook: bp.box, path: `${bp.hpath}/${pathSafe(title)}`,
+            })).ids ?? []
+        if (found.length === 1) bodyDoc = found[0] as string
+        else if (found.length >= 2) orphans.push(`${String(row.rowBlockId).slice(0, 8)} → ${found.join(", ")}`)
+      } catch (e) {
+        // фоллбек — best effort: сбой ядра на одной detached-строке не должен
+        // глушить тик (комменты/будильники здоровых привязанных строк)
+        log(`задача ${String(row.rowBlockId).slice(0, 8)}: фоллбек тела по тайтлу не удался (${errText(e)}) — строка без тела`)
+      }
+    }
+    rows.push({
       rowId: row.rowBlockId as string,
-      bodyDoc: row.linkedDocId ?? "",
-      title: (row.title ?? "").trim(),
+      bodyDoc,
+      title,
       status: row.cells?.Status?.value ?? "",
       pr: row.cells?.PR?.value ?? "",
       branch: row.cells?.Branch?.value ?? "",
-    }))
+    })
+  }
+  if (orphans.length > 0) {
+    log(`дубль-сироты: ${orphans.length} строк(и) с ≥2 доками одного тайтла — чисти руками в UI: ${orphans.join("; ")}`)
+  }
+  return rows
 }
 
 async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
@@ -746,7 +788,7 @@ async function dispatchReviewAction(
   }
 }
 
-async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
+export async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
   const rows = await readTasks(board)
   // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
@@ -839,6 +881,26 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       continue
     }
     if (row === undefined) continue // mark: маршрутизировать нечего
+
+    // ——— самоисцеление: adopt + базлайн тела (до маршрутизации/комментов) ———
+    // привязка/фоллбек в state пусты → принять из свежего скана; без засева
+    // bodyUpdated канал body-edit-wakeup (ниже требует непустого базлайна)
+    // оставался бы мёртвым у исцелённых треков
+    const adopted = adoptBodyDoc(tracked, row)
+    let healed = false
+    if (adopted !== null) {
+      tracked.bodyDoc = adopted
+      healed = true
+      log(`задача ${rowId.slice(0, 8)}: пустой bodyDoc трека — принята привязка строки ${adopted.slice(0, 8)}`)
+    }
+    if (tracked.bodyDoc !== "" && (tracked.bodyUpdated ?? "") === "") {
+      const seeded = await bodyUpdatedAt(tracked.bodyDoc)
+      if (seeded !== null) {
+        tracked.bodyUpdated = seeded
+        healed = true
+      }
+    }
+    if (healed) saveState(state)
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
     if (row.status === "Done") {
@@ -1033,4 +1095,6 @@ async function main(): Promise<void> {
   }
 }
 
-void main()
+if (import.meta.main) {
+  void main()
+}
