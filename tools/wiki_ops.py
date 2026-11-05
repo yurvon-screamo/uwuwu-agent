@@ -81,16 +81,8 @@ def post(path: str, body: dict, attempts: int = 6):
     raise RuntimeError(f"POST {path}: {last}")
 
 
-def doc_id_by_path(nb: str, hpath: str) -> str | None:
-    try:
-        r = post("/api/filetree/getIDsByHPath", {"notebook": nb, "path": hpath}, attempts=2)
-        return (r[0] if isinstance(r, list) and r else None)
-    except Exception:
-        return None
-
-
-def notebooks() -> list[dict]:
-    return [nb for nb in post("/api/notebook/lsNotebooks", {}).get("notebooks", [])
+def notebooks(attempts: int = 6) -> list[dict]:
+    return [nb for nb in post("/api/notebook/lsNotebooks", {}, attempts=attempts).get("notebooks", [])
             if not nb.get("closed")]
 
 
@@ -116,10 +108,13 @@ def cmd_append(a):
 
 
 def cmd_replace(a):
+    doc_id = a.docId.strip()
+    if not DOC_ID_RE.fullmatch(doc_id):
+        raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     md = Path(a.file).read_text()
     # найти док → пересоздать
-    rows = post("/api/query/sql", {"stmt": f"select hpath, box from blocks where type='d' and id='{a.docId}'"})
-    rows = rows if isinstance(rows, list) else rows.get("data", [])
+    stmt = f"select hpath, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
+    rows = _sql_rows(stmt)
     if not rows:
         raise RuntimeError("док не найден")
     hpath, box = rows[0]["hpath"], rows[0]["box"]
@@ -141,6 +136,11 @@ def _sql_scalar(stmt: str) -> int:
     return int(rows[0]["c"]) if rows else 0
 
 
+def _sql_str(value: str) -> str:
+    # Одинарная кавычка в SQL-литерале экранируется удвоением (SQLite kernel).
+    return value.replace("'", "''")
+
+
 def _doc_row(doc_id: str) -> dict | None:
     stmt = f"select id, hpath, path, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
     rows = _sql_rows(stmt)
@@ -156,8 +156,8 @@ def _children_count(doc_path: str) -> int:
 
 
 def _siblings_count(box: str, hpath: str) -> int:
-    hpath_sql = hpath.replace("'", "''")
-    stmt = f"select count(*) c from blocks where type='d' and box='{box}' and hpath='{hpath_sql}' limit 1"  # nosec B608 — box из kernel API, hpath экранирован
+    hpath_sql = _sql_str(hpath)
+    stmt = f"select count(*) c from blocks where type='d' and box='{box}' and hpath='{hpath_sql}' limit 1"  # nosec B608 — box из kernel API, hpath экранирован _sql_str
     return _sql_scalar(stmt)
 
 
@@ -172,6 +172,15 @@ def _is_stub(doc_id: str) -> bool:
         if "⚠️" in line and ("канон" in low or "заглушк" in low):
             return True
     return False
+
+
+def _notebook_display_name(box_id: str) -> str:
+    # Косметика для трейла delete: один запрос без ретраев, отказ ядра
+    # не роняет команду после успешного сноса — фолбэк на box-id.
+    try:
+        return next(n["name"] for n in notebooks(attempts=1) if n["id"] == box_id)
+    except Exception:
+        return box_id
 
 
 def cmd_delete(a):
@@ -194,7 +203,7 @@ def cmd_delete(a):
     for _ in range(2):
         if _doc_row(doc_id) is None:
             marker = "да" if stub else "нет (--force)"
-            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {row['box']})")
+            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {_notebook_display_name(row['box'])})")
             print(f"  маркер заглушки: {marker}; соседей по пути: {siblings}; дочерних доков: {children}")
             print("  → корзина SiYuan, восстановимо через UI (история данных) до истечения срока хранения")
             return
@@ -205,18 +214,16 @@ def cmd_delete(a):
 def cmd_orgls(a):
     for nb in notebooks():
         print(f"[{nb['name']}]")
-        stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"
-        rows = post("/api/query/sql", {"stmt": stmt})
-        rows = rows if isinstance(rows, list) else rows.get("data", [])
+        stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"  # nosec B608 — nb.id из kernel API
+        rows = _sql_rows(stmt)
         for r in sorted(rows, key=lambda x: x["hpath"]):
             depth = r["hpath"].count("/") - 1
             print("  " * (depth + 1) + r["hpath"].rstrip("/").split("/")[-1])
 
 
 def cmd_find(a):
-    stmt = f"select id, hpath from blocks where type='d' and content like '%{a.title.replace(chr(39), chr(39)*2)}%' limit 10"
-    rows = post("/api/query/sql", {"stmt": stmt})
-    rows = rows if isinstance(rows, list) else rows.get("data", [])
+    stmt = f"select id, hpath from blocks where type='d' and content like '%{_sql_str(a.title)}%' limit 10"  # nosec B608 — title экранирован _sql_str
+    rows = _sql_rows(stmt)
     for r in rows:
         print(r["id"], r["hpath"])
 

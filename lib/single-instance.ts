@@ -10,6 +10,23 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
+/** Resolves the daemon state directory: a non-empty env override wins,
+ *  otherwise the historical default (~/.local/state/<daemon>).
+ *  Empty/whitespace env counts as unset — a sandbox var left empty must not
+ *  silently point the daemon (and its lock) at a bogus relative path. */
+export function resolveStateDir(envRaw: string | undefined, fallback: string): string {
+  const v = envRaw?.trim()
+  return v !== undefined && v !== "" ? v : fallback
+}
+
+/** Is the state directory sandboxed (env override set, non-empty)?
+ *  Dry-run guard basis: fake/partial state writes must never land in prod
+ *  state, so dry-run refuses to start on the default directory. */
+export function sandboxedStateDir(envRaw: string | undefined): boolean {
+  const v = envRaw?.trim()
+  return v !== undefined && v !== ""
+}
+
 export function acquireLock(opts: {
   stateDir: string
   onStop: () => void

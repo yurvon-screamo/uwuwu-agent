@@ -3,7 +3,7 @@
 // страницу (живая проба 05.11: rowCount=145, в ответе ровно 50) — адаптер
 // обязан пагинировать. Юниты цикла — на фейковых страницах; живой тест —
 // против реальной доски «Задачи uwuwu» с независимой пробой rowCount.
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import {
   MAX_RENDER_PAGES,
   collectBoardView,
@@ -107,6 +107,69 @@ describe("collectBoardView: пагинация", () => {
 
   test("кап — 100 страниц", () => {
     expect(MAX_RENDER_PAGES).toBe(100)
+  })
+})
+
+describe("read_database_cells: связка строка→тело (linkedDocId)", () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  /** Строка доски: block-ячейка Primary Key (линк на док-тела) + Status. */
+  const rowOf = (id: string, block: { id?: string; content: string; refSubtype?: string }) => ({
+    id,
+    cells: [
+      { value: { keyID: "k-key", type: "block", block } },
+      { value: { keyID: "k-status", type: "select", mSelect: [{ content: "Design" }] } },
+    ],
+  })
+
+  function scriptBoard(rows: unknown[]): void {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/api/query/sql")) {
+        return new Response(JSON.stringify({ code: 0, msg: "", data: [{ markdown: '<div data-av-id="20260101000000-abcdef"></div>' }] }), { status: 200 })
+      }
+      if (url.includes("/mcp")) {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { arguments?: { page?: number } }
+        const page = payload.arguments?.page ?? 1
+        const result = page === 1
+          ? { structuredContent: { data: { view: { columns: [{ id: "k-status", name: "Status" }], rowCount: rows.length, rows } } } }
+          : { structuredContent: { data: { view: { rows: [] } } } }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 })
+      }
+      throw new Error(`mock: неожиданный путь ${url}`)
+    }) as typeof fetch
+  }
+
+  test("block-ячейка с refSubtype=d даёт doc-id тела, не null", async () => {
+    // Arrange: до фикса linkedDocId был хардкодом null — wakeup-контур
+    // фабрики (комменты/правки тела) не находил тело задачи
+    scriptBoard([rowOf("row1", { id: "20261105000000-bodydoc", content: "Задача один", refSubtype: "d" })])
+
+    // Act
+    const r = await tool<{ rows?: { linkedDocId?: string | null; title?: string; cells?: Record<string, { value?: string }> }[] }>(
+      "read_database_cells", { docId: "doc1", databaseBlockId: "av1" })
+
+    // Assert
+    expect(r.rows?.[0]?.linkedDocId).toBe("20261105000000-bodydoc")
+    expect(r.rows?.[0]?.title).toBe("Задача один")
+    expect(r.rows?.[0]?.cells?.Status?.value).toBe("Design")
+  })
+
+  test("block-ячейка без линка на док (refSubtype≠d) — linkedDocId null", async () => {
+    // Arrange: строки с текстовым Primary Key (не док-тело) не должны
+    // отдавать случайный block-id
+    scriptBoard([rowOf("row2", { content: "просто текст" })])
+
+    // Act
+    const r = await tool<{ rows?: { linkedDocId?: string | null }[] }>(
+      "read_database_cells", { docId: "doc1", databaseBlockId: "av1" })
+
+    // Assert
+    expect(r.rows?.[0]?.linkedDocId).toBeNull()
   })
 })
 

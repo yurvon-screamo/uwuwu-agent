@@ -11,13 +11,16 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
-import { acquireLock, makeDrain } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
   type CronRow, type CronState,
 } from "./cron-lib"
 
-const STATE_DIR = join(homedir(), ".local/state/uwuwu-cron")
+// песочница: UWUWU_CRON_STATE_DIR двигает state+lock; в песочнице лог
+// тоже переезжает (прод-лог не засоряется смоук-тиками)
+const STATE_DIR_RAW = process.env.UWUWU_CRON_STATE_DIR
+const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-cron"))
 const STATE_FILE = join(STATE_DIR, "state.json")
 
 /** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
@@ -29,12 +32,20 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
-/** Путь лога переопределяем env-ом (тесты тика пишут в tmp): os.homedir()
- *  в Bun не следует за runtime-подменой process.env.HOME — HOME-изоляция
- *  каталога лога не работает. */
-const LOG_PATH = process.env.UWUWU_CRON_LOG ?? join(homedir(), ".local/share/opencode/log/uwuwu-cron.log")
+/** Путь лога: env-override (тесты тика пишут в tmp — os.homedir() в Bun
+ *  не следует за runtime-подменой process.env.HOME, HOME-изоляция не работает);
+ *  дефолт — sandbox-логика: в песочнице лог живёт в state-каталоге
+ *  (прод-лог не засоряется смоук-тиками). */
+const LOG_PATH = process.env.UWUWU_CRON_LOG ?? (sandboxedStateDir(STATE_DIR_RAW)
+  ? join(STATE_DIR, "uwuwu-cron.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log"))
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
+/** DRY_RUN: полный цикл решений по реальным крон-доскам (чтение), спавны
+ *  и записи ячеек заменяются логом. Требует песочницу state — гард в main().
+ *  Без него песочный state опасен сам по себе: чистый state делает все
+ *  периодические кроны due → реальные спавны на прод-досках. */
+const DRY_RUN = process.env.UWUWU_CRON_DRY_RUN === "1"
 /** пауза между срабатываниями одного крона пока жива его сессия */
 const SESSION_COOLDOWN_MS = 10 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
@@ -97,7 +108,10 @@ async function cronBoardTitles(): Promise<string[]> {
       .map(n => n.data)
       .filter((d): d is string => typeof d === "string")
     return [GLOBAL_CRON_BOARD, ...projects.map(p => `Кроны ${p}`)]
-  } catch { return [GLOBAL_CRON_BOARD] }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать фоллбеком
+    return [GLOBAL_CRON_BOARD]
+  }
 }
 
 async function findBoard(title: string): Promise<BoardIds | null> {
@@ -133,7 +147,10 @@ async function boardViaOrganize(proj: string, title: string): Promise<string | n
         if (d.title === title) return docId
       }
     }
-  } catch { /* организ недоступен — остаётся null */ }
+  } catch (e) {
+    if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать null-фоллбеком
+    /* организ недоступен — остаётся null */
+  }
   return null
 }
 
@@ -143,7 +160,10 @@ async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
     try {
       const board = await findBoard(title)
       if (board !== null) out.push({ title, board })
-    } catch { /* доска недоступна — скип тика по ней */ }
+    } catch (e) {
+      if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать скипом доски
+      /* доска недоступна — скип тика по ней */
+    }
   }
   return out
 }
@@ -170,6 +190,10 @@ async function readCrons(board: BoardIds): Promise<CronRow[]> {
 }
 
 async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
+    return
+  }
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
@@ -188,7 +212,7 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   const text = await res.text()
   if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}: ${text.slice(0, 120)}`), { status: res.status })
   if (text.trim() === "") return {}
-  const j: unknown = JSON.parse(text)
+  const j: unknown = mcp.parseJsonContract(text, `opencode ${path}: HTTP ${res.status}`)
   return (j as { data?: unknown }).data ?? j
 }
 
@@ -299,10 +323,14 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
       // его «непустым», и следующий цикл файрил мусор (e2e 05.11)
       log(`крон «${title}»: отказ — ${resolved.reason}`)
       if (state.crons[row.rowId]?.lastRefusal !== resolved.reason) {
-        await mcp.tool("create_comment", {
-          docId: board.docId,
-          content: `крон «${row.title || row.rowId.slice(0, 8)}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
-        })
+        if (DRY_RUN) {
+          log(`DRY_RUN: крон «${row.title || row.rowId.slice(0, 8)}» — коммент отказа пропущен`)
+        } else {
+          await mcp.tool("create_comment", {
+            docId: board.docId,
+            content: `крон «${row.title || row.rowId.slice(0, 8)}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
+          })
+        }
       }
       state.crons[row.rowId] = {
         sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString(), lastRefusal: resolved.reason,
@@ -313,6 +341,11 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
         await setCells(board, row.rowId, { Status: "fired" })
         log(`крон «${title}»: разовый — отказ, fired`)
       }
+      continue
+    }
+    // DRY_RUN: до спавна — расписание признано due, гейт пройден, тело валидно; сессию не создаём
+    if (DRY_RUN) {
+      log(`DRY_RUN: крон «${title}» — сессия не спавнилась (промпт ${firePrompt({ ...row, title }, resolved.markdown, project).length} байт)`)
       continue
     }
     const sessionID = await fireSession(title, firePrompt({ ...row, title }, resolved.markdown, project))
@@ -342,6 +375,12 @@ async function main(): Promise<void> {
     console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
+  // гард dry-run ДО лока: невалидный режим не должен даже притворяться
+  // демоном (фиктивные записи не должны попадать в прод-state)
+  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+    console.error("DRY_RUN требует UWUWU_CRON_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-cron держит lock — выходим")
     process.exit(1)
@@ -349,7 +388,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
-  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
   let consecutiveFails = 0
@@ -359,7 +398,9 @@ async function main(): Promise<void> {
       consecutiveFails = 0
     } catch (e) {
       consecutiveFails++
-      log(`tick (${consecutiveFails} подряд): ${e}`)
+      // сообщение и стек отдельными строками: bun у подклассов Error рендерит
+      // stack без сообщения (прод-кейс 05.11: «tick: Error» без причины)
+      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? ""}` : String(e)}`)
       if (consecutiveFails >= 5) {
         // отравленное соединение/пул: свежий процесс чище вечных ретраев
         log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")

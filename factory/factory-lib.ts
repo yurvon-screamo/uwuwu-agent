@@ -153,21 +153,60 @@ export function snapshotText(content: unknown): string {
   return out.join("").trim()
 }
 
+/** Режим стартового промпта: design → утряска с план-ревью,
+ *  implement → fast-track (стадия реализации, без план-ревью). */
+export type KickoffMode = "design" | "implement"
+
+/** Режим агента по статусу строки: In Progress = стадия реализации
+ *  (fast-track владельца или approve плана ревьювером) → implement;
+ *  всё остальное → design (safe default). Единственная точка решения
+ *  «какой агент родится» — чистая, по образцу routeTask. */
+export function kickoffModeOf(status: string): KickoffMode {
+  return status === "In Progress" ? "implement" : "design"
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
-export function spawnPrompt(rowId: string, project: string, repo: string): string {
+export function spawnPrompt(rowId: string, project: string, repo: string, mode: KickoffMode = "design"): string {
+  const stage = mode === "implement"
+    ? [
+        "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
+        "и «Ревью плана» пропускаешь. Если в теле ещё нет плана — короткий план",
+        "первой секцией тела (без план-ревью) и сразу в работу:",
+      ]
+    : [
+        "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
+        "пока ждёшь ответа). План утрясан → план в тело → статус «Ревью плана» → конец хода:",
+        "ревью проводит отдельный праймари-агент фабрики, вердикт придёт wakeup'ом.",
+        "После approve плана:",
+      ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
-    "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-    "пока ждёшь ответа). План утрясан → план в тело → статус «Ревью плана» → конец хода:",
-    "ревью проводит отдельный праймари-агент фабрики, вердикт придёт wakeup'ом.",
-    "После approve плана создай worktree+ветку от origin/master (имя по сути задачи, не id),",
-    "заполни Branch-ячейку и реализуй. Код + self-check + PR (gh pr create, URL в PR-ячейку) +",
-    "отчёт в тело → статус «Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом:",
-    "request_changes → устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
+    ...stage,
+    "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
+    "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
+    "«Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом: request_changes →",
+    "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
     "Без пустого шума в комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
+    "",
+    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
+    "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
+    "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
+  ].join("\n")
+}
+
+/** Рестарт-промпт (сессия девелопера умерла/карантин → fresh spawn).
+ *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
+ *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
+export function continuePrompt(rowId: string, project: string, repo: string): string {
+  return [
+    `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
+    "",
+    "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
+    "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
+    "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
     "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
@@ -375,4 +414,96 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     typeof t.worktree === "string" && t.worktree.startsWith("/") &&
     typeof t.branch === "string" && t.branch.startsWith("work/")
   )
+}
+
+// ——— спавн-волна: пачка с ограничением конкурентности ———
+
+/** Волна Design-спавна одним проходом: последовательный спавн ≈ до 75 s
+ *  на задачу не влезал в тик 180 s. Ошибка одного элемента не останавливает
+ *  остальных (фейл задачи — её регистрация, не обвал пачки); первая ошибка
+ *  перевыбрасывается после завершения всех элементов. */
+export async function runBatch<T>(items: readonly T[], worker: (item: T) => Promise<void>, limit: number): Promise<void> {
+  let next = 0
+  let failure: unknown = null
+  const lane = async (): Promise<void> => {
+    while (true) {
+      const index = next++
+      const item = items[index]
+      if (item === undefined) return
+      try {
+        await worker(item)
+      } catch (e) {
+        failure ??= e
+      }
+    }
+  }
+  const lanes: Promise<void>[] = []
+  for (let i = 0; i < Math.min(limit, items.length); i++) lanes.push(lane())
+  await Promise.all(lanes)
+  if (failure !== null) throw failure
+}
+
+// ——— конфиг проектов (env-оверрайд для тестовых прогонов) ———
+
+export interface ProjectCfg {
+  board: string
+  repo: string
+  local: string
+}
+
+/** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
+ *  доска/чекаут для ONCE-прогона без правки кода. Отсутствие — дефолт;
+ *  невалидный — отказ старта с внятной причиной (не тихий фоллбек). */
+export function parseProjects(raw: string | undefined, fallback: Record<string, ProjectCfg>): Record<string, ProjectCfg> {
+  if (raw === undefined || raw.trim() === "") return fallback
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: не JSON (${e})`)
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("UWUWU_FACTORY_PROJECTS_JSON: ожидался объект { имя: { board, repo, local } }")
+  }
+  const out: Record<string, ProjectCfg> = {}
+  for (const [name, cfg] of Object.entries(parsed as Record<string, unknown>)) {
+    const c = cfg as Partial<ProjectCfg>
+    if (typeof c.board !== "string" || typeof c.repo !== "string" || typeof c.local !== "string") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local обязательны и строки`)
+    }
+    if (c.board.trim() === "" || c.repo.trim() === "" || c.local.trim() === "") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local не могут быть пустыми`)
+    }
+    out[name] = { board: c.board, repo: c.repo, local: c.local }
+  }
+  if (Object.keys(out).length === 0) {
+    throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")
+  }
+  return out
+}
+
+// ——— сводка прохода ———
+
+export interface PassCounters {
+  /** спавн девелоперов (Design-утряска + fast-track In Progress) */
+  devSpawned: number
+  /** спавн/рестарт ревьюверов */
+  reviewSpawned: number
+  /** доставки промптов за тик: спавн/реран ревьювера, комменты ревьюверу,
+   *  возврат девелоперу, wakeup по комментам/правкам тела */
+  wakeups: number
+  /** чистки state (Done / строка исчезла) */
+  cleanups: number
+  /** задачи под наблюдением на конец прохода (этот проект) */
+  watched: number
+  /** фейлы спавна: короткие «rowId-префикс: причина» */
+  failures: string[]
+}
+
+/** Одна строка лога на проект за тик: «молчаливые тики» должны быть
+ *  видимы — что сделано и что живо (прод-кейс 05.11). */
+export function formatPassSummary(project: string, c: PassCounters): string {
+  const failures = c.failures.length > 0 ? `, фейлы=${c.failures.length} (${c.failures.join("; ")})` : ""
+  return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}, наблюдение=${c.watched}${failures}`
 }

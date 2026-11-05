@@ -2,6 +2,8 @@
 import { describe, expect, test } from "bun:test"
 import {
   commentText,
+  continuePrompt,
+  kickoffModeOf,
   newUserComments,
   bodyEditPrompt,
   spawnPrompt,
@@ -10,6 +12,10 @@ import {
   snapshotText,
   worktreePaths,
   worktreeByBranch,
+  runBatch,
+  parseProjects,
+  formatPassSummary,
+  type ProjectCfg,
   isValidTracked,
   rowMissingAction,
   reviewKindOf,
@@ -160,6 +166,48 @@ describe("spawnPrompt", () => {
     const p = spawnPrompt("r1", "origa", "yurvon-screamo/origa")
     expect(p).not.toContain("ПАЙП")
     expect(p).not.toContain("=== ТЕЛО ЗАДАЧИ ===")
+  })
+  test("design-режим (дефолт): утряска с «Ревью плана» на месте", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
+    expect(p).toContain("Стадия Design")
+    expect(p).toContain("План утрясан")
+    expect(p).toContain("«Ревью плана»")
+  })
+  test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
+    expect(p).toContain("In Progress")
+    expect(p).toContain("пропускаешь")
+    expect(p).toContain("«Ревью результата»")
+    expect(p).toContain("task get")
+    // предписание план-ревью («План утрясан → … «Ревью плана»») — только в design-режиме
+    expect(p).not.toContain("План утрясан")
+    expect(p).not.toContain("🤖")
+  })
+})
+
+describe("continuePrompt", () => {
+  test("рестарт без предписания стадии, с якорем на пайп AGENTS.md", () => {
+    const p = continuePrompt("r1", "origa", "yurvon-screamo/origa")
+    expect(p).toContain("Задача r1")
+    expect(p).toContain("перезапущена")
+    expect(p).toContain("AGENTS.md")
+    expect(p).toContain("task get")
+    expect(p).not.toContain("Стадия Design")
+    expect(p).not.toContain("«Ревью плана»")
+    expect(p).not.toContain("🤖")
+  })
+})
+
+describe("kickoffModeOf", () => {
+  test("In Progress → implement (стадия реализации)", () => {
+    expect(kickoffModeOf("In Progress")).toBe("implement")
+  })
+  test("остальные статусы → design (safe default)", () => {
+    expect(kickoffModeOf("Design")).toBe("design")
+    expect(kickoffModeOf("Needs attention")).toBe("design")
+    expect(kickoffModeOf("")).toBe("design")
+    expect(kickoffModeOf(REVIEW_PLAN_STATUS)).toBe("design")
+    expect(kickoffModeOf(REVIEW_RESULT_STATUS)).toBe("design")
   })
 })
 
@@ -354,5 +402,123 @@ describe("worktreeByBranch", () => {
   test("пустая ветка и отсутствие ветки — пустой результат", () => {
     expect(worktreeByBranch(porcelain, "")).toBe("")
     expect(worktreeByBranch("worktree /a\nHEAD z\nbare", "nope")).toBe("")
+  })
+})
+
+// ——— спавн-волна: runBatch ———
+
+describe("runBatch: пачка с ограничением конкурентности", () => {
+  test("все элементы обработаны, конкурентность не выше лимита", async () => {
+    // Arrange
+    const processed: number[] = []
+    let active = 0
+    let maxActive = 0
+    const worker = async (n: number): Promise<void> => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await new Promise((r) => setTimeout(r, 5))
+      processed.push(n)
+      active--
+    }
+
+    // Act
+    await runBatch([1, 2, 3, 4, 5, 6, 7], worker, 3)
+
+    // Assert
+    expect(processed.sort()).toEqual([1, 2, 3, 4, 5, 6, 7])
+    expect(maxActive).toBeLessThanOrEqual(3)
+  })
+
+  test("фейл одного элемента не останавливает остальных, ошибка перевыбрасывается", async () => {
+    // Arrange
+    const processed: number[] = []
+    const worker = async (n: number): Promise<void> => {
+      await new Promise((r) => setTimeout(r, 1))
+      if (n === 2) throw new Error("boom")
+      processed.push(n)
+    }
+
+    // Act / Assert
+    await expect(runBatch([1, 2, 3], worker, 2)).rejects.toThrow("boom")
+    expect(processed.sort()).toEqual([1, 3])
+  })
+
+  test("пустая пачка и лимит больше пачки — без ошибок", async () => {
+    const done: number[] = []
+    await runBatch([], async () => { done.push(0) }, 4)
+    await runBatch([1], async (n) => { done.push(n) }, 10)
+    expect(done).toEqual([1])
+  })
+})
+
+// ——— конфиг проектов: parseProjects ———
+
+describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () => {
+  const fallback: Record<string, ProjectCfg> = {
+    uwuwu: { board: "Задачи uwuwu", repo: "r", local: "/l" },
+  }
+
+  test("нет env — дефолт без изменений", () => {
+    expect(parseProjects(undefined, fallback)).toEqual(fallback)
+  })
+
+  test("пустая строка — дефолт (сброс env без unset)", () => {
+    expect(parseProjects("  ", fallback)).toEqual(fallback)
+  })
+
+  test("валидный JSON — конфиг целиком из env (тестовая доска)", () => {
+    const raw = JSON.stringify({ test: { board: "Доска тест", repo: "repo", local: "/tmp/repo" } })
+    expect(parseProjects(raw, fallback)).toEqual({
+      test: { board: "Доска тест", repo: "repo", local: "/tmp/repo" },
+    })
+  })
+
+  test("не-JSON — внятная ошибка с именем env", () => {
+    expect(() => parseProjects("{nope", fallback)).toThrow(/UWUWU_FACTORY_PROJECTS_JSON.*не JSON/)
+  })
+
+  test("проект без обязательных полей — ошибка с именем проекта", () => {
+    const raw = JSON.stringify({ test: { board: "b", repo: "r" } })
+    expect(() => parseProjects(raw, fallback)).toThrow(/test.*board\/repo\/local/)
+  })
+
+  test("массив вместо объекта — отказ, не тихий пустой конфиг", () => {
+    expect(() => parseProjects("[]", fallback)).toThrow(/объект/)
+  })
+})
+
+// ——— сводка прохода ———
+
+describe("formatPassSummary: одна строка о проходе", () => {
+  test("полная сводка с фейлами перечисляет причины", () => {
+    const line = formatPassSummary("uwuwu", {
+      devSpawned: 4, reviewSpawned: 1, wakeups: 2, cleanups: 1, watched: 12,
+      failures: ["20261105ab: сессия мертва после спавна"],
+    })
+    expect(line).toBe(
+      "проход uwuwu: спавн dev=4 ревью=1, будильники=2, чистки=1, наблюдение=12" +
+      ", фейлы=1 (20261105ab: сессия мертва после спавна)")
+  })
+
+  test("тихий тик без событий всё равно виден (наблюдение=0)", () => {
+    const line = formatPassSummary("origa", {
+      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0, watched: 0, failures: [],
+    })
+    expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, наблюдение=0")
+  })
+})
+
+describe("parseProjects: семантическая валидация", () => {
+  const fallback: Record<string, ProjectCfg> = {
+    uwuwu: { board: "Задачи uwuwu", repo: "r", local: "/l" },
+  }
+
+  test("пустое поле — отказ с именем проекта", () => {
+    const raw = JSON.stringify({ test: { board: "  ", repo: "r", local: "/l" } })
+    expect(() => parseProjects(raw, fallback)).toThrow(/test.*пустыми/)
+  })
+
+  test("пустой объект — отказ: демон без проектов молча не работает", () => {
+    expect(() => parseProjects("{}", fallback)).toThrow(/пуст/)
   })
 })

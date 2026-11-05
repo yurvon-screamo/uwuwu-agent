@@ -2,9 +2,10 @@
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
 //   1. Design на доске (Draft = черновик на валидации триажа, пустой =
-//      легаси-черновик юзера — оба не трогаем) →
-//      сессия девелопера в чекауте репо + короткий spawn-промпт (ворктри/ветку
-//      создаёт сам агент)
+//      легаси-черновик юзера — оба не трогаем) → сессия девелопера в
+//      чекауте репо + spawn-промпт утряски (ворктри/ветку создаёт сам
+//      агент); In Progress без записи state — fast-track владельца →
+//      implement-промпт (сразу реализация, без Design/план-ревью)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
 //      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
 //      задачи); возврат статуса из ревью → wakeup девелопера; комменты
@@ -20,12 +21,14 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
   isUserComment,
   commentText,
+  continuePrompt,
+  kickoffModeOf,
   spawnPrompt,
   wakeupPrompt,
   bodyEditPrompt,
@@ -38,21 +41,25 @@ import {
   routeTask,
   rowMissingAction,
   worktreeByBranch,
+  runBatch,
+  parseProjects,
+  formatPassSummary,
+  type PassCounters,
+  type ProjectCfg,
   type ReviewKind,
   type FactoryState,
+  type KickoffMode,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
 } from "./factory-lib"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
-export interface ProjectCfg {
-  board: string
-  repo: string
-  local: string
-}
+// ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
+// здесь только прод-дефолт
+export type { ProjectCfg }
 
-const PROJECTS: Record<string, ProjectCfg> = {
+const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
   uwuwu: {
     board: "Задачи uwuwu",
     repo: "yurvon-screamo/uwuwu-agent",
@@ -74,13 +81,22 @@ const PROJECTS: Record<string, ProjectCfg> = {
     local: join(homedir(), "true-wash"),
   },
 }
-const STATE_DIR = join(homedir(), ".local/state/uwuwu-factory")
+// песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
+// тоже переезжает (прод-лог не засоряется смоук-тиками)
+const STATE_DIR_RAW = process.env.UWUWU_FACTORY_STATE_DIR
+const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-factory"))
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
+  ? join(STATE_DIR, "uwuwu-factory.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
+/** DRY_RUN: полный цикл решений по реальным доскам (чтение), все мутации
+ *  (спавны, промпты, ячейки, комменты, термин сессий) заменяются логом.
+ *  Требует песочницу state — гард в main(). */
+const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 /** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника.
  *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
@@ -89,11 +105,19 @@ const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-pl
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
+/** параллельность Design-волны: create+prompt+liveness ≈ 5 сетевых шагов
+ *  на задачу — 4 дорожки держат волну из ~10 задач в пределах полутика */
+const SPAWN_WAVE_CONCURRENCY = 4
 /** бот-аккаунт афины: его комменты — не сигналы юзера */
 const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6c71d8afeae"
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
+}
+
+/** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
 
 function rotateLog(): void {
@@ -222,6 +246,10 @@ async function readTasks(board: BoardIds): Promise<TaskRef[]> {
 }
 
 async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
+    return
+  }
   await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
 }
 
@@ -299,6 +327,10 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
 
 async function commentTask(bodyDoc: string, text: string): Promise<boolean> {
   if (bodyDoc === "") return false
+  if (DRY_RUN) {
+    log(`DRY_RUN: comment → ${bodyDoc.slice(0, 8)}: ${text.slice(0, 80)}`)
+    return true
+  }
   try {
     await mcp.tool("create_comment", { docId: bodyDoc, content: text })
     return true
@@ -356,6 +388,10 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
 }
 
 async function promptSession(sessionID: string, text: string): Promise<boolean> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80)}…`)
+    return true
+  }
   try {
     await restCall(`/session/${sessionID}/prompt`, { method: "POST", body: { text } })
     return true
@@ -392,9 +428,21 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 // ——— жизненный цикл задачи ———
 
-async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState, attemptsSeed: number): Promise<void> {
+/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf)
+ *  или рестарт умершей сессии (нейтральный промпт, стадию не предписываем). */
+type StartKind = KickoffMode | "continue"
+
+async function startTask(
+  task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState,
+  attemptsSeed: number, start: StartKind,
+): Promise<void> {
   // стоп-сигнал: не спавним новую работу — задача доедет при следующем старте
   if (drain.isStopping()) return
+  // DRY_RUN: решение о спавне принято (routeTask отлогировал) — сессию не создаём
+  if (DRY_RUN) {
+    log(`DRY_RUN: спавн девелопера над ${task.rowId.slice(0, 8)} (${start}) — пропущен`)
+    return
+  }
   // ворктри/ветку создаёт сам агент (осмысленные имена — его дело),
   // сессия стартует в основном чекауте репо
   // тайтл: линкованная строка несёт заголовок в доке-теле — деривируем из него
@@ -414,9 +462,21 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
 
   const sent = await promptSession(
     sessionID,
-    spawnPrompt(task.rowId, projectName, cfg.repo),
+    start === "continue"
+      ? continuePrompt(task.rowId, projectName, cfg.repo)
+      : spawnPrompt(task.rowId, projectName, cfg.repo, start),
   )
   if (!sent) throw new Error("spawn-промпт не ушёл")
+
+  // живость сразу после спавна: «фиктивные sessionID» (create ок, сессии
+  // нет) не попадают в state и не считаются активными — throw уводит в
+  // registerFailure, ретрай следующим тиком; осиротевшую сессию гасим
+  const liveness = await sessionLiveness(sessionID)
+  if (liveness === "dead") {
+    await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
+    throw new Error("сессия мертва сразу после спавна")
+  }
+  // unknown (транзиент REST) — пишем state как раньше: stage-2 перепроверит
 
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
@@ -441,15 +501,23 @@ async function startTask(task: TaskRef, projectName: string, cfg: ProjectCfg, st
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
-    lastStatus: task.status, // спавн из этого статуса (Design) — не рестартить им же
+    lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
   }
   saveState(state)
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, агент ведёт сам (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start} (попыток до этого: ${attemptsSeed})`)
 }
 
 /** Чистка state (Done): ворктри/ветку убирает сам агент — демон про git не знает.
  *  Живая ревью-сессия задачи — терминируем (разовая чистка, не watchdog). */
 async function finishTask(rowId: string, tracked: TrackedTask, state: FactoryState): Promise<void> {
+  // DRY_RUN: чистка в песочный state безвредна, но термин реальной
+  // ревью-сессии — side-effect на прод-сервере — не делаем
+  if (DRY_RUN) {
+    log(`DRY_RUN: Done-чистка ${rowId.slice(0, 8)} — state-запись удалена бы, ревью-сессия не терминируется`)
+    delete state.tasks[rowId]
+    saveState(state)
+    return
+  }
   log(`задача ${rowId.slice(0, 8)}: Done — чистка state`)
   if (tracked.reviewSessionID !== undefined && tracked.reviewSessionID !== "") {
     await restCall(`/session/${tracked.reviewSessionID}`, { method: "DELETE" }).catch(() => {})
@@ -506,7 +574,7 @@ async function restartTask(
   const savedReviewAttempts = tracked.reviewAttempts
   saveState(state)
   try {
-    await startTask(task, projectName, cfg, state, seed)
+    await startTask(task, projectName, cfg, state, seed, "continue")
     const reborn = state.tasks[task.rowId]
     if (reborn !== undefined && savedReview !== undefined) {
       reborn.reviewSessionID = savedReview
@@ -536,6 +604,11 @@ async function startReview(
   task: TaskRef, projectName: string, cfg: ProjectCfg, state: FactoryState,
   kind: ReviewKind, tracked: TrackedTask,
 ): Promise<void> {
+  // DRY_RUN: решение о ревью принято — ревьювера не спавним
+  if (DRY_RUN) {
+    log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
+    return
+  }
   const worktree = kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
   const ctx = { branch: task.branch, worktree, pr: task.pr }
   const sessionID = await createSession({
@@ -651,11 +724,11 @@ async function dispatchReviewAction(
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
       // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер.
       // startTask заменяет запись state — дальше по циклу не идём:
-      // свежая сессия уже получила spawn-промпт со всем контекстом
+      // свежая сессия уже получила рестарт-промпт (стадию не предписываем)
       const savedReview = d.tracked.reviewSessionID
       const savedReviewAttempts = d.tracked.reviewAttempts
       try {
-        await startTask(d.row, d.project, d.cfg, d.state, d.tracked.attempts)
+        await startTask(d.row, d.project, d.cfg, d.state, d.tracked.attempts, "continue")
         const reborn = d.state.tasks[d.row.rowId]
         if (reborn !== undefined && savedReview !== undefined) {
           reborn.reviewSessionID = savedReview
@@ -678,22 +751,43 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
   const rows = await readTasks(board)
   // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
   log(`проход ${projectName}: строк ${rows.length}`)
+  const counters: PassCounters = {
+    devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0, watched: 0, failures: [],
+  }
 
-  // 1. новые задачи: Design → девелопер, ревью-статус → ревьювер
+  // 1. новые задачи: Design → девелопер (утряска), In Progress без state →
+  //    девелопер (fast-track владельца: сразу реализация), ревью-статус → ревьювер
   //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
   const started = new Set<string>()
-  const spawnable = rows.filter((r) => r.status === "Design" || reviewKindOf(r.status) !== null)
-  for (const task of untrackedTasks(spawnable, state)) {
-    const kind = reviewKindOf(task.status)
-    if (kind === null) {
+  const spawnable = rows.filter(
+    (r) => r.status === "Design" || r.status === "In Progress" || reviewKindOf(r.status) !== null)
+  const untracked = untrackedTasks(spawnable, state)
+
+  // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
+  // и fast-track In Progress владельца) получают сессии за ОДИН проход
+  // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
+  // растягивали волну из 4 задач на 12+ минут)
+  const devWave = untracked.filter((t) => reviewKindOf(t.status) === null)
+  if (devWave.length > 0 && !drain.isStopping()) {
+    await runBatch(devWave, async (task) => {
+      if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
       try {
-        await startTask(task, projectName, cfg, state, 0)
+        await startTask(task, projectName, cfg, state, 0, kickoffModeOf(task.status))
+        // инвариант против drain-отмены внутри startTask (молчаливый return):
+        // сессия есть ⇔ в state появилась запись — иначе спавном не считаем
+        if (state.tasks[task.rowId] === undefined) return
         started.add(task.rowId)
+        counters.devSpawned++
       } catch (e) {
         await registerFailure(task, projectName, board, state, 0, e)
+        counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
       }
-      continue
-    }
+    }, SPAWN_WAVE_CONCURRENCY)
+  }
+
+  for (const task of untracked.filter((t) => reviewKindOf(t.status) !== null)) {
+    const kind = reviewKindOf(task.status)
+    if (kind === null) continue // защищённость от перефильтра выше
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
     // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
     // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
@@ -712,8 +806,10 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     state.tasks[task.rowId] = entry
     try {
       await startReview(task, projectName, cfg, state, kind, entry)
+      counters.reviewSpawned++
     } catch (e) {
       await failReview(task, board, entry, state, 0, e)
+      counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
     }
     started.add(task.rowId)
   }
@@ -739,6 +835,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     } else if (missing === "clean") {
       log(`задача ${rowId.slice(0, 8)}: строки нет в скане 2 прохода подряд (с ${tracked.missingSince}) — чистка`)
       await finishTask(rowId, tracked, state)
+      counters.cleanups++
       continue
     }
     if (row === undefined) continue // mark: маршрутизировать нечего
@@ -747,6 +844,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
     if (row.status === "Done") {
       log(`задача ${rowId.slice(0, 8)}: Done (закрыта агентом/юзером) — чистка`)
       await finishTask(rowId, tracked, state)
+      counters.cleanups++
       continue
     }
 
@@ -780,6 +878,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       row, tracked, project: tracked.project || projectName, cfg, board, state, fresh,
       consumeComments, refreshBodyBaseline,
     })
+    if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
     if (skipRest === "skip-rest") continue
 
     // запоминаем наблюдённый статус — граница перехода для след. тика
@@ -806,6 +905,7 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
           if (await promptSession(target, bodyEditPrompt(rowId))) {
             tracked.bodyUpdated = updated
             saveState(state)
+            counters.wakeups++
           }
           continue
         }
@@ -864,10 +964,16 @@ async function tickProject(state: FactoryState, projectName: string, cfg: Projec
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
       saveState(state)
+      counters.wakeups++
     } else {
       log(`задача ${rowId.slice(0, 8)}: промпт не ушёл — граница комментов не сдвинута`)
     }
   }
+
+  // сводка прохода: «молчаливые тики» видны — что сделано и сколько живых
+  counters.watched = Object.values(state.tasks)
+    .filter((t) => (t.project || "uwuwu") === projectName).length
+  log(formatPassSummary(projectName, counters))
 }
 
 let tickCount = 0
@@ -879,6 +985,21 @@ async function main(): Promise<void> {
     console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
     process.exit(1)
   }
+  // env-оверрайд проектов: валидируем ДО лока — невалидный конфиг не должен
+  // даже притворяться демоном (тестовые доски для ONCE-прогонов)
+  let projects: Record<string, ProjectCfg>
+  try {
+    projects = parseProjects(process.env.UWUWU_FACTORY_PROJECTS_JSON, DEFAULT_PROJECTS)
+  } catch (e) {
+    console.error(errText(e))
+    process.exit(1)
+  }
+  // гард dry-run ДО лока: невалидный режим не должен даже притворяться
+  // демоном (фиктивные записи не должны попадать в прод-state)
+  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+    console.error("DRY_RUN требует UWUWU_FACTORY_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
+    process.exit(1)
+  }
   if (!acquireLock({ stateDir: STATE_DIR, onStop: drain.stop })) {
     console.error("другой живой инстанс uwuwu-factory держит lock — выходим")
     process.exit(1)
@@ -886,11 +1007,11 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(PROJECTS).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {
-    for (const [name, cfg] of Object.entries(PROJECTS)) {
+    for (const [name, cfg] of Object.entries(projects)) {
       if (drain.isStopping()) break
       try {
         await tickProject(state, name, cfg)

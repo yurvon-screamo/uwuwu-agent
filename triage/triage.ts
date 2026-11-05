@@ -21,13 +21,14 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { acquireLock } from "../lib/single-instance"
+import { withE2ETag } from "../lib/e2e-tag"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, extractReplies, inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec,
+  draftReady, dropBatch, extractReplies, inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, parseWatchSec,
   promptLandedAt, setDraftAck, steerCandidate, steerRecoveryBatch, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
-  type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
+  type Attachment, type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
 const HERE = dirname(new URL(import.meta.url).pathname)
@@ -54,7 +55,7 @@ const WORKSPACE = join(RUN_ROOT, ".local/share/uwuwu-triage/workspace")
 const AGENT_NAME = "triage"
 const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${AGENT_NAME}.md`)
 /** выгруженные вложения заявок (скрины/файлы): агент видит их в ФС по путям
- *  из текста заявки и прикладывает к задаче (--attach) */
+ *  из текста заявки и фиксирует пути в теле задачи (--attach — заглушка SiYuan v1) */
 const MEDIA_DIR = join(RUN_ROOT, ".local/share/uwuwu-triage/media")
 const MEDIA_TTL_MS = 7 * 24 * 3600_000
 /** Регистрация фонового opencode-сервиса — ВХОД демона (где живой сервер),
@@ -63,6 +64,10 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** API Telegram: дефолт — прод; override — mock-TG досмерджевого протокола
  *  (см. README «Проверка»). */
 const TG_API = process.env.UWUWU_TRIAGE_TG_API ?? "https://api.telegram.org"
+/** Маркер e2e-сессий: сессия диалога создаётся с префиксом `[e2e]`, дример
+ *  пропускает помеченные сессии при пост-обработке (конвенция lib/e2e-tag.ts).
+ *  Тестовый крюк, в systemd-юнит не задаётся. */
+const E2E_SESSIONS = process.env.UWUWU_TRIAGE_E2E === "1"
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
@@ -308,7 +313,7 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: SESSION_TITLE,
+      title: E2E_SESSIONS ? withE2ETag(SESSION_TITLE) : SESSION_TITLE,
       agent: AGENT_NAME,
       // NB: model из дефа не применяется к primary-сессиям — передаём явно
       model: cfg.model ?? MODEL,
@@ -804,12 +809,13 @@ const runLoop = async (): Promise<void> => {
 
 // ——— вложения: ТГ-медиа → ФС (паттерн зоопарка: getFile → download) ———
 
-/** Выгрузить фото/документ из сообщения в MEDIA_DIR. Возвращает вложения и
- *  маркеры неудач (текст заявки честно скажет агенту, что не выгрузилось). */
-const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<{ attachments: { path: string; name: string }[]; failed: string[] }> => {
-  const out: { attachments: { path: string; name: string }[]; failed: string[] } = { attachments: [], failed: [] }
-  const save = async (fileId: string | undefined, name: string): Promise<void> => {
-    if (fileId === undefined) { out.failed.push(name); return }
+/** Выгрузить медиа из сообщения в MEDIA_DIR (состав и имена — mediaFiles
+ *  из lib: photo/document/video/animation/video_note/audio). Возвращает
+ *  вложения и маркеры неудач (текст заявки честно скажет агенту, что не
+ *  выгрузилось). */
+const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<{ attachments: Attachment[]; failed: string[] }> => {
+  const out: { attachments: Attachment[]; failed: string[] } = { attachments: [], failed: [] }
+  const save = async (fileId: string, name: string): Promise<void> => {
     try {
       const f = await tg("getFile", { file_id: fileId }) as { file_path?: string }
       if (typeof f.file_path !== "string") throw new Error("нет file_path")
@@ -826,14 +832,7 @@ const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<
       out.failed.push(name)
     }
   }
-  // фото: последний элемент массива = максимальное разрешение
-  const photo = Array.isArray(m.photo) ? m.photo[m.photo.length - 1] : undefined
-  if (photo !== undefined) await save(photo.file_id, `${m.message_id}.jpg`)
-  if (m.document?.file_id !== undefined) {
-    // имя файла из ТГ санитайзим (слэши/управляющие), режем до 80
-    const safe = (m.document.file_name ?? "file").replace(/[/\\\x00-\x1f]/g, "_").slice(0, 80)
-    await save(m.document.file_id, `${m.message_id}_${safe}`)
-  }
+  for (const { fileId, name } of mediaFiles(m)) await save(fileId, name)
   return out
 }
 
@@ -1095,7 +1094,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
     log(`сессия диалога сброшена /reset${wasRunning ? " (сброшен и активный ход)" : ""}`)
     await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста (очередь сообщений сохранена).")
   } else if (out.kind === "media") {
-    await send(state.chatID, "⚠️ Такой тип медиа не разбираю (голос/видео/стикер) — опиши словами или пришли фото/файл")
+    await send(state.chatID, "⚠️ Такой тип сообщения не разбираю (голосовые, стикеры и пр.) — опиши словами или пришли фото/файл/видео")
   } else if (out.kind === "edit") {
     // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
     if (state.firing !== undefined && state.firing.msgIDs.includes(out.msg.message_id)) {
@@ -1105,8 +1104,8 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
       if (i >= 0) {
         // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
-        // пересобираем с маркерами (пути в ФС — источник для --attach агента)
-        const hasNewMedia = (Array.isArray(out.msg.photo) && out.msg.photo.length > 0) || out.msg.document?.file_id !== undefined
+        // пересобираем с маркерами (пути в ФС — агент фиксирует их в теле задачи; --attach — заглушка)
+        const hasNewMedia = mediaFiles(out.msg).length > 0
         const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
         const cur = state.queue[i]!
         const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
