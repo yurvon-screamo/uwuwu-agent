@@ -174,14 +174,14 @@ async function setCells(board: BoardIds, rowId: string, cells: Record<string, st
 
 type BodyResolution =
   | { kind: "ok"; docId: string; markdown: string }
-  | { kind: "refuse"; reason: string; commentDocId: string }
+  | { kind: "refuse"; reason: string }
   | { kind: "infra"; error: string }
 
 /** Вердикт по рендеру тела: unsupported-комментарии/пустота → refuse. */
 function renderVerdict(docId: string, markdown: string): BodyResolution {
   const issue = bodyRenderIssue(markdown)
   if (issue !== null) {
-    return { kind: "refuse", reason: `${issue} (docId ${docId})`, commentDocId: docId }
+    return { kind: "refuse", reason: `${issue} (docId ${docId})` }
   }
   return { kind: "ok", docId, markdown }
 }
@@ -205,7 +205,7 @@ async function resolveBody(board: BoardIds, row: CronRow): Promise<BodyResolutio
       }
     }
     if (row.title === "") {
-      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback", commentDocId: board.docId }
+      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback" }
     }
     const info = await mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId })
     const byTitle = await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
@@ -213,10 +213,10 @@ async function resolveBody(board: BoardIds, row: CronRow): Promise<BodyResolutio
     })
     const choice = chooseBodyDoc(row.bodyDoc, false, byTitle.ids ?? [])
     if (choice.kind === "duplicates") {
-      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI`, commentDocId: board.docId }
+      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI` }
     }
     if (choice.kind === "missing") {
-      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет`, commentDocId: board.docId }
+      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет` }
     }
     const exported = await mcp.tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: choice.docId })
     if (exported.exists !== true) {
@@ -348,12 +348,14 @@ async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, 
     }
     if (resolved.kind === "refuse") {
       // отказ вместо спавна: коммент причины с дедупом (только при смене),
-      // lastFiredAt/Last Run фиксируем — иначе ретрай каждым тиком = спам
+      // lastFiredAt/Last Run фиксируем — иначе ретрай каждым тиком = спам.
+      // Коммент — в док доски, НЕ в тело: коммент в опустошённом теле делал
+      // его «непустым», и следующий цикл файрил мусор (e2e 05.11)
       log(`крон «${title}»: отказ — ${resolved.reason}`)
       if (state.crons[row.rowId]?.lastRefusal !== resolved.reason) {
         await mcp.tool("create_comment", {
-          docId: resolved.commentDocId,
-          content: `крон не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
+          docId: board.docId,
+          content: `крон «${row.title || row.rowId.slice(0, 8)}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
         })
       }
       state.crons[row.rowId] = {
