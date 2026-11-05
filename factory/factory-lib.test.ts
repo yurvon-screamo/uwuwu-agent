@@ -28,8 +28,12 @@ import {
   routeTask,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
+  stallMinutesFromEnv,
+  lastActivityOf,
+  stallVerdict,
   type FactoryState,
   type RouteFacts,
+  type StallFacts,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
@@ -141,6 +145,12 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, missingSince: "2026-11-05T12:00:00.000Z" })).toBe(true)
     expect(isValidTracked({ ...base, missingSince: undefined })).toBe(true)
     expect(isValidTracked({ ...base, missingSince: 42 })).toBe(false)
+  })
+  test("stallSignaled: boolean и отсутствие — валидны, не-boolean — мимо", () => {
+    expect(isValidTracked({ ...base, stallSignaled: true })).toBe(true)
+    expect(isValidTracked({ ...base, stallSignaled: undefined })).toBe(true)
+    expect(isValidTracked(base)).toBe(true)
+    expect(isValidTracked({ ...base, stallSignaled: "yes" })).toBe(false)
   })
 })
 
@@ -523,6 +533,118 @@ describe("parseProjects: семантическая валидация", () => {
 
   test("пустой объект — отказ: демон без проектов молча не работает", () => {
     expect(() => parseProjects("{}", fallback)).toThrow(/пуст/)
+  })
+})
+
+// ——— сигнал о застое: env-парсер / парсер сообщений / вердикт ———
+
+describe("stallMinutesFromEnv: UWUWU_FACTORY_STALL_MIN", () => {
+  test("таблица: дефолт 30 на пустоту/мусор, валидное число — оно", () => {
+    expect(stallMinutesFromEnv(undefined)).toBe(30)
+    expect(stallMinutesFromEnv("")).toBe(30)
+    expect(stallMinutesFromEnv("  ")).toBe(30)
+    expect(stallMinutesFromEnv("15")).toBe(15)
+    expect(stallMinutesFromEnv("7.5")).toBe(7.5)
+    expect(stallMinutesFromEnv("0")).toBe(30) // сигнал на каждой паузе — мёртвый режим
+    expect(stallMinutesFromEnv("-5")).toBe(30)
+    expect(stallMinutesFromEnv("abc")).toBe(30)
+    expect(stallMinutesFromEnv("NaN")).toBe(30)
+  })
+})
+
+describe("lastActivityOf: активность последнего сообщения (список DESC)", () => {
+  test("пустой список — сообщений нет (= застой)", () => {
+    expect(lastActivityOf([])).toBeNull()
+  })
+  test("max по числовым полям времени (created/streamed/completed)", () => {
+    expect(lastActivityOf([{ id: "m1", time: { created: 100, streamed: 200, completed: 300 } }])).toBe(300)
+    expect(lastActivityOf([{ id: "m1", time: { created: 10, streamed: 90, completed: 50 } }])).toBe(90)
+  })
+  test("idle-маркер и сообщение без completed валидны — достаточно created", () => {
+    expect(lastActivityOf([{ id: "m1", type: "assistant", time: { created: 123 } }])).toBe(123)
+    expect(lastActivityOf([{ id: "m1", type: "idle", time: { created: 123, outcome: "success" } }])).toBe(123)
+  })
+  test("мусорное время — invalid (пропуск тика, не ложный сигнал)", () => {
+    expect(lastActivityOf([{ id: "m1", time: {} }])).toBe("invalid")
+    expect(lastActivityOf([{ id: "m1", time: null }])).toBe("invalid")
+    expect(lastActivityOf([{ id: "m1" }])).toBe("invalid")
+    expect(lastActivityOf([{ id: "m1", time: { created: "100" } }])).toBe("invalid")
+    expect(lastActivityOf([null, { time: { created: 1 } }])).toBe("invalid")
+  })
+  test("берётся только первое сообщение — мусор в [0] не спасают старые", () => {
+    expect(lastActivityOf([{ time: {} }, { time: { created: 999 } }])).toBe("invalid")
+  })
+})
+
+describe("stallVerdict: зависший ход при живой сессии", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const facts = (over: Partial<StallFacts> = {}): StallFacts => ({
+    status: "In Progress",
+    sessionAlive: true,
+    lastActivityAt: NOW - 40 * MIN,
+    branch: "work/task-abc",
+    branchInWorktree: true,
+    signaled: false,
+    now: NOW,
+    ...over,
+  })
+
+  test("живой In Progress со свежей активностью — none", () => {
+    expect(stallVerdict(facts({ lastActivityAt: NOW - 5 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("завис 40 мин при пороге 30 — signal; текст несёт минуты и диагноз ветки", () => {
+    const v = stallVerdict(facts(), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    expect(v.text).toContain("ветка на месте (work/task-abc)")
+    expect(v.text).toContain("комментарий")
+    // совет «что делать» называет рабочий путь будилки (Design будит через
+    // return-to-dev); перевод Needs attention → In Progress — noop маршрутизации
+    expect(v.text).toContain("Design")
+    expect(v.text).not.toContain("переставь статус")
+  })
+  test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
+    expect(stallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("активность вернулась при стоявшем флаге — none (демон снимет флаг)", () => {
+    expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("не In Progress — none даже при застое", () => {
+    expect(stallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("dead и unknown сессия — none (соседний код карантин / пропуск тика)", () => {
+    expect(stallVerdict(facts({ sessionAlive: false }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ sessionAlive: null }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("сообщений нет вовсе — signal (трекнутая сессия минимум с промптом)", () => {
+    const v = stallVerdict(facts({ lastActivityAt: null }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("сообщений в сессии нет")
+  })
+  test("диагноз ветки: пустая ячейка и ветка вне ворктри, значение обрезано до 60", () => {
+    const empty = stallVerdict(facts({ branch: "" }), 30 * MIN)
+    expect(empty.t).toBe("signal")
+    if (empty.t !== "signal") return
+    expect(empty.text).toContain("Branch-ячейка пуста")
+    const lost = stallVerdict(facts({ branchInWorktree: false, branch: "work/task-xyz" }), 30 * MIN)
+    expect(lost.t).toBe("signal")
+    if (lost.t !== "signal") return
+    expect(lost.text).toContain("ветки нет в ворктри (work/task-xyz)")
+    const long = `work/${"b".repeat(80)}`
+    const cut = stallVerdict(facts({ branchInWorktree: false, branch: long }), 30 * MIN)
+    if (cut.t !== "signal") return
+    expect(cut.text).toContain(long.slice(0, 60))
+    expect(cut.text).not.toContain(long)
+  })
+  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
+    expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
   })
 })
 

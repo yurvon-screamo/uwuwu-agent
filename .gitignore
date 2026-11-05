@@ -60,3 +60,6 @@ tools/.venv-triage/
 tools/*.npz
 .backups/
 .worktrees/
+# корневой cargo-таргет (ad-hoc CARGO_TARGET_DIR) и ворктри агентов
+/target/
+/wt/

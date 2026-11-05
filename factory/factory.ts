@@ -14,6 +14,9 @@
 //      коммент юзера → рестарт)
 //   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
 //      state + термин живой ревью-сессии
+//   5. In Progress: сессия жива, юзер и агент молчат дольше порога
+//      (UWUWU_FACTORY_STALL_MIN, деф. 30) → сигнал-коммент + Needs attention
+//      раз за эпизод (потерянный/зависший ход: активный ход рождает сообщения)
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
@@ -44,6 +47,9 @@ import {
   runBatch,
   parseProjects,
   formatPassSummary,
+  stallMinutesFromEnv,
+  lastActivityOf,
+  stallVerdict,
   adoptBodyDoc,
   pathSafe,
   type PassCounters,
@@ -93,6 +99,11 @@ const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
   : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
+/** порог тишины сессии: активный ход рождает сообщения на каждом шаге LLM —
+ *  тишина дольше порога = потерянный/зависший ход. Парсер валидирует env
+ *  (0/NaN/мусор → дефолт 30), эффективное значение — в стартовый лог. */
+const STALL_MIN = stallMinutesFromEnv(process.env.UWUWU_FACTORY_STALL_MIN)
+const STALL_MS = STALL_MIN * 60_000
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 /** DRY_RUN: полный цикл решений по реальным доскам (чтение), все мутации
@@ -454,6 +465,20 @@ async function sessionLiveness(sessionID: string): Promise<Liveness> {
     const status = (e as { status?: number }).status
     if (status === 404 || status === 400) return "dead"
     return "unknown"
+  }
+}
+
+/** Последняя активность сессии: max(created, streamed, completed) последнего
+ *  сообщения (DESC limit=1). null — сообщений нет; "invalid" — сбой REST или
+ *  нераспознанный формат: пропуск тика (транзиентные сбои и смена формата
+ *  /message при апгрейде opencode не дают ложных сигналов). */
+async function lastSessionActivity(sessionID: string): Promise<number | null | "invalid"> {
+  try {
+    const raw = await restCall(`/session/${sessionID}/message?limit=1&order=desc`)
+    if (!Array.isArray(raw)) return "invalid"
+    return lastActivityOf(raw)
+  } catch {
+    return "invalid"
   }
 }
 
@@ -946,6 +971,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // запоминаем наблюдённый статус — граница перехода для след. тика
     if (tracked.lastStatus !== row.status) {
       tracked.lastStatus = row.status
+      // смена статуса = новый эпизод застоя: пере-вход в In Progress должен
+      // уметь сигналить снова (наш собственный сигнал уводит строку из
+      // In Progress — без сброса флаг заглушил бы повторные застои навсегда)
+      if (tracked.stallSignaled === true) {
+        delete tracked.stallSignaled
+        log(`задача ${rowId.slice(0, 8)}: статус сменился — флаг застоя сброшен (новый эпизод)`)
+      }
       saveState(state)
     }
 
@@ -992,6 +1024,54 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         saveState(state)
         await notify(tracked,
           "[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с master).")
+      } else if (quiet === "alive" && row.status === "In Progress") {
+        // сессия жива — ловим зависший ход: агент молчит дольше порога
+        // (активный ход рождает сообщения на каждом шаге LLM). Неизвестная
+        // активность (REST/формат) — пропуск тика без операций с флагом
+        const activity = await lastSessionActivity(tracked.sessionID)
+        if (activity === "invalid") {
+          log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
+        } else {
+          // git только когда вердикт может стать signal: предварительный чек
+          // застоя — решение остаётся в stallVerdict, ветка в facts нужна
+          // лишь для текста сигнала
+          const stalled = activity === null || Date.now() - activity > STALL_MS
+          const branchInWorktree = stalled && (await resolveWorktree(cfg.local, row.branch)) !== ""
+          const verdict = stallVerdict({
+            status: row.status,
+            sessionAlive: true,
+            lastActivityAt: activity,
+            branch: row.branch,
+            branchInWorktree,
+            signaled: tracked.stallSignaled === true,
+            now: Date.now(),
+          }, STALL_MS)
+          if (verdict.t === "signal") {
+            // эскалация как у registerFailure/failReview: коммент + Needs
+            // attention; lastStatus сразу за доской (как в failReview)
+            log(`задача ${rowId.slice(0, 8)}: In Progress при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
+            if (DRY_RUN) {
+              // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
+              // без флага анти-спам в песочнице не работает — сигнал повторялся
+              // бы каждые 2 тика (расхождение с продом задокументировано логом)
+              log(`DRY_RUN: эскалация Needs attention + коммент — пропущены`)
+            } else {
+              await setCells(board, rowId, { Status: "Needs attention" })
+              tracked.stallSignaled = true
+              tracked.lastStatus = "Needs attention"
+              saveState(state)
+              await notify(tracked, verdict.text)
+            }
+          } else if (verdict.t === "none" && tracked.stallSignaled === true) {
+            delete tracked.stallSignaled
+            saveState(state)
+            // до этой ветки штатный путь «возврат в In Progress» не доходит —
+            // флаг снимает сброс на смене статуса выше; здесь — эпизод,
+            // завершённый без смены статуса (наш сигнал поставил Needs attention,
+            // rollback-окно старого кода), формулировка обобщённая
+            log(`задача ${rowId.slice(0, 8)}: эпизод застоя завершён — флаг снят (статус вне In Progress или активность вернулась)`)
+          }
+        }
       }
       continue
     }
@@ -1069,7 +1149,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   while (true) {
