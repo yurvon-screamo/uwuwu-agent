@@ -736,26 +736,65 @@ async fn cached_rows(
 /// исторические тела комментились голыми буллетами без секции (thread отвечал
 /// «комментов нет» при живых комментах — гэп ADR-014).
 pub async fn comment(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
+    comment_with_ts(sy, board, task, author, text, reply_to, &ts).await
+}
+
+/// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
+/// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
+/// поэтому ts вычисляется один раз на вызов.
+pub(crate) async fn comment_with_ts(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>, ts: &str) -> Result<()> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
     ensure_comments_section(sy, &body).await?;
-    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+    let marker = format!("- **{author}** ({ts}): {text}");
     let line = match reply_to {
-        Some(_) => format!("\n  - **{author}** ({ts}): {text}"),
-        None => format!("\n- **{author}** ({ts}): {text}"),
+        Some(_) => format!("\n  {marker}"),
+        None => format!("\n{marker}"),
     };
-    sy.append_block_md(&body, &line).await?;
+    append_once_confirmed(sy, &body, &line, &marker).await
+}
+
+/// Идемпотентный аппенд строки: один POST без слепых ретраев; до и после
+/// сбоя — контрольное чтение дока, маркер уже там → успех без повтора
+/// (слепой ретрай неидемпотентной записи при потерянном ответе плодит
+/// бит-в-бит дубли — факт ses_e729d7329ffe). Маркер матчится как подстрока:
+/// отступ реплай-строки матчу не мешает.
+async fn append_once_confirmed(sy: &SiYuan, doc_id: &str, line: &str, marker: &str) -> Result<()> {
+    if doc_md_contains(sy, doc_id, marker).await? {
+        return Ok(());
+    }
+    if let Err(err) = sy.append_block_md_once(doc_id, line).await {
+        if doc_md_contains(sy, doc_id, marker).await? {
+            return Ok(());
+        }
+        return Err(err);
+    }
     Ok(())
+}
+
+async fn doc_md_contains(sy: &SiYuan, doc_id: &str, marker: &str) -> Result<bool> {
+    let md = sy.export_md_by_id(doc_id).await?;
+    Ok(md.contains(marker))
 }
 
 /// Секция «Комменты» в теле? Если нет — заголовок append'ится первым блоком.
 /// Экспорт без ретраев: сбой read честно валит коммент, вместо риска задвоить
 /// заголовок (write-пути при флаке шлюза никогда не ретраются в лоб).
+/// Аппенд — подтверждённый (append_once_confirmed-паттерн): применённый и
+/// потерянный заголовок узнаётся контрольным чтением has_h2_section.
 pub(crate) async fn ensure_comments_section(sy: &SiYuan, doc_id: &str) -> Result<()> {
     let md = sy.export_md_by_id(doc_id).await?;
-    if !crate::md_heading::has_h2_section(&md, "Комменты") {
-        sy.append_block_md(doc_id, "## Комменты").await?;
+    if crate::md_heading::has_h2_section(&md, "Комменты") {
+        return Ok(());
+    }
+    if let Err(err) = sy.append_block_md_once(doc_id, "## Комменты").await {
+        let md = sy.export_md_by_id(doc_id).await?;
+        if crate::md_heading::has_h2_section(&md, "Комменты") {
+            return Ok(());
+        }
+        return Err(err);
     }
     Ok(())
 }

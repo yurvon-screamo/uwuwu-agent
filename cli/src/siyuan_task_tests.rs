@@ -302,3 +302,193 @@ async fn comment_creates_comments_section_once() {
     assert_eq!(appends.len(), 1, "заголовок секции append'ится ровно один раз");
     assert_eq!(appends[0], "## Комменты");
 }
+
+/// Поведение appendBlock мока: успех; «применено, ответ потерян» (запись в
+/// контенте есть, клиент видит code≠0); отказ без применения.
+#[derive(Clone, Copy)]
+enum AppendBehavior {
+    Ok,
+    AppliedButLost,
+    Rejected,
+}
+
+/// Состояние мок-дока: экспорт отдаёт текущий контент, appendBlock мутирует
+/// его и/или «роняет» ответ согласно behavior.
+struct DocMock {
+    server: wiremock::MockServer,
+    content: Arc<Mutex<String>>,
+    appends: Arc<Mutex<Vec<String>>>,
+}
+
+async fn spawn_doc_mock(initial: &str, behavior: AppendBehavior) -> DocMock {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BODY_DOC: &str = "20261105120000-bounddo1";
+    let server = MockServer::start().await;
+    let content = Arc::new(Mutex::new(initial.to_string()));
+    let appends = Arc::new(Mutex::new(Vec::new()));
+
+    // резолв тела: SQL по id (живость привязки) + getIDsByHPath по тайтлу
+    Mock::given(method("POST"))
+        .and(path("/api/query/sql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+            let data = if stmt.contains(&format!("id='{BODY_DOC}'")) {
+                json!([{ "id": BODY_DOC }])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": data }).to_string())
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/filetree/getIDsByHPath"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let data = if hpath.ends_with("таск") { json!(["20261105120000-titleb2"]) } else { json!([]) };
+            ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": data }).to_string())
+        })
+        .mount(&server)
+        .await;
+
+    let content_for_export = content.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/export/exportMdContent"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let md = content_for_export.lock().expect("content lock").clone();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "code": 0, "msg": "", "data": { "content": md } }))
+        })
+        .mount(&server)
+        .await;
+
+    let content_for_append = content.clone();
+    let appends_log = appends.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/block/appendBlock"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let data = body.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+            if matches!(behavior, AppendBehavior::Ok | AppendBehavior::AppliedButLost) {
+                content_for_append.lock().expect("content lock").push_str(&data);
+            }
+            appends_log.lock().expect("appends lock").push(data);
+            // «применено, ответ потерян»: запись в контенте есть, клиент видит сбой
+            let code = match behavior {
+                AppendBehavior::Ok => 0,
+                AppendBehavior::AppliedButLost | AppendBehavior::Rejected => -1,
+            };
+            ResponseTemplate::new(200).set_body_json(json!({ "code": code, "msg": "lost", "data": null }))
+        })
+        .mount(&server)
+        .await;
+
+    DocMock { server, content, appends }
+}
+
+const TS: &str = "2026-11-05 10:00";
+
+#[tokio::test]
+async fn comment_applied_but_lost_writes_recovered_without_duplicates() {
+    let mock = spawn_doc_mock("# Таск\n\n## Постановка\nтело\n", AppendBehavior::AppliedButLost).await;
+    let sy = SiYuan::for_tests(mock.server.uri());
+    let board = test_board();
+    let task = test_task();
+
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+        .await
+        .expect("записи применены, ответы потеряны — контрольные чтения узнают свои");
+
+    let content = mock.content.lock().expect("content lock");
+    assert_eq!(
+        content.matches("## Комменты").count(),
+        1,
+        "заголовок секции без дублей: {content}"
+    );
+    assert_eq!(
+        content.matches(&format!("- **AGENTS** ({TS}): привет")).count(),
+        1,
+        "коммент без дублей (слепой ретрай дал бы копии): {content}"
+    );
+    let appends = mock.appends.lock().expect("appends lock");
+    assert_eq!(appends.len(), 2, "ровно заголовок + коммент, без слепых ретраев");
+}
+
+#[tokio::test]
+async fn comment_precheck_skips_line_already_in_doc() {
+    let seeded = "# Таск\n\n## Комменты\n- **AGENTS** (2026-11-05 10:00): привет\n";
+    let mock = spawn_doc_mock(seeded, AppendBehavior::Ok).await;
+    let sy = SiYuan::for_tests(mock.server.uri());
+    let board = test_board();
+    let task = test_task();
+
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+        .await
+        .expect("идемпотентный повтор: коммент уже в доке");
+
+    let appends = mock.appends.lock().expect("appends lock");
+    assert!(
+        appends.is_empty(),
+        "повторный коммент не постится — гвард по свежему чтению: {appends:?}"
+    );
+}
+
+#[tokio::test]
+async fn comment_precheck_matches_indented_reply_lines() {
+    let seeded = "# Таск\n\n## Комменты\n  - **AGENTS** (2026-11-05 10:00): привет\n";
+    let mock = spawn_doc_mock(seeded, AppendBehavior::Ok).await;
+    let sy = SiYuan::for_tests(mock.server.uri());
+    let board = test_board();
+    let task = test_task();
+
+    crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", Some("20261105-thread"), TS)
+        .await
+        .expect("реплай-дубль узнаётся по контенту строки без отступа");
+
+    let appends = mock.appends.lock().expect("appends lock");
+    assert!(appends.is_empty(), "отступ не ломает матчинг дубля: {appends:?}");
+}
+
+#[tokio::test]
+async fn comment_honest_failure_when_write_not_applied() {
+    let mock = spawn_doc_mock("# Таск\n\n## Комменты\n", AppendBehavior::Rejected).await;
+    let sy = SiYuan::for_tests(mock.server.uri());
+    let board = test_board();
+    let task = test_task();
+
+    let err = crate::siyuan_task::comment_with_ts(&sy, &board, &task, "AGENTS", "привет", None, TS)
+        .await
+        .expect_err("запись не применена — честный отказ без выдуманного успеха");
+    assert!(err.to_string().contains("appendBlock"), "суть сбоя названа: {err}");
+    assert_eq!(
+        mock.appends.lock().expect("appends lock").len(),
+        1,
+        "один POST, без слепых ретраев"
+    );
+}
+
+fn test_board() -> SyBoard {
+    SyBoard {
+        doc_id: "board-doc".into(),
+        av_id: "av-1".into(),
+        block_id: "block-1".into(),
+        hpath: "/uwuwu/Задачи uwuwu".into(),
+        notebook: "20261103224312-fbrf5fp".into(),
+    }
+}
+
+fn test_task() -> SyTask {
+    SyTask {
+        item_id: "item-1".into(),
+        title: "таск".into(),
+        status: "Draft".into(),
+        branch: String::new(),
+        pr: String::new(),
+        schedule: String::new(),
+        body_doc: Some("20261105120000-bounddo1".into()),
+    }
+}

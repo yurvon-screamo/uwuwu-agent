@@ -340,6 +340,22 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Одноразовый appendBlock без слепых ретраев: неидемпотентная запись при
+    /// потерянном ответе на ретрае дублируется — контрольный повтор делает
+    /// вызывающий код (confirm-чтение), транспорт честно сообщает один сбой.
+    /// Wave-гейт как у post(): окно fail-fast не пробивается записью.
+    pub async fn append_block_md_once(&self, doc_id: &str, markdown: &str) -> Result<()> {
+        if self.wave_cooldown_active() {
+            bail!("POST /api/block/appendBlock: пропущено — {WAVE_HINT} (окно fail-fast активно)");
+        }
+        self.post_probe(
+            "/api/block/appendBlock",
+            json!({ "dataType": "markdown", "data": markdown, "parentID": doc_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// docId неизменен: контент перезаписывается на месте (привязка строк-канбана живёт).
     /// Очистка детей верифицируется повторным get_children; пустой док ядра —
     /// один ZWJ-параграф (SiYuan не оставляет док без блока).
