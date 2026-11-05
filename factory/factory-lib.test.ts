@@ -11,6 +11,7 @@ import {
   worktreePaths,
   worktreeByBranch,
   isValidTracked,
+  rowMissingAction,
   reviewKindOf,
   reviewSpawnPrompt,
   reviewRerunPrompt,
@@ -126,6 +127,22 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, worktree: "relative" })).toBe(false)
     expect(isValidTracked({ ...base, sessionID: "gh_1" })).toBe(false)
     expect(isValidTracked({ ...base, lastCommentAt: "1" })).toBe(false)
+  })
+  test("missingSince: строка и отсутствие — валидны, чужой тип — мимо", () => {
+    expect(isValidTracked({ ...base, missingSince: "2026-11-05T12:00:00.000Z" })).toBe(true)
+    expect(isValidTracked({ ...base, missingSince: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, missingSince: 42 })).toBe(false)
+  })
+})
+
+describe("rowMissingAction — двухпроходная чистка", () => {
+  test("первая пропажа — пометка, повторная — чистка", () => {
+    expect(rowMissingAction(undefined, false)).toBe("mark")
+    expect(rowMissingAction("2026-11-05T12:00:00.000Z", false)).toBe("clean")
+  })
+  test("строка вернулась — пометка снимается; без пометки — hold", () => {
+    expect(rowMissingAction("2026-11-05T12:00:00.000Z", true)).toBe("clear")
+    expect(rowMissingAction(undefined, true)).toBe("hold")
   })
 })
 

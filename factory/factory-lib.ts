@@ -45,6 +45,11 @@ export interface TrackedTask {
   reviewSessionID?: string
   /** неудачные спавны ревьювера подряд (эскалация до Needs attention) */
   reviewAttempts?: number
+  /** ISO первой пропажи строки из скана доски (suspect); undefined —
+   *  строка наблюдалась. Чистка finishTask необратима (delete state +
+   *  DELETE ревью-сессии) — только при пропаже в двух проходах подряд:
+   *  одиночный промах скана не должен терять трекинг (прод-кейс 05.11). */
+  missingSince?: string
 }
 
 export interface FactoryState {
@@ -315,6 +320,18 @@ export function routeTask(f: RouteFacts): RouteAction {
   return { t: "noop" }
 }
 
+export type RowMissingAction = "mark" | "clean" | "clear" | "hold"
+
+/** Пропажа строки трека из скана доски. rowFound=false: первая пропажа —
+ *  suspect-пометка (mark), повторная — чистка (clean, необратимая
+ *  finishTask). rowFound=true: стоявшая пометка снимается (clear), без
+ *  пометки — ничего (hold). Два прохода подряд страхуют необратимую чистку
+ *  от одиночного промаха скана (дрейф страниц при конкурентных правках). */
+export function rowMissingAction(missingSince: string | undefined, rowFound: boolean): RowMissingAction {
+  if (rowFound) return missingSince === undefined ? "hold" : "clear"
+  return missingSince === undefined ? "mark" : "clean"
+}
+
 /** Ветка и путь ворктри для задачи (row-id может начинаться с дефиса). */
 export function worktreePaths(root: string, rowId: string): { branch: string; worktree: string } {
   const safe = rowId.replace(/^-+/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || "task"
@@ -345,6 +362,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   ) return false
   if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
+  if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (
     t.reviewSessionID !== undefined &&
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))

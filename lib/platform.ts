@@ -11,6 +11,7 @@
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { collectBoardView, type BoardViewPage } from "./board-view"
 
 const SIYUAN_URL = process.env.UWUWU_SIYUAN_URL || "http://127.0.0.1:6806"
 
@@ -198,23 +199,20 @@ async function avIdOfBlock(blockId: string): Promise<string> {
 
 // ——— эмуляция афин-тулзов ———
 
-interface RenderRow {
-  id?: string
-  cells?: { value?: { keyID?: string; type?: string; block?: { content?: string }; mSelect?: { content?: string }[]; text?: { content?: string } } }[]
+/** Одна страница render (page с 1; серверный pageSize — 50, см. board-view). */
+async function renderPage(blockId: string, avId: string, page: number): Promise<BoardViewPage> {
+  const r = await mcpToolCall("database", { action: "render", id: avId, blockID: blockId, page })
+  return (r.data ?? r) as BoardViewPage
 }
 
 async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const blockId = String(args.databaseBlockId ?? "")
   const avId = await avIdOfBlock(blockId)
-  const r = await mcpToolCall("database", { action: "render", id: avId, blockID: blockId })
-  const data = (r.data ?? r) as {
-    view?: { columns?: { id?: string; name?: string }[]; rows?: RenderRow[] }
-  }
-  const columns = data.view?.columns ?? []
+  const view = await collectBoardView((page) => renderPage(blockId, avId, page))
   const nameOf = new Map<string, string>()
-  for (const c of columns) if (c.id && c.name) nameOf.set(c.id, c.name)
+  for (const c of view.columns) if (c.id && c.name) nameOf.set(c.id, c.name)
   const rows: Record<string, unknown>[] = []
-  for (const row of data.view?.rows ?? []) {
+  for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
     for (const cell of row.cells ?? []) {
@@ -381,6 +379,12 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
 export const __test = {
   commentToSnapshot,
   SIYUAN_URL,
+  /** Живая проба одной страницы render (page с 1) — независимый источник
+   *  rowCount ядра для живого теста полноты выборки. */
+  renderBoardPage: async (blockId: string, page: number): Promise<BoardViewPage> => {
+    const avId = await avIdOfBlock(blockId)
+    return renderPage(blockId, avId, page)
+  },
   // совместимость со старым тестом сессий: у SiYuan адаптера нет разделяемой
   // сессии с протуханием — expireSession безопасен как no-op
   expireSession: (): void => {
