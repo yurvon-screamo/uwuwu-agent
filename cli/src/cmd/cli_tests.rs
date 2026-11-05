@@ -155,6 +155,41 @@ fn undo_journal_alone_means_restore() {
     assert_eq!(journal.as_deref(), Some("журнал.json"));
 }
 
+fn expect_create(command: Commands) -> (Option<String>, bool) {
+    let Commands::Task { command: TaskSub::Create { r#type: ty, dry_run, .. }, .. } = command
+    else {
+        panic!("expected task create subcommand");
+    };
+    (ty, dry_run)
+}
+
+#[test]
+fn create_dry_run_flag_parses_with_type() {
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "create",
+        "--title",
+        "T",
+        "--type",
+        "bug",
+        "--dry-run",
+    ])
+    .expect("dry-run — флаг create, совместим с --type");
+    let (ty, dry_run) = expect_create(command);
+    assert!(dry_run, "--dry-run распознан");
+    assert_eq!(ty.as_deref(), Some("bug"), "--type сохранён рядом с --dry-run");
+}
+
+#[test]
+fn create_without_dry_run_defaults_to_live() {
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "create", "--title", "T"]).unwrap();
+    let (_, dry_run) = expect_create(command);
+    assert!(!dry_run, "без флага — живой create (скелет-осмотр только через --dry-run)");
+}
+
 // ——— профилактика (тело задачи 20261104072048-4n1rwdt): body/edit/close —
 // строгая грамматика «id + флаги, лишнее — громкая ошибка». У этих сабкоманд
 // нет trailing_var_arg — clap отклоняет лишние позиционные; пинну, чтобы
