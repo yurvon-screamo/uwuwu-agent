@@ -173,15 +173,19 @@ describe("bodyRenderIssue: тело, рендерящееся агенту в п
     const md = "<!-- unsupported: flavour=affine:database -->\n<!-- вторая легаси-строка -->\n"
     expect(bodyRenderIssue(md)).toBe("тело рендерится в пусто/unsupported-комментарии")
   })
+  test("живой экспорт-шейп инцидента: frontmatter + заголовок-эхо + комментарии → причина", () => {
+    const md = "---\ntitle: крон\n---\n\n# крон\n\n<!-- unsupported: flavour=affine:database -->\n<!-- e2e: рендер в пустоту -->\n"
+    expect(bodyRenderIssue(md)).not.toBeNull()
+  })
   test("frontmatter + комментарии + zero-width → причина", () => {
-    const md = "---\ntitle: x\n---\n<!-- коммент -->\n\u200B\uFEFF"
+    const md = "---\ntitle: x\n---\n# x\n<!-- коммент -->\n\u200B\uFEFF"
     expect(bodyRenderIssue(md)).not.toBeNull()
   })
   test("пустая строка → причина", () => {
     expect(bodyRenderIssue("")).not.toBeNull()
     expect(bodyRenderIssue("  \n\n")).not.toBeNull()
   })
-  test("стаб cron set — валидное тело", () => {
+  test("стаб cron set — валидное тело (заголовок-эхо срезан, постановка осталась)", () => {
     expect(bodyRenderIssue(cronBodyStub("Проверка Z", "5m"))).toBeNull()
   })
   test("av-экспорт доски (таблица) читаем — валиден", () => {
@@ -194,8 +198,11 @@ describe("bodyRenderIssue: тело, рендерящееся агенту в п
 })
 
 describe("stripNonContent", () => {
-  test("frontmatter срезается только в начале дока", () => {
-    expect(stripNonContent("---\ntitle: t\n---\nтекст")).toBe("текст")
+  test("frontmatter и заголовок-эхо срезаются только в начале дока", () => {
+    expect(stripNonContent("---\ntitle: t\n---\n# эхо\nтекст")).toBe("текст")
+    expect(stripNonContent("текст\n# внутренний заголовок")).toContain("внутренний заголовок")
+  })
+  test("frontmatter не в начале — контент", () => {
     expect(stripNonContent("текст\n---\nне frontmatter\n---\n")).toContain("не frontmatter")
   })
 })
@@ -216,15 +223,15 @@ describe("chooseBodyDoc: паритет CLI choose_body_doc", () => {
 })
 
 describe("titleFromBody", () => {
-  test("frontmatter и unsupported-мусор в имя не попадают", () => {
-    const md = "---\ntitle: метадата\n---\n<!-- unsupported -->\n# Реальный заголовок\nтекст"
-    expect(titleFromBody(md)).toBe("Реальный заголовок")
+  test("заголовок-эхо и unsupported-мусор в имя не попадают", () => {
+    const md = "---\ntitle: метадата\n---\n# эхо\n<!-- unsupported -->\n## Реальная секция\nтекст"
+    expect(titleFromBody(md)).toBe("Реальная секция")
   })
   test("без заголовка — первая содержательная строка", () => {
     expect(titleFromBody("первая строка\nвторая")).toBe("первая строка")
   })
   test("пусто/мусор → пустая строка", () => {
-    expect(titleFromBody("<!-- only comments -->\u200B")).toBe("")
+    expect(titleFromBody("# эхо\n<!-- only comments -->\u200B")).toBe("")
     expect(titleFromBody("")).toBe("")
   })
 })

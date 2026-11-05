@@ -169,11 +169,15 @@ export function pathSafe(title: string): string {
   return title.replace(/\//g, "∕")
 }
 
-/** Снятие YAML-frontmatter, HTML-комментариев и zero-width символов: экспорт
- *  тела, состоящего только из них, рендерится агенту в пустоту — инцидентный
- *  класс «тело из unsupported-комментариев → сессия с пустым промптом». */
+/** Снятие экспорт-обвязки и невидимых символов: YAML-frontmatter, заголовок-эхо
+ *  дока (exportMdContent всегда препендит `# <title>` — это метаданные, не
+ *  постановка), HTML-комментарии (в т.ч. unsupported-легаси) и zero-width.
+ *  Экспорт тела, состоящего после этого из пустоты, рендерится агенту в
+ *  пустоту — инцидентный класс «тело из unsupported-комментариев → сессия
+ *  с пустым промптом». */
 export function stripNonContent(md: string): string {
   let text = md.replace(/^---\n[\s\S]*?\n---\n/, "")
+  text = text.replace(/^\s*#[^\n]*\n?/, "")
   text = text.replace(/<!--[\s\S]*?-->/g, "")
   return text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()
 }
