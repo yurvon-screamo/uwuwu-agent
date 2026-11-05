@@ -808,40 +808,52 @@ def cmd_session(args: argparse.Namespace) -> dict:
 # ---------- CLI ----------
 
 
+def _global_option_specs() -> list[tuple[tuple[str, ...], dict]]:
+    """Глобальные опции: (args, kwargs) с настоящими default.
+
+    В парсеры попадают с default=argparse.SUPPRESS (см. build_parser):
+    опцию, которую не видели, argparse не создаёт в namespace — дефолты
+    дозаполняет _fill_global_defaults() после parse_args. Один и тот же
+    parent подключён и к главному парсеру, и к каждому сабпарсеру, поэтому
+    обе формы вызова (`--db X session S` и `session S --db X`) эквивалентны.
+    """
+    return [
+        (
+            ("--db",),
+            dict(type=Path, default=DEFAULT_DB, help=f"Path to opencode.db (default: {DEFAULT_DB})"),
+        ),
+        (
+            ("--wiki",),
+            dict(type=Path, default=DEFAULT_WIKI, help=f"Path to wiki/ dir (default: {DEFAULT_WIKI})"),
+        ),
+        (("--compact",), dict(action="store_true", default=False, help="Compact JSON output (no pretty-print)")),
+        (("--limit-user-msgs",), dict(type=int, default=LIMIT_USER_MSGS)),
+        (("--limit-asst-texts",), dict(type=int, default=LIMIT_ASST_TEXTS)),
+        (("--limit-shell-cmds",), dict(type=int, default=LIMIT_SHELL_CMDS)),
+        (("--limit-kid-titles",), dict(type=int, default=LIMIT_KID_TITLES)),
+        (("--text-truncate",), dict(type=int, default=TEXT_TRUNCATE)),
+        (("--limit-timeline",), dict(type=int, default=LIMIT_TIMELINE)),
+        (("--limit-tool-use-samples",), dict(type=int, default=LIMIT_TOOL_USE_SAMPLES)),
+        (("--shell-output-preview",), dict(type=int, default=SHELL_OUTPUT_PREVIEW)),
+        (("--limit-reasoning",), dict(type=int, default=LIMIT_REASONING)),
+        (("--reasoning-truncate",), dict(type=int, default=REASONING_TRUNCATE)),
+    ]
+
+
 def build_parser() -> argparse.ArgumentParser:
+    parent = argparse.ArgumentParser(add_help=False)
+    for opt_args, kwargs in _global_option_specs():
+        parent.add_argument(*opt_args, default=argparse.SUPPRESS, **{k: v for k, v in kwargs.items() if k != "default"})
+
     p = argparse.ArgumentParser(
         prog="opencode_audit.py",
         description="Data layer для аудита opencode-сессий. JSON в stdout.",
+        parents=[parent],
     )
-    p.add_argument(
-        "--db",
-        type=Path,
-        default=DEFAULT_DB,
-        help=f"Path to opencode.db (default: {DEFAULT_DB})",
-    )
-    p.add_argument(
-        "--wiki",
-        type=Path,
-        default=DEFAULT_WIKI,
-        help=f"Path to wiki/ dir (default: {DEFAULT_WIKI})",
-    )
-    p.add_argument(
-        "--compact", action="store_true", help="Compact JSON output (no pretty-print)"
-    )
-    p.add_argument("--limit-user-msgs", type=int, default=LIMIT_USER_MSGS)
-    p.add_argument("--limit-asst-texts", type=int, default=LIMIT_ASST_TEXTS)
-    p.add_argument("--limit-shell-cmds", type=int, default=LIMIT_SHELL_CMDS)
-    p.add_argument("--limit-kid-titles", type=int, default=LIMIT_KID_TITLES)
-    p.add_argument("--text-truncate", type=int, default=TEXT_TRUNCATE)
-    p.add_argument("--limit-timeline", type=int, default=LIMIT_TIMELINE)
-    p.add_argument("--limit-tool-use-samples", type=int, default=LIMIT_TOOL_USE_SAMPLES)
-    p.add_argument("--shell-output-preview", type=int, default=SHELL_OUTPUT_PREVIEW)
-    p.add_argument("--limit-reasoning", type=int, default=LIMIT_REASONING)
-    p.add_argument("--reasoning-truncate", type=int, default=REASONING_TRUNCATE)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_over = sub.add_parser("overview", help="Aggregate stats for a period")
+    p_over = sub.add_parser("overview", parents=[parent], help="Aggregate stats for a period")
     p_over.add_argument(
         "--days", type=int, default=7, help="Look back N days (default: 7)"
     )
@@ -853,24 +865,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_over.set_defaults(func=cmd_overview)
 
-    p_day = sub.add_parser("day", help="Detailed dump of a single day")
+    p_day = sub.add_parser("day", parents=[parent], help="Detailed dump of a single day")
     p_day.add_argument("date", type=parse_date, help="Day YYYY-MM-DD")
     p_day.set_defaults(func=cmd_day)
 
-    p_range = sub.add_parser("range", help="Detailed dump of a date range (inclusive)")
+    p_range = sub.add_parser("range", parents=[parent], help="Detailed dump of a date range (inclusive)")
     p_range.add_argument("start", type=parse_date, help="Start YYYY-MM-DD")
     p_range.add_argument("end", type=parse_date, help="End YYYY-MM-DD")
     p_range.set_defaults(func=cmd_range)
 
-    p_sess = sub.add_parser("session", help="Forensic dump of a single session")
+    p_sess = sub.add_parser("session", parents=[parent], help="Forensic dump of a single session")
     p_sess.add_argument("session_id", help="session id (ses_...)")
     p_sess.set_defaults(func=cmd_session)
 
     return p
 
 
+def _fill_global_defaults(args: argparse.Namespace) -> None:
+    """Дозаполнить дефолты глобальных опций, подавленные SUPPRESS'ом."""
+    for opt_args, kwargs in _global_option_specs():
+        dest = opt_args[0].lstrip("-").replace("-", "_")
+        if not hasattr(args, dest):
+            setattr(args, dest, kwargs["default"])
+
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    args = build_parser().parse_args(argv)
+    _fill_global_defaults(args)
+    return args
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = parse_cli_args()
     result = args.func(args)
     indent = None if args.compact else 2
     print(json.dumps(result, ensure_ascii=False, indent=indent))

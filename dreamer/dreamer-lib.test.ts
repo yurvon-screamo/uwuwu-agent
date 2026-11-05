@@ -198,7 +198,8 @@ describe("dreamerPrompt / isValidTracked", () => {
       dreamerPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db" }),
       wakeupPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" }),
     ]) {
-      const cmd = p.split("\n").find((l) => l.includes("python3 \"/a.py\""))!
+      const cmd = p.split("\n").find((l) => l.includes("python3 \"/a.py\""))
+      expect(cmd).toBeDefined()
       expect(cmd).toContain(`--db "/b.db" --compact session ses_abc`)
       expect(cmd).not.toContain(`session ses_abc --`)
     }
