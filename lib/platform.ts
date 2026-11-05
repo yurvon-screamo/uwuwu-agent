@@ -108,7 +108,7 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const hasSession = mcpSession !== ""
   if (hasSession) headers["Mcp-Session-Id"] = mcpSession
-  const r = await fetch(SIYUAN_URL + "/mcp", {
+  const r = await fetch(`${SIYUAN_URL}/mcp`, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
@@ -213,7 +213,7 @@ async function avKeys(avId: string): Promise<Map<string, string>> {
   const hit = keyCache.get(avId)
   if (hit) return hit
   const r = await mcpToolCall("database", { action: "keys", id: avId })
-  const keys = ((r.data as { keys?: { id?: string; name?: string }[] }) ?? {}).keys ?? []
+  const keys = (r.data as { keys?: { id?: string; name?: string }[] })?.keys ?? []
   const m = new Map<string, string>()
   for (const k of keys) if (k.id && k.name) m.set(k.name, k.id)
   keyCache.set(avId, m)
@@ -370,7 +370,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
           })
           continue
         }
-        const rep = line.match(/^  - \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
+        const rep = line.match(/^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
         if (rep && edges.length > 0) {
           const node = edges[edges.length - 1].node as { replies?: Record<string, unknown>[] }
           node.replies = node.replies ?? []
