@@ -136,6 +136,11 @@ def _sql_scalar(stmt: str) -> int:
     return int(rows[0]["c"]) if rows else 0
 
 
+def _sql_str(value: str) -> str:
+    # Одинарная кавычка в SQL-литерале экранируется удвоением (SQLite kernel).
+    return value.replace("'", "''")
+
+
 def _doc_row(doc_id: str) -> dict | None:
     stmt = f"select id, hpath, path, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
     rows = _sql_rows(stmt)
@@ -151,8 +156,8 @@ def _children_count(doc_path: str) -> int:
 
 
 def _siblings_count(box: str, hpath: str) -> int:
-    hpath_sql = hpath.replace("'", "''")
-    stmt = f"select count(*) c from blocks where type='d' and box='{box}' and hpath='{hpath_sql}' limit 1"  # nosec B608 — box из kernel API, hpath экранирован
+    hpath_sql = _sql_str(hpath)
+    stmt = f"select count(*) c from blocks where type='d' and box='{box}' and hpath='{hpath_sql}' limit 1"  # nosec B608 — box из kernel API, hpath экранирован _sql_str
     return _sql_scalar(stmt)
 
 
@@ -200,18 +205,16 @@ def cmd_delete(a):
 def cmd_orgls(a):
     for nb in notebooks():
         print(f"[{nb['name']}]")
-        stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"
-        rows = post("/api/query/sql", {"stmt": stmt})
-        rows = rows if isinstance(rows, list) else rows.get("data", [])
+        stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"  # nosec B608 — nb.id из kernel API
+        rows = _sql_rows(stmt)
         for r in sorted(rows, key=lambda x: x["hpath"]):
             depth = r["hpath"].count("/") - 1
             print("  " * (depth + 1) + r["hpath"].rstrip("/").split("/")[-1])
 
 
 def cmd_find(a):
-    stmt = f"select id, hpath from blocks where type='d' and content like '%{a.title.replace(chr(39), chr(39)*2)}%' limit 10"
-    rows = post("/api/query/sql", {"stmt": stmt})
-    rows = rows if isinstance(rows, list) else rows.get("data", [])
+    stmt = f"select id, hpath from blocks where type='d' and content like '%{_sql_str(a.title)}%' limit 10"  # nosec B608 — title экранирован _sql_str
+    rows = _sql_rows(stmt)
     for r in rows:
         print(r["id"], r["hpath"])
 
