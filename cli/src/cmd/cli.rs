@@ -182,8 +182,6 @@ pub(crate) enum CronSub {
     },
     /// Остановить (Status=paused)
     Pause {
-    /// Остановить (Status=paused)
-    Pause {
         #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
         id: String,
         #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
