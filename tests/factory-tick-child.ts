@@ -4,7 +4,7 @@
 // двигает STATE_DIR/SERVICE_REG (инцидент 06.11: тест ходил в прод-state).
 // Ребёнок скриптует fetch (ядро/REST), грузит factory/factory.ts, гонит тик
 // и печатает вердикт JSON в stdout — родитель сверяет.
-import { mkdirSync, readFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 

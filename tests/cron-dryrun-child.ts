@@ -92,7 +92,8 @@ function sse(result: unknown, sessionId?: string): Response {
     { status: 200, headers: sessionId !== undefined ? { "mcp-session-id": sessionId } : {} })
 }
 
-const state = { crons: {} as Record<string, unknown> }
+// литерал без каста: tickBoard принимает CronState (Record<string, TrackedCron>)
+const state = { crons: {} }
 try {
   await cron.tickBoard(state, { docId: BOARD_DOC, dbId: "20261106000000-avblock1" }, "Кроны uwuwu", new Date("2026-11-06T09:35:00"))
 } catch (e) {
