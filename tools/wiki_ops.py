@@ -3,6 +3,9 @@
 wiki-операций агентов; вынос подкоманд в отдельные файлы размазал бы общий
 kernel-транспорт (post, конфиг, константы) без выигрыша в читаемости.
 
+Один файл по контракту: dreamer/triage ссылаются на путь tools/wiki_ops.py напрямую
+(см. dreamer/dreamer.ts) — разнесение по модулям сломает их пайплайны.
+
 Команды (совместимы с прежним интерфейсом дример-агентов):
   export <docId>                     markdown дока по id
   create "Заголовок" <файл> --parent <путь>   создать док; ноутбук резолвится по первому
@@ -16,6 +19,27 @@ kernel-транспорт (post, конфиг, константы) без выи
   delete <docId> [--force]           снести док в корзину SiYuan (восстановимо)
   orgls                              дерево: ноутбуки + подпапки
   find "тайтл"                       поиск дока по заголовку
+
+Блочная хирургия — точечная правка rich-доков по blockID (doc-level append умеет
+только «в конец», replace пересоздаёт док и теряет привязки/живые HTML-блоки):
+  block-update <blockID> --md <файл>     правка блока; payload строго один блок —
+                                         multi-block ядро молча обрезает до первого
+  block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален)
+  block-delete <blockID>                 снос leaf-блока; контейнер с детьми — отказ
+                                         (ядро сносит поддерево целиком и тихо;
+                                         снос list — update контейнера: list→параграф;
+                                         item list ядро не оставляет без ребёнка —
+                                         посерийный снос item'ов невозможен)
+
+Guard'ы блочных команд до любой мутации: формат id до любого SQL; блок резолвится
+в индексе (LIMIT 1); doc-id (type='d') — отказ всем трём (update на doc-id молча
+стирает весь док; правка/снос дока — append/replace/delete). Каждый stmt несёт
+явный LIMIT. Мутация — один сетевой вызов (post attempts=1) без авто-ретрая:
+ретрай после потери ответа — класс дубля вставки, не самоисправление. Undo-журнал
+пишется ДО мутации через kernel putFile в data/assets/undo/wiki_ops/<unixts>-<op>-<id>.json
+(before_md / after_md / payload_md / new_ids): ядро пишет файл под своим uid — прямой
+FS-доступ с хоста к data/assets невозможен (проба 06.11), зато журнал работает с любой
+машины, где доступно ядро. Не записался — warning, операция не падает.
 
 delete: без --force сносится только док-заглушка дубля. Заглушка — строка-цитата
 markdown, у которой на ОДНОЙ строке есть и «⚠️», и слово «канон»/«заглушк»
@@ -57,11 +81,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 URL = None
 TOKEN = None
@@ -110,12 +136,11 @@ class KernelRefused(RuntimeError):
 
 def _conf():
     global URL, TOKEN
-    URL = (URL or __import__("os").environ.get("UWUWU_SIYUAN_URL", "http://127.0.0.1:6806")).rstrip("/")
+    URL = (URL or os.environ.get("UWUWU_SIYUAN_URL", "http://127.0.0.1:6806")).rstrip("/")
     if not URL.startswith(("http://", "https://")):
         raise RuntimeError(f"UWUWU_SIYUAN_URL должен быть http(s) URL, получено: {URL!r}")
     if TOKEN:
         return
-    import os
     tok = os.environ.get("UWUWU_SIYUAN_TOKEN", "")
     if not tok:
         ws = os.environ.get("UWUWU_SIYUAN_WS", str(Path.home() / "siyuan-demo-ws"))
@@ -135,14 +160,30 @@ def _metadata_hint(api_path: str) -> str:
     return "вероятна волна деградации ядра: uwuwu-cli doctor"
 
 
-def _metadata_step(path: str, last: str, tries: int, i: int, attempts: int) -> None:
-    """Шаг «metadata is not ready»: bail при исчерпании попыток, иначе пауза
-    (кроме последней итерации цикла — без сна перед финальным отказом)."""
-    if tries >= METADATA_BAIL_ATTEMPTS:
-        raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
-                           f"{tries} попыток; {_metadata_hint(path)}")
-    if i < attempts - 1:
-        time.sleep(METADATA_BAIL_BACKOFF[tries - 1])
+def _post_once(path: str, body: dict) -> tuple[str, object, str]:
+    """Один POST к ядру. Возвращает (kind, data, last):
+    kind — ok | network | metadata | code; last — текст последней ошибки."""
+    req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — схема http/https из UWUWU_SIYUAN_URL
+            d = json.loads(r.read())
+    except Exception as e:
+        return "network", None, str(e)
+    if d.get("code") == 0:
+        return "ok", d.get("data"), ""
+    last = f"code={d.get('code')} msg={d.get('msg')}"
+    if "metadata is not ready" in str(d.get("msg")):
+        return "metadata", None, last
+    return "code", None, last
+
+
+def _retry_sleep(attempt_index: int, attempts: int, seconds: float) -> None:
+    """Пауза перед повтором; на последнем attempt сна нет — raise сразу
+    (terminal-sleep снят по ревью круга 1)."""
+    if attempt_index < attempts - 1:
+        time.sleep(seconds)
 
 
 def post(path: str, body: dict, attempts: int = 6):
@@ -150,24 +191,23 @@ def post(path: str, body: dict, attempts: int = 6):
     last = "?"
     metadata_tries = 0
     for i in range(attempts):
-        req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
-                                     headers={"Authorization": f"Token {TOKEN}",
-                                              "Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                d = json.loads(r.read())
-        except Exception as e:
-            last = str(e)
-            if i < attempts - 1:
-                time.sleep(1 + i)
+        kind, data, last = _post_once(path, body)
+        if kind == "ok":
+            return data
+        if kind == "network":
+            # транспортный флейк — лечится повтором (пин test_transport_error_keeps_full_retries)
+            _retry_sleep(i, attempts, 1 + i)
             continue
-        if d.get("code") == 0:
-            return d.get("data")
-        last = f"code={d.get('code')} msg={d.get('msg')}"
-        if "metadata is not ready" in str(d.get("msg")):
+        if kind == "metadata":
             metadata_tries += 1
-            _metadata_step(path, last, metadata_tries, i, attempts)
+            if metadata_tries >= METADATA_BAIL_ATTEMPTS:
+                raise RuntimeError(f"POST {path}: {last} — metadata-bail после "
+                                   f"{metadata_tries} попыток; {_metadata_hint(path)}")
+            _retry_sleep(i, attempts, METADATA_BAIL_BACKOFF[metadata_tries - 1])
             continue
+        # перманентный code≠0 — KernelRefused fail-fast (merge PR #80): ретраи
+        # бессмысленны, повтор отклонённой мутации вреден; блочные мутации
+        # и так single-shot (attempts=1 на call-сайтах)
         raise KernelRefused(f"POST {path}: {last}")
     raise RuntimeError(f"POST {path}: {last}")
 
@@ -524,6 +564,275 @@ def cmd_delete(a):
     print(f"  ({verdict})")
 
 
+# --- блочная хирургия: block-update / block-insert-after / block-delete ---
+
+def _block_row(block_id: str) -> dict | None:
+    stmt = f"select id, type, root_id, parent_id, markdown from blocks where id='{block_id}' limit 1"  # nosec B608 — blockID валидирован DOC_ID_RE
+    rows = _sql_rows(stmt)
+    return rows[0] if rows else None
+
+
+def _block_children_count(parent_id: str) -> int:
+    stmt = f"select count(*) c from blocks where parent_id='{parent_id}' limit 1"  # nosec B608 — parent_id из kernel API (валидирован на входе)
+    return _sql_scalar(stmt)
+
+
+def _root_hpath(root_id: str) -> str:
+    stmt = f"select hpath from blocks where type='d' and id='{root_id}' limit 1"  # nosec B608 — root_id из kernel API
+    rows = _sql_rows(stmt)
+    return rows[0]["hpath"] if rows else ""
+
+
+def _resolved_block(block_id: str) -> dict:
+    """Формат id до любого SQL (инъекция/мусор отсечены), резолв в индексе,
+    doc-id (type='d') — не блок: update на doc-id молча стирает весь док."""
+    if not DOC_ID_RE.fullmatch(block_id):
+        raise RuntimeError(f"неверный blockID: {block_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
+    row = _block_row(block_id)
+    if not row:
+        raise RuntimeError(f"блок {block_id} не найден в индексе — возьми id из wiki_ops export или SQL по доку")
+    if row["type"] == "d":
+        raise RuntimeError("doc-id не блок: правка контента дока — append/replace, снос дока — wiki_ops delete")
+    return row
+
+
+def _mutate(path: str, body: dict) -> dict:
+    """Мутация блока — один сетевой вызов без авто-ретрая: ретрай после потери
+    ответа даёт дубль вставки (не самоисправляется). Ошибка несёт рецепт проверки
+    состояния до повтора."""
+    try:
+        return post(path, body, attempts=1)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{exc}; применение не подтверждено — проверь блок (export/SQL) до повтора операции") from None
+
+
+CHUNK_FENCE_RE = re.compile(r"^(`{3,}|~{3,}).*$")  # парсер блок-стартов: fence от колонки 0 (индент = продолжение)
+HEADING_RE = re.compile(r"#{1,6}\s")
+BREAK_RE = re.compile(r"(-{3,}|\*{3,}|_{3,})$")
+QUOTE_RE = re.compile(r">")
+BULLET_RE = re.compile(r"[-*+]\s")
+ORDERED_RE = re.compile(r"\d{1,9}[.)]\s")
+TABLE_RE = re.compile(r"\|")
+
+
+def _is_closing_fence(line: str, fence_char: str) -> bool:
+    return line[0] == fence_char and set(line) == {fence_char}
+
+
+def _fence_transition(line: str, in_code: bool, fence_char: str) -> str | None:
+    """'open' / 'close' / None для строки-фенса относительно состояния кода."""
+    if not CHUNK_FENCE_RE.match(line):
+        return None
+    if in_code:
+        return "close" if _is_closing_fence(line, fence_char) else None
+    return "open"
+
+
+def _marker_kind(line: str) -> str | None:
+    """Тип топ-уровневой конструкции-маркера или None (продолжение абзаца)."""
+    if QUOTE_RE.match(line):
+        return "quote"
+    if BULLET_RE.match(line) or ORDERED_RE.match(line):
+        return "list"
+    if TABLE_RE.match(line):
+        return "table"
+    return None
+
+
+def _starts_new_block(raw_line: str, line: str, chunk_kind: str) -> bool:
+    """Новый блок по правилам ядра (Lute): конструкция впритык после абзаца
+    (fence/заголовок/цитата/список/таблица/разрыв — проба ревью 05.11: updateBlock
+    молча выбрасывает хвост таких payload'ов); строки с отступом — продолжение
+    текущего блока (вложенные списки, ленивые переносы)."""
+    if raw_line[:1].isspace():
+        return False
+    if HEADING_RE.match(line) or BREAK_RE.search(line):
+        return True  # заголовок/тематический разрыв начинают новый блок всегда
+    kind = _marker_kind(line)
+    return kind is not None and kind != chunk_kind
+
+
+def _payload_chunk_count(markdown: str) -> int:
+    """Число топ-уровневых блоков в markdown: пустая строка ИЛИ конструкция
+    впритык после абзаца начинает новый блок; fenced-код держит пустые строки
+    внутри одного блока; одно-родственные строки (items списка, строки цитаты/
+    таблицы) — один блок. Ошибки парсера уходят в безопасную сторону — лишний
+    отказ вместо тихой потери хвоста."""
+    chunk_count = 0
+    in_code = False
+    fence_char = ""
+    inside_chunk = False
+    chunk_kind = ""
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        transition = _fence_transition(line, in_code, fence_char)
+        if transition == "open":
+            in_code, fence_char = True, line[0]
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, "fence"
+            continue
+        if transition == "close":
+            in_code = False
+            # закрытый fence завершает блок: следующая строка — новый блок
+            inside_chunk, chunk_kind = False, ""
+            continue
+        if in_code:
+            continue
+        if not line:
+            inside_chunk, chunk_kind = False, ""
+            continue
+        if _starts_new_block(raw_line, line, chunk_kind):
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, _marker_kind(line) or "paragraph"
+            continue
+        if not inside_chunk:
+            chunk_count += 1
+            inside_chunk, chunk_kind = True, "paragraph"
+    return chunk_count
+
+
+UNDO_DIR = "data/assets/undo/wiki_ops"
+
+
+def _put_workspace_file(ws_path: str, payload: bytes) -> None:
+    """Запись файла в воркспейс, контракт ядра 3.8.9: POST multipart (path от
+    корня воркспейса + поле file), ядро создаёт недостающие директории и пишет
+    под своим uid — прямой FS-доступ с хоста к data/assets невозможен (проба
+    06.11: EACCES, владелец — контейнер). Тот же канал, что undo-журнал cli."""
+    _conf()
+    # B310: urlopen разрешён только для http/https из UWUWU_SIYUAN_URL.
+    if urlparse(URL).scheme not in {"http", "https"}:
+        raise RuntimeError(f"putFile: недопустимая схема в UWUWU_SIYUAN_URL: {URL!r}")
+    boundary = "----wiki-ops-undo-journal"
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="path"\r\n\r\n',
+        f"{ws_path}\r\n".encode(),
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="file"; filename="undo.json"\r\n',
+        b"Content-Type: application/octet-stream\r\n\r\n",
+        payload,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(URL + "/api/file/putFile", data=body,
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": f"multipart/form-data; boundary={boundary}"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — схема http/https проверена выше; URL из UWUWU_SIYUAN_URL ядра
+        d = json.loads(r.read())
+    if d.get("code") != 0:
+        raise RuntimeError(f"putFile: code={d.get('code')} msg={d.get('msg')}")
+
+
+def _undo_write(operation: str, block_id: str, payload: dict) -> dict | None:
+    """Undo-журнал ДО мутации (write-ahead), через kernel putFile — работает с
+    любой машины, где доступно ядро. Деградация (ядро отказало) не валит
+    операцию — warning + рецепт отката руками. None — журнал не записан."""
+    try:
+        now = int(time.time())
+        name = f"{now}-{operation}-{block_id}.json"
+        entry = {"ts": now, "op": operation, "id": block_id, **payload}
+        _put_workspace_file(f"{UNDO_DIR}/{name}",
+                            json.dumps(entry, ensure_ascii=False, indent=2).encode())
+        entry["_name"] = name
+        return entry
+    except Exception as exc:
+        print(f"WARNING: undo-журнал не записан ({exc}); откат — руками: контент из wiki_ops export дока")
+        return None
+
+
+def _undo_patch(journal: dict | None, fields: dict) -> None:
+    """Дописать поля (new_ids), известные только после мутации, в записанный журнал."""
+    if not journal:
+        return
+    name = journal.pop("_name", None)
+    if not name:
+        return
+    try:
+        journal.update(fields)
+        _put_workspace_file(f"{UNDO_DIR}/{name}",
+                            json.dumps(journal, ensure_ascii=False, indent=2).encode())
+    except Exception as exc:
+        print(f"WARNING: undo-журнал не дополнен ({exc})")
+
+
+def _new_block_ids(resp) -> list[str]:
+    """Новые block id из doOperations[].data (data-node-id) — для цепочки операций.
+    Форма ответа ядра зависит от эндпоинта: updateBlock — dict, insertBlock —
+    список транзакций (проба 06.11)."""
+    ops: list[dict] = []
+    if isinstance(resp, list):
+        ops = [op for tx in resp for op in tx.get("doOperations", [])]
+    elif isinstance(resp, dict):
+        ops = resp.get("doOperations", [])
+    block_ids: list[str] = []
+    for op in ops:
+        block_ids += re.findall(r'data-node-id="(\d{14}-[a-z0-9]{7})"', op.get("data") or "")
+    return block_ids
+
+
+def _read_payload(filename: str) -> str:
+    try:
+        payload = Path(filename).read_text()
+    except OSError as exc:
+        raise RuntimeError(f"payload недоступен: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"payload не UTF-8: {exc}") from None
+    if not payload.strip():
+        raise RuntimeError("пустой payload — блок нельзя обновить/вставить пустотой (снос — block-delete)")
+    return payload
+
+
+def cmd_block_update(a):
+    payload = _read_payload(a.file)
+    row = _resolved_block(a.blockID.strip())
+    chunks = _payload_chunk_count(payload)
+    if chunks > 1:
+        raise RuntimeError(f"payload содержит {chunks} блока(ов) — updateBlock молча применит только первый, хвост пропадёт (проба 06.11); для нескольких блоков — block-insert-after; многострочный контент одного блока — параграф с переносами или код-блок")
+    journal = _undo_write("update", row["id"], {
+        "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
+        "before_md": row["markdown"], "after_md": payload,
+    })
+    _mutate("/api/block/updateBlock", {"dataType": "markdown", "data": payload, "id": row["id"]})
+    print(f"обновлён блок {row['id']} (тип {row['type']})")
+    if journal:
+        print(f"  undo-журнал: {UNDO_DIR}/{journal['_name']}")
+        print("  откат: block-update этого id с before_md из журнала")
+
+
+def cmd_block_insert_after(a):
+    payload = _read_payload(a.file)
+    row = _resolved_block(a.blockID.strip())
+    journal = _undo_write("insert-after", row["id"], {
+        "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
+        "payload_md": payload,
+    })
+    resp = _mutate("/api/block/insertBlock", {"dataType": "markdown", "data": payload, "previousID": row["id"]})
+    new_ids = _new_block_ids(resp)
+    if journal:
+        print(f"  undo-журнал: {UNDO_DIR}/{journal['_name']} (откат: block-delete новых блоков)")
+    _undo_patch(journal, {"new_ids": new_ids})
+    print(f"вставлено после {row['id']} (тип {row['type']}), новых блоков: {len(new_ids)}")
+    for block_id in new_ids:
+        print(f"  новый блок: {block_id}")
+
+
+def cmd_block_delete(a):
+    row = _resolved_block(a.blockID.strip())
+    children = _block_children_count(row["id"])
+    if children:
+        raise RuntimeError(f"блок {row['id']} — контейнер: {children} дет.(ей) уйдут вместе с ним тихо (проба 06.11: deleteBlock на list/blockquote сносит поддерево); снос контейнера — конверсией: block-update с одно-блочным payload (проба 06.11: list→параграф) или doc-level replace; посерийный снос item'ов list невозможен — ядро держит пустого ребёнка в каждом item")
+    journal = _undo_write("delete", row["id"], {
+        "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
+        "before_md": row["markdown"],
+    })
+    _mutate("/api/block/deleteBlock", {"id": row["id"]})
+    print(f"снесён блок {row['id']} (тип {row['type']})")
+    if journal:
+        print(f"  undo-журнал: {UNDO_DIR}/{journal['_name']}")
+        print(f"  откат: block-insert-after на предыдущий сиблинг с before_md из журнала (позицию сверь по export {row['root_id']})")
+
+
 def cmd_orgls(a):
     for nb in notebooks():
         print(f"[{nb['name']}]")
@@ -566,6 +875,17 @@ def main():
     p.add_argument("docId")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_delete)
+    p = sub.add_parser("block-update")
+    p.add_argument("blockID")
+    p.add_argument("--md", dest="file", required=True)
+    p.set_defaults(fn=cmd_block_update)
+    p = sub.add_parser("block-insert-after")
+    p.add_argument("blockID")
+    p.add_argument("--md", dest="file", required=True)
+    p.set_defaults(fn=cmd_block_insert_after)
+    p = sub.add_parser("block-delete")
+    p.add_argument("blockID")
+    p.set_defaults(fn=cmd_block_delete)
     p = sub.add_parser("orgls")
     p.set_defaults(fn=cmd_orgls)
     p = sub.add_parser("find")
