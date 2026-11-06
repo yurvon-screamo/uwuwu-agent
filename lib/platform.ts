@@ -35,11 +35,18 @@ const TOKEN = siyuanToken()
 
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
-/** Ядро не ответило на транспорте (refused/DNS/таймаут) — отличать от «ядро
- *  ответило ошибкой»: демоны решают по классу. Прод-кейс 05.11: лежащее ядро
- *  было невидимо в логе uwuwu-cron — пер-досочные catch-скипы глотали голый
- *  TypeError, тик «успешно» проходил с пустым списком досок. */
-export class KernelUnavailableError extends Error {}
+/** Ядро не ответило на транспорте (refused/DNS/таймаут/обрыв тела ответа) —
+ *  отличать от «ядро ответило ошибкой»: демоны решают по классу. Прод-кейс
+ *  05.11: лежащее ядро было невидимо в логе uwuwu-cron — пер-досочные
+ *  catch-скипы глотали голый TypeError, тик «успешно» проходил с пустым
+ *  списком досок. Имя класса задаётся явно: рендер лога «${e.name}:
+ *  ${e.message}» (cron.ts tick) иначе показывает безликое «Error:». */
+export class KernelUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "KernelUnavailableError"
+  }
+}
 
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
  *  останавливать тик демона — класс «клиентские висы» (прод-контур).
@@ -81,7 +88,12 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
       }).catch((e: unknown) => {
         throw new KernelUnavailableError(`siyuan POST ${path}: ядро недоступно (${String(e)})`)
       })
-      const text = await r.text()
+      const text = await r.text().catch((e: unknown) => {
+        // связь рвётся на середине тела ответа: тот же класс, что отказ
+        // коннекта — иначе TypeError схлопнется в строку last и catch-скипы
+        // демонов замаскируют деградацию ядра
+        throw new KernelUnavailableError(`siyuan POST ${path}: тело ответа оборвалось (${String(e)})`)
+      })
       const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
       if (d.code === 0) return (d.data ?? {}) as T
       last = `code=${d.code} msg=${d.msg}`
@@ -145,7 +157,11 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
-  const text = await r.text()
+  const text = await r.text().catch((e: unknown) => {
+    // mid-body abort: тот же класс, что отказ коннекта — catch-скипы демонов
+    // (instanceof KernelUnavailableError) не должны глотать голый TypeError
+    throw new KernelUnavailableError(`mcp ${method}: тело ответа оборвалось (${String(e)})`)
+  })
   if (r.status === 404 && hasSession) throw new StaleMcpSessionError(mcpHttpError(method, r.status, text).message)
   if (text.trim() === "") return {}
   const dataLines = text.split("\n").filter((l) => l.startsWith("data: "))
@@ -408,7 +424,10 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
         const r = await post<{ content?: string }>("/api/export/exportMdContent", { id: docId })
         const t = await sql<{ content: string }>(`select content from blocks where type='d' and id='${docId}' limit 1`)
         return { exists: true, markdown: r.content ?? "", title: t[0]?.content ?? docId } as T
-      } catch {
+      } catch (e) {
+        // ADR-033: лежащее ядро — не «дока нет»: транспортный класс проходит
+        // транзитом; {exists:false} — только сбой/отсутствие при живом ядре
+        if (e instanceof KernelUnavailableError) throw e
         return { exists: false, markdown: "", title: "" } as T
       }
     }
