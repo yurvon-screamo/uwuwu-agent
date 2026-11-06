@@ -50,6 +50,16 @@ export interface TrackedTask {
    *  DELETE ревью-сессии) — только при пропаже в двух проходах подряд:
    *  одиночный промах скана не должен терять трекинг (прод-кейс 05.11). */
   missingSince?: string
+  /** сигнал о застое уже отправлен в этом эпизоде In Progress (анти-спам
+   *  «раз за эпизод»; сброс делает демон: смена статуса — штатный путь,
+   *  none-вердикт при стоявшем флаге — эпизод завершён) */
+  stallSignaled?: boolean
+  /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
+   *  env-механика к задаче не применялась */
+  envDir?: string
+  /** задача доживает в старом поведении (cwd = cfg.local, агент сам делает
+   *  ворктри): штамп loadState для записей, спавненных до env-механики */
+  legacy?: boolean
 }
 
 export interface FactoryState {
@@ -113,6 +123,54 @@ export function adoptBodyDoc(tracked: TrackedTask, row: TaskRef): string | null 
  *  конвенция миграции bind_rows.py). */
 export function pathSafe(title: string): string {
   return title.replaceAll("/", "\u{2215}")
+}
+
+/** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
+export function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+// ——— фоллбек тела по тайтлу: путь доски, мемоизированный на проход ———
+
+/** Итог обращения за путём доски: active — путь получен; failed — get_doc
+ *  упал (reason — текст ошибки); disabled — ядро вернуло пустые box/hpath
+ *  (SQL-лаг индекса по доске), фоллбек на проход невозможен. */
+export type BoardPathResolution =
+  | { kind: "active"; box: string; hpath: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "disabled" }
+
+/** Ленивый мемоизер пути доски на один проход readTasks: первая
+ *  материализация зовёт load и логирует деградацию ровно одной строкой,
+ *  последующие вызовы отдают кэш без API-вызовов и без логов — при сбое
+ *  или SQL-лаге N detached-строк дают один вызов и один лог вместо N
+ *  (per-row catch фоллбека на per-row сбои hpath больше не реагирует).
+ *  Живёт в замыкании readTasks: следующий тик материализует заново —
+ *  самолечение через тики сохранено. */
+export function createBoardPathOnce(
+  load: () => Promise<{ box?: string; hpath?: string }>,
+  log: (m: string) => void,
+): () => Promise<BoardPathResolution> {
+  let cache: BoardPathResolution | null = null
+  return async () => {
+    if (cache !== null) return cache
+    try {
+      const d = await load()
+      const box = d.box ?? ""
+      const hpath = d.hpath ?? ""
+      if (box === "" || hpath === "") {
+        log("фоллбек тела по тайтлу отключён (SQL-лаг): get_doc доски вернул пустые box/hpath")
+        cache = { kind: "disabled" }
+      } else {
+        cache = { kind: "active", box, hpath }
+      }
+    } catch (e) {
+      const reason = errText(e)
+      log(`фоллбек тела по тайтлу отключён на проход: get_doc доски не удался (${reason})`)
+      cache = { kind: "failed", reason }
+    }
+    return cache
+  }
 }
 
 /** Новые юзерские комменты после lastSeen, по порядку создания. */
@@ -182,9 +240,20 @@ export function kickoffModeOf(status: string): KickoffMode {
   return status === "In Progress" ? "implement" : "design"
 }
 
+/** Контекст окружения задачи для промптов: пути приходят из ensureEnv.
+ *  undefined — env-механика не применяется (легаси-штамп или env:false-проект),
+ *  агент действует по старым строкам (сам создаёт ворктри/ветку). */
+export interface SpawnEnvContext {
+  repoDir: string
+  branch: string
+  scratchDir: string
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
-export function spawnPrompt(rowId: string, project: string, repo: string, mode: KickoffMode = "design"): string {
+export function spawnPrompt(
+  rowId: string, project: string, repo: string, mode: KickoffMode = "design", env?: SpawnEnvContext,
+): string {
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -193,16 +262,25 @@ export function spawnPrompt(rowId: string, project: string, repo: string, mode: 
       ]
     : [
         "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-        "пока ждёшь ответа). План утрясан → план в тело → статус «Ревью плана» → конец хода:",
+        "пока ждёшь ответа). Перед планом — скан территории: uwuwu-cli task list на смежные задачи",
+        "+ gh pr list --state all (батч-сводки/hygiene съедают срезы планов тихо).",
+        "План утрясан → план в тело → статус «Ревью плана» → конец хода:",
         "ревью проводит отдельный праймари-агент фабрики, вердикт придёт wakeup'ом.",
         "После approve плана:",
+      ]
+  const workLine = env === undefined
+    ? ["создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй."]
+    : [
+        "работай в своём окружении задачи (фабрика создала, ветка уже от origin/master):",
+        `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
+        "Branch/Path-ячейки и сессии заполняет фабрика — тебе их трогать не нужно.",
       ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     ...stage,
-    "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
+    ...workLine,
     "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
     "«Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом: request_changes →",
     "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
@@ -217,18 +295,96 @@ export function spawnPrompt(rowId: string, project: string, repo: string, mode: 
 /** Рестарт-промпт (сессия девелопера умерла/карантин → fresh spawn).
  *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
  *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
-export function continuePrompt(rowId: string, project: string, repo: string): string {
+export function continuePrompt(rowId: string, project: string, repo: string, env?: SpawnEnvContext): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
     "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+        ]
+      : []),
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
     "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
     "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
   ].join("\n")
+}
+
+/** Конфликт-kickoff: PR ветки задачи конфликтует с master (владелец флипнул
+ *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте).
+ *  env называет существующее окружение задачи — агент не плодит новое. */
+export function conflictFixPrompt(rowId: string, pr: string, env?: SpawnEnvContext): string {
+  return [
+    `[factory] Задача ${rowId}: PR ветки конфликтует с master (${pr}).`,
+    "",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+          "",
+        ]
+      : []),
+    "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
+    "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
+    "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
+    `в «${REVIEW_RESULT_STATUS}» (uwuwu-cli task edit --status) и заверши ход.`,
+  ].join("\n")
+}
+
+/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf),
+ *  рестарт умершей сессии (continue, стадию не предписываем) или
+ *  конфликт-рестарт (conflict-fix: PR ветки в конфликте с master). */
+export type StartKind = KickoffMode | "continue" | "conflict-fix"
+
+/** Единственная точка выбора стартового промпта по виду старта.
+ *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR); env
+ *  сквозной для всех веток — рестарт env-задачи называет окружение. */
+export function promptForStart(
+  start: StartKind, rowId: string, project: string, repo: string, pr: string,
+  env?: SpawnEnvContext,
+): string {
+  if (start === "continue") return continuePrompt(rowId, project, repo, env)
+  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, env)
+  return spawnPrompt(rowId, project, repo, start, env)
+}
+
+/** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.
+ *  Не-JSON, неожиданные значения → UNKNOWN (трактуется как «не конфликт»). */
+export function prMergeableOf(raw: string): "CONFLICTING" | "MERGEABLE" | "UNKNOWN" {
+  try {
+    const j = JSON.parse(raw) as { mergeable?: unknown }
+    if (j.mergeable === "CONFLICTING" || j.mergeable === "MERGEABLE") return j.mergeable
+    return "UNKNOWN"
+  } catch {
+    return "UNKNOWN"
+  }
+}
+
+/** Шаг опроса mergeable. GitHub вычисляет конфликтность лениво: первый
+ *  запрос по «холодному» PR возвращает UNKNOWN и лишь запускает фоновое
+ *  вычисление — значение появляется на повторных запросах через секунды.
+ *  CONFLICTING/MERGEABLE — финальные вердикты; UNKNOWN переспрашивается,
+ *  пока не исчерпаны попытки, затем — мягкая деградация («не конфликт»). */
+export type MergeablePollStep =
+  | { t: "conflict" }
+  | { t: "clear" }
+  | { t: "retry" }
+  | { t: "degrade" }
+
+/** Единственная точка решения «что дальше» на попытке опроса mergeable. */
+export function mergeablePollStep(
+  mergeable: "CONFLICTING" | "MERGEABLE" | "UNKNOWN",
+  attempt: number,
+  maxAttempts: number,
+): MergeablePollStep {
+  if (mergeable === "CONFLICTING") return { t: "conflict" }
+  if (mergeable === "MERGEABLE") return { t: "clear" }
+  return attempt + 1 < maxAttempts ? { t: "retry" } : { t: "degrade" }
 }
 
 /** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
@@ -277,7 +433,12 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     ...(kind === "result"
       ? ["   origin/master + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.",]
       : []),
-    ...(ctx.worktree !== "" ? [`   Ворктри задачи: ${ctx.worktree}`] : []),
+    ...(ctx.worktree !== ""
+      ? [`   Ворктри задачи: ${ctx.worktree}`]
+      : kind === "result"
+        ? [`   Ворктри задачи не найден — ревью по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+           `   (git-команды из каталога сессии; ворктри не обязателен для диффа).`]
+        : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
@@ -327,7 +488,8 @@ export function reviewReturnPrompt(rowId: string): string {
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
     "- результат approved → мяч у юзера, от тебя ничего не требуется;",
-    "- владелец вернул в Design → перепланируй и снова «Ревью плана».",
+    "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
+    "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
 }
 
@@ -353,7 +515,8 @@ export type RouteAction =
 
 /** Решение по задаче на один тик. Приоритет порядка: спавн ревьювера →
  *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → возврат
- *  девелоперу (из ревью-статуса или ручной перевод в Design) → noop. */
+ *  девелоперу (из ревью-статуса по вердикту, ручной перевод в Design или
+ *  fast-track флип владельца в In Progress — «вмешайся и почини») → noop. */
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
@@ -373,6 +536,13 @@ export function routeTask(f: RouteFacts): RouteAction {
   if (f.status === "Design" && f.lastStatus !== "Design" && f.lastStatus !== "") {
     return { t: "return-to-dev" }
   }
+  // fast-track трекенной задачи: перевод владельца в In Progress из любого
+  // другого статуса — «вмешайся и почини» (конфликт PR, зависший раунд,
+  // форсаж Design-задачи). lastStatus "" — свежий карантин без спавна:
+  // перевода не было, будит только коммент юзера.
+  if (f.status === "In Progress" && f.lastStatus !== "In Progress" && f.lastStatus !== "") {
+    return { t: "return-to-dev" }
+  }
   return { t: "noop" }
 }
 
@@ -388,19 +558,114 @@ export function rowMissingAction(missingSince: string | undefined, rowFound: boo
   return missingSince === undefined ? "mark" : "clean"
 }
 
-/** Ветка и путь ворктри для задачи (row-id может начинаться с дефиса). */
-export function worktreePaths(root: string, rowId: string): { branch: string; worktree: string } {
-  const safe = rowId.replace(/^-+/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || "task"
-  return {
-    branch: `work/task-${safe}`,
-    worktree: `${root}/task-${safe}`,
-  }
+// ——— сигнал о застое: In Progress, сессия жива, агент молчит ———
+
+/** Чистый парсер UWUWU_FACTORY_STALL_MIN: undefined/пусто → 30; конечное
+ *  число > 0 → оно; иначе (NaN, 0, отрицательное, мусор) → дефолт 30.
+ *  0 исключён — сигнал срабатывал бы на каждой паузе между сообщениями
+ *  (анти-спам не спасёт), NaN исключён — мёртвая фича. */
+export function stallMinutesFromEnv(v: string | undefined): number {
+  if (v === undefined || v.trim() === "") return 30
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : 30
 }
 
-/** Валидация записи state.json. Три легальных формата: полный
- *  (ses_ + пути), чистый карантин (всё пусто) и гибрид (сессия умерла,
- *  пути живы — работа сохраняется до решения юзера). worktree/branch —
- *  legacy (ворктри теперь делает агент, демону не нужен). */
+/** Активность сессии по последнему сообщению (список DESC — берём только
+ *  [0]): max числовых полей time (created/streamed/completed). null —
+ *  сообщений нет (= застой: трекнутая сессия минимум с промптом-сообщением).
+ *  "invalid" — ответ не распознаётся (пропуск тика, без ложных сигналов).
+ *  Синтетический idle-маркер и сообщение без completed валидны: достаточно
+ *  одного числового поля времени; отсутствие completed — норма. */
+export function lastActivityOf(msgs: unknown[]): number | null | "invalid" {
+  if (msgs.length === 0) return null
+  const m = msgs[0] as { time?: unknown } | null
+  if (m === null || typeof m !== "object") return "invalid"
+  if (m.time === null || typeof m.time !== "object") return "invalid"
+  const t = m.time as Record<string, unknown>
+  const nums = [t.created, t.streamed, t.completed].filter(
+    (x): x is number => typeof x === "number" && Number.isFinite(x),
+  )
+  if (nums.length === 0) return "invalid"
+  return Math.max(...nums)
+}
+
+export interface StallFacts {
+  /** статус строки сейчас */
+  status: string
+  /** жива ли сессия девелопера (null — liveness неизвестна: пропуск тика) */
+  sessionAlive: boolean | null
+  /** активность последнего сообщения; null — сообщений нет (= застой) */
+  lastActivityAt: number | null
+  /** Branch-ячейка строки (деталь диагноза в тексте сигнала) */
+  branch: string
+  /** ветка нашлась в ворктри по `git worktree list` */
+  branchInWorktree: boolean
+  /** сигнал в этом эпизоде уже был (анти-спам «раз за эпизод») */
+  signaled: boolean
+  now: number
+}
+
+export type StallVerdict =
+  | { t: "none" }
+  | { t: "signal"; text: string }
+  | { t: "silent" }
+
+/** Единственная точка решения о застое (по образцу routeTask): трекнутая
+ *  In Progress при живой сессии, но тишине дольше порога (или без сообщений
+ *  вовсе) = потерянный/зависший ход — активный ход рождает сообщения на
+ *  каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
+ *  пропуск тика: оба → none. Повторный сигнал в эпизоде глушится флагом
+ *  (silent); сброс флага — дело демона: смена статуса — штатный путь
+ *  (пере-вход в In Progress = новый эпизод), none-вердикт при стоявшем
+ *  флаге — эпизод завершён. */
+export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
+  if (f.status !== "In Progress") return { t: "none" }
+  if (f.sessionAlive !== true) return { t: "none" }
+  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
+  if (!stalled) return { t: "none" }
+  if (f.signaled) return { t: "silent" }
+  const quietMin = f.lastActivityAt === null
+    ? null
+    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
+  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const branchDiag = f.branch === ""
+    ? "Branch-ячейка пуста — агент умер до создания ветки"
+    : f.branchInWorktree
+      ? `ветка на месте (${f.branch.slice(0, 60)})`
+      : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
+  const text = [
+    `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+    `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
+    "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
+  ].join(" ")
+  return { t: "signal", text }
+}
+
+/** Ячейки доски, которые заполняет фабрика. Колонки добавляет владелец;
+ *  запись best-effort (нет колонки → тихий no-op ядра, работа не ломается). */
+export const PATH_CELL = "Path"
+export const DEV_SESSION_CELL = "Сессия dev"
+export const REVIEW_SESSION_CELL = "Сессия ревью"
+
+/** Штамп перехода: записи state, спавненные до env-механики, доживают в
+ *  старом поведении (рестарт не уводит незакоммиченную работу в новый env).
+ *  envDir отсутствует И сессия была спавнена → легаси; карантинные записи
+ *  без сессии не штампуются — их спавн ещё попробует env-механику. */
+export function stampLegacyEntries(state: FactoryState): string[] {
+  const stamped: string[] = []
+  for (const [rowId, tracked] of Object.entries(state.tasks)) {
+    if (tracked.envDir !== undefined || tracked.legacy === true) continue
+    if (tracked.sessionID === "") continue
+    tracked.legacy = true
+    stamped.push(rowId)
+  }
+  return stamped
+}
+
+/** Валидация записи state.json. Легальные форматы: полный (ses_ + пути),
+ *  чистый карантин (всё пусто) и гибрид (сессия умерла, пути живы — работа
+ *  сохраняется до решения юзера). worktree = repoDir env-задачи; branch —
+ *  производное имя ветки (пишет фабрика) или легаси-имя агента. */
 export function isValidTracked(v: unknown): v is TrackedTask {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
@@ -419,6 +684,9 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.agentActive !== undefined && typeof t.agentActive !== "boolean") return false
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
+  if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
+  if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
+  if (t.legacy !== undefined && typeof t.legacy !== "boolean") return false
   if (
     t.reviewSessionID !== undefined &&
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
@@ -466,6 +734,10 @@ export interface ProjectCfg {
   board: string
   repo: string
   local: string
+  /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
+   *  вне механики (cfg.local не git-репо → контракт невыполним): легаси-
+   *  поведение, агент сам делает ворктри/ветку. Дефолт true. */
+  env?: boolean
 }
 
 /** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
@@ -491,7 +763,10 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
     if (c.board.trim() === "" || c.repo.trim() === "" || c.local.trim() === "") {
       throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local не могут быть пустыми`)
     }
-    out[name] = { board: c.board, repo: c.repo, local: c.local }
+    if (c.env !== undefined && typeof c.env !== "boolean") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — env должен быть boolean`)
+    }
+    out[name] = { board: c.board, repo: c.repo, local: c.local, ...(c.env !== undefined ? { env: c.env } : {}) }
   }
   if (Object.keys(out).length === 0) {
     throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")
@@ -511,6 +786,10 @@ export interface PassCounters {
   wakeups: number
   /** чистки state (Done / строка исчезла) */
   cleanups: number
+  /** окружения задачи: создано/снесено (rm) / в attic за тик */
+  envCreated: number
+  envRemoved: number
+  envAtticked: number
   /** задачи под наблюдением на конец прохода (этот проект) */
   watched: number
   /** фейлы спавна: короткие «rowId-префикс: причина» */
@@ -521,6 +800,7 @@ export interface PassCounters {
  *  видимы — что сделано и что живо (прод-кейс 05.11). */
 export function formatPassSummary(project: string, c: PassCounters): string {
   const failures = c.failures.length > 0 ? `, фейлы=${c.failures.length} (${c.failures.join("; ")})` : ""
+  const envPart = `, env=+${c.envCreated}/-${c.envRemoved}/attic:${c.envAtticked}`
   return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
-    `, будильники=${c.wakeups}, чистки=${c.cleanups}, наблюдение=${c.watched}${failures}`
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}, наблюдение=${c.watched}${failures}`
 }

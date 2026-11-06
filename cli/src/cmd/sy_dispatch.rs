@@ -1,9 +1,11 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
 use super::read_resolve;
-use crate::cmd::cli::{Commands, CronSub, KernelSub, SemanticSub, TaskSub};
+use crate::cmd::cli::{Commands, CronSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::markdown;
 use crate::md_heading;
+use crate::siyuan_person as person;
+use crate::siyuan_person::person_target;
 use crate::siyuan::{FileFetch, SiYuan};
 use crate::siyuan_guard as guard;
 use crate::siyuan_guard::{Journal, JournalRow, Probe, Verdict};
@@ -36,6 +38,7 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Blob { key, out } => blob_run(&key, out).await,
+        Commands::Person { command } => person_run(command).await,
         Commands::Projects => projects_run().await,
         Commands::Shot { .. } => Err(anyhow!(
             "shot: не портирован на SiYuan (v1) — headless chromium на http://127.0.0.1:6806 с Access Auth Code"
@@ -55,6 +58,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         let ctx = if stdin { read_stdin()? } else { String::new() };
         println!("{}", syt::body_template(&title, ty.as_deref().unwrap_or("dev"), &ctx));
         return Ok(());
+    }
+    // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
+    // проглоченный trailing_var_arg'ом (`task comment <id> "текст" --project X`
+    // → project=None), маскируется под «флаг не передан» (крон-сессия 04.11).
+    // stdin здесь НЕ читается — его читает ровно одна ветка ниже.
+    if let TaskSub::Comment { stdin, text, .. } = &command {
+        pre_guard_positional_comment(*stdin, text)?;
     }
     if project.is_empty() {
         anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
@@ -571,6 +581,43 @@ async fn restore_journal_cells(
             Ok(())
         }
         None => bail!("ключ PR не найден на доске — PR «{}» не восстановлен", row.pr),
+    }
+}
+
+// ——— person: персона владельца (SiYuan-док) ———
+
+pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
+    let sy = SiYuan::from_env()?;
+    let target = person_target();
+    match command {
+        PersonSub::Show => {
+            let md = person::show(&sy, &target).await?;
+            print!("{md}");
+            Ok(())
+        }
+        PersonSub::Append { stdin, text } => {
+            let md = collect_text(stdin, &text)?;
+            if md.trim().is_empty() {
+                bail!("append: нужен текст (позиционный или --stdin)");
+            }
+            let doc_id = person::append(&sy, &target, &md).await?;
+            println!("дописано: {}:{} ({doc_id})", target.notebook, target.hpath);
+            Ok(())
+        }
+        PersonSub::Replace { stdin, md } => {
+            let content = read_body_input(md.as_deref(), stdin)?;
+            if content.trim().is_empty() {
+                bail!(
+                    "replace: пустой контент — персона не может быть пустой; правь/удаляй док в UI"
+                );
+            }
+            let doc_id = person::replace(&sy, &target, &content).await?;
+            println!(
+                "персона перезаписана: {}:{} ({doc_id})",
+                target.notebook, target.hpath
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1215,6 +1262,19 @@ fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
     let msg = collect_text(stdin, text)?;
     validate_comment_text(stdin, &msg)?;
     Ok(msg)
+}
+
+/// Пред-гвард позиционного текста коммента: выполняется в task_run ДО bail по
+/// пустому --project, чтобы проглоченный trailing_var_arg'ом флаг
+/// (`task comment <id> "текст" --project X`) не маскировался под «--project не
+/// передан». stdin — no-op: его содержимое недоступно до чтения, читает его
+/// ровно одна ветка (двойное чтение дало бы EOF → ложный «пустой текст»).
+/// Позиционная валидация чистая и идемпотентна — повтор в Comment-ветке безвреден.
+fn pre_guard_positional_comment(stdin: bool, text: &[String]) -> Result<()> {
+    if stdin {
+        return Ok(());
+    }
+    validate_comment_text(false, &text.join(" "))
 }
 
 /// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
@@ -1956,6 +2016,56 @@ mod tests {
     fn comment_guard_skips_stdin_source() {
         validate_comment_text(true, "--не-флаг-а-текст").expect("stdin — явное намерение, не гвардим");
         validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
+    }
+
+    // ——— порядок диспетчера: гвард текста раньше bail по --project ———
+
+    /// `task comment <id> …` при пустом --project: оба пути падают до
+    /// SiYuan::from_env (гвард/байл — первые строки task_run), сети нет.
+    fn comment_command(stdin: bool, text: &[&str]) -> TaskSub {
+        TaskSub::Comment {
+            id: "20261104072048-4n1rwdt".into(),
+            reply: None,
+            stdin,
+            text: text.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Факт AGENTS-коммента задачи (крон-сессия 04.11, ×3): `task comment <id>
+    /// "текст" --project X` — флаг проглочен trailing_var_arg'ом → project=None →
+    /// bail «--project обязателен» маскировал причину под «флаг не передан».
+    /// Гвард должен стрелять РАНЬШЕ bail по --project.
+    #[tokio::test]
+    async fn comment_guard_fires_before_project_bail_on_swallowed_flag() {
+        let err = task_run("", comment_command(false, &["текст", "--project", "X"]))
+            .await
+            .expect_err("флаг в позиционном тексте — отказ гварда");
+        let msg = err.to_string();
+        assert!(msg.contains("похож на флаг"), "реальная причина в ошибке: {msg}");
+        assert!(!msg.contains("обязателен"), "маскировка «флаг не передан» недопустима: {msg}");
+    }
+
+    /// Пинну приоритета (замечание ревью плана): подкоманда-как-текст при
+    /// ОТСУТСТВУЮЩЕМ --project — тоже гвард раньше bail («list» вместо
+    /// «--project обязателен»).
+    #[tokio::test]
+    async fn comment_guard_fires_before_project_bail_on_subcommand_token() {
+        let err = task_run("", comment_command(false, &["list"]))
+            .await
+            .expect_err("подкоманда-как-текст — отказ гварда");
+        let msg = err.to_string();
+        assert!(msg.contains("подкоманд"), "сообщение гварда: {msg}");
+        assert!(!msg.contains("обязателен"), "приоритет ошибок сменился обратно: {msg}");
+    }
+
+    /// Контроль: чистый позиционный текст при пустом --project — прежний bail
+    /// (проверка --project не размыта гвардом).
+    #[tokio::test]
+    async fn clean_comment_text_still_bails_on_missing_project() {
+        let err = task_run("", comment_command(false, &["текст"]))
+            .await
+            .expect_err("--project обязателен для чистого текста");
+        assert!(err.to_string().contains("обязателен"), "{err}");
     }
 
     #[test]
