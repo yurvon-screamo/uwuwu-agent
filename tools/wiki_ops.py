@@ -255,8 +255,16 @@ def _fs_file(path: str) -> str:
 
 
 def notebooks(attempts: int = 6) -> list[dict]:
-    return [nb for nb in post("/api/notebook/lsNotebooks", {}, attempts=attempts).get("notebooks", [])
-            if not nb.get("closed")]
+    """Конверт lsNotebooks обязан нести dict с list-полем "notebooks":
+    аномалия (None, dict без поля) — RuntimeError. Тихий [] здесь читался бы
+    как «пустой воркспейс» — та же маскировка сбоя под not-found, от которой
+    защищены SQL-конверты (задача 20261104072714, ревью PR #111 round-2).
+    Пустой notebooks (все закрыты/ни одного) — легитимный not-found."""
+    data = post("/api/notebook/lsNotebooks", {}, attempts=attempts)
+    if not (isinstance(data, dict) and isinstance(data.get("notebooks"), list)):
+        raise RuntimeError(
+            f"lsNotebooks вернул аномальный конверт (ожидался dict с list-полем notebooks): {data!r:.200}")
+    return [nb for nb in data["notebooks"] if not nb.get("closed")]
 
 
 def cmd_export(a):
