@@ -297,18 +297,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     // attach-only вызов (пустой контент без rewrite) не делает
                     // пустой appendBlock: опора на недокументированную реакцию
                     // ядра на пустой data — референсы дописываются сами
-                    if replace || replace_section.is_some() || !content.trim().is_empty() {
-                        write_body_in_place(
-                            &sy,
-                            &doc_id,
-                            &task.title,
-                            replace || replace_section.is_some(),
-                            replace_section.as_deref(),
-                            &content,
-                            snapshot.as_deref(),
+                    let rewrite = if replace || replace_section.is_some() {
+                        Some(BodyRewrite {
+                            section: replace_section.as_deref(),
+                            snapshot: snapshot.as_deref(),
                             force,
-                        )
-                        .await?;
+                        })
+                    } else {
+                        None
+                    };
+                    if rewrite.is_some() || !content.trim().is_empty() {
+                        write_body_in_place(&sy, &doc_id, &task.title, rewrite, &content).await?;
                     }
                     doc_id
                 }
@@ -1265,38 +1264,45 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
 
 // ——— утилиты ———
 
+/// Параметры rewrite-пути task body (replace / replace-section).
+struct BodyRewrite<'a> {
+    /// Секционная правка: existing-база сохраняется механикой replace_md_section,
+    /// гард свежести не несёт; None — полный replace целиком.
+    section: Option<&'a str>,
+    /// Снапшот свежести --base (текст файла); None + !force = отказ.
+    snapshot: Option<&'a str>,
+    /// Осознанный overwrite без сверки.
+    force: bool,
+}
+
 /// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
-/// append — один appendBlock; replace/replace-section — экспорт по id,
+/// rewrite=None — append, один appendBlock; Some — экспорт по id,
 /// strip frontmatter (иначе он ляжет литеральным блоком), пересборка контента.
 /// Отказ гарда — Err до overwrite: экспорт read-only, ядро не тронуто.
-/// Полный replace требует снапшот свежести (--base) или осознанный
-/// --force (см. require_fresh_snapshot); секционные правки гарда не несут —
-/// existing-база сохраняется самой механикой replace_md_section.
 async fn write_body_in_place(
     sy: &SiYuan,
     doc_id: &str,
     doc_title: &str,
-    rewrite: bool,
-    section: Option<&str>,
+    rewrite: Option<BodyRewrite<'_>>,
     content: &str,
-    snapshot: Option<&str>,
-    force: bool,
 ) -> Result<()> {
-    if !rewrite {
+    let Some(rewrite) = rewrite else {
         return sy.append_block_md(doc_id, content).await;
-    }
+    };
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
     let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
-    if section.is_none() && !force {
-        require_fresh_snapshot(doc_title, &existing, snapshot)?;
-    }
-    let new_md = match section {
+    let new_md = match rewrite.section {
         Some(section) => {
             let (md, edit) = replace_md_section(&existing, section, content)?;
             report_section_edit(section, edit);
             md
         }
-        None => carry_over_comments_section(doc_title, &existing, content)?,
+        None => {
+            if !rewrite.force {
+                require_fresh_snapshot(doc_title, &existing, rewrite.snapshot)?;
+            }
+            carry_over_comments_section(doc_title, &existing, content)?
+        }
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
 }

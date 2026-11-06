@@ -45,7 +45,7 @@ pub(crate) fn collapse_whitespace(md: &str) -> String {
 /// (только pipe/дефисы/двоеточия, есть дефис) — канонизация: ядро пэддит
 /// дефисы до ширины колонок, скелет двоеточий выравнивания сохраняется.
 /// Внутри code-fence — дословно: пробелы кода семантичны. Fence-маркер —
-/// ``` (как в python-источнике; ~~~ фенсом сравнения не считается).
+/// тройные бэктики (как в python-источнике; ~~~ фенсом сравнения не считается).
 /// Границы осознанные: дроп пустых строк вне fence рендер-различим для
 /// tight/loose списков — это слипание вариантов одного текста для детекции
 /// ретрая, не «чинить».
@@ -72,7 +72,10 @@ pub(crate) fn normalized_lines(text: &str) -> Vec<String> {
         } else if stripped.matches('|').count() >= 2 {
             normalized.push(format!("{leading}{}", collapse_table_cells(stripped)));
         } else {
-            normalized.push(format!("{leading}{}", stripped.split_whitespace().collect::<Vec<_>>().join(" ")));
+            normalized.push(format!(
+                "{leading}{}",
+                stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
         }
     }
     normalized
@@ -102,7 +105,11 @@ fn canonical_separator(row: &str) -> String {
                 return String::new();
             }
             let left = if cell.starts_with(':') { ":" } else { "" };
-            let right = if cell.len() > 1 && cell.ends_with(':') { ":" } else { "" };
+            let right = if cell.len() > 1 && cell.ends_with(':') {
+                ":"
+            } else {
+                ""
+            };
             format!("{left}-{right}")
         })
         .collect();
