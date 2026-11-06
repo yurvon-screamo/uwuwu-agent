@@ -273,7 +273,7 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 "20261104000005-skelxx5" => skeleton_export("скелет-черновик"),
                 "20261104000006-drlxx06" => format!(
                     "---\ntitle: живой черновик\n---\n\n# живой черновик\n\n{}\nзаметки триажа владельца\n",
-                    body_template("живой черновик", "dev", "")
+                    body_template("dev", "")
                 ),
                 _ => "---\ntitle: живая задача\n---\n\n# живая задача\n\nживой контент владельца\n".to_string(),
             };
@@ -414,7 +414,7 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
 fn skeleton_export(title: &str) -> String {
     format!(
         "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#dev\n",
-        body_template(title, "dev", "")
+        body_template("dev", "")
     )
 }
 
