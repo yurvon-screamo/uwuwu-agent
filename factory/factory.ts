@@ -52,6 +52,8 @@ import {
   stallVerdict,
   adoptBodyDoc,
   pathSafe,
+  createBoardPathOnce,
+  errText,
   type PassCounters,
   type ProjectCfg,
   type ReviewKind,
@@ -126,11 +128,6 @@ const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
-}
-
-/** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
 }
 
 function rotateLog(): void {
@@ -252,36 +249,35 @@ export async function readTasks(board: BoardIds): Promise<TaskRef[]> {
   // CLI body_doc_by_title: саб-док доски по hpath «<доска>/<тайтл>».
   // FS-истина (getIDsByHPath) — без лага SQL-индекса. 0 → без тела,
   // 1 → тело, ≥2 → пусто (не угадываем) + агрегированный лог сирот.
-  // get_doc доски — один раз на проход (ленивое замыкание: без detached-
-  // строк доска не читается вовсе).
-  let boardPath: { box: string; hpath: string } | null = null
-  const boardPathOnce = async (): Promise<{ box: string; hpath: string }> => {
-    if (boardPath === null) {
-      const d = await mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId })
-      boardPath = { box: d.box ?? "", hpath: d.hpath ?? "" }
-    }
-    return boardPath
-  }
+  // get_doc доски — один раз на проход (ленивый мемоизер: сбой и SQL-лаг
+  // тоже кэшируются — N detached-строк дают один вызов и одну строку лога;
+  // без detached-строк доска не читается вовсе).
+  const boardPathOnce = createBoardPathOnce(
+    () => mcp.tool<{ box?: string; hpath?: string }>("get_doc", { docId: board.docId }),
+    log,
+  )
   const orphans: string[] = []
   const rows: TaskRef[] = []
   for (const row of raw) {
     const title = (row.title ?? "").trim()
     let bodyDoc = row.linkedDocId ?? ""
     if (bodyDoc === "" && title !== "") {
-      try {
-        const bp = await boardPathOnce()
-        const found = bp.box === "" || bp.hpath === ""
-          ? []
-          : (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-              notebook: bp.box, path: `${bp.hpath}/${pathSafe(title)}`,
-            })).ids ?? []
-        if (found.length === 1) bodyDoc = found[0] as string
-        else if (found.length >= 2) orphans.push(`${String(row.rowBlockId).slice(0, 8)} → ${found.join(", ")}`)
-      } catch (e) {
-        // фоллбек — best effort: сбой ядра на одной detached-строке не должен
-        // глушить тик (комменты/будильники здоровых привязанных строк)
-        log(`задача ${String(row.rowBlockId).slice(0, 8)}: фоллбек тела по тайтлу не удался (${errText(e)}) — строка без тела`)
+      const bp = await boardPathOnce()
+      if (bp.kind === "active") {
+        try {
+          const found = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+            notebook: bp.box, path: `${bp.hpath}/${pathSafe(title)}`,
+          })).ids ?? []
+          if (found.length === 1) bodyDoc = found[0] as string
+          else if (found.length >= 2) orphans.push(`${String(row.rowBlockId).slice(0, 8)} → ${found.join(", ")}`)
+        } catch (e) {
+          // фоллбек — best effort: сбой ядра на одной detached-строке не должен
+          // глушить тик (комменты/будильники здоровых привязанных строк)
+          log(`задача ${String(row.rowBlockId).slice(0, 8)}: фоллбек тела по тайтлу не удался (${errText(e)}) — строка без тела`)
+        }
       }
+      // failed/disabled: деградация уже залогирована резолвером одной строкой
+      // на проход — per-row спам не дублируем, строка остаётся без тела
     }
     rows.push({
       rowId: row.rowBlockId as string,
