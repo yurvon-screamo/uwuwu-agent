@@ -267,6 +267,78 @@ export function continuePrompt(rowId: string, project: string, repo: string, env
   ].join("\n")
 }
 
+/** Конфликт-kickoff: PR ветки задачи конфликтует с master (владелец флипнул
+ *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте).
+ *  env называет существующее окружение задачи — агент не плодит новое. */
+export function conflictFixPrompt(rowId: string, pr: string, env?: SpawnEnvContext): string {
+  return [
+    `[factory] Задача ${rowId}: PR ветки конфликтует с master (${pr}).`,
+    "",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+          "",
+        ]
+      : []),
+    "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
+    "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
+    "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
+    `в «${REVIEW_RESULT_STATUS}» (uwuwu-cli task edit --status) и заверши ход.`,
+  ].join("\n")
+}
+
+/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf),
+ *  рестарт умершей сессии (continue, стадию не предписываем) или
+ *  конфликт-рестарт (conflict-fix: PR ветки в конфликте с master). */
+export type StartKind = KickoffMode | "continue" | "conflict-fix"
+
+/** Единственная точка выбора стартового промпта по виду старта.
+ *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR); env
+ *  сквозной для всех веток — рестарт env-задачи называет окружение. */
+export function promptForStart(
+  start: StartKind, rowId: string, project: string, repo: string, pr: string,
+  env?: SpawnEnvContext,
+): string {
+  if (start === "continue") return continuePrompt(rowId, project, repo, env)
+  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, env)
+  return spawnPrompt(rowId, project, repo, start, env)
+}
+
+/** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.
+ *  Не-JSON, неожиданные значения → UNKNOWN (трактуется как «не конфликт»). */
+export function prMergeableOf(raw: string): "CONFLICTING" | "MERGEABLE" | "UNKNOWN" {
+  try {
+    const j = JSON.parse(raw) as { mergeable?: unknown }
+    if (j.mergeable === "CONFLICTING" || j.mergeable === "MERGEABLE") return j.mergeable
+    return "UNKNOWN"
+  } catch {
+    return "UNKNOWN"
+  }
+}
+
+/** Шаг опроса mergeable. GitHub вычисляет конфликтность лениво: первый
+ *  запрос по «холодному» PR возвращает UNKNOWN и лишь запускает фоновое
+ *  вычисление — значение появляется на повторных запросах через секунды.
+ *  CONFLICTING/MERGEABLE — финальные вердикты; UNKNOWN переспрашивается,
+ *  пока не исчерпаны попытки, затем — мягкая деградация («не конфликт»). */
+export type MergeablePollStep =
+  | { t: "conflict" }
+  | { t: "clear" }
+  | { t: "retry" }
+  | { t: "degrade" }
+
+/** Единственная точка решения «что дальше» на попытке опроса mergeable. */
+export function mergeablePollStep(
+  mergeable: "CONFLICTING" | "MERGEABLE" | "UNKNOWN",
+  attempt: number,
+  maxAttempts: number,
+): MergeablePollStep {
+  if (mergeable === "CONFLICTING") return { t: "conflict" }
+  if (mergeable === "MERGEABLE") return { t: "clear" }
+  return attempt + 1 < maxAttempts ? { t: "retry" } : { t: "degrade" }
+}
+
 /** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
 export function bodyEditPrompt(rowId: string): string {
   return [
@@ -368,7 +440,8 @@ export function reviewReturnPrompt(rowId: string): string {
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
     "- результат approved → мяч у юзера, от тебя ничего не требуется;",
-    "- владелец вернул в Design → перепланируй и снова «Ревью плана».",
+    "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
+    "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
 }
 
@@ -394,7 +467,8 @@ export type RouteAction =
 
 /** Решение по задаче на один тик. Приоритет порядка: спавн ревьювера →
  *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → возврат
- *  девелоперу (из ревью-статуса или ручной перевод в Design) → noop. */
+ *  девелоперу (из ревью-статуса по вердикту, ручной перевод в Design или
+ *  fast-track флип владельца в In Progress — «вмешайся и почини») → noop. */
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
@@ -412,6 +486,13 @@ export function routeTask(f: RouteFacts): RouteAction {
   }
   // …или ручной перевод живой задачи в Design («перепланируй»)
   if (f.status === "Design" && f.lastStatus !== "Design" && f.lastStatus !== "") {
+    return { t: "return-to-dev" }
+  }
+  // fast-track трекенной задачи: перевод владельца в In Progress из любого
+  // другого статуса — «вмешайся и почини» (конфликт PR, зависший раунд,
+  // форсаж Design-задачи). lastStatus "" — свежий карантин без спавна:
+  // перевода не было, будит только коммент юзера.
+  if (f.status === "In Progress" && f.lastStatus !== "In Progress" && f.lastStatus !== "") {
     return { t: "return-to-dev" }
   }
   return { t: "noop" }
@@ -507,7 +588,7 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   const text = [
     `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
     `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
-    "Напиши комментарий в задачу — это разбудит агента; или переведи строку в Design — фабрика перешлёт агенту промпт возврата.",
+    "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
   ].join(" ")
   return { t: "signal", text }
 }

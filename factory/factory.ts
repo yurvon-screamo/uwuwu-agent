@@ -5,7 +5,10 @@
 //      легаси-черновик юзера — оба не трогаем) → сессия девелопера в
 //      чекауте репо + spawn-промпт утряски (ворктри/ветку создаёт сам
 //      агент); In Progress без записи state — fast-track владельца →
-//      implement-промпт (сразу реализация, без Design/план-ревью)
+//      implement-промпт (сразу реализация, без Design/план-ревью);
+//      перевод владельца в In Progress у трекенной задачи — будильник/
+//      рестарт девелопера (return-to-dev), PR в конфликте с master →
+//      конфликт-kickoff (разреши, запушь, верни в «Ревью результата»)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
 //      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
 //      задачи); возврат статуса из ревью → wakeup девелопера; комменты
@@ -30,9 +33,11 @@ import {
   untrackedTasks,
   isUserComment,
   commentText,
-  continuePrompt,
   kickoffModeOf,
-  spawnPrompt,
+  promptForStart,
+  prMergeableOf,
+  mergeablePollStep,
+  type MergeablePollStep,
   wakeupPrompt,
   bodyEditPrompt,
   isValidTracked,
@@ -41,6 +46,7 @@ import {
   reviewRerunPrompt,
   reviewCommentsPrompt,
   reviewReturnPrompt,
+  conflictFixPrompt,
   routeTask,
   rowMissingAction,
   worktreeByBranch,
@@ -60,7 +66,7 @@ import {
   type ProjectCfg,
   type ReviewKind,
   type FactoryState,
-  type KickoffMode,
+  type StartKind,
   type SpawnEnvContext,
   type TaskComment,
   type TaskRef,
@@ -527,9 +533,39 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 // ——— жизненный цикл задачи ———
 
-/** Вид старта сессии девелопера: свежий спавн (режим от kickoffModeOf)
- *  или рестарт умершей сессии (нейтральный промпт, стадию не предписываем). */
-type StartKind = KickoffMode | "continue"
+/** PR ветки задачи конфликтует с master (gh pr view). GitHub вычисляет
+ *  mergeable лениво: первый запрос по «холодному» PR отдаёт UNKNOWN и лишь
+ *  запускает фоновое вычисление — опрос повторяется, пока не появится
+ *  вердикт или не исчерпаются попытки (канонический сценарий: PR стоит со
+ *  вчерашнего ревью, владелец флипает статус — без повтора конфликт-kickoff
+ *  молча деградировал бы в generic именно в главном случае). Пустой PR,
+ *  DRY_RUN, сбой gh или UNKNOWN после всех попыток — «не конфликт»: путь
+ *  будильника не зависит от gh, конфликт агент увидит сам при пуше. */
+const MERGEABLE_POLL_ATTEMPTS = 4
+const MERGEABLE_POLL_DELAY_MS = 5_000
+
+async function prConflicted(pr: string, cwd: string): Promise<boolean> {
+  if (pr === "") return false
+  if (DRY_RUN) {
+    log(`DRY_RUN: gh pr view ${pr.slice(0, 40)} — mergeable не проверяется`)
+    return false
+  }
+  for (let attempt = 0; attempt < MERGEABLE_POLL_ATTEMPTS; attempt++) {
+    let step: MergeablePollStep
+    try {
+      const raw = await sh(["gh", "pr", "view", pr, "--json", "mergeable"], { cwd })
+      step = mergeablePollStep(prMergeableOf(raw), attempt, MERGEABLE_POLL_ATTEMPTS)
+    } catch (e) {
+      log(`prConflicted ${pr.slice(0, 40)}: ${errText(e)}`)
+      return false
+    }
+    if (step.t === "conflict") return true
+    if (step.t === "clear") return false
+    if (step.t === "retry") await new Promise((r) => setTimeout(r, MERGEABLE_POLL_DELAY_MS))
+  }
+  log(`prConflicted ${pr.slice(0, 40)}: mergeable=UNKNOWN после ${MERGEABLE_POLL_ATTEMPTS} попыток — generic-ветка`)
+  return false
+}
 
 async function startTask(
   task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState,
@@ -570,12 +606,7 @@ async function startTask(
   })
   if (sessionID === null) throw new Error("сессия не создалась")
 
-  const sent = await promptSession(
-    sessionID,
-    start === "continue"
-      ? continuePrompt(task.rowId, projectName, cfg.repo, envCtx)
-      : spawnPrompt(task.rowId, projectName, cfg.repo, start, envCtx),
-  )
+  const sent = await promptSession(sessionID, promptForStart(start, task.rowId, projectName, cfg.repo, task.pr, envCtx))
   if (!sent) throw new Error("spawn-промпт не ушёл")
 
   // живость сразу после спавна: «фиктивные sessionID» (create ок, сессии
@@ -861,31 +892,48 @@ async function dispatchReviewAction(
     }
     case "return-to-dev": {
       const devLiveness = d.tracked.sessionID === "" ? "dead" : await sessionLiveness(d.tracked.sessionID)
-      if (devLiveness === "alive") {
-        const ok = await promptSession(d.tracked.sessionID, reviewReturnPrompt(d.row.rowId))
-        if (!ok) log(`задача ${shortId}: возврат из ревью — промпт девелоперу не ушёл`)
-        return undefined
-      }
       if (devLiveness === "unknown") {
         // транзиентная ошибка REST — не плодим дубли сессий, следующий тик перепроверит
         log(`задача ${shortId}: возврат из ревью, живость девелопера неизвестна — пропуск`)
         return undefined
       }
+      // конфликтный PR → конфликт-kickoff вместо generic-возврата (и при
+      // вердикте ревьювера, и при флипе владельца: «вмешайся и почини»)
+      const conflicted = await prConflicted(d.row.pr, d.cfg.local)
+      if (devLiveness === "alive") {
+        const ok = await promptSession(
+          d.tracked.sessionID,
+          conflicted ? conflictFixPrompt(d.row.rowId, d.row.pr) : reviewReturnPrompt(d.row.rowId),
+        )
+        if (ok) {
+          // один промпт вместо двойной доставки (промпт + wakeup тем же
+          // тиком): агент перечитывает task get вместе с комментами/телом
+          d.consumeComments()
+          await d.refreshBodyBaseline()
+          saveState(d.state)
+        } else {
+          log(`задача ${shortId}: возврат из ревью — промпт девелоперу не ушёл`)
+        }
+        return undefined
+      }
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
       // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер.
       // startTask заменяет запись state — дальше по циклу не идём:
-      // свежая сессия уже получила рестарт-промпт (стадию не предписываем)
+      // свежая сессия уже получила рестарт-промпт (конфликтный или нейтральный)
       const savedReview = d.tracked.reviewSessionID
       const savedReviewAttempts = d.tracked.reviewAttempts
       try {
-        await startTask(d.row, d.project, d.cfg, d.board, d.state, d.tracked.attempts, "continue")
+        await startTask(
+          d.row, d.project, d.cfg, d.board, d.state, d.tracked.attempts,
+          conflicted ? "conflict-fix" : "continue",
+        )
         const reborn = d.state.tasks[d.row.rowId]
         if (reborn !== undefined && savedReview !== undefined) {
           reborn.reviewSessionID = savedReview
           reborn.reviewAttempts = savedReviewAttempts
           saveState(d.state)
         }
-        log(`задача ${shortId}: возврат из ревью при мёртвом девелопере — рестарт сессии`)
+        log(`задача ${shortId}: возврат из ревью при мёртвом девелопере — рестарт сессии${conflicted ? " (конфликт-fix)" : ""}`)
       } catch (e) {
         await registerFailure(d.row, d.project, d.board, d.state, d.tracked.attempts, e)
       }
