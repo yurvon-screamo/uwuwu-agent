@@ -10,13 +10,13 @@ import {
   untrackedTasks,
   isUserComment,
   snapshotText,
-  worktreePaths,
   worktreeByBranch,
   runBatch,
   parseProjects,
   formatPassSummary,
   adoptBodyDoc,
   pathSafe,
+  stampLegacyEntries,
   type ProjectCfg,
   isValidTracked,
   rowMissingAction,
@@ -111,14 +111,32 @@ describe("snapshotText", () => {
   })
 })
 
-describe("worktreePaths", () => {
-  test("ведущий дефис row-id sanitized", () => {
-    const { branch, worktree } = worktreePaths("/root", "-5BF9NMBXZ")
-    expect(branch).toBe("work/task-5BF9NMBXZ")
-    expect(worktree).toBe("/root/task-5BF9NMBXZ")
+describe("stampLegacyEntries — штамп перехода на env-механику", () => {
+  const mkState = (entries: Record<string, { sessionID: string; envDir?: string }>): FactoryState => ({
+    tasks: Object.fromEntries(
+      Object.entries(entries).map(([k, v]) => [k, {
+        sessionID: v.sessionID, envDir: v.envDir, worktree: "", branch: "",
+        bodyDoc: "d", title: "t", project: "uwuwu",
+        lastCommentAt: 1, lastCommentId: "i", createdAt: 2, attempts: 0,
+      }]),
+    ),
   })
-  test("мусорные символы вырезаются", () => {
-    expect(worktreePaths("/r", "abc$#@!def").branch).toMatch(/^work\/task-[a-zA-Z0-9_-]+$/)
+  test("спавненная запись без envDir получает legacy, envDir-ные — нет", () => {
+    const state = mkState({ "row-a": { sessionID: "ses_1" }, "row-b": { sessionID: "ses_2", envDir: "/env/b" } })
+    const stamped = stampLegacyEntries(state)
+    expect(stamped).toEqual(["row-a"])
+    expect(state.tasks["row-a"]?.legacy).toBe(true)
+    expect(state.tasks["row-b"]?.legacy).toBeUndefined()
+  })
+  test("карантин без сессии не штампуется — его спавн ещё попробует env", () => {
+    const state = mkState({ "row-q": { sessionID: "" } })
+    expect(stampLegacyEntries(state)).toEqual([])
+    expect(state.tasks["row-q"]?.legacy).toBeUndefined()
+  })
+  test("повторный прогон идемпотентен", () => {
+    const state = mkState({ "row-a": { sessionID: "ses_1" } })
+    stampLegacyEntries(state)
+    expect(stampLegacyEntries(state)).toEqual([])
   })
 })
 
@@ -151,6 +169,13 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, stallSignaled: undefined })).toBe(true)
     expect(isValidTracked(base)).toBe(true)
     expect(isValidTracked({ ...base, stallSignaled: "yes" })).toBe(false)
+  })
+  test("envDir/legacy: строка с / и boolean валидны, чужие типы — мимо", () => {
+    expect(isValidTracked({ ...base, envDir: "/home/x/agents-env/row" })).toBe(true)
+    expect(isValidTracked({ ...base, envDir: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, envDir: "relative" })).toBe(false)
+    expect(isValidTracked({ ...base, legacy: true })).toBe(true)
+    expect(isValidTracked({ ...base, legacy: 1 })).toBe(false)
   })
 })
 
@@ -201,6 +226,21 @@ describe("spawnPrompt", () => {
     // hint скана территории — тоже design-specific, в fast-track не протекает
     expect(p).not.toContain("скан территории")
     expect(p).not.toContain("🤖")
+  })
+  test("env-контекст: работа в готовом окружении, старой строки «создай worktree» нет", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", {
+      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+    })
+    expect(p).toContain("/home/x/agents-env/r1/repo")
+    expect(p).toContain("work/task-r1")
+    expect(p).toContain("не /tmp")
+    expect(p).toContain("заполняет фабрика")
+    expect(p).not.toContain("создай worktree")
+  })
+  test("без env-контекста (легаси/env:false) — прежняя строка про worktree+Branch-ячейку", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
+    expect(p).toContain("создай worktree+ветку от origin/master")
+    expect(p).toContain("заполни Branch-ячейку")
   })
 })
 
@@ -349,6 +389,16 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("approve → Review")
     expect(p).toContain("request_changes → In Progress")
     expect(p).not.toContain("request_changes → Design")
+  })
+  test("result без ворктри (легаси) — честная строка про diff/PR, не пустота", () => {
+    const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" })
+    expect(p).toContain("Ворктри задачи не найден")
+    expect(p).toContain("diff origin/master…feat/y")
+    expect(p).not.toContain("Ворктри задачи: ")
+  })
+  test("plan без ворктри — строка про diff не появляется (плану код не нужен)", () => {
+    const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
+    expect(p).not.toContain("Ворктри задачи не найден")
   })
 })
 
@@ -504,6 +554,14 @@ describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () =
   test("массив вместо объекта — отказ, не тихий пустой конфиг", () => {
     expect(() => parseProjects("[]", fallback)).toThrow(/объект/)
   })
+
+  test("env-флаг: boolean проходит и сохраняется, не-boolean — отказ", () => {
+    const raw = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", env: false } })
+    expect(parseProjects(raw, fallback).test?.env).toBe(false)
+    expect(parseProjects(undefined, fallback).uwuwu?.env).toBeUndefined()
+    const bad = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", env: "no" } })
+    expect(() => parseProjects(bad, fallback)).toThrow(/test.*env.*boolean/)
+  })
 })
 
 // ——— сводка прохода ———
@@ -511,19 +569,22 @@ describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () =
 describe("formatPassSummary: одна строка о проходе", () => {
   test("полная сводка с фейлами перечисляет причины", () => {
     const line = formatPassSummary("uwuwu", {
-      devSpawned: 4, reviewSpawned: 1, wakeups: 2, cleanups: 1, watched: 12,
+      devSpawned: 4, reviewSpawned: 1, wakeups: 2, cleanups: 1,
+      envCreated: 2, envRemoved: 1, envAtticked: 1, watched: 12,
       failures: ["20261105ab: сессия мертва после спавна"],
     })
     expect(line).toBe(
-      "проход uwuwu: спавн dev=4 ревью=1, будильники=2, чистки=1, наблюдение=12" +
+      "проход uwuwu: спавн dev=4 ревью=1, будильники=2, чистки=1, env=+2/-1/attic:1, наблюдение=12" +
       ", фейлы=1 (20261105ab: сессия мертва после спавна)")
   })
 
   test("тихий тик без событий всё равно виден (наблюдение=0)", () => {
     const line = formatPassSummary("origa", {
-      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0, watched: 0, failures: [],
+      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0,
+      envCreated: 0, envRemoved: 0, envAtticked: 0,
+      watched: 0, failures: [],
     })
-    expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, наблюдение=0")
+    expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, env=+0/-0/attic:0, наблюдение=0")
   })
 })
 
