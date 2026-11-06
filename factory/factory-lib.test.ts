@@ -43,6 +43,11 @@ import {
   type TaskComment,
   type TaskRef,
   type TrackedTask,
+  alertTargetOf,
+  spawnGuardVerdict,
+  spawnLimitsFromEnv,
+  SPAWN_ALERT_REPEAT_MS,
+  type SpawnGuardLimits,
 } from "./factory-lib"
 
 const c = (id: string, text: string, at: number): TaskComment => ({ id, text, createdAt: at })
@@ -711,6 +716,16 @@ describe("formatPassSummary: одна строка о проходе", () => {
     })
     expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, env=+0/-0/attic:0, наблюдение=0")
   })
+
+  test("задержанные гардом спавны видны в сводке", () => {
+    const line = formatPassSummary("uwuwu", {
+      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0,
+      envCreated: 0, envRemoved: 0, envAtticked: 0,
+      watched: 3, failures: [], held: 15, heldReason: "state-loss",
+    })
+    expect(line).toContain("задержано гардом=15")
+    expect(line).toContain("state-loss")
+  })
 })
 
 describe("parseProjects: семантическая валидация", () => {
@@ -957,5 +972,224 @@ describe("createBoardPathOnce — ленивый мемоизер пути до�
     expect(errText(new Error("boom"))).toBe("boom")
     expect(errText("строка")).toBe("строка")
     expect(errText(42)).toBe("42")
+  })
+})
+
+// ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
+
+const ref = (overrides: Partial<TaskRef> & { rowId: string }): TaskRef => ({
+  bodyDoc: "", title: "Задача", status: "Design", pr: "", branch: "",
+  devSession: "", reviewSession: "", // явная нормализация: undefined тестируется отдельным кейсом
+  ...overrides,
+})
+
+const GUARD_LIMITS: SpawnGuardLimits = { lossMax: 2, burstMax: 12 }
+const GUARD_NOW = 1_000_000_000_000
+
+describe("spawnLimitsFromEnv: UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX", () => {
+  test("таблица: дефолты 2/12 на пустоту/мусор/0/минус, валидные числа — они", () => {
+    // Arrange / Act / Assert
+    expect(spawnLimitsFromEnv(undefined, undefined)).toEqual({ lossMax: 2, burstMax: 12 })
+    expect(spawnLimitsFromEnv("", "   ")).toEqual({ lossMax: 2, burstMax: 12 })
+    expect(spawnLimitsFromEnv("abc", "-3")).toEqual({ lossMax: 2, burstMax: 12 })
+    expect(spawnLimitsFromEnv("0", "0")).toEqual({ lossMax: 2, burstMax: 12 })
+    expect(spawnLimitsFromEnv("1", "20")).toEqual({ lossMax: 1, burstMax: 20 })
+    expect(spawnLimitsFromEnv("2.5", "12")).toEqual({ lossMax: 2.5, burstMax: 12 })
+  })
+})
+
+describe("spawnGuardVerdict: потеря state не превращается в каскад спавнов", () => {
+  test("штатный тик: сирот нет, untracked в пределах burst — allow", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 3, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toEqual({ t: "allow" })
+  })
+
+  test("легитимная волна новых задач без сессионных ячеек в пределах burst — allow", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toEqual({ t: "allow" })
+  })
+
+  test("легитимное опустошение (все задачи Done) — allow без алерта", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 0, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toEqual({ t: "allow" })
+  })
+
+  test("инцидент-сигнатура: state пуст, на доске живые строки с ячейками — hold(state-loss), alert=first", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 15, totalUntracked: 15, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict.t).toBe("hold")
+    if (verdict.t !== "hold") return
+    expect(verdict.reason).toBe("state-loss")
+    expect(verdict.alert).toBe("first")
+    expect(verdict.text).toContain("15")
+    expect(verdict.text).toContain("state")
+  })
+
+  test("сироты в пределах lossMax, но всего untracked > burst — hold(burst)", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 1, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+  })
+
+  test("чистый burst без сирот — hold(burst), alert=first", () => {
+    // Act
+    const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+  })
+
+  test("повторный тик эпизода в пределах окна повтора — alert=none", () => {
+    // Arrange: алерт был 10 минут назад (окно — час)
+    const signaled = new Date(GUARD_NOW - 10 * 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 15, totalUntracked: 15, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "hold", reason: "state-loss", alert: "none" })
+  })
+
+  test("длящийся HOLD дольше окна повтора — alert=repeat", () => {
+    // Arrange: алерт был 2 часа назад
+    const signaled = new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 15, totalUntracked: 15, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "hold", alert: "repeat" })
+  })
+
+  test("allow при стоящем флаге — вердикт allow (демон снимет флаг)", () => {
+    // Arrange
+    const signaled = new Date(GUARD_NOW - 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 0, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toEqual({ t: "allow" })
+  })
+
+  test("битый holdSignaled — трактуется как отсутствие флага (alert=first)", () => {
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 15, totalUntracked: 15, holdSignaled: "не-ISO", now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "hold", alert: "first" })
+  })
+
+  test("ровно на порогах — allow (триггер — строго больше)", () => {
+    // Act / Assert
+    expect(spawnGuardVerdict({ orphaned: 2, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS))
+      .toEqual({ t: "allow" })
+    expect(spawnGuardVerdict({ orphaned: 3, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS))
+      .toMatchObject({ t: "hold", reason: "state-loss" })
+    expect(spawnGuardVerdict({ orphaned: 0, totalUntracked: 13, now: GUARD_NOW }, GUARD_LIMITS))
+      .toMatchObject({ t: "hold", reason: "burst" })
+  })
+})
+
+describe("alertTargetOf: фолбэк-цепочка адресата алерта", () => {
+  test("первая сирота с телом в порядке скана выигрывает", () => {
+    // Arrange
+    const candidates = [
+      ref({ rowId: "r1", bodyDoc: "", devSession: "ses_a" }),
+      ref({ rowId: "r2", bodyDoc: "doc2", devSession: "ses_b" }),
+      ref({ rowId: "r3", bodyDoc: "doc3" }),
+    ]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert
+    expect(target?.rowId).toBe("r2")
+  })
+
+  test("сироты по ревью-ячейке тоже считаются", () => {
+    // Arrange
+    const candidates = [ref({ rowId: "r1", bodyDoc: "doc1", reviewSession: "ses_r" })]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert
+    expect(target?.rowId).toBe("r1")
+  })
+
+  test("сироты без тел пропускаются — первая строка с телом", () => {
+    // Arrange
+    const candidates = [
+      ref({ rowId: "r1", bodyDoc: "", devSession: "ses_a" }),
+      ref({ rowId: "r2", bodyDoc: "doc2" }),
+    ]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert
+    expect(target?.rowId).toBe("r2")
+  })
+
+  test("чистый burst без сирот — первая untracked с телом", () => {
+    // Arrange
+    const candidates = [
+      ref({ rowId: "r1", bodyDoc: "" }),
+      ref({ rowId: "r2", bodyDoc: "doc2" }),
+      ref({ rowId: "r3", bodyDoc: "doc3" }),
+    ]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert
+    expect(target?.rowId).toBe("r2")
+  })
+
+  test("ни одной строки с телом — null (лог-only)", () => {
+    // Arrange
+    const candidates = [ref({ rowId: "r1", bodyDoc: "" }), ref({ rowId: "r2", bodyDoc: "" })]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert
+    expect(target).toBeNull()
+  })
+
+  test("undefined-поля ячеек — свидетельством не являются (TaskRef без нормализации)", () => {
+    // Arrange: r1 несёт devSession, r2/r3 — поля не заданы вовсе
+    const candidates = [
+      ref({ rowId: "r1", bodyDoc: "doc1" }),
+      ref({ rowId: "r2", bodyDoc: "doc2", devSession: undefined, reviewSession: undefined }),
+    ]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert: сирот нет (undefined не свидетель) — фолбэк: первая с телом
+    expect(target?.rowId).toBe("r1")
+  })
+
+  test("пустой список — null", () => {
+    expect(alertTargetOf([])).toBeNull()
   })
 })

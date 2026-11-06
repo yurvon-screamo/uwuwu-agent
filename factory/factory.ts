@@ -60,6 +60,10 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
+  alertTargetOf,
+  spawnGuardVerdict,
+  spawnLimitsFromEnv,
+  hasSessionEvidence,
   stampLegacyEntries,
   PATH_CELL,
   DEV_SESSION_CELL,
@@ -70,6 +74,7 @@ import {
   type FactoryState,
   type StartKind,
   type SpawnEnvContext,
+  type SpawnGuardHold,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
@@ -119,6 +124,14 @@ const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
  *  (0/NaN/мусор → дефолт 30), эффективное значение — в стартовый лог. */
 const STALL_MIN = stallMinutesFromEnv(process.env.UWUWU_FACTORY_STALL_MIN)
 const STALL_MS = STALL_MIN * 60_000
+/** гард каскада (инцидент 06.11): пустой/резко уменьшившийся state.json не
+ *  должен превращаться в волну re-spawn. Сверка с доской до спавна —
+ *  сироты-спавны (строка с сессионной ячейкой без трека) и рубеж burst;
+ *  эффективные значения — в стартовый лог. */
+const SPAWN_LIMITS = spawnLimitsFromEnv(
+  process.env.UWUWU_FACTORY_SPAWN_LOSS_MAX,
+  process.env.UWUWU_FACTORY_SPAWN_BURST_MAX,
+)
 /** разовый тик и выход — для живого смоук-теста */
 const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 /** DRY_RUN: полный цикл решений по реальным доскам (чтение), все мутации
@@ -172,6 +185,10 @@ function loadState(): FactoryState {
     const raw: unknown = JSON.parse(readFileSync(STATE_FILE, "utf-8"))
     const tasks = (raw as { tasks?: unknown }).tasks
     const out: FactoryState = { tasks: {} }
+    // флаг эпизода гарда — top-level (не задачи): переносится между тиками,
+    // снимается allow-вердиктом (см. tickProject)
+    const holdSignaled = (raw as { holdSignaled?: unknown }).holdSignaled
+    if (typeof holdSignaled === "string") out.holdSignaled = holdSignaled
     if (tasks !== null && typeof tasks === "object") {
       for (const [k, v] of Object.entries(tasks as Record<string, unknown>)) {
         if (isValidTracked(v)) {
@@ -326,6 +343,8 @@ export async function readTasks(
       status: row.cells?.Status?.value ?? "",
       pr: row.cells?.PR?.value ?? "",
       branch: row.cells?.Branch?.value ?? "",
+      devSession: (row.cells?.[DEV_SESSION_CELL]?.value ?? "").trim(),
+      reviewSession: (row.cells?.[REVIEW_SESSION_CELL]?.value ?? "").trim(),
     })
   }
   if (orphans.length > 0) {
@@ -714,6 +733,50 @@ async function notify(task: TrackedTask, body: string): Promise<void> {
   if (!(await commentTask(task.bodyDoc, body))) log(`уведомление не доставлено: ${body.slice(0, 80)}`)
 }
 
+/** Снимок state перед перезаписью из подозрительно пустого скана (паритет
+ *  с двухпроходной чисткой трекинга, ADR-031): датированный, обычным .bak
+ *  не ротируется. */
+function backupSuspectState(): void {
+  if (!existsSync(STATE_FILE)) return
+  const stamp = new Date().toISOString().replaceAll(":", "-")
+  try {
+    copyFileSync(STATE_FILE, `${STATE_FILE}.bak-suspect-${stamp}`)
+    log(`гард спавна: бэкап state → ${STATE_FILE}.bak-suspect-${stamp}`)
+  } catch (e) {
+    log(`гард спавна: бэкап не удался — ${errText(e)}`)
+  }
+}
+
+/** HOLD-тик гарда каскада: спавны отложены (обслуживание существующих
+ *  треков продолжается — гард бьёт только по новому спавну). Алерт-политика:
+ *  first — вход в эпизод (бэкап + коммент владельцу), repeat — длящийся
+ *  HOLD за окном повтора (коммент снова), none — в пределах окна (только
+ *  лог). Флаг эпизода ставится по факту ПОПЫТКИ алерта, не доставки:
+ *  недоставимый алерт не должен ретраиться каждый тик — окно повтора
+ *  вернётся к нему через час. */
+async function holdSpawns(
+  guard: SpawnGuardHold, untracked: TaskRef[], orphaned: number,
+  state: FactoryState, counters: PassCounters,
+): Promise<void> {
+  const targets = untracked.slice(0, 10).map((r) => r.rowId.slice(0, 8))
+  counters.held = untracked.length
+  counters.heldReason = guard.reason
+  log(`гард спавна: HOLD (${guard.reason}), сирот=${orphaned}, untracked=${untracked.length}` +
+    ` — спавны отложены: ${targets.join(", ") || "нет"}`)
+  if (guard.alert === "none") return
+  if (guard.alert === "first") backupSuspectState()
+  const target = alertTargetOf(untracked)
+  if (target === null) {
+    log("гард спавна: адресата алерта нет (ни одной строки с телом) — только лог")
+  } else if (await commentTask(target.bodyDoc, guard.text)) {
+    log(`гард спавна: алерт доставлен в задачу ${target.rowId.slice(0, 8)}`)
+  } else {
+    log(`гард спавна: алерт в ${target.rowId.slice(0, 8)} не доставлен — повтор в пределах окна`)
+  }
+  state.holdSignaled = new Date().toISOString()
+  saveState(state)
+}
+
 async function registerFailure(
   task: TaskRef, projectName: string, board: BoardIds, state: FactoryState, seed: number, err: unknown,
 ): Promise<void> {
@@ -984,11 +1047,32 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     (r) => r.status === "Design" || r.status === "In Progress" || reviewKindOf(r.status) !== null)
   const untracked = untrackedTasks(spawnable, state)
 
+  // ——— гард каскада: сверка state с доской до спавна (инцидент 06.11) ———
+  // сирота-спавн: сессионная ячейка непуста, а трека в state нет — state
+  // потерял трекинг (порча/перезапись/тест-запись). Спавнить их = гарантированный
+  // каскад re-spawn (19 агентов за тик) и параллельные сессии в одних ворктри.
+  const orphaned = untracked.filter((r) => hasSessionEvidence(r)).length
+  const guard = spawnGuardVerdict(
+    { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
+    SPAWN_LIMITS,
+  )
+  if (guard.t === "hold") {
+    await holdSpawns(guard, untracked, orphaned, state, counters)
+  } else if (state.holdSignaled !== undefined) {
+    // сигнатура ушла (state восстановлен) — эпизод завершён, снимаем флаг:
+    // следующий эпизод снова получит alert=first с алертом и бэкапом
+    delete state.holdSignaled
+    saveState(state)
+    log("гард спавна: сигнатура ушла — эпизод HOLD завершён, флаг снят")
+  }
+
   // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
   // и fast-track In Progress владельца) получают сессии за ОДИН проход
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
-  // растягивали волну из 4 задач на 12+ минут)
-  const devWave = untracked.filter((t) => reviewKindOf(t.status) === null)
+  // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
+  const devWave = guard.t === "allow"
+    ? untracked.filter((t) => reviewKindOf(t.status) === null)
+    : []
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
@@ -1006,7 +1090,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }, SPAWN_WAVE_CONCURRENCY)
   }
 
-  for (const task of untracked.filter((t) => reviewKindOf(t.status) !== null)) {
+  // ревью-спавны untracked: тоже под гардом (HOLD глушит — каскад ревьюверов
+  // так же опасен, как дев-волна)
+  const reviewUntracked = guard.t === "allow"
+    ? untracked.filter((t) => reviewKindOf(t.status) !== null)
+    : []
+  for (const task of reviewUntracked) {
     const kind = reviewKindOf(task.status)
     if (kind === null) continue // защищённость от перефильтра выше
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
@@ -1084,6 +1173,11 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
     if (row.status === "Done") {
       log(`задача ${rowId.slice(0, 8)}: Done (закрыта агентом/юзером) — чистка`)
+      // инвариант гарда каскада: строка Done без сессионных ячеек —
+      // переоткрытие не выглядит сиротой-спавном. Только путь Done (строка
+      // наблюдается в скане): suspect-clean пишет ячейки в пустоту —
+      // setCellsSafe дал бы шумный catch-лог на каждой чистке
+      await setCellsSafe(board, rowId, { [DEV_SESSION_CELL]: "", [REVIEW_SESSION_CELL]: "" })
       await finishTask(rowId, tracked, cfg, state, counters)
       counters.cleanups++
       continue
@@ -1323,7 +1417,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   // старт-свип окружений: сироты без записи в state и старый attic — только

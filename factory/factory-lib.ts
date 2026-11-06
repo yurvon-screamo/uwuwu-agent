@@ -9,6 +9,11 @@ export interface TaskRef {
   status: string
   pr: string
   branch: string
+  /** сессионные ячейки строки («Сессия dev»/«Сессия ревью»): непустые —
+   *  фабрика спавнила задачу раньше (свидетель спавна, переживает потерю
+   *  state); "" — свидетельства нет (легитимно новая строка) */
+  devSession?: string
+  reviewSession?: string
 }
 
 export interface TaskComment {
@@ -68,6 +73,11 @@ export interface TrackedTask {
 
 export interface FactoryState {
   tasks: Record<string, TrackedTask>
+  /** ISO последнего алерта эпизода гарда спавна (HOLD каскада); undefined —
+   *  эпизода нет. Снимает демон: verdict=allow при стоящем флаге → удалить
+   *  (зеркало сброса stallSignaled — без сброса следующий эпизод остался бы
+   *  без алерта и бэкапа навсегда) */
+  holdSignaled?: string
 }
 
 /** Комменты агента — с этим префиксом, чтобы не петлить себя. */
@@ -653,6 +663,93 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   return { t: "signal", text }
 }
 
+// ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
+
+export const SPAWN_LOSS_MAX_DEFAULT = 2
+export const SPAWN_BURST_MAX_DEFAULT = 12
+/** окно повтора алерта при длящемся HOLD (анти-спам: между повторами — только лог и сводка) */
+export const SPAWN_ALERT_REPEAT_MS = 60 * 60_000
+
+export interface SpawnGuardLimits {
+  /** сирот-спавнов, переживаемых без алерта (пара переоткрытых старых Done-строк) */
+  lossMax: number
+  /** рубеж каскада: untracked spawnable сверх этого — HOLD на тик (не лимит обычной волны) */
+  burstMax: number
+}
+
+export interface SpawnGuardFacts {
+  /** untracked spawnable с непустой сессионной ячейкой — «сироты-спавны»:
+   *  спавн был, трека нет — сигнатура потери state */
+  orphaned: number
+  /** всего untracked spawnable (сироты + легитимно новые) */
+  totalUntracked: number
+  /** ISO последнего алерта эпизода (state.holdSignaled); undefined — эпизода нет */
+  holdSignaled?: string
+  now: number
+}
+
+export type SpawnGuardAlert = "first" | "repeat" | "none"
+
+export type SpawnGuardHold = {
+  t: "hold"
+  reason: "state-loss" | "burst"
+  alert: SpawnGuardAlert
+  text: string
+}
+
+export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold
+
+/** UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX: пусто →
+ *  дефолты 2/12; мусор/0/отрицательные → дефолт. Семантики «0 = выключено»
+ *  нет — отключение гарда только заведомо большим значением (9999). */
+export function spawnLimitsFromEnv(loss: string | undefined, burst: string | undefined): SpawnGuardLimits {
+  const parse = (v: string | undefined, fallback: number): number => {
+    if (v === undefined || v.trim() === "") return fallback
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? n : fallback
+  }
+  return { lossMax: parse(loss, SPAWN_LOSS_MAX_DEFAULT), burstMax: parse(burst, SPAWN_BURST_MAX_DEFAULT) }
+}
+
+/** Единственная точка решения гарда (по образцу routeTask/stallVerdict):
+ *  превышение любого порога = HOLD спавнов на тик. reason=state-loss, когда
+ *  сигнатура потери (сироты-спавны > lossMax); иначе burst. alert=first —
+ *  вход в эпизод (флага нет или битый ISO), repeat — длящийся HOLD за окном
+ *  повтора, none — в пределах окна (анти-спам). allow при стоящем флаге —
+ *  сигнал демону снять флаг: эпизод завершён. */
+export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): SpawnGuardVerdict {
+  if (f.orphaned <= l.lossMax && f.totalUntracked <= l.burstMax) return { t: "allow" }
+  const reason = f.orphaned > l.lossMax ? "state-loss" as const : "burst" as const
+  const prevMs = f.holdSignaled !== undefined ? Date.parse(f.holdSignaled) : Number.NaN
+  const alert: SpawnGuardAlert = Number.isNaN(prevMs)
+    ? "first"
+    : f.now - prevMs >= SPAWN_ALERT_REPEAT_MS ? "repeat" : "none"
+  const counts = `сирот-спавнов=${f.orphaned} (порог ${l.lossMax}), untracked=${f.totalUntracked} (порог ${l.burstMax})`
+  const text = reason === "state-loss"
+    ? `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
+      "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
+      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон."
+    : `[factory] Спавн задержан — за один тик набралось untracked=${f.totalUntracked} при пороге ${l.burstMax} ` +
+      `(сирот-спавнов=${f.orphaned}): массовый импорт задач или потеря state без свидетелей-ячеек. ` +
+      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон; иначе проверь state.json."
+  return { t: "hold", reason, alert, text }
+}
+
+/** Свидетель спавна в строке: сессионная ячейка непуста. Поля опциональны —
+ *  undefined (TaskRef без нормализации) свидетельством НЕ является. */
+export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession">): boolean {
+  return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== ""
+}
+
+/** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →
+ *  первая строка с телом (чистый burst без сирот) → null (ни одной строки
+ *  с телом — алерт недоставим, терминальный лог-only случай). */
+export function alertTargetOf(candidates: TaskRef[]): TaskRef | null {
+  const orphanWithBody = candidates.find((r) => r.bodyDoc !== "" && hasSessionEvidence(r))
+  if (orphanWithBody !== undefined) return orphanWithBody
+  return candidates.find((r) => r.bodyDoc !== "") ?? null
+}
+
 /** Ячейки доски, которые заполняет фабрика. Колонки добавляет владелец;
  *  запись best-effort (нет колонки → тихий no-op ядра, работа не ломается). */
 export const PATH_CELL = "Path"
@@ -808,6 +905,10 @@ export interface PassCounters {
   envAtticked: number
   /** задачи под наблюдением на конец прохода (этот проект) */
   watched: number
+  /** спавны, задержанные гардом каскада за тик (HOLD); undefined — гарда не было */
+  held?: number
+  /** причина HOLD для сводки; meaningful только при held */
+  heldReason?: "state-loss" | "burst"
   /** фейлы спавна: короткие «rowId-префикс: причина» */
   failures: string[]
 }
@@ -817,6 +918,9 @@ export interface PassCounters {
 export function formatPassSummary(project: string, c: PassCounters): string {
   const failures = c.failures.length > 0 ? `, фейлы=${c.failures.length} (${c.failures.join("; ")})` : ""
   const envPart = `, env=+${c.envCreated}/-${c.envRemoved}/attic:${c.envAtticked}`
+  const heldPart = c.held !== undefined && c.held > 0
+    ? `, задержано гардом=${c.held}${c.heldReason !== undefined ? ` (${c.heldReason})` : ""}`
+    : ""
   return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
-    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}, наблюдение=${c.watched}${failures}`
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}${heldPart}, наблюдение=${c.watched}${failures}`
 }
