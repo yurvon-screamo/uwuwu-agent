@@ -13,6 +13,7 @@ pub mod siyuan;
 pub mod siyuan_id;
 pub mod siyuan_doctor;
 pub mod siyuan_guard;
+pub mod siyuan_person;
 pub mod sofa;
 pub mod siyuan_task;
 
