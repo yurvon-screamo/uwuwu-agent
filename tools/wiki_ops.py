@@ -21,8 +21,11 @@ delete: без --force сносится только док-заглушка д�
 markdown, у которой на ОДНОЙ строке есть и «⚠️», и слово «канон»/«заглушк»
 (без учёта регистра); смежные строки не объединяются. Guard'ы: док с дочерними
 доками сносится только с --force (subtree уходит целиком); канон (без маркера)
-— только с --force. ВНИМАНИЕ: --force сносит subtree, доски и тела задач —
-для тел задач правильный путь uwuwu-cli task rm, а не delete.
+— только с --force. Пост-чек: вердикт — по файловой пробе ядра (getFile
+data/<box><path>, FS-истина — ядро читает диск, ADR-025); SQL-индекс отстаёт
+от мутаций секундами (Experience/cli write-path) — примечание к успеху или
+фолбэк при failed-пробе, успех не отвергает. ВНИМАНИЕ: --force сносит subtree,
+доски и тела задач — для тел задач правильный путь uwuwu-cli task rm, а не delete.
 
 append: идемпотентен при ретраях (инцидент append ×4, 02.11). Перед каждой
 отсылкой — контрольный export: нормализованный аппенд совпал с нормализованным
@@ -69,6 +72,9 @@ ORG_LS_LIMIT = 100000
 
 # export дока в markdown (cmd_export, _is_stub, _export_content).
 EXPORT_MD_PATH = "/api/export/exportMdContent"
+
+# getFile-проба файла воркспейса (пост-чек delete, ADR-025 файловый контракт).
+GET_FILE_PATH = "/api/file/getFile"
 
 # Формат docId ядра SiYuan: 14 цифр (timestamp) + '-' + 7 символов [a-z0-9].
 # Валидация до любых SQL-запросов — инъекция/мусор отсекаются на входе.
@@ -164,6 +170,33 @@ def post(path: str, body: dict, attempts: int = 6):
             continue
         raise KernelRefused(f"POST {path}: {last}")
     raise RuntimeError(f"POST {path}: {last}")
+
+
+def _fs_file(path: str) -> str:
+    """getFile-проба файла воркспейса (контракт ядра 3.8.9, ADR-025): один
+    выстрел без ретраев — проба существования должна быть быстрой и честной.
+    "found" — HTTP 200 с байтами (ядро читает диск, индекс не участвует);
+    "missing" — конверт code 404 (файла нет, приходит как HTTP 202);
+    "failed" — проба не состоялась: транспорт, прочий code, не-JSON, 200 с
+    пустым телом (пустое тело это промах, не успех — правило write-path).
+    """
+    _conf()
+    req = urllib.request.Request(URL + GET_FILE_PATH, data=json.dumps({"path": path}).encode(),
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
+            body = r.read()
+            status = getattr(r, "status", None)  # неизвестный статус → не 200: конверт/failed, не «found»
+    except Exception:
+        return "failed"
+    if status == 200:
+        return "found" if body else "failed"
+    try:
+        envelope = json.loads(body)
+    except Exception:
+        return "failed"
+    return "missing" if envelope.get("code") == 404 else "failed"
 
 
 def notebooks(attempts: int = 6) -> list[dict]:
@@ -361,8 +394,8 @@ def cmd_replace(a):
     print(f"заменён: {hpath}")
 
 
-def _sql_rows(stmt: str) -> list[dict]:
-    rows = post("/api/query/sql", {"stmt": stmt})
+def _sql_rows(stmt: str, attempts: int = 6) -> list[dict]:
+    rows = post("/api/query/sql", {"stmt": stmt}, attempts=attempts)
     return rows if isinstance(rows, list) else rows.get("data", [])
 
 
@@ -376,9 +409,9 @@ def _sql_str(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _doc_row(doc_id: str) -> dict | None:
+def _doc_row(doc_id: str, attempts: int = 6) -> dict | None:
     stmt = f"select id, hpath, path, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
-    rows = _sql_rows(stmt)
+    rows = _sql_rows(stmt, attempts)
     return rows[0] if rows else None
 
 
@@ -418,6 +451,54 @@ def _notebook_display_name(box_id: str) -> str:
         return box_id
 
 
+def _fs_verdict_note(doc_id: str) -> str:
+    # Примечание к FS-вердикту: расхождение SQL (лаг индекса) — не ошибка.
+    # Косметика: attempts=1, отказ пробы не роняет успешный снос.
+    try:
+        index_still_sees = _doc_row(doc_id, attempts=1) is not None
+    except Exception:
+        index_still_sees = False
+    if index_still_sees:
+        return "вердикт по файловой пробе; SQL-индекс ещё видит док — лаг, сойдётся сам"
+    return "вердикт по файловой пробе"
+
+
+def _doc_fs_path(row: dict) -> str:
+    """FS-путь файла дока: data/<box><blocks.path>. Box — каталог данных
+    ноутбука, в blocks.path НЕ входит (path — id-цепочка от корня:
+    /<rootId>/<…>/<docId>.sy); контракт сверен живым ядром (getFile: с box —
+    Bytes, без — 404) и канонической сборкой doc_file_path в cli/src/siyuan.rs
+    (ADR-025, задача 20261106044426)."""
+    return f"data/{row['box']}{row['path']}"
+
+
+def _confirm_removed(row: dict, doc_id: str) -> str:
+    """Вердикт пост-чека после ok от removeDocByID: источник вердикта строкой.
+
+    Файловая проба — истина (ядро читает диск, SQL-индекс не участвует);
+    индекс отстаёт от мутаций секундами (Experience/cli write-path) — его
+    показание даёт примечание или фолбэк, успех не отвергает (принцип
+    ADR-025: один лагающий источник ≠ истина). FS-путь — по _doc_fs_path
+    (data/<box><path>), захвачен до мутации.
+    """
+    fs_path = _doc_fs_path(row)
+    for _ in range(2):
+        probe = _fs_file(fs_path)
+        if probe == "found":
+            raise RuntimeError(f"removeDocByID вернул ok, но файл дока остался на диске ({fs_path}) — проверь состояние дока вручную")
+        if probe == "missing":
+            return _fs_verdict_note(doc_id)
+        time.sleep(1)  # проба не состоялась — транспортный транзиент, не деградация данных
+    # Файловая проба не сошлась (деградация) → фолбэк на SQL-индекс с примечанием
+    for _ in range(2):
+        if _doc_row(doc_id) is None:
+            return "вердикт по SQL-индексу (файловая проба не состоялась)"
+        time.sleep(1)
+    raise RuntimeError("removeDocByID вернул ok, но верификация не сошлась: файловая проба "
+                       "не состоялась, индекс ещё видит док — проверь вручную "
+                       "(uwuwu-cli kernel file, uwuwu-cli doctor)")
+
+
 def cmd_delete(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
@@ -435,15 +516,12 @@ def cmd_delete(a):
             raise RuntimeError(f"«{row['hpath']}» — единственный док по пути и без маркера заглушки (канон); снос только с --force")
         raise RuntimeError(f"док без маркера заглушки; по пути ещё {siblings - 1} дубл(ей) — погаси заглушкой (replace + маркер «⚠️ … Канон — …») или подтверди --force")
     post("/api/filetree/removeDocByID", {"id": doc_id}, attempts=2)
-    for _ in range(2):
-        if _doc_row(doc_id) is None:
-            marker = "да" if stub else "нет (--force)"
-            print(f"снесён: {doc_id} {row['hpath']} (ноутбук {_notebook_display_name(row['box'])})")
-            print(f"  маркер заглушки: {marker}; соседей по пути: {siblings}; дочерних доков: {children}")
-            print("  → корзина SiYuan, восстановимо через UI (история данных) до истечения срока хранения")
-            return
-        time.sleep(1)
-    raise RuntimeError("removeDocByID вернул ok, но док остался в индексе — проверь состояние дока вручную")
+    verdict = _confirm_removed(row, doc_id)
+    marker = "да" if stub else "нет (--force)"
+    print(f"снесён: {doc_id} {row['hpath']} (ноутбук {_notebook_display_name(row['box'])})")
+    print(f"  маркер заглушки: {marker}; соседей по пути: {siblings}; дочерних доков: {children}")
+    print("  → корзина SiYuan, восстановимо через UI (история данных) до истечения срока хранения")
+    print(f"  ({verdict})")
 
 
 def cmd_orgls(a):
