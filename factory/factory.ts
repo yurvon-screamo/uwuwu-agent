@@ -740,6 +740,15 @@ async function resolveWorktree(local: string, branch: string): Promise<string> {
   return ""
 }
 
+/** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
+ *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
+ *  поведение stall-сигнала, деградации нет. */
+async function prMergedByGh(url: string): Promise<boolean> {
+  try {
+    return (await sh(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])) === "MERGED"
+  } catch { return false }
+}
+
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
  *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
  *  нужен cwd ворктри. Выбрасывает при фейле. */
@@ -1121,7 +1130,25 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           // застоя — решение остаётся в stallVerdict, ветка в facts нужна
           // лишь для текста сигнала
           const stalled = activity === null || Date.now() - activity > STALL_MS
-          const branchInWorktree = stalled &&
+          // кэш мержа действителен, пока совпадает с PR-ячейкой (смена PR —
+          // stacked/ремедиация через возврат из Review — штатный пайп-путь —
+          // инвалидирует без перезаписи state; новый позитив перезапишет)
+          let prMerged = (tracked.mergedPrUrl ?? "") === row.pr && row.pr !== ""
+          // gh-проба ленивая (вердикт может стать signal) и только до первого
+          // MERGED: merge необратим — без кэша это была бы проба каждые 3 мин
+          // на всё время ожидания Done (дни). signaled=true глушит вердикт —
+          // проба не нужна
+          if (stalled && !prMerged && row.pr !== "" && tracked.stallSignaled !== true) {
+            if (await prMergedByGh(row.pr)) {
+              tracked.mergedPrUrl = row.pr
+              prMerged = true
+              saveState(state)
+              log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
+            }
+          }
+          // при валидном кэше вердикт всё равно none — факты для текста
+          // сигнала не строятся, git-проба ворктри тоже скипается
+          const branchInWorktree = !prMerged && stalled &&
             (tracked.worktree !== "" || (await resolveWorktree(cfg.local, row.branch)) !== "")
           const verdict = stallVerdict({
             status: row.status,
@@ -1129,6 +1156,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             lastActivityAt: activity,
             branch: row.branch,
             branchInWorktree,
+            prMerged,
             signaled: tracked.stallSignaled === true,
             now: Date.now(),
           }, STALL_MS)
