@@ -25,13 +25,21 @@ kernel-транспорт (post, конфиг, константы) без выи
 Блочная хирургия — точечная правка rich-доков по blockID (doc-level append умеет
 только «в конец», replace пересоздаёт док и теряет привязки/живые HTML-блоки):
   block-update <blockID> --md <файл>     правка блока; payload строго один блок —
-                                         multi-block ядро молча обрезает до первого
-  block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален)
-  block-delete <blockID>                 снос leaf-блока; контейнер с детьми — отказ
-                                         (ядро сносит поддерево целиком и тихо;
-                                         снос list — update контейнера: list→параграф;
-                                         item list ядро не оставляет без ребёнка —
-                                         посерийный снос item'ов невозможен)
+                                         multi-block ядро молча обрезает до первого;
+                                         таблица (type='t') — только payload полной
+                                         таблицы (шапка + separator + все строки):
+                                         update переписывает таблицу ЦЕЛИКОМ,
+                                         row-payload схлопывает её тихо, code=0
+                                         (пробы 06.11/07.11)
+  block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален);
+                                         на 't' — сиблинг после таблицы, таблица цела
+                                         (проба 07.11)
+  block-delete <blockID>                 снос leaf-блока; контейнер с детьми или
+                                         таблица — отказ (ядро сносит контекст целиком
+                                         и тихо; снос list — update контейнера:
+                                         list→параграф; снос таблицы — doc-level
+                                         replace; item list ядро не оставляет без
+                                         ребёнка — посерийный снос item'ов невозможен)
 
 Guard'ы блочных команд до любой мутации: формат id до любого SQL; блок резолвится
 в индексе (LIMIT 1); doc-id (type='d') — отказ всем трём (update на doc-id молча
@@ -636,6 +644,24 @@ def _root_hpath(root_id: str) -> str:
     return rows[0]["hpath"] if rows else ""
 
 
+def _payload_has_table_separator(markdown: str) -> bool:
+    """Payload несёт separator-строку GFM-таблицы вне code-fence — маркер
+    «полной таблицы» для гварда type='t' (updateBlock на 't' переписывает
+    таблицу целиком, пробы 06.11/07.11). Построчно с fullmatch: наивный search
+    матчит дефис в data-строке («| 2026-11-07 | …», ревью плана 07.11);
+    separator внутри fence — конверсия таблицы в код-блок, не таблица."""
+    in_fence = False
+    for line in markdown.splitlines():
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if SEPARATOR_ROW_RE.fullmatch(line.strip()):
+            return True
+    return False
+
+
 def _resolved_block(block_id: str) -> dict:
     """Формат id до любого SQL (инъекция/мусор отсечены), резолв в индексе,
     doc-id (type='d') — не блок: update на doc-id молча стирает весь док."""
@@ -842,6 +868,8 @@ def cmd_block_update(a):
     chunks = _payload_chunk_count(payload)
     if chunks > 1:
         raise RuntimeError(f"payload содержит {chunks} блока(ов) — updateBlock молча применит только первый, хвост пропадёт (проба 06.11); для нескольких блоков — block-insert-after; многострочный контент одного блока — параграф с переносами или код-блок")
+    if row["type"] == "t" and not _payload_has_table_separator(payload):
+        raise RuntimeError(f"блок {row['id']} — таблица (type='t'): updateBlock переписывает таблицу ЦЕЛИКОМ — payload без separator-строки шапки схлопнет её до одной строки, code=0 (пробы 06.11/07.11); правка ячейки/строки — в UI или doc-level replace дока; переписать таблицу осознанно — payload = новая таблица целиком (шапка + separator + все строки)")
     journal = _undo_write("update", row["id"], {
         "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
         "before_md": row["markdown"], "after_md": payload,
@@ -872,6 +900,8 @@ def cmd_block_insert_after(a):
 
 def cmd_block_delete(a):
     row = _resolved_block(a.blockID.strip())
+    if row["type"] == "t":
+        raise RuntimeError(f"блок {row['id']} — таблица (type='t'): deleteBlock сносит таблицу ЦЕЛИКОМ, code=0 (проба 07.11); снос таблицы — doc-level replace дока без таблицы (с --base) или в UI; правка/снос строки — в UI")
     children = _block_children_count(row["id"])
     if children:
         raise RuntimeError(f"блок {row['id']} — контейнер: {children} дет.(ей) уйдут вместе с ним тихо (проба 06.11: deleteBlock на list/blockquote сносит поддерево); снос контейнера — конверсией: block-update с одно-блочным payload (проба 06.11: list→параграф) или doc-level replace; посерийный снос item'ов list невозможен — ядро держит пустого ребёнка в каждом item")
