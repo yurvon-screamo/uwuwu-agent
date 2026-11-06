@@ -185,6 +185,10 @@ describe("spawnPrompt", () => {
     expect(p).toContain("Стадия Design")
     expect(p).toContain("План утрясан")
     expect(p).toContain("«Ревью плана»")
+    // скан территории до плана (кейс vgcm1t5 ↔ PR #79: план, дублирующий чужой PR, мёртв при рождении)
+    expect(p).toContain("скан территории")
+    expect(p).toContain("task list")
+    expect(p).toContain("gh pr list")
   })
   test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
@@ -194,6 +198,8 @@ describe("spawnPrompt", () => {
     expect(p).toContain("task get")
     // предписание план-ревью («План утрясан → … «Ревью плана»») — только в design-режиме
     expect(p).not.toContain("План утрясан")
+    // hint скана территории — тоже design-specific, в fast-track не протекает
+    expect(p).not.toContain("скан территории")
     expect(p).not.toContain("🤖")
   })
 })
