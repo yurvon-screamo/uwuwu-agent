@@ -71,6 +71,13 @@ fn default_db_path() -> PathBuf {
     data_home.join("uwuwu-cli").join("semantic.db")
 }
 
+/// Параметры семантической половины: что искать и как резать выдачу.
+pub struct SearchHalfRequest<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub threshold: f32,
+}
+
 /// Строки семантической секции ответа search: заголовок + выдача либо
 /// объяснение деградации (статус всегда видим в stdout). Печать — вызывающий.
 pub async fn search_half(
@@ -83,9 +90,11 @@ pub async fn search_half(
     search_half_at(
         sy,
         cfg,
-        query,
-        limit,
-        threshold,
+        &SearchHalfRequest {
+            query,
+            limit,
+            threshold,
+        },
         Instant::now() + SEARCH_BUDGET,
     )
     .await
@@ -95,14 +104,13 @@ pub async fn search_half(
 pub(crate) async fn search_half_at(
     sy: &SiYuan,
     cfg: &SemanticConfig,
-    query: &str,
-    limit: usize,
-    threshold: f32,
+    req: &SearchHalfRequest<'_>,
     deadline: Instant,
 ) -> Vec<String> {
     let header = format!(
         "Семантический ({model}, cos ≥ {threshold:.2}):",
-        model = cfg.embed_model
+        model = cfg.embed_model,
+        threshold = req.threshold
     );
 
     if !cfg.db_path.exists() {
@@ -111,26 +119,86 @@ pub(crate) async fn search_half_at(
             format!("индекс пуст — {REBUILD_HINT} (~55–70 мин)"),
         );
     }
-    let mut store = match Store::open(&cfg.db_path) {
-        Ok(store) => store,
-        Err(e) => return section(&header, format!("хранилище недоступно: {e:#}")),
-    };
-    if let Err(status) = index_ready(&store, cfg) {
-        return section(&header, status);
-    }
-
-    let ollama = match OllamaClient::new(&cfg.embed_url, &cfg.embed_model, SEARCH_EMBED_TIMEOUT) {
-        Ok(client) => client,
-        Err(e) => return section(&header, format!("клиент Ollama: {e:#}")),
+    let (mut store, ollama) = match open_ready_index(cfg) {
+        Ok(ready) => ready,
+        Err(status) => return section(&header, status),
     };
 
-    if let Err(e) = sync::reconcile(sy, &ollama, &mut store, Some(deadline)).await {
+    if let Err(e) = sync_up(sy, &ollama, &mut store, deadline).await {
         return section(&header, route_error(&e));
     }
-    if let Err(e) = sync::delta_sync(
+
+    // Эмбедд запроса — только из остатка бюджета (п.2 ревью PR #78):
+    // исчерпан синхронизацией → честный таймаут, не запрос с полным
+    // таймаутом поверх израсходованного бюджета.
+    let query_vec = match query_embedding(&ollama, &store, req, deadline).await {
+        Ok(vec) => vec,
+        Err(status) => return section(&header, status),
+    };
+    let hits = match store.knn(&query_vec, req.limit, req.threshold) {
+        Ok(hits) => hits,
+        Err(e) => return section(&header, format!("поиск по индексу: {e:#}")),
+    };
+
+    let mut lines = vec![header];
+    if hits.is_empty() {
+        lines.push(format!("ничего выше порога {:.2}", req.threshold));
+    } else {
+        for (i, hit) in hits.iter().enumerate() {
+            lines.push(format!("{}. {}  ({:.2})", i + 1, hit.hpath, hit.score));
+            lines.push(format!("    {}", hit.snippet.replace('\n', " ")));
+        }
+    }
+    lines
+}
+
+/// Эмбедд запроса из остатка бюджета; Err — готовый статус секции
+/// (таймаут с фактом остатка, «недоступен» — прочие отказы маршрута).
+async fn query_embedding(
+    ollama: &OllamaClient,
+    store: &Store,
+    req: &SearchHalfRequest<'_>,
+    deadline: Instant,
+) -> Result<Vec<f32>, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!(
+            "таймаут (бюджет {}s): бюджет израсходован синхронизацией, очередь дотянется следующими поисками",
+            SEARCH_BUDGET.as_secs()
+        ));
+    }
+    let index_dim = store
+        .meta("dim")
+        .ok()
+        .flatten()
+        .and_then(|d| d.parse().ok());
+    match ollama
+        .embed(&[req.query.to_string()], index_dim, remaining)
+        .await
+    {
+        Ok(mut vectors) => Ok(ollama::normalize(vectors.remove(0))),
+        Err(ollama::EmbedError::Timeout { .. }) => Err(format!(
+            "таймаут (бюджет {}s): эмбедд запроса не уложился в остаток {:.1}s",
+            SEARCH_BUDGET.as_secs(),
+            remaining.as_secs_f32()
+        )),
+        Err(e) => Err(format!("недоступен — {e}")),
+    }
+}
+
+/// Ленивая синхронизация перед поиском: reconcile-проба (не чаще суток) +
+/// дельта от watermark — оба в общем wall-clock бюджете.
+async fn sync_up(
+    sy: &SiYuan,
+    ollama: &OllamaClient,
+    store: &mut Store,
+    deadline: Instant,
+) -> Result<()> {
+    sync::reconcile(sy, ollama, store, Some(deadline)).await?;
+    sync::delta_sync(
         sy,
-        &ollama,
-        &mut store,
+        ollama,
+        store,
         &sync::SyncOptions {
             since: None,
             deadline: Some(deadline),
@@ -139,58 +207,19 @@ pub(crate) async fn search_half_at(
             on_batch: None,
         },
     )
-    .await
-    {
-        return section(&header, route_error(&e));
-    }
+    .await?;
+    Ok(())
+}
 
-    // Эмбедд запроса — только из остатка бюджета (п.2 ревью PR #78):
-    // исчерпан синхронизацией → честный таймаут, не запрос с полным
-    // таймаутом поверх израсходованного бюджета.
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return section(
-            &header,
-            format!(
-                "таймаут (бюджет {}s): бюджет израсходован синхронизацией, очередь дотянется следующими поисками",
-                SEARCH_BUDGET.as_secs()
-            ),
-        );
-    }
-    let index_dim = store
-        .meta("dim")
-        .ok()
-        .flatten()
-        .and_then(|d| d.parse().ok());
-    let query_vec = match ollama.embed(&[query.to_string()], index_dim, remaining).await {
-        Ok(mut vectors) => ollama::normalize(vectors.remove(0)),
-        Err(ollama::EmbedError::Timeout { .. }) => {
-            return section(
-                &header,
-                format!(
-                    "таймаут (бюджет {}s): эмбедд запроса не уложился в остаток {:.1}s",
-                    SEARCH_BUDGET.as_secs(),
-                    remaining.as_secs_f32()
-                ),
-            );
-        }
-        Err(e) => return section(&header, format!("недоступен — {e}")),
-    };
-    let hits = match store.knn(&query_vec, limit, threshold) {
-        Ok(hits) => hits,
-        Err(e) => return section(&header, format!("поиск по индексу: {e:#}")),
-    };
-
-    let mut lines = vec![header];
-    if hits.is_empty() {
-        lines.push(format!("ничего выше порога {threshold:.2}"));
-    } else {
-        for (i, hit) in hits.iter().enumerate() {
-            lines.push(format!("{}. {}  ({:.2})", i + 1, hit.hpath, hit.score));
-            lines.push(format!("    {}", hit.snippet.replace('\n', " ")));
-        }
-    }
-    lines
+/// Подготовить контекст семантической половины: открыть индекс, прогнать
+/// guard'ы (пустой/чужая модель — деградация с хинтом), построить клиент
+/// Ollama. Err — готовый статус секции.
+fn open_ready_index(cfg: &SemanticConfig) -> Result<(Store, OllamaClient), String> {
+    let store = Store::open(&cfg.db_path).map_err(|e| format!("хранилище недоступно: {e:#}"))?;
+    index_ready(&store, cfg)?;
+    let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, SEARCH_EMBED_TIMEOUT)
+        .map_err(|e| format!("клиент Ollama: {e:#}"))?;
+    Ok((store, ollama))
 }
 
 /// Guard'ы перед дельтой: пустой индекс и смена модели — деградация

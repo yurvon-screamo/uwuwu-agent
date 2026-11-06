@@ -91,21 +91,30 @@ fn expect_task_id(command: Commands) -> String {
 
 #[test]
 fn hyphen_leading_id_parses_and_flag_after_id_stays_flag() {
-    let command =
-        parse_command(&["task", "get", "-Prb_FZlCA", "--project", "uwuwu"]).expect("id с ведущим дефисом парсится");
+    let command = parse_command(&["task", "get", "-Prb_FZlCA", "--project", "uwuwu"])
+        .expect("id с ведущим дефисом парсится");
     let id = expect_task_id(command);
     assert_eq!(id, "-Prb_FZlCA");
     // гоча опыта VCm1mFvNdE: allow_hyphen_values не должен съесть настоящий флаг
-    let command =
-        parse_command(&["task", "get", "-Prb_FZlCA", "--no-body", "--project", "uwuwu"]).expect("флаг после id жив");
+    let command = parse_command(&[
+        "task",
+        "get",
+        "-Prb_FZlCA",
+        "--no-body",
+        "--project",
+        "uwuwu",
+    ])
+    .expect("флаг после id жив");
     let id = expect_task_id(command);
     assert_eq!(id, "-Prb_FZlCA");
 }
 
 #[test]
 fn clean_ids_value_parses_with_hyphen_leading_fragments() {
-    let Commands::Task { command: TaskSub::Clean { ids, .. }, .. } =
-        parse_command(&["task", "--project", "uwuwu", "clean", "--ids", "-abc,-def"]).unwrap()
+    let Commands::Task {
+        command: TaskSub::Clean { ids, .. },
+        ..
+    } = parse_command(&["task", "--project", "uwuwu", "clean", "--ids", "-abc,-def"]).unwrap()
     else {
         panic!("expected task clean");
     };
@@ -124,7 +133,11 @@ fn cron_pause_hyphen_leading_id_parses() {
 }
 
 fn expect_undo(command: Commands) -> (Option<String>, bool) {
-    let Commands::Task { command: TaskSub::Undo { journal, list }, .. } = command else {
+    let Commands::Task {
+        command: TaskSub::Undo { journal, list },
+        ..
+    } = command
+    else {
         panic!("expected task undo");
     };
     (journal, list)
@@ -132,7 +145,8 @@ fn expect_undo(command: Commands) -> (Option<String>, bool) {
 
 #[test]
 fn undo_list_flag_parses_documented_contract() {
-    let command = parse_command(&["task", "--project", "uwuwu", "undo", "--list"]).expect("AGENTS.md: task undo [--list]");
+    let command = parse_command(&["task", "--project", "uwuwu", "undo", "--list"])
+        .expect("AGENTS.md: task undo [--list]");
     let (journal, list) = expect_undo(command);
     assert!(list, "--list = режим списка");
     assert!(journal.is_none());
@@ -140,11 +154,22 @@ fn undo_list_flag_parses_documented_contract() {
 
 #[test]
 fn undo_list_flag_wins_over_positional() {
-    let command = parse_command(&["task", "--project", "uwuwu", "undo", "журнал.json", "--list"])
-        .expect("--list сильнее позиционного");
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "undo",
+        "журнал.json",
+        "--list",
+    ])
+    .expect("--list сильнее позиционного");
     let (journal, list) = expect_undo(command);
     assert!(list, "--list побеждает: задаём список, не восстановление");
-    assert_eq!(journal.as_deref(), Some("журнал.json"), "позиционное сохранено (не теряется молча)");
+    assert_eq!(
+        journal.as_deref(),
+        Some("журнал.json"),
+        "позиционное сохранено (не теряется молча)"
+    );
 }
 
 #[test]
@@ -156,7 +181,15 @@ fn undo_journal_alone_means_restore() {
 }
 
 fn expect_create(command: Commands) -> (Option<String>, bool) {
-    let Commands::Task { command: TaskSub::Create { r#type: ty, dry_run, .. }, .. } = command
+    let Commands::Task {
+        command:
+            TaskSub::Create {
+                r#type: ty,
+                dry_run,
+                ..
+            },
+        ..
+    } = command
     else {
         panic!("expected task create subcommand");
     };
@@ -179,15 +212,21 @@ fn create_dry_run_flag_parses_with_type() {
     .expect("dry-run — флаг create, совместим с --type");
     let (ty, dry_run) = expect_create(command);
     assert!(dry_run, "--dry-run распознан");
-    assert_eq!(ty.as_deref(), Some("bug"), "--type сохранён рядом с --dry-run");
+    assert_eq!(
+        ty.as_deref(),
+        Some("bug"),
+        "--type сохранён рядом с --dry-run"
+    );
 }
 
 #[test]
 fn create_without_dry_run_defaults_to_live() {
-    let command =
-        parse_command(&["task", "--project", "uwuwu", "create", "--title", "T"]).unwrap();
+    let command = parse_command(&["task", "--project", "uwuwu", "create", "--title", "T"]).unwrap();
     let (_, dry_run) = expect_create(command);
-    assert!(!dry_run, "без флага — живой create (скелет-осмотр только через --dry-run)");
+    assert!(
+        !dry_run,
+        "без флага — живой create (скелет-осмотр только через --dry-run)"
+    );
 }
 
 // ——— профилактика (тело задачи 20261104072048-4n1rwdt): body/edit/close —
@@ -197,8 +236,16 @@ fn create_without_dry_run_defaults_to_live() {
 
 #[test]
 fn edit_rejects_extra_positional() {
-    let Err(err) = parse_command(&["task", "--project", "uwuwu", "edit", "abc", "--status", "Review", "лишний"])
-    else {
+    let Err(err) = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "edit",
+        "abc",
+        "--status",
+        "Review",
+        "лишний",
+    ]) else {
         panic!("лишний позиционный — ошибка грамматики");
     };
     assert_eq!(
@@ -210,7 +257,8 @@ fn edit_rejects_extra_positional() {
 
 #[test]
 fn close_rejects_extra_positional() {
-    let Err(err) = parse_command(&["task", "--project", "uwuwu", "close", "abc", "лишний"]) else {
+    let Err(err) = parse_command(&["task", "--project", "uwuwu", "close", "abc", "лишний"])
+    else {
         panic!("лишний позиционный — ошибка грамматики");
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
@@ -218,7 +266,15 @@ fn close_rejects_extra_positional() {
 
 #[test]
 fn body_rejects_extra_positional() {
-    let Err(err) = parse_command(&["task", "--project", "uwuwu", "body", "abc", "--replace", "лишний"]) else {
+    let Err(err) = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "body",
+        "abc",
+        "--replace",
+        "лишний",
+    ]) else {
         panic!("лишний позиционный — ошибка грамматики");
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{err}");
@@ -228,8 +284,12 @@ fn body_rejects_extra_positional() {
 
 #[test]
 fn search_defaults_are_dual_mode_without_semantic_flag() {
-    let Commands::Search { query, limit, sofa, threshold } =
-        parse_command(&["search", "тема"]).unwrap()
+    let Commands::Search {
+        query,
+        limit,
+        sofa,
+        threshold,
+    } = parse_command(&["search", "тема"]).unwrap()
     else {
         panic!("expected search");
     };
@@ -247,9 +307,7 @@ fn search_semantic_flag_is_rejected() {
 
 #[test]
 fn semantic_subcommands_parse() {
-    let Commands::Semantic { command } =
-        parse_command(&["semantic", "rebuild"]).unwrap()
-    else {
+    let Commands::Semantic { command } = parse_command(&["semantic", "rebuild"]).unwrap() else {
         panic!("expected semantic");
     };
     assert!(matches!(command, SemanticSub::Rebuild { resume: false }));

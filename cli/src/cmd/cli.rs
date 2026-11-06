@@ -31,7 +31,10 @@ pub(crate) enum TaskSub {
         attach: Vec<std::path::PathBuf>,
         // Осмотр скелета без записи: живой create ради просмотра костяка
         // кормит триаж-демон мусорными черновиками.
-        #[arg(long = "dry-run", help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)")]
+        #[arg(
+            long = "dry-run",
+            help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)"
+        )]
         dry_run: bool,
     },
     /// Очередь задач доски
@@ -43,7 +46,10 @@ pub(crate) enum TaskSub {
     },
     /// Карточка задачи: колонки + свежие комменты
     Get {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / уникальный префикс")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / уникальный префикс"
+        )]
         id: String,
         /// Быстрая проверка статуса: без экспорта тела и картинок
         #[arg(long = "no-body")]
@@ -96,7 +102,10 @@ pub(crate) enum TaskSub {
     /// именованный фенс заменяет прежнюю диаграмму с этим именем,
     /// пустой (```html_embed имя без тела) — удаляет её.
     Body {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс / подстрока заголовка")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока заголовка"
+        )]
         id: String,
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
@@ -221,7 +230,9 @@ pub(crate) enum KernelSub {
     Ping,
     /// SQL-проба: полный конверт ядра JSON (data + limit/truncated as-is)
     Sql {
-        #[arg(help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\"")]
+        #[arg(
+            help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\""
+        )]
         stmt: String,
     },
     /// getFile-проба: Bytes/Missing — диагностические ответы (exit 0),
@@ -294,7 +305,11 @@ pub(crate) enum Commands {
         limit: usize,
         #[arg(long, default_value = "0", help = "SOFA public limit (0 = off)")]
         sofa: usize,
-        #[arg(long, default_value = "0.35", help = "semantic cosine threshold (0..1)")]
+        #[arg(
+            long,
+            default_value = "0.35",
+            help = "semantic cosine threshold (0..1)"
+        )]
         threshold: f32,
     },
     /// Локальный эмбеддинг-индекс (семантическая половина поиска):

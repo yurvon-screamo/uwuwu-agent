@@ -52,14 +52,7 @@ impl KernelMock {
                 .expect("граница длины парсится");
             let count = blocks
                 .iter()
-                .filter(|b| {
-                    b["content"]
-                        .as_str()
-                        .unwrap_or("")
-                        .chars()
-                        .count()
-                        > max
-                })
+                .filter(|b| b["content"].as_str().unwrap_or("").chars().count() > max)
                 .count();
             return vec![json!({ "c": count })];
         }
@@ -295,7 +288,11 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
     let client = ollama(&server.uri());
 
     let vectors = client
-        .embed(&["один".into(), "два".into()], Some(3), Duration::from_secs(2))
+        .embed(
+            &["один".into(), "два".into()],
+            Some(3),
+            Duration::from_secs(2),
+        )
         .await
         .expect("embed ок");
     assert_eq!(vectors.len(), 2);
@@ -316,7 +313,10 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
 
     let dead = OllamaClient::new("http://127.0.0.1:1", "test-model", Duration::from_secs(1))
         .expect("client");
-    let unreachable = dead.embed(&["q".into()], None, Duration::from_secs(1)).await.expect_err("route");
+    let unreachable = dead
+        .embed(&["q".into()], None, Duration::from_secs(1))
+        .await
+        .expect_err("route");
     assert!(matches!(unreachable, EmbedError::Unreachable { .. }));
 
     let missing_server = MockServer::start().await;
@@ -392,7 +392,10 @@ async fn delta_pages_through_equal_timestamp_run_without_loss() {
                 stmt.contains(&format!("limit {}", sync::PAGE)),
                 "LIMIT: {stmt}"
             );
-            assert!(!stmt.contains(", content,"), "скан не таскает content: {stmt}");
+            assert!(
+                !stmt.contains(", content,"),
+                "скан не таскает content: {stmt}"
+            );
         } else {
             // точечный fetch по PK
             assert!(stmt.contains("order by"), "ORDER BY: {stmt}");
@@ -937,9 +940,11 @@ async fn search_half_reports_timeout_when_budget_spent_by_sync() {
     let section = crate::semantic::search_half_at(
         &sy,
         &cfg,
-        "запрос",
-        10,
-        0.35,
+        &crate::semantic::SearchHalfRequest {
+            query: "запрос",
+            limit: 10,
+            threshold: 0.35,
+        },
         Instant::now() - Duration::from_millis(1),
     )
     .await;
@@ -970,9 +975,11 @@ async fn search_half_bounds_query_embed_timeout_by_remaining_budget() {
     let section = crate::semantic::search_half_at(
         &sy,
         &cfg,
-        "запрос",
-        10,
-        0.35,
+        &crate::semantic::SearchHalfRequest {
+            query: "запрос",
+            limit: 10,
+            threshold: 0.35,
+        },
         started + Duration::from_millis(200),
     )
     .await;
@@ -1058,10 +1065,7 @@ async fn rebuild_resume_refuses_model_mismatch() {
     let message = err.to_string();
     assert!(message.contains("model-a"), "индексная модель: {message}");
     assert!(message.contains("model-b"), "env-модель: {message}");
-    assert!(
-        inputs.lock().unwrap().is_empty(),
-        "смешение не началось"
-    );
+    assert!(inputs.lock().unwrap().is_empty(), "смешение не началось");
     let store = seeded_store(dir.path());
     assert_eq!(store.chunk_count().unwrap(), 1, "чанки не тронуты");
 }
@@ -1135,7 +1139,9 @@ fn rebuild_lock_steals_from_dead_pid() {
     // Крэш прежнего прогона: устаревший lock снимается следующим запуском.
     let dir = tempfile::tempdir().expect("tmpdir");
     let store = seeded_store(dir.path());
-    store.place_lock("99999999:1700000000").expect("мёртвый pid");
+    store
+        .place_lock("99999999:1700000000")
+        .expect("мёртвый pid");
 
     store.acquire_rebuild_lock().expect("steal от мёртвого pid");
 
@@ -1286,8 +1292,8 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
         eprintln!("skip: APP_TEST_LLM=1 не задан (opt-in Tier-L)");
         return;
     }
-    let base = std::env::var("UWUWU_EMBED_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let base =
+        std::env::var("UWUWU_EMBED_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let model =
         std::env::var("APP_TEST_LLM_MODEL").unwrap_or_else(|_| "qwen3-embedding:0.6b".into());
 
@@ -1305,9 +1311,15 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
     let client = OllamaClient::new(&base, &model, Duration::from_secs(60)).expect("client");
     let query = "как протянуть защищённый туннель до ноутбука через публичный релей".to_string();
     let relevant = "rathole-клиент устанавливает туннель до сервера через TCP-релей, пробрасывая локальный порт ноутбука в публичный endpoint".to_string();
-    let irrelevant = "канбан-доска задач хранит строки с колонками Title, Status, Branch и PR в SiYuan database".to_string();
+    let irrelevant =
+        "канбан-доска задач хранит строки с колонками Title, Status, Branch и PR в SiYuan database"
+            .to_string();
     let vectors = client
-        .embed(&[query, relevant, irrelevant], None, Duration::from_secs(60))
+        .embed(
+            &[query, relevant, irrelevant],
+            None,
+            Duration::from_secs(60),
+        )
         .await
         .expect("живой эмбеддинг");
     let query_vec = &vectors[0];
@@ -1326,10 +1338,30 @@ async fn rebuild_resume_continues_from_watermark_without_reembedding() {
     // a1 в секунду сбоя, a2/a3 не доезжали. Watermark = T0.
     let t_old = "20261104235800"; // T0 − 120 s: за границей overlap
     let blocks = vec![
-        block("a0", t_old, "нулевой чанк с длинным содержанием для индексации", "/d"),
-        block("a1", T0, "первый чанк с длинным содержанием для индексации", "/d"),
-        block("a2", T1, "второй чанк с длинным содержанием для индексации", "/d"),
-        block("a3", T1, "третий чанк с длинным содержанием для индексации", "/d"),
+        block(
+            "a0",
+            t_old,
+            "нулевой чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a1",
+            T0,
+            "первый чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a2",
+            T1,
+            "второй чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a3",
+            T1,
+            "третий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
     ];
     let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
@@ -1361,7 +1393,9 @@ async fn rebuild_resume_continues_from_watermark_without_reembedding() {
         tx.commit().unwrap();
     }
 
-    crate::semantic::rebuild(&sy, &cfg, None, true).await.expect("resume");
+    crate::semantic::rebuild(&sy, &cfg, None, true)
+        .await
+        .expect("resume");
 
     let embedded = inputs.lock().unwrap();
     // a0 вне overlap-окна — не переэмбедден; хвост секунды сбоя (a1,
@@ -1410,8 +1444,18 @@ async fn backlog_size_counts_only_rows_above_watermark() {
     // Регрессия: литерал watermark без кавычек делал строковое updated
     // числом и count отдавал «все строки ядра».
     let blocks = vec![
-        block("a1", "20261103230000", "первый чанк с длинным содержанием для индексации", "/d"),
-        block("a2", "20261104000000", "второй чанк с длинным содержанием для индексации", "/d"),
+        block(
+            "a1",
+            "20261103230000",
+            "первый чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a2",
+            "20261104000000",
+            "второй чанк с длинным содержанием для индексации",
+            "/d",
+        ),
     ];
     let (server, _) = kernel_server_blocks_only(blocks).await;
     let sy = SiYuan::for_tests(server.uri());

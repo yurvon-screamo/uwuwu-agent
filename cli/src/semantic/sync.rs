@@ -77,7 +77,6 @@ pub(crate) fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Страница дельты: keyset по (updated, id), старейшие первыми.
 /// Страница дельты: keyset по (updated, id), старейшие первыми. Лёгкие
 /// колонки без content — полный скан blocks не таскает мегабайты текста
 /// (ядро без индекса по updated; тяжёлый content достаётся точечно по
@@ -181,6 +180,95 @@ fn since_with_overlap(watermark: &str) -> Result<String> {
         .to_string())
 }
 
+/// Результат классификации страницы дельты (чистый, без IO).
+struct PageOutcome {
+    /// Строки полосы [MIN, MAX] — кандидаты на эмбедд.
+    pending: Vec<KernelRow>,
+    /// Усохшие/переросшие строки — prune-кандидаты (DELETE отсутствующих
+    /// no-op по PK; вернуть блок может правка).
+    prune_ids: Vec<String>,
+    cursor_updated: String,
+    cursor_id: String,
+    skipped_short: usize,
+    skipped_long: usize,
+}
+
+/// Классификация страницы дельты: курсор двигается по всем найденным
+/// строкам (включая пропущенные по длине), исчезнувшие между сканом и
+/// fetch'ем курсор не двигают — их поймает reconcile.
+fn process_page(
+    rows: &[Value],
+    by_id: &std::collections::HashMap<String, KernelRow>,
+) -> PageOutcome {
+    let mut outcome = PageOutcome {
+        pending: Vec::with_capacity(rows.len()),
+        prune_ids: Vec::new(),
+        cursor_updated: String::new(),
+        cursor_id: String::new(),
+        skipped_short: 0,
+        skipped_long: 0,
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(kernel_row) = by_id.get(id) else {
+            continue;
+        };
+        outcome.cursor_updated = kernel_row.meta.updated.clone();
+        outcome.cursor_id = kernel_row.meta.block_id.clone();
+        match length_class(&kernel_row.content) {
+            LengthClass::TooShort => {
+                outcome.skipped_short += 1;
+                outcome.prune_ids.push(kernel_row.meta.block_id.clone());
+            }
+            LengthClass::TooLong => {
+                outcome.skipped_long += 1;
+                outcome.prune_ids.push(kernel_row.meta.block_id.clone());
+            }
+            LengthClass::Embeddable => outcome.pending.push(kernel_row.clone()),
+        }
+    }
+    outcome
+}
+
+/// Стартовый курсор дельты: явный since (rebuild) или watermark минус
+/// overlap; пустой watermark — с нуля; мусор в meta — громкая ошибка.
+fn starting_cursor(store: &Store, since: &Option<String>) -> Result<(String, String)> {
+    let updated = match since {
+        Some(since) => since.clone(),
+        None => match store.meta("watermark")? {
+            Some(mark) => since_with_overlap(&mark)?,
+            None => "0".to_string(),
+        },
+    };
+    Ok((updated, String::new()))
+}
+
+/// Шаг scan-page: страница дельты + точечный fetch полных строк по PK,
+/// индексированные по id — тяжёлый content не идёт через keyset-скан
+/// (ядро без индекса по updated, полный скан таскает мегабайты).
+async fn fetch_classifiable_page(
+    sy: &SiYuan,
+    cursor_updated: &str,
+    cursor_id: &str,
+) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>)> {
+    let rows = sy.sql(&delta_page_stmt(cursor_updated, cursor_id)).await?;
+    if rows.is_empty() {
+        return Ok((rows, std::collections::HashMap::new()));
+    }
+    let page_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let full_rows = fetch_by_ids(sy, &page_ids).await?;
+    let by_id = full_rows
+        .into_iter()
+        .map(|row| (row.meta.block_id.clone(), row))
+        .collect();
+    Ok((rows, by_id))
+}
+
 /// Дельта-цикл: страницы → фильтр длины → эмбедд батчами → upsert+watermark.
 ///
 /// EmbedError пробрасывается корнем anyhow-цепочки (search-путь даункастит
@@ -193,95 +281,42 @@ pub async fn delta_sync(
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
     let mut report = SyncReport::default();
+    let (mut cursor_updated, mut cursor_id) = starting_cursor(store, &opts.since)?;
 
-    let mut cursor_updated = match &opts.since {
-        Some(since) => since.clone(),
-        None => match store.meta("watermark")? {
-            Some(mark) => since_with_overlap(&mark)?,
-            None => "0".to_string(),
-        },
-    };
-    let mut cursor_id = String::new();
-
-    'pages: loop {
+    loop {
         if !budget_left(opts.deadline) {
             report.budget_exhausted = true;
             break;
         }
-        let rows = sy
-            .sql(&delta_page_stmt(&cursor_updated, &cursor_id))
-            .await?;
+        let (rows, by_id) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
         if rows.is_empty() {
             break;
         }
         let page_len = rows.len();
-        // Точечный fetch content по PK: тяжёлый текст не проходит
-        // через полный keyset-скан.
-        let page_ids: Vec<String> = rows
-            .iter()
-            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
-        let full_rows = fetch_by_ids(sy, &page_ids).await?;
-        let by_id: std::collections::HashMap<String, KernelRow> = full_rows
-            .into_iter()
-            .map(|row| (row.meta.block_id.clone(), row))
-            .collect();
 
-        let mut pending: Vec<KernelRow> = Vec::with_capacity(EMBED_BATCH);
-        let mut prune_ids: Vec<String> = Vec::new();
-        let mut budget_out = false;
-        for row in &rows {
-            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(kernel_row) = by_id.get(id) else {
-                // Блок исчез между сканом и fetch'ем — prune поймает reconcile'ом.
-                continue;
-            };
-            cursor_updated = kernel_row.meta.updated.clone();
-            cursor_id = kernel_row.meta.block_id.clone();
-            match length_class(&kernel_row.content) {
-                LengthClass::TooShort => {
-                    report.skipped_short += 1;
-                    prune_ids.push(kernel_row.meta.block_id.clone());
-                }
-                LengthClass::TooLong => {
-                    report.skipped_long += 1;
-                    prune_ids.push(kernel_row.meta.block_id.clone());
-                }
-                LengthClass::Embeddable => pending.push(kernel_row.clone()),
-            }
-            if pending.len() == EMBED_BATCH {
-                if !budget_left(opts.deadline) {
-                    report.budget_exhausted = true;
-                    budget_out = true;
-                    break;
-                }
-                embed_and_upsert(ollama, store, &pending, embed_call_timeout(opts.deadline, opts.embed_timeout), &mut report).await?;
-                if let Some(on_batch) = &opts.on_batch {
-                    on_batch(report.embedded);
-                }
-                pending.clear();
-            }
-        }
+        let outcome = process_page(&rows, &by_id);
+        cursor_updated = outcome.cursor_updated;
+        cursor_id = outcome.cursor_id;
+        report.skipped_short += outcome.skipped_short;
+        report.skipped_long += outcome.skipped_long;
 
         // Усохшие/переросшие чанки уходят из индекса в том же прогоне —
         // иначе дельта, пропустив строку, оставляла бы в индексе вечно
-        // устаревший контент с вектором (п.1 ревью PR #78). DELETE
-        // отсутствующих строк — no-op по PK; вернуть блок может правка.
-        if !prune_ids.is_empty() {
-            report.pruned += store.prune(&prune_ids)?;
-        }
-        if budget_out {
-            break 'pages;
+        // устаревший контент с вектором (п.1 ревью PR #78).
+        if !outcome.prune_ids.is_empty() {
+            report.pruned += store.prune(&outcome.prune_ids)?;
         }
 
-        if !pending.is_empty() {
-            embed_and_upsert(ollama, store, &pending, embed_call_timeout(opts.deadline, opts.embed_timeout), &mut report).await?;
-            if let Some(on_batch) = &opts.on_batch {
-                on_batch(report.embedded);
-            }
-            pending.clear();
+        if !embed_batches(
+            ollama,
+            store,
+            outcome.pending.chunks(EMBED_BATCH),
+            opts,
+            &mut report,
+        )
+        .await?
+        {
+            break;
         }
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
@@ -295,6 +330,35 @@ pub async fn delta_sync(
         }
     }
     Ok(report)
+}
+
+/// Эмбедд батчей с бюджет-гейтом на каждый батч; false — бюджет исчерпан
+/// (хвост остаётся над watermark и дотягивается следующими запусками).
+async fn embed_batches(
+    ollama: &OllamaClient,
+    store: &mut Store,
+    batches: std::slice::Chunks<'_, KernelRow>,
+    opts: &SyncOptions,
+    report: &mut SyncReport,
+) -> Result<bool> {
+    for batch in batches {
+        if !budget_left(opts.deadline) {
+            report.budget_exhausted = true;
+            return Ok(false);
+        }
+        embed_and_upsert(
+            ollama,
+            store,
+            batch,
+            embed_call_timeout(opts.deadline, opts.embed_timeout),
+            report,
+        )
+        .await?;
+        if let Some(on_batch) = &opts.on_batch {
+            on_batch(report.embedded);
+        }
+    }
+    Ok(true)
 }
 
 /// Эмбедд батча + атомарная запись (чанки и watermark одной транзакцией).
@@ -372,12 +436,35 @@ pub async fn reconcile(
         }
     }
 
-    // Лёгкий полный скан ядра: keyset по id, без content.
+    let kernel = scan_kernel_pages(sy, deadline).await?;
+    let diff = diff_index(&kernel, &store.chunk_metas()?);
+
+    if !diff.vanished.is_empty() {
+        report.pruned = store.prune(&diff.vanished)?;
+    }
+    if !diff.path_drift.is_empty() {
+        report.paths_refreshed = store.refresh_paths(&diff.path_drift)?;
+    }
+
+    let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, deadline).await?;
+    report.pruned += repaired.pruned;
+    report.repaired += repaired.repaired;
+
+    // last_reconcile_at только по завершённому прогону — оборванный
+    // бюджетом повторится на следующем поиске.
+    store.set_meta("last_reconcile_at", &now.to_string())?;
+    Ok(report)
+}
+
+/// Лёгкий полный скан ядра: keyset по id, без content; оборванный
+/// бюджетом возвращает частичный результат с flag'ом (прогон не
+/// засчитывается — см. reconcile).
+async fn scan_kernel_pages(sy: &SiYuan, deadline: Option<Instant>) -> Result<Vec<ChunkMeta>> {
     let mut kernel: Vec<ChunkMeta> = Vec::new();
     let mut cursor = String::new();
     loop {
         if !budget_left(deadline) {
-            return Ok(report);
+            return Ok(kernel);
         }
         let stmt = format!(
             "select id, root_id, box, hpath, updated from blocks \
@@ -399,54 +486,81 @@ pub async fn reconcile(
             break;
         }
     }
+    Ok(kernel)
+}
 
-    let index = store.chunk_metas()?;
+/// Три класса расхождений ядра и индекса; порядок проверок важен:
+/// изменившийся updated ремонтируется полным переэмбеддом (заберёт
+/// и свежий hpath).
+struct IndexDiff {
+    /// В ядре есть, в индексе нет (или updated разошёлся) — repair.
+    repair_ids: Vec<String>,
+    /// Дрейф путей — метаданные без переэмбеддинга.
+    path_drift: Vec<ChunkMeta>,
+    /// В индексе есть, в ядре нет (удаление/трэш) — prune.
+    vanished: Vec<String>,
+}
+
+fn diff_index(kernel: &[ChunkMeta], index: &[ChunkMeta]) -> IndexDiff {
     let index_by_id: std::collections::HashMap<&str, &ChunkMeta> =
         index.iter().map(|m| (m.block_id.as_str(), m)).collect();
     let kernel_by_id: std::collections::HashMap<&str, &ChunkMeta> =
         kernel.iter().map(|m| (m.block_id.as_str(), m)).collect();
 
-    // Три класса расхождений; порядок проверок важен: изменившийся updated
-    // ремонтируется полным переэмбеддом (заберёт и свежий hpath).
-    let mut repair_ids: Vec<String> = Vec::new();
-    let mut path_drift: Vec<ChunkMeta> = Vec::new();
-    for meta in &kernel {
+    let mut diff = IndexDiff {
+        repair_ids: Vec::new(),
+        path_drift: Vec::new(),
+        vanished: Vec::new(),
+    };
+    for meta in kernel {
         match index_by_id.get(meta.block_id.as_str()) {
-            None => repair_ids.push(meta.block_id.clone()),
+            None => diff.repair_ids.push(meta.block_id.clone()),
             Some(indexed) if indexed.updated != meta.updated => {
-                repair_ids.push(meta.block_id.clone())
+                diff.repair_ids.push(meta.block_id.clone())
             }
             Some(indexed)
                 if indexed.hpath != meta.hpath
                     || indexed.box_id != meta.box_id
                     || indexed.root_id != meta.root_id =>
             {
-                path_drift.push(meta.clone())
+                diff.path_drift.push(meta.clone())
             }
             _ => {}
         }
     }
-    let vanished: Vec<String> = index_by_id
+    diff.vanished = index_by_id
         .keys()
         .filter(|id| !kernel_by_id.contains_key(*id))
         .map(|id| id.to_string())
         .collect();
+    diff
+}
 
-    if !vanished.is_empty() {
-        report.pruned = store.prune(&vanished)?;
-    }
-    if !path_drift.is_empty() {
-        report.paths_refreshed = store.refresh_paths(&path_drift)?;
-    }
+/// Счётчики repair-прохода.
+struct RepairOutcome {
+    repaired: usize,
+    pruned: usize,
+}
 
+/// Backfill/переэмбедд недостающих строк: классификация по длине —
+/// усохшие/переросшие блоки вычищаются из индекса (а при backfill просто
+/// не индексируются), полосу [MIN, MAX] ремонтирует переэмбедд.
+async fn repair_missing(
+    sy: &SiYuan,
+    ollama: &OllamaClient,
+    store: &mut Store,
+    repair_ids: &[String],
+    deadline: Option<Instant>,
+) -> Result<RepairOutcome> {
+    let mut outcome = RepairOutcome {
+        repaired: 0,
+        pruned: 0,
+    };
     for id_batch in repair_ids.chunks(PAGE) {
         if !budget_left(deadline) {
-            return Ok(report);
+            return Ok(outcome);
         }
         let rows = fetch_by_ids(sy, id_batch).await?;
-        // Классификация по длине: усохшие/переросшие блоки вычищаются из
-        // индекса (а при backfill — просто не индексируются), полосу
-        // [MIN, MAX] ремонтирует переэмбедд.
         let mut prune_ids: Vec<String> = Vec::new();
         let target: Vec<KernelRow> = rows
             .into_iter()
@@ -459,20 +573,25 @@ pub async fn reconcile(
             })
             .collect();
         if !prune_ids.is_empty() {
-            report.pruned += store.prune(&prune_ids)?;
+            outcome.pruned += store.prune(&prune_ids)?;
         }
         for batch in target.chunks(EMBED_BATCH) {
             if !budget_left(deadline) {
-                return Ok(report);
+                return Ok(outcome);
             }
             let mut delta_report = SyncReport::default();
-            embed_and_upsert(ollama, store, batch, embed_call_timeout(deadline, SEARCH_EMBED_TIMEOUT), &mut delta_report).await?;
-            report.repaired += delta_report.embedded;
+            embed_and_upsert(
+                ollama,
+                store,
+                batch,
+                embed_call_timeout(deadline, SEARCH_EMBED_TIMEOUT),
+                &mut delta_report,
+            )
+            .await?;
+            outcome.repaired += delta_report.embedded;
         }
     }
-
-    store.set_meta("last_reconcile_at", &now.to_string())?;
-    Ok(report)
+    Ok(outcome)
 }
 
 /// Точечный fetch полных строк по id (backfill-ремонт): явный LIMIT.

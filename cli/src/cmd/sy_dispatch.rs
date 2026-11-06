@@ -759,9 +759,20 @@ fn cron_schedule(in_: &Option<String>, every: &Option<String>, at: &Option<Strin
 
 // ——— docs/search/blob/projects ———
 
-pub(crate) async fn search_run(query: &str, limit: usize, threshold: f32, sofa: usize) -> Result<()> {
+/// Голова stdout search — контракт фабричных агентов (парсят вывод);
+/// единственная точка формата, правка = красный golden-тест.
+fn search_head(query: &str) -> String {
+    format!("Searching for: \"{query}\"")
+}
+
+pub(crate) async fn search_run(
+    query: &str,
+    limit: usize,
+    threshold: f32,
+    sofa: usize,
+) -> Result<()> {
     let sy = SiYuan::from_env()?;
-    println!("Searching for: \"{query}\"\n");
+    println!("{}\n", search_head(query));
     // Полнотекстовая секция — формат и состав байт-в-байт прежние:
     // вывод парсят фабричные агенты (контракт регрессии задачи 20261104072044).
     let rows = sy.search(query, limit).await?;
@@ -1356,9 +1367,10 @@ mod tests {
     use super::collect_threads;
     use super::replace_md_section;
     use super::save_body_assets;
+    use super::search_head;
+    use super::task_run;
     use super::validate_comment_text;
     use super::SectionEdit;
-    use super::task_run;
     use crate::cmd::cli::TaskSub;
     use crate::siyuan::SiYuan;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2117,5 +2129,16 @@ mod tests {
         assert!(!asset_key_is_safe(""));
         assert!(asset_key_is_safe("img.png"));
         assert!(asset_key_is_safe("sub/dir/file.htm"));
+    }
+
+    /// Golden stdout-головы search (Low ревью PR #78): формат парсят
+    /// фабричные агенты — правка println! мимо search_head невозможна,
+    /// правка самого search_head красит этот тест.
+    #[test]
+    fn search_head_is_byte_stable_contract_format() {
+        assert_eq!(
+            search_head("семантический индекс"),
+            "Searching for: \"семантический индекс\""
+        );
     }
 }
