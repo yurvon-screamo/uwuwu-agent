@@ -440,6 +440,8 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     "Работай по секции «Ревью задач фабрики uwuwu» своей методики:",
     "",
     `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи и треды комментов.`,
+    "   Если в тредах есть прошлые раунды ревью этой задачи (твоя сессия пересоздана) —",
+    "   это продолжение: проверь устранение прошлых замечаний, не начинай с нуля.",
     kind === "plan"
       ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
       : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
@@ -455,11 +457,17 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
-    "   вердикт-строка «Статус: approve|request_changes» обязательна.",
+    "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
+    kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
     "4. Статус после вердикта (uwuwu-cli task edit):",
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
-      : "   approve → Review · request_changes → In Progress",
+      : [
+          "   approve → Review",
+          "   approve с мелкими замечаниями (все находки Low) → In Progress —",
+          "   следующее ревью с тем же ревьювером (дельта), после дельта-апрува → Review владельцу",
+          "   request_changes → In Progress",
+        ].join("\n"),
     "5. Вопросы юзеру — комментом без смены статуса; код и тело задачи не правь.",
   ]
   return lines.join("\n")
@@ -473,7 +481,21 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
     "",
     "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
     "проверь устранение своих прошлых замечаний, отчёт комментом,",
-    `статус по вердикту (${kind === "plan" ? "approve → In Progress · request_changes → Design" : "approve → Review · request_changes → In Progress"}).`,
+    "статус по вердикту " +
+      (kind === "plan"
+        ? "(approve → In Progress · request_changes → Design)."
+        : [
+            "(approve → Review · approve с мелкими замечаниями (все находки Low) → In Progress ·",
+            "request_changes → In Progress).",
+          ].join("\n")),
+    ...(kind === "result"
+      ? [
+          "Прошлый раунд был «approve с мелкими замечаниями» (свой прошлый отчёт в тредах)?",
+          "Тогда это дельта-раунд: проверь только устранение тех мелочей, всё заново не пересматривай;",
+          "новые High/Common — обычный request_changes. Второй раз подряд approve-with-notes не выдавай:",
+          "те же мелочи не устранены → request_changes («мелочи повторно не устранены»).",
+        ]
+      : []),
     ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
     ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
   ].join("\n")
@@ -500,7 +522,10 @@ export function reviewReturnPrompt(rowId: string): string {
     "Перечитай uwuwu-cli task get + треды и действуй по пайпу:",
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
-    "- результат approved → мяч у юзера, от тебя ничего не требуется;",
+    "- результат: approve с мелкими замечаниями → дофикси мелочи из отчёта ревьювера,",
+    "  запушь и сразу «Ревью результата» — та же ревью-сессия делает дельта-проверку",
+    "  (следующее ревью с тем же ревьювером; после дельта-апрува мяч у юзера);",
+    "- результат approved (чистый) → мяч у юзера, от тебя ничего не требуется;",
     "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
     "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
