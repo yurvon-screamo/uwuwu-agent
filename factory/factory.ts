@@ -1281,7 +1281,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     const skipRest = await dispatchReviewAction(action, {
-      row, tracked, project: tracked.project || projectName, cfg, board, state, fresh,
+      row, tracked, project: tracked.project || projectName, cfg, board, state, fresh: foreign,
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура

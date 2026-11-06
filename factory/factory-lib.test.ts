@@ -1254,6 +1254,12 @@ describe("parseAgentHeadTs — время коммента из CLI-обёртк
     expect(parseAgentHeadTs("AGENTS (завтра утром): hi")).toBeNull()
     expect(parseAgentHeadTs("")).toBeNull()
   })
+  test("компоненты вне диапазонов (перелив Date.UTC) — null", () => {
+    expect(parseAgentHeadTs("AGENTS (2026-13-45 99:99): hi")).toBeNull()
+    expect(parseAgentHeadTs("AGENTS (2026-11-05 24:00): hi")).toBeNull()
+    expect(parseAgentHeadTs("AGENTS (2026-02-30 10:00): hi")).toBeNull()
+    expect(parseAgentHeadTs("AGENTS (2026-11-05 10:60): hi")).toBeNull()
+  })
 })
 
 describe("freshForeignComments — сесс-скопед срез self-эха (дефект №1)", () => {
@@ -1342,10 +1348,40 @@ describe("normalizeBodyMd + bodyContentHash — контент-хэш вне «�
     const b = "# H\n\nТекст B.\n"
     expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
   })
+  test("пробелы после bold-маркера (UI-ренормализация) — хэш не меняется", () => {
+    const a = "**Обратная совместимость:** state валиден\n"
+    const b = "**Обратная совместимость:**  state валиден\n"
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("перестройка таблиц (пэддинг ячеек, separator) — хэш не меняется", () => {
+    const a = "|Проверка|Статус|\n|---|---|\n|Tests|✅|\n"
+    const b = "| Проверка    | Статус   |\n| ------------------| --------------|\n| Tests       | ✅       |\n"
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("содержательная правка ячейки таблицы — хэш меняется", () => {
+    const a = "|Tests|✅|\n"
+    const b = "|Tests|❌|\n"
+    expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
+  })
   test("аппенд коммента в «Комменты» — хэш не меняется (№4)", () => {
     const a = "# План\n\nтело\n\n## Комменты\n\n- **AGENTS** (t1): вопрос\n"
     const b = "# План\n\nтело\n\n## Комменты\n\n- **AGENTS** (t1): вопрос\n- **AGENTS** (t2): вердикт\n"
     expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("трейлинг-хвост комментов в конце дока (CLI-аппенд мимо секции) — хэш не меняется", () => {
+    const a = "## План\n\nтело\n\n## Комменты\n\n- **AGENTS** (t0): старый\n\n## Дефект\n\nтекст дефекта\n"
+    const b = `${a}\n- **AGENTS** (2026-11-06 16:46): вердикт ревьювера\n\n`
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("контентная строка в хвосте — хэш меняется", () => {
+    const a = "## План\n\nтело\n\n- **AGENTS** (2026-11-06 16:46): коммент\n"
+    const b = `${a}добавленная контентная строка\n`
+    expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
+  })
+  test("легитимный список без даты в скобках хвостом не срезается", () => {
+    const a = "## План\n\n- **жирный** пункт списка\n"
+    const b = `${a}- **жирный** ещё пункт\n`
+    expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
   })
   test("контент ПОСЛЕ секции «Комменты» учитывается (правка дефектов видна)", () => {
     const a = "## План\n\nтело\n\n## Комменты\n\n- **AGENTS** (t): c\n\n## Дефект\n\nстарый текст\n"

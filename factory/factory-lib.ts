@@ -140,7 +140,15 @@ export function parseAgentHeadTs(text: string): number | null {
   if (m === null) return null
   const p = m[1].trim().split(/[-: ]+/).map(Number)
   if (p.length < 5 || p.some((x) => Number.isNaN(x))) return null
-  return Date.UTC(p[0], p[1] - 1, p[2], p[3], p[4], p[5] ?? 0)
+  // диапазоны: Date.UTC молча переливает («2026-13-45 99:99», «2026-02-30») в
+  // валидные ms — битый ts не должен притворяться живым временем own-среза
+  const [, , , , , second] = p
+  const [year, month, day, hour, minute] = p
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || (second !== undefined && second > 59)) return null
+  const ms = Date.UTC(year, month - 1, day, hour, minute, second ?? 0)
+  const d = new Date(ms)
+  if (d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null
+  return ms
 }
 
 export interface FreshSplit {
@@ -192,10 +200,12 @@ export function latestComment(comments: TaskComment[]): TaskComment | null {
 // артефакты SiYuan-экспорта (инвентарь опыта «wakeup по собственному комменту»)
 const ZERO_WIDTH = /\p{Cf}/gu
 
-/** Контент тела вне секции «## Комменты» (от неё до следующего ## или EOF):
- *  коммент-аппенды (включая слитые фабрикой вердикты/notify) иммунны к хэшу —
- *  comment-контур не дублируется bodyEdit-будкой (дефект №4). Контент ПОСЛЕ
- *  секции учитывается — правки после «Комменты» видны. */
+/** Контент тела вне коммент-записей: (а) секция «## Комменты» (от неё до
+ *  следующего ##) — исторические тела; (б) трейлинг-хвост коммент-пунктов —
+ *  CLI аппендит комменты в конец дока (appendBlock parentID=docId), в телах
+ *  с дефект-секциями после «## Комменты» свежие записи живут хвостом.
+ *  Коммент-аппенды иммунны к хэшу — comment-контур не дублируется
+ *  bodyEdit-будкой (дефект №4). Контент между секциями учитывается. */
 export function bodyOutsideComments(md: string): string {
   const out: string[] = []
   let inComments = false
@@ -207,23 +217,47 @@ export function bodyOutsideComments(md: string): string {
     if (inComments && /^## /.test(line)) inComments = false
     if (!inComments) out.push(line)
   }
+  // трейлинг-хвост: все непустые строки от последнего контента до EOF —
+  // коммент-пункты формата «- **Author** (дата): …» (строгий матч с датой —
+  // легитимные списки не срезаются)
+  while (out.length > 0) {
+    const last = out[out.length - 1]
+    if (last.trim() === "" || /^- \*\*[^*]+\*\* \(\d{4}-\d{2}-\d{2}[^)]*\): /.test(last.trimStart())) {
+      out.pop()
+    } else {
+      break
+    }
+  }
   return out.join("\n")
 }
 
 /** Норм-форма markdown тела: frontmatter срезается (lastmod двигает каждое
- *  UI-пересохранение — дефект №5), zero-width SiYuan, \r\n, trailing-пробелы,
- *  схлопывание пустых строк. Правки «только форматирование» не будят;
- *  содержательные (слова, секции, порядок) — будят. */
+ *  UI-пересохранение — дефект №5), format-символы SiYuan, \r\n, trailing,
+ *  схлопывание пустых строк, канонизация таблиц (пэддинг/выравнивание ячеек
+ *  перестраивается при UI-save — инвентарь round-trip артефактов) и пробелов
+ *  после inline-bold. Правки «только форматирование» не будят; содержательные
+ *  (слова, секции, порядок) — будят. */
 export function normalizeBodyMd(md: string): string {
   return md
     .replace(/^---\n[\s\S]*?\n---\n/, "")
     .replace(/\r\n?/g, "\n")
     .replace(ZERO_WIDTH, "")
     .split("\n")
-    .map((line) => line.replace(/[ \t]+$/, ""))
+    .map((line) => line.startsWith("|") ? canonicalizeTableRow(line) : line.replace(/[ \t]+$/, ""))
     .join("\n")
+    .replace(/\*\* +/g, "** ")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
+}
+
+/** Ячейка таблицы: trim + схлопывание внутренних пробелов; separator
+ *  (дефисы/двоеточия любой длины) канонизуется — выравнивание колонок при
+ *  UI-save меняет пэддинг, контент не меняется. */
+function canonicalizeTableRow(line: string): string {
+  return line.split("|").map((cell) => {
+    const trimmed = cell.trim().replace(/ {2,}/g, " ")
+    return /^[-: ]+$/.test(trimmed) && trimmed !== "" ? "---" : trimmed
+  }).join("|")
 }
 
 /** Хэш норм-формы контента тела вне «Комменты». */
