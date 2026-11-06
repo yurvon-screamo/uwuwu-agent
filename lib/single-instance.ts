@@ -39,6 +39,41 @@ function branchSegment(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]/g, "_")
 }
 
+/** Метка ветки для громких замечаний: trim stdout'а git, «detached» для
+ *  пустого (отсоединённый HEAD), null — детект не удаллся. Единая точка
+ *  знания для резолюции state и warning'ов демонов (triage). */
+export function branchLabel(raw: string | null): string | null {
+  if (raw === null) return null
+  const b = raw.trim()
+  return b === "" ? "detached" : b
+}
+
+/** Путь лога тик-демона: явный override (тесты тика пишут в tmp —
+ *  os.homedir() в Bun не следует за runtime-подменой process.env.HOME);
+ *  в песочнице (явный env state или авто-изоляция ветки) лог живёт в
+ *  state-каталоге — прод-лог не засоряется смоук-тиками; иначе — общий
+ *  каталог логов opencode. Единая точка знания: демоны и тест-дети. */
+export function daemonLogPath(opts: {
+  /** явный override (тесты тика пишут в tmp); опционален */
+  override?: string | undefined
+  stateDir: string
+  sandboxed: boolean
+  fileName: string
+  homeDir: string
+}): string {
+  return opts.override ?? (opts.sandboxed
+    ? join(opts.stateDir, opts.fileName)
+    : join(opts.homeDir, ".local/share/opencode/log", opts.fileName))
+}
+
+/** Громкая эмиссия замечания резолюции демоном: stderr (виден в journald
+ *  сразу) + стартовый лог. null — тихо (штатный старт). */
+export function emitNotice(notice: string | null, log: (m: string) => void): void {
+  if (notice === null) return
+  console.error(notice)
+  log(notice)
+}
+
 /** Резолюция state-каталога демона с дефолт-изоляцией веточных чекаутов
  *  (инцидент-класс 06.11: прогон демона из ветки без env читал и писал
  *  общий прод-state). Порядок:
@@ -78,8 +113,8 @@ export function resolveDaemonStateDir(opts: {
     return { stateDir: env, sandboxed: true, autoIsolated: false, notice: null }
   }
   const detect = opts.detect ?? detectBranch
-  const raw = detect(opts.repoRoot)
-  if (raw === null) {
+  const label = branchLabel(detect(opts.repoRoot))
+  if (label === null) {
     return {
       stateDir: opts.defaultDir,
       sandboxed: false,
@@ -87,11 +122,9 @@ export function resolveDaemonStateDir(opts: {
       notice: `${opts.daemon}: git-детект ветки не удался (${opts.repoRoot}) — работаю на дефолтном state ${opts.defaultDir}; если это веточный чекаут, задай ${opts.envName} — иначе прод-state будет перезаписан`,
     }
   }
-  const branch = raw.trim()
-  if (branch === "master") {
+  if (label === "master") {
     return { stateDir: opts.defaultDir, sandboxed: false, autoIsolated: false, notice: null }
   }
-  const label = branch === "" ? "detached" : branch
   const stateDir = join(opts.defaultDir, "branches", branchSegment(label))
   return {
     stateDir,

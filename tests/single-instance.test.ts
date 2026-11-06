@@ -6,7 +6,7 @@ import { describe, expect, test, afterAll } from "bun:test"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
-import { resolveStateDir, resolveDaemonStateDir, type DaemonStateResolution } from "../lib/single-instance"
+import { resolveStateDir, resolveDaemonStateDir, branchLabel, daemonLogPath, emitNotice, type DaemonStateResolution } from "../lib/single-instance"
 
 const LIB_PATH = resolve(import.meta.dir, "../lib/single-instance.ts")
 const CHILD = join(import.meta.dir, "single-instance-child.ts")
@@ -142,6 +142,36 @@ describe("resolveStateDir", () => {
   test("env задан — переопределение as-is (песочница)", () => {
     expect(resolveStateDir("/tmp/smoke-factory", fallback)).toBe("/tmp/smoke-factory")
     expect(resolveStateDir("  /tmp/smoke-factory  ", fallback)).toBe("/tmp/smoke-factory")
+  })
+})
+
+describe("branchLabel / daemonLogPath / emitNotice", () => {
+  test("branchLabel: null-детект → null, пустой stdout → detached, trim", () => {
+    expect(branchLabel(null)).toBeNull()
+    expect(branchLabel("")).toBe("detached")
+    expect(branchLabel("   ")).toBe("detached")
+    expect(branchLabel("  master  ")).toBe("master")
+    expect(branchLabel("work/task-1")).toBe("work/task-1")
+  })
+
+  test("daemonLogPath: override выигрывает; песочница — state-каталог; прод — логи opencode", () => {
+    expect(daemonLogPath({ override: "/tmp/x.log", stateDir: "/s", sandboxed: false, fileName: "d.log", homeDir: "/h" })).toBe("/tmp/x.log")
+    expect(daemonLogPath({ override: undefined, stateDir: "/s", sandboxed: true, fileName: "d.log", homeDir: "/h" })).toBe("/s/d.log")
+    expect(daemonLogPath({ override: undefined, stateDir: "/s", sandboxed: false, fileName: "d.log", homeDir: "/h" })).toBe("/h/.local/share/opencode/log/d.log")
+  })
+
+  test("emitNotice: null — тихо; строка — console.error + log", () => {
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (m: string): void => { lines.push(`err:${m}`) }
+    try {
+      emitNotice(null, (m) => lines.push(`log:${m}`))
+      expect(lines).toEqual([])
+      emitNotice("notice!", (m) => lines.push(`log:${m}`))
+      expect(lines).toEqual(["err:notice!", "log:notice!"])
+    } finally {
+      console.error = orig
+    }
   })
 })
 
