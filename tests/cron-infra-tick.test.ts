@@ -100,7 +100,8 @@ afterEach(() => {
 describe("tick: инфра-сбой ядра ≠ вердикт — слот крона не сжигается", () => {
   test("SQL-лаг доски → infra: state пуст, доска не пишется, сессии нет", async () => {
     const { calls } = scriptKernel()
-    const state = { crons: {} as Record<string, unknown> }
+    // литерал без каста: tickBoard принимает CronState (Record<string, TrackedCron>)
+    const state = { crons: {} }
     // 09:35 при расписании 09:30 — due (догон); one-shot: гасился бы в fired
     // при refuse, но infra не имеет права тронуть ни state, ни доску
     await cron.tickBoard(state, { docId: "20261105210000-board1", dbId: "20261105210000-avblock1" }, "Кроны uwuwu", new Date("2026-11-05T09:35:00"))

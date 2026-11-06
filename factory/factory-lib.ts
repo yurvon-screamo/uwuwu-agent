@@ -125,6 +125,54 @@ export function pathSafe(title: string): string {
   return title.replaceAll("/", "\u{2215}")
 }
 
+/** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
+export function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+// ——— фоллбек тела по тайтлу: путь доски, мемоизированный на проход ———
+
+/** Итог обращения за путём доски: active — путь получен; failed — get_doc
+ *  упал (reason — текст ошибки); disabled — ядро вернуло пустые box/hpath
+ *  (SQL-лаг индекса по доске), фоллбек на проход невозможен. */
+export type BoardPathResolution =
+  | { kind: "active"; box: string; hpath: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "disabled" }
+
+/** Ленивый мемоизер пути доски на один проход readTasks: первая
+ *  материализация зовёт load и логирует деградацию ровно одной строкой,
+ *  последующие вызовы отдают кэш без API-вызовов и без логов — при сбое
+ *  или SQL-лаге N detached-строк дают один вызов и один лог вместо N
+ *  (per-row catch фоллбека на per-row сбои hpath больше не реагирует).
+ *  Живёт в замыкании readTasks: следующий тик материализует заново —
+ *  самолечение через тики сохранено. */
+export function createBoardPathOnce(
+  load: () => Promise<{ box?: string; hpath?: string }>,
+  log: (m: string) => void,
+): () => Promise<BoardPathResolution> {
+  let cache: BoardPathResolution | null = null
+  return async () => {
+    if (cache !== null) return cache
+    try {
+      const d = await load()
+      const box = d.box ?? ""
+      const hpath = d.hpath ?? ""
+      if (box === "" || hpath === "") {
+        log("фоллбек тела по тайтлу отключён (SQL-лаг): get_doc доски вернул пустые box/hpath")
+        cache = { kind: "disabled" }
+      } else {
+        cache = { kind: "active", box, hpath }
+      }
+    } catch (e) {
+      const reason = errText(e)
+      log(`фоллбек тела по тайтлу отключён на проход: get_doc доски не удался (${reason})`)
+      cache = { kind: "failed", reason }
+    }
+    return cache
+  }
+}
+
 /** Новые юзерские комменты после lastSeen, по порядку создания. */
 export function newUserComments(
   comments: TaskComment[],

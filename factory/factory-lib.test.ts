@@ -20,6 +20,8 @@ import {
   formatPassSummary,
   adoptBodyDoc,
   pathSafe,
+  createBoardPathOnce,
+  errText,
   stampLegacyEntries,
   type ProjectCfg,
   isValidTracked,
@@ -869,5 +871,81 @@ describe("pathSafe", () => {
 
   test("уже санитизированный остаётся как есть (идемпотентность)", () => {
     expect(pathSafe("уже \u{2215} санитизирован")).toBe("уже \u{2215} санитизирован")
+  })
+})
+
+// ——— мемоизер пути доски на проход (фоллбек тела detached-строк) ———
+
+describe("createBoardPathOnce — ленивый мемоизер пути доски на проход", () => {
+  const logs: string[] = []
+  const log = (m: string): void => { logs.push(m) }
+
+  test("успех: путь кэшируется — один load на несколько вызовов", async () => {
+    // Arrange
+    logs.length = 0
+    let loads = 0
+    const load = async (): Promise<{ box?: string; hpath?: string }> => {
+      loads++
+      return { box: "nb", hpath: "/proj/Задачи x" }
+    }
+
+    // Act
+    const resolve = createBoardPathOnce(load, log)
+    const [a, b, c] = [await resolve(), await resolve(), await resolve()]
+
+    // Assert: кэш отдаёт один и тот же активный путь, load и лог — однократно
+    expect(a).toEqual({ kind: "active", box: "nb", hpath: "/proj/Задачи x" })
+    expect(b).toEqual(a)
+    expect(c).toEqual(a)
+    expect(loads).toBe(1)
+    expect(logs).toEqual([])
+  })
+
+  test("сбой get_doc: мемоизируется как failed — один load и один лог на проход", async () => {
+    // Arrange
+    logs.length = 0
+    let loads = 0
+    const load = async (): Promise<{ box?: string; hpath?: string }> => {
+      loads++
+      throw new Error("ядро лежит")
+    }
+
+    // Act
+    const resolve = createBoardPathOnce(load, log)
+    const results = [await resolve(), await resolve(), await resolve()]
+
+    // Assert: все вызовы получили один failed без повторных load,
+    // деградация — ровно одна строка лога (не per-row спам)
+    for (const r of results) expect(r).toEqual({ kind: "failed", reason: "ядро лежит" })
+    expect(loads).toBe(1)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain("отключён на проход")
+    expect(logs[0]).toContain("ядро лежит")
+  })
+
+  test("пустые box/hpath (SQL-лаг): disabled + один лог", async () => {
+    // Arrange
+    logs.length = 0
+    let loads = 0
+    const load = async (): Promise<{ box?: string; hpath?: string }> => {
+      loads++
+      return { box: "", hpath: "" }
+    }
+
+    // Act
+    const resolve = createBoardPathOnce(load, log)
+    const results = [await resolve(), await resolve()]
+
+    // Assert
+    for (const r of results) expect(r).toEqual({ kind: "disabled" })
+    expect(loads).toBe(1)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain("SQL-лаг")
+  })
+
+  test("errText: Error даёт message, не-Error — строку", () => {
+    expect(errText(new Error("boom"))).toBe("boom")
+    expect(errText("строка")).toBe("строка")
+    expect(errText(42)).toBe("42")
   })
 })
