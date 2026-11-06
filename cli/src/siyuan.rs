@@ -422,6 +422,68 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Заменить содержимое блока (тип сохраняется: html-блок остаётся html).
+    pub async fn update_block_md(&self, block_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/updateBlock",
+            json!({ "dataType": "markdown", "data": markdown, "id": block_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Вставить markdown-блоки сразу после блока previous_id.
+    pub async fn insert_block_md_after(&self, previous_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/insertBlock",
+            json!({
+                "dataType": "markdown",
+                "data": markdown,
+                "previousID": previous_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Расположение .sy-файла дока в воркспейсе: (box, path от data/) —
+    /// FS-истина порядка детей (индекс ядра порядок не отдаёт).
+    pub async fn doc_file_location(&self, doc_id: &str) -> Result<(String, String)> {
+        let v = self
+            .post("/api/block/getBlockInfo", json!({ "id": doc_id }))
+            .await?;
+        let box_id = v
+            .pointer("/box")
+            .and_then(|b| b.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет box в ответе {v}"))?
+            .to_string();
+        let path = v
+            .pointer("/path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет path в ответе {v}"))?
+            .to_string();
+        Ok((box_id, path))
+    }
+
+    /// Упорядоченные дети дока верхнего уровня из .sy-файла ( Children массив
+    /// в порядке документа). Нужен для адресации «блок после маркера»:
+    /// SQL-индекс порядок детей не хранит, kramdown-пропы html-блоков
+    /// недокументированы — .sy детерминирован (NodeHTMLBlock).
+    pub(crate) async fn doc_children(&self, doc_id: &str) -> Result<Vec<DocChild>> {
+        let (box_id, path) = self.doc_file_location(doc_id).await?;
+        let bytes = match self
+            .fetch_workspace_file(&format!("data/{box_id}{path}"))
+            .await
+        {
+            FileFetch::Bytes(bytes) => bytes,
+            FileFetch::Missing => bail!("{}: .sy дока нет в data/ (box={box_id})", doc_id),
+            FileFetch::Failed(err) => bail!("getFile {doc_id}: {err}"),
+        };
+        let tree: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("{}: .sy не JSON", doc_id))?;
+        Ok(doc_children_from_sy(&tree))
+    }
+
     /// Экспорт дока в markdown по hPath. `notebook_id` — **ИД** ноутбука
     /// (формат 20261103224312-fbrf5fp, как возвращает `ensure_notebook`),
     /// не имя: kernel getIDsByHPath принимает только ID (см. `siyuan_id`).
@@ -892,6 +954,94 @@ fn body_snippet(raw: &str) -> String {
         head.push('…');
     }
     head
+}
+
+/// Верхнеуровневые дети дока из .sy в порядке документа — минимум для
+/// адресации диаграмм по маркеру.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocChild {
+    pub(crate) id: String,
+    pub(crate) kind: DocChildKind,
+    /// Текст абзаца/заголовка (для html-блока — сам html).
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocChildKind {
+    Paragraph,
+    Heading,
+    Html,
+    Other,
+}
+
+/// Парсер Children массива .sy-дока (проба ядра 3.8.10: NodeParagraph /
+/// NodeHeading несут текст во вложенных NodeText.Data, NodeHTMLBlock —
+/// html в собственном Data).
+pub(crate) fn doc_children_from_sy(tree: &Value) -> Vec<DocChild> {
+    tree.get("Children")
+        .and_then(|c| c.as_array())
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|node| {
+                    let id = node.get("ID")?.as_str()?.to_string();
+                    let kind = match node.get("Type").and_then(|t| t.as_str()) {
+                        Some("NodeParagraph") => DocChildKind::Paragraph,
+                        Some("NodeHeading") => DocChildKind::Heading,
+                        Some("NodeHTMLBlock") => DocChildKind::Html,
+                        _ => DocChildKind::Other,
+                    };
+                    let text = match kind {
+                        DocChildKind::Html | DocChildKind::Other => node
+                            .get("Data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        DocChildKind::Paragraph | DocChildKind::Heading => node
+                            .get("Children")
+                            .and_then(|c| c.as_array())
+                            .map(|texts| {
+                                texts
+                                    .iter()
+                                    .filter(|t| {
+                                        t.get("Type").and_then(|v| v.as_str()) == Some("NodeText")
+                                    })
+                                    .filter_map(|t| t.get("Data").and_then(|d| d.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .unwrap_or_default(),
+                    };
+                    Some(DocChild { id, kind, text })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Адрес диаграммы: маркер-абзац `⁂ diagram:<имя>` и следующий блок.
+/// Маркеров с одним именем несколько → первое вхождение (детерминизм,
+/// как в replace_md_section); сосед маркера — любой вид, is_html решает
+/// операцию (update/delete против insert-after).
+pub(crate) fn find_marker_location(
+    children: &[DocChild],
+    marker_prefix: &str,
+    name: &str,
+) -> Option<crate::html_embed::MarkerLocation> {
+    let marker_text = format!("{marker_prefix}{name}");
+    let pos = children
+        .iter()
+        .position(|c| c.kind == DocChildKind::Paragraph && c.text == marker_text)?;
+    let following = children
+        .get(pos + 1)
+        .map(|next| crate::html_embed::FollowingBlock {
+            id: next.id.clone(),
+            is_html: next.kind == DocChildKind::Html,
+        });
+    Some(crate::html_embed::MarkerLocation {
+        marker_id: children[pos].id.clone(),
+        following,
+    })
 }
 
 /// id блоков из markdown-дампа get_children (строки вида `- [p] текст (20261104-x)`).

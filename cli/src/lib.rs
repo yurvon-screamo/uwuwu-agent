@@ -5,6 +5,7 @@
 //! PR #30/#31 в yurvon-screamo/uwuwu-agent).
 
 pub mod cmd;
+pub mod html_embed;
 pub mod markdown;
 pub mod md_heading;
 pub mod path;

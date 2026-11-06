@@ -157,7 +157,7 @@ Folders handle organization; tags are only for lookup.
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot` — не портирован на SiYuan v1 (headless chromium + Access Auth Code при необходимости)
 - `projects` — live workspace project registry
-- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown (live diagrams: manual HTML block via SiYuan UI — ```html_embed fence conversion unimplemented on SiYuan v1, see `skills/visual-diagrams`)
+- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown (live diagrams: ```html_embed fences convert to SiYuan html-blocks, marker-addressed `⁂ diagram:<name>`, see `skills/visual-diagrams`)
 
 **Infrastructure**: ноут (docker: siyuan-demo :6806, воркспейс ~/siyuan-demo-ws), наружу — Railway-релей + rathole (временно дефолт-домен Railway из-за бага сертов)
 
