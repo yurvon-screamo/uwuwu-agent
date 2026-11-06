@@ -155,10 +155,19 @@ STUB_TEXTS = (
 )
 
 
+def _stub_section_effective(body_lines: list[str]) -> str:
+    """Контент секции без тегов типа, с unescape скобок, в collapse-форме —
+    то, что сверяется с текстами-заглушками."""
+    core = [x for x in body_lines if x.strip() not in ("#dev", "#spike", "#bug")]
+    return " ".join(" ".join(x.replace("\\<", "<").replace("\\>", ">").split())
+                    for x in core).strip()
+
+
 def _drop_stub_sections(content: str) -> str:
-    """Секции-заглушки старого костяка (контент = только текст-плейсхолдер
-    или пусто) — дроп. Реальные секции с контентом не трогаются: непустой
-    дубль — ручной режим. Экранирование `\\<` ядро вносит при экспорте."""
+    """Секции-заглушки старого костяка (контент = только текст-плейсхолдер,
+    тег типа или пусто) — дроп; теги `#dev/#spike/#bug` сохраняются отдельной
+    строкой. Реальные секции с контентом не трогаются: непустой дубль —
+    ручной режим. Экранирование `\\<`/`\\>` ядро вносит при экспорте."""
     lines = content.split("\n")
     out: list[str] = []
     i = 0
@@ -169,9 +178,9 @@ def _drop_stub_sections(content: str) -> str:
             while j < len(lines) and not re.match(r"^## ", lines[j]):
                 body_lines.append(lines[j])
                 j += 1
-            body = " ".join(" ".join(b.replace("\\<", "<").replace("\\>", ">").split())
-                            for b in body_lines).strip()
-            if body in ("",) or body in STUB_TEXTS:
+            effective = _stub_section_effective(body_lines)
+            if effective == "" or effective in STUB_TEXTS:
+                out.extend(x for x in body_lines if x.strip() in ("#dev", "#spike", "#bug"))
                 i = j  # заглушка целиком — дроп вместе с заголовком
                 continue
         out.append(lines[i])
@@ -241,9 +250,10 @@ def _records_of(block: str) -> str:
 
 def apply_body(doc_id: str, project: str, new_content: str,
                export_before: str, scratch: Path, label: str) -> bool:
-    """Сборка нового тела (контент + «Комменты» дословно) → cli replace →
-    пост-чек. Возвращает успех."""
-    payload = new_content.rstrip() + "\n\n" + comments_section(export_before).lstrip("\n")
+    """Сборка нового тела (контент + блок «Комменты» любого имени дословно)
+    → cli replace → пост-чек; при провале — РЕАЛЬНЫЙ откат тела в
+    до-состояние (план п.11 обещает откат, а не рецепт)."""
+    payload = new_content.rstrip() + "\n\n" + comments_block_any_name(export_before).lstrip("\n")
     md_file = scratch / f"{doc_id}.{label}.md"
     md_file.write_text(payload, encoding="utf-8")
     subprocess.run(  # nosec B603 — фиксированный бинарь, аргументы из аудита
@@ -251,23 +261,34 @@ def apply_body(doc_id: str, project: str, new_content: str,
          "--md", str(md_file)],
         capture_output=True, text=True, check=True)
     after = fresh(doc_id)
-    if not after.strip():
-        print(f"FAIL {doc_id}: export пуст после replace — откат из undo-журнала")
-        return False
-    before_c = _records_of(comments_block_any_name(export_before))
-    # sync-lag guard: экспорт сразу после replace может отнести старьё
-    # (синк ядра бывает >2 с) — расхождение проверяется повторным экспортом
-    for attempt in range(2):
-        after_c = _records_of(comments_section(fresh(doc_id)))
-        if normalize(before_c) == normalize(after_c):
-            break
-        if attempt == 0:
-            time.sleep(4)
-    if normalize(before_c) != normalize(after_c):
-        print(f"FAIL {doc_id}: «## Комменты» потеряны/изменены — откат из undo-журнала; "
+    ok = bool(after.strip())
+    if ok:
+        before_c = _records_of(comments_block_any_name(export_before))
+        # sync-lag guard: экспорт сразу после replace может отнести старьё
+        # (синк ядра бывает >2 с) — расхождение проверяется повторным экспортом
+        after_c = ""
+        for attempt in range(2):
+            after_c = _records_of(comments_section(fresh(doc_id)))
+            if normalize(before_c) == normalize(after_c):
+                break
+            if attempt == 0:
+                time.sleep(4)
+        ok = normalize(before_c) == normalize(after_c)
+        if not ok:
+            (scratch / f"{doc_id}.comments.diff").write_text(
+                f"--- ДО\n{before_c}\n--- ПОСЛЕ\n{after_c}", encoding="utf-8")
+    if not ok:
+        # реальный откат: до-контент без frontmatter/рендер-строки (план п.11)
+        m = re.search(r"^title: (.+)$", export_before, flags=re.M)
+        restore_payload = tba.content_of(export_before, m.group(1).strip() if m else "")
+        rollback_file = scratch / f"{doc_id}.rollback.md"
+        rollback_file.write_text(restore_payload, encoding="utf-8")
+        subprocess.run(  # nosec B603 — фиксированный бинарь
+            [UWUWU_CLI, "task", "body", doc_id, "--project", project, "--replace",
+             "--md", str(rollback_file)],
+            capture_output=True, text=True, check=True)
+        print(f"FAIL {doc_id}: пост-чек не прошёл — тело откачено в до-состояние; "
               f"diff: {scratch / f'{doc_id}.comments.diff'}")
-        (scratch / f"{doc_id}.comments.diff").write_text(
-            f"--- ДО\n{before_c}\n--- ПОСЛЕ\n{after_c}", encoding="utf-8")
         return False
     (scratch / f"{doc_id}.after.md").write_text(after, encoding="utf-8")
     print(f"OK {doc_id}: {label} (замечаний нет; diff до/после в scratch)")
