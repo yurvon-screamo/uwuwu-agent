@@ -9,14 +9,18 @@
      box-scoped по hpath; апостроф в hpath экранируется;
   5) маркер заглушки — строка-цитата с «⚠️» И словом «канон»/«заглушк» на той же
      строке (живой контрпример: цитата-упоминание без ⚠️ на канон-ранбуке);
-  6) после ok от removeDocByID — подтверждение по индексу; док остался → громкая
-     ошибка, тихого ok нет;
+  6) после ok от removeDocByID вердикт — по файловой пробе ядра (FS-истина:
+     getFile data/<box><path>, контракт 3.8.9); файл остался на диске → громкая
+     ошибка, тихого ok без вердикта нет; SQL-индекс (лагает секундами после
+     мутаций) — примечание к успеху или фолбэк при failed-пробе, успех не
+     отвергает (принцип ADR-025: один лагающий источник ≠ истина);
   7) каждый SQL-stmt несёт явный LIMIT (правило проекта после orgls-инцидента).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_delete.py
 """
 import io
+import json
 import re
 import sys
 import unittest
@@ -52,17 +56,23 @@ def _doc(doc_id: str, hpath: str, path: str, box: str = BOX) -> dict:
 
 
 class FakeKernel:
-    """Двойник kernel API: blocks-таблица, export, removeDocByID.
+    """Двойник kernel API: blocks-таблица, export, removeDocByID, getFile-проба.
 
     SQL эмулируется по семантике stmt (id-резолв / дети по path-префиксу /
-    box-scoped соседи), не по точной строке запроса.
+    box-scoped соседи), не по точной строке запроса. FS — отдельная модель
+    (set путей data<path>): файл уходит при removeDocByID независимо от
+    SQL-индекса, fs_probe различает found/missing/failed как ядро 3.8.9.
     """
 
-    def __init__(self, docs, contents=None, removal_updates_index=True, notebooks=None):
+    def __init__(self, docs, contents=None, removal_updates_index=True, notebooks=None,
+                 removal_updates_fs=True, fs_probe_fails=False):
         self.docs = {d["id"]: dict(d) for d in docs}
         self.contents = contents or {}
         self.removal_updates_index = removal_updates_index
+        self.removal_updates_fs = removal_updates_fs
+        self.fs_probe_fails = fs_probe_fails
         self.notebooks = notebooks
+        self.fs = {f"data{d['path']}" for d in self.docs.values()}
         self.removed = []
         self.sql_stmts = []
 
@@ -77,10 +87,20 @@ class FakeKernel:
             return {"content": self.contents.get(body["id"], "")}
         if path == "/api/filetree/removeDocByID":
             self.removed.append(body["id"])
+            doc = self.docs.get(body["id"])
             if self.removal_updates_index:
                 self.docs.pop(body["id"], None)
+            if self.removal_updates_fs and doc:
+                self.fs.discard(f"data{doc['path']}")
             return None
         raise AssertionError(f"неожиданный путь: {path}")
+
+    def fs_probe(self, path: str) -> str:
+        """getFile-семантика ядра 3.8.9: 200+байты → found, конверт 404 → missing,
+        отказ пробы → failed (флаг fs_probe_fails)."""
+        if self.fs_probe_fails:
+            return "failed"
+        return "found" if path in self.fs else "missing"
 
     def _sql(self, stmt: str):
         self.sql_stmts.append(stmt)
@@ -105,13 +125,19 @@ class FakeKernel:
 def run_delete(kernel: FakeKernel, doc_id: str, force: bool = False) -> str:
     args = SimpleNamespace(docId=doc_id, force=force)
     original_post = wiki_ops.post
+    original_fs_file = getattr(wiki_ops, "_fs_file", None)
     wiki_ops.post = kernel.post
+    wiki_ops._fs_file = kernel.fs_probe
     try:
         buffer = io.StringIO()
         with redirect_stdout(buffer), patch.object(wiki_ops.time, "sleep", lambda s: None):
             wiki_ops.cmd_delete(args)
     finally:
         wiki_ops.post = original_post
+        if original_fs_file is not None:
+            wiki_ops._fs_file = original_fs_file
+        else:
+            del wiki_ops._fs_file
     return buffer.getvalue()
 
 
@@ -217,18 +243,119 @@ class BadInputs(unittest.TestCase):
 
 
 class PostCheck(unittest.TestCase):
-    """ok от ядра при живом индексе — громкая ошибка, не тихий успех."""
+    """Вердикт после ok — по файловой пробе (FS-истина); лагающий индекс
+    успех не отвергает, файл на диске — громкая ошибка."""
 
-    def test_doc_still_indexed_after_ok_is_loud_error(self):
-        kernel = FakeKernel(
+    def _kernel(self, **kwargs):
+        return FakeKernel(
             docs=[_doc(STUB_ID, "/uwuwu/Ранбуки/РБ", "/20261103224612-e9q7eyv/РБ/РБ.sy")],
             contents={STUB_ID: STUB_CONTENT},
-            removal_updates_index=False,
+            **kwargs,
         )
+
+    def test_index_lag_after_ok_is_quiet_success_with_fs_verdict(self):
+        # Красный тест задачи: removeDocByID ok, файл уехал в корзину,
+        # SQL-индекс ещё показывает док — тихий успех, никакого raise.
+        kernel = self._kernel(removal_updates_index=False)
+        output = run_delete(kernel, STUB_ID)
+        self.assertEqual(kernel.removed, [STUB_ID])
+        self.assertIn("снесён", output)
+        self.assertIn("вердикт по файловой пробе", output)
+        self.assertIn("SQL-индекс ещё видит док", output)
+
+    def test_file_left_on_disk_is_loud_error_with_path(self):
+        kernel = self._kernel(removal_updates_fs=False)
         with self.assertRaises(RuntimeError) as cm:
             run_delete(kernel, STUB_ID)
-        self.assertIn("остался в индексе", str(cm.exception))
+        message = str(cm.exception)
+        self.assertIn("файл дока остался на диске", message)
+        self.assertIn("data/20261103224612-e9q7eyv/РБ/РБ.sy", message)
         self.assertEqual(kernel.removed, [STUB_ID])
+
+    def test_fs_probe_failure_falls_back_to_index_verdict(self):
+        kernel = self._kernel(fs_probe_fails=True)
+        output = run_delete(kernel, STUB_ID)
+        self.assertEqual(kernel.removed, [STUB_ID])
+        self.assertIn("снесён", output)
+        self.assertIn("вердикт по SQL-индексу (файловая проба не состоялась)", output)
+
+    def test_fs_probe_failure_with_stale_index_is_loud_error(self):
+        kernel = self._kernel(removal_updates_index=False, fs_probe_fails=True)
+        with self.assertRaises(RuntimeError) as cm:
+            run_delete(kernel, STUB_ID)
+        self.assertIn("верификация не сошлась", str(cm.exception))
+        self.assertEqual(kernel.removed, [STUB_ID])
+
+
+class _FakeResponse:
+    """Стенд urlopen-ответа: status + тело, контекстный менеджер как у urllib."""
+
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FsProbeContract(unittest.TestCase):
+    """Транспортный контракт _fs_file пинится целиком (юнит-тесты cmd_delete
+    патчат _fs_file — здесь проверяется сам выстрел): Authorization из _conf,
+    явный timeout, путь в теле, три исхода ядра 3.8.9."""
+
+    KERNEL_URL = "http://kernel.test"
+    DOC_PATH = "data/20261103224612-e9q7eyv/РБ/РБ.sy"
+
+    def _probe_with(self, response):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.get_header("Authorization")
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(req.data.decode())
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        saved = (wiki_ops.URL, wiki_ops.TOKEN)
+        wiki_ops.URL, wiki_ops.TOKEN = self.KERNEL_URL, "t0k3n"
+        try:
+            with patch.object(wiki_ops.urllib.request, "urlopen", fake_urlopen):
+                verdict = wiki_ops._fs_file(self.DOC_PATH)
+        finally:
+            wiki_ops.URL, wiki_ops.TOKEN = saved
+        return verdict, captured
+
+    def test_sends_auth_token_and_explicit_timeout(self):
+        verdict, captured = self._probe_with(_FakeResponse(200, b'{"ID":"doc"}'))
+        self.assertEqual(verdict, "found")
+        self.assertEqual(captured["auth"], "Token t0k3n")
+        self.assertEqual(captured["timeout"], 60)
+        self.assertEqual(captured["body"], {"path": self.DOC_PATH})
+
+    def test_http_202_envelope_code_404_is_missing(self):
+        body = b'{"code":404,"msg":"open \u2026: file does not exist","data":null}'
+        verdict, _ = self._probe_with(_FakeResponse(202, body))
+        self.assertEqual(verdict, "missing")
+
+    def test_http_200_with_empty_body_is_failed_not_found(self):
+        # Пустое тело это промах, не успех (правило write-path, ловушка blob).
+        verdict, _ = self._probe_with(_FakeResponse(200, b""))
+        self.assertEqual(verdict, "failed")
+
+    def test_unexpected_envelope_code_is_failed(self):
+        verdict, _ = self._probe_with(_FakeResponse(202, b'{"code":-1,"msg":"wave"}'))
+        self.assertEqual(verdict, "failed")
+
+    def test_transport_error_is_failed(self):
+        verdict, _ = self._probe_with(Exception("connection refused"))
+        self.assertEqual(verdict, "failed")
 
 
 class ApostropheInHpath(unittest.TestCase):
