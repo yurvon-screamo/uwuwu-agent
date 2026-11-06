@@ -63,6 +63,7 @@ import {
   spawnGuardVerdict,
   spawnLimitsFromEnv,
   hasSessionEvidence,
+  activeTaskGuards,
   PATH_CELL,
   DEV_SESSION_CELL,
   REVIEW_SESSION_CELL,
@@ -78,6 +79,7 @@ import {
   type TrackedTask,
 } from "./factory-lib"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
+import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 // ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
@@ -163,6 +165,9 @@ const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6
  *  не tmpfs — урок SIGSEGV 03.11). Песочница переопределяет вместе с state. */
 const ENV_ROOT = process.env.UWUWU_FACTORY_ENV_ROOT ?? join(homedir(), "agents-env")
 const ENV_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** периодичность GC легаси-ворктри в тиках: при poll 180s ≈ раз в час.
+ *  Старт-проход отдельный — рестарт демона не обязан ждать час. */
+const GC_EVERY_TICKS = 20
 
 /** Исполнитель git-операций окружения: прод — фабричный sh() с таймаутом. */
 const envDeps = (): EnvDeps => ({ run: (cmd, cwd) => sh(cmd, { cwd }), log })
@@ -679,6 +684,27 @@ async function startTask(
     [DEV_SESSION_CELL]: sessionID,
   })
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
+}
+
+/** GC легаси-корней ворктри проекта (wt/, .worktrees/ под cfg.local):
+ *  снос merged+clean по факту смержа PR с полным набором гардов.
+ *  Проекты без легаси-корней — мгновенный no-op внутри gcLegacyWorktrees. */
+async function gcLegacyRoots(name: string, cfg: ProjectCfg, state: FactoryState): Promise<void> {
+  const guards = activeTaskGuards(state)
+  const report = await gcLegacyWorktrees(envDeps(), {
+    local: cfg.local,
+    roots: [join(cfg.local, "wt"), join(cfg.local, ".worktrees")],
+    base: "origin/master",
+    protectedBranches: guards.branches,
+    protectedDirs: guards.dirs,
+    nowMs: Date.now(),
+    graceMs: MERGE_GRACE_MS_DEFAULT,
+  })
+  log(
+    `gc[${name}]: снесено=${report.removed.length}, веток=${report.branchesDeleted.length}, ` +
+      `пропущено=${report.skipped.length}, неудач=${report.failed.length}` +
+      (report.abortedReason !== undefined ? `, прерван: ${report.abortedReason}` : ""),
+  )
 }
 
 /** Чистка state (Done): гасим ОБЕ сессии задачи и сносим env (rm/attic +
@@ -1420,6 +1446,14 @@ async function main(): Promise<void> {
       maxAgeMs: ENV_MAX_AGE_MS,
     })
     log(`старт-свип env (${ENV_ROOT}): снесено сирот=${sweep.sweptEnvs.length}, attic=${sweep.sweptAttic.length}`)
+    // GC легаси-корней ворктри: старт-проход по всем проектам
+    for (const [name, cfg] of Object.entries(projects)) {
+      try {
+        await gcLegacyRoots(name, cfg, state)
+      } catch (e) {
+        log(`gc[${name}]: ${e}`)
+      }
+    }
   }
   while (true) {
     for (const [name, cfg] of Object.entries(projects)) {
@@ -1432,6 +1466,17 @@ async function main(): Promise<void> {
     }
     tickCount++
     if (tickCount % 10 === 0) rotateLog()
+    // GC легаси-ворктри: раз в GC_EVERY_TICKS тиков (≈час при poll 180s)
+    if (!DRY_RUN && !STATE_RESOLVED.sandboxed && tickCount % GC_EVERY_TICKS === 0) {
+      for (const [name, cfg] of Object.entries(projects)) {
+        if (drain.isStopping()) break
+        try {
+          await gcLegacyRoots(name, cfg, state)
+        } catch (e) {
+          log(`gc[${name}]: ${e}`)
+        }
+      }
+    }
     if (ONCE) {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)
