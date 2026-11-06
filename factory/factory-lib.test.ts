@@ -484,6 +484,10 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("approve → In Progress")
     expect(p).toContain("request_changes → Design")
     expect(p).not.toContain("request_changes → In Progress")
+    // вердикт-строка с тремя исходами; approve-with-notes plan-у не светит
+    expect(p).toContain("approve|approve с мелкими замечаниями|request_changes")
+    expect(p).toContain("только для result")
+    expect(p).not.toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
   })
   test("result: ветка/ворктри/PR и переходы результата", () => {
     const p = reviewSpawnPrompt("r2", "origa", "result", ctx)
@@ -494,6 +498,12 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("approve → Review")
     expect(p).toContain("request_changes → In Progress")
     expect(p).not.toContain("request_changes → Design")
+  })
+  test("result: approve-with-notes → In Progress с пометкой дельты и прошлых раундов", () => {
+    const p = reviewSpawnPrompt("r5", "uwuwu", "result", { branch: "", worktree: "", pr: "" })
+    expect(p).toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
+    expect(p).toContain("следующее ревью с тем же ревьювером")
+    expect(p).toContain("прошлые раунды ревью этой задачи")
   })
   test("result без ворктри (env:false / карантинный ревью-вход) — честная строка про diff/PR, не пустота", () => {
     const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" })
@@ -513,7 +523,20 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain(REVIEW_RESULT_STATUS)
     expect(p).toContain("устранение своих прошлых замечаний")
     expect(p).toContain("approve → Review")
+    expect(p).toContain("request_changes → In Progress")
     expect(p).toContain("https://pr/1")
+  })
+  test("rerun result: дельта-ветка approve-with-notes + эскалация повторных мелочей", () => {
+    const p = reviewRerunPrompt("r2", "result", { branch: "", worktree: "", pr: "" })
+    expect(p).toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
+    expect(p).toContain("дельта-раунд")
+    expect(p).toContain("мелочи повторно не устранены")
+  })
+  test("rerun plan: дельта-ветка result не появляется, переходы плановые", () => {
+    const p = reviewRerunPrompt("r3", "plan", { branch: "", worktree: "", pr: "" })
+    expect(p).toContain("approve → In Progress")
+    expect(p).toContain("request_changes → Design")
+    expect(p).not.toContain("дельта-раунд")
   })
   test("comments: цитаты юзера + ответ комментом", () => {
     const p = reviewCommentsPrompt("r1", [c("a", "а точно?", 1)])
@@ -529,6 +552,13 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain("перепланируй")
     // фаст-трек владельца — тот же возврат: продолжай/почини без Design
     expect(p).toContain("In Progress")
+  })
+  test("return: approve-with-notes → дофикси и сразу «Ревью результата», чистый approve — мяч юзеру", () => {
+    const p = reviewReturnPrompt("r4")
+    expect(p).toContain("approve с мелкими замечаниями")
+    expect(p).toContain(REVIEW_RESULT_STATUS)
+    expect(p).toContain("дельта")
+    expect(p).toContain("чистый")
   })
 })
 
