@@ -80,11 +80,30 @@ pub async fn search_half(
     limit: usize,
     threshold: f32,
 ) -> Vec<String> {
+    search_half_at(
+        sy,
+        cfg,
+        query,
+        limit,
+        threshold,
+        Instant::now() + SEARCH_BUDGET,
+    )
+    .await
+}
+
+/// Тестовый вход с явным дедлайном: остальной контракт тот же.
+pub(crate) async fn search_half_at(
+    sy: &SiYuan,
+    cfg: &SemanticConfig,
+    query: &str,
+    limit: usize,
+    threshold: f32,
+    deadline: Instant,
+) -> Vec<String> {
     let header = format!(
         "Семантический ({model}, cos ≥ {threshold:.2}):",
         model = cfg.embed_model
     );
-    let deadline = Instant::now() + SEARCH_BUDGET;
 
     if !cfg.db_path.exists() {
         return section(
@@ -108,30 +127,53 @@ pub async fn search_half(
     if let Err(e) = sync::reconcile(sy, &ollama, &mut store, Some(deadline)).await {
         return section(&header, route_error(&e));
     }
-    let report = match sync::delta_sync(
+    if let Err(e) = sync::delta_sync(
         sy,
         &ollama,
         &mut store,
         &sync::SyncOptions {
             since: None,
             deadline: Some(deadline),
+            embed_timeout: SEARCH_EMBED_TIMEOUT,
             page_delay: None,
             on_batch: None,
         },
     )
     .await
     {
-        Ok(report) => report,
-        Err(e) => return section(&header, route_error(&e)),
-    };
+        return section(&header, route_error(&e));
+    }
 
+    // Эмбедд запроса — только из остатка бюджета (п.2 ревью PR #78):
+    // исчерпан синхронизацией → честный таймаут, не запрос с полным
+    // таймаутом поверх израсходованного бюджета.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return section(
+            &header,
+            format!(
+                "таймаут (бюджет {}s): бюджет израсходован синхронизацией, очередь дотянется следующими поисками",
+                SEARCH_BUDGET.as_secs()
+            ),
+        );
+    }
     let index_dim = store
         .meta("dim")
         .ok()
         .flatten()
         .and_then(|d| d.parse().ok());
-    let query_vec = match ollama.embed(&[query.to_string()], index_dim).await {
+    let query_vec = match ollama.embed(&[query.to_string()], index_dim, remaining).await {
         Ok(mut vectors) => ollama::normalize(vectors.remove(0)),
+        Err(ollama::EmbedError::Timeout { .. }) => {
+            return section(
+                &header,
+                format!(
+                    "таймаут (бюджет {}s): эмбедд запроса не уложился в остаток {:.1}s",
+                    SEARCH_BUDGET.as_secs(),
+                    remaining.as_secs_f32()
+                ),
+            );
+        }
         Err(e) => return section(&header, format!("недоступен — {e}")),
     };
     let hits = match store.knn(&query_vec, limit, threshold) {
@@ -147,12 +189,6 @@ pub async fn search_half(
             lines.push(format!("{}. {}  ({:.2})", i + 1, hit.hpath, hit.score));
             lines.push(format!("    {}", hit.snippet.replace('\n', " ")));
         }
-    }
-    if report.budget_exhausted {
-        lines.push(
-            "(индекс дотянут частично: бюджет исчерпан — очередь дотянется следующими поисками)"
-                .to_string(),
-        );
     }
     lines
 }
@@ -179,6 +215,10 @@ fn section(header: &str, status: String) -> Vec<String> {
 
 fn route_error(error: &anyhow::Error) -> String {
     match error.downcast_ref::<ollama::EmbedError>() {
+        Some(ollama::EmbedError::Timeout { .. }) => format!(
+            "таймаут (бюджет {}s): синхронизация не уложилась — очередь дотянется следующими поисками",
+            SEARCH_BUDGET.as_secs()
+        ),
         Some(embed_error) => format!("недоступен — {embed_error}"),
         None => format!("сбой синхронизации: {error:#}"),
     }
@@ -214,6 +254,7 @@ pub async fn rebuild(
     let opts = sync::SyncOptions {
         since: if resume { None } else { Some("0".to_string()) },
         deadline: None,
+        embed_timeout: REBUILD_EMBED_TIMEOUT,
         page_delay: Some(Duration::from_millis(200)),
         on_batch,
     };

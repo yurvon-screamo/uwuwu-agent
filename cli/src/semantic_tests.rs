@@ -165,6 +165,8 @@ impl Respond for KernelMock {
 struct EmbedMock {
     vector: Vec<f32>,
     inputs: Arc<Mutex<Vec<String>>>,
+    /// Задержка ответа — тесты таймаутов бюджета (п.2 ревью PR #78).
+    delay: Duration,
 }
 
 impl Respond for EmbedMock {
@@ -177,7 +179,9 @@ impl Respond for EmbedMock {
             .collect();
         self.inputs.lock().unwrap().extend(sent.iter().cloned());
         let embeddings: Vec<Vec<f32>> = inputs.iter().map(|_| self.vector.clone()).collect();
-        ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "embeddings": embeddings }))
+            .set_delay(self.delay)
     }
 }
 
@@ -195,6 +199,13 @@ async fn kernel_server(
 }
 
 async fn embed_server(vector: Vec<f32>) -> (MockServer, Arc<Mutex<Vec<String>>>) {
+    embed_server_with_delay(vector, Duration::ZERO).await
+}
+
+async fn embed_server_with_delay(
+    vector: Vec<f32>,
+    delay: Duration,
+) -> (MockServer, Arc<Mutex<Vec<String>>>) {
     let server = MockServer::start().await;
     let inputs = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -202,6 +213,7 @@ async fn embed_server(vector: Vec<f32>) -> (MockServer, Arc<Mutex<Vec<String>>>)
         .respond_with(EmbedMock {
             vector,
             inputs: inputs.clone(),
+            delay,
         })
         .mount(&server)
         .await;
@@ -232,6 +244,7 @@ fn opts_no_deadline() -> sync::SyncOptions {
     sync::SyncOptions {
         since: None,
         deadline: None,
+        embed_timeout: Duration::from_secs(2),
         page_delay: None,
         on_batch: None,
     }
@@ -282,14 +295,14 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
     let client = ollama(&server.uri());
 
     let vectors = client
-        .embed(&["один".into(), "два".into()], Some(3))
+        .embed(&["один".into(), "два".into()], Some(3), Duration::from_secs(2))
         .await
         .expect("embed ок");
     assert_eq!(vectors.len(), 2);
     assert_eq!(inputs.lock().unwrap().len(), 2);
 
     let mismatch = client
-        .embed(&["три".into()], Some(1024))
+        .embed(&["три".into()], Some(1024), Duration::from_secs(2))
         .await
         .expect_err("dim-guard");
     assert!(matches!(
@@ -303,7 +316,7 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
 
     let dead = OllamaClient::new("http://127.0.0.1:1", "test-model", Duration::from_secs(1))
         .expect("client");
-    let unreachable = dead.embed(&["q".into()], None).await.expect_err("route");
+    let unreachable = dead.embed(&["q".into()], None, Duration::from_secs(1)).await.expect_err("route");
     assert!(matches!(unreachable, EmbedError::Unreachable { .. }));
 
     let missing_server = MockServer::start().await;
@@ -315,7 +328,7 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
         .mount(&missing_server)
         .await;
     let missing = ollama(&missing_server.uri())
-        .embed(&["q".into()], None)
+        .embed(&["q".into()], None, Duration::from_secs(2))
         .await
         .expect_err("404");
     assert!(matches!(missing, EmbedError::ModelMissing { .. }));
@@ -464,6 +477,7 @@ async fn delta_deadline_exhausted_embeds_nothing() {
         &sync::SyncOptions {
             since: None,
             deadline: Some(Instant::now() - Duration::from_millis(1)),
+            embed_timeout: Duration::from_secs(2),
             page_delay: None,
             on_batch: None,
         },
@@ -889,6 +903,114 @@ async fn search_half_reports_model_mismatch() {
     assert!(lines[1].contains("semantic rebuild"));
 }
 
+// ——— п.2 бюджет поиска: wall-clock ≤ 10s, честный таймаут ———
+
+fn seed_indexed_chunk(dir: &std::path::Path) {
+    let mut store = index_ready_store(dir);
+    let chunk = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "c1".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/h".into(),
+            updated: T0.into(),
+        },
+        content: "чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[chunk], Some(T0)).unwrap();
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn search_half_reports_timeout_when_budget_spent_by_sync() {
+    // Бюджет исчерпан синхронизацией: эмбедд запроса не выполняется,
+    // секция — честный «таймаут (бюджет 10s)», не «недоступен».
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    seed_indexed_chunk(dir.path());
+
+    let section = crate::semantic::search_half_at(
+        &sy,
+        &cfg,
+        "запрос",
+        10,
+        0.35,
+        Instant::now() - Duration::from_millis(1),
+    )
+    .await;
+
+    assert!(
+        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
+        "секция: {section:?}"
+    );
+    assert!(!section.iter().any(|l| l.contains("недоступен")));
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "эмбедд запроса не выполнялся"
+    );
+}
+
+#[tokio::test]
+async fn search_half_bounds_query_embed_timeout_by_remaining_budget() {
+    // Дельта пуста, на эмбедд запроса осталось ~200ms, embed-мок отвечает
+    // через 2s: Timeout, wall-clock ≈ остаток бюджета — не полный таймаут.
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    seed_indexed_chunk(dir.path());
+
+    let started = Instant::now();
+    let section = crate::semantic::search_half_at(
+        &sy,
+        &cfg,
+        "запрос",
+        10,
+        0.35,
+        started + Duration::from_millis(200),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
+        "секция: {section:?}"
+    );
+    assert!(
+        section.iter().any(|l| l.contains("не уложился в остаток")),
+        "честный факт остатка: {section:?}"
+    );
+    assert!(!section.iter().any(|l| l.contains("недоступен")));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "wall-clock ≈ остаток бюджета, не 2s/10s: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn embed_timeout_is_distinct_from_unreachable() {
+    // Классификация: reqwest-таймаут → Timeout (медленный ответ/холодный
+    // старт), не Unreachable (лежащая Ollama) — статус не вводит в
+    // заблуждение (п.2 ревью PR #78).
+    let (server, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
+    let client =
+        OllamaClient::new(&server.uri(), "test-model", Duration::from_secs(5)).expect("client");
+
+    let err = client
+        .embed(&["запрос".into()], None, Duration::from_millis(100))
+        .await
+        .expect_err("таймаут");
+
+    assert!(matches!(err, EmbedError::Timeout { .. }), "{err}");
+    assert!(err.to_string().contains("таймаут"));
+}
+
 #[tokio::test]
 async fn search_half_degrades_loudly_when_ollama_down() {
     let (server, _) = kernel_server_blocks_only(vec![]).await;
@@ -1018,7 +1140,7 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
     let relevant = "rathole-клиент устанавливает туннель до сервера через TCP-релей, пробрасывая локальный порт ноутбука в публичный endpoint".to_string();
     let irrelevant = "канбан-доска задач хранит строки с колонками Title, Status, Branch и PR в SiYuan database".to_string();
     let vectors = client
-        .embed(&[query, relevant, irrelevant], None)
+        .embed(&[query, relevant, irrelevant], None, Duration::from_secs(60))
         .await
         .expect("живой эмбеддинг");
     let query_vec = &vectors[0];

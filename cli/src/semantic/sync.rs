@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use super::ollama::OllamaClient;
 use super::store::{ChunkMeta, ChunkRecord, Store};
+use super::SEARCH_EMBED_TIMEOUT;
 
 /// Целевые типы блоков-чанков (контентные; l/d/av/tb — не чанки).
 pub(crate) const TARGET_TYPES_SQL: &str = "('p','i','h','c','t')";
@@ -44,6 +45,9 @@ pub struct SyncOptions {
     /// (rebuild: Some("0") — с нуля).
     pub since: Option<String>,
     pub deadline: Option<Instant>,
+    /// Потолок таймаута одного embed-вызова (rebuild — 120s, поиск —
+    /// SEARCH_EMBED_TIMEOUT); фактический таймаут = min(cap, остаток deadline).
+    pub embed_timeout: Duration,
     /// Пауза между kernel-страницами (rebuild): не душить прод-ядро
     /// keyset-сканами (поисковый путь — None, там 1–3 запроса в бюджете).
     pub page_delay: Option<Duration>,
@@ -150,6 +154,16 @@ fn budget_left(deadline: Option<Instant>) -> bool {
     deadline.map(|d| Instant::now() < d).unwrap_or(true)
 }
 
+/// Таймаут embed-вызова: потолок синка минус остаток wall-clock бюджета —
+/// каждый вызов укладывается в общий контракт поиска (п.2 ревью PR #78),
+/// а не получает свежий полный таймаут поверх израсходованного бюджета.
+fn embed_call_timeout(deadline: Option<Instant>, cap: Duration) -> Duration {
+    match deadline {
+        Some(deadline) => cap.min(deadline.saturating_duration_since(Instant::now())),
+        None => cap,
+    }
+}
+
 fn stored_dim(store: &Store) -> Option<usize> {
     store
         .meta("dim")
@@ -179,7 +193,6 @@ pub async fn delta_sync(
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
     let mut report = SyncReport::default();
-    let index_dim = stored_dim(store);
 
     let mut cursor_updated = match &opts.since {
         Some(since) => since.clone(),
@@ -244,7 +257,7 @@ pub async fn delta_sync(
                     budget_out = true;
                     break;
                 }
-                embed_and_upsert(ollama, store, &pending, index_dim, &mut report).await?;
+                embed_and_upsert(ollama, store, &pending, embed_call_timeout(opts.deadline, opts.embed_timeout), &mut report).await?;
                 if let Some(on_batch) = &opts.on_batch {
                     on_batch(report.embedded);
                 }
@@ -264,7 +277,7 @@ pub async fn delta_sync(
         }
 
         if !pending.is_empty() {
-            embed_and_upsert(ollama, store, &pending, index_dim, &mut report).await?;
+            embed_and_upsert(ollama, store, &pending, embed_call_timeout(opts.deadline, opts.embed_timeout), &mut report).await?;
             if let Some(on_batch) = &opts.on_batch {
                 on_batch(report.embedded);
             }
@@ -285,16 +298,18 @@ pub async fn delta_sync(
 }
 
 /// Эмбедд батча + атомарная запись (чанки и watermark одной транзакцией).
-/// Векторы приходят уже нормированными из клиента.
+/// Векторы приходят уже нормированными из клиента; размерность канона —
+/// из meta (свежий индекс adopt'ит фактическую dim первого ответа).
 async fn embed_and_upsert(
     ollama: &OllamaClient,
     store: &mut Store,
     rows: &[KernelRow],
-    index_dim: Option<usize>,
+    timeout: Duration,
     report: &mut SyncReport,
 ) -> Result<()> {
+    let index_dim = stored_dim(store);
     let inputs: Vec<String> = rows.iter().map(|r| r.content.clone()).collect();
-    let vectors = ollama.embed(&inputs, index_dim).await?;
+    let vectors = ollama.embed(&inputs, index_dim, timeout).await?;
     if index_dim.is_none() {
         // Свежий индекс: первый ответ задаёт каноническую размерность.
         if let Some(first) = vectors.first() {
@@ -424,7 +439,6 @@ pub async fn reconcile(
         report.paths_refreshed = store.refresh_paths(&path_drift)?;
     }
 
-    let index_dim = stored_dim(store);
     for id_batch in repair_ids.chunks(PAGE) {
         if !budget_left(deadline) {
             return Ok(report);
@@ -452,7 +466,7 @@ pub async fn reconcile(
                 return Ok(report);
             }
             let mut delta_report = SyncReport::default();
-            embed_and_upsert(ollama, store, batch, index_dim, &mut delta_report).await?;
+            embed_and_upsert(ollama, store, batch, embed_call_timeout(deadline, SEARCH_EMBED_TIMEOUT), &mut delta_report).await?;
             report.repaired += delta_report.embedded;
         }
     }
