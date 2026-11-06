@@ -2,7 +2,8 @@
 // master-чекаутом): снос по факту смержа PR. Кандидаты — зарегистрированные
 // ворктри внутри корней; гарды обязательны (все, иначе skip+лог): активная
 // задача, грязный статус, открытый PR, ветка не смержена в base, грейс
-// после мерджа. Сбой gh останавливает весь проход: решений без данных нет.
+// после мерджа. Решений без данных нет: сбой gh останавливает весь проход,
+// standalone при нечитаемом state — тоже (активные задачи не защищаются).
 // git-операции через инъекцию run(): прод — фабричный sh() с таймаутом,
 // тесты — реальный Bun.spawn на temp-репо, gh — фейковый фиксчер.
 import { existsSync, rmdirSync } from "node:fs"
@@ -201,8 +202,15 @@ export async function gcLegacyWorktrees(deps: GcDeps, args: GcArgs): Promise<GcR
       skip("открытый PR")
       continue
     }
+    const mergedInCatalog = prs.some((pr) => pr.state === "MERGED")
     if (!(await isAncestor(deps, args.local, wt.branch, args.base))) {
-      skip(`ветка не смержена в ${args.base}`)
+      // MERGED в каталоге + не-предок: squash/rebase-мердж или коммиты поверх
+      // мержа — без mergeCommit из gh причины не различить, честно называем обе
+      skip(
+        mergedInCatalog
+          ? `ветка не предок ${args.base} при MERGED-PR (squash/rebase-мердж или коммиты поверх мержа)`
+          : `ветка не смержена в ${args.base}`,
+      )
       continue
     }
     const mergedAtMs = latestMergeAtMs(prs)
@@ -266,26 +274,29 @@ async function sh(cmd: string[], cwd?: string): Promise<string> {
   return out.trim()
 }
 
+/** gard-наборы из state.json standalone-прогона. null — state нечитаем:
+ *  паритет с gh-абортом — решений без данных об активных задачах нет. */
+async function standaloneGuards(stateFile: string): Promise<{ branches: Set<string>; dirs: Set<string> } | null> {
+  try {
+    return activeTaskGuards(JSON.parse(await Bun.file(stateFile).text()))
+  } catch (e) {
+    console.log(`state не прочитан (${errText(e)}) — abort: активные задачи не защищаются`)
+    return null
+  }
+}
+
 async function standaloneMain(): Promise<void> {
   const local = join(homedir(), "uwuwu-agent")
   const stateFile = join(homedir(), ".local/state/uwuwu-factory/state.json")
   const deps: GcDeps = { run: sh, log: (m) => console.log(m) }
-  let protectedBranches: ReadonlySet<string> = new Set()
-  let protectedDirs: ReadonlySet<string> = new Set()
-  try {
-    const state = JSON.parse(await Bun.file(stateFile).text())
-    const guards = activeTaskGuards(state)
-    protectedBranches = guards.branches
-    protectedDirs = guards.dirs
-  } catch (e) {
-    console.log(`state не прочитан (${errText(e)}) — активные задачи не защищаются`)
-  }
+  const guards = await standaloneGuards(stateFile)
+  if (guards === null) process.exit(1)
   const report = await gcLegacyWorktrees(deps, {
     local,
     roots: [join(local, "wt"), join(local, ".worktrees")],
     base: "origin/master",
-    protectedBranches,
-    protectedDirs,
+    protectedBranches: guards.branches,
+    protectedDirs: guards.dirs,
     nowMs: Date.now(),
     graceMs: MERGE_GRACE_MS_DEFAULT,
   })

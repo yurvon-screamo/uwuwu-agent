@@ -190,6 +190,33 @@ describe("gcLegacyWorktrees — реальный git", () => {
     expect(existsSync(wtPath)).toBe(true)
   })
 
+  test("squash/rebase-мердж (MERGED в каталоге, не предок) — скип с точной причиной", async () => {
+    const repo = await makeRepo()
+    const wtPath = join(repo.wtRoot, "squashed")
+    await sh(["git", "-C", repo.local, "worktree", "add", wtPath, "-b", "feat-squashed"])
+    writeFileSync(join(wtPath, "squashed.txt"), "work\n")
+    await sh(["git", "-C", wtPath, "add", "."])
+    await sh(["git", "-C", wtPath, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "squashed work"])
+    // squash-мердж в master (содержимое там, коммитов ветки нет) — имитация
+    // обычным коммитом в master: ветка остаётся не-предком
+    writeFileSync(join(repo.local, "squash-landed.txt"), "landed via squash\n")
+    await sh(["git", "-C", repo.local, "add", "."])
+    await sh(["git", "-C", repo.local, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "feat-squashed (squash)"])
+    setGh([prEntry("feat-squashed", "MERGED", oldMergeIso())])
+
+    const report = await gcLegacyWorktrees(deps, gcArgs(repo))
+
+    expect(report.removed).toEqual([])
+    expect(report.skipped).toEqual([
+      {
+        worktree: wtPath,
+        branch: "feat-squashed",
+        reason: "ветка не предок master при MERGED-PR (squash/rebase-мердж или коммиты поверх мержа)",
+      },
+    ])
+    expect(existsSync(wtPath)).toBe(true)
+  })
+
   test("грейс после мерджа: свежий MERGED — пропуск, по истечении — снос", async () => {
     const repo = await makeRepo()
     const wtPath = await mergedBranchWorktree(repo, "feat-grace", "wt")
@@ -217,7 +244,11 @@ describe("gcLegacyWorktrees — реальный git", () => {
 
     expect(report.removed).toEqual([])
     expect(report.skipped).toEqual([
-      { worktree: wtPath, branch: "feat-ahead", reason: "ветка не смержена в master" },
+      {
+        worktree: wtPath,
+        branch: "feat-ahead",
+        reason: "ветка не предок master при MERGED-PR (squash/rebase-мердж или коммиты поверх мержа)",
+      },
     ])
     expect(existsSync(wtPath)).toBe(true)
   })
