@@ -183,6 +183,12 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, legacy: true })).toBe(true)
     expect(isValidTracked({ ...base, legacy: 1 })).toBe(false)
   })
+  test("mergedPrUrl: http(s)-строка и undefined валидны, не-url и чужие типы — мимо", () => {
+    expect(isValidTracked({ ...base, mergedPrUrl: "https://github.com/o/r/pull/1" })).toBe(true)
+    expect(isValidTracked({ ...base, mergedPrUrl: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, mergedPrUrl: "not-a-url" })).toBe(false)
+    expect(isValidTracked({ ...base, mergedPrUrl: true })).toBe(false)
+  })
 })
 
 describe("rowMissingAction — двухпроходная чистка", () => {
@@ -771,6 +777,7 @@ describe("stallVerdict: зависший ход при живой сессии",
     lastActivityAt: NOW - 40 * MIN,
     branch: "work/task-abc",
     branchInWorktree: true,
+    prMerged: false,
     signaled: false,
     now: NOW,
     ...over,
@@ -778,6 +785,9 @@ describe("stallVerdict: зависший ход при живой сессии",
 
   test("живой In Progress со свежей активностью — none", () => {
     expect(stallVerdict(facts({ lastActivityAt: NOW - 5 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("PR смержен при застое — none (тишина = штатное ожидание приёмки, прод-кейс 06.11)", () => {
+    expect(stallVerdict(facts({ prMerged: true }), 30 * MIN)).toEqual({ t: "none" })
   })
   test("завис 40 мин при пороге 30 — signal; текст несёт минуты и диагноз ветки", () => {
     const v = stallVerdict(facts(), 30 * MIN)

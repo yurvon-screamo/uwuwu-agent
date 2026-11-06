@@ -60,6 +60,10 @@ export interface TrackedTask {
   /** задача доживает в старом поведении (cwd = cfg.local, агент сам делает
    *  ворктри): штамп loadState для записей, спавненных до env-механики */
   legacy?: boolean
+  /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
+   *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
+   *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
+  mergedPrUrl?: string
 }
 
 export interface FactoryState {
@@ -600,6 +604,9 @@ export interface StallFacts {
   branch: string
   /** ветка нашлась в ворктри по `git worktree list` */
   branchInWorktree: boolean
+  /** PR строки смержен (gh-проба по URL ячейки, позитив-кэш в state):
+   *  тишина сессии — штатное ожидание приёмки, сигнал не нужен */
+  prMerged: boolean
   /** сигнал в этом эпизоде уже был (анти-спам «раз за эпизод») */
   signaled: boolean
   now: number
@@ -623,6 +630,11 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.sessionAlive !== true) return { t: "none" }
   const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
   if (!stalled) return { t: "none" }
+  // PR смержен = работа закончена, тишина сессии — штатное ожидание приёмки
+  // (мяч у владельца на Done); сигнал был бы ложным (прод-кейс 06.11:
+  // финализированная задача получила stall-wakeup). none — флаг анти-спама,
+  // если стоял, снимет штатная none-ветка демона («эпизод завершён»).
+  if (f.prMerged) return { t: "none" }
   if (f.signaled) return { t: "silent" }
   const quietMin = f.lastActivityAt === null
     ? null
@@ -687,6 +699,10 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
   if (t.legacy !== undefined && typeof t.legacy !== "boolean") return false
+  if (
+    t.mergedPrUrl !== undefined &&
+    !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
+  ) return false
   if (
     t.reviewSessionID !== undefined &&
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
