@@ -18,9 +18,9 @@
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
-import { acquireLock } from "../lib/single-instance"
+import { acquireLock, branchLabel, detectBranch } from "../lib/single-instance"
 import { withE2ETag } from "../lib/e2e-tag"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
@@ -1174,6 +1174,27 @@ const main = async (): Promise<void> => {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   gcMedia()
   syncAgentDef()
+  // громкий warning инцидент-класса 06.11: чекаут не master без явного
+  // UWUWU_TRIAGE_HOME — E2E/тестовый прогон трогает прод-state. Пути не
+  // переезжают (HOME-механика изолирует state+лог+workspace+media разом
+  // и остаётся явной), но молчать о риске нельзя.
+  const triageHome = process.env.UWUWU_TRIAGE_HOME?.trim()
+  if (triageHome === undefined || triageHome === "") {
+    const repoRoot = resolve(HERE, "..")
+    // label-логика (trim, «detached») — общая с резолюцией state (lib);
+    // null — git-детект не удался (копия чекаута без .git и т.п.): риск
+    // прод-контакта тот же, warning тем более — молчать нельзя
+    const label = branchLabel(detectBranch(repoRoot))
+    const warn = label === null
+      ? `uwuwu-triage: git-детект ветки не удался (${repoRoot}), UWUWU_TRIAGE_HOME не задан: state/лог/workspace идут в прод; для прогонов задай UWUWU_TRIAGE_HOME`
+      : label === "master"
+        ? null
+        : `uwuwu-triage: чекаут «${label}» — не master, UWUWU_TRIAGE_HOME не задан: state/лог/workspace идут в прод; для прогонов из ветки задай UWUWU_TRIAGE_HOME`
+    if (warn !== null) {
+      console.error(warn)
+      log(warn)
+    }
+  }
   const me = await tg("getMe") as { username?: string }
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }
   log(`uwuwu-triage: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${(cfg.model ?? MODEL).id}, опенкод=${reg.url ?? "?"}, вотчер=${WATCH_SEC > 0 ? `${WATCH_SEC}s` : "off"})`)
