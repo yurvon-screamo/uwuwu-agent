@@ -30,6 +30,10 @@ pub(crate) const PAGE: usize = 256;
 pub(crate) const EMBED_BATCH: usize = 32;
 /// Минимальная длина чанка (символы): заголовки-ярлыки не индексируем.
 pub(crate) const MIN_CONTENT_CHARS: usize = 40;
+/// Верхняя граница чанка (символы): html_embed-стены и крупные код-блоки
+/// за ней дают эмбеддинг «головы» (ctx Ollama ~8192 токенов) — не индексируем.
+/// Заземлено живым замером корпуса 06.11: выше границы 6 блоков из ~74k.
+pub(crate) const MAX_CONTENT_CHARS: usize = 8000;
 /// Overlap окна дельты: правки в ту же секунду, что watermark.
 pub(crate) const OVERLAP_SECS: i64 = 60;
 /// Reconcile не чаще раза в сутки.
@@ -51,6 +55,10 @@ pub struct SyncOptions {
 pub struct SyncReport {
     pub embedded: usize,
     pub skipped_short: usize,
+    /// Блоки за верхней границей длины — per-run счётчик (как skipped_short).
+    pub skipped_long: usize,
+    /// Строк, вычищенных из индекса (усохшие/переросшие чанки) — per-run.
+    pub pruned: usize,
     /// Бюджет исчерпан до полной дотяжки — хвост останется над watermark.
     pub budget_exhausted: bool,
 }
@@ -81,6 +89,25 @@ pub(crate) fn delta_page_stmt(cursor_updated: &str, cursor_id: &str) -> String {
         i = sql_literal(cursor_id),
         page = PAGE,
     )
+}
+
+/// Класс длины контента: вне индексируемой полосы [MIN, MAX] чанк либо
+/// ярлык (ниже нижней), либо «голова вместо содержимого» (за верхней).
+enum LengthClass {
+    TooShort,
+    TooLong,
+    Embeddable,
+}
+
+fn length_class(content: &str) -> LengthClass {
+    let len = content.chars().count();
+    if len <= MIN_CONTENT_CHARS {
+        LengthClass::TooShort
+    } else if len > MAX_CONTENT_CHARS {
+        LengthClass::TooLong
+    } else {
+        LengthClass::Embeddable
+    }
 }
 
 fn parse_kernel_row(row: &Value, with_content: bool) -> Option<KernelRow> {
@@ -188,6 +215,8 @@ pub async fn delta_sync(
             .collect();
 
         let mut pending: Vec<KernelRow> = Vec::with_capacity(EMBED_BATCH);
+        let mut prune_ids: Vec<String> = Vec::new();
+        let mut budget_out = false;
         for row in &rows {
             let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
                 continue;
@@ -198,15 +227,22 @@ pub async fn delta_sync(
             };
             cursor_updated = kernel_row.meta.updated.clone();
             cursor_id = kernel_row.meta.block_id.clone();
-            if kernel_row.content.chars().count() <= MIN_CONTENT_CHARS {
-                report.skipped_short += 1;
-                continue;
+            match length_class(&kernel_row.content) {
+                LengthClass::TooShort => {
+                    report.skipped_short += 1;
+                    prune_ids.push(kernel_row.meta.block_id.clone());
+                }
+                LengthClass::TooLong => {
+                    report.skipped_long += 1;
+                    prune_ids.push(kernel_row.meta.block_id.clone());
+                }
+                LengthClass::Embeddable => pending.push(kernel_row.clone()),
             }
-            pending.push(kernel_row.clone());
             if pending.len() == EMBED_BATCH {
                 if !budget_left(opts.deadline) {
                     report.budget_exhausted = true;
-                    break 'pages;
+                    budget_out = true;
+                    break;
                 }
                 embed_and_upsert(ollama, store, &pending, index_dim, &mut report).await?;
                 if let Some(on_batch) = &opts.on_batch {
@@ -214,6 +250,17 @@ pub async fn delta_sync(
                 }
                 pending.clear();
             }
+        }
+
+        // Усохшие/переросшие чанки уходят из индекса в том же прогоне —
+        // иначе дельта, пропустив строку, оставляла бы в индексе вечно
+        // устаревший контент с вектором (п.1 ревью PR #78). DELETE
+        // отсутствующих строк — no-op по PK; вернуть блок может правка.
+        if !prune_ids.is_empty() {
+            report.pruned += store.prune(&prune_ids)?;
+        }
+        if budget_out {
+            break 'pages;
         }
 
         if !pending.is_empty() {
@@ -383,10 +430,23 @@ pub async fn reconcile(
             return Ok(report);
         }
         let rows = fetch_by_ids(sy, id_batch).await?;
+        // Классификация по длине: усохшие/переросшие блоки вычищаются из
+        // индекса (а при backfill — просто не индексируются), полосу
+        // [MIN, MAX] ремонтирует переэмбедд.
+        let mut prune_ids: Vec<String> = Vec::new();
         let target: Vec<KernelRow> = rows
             .into_iter()
-            .filter(|row| row.content.chars().count() > MIN_CONTENT_CHARS)
+            .filter(|row| match length_class(&row.content) {
+                LengthClass::Embeddable => true,
+                LengthClass::TooShort | LengthClass::TooLong => {
+                    prune_ids.push(row.meta.block_id.clone());
+                    false
+                }
+            })
             .collect();
+        if !prune_ids.is_empty() {
+            report.pruned += store.prune(&prune_ids)?;
+        }
         for batch in target.chunks(EMBED_BATCH) {
             if !budget_left(deadline) {
                 return Ok(report);

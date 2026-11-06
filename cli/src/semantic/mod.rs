@@ -243,12 +243,17 @@ pub async fn status(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
     let built_at = human_ts(store.meta("built_at")?);
     let reconciled = human_ts(store.meta("last_reconcile_at")?);
     let backlog = backlog_size(sy, &store).await?;
+    let oversize = oversize_count(sy).await?;
     Ok(vec![
         format!("чанков: {count}"),
         format!("модель: {model} ({dim}-dim)"),
         format!("watermark: {watermark}"),
         format!("built: {built_at}, reconcile: {reconciled}"),
         format!("очередь дельты: {backlog} строк"),
+        format!(
+            "блоков >{} симв. в корпусе: {oversize} (не индексируются)",
+            sync::MAX_CONTENT_CHARS
+        ),
         format!("путь: {}", cfg.db_path.display()),
     ])
 }
@@ -264,6 +269,24 @@ fn human_ts(raw: Option<String>) -> String {
 #[cfg(test)]
 pub(crate) async fn status_backlog_for_tests(sy: &SiYuan, store: &Store) -> u64 {
     backlog_size(sy, store).await.expect("backlog")
+}
+
+/// Живая state-метрика корпуса: блоки за верхней границей длины, по целевым
+/// типам — тот же фильтр, что у индексации. Пересчёт на каждый status —
+/// overlap-перескан дельты накопительный счётчик не завышает по построению.
+async fn oversize_count(sy: &SiYuan) -> Result<u64> {
+    let stmt = format!(
+        "select count(*) as c from blocks \
+         where type in {types} and length(content) > {max} limit 1",
+        types = sync::TARGET_TYPES_SQL,
+        max = sync::MAX_CONTENT_CHARS,
+    );
+    let rows = sy.sql(&stmt).await?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.get("c"))
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0) as u64)
 }
 
 /// Размер очереди: строки ядра над watermark (без content; явный LIMIT).

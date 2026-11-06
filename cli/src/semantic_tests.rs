@@ -42,6 +42,27 @@ impl KernelMock {
 
     fn handle(&self, stmt: &str) -> Vec<Value> {
         let blocks = self.blocks.lock().unwrap();
+        if stmt.contains("length(content)") {
+            // state-метрика status: блоки за верхней границей длины
+            let max = stmt
+                .split("length(content) > ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|v| v.parse::<usize>().ok())
+                .expect("граница длины парсится");
+            let count = blocks
+                .iter()
+                .filter(|b| {
+                    b["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .count()
+                        > max
+                })
+                .count();
+            return vec![json!({ "c": count })];
+        }
         if stmt.contains("count(*)") {
             // честный count: только строки над watermark-предикатом
             let after = stmt
@@ -575,6 +596,226 @@ async fn reconcile_skips_within_daily_interval() {
 
     assert!(report.skipped);
     assert!(inputs.lock().unwrap().is_empty());
+}
+
+// ——— п.1 stale-чанки: классификация по длине (мин./макс. граница) ———
+
+#[tokio::test]
+async fn reconcile_prunes_block_shrunk_below_min_chars() {
+    // Ревьюверский сценарий п.1: длинный блок проиндексирован, затем усох
+    // до ≤ MIN — reconcile обязан вычистить его из индекса, а не гонять
+    // холостой repair→drop ежедневно.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T1, "короткий", "/d");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "усохший чанк удалён из индекса"
+    );
+    assert_eq!(report.pruned, 1, "усохший блок учтён в prune");
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "усохший блок не переэмбеддится"
+    );
+}
+
+#[tokio::test]
+async fn delta_prunes_block_shrunk_below_min_chars() {
+    // Тот же усохший блок в overlap-окне дельты: старый чанк уходит
+    // из индекса сразу, не дожидаясь суточного reconcile.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T0, "короткий", "/d");
+    }
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("delta");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "усохший чанк удалён в той же дельте"
+    );
+    assert_eq!(report.skipped_short, 1);
+    assert_eq!(report.pruned, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delta_skips_oversize_block_without_indexing() {
+    // Блок за верхней границей (html_embed-стена): не индексируется,
+    // счётчик per-run растёт, эмбедд-маршрут не тратится.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![block("big", T0, &oversize, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("delta");
+
+    assert_eq!(store.chunk_count().unwrap(), 0, "оверсайз не в индексе");
+    assert_eq!(report.skipped_long, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_skips_oversize_backfill() {
+    // Backfill оверсайза не происходит: блок в ядре, в индексе его нет —
+    // и это финальное состояние, а не вечный repair-кандидат.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![block("big", T0, &oversize, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(report.repaired, 0, "оверсайз не попадает в backfill");
+    assert_eq!(store.chunk_count().unwrap(), 0);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_prunes_block_grown_beyond_max_chars() {
+    // Проиндексированный блок вырос за MAX: старый вектор больше не
+    // представляет содержимое — prune, не переэмбедд головы.
+    let medium = "х".repeat(5000);
+    let blocks = vec![block("b1", T0, &medium, "/d")];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T1, &oversize, "/d");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "переросший MAX чанк удалён"
+    );
+    assert_eq!(report.pruned, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn status_reports_oversize_blocks_by_target_types() {
+    // State-метрика status: оверсайз-блоки корпуса, stmt несёт фильтр
+    // целевых типов (тот же, что у индексации) и явный LIMIT.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![
+        block("big", T0, &oversize, "/d"),
+        block(
+            "b1",
+            T0,
+            "обычный чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+    ];
+    let (server, _, stmts) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: "http://127.0.0.1:1".into(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    Store::open(&cfg.db_path).expect("пустой индекс для status");
+
+    let lines = crate::semantic::status(&sy, &cfg).await.expect("status");
+
+    let line = lines
+        .iter()
+        .find(|l| l.contains("не индексируются"))
+        .expect("строка метрики оверсайза");
+    assert!(line.contains('1'), "оверсайз-блок один: {line}");
+    let captured = stmts.lock().unwrap();
+    let metric_stmt = captured
+        .iter()
+        .find(|s| s.contains("length(content)"))
+        .expect("stmt метрики ушёл в ядро");
+    assert!(
+        metric_stmt.contains("type in"),
+        "фильтр целевых типов в метрике: {metric_stmt}"
+    );
+    assert!(metric_stmt.contains("limit"), "явный LIMIT: {metric_stmt}");
 }
 
 // ——— search_half: матрица деградации и happy path ———
