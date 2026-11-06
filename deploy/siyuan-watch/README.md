@@ -1,10 +1,10 @@
-# siyuan-watch — вотчдер контейнера siyuan-demo
+# siyuan-watch — вотчер контейнера siyuan-demo
 
 Минутный systemd user-таймер, который держит прод-контур SiYuan поднятым:
 TCP-проба `127.0.0.1:6806` (транспорт-детект) → если порт мёртв, инцидент-строка
 в `~/.local/state/siyuan-watch/watch.log` и `podman start siyuan-demo`
 (на running-контейнере — no-op, безопасно). Hang-классы (контейнер Up, порт
-мёртв — pasta-клин / вис туннеля) вотчдер только детектит и логирует; их
+мёртв — pasta-клин / вис туннеля) вотчер только детектит и логирует; их
 хил-лестница — осознанно вне среза (задача 20261105224609).
 
 Контекст класса «тихие остановки» и рецепт атрибуции SIGTERM —
@@ -38,8 +38,13 @@ systemctl --user enable --now siyuan-watch.timer
 
 ```sh
 systemctl --user list-timers siyuan-watch.timer     # тик каждую минуту
-journalctl --user -u siyuan-watch.service -n 20     # тишина = всё здорово
+systemctl --user status siyuan-watch.service        # без «Failed» = здорово
+journalctl --user -u siyuan-watch.service -n 20
 ```
+
+Пары Starting/Finished в journal — норма каждого тика. О здоровье говорит
+отсутствие stderr-строк хила (`failed to start …`, `failed to heal …`) и
+статуса Failed у сервиса, а не тишина в journal.
 
 Живое даун-окно (осознанный прод-эксперимент, ~минута 502 на публичном UI):
 
