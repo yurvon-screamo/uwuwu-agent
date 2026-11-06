@@ -1115,6 +1115,69 @@ async fn rebuild_resume_adopts_missing_model_meta() {
     );
 }
 
+// ——— п.4 rebuild-lock: advisory-лок в таблице locks ———
+
+#[test]
+fn rebuild_lock_refuses_second_acquisition_for_live_pid() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("первый acquire");
+    let err = store
+        .acquire_rebuild_lock()
+        .expect_err("второй acquire при живом прогоне");
+
+    assert!(err.to_string().contains("уже идёт"), "{err}");
+}
+
+#[test]
+fn rebuild_lock_steals_from_dead_pid() {
+    // Крэш прежнего прогона: устаревший lock снимается следующим запуском.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+    store.place_lock("99999999:1700000000").expect("мёртвый pid");
+
+    store.acquire_rebuild_lock().expect("steal от мёртвого pid");
+
+    let payload = store
+        .lock_payload()
+        .expect("payload")
+        .expect("лок на месте");
+    let pid = payload.split(':').next().expect("pid в payload");
+    assert_eq!(
+        pid,
+        std::process::id().to_string(),
+        "лок перезаписан текущим процессом"
+    );
+}
+
+#[test]
+fn rebuild_lock_release_allows_fresh_acquisition() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("acquire");
+    store.release_rebuild_lock().expect("release");
+    store.acquire_rebuild_lock().expect("acquire после release");
+}
+
+#[test]
+fn rebuild_lock_survives_clear_for_rebuild() {
+    // Пиннящий тест дыры (ревью плана v1, High): лок в стираемой meta
+    // переживал clear только до первого fresh-прогона — два параллельных
+    // fresh-запуска оба проходили. Лок живёт в таблице locks вне меты.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("acquire");
+    store.clear_for_rebuild().expect("clear");
+    let err = store
+        .acquire_rebuild_lock()
+        .expect_err("второй fresh-прогон после clear");
+
+    assert!(err.to_string().contains("уже идёт"), "{err}");
+}
+
 #[tokio::test]
 async fn search_half_degrades_loudly_when_ollama_down() {
     let (server, _) = kernel_server_blocks_only(vec![]).await;

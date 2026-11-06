@@ -233,14 +233,30 @@ pub struct RebuildReport {
 /// Полный пересбор индекса: сброс чанков/меты + дельта-цикл с нуля;
 /// `resume` — продолжение прерванного прогона от watermark без сброса.
 /// Прогресс — коллбэк после каждого батча (CLI печатает в stderr).
+/// Advisory-лок держится весь прогон (acquire до ветки resume/clear,
+/// release на любом исходе) — параллельный rebuild громко отказывает.
 pub async fn rebuild(
     sy: &SiYuan,
     cfg: &SemanticConfig,
     on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
     resume: bool,
 ) -> Result<RebuildReport> {
-    let started = Instant::now();
     let mut store = Store::open(&cfg.db_path)?;
+    store.acquire_rebuild_lock()?;
+    let result = rebuild_index(sy, cfg, &mut store, on_batch, resume).await;
+    // Крэш-лок (убитый процесс) снимается steal'ом следующего запуска.
+    let _ = store.release_rebuild_lock();
+    result
+}
+
+async fn rebuild_index(
+    sy: &SiYuan,
+    cfg: &SemanticConfig,
+    store: &mut Store,
+    on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
+    resume: bool,
+) -> Result<RebuildReport> {
+    let started = Instant::now();
     if resume {
         if !cfg.db_path.exists() || store.chunk_count().unwrap_or(0) == 0 {
             anyhow::bail!("--resume: индекс пуст — продолжать нечего, запускай без --resume");
@@ -270,7 +286,7 @@ pub async fn rebuild(
         page_delay: Some(Duration::from_millis(200)),
         on_batch,
     };
-    let report = sync::delta_sync(sy, &ollama, &mut store, &opts).await?;
+    let report = sync::delta_sync(sy, &ollama, store, &opts).await?;
     store.set_meta("built_at", &chrono::Utc::now().timestamp().to_string())?;
     Ok(RebuildReport {
         embedded: report.embedded,
