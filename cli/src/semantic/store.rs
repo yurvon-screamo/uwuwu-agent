@@ -139,9 +139,7 @@ impl Store {
         let payload = format!("{}:{}", std::process::id(), chrono::Utc::now().timestamp());
         match self.insert_rebuild_lock(&payload) {
             Ok(_) => Ok(()),
-            Err(e)
-                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
-            {
+            Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) => {
                 let existing = self.rebuild_lock_value()?.unwrap_or_default();
                 let pid = existing.split(':').next().unwrap_or_default();
                 if pid_alive(pid) {
