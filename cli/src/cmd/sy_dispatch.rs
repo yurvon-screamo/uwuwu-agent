@@ -1296,9 +1296,46 @@ async fn write_body_in_place(
             report_section_edit(section, edit);
             md
         }
-        None => content.to_string(),
+        None => carry_over_comments_section(doc_title, &existing, content)?,
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
+}
+
+/// Системная секция «Комменты» переживает полный replace: если новый контент
+/// её не несёт, существующая переносится в конец дословно (история диалога
+/// юзер ↔ агент невосстановима — инцидент 06.11, крон «stable-ватчер»).
+/// Контент с h2-секцией пишется как есть — осознанная замена; осознанный снос
+/// — пустая секция в контенте. Тёзка «Комменты» на другом уровне — отказ:
+/// перенос создал бы дубль (гард по образцу replace_md_section, ADR-048).
+/// Инвариант системной секции, не сверка: действует и при --force.
+fn carry_over_comments_section(
+    doc_title: &str,
+    existing: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    if crate::md_heading::has_h2_section(content, "Комменты") {
+        return Ok(content.to_string());
+    }
+    if let Some((level, twin_line)) =
+        crate::md_heading::heading_twin_outside_h2(content, "Комменты")
+    {
+        bail!(
+            "контент несёт «Комменты» на уровне h{level}: «{twin_line}» — авто-перенос системной \
+             секции создал бы дубль. Включи секцию «## Комменты» в контент осознанно (замена/снос \
+             истории) или переименуй подсекцию"
+        );
+    }
+    let Some(comments) = crate::md_heading::extract_h2_section(existing, "Комменты") else {
+        return Ok(content.to_string());
+    };
+    let mut carried = content.trim_end().to_string();
+    if carried.is_empty() {
+        bail!("пустой контент replace тела «{doc_title}» — используй append без --replace");
+    }
+    carried.push_str("\n\n");
+    carried.push_str(comments.trim_end());
+    carried.push('\n');
+    Ok(carried)
 }
 
 /// Freshness-гард полного --replace (потеря апдейта — класс инцидента 05.11
@@ -1776,6 +1813,7 @@ async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::asset_key_is_safe;
+    use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
     use super::replace_md_section;
@@ -2330,6 +2368,56 @@ mod tests {
         }
     }
 
+    /// Авто-перенос системной секции на живом мок-ядре: existing с комментами,
+    /// контент без «## Комменты» → запись несёт контент + перенесённую секцию.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_carries_over_comments_section_into_write() {
+        let export =
+            "---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n"
+                .to_string();
+        let (server, _create, append_bodies, _deletes) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            snapshot.path(),
+            "----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n",
+        )
+        .unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "переписанное тело\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: Some(snapshot.path().to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let appends = append_bodies.lock().unwrap();
+            let payload = appends.join("\n");
+            assert!(
+                payload.contains("переписанное тело"),
+                "контент записан: {payload}"
+            );
+            assert!(
+                payload.contains("## Комменты") && payload.contains("- **AGENTS** (ts): тик"),
+                "история комментов пережила replace: {payload}"
+            );
+        }
+    }
+
     #[test]
     fn strip_task_get_output_cuts_card_header_and_attach_tail() {
         let full_get = "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\nтело\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n";
@@ -2357,6 +2445,42 @@ mod tests {
         // снапшота нет вовсе
         let err = require_fresh_snapshot("таск", existing, None).unwrap_err();
         assert!(err.to_string().contains("--base") && err.to_string().contains("--force"));
+    }
+
+    #[test]
+    fn carry_over_comments_appends_existing_section_verbatim() {
+        let existing = "старое тело\n\n## Комменты\n- **AGENTS** (2026-11-06):  вердикт ^abc123\n  вложенный ответ\n";
+        let out = carry_over_comments_section("таск", existing, "новое тело\n").unwrap();
+        assert!(out.starts_with("новое тело\n"), "контент основа: {out}");
+        assert!(out.contains(
+            "## Комменты\n- **AGENTS** (2026-11-06):  вердикт ^abc123\n  вложенный ответ"
+        ));
+    }
+
+    #[test]
+    fn carry_over_comments_keeps_content_with_its_own_section() {
+        let existing = "старое\n\n## Комменты\n- старый коммент\n";
+        let out = carry_over_comments_section(
+            "таск",
+            existing,
+            "новое\n\n## Комменты\n- новая история\n",
+        )
+        .unwrap();
+        assert_eq!(out, "новое\n\n## Комменты\n- новая история\n");
+    }
+
+    #[test]
+    fn carry_over_comments_refuses_twin_on_other_level() {
+        let existing = "старое\n\n## Комменты\n- коммент\n";
+        let err =
+            carry_over_comments_section("таск", existing, "новое\n\n### Комменты\n").unwrap_err();
+        assert!(err.to_string().contains("h3") && err.to_string().contains("дубль"));
+    }
+
+    #[test]
+    fn carry_over_comments_noop_without_existing_section() {
+        let out = carry_over_comments_section("таск", "старое без секции\n", "новое\n").unwrap();
+        assert_eq!(out, "новое\n");
     }
 
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
