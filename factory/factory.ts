@@ -49,7 +49,6 @@ import {
   conflictFixPrompt,
   routeTask,
   rowMissingAction,
-  worktreeByBranch,
   runBatch,
   parseProjects,
   formatPassSummary,
@@ -64,7 +63,6 @@ import {
   spawnGuardVerdict,
   spawnLimitsFromEnv,
   hasSessionEvidence,
-  stampLegacyEntries,
   PATH_CELL,
   DEV_SESSION_CELL,
   REVIEW_SESSION_CELL,
@@ -106,7 +104,7 @@ const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
     board: "Задачи true-washing",
     repo: "~/true-washing (detector, saas — репо в подпапках)",
     local: join(homedir(), "true-wash"),
-    env: false, // cfg.local — не git-репо: env-контракт невыполним, легаси-поведение
+    env: false, // cfg.local — не git-репо: env-контракт невыполним, агент сам делает ворктри
   },
 }
 // песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
@@ -197,14 +195,6 @@ function loadState(): FactoryState {
           log(`state: запись ${k.slice(0, 10)} битая — пропущена`)
         }
       }
-    }
-    // переход на env-механику: записи, спавненные до неё (сессия была, envDir
-    // не заводился), доживают в старом поведении — рестарт не уводит их
-    // незакоммиченную работу в новый env
-    const stamped = stampLegacyEntries(out)
-    if (stamped.length > 0) {
-      saveState(out)
-      log(`переход: штамп легаси — ${stamped.map((id) => id.slice(0, 8)).join(", ")}`)
     }
     return out
   } catch {
@@ -606,9 +596,8 @@ async function startTask(
     return
   }
   // env-механика: work/task-ветку и ворктри делает фабрика, сессия стартует
-  // cwd=repo. Легаси-штамп или env:false-проект → старое поведение (агент сам)
-  const prev = state.tasks[task.rowId]
-  const useEnv = cfg.env !== false && prev?.legacy !== true
+  // cwd=repo. env:false-проект → поведение вне механики (агент сам)
+  const useEnv = cfg.env !== false
   let envCtx: SpawnEnvContext | undefined
   let envDir: string | undefined
   if (useEnv) {
@@ -671,7 +660,6 @@ async function startTask(
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
-    ...(prev?.legacy === true ? { legacy: true } : {}),
   }
   saveState(state)
   await setCellsSafe(board, task.rowId, {
@@ -680,7 +668,7 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (легаси-поведение)"} (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
 
 /** Чистка state (Done): гасим ОБЕ сессии задачи и сносим env (rm/attic +
@@ -832,16 +820,6 @@ async function restartTask(
 
 // ——— ревьювер: спавн/будильник на ревью-статусах ———
 
-/** Ворктри задачи по Branch-ячейке (легаси-fallback перехода: env-задачи
- *  берут repoDir из state). */
-async function resolveWorktree(local: string, branch: string): Promise<string> {
-  if (branch === "") return ""
-  try {
-    return worktreeByBranch(await sh(["git", "-C", local, "worktree", "list", "--porcelain"]), branch)
-  } catch { /* git недоступен — ревьюверу останется cfg.local/PR */ }
-  return ""
-}
-
 /** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
  *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
  *  поведение stall-сигнала, деградации нет. */
@@ -863,11 +841,10 @@ async function startReview(
     log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
     return
   }
-  // env-задача: repoDir из state (оба вида ревью — код живёт там);
-  // легаси-fallback: resolveWorktree по Branch-ячейке (переход)
-  const worktree = tracked.worktree !== ""
-    ? tracked.worktree
-    : kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
+  // ворктри задачи из state (repoDir env-задачи, пишет фабрика на спавне);
+  // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
+  // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
+  const worktree = tracked.worktree
   const ctx = { branch: task.branch, worktree, pr: task.pr }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
@@ -944,12 +921,9 @@ async function dispatchReviewAction(
       return undefined
     }
     case "rerun-reviewer": {
-      const worktree = d.tracked.worktree !== ""
-        ? d.tracked.worktree
-        : action.kind === "result" ? await resolveWorktree(d.cfg.local, d.row.branch) : ""
       const ok = await promptSession(
         d.tracked.reviewSessionID ?? "",
-        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree, pr: d.row.pr }),
+        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr }),
       )
       if (ok) {
         d.consumeComments()
@@ -1301,9 +1275,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
-          // сигнала не строятся, git-проба ворктри тоже скипается
-          const branchInWorktree = !prMerged && stalled &&
-            (tracked.worktree !== "" || (await resolveWorktree(cfg.local, row.branch)) !== "")
+          // сигнала не строятся; ворктри из state — для env-задач он всегда
+          // записан фабрикой, env:false живёт вне механики
+          const branchInWorktree = !prMerged && stalled && tracked.worktree !== ""
           const verdict = stallVerdict({
             status: row.status,
             sessionAlive: true,

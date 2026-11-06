@@ -62,9 +62,6 @@ export interface TrackedTask {
   /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
    *  env-механика к задаче не применялась */
   envDir?: string
-  /** задача доживает в старом поведении (cwd = cfg.local, агент сам делает
-   *  ворктри): штамп loadState для записей, спавненных до env-механики */
-  legacy?: boolean
   /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
    *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
    *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
@@ -89,19 +86,6 @@ export const REVIEW_PLAN_STATUS = "Ревью плана"
 export const REVIEW_RESULT_STATUS = "Ревью результата"
 
 export type ReviewKind = "plan" | "result"
-
-/** Ворктри задачи по Branch-ячейке из `git worktree list --porcelain`.
- *  Точное сравнение refs/heads/<branch> — суффикс-матч ловил чужие ветки
- *  (commits совпадал с auto-atomic-commits). */
-export function worktreeByBranch(porcelain: string, branch: string): string {
-  if (branch === "") return ""
-  let worktree = ""
-  for (const line of porcelain.split("\n")) {
-    if (line.startsWith("worktree ")) worktree = line.slice("worktree ".length)
-    else if (line === `branch refs/heads/${branch}` && worktree !== "") return worktree
-  }
-  return ""
-}
 
 /** Ревью-статус → вид ревью; null — обычный статус (мяч у девелопера/юзера). */
 export function reviewKindOf(status: string): ReviewKind | null {
@@ -255,8 +239,8 @@ export function kickoffModeOf(status: string): KickoffMode {
 }
 
 /** Контекст окружения задачи для промптов: пути приходят из ensureEnv.
- *  undefined — env-механика не применяется (легаси-штамп или env:false-проект),
- *  агент действует по старым строкам (сам создаёт ворктри/ветку). */
+ *  undefined — проект вне env-механики (env:false), агент действует по
+ *  прежним строкам (сам создаёт ворктри/ветку и заполняет Branch-ячейку). */
 export interface SpawnEnvContext {
   repoDir: string
   branch: string
@@ -758,25 +742,10 @@ export const PATH_CELL = "Path"
 export const DEV_SESSION_CELL = "Сессия dev"
 export const REVIEW_SESSION_CELL = "Сессия ревью"
 
-/** Штамп перехода: записи state, спавненные до env-механики, доживают в
- *  старом поведении (рестарт не уводит незакоммиченную работу в новый env).
- *  envDir отсутствует И сессия была спавнена → легаси; карантинные записи
- *  без сессии не штампуются — их спавн ещё попробует env-механику. */
-export function stampLegacyEntries(state: FactoryState): string[] {
-  const stamped: string[] = []
-  for (const [rowId, tracked] of Object.entries(state.tasks)) {
-    if (tracked.envDir !== undefined || tracked.legacy === true) continue
-    if (tracked.sessionID === "") continue
-    tracked.legacy = true
-    stamped.push(rowId)
-  }
-  return stamped
-}
-
 /** Валидация записи state.json. Легальные форматы: полный (ses_ + пути),
  *  чистый карантин (всё пусто) и гибрид (сессия умерла, пути живы — работа
  *  сохраняется до решения юзера). worktree = repoDir env-задачи; branch —
- *  производное имя ветки (пишет фабрика) или легаси-имя агента. */
+ *  производное имя ветки (пишет фабрика). */
 export function isValidTracked(v: unknown): v is TrackedTask {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
@@ -797,7 +766,6 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
-  if (t.legacy !== undefined && typeof t.legacy !== "boolean") return false
   if (
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
@@ -850,8 +818,8 @@ export interface ProjectCfg {
   repo: string
   local: string
   /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
-   *  вне механики (cfg.local не git-репо → контракт невыполним): легаси-
-   *  поведение, агент сам делает ворктри/ветку. Дефолт true. */
+   *  вне механики (cfg.local не git-репо → контракт невыполним): агент сам
+   *  делает ворктри/ветку и заполняет Branch-ячейку. Дефолт true. */
   env?: boolean
 }
 
