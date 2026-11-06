@@ -1104,6 +1104,11 @@ pub(crate) async fn semantic_run(command: SemanticSub) -> Result<()> {
                 println!("{line}");
             }
         }
+        SemanticSub::Sync => {
+            for line in crate::semantic::sync_once(&sy, &cfg).await? {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
