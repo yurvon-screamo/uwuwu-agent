@@ -234,15 +234,36 @@ fn process_page(
 
 /// Стартовый курсор дельты: явный since (rebuild) или watermark минус
 /// overlap; пустой watermark — с нуля; мусор в meta — громкая ошибка.
+/// Overlap сдвигает только секунду: id-компонента пары на resume не
+/// сужает перескан (тот же at-least-once, что у голого watermark).
 fn starting_cursor(store: &Store, since: &Option<String>) -> Result<(String, String)> {
     let updated = match since {
         Some(since) => since.clone(),
         None => match store.meta("watermark")? {
-            Some(mark) => since_with_overlap(&mark)?,
+            Some(mark) => {
+                let (watermark_updated, _) = split_watermark(&mark);
+                since_with_overlap(&watermark_updated)?
+            }
             None => "0".to_string(),
         },
     };
     Ok((updated, String::new()))
+}
+
+/// Композитный курсор «updated|id»: лексикография = порядок (updated, id)
+/// (updated фиксированной ширины 14 цифр; id сравнивается строкой — тот же
+/// порядок, что keyset ядра). Сепаратор '|' в обеих частях не встречается.
+pub(crate) fn watermark_composite(updated: &str, id: &str) -> String {
+    format!("{updated}|{id}")
+}
+
+/// Обратный разбор композита; legacy-значение без '|' (водяной знак
+/// до pair-фикса) — секунда известна, id-курсор пуст.
+pub(crate) fn split_watermark(mark: &str) -> (String, String) {
+    match mark.split_once('|') {
+        Some((updated, id)) => (updated.to_string(), id.to_string()),
+        None => (mark.to_string(), String::new()),
+    }
 }
 
 /// Шаг scan-page: страница дельты + точечный fetch полных строк по PK,
@@ -320,9 +341,9 @@ pub async fn delta_sync(
         }
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
-            // на крайний курсор (включая пропущенные по длине строки);
+            // на крайний курсор-пару (включая пропущенные по длине строки);
             // запись — с MAX-гвардом (только вперёд).
-            store.advance_watermark(&cursor_updated)?;
+            store.advance_watermark(&watermark_composite(&cursor_updated, &cursor_id))?;
             break;
         }
         if let Some(delay) = opts.page_delay {
@@ -395,7 +416,9 @@ async fn embed_and_upsert(
             vec,
         })
         .collect();
-    let watermark = rows.last().map(|r| r.meta.updated.clone());
+    let watermark = rows
+        .last()
+        .map(|r| watermark_composite(&r.meta.updated, &r.meta.block_id));
     let tx = store.begin()?;
     Store::upsert_batch(&tx, &records, watermark.as_deref())?;
     tx.commit()?;

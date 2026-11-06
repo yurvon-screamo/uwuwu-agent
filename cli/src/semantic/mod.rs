@@ -387,16 +387,21 @@ async fn oversize_count(sy: &SiYuan) -> Result<u64> {
         .unwrap_or(0) as u64)
 }
 
-/// Размер очереди: строки ядра над watermark (без content; явный LIMIT).
+/// Размер очереди: строки ядра над watermark-парой (без content; явный
+/// LIMIT). Пара курсора: `updated > wu or (updated = wu и id > wi)` —
+/// хвост лавины одной секунды виден, закоммиченный префикс секунды — нет.
 async fn backlog_size(sy: &SiYuan, store: &Store) -> Result<u64> {
     let Some(mark) = store.meta("watermark")? else {
         return Ok(0);
     };
+    let (mark_updated, mark_id) = sync::split_watermark(&mark);
     let stmt = format!(
         "select count(*) as c from blocks \
-         where type in {types} and updated > {u} limit 1",
+         where type in {types} \
+         and (updated > {u} or (updated = {u} and id > {i})) limit 1",
         types = sync::TARGET_TYPES_SQL,
-        u = sync::sql_literal(&mark),
+        u = sync::sql_literal(&mark_updated),
+        i = sync::sql_literal(&mark_id),
     );
     let rows = sy.sql(&stmt).await?;
     Ok(rows

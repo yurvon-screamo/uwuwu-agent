@@ -57,16 +57,29 @@ impl KernelMock {
             return vec![json!({ "c": count })];
         }
         if stmt.contains("count(*)") {
-            // честный count: только строки над watermark-предикатом
+            // честный count: строки над watermark-парой
+            // (updated > wu or (updated = wu and id > wi))
             let after = stmt
                 .split("updated > '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("0")
                 .to_string();
+            let id_marker = "and id > '";
+            let id_after = stmt
+                .split(id_marker)
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("")
+                .to_string();
             let count = blocks
                 .iter()
-                .filter(|b| b["updated"].as_str().unwrap_or("").as_bytes() > after.as_bytes())
+                .filter(|b| {
+                    let updated = b["updated"].as_str().unwrap_or("").as_bytes();
+                    let id = b["id"].as_str().unwrap_or("").as_bytes();
+                    updated > after.as_bytes()
+                        || (updated == after.as_bytes() && id > id_after.as_bytes())
+                })
                 .count();
             return vec![json!({ "c": count })];
         }
@@ -370,7 +383,9 @@ async fn delta_pages_through_equal_timestamp_run_without_loss() {
     assert_eq!(report.skipped_short, 52);
     assert_eq!(report.embedded, 468);
     assert_eq!(store.chunk_count().unwrap(), 468);
-    assert_eq!(store.meta("watermark").unwrap().as_deref(), Some(T1));
+    let (mark_updated, mark_id) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(mark_updated, T1);
+    assert_eq!(mark_id, "20261105-0519", "clean-end пишет курсор-пару");
     assert_eq!(store.meta("dim").unwrap().as_deref(), Some("3"));
     // каждый чанк эмбедден ровно один раз — 0 потерь, 0 дублей
     assert_eq!(inputs.lock().unwrap().len(), 468);
@@ -435,7 +450,8 @@ async fn delta_overlap_reembeds_same_second_edit_after_watermark() {
     sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
         .await
         .expect("первая дельта");
-    assert_eq!(store.meta("watermark").unwrap().as_deref(), Some(T0));
+    let (mark_updated, _) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(mark_updated, T0);
 
     // Правка a2 в ту же секунду, что watermark — после прохода курсора.
     {
@@ -498,6 +514,175 @@ async fn kernel_server_blocks_only(blocks: Vec<Value>) -> (MockServer, Arc<Mutex
     let (server, blocks_handle, _) = kernel_server(blocks).await;
     (server, blocks_handle)
 }
+
+// ——— pair-watermark: лавина одной секунды (диагноз 20261106182055) ———
+
+/// Водяной знак несёт пару (updated, id): курсор дельты не теряет id-компоненту
+/// при записи — иначе лавина блоков одной секунды (булк-реимпорт тела задачи)
+/// замораживает прогресс: per-batch watermark равен текущему, MAX-гвард
+/// отвергает равенство, очередь «висит» вечно (факт: 267 блоков секунды
+/// 20261106223122, watermark стоял на ней же).
+#[tokio::test]
+async fn delta_watermark_pair_persists_after_full_mountain_pass() {
+    // 300 блоков одной секунды T1; watermark стоит на T1 (как оставил бы
+    // clean-end, пишущий голый updated без id-компоненты курсора).
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("watermark", T1).unwrap();
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    let mark = store.meta("watermark").unwrap().unwrap();
+    let (updated, id) = sync::split_watermark(&mark);
+    assert_eq!(updated, T1, "секунда курсора — секунда лавины");
+    assert_eq!(
+        id, "20261105-0299",
+        "id-компонента курсора сохранена: watermark = {mark}"
+    );
+}
+
+/// Бюджет умер посреди лавины — закоммиченный батч двигает пару: watermark
+/// указывает на последнюю строку закоммиченного батча, backlog считает
+/// незакрытый хвост (сегодня: пара не персистится, очередь «висит»).
+#[tokio::test]
+async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // батчи по 25ms — бюджет 100ms умирает посреди лавины: как вживую
+    // (EmbedError::Timeout), так и чистым budget_exhausted между батчами.
+    let (embed, inputs) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(25))
+        .await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("watermark", T1).unwrap();
+
+    let report = sync::delta_sync(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &sync::SyncOptions {
+            since: None,
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            embed_timeout: Duration::from_secs(2),
+            page_delay: None,
+            on_batch: None,
+        },
+    )
+    .await;
+
+    // оба исхода честны: Ok(budget_exhausted) или Err(EmbedError::Timeout)
+    if let Ok(report) = report {
+        assert!(report.budget_exhausted, "бюджет умер: {:?}", report.budget_exhausted);
+    }
+    // закоммиченные строки берём из стора: счётчик инпутов мока считает
+    // отправленные запросы, а батч может умереть по таймауту уже после
+    // отправки — без коммита
+    let committed = store.chunk_count().unwrap() as usize;
+    assert!(committed >= 32, "первый батч успел закоммититься: {committed}");
+    assert!(committed < 300, "бюджет умер до конца лавины: {committed}");
+    let mark = store.meta("watermark").unwrap().unwrap();
+    let (updated, id) = sync::split_watermark(&mark);
+    assert_eq!(updated, T1);
+    assert_eq!(
+        id,
+        format!("20261105-{:04}", committed - 1),
+        "пара указывает на последнюю закоммиченную строку: {mark}"
+    );
+
+    // backlog над парой — незакрытый хвост лавины, а не вся секунда
+    let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
+    assert_eq!(
+        backlog,
+        (300 - committed) as u64,
+        "очередь над парой: {backlog}"
+    );
+}
+
+/// Пара монотонна и по id внутри секунды: откат id-компоненты не двигает
+/// курсор назад (resume с overlap-окном переезает секунды повторно).
+#[test]
+fn advance_watermark_pair_is_monotonic_within_second() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-0100"))
+        .unwrap();
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-0001"))
+        .unwrap();
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some("20261105000001|20261105-0100"),
+        "откат id внутри секунды отвергнут"
+    );
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-9999"))
+        .unwrap();
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some("20261105000001|20261105-9999"),
+        "id вперёд внутри той же секунды принят"
+    );
+}
+
+/// Repair (reconcile) пишет watermark той же парой, но назад её двигать
+/// нельзя: stale-строка с updated ниже курсора отвергается MAX-гвардом,
+/// дельта не теряет хвост над парой (примечание ревью плана).
+#[tokio::test]
+async fn repair_does_not_rewind_watermark_pair() {
+    let blocks = vec![block(
+        "old-row",
+        T0,
+        "старый чанк с длинным содержанием для ремонта",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    let ahead = sync::watermark_composite(T1, "20261105-5000");
+    store.set_meta("watermark", &ahead).unwrap();
+
+    let outcome =
+        sync::repair_missing(&sy, &ollama(&embed.uri()), &mut store, &["old-row".into()], None)
+            .await
+            .expect("repair");
+
+    assert_eq!(outcome.repaired, 1, "строка закоммичена в индекс");
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some(ahead.as_str()),
+        "пара не откатилась stale-строкой"
+    );
+}
+
 
 // ——— reconcile: backfill / prune / дрейф ———
 
