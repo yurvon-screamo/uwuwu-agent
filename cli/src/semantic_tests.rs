@@ -1011,6 +1011,110 @@ async fn embed_timeout_is_distinct_from_unreachable() {
     assert!(err.to_string().contains("таймаут"));
 }
 
+// ——— п.3 resume: model-guard ———
+
+#[tokio::test]
+async fn rebuild_resume_refuses_model_mismatch() {
+    // Прерванный билд моделью A + resume при env-модели B молча дособрал бы
+    // индекс смешанными эмбеддингами (п.3 ревью PR #78) — громкий отказ.
+    let blocks = vec![block(
+        "a2",
+        T1,
+        "второй чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: embed.uri(),
+        embed_model: "model-b".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    let mut store = seeded_store(dir.path());
+    store.set_meta("model", "model-a").unwrap();
+    let partial = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "a0".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/d".into(),
+            updated: T0.into(),
+        },
+        content: "первый чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[partial], Some(T0)).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+
+    let err = match crate::semantic::rebuild(&sy, &cfg, None, true).await {
+        Ok(_) => panic!("model mismatch на resume — ожидание отказа"),
+        Err(e) => e,
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("model-a"), "индексная модель: {message}");
+    assert!(message.contains("model-b"), "env-модель: {message}");
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "смешение не началось"
+    );
+    let store = seeded_store(dir.path());
+    assert_eq!(store.chunk_count().unwrap(), 1, "чанки не тронуты");
+}
+
+#[tokio::test]
+async fn rebuild_resume_adopts_missing_model_meta() {
+    // Сбой до первого батча: чанки есть, meta.model нет — resume adopt'ит
+    // env-модель (семантика свежей БД) и продолжает.
+    let blocks = vec![block(
+        "a2",
+        T1,
+        "второй чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: embed.uri(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    let mut store = seeded_store(dir.path());
+    let partial = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "a0".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/d".into(),
+            updated: T0.into(),
+        },
+        content: "первый чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[partial], Some(T0)).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+    assert_eq!(seeded_store(dir.path()).meta("model").unwrap(), None);
+
+    crate::semantic::rebuild(&sy, &cfg, None, true)
+        .await
+        .expect("resume после adopt");
+
+    let store = seeded_store(dir.path());
+    assert_eq!(
+        store.meta("model").unwrap().as_deref(),
+        Some("test-model"),
+        "env-модель adopt'нута в meta"
+    );
+}
+
 #[tokio::test]
 async fn search_half_degrades_loudly_when_ollama_down() {
     let (server, _) = kernel_server_blocks_only(vec![]).await;

@@ -245,6 +245,18 @@ pub async fn rebuild(
         if !cfg.db_path.exists() || store.chunk_count().unwrap_or(0) == 0 {
             anyhow::bail!("--resume: индекс пуст — продолжать нечего, запускай без --resume");
         }
+        // Model-guard resume (п.3 ревью PR #78): guard на поисковом пути
+        // не спасает resume — тот молча дособрал бы индекс смешанными
+        // эмбеддингами двух моделей.
+        match store.meta("model")? {
+            Some(indexed) if indexed != cfg.embed_model => anyhow::bail!(
+                "--resume: индекс собран моделью «{indexed}», env — «{env}» — продолжение смешает эмбеддинги; запускай без --resume (полный пересбор)",
+                env = cfg.embed_model
+            ),
+            // Сбой до первого батча: модель не успела записаться — adopt.
+            None => store.set_meta("model", &cfg.embed_model)?,
+            _ => {}
+        }
     } else {
         store.clear_for_rebuild()?;
         store.set_meta("model", &cfg.embed_model)?;
