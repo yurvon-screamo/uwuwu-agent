@@ -649,11 +649,18 @@ def _payload_has_table_separator(markdown: str) -> bool:
     «полной таблицы» для гварда type='t' (updateBlock на 't' переписывает
     таблицу целиком, пробы 06.11/07.11). Построчно с fullmatch: наивный search
     матчит дефис в data-строке («| 2026-11-07 | …», ревью плана 07.11);
-    separator внутри fence — конверсия таблицы в код-блок, не таблица."""
+    separator внутри fence — конверсия таблицы в код-блок, не таблица. Фенсы —
+    через _fence_transition чанк-парсера (backtick и tilde, закрытие только
+    тем же символом; ревью кода 07.11: FENCE_RE ловил только backticks)."""
     in_fence = False
+    fence_char = ""
     for line in markdown.splitlines():
-        if FENCE_RE.match(line):
-            in_fence = not in_fence
+        transition = _fence_transition(line, in_fence, fence_char)
+        if transition == "open":
+            in_fence, fence_char = True, line[0]
+            continue
+        if transition == "close":
+            in_fence = False
             continue
         if in_fence:
             continue

@@ -293,6 +293,15 @@ class TableBlockGuard(unittest.TestCase):
                       payload="```markdown\n| a | b |\n| --- | --- |\n```")
         self.assertEqual(kernel.mutations, [])
 
+    def test_tilde_fenced_table_syntax_payload_is_refused(self):
+        # Ревью кода 07.11: FENCE_RE ловил только backticks — ~~~-фенс с
+        # таблицей внутри проходил гвардом и молча заменял таблицу код-блоком.
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError):
+            run_block(kernel, "update", block_id=TABLE_ID,
+                      payload="~~~\n| a | b |\n| --- | --- |\n~~~")
+        self.assertEqual(kernel.mutations, [])
+
     def test_full_table_payload_update_is_allowed(self):
         kernel = self._table_kernel()
         new_table = "| Новая шапка | Ц2 |\n| --- | --- |\n| альфа | 1 |"
