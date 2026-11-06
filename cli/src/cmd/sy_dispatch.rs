@@ -224,6 +224,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             );
             Ok(())
         }
+        TaskSub::Claim { id, session } => {
+            let session = match session {
+                Some(sid) => sid,
+                None => std::env::var("OPENCODE_SESSION_ID").map_err(|_| anyhow!(
+                    "sessionID не задан: нет --session и нет OPENCODE_SESSION_ID в env — заявись из сессии агента или передай id явно"
+                ))?,
+            };
+            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
+            note_fallback_board(origin, &board);
+            syt::claim(&sy, &board, &task, &session).await?;
+            println!("заявлено: {} ← {}", task.title, session);
+            Ok(())
+        }
         TaskSub::Comment {
             id,
             reply,
@@ -1550,8 +1563,8 @@ fn collect_text(stdin: bool, text: &[String]) -> Result<String> {
 /// комментом вместо чтения треда). Токены сравниваются целиком: «get:» или
 /// «get-задача» — контент.
 const TASK_SUB_NAMES: &[&str] = &[
-    "create", "list", "get", "edit", "comment", "thread", "close", "body", "rm", "clean", "undo",
-    "set", "pause", "resume",
+    "create", "list", "get", "edit", "claim", "comment", "thread", "close", "body", "rm", "clean",
+    "undo", "set", "pause", "resume",
 ];
 
 /// Токен выглядит как флаг: `--…` всегда; одиночный дефис — только перед
@@ -2877,6 +2890,7 @@ mod tests {
             pr: String::new(),
             schedule: String::new(),
             last_run: String::new(),
+            dev_session: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
     }

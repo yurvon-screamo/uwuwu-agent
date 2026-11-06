@@ -11,6 +11,8 @@ mod create_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod claim_tests;
+#[cfg(test)]
 mod fallback_tests;
 #[cfg(test)]
 mod kernel_tests;
