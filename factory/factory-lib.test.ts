@@ -1373,14 +1373,29 @@ describe("normalizeBodyMd + bodyContentHash — контент-хэш вне «�
     const b = `${a}\n- **AGENTS** (2026-11-06 16:46): вердикт ревьювера\n\n`
     expect(bodyContentHash(b)).toBe(bodyContentHash(a))
   })
-  test("контентная строка в хвосте — хэш меняется", () => {
+  test("контентная строка после хвостового коммента неразличима (коммент-область до EOF)", () => {
     const a = "## План\n\nтело\n\n- **AGENTS** (2026-11-06 16:46): коммент\n"
     const b = `${a}добавленная контентная строка\n`
-    expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
   })
   test("легитимный список без даты в скобках хвостом не срезается", () => {
     const a = "## План\n\n- **жирный** пункт списка\n"
     const b = `${a}- **жирный** ещё пункт\n`
+    expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
+  })
+  test("трейлинг-хвост многострочных коммент-блоков срезается целиком (тела вердиктов)", () => {
+    const a = "## План\n\nтело\n\n## Дефект\n\nтекст дефекта\n"
+    const b = `${a}\n- **AGENTS** (2026-11-06 16:39): PR готов к ревью\n\nподробности\n\n- **AGENTS** (2026-11-06 16:46): вердикт\n\nСтатус: approve\n\nабзацы отчёта\n`
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("коммент-аппенд в хвост с контентным абзацем — хэш не меняется (абзац сохранён)", () => {
+    const a = "## Отчёт\n\nабзац отчёта\n"
+    const b = `${a}\n- **AGENTS** (2026-11-06 16:46): коммент\n\nСтатус: approve\n`
+    expect(bodyContentHash(b)).toBe(bodyContentHash(a))
+  })
+  test("правка абзаца хвоста до первого коммент-пункта — хэш меняется", () => {
+    const a = "## Отчёт\n\nабзац А\n\n- **AGENTS** (2026-11-06 16:46): коммент\n"
+    const b = "## Отчёт\n\nабзац Б\n\n- **AGENTS** (2026-11-06 16:46): коммент\n"
     expect(bodyContentHash(b)).not.toBe(bodyContentHash(a))
   })
   test("контент ПОСЛЕ секции «Комменты» учитывается (правка дефектов видна)", () => {
@@ -1457,5 +1472,36 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
   })
   test("без секции «Комменты» — пусто", () => {
     expect(parseCommentsMarkdown("## Прочее\nтекст", "DOC")).toEqual([])
+  })
+  test("трейлинг-хвост после последней ## — комменты детектятся ( High-1: CLI-аппенд в конец дока)", () => {
+    const MD_TAIL = [
+      "## План", "", "тело плана", "",
+      "## Комменты", "", "- **AGENTS** (t0): старый",
+      "", "## Дефект", "", "текст дефекта", "",
+      "- **AGENTS** (2026-11-06 16:39): PR готов к ревью",
+      "", "подробности вердикта", "",
+      "- **AGENTS** (2026-11-06 16:46): вердикт раунд 2",
+    ].join("\n")
+    const parsed = parseCommentsMarkdown(MD_TAIL, "DOC")
+    // старая секция + оба хвостовых пункта
+    expect(parsed.length).toBe(3)
+    expect(parsed[1].id).toBe("cDOC-0001")
+    expect(parsed[1].text).toContain("PR готов к ревью")
+    // продолжение блока (тело вердикта) входит в text пункта
+    expect(parsed[1].text).toContain("подробности вердикта")
+    expect(parsed[2].text).toContain("вердикт раунд 2")
+  })
+  test("юзерский тред-ответ в хвосте (вложенный пункт с датой) — reply последнего пункта", () => {
+    const MD_TAIL_REPLY = "## Секции\n\nконтент\n\n- **AGENTS** (2026-11-06 16:46): вопрос\n  - **Юра** (2026-11-06 17:00): ответ владельца\n"
+    const parsed = parseCommentsMarkdown(MD_TAIL_REPLY, "DOC")
+    expect(parsed.length).toBe(1)
+    expect(parsed[0].replies[0].userId).toBe("Юра")
+    expect(parsed[0].replies[0].text).toContain("ответ владельца")
+  })
+  test("контентные абзацы хвоста ДО первого пункта не теряются", () => {
+    const MD_LEAD = "## Отчёт\n\nабзац отчёта\n\n- **AGENTS** (2026-11-06 16:46): коммент\n"
+    const parsed = parseCommentsMarkdown(MD_LEAD, "DOC")
+    expect(parsed.length).toBe(1)
+    expect(parsed[0].text).not.toContain("абзац отчёта")
   })
 })

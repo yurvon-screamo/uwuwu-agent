@@ -354,43 +354,86 @@ export interface ParsedComment {
   replies: { id: string; text: string; userId: string }[]
 }
 
-/** Разбор секции «## Комменты» markdown-экспорта тела: пункты-обёртки
- *  «- **Author** (ts): text» верхнего уровня и вложенные reply-пункты.
- *  id синтетические с паддингом индекса — лексикографический порядок стабилен
- *  (свежесть newUserComments держится на позиционном findIndex; без паддинга
- *  «cX-10» < «cX-2» ломал порядок с ≥10 комментов). Replies несут id/userId:
- *  юзерский тред-ответ детектится comment-каналом (раньше replies без id
- *  отбрасывались — молча терянный мяч), агентские срезаются own-фильтром. */
+const TOP_COMMENT = /^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const TOP_COMMENT_DATED = /^- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+const REPLY_COMMENT = /^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const REPLY_COMMENT_DATED = /^ {2}- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+
+const padIdx = (i: number): string => String(i).padStart(4, "0")
+const commentHead = (m: RegExpMatchArray): string => `${m[1]} (${m[2]}): ${m[3]}`
+
+/** Разбор коммент-записей markdown-экспорта тела. Два источника:
+ *  (а) секция «## Комменты» — историческая конвенция;
+ *  (б) трейлинг-хвост после последней ## — CLI аппендит комменты appendBlock'ом
+ *  в конец дока, в телах с секциями после «## Комменты» (слияния дефектов —
+ *  регулярный паттерн владельца) свежие записи живут хвостом; без (б) comment-
+ *  канал слеп к ним — юзерский ответ не будит ни одним каналом (High-1 ревью
+ *  раунда 3). Хвост строгим матчем с датой — легитимные списки не комменты.
+ *  Продолжения блока (абзацы тела пункта — вердикты многострочные) конкатенируются
+ *  в text — будильник цитирует коммент целиком. id синтетические с паддингом —
+ *  лексикографический порядок стабилен (свежесть newUserComments держится на
+ *  позиционном findIndex). Replies несут id/userId: юзерский тред-ответ
+ *  детектится, агентский срезается own-фильтром. */
 export function parseCommentsMarkdown(md: string, docId: string): ParsedComment[] {
+  const lines = md.split("\n")
   const comments: ParsedComment[] = []
   let inSection = false
   let topIdx = 0
   let replyIdx = 0
-  for (const line of md.split("\n")) {
+  let lastHeadIdx = -1
+  let lastHeadIsComments = false
+  const appendContinuation = (line: string): void => {
+    if (comments.length === 0 || line.trim() === "") return
+    const last = comments[comments.length - 1]
+    last.text = `${last.text}\n${line}`
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
     if (line.startsWith("## ")) {
-      inSection = line.startsWith("## Комменты")
+      lastHeadIdx = i
+      lastHeadIsComments = /^## Комменты\s*$/.test(line)
+      inSection = lastHeadIsComments
+      if (inSection) replyIdx = 0
       continue
     }
     if (!inSection) continue
-    const top = line.match(/^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
+    const top = line.match(TOP_COMMENT)
     if (top) {
       replyIdx = 0
-      comments.push({
-        id: `c${docId}-${String(topIdx++).padStart(4, "0")}`,
-        text: `${top[1]} (${top[2]}): ${top[3]}`,
-        userId: top[1],
-        replies: [],
+      comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+      continue
+    }
+    const rep = line.match(REPLY_COMMENT)
+    if (rep && comments.length > 0) {
+      comments[comments.length - 1].replies.push({
+        id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(replyIdx++)}`,
+        text: commentHead(rep),
+        userId: rep[1],
       })
       continue
     }
-    const rep = line.match(/^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
-    if (rep && comments.length > 0) {
-      const parentIdx = topIdx - 1
-      comments[comments.length - 1].replies.push({
-        id: `r${docId}-${String(parentIdx).padStart(4, "0")}-${String(replyIdx++).padStart(4, "0")}`,
-        text: `${rep[1]} (${rep[2]}): ${rep[3]}`,
-        userId: rep[1],
-      })
+    appendContinuation(line)
+  }
+  if (!lastHeadIsComments) {
+    let tailReplyIdx = 0
+    for (let i = lastHeadIdx + 1; i < lines.length; i++) {
+      const line = lines[i]
+      const top = line.match(TOP_COMMENT_DATED)
+      if (top) {
+        tailReplyIdx = 0
+        comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+        continue
+      }
+      const rep = line.match(REPLY_COMMENT_DATED)
+      if (rep && comments.length > 0) {
+        comments[comments.length - 1].replies.push({
+          id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(tailReplyIdx++)}`,
+          text: commentHead(rep),
+          userId: rep[1],
+        })
+        continue
+      }
+      if (i > lastHeadIdx) appendContinuation(line)
     }
   }
   return comments

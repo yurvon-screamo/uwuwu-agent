@@ -201,11 +201,12 @@ export function latestComment(comments: TaskComment[]): TaskComment | null {
 const ZERO_WIDTH = /\p{Cf}/gu
 
 /** Контент тела вне коммент-записей: (а) секция «## Комменты» (от неё до
- *  следующего ##) — исторические тела; (б) трейлинг-хвост коммент-пунктов —
- *  CLI аппендит комменты в конец дока (appendBlock parentID=docId), в телах
- *  с дефект-секциями после «## Комменты» свежие записи живут хвостом.
- *  Коммент-аппенды иммунны к хэшу — comment-контур не дублируется
- *  bodyEdit-будкой (дефект №4). Контент между секциями учитывается. */
+ *  следующего ##) — историческая конвенция; (б) хвост после последней ## —
+ *  CLI аппендит комменты appendBlock'ом в конец дока, в телах с секциями
+ *  после «## Комменты» свежие записи живут хвостом (тела вердиктов уходят
+ *  с блоками). Коммент-аппенды иммунны к хэшу — comment-контур не дублируется
+ *  bodyEdit-будкой (дефект №4). Контент ДО первого хвостового пункта
+ *  (абзацы отчёта и т.п.) сохраняется — его правки видны хэшу. */
 export function bodyOutsideComments(md: string): string {
   const out: string[] = []
   let inComments = false
@@ -217,14 +218,16 @@ export function bodyOutsideComments(md: string): string {
     if (inComments && /^## /.test(line)) inComments = false
     if (!inComments) out.push(line)
   }
-  // трейлинг-хвост: все непустые строки от последнего контента до EOF —
-  // коммент-пункты формата «- **Author** (дата): …» (строгий матч с датой —
-  // легитимные списки не срезаются)
-  while (out.length > 0) {
-    const last = out[out.length - 1]
-    if (last.trim() === "" || /^- \*\*[^*]+\*\* \(\d{4}-\d{2}-\d{2}[^)]*\): /.test(last.trimStart())) {
-      out.pop()
-    } else {
+  let lastHead = -1
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (/^## /.test(out[i])) {
+      lastHead = i
+      break
+    }
+  }
+  for (let i = lastHead + 1; i < out.length; i++) {
+    if (/^- \*\*[^*]+\*\* \(\d{4}-\d{2}-\d{2}[^)]*\): /.test(out[i])) {
+      out.length = i
       break
     }
   }

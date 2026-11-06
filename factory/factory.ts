@@ -26,13 +26,13 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeF
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
+import { parseCommentsMarkdown } from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
   isUserComment,
-  commentText,
   kickoffModeOf,
   promptForStart,
   prMergeableOf,
@@ -385,79 +385,36 @@ async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string
   }
 }
 
-interface CommentEdge { node?: { id?: string; content?: unknown } }
-
-async function commentPage(bodyDoc: string, after: string): Promise<{
-  edges: CommentEdge[]
-  endCursor: string
-  hasNext: boolean
-}> {
-  const args: Record<string, unknown> = { docId: bodyDoc, first: 50 }
-  if (after !== "") args.after = after
-  const r = await mcp.tool<{
-    edges?: CommentEdge[]
-    pageInfo?: { hasNextPage?: boolean; endCursor?: string }
-  }>("list_comments", args)
-  return {
-    edges: r.edges ?? [],
-    endCursor: r.pageInfo?.endCursor ?? "",
-    hasNext: r.pageInfo?.hasNextPage === true,
-  }
-}
-
-/** ВСЕ комменты тела с relay-пагинацией (без досылки мост слепнет на
- *  задачах с длинной историей: 50-окно роняет свежие комменты).
- *  Разворачивает нативные треды афины (replies ноды) в плоский список —
- *  reply юзера помечается префиксом «(тред-ответ на «…»)», чтобы агент
- *  видел контекст в ленте; сам ответ агента в тред идёт через
- *  `task comment --reply` (uwuwu-cli). */
-async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
+/** Комменты тела из экспорта + parseCommentsMarkdown (секции «## Комменты» и
+ *  трейлинг-хвост — CLI-аппенд в конец дока). exportCache — per-tick кэш
+ *  экспортов: тик читает тело один раз для комментов и хэша (дубль тяжёлого
+ *  вызова ядра — Low-1 ревью раунда 3). Тред-ответы — префикс-якорь родителя
+ *  для контекста ленты; сам ответ в тред — `task comment --reply` (uwuwu-cli). */
+async function taskComments(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<TaskComment[]> {
   if (bodyDoc === "") return []
+  const md = await bodyExport(bodyDoc, exportCache)
+  if (md === null) return []
+  const parsed = parseCommentsMarkdown(md, bodyDoc)
   const out: TaskComment[] = []
-  let cursor = ""
-  for (let page = 0; page < 10; page++) {
-    const { edges, endCursor, hasNext } = await commentPage(bodyDoc, cursor)
-    for (const e of edges) {
-      const n = e.node
-      if (n === undefined || typeof n.id !== "string") continue
-      const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
-      const text = commentText(n.content)
+  for (const c of parsed) {
+    out.push({
+      id: c.id,
+      text: c.text,
       // ts из CLI-головы («AGENTS (2026-11-05 19:43): …») — UTC, надёжный
-      // порядок; snapshot-meta (афина) — фоллбек; 0 — легаси без времени
-      const created = parseAgentHeadTs(text) ??
-        (typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0)
-      const userId = (n as { user?: { id?: unknown } }).user?.id
+      // порядок; 0 — легаси без времени (не срезается own-фильтром)
+      createdAt: parseAgentHeadTs(c.text) ?? 0,
+      userId: c.userId,
+    })
+    const parentHead = c.text.slice(0, 60)
+    for (const rep of c.replies) {
+      const repCreated = parseAgentHeadTs(rep.text)
       out.push({
-        id: n.id,
-        text,
-        createdAt: created,
-        ...(typeof userId === "string" ? { userId } : {}),
+        id: rep.id,
+        text: `(тред-ответ на «${parentHead}…») ${rep.text}`,
+        createdAt: repCreated ?? (out[out.length - 1].createdAt + 1),
+        userId: rep.userId,
       })
-      // тред-ответы (нативные replies афины): префикс-якорь родителя для контекста
-      const replies = (n as { replies?: unknown }).replies
-      if (Array.isArray(replies)) {
-        const parentHead = text.replace(/^\(в ответ на: [^)]*\)\s*/, "").slice(0, 60)
-        for (const rep of replies) {
-          const r = rep as { id?: unknown; content?: unknown; createdAt?: unknown; user?: { id?: unknown } }
-          if (typeof r.id !== "string") continue
-          const repText = commentText(r.content)
-          const repUser = r.user?.id
-          // GraphQL отдаёт createdAt ISO-строкой; иначе ts из CLI-головы reply,
-          // иначе позиция после родителя
-          const repCreated =
-            parseAgentHeadTs(repText) ??
-            (typeof r.createdAt === "string" ? Date.parse(r.createdAt) : created + 1)
-          out.push({
-            id: r.id,
-            text: `(тред-ответ на «${parentHead}…») ${repText}`,
-            createdAt: Number.isNaN(repCreated) ? created + 1 : repCreated,
-            ...(typeof repUser === "string" ? { userId: repUser } : {}),
-          })
-        }
-      }
     }
-    if (!hasNext || endCursor === "") break
-    cursor = endCursor
   }
   return out
 }
@@ -578,20 +535,26 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 }
 
 /** Markdown-экспорт тела; null — экспорт не удался (гейты деградируют к будке —
- *  тихий скип на сбое чтения потерял бы реальную правку владельца). */
-async function bodyExport(bodyDoc: string): Promise<string | null> {
+ *  тихий скип на сбое чтения потерял бы реальную правку владельца).
+ *  exportCache — per-tick мемоизация: тик читает тело один раз независимо от
+ *  числа потребителей (комменты, хэш, bodyEdit-гейт). */
+async function bodyExport(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<string | null> {
   if (bodyDoc === "") return null
+  if (exportCache?.has(bodyDoc)) return exportCache.get(bodyDoc) ?? null
+  let result: string | null
   try {
     const r = await mcp.tool<{ markdown?: string; exists?: boolean }>("export_doc_markdown", { docId: bodyDoc })
-    return r.exists === true ? r.markdown ?? "" : null
+    result = r.exists === true ? r.markdown ?? "" : null
   } catch {
-    return null
+    result = null
   }
+  if (exportCache !== undefined) exportCache.set(bodyDoc, result)
+  return result
 }
 
-/** Хэш норм-формы контента тела вне «Комменты»; null при сбое экспорта. */
-async function bodyHashOf(bodyDoc: string): Promise<string | null> {
-  const md = await bodyExport(bodyDoc)
+/** Хэш норм-формы контента тела вне коммент-записей; null при сбое экспорта. */
+async function bodyHashOf(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<string | null> {
+  const md = await bodyExport(bodyDoc, exportCache)
   return md === null ? null : bodyContentHash(md)
 }
 
@@ -685,8 +648,9 @@ async function startTask(
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
   // newUserComments идёт по юзерскому списку)
+  const startExports = new Map<string, string | null>()
   const last = latestComment(
-    (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID)),
+    (await taskComments(task.bodyDoc, startExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
   )
 
   state.tasks[task.rowId] = {
@@ -701,7 +665,7 @@ async function startTask(
     attempts: attemptsSeed,
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
-    bodyHash: await bodyHashOf(task.bodyDoc) ?? undefined,
+    bodyHash: (await bodyHashOf(task.bodyDoc, startExports)) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
@@ -1066,6 +1030,9 @@ async function dispatchReviewAction(
 
 export async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
+  // per-tick кэш экспортов тел: комменты, bodyEdit-гейт и comment-ветка
+  // читают один и тот же док одним физическим вызовом ядра (Low-1)
+  const bodyExports = new Map<string, string | null>()
   // known bodyDocs из state: detached-строки с излеченным треком идут мимо
   // фоллбека (без API-вызовов); читается до волны спавнов — новые старты
   // этого тика резолвятся фоллбеком как раньше
@@ -1141,8 +1108,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
     // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
     // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
+    const quarantineExports = new Map<string, string | null>()
     const last = latestComment(
-      (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID)),
+      (await taskComments(task.bodyDoc, quarantineExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
     )
     const entry: TrackedTask = {
       sessionID: "", worktree: "", branch: "",
@@ -1151,7 +1119,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
       lastStatus: task.status,
       bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
-      bodyHash: (await bodyHashOf(task.bodyDoc)) ?? undefined,
+      bodyHash: (await bodyHashOf(task.bodyDoc, quarantineExports)) ?? undefined,
     }
     state.tasks[task.rowId] = entry
     try {
@@ -1208,13 +1176,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         healed = true
       }
     }
-    if (tracked.bodyDoc !== "" && (tracked.bodyHash ?? "") === "") {
-      const hashSeeded = await bodyHashOf(tracked.bodyDoc)
-      if (hashSeeded !== null) {
-        tracked.bodyHash = hashSeeded
-        healed = true
-      }
-    }
+    // bodyHash здесь НЕ сеется: экспорт тяжёлый (интеграционный тест
+    // done-clean падал на таймауте мока), первая lastmod-дельта даст
+    // честную оценку без волны ложных будок
     if (healed) saveState(state)
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
@@ -1231,7 +1195,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
-    const comments = await taskComments(tracked.bodyDoc)
+    const comments = await taskComments(tracked.bodyDoc, bodyExports)
     const users = comments.filter((c) => isUserComment(c, BOT_USER_ID))
     // легаси-переход (деплой фильтра self-эха): старый id при нулевом времени —
     // фоллбек по времени отдал бы всю историю чужих AGENTS-комментов одной волной
@@ -1276,7 +1240,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     const refreshBodyBaseline = async (): Promise<void> => {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
       if (updated !== null) tracked.bodyUpdated = updated
-      const hash = await bodyHashOf(tracked.bodyDoc)
+      const hash = await bodyHashOf(tracked.bodyDoc, bodyExports)
       if (hash !== null) tracked.bodyHash = hash
     }
 
@@ -1317,7 +1281,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         const inReview = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
         const target = inReview ? tracked.reviewSessionID ?? "" : tracked.sessionID
         if (target !== "") {
-          const md = await bodyExport(tracked.bodyDoc)
+          const md = await bodyExport(tracked.bodyDoc, bodyExports)
           // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
           const hash = md === null ? null : bodyContentHash(md)
           const lastmodMs = md === null ? null : bodyLastmodMs(md)
@@ -1467,7 +1431,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       (tracked.bodyUpdated ?? "") !== "" &&
       updatedWithComments > (tracked.bodyUpdated ?? "")
     ) {
-      const hashWithComments = await bodyHashOf(tracked.bodyDoc)
+      const hashWithComments = await bodyHashOf(tracked.bodyDoc, bodyExports)
       if (hashWithComments !== null) tracked.bodyHash = hashWithComments
       tracked.bodyUpdated = updatedWithComments
       saveState(state)
