@@ -231,6 +231,9 @@ describe("spawnPrompt", () => {
     expect(p).toContain("скан территории")
     expect(p).toContain("task list")
     expect(p).toContain("gh pr list")
+    // живые указатели доски (кейс сводной dzype6z: 5 из 6 row-id мертвы — план адресовал фантомы)
+    expect(p).toContain("указатели постановки")
+    expect(p).toContain("гниёт")
   })
   test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
@@ -242,6 +245,8 @@ describe("spawnPrompt", () => {
     expect(p).not.toContain("План утрясан")
     // hint скана территории — тоже design-specific, в fast-track не протекает
     expect(p).not.toContain("скан территории")
+    // живые указатели — тоже design-specific
+    expect(p).not.toContain("указатели постановки")
     expect(p).not.toContain("🤖")
   })
   test("env-контекст: работа в готовом окружении, старой строки «создай worktree» нет", () => {
