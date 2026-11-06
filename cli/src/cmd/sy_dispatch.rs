@@ -272,12 +272,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             md,
             stdin,
             attach,
+            base,
+            force,
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
             // фенс-вход валидируется до resolve/upload: отказ (дубль имени,
             // незакрытый фенс, пустая строка в html) не грузит ассеты
             let fences = html_embed::parse_input(&content)?;
+            // снапшот читается до обращения к ядру: локальная ошибка — fail fast
+            let snapshot = match base.as_deref() {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("снапшот --base не читается: {path}"))?,
+                ),
+                None => None,
+            };
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             let body_path = board.body_hpath(&task.title);
@@ -294,20 +304,20 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     // ядра на пустой data — референсы дописываются сами.
                     // Ввод только из named-фенсов — легитимная запись без
                     // residual-текста («замени диаграмму arch»).
-                    if replace
-                        || replace_section.is_some()
+                    let rewrite = if replace || replace_section.is_some() {
+                        Some(BodyRewrite {
+                            section: replace_section.as_deref(),
+                            snapshot: snapshot.as_deref(),
+                            force,
+                        })
+                    } else {
+                        None
+                    };
+                    if rewrite.is_some()
                         || !content.trim().is_empty()
                         || !fences.named_fences().is_empty()
                     {
-                        write_body_in_place(
-                            &sy,
-                            &doc_id,
-                            &task.title,
-                            replace || replace_section.is_some(),
-                            replace_section.as_deref(),
-                            &content,
-                        )
-                        .await?;
+                        write_body_in_place(&sy, &doc_id, &task.title, rewrite, &content).await?;
                     }
                     doc_id
                 }
@@ -1115,6 +1125,11 @@ pub(crate) async fn semantic_run(command: SemanticSub) -> Result<()> {
                 println!("{line}");
             }
         }
+        SemanticSub::Sync => {
+            for line in crate::semantic::sync_once(&sy, &cfg).await? {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
@@ -1264,34 +1279,49 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
 
 // ——— утилиты ———
 
+/// Параметры rewrite-пути task body (replace / replace-section).
+struct BodyRewrite<'a> {
+    /// Секционная правка: existing-база сохраняется механикой replace_md_section,
+    /// гард свежести не несёт; None — полный replace целиком.
+    section: Option<&'a str>,
+    /// Снапшот свежести --base (текст файла); None + !force = отказ.
+    snapshot: Option<&'a str>,
+    /// Осознанный overwrite без сверки.
+    force: bool,
+}
+
 /// Запись тела in-place: docId сохраняется, привязка строки не рвётся.
-/// append — block-хирургия именованных html_embed-фенсов (update/insert/
-/// delete по маркерам) + один appendBlock остатка; replace/replace-section —
+/// rewrite=None — append: block-хирургия именованных html_embed-фенсов
+/// (update/insert/delete по маркерам) + один appendBlock остатка; Some —
 /// экспорт по id, strip frontmatter (иначе он ляжет литеральным блоком),
 /// фенсы инлайнятся парами «маркер + html», пересборка контента.
-/// Отказ гарда секции — Err до overwrite: экспорт read-only, ядро не тронуто.
+/// Отказ гарда — Err до overwrite: экспорт read-only, ядро не тронуто.
 /// Валидация ввода (дубль имени, пустая строка в html) — Err до любых мутаций.
 async fn write_body_in_place(
     sy: &SiYuan,
     doc_id: &str,
     doc_title: &str,
-    rewrite: bool,
-    section: Option<&str>,
+    rewrite: Option<BodyRewrite<'_>>,
     content: &str,
 ) -> Result<()> {
-    if !rewrite {
+    let Some(rewrite) = rewrite else {
         return append_with_diagrams(sy, doc_id, content).await;
-    }
+    };
     let inline = html_embed::parse_input(content)?.inline_md();
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
     let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
-    let new_md = match section {
+    let new_md = match rewrite.section {
         Some(section) => {
             let (md, edit) = replace_md_section(&existing, section, &inline)?;
             report_section_edit(section, edit);
             md
         }
-        None => inline,
+        None => {
+            if !rewrite.force {
+                require_fresh_snapshot(doc_title, &existing, rewrite.snapshot)?;
+            }
+            carry_over_comments_section(doc_title, &existing, &inline)?
+        }
     };
     sy.overwrite_doc_md(doc_id, &new_md).await
 }
@@ -1316,6 +1346,75 @@ async fn append_with_diagrams(sy: &SiYuan, doc_id: &str, content: &str) -> Resul
     Ok(())
 }
 
+/// Системная секция «Комменты» переживает полный replace: если новый контент
+/// её не несёт, существующая переносится в конец дословно (история диалога
+/// юзер ↔ агент невосстановима — инцидент 06.11, крон «stable-ватчер»).
+/// Контент с h2-секцией пишется как есть — осознанная замена; осознанный снос
+/// — пустая секция в контенте. Тёзка «Комменты» на другом уровне — отказ:
+/// перенос создал бы дубль (гард по образцу replace_md_section, ADR-048).
+/// Инвариант системной секции, не сверка: действует и при --force.
+fn carry_over_comments_section(
+    doc_title: &str,
+    existing: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    if crate::md_heading::has_h2_section(content, "Комменты") {
+        return Ok(content.to_string());
+    }
+    if let Some((level, twin_line)) =
+        crate::md_heading::heading_twin_outside_h2(content, "Комменты")
+    {
+        bail!(
+            "контент несёт «Комменты» на уровне h{level}: «{twin_line}» — авто-перенос системной \
+             секции создал бы дубль. Включи секцию «## Комменты» в контент осознанно (замена/снос \
+             истории) или переименуй подсекцию"
+        );
+    }
+    let Some(comments) = crate::md_heading::extract_h2_section(existing, "Комменты") else {
+        return Ok(content.to_string());
+    };
+    let mut carried = content.trim_end().to_string();
+    if carried.is_empty() {
+        bail!("пустой контент replace тела «{doc_title}» — используй append без --replace");
+    }
+    carried.push_str("\n\n");
+    carried.push_str(comments.trim_end());
+    carried.push('\n');
+    Ok(carried)
+}
+
+/// Freshness-гард полного --replace (потеря апдейта — класс инцидента 05.11
+/// «Стек и архитектура», путь task body тот же класс: инцидент 06.11, крон
+/// «stable-ватчер»). Снапшот --base — нетронутый вывод task get (или сырой
+/// экспорт/чистое тело), снятый до правки: сверка со свежим экспортом
+/// нормализованная (normalized_lines гасит рендер-шум round-trip — ложный
+/// отказ на whitespace-дрейфе невозможен). Без снапшота сверять не с чем —
+/// отказ с рецептом, не тихая запись. Существующая секция «Комменты» — часть
+/// тела: свой коммент (task comment) между снапшотом и replace — легитимная
+/// правка, гард честно откажет; порядок — replace → comment.
+fn require_fresh_snapshot(doc_title: &str, existing: &str, snapshot: Option<&str>) -> Result<()> {
+    let Some(snapshot_text) = snapshot else {
+        bail!(
+            "replace требует --base <снапшот.md> — вывод `task get <id>` (допустим сырой \
+             экспорт или чистое тело), снятый до правки: workflow «task get > снапшот → \
+             правь → --replace --base снапшот»; без снапшота параллельная правка тела \
+             теряется тихо. --force — осознанный overwrite без сверки"
+        );
+    };
+    let snapshot_body =
+        markdown::strip_export_wrapper(&strip_task_get_output(snapshot_text), doc_title);
+    if markdown::normalized_lines(&snapshot_body) != markdown::normalized_lines(existing) {
+        bail!(
+            "тело менялось после снапшота (--base) — replace затёр бы чужие правки. \
+             Перечитай текущий контент: task get <id>; влей дельту в новый контент, \
+             пересними снапшот и повтори; --force — overwrite без сверки. Если между \
+             снапшотом и replace тело комментировалось (task comment) — это тоже \
+             правка: комменты после replace"
+        );
+    }
+    Ok(())
+}
+
 async fn apply_diagram_op(sy: &SiYuan, doc_id: &str, op: html_embed::DiagramOp) -> Result<()> {
     match op {
         html_embed::DiagramOp::UpdateExisting { block_id, html } => {
@@ -1333,6 +1432,25 @@ async fn apply_diagram_op(sy: &SiYuan, doc_id: &str, op: html_embed::DiagramOp) 
         }
         html_embed::DiagramOp::Nothing => Ok(()),
     }
+}
+
+/// Разметка вывода `task get` вокруг тела — не контент: шапка карточки
+/// (Задача:/Статус:/…) до строки-маркера «----- тело -----» и хвост «Аттачи:»
+/// с путями ассетов после тела. Полный get-вывод, сырой экспорт и чистое
+/// тело сводятся к телу (контракт --base). Легитимные строки-маркеры в
+/// чистом теле срежут часть контента — false-mismatch, отказ (safe-направление).
+fn strip_task_get_output(raw: &str) -> String {
+    let body = match raw.split_once("----- тело -----") {
+        Some((_, rest)) => rest,
+        None => raw,
+    };
+    let body = match body.split_once("\nАттачи:") {
+        Some((body, _)) => body.to_string(),
+        None => body.to_string(),
+    };
+    // ведущие переводы после маркера срезаются: strip_frontmatter дальше
+    // требует строгий префикс «---\n» — "\n\n---\n…" свёл бы сверку вразнос
+    body.trim_start_matches('\n').to_string()
 }
 
 /// Итог секционной правки: заменено (со счётчиком удалённых дублей) или добавлено.
@@ -1759,11 +1877,14 @@ async fn save_body_assets(sy: &SiYuan, md: &str, row_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::asset_key_is_safe;
+    use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
     use super::replace_md_section;
+    use super::require_fresh_snapshot;
     use super::save_body_assets;
     use super::search_head;
+    use super::strip_task_get_output;
     use super::task_run;
     use super::validate_comment_text;
     use super::SectionEdit;
@@ -1989,6 +2110,8 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: None,
+                base: None,
+                force: false,
                 attach: Vec::new(),
             },
         )
@@ -2047,6 +2170,8 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: Some("Проверка".into()),
+                base: None,
+                force: false,
                 attach: Vec::new(),
             },
         )
@@ -2100,6 +2225,8 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: Some("Подсекция".into()),
+                base: None,
+                force: false,
                 attach: vec![],
             },
         )
@@ -2125,6 +2252,299 @@ mod tests {
             0,
             "deleteBlock-шторма нет — ядро не тронуто"
         );
+    }
+
+    /// Гард свежести полного --replace: без --base и без --force — отказ с
+    /// рецептом до первой мутации (экспорт read-only): ни appendBlock
+    /// пересборки, ни deleteBlock-шторма — ядро не тронуто.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_without_snapshot_or_force_refuses_without_kernel_write() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\nтело\n".to_string();
+        let (server, create_calls, append_bodies, delete_calls) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое тело\n").unwrap();
+        let err = task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: None,
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--base") && msg.contains("--force"),
+            "рецепт в отказе: {msg}"
+        );
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0, "доки не создаются");
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(
+                appends.is_empty(),
+                "appendBlock не вызывался: {:?}",
+                *appends
+            );
+        }
+        assert_eq!(delete_calls.load(Ordering::SeqCst), 0, "ядро не тронуто");
+    }
+
+    /// Свежий снапшот (--base) — полный вывод task get (шапка карточки +
+    /// обёртка экспорта + рендер-шум пустыми строками + хвост «Аттачи:») —
+    /// сверка проходит нормализованно и запись состоялась.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_with_fresh_task_get_snapshot_writes() {
+        let export =
+            "---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- коммент\n".to_string();
+        let (server, create_calls, append_bodies, _deletes) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        // снапшот — «task get целиком»: рендер-шум (пустые строки) не рвёт сверку
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            snapshot.path(),
+            "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n\n## Комменты\n\n\n- коммент\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n",
+        )
+        .unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое тело\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: Some(snapshot.path().to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0);
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(
+                appends.iter().any(|p| p.contains("новое тело")),
+                "запись состоялась: {:?}",
+                *appends
+            );
+        }
+    }
+
+    /// Устаревший снапшот (тело менялось после снятия) — отказ «менялся
+    /// после снапшота» до первой мутации: ядро не тронуто.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_with_stale_snapshot_refuses_without_kernel_write() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\nтело\n\nпараллельная правка\n".to_string();
+        let (server, _create, append_bodies, delete_calls) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(snapshot.path(), "----- тело -----\n\nтело\n").unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое тело\n").unwrap();
+        let err = task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: Some(snapshot.path().to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("меняло")
+                && msg.contains("после снапшота")
+                && msg.contains("task comment"),
+            "суть отказа и порядок replace → comment: {msg}"
+        );
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(appends.is_empty(), "записи нет: {:?}", *appends);
+        }
+        assert_eq!(delete_calls.load(Ordering::SeqCst), 0, "ядро не тронуто");
+    }
+
+    /// --force старше --base: осознанный overwrite идёт без сверки —
+    /// устаревший снапшот не мешает записи.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_with_force_writes_despite_stale_snapshot() {
+        let export = "---\ntitle: таск\n---\n\n# таск\n\nтело\n\nпараллельная правка\n".to_string();
+        let (server, _create, append_bodies, _deletes) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(snapshot.path(), "----- тело -----\n\nтело\n").unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "новое тело\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: Some(snapshot.path().to_string_lossy().into_owned()),
+                force: true,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(
+                appends.iter().any(|p| p.contains("новое тело")),
+                "force-запись состоялась: {:?}",
+                *appends
+            );
+        }
+    }
+
+    /// Авто-перенос системной секции на живом мок-ядре: existing с комментами,
+    /// контент без «## Комменты» → запись несёт контент + перенесённую секцию.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_carries_over_comments_section_into_write() {
+        let export =
+            "---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n"
+                .to_string();
+        let (server, _create, append_bodies, _deletes) =
+            mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            snapshot.path(),
+            "----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n",
+        )
+        .unwrap();
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "переписанное тело\n").unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: "таск".into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: Some(snapshot.path().to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let appends = append_bodies.lock().unwrap();
+            let payload = appends.join("\n");
+            assert!(
+                payload.contains("переписанное тело"),
+                "контент записан: {payload}"
+            );
+            assert!(
+                payload.contains("## Комменты") && payload.contains("- **AGENTS** (ts): тик"),
+                "история комментов пережила replace: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_task_get_output_cuts_card_header_and_attach_tail() {
+        let full_get = "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\nтело\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n";
+        assert_eq!(
+            strip_task_get_output(full_get),
+            "---\ntitle: таск\n---\n\nтело\n"
+        );
+        let raw_export = "---\ntitle: таск\n---\n\nтело\n";
+        assert_eq!(strip_task_get_output(raw_export), raw_export);
+        let clean_body = "тело без разметки\n";
+        assert_eq!(strip_task_get_output(clean_body), clean_body);
+    }
+
+    #[test]
+    fn require_fresh_snapshot_accepts_noise_and_refuses_delta() {
+        let existing = "тело\n\n## Комменты\n- коммент\n";
+        // свежий снапшот с рендер-шумом: сверка нормализованная, не байтовая
+        let noisy = "шапка\n----- тело -----\n\nтело\n\n\n## Комменты\n\n\n- коммент\n";
+        require_fresh_snapshot("таск", existing, Some(noisy)).unwrap();
+        // чужая правка после снапшота
+        let stale = "----- тело -----\n\nтело без секции\n";
+        let err = require_fresh_snapshot("таск", existing, Some(stale)).unwrap_err();
+        assert!(err.to_string().contains("меняло"));
+        assert!(err.to_string().contains("после снапшота"));
+        // снапшота нет вовсе
+        let err = require_fresh_snapshot("таск", existing, None).unwrap_err();
+        assert!(err.to_string().contains("--base") && err.to_string().contains("--force"));
+    }
+
+    #[test]
+    fn carry_over_comments_appends_existing_section_verbatim() {
+        let existing = "старое тело\n\n## Комменты\n- **AGENTS** (2026-11-06):  вердикт ^abc123\n  вложенный ответ\n";
+        let out = carry_over_comments_section("таск", existing, "новое тело\n").unwrap();
+        assert!(out.starts_with("новое тело\n"), "контент основа: {out}");
+        assert!(out.contains(
+            "## Комменты\n- **AGENTS** (2026-11-06):  вердикт ^abc123\n  вложенный ответ"
+        ));
+    }
+
+    #[test]
+    fn carry_over_comments_keeps_content_with_its_own_section() {
+        let existing = "старое\n\n## Комменты\n- старый коммент\n";
+        let out = carry_over_comments_section(
+            "таск",
+            existing,
+            "новое\n\n## Комменты\n- новая история\n",
+        )
+        .unwrap();
+        assert_eq!(out, "новое\n\n## Комменты\n- новая история\n");
+    }
+
+    #[test]
+    fn carry_over_comments_refuses_twin_on_other_level() {
+        let existing = "старое\n\n## Комменты\n- коммент\n";
+        let err =
+            carry_over_comments_section("таск", existing, "новое\n\n### Комменты\n").unwrap_err();
+        assert!(err.to_string().contains("h3") && err.to_string().contains("дубль"));
+    }
+
+    #[test]
+    fn carry_over_comments_noop_without_existing_section() {
+        let out = carry_over_comments_section("таск", "старое без секции\n", "новое\n").unwrap();
+        assert_eq!(out, "новое\n");
     }
 
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
@@ -3586,6 +4006,8 @@ mod tests {
                 md: md.map(|p| p.to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: None,
+                base: None,
+                force: false,
                 attach: attach.to_vec(),
             },
         )
@@ -3792,6 +4214,10 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace,
                 replace_section: section,
+                // тесты про конвертацию фенсов, не про freshness-гард (#119):
+                // force снимает требование снапшота при полном replace
+                base: None,
+                force: replace,
                 attach: Vec::new(),
             },
         )
@@ -4131,6 +4557,8 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: None,
+                base: None,
+                force: false,
                 attach: vec![attach.path().to_path_buf()],
             },
         )

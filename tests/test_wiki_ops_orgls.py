@@ -8,6 +8,15 @@ limit 100000 → все строки). Контракты:
   3) живой инвариант — вывод покрывает все корневые имена listDocsByPath
      и строки-документы каждой секции == count(*) блоков ноутбука.
 
+Контракты сбоя (задача 20261104072714 — «сбой маскируется под "не найден"»):
+  4) сбой SQL по ноутбуку посреди обхода → ошибка с именем ноутбука и
+     последней причиной, exit 1, stdout ПУСТ (атомарность: частичное
+     дерево нельзя прочитать как полное);
+  5) «не найден» в тексте ошибки нет — сбой ≠ not-found;
+  6) аномальный конверт lsNotebooks (data=None, dict без "notebooks") →
+     громкая ошибка, не «пустой воркспейс» с exit 0; пустой notebooks —
+     легитимный not-found (round-2 ревью PR #111, High).
+
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_orgls.py
 """
@@ -15,8 +24,9 @@ import io
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,18 +46,28 @@ class FakeKernel:
     (для проверки клиентского капа).
     """
 
-    def __init__(self, notebook_count: int = 1, kernel_cuts_unlimited: bool = True):
+    def __init__(self, notebook_count: int = 1, kernel_cuts_unlimited: bool = True,
+                 fail_sql_for: str | None = None, ls_payload="__normal__",
+                 closed_count: int = 0):
         self.calls: list[tuple[str, dict]] = []
         self.notebook_count = notebook_count
         self.kernel_cuts_unlimited = kernel_cuts_unlimited
+        self.fail_sql_for = fail_sql_for
+        self.ls_payload = ls_payload
+        self.closed_count = closed_count
 
     def post(self, path: str, body: dict, attempts: int = 6):
         self.calls.append((path, body))
         if path == "/api/notebook/lsNotebooks":
-            notebooks = [{"id": f"nb{i}", "name": f"NB{i}", "closed": False}
+            if self.ls_payload != "__normal__":
+                return self.ls_payload
+            notebooks = [{"id": f"nb{i}", "name": f"NB{i}",
+                          "closed": i >= self.notebook_count - self.closed_count}
                          for i in range(self.notebook_count)]
             return {"notebooks": notebooks}
         if path == "/api/query/sql":
+            if self.fail_sql_for is not None and self.fail_sql_for in body["stmt"]:
+                raise RuntimeError(f"POST {path}: code=500 msg=boom")
             limit = self._stmt_limit(body["stmt"])
             if limit is None and self.kernel_cuts_unlimited:
                 limit = KERNEL_DEFAULT_LIMIT
@@ -139,6 +159,76 @@ class LiveWorkspaceInvariant(unittest.TestCase):
                                  f"строки-документы ({len(doc_names)}) != count(*) ({total[0]['c']})")
         self.assertGreaterEqual(len(sections.get("Experience", [])), EXPERIENCE_MIN_DOCS)
         self.assertGreaterEqual(len(sections.get("Projects", [])), PROJECTS_MIN_DOCS)
+
+
+class OrglsMainHarness(unittest.TestCase):
+    """Общий харнесс main-уровня: отказ обязан завершаться exit 1.
+    Возвращает (stdout, stderr); ассерты кода — здесь, контента — в тестах."""
+
+    def run_orgls_via_main(self, kernel) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["wiki_ops.py", "orgls"]), \
+                patch.object(wiki_ops, "post", kernel.post), \
+                redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                wiki_ops.main()
+        self.assertEqual(cm.exception.code, 1, "сбой обязан завершаться exit 1")
+        return out.getvalue(), err.getvalue()
+
+
+class NotebooksEnvelopeIsClassified(OrglsMainHarness):
+    """Аномалия lsNotebooks — громкий RuntimeError; пустой notebooks легитимен."""
+
+    def test_ls_payload_none_raises_not_attribute_error(self):
+        kernel = FakeKernel(ls_payload=None)
+        out, err = self.run_orgls_via_main(kernel)
+        self.assertIn("ERROR:", err)
+        self.assertIn("lsNotebooks", err)
+        self.assertEqual(out, "")
+        self.assertNotIn("не найден", err)
+        self.assertNotIn("не найдено", err)
+
+    def test_ls_dict_without_notebooks_raises_not_silent_empty(self):
+        kernel = FakeKernel(ls_payload={"code": 0})
+        out, err = self.run_orgls_via_main(kernel)
+        self.assertIn("ERROR:", err)
+        self.assertIn("lsNotebooks", err)
+        self.assertEqual(out, "", "пустой stdout обязателен: «пустой воркспейс» — это маска сбоя")
+
+    def test_empty_notebooks_is_legitimate_not_found(self):
+        kernel = FakeKernel(notebook_count=0)
+        original_post = wiki_ops.post
+        wiki_ops.post = kernel.post
+        try:
+            self.assertEqual(wiki_ops.notebooks(), [])
+        finally:
+            wiki_ops.post = original_post
+
+    def test_closed_notebooks_filtered_out(self):
+        kernel = FakeKernel(notebook_count=3, closed_count=1)
+        original_post = wiki_ops.post
+        wiki_ops.post = kernel.post
+        try:
+            names = [nb["name"] for nb in wiki_ops.notebooks()]
+        finally:
+            wiki_ops.post = original_post
+        self.assertEqual(names, ["NB0", "NB1"],
+                         "закрытый NB2 обязан отфильтровываться (иначе тест пустой)")
+
+
+class MidTreeFailureIsLoudAndAtomic(OrglsMainHarness):
+    """Сбой SQL по ноутбуку посреди обхода ≠ «не найдено»: причина + пустой stdout."""
+
+    def test_mid_tree_sql_failure_names_notebook_and_keeps_stdout_empty(self):
+        kernel = FakeKernel(notebook_count=2, fail_sql_for="nb1")
+        out, err = self.run_orgls_via_main(kernel)
+        self.assertIn("ERROR:", err)
+        self.assertIn("orgls", err)
+        self.assertIn("NB1", err, "имя упавшего ноутбука не дошло до ошибки")
+        self.assertIn("code=500", err, "последняя причина не дошла до ошибки")
+        self.assertNotIn("не найден", err)
+        self.assertNotIn("не найдено", err)
+        self.assertEqual(out, "", "частичное дерево в stdout читается как полное")
 
 
 if __name__ == "__main__":
