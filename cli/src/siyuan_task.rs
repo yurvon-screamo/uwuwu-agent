@@ -1172,22 +1172,11 @@ pub const DEV_SESSION_CELL: &str = "Сессия dev";
 /// оставил бы агента в уверенности, что он заявлен, и фабрика заспавнила бы
 /// дубль; поэтому отсутствие колонки — громкий отказ, а не best-effort.
 pub async fn claim(sy: &SiYuan, board: &SyBoard, task: &SyTask, session: &str) -> Result<()> {
-    let keys = sy
-        .mcp_tool(
-            "database",
-            serde_json::json!({ "action": "keys", "id": board.av_id }),
-        )
-        .await?;
-    let arr = keys
-        .pointer("/data/keys")
-        .or_else(|| keys.get("keys"))
-        .and_then(|k| k.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let key = arr
-        .iter()
-        .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(DEV_SESSION_CELL))
-        .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
+    let key = board_keys(sy, &board.av_id)
+        .await?
+        .into_iter()
+        .find(|(name, _)| name == DEV_SESSION_CELL)
+        .map(|(_, id)| id)
         .context(format!(
             "колонки «{DEV_SESSION_CELL}» нет на доске «{}» — попроси владельца добавить колонку: \
              без ячейки заявка молча потеряется и фабрика заспавнит дубль",
@@ -1231,30 +1220,17 @@ pub async fn edit(
 ) -> Result<()> {
     // валидация PR до любых записей: без частичных обновлений
     let pr_value = pr.map(pr_cell_value).transpose()?;
-    let keys = sy
-        .mcp_tool(
-            "database",
-            serde_json::json!({ "action": "keys", "id": board.av_id }),
-        )
-        .await?;
-    let arr = keys
-        .pointer("/data/keys")
-        .or_else(|| keys.get("keys"))
-        .and_then(|k| k.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let find = |name: &str| -> Option<String> {
-        arr.iter()
-            .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(name))
-            .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
-    };
+    let find = |name: &str,
+                keys: &[(String, String)]|
+     -> Option<String> { keys.iter().find(|(k, _)| k == name).map(|(_, id)| id.clone()) };
+    let keys = board_keys(sy, &board.av_id).await?;
     if let Some(st) = status {
-        let k = find("Status").context("ключ Status не найден")?;
+        let k = find("Status", &keys).context("ключ Status не найден")?;
         sy.db_item_set_status(&board.av_id, &k, &task.item_id, st)
             .await?;
     }
     if let Some(v) = branch {
-        let k = find("Branch").context("ключ Branch не найден")?;
+        let k = find("Branch", &keys).context("ключ Branch не найден")?;
         sy.mcp_tool(
             "database",
             serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
@@ -1263,7 +1239,7 @@ pub async fn edit(
         .await?;
     }
     if let Some(value) = pr_value {
-        let k = find("PR").context("ключ PR не найден")?;
+        let k = find("PR", &keys).context("ключ PR не найден")?;
         sy.mcp_tool(
             "database",
             serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,

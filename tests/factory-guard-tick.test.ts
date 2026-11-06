@@ -42,7 +42,7 @@ describe("tickProject: гард каскада при потере state", () =>
   })
 
   async function runTick(
-    scenario: "hold" | "done-clean" | "resolve" | "claim-skip", stateJson: string,
+    scenario: "hold" | "done-clean" | "resolve" | "claim-skip" | "claim-dead", stateJson: string,
   ): Promise<GuardVerdict> {
     // Arrange: state и service.json песочницы — до старта ребёнка
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), stateJson)
@@ -166,5 +166,20 @@ describe("tickProject: гард каскада при потере state", () =>
     expect(verdict.holdSignaled).toBeNull()
     expect(verdict.comments).toEqual([])
     expect(verdict.taskCount).toBe(0)
+  })
+
+  test("claim-dead: мёртвая дев-заявка без трека — сирота как прежде, спавнится при allow", async () => {
+    // Act: пустой state + untracked In Progress с мёртвой ячейкой (мок 404);
+    // сирот = 1 ≤ lossMax → allow
+    const verdict = await runTick("claim-dead", JSON.stringify({ tasks: {} }))
+
+    // Assert: ре-спавн компенсирует мёртвую заявку (без него — зомби-строка:
+    // ни спавна, ни stall-сигнала, ни wakeup-роутинга)
+    expect(verdict.sessionCreates).toBe(1)
+    expect(verdict.prompts).toBe(1)
+    // Assert: 1 сирота в пределах lossMax — HOLD-эпизода нет
+    expect(verdict.holdSignaled).toBeNull()
+    expect(verdict.comments).toEqual([])
+    expect(verdict.taskCount).toBe(1)
   })
 })

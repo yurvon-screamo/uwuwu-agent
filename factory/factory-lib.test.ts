@@ -1224,11 +1224,13 @@ describe("untrackedRowDecision: вердикт untracked строки (матр�
     expect(untrackedRowDecision(cell("ses_dev01", undefined), "unknown")).toEqual({ devWave: false, orphan: false })
   })
 
-  test("мёртвая дев-заявка — сирота как прежде (подозрение потери state)", () => {
-    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead")).toEqual({ devWave: false, orphan: true })
+  test("мёртвая дев-заявка — сирота как прежде и остаётся в дев-волне (ре-спавн при allow)", () => {
+    // «как прежде» = сирота в подсчёте гарда + спавн при allow: путь
+    // автокомпенсации lossMax-допуска (1-2 сироты спавнятся, ≥3 — HOLD)
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead")).toEqual({ devWave: true, orphan: true })
   })
 
   test("мёртвый claim с ревью-свидетельством — сирота (любое свидетельство)", () => {
-    expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: false, orphan: true })
+    expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
   })
 })

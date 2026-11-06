@@ -759,7 +759,11 @@ export type SessionLiveness = "alive" | "dead" | "unknown"
  *  - liveness-проба не удалась → трактуем как живую (прецедент routeTask):
  *    транзиентный сбой REST не даёт ни спавна, ни orphan-счёта, следующий
  *    тик перепроверит;
- *  - мёртвая дев-заявка → сирота как прежде (подозрение потери state). */
+ *  - мёртвая дев-заявка → сирота как прежде И остаётся в дев-волне: семантика
+ *    сирот не менялась — при allow ре-спавн компенсирует (это путь автоком-
+ *  пенсации lossMax-допуска: 1-2 сироты спавнятся, ≥3 — HOLD). Отличить
+ *  «мёртвый claim» от «потери state» по одной строке невозможно, поэтому
+ *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow. */
 export interface UntrackedRowDecision {
   /** спавнить в дев-волне этого тика (финально фильтруется статусом) */
   devWave: boolean
@@ -775,8 +779,9 @@ export function untrackedRowDecision(
   if (devCell === "") {
     return { devWave: true, orphan: (r.reviewSession ?? "") !== "" }
   }
+  // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
   if (liveness !== "dead") return { devWave: false, orphan: false }
-  return { devWave: false, orphan: true }
+  return { devWave: true, orphan: true }
 }
 
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →

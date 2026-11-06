@@ -1051,17 +1051,22 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // по каждой untracked строке — untrackedRowDecision (единственная точка):
   // живая дев-заявка (task claim / фабричный спавн с потерей state) — внешняя
   // работа идёт: не спавнить дубль и не считать сиротой; мёртвая — сирота как
-  // прежде; ревью-свидетельство без трека — сирота как прежде. Спавнить сирот
-  // = гарантированный каскад re-spawn и параллельные сессии в одних ворктри.
+  // прежде и остаётся в дев-волне (ре-спавн при allow — автокомпенсация);
+  // ревью-свидетельство без трека — сирота как прежде. Спавнить сирот сверх
+  // lossMax = гарантированный каскад re-spawn и параллельные сессии.
+  // Liveness-пробы параллельны: сериальные await в цикле растягивали тик
+  // при волне заявленных строк (культура дев-волны 05.11).
   const externalSkip = new Set<string>()
-  let orphaned = 0
-  for (const r of untracked) {
+  const verdicts = await Promise.all(untracked.map(async (r) => {
     const devCell = r.devSession ?? ""
     const liveness = devCell === "" ? "dead" : await sessionLiveness(devCell)
-    const decision = untrackedRowDecision(r, liveness)
+    return { rowId: r.rowId, liveness, decision: untrackedRowDecision(r, liveness) }
+  }))
+  let orphaned = 0
+  for (const { rowId, liveness, decision } of verdicts) {
     if (!decision.devWave) {
-      externalSkip.add(r.rowId)
-      log(`внешняя заявка ${r.rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
+      externalSkip.add(rowId)
+      log(`внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
     }
     if (decision.orphan) orphaned++
   }
