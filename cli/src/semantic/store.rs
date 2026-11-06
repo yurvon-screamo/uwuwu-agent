@@ -10,6 +10,16 @@ use std::path::Path;
 
 use super::sync::sql_literal;
 
+const REBUILD_LOCK_KEY: &str = "rebuild_lock";
+
+/// Жив ли pid (linux /proc). Неразбираемый — консервативно «жив»:
+/// отказ вместо порчи работы.
+fn pid_alive(pid: &str) -> bool {
+    pid.parse::<u32>()
+        .map(|p| std::path::Path::new(&format!("/proc/{p}")).exists())
+        .unwrap_or(true)
+}
+
 const SCHEMA: &str = "
 create table if not exists meta(
     key   text primary key,
@@ -23,6 +33,10 @@ create table if not exists chunks(
     updated  text not null,
     content  text not null,
     vec      blob not null
+);
+create table if not exists locks(
+    key   text primary key,
+    value text not null
 );
 ";
 
@@ -109,10 +123,74 @@ impl Store {
 
     /// Сброс к пустому индексу перед полным пересбором (sem/rebuild):
     /// чанки и мета уходят, модель/dim зададутся первым батчем нового прогона.
+    /// Таблица locks не стирается — advisory-лок переживает clear.
     pub fn clear_for_rebuild(&self) -> Result<()> {
         self.conn.execute("delete from chunks", [])?;
         self.conn.execute("delete from meta", [])?;
         Ok(())
+    }
+
+    /// Advisory-лок пересбора (п.4 ревью PR #78): INSERT без upsert —
+    /// конфликт PK означает чужой живой прогон (громкий отказ вместо
+    /// взаимной порчи работы). Мёртвый pid = крэш прежнего прогона —
+    /// лок снимается (steal) и занимает место. Живёт в таблице locks:
+    /// clear_for_rebuild стирает meta, лок обязан переживать fresh-прогон.
+    pub fn acquire_rebuild_lock(&self) -> Result<()> {
+        let payload = format!("{}:{}", std::process::id(), chrono::Utc::now().timestamp());
+        match self.insert_rebuild_lock(&payload) {
+            Ok(_) => Ok(()),
+            Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                let existing = self.rebuild_lock_value()?.unwrap_or_default();
+                let pid = existing.split(':').next().unwrap_or_default();
+                if pid_alive(pid) {
+                    anyhow::bail!(
+                        "параллельный semantic rebuild уже идёт (pid {pid}) — жди завершения; если процесс мёртв, повторный запуск снимет устаревший lock"
+                    );
+                }
+                self.release_rebuild_lock()?;
+                self.insert_rebuild_lock(&payload)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Снятие лока после завершения прогона (idempotent: крэш-лок снимает
+    /// steal следующего запуска).
+    pub fn release_rebuild_lock(&self) -> Result<()> {
+        self.conn
+            .execute("delete from locks where key = ?1", [REBUILD_LOCK_KEY])?;
+        Ok(())
+    }
+
+    fn insert_rebuild_lock(&self, payload: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "insert into locks(key, value) values (?1, ?2)",
+            rusqlite::params![REBUILD_LOCK_KEY, payload],
+        )
+    }
+
+    fn rebuild_lock_value(&self) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("select value from locks where key = ?1 limit 1")?;
+        let mut rows = stmt.query([REBUILD_LOCK_KEY])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn place_lock(&self, payload: &str) -> Result<()> {
+        self.conn.execute(
+            "insert into locks(key, value) values (?1, ?2)
+             on conflict(key) do update set value = excluded.value",
+            rusqlite::params![REBUILD_LOCK_KEY, payload],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_payload(&self) -> Result<Option<String>> {
+        self.rebuild_lock_value()
     }
 
     /// write-транзакция на батч: короткие IMMEDIATE-серии не держат

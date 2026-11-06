@@ -9,8 +9,11 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub enum EmbedError {
-    /// Транспорт: сервер не отвечает (лежит/не запущен/таймаут).
+    /// Транспорт: сервер не отвечает (лежит/не запущен/отказ соединения).
     Unreachable { url: String, cause: String },
+    /// Таймаут запроса (медленный ответ/холодный старт модели) — отдельный
+    /// класс: на поисковом пути это исчерпание бюджета, а не лежащий сервер.
+    Timeout { url: String, cause: String },
     /// 404 «model not found» — модель не вытянута.
     ModelMissing { model: String },
     /// Прочий неуспешный ответ API.
@@ -24,6 +27,9 @@ impl std::fmt::Display for EmbedError {
         match self {
             Self::Unreachable { url, cause } => {
                 write!(f, "Ollama недоступна ({url}): {cause}")
+            }
+            Self::Timeout { url, cause } => {
+                write!(f, "таймаут эмбедд-запроса ({url}): {cause}")
             }
             Self::ModelMissing { model } => {
                 write!(f, "модели «{model}» нет — ollama pull {model}")
@@ -59,22 +65,35 @@ impl OllamaClient {
     }
 
     /// Батч-эмбеддинг; `index_dim = Some(d)` включает dim-guard (первый ответ
-    /// свежего индекса принимает фактическую dim как канон).
+    /// свежего индекса принимает фактическую dim как канон). Таймаут явный
+    /// на каждый вызов: поисковый путь берёт остаток wall-clock бюджета,
+    /// rebuild — полный таймаут батча.
     pub async fn embed(
         &self,
         inputs: &[String],
         index_dim: Option<usize>,
+        timeout: Duration,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
         let url = format!("{}/api/embed", self.base);
         let resp = self
             .client
             .post(&url)
+            .timeout(timeout)
             .json(&serde_json::json!({ "model": self.model, "input": inputs }))
             .send()
             .await
-            .map_err(|e| EmbedError::Unreachable {
-                url: url.clone(),
-                cause: e.to_string(),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    EmbedError::Timeout {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    }
+                } else {
+                    EmbedError::Unreachable {
+                        url: url.clone(),
+                        cause: e.to_string(),
+                    }
+                }
             })?;
 
         let status = resp.status();

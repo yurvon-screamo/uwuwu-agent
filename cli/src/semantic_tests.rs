@@ -42,6 +42,20 @@ impl KernelMock {
 
     fn handle(&self, stmt: &str) -> Vec<Value> {
         let blocks = self.blocks.lock().unwrap();
+        if stmt.contains("length(content)") {
+            // state-метрика status: блоки за верхней границей длины
+            let max = stmt
+                .split("length(content) > ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|v| v.parse::<usize>().ok())
+                .expect("граница длины парсится");
+            let count = blocks
+                .iter()
+                .filter(|b| b["content"].as_str().unwrap_or("").chars().count() > max)
+                .count();
+            return vec![json!({ "c": count })];
+        }
         if stmt.contains("count(*)") {
             // честный count: только строки над watermark-предикатом
             let after = stmt
@@ -144,6 +158,8 @@ impl Respond for KernelMock {
 struct EmbedMock {
     vector: Vec<f32>,
     inputs: Arc<Mutex<Vec<String>>>,
+    /// Задержка ответа — тесты таймаутов бюджета (п.2 ревью PR #78).
+    delay: Duration,
 }
 
 impl Respond for EmbedMock {
@@ -156,7 +172,9 @@ impl Respond for EmbedMock {
             .collect();
         self.inputs.lock().unwrap().extend(sent.iter().cloned());
         let embeddings: Vec<Vec<f32>> = inputs.iter().map(|_| self.vector.clone()).collect();
-        ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "embeddings": embeddings }))
+            .set_delay(self.delay)
     }
 }
 
@@ -174,6 +192,13 @@ async fn kernel_server(
 }
 
 async fn embed_server(vector: Vec<f32>) -> (MockServer, Arc<Mutex<Vec<String>>>) {
+    embed_server_with_delay(vector, Duration::ZERO).await
+}
+
+async fn embed_server_with_delay(
+    vector: Vec<f32>,
+    delay: Duration,
+) -> (MockServer, Arc<Mutex<Vec<String>>>) {
     let server = MockServer::start().await;
     let inputs = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -181,6 +206,7 @@ async fn embed_server(vector: Vec<f32>) -> (MockServer, Arc<Mutex<Vec<String>>>)
         .respond_with(EmbedMock {
             vector,
             inputs: inputs.clone(),
+            delay,
         })
         .mount(&server)
         .await;
@@ -211,6 +237,7 @@ fn opts_no_deadline() -> sync::SyncOptions {
     sync::SyncOptions {
         since: None,
         deadline: None,
+        embed_timeout: Duration::from_secs(2),
         page_delay: None,
         on_batch: None,
     }
@@ -261,14 +288,18 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
     let client = ollama(&server.uri());
 
     let vectors = client
-        .embed(&["один".into(), "два".into()], Some(3))
+        .embed(
+            &["один".into(), "два".into()],
+            Some(3),
+            Duration::from_secs(2),
+        )
         .await
         .expect("embed ок");
     assert_eq!(vectors.len(), 2);
     assert_eq!(inputs.lock().unwrap().len(), 2);
 
     let mismatch = client
-        .embed(&["три".into()], Some(1024))
+        .embed(&["три".into()], Some(1024), Duration::from_secs(2))
         .await
         .expect_err("dim-guard");
     assert!(matches!(
@@ -282,7 +313,10 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
 
     let dead = OllamaClient::new("http://127.0.0.1:1", "test-model", Duration::from_secs(1))
         .expect("client");
-    let unreachable = dead.embed(&["q".into()], None).await.expect_err("route");
+    let unreachable = dead
+        .embed(&["q".into()], None, Duration::from_secs(1))
+        .await
+        .expect_err("route");
     assert!(matches!(unreachable, EmbedError::Unreachable { .. }));
 
     let missing_server = MockServer::start().await;
@@ -294,7 +328,7 @@ async fn ollama_embed_guards_dim_and_reports_missing_model() {
         .mount(&missing_server)
         .await;
     let missing = ollama(&missing_server.uri())
-        .embed(&["q".into()], None)
+        .embed(&["q".into()], None, Duration::from_secs(2))
         .await
         .expect_err("404");
     assert!(matches!(missing, EmbedError::ModelMissing { .. }));
@@ -358,7 +392,10 @@ async fn delta_pages_through_equal_timestamp_run_without_loss() {
                 stmt.contains(&format!("limit {}", sync::PAGE)),
                 "LIMIT: {stmt}"
             );
-            assert!(!stmt.contains(", content,"), "скан не таскает content: {stmt}");
+            assert!(
+                !stmt.contains(", content,"),
+                "скан не таскает content: {stmt}"
+            );
         } else {
             // точечный fetch по PK
             assert!(stmt.contains("order by"), "ORDER BY: {stmt}");
@@ -443,6 +480,7 @@ async fn delta_deadline_exhausted_embeds_nothing() {
         &sync::SyncOptions {
             since: None,
             deadline: Some(Instant::now() - Duration::from_millis(1)),
+            embed_timeout: Duration::from_secs(2),
             page_delay: None,
             on_batch: None,
         },
@@ -577,6 +615,312 @@ async fn reconcile_skips_within_daily_interval() {
     assert!(inputs.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
+    // High ревью PR #96: прерванный бюджетом скан — рутинное событие
+    // поискового пути (бюджет 10s, живой бэклог). Частичный kernel против
+    // индекса даёт ложные vanished (весь несосканированный хвост) —
+    // прерванный прогон обязан быть no-op: без prune, без last_reconcile_at.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        Some(Instant::now() - Duration::from_millis(1)),
+    )
+    .await
+    .expect("reconcile");
+
+    assert_eq!(report.pruned, 0, "частичный скан не prune'ит индекс");
+    assert_eq!(report.repaired, 0, "частичный скан не ремонтирует");
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        1,
+        "чанк пережил прерванный прогон"
+    );
+    assert_eq!(
+        store.meta("last_reconcile_at").unwrap().as_deref(),
+        Some("1000"),
+        "прерванный прогон не засчитывается"
+    );
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_interrupted_repair_does_not_count_run() {
+    // Common ревью PR #96: частичный backfill (бюджет умер посреди repair)
+    // не должен проставлять last_reconcile_at — дыры ретраятся следующим
+    // поиском, а не через сутки.
+    let (server, _) = kernel_server_blocks_only(vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )])
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let outcome = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["b1".to_string()],
+        Some(Instant::now() - Duration::from_millis(1)),
+    )
+    .await
+    .expect("repair_missing");
+
+    assert!(!outcome.completed, "частичный outcome помечен");
+    assert_eq!(outcome.repaired, 0);
+    assert!(inputs.lock().unwrap().is_empty());
+    assert_eq!(
+        store.meta("last_reconcile_at").unwrap().as_deref(),
+        Some("1000")
+    );
+}
+
+// ——— п.1 stale-чанки: классификация по длине (мин./макс. граница) ———
+
+#[tokio::test]
+async fn reconcile_prunes_block_shrunk_below_min_chars() {
+    // Ревьюверский сценарий п.1: длинный блок проиндексирован, затем усох
+    // до ≤ MIN — reconcile обязан вычистить его из индекса, а не гонять
+    // холостой repair→drop ежедневно.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T1, "короткий", "/d");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "усохший чанк удалён из индекса"
+    );
+    assert_eq!(report.pruned, 1, "усохший блок учтён в prune");
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "усохший блок не переэмбеддится"
+    );
+}
+
+#[tokio::test]
+async fn delta_prunes_block_shrunk_below_min_chars() {
+    // Тот же усохший блок в overlap-окне дельты: старый чанк уходит
+    // из индекса сразу, не дожидаясь суточного reconcile.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T0, "короткий", "/d");
+    }
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("delta");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "усохший чанк удалён в той же дельте"
+    );
+    assert_eq!(report.skipped_short, 1);
+    assert_eq!(report.pruned, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delta_skips_oversize_block_without_indexing() {
+    // Блок за верхней границей (html_embed-стена): не индексируется,
+    // счётчик per-run растёт, эмбедд-маршрут не тратится.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![block("big", T0, &oversize, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("delta");
+
+    assert_eq!(store.chunk_count().unwrap(), 0, "оверсайз не в индексе");
+    assert_eq!(report.skipped_long, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_skips_oversize_backfill() {
+    // Backfill оверсайза не происходит: блок в ядре, в индексе его нет —
+    // и это финальное состояние, а не вечный repair-кандидат.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![block("big", T0, &oversize, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(report.repaired, 0, "оверсайз не попадает в backfill");
+    assert_eq!(store.chunk_count().unwrap(), 0);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_prunes_block_grown_beyond_max_chars() {
+    // Проиндексированный блок вырос за MAX: старый вектор больше не
+    // представляет содержимое — prune, не переэмбедд головы.
+    let medium = "х".repeat(5000);
+    let blocks = vec![block("b1", T0, &medium, "/d")];
+    let (server, blocks_handle, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+
+    {
+        let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+        let mut kernel = blocks_handle.lock().unwrap();
+        *kernel
+            .iter_mut()
+            .find(|b| b["id"].as_str() == Some("b1"))
+            .unwrap() = block("b1", T1, &oversize, "/d");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "переросший MAX чанк удалён"
+    );
+    assert_eq!(report.pruned, 1);
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn status_reports_oversize_blocks_by_target_types() {
+    // State-метрика status: оверсайз-блоки корпуса, stmt несёт фильтр
+    // целевых типов (тот же, что у индексации) и явный LIMIT.
+    let oversize = "х".repeat(sync::MAX_CONTENT_CHARS + 1);
+    let blocks = vec![
+        block("big", T0, &oversize, "/d"),
+        block(
+            "b1",
+            T0,
+            "обычный чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+    ];
+    let (server, _, stmts) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: "http://127.0.0.1:1".into(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    Store::open(&cfg.db_path).expect("пустой индекс для status");
+
+    let lines = crate::semantic::status(&sy, &cfg).await.expect("status");
+
+    let line = lines
+        .iter()
+        .find(|l| l.contains("не индексируются"))
+        .expect("строка метрики оверсайза");
+    assert!(line.contains('1'), "оверсайз-блок один: {line}");
+    let captured = stmts.lock().unwrap();
+    let metric_stmt = captured
+        .iter()
+        .find(|s| s.contains("length(content)"))
+        .expect("stmt метрики ушёл в ядро");
+    assert!(
+        metric_stmt.contains("type in"),
+        "фильтр целевых типов в метрике: {metric_stmt}"
+    );
+    assert!(metric_stmt.contains("limit"), "явный LIMIT: {metric_stmt}");
+}
+
 // ——— search_half: матрица деградации и happy path ———
 
 fn config(dir: &std::path::Path, embed_url: &str) -> SemanticConfig {
@@ -646,6 +990,284 @@ async fn search_half_reports_model_mismatch() {
 
     assert!(lines[1].contains("другой моделью"));
     assert!(lines[1].contains("semantic rebuild"));
+}
+
+// ——— п.2 бюджет поиска: wall-clock ≤ 10s, честный таймаут ———
+
+fn seed_indexed_chunk(dir: &std::path::Path) {
+    let mut store = index_ready_store(dir);
+    let chunk = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "c1".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/h".into(),
+            updated: T0.into(),
+        },
+        content: "чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[chunk], Some(T0)).unwrap();
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn search_half_reports_timeout_when_budget_spent_by_sync() {
+    // Бюджет исчерпан синхронизацией: эмбедд запроса не выполняется,
+    // секция — честный «таймаут (бюджет 10s)», не «недоступен».
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    seed_indexed_chunk(dir.path());
+
+    let section = crate::semantic::search_half_at(
+        &sy,
+        &cfg,
+        &crate::semantic::SearchHalfRequest {
+            query: "запрос",
+            limit: 10,
+            threshold: 0.35,
+        },
+        Instant::now() - Duration::from_millis(1),
+    )
+    .await;
+
+    assert!(
+        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
+        "секция: {section:?}"
+    );
+    assert!(!section.iter().any(|l| l.contains("недоступен")));
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "эмбедд запроса не выполнялся"
+    );
+}
+
+#[tokio::test]
+async fn search_half_bounds_query_embed_timeout_by_remaining_budget() {
+    // Дельта пуста, на эмбедд запроса осталось ~200ms, embed-мок отвечает
+    // через 2s: Timeout, wall-clock ≈ остаток бюджета — не полный таймаут.
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    seed_indexed_chunk(dir.path());
+
+    let started = Instant::now();
+    let section = crate::semantic::search_half_at(
+        &sy,
+        &cfg,
+        &crate::semantic::SearchHalfRequest {
+            query: "запрос",
+            limit: 10,
+            threshold: 0.35,
+        },
+        started + Duration::from_millis(200),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
+        "секция: {section:?}"
+    );
+    assert!(
+        section.iter().any(|l| l.contains("не уложился в остаток")),
+        "честный факт остатка: {section:?}"
+    );
+    assert!(!section.iter().any(|l| l.contains("недоступен")));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "wall-clock ≈ остаток бюджета, не 2s/10s: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn embed_timeout_is_distinct_from_unreachable() {
+    // Классификация: reqwest-таймаут → Timeout (медленный ответ/холодный
+    // старт), не Unreachable (лежащая Ollama) — статус не вводит в
+    // заблуждение (п.2 ревью PR #78).
+    let (server, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
+    let client =
+        OllamaClient::new(&server.uri(), "test-model", Duration::from_secs(5)).expect("client");
+
+    let err = client
+        .embed(&["запрос".into()], None, Duration::from_millis(100))
+        .await
+        .expect_err("таймаут");
+
+    assert!(matches!(err, EmbedError::Timeout { .. }), "{err}");
+    assert!(err.to_string().contains("таймаут"));
+}
+
+// ——— п.3 resume: model-guard ———
+
+#[tokio::test]
+async fn rebuild_resume_refuses_model_mismatch() {
+    // Прерванный билд моделью A + resume при env-модели B молча дособрал бы
+    // индекс смешанными эмбеддингами (п.3 ревью PR #78) — громкий отказ.
+    let blocks = vec![block(
+        "a2",
+        T1,
+        "второй чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: embed.uri(),
+        embed_model: "model-b".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    let mut store = seeded_store(dir.path());
+    store.set_meta("model", "model-a").unwrap();
+    let partial = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "a0".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/d".into(),
+            updated: T0.into(),
+        },
+        content: "первый чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[partial], Some(T0)).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+
+    let err = match crate::semantic::rebuild(&sy, &cfg, None, true).await {
+        Ok(_) => panic!("model mismatch на resume — ожидание отказа"),
+        Err(e) => e,
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("model-a"), "индексная модель: {message}");
+    assert!(message.contains("model-b"), "env-модель: {message}");
+    assert!(inputs.lock().unwrap().is_empty(), "смешение не началось");
+    let store = seeded_store(dir.path());
+    assert_eq!(store.chunk_count().unwrap(), 1, "чанки не тронуты");
+}
+
+#[tokio::test]
+async fn rebuild_resume_adopts_missing_model_meta() {
+    // Сбой до первого батча: чанки есть, meta.model нет — resume adopt'ит
+    // env-модель (семантика свежей БД) и продолжает.
+    let blocks = vec![block(
+        "a2",
+        T1,
+        "второй чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = SemanticConfig {
+        embed_url: embed.uri(),
+        embed_model: "test-model".into(),
+        db_path: dir.path().join("semantic.db"),
+    };
+    let mut store = seeded_store(dir.path());
+    let partial = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "a0".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/d".into(),
+            updated: T0.into(),
+        },
+        content: "первый чанк с длинным содержанием для индексации".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[partial], Some(T0)).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+    assert_eq!(seeded_store(dir.path()).meta("model").unwrap(), None);
+
+    crate::semantic::rebuild(&sy, &cfg, None, true)
+        .await
+        .expect("resume после adopt");
+
+    let store = seeded_store(dir.path());
+    assert_eq!(
+        store.meta("model").unwrap().as_deref(),
+        Some("test-model"),
+        "env-модель adopt'нута в meta"
+    );
+}
+
+// ——— п.4 rebuild-lock: advisory-лок в таблице locks ———
+
+#[test]
+fn rebuild_lock_refuses_second_acquisition_for_live_pid() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("первый acquire");
+    let err = store
+        .acquire_rebuild_lock()
+        .expect_err("второй acquire при живом прогоне");
+
+    assert!(err.to_string().contains("уже идёт"), "{err}");
+}
+
+#[test]
+fn rebuild_lock_steals_from_dead_pid() {
+    // Крэш прежнего прогона: устаревший lock снимается следующим запуском.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+    store
+        .place_lock("99999999:1700000000")
+        .expect("мёртвый pid");
+
+    store.acquire_rebuild_lock().expect("steal от мёртвого pid");
+
+    let payload = store
+        .lock_payload()
+        .expect("payload")
+        .expect("лок на месте");
+    let pid = payload.split(':').next().expect("pid в payload");
+    assert_eq!(
+        pid,
+        std::process::id().to_string(),
+        "лок перезаписан текущим процессом"
+    );
+}
+
+#[test]
+fn rebuild_lock_release_allows_fresh_acquisition() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("acquire");
+    store.release_rebuild_lock().expect("release");
+    store.acquire_rebuild_lock().expect("acquire после release");
+}
+
+#[test]
+fn rebuild_lock_survives_clear_for_rebuild() {
+    // Пиннящий тест дыры (ревью плана v1, High): лок в стираемой meta
+    // переживал clear только до первого fresh-прогона — два параллельных
+    // fresh-запуска оба проходили. Лок живёт в таблице locks вне меты.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store.acquire_rebuild_lock().expect("acquire");
+    store.clear_for_rebuild().expect("clear");
+    let err = store
+        .acquire_rebuild_lock()
+        .expect_err("второй fresh-прогон после clear");
+
+    assert!(err.to_string().contains("уже идёт"), "{err}");
 }
 
 #[tokio::test]
@@ -756,8 +1378,8 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
         eprintln!("skip: APP_TEST_LLM=1 не задан (opt-in Tier-L)");
         return;
     }
-    let base = std::env::var("UWUWU_EMBED_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let base =
+        std::env::var("UWUWU_EMBED_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let model =
         std::env::var("APP_TEST_LLM_MODEL").unwrap_or_else(|_| "qwen3-embedding:0.6b".into());
 
@@ -775,9 +1397,15 @@ async fn tier_l_real_ollama_ranks_relevant_chunk_higher() {
     let client = OllamaClient::new(&base, &model, Duration::from_secs(60)).expect("client");
     let query = "как протянуть защищённый туннель до ноутбука через публичный релей".to_string();
     let relevant = "rathole-клиент устанавливает туннель до сервера через TCP-релей, пробрасывая локальный порт ноутбука в публичный endpoint".to_string();
-    let irrelevant = "канбан-доска задач хранит строки с колонками Title, Status, Branch и PR в SiYuan database".to_string();
+    let irrelevant =
+        "канбан-доска задач хранит строки с колонками Title, Status, Branch и PR в SiYuan database"
+            .to_string();
     let vectors = client
-        .embed(&[query, relevant, irrelevant], None)
+        .embed(
+            &[query, relevant, irrelevant],
+            None,
+            Duration::from_secs(60),
+        )
         .await
         .expect("живой эмбеддинг");
     let query_vec = &vectors[0];
@@ -796,10 +1424,30 @@ async fn rebuild_resume_continues_from_watermark_without_reembedding() {
     // a1 в секунду сбоя, a2/a3 не доезжали. Watermark = T0.
     let t_old = "20261104235800"; // T0 − 120 s: за границей overlap
     let blocks = vec![
-        block("a0", t_old, "нулевой чанк с длинным содержанием для индексации", "/d"),
-        block("a1", T0, "первый чанк с длинным содержанием для индексации", "/d"),
-        block("a2", T1, "второй чанк с длинным содержанием для индексации", "/d"),
-        block("a3", T1, "третий чанк с длинным содержанием для индексации", "/d"),
+        block(
+            "a0",
+            t_old,
+            "нулевой чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a1",
+            T0,
+            "первый чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a2",
+            T1,
+            "второй чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a3",
+            T1,
+            "третий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
     ];
     let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
@@ -831,7 +1479,9 @@ async fn rebuild_resume_continues_from_watermark_without_reembedding() {
         tx.commit().unwrap();
     }
 
-    crate::semantic::rebuild(&sy, &cfg, None, true).await.expect("resume");
+    crate::semantic::rebuild(&sy, &cfg, None, true)
+        .await
+        .expect("resume");
 
     let embedded = inputs.lock().unwrap();
     // a0 вне overlap-окна — не переэмбедден; хвост секунды сбоя (a1,
@@ -880,8 +1530,18 @@ async fn backlog_size_counts_only_rows_above_watermark() {
     // Регрессия: литерал watermark без кавычек делал строковое updated
     // числом и count отдавал «все строки ядра».
     let blocks = vec![
-        block("a1", "20261103230000", "первый чанк с длинным содержанием для индексации", "/d"),
-        block("a2", "20261104000000", "второй чанк с длинным содержанием для индексации", "/d"),
+        block(
+            "a1",
+            "20261103230000",
+            "первый чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "a2",
+            "20261104000000",
+            "второй чанк с длинным содержанием для индексации",
+            "/d",
+        ),
     ];
     let (server, _) = kernel_server_blocks_only(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
