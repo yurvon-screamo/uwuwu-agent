@@ -191,6 +191,19 @@ export function untrackedTasks(rows: TaskRef[], state: FactoryState): TaskRef[] 
   return rows.filter((r) => state.tasks[r.rowId] === undefined)
 }
 
+/** Гارد-наборы GC ворктри: ветки и каталоги всего, что числится в state,
+ *  снос легаси-ворктри не трогает никогда. */
+export function activeTaskGuards(state: FactoryState): { branches: Set<string>; dirs: Set<string> } {
+  const branches = new Set<string>()
+  const dirs = new Set<string>()
+  for (const task of Object.values(state.tasks)) {
+    if (task.branch !== "") branches.add(task.branch)
+    if (task.worktree !== "") dirs.add(task.worktree)
+    if (task.envDir !== undefined && task.envDir !== "") dirs.add(task.envDir)
+  }
+  return { branches, dirs }
+}
+
 /** Текст коммента с контекстом ответа: page-режим (ответ цитатой на кусок
  *  дока/коммента) несёт preview = цитата-якорь; треды — см. taskComments. */
 export function commentText(content: unknown): string {

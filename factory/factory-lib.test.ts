@@ -44,6 +44,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
   type SpawnGuardLimits,
 } from "./factory-lib"
@@ -1137,5 +1138,35 @@ describe("alertTargetOf: фолбэк-цепочка адресата алерт
 
   test("пустой список — null", () => {
     expect(alertTargetOf([])).toBeNull()
+  })
+})
+
+describe("activeTaskGuards", () => {
+  const tracked = (branch: string, worktree: string, envDir?: string) => ({
+    sessionID: "ses_abc", worktree, branch,
+    bodyDoc: "d1", title: "t", project: "uwuwu", lastCommentAt: 1, lastCommentId: "i", createdAt: 2, attempts: 0,
+    ...(envDir !== undefined ? { envDir } : {}),
+  })
+  const state = (tasks: Record<string, ReturnType<typeof tracked>>): FactoryState => ({ tasks })
+
+  test("ветки и каталоги (worktree + envDir) активных задач собираются", () => {
+    const guards = activeTaskGuards(state({
+      a: tracked("work/task-a", "/env/a/repo", "/env/a"),
+      b: tracked("factory/legacy-branch", "/wt/legacy"),
+    }))
+    expect([...guards.branches].sort()).toEqual(["factory/legacy-branch", "work/task-a"])
+    expect([...guards.dirs].sort()).toEqual(["/env/a", "/env/a/repo", "/wt/legacy"])
+  })
+
+  test("пустые ветка/ворктри (карантин) — мимо наборов", () => {
+    const guards = activeTaskGuards(state({ c: tracked("", "",) }))
+    expect(guards.branches.size).toBe(0)
+    expect(guards.dirs.size).toBe(0)
+  })
+
+  test("пустой state — пустые наборы", () => {
+    const guards = activeTaskGuards({ tasks: {} })
+    expect(guards.branches.size).toBe(0)
+    expect(guards.dirs.size).toBe(0)
   })
 })
