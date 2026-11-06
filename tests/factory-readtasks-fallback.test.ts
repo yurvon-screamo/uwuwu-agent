@@ -59,9 +59,14 @@ describe("readTasks: фоллбек тела по тайтлу (detached-стр�
     expect(v.bodies["row-slash"]).toBe("20261106000000-slashbod")
     expect(v.hpathCalls).toContain("/uwuwu/Задачи x/Deploy: up\u{2215}down gateway")
 
-    // кэш: get_doc доски ровно один на 7 detached-строк
+    // known-строка (трек знает bodyDoc из state): тело из known-карты,
+    // фоллбек не тикает — ни hpath-вызова, ни мимо-мока
+    expect(v.bodies["row-known"]).toBe("20261106000000-knownbod")
+    expect(v.hpathCalls).not.toContain("/uwuwu/Задачи x/Known док")
+
+    // кэш: get_doc доски ровно один на проход
     expect(v.boardGetDocCalls).toBe(1)
-    // bound-строка не ходит в фоллбек: вызовов getIDsByHPath — по числу detached
+    // bound и known не ходят в фоллбек: 8 detached − 1 известная = 7 вызовов
     expect(v.hpathCalls).toHaveLength(7)
 
     // дубль-сироты: агрегированный лог одной строкой, обе строки в ней

@@ -39,7 +39,15 @@ const ROWS = [
   rowOf("row-cache-a", "Cache A"),
   rowOf("row-cache-b", "Cache B"),
   rowOf("row-cache-c", "Cache C"),
+  // known-строка только в resolve-сценарии: state-карта от child'а должна
+  // убрать её hpath-вызов (8 detached − 1 известная = 7 вызовов); в прочих
+  // сценариях её нет — там проверяется деградация резолвера
+  ...(SCENARIO === "resolve" ? [rowOf("row-known", "Known док")] : []),
 ]
+
+/** known-карта среза «сверка с state»: rowId → bodyDoc, как её строит
+ *  tickProject из state.tasks. */
+const KNOWN = new Map([["row-known", "20261106000000-knownbod"]])
 
 const HPATH_TO_IDS: Record<string, string[]> = {
   [`${BOARD_HPATH}/Detached single`]: ["20261106000000-singlebod"],
@@ -122,7 +130,10 @@ mkdirSync(dirname(logPath), { recursive: true })
 
 const probe = scriptKernel()
 const { readTasks } = await import("../factory/factory")
-const rows = await readTasks({ docId: BOARD_DOC, dbId: "avblk1" })
+const rows = await readTasks(
+  { docId: BOARD_DOC, dbId: "avblk1" },
+  SCENARIO === "resolve" ? KNOWN : undefined,
+)
 
 let logText = ""
 try { logText = readFileSync(logPath, "utf-8") } catch { /* лога ещё нет — тоже валидно */ }

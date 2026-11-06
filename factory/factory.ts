@@ -234,7 +234,10 @@ async function boardViaOrganize(title: string): Promise<string | null> {
   return null
 }
 
-export async function readTasks(board: BoardIds): Promise<TaskRef[]> {
+export async function readTasks(
+  board: BoardIds,
+  known: ReadonlyMap<string, string> = new Map(),
+): Promise<TaskRef[]> {
   const r = await mcp.tool<{
     rows?: {
       rowBlockId?: string
@@ -261,23 +264,32 @@ export async function readTasks(board: BoardIds): Promise<TaskRef[]> {
   for (const row of raw) {
     const title = (row.title ?? "").trim()
     let bodyDoc = row.linkedDocId ?? ""
-    if (bodyDoc === "" && title !== "") {
-      const bp = await boardPathOnce()
-      if (bp.kind === "active") {
-        try {
-          const found = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-            notebook: bp.box, path: `${bp.hpath}/${pathSafe(title)}`,
-          })).ids ?? []
-          if (found.length === 1) bodyDoc = found[0] as string
-          else if (found.length >= 2) orphans.push(`${String(row.rowBlockId).slice(0, 8)} → ${found.join(", ")}`)
-        } catch (e) {
-          // фоллбек — best effort: сбой ядра на одной detached-строке не должен
-          // глушить тик (комменты/будильники здоровых привязанных строк)
-          log(`задача ${String(row.rowBlockId).slice(0, 8)}: фоллбек тела по тайтлу не удался (${errText(e)}) — строка без тела`)
+    if (bodyDoc === "") {
+      // Трек уже знает тело (self-heal прошлых тиков): state выигрывает у
+      // фоллбека без единого API-вызова — per-tick трафик не растёт с числом
+      // detached-строк. Результат фоллбека для такого трека и сегодня
+      // отбрасывался бы (adopt идемпотентен, комменты читаются из
+      // tracked.bodyDoc). linkedDocId по-прежнему всегда выигрывает над state.
+      const knownDoc = known.get(row.rowBlockId as string) ?? ""
+      if (knownDoc !== "") bodyDoc = knownDoc
+      else if (title !== "") {
+        const bp = await boardPathOnce()
+        if (bp.kind === "active") {
+          try {
+            const found = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+              notebook: bp.box, path: `${bp.hpath}/${pathSafe(title)}`,
+            })).ids ?? []
+            if (found.length === 1) bodyDoc = found[0] as string
+            else if (found.length >= 2) orphans.push(`${String(row.rowBlockId).slice(0, 8)} → ${found.join(", ")}`)
+          } catch (e) {
+            // фоллбек — best effort: сбой ядра на одной detached-строке не должен
+            // глушить тик (комменты/будильники здоровых привязанных строк)
+            log(`задача ${String(row.rowBlockId).slice(0, 8)}: фоллбек тела по тайтлу не удался (${errText(e)}) — строка без тела`)
+          }
         }
+        // failed/disabled: деградация уже залогирована резолвером одной строкой
+        // на проход — per-row спам не дублируем, строка остаётся без тела
       }
-      // failed/disabled: деградация уже залогирована резолвером одной строкой
-      // на проход — per-row спам не дублируем, строка остаётся без тела
     }
     rows.push({
       rowId: row.rowBlockId as string,
@@ -811,7 +823,11 @@ async function dispatchReviewAction(
 
 export async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
-  const rows = await readTasks(board)
+  // known bodyDocs из state: detached-строки с излеченным треком идут мимо
+  // фоллбека (без API-вызовов); читается до волны спавнов — новые старты
+  // этого тика резолвятся фоллбеком как раньше
+  const knownBodyDocs = new Map(Object.entries(state.tasks).map(([id, t]) => [id, t.bodyDoc]))
+  const rows = await readTasks(board, knownBodyDocs)
   // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
   log(`проход ${projectName}: строк ${rows.length}`)
   const counters: PassCounters = {
