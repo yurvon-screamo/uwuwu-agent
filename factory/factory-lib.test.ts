@@ -969,6 +969,7 @@ describe("createBoardPathOnce — ленивый мемоизер пути до�
 
 const ref = (overrides: Partial<TaskRef> & { rowId: string }): TaskRef => ({
   bodyDoc: "", title: "Задача", status: "Design", pr: "", branch: "",
+  devSession: "", reviewSession: "", // явная нормализация: undefined тестируется отдельным кейсом
   ...overrides,
 })
 
@@ -1162,6 +1163,20 @@ describe("alertTargetOf: фолбэк-цепочка адресата алерт
 
     // Assert
     expect(target).toBeNull()
+  })
+
+  test("undefined-поля ячеек — свидетельством не являются (TaskRef без нормализации)", () => {
+    // Arrange: r1 несёт devSession, r2/r3 — поля не заданы вовсе
+    const candidates = [
+      ref({ rowId: "r1", bodyDoc: "doc1" }),
+      ref({ rowId: "r2", bodyDoc: "doc2", devSession: undefined, reviewSession: undefined }),
+    ]
+
+    // Act
+    const target = alertTargetOf(candidates)
+
+    // Assert: сирот нет (undefined не свидетель) — фолбэк: первая с телом
+    expect(target?.rowId).toBe("r1")
   })
 
   test("пустой список — null", () => {

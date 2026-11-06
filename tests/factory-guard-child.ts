@@ -2,6 +2,8 @@
 // (не запускать руками). Сценарий — env GUARD_SCENARIO:
 //   hold       — пустой state + доска с сиротами-спавнами (строки с сессионной
 //                ячейкой без трека): HOLD, алерт, бэкап, ноль спавнов;
+//   resolve    — доска без spawnable-строк: allow при стоящем флаге эпизода —
+//                демон обязан снять holdSignaled (выход из эпизода);
 //   done-clean — трекнутая Done-строка с сессионными ячейками: чистка state
 //                + очистка ячеек (инвариант гарда), ноль спавнов.
 // HOME задаются родителем ДО старта процесса: os.homedir() в bun читает env
@@ -10,7 +12,9 @@ import { mkdirSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const SCENARIO = process.env.GUARD_SCENARIO === "done-clean" ? "done-clean" : "hold"
+const SCENARIO = process.env.GUARD_SCENARIO === "done-clean"
+  ? "done-clean"
+  : process.env.GUARD_SCENARIO === "resolve" ? "resolve" : "hold"
 const AV_ID = "20260101000000-abcdef"
 
 interface MockRow {
@@ -38,7 +42,10 @@ const DONE_ROWS: MockRow[] = [{
   title: "Закрытая задача",
 }]
 
-const rows = SCENARIO === "done-clean" ? DONE_ROWS : HOLD_ROWS
+// resolve: доска без spawnable-строк — сирот и untracked нет, allow при любом флаге
+const RESOLVE_ROWS: MockRow[] = HOLD_ROWS.map((r) => ({ ...r, status: "Todo", devSession: undefined }))
+
+const rows = SCENARIO === "done-clean" ? DONE_ROWS : SCENARIO === "resolve" ? RESOLVE_ROWS : HOLD_ROWS
 
 function scriptTick(): string[] {
   const calls: string[] = []

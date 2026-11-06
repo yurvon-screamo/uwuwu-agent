@@ -723,13 +723,17 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
   return { t: "hold", reason, alert, text }
 }
 
+/** Свидетель спавна в строке: сессионная ячейка непуста. Поля опциональны —
+ *  undefined (TaskRef без нормализации) свидетельством НЕ является. */
+export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession">): boolean {
+  return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== ""
+}
+
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →
  *  первая строка с телом (чистый burst без сирот) → null (ни одной строки
  *  с телом — алерт недоставим, терминальный лог-only случай). */
 export function alertTargetOf(candidates: TaskRef[]): TaskRef | null {
-  const orphanWithBody = candidates.find(
-    (r) => r.bodyDoc !== "" && (r.devSession !== "" || r.reviewSession !== ""),
-  )
+  const orphanWithBody = candidates.find((r) => r.bodyDoc !== "" && hasSessionEvidence(r))
   if (orphanWithBody !== undefined) return orphanWithBody
   return candidates.find((r) => r.bodyDoc !== "") ?? null
 }

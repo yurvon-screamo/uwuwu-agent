@@ -63,6 +63,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  hasSessionEvidence,
   stampLegacyEntries,
   PATH_CELL,
   DEV_SESSION_CELL,
@@ -1041,7 +1042,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // сирота-спавн: сессионная ячейка непуста, а трека в state нет — state
   // потерял трекинг (порча/перезапись/тест-запись). Спавнить их = гарантированный
   // каскад re-spawn (19 агентов за тик) и параллельные сессии в одних ворктри.
-  const orphaned = untracked.filter((r) => r.devSession !== "" || r.reviewSession !== "").length
+  const orphaned = untracked.filter((r) => hasSessionEvidence(r)).length
   const guard = spawnGuardVerdict(
     { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
     SPAWN_LIMITS,

@@ -41,7 +41,9 @@ describe("tickProject: гард каскада при потере state", () =>
     rmSync(home, { recursive: true, force: true })
   })
 
-  async function runTick(scenario: "hold" | "done-clean", stateJson: string): Promise<GuardVerdict> {
+  async function runTick(
+    scenario: "hold" | "done-clean" | "resolve", stateJson: string,
+  ): Promise<GuardVerdict> {
     // Arrange: state и service.json песочницы — до старта ребёнка
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), stateJson)
     const proc = Bun.spawn(["bun", CHILD], {
@@ -97,6 +99,32 @@ describe("tickProject: гард каскада при потере state", () =>
     expect(verdict.holdSignaled).toBe(afterTick1.holdSignaled ?? null)
     expect(verdict.comments).toEqual([])
     expect(suspectBackups().length).toBe(1)
+  })
+
+  test("полный цикл эпизода: hold → allow снял флаг → повторный hold даёт второй бэкап и алерт снова", async () => {
+    // Arrange: вход в эпизод — флаг и первый бэкап
+    await runTick("hold", JSON.stringify({ tasks: {} }))
+    const flag1 = savedState().holdSignaled
+    expect(flag1).toBeDefined()
+    expect(suspectBackups().length).toBe(1)
+
+    // Act: сигнатура ушла (allow при стоящем флаге) — демон обязан снять флаг
+    const resolved = await runTick("resolve", readFileSync(join(home, ".local/state/uwuwu-factory/state.json"), "utf-8"))
+
+    // Assert: флаг стёрт, спавнов нет, эпизод завершён
+    expect(resolved.holdSignaled).toBeNull()
+    expect(resolved.sessionCreates).toBe(0)
+    expect(savedState().holdSignaled).toBeUndefined()
+
+    // Act: сигнатура вернулась — новый эпизод с alert=first
+    const reentered = await runTick("hold", readFileSync(join(home, ".local/state/uwuwu-factory/state.json"), "utf-8"))
+
+    // Assert: алерт доставлен снова, второй бэкап появился, флаг свежий
+    expect(reentered.holdSignaled).not.toBeNull()
+    expect(reentered.comments).toEqual(["20261106000000-doc1"])
+    expect(reentered.taskCount).toBe(0)
+    expect(suspectBackups().length).toBe(2)
+    expect(savedState().holdSignaled === flag1).toBe(false)
   })
 
   test("done-clean: чистка трека при Done — сессионные ячейки строки очищены (инвариант гарда)", async () => {
