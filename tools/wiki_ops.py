@@ -13,7 +13,10 @@ kernel-транспорт (post, конфиг, константы) без выи
                                    Projects + hpath /uwuwu/ADR, /Experience/cli →
                                    Experience + hpath /cli) или корневая папка ровно
                                    одного ноутбука (/uwuwu/ADR → Projects, /affine →
-                                   Experience); пустой --parent → Projects (легаси)
+                                   Experience); пустой --parent → Projects (легаси).
+                                   Гард номера ADR: живой SQL-find по папке-приёмнику —
+                                   занятый «ADR-NNN» в тайтле даёт предупреждение в stderr
+                                   (гонка параллельных дримеров 06.11), создание продолжается
   append <docId> --md <файл> [--force]         дописать markdown-блоки в конец
   replace <docId> --md <файл> [--base <снапшот>] [--force]
                                    заменить док целиком; --base — снапшот
@@ -268,8 +271,44 @@ def cmd_create(a):
     md = Path(a.file).read_text()
     nb_id, nb_name, prefix = _resolve_parent(a.parent)
     hpath = prefix.rstrip("/") + "/" + a.title.strip("/")
+    _warn_if_adr_number_taken(nb_id, prefix.rstrip("/"), a.title)
     post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
     print(f"создан: [{nb_name}] {hpath}")
+
+
+ADR_NUMBER_RE = re.compile(r"ADR-(\d{2,4})\b")
+
+
+def _adr_number(title: str) -> int | None:
+    match = ADR_NUMBER_RE.search(title)
+    return int(match.group(1)) if match else None
+
+
+def _warn_if_adr_number_taken(notebook_id: str, folder_hpath: str, title: str) -> None:
+    """Живой find номера ADR в папке-приёмнике до создания дока (профилактика гонки).
+
+    Гонка параллельных дримеров реальна: двойные ADR-033/037/040 за один день
+    (06.11) — orgls-срез у каждого автора был до создания чужого дока. Номер
+    держит первый по времени (ADR-013). Проба косметическая: отказ ядра не
+    роняет создание — только глушит проверку; находка — предупреждение в stderr,
+    не отказ (занятый номер бывает осознанным переездом дока).
+    """
+    number = _adr_number(title)
+    if number is None:
+        return
+    stmt = (f"select content, hpath from blocks where type='d' and box='{notebook_id}' "
+            f"and hpath like '{_sql_str(folder_hpath)}/%' limit 200")  # nosec B608 — box из kernel API, hpath экранирован _sql_str
+    try:
+        rows = _sql_rows(stmt, attempts=1)
+    except Exception:
+        print("ПРЕДУПРЕЖДЕНИЕ: проба занятости ADR-номера не состоялась (ядро) — "
+              'сверь папку руками: wiki_ops.py find "<тайтл>"', file=sys.stderr)
+        return
+    taken_by = [r["hpath"] for r in rows if _adr_number(r.get("content") or "") == number]
+    if taken_by:
+        print(f"ПРЕДУПРЕЖДЕНИЕ: номер ADR-{number:03d} уже занят в {folder_hpath}: "
+              f"{'; '.join(taken_by)} — номер держит первый по времени (ADR-013); "
+              f"создание продолжено", file=sys.stderr)
 
 
 def _normalize_parent(parent: str) -> str:
