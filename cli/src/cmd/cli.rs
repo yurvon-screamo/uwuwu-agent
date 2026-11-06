@@ -358,7 +358,7 @@ pub(crate) enum PersonSub {
     /// создать со скелетом (шапка приватности + секции) и сразу с этим
     /// текстом. Дедуп перед append — на пишущем: прочитай `person show`.
     Append {
-        #[arg(long, help = "Текст из stdin")]
+        #[arg(long, conflicts_with = "text", help = "Текст из stdin")]
         stdin: bool,
         #[arg(trailing_var_arg = true, help = "Markdown-текст (факт или секция)")]
         text: Vec<String>,
@@ -368,7 +368,7 @@ pub(crate) enum PersonSub {
     Replace {
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
-        #[arg(long, help = "Файл с markdown (иначе stdin)")]
+        #[arg(long, help = "Файл с markdown (обязателен без --stdin)")]
         md: Option<String>,
     },
 }

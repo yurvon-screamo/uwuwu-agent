@@ -596,6 +596,11 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
         }
         PersonSub::Replace { stdin, md } => {
             let content = read_body_input(md.as_deref(), stdin)?;
+            if content.trim().is_empty() {
+                bail!(
+                    "replace: пустой контент — персона не может быть пустой; правь/удаляй док в UI"
+                );
+            }
             let doc_id = person::replace(&sy, &target, &content).await?;
             println!(
                 "персона перезаписана: {}:{} ({doc_id})",

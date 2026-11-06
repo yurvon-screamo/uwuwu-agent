@@ -13,6 +13,19 @@ use crate::markdown::strip_export_wrapper;
 use crate::siyuan::SiYuan;
 use anyhow::{bail, Result};
 
+/// Ноутбук по имени — read-only (без create-or-get ensure_notebook):
+/// show — команда чтения, молча создавать ноутбук ей нельзя.
+async fn notebook_id_readonly(sy: &SiYuan, name: &str) -> Result<Option<String>> {
+    for nb in sy.notebooks().await? {
+        if !nb.get("closed").and_then(|c| c.as_bool()).unwrap_or(false)
+            && nb.get("name").and_then(|n| n.as_str()) == Some(name)
+        {
+            return Ok(nb.get("id").and_then(|i| i.as_str()).map(String::from));
+        }
+    }
+    Ok(None)
+}
+
 /// Канонический адрес персоны: ноутбук и hpath (env-шов для e2e).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonTarget {
@@ -38,7 +51,9 @@ impl PersonTarget {
 /// несколько id) — громкая ошибка: молча брать первый значит тихо потерять
 /// второй; чистится руками в UI (дисциплина task create).
 pub async fn resolve(sy: &SiYuan, target: &PersonTarget) -> Result<Option<String>> {
-    let nb = sy.ensure_notebook(&target.notebook).await?;
+    let Some(nb) = notebook_id_readonly(sy, &target.notebook).await? else {
+        return Ok(None);
+    };
     let ids = sy.doc_ids_by_hpath(&nb, &target.hpath).await?;
     match ids.len() {
         0 => Ok(None),
@@ -76,8 +91,9 @@ pub async fn show(sy: &SiYuan, target: &PersonTarget) -> Result<String> {
 
 /// Дописать markdown в конец (факт/секция). Дока нет — создать со скелетом
 /// и сразу с этим текстом (один атомарный createDocWithMd); создание
-/// верифицируется ждущим резолвом (дубль hpath двух создателей → громкий
-/// отказ resolve). Возвращает docId.
+/// верифицируется ждущим резолвом со сверкой id (дубль hpath двух создателей
+/// → громкий отказ resolve, невидимый индексом дубль — расхождением id).
+/// Возвращает docId.
 pub async fn append(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<String> {
     if md.trim().is_empty() {
         bail!("append: пустой текст — нечего дописывать");
@@ -91,27 +107,40 @@ pub async fn append(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<Stri
             let nb = sy.ensure_notebook(&target.notebook).await?;
             let combined = format!("{}\n{}", skeleton(target), md.trim_end());
             let created = sy.create_doc_md(&nb, &target.hpath, &combined).await?;
-            match resolve_waited(sy, target).await? {
-                // дубли hpath уже отловлены resolve (>1 → громкий отказ)
-                Some(doc_id) => Ok(doc_id),
-                None if !created.is_empty() => Ok(created),
-                None => Err(person_missing()),
-            }
+            verify_created(sy, target, &created).await
         }
     }
 }
 
+/// Верификация только что созданного дока: ждём индекс и сверяем резолвнутый
+/// id с возвращённым create'ом. Совпал — наш док и дублей нет (len>1 отловлен
+/// resolve); индекс видит ЧУЖОЙ id — гонка двух создателей, дубль уже есть →
+/// громкий отказ; индекс никого не видит — доверяем ответу create.
+async fn verify_created(sy: &SiYuan, target: &PersonTarget, created: &str) -> Result<String> {
+    match resolve_waited(sy, target).await? {
+        Some(doc_id) if created.is_empty() || doc_id == created => Ok(doc_id),
+        Some(other) => bail!(
+            "создание персоны {} задублировалось (создан {created}, индекс видит {other}) — почисти в UI, оставь один",
+            target.hpath
+        ),
+        None if !created.is_empty() => Ok(created.to_string()),
+        None => Err(person_missing()),
+    }
+}
+
 /// Перезаписать контент целиком на месте (docId стабилен). Дока нет —
-/// создать (без скелета: полная перезапись = ответственность пишущего).
+/// создать: контент пишет сам create, повторной перезаписи нет. Пустой
+/// контент — отказ (персона не может быть пустой).
 pub async fn replace(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<String> {
+    if md.trim().is_empty() {
+        bail!("replace: пустой контент — персона не может быть пустой; правь/удаляй док в UI");
+    }
     let doc_id = match resolve(sy, target).await? {
         Some(doc_id) => doc_id,
         None => {
             let nb = sy.ensure_notebook(&target.notebook).await?;
-            sy.create_doc_md(&nb, &target.hpath, md).await?;
-            resolve_waited(sy, target)
-                .await?
-                .ok_or_else(person_missing)?
+            let created = sy.create_doc_md(&nb, &target.hpath, md).await?;
+            verify_created(sy, target, &created).await?
         }
     };
     sy.overwrite_doc_md(&doc_id, md).await?;

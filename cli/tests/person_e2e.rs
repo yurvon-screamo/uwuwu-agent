@@ -149,6 +149,54 @@ async fn replace_rewrites_in_place_keeps_doc_id() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn duplicate_hpath_is_loud_error() -> Result<()> {
+    if !e2e_enabled() {
+        return Ok(());
+    }
+    let target = e2e_target();
+    let sy = SiYuan::from_env()?;
+    cleanup(&sy).await?;
+
+    // гонка двух создателей руками: два createDocWithMd на один hpath
+    let nb = sy.ensure_notebook(E2E_NOTEBOOK).await?;
+    sy.create_doc_md(&nb, E2E_HPATH, "первый").await?;
+    for _ in 0..10 {
+        if !sy.doc_ids_by_hpath(&nb, E2E_HPATH).await?.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sy.create_doc_md(&nb, E2E_HPATH, "второй").await?;
+    for _ in 0..10 {
+        if sy.doc_ids_by_hpath(&nb, E2E_HPATH).await?.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // resolve: громкий отказ вместо молчаливого «взять первый»
+    let err = siyuan_person::resolve(&sy, &target).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("продублирован"), "неожиданная ошибка: {msg}");
+    assert!(msg.contains("почисти в UI"), "нет пути починки: {msg}");
+
+    // append: тот же громкий отказ (не дописывает в первый попавшийся)
+    let err = siyuan_person::append(&sy, &target, "факт в дубль")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("продублирован"),
+        "append на дубле должен отказать: {err:#}"
+    );
+
+    // show: тоже отказ, не молчаливый вывод первого дока
+    let err = siyuan_person::show(&sy, &target).await.unwrap_err();
+    assert!(format!("{err:#}").contains("продублирован"));
+    cleanup(&sy).await
+}
+
+#[tokio::test]
+#[serial]
 async fn replace_creates_when_missing() -> Result<()> {
     if !e2e_enabled() {
         return Ok(());
@@ -164,5 +212,29 @@ async fn replace_creates_when_missing() -> Result<()> {
         !md.contains("Границы приватности"),
         "replace не должен подмешивать скелет"
     );
+    cleanup(&sy).await
+}
+
+#[tokio::test]
+#[serial]
+async fn empty_replace_is_refused() -> Result<()> {
+    if !e2e_enabled() {
+        return Ok(());
+    }
+    let target = e2e_target();
+    let sy = SiYuan::from_env()?;
+    cleanup(&sy).await?;
+
+    // пустой replace не должен стирать существующую персону
+    siyuan_person::append(&sy, &target, "ценный факт").await?;
+    let err = siyuan_person::replace(&sy, &target, "   \n")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("пустой контент"),
+        "неожиданная ошибка: {err:#}"
+    );
+    let md = siyuan_person::show(&sy, &target).await?;
+    assert!(md.contains("ценный факт"), "пустой replace стёр персону");
     cleanup(&sy).await
 }
