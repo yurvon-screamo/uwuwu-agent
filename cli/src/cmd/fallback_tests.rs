@@ -130,6 +130,9 @@ struct Kernel {
     item_updates: Mutex<Vec<(String, String, String)>>,
     appends: Mutex<Vec<String>>,
     sql_fail: AtomicBool,
+    /// true → item_update отвечает success-формой с ok:false (WRITE_QUEUE_TIMEOUT):
+    /// логический фейл шлюза внутри HTTP 200 без isError.
+    item_update_ok_false: AtomicBool,
 }
 
 impl Kernel {
@@ -139,6 +142,7 @@ impl Kernel {
             item_updates: Mutex::new(Vec::new()),
             appends: Mutex::new(Vec::new()),
             sql_fail: AtomicBool::new(false),
+            item_update_ok_false: AtomicBool::new(false),
         })
     }
 
@@ -365,6 +369,11 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                     let item = args.get("itemID").and_then(|v| v.as_str()).unwrap_or("");
                     let key = args.get("keyID").and_then(|v| v.as_str()).unwrap_or("");
                     kernel.item_updates.lock().unwrap().push((av.to_string(), key.to_string(), item.to_string()));
+                    if kernel.item_update_ok_false.load(Ordering::Relaxed) {
+                        return mcp_text(serde_json::json!(
+                            { "action": "item_update", "ok": false, "msg": "WRITE_QUEUE_TIMEOUT" }
+                        ));
+                    }
                     return mcp_text(serde_json::json!({ "action": "item_update", "data": null }));
                 }
                 if body.contains("\"block\"") && action == "get" {
@@ -622,6 +631,47 @@ async fn full_cron_row_id_beats_prefix_collision_on_tasks_board() {
             .iter()
             .any(|(av, _, item)| av == CRON_AV && item == "20261105100000-kcron1"),
         "статус выставлен крон-строке, не same-minute задаче: {updates:?}"
+    );
+}
+
+/// (8а-барьер) ok:false в success-форме item_update: edit падает громко,
+/// не печатает «обновлено» (класс тихого ok:false, задача 20261104072045).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_with_ok_false_item_update_fails_loud() {
+    let kernel = Kernel::new();
+    kernel.item_update_ok_false.store(true, Ordering::Relaxed);
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261105100000-kcron1".into(),
+            status: Some("In Progress".into()),
+            title: None,
+            pr: None,
+            branch: None,
+        },
+    )
+    .await
+    .expect_err("ok:false на item_update обязан падать с явной ошибкой");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ok=false"),
+        "сообщение называет форму фейла: {msg}"
+    );
+    assert!(
+        msg.contains("WRITE_QUEUE_TIMEOUT"),
+        "сообщение несёт причину шлюза: {msg}"
+    );
+    // мутация ушла в ядро (барьер после RPC), но клиент обязан прокричать
+    let updates = kernel.updates_snapshot();
+    assert!(
+        !updates.is_empty(),
+        "item_update дошёл до ядра — барьер на ответе, не на отправке"
     );
 }
 
