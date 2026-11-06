@@ -6,7 +6,7 @@ import { describe, expect, test, afterAll } from "bun:test"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
-import { resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
+import { resolveStateDir, resolveDaemonStateDir, type DaemonStateResolution } from "../lib/single-instance"
 
 const LIB_PATH = resolve(import.meta.dir, "../lib/single-instance.ts")
 const CHILD = join(import.meta.dir, "single-instance-child.ts")
@@ -130,22 +130,80 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
   })
 })
 
-describe("resolveStateDir / sandboxedStateDir", () => {
+describe("resolveStateDir", () => {
   const fallback = "/home/u/.local/state/uwuwu-factory"
 
   test("env отсутствует/пустой/whitespace — дефолт (прод-путь)", () => {
     expect(resolveStateDir(undefined, fallback)).toBe(fallback)
     expect(resolveStateDir("", fallback)).toBe(fallback)
     expect(resolveStateDir("   ", fallback)).toBe(fallback)
-    expect(sandboxedStateDir(undefined)).toBeFalse()
-    expect(sandboxedStateDir("")).toBeFalse()
-    expect(sandboxedStateDir("  ")).toBeFalse()
   })
 
   test("env задан — переопределение as-is (песочница)", () => {
     expect(resolveStateDir("/tmp/smoke-factory", fallback)).toBe("/tmp/smoke-factory")
     expect(resolveStateDir("  /tmp/smoke-factory  ", fallback)).toBe("/tmp/smoke-factory")
-    expect(sandboxedStateDir("/tmp/smoke-factory")).toBeTrue()
-    expect(sandboxedStateDir(" /tmp/smoke-factory ")).toBeTrue()
+  })
+})
+
+describe("resolveDaemonStateDir — дефолт-изоляция веточных чекаутов", () => {
+  const base = {
+    daemon: "uwuwu-factory",
+    envName: "UWUWU_FACTORY_STATE_DIR",
+    defaultDir: "/home/u/.local/state/uwuwu-factory",
+    repoRoot: "/home/u/repo",
+  }
+  const detectOf = (out: string | null) => () => out
+  const resolveWith = (detectOut: string | null, envRaw?: string): DaemonStateResolution =>
+    resolveDaemonStateDir({ ...base, envRaw, detect: detectOf(detectOut) })
+
+  test("явный env выигрывает — git-детект не зовётся (песочница as-is)", () => {
+    let called = false
+    const r = resolveDaemonStateDir({
+      ...base,
+      envRaw: "  /tmp/smoke-factory  ",
+      detect: () => { called = true; return "work/task-1" },
+    })
+    expect(r).toEqual({ stateDir: "/tmp/smoke-factory", sandboxed: true, autoIsolated: false, notice: null })
+    expect(called).toBeFalse()
+  })
+
+  test("master — прод-дефолт, тихо (прежнее поведение прод-демона)", () => {
+    expect(resolveWith("master")).toEqual({
+      stateDir: base.defaultDir, sandboxed: false, autoIsolated: false, notice: null,
+    })
+    // whitespace в stdout git обрезается
+    expect(resolveWith("  master  ")).toEqual({
+      stateDir: base.defaultDir, sandboxed: false, autoIsolated: false, notice: null,
+    })
+  })
+
+  test("не-master ветка — авто-изоляция branches/<safe-branch> + громкий notice", () => {
+    const r = resolveWith("work/task-20261106082216-lkgrqwh")
+    expect(r.stateDir).toBe(join(base.defaultDir, "branches", "work_task-20261106082216-lkgrqwh"))
+    expect(r.sandboxed).toBeTrue()
+    expect(r.autoIsolated).toBeTrue()
+    expect(r.notice).toContain("work/task-20261106082216-lkgrqwh")
+    expect(r.notice).toContain("UWUWU_FACTORY_STATE_DIR")
+    expect(r.notice).toContain("не master")
+  })
+
+  test("detached HEAD (пустой stdout) — изоляция branches/detached", () => {
+    const r = resolveWith("")
+    expect(r.stateDir).toBe(join(base.defaultDir, "branches", "detached"))
+    expect(r.autoIsolated).toBeTrue()
+  })
+
+  test("git-детект не удался — прод-дефолт + громкий warning (не изоляция)", () => {
+    const r = resolveWith(null)
+    expect(r.stateDir).toBe(base.defaultDir)
+    expect(r.sandboxed).toBeFalse()
+    expect(r.autoIsolated).toBeFalse()
+    expect(r.notice).toContain("git-детект")
+    expect(r.notice).toContain("UWUWU_FACTORY_STATE_DIR")
+  })
+
+  test("имя ветки санитизируется в сегмент пути (слэши/двоеточия/пробелы)", () => {
+    expect(resolveWith("feat: x y").stateDir).toBe(join(base.defaultDir, "branches", "feat__x_y"))
+    expect(resolveWith("release/1.2").stateDir).toBe(join(base.defaultDir, "branches", "release_1.2"))
   })
 })
