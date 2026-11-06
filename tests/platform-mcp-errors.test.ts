@@ -261,7 +261,7 @@ describe("KernelUnavailableError: транспорт ядра отделён о�
     globalThis.fetch = (async () => {
       state.calls++
       throw new TypeError("fetch failed")
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     return state
   }
 

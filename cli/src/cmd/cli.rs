@@ -29,6 +29,13 @@ pub(crate) enum TaskSub {
             help = "Аттач в тело (repeatable)"
         )]
         attach: Vec<std::path::PathBuf>,
+        // Осмотр скелета без записи: живой create ради просмотра костяка
+        // кормит триаж-демон мусорными черновиками.
+        #[arg(
+            long = "dry-run",
+            help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)"
+        )]
+        dry_run: bool,
     },
     /// Очередь задач доски
     List {
@@ -39,7 +46,10 @@ pub(crate) enum TaskSub {
     },
     /// Карточка задачи: колонки + свежие комменты
     Get {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / уникальный префикс")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / уникальный префикс"
+        )]
         id: String,
         /// Быстрая проверка статуса: без экспорта тела и картинок
         #[arg(long = "no-body")]
@@ -94,7 +104,10 @@ pub(crate) enum TaskSub {
     /// --attach (repeatable) грузит файлы в assets/ и дописывает референсы
     /// после контент-операции; вызов с одними аттачами (без --stdin/--md) валиден.
     Body {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс / подстрока заголовка")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока заголовка"
+        )]
         id: String,
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
@@ -225,7 +238,9 @@ pub(crate) enum KernelSub {
     Ping,
     /// SQL-проба: полный конверт ядра JSON (data + limit/truncated as-is)
     Sql {
-        #[arg(help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\"")]
+        #[arg(
+            help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\""
+        )]
         stmt: String,
     },
     /// getFile-проба: Bytes/Missing — диагностические ответы (exit 0),
@@ -270,6 +285,13 @@ pub(crate) enum Commands {
         #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
     },
+    /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
+    /// прочитать (агенты в начале работы), append — дописать долговременный
+    /// факт (владелец/дример), replace — полная перезапись на месте.
+    Person {
+        #[command(subcommand)]
+        command: PersonSub,
+    },
     /// Download a workspace asset (image/attachment) by key from assets/.
     Blob {
         #[arg(help = "Blob key, e.g. pixel.png")]
@@ -298,7 +320,11 @@ pub(crate) enum Commands {
         limit: usize,
         #[arg(long, default_value = "0", help = "SOFA public limit (0 = off)")]
         sofa: usize,
-        #[arg(long, default_value = "0.35", help = "semantic cosine threshold (0..1)")]
+        #[arg(
+            long,
+            default_value = "0.35",
+            help = "semantic cosine threshold (0..1)"
+        )]
         threshold: f32,
     },
     /// Локальный эмбеддинг-индекс (семантическая половина поиска):
@@ -345,6 +371,32 @@ pub(crate) enum Commands {
         /// Окно wave-скана docker logs, минут
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
+    },
+}
+
+/// Персона владельца: приватный SiYuan-док (Experience:/personal/PERSON).
+/// Один инстанс SiYuan на все машины — синков и пуш-политики нет.
+#[derive(Subcommand)]
+pub(crate) enum PersonSub {
+    /// Актуальная персона (markdown). Дока нет — честная ошибка с подсказкой
+    /// создания (не молчаливый пустой вывод).
+    Show,
+    /// Дописать markdown в конец (долговременный факт/секция). Дока нет —
+    /// создать со скелетом (шапка приватности + секции) и сразу с этим
+    /// текстом. Дедуп перед append — на пишущем: прочитай `person show`.
+    Append {
+        #[arg(long, conflicts_with = "text", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(trailing_var_arg = true, help = "Markdown-текст (факт или секция)")]
+        text: Vec<String>,
+    },
+    /// Перезаписать контент целиком на месте (docId стабилен); дока нет —
+    /// создать без скелета (полная ответственность пишущего за контент).
+    Replace {
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(long, help = "Файл с markdown (обязателен без --stdin)")]
+        md: Option<String>,
     },
 }
 

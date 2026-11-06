@@ -80,7 +80,7 @@ describe.skipIf(process.platform !== "linux")("single-instance", () => {
     await new Promise((r) => setTimeout(r, 30))
     a.proc.kill("SIGTERM")
     expect(await a.proc.exited).toBe(0)
-    const stdout = await new Response(a.proc.stdout).text()
+    const stdout = await new Response(a.proc.stdout as ReadableStream<Uint8Array>).text()
     expect(stdout).toContain("onStop=1")
     expect(stdout).not.toContain("onStop=2")
   })

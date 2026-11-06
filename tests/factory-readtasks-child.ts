@@ -4,9 +4,14 @@
 // только на старте — иначе log()/siyuanToken() ходят в прод (инцидент 06.11).
 // Ребёнок скриптует fetch (ядро), зовёт readTasks напрямую и печатает
 // вердикт JSON в stdout — родитель сверяет резолвы и число вызовов.
+// SCENARIO (env, дефолт «resolve»): resolve — штатный резолв 0/1/≥2;
+// fail-get-doc — get_doc доски всегда ошибкой конверта (мемоизация сбоя);
+// sql-lag — get_doc доски отдаёт пустые box/hpath (тихое отключение).
 import { mkdirSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+
+const SCENARIO = process.env.SCENARIO ?? "resolve"
 
 const BOARD_DOC = "boarddoc1"
 const BOARD_HPATH = "/uwuwu/Задачи x"
@@ -34,7 +39,15 @@ const ROWS = [
   rowOf("row-cache-a", "Cache A"),
   rowOf("row-cache-b", "Cache B"),
   rowOf("row-cache-c", "Cache C"),
+  // known-строка только в resolve-сценарии: state-карта от child'а должна
+  // убрать её hpath-вызов (8 detached − 1 известная = 7 вызовов); в прочих
+  // сценариях её нет — там проверяется деградация резолвера
+  ...(SCENARIO === "resolve" ? [rowOf("row-known", "Known док")] : []),
 ]
+
+/** known-карта среза «сверка с state»: rowId → bodyDoc, как её строит
+ *  tickProject из state.tasks. */
+const KNOWN = new Map([["row-known", "20261106000000-knownbod"]])
 
 const HPATH_TO_IDS: Record<string, string[]> = {
   [`${BOARD_HPATH}/Detached single`]: ["20261106000000-singlebod"],
@@ -56,6 +69,17 @@ function scriptKernel(): { hpathCalls: string[]; boardGetDocCalls: number; misse
       const stmt = (JSON.parse(String(init?.body ?? "{}")) as { stmt?: string }).stmt ?? ""
       if (stmt.includes("box, hpath")) {
         boardGetDocCalls++
+        if (SCENARIO === "fail-get-doc") {
+          // конверт-ошибка ядра: post() ретраит ×4 (пин в тесте-родителе),
+          // резолвер мемоизирует сбой — последующие detached-строки не зовут
+          return new Response(JSON.stringify({ code: -1, msg: "kernel down" }), { status: 200 })
+        }
+        if (SCENARIO === "sql-lag") {
+          // SQL-лаг индекса: путь доски есть, box/hpath пустые — тихое отключение
+          return new Response(JSON.stringify({
+            code: 0, msg: "", data: [{ id: BOARD_DOC, content: "Задачи x", updated: "20261106000000", box: "", hpath: "" }],
+          }), { status: 200 })
+        }
         return new Response(JSON.stringify({
           code: 0, msg: "", data: [{ id: BOARD_DOC, content: "Задачи x", updated: "20261106000000", box: BOARD_BOX, hpath: BOARD_HPATH }],
         }), { status: 200 })
@@ -96,12 +120,20 @@ function scriptKernel(): { hpathCalls: string[]; boardGetDocCalls: number; misse
 }
 
 // ——— песочница: HOME от родителя; лог читаем оттуда же ———
+// fail-get-doc: ретраи post() (4 попытки с бэкоффом) не должны растягивать
+// ребёнка — setTimeout исполняет сон немедленно (паттерн platform-mcp-errors)
+if (SCENARIO === "fail-get-doc") {
+  globalThis.setTimeout = ((fn: () => void) => { fn(); return 0 as unknown as ReturnType<typeof setTimeout> }) as typeof setTimeout
+}
 const logPath = join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 mkdirSync(dirname(logPath), { recursive: true })
 
 const probe = scriptKernel()
 const { readTasks } = await import("../factory/factory")
-const rows = await readTasks({ docId: BOARD_DOC, dbId: "avblk1" })
+const rows = await readTasks(
+  { docId: BOARD_DOC, dbId: "avblk1" },
+  SCENARIO === "resolve" ? KNOWN : undefined,
+)
 
 let logText = ""
 try { logText = readFileSync(logPath, "utf-8") } catch { /* лога ещё нет — тоже валидно */ }

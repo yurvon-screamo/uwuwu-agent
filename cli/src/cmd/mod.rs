@@ -7,6 +7,8 @@ mod sy_dispatch;
 #[cfg(test)]
 mod cli_tests;
 #[cfg(test)]
+mod create_tests;
+#[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
 mod fallback_tests;

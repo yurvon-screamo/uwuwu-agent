@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use super::ollama::OllamaClient;
 use super::store::{ChunkMeta, ChunkRecord, Store};
+use super::SEARCH_EMBED_TIMEOUT;
 
 /// Целевые типы блоков-чанков (контентные; l/d/av/tb — не чанки).
 pub(crate) const TARGET_TYPES_SQL: &str = "('p','i','h','c','t')";
@@ -30,6 +31,10 @@ pub(crate) const PAGE: usize = 256;
 pub(crate) const EMBED_BATCH: usize = 32;
 /// Минимальная длина чанка (символы): заголовки-ярлыки не индексируем.
 pub(crate) const MIN_CONTENT_CHARS: usize = 40;
+/// Верхняя граница чанка (символы): html_embed-стены и крупные код-блоки
+/// за ней дают эмбеддинг «головы» (ctx Ollama ~8192 токенов) — не индексируем.
+/// Заземлено живым замером корпуса 06.11: выше границы 6 блоков из ~74k.
+pub(crate) const MAX_CONTENT_CHARS: usize = 8000;
 /// Overlap окна дельты: правки в ту же секунду, что watermark.
 pub(crate) const OVERLAP_SECS: i64 = 60;
 /// Reconcile не чаще раза в сутки.
@@ -40,6 +45,9 @@ pub struct SyncOptions {
     /// (rebuild: Some("0") — с нуля).
     pub since: Option<String>,
     pub deadline: Option<Instant>,
+    /// Потолок таймаута одного embed-вызова (rebuild — 120s, поиск —
+    /// SEARCH_EMBED_TIMEOUT); фактический таймаут = min(cap, остаток deadline).
+    pub embed_timeout: Duration,
     /// Пауза между kernel-страницами (rebuild): не душить прод-ядро
     /// keyset-сканами (поисковый путь — None, там 1–3 запроса в бюджете).
     pub page_delay: Option<Duration>,
@@ -51,6 +59,10 @@ pub struct SyncOptions {
 pub struct SyncReport {
     pub embedded: usize,
     pub skipped_short: usize,
+    /// Блоки за верхней границей длины — per-run счётчик (как skipped_short).
+    pub skipped_long: usize,
+    /// Строк, вычищенных из индекса (усохшие/переросшие чанки) — per-run.
+    pub pruned: usize,
     /// Бюджет исчерпан до полной дотяжки — хвост останется над watermark.
     pub budget_exhausted: bool,
 }
@@ -65,7 +77,6 @@ pub(crate) fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Страница дельты: keyset по (updated, id), старейшие первыми.
 /// Страница дельты: keyset по (updated, id), старейшие первыми. Лёгкие
 /// колонки без content — полный скан blocks не таскает мегабайты текста
 /// (ядро без индекса по updated; тяжёлый content достаётся точечно по
@@ -81,6 +92,25 @@ pub(crate) fn delta_page_stmt(cursor_updated: &str, cursor_id: &str) -> String {
         i = sql_literal(cursor_id),
         page = PAGE,
     )
+}
+
+/// Класс длины контента: вне индексируемой полосы [MIN, MAX] чанк либо
+/// ярлык (ниже нижней), либо «голова вместо содержимого» (за верхней).
+enum LengthClass {
+    TooShort,
+    TooLong,
+    Embeddable,
+}
+
+fn length_class(content: &str) -> LengthClass {
+    let len = content.chars().count();
+    if len <= MIN_CONTENT_CHARS {
+        LengthClass::TooShort
+    } else if len > MAX_CONTENT_CHARS {
+        LengthClass::TooLong
+    } else {
+        LengthClass::Embeddable
+    }
 }
 
 fn parse_kernel_row(row: &Value, with_content: bool) -> Option<KernelRow> {
@@ -123,6 +153,16 @@ fn budget_left(deadline: Option<Instant>) -> bool {
     deadline.map(|d| Instant::now() < d).unwrap_or(true)
 }
 
+/// Таймаут embed-вызова: потолок синка минус остаток wall-clock бюджета —
+/// каждый вызов укладывается в общий контракт поиска (п.2 ревью PR #78),
+/// а не получает свежий полный таймаут поверх израсходованного бюджета.
+fn embed_call_timeout(deadline: Option<Instant>, cap: Duration) -> Duration {
+    match deadline {
+        Some(deadline) => cap.min(deadline.saturating_duration_since(Instant::now())),
+        None => cap,
+    }
+}
+
 fn stored_dim(store: &Store) -> Option<usize> {
     store
         .meta("dim")
@@ -140,6 +180,95 @@ fn since_with_overlap(watermark: &str) -> Result<String> {
         .to_string())
 }
 
+/// Результат классификации страницы дельты (чистый, без IO).
+struct PageOutcome {
+    /// Строки полосы [MIN, MAX] — кандидаты на эмбедд.
+    pending: Vec<KernelRow>,
+    /// Усохшие/переросшие строки — prune-кандидаты (DELETE отсутствующих
+    /// no-op по PK; вернуть блок может правка).
+    prune_ids: Vec<String>,
+    cursor_updated: String,
+    cursor_id: String,
+    skipped_short: usize,
+    skipped_long: usize,
+}
+
+/// Классификация страницы дельты: курсор двигается по всем найденным
+/// строкам (включая пропущенные по длине), исчезнувшие между сканом и
+/// fetch'ем курсор не двигают — их поймает reconcile.
+fn process_page(
+    rows: &[Value],
+    by_id: &std::collections::HashMap<String, KernelRow>,
+) -> PageOutcome {
+    let mut outcome = PageOutcome {
+        pending: Vec::with_capacity(rows.len()),
+        prune_ids: Vec::new(),
+        cursor_updated: String::new(),
+        cursor_id: String::new(),
+        skipped_short: 0,
+        skipped_long: 0,
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(kernel_row) = by_id.get(id) else {
+            continue;
+        };
+        outcome.cursor_updated = kernel_row.meta.updated.clone();
+        outcome.cursor_id = kernel_row.meta.block_id.clone();
+        match length_class(&kernel_row.content) {
+            LengthClass::TooShort => {
+                outcome.skipped_short += 1;
+                outcome.prune_ids.push(kernel_row.meta.block_id.clone());
+            }
+            LengthClass::TooLong => {
+                outcome.skipped_long += 1;
+                outcome.prune_ids.push(kernel_row.meta.block_id.clone());
+            }
+            LengthClass::Embeddable => outcome.pending.push(kernel_row.clone()),
+        }
+    }
+    outcome
+}
+
+/// Стартовый курсор дельты: явный since (rebuild) или watermark минус
+/// overlap; пустой watermark — с нуля; мусор в meta — громкая ошибка.
+fn starting_cursor(store: &Store, since: &Option<String>) -> Result<(String, String)> {
+    let updated = match since {
+        Some(since) => since.clone(),
+        None => match store.meta("watermark")? {
+            Some(mark) => since_with_overlap(&mark)?,
+            None => "0".to_string(),
+        },
+    };
+    Ok((updated, String::new()))
+}
+
+/// Шаг scan-page: страница дельты + точечный fetch полных строк по PK,
+/// индексированные по id — тяжёлый content не идёт через keyset-скан
+/// (ядро без индекса по updated, полный скан таскает мегабайты).
+async fn fetch_classifiable_page(
+    sy: &SiYuan,
+    cursor_updated: &str,
+    cursor_id: &str,
+) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>)> {
+    let rows = sy.sql(&delta_page_stmt(cursor_updated, cursor_id)).await?;
+    if rows.is_empty() {
+        return Ok((rows, std::collections::HashMap::new()));
+    }
+    let page_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let full_rows = fetch_by_ids(sy, &page_ids).await?;
+    let by_id = full_rows
+        .into_iter()
+        .map(|row| (row.meta.block_id.clone(), row))
+        .collect();
+    Ok((rows, by_id))
+}
+
 /// Дельта-цикл: страницы → фильтр длины → эмбедд батчами → upsert+watermark.
 ///
 /// EmbedError пробрасывается корнем anyhow-цепочки (search-путь даункастит
@@ -152,76 +281,42 @@ pub async fn delta_sync(
     opts: &SyncOptions,
 ) -> Result<SyncReport> {
     let mut report = SyncReport::default();
-    let index_dim = stored_dim(store);
+    let (mut cursor_updated, mut cursor_id) = starting_cursor(store, &opts.since)?;
 
-    let mut cursor_updated = match &opts.since {
-        Some(since) => since.clone(),
-        None => match store.meta("watermark")? {
-            Some(mark) => since_with_overlap(&mark)?,
-            None => "0".to_string(),
-        },
-    };
-    let mut cursor_id = String::new();
-
-    'pages: loop {
+    loop {
         if !budget_left(opts.deadline) {
             report.budget_exhausted = true;
             break;
         }
-        let rows = sy
-            .sql(&delta_page_stmt(&cursor_updated, &cursor_id))
-            .await?;
+        let (rows, by_id) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
         if rows.is_empty() {
             break;
         }
         let page_len = rows.len();
-        // Точечный fetch content по PK: тяжёлый текст не проходит
-        // через полный keyset-скан.
-        let page_ids: Vec<String> = rows
-            .iter()
-            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
-        let full_rows = fetch_by_ids(sy, &page_ids).await?;
-        let by_id: std::collections::HashMap<String, KernelRow> = full_rows
-            .into_iter()
-            .map(|row| (row.meta.block_id.clone(), row))
-            .collect();
 
-        let mut pending: Vec<KernelRow> = Vec::with_capacity(EMBED_BATCH);
-        for row in &rows {
-            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(kernel_row) = by_id.get(id) else {
-                // Блок исчез между сканом и fetch'ем — prune поймает reconcile'ом.
-                continue;
-            };
-            cursor_updated = kernel_row.meta.updated.clone();
-            cursor_id = kernel_row.meta.block_id.clone();
-            if kernel_row.content.chars().count() <= MIN_CONTENT_CHARS {
-                report.skipped_short += 1;
-                continue;
-            }
-            pending.push(kernel_row.clone());
-            if pending.len() == EMBED_BATCH {
-                if !budget_left(opts.deadline) {
-                    report.budget_exhausted = true;
-                    break 'pages;
-                }
-                embed_and_upsert(ollama, store, &pending, index_dim, &mut report).await?;
-                if let Some(on_batch) = &opts.on_batch {
-                    on_batch(report.embedded);
-                }
-                pending.clear();
-            }
+        let outcome = process_page(&rows, &by_id);
+        cursor_updated = outcome.cursor_updated;
+        cursor_id = outcome.cursor_id;
+        report.skipped_short += outcome.skipped_short;
+        report.skipped_long += outcome.skipped_long;
+
+        // Усохшие/переросшие чанки уходят из индекса в том же прогоне —
+        // иначе дельта, пропустив строку, оставляла бы в индексе вечно
+        // устаревший контент с вектором (п.1 ревью PR #78).
+        if !outcome.prune_ids.is_empty() {
+            report.pruned += store.prune(&outcome.prune_ids)?;
         }
 
-        if !pending.is_empty() {
-            embed_and_upsert(ollama, store, &pending, index_dim, &mut report).await?;
-            if let Some(on_batch) = &opts.on_batch {
-                on_batch(report.embedded);
-            }
-            pending.clear();
+        if !embed_batches(
+            ollama,
+            store,
+            outcome.pending.chunks(EMBED_BATCH),
+            opts,
+            &mut report,
+        )
+        .await?
+        {
+            break;
         }
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
@@ -237,17 +332,48 @@ pub async fn delta_sync(
     Ok(report)
 }
 
+/// Эмбедд батчей с бюджет-гейтом на каждый батч; false — бюджет исчерпан
+/// (хвост остаётся над watermark и дотягивается следующими запусками).
+async fn embed_batches(
+    ollama: &OllamaClient,
+    store: &mut Store,
+    batches: std::slice::Chunks<'_, KernelRow>,
+    opts: &SyncOptions,
+    report: &mut SyncReport,
+) -> Result<bool> {
+    for batch in batches {
+        if !budget_left(opts.deadline) {
+            report.budget_exhausted = true;
+            return Ok(false);
+        }
+        embed_and_upsert(
+            ollama,
+            store,
+            batch,
+            embed_call_timeout(opts.deadline, opts.embed_timeout),
+            report,
+        )
+        .await?;
+        if let Some(on_batch) = &opts.on_batch {
+            on_batch(report.embedded);
+        }
+    }
+    Ok(true)
+}
+
 /// Эмбедд батча + атомарная запись (чанки и watermark одной транзакцией).
-/// Векторы приходят уже нормированными из клиента.
+/// Векторы приходят уже нормированными из клиента; размерность канона —
+/// из meta (свежий индекс adopt'ит фактическую dim первого ответа).
 async fn embed_and_upsert(
     ollama: &OllamaClient,
     store: &mut Store,
     rows: &[KernelRow],
-    index_dim: Option<usize>,
+    timeout: Duration,
     report: &mut SyncReport,
 ) -> Result<()> {
+    let index_dim = stored_dim(store);
     let inputs: Vec<String> = rows.iter().map(|r| r.content.clone()).collect();
-    let vectors = ollama.embed(&inputs, index_dim).await?;
+    let vectors = ollama.embed(&inputs, index_dim, timeout).await?;
     if index_dim.is_none() {
         // Свежий индекс: первый ответ задаёт каноническую размерность.
         if let Some(first) = vectors.first() {
@@ -310,12 +436,57 @@ pub async fn reconcile(
         }
     }
 
-    // Лёгкий полный скан ядра: keyset по id, без content.
+    let kernel = scan_kernel_pages(sy, deadline).await?;
+    if !kernel.completed {
+        // Прерванный бюджетом скан — рутинное событие поискового пути
+        // (бюджет 10s, живой бэклог). Частичный kernel против индекса дал бы
+        // ложные vanished — весь несосканированный хвост был бы вычищен
+        // (High ревью PR #96). Прерванный прогон — no-op: без prune,
+        // без last_reconcile_at; повторится следующим поиском.
+        return Ok(report);
+    }
+    let diff = diff_index(&kernel.metas, &store.chunk_metas()?);
+
+    if !diff.vanished.is_empty() {
+        report.pruned = store.prune(&diff.vanished)?;
+    }
+    if !diff.path_drift.is_empty() {
+        report.paths_refreshed = store.refresh_paths(&diff.path_drift)?;
+    }
+
+    let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, deadline).await?;
+    if !repaired.completed {
+        // Частичный backfill не фиксирует прогон — дыры ретраятся
+        // следующим поиском, а не через сутки (Common ревью PR #96).
+        return Ok(report);
+    }
+    report.pruned += repaired.pruned;
+    report.repaired += repaired.repaired;
+
+    // last_reconcile_at только по завершённому прогону — оборванный
+    // бюджетом повторится на следующем поиске.
+    store.set_meta("last_reconcile_at", &now.to_string())?;
+    Ok(report)
+}
+
+/// Результат скана ядра: меты всех целевых блоков + признак завершённости.
+struct ScanOutcome {
+    metas: Vec<ChunkMeta>,
+    /// Скан дошёл до конца ядра; false = бюджет исчерпан посреди —
+    /// прогон не засчитывается (см. reconcile).
+    completed: bool,
+}
+
+/// Лёгкий полный скан ядра: keyset по id, без content.
+async fn scan_kernel_pages(sy: &SiYuan, deadline: Option<Instant>) -> Result<ScanOutcome> {
     let mut kernel: Vec<ChunkMeta> = Vec::new();
     let mut cursor = String::new();
     loop {
         if !budget_left(deadline) {
-            return Ok(report);
+            return Ok(ScanOutcome {
+                metas: kernel,
+                completed: false,
+            });
         }
         let stmt = format!(
             "select id, root_id, box, hpath, updated from blocks \
@@ -334,71 +505,124 @@ pub async fn reconcile(
             }
         }
         if page_len < PAGE {
-            break;
+            return Ok(ScanOutcome {
+                metas: kernel,
+                completed: true,
+            });
         }
     }
+}
 
-    let index = store.chunk_metas()?;
+/// Три класса расхождений ядра и индекса; порядок проверок важен:
+/// изменившийся updated ремонтируется полным переэмбеддом (заберёт
+/// и свежий hpath).
+struct IndexDiff {
+    /// В ядре есть, в индексе нет (или updated разошёлся) — repair.
+    repair_ids: Vec<String>,
+    /// Дрейф путей — метаданные без переэмбеддинга.
+    path_drift: Vec<ChunkMeta>,
+    /// В индексе есть, в ядре нет (удаление/трэш) — prune.
+    vanished: Vec<String>,
+}
+
+fn diff_index(kernel: &[ChunkMeta], index: &[ChunkMeta]) -> IndexDiff {
     let index_by_id: std::collections::HashMap<&str, &ChunkMeta> =
         index.iter().map(|m| (m.block_id.as_str(), m)).collect();
     let kernel_by_id: std::collections::HashMap<&str, &ChunkMeta> =
         kernel.iter().map(|m| (m.block_id.as_str(), m)).collect();
 
-    // Три класса расхождений; порядок проверок важен: изменившийся updated
-    // ремонтируется полным переэмбеддом (заберёт и свежий hpath).
-    let mut repair_ids: Vec<String> = Vec::new();
-    let mut path_drift: Vec<ChunkMeta> = Vec::new();
-    for meta in &kernel {
+    let mut diff = IndexDiff {
+        repair_ids: Vec::new(),
+        path_drift: Vec::new(),
+        vanished: Vec::new(),
+    };
+    for meta in kernel {
         match index_by_id.get(meta.block_id.as_str()) {
-            None => repair_ids.push(meta.block_id.clone()),
+            None => diff.repair_ids.push(meta.block_id.clone()),
             Some(indexed) if indexed.updated != meta.updated => {
-                repair_ids.push(meta.block_id.clone())
+                diff.repair_ids.push(meta.block_id.clone())
             }
             Some(indexed)
                 if indexed.hpath != meta.hpath
                     || indexed.box_id != meta.box_id
                     || indexed.root_id != meta.root_id =>
             {
-                path_drift.push(meta.clone())
+                diff.path_drift.push(meta.clone())
             }
             _ => {}
         }
     }
-    let vanished: Vec<String> = index_by_id
+    diff.vanished = index_by_id
         .keys()
         .filter(|id| !kernel_by_id.contains_key(*id))
         .map(|id| id.to_string())
         .collect();
+    diff
+}
 
-    if !vanished.is_empty() {
-        report.pruned = store.prune(&vanished)?;
-    }
-    if !path_drift.is_empty() {
-        report.paths_refreshed = store.refresh_paths(&path_drift)?;
-    }
+/// Счётчики repair-прохода + признак завершённости.
+pub(crate) struct RepairOutcome {
+    pub(crate) repaired: usize,
+    pub(crate) pruned: usize,
+    /// Repair дошёл до конца списка; false = бюджет исчерпан посреди —
+    /// прогон не засчитывается (см. reconcile).
+    pub(crate) completed: bool,
+}
 
-    let index_dim = stored_dim(store);
+/// Backfill/переэмбедд недостающих строк: классификация по длине —
+/// усохшие/переросшие блоки вычищаются из индекса (а при backfill просто
+/// не индексируются), полосу [MIN, MAX] ремонтирует переэмбедд.
+/// Тестовый вход закрепляет контракт частичного прогона.
+pub(crate) async fn repair_missing(
+    sy: &SiYuan,
+    ollama: &OllamaClient,
+    store: &mut Store,
+    repair_ids: &[String],
+    deadline: Option<Instant>,
+) -> Result<RepairOutcome> {
+    let mut outcome = RepairOutcome {
+        repaired: 0,
+        pruned: 0,
+        completed: true,
+    };
     for id_batch in repair_ids.chunks(PAGE) {
         if !budget_left(deadline) {
-            return Ok(report);
+            outcome.completed = false;
+            return Ok(outcome);
         }
         let rows = fetch_by_ids(sy, id_batch).await?;
+        let mut prune_ids: Vec<String> = Vec::new();
         let target: Vec<KernelRow> = rows
             .into_iter()
-            .filter(|row| row.content.chars().count() > MIN_CONTENT_CHARS)
+            .filter(|row| match length_class(&row.content) {
+                LengthClass::Embeddable => true,
+                LengthClass::TooShort | LengthClass::TooLong => {
+                    prune_ids.push(row.meta.block_id.clone());
+                    false
+                }
+            })
             .collect();
+        if !prune_ids.is_empty() {
+            outcome.pruned += store.prune(&prune_ids)?;
+        }
         for batch in target.chunks(EMBED_BATCH) {
             if !budget_left(deadline) {
-                return Ok(report);
+                outcome.completed = false;
+                return Ok(outcome);
             }
             let mut delta_report = SyncReport::default();
-            embed_and_upsert(ollama, store, batch, index_dim, &mut delta_report).await?;
-            report.repaired += delta_report.embedded;
+            embed_and_upsert(
+                ollama,
+                store,
+                batch,
+                embed_call_timeout(deadline, SEARCH_EMBED_TIMEOUT),
+                &mut delta_report,
+            )
+            .await?;
+            outcome.repaired += delta_report.embedded;
         }
     }
-
-    store.set_meta("last_reconcile_at", &now.to_string())?;
-    Ok(report)
+    Ok(outcome)
 }
 
 /// Точечный fetch полных строк по id (backfill-ремонт): явный LIMIT.
