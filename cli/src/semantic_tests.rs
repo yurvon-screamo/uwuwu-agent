@@ -466,9 +466,11 @@ async fn delta_overlap_reembeds_same_second_edit_after_watermark() {
     let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
         .await
         .expect("вторая дельта");
+    // отредактированная a2 переэмбеддится (content разошёлся), нетронутые
+    // a1/a3 — skip-unchanged без переэмбедда (пара в watermark различает)
     assert_eq!(
-        report.embedded, 3,
-        "overlap-окно переэмбеддит хвост секунды"
+        report.embedded, 1,
+        "overlap-окно переэмбеддит только правку"
     );
     assert_eq!(store.chunk_count().unwrap(), 3);
     let reembedded = inputs.lock().unwrap();
@@ -508,6 +510,132 @@ async fn delta_deadline_exhausted_embeds_nothing() {
     assert_eq!(report.embedded, 0);
     assert_eq!(store.chunk_count().unwrap(), 0);
     assert!(inputs.lock().unwrap().is_empty());
+}
+
+// ——— skip-unchanged: идемпотентность дельты без переэмбедда ———
+
+/// Строка, уже проиндексированная с теми же (updated, content), не
+/// переэмбеддится: overlap-перескан проходит её бесплатно, курсор двигается.
+#[tokio::test]
+async fn delta_skips_reembed_of_identical_rows() {
+    let content = "чанк с длинным содержанием, уже в индексе без изменений";
+    let blocks = vec![block("c1", T1, content, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "c1", T1, content, "/d");
+    store
+        .set_meta("watermark", &sync::watermark_composite(T0, "seed"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        0,
+        "идентичная строка не переэмбеддится"
+    );
+    assert_eq!(report.embedded, 0);
+    let mark = store.meta("watermark").unwrap().unwrap();
+    assert_eq!(
+        sync::split_watermark(&mark),
+        (T1.to_string(), "c1".to_string()),
+        "курсор прошёл пропущенную строку: {mark}"
+    );
+}
+
+/// Дрейф путей (hpath изменился при равных updated и content) чинится
+/// метаданными без переэмбедда — свежесть hpath не деградирует до суток.
+#[tokio::test]
+async fn delta_refreshes_path_drift_without_reembed() {
+    let content = "чанк с длинным содержанием, переехавший между доками";
+    let blocks = vec![block("c1", T1, content, "/new-place")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "c1", T1, content, "/old-place");
+    store
+        .set_meta("watermark", &sync::watermark_composite(T0, "seed"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    assert_eq!(inputs.lock().unwrap().len(), 0, "переэмбедда нет");
+    assert_eq!(report.paths_refreshed, 1, "дрейф путей освежён");
+    let hpath = store
+        .chunk_metas()
+        .expect("меты чанков")
+        .into_iter()
+        .find(|m| m.block_id == "c1")
+        .expect("чанк на месте")
+        .hpath;
+    assert_eq!(hpath, "/new-place");
+}
+
+/// Анти-карусельный сценарий (диагноз 20261106182055): лавина одной
+/// секунды, префикс закоммичен прошлым прогоном (пара T1|0031) —
+/// следующий прогон переэмбеддит только незакрытый хвост, курсор доходит
+/// до конца лавины.
+#[tokio::test]
+async fn delta_mountain_run2_does_not_reembed_committed_prefix() {
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    // «Прогон 1»: префикс 0000..0031 закоммичен, курсор стоит на 0031
+    for i in 0..32 {
+        seed_indexed_chunk_at(
+            &mut store,
+            &format!("20261105-{i:04}"),
+            T1,
+            &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+            "/d",
+        );
+    }
+    store
+        .set_meta("watermark", &sync::watermark_composite(T1, "20261105-0031"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    let embedded = inputs.lock().unwrap();
+    assert_eq!(
+        embedded.len(),
+        268,
+        "переэмбедден только хвост 0032..0299, не префикс: {}",
+        embedded.len()
+    );
+    assert!(!embedded.iter().any(|c| c.contains("номер 0 ")));
+    assert_eq!(report.embedded, 268);
+    let mark = store.meta("watermark").unwrap().unwrap();
+    assert_eq!(
+        sync::split_watermark(&mark),
+        (T1.to_string(), "20261105-0299".to_string()),
+        "курсор дошёл до конца лавины: {mark}"
+    );
+    let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
+    assert_eq!(backlog, 0, "очередь закрыта");
 }
 
 async fn kernel_server_blocks_only(blocks: Vec<Value>) -> (MockServer, Arc<Mutex<Vec<Value>>>) {
@@ -575,8 +703,8 @@ async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
     let sy = SiYuan::for_tests(server.uri());
     // батчи по 25ms — бюджет 100ms умирает посреди лавины: как вживую
     // (EmbedError::Timeout), так и чистым budget_exhausted между батчами.
-    let (embed, inputs) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(25))
-        .await;
+    let (embed, _inputs) =
+        embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(25)).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let mut store = seeded_store(dir.path());
     store.set_meta("watermark", T1).unwrap();
@@ -1194,6 +1322,24 @@ fn seed_indexed_chunk(dir: &std::path::Path) {
     };
     let tx = store.begin().unwrap();
     Store::upsert_batch(&tx, &[chunk], Some(T0)).unwrap();
+    tx.commit().unwrap();
+}
+
+/// Положить чанк в индекс от руки (срезы skip-unchanged/дрейфа).
+fn seed_indexed_chunk_at(store: &mut Store, block_id: &str, updated: &str, content: &str, hpath: &str) {
+    let chunk = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: block_id.into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: hpath.into(),
+            updated: updated.into(),
+        },
+        content: content.into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[chunk], None).unwrap();
     tx.commit().unwrap();
 }
 
