@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
 // Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
@@ -66,6 +68,13 @@ export interface TrackedTask {
    *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
    *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
   mergedPrUrl?: string
+  /** хэш норм-формы контента тела вне секции «Комменты» — bodyEdit-гейт:
+   *  lastmod двигают UI-пересохранения и собственные записи агента, хэш —
+   *  только контентные дельты (дефекты №3/№5) */
+  bodyHash?: string
+  /** последний доставленный будильник: идентичный ключ в коротком окне не
+   *  ставится в сессию повторно (дефект №5.2, дубль-доставка) */
+  lastWakeup?: WakeupStamp
 }
 
 export interface FactoryState {
@@ -94,16 +103,156 @@ export function reviewKindOf(status: string): ReviewKind | null {
   return null
 }
 
-/** Юзерский коммент: не наш (🤖), не служебный ([factory]). */
+/** Юзерский коммент: не наш (🤖), не служебный ([factory]).
+ *  Маркеры проверяются ПОСЛЕ снятия CLI-обёртки «AGENTS (ts): » — CLI выносит
+ *  автора вперёд, без среза фабричные notify проходят как юзерские (дефект №2). */
 export function isUserComment(c: TaskComment, botUserId?: string): boolean {
   // точный фильтр: комменты бот-аккаунта — не юзер (независимо от текста)
   if (botUserId !== undefined && c.userId !== undefined && c.userId === botUserId) {
     return false
   }
-  const body = c.text.trimStart()
+  const body = stripAgentHead(c.text.trimStart())
   if (body.startsWith(AGENT_MARK)) return false
   if (body.startsWith("[factory]")) return false
   return body.trim() !== ""
+}
+
+// ——— self-эхо wakeup-контура: маркеры, время, сесс-скопед срез (20261106032707) ———
+
+/** Автор агентских комментов CLI (sy_dispatch): обёртка «- **AGENTS** (ts): …».
+ *  Автор-скопед фильтр по этой строке — ловушка (вердики ревьювера и триаж
+ *  приходят тем же маркером): здесь только признак «мог быть от сессии». */
+export const AGENT_COMMENT_USER = "AGENTS"
+
+const THREAD_REPLY_PREFIX = /^\(тред-ответ на [^)]*\)\s*/
+const AGENT_HEAD = /^AGENTS \(([^)]*)\): /
+
+/** Срезает тред-префикс и голову «AGENTS (ts): » из текста коммента. */
+export function stripAgentHead(text: string): string {
+  return text.replace(THREAD_REPLY_PREFIX, "").replace(AGENT_HEAD, "")
+}
+
+/** ms из головы «(2026-11-05 19:43)» коммента. CLI пишет toISOString (UTC,
+ *  без зоны) — парс строго как UTC: локальная зона рантайма (демон в JST)
+ *  занизила бы время на 9ч и перевернула own-срез в потерю чужих комментов. */
+export function parseAgentHeadTs(text: string): number | null {
+  const m = text.replace(THREAD_REPLY_PREFIX, "").match(AGENT_HEAD)
+  if (m === null) return null
+  const p = m[1].trim().split(/[-: ]+/).map(Number)
+  if (p.length < 5 || p.some((x) => Number.isNaN(x))) return null
+  return Date.UTC(p[0], p[1] - 1, p[2], p[3], p[4], p[5] ?? 0)
+}
+
+export interface FreshSplit {
+  /** комменты, будящие адресата (юзерские и чужие агентские) */
+  foreign: TaskComment[]
+  /** срезанные собственные комменты сессии */
+  ownCount: number
+}
+
+/** Сесс-скопед срез self-эха (дефект №1): коммент — «свой» для сессии-адресата,
+ *  если он агентский (userId AGENTS), время в нём живое и не позже последнего
+ *  сообщения сессии (CLI-вызов идёт из хода, ход после коммита двигает
+ *  активность). Чужие AGENTS (вердикт ревьювера, триаж) и юзерские будят.
+ *  activityAt null — активность неизвестна: без среза (лишняя эхо-будка вместо
+ *  потерянного коммента). ts=0 (легаси) не срезаем — неизвестное время не
+ *  доказательство «своего». */
+export function freshForeignComments(fresh: TaskComment[], agentActivityAt: number | null): FreshSplit {
+  if (agentActivityAt === null) return { foreign: fresh, ownCount: 0 }
+  let ownCount = 0
+  const foreign = fresh.filter((c) => {
+    const own = c.userId === AGENT_COMMENT_USER && c.createdAt > 0 && c.createdAt <= agentActivityAt
+    if (own) ownCount++
+    return !own
+  })
+  return { foreign, ownCount }
+}
+
+/** Легаси-переход после деплоя (ревью раунд-2): треки держат lastCommentId в
+ *  старом непаддированном формате при lastCommentAt = 0 (createdAt комментов
+ *  не жил до оживления ts). Без этой проверки фоллбек newUserComments по
+ *  времени отдал бы ВСЕ чужие AGENTS-комменты одной волной будок. Идемпотентно:
+ *  re-baseline двигает at, условие больше не срабатывает. Свежий спавн
+ *  (id = "") и несматченный id при живом времени (штатный фоллбек) не сюда. */
+export function legacyRebaselineNeeded(lastSeen: { at: number; id: string }, userComments: TaskComment[]): boolean {
+  if (lastSeen.id === "" || lastSeen.at !== 0) return false
+  return !userComments.some((c) => c.id === lastSeen.id)
+}
+
+/** Последний коммент по (createdAt, id) — точка спавн-границ и re-baseline. */
+export function latestComment(comments: TaskComment[]): TaskComment | null {
+  if (comments.length === 0) return null
+  return comments.reduce((m, c) =>
+    c.createdAt > m.createdAt || (c.createdAt === m.createdAt && c.id.localeCompare(m.id) > 0) ? c : m)
+}
+
+// ——— bodyEdit: контент-хэш тела вне «Комменты» (дефекты №3/№5) ———
+
+// весь класс Format-символов (Cf): ZWSP/ZWNJ/ZWJ/WORD JOINER/BOM — рендер-
+// артефакты SiYuan-экспорта (инвентарь опыта «wakeup по собственному комменту»)
+const ZERO_WIDTH = /\p{Cf}/gu
+
+/** Контент тела вне секции «## Комменты» (от неё до следующего ## или EOF):
+ *  коммент-аппенды (включая слитые фабрикой вердикты/notify) иммунны к хэшу —
+ *  comment-контур не дублируется bodyEdit-будкой (дефект №4). Контент ПОСЛЕ
+ *  секции учитывается — правки после «Комменты» видны. */
+export function bodyOutsideComments(md: string): string {
+  const out: string[] = []
+  let inComments = false
+  for (const line of md.split("\n")) {
+    if (/^## Комменты\s*$/.test(line)) {
+      inComments = true
+      continue
+    }
+    if (inComments && /^## /.test(line)) inComments = false
+    if (!inComments) out.push(line)
+  }
+  return out.join("\n")
+}
+
+/** Норм-форма markdown тела: frontmatter срезается (lastmod двигает каждое
+ *  UI-пересохранение — дефект №5), zero-width SiYuan, \r\n, trailing-пробелы,
+ *  схлопывание пустых строк. Правки «только форматирование» не будят;
+ *  содержательные (слова, секции, порядок) — будят. */
+export function normalizeBodyMd(md: string): string {
+  return md
+    .replace(/^---\n[\s\S]*?\n---\n/, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(ZERO_WIDTH, "")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+}
+
+/** Хэш норм-формы контента тела вне «Комменты». */
+export function bodyContentHash(md: string): string {
+  return createHash("sha256").update(normalizeBodyMd(bodyOutsideComments(md))).digest("hex")
+}
+
+/** Время правки тела из frontmatter lastmod — ядро пишет с суффиксом зоны,
+ *  парсится в корректный ms (SQL updated живёт в зоне контейнера, демону не
+ *  видной). null — строки нет или битая дата. */
+export function bodyLastmodMs(md: string): number | null {
+  const m = md.match(/^lastmod:\s*(.+)$/m)
+  if (m === null) return null
+  const ms = Date.parse(m[1].trim())
+  return Number.isNaN(ms) ? null : ms
+}
+
+// ——— дедуп доставки будильников (дефект №5.2) ———
+
+export interface WakeupStamp {
+  key: string
+  at: number
+}
+
+/** Идентичный ключ в окне — скип (дельта уже доставлена); другой ключ или
+ *  окно истекло — доставка. */
+export function wakeupDedup(prev: WakeupStamp | undefined, key: string, now: number, windowMs: number): "deliver" | "skip" {
+  if (prev !== undefined && prev.key === key && now - prev.at < windowMs) return "skip"
+  return "deliver"
 }
 
 /** Самоисцеление трека: пустой bodyDoc в state (след спавна до-фиксного
@@ -400,13 +549,17 @@ export function mergeablePollStep(
   return attempt + 1 < maxAttempts ? { t: "retry" } : { t: "degrade" }
 }
 
-/** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
+/** Будильник: тело задачи изменено контентно и не из хода адресата. Формулировка
+ *  нейтральная (дополнение №3): до агента доходят только не-own дельты, но
+ *  «чья правка» проверяется по телу — не дисконтировать реальную правку
+ *  владельца как своё эхо. */
 export function bodyEditPrompt(rowId: string): string {
   return [
-    `[factory] Юзер отредактировал ТЕЛО задачи ${rowId} (не коммент).`,
+    `[factory] Тело задачи ${rowId} изменено (не коммент).`,
     "",
-    "Перечитай тело (uwuwu-cli task get — печатает тело целиком), найди что изменилось,",
-    "учти изменения в работе. Ответь/доложи по пайпу — комментом.",
+    "Перечитай тело (uwuwu-cli task get), определи чью это правку и учти её.",
+    "Хинт: единый updated у всех блоков = механическая перезапись, точечные updated = ручная правка.",
+    "Если это собственная запись тебя или пайпа — эхо: тихий конец хода, без коммента и без смены статуса.",
   ].join("\n")
 }
 
@@ -807,6 +960,15 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
+  ) return false
+  if (t.bodyHash !== undefined && typeof t.bodyHash !== "string") return false
+  if (
+    t.lastWakeup !== undefined &&
+    !(
+      typeof t.lastWakeup === "object" && t.lastWakeup !== null &&
+      typeof (t.lastWakeup as WakeupStamp).key === "string" &&
+      typeof (t.lastWakeup as WakeupStamp).at === "number"
+    )
   ) return false
   if (
     t.reviewSessionID !== undefined &&
