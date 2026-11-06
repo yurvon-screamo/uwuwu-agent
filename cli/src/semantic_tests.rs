@@ -1344,6 +1344,89 @@ fn seed_indexed_chunk_at(store: &mut Store, block_id: &str, updated: &str, conte
 }
 
 #[tokio::test]
+async fn sync_command_drains_queue_and_reports() {
+    // Ручная дотяжка вне бюджета поиска: очередь из трёх свежих строк
+    // закоммичена, отчёт содержит счётчики и нулевой backlog.
+    let blocks = vec![
+        block(
+            "s1",
+            "20261105000010",
+            "первый свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "s2",
+            "20261105000011",
+            "второй свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "s3",
+            "20261105000012",
+            "третий свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+    ];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    drop(store);
+
+    let lines = crate::semantic::sync_once(&sy, &cfg).await.expect("sync");
+
+    assert!(
+        lines.iter().any(|l| l.contains("3 чанков")),
+        "отчёт дельты: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("очередь дельты: 0")),
+        "очередь закрыта: {lines:?}"
+    );
+    let store = seeded_store(dir.path());
+    let (updated, id) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(updated, "20261105000012");
+    assert_eq!(id, "s3", "курсор-пара на последней строке: {id}");
+}
+
+#[tokio::test]
+async fn sync_command_refuses_while_rebuild_lock_held() {
+    // Advisory-лок: синк на сотни секунд записей не должен пересекаться
+    // с rebuild'ом — громкий отказ, а не взаимная порча индекса.
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    store.acquire_rebuild_lock().expect("чужой прогон");
+    drop(store);
+
+    let err = crate::semantic::sync_once(&sy, &cfg)
+        .await
+        .expect_err("лок держит живой прогон");
+    assert!(err.to_string().contains("уже идёт"), "{err}");
+}
+
+#[tokio::test]
+async fn sync_command_refuses_empty_index() {
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+
+    let err = crate::semantic::sync_once(&sy, &cfg)
+        .await
+        .expect_err("пустой индекс");
+    assert!(err.to_string().contains("индекс пуст"), "{err}");
+}
+
+#[tokio::test]
 async fn search_half_returns_results_when_sync_budget_dies() {
     // Query-first: эмбедд запроса — первым (полный бюджет), sync — в
     // остатке. Бюджет умер посреди синка — секция отдаёт РЕЗУЛЬТАТЫ и

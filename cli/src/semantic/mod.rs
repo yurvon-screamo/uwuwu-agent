@@ -27,6 +27,11 @@ pub(crate) const SEARCH_BUDGET: Duration = Duration::from_secs(10);
 /// Таймаут батча на поисковом пути; `semantic rebuild` строит клиент шире.
 pub(crate) const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REBUILD_EMBED_TIMEOUT: Duration = Duration::from_secs(120);
+/// Бюджет ручной дотяжки `semantic sync`: очередь в тысячи строк ≈ минуты
+/// тёплых батчей (1879 строк ≈ 60 батчей ≈ 2–5 мин) с запасом; команда
+/// явная — долгий wall-clock приемлем. Хвост над watermark догоняется
+/// повтором команды.
+pub(crate) const SYNC_BUDGET: Duration = Duration::from_secs(600);
 pub(crate) const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:11434";
 pub(crate) const DEFAULT_EMBED_MODEL: &str = "qwen3-embedding:0.6b";
 const REBUILD_HINT: &str = "uwuwu-cli semantic rebuild";
@@ -331,6 +336,70 @@ async fn rebuild_index(
         skipped_short: report.skipped_short,
         elapsed: started.elapsed(),
     })
+}
+
+/// Ручная дотяжка индекса вне бюджета поиска (`semantic sync`): дельта,
+/// затем reconcile — с advisory-локом (параллельный rebuild или синк
+/// громко отказывает: сотни секунд записей без лока могли бы портить
+/// чужой свежий rebuild — watermark перескочил бы незакрытые строки).
+/// Строки отчёта — в stdout вызывающего.
+pub async fn sync_once(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
+    if !cfg.db_path.exists() {
+        anyhow::bail!("индекс пуст — {REBUILD_HINT}");
+    }
+    let mut store = Store::open(&cfg.db_path)?;
+    index_ready(&store, cfg).map_err(anyhow::Error::msg)?;
+    store.acquire_rebuild_lock()?;
+    let result = sync_once_locked(sy, cfg, &mut store).await;
+    // Крэш-лок снимается steal'ом следующего запуска (как у rebuild).
+    let _ = store.release_rebuild_lock();
+    result
+}
+
+async fn sync_once_locked(
+    sy: &SiYuan,
+    cfg: &SemanticConfig,
+    store: &mut Store,
+) -> Result<Vec<String>> {
+    let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
+    let deadline = Instant::now() + SYNC_BUDGET;
+    let delta = sync::delta_sync(
+        sy,
+        &ollama,
+        store,
+        &sync::SyncOptions {
+            since: None,
+            deadline: Some(deadline),
+            embed_timeout: REBUILD_EMBED_TIMEOUT,
+            // пауза между страницами: дотяжка ходит по ядру страницами —
+            // не душим прод-ядро сканами (как rebuild)
+            page_delay: Some(Duration::from_millis(200)),
+            on_batch: None,
+        },
+    )
+    .await?;
+    let reconcile = sync::reconcile(sy, &ollama, store, Some(deadline)).await?;
+    let backlog = backlog_size(sy, store).await?;
+
+    let mut lines = vec![format!(
+        "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
+        delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
+    )];
+    if reconcile.skipped {
+        lines.push("reconcile: скипнут (суточный интервал не истёк)".to_string());
+    } else {
+        lines.push(format!(
+            "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
+            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+        ));
+    }
+    if delta.budget_exhausted {
+        lines.push(
+            "бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string(),
+        );
+    }
+    lines.push(format!("очередь дельты: {backlog} строк"));
+    Ok(lines)
 }
 
 /// Строки `uwuwu-cli semantic status`: состояние индекса и очереди дельты.
