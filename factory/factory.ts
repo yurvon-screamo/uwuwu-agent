@@ -36,6 +36,8 @@ import {
   kickoffModeOf,
   promptForStart,
   prMergeableOf,
+  mergeablePollStep,
+  type MergeablePollStep,
   wakeupPrompt,
   bodyEditPrompt,
   isValidTracked,
@@ -499,22 +501,38 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
 
 // ——— жизненный цикл задачи ———
 
-/** PR ветки задачи конфликтует с master (gh pr view). Пустой PR, DRY_RUN,
- *  сбой gh или UNKNOWN — «не конфликт»: путь будильника не зависит от gh,
- *  конфликт агент увидит сам при пуше. */
+/** PR ветки задачи конфликтует с master (gh pr view). GitHub вычисляет
+ *  mergeable лениво: первый запрос по «холодному» PR отдаёт UNKNOWN и лишь
+ *  запускает фоновое вычисление — опрос повторяется, пока не появится
+ *  вердикт или не исчерпаются попытки (канонический сценарий: PR стоит со
+ *  вчерашнего ревью, владелец флипает статус — без повтора конфликт-kickoff
+ *  молча деградировал бы в generic именно в главном случае). Пустой PR,
+ *  DRY_RUN, сбой gh или UNKNOWN после всех попыток — «не конфликт»: путь
+ *  будильника не зависит от gh, конфликт агент увидит сам при пуше. */
+const MERGEABLE_POLL_ATTEMPTS = 4
+const MERGEABLE_POLL_DELAY_MS = 5_000
+
 async function prConflicted(pr: string, cwd: string): Promise<boolean> {
   if (pr === "") return false
   if (DRY_RUN) {
     log(`DRY_RUN: gh pr view ${pr.slice(0, 40)} — mergeable не проверяется`)
     return false
   }
-  try {
-    const raw = await sh(["gh", "pr", "view", pr, "--json", "mergeable"], { cwd })
-    return prMergeableOf(raw) === "CONFLICTING"
-  } catch (e) {
-    log(`prConflicted ${pr.slice(0, 40)}: ${errText(e)}`)
-    return false
+  for (let attempt = 0; attempt < MERGEABLE_POLL_ATTEMPTS; attempt++) {
+    let step: MergeablePollStep
+    try {
+      const raw = await sh(["gh", "pr", "view", pr, "--json", "mergeable"], { cwd })
+      step = mergeablePollStep(prMergeableOf(raw), attempt, MERGEABLE_POLL_ATTEMPTS)
+    } catch (e) {
+      log(`prConflicted ${pr.slice(0, 40)}: ${errText(e)}`)
+      return false
+    }
+    if (step.t === "conflict") return true
+    if (step.t === "clear") return false
+    if (step.t === "retry") await new Promise((r) => setTimeout(r, MERGEABLE_POLL_DELAY_MS))
   }
+  log(`prConflicted ${pr.slice(0, 40)}: mergeable=UNKNOWN после ${MERGEABLE_POLL_ATTEMPTS} попыток — generic-ветка`)
+  return false
 }
 
 async function startTask(

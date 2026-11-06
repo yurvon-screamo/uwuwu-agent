@@ -9,6 +9,7 @@ import {
   bodyEditPrompt,
   promptForStart,
   prMergeableOf,
+  mergeablePollStep,
   spawnPrompt,
   untrackedTasks,
   isUserComment,
@@ -386,6 +387,21 @@ describe("prMergeableOf: парс gh pr view --json mergeable", () => {
     expect(prMergeableOf("{}")).toBe("UNKNOWN")
     expect(prMergeableOf("не json")).toBe("UNKNOWN")
     expect(prMergeableOf("")).toBe("UNKNOWN")
+  })
+})
+
+describe("mergeablePollStep: политика опроса ленивого mergeable", () => {
+  test("финальные вердикты на любой попытке", () => {
+    expect(mergeablePollStep("CONFLICTING", 0, 4)).toEqual({ t: "conflict" })
+    expect(mergeablePollStep("CONFLICTING", 3, 4)).toEqual({ t: "conflict" })
+    expect(mergeablePollStep("MERGEABLE", 0, 4)).toEqual({ t: "clear" })
+    expect(mergeablePollStep("MERGEABLE", 3, 4)).toEqual({ t: "clear" })
+  })
+  test("UNKNOWN переспрашивается до исчерпания попыток, затем мягкая деградация", () => {
+    expect(mergeablePollStep("UNKNOWN", 0, 4)).toEqual({ t: "retry" })
+    expect(mergeablePollStep("UNKNOWN", 1, 4)).toEqual({ t: "retry" })
+    expect(mergeablePollStep("UNKNOWN", 2, 4)).toEqual({ t: "retry" })
+    expect(mergeablePollStep("UNKNOWN", 3, 4)).toEqual({ t: "degrade" })
   })
 })
 

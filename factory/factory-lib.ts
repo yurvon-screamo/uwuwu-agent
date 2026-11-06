@@ -275,6 +275,28 @@ export function prMergeableOf(raw: string): "CONFLICTING" | "MERGEABLE" | "UNKNO
   }
 }
 
+/** Шаг опроса mergeable. GitHub вычисляет конфликтность лениво: первый
+ *  запрос по «холодному» PR возвращает UNKNOWN и лишь запускает фоновое
+ *  вычисление — значение появляется на повторных запросах через секунды.
+ *  CONFLICTING/MERGEABLE — финальные вердикты; UNKNOWN переспрашивается,
+ *  пока не исчерпаны попытки, затем — мягкая деградация («не конфликт»). */
+export type MergeablePollStep =
+  | { t: "conflict" }
+  | { t: "clear" }
+  | { t: "retry" }
+  | { t: "degrade" }
+
+/** Единственная точка решения «что дальше» на попытке опроса mergeable. */
+export function mergeablePollStep(
+  mergeable: "CONFLICTING" | "MERGEABLE" | "UNKNOWN",
+  attempt: number,
+  maxAttempts: number,
+): MergeablePollStep {
+  if (mergeable === "CONFLICTING") return { t: "conflict" }
+  if (mergeable === "MERGEABLE") return { t: "clear" }
+  return attempt + 1 < maxAttempts ? { t: "retry" } : { t: "degrade" }
+}
+
 /** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
 export function bodyEditPrompt(rowId: string): string {
   return [
@@ -398,7 +420,8 @@ export type RouteAction =
 
 /** Решение по задаче на один тик. Приоритет порядка: спавн ревьювера →
  *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → возврат
- *  девелоперу (из ревью-статуса или ручной перевод в Design) → noop. */
+ *  девелоперу (из ревью-статуса по вердикту, ручной перевод в Design или
+ *  fast-track флип владельца в In Progress — «вмешайся и почини») → noop. */
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
