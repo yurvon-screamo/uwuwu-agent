@@ -34,12 +34,42 @@ struct Row {
 }
 
 const ROWS: &[Row] = &[
-    Row { item: "item-live", title: "живая задача", status: "In Progress", doc: Some("20261104000001-livexx1") },
-    Row { item: "item-dead", title: "мёртвая строка", status: "Todo", doc: Some("20261104000002-dedxxx2") },
-    Row { item: "item-draft", title: "черновик-пустышка", status: "Draft", doc: Some("20261104000003-dra0003") },
-    Row { item: "item-div", title: "див-строка", status: "Todo", doc: Some("20261104000004-divxx04") },
-    Row { item: "item-skel", title: "скелет-черновик", status: "Draft", doc: Some("20261104000005-skelxx5") },
-    Row { item: "item-draft-live", title: "живой черновик", status: "Draft", doc: Some("20261104000006-drlxx06") },
+    Row {
+        item: "item-live",
+        title: "живая задача",
+        status: "In Progress",
+        doc: Some("20261104000001-livexx1"),
+    },
+    Row {
+        item: "item-dead",
+        title: "мёртвая строка",
+        status: "Todo",
+        doc: Some("20261104000002-dedxxx2"),
+    },
+    Row {
+        item: "item-draft",
+        title: "черновик-пустышка",
+        status: "Draft",
+        doc: Some("20261104000003-dra0003"),
+    },
+    Row {
+        item: "item-div",
+        title: "див-строка",
+        status: "Todo",
+        doc: Some("20261104000004-divxx04"),
+    },
+    Row {
+        item: "item-skel",
+        title: "скелет-черновик",
+        status: "Draft",
+        doc: Some("20261104000005-skelxx5"),
+    },
+    Row {
+        item: "item-draft-live",
+        title: "живой черновик",
+        status: "Draft",
+        doc: Some("20261104000006-drlxx06"),
+    },
 ];
 
 fn row_by_item(item: &str) -> &'static Row {
@@ -102,7 +132,12 @@ fn render_added_row(id: &str, title: &str, status: &str) -> serde_json::Value {
     )
 }
 
-fn render_row_cells(id: &str, _title: &str, status: &str, block: serde_json::Value) -> serde_json::Value {
+fn render_row_cells(
+    id: &str,
+    _title: &str,
+    status: &str,
+    block: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "cells": [
@@ -167,22 +202,28 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let kernel = kernel.clone();
             move |req: &Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let file = body.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                if file == format!("data/{NB}/folder-doc/{BOARD_DOC}.sy") && kernel.counter(&kernel.boards_file_missing) > 0 {
+                let file = body
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if file == format!("data/{NB}/folder-doc/{BOARD_DOC}.sy")
+                    && kernel.counter(&kernel.boards_file_missing) > 0
+                {
                     return missing_file();
                 }
                 match file.as_str() {
                     "data/nb-1/folder-doc/board-doc/20261104000001-livexx1.sy"
                     | "data/nb-1/folder-doc/board-doc/20261104000005-skelxx5.sy"
                     | "data/nb-1/folder-doc/board-doc/20261104000006-drlxx06.sy" => {
-                        ResponseTemplate::new(200).set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec())
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec())
                     }
                     "data/nb-1/folder-doc/board-doc/20261104000004-divxx04.sy" => {
                         ResponseTemplate::new(500).set_body_string(r#"{"code":-1,"msg":"boom"}"#)
                     }
-                    "data/nb-1/folder-doc/board-doc.sy" => {
-                        ResponseTemplate::new(200).set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec())
-                    }
+                    "data/nb-1/folder-doc/board-doc.sy" => ResponseTemplate::new(200)
+                        .set_body_bytes(b"{\"Type\":\"NodeDocument\"}".to_vec()),
                     _ => {
                         let seeded = kernel.undo_journal.lock().unwrap().get(&file).cloned();
                         match seeded {
@@ -205,12 +246,19 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let data = match hpath {
                 "/uwuwu" => serde_json::json!(["folder-doc"]),
                 "/uwuwu/Задачи uwuwu" => serde_json::json!([BOARD_DOC]),
-                "/uwuwu/Задачи uwuwu/живая задача" => serde_json::json!(["20261104000001-livexx1"]),
-                "/uwuwu/Задачи uwuwu/скелет-черновик" => serde_json::json!(["20261104000005-skelxx5"]),
-                "/uwuwu/Задачи uwuwu/живой черновик" => serde_json::json!(["20261104000006-drlxx06"]),
+                "/uwuwu/Задачи uwuwu/живая задача" => {
+                    serde_json::json!(["20261104000001-livexx1"])
+                }
+                "/uwuwu/Задачи uwuwu/скелет-черновик" => {
+                    serde_json::json!(["20261104000005-skelxx5"])
+                }
+                "/uwuwu/Задачи uwuwu/живой черновик" => {
+                    serde_json::json!(["20261104000006-drlxx06"])
+                }
                 _ => serde_json::json!([]),
             };
-            ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+            ResponseTemplate::new(200)
+                .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
         })
         .mount(server)
         .await;
@@ -246,7 +294,11 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 let body = String::from_utf8_lossy(&req.body).to_string();
                 if let Some(name) = journal_name_from_multipart(&body) {
                     let path = format!("data/assets/undo/{name}");
-                    kernel.undo_journal.lock().unwrap().insert(path, req.body.clone());
+                    kernel
+                        .undo_journal
+                        .lock()
+                        .unwrap()
+                        .insert(path, req.body.clone());
                 }
                 ResponseTemplate::new(200).set_body_string(r#"{"code":0,"msg":"","data":null}"#)
             }
@@ -360,7 +412,10 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
 }
 
 fn skeleton_export(title: &str) -> String {
-    format!("---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#dev\n", body_template(title, "dev", ""))
+    format!(
+        "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#dev\n",
+        body_template(title, "dev", "")
+    )
 }
 
 /// Имя журнала из multipart-тела putFile (поле path).
@@ -386,18 +441,32 @@ async fn clean_refuses_whole_batch_when_live_row_lacks_ack() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Clean {
-        ids: "живая задача,мёртвая строка".into(),
-        yes: true,
-        live: None,
-    })
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "живая задача,мёртвая строка".into(),
+            yes: true,
+            live: None,
+        },
+    )
     .await
     .expect_err("батч с Live без ack обязан отказать");
 
     assert!(err.to_string().contains("ЦЕЛИКОМ"), "суть отказа: {err}");
-    assert!(err.to_string().contains("живая задача"), "отказная строка названа: {err}");
-    assert_eq!(kernel.counter(&kernel.item_remove_calls), 0, "ноль item_remove");
-    assert_eq!(kernel.counter(&kernel.put_file_calls), 0, "журнал не пишется до гейта");
+    assert!(
+        err.to_string().contains("живая задача"),
+        "отказная строка названа: {err}"
+    );
+    assert_eq!(
+        kernel.counter(&kernel.item_remove_calls),
+        0,
+        "ноль item_remove"
+    );
+    assert_eq!(
+        kernel.counter(&kernel.put_file_calls),
+        0,
+        "журнал не пишется до гейта"
+    );
 }
 
 /// (б) Dead+DraftDead с --yes: снесены одним item_remove, журнал до мутации,
@@ -410,21 +479,39 @@ async fn clean_removes_dead_and_draft_rows_with_yes_and_writes_journal() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Clean {
-        ids: "мёртвая строка,черновик-пустышка".into(),
-        yes: true,
-        live: None,
-    })
+    task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "мёртвая строка,черновик-пустышка".into(),
+            yes: true,
+            live: None,
+        },
+    )
     .await
     .expect("dead+draftdead сносится с --yes");
 
-    assert_eq!(kernel.counter(&kernel.item_remove_calls), 1, "один item_remove массивом");
-    assert_eq!(kernel.counter(&kernel.put_file_calls), 1, "write-ahead журнал записан");
-    assert_eq!(kernel.counter(&kernel.remove_doc_calls), 0, "у Dead/DraftDead тел нет — трэш не зовётся");
+    assert_eq!(
+        kernel.counter(&kernel.item_remove_calls),
+        1,
+        "один item_remove массивом"
+    );
+    assert_eq!(
+        kernel.counter(&kernel.put_file_calls),
+        1,
+        "write-ahead журнал записан"
+    );
+    assert_eq!(
+        kernel.counter(&kernel.remove_doc_calls),
+        0,
+        "у Dead/DraftDead тел нет — трэш не зовётся"
+    );
     {
         let remaining = kernel.remaining.lock().unwrap();
         assert!(remaining.contains(&"item-live"), "живая строка на доске");
-        assert!(!remaining.contains(&"item-dead") && !remaining.contains(&"item-draft"), "кандидаты сняты");
+        assert!(
+            !remaining.contains(&"item-dead") && !remaining.contains(&"item-draft"),
+            "кандидаты сняты"
+        );
     }
 }
 
@@ -437,14 +524,32 @@ async fn clean_marks_divergent_in_dry_run_and_refuses_execution() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Clean { ids: "див-строка".into(), yes: false, live: None })
-        .await
-        .expect("dry-run всегда проходит");
-    assert_eq!(kernel.counter(&kernel.item_remove_calls), 0, "dry-run не мутирует");
+    task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "див-строка".into(),
+            yes: false,
+            live: None,
+        },
+    )
+    .await
+    .expect("dry-run всегда проходит");
+    assert_eq!(
+        kernel.counter(&kernel.item_remove_calls),
+        0,
+        "dry-run не мутирует"
+    );
 
-    let err = task_run("uwuwu", TaskSub::Clean { ids: "див-строка".into(), yes: true, live: None })
-        .await
-        .expect_err("Divergent не сносится");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "див-строка".into(),
+            yes: true,
+            live: None,
+        },
+    )
+    .await
+    .expect_err("Divergent не сносится");
     assert!(err.to_string().contains("ЦЕЛИКОМ"), "суть отказа: {err}");
     assert_eq!(kernel.counter(&kernel.item_remove_calls), 0);
 }
@@ -458,12 +563,23 @@ async fn clean_removes_draft_skeleton_and_trashes_body() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Clean { ids: "скелет-черновик".into(), yes: true, live: None })
-        .await
-        .expect("DraftSkeleton сносится без ack");
+    task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "скелет-черновик".into(),
+            yes: true,
+            live: None,
+        },
+    )
+    .await
+    .expect("DraftSkeleton сносится без ack");
 
     assert_eq!(kernel.counter(&kernel.item_remove_calls), 1);
-    assert_eq!(kernel.counter(&kernel.remove_doc_calls), 1, "скелет тела в трэш");
+    assert_eq!(
+        kernel.counter(&kernel.remove_doc_calls),
+        1,
+        "скелет тела в трэш"
+    );
     assert!(!kernel.remaining.lock().unwrap().contains(&"item-skel"));
 }
 
@@ -477,13 +593,27 @@ async fn clean_aborts_without_mutations_when_board_file_missing() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Clean { ids: "мёртвая строка".into(), yes: true, live: None })
-        .await
-        .expect_err("контрольная проба обязана прервать батч");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "мёртвая строка".into(),
+            yes: true,
+            live: None,
+        },
+    )
+    .await
+    .expect_err("контрольная проба обязана прервать батч");
 
-    assert!(err.to_string().contains("контрольная проба"), "суть отказа: {err}");
+    assert!(
+        err.to_string().contains("контрольная проба"),
+        "суть отказа: {err}"
+    );
     assert_eq!(kernel.counter(&kernel.item_remove_calls), 0, "ноль мутаций");
-    assert_eq!(kernel.counter(&kernel.put_file_calls), 0, "журнал не пишется");
+    assert_eq!(
+        kernel.counter(&kernel.put_file_calls),
+        0,
+        "журнал не пишется"
+    );
 }
 
 /// (ж) Пост-чек: item_remove снял больше плана → громкая ошибка с журналом.
@@ -496,14 +626,27 @@ async fn clean_post_check_alarms_on_unplanned_loss() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Clean { ids: "мёртвая строка".into(), yes: true, live: None })
-        .await
-        .expect_err("лишняя пропажа обязана поднять аларм");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Clean {
+            ids: "мёртвая строка".into(),
+            yes: true,
+            live: None,
+        },
+    )
+    .await
+    .expect_err("лишняя пропажа обязана поднять аларм");
 
     let msg = err.to_string();
     assert!(msg.contains("ПОСТ-ЧЕК"), "суть ошибки: {msg}");
-    assert!(msg.contains("живая задача"), "названа неплановая жертва: {msg}");
-    assert!(msg.contains("task undo"), "путь восстановления указан: {msg}");
+    assert!(
+        msg.contains("живая задача"),
+        "названа неплановая жертва: {msg}"
+    );
+    assert!(
+        msg.contains("task undo"),
+        "путь восстановления указан: {msg}"
+    );
     assert!(msg.contains("data/assets/undo/"), "журнал упомянут: {msg}");
 }
 
@@ -517,20 +660,38 @@ async fn rm_refuses_live_task_but_removes_contentful_draft() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Rm { id: "живая задача".into() })
-        .await
-        .expect_err("rm живой задачи обязан отказать");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Rm {
+            id: "живая задача".into(),
+        },
+    )
+    .await
+    .expect_err("rm живой задачи обязан отказать");
     let msg = err.to_string();
     assert!(msg.contains("rm только для Draft"), "суть отказа: {msg}");
     assert!(msg.contains("task close"), "hint на close: {msg}");
     assert_eq!(kernel.counter(&kernel.item_remove_calls), 0);
 
-    task_run("uwuwu", TaskSub::Rm { id: "живой черновик".into() })
-        .await
-        .expect("контентный Draft (Live+Draft) сносится rm");
+    task_run(
+        "uwuwu",
+        TaskSub::Rm {
+            id: "живой черновик".into(),
+        },
+    )
+    .await
+    .expect("контентный Draft (Live+Draft) сносится rm");
     assert_eq!(kernel.counter(&kernel.item_remove_calls), 1);
-    assert_eq!(kernel.counter(&kernel.put_file_calls), 1, "журнал до мутации");
-    assert_eq!(kernel.counter(&kernel.remove_doc_calls), 1, "тело черновика в трэш");
+    assert_eq!(
+        kernel.counter(&kernel.put_file_calls),
+        1,
+        "журнал до мутации"
+    );
+    assert_eq!(
+        kernel.counter(&kernel.remove_doc_calls),
+        1,
+        "тело черновика в трэш"
+    );
 }
 
 /// (г) undo: восстанавливает строку из журнала (detached — тела не было);
@@ -568,24 +729,48 @@ async fn undo_restores_row_and_repeats_as_noop() {
 
     // строка снята с доски (журнал писался при её сносе) — иначе undo
     // честно no-op по тайтлу
-    kernel.remaining.lock().unwrap().retain(|item| *item != "item-dead");
+    kernel
+        .remaining
+        .lock()
+        .unwrap()
+        .retain(|item| *item != "item-dead");
 
-    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()), list: false })
-        .await
-        .expect("первый undo восстанавливает");
+    task_run(
+        "uwuwu",
+        TaskSub::Undo {
+            journal: Some(UNDO_JOURNAL.into()),
+            list: false,
+        },
+    )
+    .await
+    .expect("первый undo восстанавливает");
     let after_first = kernel.counter(&kernel.item_add_calls);
     assert_eq!(after_first, 1, "одна вставка строки");
     assert!(
-        kernel.added.lock().unwrap().iter().any(|(id, title, _)| id == "item-restored" && title == "мёртвая строка"),
+        kernel
+            .added
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, title, _)| id == "item-restored" && title == "мёртвая строка"),
         "восстановленная строка отдаётся render'ом"
     );
     // Status (mSelect) + Branch (text) + PR (url) — три item_update по клеткам
     let updates = kernel.counter(&kernel.item_update_calls);
-    assert!(updates >= 2, "Branch/PR клетки восстанавливаются item_update: {updates}");
+    assert!(
+        updates >= 2,
+        "Branch/PR клетки восстанавливаются item_update: {updates}"
+    );
 
-    task_run("uwuwu", TaskSub::Undo { journal: Some(UNDO_JOURNAL.into()), list: false })
-        .await
-        .expect("повторный undo — идемпотентный no-op");
+    task_run(
+        "uwuwu",
+        TaskSub::Undo {
+            journal: Some(UNDO_JOURNAL.into()),
+            list: false,
+        },
+    )
+    .await
+    .expect("повторный undo — идемпотентный no-op");
     assert_eq!(
         kernel.counter(&kernel.item_add_calls),
         after_first,

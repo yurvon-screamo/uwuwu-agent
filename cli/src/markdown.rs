@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn strip_export_wrapper_keeps_body_without_name_prefix() {
         let md = "# другой заголовок\nтекст\n";
-        assert_eq!(strip_export_wrapper(md, "таск"), "# другой заголовок\nтекст\n");
+        assert_eq!(
+            strip_export_wrapper(md, "таск"),
+            "# другой заголовок\nтекст\n"
+        );
     }
 
     #[test]

@@ -65,13 +65,21 @@ fn export_parses_doc_id() {
 
 #[test]
 fn render_parses_ids_and_page() {
-    let KernelSub::Render { av_id, block_id, page } = expect_kernel(parse_kernel(&[
-        "render",
-        "20261104102403-kernel1",
-        "20261104102403-block02",
-        "--page",
-        "2",
-    ]).unwrap()) else {
+    let KernelSub::Render {
+        av_id,
+        block_id,
+        page,
+    } = expect_kernel(
+        parse_kernel(&[
+            "render",
+            "20261104102403-kernel1",
+            "20261104102403-block02",
+            "--page",
+            "2",
+        ])
+        .unwrap(),
+    )
+    else {
         panic!("expected render subcommand");
     };
     assert_eq!(av_id, "20261104102403-kernel1");
@@ -109,7 +117,11 @@ fn ls_lines_marks_directories_with_trailing_slash() {
     ]);
     assert_eq!(
         ls_lines(entries.as_array().unwrap()),
-        vec!["doc.sy".to_string(), "assets/".to_string(), "no-flag.png".to_string()]
+        vec![
+            "doc.sy".to_string(),
+            "assets/".to_string(),
+            "no-flag.png".to_string()
+        ]
     );
 }
 

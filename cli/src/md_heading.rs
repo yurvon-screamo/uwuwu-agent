@@ -32,7 +32,10 @@ pub(crate) fn normalize_heading_text(raw: &str) -> String {
 
 /// Суффикс block-id SiYuan: непустой ASCII (буквы, цифры, дефисы).
 fn is_block_id(suffix: &str) -> bool {
-    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Нормализация ЗАПРОСА секции (--replace-section): запрос может нести
@@ -87,7 +90,10 @@ mod tests {
     #[test]
     fn heading_detects_level_and_text() {
         assert_eq!(heading_of("# Титул"), Some((1, "Титул".to_string())));
-        assert_eq!(heading_of("### Подсекция"), Some((3, "Подсекция".to_string())));
+        assert_eq!(
+            heading_of("### Подсекция"),
+            Some((3, "Подсекция".to_string()))
+        );
     }
 
     #[test]
@@ -98,7 +104,10 @@ mod tests {
 
     #[test]
     fn heading_normalizes_whitespace() {
-        assert_eq!(heading_of("##  Двойные   пробелы "), Some((2, "Двойные пробелы".to_string())));
+        assert_eq!(
+            heading_of("##  Двойные   пробелы "),
+            Some((2, "Двойные пробелы".to_string()))
+        );
     }
 
     #[test]
@@ -111,7 +120,10 @@ mod tests {
 
     #[test]
     fn heading_keeps_caret_text_that_is_not_block_id() {
-        assert_eq!(heading_of("## A ^не id!"), Some((2, "A ^не id!".to_string())));
+        assert_eq!(
+            heading_of("## A ^не id!"),
+            Some((2, "A ^не id!".to_string()))
+        );
     }
 
     #[test]
@@ -122,18 +134,28 @@ mod tests {
     #[test]
     fn normalize_query_strips_atx_prefix() {
         assert_eq!(normalize_heading_query("## Решение"), "Решение");
-        assert_eq!(normalize_heading_query("###  Подсекция ^20261105230000-ab12cd"), "Подсекция");
+        assert_eq!(
+            normalize_heading_query("###  Подсекция ^20261105230000-ab12cd"),
+            "Подсекция"
+        );
     }
 
     #[test]
     fn normalize_query_keeps_plain_name_and_hashless_word() {
         assert_eq!(normalize_heading_query(" Решение "), "Решение");
-        assert_eq!(normalize_heading_query("#bug"), "#bug", "нет пробела после хэшей — не ATX, не срезаем");
+        assert_eq!(
+            normalize_heading_query("#bug"),
+            "#bug",
+            "нет пробела после хэшей — не ATX, не срезаем"
+        );
     }
 
     #[test]
     fn has_h2_section_matches_normalized_heading() {
-        assert!(has_h2_section("вступление\n\n##  Комменты \n- строка\n", "Комменты"));
+        assert!(has_h2_section(
+            "вступление\n\n##  Комменты \n- строка\n",
+            "Комменты"
+        ));
     }
 
     #[test]
