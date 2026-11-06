@@ -64,6 +64,13 @@ import {
   spawnLimitsFromEnv,
   hasSessionEvidence,
   activeTaskGuards,
+  parseAgentHeadTs,
+  freshForeignComments,
+  legacyRebaselineNeeded,
+  latestComment,
+  bodyContentHash,
+  bodyLastmodMs,
+  wakeupDedup,
   PATH_CELL,
   DEV_SESSION_CELL,
   REVIEW_SESSION_CELL,
@@ -161,6 +168,8 @@ const MAX_ATTEMPTS = 3
 const SPAWN_WAVE_CONCURRENCY = 4
 /** бот-аккаунт афины: его комменты — не сигналы юзера */
 const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6c71d8afeae"
+/** окно дедупа повторной доставки будильника (дефект №5.2: 7 будок за 9 минут) */
+const WAKEUP_DEDUP_MS = 10 * 60_000
 /** корень окружений задач: <root>/<row-id>/{repo,scratch,logs} (на /home,
  *  не tmpfs — урок SIGSEGV 03.11). Песочница переопределяет вместе с state. */
 const ENV_ROOT = process.env.UWUWU_FACTORY_ENV_ROOT ?? join(homedir(), "agents-env")
@@ -412,8 +421,11 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
       const n = e.node
       if (n === undefined || typeof n.id !== "string") continue
       const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
-      const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
       const text = commentText(n.content)
+      // ts из CLI-головы («AGENTS (2026-11-05 19:43): …») — UTC, надёжный
+      // порядок; snapshot-meta (афина) — фоллбек; 0 — легаси без времени
+      const created = parseAgentHeadTs(text) ??
+        (typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0)
       const userId = (n as { user?: { id?: unknown } }).user?.id
       out.push({
         id: n.id,
@@ -430,9 +442,11 @@ async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
           if (typeof r.id !== "string") continue
           const repText = commentText(r.content)
           const repUser = r.user?.id
-          // GraphQL отдаёт createdAt ISO-строкой; число — только в snapshot
+          // GraphQL отдаёт createdAt ISO-строкой; иначе ts из CLI-головы reply,
+          // иначе позиция после родителя
           const repCreated =
-            typeof r.createdAt === "string" ? Date.parse(r.createdAt) : created + 1
+            parseAgentHeadTs(repText) ??
+            (typeof r.createdAt === "string" ? Date.parse(r.createdAt) : created + 1)
           out.push({
             id: r.id,
             text: `(тред-ответ на «${parentHead}…») ${repText}`,
@@ -563,6 +577,24 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
   }
 }
 
+/** Markdown-экспорт тела; null — экспорт не удался (гейты деградируют к будке —
+ *  тихий скип на сбое чтения потерял бы реальную правку владельца). */
+async function bodyExport(bodyDoc: string): Promise<string | null> {
+  if (bodyDoc === "") return null
+  try {
+    const r = await mcp.tool<{ markdown?: string; exists?: boolean }>("export_doc_markdown", { docId: bodyDoc })
+    return r.exists === true ? r.markdown ?? "" : null
+  } catch {
+    return null
+  }
+}
+
+/** Хэш норм-формы контента тела вне «Комменты»; null при сбое экспорта. */
+async function bodyHashOf(bodyDoc: string): Promise<string | null> {
+  const md = await bodyExport(bodyDoc)
+  return md === null ? null : bodyContentHash(md)
+}
+
 // ——— жизненный цикл задачи ———
 
 /** PR ветки задачи конфликтует с master (gh pr view). GitHub вычисляет
@@ -653,12 +685,9 @@ async function startTask(
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
   // newUserComments идёт по юзерскому списку)
-  const comments = (await taskComments(task.bodyDoc)).filter((c) =>
-    isUserComment(c, BOT_USER_ID),
+  const last = latestComment(
+    (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID)),
   )
-  const last = comments.length > 0
-    ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
-    : null
 
   state.tasks[task.rowId] = {
     sessionID,
@@ -672,6 +701,7 @@ async function startTask(
     attempts: attemptsSeed,
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
+    bodyHash: await bodyHashOf(task.bodyDoc) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
@@ -1111,10 +1141,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
     // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
     // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
-    const comments = (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID))
-    const last = comments.length > 0
-      ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
-      : null
+    const last = latestComment(
+      (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID)),
+    )
     const entry: TrackedTask = {
       sessionID: "", worktree: "", branch: "",
       bodyDoc: task.bodyDoc, title: task.title, project: projectName,
@@ -1122,6 +1151,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
       lastStatus: task.status,
       bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
+      bodyHash: (await bodyHashOf(task.bodyDoc)) ?? undefined,
     }
     state.tasks[task.rowId] = entry
     try {
@@ -1178,6 +1208,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         healed = true
       }
     }
+    if (tracked.bodyDoc !== "" && (tracked.bodyHash ?? "") === "") {
+      const hashSeeded = await bodyHashOf(tracked.bodyDoc)
+      if (hashSeeded !== null) {
+        tracked.bodyHash = hashSeeded
+        healed = true
+      }
+    }
     if (healed) saveState(state)
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
@@ -1195,7 +1232,27 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
 
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
     const comments = await taskComments(tracked.bodyDoc)
+    const users = comments.filter((c) => isUserComment(c, BOT_USER_ID))
+    // легаси-переход (деплой фильтра self-эха): старый id при нулевом времени —
+    // фоллбек по времени отдал бы всю историю чужих AGENTS-комментов одной волной
+    if (legacyRebaselineNeeded({ at: tracked.lastCommentAt, id: tracked.lastCommentId }, users)) {
+      const last = latestComment(users)
+      tracked.lastCommentAt = last?.createdAt ?? 0
+      tracked.lastCommentId = last?.id ?? ""
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: легаси-граница комментов — re-baseline на текущий срез без будки`)
+    }
     const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
+    // сесс-скопед срез self-эха: активность адресата по статусу (в ревью —
+    // ревьювер, иначе девелопер); сбой активности — без среза
+    const addresseeSession = reviewKindOf(row.status) !== null
+      ? tracked.reviewSessionID ?? ""
+      : tracked.sessionID
+    const activity = addresseeSession !== "" ? await lastSessionActivity(addresseeSession) : null
+    const { foreign, ownCount } = freshForeignComments(fresh, activity === "invalid" ? null : activity)
+    if (ownCount > 0) {
+      log(`задача ${rowId.slice(0, 8)}: self-эхо срезано (${ownCount}/${fresh.length} комментов)`)
+    }
     const reviewerLiveness = tracked.reviewSessionID === undefined || tracked.reviewSessionID === ""
       ? "dead"
       : await sessionLiveness(tracked.reviewSessionID)
@@ -1203,7 +1260,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
-      freshComments: fresh,
+      freshComments: foreign,
     })
     let commentsConsumed = false
     const consumeComments = (): void => {
@@ -1213,10 +1270,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.lastCommentId = lastComment.id
       commentsConsumed = true
     }
-    /** базлайн тела: дев правил тело перед передачей мяча — этим не будить */
+    /** базлайн тела: дев правил тело перед передачей мяча — этим не будить
+     *  (lastmod + хэш контента вне «Комменты»: собственные записи отчёта
+     *  меняют контент — без обновления хэша след lastmod-only дал бы будку) */
     const refreshBodyBaseline = async (): Promise<void> => {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
       if (updated !== null) tracked.bodyUpdated = updated
+      const hash = await bodyHashOf(tracked.bodyDoc)
+      if (hash !== null) tracked.bodyHash = hash
     }
 
     const skipRest = await dispatchReviewAction(action, {
@@ -1240,24 +1301,56 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // ——— пайп девелопера: комменты/тело/живость (комменты мог съесть ревьювер) ———
-    const devFresh = commentsConsumed ? [] : fresh
+    const devFresh = commentsConsumed ? [] : foreign
 
     // будильник правок ТЕЛА без комментов — до карантинных веток: адресат
-    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине)
+    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине).
+    // Гейт: lastmod двигают и UI-пересохранения, и собственные записи агента —
+    // будим только на контентную дельту (хэш норм-формы вне «Комменты») не из
+    // хода адресата (дефекты №3/№4/№5)
     if (devFresh.length === 0) {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
-      const bodyChanged = updated !== null
+      const lastmodChanged = updated !== null
         && (tracked.bodyUpdated ?? "") !== ""
         && updated > (tracked.bodyUpdated ?? "")
-      if (bodyChanged) {
+      if (lastmodChanged) {
         const inReview = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
         const target = inReview ? tracked.reviewSessionID ?? "" : tracked.sessionID
         if (target !== "") {
-          log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно (${inReview ? "ревьювер" : "девелопер"})`)
-          if (await promptSession(target, bodyEditPrompt(rowId))) {
+          const md = await bodyExport(tracked.bodyDoc)
+          // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
+          const hash = md === null ? null : bodyContentHash(md)
+          const lastmodMs = md === null ? null : bodyLastmodMs(md)
+          const activity = await lastSessionActivity(target)
+          const ownEdit = lastmodMs !== null && typeof activity === "number" && lastmodMs <= activity
+          const contentChanged = hash === null || hash !== (tracked.bodyHash ?? "")
+          if (!contentChanged) {
             tracked.bodyUpdated = updated
+            if (hash !== null) tracked.bodyHash = hash
             saveState(state)
-            counters.wakeups++
+            log(`задача ${rowId.slice(0, 8)}: lastmod-only правка тела (UI-пересохранение) — без будки`)
+          } else if (ownEdit) {
+            tracked.bodyUpdated = updated
+            if (hash !== null) tracked.bodyHash = hash
+            saveState(state)
+            log(`задача ${rowId.slice(0, 8)}: правка тела из хода адресата — без будки`)
+          } else {
+            const bodyKey = `body:${hash ?? updated}`
+            if (wakeupDedup(tracked.lastWakeup, bodyKey, Date.now(), WAKEUP_DEDUP_MS) === "skip") {
+              tracked.bodyUpdated = updated
+              if (hash !== null) tracked.bodyHash = hash
+              saveState(state)
+              log(`задача ${rowId.slice(0, 8)}: дубль bodyEdit-wakeup в окне дедупа — скип`)
+            } else {
+              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${inReview ? "ревьювер" : "девелопер"})`)
+              if (await promptSession(target, bodyEditPrompt(rowId))) {
+                tracked.bodyUpdated = updated
+                if (hash !== null) tracked.bodyHash = hash
+                tracked.lastWakeup = { key: bodyKey, at: Date.now() }
+                saveState(state)
+                counters.wakeups++
+              }
+            }
           }
           continue
         }
@@ -1366,23 +1459,38 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // правка ТЕЛА при наличии комментов: wakeup-комменты ниже разбудят той
-    // же пачкой — тело агент перечитает сам, двигаем только базлайн
+    // же пачкой — тело агент перечитает сам; хэш пересчитывается (юзерская
+    // правка тела могла прийти вместе с комментом), lastmod двигается
     const updatedWithComments = await bodyUpdatedAt(tracked.bodyDoc)
     if (
       updatedWithComments !== null &&
       (tracked.bodyUpdated ?? "") !== "" &&
       updatedWithComments > (tracked.bodyUpdated ?? "")
     ) {
+      const hashWithComments = await bodyHashOf(tracked.bodyDoc)
+      if (hashWithComments !== null) tracked.bodyHash = hashWithComments
       tracked.bodyUpdated = updatedWithComments
       saveState(state)
     }
 
+    if (devFresh.length === 0) continue
+    const wakeupKey = `comment:${devFresh.map((x) => x.id).join(",")}`
+    if (wakeupDedup(tracked.lastWakeup, wakeupKey, Date.now(), WAKEUP_DEDUP_MS) === "skip") {
+      // та же дельта уже доставлена — границу съедаем без повторной будки (№5.2)
+      const lastComment = devFresh[devFresh.length - 1]
+      tracked.lastCommentAt = lastComment.createdAt
+      tracked.lastCommentId = lastComment.id
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: дубль comment-wakeup в окне дедупа — скип`)
+      continue
+    }
     log(`задача ${rowId.slice(0, 8)}: ${devFresh.length} новых коммент(ов) → сессия`)
     if (await promptSession(tracked.sessionID, wakeupPrompt(rowId, devFresh))) {
       const lastComment = devFresh[devFresh.length - 1]
       tracked.lastCommentAt = lastComment.createdAt
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
+      tracked.lastWakeup = { key: wakeupKey, at: Date.now() }
       saveState(state)
       counters.wakeups++
     } else {
