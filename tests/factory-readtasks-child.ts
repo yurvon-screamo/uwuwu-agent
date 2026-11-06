@@ -120,12 +120,19 @@ function scriptKernel(): { hpathCalls: string[]; boardGetDocCalls: number; misse
 }
 
 // ——— песочница: HOME от родителя; лог читаем оттуда же ———
+// Путь лога: при явной песочнице UWUWU_FACTORY_STATE_DIR (родитель задаёт —
+// дефолт-изоляция ветки задачи 20261106082216 не должна уводить лог из
+// подконтрольного пути) sandbox-лог живёт в state-каталоге; без env —
+// прод-путь от HOME.
 // fail-get-doc: ретраи post() (4 попытки с бэкоффом) не должны растягивать
 // ребёнка — setTimeout исполняет сон немедленно (паттерн platform-mcp-errors)
 if (SCENARIO === "fail-get-doc") {
   globalThis.setTimeout = ((fn: () => void) => { fn(); return 0 as unknown as ReturnType<typeof setTimeout> }) as typeof setTimeout
 }
-const logPath = join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const stateEnv = process.env.UWUWU_FACTORY_STATE_DIR
+const logPath = stateEnv !== undefined && stateEnv !== ""
+  ? join(stateEnv, "uwuwu-factory.log")
+  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 mkdirSync(dirname(logPath), { recursive: true })
 
 const probe = scriptKernel()

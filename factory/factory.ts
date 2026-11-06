@@ -24,10 +24,10 @@
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -109,12 +109,21 @@ const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
     env: false, // cfg.local — не git-репо: env-контракт невыполним, легаси-поведение
   },
 }
-// песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
-// тоже переезжает (прод-лог не засоряется смоук-тиками)
-const STATE_DIR_RAW = process.env.UWUWU_FACTORY_STATE_DIR
-const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-factory"))
+// state: песочница — UWUWU_FACTORY_STATE_DIR двигает state+lock, в песочнице
+// лог тоже переезжает (прод-лог не засоряется смоук-тиками). Дефолт-изоляция:
+// не-master чекаут без env получает свой state в branches/<ветка> и прод не
+// трогает (инцидент-класс 06.11 — прогон из ветки писал общий прод-state);
+// master — прежний прод-путь.
+const STATE_RESOLVED = resolveDaemonStateDir({
+  daemon: "uwuwu-factory",
+  envName: "UWUWU_FACTORY_STATE_DIR",
+  envRaw: process.env.UWUWU_FACTORY_STATE_DIR,
+  defaultDir: join(homedir(), ".local/state/uwuwu-factory"),
+  repoRoot: resolve(import.meta.dir, ".."),
+})
+const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
+const LOG_PATH = STATE_RESOLVED.sandboxed
   ? join(STATE_DIR, "uwuwu-factory.log")
   : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
@@ -1405,8 +1414,9 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   // гард dry-run ДО лока: невалидный режим не должен даже притворяться
-  // демоном (фиктивные записи не должны попадать в прод-state)
-  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  // демоном (фиктивные записи не должны попадать в прод-state). Эффективная
+  // песочница — с авто-изоляцией ветки: там прод-state и так недостижим.
+  if (DRY_RUN && !STATE_RESOLVED.sandboxed) {
     console.error("DRY_RUN требует UWUWU_FACTORY_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
     process.exit(1)
   }
@@ -1417,12 +1427,18 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
+  // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов
+  if (STATE_RESOLVED.notice !== null) {
+    console.error(STATE_RESOLVED.notice)
+    log(STATE_RESOLVED.notice)
+  }
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   // старт-свип окружений: сироты без записи в state и старый attic — только
   // прод (песочница/DRY_RUN не трогают реальный ENV_ROOT)
-  if (!DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  if (!DRY_RUN && !STATE_RESOLVED.sandboxed) {
     const sweep = sweepEnvs(envDeps(), {
       root: ENV_ROOT,
       // имена каталогов прошли sanitizeRowId (envPaths) — сравниваем в том же
