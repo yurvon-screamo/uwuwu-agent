@@ -52,7 +52,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
     if let TaskSub::Create {
-        title,
+        title: _,
         r#type: ty,
         stdin,
         attach,
@@ -65,7 +65,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         let ctx = if stdin { read_stdin()? } else { String::new() };
         println!(
             "{}",
-            syt::body_template(&title, ty.as_deref().unwrap_or("dev"), &ctx)
+            syt::body_template(ty.as_deref().unwrap_or("dev"), &ctx)
         );
         return Ok(());
     }

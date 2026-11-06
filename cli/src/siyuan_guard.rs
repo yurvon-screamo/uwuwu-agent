@@ -7,7 +7,7 @@
 
 use crate::markdown::{collapse_whitespace, strip_export_wrapper};
 use crate::siyuan::{FileFetch, SiYuan};
-use crate::siyuan_task::{body_template, normalize_title, SyBoard, SyTask};
+use crate::siyuan_task::{body_template, legacy_body_template, normalize_title, SyBoard, SyTask};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -135,6 +135,15 @@ pub(crate) fn verdict(evidence: &RowEvidence) -> Verdict {
 /// `#dev/#spike/#bug` (её дописывает create) вырезается, пробельные run'ы
 /// схлопываются; сравнение против всех трёх шаблонов — тип задачи живёт
 /// в теле, не в строке.
+/// Тело равно пустому шаблону? Экспортная обёртка снимается, тег-строка
+/// `#dev/#spike/#bug` (её дописывает create) вырезается, пробельные run'ы
+/// схлопываются. Сверка против нового костяка и легаси всех трёх типов
+/// (тип задачи живёт в теле, не в строке): новый костяк от тайтла не
+/// зависит, легаси (до 06.11, `# {title}`-блок в контенте и полный
+/// dev-набор Решение/Юзкейсы/Сиквенсы) — зависит. Легаси-ветка
+/// обязательна: нетронутые скелеты, созданные до смены шаблона, иначе
+/// матчатся как Live → task clean теряет брошенные Draft-черновики
+/// (уходят в ручной --live-режим).
 pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
     let stripped = strip_export_wrapper(export_md, title);
     let without_type_tag: String = stripped
@@ -143,9 +152,10 @@ pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
     let normalized = collapse_whitespace(&without_type_tag);
-    ["dev", "spike", "bug"]
-        .iter()
-        .any(|ty| collapse_whitespace(&body_template(title, ty, "")) == normalized)
+    ["dev", "spike", "bug"].iter().any(|ty| {
+        collapse_whitespace(&body_template(ty, "")) == normalized
+            || collapse_whitespace(&legacy_body_template(title, ty)) == normalized
+    })
 }
 
 // ——— undo-журнал: write-ahead в data/assets/undo/ ———
@@ -541,7 +551,18 @@ mod tests {
     fn skeleton_export(title: &str, ty: &str) -> String {
         format!(
             "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n",
-            body_template(title, ty, "")
+            body_template(ty, "")
+        )
+    }
+
+    /// Экспорт нетронутого скелета эпохи до 06.11: рендер-строка имени
+    /// плюс легаси-костяк со своим `# {title}` heading-блоком в контенте
+    /// (живая проба: у свежих Draft-скелетов той эпохи в экспорте два H1;
+    /// strip_export_wrapper снимает только рендер-строку — блок остаётся).
+    fn legacy_skeleton_export(title: &str, ty: &str) -> String {
+        format!(
+            "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n",
+            legacy_body_template(title, ty)
         )
     }
 
@@ -557,17 +578,37 @@ mod tests {
     }
 
     #[test]
+    fn body_is_skeleton_matches_legacy_skeletons_of_all_three_types() {
+        for ty in ["dev", "spike", "bug"] {
+            let export = legacy_skeleton_export("таск", ty);
+            assert!(
+                body_is_skeleton(&export, "таск"),
+                "легаси-шаблон {ty} должен совпасть"
+            );
+        }
+    }
+
+    #[test]
     fn body_is_skeleton_rejects_body_with_user_content() {
         let export = format!(
             "---\ntitle: таск\n---\n\n# таск\n\n{}\nзаметка владельца\n",
-            body_template("таск", "dev", "")
+            body_template("dev", "")
+        );
+        assert!(!body_is_skeleton(&export, "таск"));
+    }
+
+    #[test]
+    fn body_is_skeleton_rejects_legacy_skeleton_with_extra_user_line() {
+        let export = format!(
+            "{}\nзаметка владельца\n",
+            legacy_skeleton_export("таск", "spike")
         );
         assert!(!body_is_skeleton(&export, "таск"));
     }
 
     #[test]
     fn body_is_skeleton_normalizes_whitespace_runs() {
-        let raw = body_template("т", "dev", "").replace('\n', "\n\n  \n");
+        let raw = body_template("dev", "").replace('\n', "\n\n  \n");
         let export = format!("---\ntitle: т\n---\n\n# т\n\n{raw}\n");
         assert!(body_is_skeleton(&export, "т"));
     }
