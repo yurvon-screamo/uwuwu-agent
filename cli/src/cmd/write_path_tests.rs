@@ -572,9 +572,9 @@ async fn body_via_cli(server: &MockServer, replace: bool, content: &str) -> anyh
             md: Some(md.path().to_string_lossy().into_owned()),
             replace,
             replace_section: None,
+            // тест про docId-стабильность overwrite, не про freshness-гард (#119):
+            // force возвращает исходную семантику «replace проходит» без снапшота
             base: None,
-            // полный replace в тестах — осознанный overwrite (#119-гард):
-            // мок не несёт снапшота, --force выражает именно это
             force: replace,
             attach: Vec::new(),
         },
