@@ -13,6 +13,7 @@ ALWAYS RESPOND IN RUSSIAN.
 - NEVER DELETE CODE YOU DON'T UNDERSTAND!
 - NEVER HIDE LINTER ISSUES — FIX THEM OR AT LEAST IGNORE THEM, BUT DON'T HIDE THEM!
 - ALWAYS PROACTIVELY USE the `qlty` formatting and linting tool after making code changes — inside a git repository with qlty initialized; otherwise use the project's native toolchain. In the final task report, the Lint/qlty line must follow the delta-vs-baseline spec (canonical spec: agents/developer.md, report template section) — a bare «qlty чисто» is forbidden, it masks the repo's baseline debt.
+- NEVER run formatters (prettier, black, rustfmt, …) in the master checkout (`~/uwuwu-agent`) — accidental formatting diffs there are not to be committed or stashed; formatting happens only in task worktrees as part of PRs (`.prettierignore` with `**` blocks prettier repo-wide as a structural guard).
 - Any destructive or irreversible operation (file deletion, move/overwrite, force-push, DB migrations) must be preceded by creating a backup. Normal edits are not destructive.
 
 SKILLS rules:
