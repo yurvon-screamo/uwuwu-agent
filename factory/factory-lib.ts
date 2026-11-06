@@ -678,9 +678,14 @@ export interface SpawnGuardFacts {
 
 export type SpawnGuardAlert = "first" | "repeat" | "none"
 
-export type SpawnGuardVerdict =
-  | { t: "allow" }
-  | { t: "hold"; reason: "state-loss" | "burst"; alert: SpawnGuardAlert; text: string }
+export type SpawnGuardHold = {
+  t: "hold"
+  reason: "state-loss" | "burst"
+  alert: SpawnGuardAlert
+  text: string
+}
+
+export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold
 
 /** UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX: пусто →
  *  дефолты 2/12; мусор/0/отрицательные → дефолт. Семантики «0 = выключено»
