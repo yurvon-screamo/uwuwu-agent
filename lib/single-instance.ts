@@ -72,8 +72,9 @@ export function resolveDaemonStateDir(opts: {
   /** инъекция для тестов; дефолт — реальный detectBranch */
   detect?: (repoRoot: string) => string | null
 }): DaemonStateResolution {
-  const env = opts.envRaw?.trim()
-  if (env !== undefined && env !== "") {
+  // trim-контракт env — каноничный resolveStateDir: пустой/blank env = unset
+  const env = resolveStateDir(opts.envRaw, "")
+  if (env !== "") {
     return { stateDir: env, sandboxed: true, autoIsolated: false, notice: null }
   }
   const detect = opts.detect ?? detectBranch
