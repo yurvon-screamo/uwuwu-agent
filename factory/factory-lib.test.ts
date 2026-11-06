@@ -249,6 +249,19 @@ describe("continuePrompt", () => {
     expect(p).not.toContain("«Ревью плана»")
     expect(p).not.toContain("🤖")
   })
+  test("env-контекст: окружение уже существует — своё не создавай, пути названы", () => {
+    const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", {
+      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+    })
+    expect(p).toContain("уже существует — своё не создавай")
+    expect(p).toContain("/home/x/agents-env/r1/repo")
+    expect(p).toContain("work/task-r1")
+    expect(p).toContain("Незакоммиченное — там же")
+  })
+  test("без env-контекста (легаси/env:false) — строки окружения нет", () => {
+    const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
+    expect(p).not.toContain("своё не создавай")
+  })
 })
 
 describe("kickoffModeOf", () => {
