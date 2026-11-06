@@ -572,6 +572,11 @@ async fn body_via_cli(server: &MockServer, replace: bool, content: &str) -> anyh
             md: Some(md.path().to_string_lossy().into_owned()),
             replace,
             replace_section: None,
+            // replace здесь — механика in-place (без пересоздания дока):
+            // overwrite идёт через force, гард свежести --base покрыт
+            // юнит-тестами require_fresh_snapshot_* в sy_dispatch.rs
+            force: replace,
+            base: None,
             attach: Vec::new(),
         },
     )
