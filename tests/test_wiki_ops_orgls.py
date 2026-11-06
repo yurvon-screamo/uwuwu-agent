@@ -47,19 +47,22 @@ class FakeKernel:
     """
 
     def __init__(self, notebook_count: int = 1, kernel_cuts_unlimited: bool = True,
-                 fail_sql_for: str | None = None, ls_payload="__normal__"):
+                 fail_sql_for: str | None = None, ls_payload="__normal__",
+                 closed_count: int = 0):
         self.calls: list[tuple[str, dict]] = []
         self.notebook_count = notebook_count
         self.kernel_cuts_unlimited = kernel_cuts_unlimited
         self.fail_sql_for = fail_sql_for
         self.ls_payload = ls_payload
+        self.closed_count = closed_count
 
     def post(self, path: str, body: dict, attempts: int = 6):
         self.calls.append((path, body))
         if path == "/api/notebook/lsNotebooks":
             if self.ls_payload != "__normal__":
                 return self.ls_payload
-            notebooks = [{"id": f"nb{i}", "name": f"NB{i}", "closed": False}
+            notebooks = [{"id": f"nb{i}", "name": f"NB{i}",
+                          "closed": i >= self.notebook_count - self.closed_count}
                          for i in range(self.notebook_count)]
             return {"notebooks": notebooks}
         if path == "/api/query/sql":
@@ -158,8 +161,9 @@ class LiveWorkspaceInvariant(unittest.TestCase):
         self.assertGreaterEqual(len(sections.get("Projects", [])), PROJECTS_MIN_DOCS)
 
 
-class NotebooksEnvelopeIsClassified(unittest.TestCase):
-    """Аномалия lsNotebooks — громкий RuntimeError; пустой notebooks легитимен."""
+class OrglsMainHarness(unittest.TestCase):
+    """Общий харнесс main-уровня: отказ обязан завершаться exit 1.
+    Возвращает (stdout, stderr); ассерты кода — здесь, контента — в тестах."""
 
     def run_orgls_via_main(self, kernel) -> tuple[str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -168,9 +172,12 @@ class NotebooksEnvelopeIsClassified(unittest.TestCase):
                 redirect_stdout(out), redirect_stderr(err):
             with self.assertRaises(SystemExit) as cm:
                 wiki_ops.main()
-        self.assertEqual(cm.exception.code, 1,
-                         "сбой обхода обязан завершаться exit 1, а не молча/успешно")
+        self.assertEqual(cm.exception.code, 1, "сбой обязан завершаться exit 1")
         return out.getvalue(), err.getvalue()
+
+
+class NotebooksEnvelopeIsClassified(OrglsMainHarness):
+    """Аномалия lsNotebooks — громкий RuntimeError; пустой notebooks легитимен."""
 
     def test_ls_payload_none_raises_not_attribute_error(self):
         kernel = FakeKernel(ls_payload=None)
@@ -197,30 +204,20 @@ class NotebooksEnvelopeIsClassified(unittest.TestCase):
         finally:
             wiki_ops.post = original_post
 
-    def test_closed_notebooks_filtered(self):
-        kernel = FakeKernel(notebook_count=2)
+    def test_closed_notebooks_filtered_out(self):
+        kernel = FakeKernel(notebook_count=3, closed_count=1)
         original_post = wiki_ops.post
         wiki_ops.post = kernel.post
         try:
             names = [nb["name"] for nb in wiki_ops.notebooks()]
         finally:
             wiki_ops.post = original_post
-        self.assertEqual(names, ["NB0", "NB1"])
+        self.assertEqual(names, ["NB0", "NB1"],
+                         "закрытый NB2 обязан отфильтровываться (иначе тест пустой)")
 
 
-class MidTreeFailureIsLoudAndAtomic(unittest.TestCase):
+class MidTreeFailureIsLoudAndAtomic(OrglsMainHarness):
     """Сбой SQL по ноутбуку посреди обхода ≠ «не найдено»: причина + пустой stdout."""
-
-    def run_orgls_via_main(self, kernel) -> tuple[str, str]:
-        out, err = io.StringIO(), io.StringIO()
-        with patch.object(sys, "argv", ["wiki_ops.py", "orgls"]), \
-                patch.object(wiki_ops, "post", kernel.post), \
-                redirect_stdout(out), redirect_stderr(err):
-            with self.assertRaises(SystemExit) as cm:
-                wiki_ops.main()
-        self.assertEqual(cm.exception.code, 1,
-                         "сбой обхода обязан завершаться exit 1, а не молча/успешно")
-        return out.getvalue(), err.getvalue()
 
     def test_mid_tree_sql_failure_names_notebook_and_keeps_stdout_empty(self):
         kernel = FakeKernel(notebook_count=2, fail_sql_for="nb1")
