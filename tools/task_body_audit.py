@@ -96,7 +96,6 @@ REQUIRED = {
     "spike": [(CONTEXT_SECTION, SETUP_SECTION), (OUTCOME_SECTION,)],
     "bug": [("Сценарий (BDD)",), ("Причина",), ("Фикс",)],
 }
-LEGAL_EXTRA_H2 = {"Отчёт инженера", "Смежное", "Юзкейсы", "Сиквенсы", "Комменты"}
 
 BOARD_PREFIX = "Задачи"
 COMMENTS_H2 = "## Комменты"

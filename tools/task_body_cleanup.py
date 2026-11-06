@@ -34,6 +34,7 @@ import re
 import subprocess  # nosec B404 — argv списком, бинарь фиксирован shutil.which
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -281,11 +282,21 @@ def _comments_ok(doc_id: str, export_before: str, scratch: Path) -> bool:
     return False
 
 
-def apply_body(doc_id: str, project: str, new_content: str,
-               export_before: str, scratch: Path, label: str) -> bool:
+@dataclass
+class CleanupCase:
+    """Одна чистка: док + доска + до-состояние + куда складывать артефакты."""
+    doc_id: str
+    project: str
+    export_before: str
+    scratch: Path
+
+
+def apply_body(case: CleanupCase, new_content: str, label: str) -> bool:
     """Сборка нового тела (контент + блок «Комменты» любого имени дословно)
     → cli replace → пост-чек; при провале — РЕАЛЬНЫЙ откат тела в
     до-состояние (план п.11 обещает откат, а не рецепт)."""
+    doc_id, project = case.doc_id, case.project
+    export_before, scratch = case.export_before, case.scratch
     payload = new_content.rstrip()
     plain = comments_section(export_before)
     if plain:
@@ -296,6 +307,7 @@ def apply_body(doc_id: str, project: str, new_content: str,
             payload += "\n\n" + migrated.replace(
                 "## Комменты (миграция из афины)", "## Комменты", 1).lstrip("\n")
     md_file = scratch / f"{doc_id}.{label}.md"
+    scratch.mkdir(parents=True, exist_ok=True)
     md_file.write_text(payload, encoding="utf-8")
     subprocess.run(  # nosec B603 — фиксированный бинарь, аргументы из аудита
         [UWUWU_CLI, "task", "body", doc_id, "--project", project, "--replace",
@@ -330,8 +342,8 @@ def _fix_one(e: dict, scratch: Path) -> str:
         if normalize(new_content) == normalize(content_before):
             print(f"SKIP {e['doc_id']}: механике нечего менять")
             return "skip"
-        return "ok" if apply_body(e["doc_id"], e["board"], new_content,
-                                  export_before, scratch, "mech") else "fail"
+        case = CleanupCase(e["doc_id"], e["board"], export_before, scratch)
+        return "ok" if apply_body(case, new_content, "mech") else "fail"
     except subprocess.CalledProcessError as exc:
         print(f"FAIL {e['doc_id']}: cli отказал — "
               f"{(exc.stderr or exc.stdout or '?').strip()[:160]}")
@@ -371,8 +383,8 @@ def apply(audit_path: str, doc_id: str, project: str, md_file: str, scratch_dir:
     # ручной контент приходит без «Комментов» — драйвер дословно досыпает их
     if "## Комменты" in new_content:
         sys.exit("в пересобранном файле не должно быть секции «## Комменты» — её досыпает драйвер")
-    if not apply_body(doc_id, project, new_content, export_before,
-                      Path(scratch_dir), "hand"):
+    case = CleanupCase(doc_id, project, export_before, Path(scratch_dir))
+    if not apply_body(case, new_content, "hand"):
         sys.exit(1)
 
 
