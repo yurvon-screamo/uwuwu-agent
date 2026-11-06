@@ -1344,37 +1344,66 @@ fn seed_indexed_chunk_at(store: &mut Store, block_id: &str, updated: &str, conte
 }
 
 #[tokio::test]
-async fn search_half_reports_timeout_when_budget_spent_by_sync() {
-    // Бюджет исчерпан синхронизацией: эмбедд запроса не выполняется,
-    // секция — честный «таймаут (бюджет 10s)», не «недоступен».
-    let (server, _) = kernel_server_blocks_only(vec![]).await;
+async fn search_half_returns_results_when_sync_budget_dies() {
+    // Query-first: эмбедд запроса — первым (полный бюджет), sync — в
+    // остатке. Бюджет умер посреди синка — секция отдаёт РЕЗУЛЬТАТЫ и
+    // примечание о дельте, а не «таймаут: синхронизация не уложилась»
+    // (пункт «Что сделать» задачи 20261106182055: результаты не заложники
+    // синхронизации).
+    let mut blocks = Vec::new();
+    for i in 0..64 {
+        blocks.push(block(
+            &format!("fresh-{i:02}"),
+            "20261105000010",
+            &format!("свежий чанк очереди номер {i} с содержанием длиннее сорока символов"),
+            "/queue",
+        ));
+    }
+    let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
-    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    // батчи по 60ms — бюджет 150ms умирает посреди синка
+    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(60)).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), &embed.uri());
-    seed_indexed_chunk(dir.path());
+    let mut store = index_ready_store(dir.path());
+    let hit = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "hit-doc".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/важный/док".into(),
+            updated: T0.into(),
+        },
+        content: "важный документ с ответом на запрос".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[hit], None).unwrap();
+    tx.commit().unwrap();
+    drop(store);
 
     let section = crate::semantic::search_half_at(
         &sy,
         &cfg,
         &crate::semantic::SearchHalfRequest {
-            query: "запрос",
+            query: "важный запрос",
             limit: 10,
             threshold: 0.35,
         },
-        Instant::now() - Duration::from_millis(1),
+        Instant::now() + Duration::from_millis(150),
     )
     .await;
 
     assert!(
-        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
-        "секция: {section:?}"
+        section.iter().any(|l| l.starts_with("1. /важный/док")),
+        "результаты в секции несмотря на смерть синка: {section:?}"
+    );
+    assert_eq!(
+        section.last().map(String::as_str),
+        Some("дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками"),
+        "примечание о дельте — последняя строка секции: {section:?}"
     );
     assert!(!section.iter().any(|l| l.contains("недоступен")));
-    assert!(
-        inputs.lock().unwrap().is_empty(),
-        "эмбедд запроса не выполнялся"
-    );
 }
 
 #[tokio::test]
