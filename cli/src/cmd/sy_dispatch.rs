@@ -4100,6 +4100,18 @@ mod tests {
     async fn validation_errors_fire_before_network_and_uploads() {
         let (server, create_calls, append_bodies, delete_calls) =
             mock_siyuan(vec![BOUND_DOC.to_string()], true).await;
+        let upload_hits = Arc::new(AtomicUsize::new(0));
+        let hits = upload_hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with(move |_req: &wiremock::Request| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"code":0,"data":{"succMap":{"a.png":"assets/a-20261106090000-abc1234.png"}}}"#,
+                )
+            })
+            .mount(&server)
+            .await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
 
@@ -4109,6 +4121,8 @@ mod tests {
             "```html_embed arch\n<div>a</div>\n```\n```html_embed arch\n<div>b</div>\n```\n",
         )
         .unwrap();
+        let attach = tempfile::NamedTempFile::with_suffix(".png").unwrap();
+        std::fs::write(attach.path(), b"png-bytes").unwrap();
         let err = task_run(
             "uwuwu",
             TaskSub::Body {
@@ -4117,13 +4131,18 @@ mod tests {
                 md: Some(md.path().to_string_lossy().into_owned()),
                 replace: false,
                 replace_section: None,
-                attach: Vec::new(),
+                attach: vec![attach.path().to_path_buf()],
             },
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("дубль имени"), "{err}");
         assert_eq!(create_calls.load(Ordering::SeqCst), 0, "отказ до сети");
+        assert_eq!(
+            upload_hits.load(Ordering::SeqCst),
+            0,
+            "отказ до upload: ассет не загружен"
+        );
         assert!(append_payloads(&append_bodies).is_empty());
         assert_eq!(delete_calls.load(Ordering::SeqCst), 0);
     }

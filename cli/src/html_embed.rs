@@ -159,16 +159,46 @@ fn html_from_body(body_lines: &[String]) -> Result<FenceBody> {
 }
 
 /// Разбор открывающей строки фенса: ` ```html_embed [имя] `. Имя — весь
-/// остаток строки trimmed: пусто → анонимный. Возвращает None для прочих
+/// остаток строки trimmed (разделитель — пробел или таб, как в
+/// CommonMark info-string): пусто → анонимный. Возвращает None для прочих
 /// строк (в том числе ```:html_embedded и прочих соседних языков).
 fn embed_fence_opener(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     let rest = trimmed.strip_prefix(FENCE_OPEN)?;
     if rest.is_empty() {
-        Some(String::new())
-    } else {
-        rest.strip_prefix(' ').map(str::trim).map(String::from)
+        return Some(String::new());
     }
+    let name = rest.trim_start_matches([' ', '\t']);
+    if name.len() == rest.len() {
+        return None; // нет разделителя — ```:html_embedded, не наш фенс
+    }
+    Some(name.trim().to_string())
+}
+
+/// Накопитель markdown-строк вне фенсов: между html_embed-сегментами.
+#[derive(Default)]
+struct MarkdownBuffer {
+    text: String,
+}
+impl MarkdownBuffer {
+    /// Выгрузить накопленное в сегменты (пустой буфер не пушится).
+    fn flush(&mut self, segments: &mut Vec<InputSegment>) {
+        if !self.text.is_empty() {
+            segments.push(InputSegment::Markdown(std::mem::take(&mut self.text)));
+        }
+    }
+    fn push_line(&mut self, line: &str) {
+        self.text.push_str(line);
+        self.text.push('\n');
+    }
+}
+
+/// Позиция разбора: верхний уровень, посторонний кодовый блок,
+/// тело html_embed-фенса.
+enum State {
+    Top,
+    InEmbed { name: String, body: Vec<String> },
+    InOtherFence,
 }
 
 /// Разбор ввода: фенсы на верхнем уровне markdown (внутри других кодовых
@@ -177,81 +207,22 @@ fn embed_fence_opener(line: &str) -> Option<String> {
 pub(crate) fn parse_input(md: &str) -> Result<ParsedInput> {
     let mut segments: Vec<InputSegment> = Vec::new();
     let mut named: Vec<NamedFence> = Vec::new();
-
-    #[derive(Default)]
-    struct MarkdownBuffer {
-        text: String,
-    }
-    impl MarkdownBuffer {
-        fn flush(self, segments: &mut Vec<InputSegment>) -> Self {
-            if !self.text.is_empty() {
-                segments.push(InputSegment::Markdown(self.text));
-            }
-            Self::default()
-        }
-        fn push_line(&mut self, line: &str) {
-            self.text.push_str(line);
-            self.text.push('\n');
-        }
-    }
     let mut plain = MarkdownBuffer::default();
-
-    enum State {
-        Top,
-        InEmbed { name: String, body: Vec<String> },
-        InOtherFence,
-    }
     let mut state = State::Top;
 
     for line in md.lines() {
         match &mut state {
-            State::Top => {
-                if let Some(name) = embed_fence_opener(line) {
-                    state = State::InEmbed {
-                        name,
-                        body: Vec::new(),
-                    };
-                    continue;
-                }
-                if line.trim_start().starts_with("```") {
-                    state = State::InOtherFence;
-                }
-                plain.push_line(line);
-            }
-            State::InOtherFence => {
-                if line.trim_start().starts_with("```") {
-                    state = State::Top;
-                }
-                plain.push_line(line);
-            }
+            State::Top => parse_top_line(line, &mut state, &mut plain),
+            State::InOtherFence => parse_fenced_line(line, &mut state, &mut plain),
             State::InEmbed { name, body } => {
                 if line.trim_start().starts_with("```") {
-                    let name = std::mem::take(name);
-                    let body = std::mem::take(body);
-                    let html = html_from_body(&body)?;
+                    let (name, body) = (std::mem::take(name), std::mem::take(body));
+                    plain.flush(&mut segments);
+                    accept_embed_fence(&name, &body, &mut segments, &mut named)?;
                     state = State::Top;
-                    plain = plain.flush(&mut segments);
-                    if name.is_empty() {
-                        // анонимный: html инлайн; пустое тело — вырезается
-                        if let FenceBody::Html(html) = html {
-                            segments.push(InputSegment::AnonymousHtml(html));
-                        }
-                    } else {
-                        if named.iter().any(|f| f.name == name) {
-                            bail!(
-                                "дубль имени html_embed-фенса «{name}» в одном вводе — \
-                                 адресация по маркеру стала бы неоднозначной"
-                            );
-                        }
-                        named.push(NamedFence {
-                            name: name.clone(),
-                            body: html,
-                        });
-                        segments.push(InputSegment::Named(named.last().unwrap().clone()));
-                    }
-                    continue;
+                } else {
+                    body.push(line.to_string());
                 }
-                body.push(line.to_string());
             }
         }
     }
@@ -261,6 +232,58 @@ pub(crate) fn parse_input(md: &str) -> Result<ParsedInput> {
     plain.flush(&mut segments);
 
     Ok(ParsedInput { segments })
+}
+
+/// Строка вне фенсов: открытие html_embed / открытие прочего фенса / plain.
+fn parse_top_line(line: &str, state: &mut State, plain: &mut MarkdownBuffer) {
+    if let Some(name) = embed_fence_opener(line) {
+        *state = State::InEmbed {
+            name,
+            body: Vec::new(),
+        };
+        return;
+    }
+    if line.trim_start().starts_with("```") {
+        *state = State::InOtherFence;
+    }
+    plain.push_line(line);
+}
+
+/// Строка внутри постороннего кодового блока: закрытие возвращает в Top.
+fn parse_fenced_line(line: &str, state: &mut State, plain: &mut MarkdownBuffer) {
+    if line.trim_start().starts_with("```") {
+        *state = State::Top;
+    }
+    plain.push_line(line);
+}
+
+/// Закрытый html_embed-фенс → сегменты: анонимный — html инлайн (пустое
+/// тело вырезается), именованный — валидация html + отказ на дубль имени.
+fn accept_embed_fence(
+    name: &str,
+    body_lines: &[String],
+    segments: &mut Vec<InputSegment>,
+    named: &mut Vec<NamedFence>,
+) -> Result<()> {
+    let html = html_from_body(body_lines)?;
+    if name.is_empty() {
+        if let FenceBody::Html(html) = html {
+            segments.push(InputSegment::AnonymousHtml(html));
+        }
+        return Ok(());
+    }
+    if named.iter().any(|f| f.name == name) {
+        bail!(
+            "дубль имени html_embed-фенса «{name}» в одном вводе — \
+             адресация по маркеру стала бы неоднозначной"
+        );
+    }
+    named.push(NamedFence {
+        name: name.to_string(),
+        body: html,
+    });
+    segments.push(InputSegment::Named(named.last().unwrap().clone()));
+    Ok(())
 }
 
 /// Текст маркер-абзаца для имени диаграммы.
@@ -418,6 +441,20 @@ mod tests {
     fn indented_fence_opener_is_matched() {
         let parsed = parse("  ```html_embed arch\n<div>a</div>\n```\n");
         assert_eq!(parsed.named_fences()[0].name, "arch");
+    }
+
+    #[test]
+    fn tab_separator_between_language_and_name_is_matched() {
+        let parsed = parse("```html_embed\tarch\n<div>a</div>\n```\n");
+        assert_eq!(parsed.named_fences()[0].name, "arch");
+    }
+
+    #[test]
+    fn name_without_separator_is_not_our_fence() {
+        let md = "```html_embedarch\n<div>a</div>\n```\n";
+        let parsed = parse(md);
+        assert!(parsed.named_fences().is_empty());
+        assert_eq!(parsed.residual_md(), md);
     }
 
     #[test]
