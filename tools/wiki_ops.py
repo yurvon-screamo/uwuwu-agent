@@ -264,10 +264,21 @@ def cmd_export(a):
     print((r or {}).get("content", ""))
 
 
+def path_safe(title: str) -> str:
+    """Тайтл → безопасный сегмент hpath: сырой «/» в нём — разделитель пути,
+    ядро молча строит цепочку доков-оболочек (инцидент 06.11, /devops).
+    Канвенция миграции bind_rows / cli path_safe (PR #36): «/» → U+2215."""
+    return title.replace("/", "\u2215")
+
+
 def cmd_create(a):
     md = Path(a.file).read_text()
     nb_id, nb_name, prefix = _resolve_parent(a.parent)
-    hpath = prefix.rstrip("/") + "/" + a.title.strip("/")
+    title = path_safe(a.title.strip("/"))
+    if not title:
+        raise RuntimeError(f"пустой тайтл: {a.title!r} состоит из одних слэшей — "
+                           "имя дока не может быть пустым")
+    hpath = prefix.rstrip("/") + "/" + title
     post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
     print(f"создан: [{nb_name}] {hpath}")
 

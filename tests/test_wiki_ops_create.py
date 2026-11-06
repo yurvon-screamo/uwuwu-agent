@@ -9,7 +9,10 @@
   3) пустой --parent — легаси-дефолт Projects;
   4) «metadata is not ready» в post(): ровно METADATA_BAIL_ATTEMPTS попыток с паузами
      +2s/+5s → различимый bail с хинтом; транспорт — прежний бюджет ретраев;
-     перманентный code≠0 — KernelRefused fail-fast (merge PR #80).
+     перманентный code≠0 — KernelRefused fail-fast (merge PR #80);
+  5) сырой «/» в тайтле санитизируется в ∕ (U+2215) — ровно ОДИН вызов
+     createDocWithMd; сырой «/» становится разделителем пути, и ядро молча
+     создаёт цепочку вложенных доков-оболочек (инцидент 06.11, /devops).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_create.py
@@ -184,6 +187,29 @@ class DefaultsAndErrors(unittest.TestCase):
         message = str(cm.exception)
         self.assertIn("/Projects/patterns", message)
         self.assertIn("/Experience/patterns", message)
+
+
+class TitleSanitization(unittest.TestCase):
+    """Сырой «/» в тайтле не долетает до ядра: ∕-санитайз до build hpath."""
+
+    def test_inner_slashes_become_division_slashes_single_doc(self):
+        kernel = FakeKernel()
+        run_create(kernel, "/affine", title="A/B/C")
+        calls = kernel.create_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["path"], "/affine/A∕B∕C")
+
+    def test_division_slash_title_passes_through_untouched(self):
+        kernel = FakeKernel()
+        run_create(kernel, "/affine", title="уже ∕ санитизирован")
+        self.assertEqual(kernel.create_calls()[0]["path"], "/affine/уже ∕ санитизирован")
+
+    def test_slash_only_title_rejected_before_kernel(self):
+        kernel = FakeKernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_create(kernel, "/affine", title="///")
+        self.assertEqual(kernel.create_calls(), [])
+        self.assertIn("пустой", str(cm.exception))
 
 
 class FakeResponse:
