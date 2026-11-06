@@ -49,6 +49,9 @@ describe("tickProject: гард каскада при потере state", () =>
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
         ...process.env, HOME: home, UWUWU_SIYUAN_TOKEN: "test-token", GUARD_SCENARIO: scenario,
+        // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
+        // не должна уводить сидированный state в branches/<ветка>
+        UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
         // фиксируем дефолтные пороги: тест не зависит от env окружения
         UWUWU_FACTORY_SPAWN_LOSS_MAX: "", UWUWU_FACTORY_SPAWN_BURST_MAX: "",
       },

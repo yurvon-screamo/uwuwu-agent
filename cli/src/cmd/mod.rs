@@ -18,6 +18,8 @@ mod fallback_tests;
 mod kernel_tests;
 #[cfg(test)]
 mod cron_tests;
+#[cfg(test)]
+mod write_path_tests;
 
 pub use sy_dispatch::read_markdown;
 
