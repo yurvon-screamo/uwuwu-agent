@@ -46,8 +46,15 @@ async fn dry_run_prints_skeleton_without_touching_kernel() {
 
     let result = task_run("", create(true)).await;
 
-    assert!(result.is_ok(), "dry-run проходит: без --project и без живого ядра");
-    assert_eq!(kernel_calls.load(Ordering::SeqCst), 0, "ноль запросов к ядру");
+    assert!(
+        result.is_ok(),
+        "dry-run проходит: без --project и без живого ядра"
+    );
+    assert_eq!(
+        kernel_calls.load(Ordering::SeqCst),
+        0,
+        "ноль запросов к ядру"
+    );
 }
 
 /// Живой create без --project отказывает до обращения к ядру: dry-run ветка
@@ -62,5 +69,9 @@ async fn live_create_still_requires_project_before_kernel() {
         .await
         .expect_err("живой create без --project отказывает");
     assert!(err.to_string().contains("--project"), "суть отказа: {err}");
-    assert_eq!(kernel_calls.load(Ordering::SeqCst), 0, "до отказа ядро не зовётся");
+    assert_eq!(
+        kernel_calls.load(Ordering::SeqCst),
+        0,
+        "до отказа ядро не зовётся"
+    );
 }

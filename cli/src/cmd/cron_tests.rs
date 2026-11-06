@@ -176,7 +176,11 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let next_doc_id = Mutex::new(0usize);
             move |req: &Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let hpath = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let hpath = body
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 kernel.created_docs.lock().unwrap().push(hpath);
                 let id = format!("20261105120000-body{:02}", next_doc_id.lock().unwrap());
                 ResponseTemplate::new(200)
@@ -301,25 +305,53 @@ async fn set_creates_bound_row_and_fills_cells() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    cron_run(set_cmd("ночной крон", None)).await.expect("set на полной доске");
+    cron_run(set_cmd("ночной крон", None))
+        .await
+        .expect("set на полной доске");
 
     let created = kernel.created_docs.lock().unwrap();
     assert_eq!(created.len(), 1, "ровно одно тело");
-    assert!(created[0].contains("ночной крон"), "тело по hpath тайтла: {:?}", created[0]);
+    assert!(
+        created[0].contains("ночной крон"),
+        "тело по hpath тайтла: {:?}",
+        created[0]
+    );
 
     let adds = kernel.item_adds.lock().unwrap();
     assert_eq!(adds.len(), 1, "одна вставка строки (verify с первого раза)");
-    let bound = adds[0].get("blockID").and_then(|b| b.as_str()).unwrap_or("");
-    assert!(!bound.is_empty(), "строка привязана к телу (blockID), не detached: {:?}", adds[0]);
-    assert!(adds[0].get("detached").is_none(), "флаг detached не используется: {:?}", adds[0]);
+    let bound = adds[0]
+        .get("blockID")
+        .and_then(|b| b.as_str())
+        .unwrap_or("");
+    assert!(
+        !bound.is_empty(),
+        "строка привязана к телу (blockID), не detached: {:?}",
+        adds[0]
+    );
+    assert!(
+        adds[0].get("detached").is_none(),
+        "флаг detached не используется: {:?}",
+        adds[0]
+    );
 
     let updates = kernel.item_updates.lock().unwrap();
     let by_key = |name: &str| updates.iter().find(|(_, k, _, _)| k == name);
     let status = by_key("key-status").expect("Status записан");
-    assert_eq!(status.3, json!({ "mSelect": [{ "content": "active" }] }), "Status через mSelect");
+    assert_eq!(
+        status.3,
+        json!({ "mSelect": [{ "content": "active" }] }),
+        "Status через mSelect"
+    );
     let schedule = by_key("key-schedule").expect("Schedule записан");
-    assert_eq!(schedule.3, json!({ "text": { "content": "10m" } }), "Schedule текстом");
-    assert!(by_key("key-lastrun").is_some(), "Last Run записан (пустое значение)");
+    assert_eq!(
+        schedule.3,
+        json!({ "text": { "content": "10m" } }),
+        "Schedule текстом"
+    );
+    assert!(
+        by_key("key-lastrun").is_some(),
+        "Last Run записан (пустое значение)"
+    );
 }
 
 /// (3) тайтл уже жив строкой: отказ без мутаций (дедуп по строкам, не только телам).
@@ -328,7 +360,11 @@ async fn set_creates_bound_row_and_fills_cells() {
 async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
     let kernel = Arc::new(Kernel::default());
     *kernel.cron_keys_full.lock().unwrap() = true;
-    kernel.cron_rows.lock().unwrap().push(CronRow { item: "20261105110000-live1".into(), title: "ночной крон", last_run: "" });
+    kernel.cron_rows.lock().unwrap().push(CronRow {
+        item: "20261105110000-live1".into(),
+        title: "ночной крон",
+        last_run: "",
+    });
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
     set_env(&server);
@@ -337,9 +373,18 @@ async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
         .await
         .expect_err("дубль-тайтл в живых строках");
 
-    assert!(err.to_string().contains("уже есть"), "сообщение про дубль: {err}");
-    assert!(kernel.created_docs.lock().unwrap().is_empty(), "тело не создано");
-    assert!(kernel.item_adds.lock().unwrap().is_empty(), "строка не создана");
+    assert!(
+        err.to_string().contains("уже есть"),
+        "сообщение про дубль: {err}"
+    );
+    assert!(
+        kernel.created_docs.lock().unwrap().is_empty(),
+        "тело не создано"
+    );
+    assert!(
+        kernel.item_adds.lock().unwrap().is_empty(),
+        "строка не создана"
+    );
 }
 
 /// (4) ядро «потеряло» вставку: после ретрая ×1 — громкий отказ.
@@ -357,8 +402,15 @@ async fn set_bails_when_row_never_appears_in_render() {
         .await
         .expect_err("строка не появилась в render");
 
-    assert!(err.to_string().contains("не появилась"), "отказ объясняет причину: {err}");
-    assert_eq!(kernel.item_adds.lock().unwrap().len(), 2, "ровно один ретрай вставки");
+    assert!(
+        err.to_string().contains("не появилась"),
+        "отказ объясняет причину: {err}"
+    );
+    assert_eq!(
+        kernel.item_adds.lock().unwrap().len(),
+        2,
+        "ровно один ретрай вставки"
+    );
 }
 
 /// (5) pause с --project пишет Status на доске указанного проекта.
@@ -367,21 +419,32 @@ async fn set_bails_when_row_never_appears_in_render() {
 async fn pause_targets_project_board() {
     let kernel = Arc::new(Kernel::default());
     *kernel.cron_keys_full.lock().unwrap() = true;
-    kernel.cron_rows.lock().unwrap().push(CronRow { item: "20261105110000-kc1".into(), title: "крон foilcap", last_run: "" });
+    kernel.cron_rows.lock().unwrap().push(CronRow {
+        item: "20261105110000-kc1".into(),
+        title: "крон foilcap",
+        last_run: "",
+    });
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    cron_run(CronSub::Pause { id: "kc1".into(), project: Some("foilcap".into()) })
-        .await
-        .expect("pause на доске foilcap");
+    cron_run(CronSub::Pause {
+        id: "kc1".into(),
+        project: Some("foilcap".into()),
+    })
+    .await
+    .expect("pause на доске foilcap");
 
     let updates = kernel.item_updates.lock().unwrap();
     let status = updates
         .iter()
         .find(|(av, k, _, _)| *av == FOIL_AV && *k == "key-status")
         .expect("Status записан на доске foilcap");
-    assert_eq!(status.3, json!({ "mSelect": [{ "content": "paused" }] }), "paused через mSelect");
+    assert_eq!(
+        status.3,
+        json!({ "mSelect": [{ "content": "paused" }] }),
+        "paused через mSelect"
+    );
 }
 
 /// (6) таблица list несёт значения Schedule и Last Run.
@@ -399,8 +462,14 @@ fn list_table_carries_schedule_and_last_run_values() {
     }];
     let table = format_cron_table(&rows);
     assert!(table.contains("09:30"), "Schedule виден: {table}");
-    assert!(table.contains("2026-11-05 09:30"), "Last Run виден: {table}");
-    assert!(table.contains("утренний дайджест"), "заголовок виден: {table}");
+    assert!(
+        table.contains("2026-11-05 09:30"),
+        "Last Run виден: {table}"
+    );
+    assert!(
+        table.contains("утренний дайджест"),
+        "заголовок виден: {table}"
+    );
 }
 
 /// (7) парс: --project у всей семьи, дефолт — None (uwuwu).

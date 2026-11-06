@@ -102,7 +102,10 @@ const WAVE_DEGRADED_THRESHOLD: usize = 5;
 
 pub(crate) fn scan_kernel_log_for_waves(log: &str) -> WaveScan {
     WaveScan {
-        commit_failures: log.lines().filter(|l| l.contains("commit tx failed")).count(),
+        commit_failures: log
+            .lines()
+            .filter(|l| l.contains("commit tx failed"))
+            .count(),
         metadata_failures: log
             .lines()
             .filter(|l| l.contains("metadata is not ready"))
@@ -190,7 +193,9 @@ async fn sql_doc_ids(sy: &SiYuan, box_id: &str) -> Result<Vec<String>, anyhow::E
             "select id from blocks where box='{box_id}' and type='d' and id=root_id \
              order by id limit {PAGE} offset {offset}"
         );
-        let envelope = sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await?;
+        let envelope = sy
+            .post_probe("/api/query/sql", json!({ "stmt": stmt }))
+            .await?;
         let page: Vec<String> = envelope
             .pointer("/data")
             .and_then(|d| d.as_array())
@@ -240,19 +245,13 @@ pub(crate) async fn run(sy: &SiYuan, project: &str, since_min: u64) -> Vec<Probe
     outcomes.push(if kernel_alive {
         board_probe(sy, project).await
     } else {
-        ProbeOutcome::new(
-            BOARD,
-            ProbeVerdict::Skipped("kernel недоступен".into()),
-        )
+        ProbeOutcome::new(BOARD, ProbeVerdict::Skipped("kernel недоступен".into()))
     });
 
     outcomes.push(if kernel_alive {
         fs_sql_probe(sy).await
     } else {
-        ProbeOutcome::new(
-            FS_SQL,
-            ProbeVerdict::Skipped("kernel недоступен".into()),
-        )
+        ProbeOutcome::new(FS_SQL, ProbeVerdict::Skipped("kernel недоступен".into()))
     });
 
     outcomes
@@ -299,10 +298,7 @@ async fn board_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
     let rows = match syt::read_rows(sy, &board).await {
         Ok(rows) => rows,
         Err(e) => {
-            return ProbeOutcome::new(
-                BOARD,
-                ProbeVerdict::Skipped(format!("render доски: {e}")),
-            )
+            return ProbeOutcome::new(BOARD, ProbeVerdict::Skipped(format!("render доски: {e}")))
         }
     };
     // Молчаливый default на отказе SQL = ложный Clean при живой деградации
@@ -313,7 +309,9 @@ async fn board_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
         Err(e) => {
             return ProbeOutcome::new(
                 BOARD,
-                ProbeVerdict::Skipped(format!("мёртвые привязки не проверены ({e}); доска не верифицирована")),
+                ProbeVerdict::Skipped(format!(
+                    "мёртвые привязки не проверены ({e}); доска не верифицирована"
+                )),
             )
         }
     };
@@ -352,18 +350,14 @@ async fn empty_body_finding(sy: &SiYuan, doc_id: &str, title: &str) -> Option<St
         Err(_) => return Some(format!("«{title}»: тело {doc_id} не читается (ошибка MCP)")),
     };
     let ids = parse_block_ids(&text);
-    doc_content_is_empty(&ids, &text)
-        .then(|| format!("«{title}»: пустое тело (ZWJ-заглушка)"))
+    doc_content_is_empty(&ids, &text).then(|| format!("«{title}»: пустое тело (ZWJ-заглушка)"))
 }
 
 async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
     let notebooks = match sy.post_probe("/api/notebook/lsNotebooks", json!({})).await {
         Ok(notebooks) => notebooks,
         Err(e) => {
-            return ProbeOutcome::new(
-                FS_SQL,
-                ProbeVerdict::Skipped(format!("lsNotebooks: {e}")),
-            )
+            return ProbeOutcome::new(FS_SQL, ProbeVerdict::Skipped(format!("lsNotebooks: {e}")))
         }
     };
     let open = notebooks
@@ -407,7 +401,10 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
         let stmt = format!(
             "select count(*) as c from blocks where box='{id}' and type='d' and id=root_id"
         );
-        let sql_count = match sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await {
+        let sql_count = match sy
+            .post_probe("/api/query/sql", json!({ "stmt": stmt }))
+            .await
+        {
             Ok(envelope) => envelope.pointer("/data/0/c").and_then(|c| c.as_u64()),
             Err(e) => {
                 mismatches.push(format!("{name}: SQL недоступен ({e})"));
@@ -464,7 +461,8 @@ mod tests {
 
     #[test]
     fn wave_scan_clean_log_is_zero() {
-        let scan = scan_kernel_log_for_waves("I 2026/11/05 07:12:39 plugin.go:278: loaded petals\n");
+        let scan =
+            scan_kernel_log_for_waves("I 2026/11/05 07:12:39 plugin.go:278: loaded petals\n");
         assert_eq!(scan.commit_failures, 0);
         assert_eq!(scan.metadata_failures, 0);
     }
@@ -494,8 +492,14 @@ mod tests {
 
     #[test]
     fn diff_id_lists_samples_both_directions_with_tail_count() {
-        let fs: Vec<String> = ["f1", "shared", "f2", "f3"].iter().map(|s| s.to_string()).collect();
-        let sql: Vec<String> = ["shared", "s1", "s2", "s3", "s4", "s5"].iter().map(|s| s.to_string()).collect();
+        let fs: Vec<String> = ["f1", "shared", "f2", "f3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let sql: Vec<String> = ["shared", "s1", "s2", "s3", "s4", "s5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let text = diff_id_lists(&fs, &sql, 2);
         assert!(text.contains("только ФС [f1, f2 …+1]"), "{text}");
         assert!(text.contains("только SQL [s1, s2 …+3]"), "{text}");
@@ -522,7 +526,9 @@ mod tests {
         let (verdict, detail) = wave_verdict(&scan, 30);
         assert!(matches!(verdict, ProbeVerdict::Degraded(_)));
         assert!(detail.is_none());
-        let ProbeVerdict::Degraded(msg) = verdict else { unreachable!() };
+        let ProbeVerdict::Degraded(msg) = verdict else {
+            unreachable!()
+        };
         assert!(msg.contains("агентам пауза 2–5 мин"));
     }
 
@@ -549,10 +555,7 @@ mod tests {
     fn clean_probe_with_skipped_ones_exits_zero() {
         let outcomes = vec![
             ProbeOutcome::new("kernel", ProbeVerdict::Clean),
-            ProbeOutcome::new(
-                "wave",
-                ProbeVerdict::Skipped("docker недоступен".into()),
-            ),
+            ProbeOutcome::new("wave", ProbeVerdict::Skipped("docker недоступен".into())),
         ];
         assert_eq!(doctor_exit_code(&outcomes), 0);
     }
@@ -575,10 +578,7 @@ mod tests {
                 ProbeVerdict::Degraded("«t»: пустое тело (ZWJ-заглушка)".into()),
             )
             .with_detail("строк 5, легаси без привязки 2".into()),
-            ProbeOutcome::new(
-                "wave",
-                ProbeVerdict::Skipped("docker недоступен".into()),
-            ),
+            ProbeOutcome::new("wave", ProbeVerdict::Skipped("docker недоступен".into())),
         ];
         let text = report(&outcomes);
         assert!(text.contains("OK      kernel"));

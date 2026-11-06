@@ -51,12 +51,22 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
-    if let TaskSub::Create { title, r#type: ty, stdin, attach, dry_run: true } = command {
+    if let TaskSub::Create {
+        title,
+        r#type: ty,
+        stdin,
+        attach,
+        dry_run: true,
+    } = command
+    {
         if !attach.is_empty() {
             anyhow::bail!("create --dry-run не аттачит: скелет печатается без записей в воркспейс — убери --attach");
         }
         let ctx = if stdin { read_stdin()? } else { String::new() };
-        println!("{}", syt::body_template(&title, ty.as_deref().unwrap_or("dev"), &ctx));
+        println!(
+            "{}",
+            syt::body_template(&title, ty.as_deref().unwrap_or("dev"), &ctx)
+        );
         return Ok(());
     }
     // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
@@ -133,7 +143,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             Ok(())
         }
-        TaskSub::Create { title, r#type: ty, stdin, attach, .. } => {
+        TaskSub::Create {
+            title,
+            r#type: ty,
+            stdin,
+            attach,
+            ..
+        } => {
             let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
             // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
@@ -146,7 +162,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 if rows.iter().any(|r| syt::normalize_title(&r.title) == canon) {
                     anyhow::bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
                 }
-                if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
+                if !syt::body_doc_by_title(&sy, &board, &title)
+                    .await?
+                    .is_empty()
+                {
                     anyhow::bail!("тело задачи «{title}» уже есть");
                 }
             }
@@ -156,7 +175,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) = syt::create(&sy, project, &title, ty.as_deref().unwrap_or("dev"), &ctx).await?;
+            let (item, body) =
+                syt::create(&sy, project, &title, ty.as_deref().unwrap_or("dev"), &ctx).await?;
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
                 sy.append_block_md(&body, &refs).await.with_context(|| {
@@ -173,7 +193,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             Ok(())
         }
-        TaskSub::Edit { id, status, title, pr, branch } => {
+        TaskSub::Edit {
+            id,
+            status,
+            title,
+            pr,
+            branch,
+        } => {
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
             // валидация PR до rename: без частичных обновлений (тайтл сменился,
@@ -183,11 +209,27 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
                 None => None,
             };
-            syt::edit(&sy, &board, &task, status.as_deref(), branch.as_deref(), pr.as_deref()).await?;
-            println!("обновлено: {}", final_title.as_deref().unwrap_or(&task.title));
+            syt::edit(
+                &sy,
+                &board,
+                &task,
+                status.as_deref(),
+                branch.as_deref(),
+                pr.as_deref(),
+            )
+            .await?;
+            println!(
+                "обновлено: {}",
+                final_title.as_deref().unwrap_or(&task.title)
+            );
             Ok(())
         }
-        TaskSub::Comment { id, reply, stdin, text } => {
+        TaskSub::Comment {
+            id,
+            reply,
+            stdin,
+            text,
+        } => {
             let msg = guarded_comment_text(stdin, &text)?;
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
             note_fallback_board(origin, &board);
@@ -213,13 +255,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
-        TaskSub::Clean { ids, yes, live } => task_clean(&sy, project, &ids, yes, live.as_deref()).await,
+        TaskSub::Clean { ids, yes, live } => {
+            task_clean(&sy, project, &ids, yes, live.as_deref()).await
+        }
         TaskSub::Undo { journal, list } => {
             // --list сильнее позиционного (задаём список, имя не теряем — тест фиксирует)
             let name = if list { None } else { journal.as_deref() };
             task_undo(&sy, project, name).await
         }
-        TaskSub::Body { id, replace, replace_section, md, stdin, attach } => {
+        TaskSub::Body {
+            id,
+            replace,
+            replace_section,
+            md,
+            stdin,
+            attach,
+        } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
             let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
@@ -237,7 +288,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     // пустой appendBlock: опора на недокументированную реакцию
                     // ядра на пустой data — референсы дописываются сами
                     if replace || replace_section.is_some() || !content.trim().is_empty() {
-                        write_body_in_place(&sy, &doc_id, &task.title, replace || replace_section.is_some(), replace_section.as_deref(), &content).await?;
+                        write_body_in_place(
+                            &sy,
+                            &doc_id,
+                            &task.title,
+                            replace || replace_section.is_some(),
+                            replace_section.as_deref(),
+                            &content,
+                        )
+                        .await?;
                     }
                     doc_id
                 }
@@ -248,7 +307,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     } else {
                         content.trim_start().to_string()
                     };
-                    sy.create_doc_md(&board.notebook, &body_path, &initial).await?
+                    sy.create_doc_md(&board.notebook, &body_path, &initial)
+                        .await?
                 }
             };
             if !uploaded.is_empty() {
@@ -353,7 +413,13 @@ async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
 
 /// Батч-снос строк под guard'ом: dry-run дефолт, гейт ack на весь батч,
 /// write-ahead журнал, один item_remove массивом, пост-чек состава.
-async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Option<&str>) -> Result<()> {
+async fn task_clean(
+    sy: &SiYuan,
+    project: &str,
+    ids: &str,
+    yes: bool,
+    live: Option<&str>,
+) -> Result<()> {
     let frags: Vec<String> = ids
         .split(',')
         .map(str::trim)
@@ -398,7 +464,13 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
                 } else {
                     "не трогаю"
                 };
-                println!("  [{:<13}] «{}» (строка {}) — {}", verdict.label(), task.title, task.item_id, hint);
+                println!(
+                    "  [{:<13}] «{}» (строка {}) — {}",
+                    verdict.label(),
+                    task.title,
+                    task.item_id,
+                    hint
+                );
                 planned.push((frag, task, verdict));
             }
             syt::NeedleMatch::NotFound => {
@@ -418,7 +490,9 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         .map(String::from)
         .collect();
     for frag in &live_frags {
-        let matched = planned.iter().any(|(_, task, _)| guard::frag_matches(frag, task));
+        let matched = planned
+            .iter()
+            .any(|(_, task, _)| guard::frag_matches(frag, task));
         if !matched {
             println!("предупреждение: --live «{frag}» не матчит ни одну строку плана (опечатка?)");
         }
@@ -431,18 +505,26 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         if verdict.is_removable() || (verdict.needs_live_ack() && acked) {
             removable.push((task, *verdict));
         } else if verdict.needs_live_ack() {
-            refused.push(format!("«{}» — Live: нужен --live <фрагмент> или исключи из --ids", task.title));
+            refused.push(format!(
+                "«{}» — Live: нужен --live <фрагмент> или исключи из --ids",
+                task.title
+            ));
         } else {
             refused.push(format!("«{}» — {}: не трогаю", task.title, verdict.label()));
         }
     }
 
     if !yes {
-        println!("dry-run: мутаций нет. Исполнение — повтор с --yes (журнал и пост-чек включатся сами).");
+        println!(
+            "dry-run: мутаций нет. Исполнение — повтор с --yes (журнал и пост-чек включатся сами)."
+        );
         return Ok(());
     }
     if !refused.is_empty() {
-        bail!("батч отклонён ЦЕЛИКОМ, ноль мутаций:\n  - {}", refused.join("\n  - "));
+        bail!(
+            "батч отклонён ЦЕЛИКОМ, ноль мутаций:\n  - {}",
+            refused.join("\n  - ")
+        );
     }
     if removable.is_empty() {
         println!("сносить нечего: ни один кандидат не в вердиктах сноса");
@@ -481,7 +563,8 @@ async fn task_clean(sy: &SiYuan, project: &str, ids: &str, yes: bool, live: Opti
         bail!(
             "ПОСТ-ЧЕК: с доски пропали строки ВНЕ плана ({:?}) — возможна потеря живых задач; \
              восстановление — task undo {} --project {project}",
-            extra, journal_path
+            extra,
+            journal_path
         );
     }
     println!(
@@ -502,14 +585,22 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
         }
         println!("undo-журналы ({}):", guard::UNDO_DIR);
         for (name, journal) in &journals {
-            println!("  {name}  {} [{}, {} строк(а)]", journal.created, journal.kind, journal.rows.len());
+            println!(
+                "  {name}  {} [{}, {} строк(а)]",
+                journal.created,
+                journal.kind,
+                journal.rows.len()
+            );
         }
         println!("восстановление: task undo <имя> --project <проект журнала>");
         return Ok(());
     };
     let journal = Journal::load(sy, name).await?;
     if journal.project != project {
-        bail!("журнал принадлежит проекту «{}», а --project «{project}»", journal.project);
+        bail!(
+            "журнал принадлежит проекту «{}», а --project «{project}»",
+            journal.project
+        );
     }
     let board = match journal.kind.as_str() {
         "cron-rm" => syt::find_board_cron(sy, project).await?,
@@ -535,7 +626,8 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
         }
         let body_doc = restore_journal_body(sy, &board, row).await?;
         let item = if body_doc.is_empty() {
-            sy.db_item_add(&board.av_id, &syt::path_safe(&row.title)).await?
+            sy.db_item_add(&board.av_id, &syt::path_safe(&row.title))
+                .await?
         } else {
             sy.db_item_add_bound(&board.av_id, &body_doc).await?
         };
@@ -544,7 +636,11 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
             "  восстановлена: «{}» — строка {item} (была {}), тело {}",
             row.title,
             row.item_id,
-            if body_doc.is_empty() { "—".to_string() } else { body_doc.clone() }
+            if body_doc.is_empty() {
+                "—".to_string()
+            } else {
+                body_doc.clone()
+            }
         );
         restored += 1;
     }
@@ -557,7 +653,11 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
 
 /// Тело для восстановленной строки: живое переиспользуется, отсутствующее
 /// пересоздаётся из журнала (docId меняется); без тела — detached-строка.
-async fn restore_journal_body(sy: &SiYuan, board: &syt::SyBoard, row: &JournalRow) -> Result<String> {
+async fn restore_journal_body(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    row: &JournalRow,
+) -> Result<String> {
     let Some(md) = row.body_md.as_deref() else {
         return Ok(String::new());
     };
@@ -570,7 +670,8 @@ async fn restore_journal_body(sy: &SiYuan, board: &syt::SyBoard, row: &JournalRo
     match ids.as_slice() {
         [] => {
             let clean_md = markdown::strip_export_wrapper(md, &row.title);
-            sy.create_doc_md(&board.notebook, &row.body_hpath, &clean_md).await
+            sy.create_doc_md(&board.notebook, &row.body_hpath, &clean_md)
+                .await
         }
         [only] => Ok(only.clone()),
         many => bail!(
@@ -595,7 +696,8 @@ async fn restore_journal_cells(
         // текстовая клетка из extra
         if !row.status.is_empty() {
             let sk = syt::status_key(sy, &board.av_id).await?;
-            sy.db_item_set_status(&board.av_id, &sk, item, &row.status).await?;
+            sy.db_item_set_status(&board.av_id, &sk, item, &row.status)
+                .await?;
         }
         if row.extra_text_cells.is_empty() {
             return Ok(());
@@ -609,7 +711,8 @@ async fn restore_journal_cells(
     }
     if !row.status.is_empty() {
         let sk = syt::status_key(sy, &board.av_id).await?;
-        sy.db_item_set_status(&board.av_id, &sk, item, &row.status).await?;
+        sy.db_item_set_status(&board.av_id, &sk, item, &row.status)
+            .await?;
     }
     if !row.branch.is_empty() {
         set_text_cells(sy, &board.av_id, item, &[("Branch", row.branch.as_str())]).await?;
@@ -617,7 +720,9 @@ async fn restore_journal_cells(
     if row.pr.is_empty() {
         return Ok(());
     }
-    let keys = sy.mcp_tool("database", json!({ "action": "keys", "id": board.av_id })).await?;
+    let keys = sy
+        .mcp_tool("database", json!({ "action": "keys", "id": board.av_id }))
+        .await?;
     let pr_key = keys
         .pointer("/data/keys")
         .or_else(|| keys.get("keys"))
@@ -638,7 +743,10 @@ async fn restore_journal_cells(
             .await?;
             Ok(())
         }
-        None => bail!("ключ PR не найден на доске — PR «{}» не восстановлен", row.pr),
+        None => bail!(
+            "ключ PR не найден на доске — PR «{}» не восстановлен",
+            row.pr
+        ),
     }
 }
 
@@ -687,9 +795,21 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
     match command {
         CronSub::List { project } => cron_list(&sy, &cron_project(project)).await,
-        CronSub::Set { title, r#in, every, at, cron_expr, project, stdin } => {
+        CronSub::Set {
+            title,
+            r#in,
+            every,
+            at,
+            cron_expr,
+            project,
+            stdin,
+        } => {
             let schedule = cron_schedule(&r#in, &every, &at, &cron_expr)?;
-            let prompt = if stdin { read_stdin()? } else { "<промпт крона>".into() };
+            let prompt = if stdin {
+                read_stdin()?
+            } else {
+                "<промпт крона>".into()
+            };
             let proj = cron_project(project);
             let board = syt::find_board_cron(&sy, &proj).await?;
             // колонки — до мутаций: строка без Schedule демону не видна,
@@ -698,17 +818,26 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
             let cron_keys = syt::require_cron_keys(&keys, &board.hpath)?;
             // дубль-тайтл: живая строка или тело-сирота (дедуп как в task create)
             let canon = syt::normalize_title(&title);
-            if syt::read_rows(&sy, &board).await?.iter().any(|r| syt::normalize_title(&r.title) == canon) {
+            if syt::read_rows(&sy, &board)
+                .await?
+                .iter()
+                .any(|r| syt::normalize_title(&r.title) == canon)
+            {
                 anyhow::bail!("крон «{title}» уже есть (живая строка на {})", board.hpath);
             }
-            if !syt::body_doc_by_title(&sy, &board, &title).await?.is_empty() {
+            if !syt::body_doc_by_title(&sy, &board, &title)
+                .await?
+                .is_empty()
+            {
                 anyhow::bail!("тело крона «{title}» уже есть");
             }
             // тело → bound-строка (клик по карточке открывает промпт) →
             // клетки → verify вставки в render (репро 04.11 08:27: success
             // item_add не гарантирует строку), паттерн task create
             let body_h = board.body_hpath(&title);
-            let body = sy.create_doc_md(&board.notebook, &body_h, &cron_body_md(&title, &prompt)).await?;
+            let body = sy
+                .create_doc_md(&board.notebook, &body_h, &cron_body_md(&title, &prompt))
+                .await?;
             let mut item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
             for attempt in 0..=1u8 {
                 let rows = syt::read_rows(&sy, &board).await?;
@@ -781,7 +910,8 @@ async fn insert_cron_row(
     schedule: &str,
 ) -> Result<String> {
     let item = sy.db_item_add_bound(&board.av_id, body).await?;
-    sy.db_item_set_status(&board.av_id, &keys.status, &item, "active").await?;
+    sy.db_item_set_status(&board.av_id, &keys.status, &item, "active")
+        .await?;
     write_text_cell(sy, &board.av_id, &keys.schedule, &item, schedule).await?;
     write_text_cell(sy, &board.av_id, &keys.last_run, &item, "").await?;
     Ok(item)
@@ -825,11 +955,18 @@ pub(crate) fn format_cron_table(rows: &[syt::SyTask]) -> String {
     out
 }
 
-async fn cron_set_status(sy: &SiYuan, id: &str, status: &str, verb: &str, project: &str) -> Result<()> {
+async fn cron_set_status(
+    sy: &SiYuan,
+    id: &str,
+    status: &str,
+    verb: &str,
+    project: &str,
+) -> Result<()> {
     let board = syt::find_board_cron(sy, project).await?;
     let task = syt::resolve(sy, &board, id).await?;
     let key = syt::status_key(sy, &board.av_id).await?;
-    sy.db_item_set_status(&board.av_id, &key, &task.item_id, status).await?;
+    sy.db_item_set_status(&board.av_id, &key, &task.item_id, status)
+        .await?;
     println!("крон {verb}: {}", task.title);
     Ok(())
 }
@@ -840,7 +977,11 @@ async fn cron_set_status(sy: &SiYuan, id: &str, status: &str, verb: &str, projec
 async fn set_text_cells(sy: &SiYuan, av: &str, item: &str, cells: &[(&str, &str)]) -> Result<()> {
     let keys = syt::board_keys(sy, av).await?;
     for (name, value) in cells {
-        let Some(key) = keys.iter().find(|(n, _)| n == name).map(|(_, id)| id.as_str()) else {
+        let Some(key) = keys
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| id.as_str())
+        else {
             anyhow::bail!("колонка «{name}» не найдена на доске {av} — ячейка не записана");
         };
         write_text_cell(sy, av, key, item, value).await?;
@@ -848,8 +989,18 @@ async fn set_text_cells(sy: &SiYuan, av: &str, item: &str, cells: &[(&str, &str)
     Ok(())
 }
 
-fn cron_schedule(in_: &Option<String>, every: &Option<String>, at: &Option<String>, expr: &Option<String>) -> Result<String> {
-    let opts = [in_.as_deref(), every.as_deref(), at.as_deref(), expr.as_deref()];
+fn cron_schedule(
+    in_: &Option<String>,
+    every: &Option<String>,
+    at: &Option<String>,
+    expr: &Option<String>,
+) -> Result<String> {
+    let opts = [
+        in_.as_deref(),
+        every.as_deref(),
+        at.as_deref(),
+        expr.as_deref(),
+    ];
     let n = opts.iter().filter(|o| o.is_some()).count();
     if n != 1 {
         anyhow::bail!("нужен ровно один из --in / --every / --at / --cron (получено {n})");
@@ -1004,7 +1155,11 @@ pub(crate) fn ls_lines(entries: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|entry| {
             entry.get("name").and_then(|n| n.as_str()).map(|name| {
-                if entry.get("isDir").and_then(|d| d.as_bool()).unwrap_or(false) {
+                if entry
+                    .get("isDir")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false)
+                {
                     format!("{name}/")
                 } else {
                     name.to_string()
@@ -1028,11 +1183,14 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
     let sy = SiYuan::from_env_with_timeout(timeout_secs)?;
     match command {
         KernelSub::Ping => {
-            sy.post_probe("/api/query/sql", json!({ "stmt": "select 1" })).await?;
+            sy.post_probe("/api/query/sql", json!({ "stmt": "select 1" }))
+                .await?;
             println!("alive: sql ok");
         }
         KernelSub::Sql { stmt } => {
-            let envelope = sy.post_probe("/api/query/sql", json!({ "stmt": stmt })).await?;
+            let envelope = sy
+                .post_probe("/api/query/sql", json!({ "stmt": stmt }))
+                .await?;
             println!("{}", serde_json::to_string_pretty(&envelope)?);
         }
         KernelSub::File { path, out } => match sy.fetch_workspace_file(&path).await {
@@ -1051,7 +1209,9 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
             FileFetch::Failed(err) => bail!("kernel file {path}: {err}"),
         },
         KernelSub::Ls { path } => {
-            let envelope = sy.post_probe("/api/file/readDir", json!({ "path": path })).await?;
+            let envelope = sy
+                .post_probe("/api/file/readDir", json!({ "path": path }))
+                .await?;
             let entries = envelope
                 .get("data")
                 .and_then(|d| d.as_array())
@@ -1071,11 +1231,17 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             if content.is_empty() {
-                eprintln!("(export пуст: 0 символов — док пуст, деградация индекса или неверный id)");
+                eprintln!(
+                    "(export пуст: 0 символов — док пуст, деградация индекса или неверный id)"
+                );
             }
             print!("{content}");
         }
-        KernelSub::Render { av_id, block_id, page } => {
+        KernelSub::Render {
+            av_id,
+            block_id,
+            page,
+        } => {
             crate::siyuan_id::ensure_node_id(&av_id, "av_id")?;
             crate::siyuan_id::ensure_node_id(&block_id, "block_id")?;
             let render = sy.db_render(&av_id, &block_id, page).await?;
@@ -1298,11 +1464,7 @@ fn validate_attach_files(files: &[std::path::PathBuf]) -> Result<&[std::path::Pa
     for file in files {
         let meta = std::fs::metadata(file)
             .with_context(|| format!("файл {}: недоступен", file.display()))?;
-        anyhow::ensure!(
-            meta.is_file(),
-            "{} — не файл (директория?)",
-            file.display()
-        );
+        anyhow::ensure!(meta.is_file(), "{} — не файл (директория?)", file.display());
     }
     Ok(files)
 }
@@ -1349,7 +1511,11 @@ fn is_image_name(name: &str) -> bool {
 fn asset_ref_md(asset: &crate::siyuan::UploadedAsset) -> String {
     let alt = asset.original_name.replace(['[', ']'], "");
     let encoded = percent_encode_asset_path(&asset.asset_path);
-    let prefix = if is_image_name(&asset.original_name) { "!" } else { "" };
+    let prefix = if is_image_name(&asset.original_name) {
+        "!"
+    } else {
+        ""
+    };
     format!("{prefix}[{alt}]({encoded})")
 }
 
@@ -1498,7 +1664,8 @@ fn percent_decode(raw: &str) -> String {
 /// Ключ asset-ссылки безопасен: ни один сегмент пути не пуст, «.» или «..» —
 /// такие ключи («assets/../../etc») не скачиваются вовсе, до сетевого вызова.
 fn asset_key_is_safe(key: &str) -> bool {
-    key.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    key.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 /// Выгрузить asset-аттачи тела в /tmp/uwuwu-task-<row-id>/ (полный row-id —
@@ -1593,7 +1760,12 @@ mod tests {
     async fn mock_siyuan(
         title_doc_ids: Vec<String>,
         with_binding: bool,
-    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+    ) -> (
+        MockServer,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
         mock_siyuan_with_export(title_doc_ids, with_binding, String::new()).await
     }
 
@@ -1605,7 +1777,12 @@ mod tests {
         title_doc_ids: Vec<String>,
         with_binding: bool,
         export_content: String,
-    ) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+    ) -> (
+        MockServer,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
         let server = MockServer::start().await;
         let create_calls = Arc::new(AtomicUsize::new(0));
         let append_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1636,7 +1813,8 @@ mod tests {
             .and(path("/api/filetree/createDocWithMd"))
             .respond_with(move |_req: &wiremock::Request| {
                 create_for_mount.fetch_add(1, Ordering::SeqCst);
-                ResponseTemplate::new(200).set_body_string(r#"{"code":-1,"msg":"createDocWithMd must not be called"}"#)
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"code":-1,"msg":"createDocWithMd must not be called"}"#)
             })
             .mount(&server)
             .await;
@@ -1678,7 +1856,8 @@ mod tests {
                     // прочие пути (крон-доски и пр.) в этом сценарии не существуют
                     serde_json::json!([])
                 };
-                ResponseTemplate::new(200).set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
+                ResponseTemplate::new(200)
+                    .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
             })
             .mount(&server)
             .await;
@@ -1772,11 +1951,18 @@ mod tests {
             mock_siyuan(vec![ORPHAN_DOC.to_string(), BOUND_DOC.to_string()], true).await;
         write_body_via_cli(&server).await.unwrap();
 
-        assert_eq!(create_calls.load(Ordering::SeqCst), 0, "createDocWithMd не должен вызываться");
+        assert_eq!(
+            create_calls.load(Ordering::SeqCst),
+            0,
+            "createDocWithMd не должен вызываться"
+        );
         {
             let appends = append_bodies.lock().unwrap();
             assert_eq!(appends.len(), 1, "один appendBlock в привязанный док");
-            assert!(appends[0].contains("маркер-контент"), "контент в appendBlock");
+            assert!(
+                appends[0].contains("маркер-контент"),
+                "контент в appendBlock"
+            );
             assert!(
                 appends[0].contains(&format!("\"parentID\":\"{BOUND_DOC}\"")),
                 "append в привязанный док, не в сироту"
@@ -1791,7 +1977,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn replace_section_rewrites_without_name_and_frontmatter_blocks() {
-        let export = "---\ntitle: таск\n---\n\n# таск\n\n## Проверка\nстарое тело секции\n".to_string();
+        let export =
+            "---\ntitle: таск\n---\n\n# таск\n\n## Проверка\nстарое тело секции\n".to_string();
         let (server, create_calls, append_bodies, _deletes) =
             mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
@@ -1817,10 +2004,22 @@ mod tests {
             let appends = append_bodies.lock().unwrap();
             assert_eq!(appends.len(), 1, "один appendBlock пересборки");
             let payload = &appends[0];
-            assert!(payload.contains("новое содержимое секции"), "новая секция в appendBlock");
-            assert!(!payload.contains("# таск"), "имя дока не реимпортируется блоком");
-            assert!(!payload.contains("title: таск"), "frontmatter не реимпортируется блоком");
-            assert!(!payload.contains("старое тело секции"), "старая секция заменена");
+            assert!(
+                payload.contains("новое содержимое секции"),
+                "новая секция в appendBlock"
+            );
+            assert!(
+                !payload.contains("# таск"),
+                "имя дока не реимпортируется блоком"
+            );
+            assert!(
+                !payload.contains("title: таск"),
+                "frontmatter не реимпортируется блоком"
+            );
+            assert!(
+                !payload.contains("старое тело секции"),
+                "старая секция заменена"
+            );
         }
     }
 
@@ -1830,7 +2029,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn replace_section_twin_other_level_refuses_without_kernel_write() {
-        let export = "---\ntitle: таск\n---\n\n# таск\n\n## Родитель\nввод\n### Подсекция\nдетали\n".to_string();
+        let export =
+            "---\ntitle: таск\n---\n\n# таск\n\n## Родитель\nввод\n### Подсекция\nдетали\n"
+                .to_string();
         let (server, create_calls, append_bodies, delete_calls) =
             mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
@@ -1852,13 +2053,24 @@ mod tests {
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("h3") && msg.contains("### Подсекция"), "суть отказа: {msg}");
+        assert!(
+            msg.contains("h3") && msg.contains("### Подсекция"),
+            "суть отказа: {msg}"
+        );
         assert_eq!(create_calls.load(Ordering::SeqCst), 0, "доки не создаются");
         {
             let appends = append_bodies.lock().unwrap();
-            assert!(appends.is_empty(), "appendBlock не вызывался: {:?}", *appends);
+            assert!(
+                appends.is_empty(),
+                "appendBlock не вызывался: {:?}",
+                *appends
+            );
         }
-        assert_eq!(delete_calls.load(Ordering::SeqCst), 0, "deleteBlock-шторма нет — ядро не тронуто");
+        assert_eq!(
+            delete_calls.load(Ordering::SeqCst),
+            0,
+            "deleteBlock-шторма нет — ядро не тронуто"
+        );
     }
 
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
@@ -1871,11 +2083,11 @@ mod tests {
         let err = write_body_via_cli(&server).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("несколько доков"), "суть ошибки: {msg}");
-        assert!(msg.contains(ORPHAN_DOC) && msg.contains("doc-b"), "список docId в ошибке: {msg}");
+        assert!(
+            msg.contains(ORPHAN_DOC) && msg.contains("doc-b"),
+            "список docId в ошибке: {msg}"
+        );
     }
-
-
-
 
     #[test]
     fn replace_md_section_replaces_body_keeps_heading() {
@@ -1883,7 +2095,12 @@ mod tests {
         let (out, edit) = replace_md_section(md, "А", "новое содержимое\n").unwrap();
         assert!(out.contains("## А\nновое содержимое"));
         assert!(out.contains("## Б\nвторое"));
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 0
+            }
+        );
     }
 
     #[test]
@@ -1900,10 +2117,21 @@ mod tests {
         let md = "# Таск\n\n## Причина\nпервое вхождение\n\n## Причина\nвторое вхождение\n\n## Фикс\nправка\n";
         let (out, edit) = replace_md_section(md, "Причина", "новый механизм\n").unwrap();
         assert_eq!(out.matches("## Причина").count(), 1, "секция остаётся одна");
-        assert!(!out.contains("первое вхождение"), "старый контент первого удалён");
+        assert!(
+            !out.contains("первое вхождение"),
+            "старый контент первого удалён"
+        );
         assert!(!out.contains("второе вхождение"), "контент дубля удалён");
-        assert!(out.contains("## Фикс\nправка"), "соседняя секция не тронута");
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 1 });
+        assert!(
+            out.contains("## Фикс\nправка"),
+            "соседняя секция не тронута"
+        );
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 1
+            }
+        );
     }
 
     #[test]
@@ -1911,19 +2139,26 @@ mod tests {
         let md = "## А\nстарое\n# Заголовок H1\nхвост тайтла\n\n## Б\nвторое\n";
         let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(out.contains("# Заголовок H1"), "h1 переживает replace");
-        assert!(out.contains("хвост тайтла"), "контент после h1 переживает replace");
+        assert!(
+            out.contains("хвост тайтла"),
+            "контент после h1 переживает replace"
+        );
         assert!(out.contains("## Б\nвторое"));
     }
 
     #[test]
     fn h3_stays_inside_section() {
-        let md = "## А\nввод\n### Подсекция\nдетали подсекции\n\n## Б\nвторое\n### Б-под\nб-детали\n";
+        let md =
+            "## А\nввод\n### Подсекция\nдетали подсекции\n\n## Б\nвторое\n### Б-под\nб-детали\n";
         let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
         assert!(
             !out.contains("детали подсекции"),
             "h3 не рвёт диапазон: контент под h3 заменяется вместе с секцией"
         );
-        assert!(out.contains("### Б-под\nб-детали"), "h3 чужой секции не тронут");
+        assert!(
+            out.contains("### Б-под\nб-детали"),
+            "h3 чужой секции не тронут"
+        );
         assert!(out.contains("## Б\nвторое"));
     }
 
@@ -1933,7 +2168,12 @@ mod tests {
         let (out, edit) = replace_md_section(md, " Постановка ", "новое\n").unwrap();
         assert!(out.contains("новое"), "матч по нормализованному тексту");
         assert_eq!(out.matches("##").count(), 1, "без append-дубля секции");
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 0
+            }
+        );
     }
 
     #[test]
@@ -1952,14 +2192,22 @@ mod tests {
         let md = "## Причина ^20261104120000-ab12cd\nстарое\n\n## Б\nвторое\n";
         let (out, edit) = replace_md_section(md, "Причина", "новое\n").unwrap();
         assert!(out.contains("новое"), "суффикс ^id не мешает матчу");
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 0
+            }
+        );
     }
 
     #[test]
     fn fenced_h2_does_not_bound_section() {
         let md = "## А\nстарое\n```md\n## Фейк внутри фенса\n```\nхвост секции\n\n## Б\nвторое\n";
         let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
-        assert!(!out.contains("Фейк"), "h2 внутри фенса — контент секции, заменяется");
+        assert!(
+            !out.contains("Фейк"),
+            "h2 внутри фенса — контент секции, заменяется"
+        );
         assert!(!out.contains("хвост секции"), "секция длится сквозь фенс");
         assert!(out.contains("## Б\nвторое"));
     }
@@ -1968,9 +2216,15 @@ mod tests {
     fn hash_line_inside_fence_survives() {
         let md = "## Сценарий (BDD)\nстарое\n```gherkin\nСценарий: x\n  Дано y\n  Тогда z  # факт\n```\n\n## Б\nвторое\n";
         let (out, _) = replace_md_section(md, "Сценарий (BDD)", "новое\n").unwrap();
-        assert!(out.contains("## Б\nвторое"), "граница секции — настоящий заголовок Б");
+        assert!(
+            out.contains("## Б\nвторое"),
+            "граница секции — настоящий заголовок Б"
+        );
         assert_eq!(out.matches("## Б").count(), 1, "секция Б не задвоена");
-        assert!(!out.contains("# факт"), "старый контент секции заменён целиком");
+        assert!(
+            !out.contains("# факт"),
+            "старый контент секции заменён целиком"
+        );
     }
 
     #[test]
@@ -1986,7 +2240,10 @@ mod tests {
     fn blank_line_restored_before_next_heading() {
         let md = "## А\nстарое\n\n## Б\nвторое\n";
         let (out, _) = replace_md_section(md, "А", "новое\n").unwrap();
-        assert!(out.contains("новое\n\n## Б"), "пустая строка между секциями восстановлена");
+        assert!(
+            out.contains("новое\n\n## Б"),
+            "пустая строка между секциями восстановлена"
+        );
     }
 
     // ——— гард уровня: h2-матча нет, тёзка на уровне 1 или ≥3 → отказ, записи нет ———
@@ -1997,7 +2254,10 @@ mod tests {
         let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("h3"), "уровень тёзки в ошибке: {msg}");
-        assert!(msg.contains("### Подсекция"), "байт-точная строка заголовка: {msg}");
+        assert!(
+            msg.contains("### Подсекция"),
+            "байт-точная строка заголовка: {msg}"
+        );
         assert!(msg.contains("--replace"), "рецепт обхода в ошибке: {msg}");
     }
 
@@ -2006,7 +2266,10 @@ mod tests {
         let md = "# Подсекция\nтело тайтла\n";
         let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("h1"), "h1-тёзка гардится тем же правилом: {msg}");
+        assert!(
+            msg.contains("h1"),
+            "h1-тёзка гардится тем же правилом: {msg}"
+        );
     }
 
     #[test]
@@ -2037,9 +2300,21 @@ mod tests {
     fn h2_match_wins_over_h3_twin_without_guard() {
         let md = "## Подсекция\nстарое\n\n## Другое\nввод\n### Подсекция\nдетали\n";
         let (out, edit) = replace_md_section(md, "Подсекция", "новое\n").unwrap();
-        assert!(out.contains("## Подсекция\nновое"), "h2-матч заменён на месте");
-        assert!(out.contains("### Подсекция\nдетали"), "###-тёзка вне секции не тронута");
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 }, "гард не стреляет при живом h2");
+        assert!(
+            out.contains("## Подсекция\nновое"),
+            "h2-матч заменён на месте"
+        );
+        assert!(
+            out.contains("### Подсекция\nдетали"),
+            "###-тёзка вне секции не тронута"
+        );
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 0
+            },
+            "гард не стреляет при живом h2"
+        );
     }
 
     #[test]
@@ -2047,7 +2322,10 @@ mod tests {
         let md = "### Подсекция\nверхняя\n\n# Подсекция\nнижняя\n";
         let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("h3"), "первая тёзка по порядку — детерминизм: {msg}");
+        assert!(
+            msg.contains("h3"),
+            "первая тёзка по порядку — детерминизм: {msg}"
+        );
         assert!(msg.contains("### Подсекция"), "строка первой тёзки: {msg}");
         assert!(!msg.contains("h1"), "вторая тёзка не упоминается: {msg}");
     }
@@ -2059,28 +2337,49 @@ mod tests {
         // факт 06.11 (задача 20261104072048): запрос «### Замечания…» при живой
         // h3-секции → раньше not-found append «## ### Замечания…» в хвост тела
         let md = "## Финальный отчёт\nввод\n### Замечания и неочевидные решения\nдетали\n\n## Комменты\n- строка\n";
-        let err = replace_md_section(md, "### Замечания и неочевидные решения", "новое\n").unwrap_err();
+        let err =
+            replace_md_section(md, "### Замечания и неочевидные решения", "новое\n").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("h3"), "запрос с префиксом матчит тёзку после среза хэшей: {msg}");
-        assert!(msg.contains("### Замечания и неочевидные решения"), "байт-точная строка: {msg}");
+        assert!(
+            msg.contains("h3"),
+            "запрос с префиксом матчит тёзку после среза хэшей: {msg}"
+        );
+        assert!(
+            msg.contains("### Замечания и неочевидные решения"),
+            "байт-точная строка: {msg}"
+        );
     }
 
     #[test]
     fn prefixed_h2_query_matches_live_section() {
         let md = "## X\nстарое\n\n## Б\nвторое\n";
         let (out, edit) = replace_md_section(md, "## X", "новое\n").unwrap();
-        assert!(out.contains("## X\nновое"), "запрос «## X» матчит живую секцию «X»");
+        assert!(
+            out.contains("## X\nновое"),
+            "запрос «## X» матчит живую секцию «X»"
+        );
         assert!(out.contains("## Б\nвторое"));
         assert_eq!(out.matches("## X").count(), 1, "без дубля секции");
-        assert_eq!(edit, SectionEdit::Replaced { duplicates_removed: 0 });
+        assert_eq!(
+            edit,
+            SectionEdit::Replaced {
+                duplicates_removed: 0
+            }
+        );
     }
 
     #[test]
     fn prefixed_query_appends_clean_heading() {
         let md = "## А\nтело\n";
         let (out, edit) = replace_md_section(md, "### Новая", "контент").unwrap();
-        assert!(out.contains("## Новая\nконтент"), "append пишет чистый заголовок без хэшей запроса");
-        assert!(!out.contains("## ###"), "двойного префикса в теле нет: {out}");
+        assert!(
+            out.contains("## Новая\nконтент"),
+            "append пишет чистый заголовок без хэшей запроса"
+        );
+        assert!(
+            !out.contains("## ###"),
+            "двойного префикса в теле нет: {out}"
+        );
         assert_eq!(edit, SectionEdit::Appended);
     }
 
@@ -2088,7 +2387,10 @@ mod tests {
     fn collect_threads_prints_normalized_section() {
         let md = "## Постановка\nтело\n\n##  Комменты\n- **AGENTS**: вопрос\n";
         let out = collect_threads(md);
-        assert!(out.contains("##  Комменты"), "заголовок с двойным пробелом матчится");
+        assert!(
+            out.contains("##  Комменты"),
+            "заголовок с двойным пробелом матчится"
+        );
         assert!(out.contains("- **AGENTS**: вопрос"));
         assert!(!out.contains("тело"));
     }
@@ -2107,14 +2409,20 @@ mod tests {
         let md = "## Комменты\n- первый\n\n## Комменты\n- второй\n";
         let out = collect_threads(md);
         assert!(out.contains("- первый"));
-        assert!(out.contains("- второй"), "дубли секций печатаются обе — read-путь ничего не роняет");
+        assert!(
+            out.contains("- второй"),
+            "дубли секций печатаются обе — read-путь ничего не роняет"
+        );
     }
 
     #[test]
     fn collect_threads_prints_hash_tag_inside_section() {
         let md = "## Комменты\n- коммент\n#bug\n- коммент после тега\n";
         let out = collect_threads(md);
-        assert!(out.contains("#bug"), "#bug без пробела — не заголовок, секцию не закрывает");
+        assert!(
+            out.contains("#bug"),
+            "#bug без пробела — не заголовок, секцию не закрывает"
+        );
         assert!(out.contains("- коммент после тега"));
     }
 
@@ -2127,7 +2435,10 @@ mod tests {
     fn comment_guard_rejects_subcommand_name_as_text() {
         let err = validate_comment_text(false, "list").expect_err("«list» — подкоманда, не текст");
         assert!(err.to_string().contains("подкоманд"), "суть отказа: {err}");
-        assert!(err.to_string().contains("task get/thread"), "подсказка чтения: {err}");
+        assert!(
+            err.to_string().contains("task get/thread"),
+            "подсказка чтения: {err}"
+        );
     }
 
     #[test]
@@ -2146,7 +2457,8 @@ mod tests {
 
     #[test]
     fn comment_guard_allows_markdown_bullets() {
-        validate_comment_text(false, "- пункт один\n- ещё пункт").expect("markdown-буллет — контент, не флаг");
+        validate_comment_text(false, "- пункт один\n- ещё пункт")
+            .expect("markdown-буллет — контент, не флаг");
     }
 
     #[test]
@@ -2164,8 +2476,10 @@ mod tests {
 
     #[test]
     fn comment_guard_skips_stdin_source() {
-        validate_comment_text(true, "--не-флаг-а-текст").expect("stdin — явное намерение, не гвардим");
-        validate_comment_text(true, "list из пайпа — тоже контент").expect("stdin: подкоманды не гвардятся");
+        validate_comment_text(true, "--не-флаг-а-текст")
+            .expect("stdin — явное намерение, не гвардим");
+        validate_comment_text(true, "list из пайпа — тоже контент")
+            .expect("stdin: подкоманды не гвардятся");
     }
 
     // ——— порядок диспетчера: гвард текста раньше bail по --project ———
@@ -2191,8 +2505,14 @@ mod tests {
             .await
             .expect_err("флаг в позиционном тексте — отказ гварда");
         let msg = err.to_string();
-        assert!(msg.contains("похож на флаг"), "реальная причина в ошибке: {msg}");
-        assert!(!msg.contains("обязателен"), "маскировка «флаг не передан» недопустима: {msg}");
+        assert!(
+            msg.contains("похож на флаг"),
+            "реальная причина в ошибке: {msg}"
+        );
+        assert!(
+            !msg.contains("обязателен"),
+            "маскировка «флаг не передан» недопустима: {msg}"
+        );
     }
 
     /// Пинну приоритета (замечание ревью плана): подкоманда-как-текст при
@@ -2205,7 +2525,10 @@ mod tests {
             .expect_err("подкоманда-как-текст — отказ гварда");
         let msg = err.to_string();
         assert!(msg.contains("подкоманд"), "сообщение гварда: {msg}");
-        assert!(!msg.contains("обязателен"), "приоритет ошибок сменился обратно: {msg}");
+        assert!(
+            !msg.contains("обязателен"),
+            "приоритет ошибок сменился обратно: {msg}"
+        );
     }
 
     /// Контроль: чистый позиционный текст при пустом --project — прежний bail
@@ -2245,12 +2568,20 @@ mod tests {
     use crate::siyuan::UploadedAsset;
 
     fn asset(name: &str, path: &str) -> UploadedAsset {
-        UploadedAsset { original_name: name.into(), asset_path: path.into() }
+        UploadedAsset {
+            original_name: name.into(),
+            asset_path: path.into(),
+        }
     }
 
     #[test]
     fn percent_encoding_round_trips_through_reader_on_space_and_cyrillic() {
-        for name in ["скрин 2.png", "имя я.png", "снимок экрана (1).png", "отчёт.pdf"] {
+        for name in [
+            "скрин 2.png",
+            "имя я.png",
+            "снимок экрана (1).png",
+            "отчёт.pdf",
+        ] {
             let path = format!("assets/{name}");
             let md = asset_ref_md(&asset(name, &path));
             let decoded = collect_asset_refs(&md);
@@ -2260,10 +2591,22 @@ mod tests {
 
     #[test]
     fn percent_encoding_covers_unreserved_only() {
-        assert_eq!(percent_encode_asset_path("assets/a b.png"), "assets/a%20b.png");
-        assert_eq!(percent_encode_asset_path("assets/а.png"), "assets/%D0%B0.png");
-        assert_eq!(percent_encode_asset_path("assets/ok-_.~1.txt"), "assets/ok-_.~1.txt");
-        assert_eq!(percent_encode_asset_path("assets/x(1).png"), "assets/x%281%29.png");
+        assert_eq!(
+            percent_encode_asset_path("assets/a b.png"),
+            "assets/a%20b.png"
+        );
+        assert_eq!(
+            percent_encode_asset_path("assets/а.png"),
+            "assets/%D0%B0.png"
+        );
+        assert_eq!(
+            percent_encode_asset_path("assets/ok-_.~1.txt"),
+            "assets/ok-_.~1.txt"
+        );
+        assert_eq!(
+            percent_encode_asset_path("assets/x(1).png"),
+            "assets/x%281%29.png"
+        );
     }
 
     #[test]
@@ -2272,20 +2615,33 @@ mod tests {
         assert!(img.starts_with("![скрин.png]("), "картинка: {img}");
         assert!(img.contains("%D1%81"), "кириллица пути закодирована: {img}");
         let file = asset_ref_md(&asset("отчёт.pdf", "assets/отчёт.pdf"));
-        assert!(file.starts_with("[отчёт.pdf](") && !file.starts_with("!["), "ссылка: {file}");
+        assert!(
+            file.starts_with("[отчёт.pdf](") && !file.starts_with("!["),
+            "ссылка: {file}"
+        );
     }
 
     #[test]
     fn asset_ref_md_alt_text_without_brackets_keeps_markdown_intact() {
         let md = asset_ref_md(&asset("weird]name.png", "assets/weird.png"));
         let decoded = collect_asset_refs(&md);
-        assert_eq!(decoded, vec!["weird.png".to_string()], "ссылка не разорвана: {md}");
+        assert_eq!(
+            decoded,
+            vec!["weird.png".to_string()],
+            "ссылка не разорвана: {md}"
+        );
     }
 
     #[test]
     fn attach_refs_md_starts_with_blank_line_one_ref_per_line() {
-        let md = attach_refs_md(&[asset("a.png", "assets/a.png"), asset("b.pdf", "assets/b.pdf")]);
-        assert!(md.starts_with("\n"), "пустая строка-разделитель от контента: {md:?}");
+        let md = attach_refs_md(&[
+            asset("a.png", "assets/a.png"),
+            asset("b.pdf", "assets/b.pdf"),
+        ]);
+        assert!(
+            md.starts_with("\n"),
+            "пустая строка-разделитель от контента: {md:?}"
+        );
         let lines: Vec<&str> = md.trim().lines().collect();
         assert_eq!(lines.len(), 2, "по строке на ассет: {md:?}");
         assert!(lines[0].starts_with("![") && lines[1].starts_with("["));
@@ -2297,11 +2653,11 @@ mod tests {
         let ok = dir.path().join("ok.png");
         std::fs::write(&ok, b"x").unwrap();
         let missing = dir.path().join("нет.png");
-        let err = validate_attach_files(&[ok.clone(), missing])
-            .expect_err("несуществующий файл — отказ");
+        let err =
+            validate_attach_files(&[ok.clone(), missing]).expect_err("несуществующий файл — отказ");
         assert!(err.to_string().contains("нет.png"), "суть: {err}");
-        let err = validate_attach_files(&[dir.path().to_path_buf()])
-            .expect_err("директория — отказ");
+        let err =
+            validate_attach_files(&[dir.path().to_path_buf()]).expect_err("директория — отказ");
         assert!(err.to_string().contains("не файл"), "суть: {err}");
         assert_eq!(validate_attach_files(&[ok]).unwrap().len(), 1);
     }
@@ -2317,7 +2673,8 @@ mod tests {
                 if path == "data/assets/assets-self-test/img.png" {
                     ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
                 } else {
-                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                    ResponseTemplate::new(404)
+                        .set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
                 }
             })
             .mount(&server)
@@ -2328,8 +2685,15 @@ mod tests {
         let md = "![и](assets/assets-self-test/img.png) ![нет](assets/assets-self-test/gone.png)\n";
         let saved = save_body_assets(&sy, md, ROW).await;
 
-        assert_eq!(saved.len(), 1, "доступный аттач сохранён, Missing — тихо пропущен: {saved:?}");
-        assert!(saved[0].ends_with("/img.png"), "оригинальное имя файла: {saved:?}");
+        assert_eq!(
+            saved.len(),
+            1,
+            "доступный аттач сохранён, Missing — тихо пропущен: {saved:?}"
+        );
+        assert!(
+            saved[0].ends_with("/img.png"),
+            "оригинальное имя файла: {saved:?}"
+        );
         let bytes = std::fs::read(&saved[0]).expect("файл записан");
         assert_eq!(bytes, b"png-bytes");
         std::fs::remove_dir_all(format!("/tmp/uwuwu-task-{ROW}")).expect("тест прибрал за себя");
@@ -2349,7 +2713,8 @@ mod tests {
                 if path == "data/assets/ok.png" {
                     ResponseTemplate::new(200).set_body_bytes(b"png-bytes".to_vec())
                 } else {
-                    ResponseTemplate::new(404).set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
+                    ResponseTemplate::new(404)
+                        .set_body_string(r#"{"code":404,"msg":"path does not exist"}"#)
                 }
             })
             .mount(&server)
@@ -2415,7 +2780,9 @@ mod tests {
                     "/uwuwu/Задачи uwuwu" => serde_json::json!([BOARD_DOC]),
                     // «новый тайтл» отдаёт СОБСТВЕННЫЙ док: happy-путь проверяет
                     // исключение своего docId из orphan-чека (retry после лага)
-                    "/uwuwu/Задачи uwuwu/новый тайтл" => serde_json::json!([BOUND_DOC]),
+                    "/uwuwu/Задачи uwuwu/новый тайтл" => {
+                        serde_json::json!([BOUND_DOC])
+                    }
                     "/uwuwu/Задачи uwuwu/сирота" => serde_json::json!([ORPHAN_DOC]),
                     _ => serde_json::json!([]),
                 };
@@ -2669,7 +3036,11 @@ mod tests {
         .expect("retry идемпотентен: собственный док исключён из orphan-чека");
 
         assert_eq!(result, "новый тайтл");
-        assert_eq!(renames.lock().unwrap().len(), 1, "retry делает свой no-op renameDoc");
+        assert_eq!(
+            renames.lock().unwrap().len(),
+            1,
+            "retry делает свой no-op renameDoc"
+        );
     }
 
     #[tokio::test]
@@ -2986,7 +3357,11 @@ mod tests {
     /// Мок под body-путь: bound-строка «таск» (resolve id-first), upload и
     /// appendBlock пишут в общий лог порядка, createDocWithMd фиксируется
     /// (append-режим не должен его звать).
-    async fn mock_siyuan_for_body() -> (MockServer, Arc<Mutex<Vec<&'static str>>>, Arc<Mutex<Vec<String>>>) {
+    async fn mock_siyuan_for_body() -> (
+        MockServer,
+        Arc<Mutex<Vec<&'static str>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let server = MockServer::start().await;
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3056,9 +3431,8 @@ mod tests {
                 } else {
                     serde_json::json!([])
                 };
-                ResponseTemplate::new(200).set_body_string(
-                    serde_json::json!({ "code": 0, "data": data }).to_string(),
-                )
+                ResponseTemplate::new(200)
+                    .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string())
             })
             .mount(&server)
             .await;
@@ -3184,10 +3558,15 @@ mod tests {
             "порядок: upload → контент-операция → референсы; createDoc не зовётся"
         );
         let appends = appends.lock().unwrap();
-        assert!(appends[0].contains("маркер-контент"), "первый append — контент: {}", appends[0]);
+        assert!(
+            appends[0].contains("маркер-контент"),
+            "первый append — контент: {}",
+            appends[0]
+        );
         assert!(
             appends[1].contains("![скрин до.png](assets/"),
-            "второй append — референс картинки: {}", appends[1]
+            "второй append — референс картинки: {}",
+            appends[1]
         );
     }
 
@@ -3212,7 +3591,8 @@ mod tests {
         assert_eq!(appends.len(), 1, "единственный append — референсы");
         assert!(
             !appends[0].contains("\"data\":\"\""),
-            "в appendBlock не уходит пустой data: {}", appends[0]
+            "в appendBlock не уходит пустой data: {}",
+            appends[0]
         );
         let refs_md: String = serde_json::from_str::<serde_json::Value>(&appends[0])
             .expect("appendBlock body — json")

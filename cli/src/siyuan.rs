@@ -104,8 +104,8 @@ impl SiYuan {
     /// с коротким (деф. 10s), чтобы тихий вис ядра различался быстро;
     /// штатные команды держат 120s.
     pub fn from_env_with_timeout(timeout_secs: u64) -> Result<Self> {
-        let base = std::env::var("UWUWU_SIYUAN_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:6806".into());
+        let base =
+            std::env::var("UWUWU_SIYUAN_URL").unwrap_or_else(|_| "http://127.0.0.1:6806".into());
         let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -170,7 +170,12 @@ impl SiYuan {
     /// Прочие ошибки (транспорт, code≠0) ретраются как прежде, 4 попытки,
     /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
     /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
-    async fn post_with_pacing(&self, path: &str, body: Value, pacing: RetryPacing) -> Result<Value> {
+    async fn post_with_pacing(
+        &self,
+        path: &str,
+        body: Value,
+        pacing: RetryPacing,
+    ) -> Result<Value> {
         if self.wave_cooldown_active() {
             bail!("POST {path}: пропущено — {WAVE_HINT} (окно fail-fast активно)");
         }
@@ -270,8 +275,7 @@ impl SiYuan {
 
     pub async fn notebooks(&self) -> Result<Vec<Value>> {
         let v = self.post("/api/notebook/lsNotebooks", json!({})).await?;
-        Ok(v
-            .pointer("/notebooks")
+        Ok(v.pointer("/notebooks")
             .and_then(|n| n.as_array())
             .cloned()
             .unwrap_or_default())
@@ -288,8 +292,7 @@ impl SiYuan {
         let v = self
             .post("/api/notebook/createNotebook", json!({ "name": name }))
             .await?;
-        Ok(v
-            .pointer("/notebook/id")
+        Ok(v.pointer("/notebook/id")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .into())
@@ -329,7 +332,12 @@ impl SiYuan {
             .collect())
     }
 
-    pub async fn create_doc_md(&self, notebook: &str, hpath: &str, markdown: &str) -> Result<String> {
+    pub async fn create_doc_md(
+        &self,
+        notebook: &str,
+        hpath: &str,
+        markdown: &str,
+    ) -> Result<String> {
         let v = self
             .post(
                 "/api/filetree/createDocWithMd",
@@ -391,7 +399,9 @@ impl SiYuan {
     /// Пустой док ядра несёт ZWJ-заглушку; после записи контента в «пустой» док
     /// заглушка остаётся первым блоком — снять её, пока контент уже на месте.
     async fn drop_leading_blank_block(&self, doc_id: &str) {
-        let Ok(text) = self.block_children_text(doc_id).await else { return };
+        let Ok(text) = self.block_children_text(doc_id).await else {
+            return;
+        };
         let ids = parse_block_ids(&text);
         if ids.len() >= 2 {
             let first_line = text.lines().next().unwrap_or("");
@@ -407,7 +417,8 @@ impl SiYuan {
     }
 
     pub async fn delete_block(&self, block_id: &str) -> Result<()> {
-        self.post("/api/block/deleteBlock", json!({ "id": block_id })).await?;
+        self.post("/api/block/deleteBlock", json!({ "id": block_id }))
+            .await?;
         Ok(())
     }
 
@@ -479,8 +490,9 @@ impl SiYuan {
                 Err(e) => FileFetch::Failed(e.to_string()),
             },
             status => {
-                let envelope: Value = serde_json::from_slice(&resp.bytes().await.unwrap_or_default())
-                    .unwrap_or(Value::Null);
+                let envelope: Value =
+                    serde_json::from_slice(&resp.bytes().await.unwrap_or_default())
+                        .unwrap_or(Value::Null);
                 if envelope.get("code").and_then(|c| c.as_i64()) == Some(404) {
                     FileFetch::Missing
                 } else {
@@ -556,7 +568,10 @@ impl SiYuan {
             .with_context(|| {
                 format!("asset upload {original_name}: ядро не вернуло succFiles: {body}")
             })?;
-        Ok(UploadedAsset { original_name, asset_path })
+        Ok(UploadedAsset {
+            original_name,
+            asset_path,
+        })
     }
 
     /// Переименовать док (kernel renameDoc): меняет тайтл дока и hpath-лист,
@@ -710,20 +725,22 @@ impl SiYuan {
                 }),
             )
             .await?;
-        let _ = self
-            .mcp_call("notifications/initialized", json!({}))
-            .await;
+        let _ = self.mcp_call("notifications/initialized", json!({})).await;
         Ok(r)
     }
 
     /// Ответ tools/call как исходный текст content[0] (markdown-инструменты: block).
     pub async fn mcp_tool_text(&self, name: &str, args: Value) -> Result<String> {
         self.ensure_mcp_session().await?;
-        let r = self.mcp_call("tools/call", json!({ "name": name, "arguments": args })).await?;
+        let r = self
+            .mcp_call("tools/call", json!({ "name": name, "arguments": args }))
+            .await?;
         if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
             bail!(
                 "tool {name}: {}",
-                r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("?")
+                r.pointer("/content/0/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
             );
         }
         Ok(r.pointer("/content/0/text")
@@ -741,14 +758,19 @@ impl SiYuan {
         if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
             bail!(
                 "tool {name}: {}",
-                r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("?")
+                r.pointer("/content/0/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
             );
         }
         // structuredContent при наличии, иначе parse content[0].text
         if let Some(sc) = r.get("structuredContent") {
             return Ok(sc.clone());
         }
-        let text = r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("{}");
+        let text = r
+            .pointer("/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("{}");
         Ok(serde_json::from_str(text).unwrap_or(Value::Null))
     }
 
@@ -774,8 +796,11 @@ impl SiYuan {
 
     /// Поиск database по имени через MCP database search.
     pub async fn db_search(&self, keyword: &str) -> Result<Value> {
-        self.mcp_tool("database", json!({ "action": "search", "keyword": keyword }))
-            .await
+        self.mcp_tool(
+            "database",
+            json!({ "action": "search", "keyword": keyword }),
+        )
+        .await
     }
 
     /// Строки database (render): items с клетками; page с 1 (серверный
@@ -795,8 +820,7 @@ impl SiYuan {
                 json!({ "action": "item_add", "id": av_id, "detached": true, "content": title }),
             )
             .await?;
-        Ok(v
-            .pointer("/data/itemID")
+        Ok(v.pointer("/data/itemID")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .to_string())
@@ -810,14 +834,19 @@ impl SiYuan {
                 json!({ "action": "item_add", "id": av_id, "blockID": block_id }),
             )
             .await?;
-        Ok(v
-            .pointer("/data/itemID")
+        Ok(v.pointer("/data/itemID")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .to_string())
     }
 
-    pub async fn db_item_set_status(&self, av_id: &str, key_id: &str, item_id: &str, status: &str) -> Result<()> {
+    pub async fn db_item_set_status(
+        &self,
+        av_id: &str,
+        key_id: &str,
+        item_id: &str,
+        status: &str,
+    ) -> Result<()> {
         self.mcp_tool(
             "database",
             json!({ "action": "item_update", "id": av_id, "keyID": key_id,
@@ -827,7 +856,6 @@ impl SiYuan {
         Ok(())
     }
 }
-
 
 /// Голова тела ответа для сообщений об ошибках: диагностика без простыни.
 fn body_snippet(raw: &str) -> String {
@@ -844,7 +872,9 @@ fn body_snippet(raw: &str) -> String {
 pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for line in children_text.lines() {
-        let Some(open) = line.rfind('(') else { continue };
+        let Some(open) = line.rfind('(') else {
+            continue;
+        };
         let candidate = line[open + 1..].trim_end_matches(')');
         // Кандидат — произвольный текст после последней '('; срезы по байтам
         // паникуют на не-ASCII (репро doctor'ом: 22-байтный текст с кириллицей).
@@ -888,7 +918,8 @@ pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) ->
 impl SiYuan {
     /// Удалить док по id.
     pub async fn remove_doc(&self, doc_id: &str) -> Result<()> {
-        self.post("/api/filetree/removeDocByID", json!({ "id": doc_id })).await?;
+        self.post("/api/filetree/removeDocByID", json!({ "id": doc_id }))
+            .await?;
         Ok(())
     }
 }
@@ -920,7 +951,11 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let err = sy
-            .post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/block/appendBlock",
+                json!({"id": "x"}),
+                RetryPacing::instant(),
+            )
             .await
             .expect_err("persistent metadata error must bail");
 
@@ -945,14 +980,22 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
-            .await
-            .expect("retry after transient lag must succeed");
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({"id": "x"}),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect("retry after transient lag must succeed");
 
         // Окно не армировано: следующий вызов доходит до мока.
-        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
-            .await
-            .expect("cooldown must stay disarmed after successful retry");
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({"id": "x"}),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect("cooldown must stay disarmed after successful retry");
     }
 
     #[tokio::test]
@@ -967,12 +1010,20 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let first = sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant(),
+            )
             .await;
         assert!(first.is_err(), "persistent wave must bail");
 
         let second = sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant(),
+            )
             .await;
         assert!(second.is_err(), "cooldown must fail fast the next call");
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
@@ -983,19 +1034,29 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": -1, "msg": "не найдено"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code": -1, "msg": "не найдено"})),
+            )
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
         assert!(sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant()
+            )
             .await
             .is_err());
 
         // Окно не армировано: следующий вызов доходит до мока (4+ запросов суммарно).
         assert!(sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant()
+            )
             .await
             .is_err());
     }
@@ -1051,7 +1112,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("10201") && err.contains("metadata is not ready"), "{err}");
+        assert!(
+            err.contains("10201") && err.contains("metadata is not ready"),
+            "{err}"
+        );
         // expect(1): ровно один запрос — если бы проба ретраила, мок упал бы на съёмке
     }
 
@@ -1060,9 +1124,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
-            .respond_with(ResponseTemplate::new(401).set_body_string(
-                r#"{"code":-1,"msg":"Auth failed: invalid token"}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed: invalid token"}"#),
+            )
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
@@ -1090,13 +1155,20 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("не JSON") && err.contains("<html>login</html>"), "{err}");
+        assert!(
+            err.contains("не JSON") && err.contains("<html>login</html>"),
+            "{err}"
+        );
     }
 
     #[test]
     fn parse_block_ids_reads_trailing_kernel_ids() {
-        let text = "- [p] первый (20261104130857-b9drqmf)\n- [h] ## Заголовок (20261104130919-on7yaie)\n";
-        assert_eq!(parse_block_ids(text), vec!["20261104130857-b9drqmf", "20261104130919-on7yaie"]);
+        let text =
+            "- [p] первый (20261104130857-b9drqmf)\n- [h] ## Заголовок (20261104130919-on7yaie)\n";
+        assert_eq!(
+            parse_block_ids(text),
+            vec!["20261104130857-b9drqmf", "20261104130919-on7yaie"]
+        );
     }
 
     #[test]
@@ -1130,7 +1202,10 @@ mod tests {
         let ids_text = parse_block_ids(with_text);
         assert!(!doc_content_is_empty(&ids_text, with_text));
         assert!(!doc_content_is_empty(
-            &["20261104130857-b9drqmf".into(), "20261104131412-wbpz3sx".into()],
+            &[
+                "20261104130857-b9drqmf".into(),
+                "20261104131412-wbpz3sx".into()
+            ],
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
     }
@@ -1145,11 +1220,17 @@ mod tests {
         assert_eq!(ids, vec!["20261105101010-abc1234".to_string()]);
     }
 
-
     #[test]
     fn doc_file_path_joins_notebook_ancestors_and_doc_id() {
-        let got = SiYuan::doc_file_path("20261103224312-fbrf5fp", &["20261103233646-vzgad8m"], "20261104215722-1p0eetv");
-        assert_eq!(got, "data/20261103224312-fbrf5fp/20261103233646-vzgad8m/20261104215722-1p0eetv.sy");
+        let got = SiYuan::doc_file_path(
+            "20261103224312-fbrf5fp",
+            &["20261103233646-vzgad8m"],
+            "20261104215722-1p0eetv",
+        );
+        assert_eq!(
+            got,
+            "data/20261103224312-fbrf5fp/20261103233646-vzgad8m/20261104215722-1p0eetv.sy"
+        );
         assert_eq!(
             SiYuan::doc_file_path("nb-1", &[], "20261103224557-4yurg8d"),
             "data/nb-1/20261103224557-4yurg8d.sy"
@@ -1175,15 +1256,24 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        assert_eq!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Bytes(b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec()));
-        assert_eq!(sy.fetch_workspace_file("data/nb/other.sy").await, FileFetch::Missing);
+        assert_eq!(
+            sy.fetch_workspace_file("data/nb/doc.sy").await,
+            FileFetch::Bytes(b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec())
+        );
+        assert_eq!(
+            sy.fetch_workspace_file("data/nb/other.sy").await,
+            FileFetch::Missing
+        );
     }
 
     #[tokio::test]
     async fn fetch_workspace_file_reports_failure_on_transport_error() {
         // несуществующий порт = соединение не состоялось → Failed, не Missing
         let sy = SiYuan::for_tests("http://127.0.0.1:9".into());
-        assert!(matches!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Failed(_)));
+        assert!(matches!(
+            sy.fetch_workspace_file("data/nb/doc.sy").await,
+            FileFetch::Failed(_)
+        ));
     }
 
     #[tokio::test]
@@ -1199,7 +1289,11 @@ mod tests {
                 if ok {
                     *stored_put.lock().unwrap() = req.body.clone();
                 }
-                ResponseTemplate::new(200).set_body_string(if ok { r#"{"code":0,"msg":"","data":null}"# } else { r#"{"code":-1}"# })
+                ResponseTemplate::new(200).set_body_string(if ok {
+                    r#"{"code":0,"msg":"","data":null}"#
+                } else {
+                    r#"{"code":-1}"#
+                })
             })
             .mount(&server)
             .await;
@@ -1213,11 +1307,16 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        sy.put_workspace_file("data/assets/undo/j.json", b"{\"k\":1}").await.unwrap();
+        sy.put_workspace_file("data/assets/undo/j.json", b"{\"k\":1}")
+            .await
+            .unwrap();
         let read_back = sy.fetch_workspace_file("data/assets/undo/j.json").await;
         assert!(matches!(read_back, FileFetch::Bytes(_)));
         if let FileFetch::Bytes(bytes) = read_back {
-            assert!(bytes.windows(7).any(|w| w == b"{\"k\":1}"), "контент в multipart-теле: {bytes:?}");
+            assert!(
+                bytes.windows(7).any(|w| w == b"{\"k\":1}"),
+                "контент в multipart-теле: {bytes:?}"
+            );
         }
     }
 
@@ -1244,12 +1343,17 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let names = sy.list_dir("data/assets/undo").await.unwrap();
-        assert_eq!(names, vec!["20261104-clean.json".to_string(), "sub".to_string()]);
-        let err = sy
-            .list_dir("data/assets/nowhere")
-            .await
-            .expect_err("list_dir честен: несуществующая директория — ошибка ядра, не пустой список");
-        assert!(err.to_string().contains("path does not exist"), "суть отказа: {err}");
+        assert_eq!(
+            names,
+            vec!["20261104-clean.json".to_string(), "sub".to_string()]
+        );
+        let err = sy.list_dir("data/assets/nowhere").await.expect_err(
+            "list_dir честен: несуществующая директория — ошибка ядра, не пустой список",
+        );
+        assert!(
+            err.to_string().contains("path does not exist"),
+            "суть отказа: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1259,18 +1363,23 @@ mod tests {
             .and(path("/api/file/readDir"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let envelope = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
-                    serde_json::json!({ "code": 0, "data": [{ "name": "j.json" }] })
-                } else {
-                    serde_json::json!({ "code": 404, "msg": "path does not exist" })
-                };
+                let envelope =
+                    if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
+                        serde_json::json!({ "code": 0, "data": [{ "name": "j.json" }] })
+                    } else {
+                        serde_json::json!({ "code": 404, "msg": "path does not exist" })
+                    };
                 ResponseTemplate::new(200).set_body_string(envelope.to_string())
             })
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        let names = sy.try_list_dir("data/assets/undo").await.unwrap().expect("директория есть");
+        let names = sy
+            .try_list_dir("data/assets/undo")
+            .await
+            .unwrap()
+            .expect("директория есть");
         assert_eq!(names, vec!["j.json".to_string()]);
         let missing = sy.try_list_dir("data/assets/nowhere").await.unwrap();
         assert!(missing.is_none(), "нет директории — None, не ошибка");

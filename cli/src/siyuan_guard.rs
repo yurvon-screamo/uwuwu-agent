@@ -61,7 +61,10 @@ impl Verdict {
     /// Снос разрешён с `--yes` (Dead — с owner-подтверждением по процедуре
     /// dry-run → владелец → --yes).
     pub(crate) fn is_removable(self) -> bool {
-        matches!(self, Verdict::DraftSkeleton | Verdict::DraftDead | Verdict::Dead)
+        matches!(
+            self,
+            Verdict::DraftSkeleton | Verdict::DraftDead | Verdict::Dead
+        )
     }
 
     /// Снос только по явному per-row ack.
@@ -108,9 +111,8 @@ pub(crate) fn verdict(evidence: &RowEvidence) -> Verdict {
     if !evidence.in_render {
         return Verdict::Phantom;
     }
-    let body_alive = evidence.fs == Probe::Found
-        || evidence.sql == Probe::Found
-        || evidence.title_body_found;
+    let body_alive =
+        evidence.fs == Probe::Found || evidence.sql == Probe::Found || evidence.title_body_found;
     // DraftSkeleton стоит ПЕРЕД Live: исключение возможно только при явном
     // гейте Draft — иначе ветка сносила бы нетронутые костяки живых задач.
     if evidence.status_is_draft && evidence.fs == Probe::Found && evidence.skeleton_match {
@@ -228,8 +230,9 @@ impl Journal {
             format!("{UNDO_DIR}/{name_or_path}")
         };
         match sy.fetch_workspace_file(&path).await {
-            FileFetch::Bytes(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("журнал {path} не парсится")),
+            FileFetch::Bytes(bytes) => {
+                serde_json::from_slice(&bytes).with_context(|| format!("журнал {path} не парсится"))
+            }
             FileFetch::Missing => bail!("журнала {path} нет (список: task undo --list)"),
             FileFetch::Failed(err) => bail!("журнал {path} не прочитан: {err}"),
         }
@@ -287,7 +290,12 @@ pub(crate) fn evidence_from_sources(
 
 /// FS-проба тела строки: docId известен — путь по id-цепочке доски
 /// (индекс и тайтлы не участвуют); detached-строка — проба невозможна.
-pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, chain: &[String], task: &SyTask) -> Probe {
+pub(crate) async fn probe_body_fs(
+    sy: &SiYuan,
+    board: &SyBoard,
+    chain: &[String],
+    task: &SyTask,
+) -> Probe {
     let Some(doc) = task.body_doc.as_deref() else {
         return Probe::NotPossible;
     };
@@ -297,7 +305,10 @@ pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, chain: &[String]
         FileFetch::Bytes(_) => Probe::Found,
         FileFetch::Missing => Probe::Absent,
         FileFetch::Failed(err) => {
-            eprintln!("предупреждение: FS-проба тела {} не состоялась: {err}", task.item_id);
+            eprintln!(
+                "предупреждение: FS-проба тела {} не состоялась: {err}",
+                task.item_id
+            );
             Probe::Failed
         }
     }
@@ -316,10 +327,19 @@ pub(crate) async fn probe_body_sql(sy: &SiYuan, task: &SyTask) -> Probe {
         ))
         .await;
     match rows {
-        Ok(rows) if rows.iter().any(|r| r.get("id").and_then(|i| i.as_str()) == Some(doc)) => Probe::Found,
+        Ok(rows)
+            if rows
+                .iter()
+                .any(|r| r.get("id").and_then(|i| i.as_str()) == Some(doc)) =>
+        {
+            Probe::Found
+        }
         Ok(_) => Probe::Absent,
         Err(err) => {
-            eprintln!("предупреждение: SQL-проба тела {} не состоялась: {err}", task.item_id);
+            eprintln!(
+                "предупреждение: SQL-проба тела {} не состоялась: {err}",
+                task.item_id
+            );
             Probe::Failed
         }
     }
@@ -328,8 +348,15 @@ pub(crate) async fn probe_body_sql(sy: &SiYuan, task: &SyTask) -> Probe {
 /// Контрольная проба доски: файл самого док-доски обязан существовать.
 /// Мисс — резолв доски подозрителен (find_board мог соврать), все FS-пробы
 /// тел были бы ложно мертвы → аборт без мутаций.
-pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard, chain: &[String]) -> Result<()> {
-    let ancestors: Vec<&str> = chain[..chain.len().saturating_sub(1)].iter().map(String::as_str).collect();
+pub(crate) async fn control_probe_board(
+    sy: &SiYuan,
+    board: &SyBoard,
+    chain: &[String],
+) -> Result<()> {
+    let ancestors: Vec<&str> = chain[..chain.len().saturating_sub(1)]
+        .iter()
+        .map(String::as_str)
+        .collect();
     let path = SiYuan::doc_file_path(&board.notebook, &ancestors, &board.doc_id);
     match sy.fetch_workspace_file(&path).await {
         FileFetch::Bytes(_) => Ok(()),
@@ -442,7 +469,14 @@ mod tests {
     #[test]
     fn title_body_found_on_detached_row_is_live() {
         // сломанная привязка при живом теле (класс P0-бага привязки)
-        let ev = evidence(true, false, Probe::NotPossible, Probe::NotPossible, true, false);
+        let ev = evidence(
+            true,
+            false,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            true,
+            false,
+        );
         assert_eq!(verdict(&ev), Verdict::Live);
     }
 
@@ -471,9 +505,23 @@ mod tests {
 
     #[test]
     fn detached_row_without_title_body_is_dead_by_status() {
-        let draft = evidence(true, true, Probe::NotPossible, Probe::NotPossible, false, false);
+        let draft = evidence(
+            true,
+            true,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            false,
+            false,
+        );
         assert_eq!(verdict(&draft), Verdict::DraftDead);
-        let live_status = evidence(true, false, Probe::NotPossible, Probe::NotPossible, false, false);
+        let live_status = evidence(
+            true,
+            false,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            false,
+            false,
+        );
         assert_eq!(verdict(&live_status), Verdict::Dead);
     }
 
@@ -491,14 +539,20 @@ mod tests {
     }
 
     fn skeleton_export(title: &str, ty: &str) -> String {
-        format!("---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n", body_template(title, ty, ""))
+        format!(
+            "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n",
+            body_template(title, ty, "")
+        )
     }
 
     #[test]
     fn body_is_skeleton_matches_all_three_templates_with_export_wrapper_and_tag() {
         for ty in ["dev", "spike", "bug"] {
             let export = skeleton_export("таск", ty);
-            assert!(body_is_skeleton(&export, "таск"), "шаблон {ty} должен совпасть");
+            assert!(
+                body_is_skeleton(&export, "таск"),
+                "шаблон {ty} должен совпасть"
+            );
         }
     }
 
@@ -539,23 +593,36 @@ mod tests {
     fn frag_matches_by_item_id_prefix_and_title_substring() {
         let mut task = sy_task("Пилот RU\u{2215}EN: старт", "Todo");
         task.item_id = "20261104215724-iso1ra4".into();
-        assert!(frag_matches("20261104215724-iso1ra4", &task), "равенство полного id");
+        assert!(
+            frag_matches("20261104215724-iso1ra4", &task),
+            "равенство полного id"
+        );
         assert!(frag_matches("20261104", &task), "префикс id");
-        assert!(frag_matches("-iso1ra4", &task), "суффикс id с ведущим дефисом, как в resolve");
-        assert!(frag_matches("пилот ru/en", &task), "подстрока нормализованного тайтла");
+        assert!(
+            frag_matches("-iso1ra4", &task),
+            "суффикс id с ведущим дефисом, как в resolve"
+        );
+        assert!(
+            frag_matches("пилот ru/en", &task),
+            "подстрока нормализованного тайтла"
+        );
         assert!(!frag_matches("чужое", &task));
         assert!(!frag_matches("", &task));
     }
 
     #[test]
     fn journal_save_and_load_roundtrip_via_workspace_file() {
-        let mut journal = Journal::new("uwuwu", "clean", &SyBoard {
-            doc_id: "board-doc".into(),
-            av_id: "av-1".into(),
-            block_id: "block-1".into(),
-            hpath: "/uwuwu/Задачи uwuwu".into(),
-            notebook: "20261103224312-fbrf5fp".into(),
-        });
+        let mut journal = Journal::new(
+            "uwuwu",
+            "clean",
+            &SyBoard {
+                doc_id: "board-doc".into(),
+                av_id: "av-1".into(),
+                block_id: "block-1".into(),
+                hpath: "/uwuwu/Задачи uwuwu".into(),
+                notebook: "20261103224312-fbrf5fp".into(),
+            },
+        );
         journal.rows.push(JournalRow {
             item_id: "item-1".into(),
             title: "таск".into(),
@@ -572,12 +639,18 @@ mod tests {
         let parsed: Journal = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.rows.len(), 1);
         assert_eq!(parsed.rows[0].title, "таск");
-        assert_eq!(parsed.rows[0].extra_text_cells, vec![("Schedule".to_string(), "*/5 * * * *".to_string())]);
+        assert_eq!(
+            parsed.rows[0].extra_text_cells,
+            vec![("Schedule".to_string(), "*/5 * * * *".to_string())]
+        );
         assert_eq!(parsed.kind, "clean");
         assert_eq!(parsed.av_id, "av-1");
         let name = parsed.file_name();
         assert!(name.ends_with("-uwuwu-clean.json"));
-        assert!(!name.contains(':'), "колонки недопустимы в имени файла: {name}");
+        assert!(
+            !name.contains(':'),
+            "колонки недопустимы в имени файла: {name}"
+        );
         assert!(parsed.path().starts_with("data/assets/undo/"));
     }
 }

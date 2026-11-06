@@ -42,25 +42,77 @@ struct Row {
 }
 
 const TASKS_ROWS: &[Row] = &[
-    Row { item: "20261105100000-ttask1", title: "обычная задача", status: "In Progress", doc: Some("20261105000001-tbodyx1"), schedule: "" },
-    Row { item: "item-alpha1", title: "Alpha task", status: "Todo", doc: None, schedule: "" },
-    Row { item: "item-alpha2", title: "Alpha second", status: "Todo", doc: None, schedule: "" },
+    Row {
+        item: "20261105100000-ttask1",
+        title: "обычная задача",
+        status: "In Progress",
+        doc: Some("20261105000001-tbodyx1"),
+        schedule: "",
+    },
+    Row {
+        item: "item-alpha1",
+        title: "Alpha task",
+        status: "Todo",
+        doc: None,
+        schedule: "",
+    },
+    Row {
+        item: "item-alpha2",
+        title: "Alpha second",
+        status: "Todo",
+        doc: None,
+        schedule: "",
+    },
 ];
 
 const CRON_ROWS: &[Row] = &[
-    Row { item: "20261105100000-kcron1", title: "крон задач", status: "fired", doc: Some("20261105000002-kbodyx2"), schedule: "*/5 * * * *" },
-    Row { item: "item-kcron2", title: "другой крон", status: "active", doc: Some("20261105000003-kbodyx3"), schedule: "1d" },
-    Row { item: "item-kalpha", title: "Alpha cron", status: "active", doc: None, schedule: "" },
+    Row {
+        item: "20261105100000-kcron1",
+        title: "крон задач",
+        status: "fired",
+        doc: Some("20261105000002-kbodyx2"),
+        schedule: "*/5 * * * *",
+    },
+    Row {
+        item: "item-kcron2",
+        title: "другой крон",
+        status: "active",
+        doc: Some("20261105000003-kbodyx3"),
+        schedule: "1d",
+    },
+    Row {
+        item: "item-kalpha",
+        title: "Alpha cron",
+        status: "active",
+        doc: None,
+        schedule: "",
+    },
 ];
 
 const K1_ROWS: &[Row] = &[
-    Row { item: "20261104120000-kxgame", title: "чужой крон", status: "active", doc: None, schedule: "" },
-    Row { item: "20261104120000-kxdup1", title: "Дубль-тайтл", status: "active", doc: None, schedule: "" },
+    Row {
+        item: "20261104120000-kxgame",
+        title: "чужой крон",
+        status: "active",
+        doc: None,
+        schedule: "",
+    },
+    Row {
+        item: "20261104120000-kxdup1",
+        title: "Дубль-тайтл",
+        status: "active",
+        doc: None,
+        schedule: "",
+    },
 ];
 
-const K2_ROWS: &[Row] = &[
-    Row { item: "20261104130000-kodup1", title: "Дубль-тайтл", status: "active", doc: None, schedule: "" },
-];
+const K2_ROWS: &[Row] = &[Row {
+    item: "20261104130000-kodup1",
+    title: "Дубль-тайтл",
+    status: "active",
+    doc: None,
+    schedule: "",
+}];
 
 fn rows_for_av(av: &str) -> &'static [Row] {
     match av {
@@ -91,7 +143,12 @@ impl Kernel {
     }
 
     fn render_count(&self, av: &str) -> usize {
-        self.render_calls.lock().unwrap().get(av).copied().unwrap_or(0)
+        self.render_calls
+            .lock()
+            .unwrap()
+            .get(av)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn appends_snapshot(&self) -> Vec<String> {
@@ -231,7 +288,8 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
             ResponseTemplate::new(200).set_body_string(
-                serde_json::json!({ "code": 0, "data": { "content": format!("# {id}\n") } }).to_string(),
+                serde_json::json!({ "code": 0, "data": { "content": format!("# {id}\n") } })
+                    .to_string(),
             )
         })
         .mount(server)
@@ -243,7 +301,11 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             let kernel = kernel.clone();
             move |req: &Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let data = body
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 kernel.appends.lock().unwrap().push(data);
                 ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
             }
@@ -336,9 +398,15 @@ async fn get_resolves_cron_row_via_fallback() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Get { id: "20261105100000-kcron1".into(), no_body: true })
-        .await
-        .expect("крон-строка резолвится через фоллбек");
+    task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261105100000-kcron1".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("крон-строка резолвится через фоллбек");
 
     assert!(kernel.render_count(CRON_AV) >= 1, "крон-доска опрошена");
 }
@@ -365,9 +433,14 @@ async fn comment_lands_in_cron_body_comments_section() {
     .expect("коммент крон-строке уходит");
 
     let appends = kernel.appends_snapshot();
-    assert!(appends.iter().any(|a| a.contains("## Комменты")), "секция Комменты создана: {appends:?}");
     assert!(
-        appends.iter().any(|a| a.contains("**AGENTS**") && a.contains("отчёт: ok")),
+        appends.iter().any(|a| a.contains("## Комменты")),
+        "секция Комменты создана: {appends:?}"
+    );
+    assert!(
+        appends
+            .iter()
+            .any(|a| a.contains("**AGENTS**") && a.contains("отчёт: ok")),
         "коммент в теле крона: {appends:?}"
     );
 }
@@ -381,13 +454,27 @@ async fn full_miss_lists_all_searched_boards() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Get { id: "совсем нет".into(), no_body: true })
-        .await
-        .expect_err("полный промах — ошибка");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "совсем нет".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("полный промах — ошибка");
 
     let msg = err.to_string();
-    for board in ["/uwuwu/Задачи uwuwu", "/uwuwu/Кроны uwuwu", "/1xgames/Кроны 1xgames", "/origa/Кроны origa"] {
-        assert!(msg.contains(board), "обысканная доска названа ({board}): {msg}");
+    for board in [
+        "/uwuwu/Задачи uwuwu",
+        "/uwuwu/Кроны uwuwu",
+        "/1xgames/Кроны 1xgames",
+        "/origa/Кроны origa",
+    ] {
+        assert!(
+            msg.contains(board),
+            "обысканная доска названа ({board}): {msg}"
+        );
     }
 }
 
@@ -400,11 +487,20 @@ async fn cross_project_cron_row_found_from_other_project() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Get { id: "20261104120000-kxgame".into(), no_body: true })
-        .await
-        .expect("чужая крон-строка находится по контракту «всех проектов»");
+    task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261104120000-kxgame".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("чужая крон-строка находится по контракту «всех проектов»");
 
-    assert!(kernel.render_count(K1_AV) >= 1, "крон-доска 1xgames опрошена");
+    assert!(
+        kernel.render_count(K1_AV) >= 1,
+        "крон-доска 1xgames опрошена"
+    );
 }
 
 /// (5) точный id задачи на «Задачи»: фаза A возвращает сразу, крон-доска не читается.
@@ -416,12 +512,26 @@ async fn exact_task_id_on_tasks_board_wins_without_cron_reads() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    task_run("uwuwu", TaskSub::Get { id: "20261105100000-ttask1".into(), no_body: true })
-        .await
-        .expect("задача резолвится штатно");
+    task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261105100000-ttask1".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("задача резолвится штатно");
 
-    assert_eq!(kernel.render_count(TASKS_AV), 1, "задачная доска прочитана один раз");
-    assert_eq!(kernel.render_count(CRON_AV), 0, "крон-доска не читается (ранний возврат фазы A)");
+    assert_eq!(
+        kernel.render_count(TASKS_AV),
+        1,
+        "задачная доска прочитана один раз"
+    );
+    assert_eq!(
+        kernel.render_count(CRON_AV),
+        0,
+        "крон-доска не читается (ранний возврат фазы A)"
+    );
 }
 
 /// (6) одинаковый тайтл на двух чужих крон-досках — громкая ошибка со списком.
@@ -433,13 +543,25 @@ async fn same_title_on_two_foreign_cron_boards_is_a_loud_error() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Get { id: "Дубль-тайтл".into(), no_body: true })
-        .await
-        .expect_err("неоднозначность между чужими досками — ошибка");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "Дубль-тайтл".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("неоднозначность между чужими досками — ошибка");
 
     let msg = err.to_string();
-    assert!(msg.contains("/1xgames/Кроны 1xgames"), "доска 1xgames названа: {msg}");
-    assert!(msg.contains("/origa/Кроны origa"), "доска origa названа: {msg}");
+    assert!(
+        msg.contains("/1xgames/Кроны 1xgames"),
+        "доска 1xgames названа: {msg}"
+    );
+    assert!(
+        msg.contains("/origa/Кроны origa"),
+        "доска origa названа: {msg}"
+    );
 }
 
 /// (7) Ambiguous на «Задачи» + единственный Found на кронах — громкая раскладка.
@@ -451,13 +573,25 @@ async fn ambiguous_on_tasks_plus_found_on_cron_is_loud_not_silent() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Get { id: "Alpha".into(), no_body: true })
-        .await
-        .expect_err("неоднозначный матч не уходит в тихий выбор доски");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "Alpha".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("неоднозначный матч не уходит в тихий выбор доски");
 
     let msg = err.to_string();
-    assert!(msg.contains("Задачи uwuwu"), "задачная доска с Ambiguous названа: {msg}");
-    assert!(msg.contains("Кроны uwuwu"), "крон-доска с Found названа: {msg}");
+    assert!(
+        msg.contains("Задачи uwuwu"),
+        "задачная доска с Ambiguous названа: {msg}"
+    );
+    assert!(
+        msg.contains("Кроны uwuwu"),
+        "крон-доска с Found названа: {msg}"
+    );
 }
 
 /// (8а) полный id крона побеждает same-minute префикс-коллизию на «Задачи».
@@ -471,14 +605,22 @@ async fn full_cron_row_id_beats_prefix_collision_on_tasks_board() {
 
     task_run(
         "uwuwu",
-        TaskSub::Edit { id: "20261105100000-kcron1".into(), status: Some("Review".into()), title: None, pr: None, branch: None },
+        TaskSub::Edit {
+            id: "20261105100000-kcron1".into(),
+            status: Some("Review".into()),
+            title: None,
+            pr: None,
+            branch: None,
+        },
     )
     .await
     .expect("edit по полному id крона уходит на крон-строку");
 
     let updates = kernel.updates_snapshot();
     assert!(
-        updates.iter().any(|(av, _, item)| av == CRON_AV && item == "20261105100000-kcron1"),
+        updates
+            .iter()
+            .any(|(av, _, item)| av == CRON_AV && item == "20261105100000-kcron1"),
         "статус выставлен крон-строке, не same-minute задаче: {updates:?}"
     );
 }
@@ -492,12 +634,21 @@ async fn minute_prefix_matching_both_boards_is_a_loud_error() {
     mount_kernel(&server, &kernel).await;
     set_env(&server);
 
-    let err = task_run("uwuwu", TaskSub::Get { id: "20261105100000".into(), no_body: true })
-        .await
-        .expect_err("префикс двух досок обязан ошибиться громко");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261105100000".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("префикс двух досок обязан ошибиться громко");
 
     let msg = err.to_string();
-    assert!(msg.contains("Задачи uwuwu"), "задачная доска названа: {msg}");
+    assert!(
+        msg.contains("Задачи uwuwu"),
+        "задачная доска названа: {msg}"
+    );
     assert!(msg.contains("Кроны uwuwu"), "крон-доска названа: {msg}");
 }
 
@@ -511,11 +662,23 @@ async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
     set_env(&server);
     kernel.sql_fail.store(true, Ordering::SeqCst);
 
-    let err = task_run("uwuwu", TaskSub::Get { id: "что угодно".into(), no_body: true })
-        .await
-        .expect_err("инфра-сбой не маскируется под «не найдена»");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "что угодно".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("инфра-сбой не маскируется под «не найдена»");
 
     let msg = err.to_string();
-    assert!(msg.contains("POST /api/query/sql"), "инфра-сбой назван: {msg}");
-    assert!(!msg.contains("не найдена"), "нет маскировки под промах: {msg}");
+    assert!(
+        msg.contains("POST /api/query/sql"),
+        "инфра-сбой назван: {msg}"
+    );
+    assert!(
+        !msg.contains("не найдена"),
+        "нет маскировки под промах: {msg}"
+    );
 }

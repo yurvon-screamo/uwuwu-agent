@@ -14,7 +14,12 @@ use std::collections::HashSet;
 
 /// Валидный хит db_search: имя доски совпадает точно, анкор — по hPath
 /// (первый сегмент — имя ноутбука) или как OR-страховка по blockID == doc_id.
-fn pick_search_hit(results: &[Value], expect_hpath: &str, title: &str, doc_id: &str) -> Option<(String, String)> {
+fn pick_search_hit(
+    results: &[Value],
+    expect_hpath: &str,
+    title: &str,
+    doc_id: &str,
+) -> Option<(String, String)> {
     results.iter().find_map(|hit| {
         let av_name = hit.get("avName").and_then(|n| n.as_str()).unwrap_or("");
         let av_id = hit.get("avID").and_then(|a| a.as_str()).unwrap_or("");
@@ -71,15 +76,14 @@ pub async fn find_board_titled(sy: &SiYuan, project: &str, title: &str) -> Resul
 /// Доска по тайтлу с таксономией отсутствия: None = дока нет (benign —
 /// доску в воркспейсе не завели); Err = инфра-сбой ядра или битая доска
 /// (database-блок не найден — маскировать нельзя).
-pub async fn find_board_titled_opt(sy: &SiYuan, project: &str, title: &str) -> Result<Option<SyBoard>> {
+pub async fn find_board_titled_opt(
+    sy: &SiYuan,
+    project: &str,
+    title: &str,
+) -> Result<Option<SyBoard>> {
     let nb = sy.ensure_notebook("Projects").await?;
     let hpath = format!("/{p}/{title}", p = project);
-    let Some(doc_id) = sy
-        .doc_ids_by_hpath(&nb, &hpath)
-        .await?
-        .into_iter()
-        .next()
-    else {
+    let Some(doc_id) = sy.doc_ids_by_hpath(&nb, &hpath).await?.into_iter().next() else {
         return Ok(None);
     };
     // database-блок внутри дока: av-блок ядра (data-av-id=) или legacy i-носитель (avID=)
@@ -95,7 +99,11 @@ pub async fn find_board_titled_opt(sy: &SiYuan, project: &str, title: &str) -> R
         let md = r.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
         if let Some(av) = extract_av_id(md) {
             av_id = av;
-            block_id = r.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            block_id = r
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
             break;
         }
     }
@@ -120,11 +128,20 @@ pub async fn find_board_titled_opt(sy: &SiYuan, project: &str, title: &str) -> R
             ),
         }
     }
-    Ok(Some(SyBoard { doc_id, av_id, block_id, hpath, notebook: nb }))
+    Ok(Some(SyBoard {
+        doc_id,
+        av_id,
+        block_id,
+        hpath,
+        notebook: nb,
+    }))
 }
 
 fn extract_av_id(md: &str) -> Option<String> {
-    let markers = [("data-av-id=", "data-av-id=".len()), ("avID=", "avID=".len())];
+    let markers = [
+        ("data-av-id=", "data-av-id=".len()),
+        ("avID=", "avID=".len()),
+    ];
     let (idx, marker_len) = markers
         .iter()
         .filter_map(|(marker, len)| md.find(marker).map(|pos| (pos, *len)))
@@ -167,7 +184,10 @@ struct BoardView {
 /// Полная выборка доски по страницам render: терминация по валидному rowCount
 /// или пустой странице, дедуп по id, кап страниц с громкой ошибкой.
 async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
-    let mut view = BoardView { columns: Vec::new(), items: Vec::new() };
+    let mut view = BoardView {
+        columns: Vec::new(),
+        items: Vec::new(),
+    };
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut row_count: Option<u64> = None;
     let mut page: u64 = 1;
@@ -250,7 +270,12 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         last_run: String::new(),
         body_doc: None,
     };
-    for cell in it.get("cells").and_then(|c| c.as_array()).cloned().unwrap_or_default() {
+    for cell in it
+        .get("cells")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
         let kid = cell
             .pointer("/value/keyID")
             .and_then(|k| k.as_str())
@@ -287,9 +312,8 @@ fn cell_value(cell: &Value) -> String {
     }
     // ячейка несёт активный type: после конвертации ключа (text→url) в значении
     // остаётся stale text.content — читать нужно только поле активного типа
-    let single = |ptr: &str| -> Option<String> {
-        c.pointer(ptr).and_then(|s| s.as_str()).map(String::from)
-    };
+    let single =
+        |ptr: &str| -> Option<String> { c.pointer(ptr).and_then(|s| s.as_str()).map(String::from) };
     let by_type = match c.get("type").and_then(|t| t.as_str()) {
         Some("block") => single("/block/content"),
         Some("text") => single("/text/content"),
@@ -309,7 +333,14 @@ fn cell_value(cell: &Value) -> String {
         return v;
     }
     // фоллбек для значений без type: старый порядок указателей
-    for ptr in ["/block/content", "/select/content", "/text/content", "/url/content", "/email/content", "/phone/content"] {
+    for ptr in [
+        "/block/content",
+        "/select/content",
+        "/text/content",
+        "/url/content",
+        "/email/content",
+        "/phone/content",
+    ] {
         if let Some(s) = single(ptr) {
             return s;
         }
@@ -330,7 +361,11 @@ fn select_contents(options: &[Value]) -> String {
 
 /// Выбор дока тела: живая привязка строки выигрывает (id-first); иначе —
 /// док по заголовку (0 → нет тела, 1 → он, ≥2 → явная ошибка-дубль).
-fn choose_body_doc(bound: Option<&str>, bound_is_live: bool, title_doc_ids: &[String]) -> Result<Option<String>> {
+fn choose_body_doc(
+    bound: Option<&str>,
+    bound_is_live: bool,
+    title_doc_ids: &[String],
+) -> Result<Option<String>> {
     if let Some(b) = bound {
         if bound_is_live {
             return Ok(Some(b.to_string()));
@@ -339,7 +374,10 @@ fn choose_body_doc(bound: Option<&str>, bound_is_live: bool, title_doc_ids: &[St
     match title_doc_ids {
         [] => Ok(None),
         [only] => Ok(Some(only.clone())),
-        many => bail!("несколько доков с этим заголовком (тела-дубли): {}; вычисти сироты в UI", many.join(", ")),
+        many => bail!(
+            "несколько доков с этим заголовком (тела-дубли): {}; вычисти сироты в UI",
+            many.join(", ")
+        ),
     }
 }
 
@@ -348,7 +386,10 @@ fn choose_body_doc(bound: Option<&str>, bound_is_live: bool, title_doc_ids: &[St
 /// строку на title-fallback с ложным предупреждением (репро ревью 04.11).
 pub(crate) async fn doc_block_exists(sy: &SiYuan, doc_id: &str) -> bool {
     let Ok(text) = sy
-        .mcp_tool_text("block", serde_json::json!({ "action": "get", "id": doc_id }))
+        .mcp_tool_text(
+            "block",
+            serde_json::json!({ "action": "get", "id": doc_id }),
+        )
         .await
     else {
         return false;
@@ -391,7 +432,11 @@ pub async fn dead_bound_doc_ids(sy: &SiYuan, rows: &[SyTask]) -> Result<HashSet<
     if bound.is_empty() {
         return Ok(HashSet::new());
     }
-    let list = bound.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(",");
+    let list = bound
+        .iter()
+        .map(|b| format!("'{b}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     // явный limit: у ядра дефолт-лимит 64 строки — без него хвост выглядит мёртвым
     let live = sy
         .sql(&format!(
@@ -420,7 +465,12 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
 
 /// Колонки database: (имя → id) в порядке объявления на доске.
 pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, String)>> {
-    let v = sy.mcp_tool("database", serde_json::json!({ "action": "keys", "id": av })).await?;
+    let v = sy
+        .mcp_tool(
+            "database",
+            serde_json::json!({ "action": "keys", "id": av }),
+        )
+        .await?;
     let keys = v
         .pointer("/data/keys")
         .or_else(|| v.get("keys"))
@@ -441,7 +491,11 @@ pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, Str
 /// Громкий отказ с перечнем недостающих — ДО любых мутаций (строка без
 /// Schedule демону не видна, тело без строки — сирота).
 pub(crate) fn require_cron_keys(keys: &[(String, String)], board_hpath: &str) -> Result<CronKeys> {
-    let id_of = |name: &str| keys.iter().find(|(n, _)| n == name).map(|(_, id)| id.clone());
+    let id_of = |name: &str| {
+        keys.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| id.clone())
+    };
     let required = ["Schedule", "Status", "Last Run"];
     let missing: Vec<&str> = required
         .iter()
@@ -507,14 +561,18 @@ pub async fn create(
     let body_path = board.body_hpath(title);
     let body = match reused {
         Some(existing) => existing,
-        None => sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx)).await?,
+        None => {
+            sy.create_doc_md(&board.notebook, &body_path, &body_template(title, ty, ctx))
+                .await?
+        }
     };
     // вставка строки сразу после createDocWithMd ненадёжна (репро 04.11 08:27):
     // success-ответ item_add не гарантирует строку в render — verify по itemID
     // с ретраем ×1; дедуп по тайтлу не даёт ретраю минтить вторую строку
     let sk = status_key(sy, &board.av_id).await?;
     let mut item = sy.db_item_add_bound(&board.av_id, &body).await?;
-    sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
+    sy.db_item_set_status(&board.av_id, &sk, &item, "Draft")
+        .await?;
     for attempt in 0..=1u8 {
         let rows = read_rows(sy, &board).await?;
         match check_row_insert(&rows, &item, title) {
@@ -629,7 +687,11 @@ pub(crate) async fn edit_title_with_pacing(
     // собственный док не сирота: после неподтвердившегося синка (rename прошёл,
     // клетка лагает) повтор находит УЖЕ переименованный собственный док —
     // исключение собственного docId и делает повтор идемпотентным
-    let foreign_orphans: Vec<&str> = orphan_ids.iter().map(String::as_str).filter(|id| *id != doc).collect();
+    let foreign_orphans: Vec<&str> = orphan_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| *id != doc)
+        .collect();
     if !foreign_orphans.is_empty() {
         bail!(
             "док с заголовком «{new_title}» уже существует ({}): вычисти сироту в UI или выбери другой тайтл",
@@ -722,7 +784,10 @@ pub(crate) enum NeedleMatch {
     /// Ни id, ни docId-префикс, ни подстрока тайтла не совпали.
     NotFound,
     /// Фрагмент матчит несколько строк: «id», «doc-id» или «подстрока».
-    Ambiguous { reason: &'static str, matches: usize },
+    Ambiguous {
+        reason: &'static str,
+        matches: usize,
+    },
 }
 
 /// Матчинг фрагмента по готовым строкам: та же семантика, что у resolve()
@@ -733,13 +798,18 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
     let needle = needle.trim_start_matches('-');
     let by_id: Vec<&SyTask> = rows
         .iter()
-        .filter(|r| r.item_id == needle || r.item_id.starts_with(needle) || r.item_id.ends_with(needle))
+        .filter(|r| {
+            r.item_id == needle || r.item_id.starts_with(needle) || r.item_id.ends_with(needle)
+        })
         .collect();
     if by_id.len() == 1 {
         return NeedleMatch::Found(by_id[0].clone());
     }
     if !by_id.is_empty() {
-        return NeedleMatch::Ambiguous { reason: "id", matches: by_id.len() };
+        return NeedleMatch::Ambiguous {
+            reason: "id",
+            matches: by_id.len(),
+        };
     }
     let mut by_doc_prefix: Vec<&SyTask> = Vec::new();
     for r in rows {
@@ -754,7 +824,10 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         return NeedleMatch::Found(by_doc_prefix[0].clone());
     }
     if by_doc_prefix.len() > 1 {
-        return NeedleMatch::Ambiguous { reason: "doc-id", matches: by_doc_prefix.len() };
+        return NeedleMatch::Ambiguous {
+            reason: "doc-id",
+            matches: by_doc_prefix.len(),
+        };
     }
     let by_title: Vec<&SyTask> = rows
         .iter()
@@ -764,7 +837,10 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         return NeedleMatch::Found(by_title[0].clone());
     }
     if by_title.len() > 1 {
-        return NeedleMatch::Ambiguous { reason: "подстрока", matches: by_title.len() };
+        return NeedleMatch::Ambiguous {
+            reason: "подстрока",
+            matches: by_title.len(),
+        };
     }
     NeedleMatch::NotFound
 }
@@ -813,7 +889,11 @@ pub enum ResolveOrigin {
 /// матч ровно на одной доске → она (независимо от приоритета); матчи на
 /// нескольких или неоднозначность хоть на одной — громкая ошибка с раскладкой
 /// (тихий wrong-target исключён конструктивно).
-pub async fn resolve_on_project(sy: &SiYuan, project: &str, needle: &str) -> Result<(SyBoard, SyTask, ResolveOrigin)> {
+pub async fn resolve_on_project(
+    sy: &SiYuan,
+    project: &str,
+    needle: &str,
+) -> Result<(SyBoard, SyTask, ResolveOrigin)> {
     let candidates = resolve_candidates(sy, project).await?;
     if candidates.is_empty() {
         bail!("доски проекта «{project}» не найдены: нет ни «Задачи {project}», ни «Кроны {project}», чужих крон-досок тоже");
@@ -845,21 +925,30 @@ pub async fn resolve_on_project(sy: &SiYuan, project: &str, needle: &str) -> Res
     }
     if found.len() == 1 && ambiguous.is_empty() {
         let (idx, task) = found.remove(0);
-        let (board, origin) = candidates.into_iter().nth(idx).expect("idx из той же выборки");
+        let (board, origin) = candidates
+            .into_iter()
+            .nth(idx)
+            .expect("idx из той же выборки");
         return Ok((board, task, origin));
     }
 
     let searched: Vec<String> = candidates.iter().map(|(b, _)| b.hpath.clone()).collect();
     let mut parts: Vec<String> = Vec::new();
     if !found.is_empty() {
-        let boards: Vec<String> = found.iter().map(|(i, _)| candidates[*i].0.hpath.clone()).collect();
+        let boards: Vec<String> = found
+            .iter()
+            .map(|(i, _)| candidates[*i].0.hpath.clone())
+            .collect();
         parts.push(format!("найдено на: {}", boards.join(", ")));
     }
     if !ambiguous.is_empty() {
         parts.push(format!("неоднозначно на: {}", ambiguous.join("; ")));
     }
     if parts.is_empty() {
-        bail!("задача «{needle}» не найдена; обысканы доски: {}", searched.join(", "));
+        bail!(
+            "задача «{needle}» не найдена; обысканы доски: {}",
+            searched.join(", ")
+        );
     }
     bail!(
         "задача «{needle}»: {} (обысканы доски: {}) — уточни id",
@@ -872,10 +961,12 @@ pub async fn resolve_on_project(sy: &SiYuan, project: &str, needle: &str) -> Res
 /// битая доска / инфра-сбой — громкая ошибка (таксономия find_board_titled_opt).
 async fn resolve_candidates(sy: &SiYuan, project: &str) -> Result<Vec<(SyBoard, ResolveOrigin)>> {
     let mut out = Vec::new();
-    if let Some(board) = find_board_titled_opt(sy, project, &format!("Задачи {project}")).await? {
+    if let Some(board) = find_board_titled_opt(sy, project, &format!("Задачи {project}")).await?
+    {
         out.push((board, ResolveOrigin::Tasks));
     }
-    if let Some(board) = find_board_titled_opt(sy, project, &format!("Кроны {project}")).await? {
+    if let Some(board) = find_board_titled_opt(sy, project, &format!("Кроны {project}")).await?
+    {
         out.push((board, ResolveOrigin::CronProject));
     }
     for board in discover_foreign_cron_boards(sy, project).await? {
@@ -900,7 +991,9 @@ async fn discover_foreign_cron_boards(sy: &SiYuan, project: &str) -> Result<Vec<
     let mut out = Vec::new();
     let mut seen_projects = HashSet::new();
     for hpath in hpaths {
-        let Some((other, title)) = foreign_board_parts(&hpath) else { continue };
+        let Some((other, title)) = foreign_board_parts(&hpath) else {
+            continue;
+        };
         if other == project || !seen_projects.insert(other.clone()) {
             continue;
         }
@@ -940,9 +1033,20 @@ async fn cached_rows(
 /// Секция создаётся лениво перед первым комментом: шаблоны тел её не содержат,
 /// исторические тела комментились голыми буллетами без секции (thread отвечал
 /// «комментов нет» при живых комментах — гэп ADR-014).
-pub async fn comment(sy: &SiYuan, board: &SyBoard, task: &SyTask, author: &str, text: &str, reply_to: Option<&str>) -> Result<()> {
+pub async fn comment(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    author: &str,
+    text: &str,
+    reply_to: Option<&str>,
+) -> Result<()> {
     let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
-    let draft = CommentDraft { author, text, reply_to };
+    let draft = CommentDraft {
+        author,
+        text,
+        reply_to,
+    };
     comment_with_ts(sy, board, task, &draft, &ts).await
 }
 
@@ -956,7 +1060,13 @@ pub(crate) struct CommentDraft<'a> {
 /// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
 /// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
 /// поэтому ts вычисляется один раз на вызов.
-pub(crate) async fn comment_with_ts(sy: &SiYuan, board: &SyBoard, task: &SyTask, draft: &CommentDraft<'_>, ts: &str) -> Result<()> {
+pub(crate) async fn comment_with_ts(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    draft: &CommentDraft<'_>,
+    ts: &str,
+) -> Result<()> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
@@ -1016,7 +1126,8 @@ pub(crate) async fn ensure_comments_section(sy: &SiYuan, doc_id: &str) -> Result
 /// Закрытие: статус Done (+note комментом).
 pub async fn close(sy: &SiYuan, board: &SyBoard, task: &SyTask, note: Option<&str>) -> Result<()> {
     let sk = status_key(sy, &board.av_id).await?;
-    sy.db_item_set_status(&board.av_id, &sk, &task.item_id, "Done").await?;
+    sy.db_item_set_status(&board.av_id, &sk, &task.item_id, "Done")
+        .await?;
     if let Some(n) = note {
         let _ = comment(sy, board, task, "AGENTS", &format!("закрыта: {n}"), None).await;
     }
@@ -1036,10 +1147,22 @@ pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
 }
 
 /// Смена статуса/branch/pr (title-переименование не поддерживаем v1).
-pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&str>, branch: Option<&str>, pr: Option<&str>) -> Result<()> {
+pub async fn edit(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    status: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<&str>,
+) -> Result<()> {
     // валидация PR до любых записей: без частичных обновлений
     let pr_value = pr.map(pr_cell_value).transpose()?;
-    let keys = sy.mcp_tool("database", serde_json::json!({ "action": "keys", "id": board.av_id })).await?;
+    let keys = sy
+        .mcp_tool(
+            "database",
+            serde_json::json!({ "action": "keys", "id": board.av_id }),
+        )
+        .await?;
     let arr = keys
         .pointer("/data/keys")
         .or_else(|| keys.get("keys"))
@@ -1053,7 +1176,8 @@ pub async fn edit(sy: &SiYuan, board: &SyBoard, task: &SyTask, status: Option<&s
     };
     if let Some(st) = status {
         let k = find("Status").context("ключ Status не найден")?;
-        sy.db_item_set_status(&board.av_id, &k, &task.item_id, st).await?;
+        sy.db_item_set_status(&board.av_id, &k, &task.item_id, st)
+            .await?;
     }
     if let Some(v) = branch {
         let k = find("Branch").context("ключ Branch не найден")?;
@@ -1098,7 +1222,10 @@ mod tests {
 
     #[test]
     fn path_safe_replaces_slash_with_division_slash() {
-        assert_eq!(path_safe("вынести сборки из /tmp на /home"), "вынести сборки из \u{2215}tmp на \u{2215}home");
+        assert_eq!(
+            path_safe("вынести сборки из /tmp на /home"),
+            "вынести сборки из \u{2215}tmp на \u{2215}home"
+        );
     }
 
     #[test]
@@ -1125,7 +1252,10 @@ mod tests {
 
     #[test]
     fn normalize_title_matches_ascii_slash_needle_against_division_slash_title() {
-        assert_eq!(normalize_title("Пилот RU\u{2215}EN"), normalize_title("пилот ru/en"));
+        assert_eq!(
+            normalize_title("Пилот RU\u{2215}EN"),
+            normalize_title("пилот ru/en")
+        );
     }
 
     #[test]
@@ -1178,7 +1308,12 @@ mod tests {
             "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
             "hPath": "Projects/1xgames/Задачи 1xgames"
         })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        let hit = pick_search_hit(
+            &results,
+            "Projects/1xgames/Задачи 1xgames",
+            "Задачи 1xgames",
+            "doc-x",
+        );
         assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
     }
 
@@ -1194,7 +1329,12 @@ mod tests {
                 "hPath": "Projects/1xgames/Задачи 1xgames"
             }),
         ];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        let hit = pick_search_hit(
+            &results,
+            "Projects/1xgames/Задачи 1xgames",
+            "Задачи 1xgames",
+            "doc-x",
+        );
         assert_eq!(hit, Some(("av-1".into(), "b-1".into())));
     }
 
@@ -1204,7 +1344,12 @@ mod tests {
             "avID": "av-k", "avName": "Кроны 1xgames", "blockID": "b-k",
             "hPath": "Projects/1xgames/Кроны 1xgames"
         })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-x");
+        let hit = pick_search_hit(
+            &results,
+            "Projects/1xgames/Задачи 1xgames",
+            "Задачи 1xgames",
+            "doc-x",
+        );
         assert_eq!(hit, None);
     }
 
@@ -1214,7 +1359,12 @@ mod tests {
             "avID": "av-9", "avName": "Задачи 1xgames", "blockID": "doc-77",
             "hPath": "Другой/путь"
         })];
-        let hit = pick_search_hit(&results, "Projects/1xgames/Задачи 1xgames", "Задачи 1xgames", "doc-77");
+        let hit = pick_search_hit(
+            &results,
+            "Projects/1xgames/Задачи 1xgames",
+            "Задачи 1xgames",
+            "doc-77",
+        );
         assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
     }
 
@@ -1307,19 +1457,28 @@ mod tests {
             sy_task("item-1", "первая", Some("doc-1")),
             sy_task("item-2", "вторая", Some("doc-2")),
         ];
-        assert!(matches!(check_row_insert(&rows, "item-2", "новая"), RowInsertCheck::Confirmed));
+        assert!(matches!(
+            check_row_insert(&rows, "item-2", "новая"),
+            RowInsertCheck::Confirmed
+        ));
     }
 
     #[test]
     fn check_row_insert_reports_duplicate_title_not_inserted_id() {
         let rows = vec![sy_task("item-x", "задача", Some("doc-x"))];
-        assert!(matches!(check_row_insert(&rows, "item-y", "задача"), RowInsertCheck::DuplicateTitle));
+        assert!(matches!(
+            check_row_insert(&rows, "item-y", "задача"),
+            RowInsertCheck::DuplicateTitle
+        ));
     }
 
     #[test]
     fn check_row_insert_reports_missing_row() {
         let rows = vec![sy_task("item-1", "другая", Some("doc-1"))];
-        assert!(matches!(check_row_insert(&rows, "item-9", "новая"), RowInsertCheck::Missing));
+        assert!(matches!(
+            check_row_insert(&rows, "item-9", "новая"),
+            RowInsertCheck::Missing
+        ));
     }
 
     fn cell_of(value: Value) -> Value {
@@ -1378,19 +1537,28 @@ mod tests {
     #[test]
     fn pr_cell_value_wraps_https_link_into_url_payload() {
         let v = pr_cell_value("https://github.com/yurvon-screamo/uwuwu-agent/pull/36").unwrap();
-        assert_eq!(v, json!({ "url": { "content": "https://github.com/yurvon-screamo/uwuwu-agent/pull/36" } }));
+        assert_eq!(
+            v,
+            json!({ "url": { "content": "https://github.com/yurvon-screamo/uwuwu-agent/pull/36" } })
+        );
     }
 
     #[test]
     fn pr_cell_value_accepts_http_link() {
         let v = pr_cell_value("http://gitea.local/origa/pull/9").unwrap();
-        assert_eq!(v, json!({ "url": { "content": "http://gitea.local/origa/pull/9" } }));
+        assert_eq!(
+            v,
+            json!({ "url": { "content": "http://gitea.local/origa/pull/9" } })
+        );
     }
 
     #[test]
     fn pr_cell_value_trims_whitespace_around_link() {
         let v = pr_cell_value("  https://github.com/a/b/pull/1  ").unwrap();
-        assert_eq!(v, json!({ "url": { "content": "https://github.com/a/b/pull/1" } }));
+        assert_eq!(
+            v,
+            json!({ "url": { "content": "https://github.com/a/b/pull/1" } })
+        );
     }
 
     #[test]
@@ -1428,21 +1596,48 @@ mod tests {
         ];
         use NeedleMatch::*;
 
-        assert!(matches!(match_needle(&rows, &[], "мёртвая"), Found(_)), "подстрока одна → Found");
-        assert!(matches!(match_needle(&rows, &[], "несуществующая"), NotFound), "мимо всего → NotFound");
+        assert!(
+            matches!(match_needle(&rows, &[], "мёртвая"), Found(_)),
+            "подстрока одна → Found"
+        );
+        assert!(
+            matches!(match_needle(&rows, &[], "несуществующая"), NotFound),
+            "мимо всего → NotFound"
+        );
         let ambiguous = match_needle(&rows, &[], "жив");
         assert!(
-            matches!(ambiguous, Ambiguous { reason: "подстрока", matches: 2 }),
+            matches!(
+                ambiguous,
+                Ambiguous {
+                    reason: "подстрока",
+                    matches: 2
+                }
+            ),
             "два тайтла с «жив» → неоднозначно: {ambiguous:?}"
         );
         let dup_title = vec![needle_row("item-a", "таск"), needle_row("item-b", "таск")];
         assert!(
-            matches!(match_needle(&dup_title, &[], "таск"), Ambiguous { reason: "подстрока", matches: 2 }),
+            matches!(
+                match_needle(&dup_title, &[], "таск"),
+                Ambiguous {
+                    reason: "подстрока",
+                    matches: 2
+                }
+            ),
             "дубль тайтла → неоднозначно"
         );
-        let dup_id = vec![needle_row("20261104000009-aaaaaa1", "таск А"), needle_row("20261104000009-aaaaaa2", "таск Б")];
+        let dup_id = vec![
+            needle_row("20261104000009-aaaaaa1", "таск А"),
+            needle_row("20261104000009-aaaaaa2", "таск Б"),
+        ];
         assert!(
-            matches!(match_needle(&dup_id, &[], "20261104000009"), Ambiguous { reason: "id", matches: 2 }),
+            matches!(
+                match_needle(&dup_id, &[], "20261104000009"),
+                Ambiguous {
+                    reason: "id",
+                    matches: 2
+                }
+            ),
             "дубль id-префикса → неоднозначно по id"
         );
     }
@@ -1454,6 +1649,9 @@ mod tests {
             needle_row("20261104000002-alivex2", "таск Б"),
         ];
         // фрагмент совпадает с префиксом ОДНОГО id → Found даже при тайтл-коллизии
-        assert!(matches!(match_needle(&rows, &[], "20261104000001"), NeedleMatch::Found(_)));
+        assert!(matches!(
+            match_needle(&rows, &[], "20261104000001"),
+            NeedleMatch::Found(_)
+        ));
     }
 }
