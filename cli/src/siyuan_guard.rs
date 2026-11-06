@@ -340,29 +340,6 @@ pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard, chain: &[S
     }
 }
 
-/// Цепочка doc-id от корня ноутбука до дока доски: getIDsByHPath отдаёт id
-/// последнего сегмента пути — идём по префиксам hpath. Хвост цепочки обязан
-/// совпасть с doc_id доски (расхождение = резолв доски расходится с деревом).
-pub(crate) async fn board_doc_chain(sy: &SiYuan, board: &SyBoard) -> Result<Vec<String>> {
-    let segments: Vec<&str> = board.hpath.split('/').filter(|s| !s.is_empty()).collect();
-    let mut chain = Vec::with_capacity(segments.len());
-    for i in 1..=segments.len() {
-        let prefix = format!("/{}", segments[..i].join("/"));
-        let ids = sy.doc_ids_by_hpath(&board.notebook, &prefix).await?;
-        let Some(id) = ids.first() else {
-            bail!("цепочка доков доски оборвана на «{prefix}»: деревья по пути нет");
-        };
-        chain.push(id.clone());
-    }
-    if chain.last().map(String::as_str) != Some(board.doc_id.as_str()) {
-        bail!(
-            "цепочка доков ({:?}) не сходится с доской {} — резолв доски расходится с деревом",
-            chain, board.doc_id
-        );
-    }
-    Ok(chain)
-}
-
 /// Пост-чек: лишние пропажи тайтлов. Ожидание: после = до − план.
 /// Возврат — тайтлы, пропавшие без плана (нормализованное сравнение:
 /// ∕ ≡ /, регистр не важен).

@@ -67,6 +67,14 @@ pub enum FileFetch {
     Failed(String),
 }
 
+/// Загруженный ассет: оригинальное имя файла и финальный путь в assets/,
+/// сгенерированный ядром (`<stem>-<timestamp>-<random>.<ext>`).
+#[derive(Debug)]
+pub struct UploadedAsset {
+    pub original_name: String,
+    pub asset_path: String,
+}
+
 pub struct SiYuan {
     pub base: String,
     pub token: String,
@@ -507,6 +515,62 @@ impl SiYuan {
             return Ok(());
         }
         bail!("putFile {path}: HTTP {status}, {}", body)
+    }
+
+    /// Upload файла в assets/ воркспейса, контракт ядра 3.8.9: POST multipart
+    /// `/api/asset/upload` (`assetsDir` + `file[]`). Ровно один файл за вызов —
+    /// succMap ключуется оригинальным именем, два файла с одним basename в
+    /// одном вызове конфликтуют ключами. Уникальность финального имени даёт
+    /// ядро, своей naming-логики нет. One-shot (как putFile): сбой громкий.
+    pub async fn upload_asset(&self, file: &std::path::Path) -> Result<UploadedAsset> {
+        let bytes = std::fs::read(file)
+            .with_context(|| format!("чтение файла {}: недоступен", file.display()))?;
+        let original_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .with_context(|| format!("имя файла {} не UTF-8", file.display()))?;
+        let form = reqwest::multipart::Form::new()
+            .text("assetsDir", "assets".to_string())
+            .part(
+                "file[]",
+                reqwest::multipart::Part::bytes(bytes).file_name(original_name.clone()),
+            );
+        let resp = self
+            .client
+            .post(format!("{}/api/asset/upload", self.base))
+            .header("Authorization", format!("Token {}", self.token))
+            .multipart(form)
+            .send()
+            .await
+            .context("asset upload: транспорт недоступен")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if !status.is_success() || body.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            bail!("asset upload {original_name}: HTTP {status}, {body}");
+        }
+        let asset_path = body
+            .pointer("/data/succFiles/0/path")
+            .and_then(|p| p.as_str())
+            .map(String::from)
+            .with_context(|| {
+                format!("asset upload {original_name}: ядро не вернуло succFiles: {body}")
+            })?;
+        Ok(UploadedAsset { original_name, asset_path })
+    }
+
+    /// Переименовать док (kernel renameDoc): меняет тайтл дока и hpath-лист,
+    /// storage-путь (id-цепочка) и blockID неизменны — привязка строк канбанов
+    /// живёт. `path` — storage-путь ОТНОСИТЕЛЬНО КОРНЯ НОУТБУКА
+    /// (`/предки…/<docId>.sy`); kernel сам префиксует `data/<notebook>/`.
+    /// Ретраи — штатный post() (metadata-волна и транспорт).
+    pub async fn rename_doc(&self, notebook: &str, path: &str, title: &str) -> Result<()> {
+        self.post(
+            "/api/filetree/renameDoc",
+            json!({ "notebook": notebook, "path": path, "title": title }),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Список файлов директории воркспейса (POST JSON, контракт 3.8.9),
@@ -1210,5 +1274,111 @@ mod tests {
         assert_eq!(names, vec!["j.json".to_string()]);
         let missing = sy.try_list_dir("data/assets/nowhere").await.unwrap();
         assert!(missing.is_none(), "нет директории — None, не ошибка");
+    }
+
+    #[tokio::test]
+    async fn upload_asset_returns_kernel_generated_path_from_succ_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with(|req: &wiremock::Request| {
+                // multipart: ядро ждёт assetsDir + file[] с оригинальным именем
+                let body = String::from_utf8_lossy(&req.body);
+                let ok = body.contains("name=\"assetsDir\"")
+                    && body.contains("name=\"file[]\"")
+                    && body.contains("filename=\"скрин 2.png\"")
+                    && body.contains("png-bytes");
+                if ok {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "data": { "succFiles": [{ "index": 0, "name": "скрин 2.png",
+                                  "path": "assets/скрин 2-20261106090000-abc1234.png" }] }
+                    }))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"code":-1,"msg":"нет полей multipart"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let file = dir.path().join("скрин 2.png");
+        std::fs::write(&file, b"png-bytes").expect("write fixture");
+
+        let asset = sy.upload_asset(&file).await.expect("upload ok");
+        assert_eq!(asset.original_name, "скрин 2.png");
+        assert_eq!(
+            asset.asset_path,
+            "assets/скрин 2-20261106090000-abc1234.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_asset_kernel_error_envelope_is_loud_bail() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"code":-1,"msg":"asset size exceeds limit"}"#),
+            )
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let file = dir.path().join("big.png");
+        std::fs::write(&file, b"bytes").expect("write fixture");
+
+        let err = sy
+            .upload_asset(&file)
+            .await
+            .expect_err("kernel code=-1 must bail");
+        assert!(
+            err.to_string().contains("asset size exceeds limit"),
+            "суть отказа ядра видна: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_asset_missing_file_bails_before_network() {
+        let server = MockServer::start().await;
+        // ни одного маунта: любой сетевой вызов упал бы по соединению —
+        // отказ обязан случиться раньше, на чтении файла
+        let sy = SiYuan::for_tests(server.uri());
+        let err = sy
+            .upload_asset(std::path::Path::new("/nonexistent/dir/x.png"))
+            .await
+            .expect_err("missing file must bail");
+        assert!(
+            err.to_string().contains("недоступен"),
+            "отказ на чтении файла: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_doc_sends_notebook_relative_path_and_title() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/renameDoc"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let ok = body.get("notebook").and_then(|n| n.as_str()) == Some("nb-1")
+                    && body.get("path").and_then(|p| p.as_str()) == Some("/root/board/doc-id.sy")
+                    && body.get("title").and_then(|t| t.as_str()) == Some("новый тайтл");
+                if ok {
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"code":-1,"msg":"rename request shape mismatch"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.rename_doc("nb-1", "/root/board/doc-id.sy", "новый тайтл")
+            .await
+            .expect("rename ok");
     }
 }
