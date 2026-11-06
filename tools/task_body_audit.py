@@ -340,7 +340,7 @@ def _row_cells(item: dict, key_name: dict) -> dict:
     return row
 
 
-def _body_entry(board: dict, body: dict, rows_by_doc: dict, rows_by_title: dict) -> dict:
+def _body_entry(board: dict, body: dict, rows_by_doc: dict) -> dict:
     export_md = wiki_ops._export_content(body["id"])
     title = body.get("content", "")
     if not export_md.strip():
@@ -348,11 +348,19 @@ def _body_entry(board: dict, body: dict, rows_by_doc: dict, rows_by_title: dict)
                 "status": "(export пуст)", "verdict": VERDICT_EMPTY, "type": "?",
                 "markers": ["export пуст"], "comments": False, "html": False,
                 "sha": "", "row": ""}
-    row = rows_by_doc.get(body["id"]) or rows_by_title.get(title) or {}
+    # статус — ТОЛЬКО по живой привязке строки: тайтл-фоллбек дал бы сироте
+    # (строка снесена) чужой статус, и чистка пошла бы в тело мимо cli-резолва
+    row = rows_by_doc.get(body["id"])
     cls = classify(export_md, title)
     return {"board": board["project"], "doc_id": body["id"], "title": title,
-            "status": row.get("status", ""), "row": row.get("body_doc", ""),
-            "sha": hashlib.sha256(export_md.encode()).hexdigest()[:16], **cls}
+            "status": row["status"] if row else "(без строки)",
+            "row": row["body_doc"] if row else "",
+            "sha": hashlib.sha256(  # normalized-sha без frontmatter (lastmod
+                # ядро двигает при каждом реимпорте); тот же регион хэша,
+                # что sha16 драйвера чистки — freshness-сверка сходится
+                "\n".join(wiki_ops._normalized_lines(
+                    strip_frontmatter(export_md))).encode()).hexdigest()[:16],
+            **cls}
 
 
 def _audit_board(board: dict) -> list[dict]:
@@ -361,10 +369,7 @@ def _audit_board(board: dict) -> list[dict]:
         f"SELECT id, content FROM blocks WHERE type='d' AND hpath LIKE "  # nosec B608 — hpath провалидирован sql_safe
         f"'{sql_safe(board['hpath'], 'board hpath')}/%' ORDER BY hpath {SQL_PAGE}")
     rows_by_doc = {r["body_doc"]: r for r in rows if r["body_doc"]}
-    rows_by_title = {}
-    for r in rows:
-        rows_by_title.setdefault(r["title"], r)
-    entries = [_body_entry(board, b, rows_by_doc, rows_by_title) for b in bodies]
+    entries = [_body_entry(board, b, rows_by_doc) for b in bodies]
     body_ids = {b["id"] for b in bodies}
     entries += [
         {"board": board["project"], "doc_id": r["body_doc"], "title": r["title"],
@@ -388,7 +393,8 @@ def audit(only: str | None, out_path: str | None) -> None:
     cleanable = [e for e in result if e["verdict"] in (VERDICT_CHAT, VERDICT_SEMI)
                  and e["status"] in CLEANABLE_STATUSES]
     excluded_live = [e for e in result if e["status"] in LIVE_STATUSES]
-    excluded_empty = [e for e in result if e["status"] == "" and e["verdict"] != VERDICT_EMPTY]
+    excluded_empty = [e for e in result if e["status"] in ("", "(без строки)")
+                      and e["verdict"] != VERDICT_EMPTY]
     payload = {"ts": int(time.time()), "boards": [b["hpath"] for b in all_boards],
                "stats": stats, "cleanable": cleanable, "excluded_live": excluded_live,
                "excluded_empty_status": excluded_empty, "all": result}
