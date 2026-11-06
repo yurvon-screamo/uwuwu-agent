@@ -187,7 +187,7 @@ def _fs_file(path: str) -> str:
     try:
         with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
             body = r.read()
-            status = getattr(r, "status", 200)
+            status = getattr(r, "status", None)  # неизвестный статус → не 200: конверт/failed, не «found»
     except Exception:
         return "failed"
     if status == 200:
@@ -463,16 +463,25 @@ def _fs_verdict_note(doc_id: str) -> str:
     return "вердикт по файловой пробе"
 
 
+def _doc_fs_path(row: dict) -> str:
+    """FS-путь файла дока: data/<box><blocks.path>. Box — каталог данных
+    ноутбука, в blocks.path НЕ входит (path — id-цепочка от корня:
+    /<rootId>/<…>/<docId>.sy); контракт сверен живым ядром (getFile: с box —
+    Bytes, без — 404) и канонической сборкой doc_file_path в cli/src/siyuan.rs
+    (ADR-025, задача 20261106044426)."""
+    return f"data/{row['box']}{row['path']}"
+
+
 def _confirm_removed(row: dict, doc_id: str) -> str:
     """Вердикт пост-чека после ok от removeDocByID: источник вердикта строкой.
 
     Файловая проба — истина (ядро читает диск, SQL-индекс не участвует);
     индекс отстаёт от мутаций секундами (Experience/cli write-path) — его
     показание даёт примечание или фолбэк, успех не отвергает (принцип
-    ADR-025: один лагающий источник ≠ истина). FS-путь = data/<box> +
-    blocks.path (id-цепочка от корня ноутбука), захвачен до мутации.
+    ADR-025: один лагающий источник ≠ истина). FS-путь — по _doc_fs_path
+    (data/<box><path>), захвачен до мутации.
     """
-    fs_path = f"data{row['path']}"
+    fs_path = _doc_fs_path(row)
     for _ in range(2):
         probe = _fs_file(fs_path)
         if probe == "found":

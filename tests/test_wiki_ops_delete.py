@@ -59,9 +59,12 @@ class FakeKernel:
     """Двойник kernel API: blocks-таблица, export, removeDocByID, getFile-проба.
 
     SQL эмулируется по семантике stmt (id-резолв / дети по path-префиксу /
-    box-scoped соседи), не по точной строке запроса. FS — отдельная модель
-    (set путей data<path>): файл уходит при removeDocByID независимо от
-    SQL-индекса, fs_probe различает found/missing/failed как ядро 3.8.9.
+    box-scoped соседи), не по точной строке запроса. FS — отдельная модель по
+    контракту ядра (пути data/<box><path>, box в blocks.path не входит):
+    файл уходит при removeDocByID независимо от SQL-индекса, fs_probe
+    различает found/missing/failed как ядро 3.8.9. Формула модели независима
+    от кода — неверная сборка пути в wiki_ops не проходит тесты (проба мимо
+    файла даёт missing там, где модель держит файл).
     """
 
     def __init__(self, docs, contents=None, removal_updates_index=True, notebooks=None,
@@ -72,7 +75,7 @@ class FakeKernel:
         self.removal_updates_fs = removal_updates_fs
         self.fs_probe_fails = fs_probe_fails
         self.notebooks = notebooks
-        self.fs = {f"data{d['path']}" for d in self.docs.values()}
+        self.fs = {f"data/{d['box']}{d['path']}" for d in self.docs.values()}
         self.removed = []
         self.sql_stmts = []
 
@@ -91,7 +94,7 @@ class FakeKernel:
             if self.removal_updates_index:
                 self.docs.pop(body["id"], None)
             if self.removal_updates_fs and doc:
-                self.fs.discard(f"data{doc['path']}")
+                self.fs.discard(f"data/{doc['box']}{doc['path']}")
             return None
         raise AssertionError(f"неожиданный путь: {path}")
 
@@ -269,8 +272,21 @@ class PostCheck(unittest.TestCase):
             run_delete(kernel, STUB_ID)
         message = str(cm.exception)
         self.assertIn("файл дока остался на диске", message)
-        self.assertIn("data/20261103224612-e9q7eyv/РБ/РБ.sy", message)
+        self.assertIn(f"data/{BOX}/20261103224612-e9q7eyv/РБ/РБ.sy", message,
+                      "путь в ошибке обязан нести box-сегмент ноутбука")
         self.assertEqual(kernel.removed, [STUB_ID])
+
+    def test_built_fs_path_carries_box_and_sees_live_file(self):
+        # Позитивный контроль сборки пути: путь по контракту ядра
+        # (data/<box><path>), файловая проба живого дока находит файл.
+        kernel = self._kernel()
+        row = {"id": STUB_ID, "hpath": "/uwuwu/Ранбуки/РБ",
+               "path": "/20261103224612-e9q7eyv/РБ/РБ.sy", "box": BOX}
+        fs_path = wiki_ops._doc_fs_path(row)
+        self.assertTrue(fs_path.startswith(f"data/{BOX}/"),
+                        "blocks.path не содержит box — путь обязан начинаться с data/<box>/")
+        self.assertEqual(kernel.fs_probe(fs_path), "found",
+                         "проба по построенному кодом пути обязана находить живой файл")
 
     def test_fs_probe_failure_falls_back_to_index_verdict(self):
         kernel = self._kernel(fs_probe_fails=True)
