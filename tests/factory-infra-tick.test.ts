@@ -44,7 +44,10 @@ describe("tickProject: самоисцеление пустого bodyDoc тре�
   /** Ребёнок с HOME от старта процесса: state/лог/REST — только песочница. */
   async function runTick(): Promise<{ bodyDoc: string | null; bodyUpdated: string | null; exportIds: string[]; prompts: number }> {
     const proc = Bun.spawn(["bun", CHILD], {
-      env: { ...process.env, HOME: home, UWUWU_SIYUAN_TOKEN: "test-token" },
+      // UWUWU_FACTORY_STATE_DIR — явная песочница: дефолт-изоляция ветки
+      // (задача 20261106082216) не должна уводить сидированный state
+      // в branches/<ветка>, тест проверяет HOME-изоляцию прод-путей
+      env: { ...process.env, HOME: home, UWUWU_SIYUAN_TOKEN: "test-token", UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory") },
       stdout: "pipe", stderr: "pipe",
     })
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])

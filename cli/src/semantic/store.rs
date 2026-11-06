@@ -54,6 +54,14 @@ pub struct ChunkMeta {
     pub updated: String,
 }
 
+/// Строка индекса с контентом, без вектора — сверка дельты на
+/// skip-unchanged ((updated, content) идентичны — переэмбедд не нужен).
+#[derive(Clone)]
+pub struct IndexedRow {
+    pub meta: ChunkMeta,
+    pub content: String,
+}
+
 /// Строка индекса целиком: upsert дельты/backfill и KNN-выдача.
 #[derive(Clone)]
 pub struct ChunkRecord {
@@ -274,6 +282,43 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Проиндексированные строки для страницы дельты: мета + контент,
+    /// без векторов (skip-unchanged сверяет (updated, content) в памяти).
+    pub fn indexed_rows(
+        &self,
+        block_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, IndexedRow>> {
+        let mut indexed = std::collections::HashMap::new();
+        for batch in block_ids.chunks(500) {
+            let placeholders = batch
+                .iter()
+                .map(|id| sql_literal(id))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "select block_id, root_id, box_id, hpath, updated, content \
+                 from chunks where block_id in ({placeholders})"
+            ))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(IndexedRow {
+                    meta: ChunkMeta {
+                        block_id: r.get(0)?,
+                        root_id: r.get(1)?,
+                        box_id: r.get(2)?,
+                        hpath: r.get(3)?,
+                        updated: r.get(4)?,
+                    },
+                    content: r.get(5)?,
+                })
+            })?;
+            for row in rows {
+                let row = row?;
+                indexed.insert(row.meta.block_id.clone(), row);
+            }
+        }
+        Ok(indexed)
     }
 
     /// Prune строк, исчезнувших из ядра (трэш/удаление доков ловится тут же).

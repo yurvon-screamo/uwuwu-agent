@@ -14,7 +14,6 @@ import {
   untrackedTasks,
   isUserComment,
   snapshotText,
-  worktreeByBranch,
   runBatch,
   parseProjects,
   formatPassSummary,
@@ -22,7 +21,6 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
-  stampLegacyEntries,
   type ProjectCfg,
   isValidTracked,
   rowMissingAction,
@@ -123,35 +121,6 @@ describe("snapshotText", () => {
   })
 })
 
-describe("stampLegacyEntries — штамп перехода на env-механику", () => {
-  const mkState = (entries: Record<string, { sessionID: string; envDir?: string }>): FactoryState => ({
-    tasks: Object.fromEntries(
-      Object.entries(entries).map(([k, v]) => [k, {
-        sessionID: v.sessionID, envDir: v.envDir, worktree: "", branch: "",
-        bodyDoc: "d", title: "t", project: "uwuwu",
-        lastCommentAt: 1, lastCommentId: "i", createdAt: 2, attempts: 0,
-      }]),
-    ),
-  })
-  test("спавненная запись без envDir получает legacy, envDir-ные — нет", () => {
-    const state = mkState({ "row-a": { sessionID: "ses_1" }, "row-b": { sessionID: "ses_2", envDir: "/env/b" } })
-    const stamped = stampLegacyEntries(state)
-    expect(stamped).toEqual(["row-a"])
-    expect(state.tasks["row-a"]?.legacy).toBe(true)
-    expect(state.tasks["row-b"]?.legacy).toBeUndefined()
-  })
-  test("карантин без сессии не штампуется — его спавн ещё попробует env", () => {
-    const state = mkState({ "row-q": { sessionID: "" } })
-    expect(stampLegacyEntries(state)).toEqual([])
-    expect(state.tasks["row-q"]?.legacy).toBeUndefined()
-  })
-  test("повторный прогон идемпотентен", () => {
-    const state = mkState({ "row-a": { sessionID: "ses_1" } })
-    stampLegacyEntries(state)
-    expect(stampLegacyEntries(state)).toEqual([])
-  })
-})
-
 describe("isValidTracked", () => {
   const base = {
     sessionID: "ses_abc", worktree: "/wt/task-x", branch: "work/task-x",
@@ -182,12 +151,15 @@ describe("isValidTracked", () => {
     expect(isValidTracked(base)).toBe(true)
     expect(isValidTracked({ ...base, stallSignaled: "yes" })).toBe(false)
   })
-  test("envDir/legacy: строка с / и boolean валидны, чужие типы — мимо", () => {
+  test("envDir: строка с / валидна, чужие типы — мимо", () => {
     expect(isValidTracked({ ...base, envDir: "/home/x/agents-env/row" })).toBe(true)
     expect(isValidTracked({ ...base, envDir: undefined })).toBe(true)
     expect(isValidTracked({ ...base, envDir: "relative" })).toBe(false)
+  })
+  test("чужие поля legacy-хвоста перехода игнорируются — запись валидна", () => {
+    // прод-state содержит записи со штампом legacy переходного периода:
+    // после выпила штампа валидатор не должен ронять их как «битые»
     expect(isValidTracked({ ...base, legacy: true })).toBe(true)
-    expect(isValidTracked({ ...base, legacy: 1 })).toBe(false)
   })
   test("mergedPrUrl: http(s)-строка и undefined валидны, не-url и чужие типы — мимо", () => {
     expect(isValidTracked({ ...base, mergedPrUrl: "https://github.com/o/r/pull/1" })).toBe(true)
@@ -260,7 +232,7 @@ describe("spawnPrompt", () => {
     expect(p).toContain("заполняет фабрика")
     expect(p).not.toContain("создай worktree")
   })
-  test("без env-контекста (легаси/env:false) — прежняя строка про worktree+Branch-ячейку", () => {
+  test("без env-контекста (env:false-проект) — прежняя строка про worktree+Branch-ячейку", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
     expect(p).toContain("создай worktree+ветку от origin/master")
     expect(p).toContain("заполни Branch-ячейку")
@@ -287,7 +259,7 @@ describe("continuePrompt", () => {
     expect(p).toContain("work/task-r1")
     expect(p).toContain("Незакоммиченное — там же")
   })
-  test("без env-контекста (легаси/env:false) — строки окружения нет", () => {
+  test("без env-контекста (env:false-проект) — строки окружения нет", () => {
     const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
     expect(p).not.toContain("своё не создавай")
   })
@@ -524,7 +496,7 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("request_changes → In Progress")
     expect(p).not.toContain("request_changes → Design")
   })
-  test("result без ворктри (легаси) — честная строка про diff/PR, не пустота", () => {
+  test("result без ворктри (env:false / карантинный ревью-вход) — честная строка про diff/PR, не пустота", () => {
     const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" })
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
@@ -576,37 +548,6 @@ describe("isValidTracked: ревью-поля", () => {
     expect(isValidTracked({ ...base, reviewSessionID: "junk" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: "1" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: 2 })).toBe(true)
-  })
-})
-
-describe("worktreeByBranch", () => {
-  const porcelain = [
-    "worktree /home/x/origa",
-    "HEAD abc",
-    "branch refs/heads/master",
-    "",
-    "worktree /home/x/origa-wt-commits",
-    "HEAD def",
-    "branch refs/heads/work/auto-atomic-commits",
-    "",
-    "worktree /home/x/origa-wt-x",
-    "HEAD 123",
-    "branch refs/heads/fix-x",
-    "",
-  ].join("\n")
-  test("точное совпадение имени ветки", () => {
-    expect(worktreeByBranch(porcelain, "fix-x")).toBe("/home/x/origa-wt-x")
-    expect(worktreeByBranch(porcelain, "work/auto-atomic-commits")).toBe("/home/x/origa-wt-commits")
-    expect(worktreeByBranch(porcelain, "master")).toBe("/home/x/origa")
-  })
-  test("суффикс-подстрока чужой ветки не матчится", () => {
-    expect(worktreeByBranch(porcelain, "commits")).toBe("")
-    expect(worktreeByBranch(porcelain, "x")).toBe("")
-    expect(worktreeByBranch(porcelain, "auto-atomic-commits")).toBe("")
-  })
-  test("пустая ветка и отсутствие ветки — пустой результат", () => {
-    expect(worktreeByBranch(porcelain, "")).toBe("")
-    expect(worktreeByBranch("worktree /a\nHEAD z\nbare", "nope")).toBe("")
   })
 })
 

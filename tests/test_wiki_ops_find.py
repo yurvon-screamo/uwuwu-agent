@@ -6,6 +6,12 @@
   2) найденные строки печатаются как «id hpath»;
   3) stmt несёт явный LIMIT (правило после orgls-инцидента).
 
+Контракты сбоя (задача 20261104072714 — «сбой маскируется под "не найден"»):
+  4) отказ ядра (code≠0) → «ERROR: …» с причиной, exit 1, stdout пуст —
+     текст ошибки никогда не выглядит как «не найдено»;
+  5) честный not-found на здоровом ядре — тихий exit 0 (конвенция
+     «успех — тихий»), сбой от него отличим по паре exit-код/stderr.
+
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_find.py
 """
@@ -13,8 +19,9 @@ import io
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -84,6 +91,36 @@ class Output(unittest.TestCase):
         kernel = FakeKernel(docs=[OTHER])
         output = run_find(kernel, "несуществующий-тайтл")
         self.assertEqual(output, "")
+
+
+def refused_kernel(path, body, attempts=6):
+    raise wiki_ops.KernelRefused("POST /api/query/sql: code=500 msg=boom")
+
+
+class FailureIsNotNotFound(unittest.TestCase):
+    """Отказ ядра не проходит за «не найдено»: exit 1 + причина в stderr."""
+
+    def test_kernel_refusal_prints_error_and_exits_1(self):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["wiki_ops.py", "find", "Стек"]), \
+                patch.object(wiki_ops, "post", refused_kernel), \
+                redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                wiki_ops.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertIn("code=500", err.getvalue(), "последняя причина не дошла до ошибки")
+        self.assertNotIn("не найден", err.getvalue())
+        self.assertNotIn("не найдено", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_honest_not_found_is_quiet_exit_0(self):
+        kernel = FakeKernel(docs=[])
+        args = type("Args", (), {"title": "несуществующий-тайтл"})()
+        out = io.StringIO()
+        with patch.object(wiki_ops, "post", kernel.post), redirect_stdout(out):
+            wiki_ops.cmd_find(args)  # ни исключения, ни SystemExit — естественный 0
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":

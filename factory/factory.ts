@@ -24,10 +24,10 @@
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -49,7 +49,6 @@ import {
   conflictFixPrompt,
   routeTask,
   rowMissingAction,
-  worktreeByBranch,
   runBatch,
   parseProjects,
   formatPassSummary,
@@ -64,7 +63,6 @@ import {
   spawnGuardVerdict,
   spawnLimitsFromEnv,
   hasSessionEvidence,
-  stampLegacyEntries,
   activeTaskGuards,
   PATH_CELL,
   DEV_SESSION_CELL,
@@ -108,17 +106,27 @@ const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
     board: "Задачи true-washing",
     repo: "~/true-washing (detector, saas — репо в подпапках)",
     local: join(homedir(), "true-wash"),
-    env: false, // cfg.local — не git-репо: env-контракт невыполним, легаси-поведение
+    env: false, // cfg.local — не git-репо: env-контракт невыполним, агент сам делает ворктри
   },
 }
-// песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
-// тоже переезжает (прод-лог не засоряется смоук-тиками)
-const STATE_DIR_RAW = process.env.UWUWU_FACTORY_STATE_DIR
-const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-factory"))
+// state: песочница — UWUWU_FACTORY_STATE_DIR двигает state+lock, в песочнице
+// лог тоже переезжает (прод-лог не засоряется смоук-тиками). Дефолт-изоляция:
+// не-master чекаут без env получает свой state в branches/<ветка> и прод не
+// трогает (инцидент-класс 06.11 — прогон из ветки писал общий прод-state);
+// master — прежний прод-путь.
+const STATE_RESOLVED = resolveDaemonStateDir({
+  daemon: "uwuwu-factory",
+  envName: "UWUWU_FACTORY_STATE_DIR",
+  envRaw: process.env.UWUWU_FACTORY_STATE_DIR,
+  defaultDir: join(homedir(), ".local/state/uwuwu-factory"),
+  repoRoot: resolve(import.meta.dir, ".."),
+})
+const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
-  ? join(STATE_DIR, "uwuwu-factory.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const LOG_PATH = daemonLogPath({
+  stateDir: STATE_DIR, sandboxed: STATE_RESOLVED.sandboxed,
+  fileName: "uwuwu-factory.log", homeDir: homedir(),
+})
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** порог тишины сессии: активный ход рождает сообщения на каждом шаге LLM —
@@ -202,14 +210,6 @@ function loadState(): FactoryState {
           log(`state: запись ${k.slice(0, 10)} битая — пропущена`)
         }
       }
-    }
-    // переход на env-механику: записи, спавненные до неё (сессия была, envDir
-    // не заводился), доживают в старом поведении — рестарт не уводит их
-    // незакоммиченную работу в новый env
-    const stamped = stampLegacyEntries(out)
-    if (stamped.length > 0) {
-      saveState(out)
-      log(`переход: штамп легаси — ${stamped.map((id) => id.slice(0, 8)).join(", ")}`)
     }
     return out
   } catch {
@@ -611,9 +611,8 @@ async function startTask(
     return
   }
   // env-механика: work/task-ветку и ворктри делает фабрика, сессия стартует
-  // cwd=repo. Легаси-штамп или env:false-проект → старое поведение (агент сам)
-  const prev = state.tasks[task.rowId]
-  const useEnv = cfg.env !== false && prev?.legacy !== true
+  // cwd=repo. env:false-проект → поведение вне механики (агент сам)
+  const useEnv = cfg.env !== false
   let envCtx: SpawnEnvContext | undefined
   let envDir: string | undefined
   if (useEnv) {
@@ -676,7 +675,6 @@ async function startTask(
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
-    ...(prev?.legacy === true ? { legacy: true } : {}),
   }
   saveState(state)
   await setCellsSafe(board, task.rowId, {
@@ -685,7 +683,7 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (легаси-поведение)"} (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
 
 /** GC легаси-корней ворктри проекта (wt/, .worktrees/ под cfg.local):
@@ -858,16 +856,6 @@ async function restartTask(
 
 // ——— ревьювер: спавн/будильник на ревью-статусах ———
 
-/** Ворктри задачи по Branch-ячейке (легаси-fallback перехода: env-задачи
- *  берут repoDir из state). */
-async function resolveWorktree(local: string, branch: string): Promise<string> {
-  if (branch === "") return ""
-  try {
-    return worktreeByBranch(await sh(["git", "-C", local, "worktree", "list", "--porcelain"]), branch)
-  } catch { /* git недоступен — ревьюверу останется cfg.local/PR */ }
-  return ""
-}
-
 /** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
  *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
  *  поведение stall-сигнала, деградации нет. */
@@ -889,11 +877,10 @@ async function startReview(
     log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
     return
   }
-  // env-задача: repoDir из state (оба вида ревью — код живёт там);
-  // легаси-fallback: resolveWorktree по Branch-ячейке (переход)
-  const worktree = tracked.worktree !== ""
-    ? tracked.worktree
-    : kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
+  // ворктри задачи из state (repoDir env-задачи, пишет фабрика на спавне);
+  // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
+  // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
+  const worktree = tracked.worktree
   const ctx = { branch: task.branch, worktree, pr: task.pr }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
@@ -970,12 +957,9 @@ async function dispatchReviewAction(
       return undefined
     }
     case "rerun-reviewer": {
-      const worktree = d.tracked.worktree !== ""
-        ? d.tracked.worktree
-        : action.kind === "result" ? await resolveWorktree(d.cfg.local, d.row.branch) : ""
       const ok = await promptSession(
         d.tracked.reviewSessionID ?? "",
-        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree, pr: d.row.pr }),
+        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr }),
       )
       if (ok) {
         d.consumeComments()
@@ -1327,9 +1311,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
-          // сигнала не строятся, git-проба ворктри тоже скипается
-          const branchInWorktree = !prMerged && stalled &&
-            (tracked.worktree !== "" || (await resolveWorktree(cfg.local, row.branch)) !== "")
+          // сигнала не строятся; ворктри из state — для env-задач он всегда
+          // записан фабрикой, env:false живёт вне механики
+          const branchInWorktree = !prMerged && stalled && tracked.worktree !== ""
           const verdict = stallVerdict({
             status: row.status,
             sessionAlive: true,
@@ -1431,8 +1415,9 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   // гард dry-run ДО лока: невалидный режим не должен даже притворяться
-  // демоном (фиктивные записи не должны попадать в прод-state)
-  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  // демоном (фиктивные записи не должны попадать в прод-state). Эффективная
+  // песочница — с авто-изоляцией ветки: там прод-state и так недостижим.
+  if (DRY_RUN && !STATE_RESOLVED.sandboxed) {
     console.error("DRY_RUN требует UWUWU_FACTORY_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
     process.exit(1)
   }
@@ -1443,12 +1428,15 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
+  // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов
+  emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   // старт-свип окружений: сироты без записи в state и старый attic — только
   // прод (песочница/DRY_RUN не трогают реальный ENV_ROOT)
-  if (!DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  if (!DRY_RUN && !STATE_RESOLVED.sandboxed) {
     const sweep = sweepEnvs(envDeps(), {
       root: ENV_ROOT,
       // имена каталогов прошли sanitizeRowId (envPaths) — сравниваем в том же
@@ -1479,7 +1467,7 @@ async function main(): Promise<void> {
     tickCount++
     if (tickCount % 10 === 0) rotateLog()
     // GC легаси-ворктри: раз в GC_EVERY_TICKS тиков (≈час при poll 180s)
-    if (!DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW) && tickCount % GC_EVERY_TICKS === 0) {
+    if (!DRY_RUN && !STATE_RESOLVED.sandboxed && tickCount % GC_EVERY_TICKS === 0) {
       for (const [name, cfg] of Object.entries(projects)) {
         if (drain.isStopping()) break
         try {
