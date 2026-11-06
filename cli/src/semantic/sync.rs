@@ -437,7 +437,15 @@ pub async fn reconcile(
     }
 
     let kernel = scan_kernel_pages(sy, deadline).await?;
-    let diff = diff_index(&kernel, &store.chunk_metas()?);
+    if !kernel.completed {
+        // Прерванный бюджетом скан — рутинное событие поискового пути
+        // (бюджет 10s, живой бэклог). Частичный kernel против индекса дал бы
+        // ложные vanished — весь несосканированный хвост был бы вычищен
+        // (High ревью PR #96). Прерванный прогон — no-op: без prune,
+        // без last_reconcile_at; повторится следующим поиском.
+        return Ok(report);
+    }
+    let diff = diff_index(&kernel.metas, &store.chunk_metas()?);
 
     if !diff.vanished.is_empty() {
         report.pruned = store.prune(&diff.vanished)?;
@@ -447,6 +455,11 @@ pub async fn reconcile(
     }
 
     let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, deadline).await?;
+    if !repaired.completed {
+        // Частичный backfill не фиксирует прогон — дыры ретраятся
+        // следующим поиском, а не через сутки (Common ревью PR #96).
+        return Ok(report);
+    }
     report.pruned += repaired.pruned;
     report.repaired += repaired.repaired;
 
@@ -456,15 +469,24 @@ pub async fn reconcile(
     Ok(report)
 }
 
-/// Лёгкий полный скан ядра: keyset по id, без content; оборванный
-/// бюджетом возвращает частичный результат с flag'ом (прогон не
-/// засчитывается — см. reconcile).
-async fn scan_kernel_pages(sy: &SiYuan, deadline: Option<Instant>) -> Result<Vec<ChunkMeta>> {
+/// Результат скана ядра: меты всех целевых блоков + признак завершённости.
+struct ScanOutcome {
+    metas: Vec<ChunkMeta>,
+    /// Скан дошёл до конца ядра; false = бюджет исчерпан посреди —
+    /// прогон не засчитывается (см. reconcile).
+    completed: bool,
+}
+
+/// Лёгкий полный скан ядра: keyset по id, без content.
+async fn scan_kernel_pages(sy: &SiYuan, deadline: Option<Instant>) -> Result<ScanOutcome> {
     let mut kernel: Vec<ChunkMeta> = Vec::new();
     let mut cursor = String::new();
     loop {
         if !budget_left(deadline) {
-            return Ok(kernel);
+            return Ok(ScanOutcome {
+                metas: kernel,
+                completed: false,
+            });
         }
         let stmt = format!(
             "select id, root_id, box, hpath, updated from blocks \
@@ -483,10 +505,12 @@ async fn scan_kernel_pages(sy: &SiYuan, deadline: Option<Instant>) -> Result<Vec
             }
         }
         if page_len < PAGE {
-            break;
+            return Ok(ScanOutcome {
+                metas: kernel,
+                completed: true,
+            });
         }
     }
-    Ok(kernel)
 }
 
 /// Три класса расхождений ядра и индекса; порядок проверок важен:
@@ -536,16 +560,20 @@ fn diff_index(kernel: &[ChunkMeta], index: &[ChunkMeta]) -> IndexDiff {
     diff
 }
 
-/// Счётчики repair-прохода.
-struct RepairOutcome {
-    repaired: usize,
-    pruned: usize,
+/// Счётчики repair-прохода + признак завершённости.
+pub(crate) struct RepairOutcome {
+    pub(crate) repaired: usize,
+    pub(crate) pruned: usize,
+    /// Repair дошёл до конца списка; false = бюджет исчерпан посреди —
+    /// прогон не засчитывается (см. reconcile).
+    pub(crate) completed: bool,
 }
 
 /// Backfill/переэмбедд недостающих строк: классификация по длине —
 /// усохшие/переросшие блоки вычищаются из индекса (а при backfill просто
 /// не индексируются), полосу [MIN, MAX] ремонтирует переэмбедд.
-async fn repair_missing(
+/// Тестовый вход закрепляет контракт частичного прогона.
+pub(crate) async fn repair_missing(
     sy: &SiYuan,
     ollama: &OllamaClient,
     store: &mut Store,
@@ -555,9 +583,11 @@ async fn repair_missing(
     let mut outcome = RepairOutcome {
         repaired: 0,
         pruned: 0,
+        completed: true,
     };
     for id_batch in repair_ids.chunks(PAGE) {
         if !budget_left(deadline) {
+            outcome.completed = false;
             return Ok(outcome);
         }
         let rows = fetch_by_ids(sy, id_batch).await?;
@@ -577,6 +607,7 @@ async fn repair_missing(
         }
         for batch in target.chunks(EMBED_BATCH) {
             if !budget_left(deadline) {
+                outcome.completed = false;
                 return Ok(outcome);
             }
             let mut delta_report = SyncReport::default();

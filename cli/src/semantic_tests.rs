@@ -615,6 +615,92 @@ async fn reconcile_skips_within_daily_interval() {
     assert!(inputs.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
+    // High ревью PR #96: прерванный бюджетом скан — рутинное событие
+    // поискового пути (бюджет 10s, живой бэклог). Частичный kernel против
+    // индекса даёт ложные vanished (весь несосканированный хвост) —
+    // прерванный прогон обязан быть no-op: без prune, без last_reconcile_at.
+    let blocks = vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("seed");
+    assert_eq!(store.chunk_count().unwrap(), 1);
+    inputs.lock().unwrap().clear();
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        Some(Instant::now() - Duration::from_millis(1)),
+    )
+    .await
+    .expect("reconcile");
+
+    assert_eq!(report.pruned, 0, "частичный скан не prune'ит индекс");
+    assert_eq!(report.repaired, 0, "частичный скан не ремонтирует");
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        1,
+        "чанк пережил прерванный прогон"
+    );
+    assert_eq!(
+        store.meta("last_reconcile_at").unwrap().as_deref(),
+        Some("1000"),
+        "прерванный прогон не засчитывается"
+    );
+    assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconcile_interrupted_repair_does_not_count_run() {
+    // Common ревью PR #96: частичный backfill (бюджет умер посреди repair)
+    // не должен проставлять last_reconcile_at — дыры ретраятся следующим
+    // поиском, а не через сутки.
+    let (server, _) = kernel_server_blocks_only(vec![block(
+        "b1",
+        T0,
+        "первый чанк с длинным содержанием для индексации",
+        "/d",
+    )])
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let outcome = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["b1".to_string()],
+        Some(Instant::now() - Duration::from_millis(1)),
+    )
+    .await
+    .expect("repair_missing");
+
+    assert!(!outcome.completed, "частичный outcome помечен");
+    assert_eq!(outcome.repaired, 0);
+    assert!(inputs.lock().unwrap().is_empty());
+    assert_eq!(
+        store.meta("last_reconcile_at").unwrap().as_deref(),
+        Some("1000")
+    );
+}
+
 // ——— п.1 stale-чанки: классификация по длине (мин./макс. граница) ———
 
 #[tokio::test]
