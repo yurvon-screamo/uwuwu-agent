@@ -27,7 +27,7 @@ import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain, resolveDaemonStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
@@ -123,9 +123,10 @@ const STATE_RESOLVED = resolveDaemonStateDir({
 })
 const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = STATE_RESOLVED.sandboxed
-  ? join(STATE_DIR, "uwuwu-factory.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const LOG_PATH = daemonLogPath({
+  stateDir: STATE_DIR, sandboxed: STATE_RESOLVED.sandboxed,
+  fileName: "uwuwu-factory.log", homeDir: homedir(),
+})
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** порог тишины сессии: активный ход рождает сообщения на каждом шаге LLM —
@@ -1430,10 +1431,7 @@ async function main(): Promise<void> {
   log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
   // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов
-  if (STATE_RESOLVED.notice !== null) {
-    console.error(STATE_RESOLVED.notice)
-    log(STATE_RESOLVED.notice)
-  }
+  emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   // старт-свип окружений: сироты без записи в state и старый attic — только

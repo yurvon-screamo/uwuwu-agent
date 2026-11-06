@@ -16,7 +16,7 @@ import {
   normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
-import { acquireLock, makeDrain, resolveDaemonStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 
 // state: песочница — UWUWU_DREAMER_STATE_DIR двигает state+lock, в песочнице
 // лог тоже переезжает (прод-лог не засоряется смоук-тиками). Дефолт-изоляция:
@@ -31,9 +31,10 @@ const STATE_RESOLVED = resolveDaemonStateDir({
 })
 const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = STATE_RESOLVED.sandboxed
-  ? join(STATE_DIR, "uwuwu-dreamer.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-dreamer.log")
+const LOG_PATH = daemonLogPath({
+  stateDir: STATE_DIR, sandboxed: STATE_RESOLVED.sandboxed,
+  fileName: "uwuwu-dreamer.log", homeDir: homedir(),
+})
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 const DB_PATH = process.env.UWUWU_DREAMER_DB
@@ -365,10 +366,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   log(`uwuwu-dreamer: старт (tick=${TICK_SEC}s, idle=${IDLE_MS / 60_000}м, model=${MODEL.id}#${MODEL.variant}, db=${DB_PATH}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
-  if (STATE_RESOLVED.notice !== null) {
-    console.error(STATE_RESOLVED.notice)
-    log(STATE_RESOLVED.notice)
-  }
+  emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`сессий в state: ${Object.keys(state.sessions).length}`)
   let consecutiveFails = 0

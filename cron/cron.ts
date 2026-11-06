@@ -11,7 +11,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
-import { acquireLock, makeDrain, resolveDaemonStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
   type CronRow, type CronState,
@@ -44,9 +44,10 @@ const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
  *  не следует за runtime-подменой process.env.HOME, HOME-изоляция не работает);
  *  дефолт — sandbox-логика: в песочнице лог живёт в state-каталоге
  *  (прод-лог не засоряется смоук-тиками). */
-const LOG_PATH = process.env.UWUWU_CRON_LOG ?? (STATE_RESOLVED.sandboxed
-  ? join(STATE_DIR, "uwuwu-cron.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log"))
+const LOG_PATH = daemonLogPath({
+  override: process.env.UWUWU_CRON_LOG, stateDir: STATE_DIR,
+  sandboxed: STATE_RESOLVED.sandboxed, fileName: "uwuwu-cron.log", homeDir: homedir(),
+})
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
 /** DRY_RUN: полный цикл решений по реальным крон-доскам (чтение), спавны
@@ -407,10 +408,7 @@ async function main(): Promise<void> {
   await mcp.connect()
   log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
-  if (STATE_RESOLVED.notice !== null) {
-    console.error(STATE_RESOLVED.notice)
-    log(STATE_RESOLVED.notice)
-  }
+  emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
   let consecutiveFails = 0

@@ -9,7 +9,8 @@
 // sql-lag — get_doc доски отдаёт пустые box/hpath (тихое отключение).
 import { mkdirSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
+import { resolveDaemonStateDir, daemonLogPath } from "../lib/single-instance"
 
 const SCENARIO = process.env.SCENARIO ?? "resolve"
 
@@ -120,19 +121,25 @@ function scriptKernel(): { hpathCalls: string[]; boardGetDocCalls: number; misse
 }
 
 // ——— песочница: HOME от родителя; лог читаем оттуда же ———
-// Путь лога: при явной песочнице UWUWU_FACTORY_STATE_DIR (родитель задаёт —
-// дефолт-изоляция ветки задачи 20261106082216 не должна уводить лог из
-// подконтрольного пути) sandbox-лог живёт в state-каталоге; без env —
-// прод-путь от HOME.
+// Путь лога — ЕДИНОЕ правило с демоном: daemonLogPath над той же
+// resolveDaemonStateDir (ревью 108: правило не дублируется усечённой копией —
+// trim-контракт env и авто-изоляция ветки учитываются самой lib).
 // fail-get-doc: ретраи post() (4 попытки с бэкоффом) не должны растягивать
 // ребёнка — setTimeout исполняет сон немедленно (паттерн platform-mcp-errors)
 if (SCENARIO === "fail-get-doc") {
   globalThis.setTimeout = ((fn: () => void) => { fn(); return 0 as unknown as ReturnType<typeof setTimeout> }) as typeof setTimeout
 }
-const stateEnv = process.env.UWUWU_FACTORY_STATE_DIR
-const logPath = stateEnv !== undefined && stateEnv !== ""
-  ? join(stateEnv, "uwuwu-factory.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const resolved = resolveDaemonStateDir({
+  daemon: "uwuwu-factory",
+  envName: "UWUWU_FACTORY_STATE_DIR",
+  envRaw: process.env.UWUWU_FACTORY_STATE_DIR,
+  defaultDir: join(homedir(), ".local/state/uwuwu-factory"),
+  repoRoot: resolve(import.meta.dir, ".."),
+})
+const logPath = daemonLogPath({
+  stateDir: resolved.stateDir, sandboxed: resolved.sandboxed,
+  fileName: "uwuwu-factory.log", homeDir: homedir(),
+})
 mkdirSync(dirname(logPath), { recursive: true })
 
 const probe = scriptKernel()

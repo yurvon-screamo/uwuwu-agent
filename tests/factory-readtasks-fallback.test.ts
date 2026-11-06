@@ -30,8 +30,9 @@ describe("readTasks: фоллбек тела по тайтлу (detached-стр�
         ...process.env,
         HOME: home,
         UWUWU_SIYUAN_TOKEN: "test-token",
-        // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
-        // не должна уводить лог демона из прод-пути, который читает ребёнок
+        // явная песочница state: лог остаётся на пути, который читает ребёнок
+        // (при песочнице это state-каталог — правило daemonLogPath), а
+        // сидированный state не уводится в branches/<ветка> авто-изоляцией
         UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
         ...(scenario !== undefined ? { SCENARIO: scenario } : {}),
       },
