@@ -54,6 +54,12 @@ export interface TrackedTask {
    *  «раз за эпизод»; сброс делает демон: смена статуса — штатный путь,
    *  none-вердикт при стоявшем флаге — эпизод завершён) */
   stallSignaled?: boolean
+  /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
+   *  env-механика к задаче не применялась */
+  envDir?: string
+  /** задача доживает в старом поведении (cwd = cfg.local, агент сам делает
+   *  ворктри): штамп loadState для записей, спавненных до env-механики */
+  legacy?: boolean
 }
 
 export interface FactoryState {
@@ -186,9 +192,20 @@ export function kickoffModeOf(status: string): KickoffMode {
   return status === "In Progress" ? "implement" : "design"
 }
 
+/** Контекст окружения задачи для промптов: пути приходят из ensureEnv.
+ *  undefined — env-механика не применяется (легаси-штамп или env:false-проект),
+ *  агент действует по старым строкам (сам создаёт ворктри/ветку). */
+export interface SpawnEnvContext {
+  repoDir: string
+  branch: string
+  scratchDir: string
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
-export function spawnPrompt(rowId: string, project: string, repo: string, mode: KickoffMode = "design"): string {
+export function spawnPrompt(
+  rowId: string, project: string, repo: string, mode: KickoffMode = "design", env?: SpawnEnvContext,
+): string {
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -197,16 +214,25 @@ export function spawnPrompt(rowId: string, project: string, repo: string, mode: 
       ]
     : [
         "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-        "пока ждёшь ответа). План утрясан → план в тело → статус «Ревью плана» → конец хода:",
+        "пока ждёшь ответа). Перед планом — скан территории: uwuwu-cli task list на смежные задачи",
+        "+ gh pr list --state all (батч-сводки/hygiene съедают срезы планов тихо).",
+        "План утрясан → план в тело → статус «Ревью плана» → конец хода:",
         "ревью проводит отдельный праймари-агент фабрики, вердикт придёт wakeup'ом.",
         "После approve плана:",
+      ]
+  const workLine = env === undefined
+    ? ["создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй."]
+    : [
+        "работай в своём окружении задачи (фабрика создала, ветка уже от origin/master):",
+        `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
+        "Branch/Path-ячейки и сессии заполняет фабрика — тебе их трогать не нужно.",
       ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     ...stage,
-    "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
+    ...workLine,
     "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
     "«Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом: request_changes →",
     "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
@@ -254,13 +280,15 @@ export function conflictFixPrompt(rowId: string, pr: string): string {
 export type StartKind = KickoffMode | "continue" | "conflict-fix"
 
 /** Единственная точка выбора стартового промпта по виду старта.
- *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR). */
+ *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR); env
+ *  прокидывается в свежий спавн — work-line окружения задачи. */
 export function promptForStart(
   start: StartKind, rowId: string, project: string, repo: string, pr: string,
+  env?: SpawnEnvContext,
 ): string {
   if (start === "continue") return continuePrompt(rowId, project, repo)
   if (start === "conflict-fix") return conflictFixPrompt(rowId, pr)
-  return spawnPrompt(rowId, project, repo, start)
+  return spawnPrompt(rowId, project, repo, start, env)
 }
 
 /** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.
@@ -343,7 +371,12 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     ...(kind === "result"
       ? ["   origin/master + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.",]
       : []),
-    ...(ctx.worktree !== "" ? [`   Ворктри задачи: ${ctx.worktree}`] : []),
+    ...(ctx.worktree !== ""
+      ? [`   Ворктри задачи: ${ctx.worktree}`]
+      : kind === "result"
+        ? [`   Ворктри задачи не найден — ревью по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+           `   (git-команды из каталога сессии; ворктри не обязателен для диффа).`]
+        : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
@@ -546,19 +579,31 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   return { t: "signal", text }
 }
 
-/** Ветка и путь ворктри для задачи (row-id может начинаться с дефиса). */
-export function worktreePaths(root: string, rowId: string): { branch: string; worktree: string } {
-  const safe = rowId.replace(/^-+/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || "task"
-  return {
-    branch: `work/task-${safe}`,
-    worktree: `${root}/task-${safe}`,
+/** Ячейки доски, которые заполняет фабрика. Колонки добавляет владелец;
+ *  запись best-effort (нет колонки → тихий no-op ядра, работа не ломается). */
+export const PATH_CELL = "Path"
+export const DEV_SESSION_CELL = "Сессия dev"
+export const REVIEW_SESSION_CELL = "Сессия ревью"
+
+/** Штамп перехода: записи state, спавненные до env-механики, доживают в
+ *  старом поведении (рестарт не уводит незакоммиченную работу в новый env).
+ *  envDir отсутствует И сессия была спавнена → легаси; карантинные записи
+ *  без сессии не штампуются — их спавн ещё попробует env-механику. */
+export function stampLegacyEntries(state: FactoryState): string[] {
+  const stamped: string[] = []
+  for (const [rowId, tracked] of Object.entries(state.tasks)) {
+    if (tracked.envDir !== undefined || tracked.legacy === true) continue
+    if (tracked.sessionID === "") continue
+    tracked.legacy = true
+    stamped.push(rowId)
   }
+  return stamped
 }
 
-/** Валидация записи state.json. Три легальных формата: полный
- *  (ses_ + пути), чистый карантин (всё пусто) и гибрид (сессия умерла,
- *  пути живы — работа сохраняется до решения юзера). worktree/branch —
- *  legacy (ворктри теперь делает агент, демону не нужен). */
+/** Валидация записи state.json. Легальные форматы: полный (ses_ + пути),
+ *  чистый карантин (всё пусто) и гибрид (сессия умерла, пути живы — работа
+ *  сохраняется до решения юзера). worktree = repoDir env-задачи; branch —
+ *  производное имя ветки (пишет фабрика) или легаси-имя агента. */
 export function isValidTracked(v: unknown): v is TrackedTask {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
@@ -578,6 +623,8 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
+  if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
+  if (t.legacy !== undefined && typeof t.legacy !== "boolean") return false
   if (
     t.reviewSessionID !== undefined &&
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
@@ -625,6 +672,10 @@ export interface ProjectCfg {
   board: string
   repo: string
   local: string
+  /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
+   *  вне механики (cfg.local не git-репо → контракт невыполним): легаси-
+   *  поведение, агент сам делает ворктри/ветку. Дефолт true. */
+  env?: boolean
 }
 
 /** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
@@ -650,7 +701,10 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
     if (c.board.trim() === "" || c.repo.trim() === "" || c.local.trim() === "") {
       throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — board/repo/local не могут быть пустыми`)
     }
-    out[name] = { board: c.board, repo: c.repo, local: c.local }
+    if (c.env !== undefined && typeof c.env !== "boolean") {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — env должен быть boolean`)
+    }
+    out[name] = { board: c.board, repo: c.repo, local: c.local, ...(c.env !== undefined ? { env: c.env } : {}) }
   }
   if (Object.keys(out).length === 0) {
     throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")
@@ -670,6 +724,10 @@ export interface PassCounters {
   wakeups: number
   /** чистки state (Done / строка исчезла) */
   cleanups: number
+  /** окружения задачи: создано/снесено (rm) / в attic за тик */
+  envCreated: number
+  envRemoved: number
+  envAtticked: number
   /** задачи под наблюдением на конец прохода (этот проект) */
   watched: number
   /** фейлы спавна: короткие «rowId-префикс: причина» */
@@ -680,6 +738,7 @@ export interface PassCounters {
  *  видимы — что сделано и что живо (прод-кейс 05.11). */
 export function formatPassSummary(project: string, c: PassCounters): string {
   const failures = c.failures.length > 0 ? `, фейлы=${c.failures.length} (${c.failures.join("; ")})` : ""
+  const envPart = `, env=+${c.envCreated}/-${c.envRemoved}/attic:${c.envAtticked}`
   return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
-    `, будильники=${c.wakeups}, чистки=${c.cleanups}, наблюдение=${c.watched}${failures}`
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}, наблюдение=${c.watched}${failures}`
 }

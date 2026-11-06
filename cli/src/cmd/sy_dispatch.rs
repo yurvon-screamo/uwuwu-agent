@@ -1,9 +1,11 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
 use super::read_resolve;
-use crate::cmd::cli::{Commands, CronSub, KernelSub, SemanticSub, TaskSub};
+use crate::cmd::cli::{Commands, CronSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::markdown;
 use crate::md_heading;
+use crate::siyuan_person as person;
+use crate::siyuan_person::person_target;
 use crate::siyuan::{FileFetch, SiYuan};
 use crate::siyuan_guard as guard;
 use crate::siyuan_guard::{Journal, JournalRow, Probe, Verdict};
@@ -36,6 +38,7 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Blob { key, out } => blob_run(&key, out).await,
+        Commands::Person { command } => person_run(command).await,
         Commands::Projects => projects_run().await,
         Commands::Shot { .. } => Err(anyhow!(
             "shot: не портирован на SiYuan (v1) — headless chromium на http://127.0.0.1:6806 с Access Auth Code"
@@ -578,6 +581,43 @@ async fn restore_journal_cells(
             Ok(())
         }
         None => bail!("ключ PR не найден на доске — PR «{}» не восстановлен", row.pr),
+    }
+}
+
+// ——— person: персона владельца (SiYuan-док) ———
+
+pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
+    let sy = SiYuan::from_env()?;
+    let target = person_target();
+    match command {
+        PersonSub::Show => {
+            let md = person::show(&sy, &target).await?;
+            print!("{md}");
+            Ok(())
+        }
+        PersonSub::Append { stdin, text } => {
+            let md = collect_text(stdin, &text)?;
+            if md.trim().is_empty() {
+                bail!("append: нужен текст (позиционный или --stdin)");
+            }
+            let doc_id = person::append(&sy, &target, &md).await?;
+            println!("дописано: {}:{} ({doc_id})", target.notebook, target.hpath);
+            Ok(())
+        }
+        PersonSub::Replace { stdin, md } => {
+            let content = read_body_input(md.as_deref(), stdin)?;
+            if content.trim().is_empty() {
+                bail!(
+                    "replace: пустой контент — персона не может быть пустой; правь/удаляй док в UI"
+                );
+            }
+            let doc_id = person::replace(&sy, &target, &content).await?;
+            println!(
+                "персона перезаписана: {}:{} ({doc_id})",
+                target.notebook, target.hpath
+            );
+            Ok(())
+        }
     }
 }
 

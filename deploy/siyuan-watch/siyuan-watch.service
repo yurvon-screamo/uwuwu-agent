@@ -1,0 +1,7 @@
+[Unit]
+Description=siyuan-demo watchdog: probe 127.0.0.1:6806, start container if down
+
+[Service]
+Type=oneshot
+# Одна watchdog-итерация; неудача хила = exit 1 (виден в journalctl)
+ExecStart=/usr/bin/python3 %h/.local/bin/siyuan-watch
