@@ -5,7 +5,10 @@
 //   resolve    — доска без spawnable-строк: allow при стоящем флаге эпизода —
 //                демон обязан снять holdSignaled (выход из эпизода);
 //   done-clean — трекнутая Done-строка с сессионными ячейками: чистка state
-//                + очистка ячеек (инвариант гарда), ноль спавнов.
+//                + очистка ячеек (инвариант гарда), ноль спавнов;
+//   claim-skip — пустой state + untracked In Progress с живой дев-заявкой
+//                (task claim): внешняя работа идёт — не спавнить дубль,
+//                HOLD-эпизода нет (20261105174319).
 // HOME задаются родителем ДО старта процесса: os.homedir() в bun читает env
 // только на старте (инцидент 06.11: тест с runtime-HOME ходил в прод-state).
 import { mkdirSync, mkdtempSync, readFileSync } from "node:fs"
@@ -14,7 +17,9 @@ import { join } from "node:path"
 
 const SCENARIO = process.env.GUARD_SCENARIO === "done-clean"
   ? "done-clean"
-  : process.env.GUARD_SCENARIO === "resolve" ? "resolve" : "hold"
+  : process.env.GUARD_SCENARIO === "claim-skip"
+    ? "claim-skip"
+    : process.env.GUARD_SCENARIO === "resolve" ? "resolve" : "hold"
 const AV_ID = "20260101000000-abcdef"
 
 interface MockRow {
@@ -45,7 +50,20 @@ const DONE_ROWS: MockRow[] = [{
 // resolve: доска без spawnable-строк — сирот и untracked нет, allow при любом флаге
 const RESOLVE_ROWS: MockRow[] = HOLD_ROWS.map((r) => ({ ...r, status: "Todo", devSession: undefined }))
 
-const rows = SCENARIO === "done-clean" ? DONE_ROWS : SCENARIO === "resolve" ? RESOLVE_ROWS : HOLD_ROWS
+// claim-skip: untracked In Progress с живой дев-заявкой (мок /api/session/:id отвечает 200)
+const CLAIM_ROWS: MockRow[] = [{
+  id: "20261107000000-row1",
+  status: "In Progress",
+  devSession: "ses_ext1",
+  bodyDoc: "20261107000000-doc1",
+  title: "Заявленная задача",
+}]
+
+const rows = SCENARIO === "done-clean"
+  ? DONE_ROWS
+  : SCENARIO === "claim-skip"
+    ? CLAIM_ROWS
+    : SCENARIO === "resolve" ? RESOLVE_ROWS : HOLD_ROWS
 
 function scriptTick(): string[] {
   const calls: string[] = []
@@ -166,7 +184,12 @@ function scriptTick(): string[] {
         return new Response(JSON.stringify({}), { status: 200 })
       }
       calls.push("session-get")
-      return new Response(JSON.stringify({ id: "ses_x" }), { status: 200 })
+      // claim-skip: живая заявка (liveness alive); остальные сценарии —
+      // мёртвые сессии сирот (404 → liveness dead: сироты-спавны)
+      if (SCENARIO === "claim-skip") {
+        return new Response(JSON.stringify({ id: "ses_ext1" }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: -1, msg: "session gone" }), { status: 404 })
     }
     if (url.includes("/api/session")) {
       calls.push("session-create")

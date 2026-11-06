@@ -42,7 +42,7 @@ describe("tickProject: гард каскада при потере state", () =>
   })
 
   async function runTick(
-    scenario: "hold" | "done-clean" | "resolve", stateJson: string,
+    scenario: "hold" | "done-clean" | "resolve" | "claim-skip", stateJson: string,
   ): Promise<GuardVerdict> {
     // Arrange: state и service.json песочницы — до старта ребёнка
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), stateJson)
@@ -152,5 +152,19 @@ describe("tickProject: гард каскада при потере state", () =>
     // Assert: Hold-эпизода нет — легитимная чистка не алертит
     expect(verdict.holdSignaled).toBeNull()
     expect(verdict.comments).toEqual([])
+  })
+
+  test("claim-skip: живая дев-заявка без трека — не спавнится, HOLD-эпизода нет", async () => {
+    // Act: пустой state + untracked In Progress с непустой «Сессия dev»
+    // (мок сессии отвечает живостью)
+    const verdict = await runTick("claim-skip", JSON.stringify({ tasks: {} }))
+
+    // Assert: фабрика не заспавнила дубль — внешняя работа уже идёт
+    expect(verdict.sessionCreates).toBe(0)
+    expect(verdict.prompts).toBe(0)
+    // Assert: живая заявка — не сирота: HOLD-эпизод не открыт, алерта нет
+    expect(verdict.holdSignaled).toBeNull()
+    expect(verdict.comments).toEqual([])
+    expect(verdict.taskCount).toBe(0)
   })
 })
