@@ -9,10 +9,14 @@
   3) пустой --parent — легаси-дефолт Projects;
   4) «metadata is not ready» в post(): ровно METADATA_BAIL_ATTEMPTS попыток с паузами
      +2s/+5s → различимый bail с хинтом; транспорт — прежний бюджет ретраев;
-     перманентный code≠0 — KernelRefused fail-fast (merge PR #80);
-  5) сырой «/» в тайтле санитизируется в ∕ (U+2215) — ровно ОДИН вызов
-     createDocWithMd; сырой «/» становится разделителем пути, и ядро молча
-     создаёт цепочку вложенных доков-оболочек (инцидент 06.11, /devops).
+      перманентный code≠0 — KernelRefused fail-fast (merge PR #80);
+   5) сырой «/» в тайтле санитизируется в ∕ (U+2215) — ровно ОДИН вызов
+      createDocWithMd; сырой «/» становится разделителем пути, и ядро молча
+      создаёт цепочку вложенных доков-оболочек (инцидент 06.11, /devops).
+   6) гард номера ADR: тайтл с «ADR-NNN» — живой SQL-find по папке-приёмнику;
+      занятый номер — предупреждение в stderr, создание продолжается; тайтл без
+      номера — пробы нет; отказ пробы — предупреждение «не состоялась»
+      (профилактика гонки параллельных дримеров 06.11).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_create.py
@@ -23,7 +27,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -85,6 +89,98 @@ def run_create(kernel: FakeKernel, parent: str, title: str = "Probe") -> str:
     finally:
         os.unlink(md_file.name)
     return buffer.getvalue()
+
+
+def run_create_capture_stderr(kernel: FakeKernel, parent: str,
+                              title: str = "Probe") -> tuple[str, str]:
+    """run_create с захватом stderr: гард номера ADR пишет предупреждения туда,
+    stdout («создан: …») остаётся машинно-читаемым."""
+    md_file = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+    try:
+        md_file.write("# probe\n")
+        md_file.close()
+        original_post = wiki_ops.post
+        wiki_ops.post = kernel.post
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            args = SimpleNamespace(title=title, file=md_file.name, parent=parent)
+            with redirect_stdout(out), redirect_stderr(err):
+                wiki_ops.cmd_create(args)
+        finally:
+            wiki_ops.post = original_post
+    finally:
+        os.unlink(md_file.name)
+    return out.getvalue(), err.getvalue()
+
+
+class AdrNumberGuardKernel(FakeKernel):
+    """FakeKernel + SQL-двойник: ответ на пробу занятости номера гардом create."""
+
+    def __init__(self, siblings: list[str] | None = None, sql_fails: bool = False):
+        super().__init__()
+        self.siblings = siblings or []
+        self.sql_fails = sql_fails
+
+    def post(self, path: str, body: dict, attempts: int = 6):
+        if path == "/api/query/sql":
+            self.calls.append((path, body))
+            if self.sql_fails:
+                raise wiki_ops.KernelRefused("POST /api/query/sql: code=-1 msg=boom")
+            return {"data": [{"content": s, "hpath": f"/uwuwu/ADR/{s}"}
+                             for s in self.siblings]}
+        return super().post(path, body)
+
+    def sql_stmts(self) -> list[str]:
+        return [body["stmt"] for path, body in self.calls if path == "/api/query/sql"]
+
+
+class AdrNumberGuard(unittest.TestCase):
+    """create предупреждает о занятом ADR-номере в папке-приёмнике и продолжает."""
+
+    KERNEL_DOC = "ADR-033: KernelUnavailableError — типизированный класс"
+
+    def test_taken_number_warns_and_create_continues(self):
+        kernel = AdrNumberGuardKernel(siblings=[self.KERNEL_DOC])
+        _, err = run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-033: Маркер e2e-сессий")
+        self.assertIn("ПРЕДУПРЕЖДЕНИЕ", err)
+        self.assertIn("ADR-033", err)
+        self.assertIn(self.KERNEL_DOC, err)
+        self.assertEqual(len(kernel.create_calls()), 1)
+
+    def test_free_number_creates_without_warning(self):
+        kernel = AdrNumberGuardKernel(siblings=[self.KERNEL_DOC])
+        _, err = run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-034: Маркер e2e-сессий")
+        self.assertEqual(err, "")
+        self.assertEqual(len(kernel.sql_stmts()), 1)
+
+    def test_title_without_adr_number_skips_probe(self):
+        kernel = AdrNumberGuardKernel(siblings=[self.KERNEL_DOC])
+        run_create_capture_stderr(kernel, "/uwuwu/ADR", "Probe")
+        self.assertEqual(kernel.sql_stmts(), [])
+
+    def test_probe_scopes_to_target_folder_notebook(self):
+        kernel = AdrNumberGuardKernel(siblings=[])
+        run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-034: Маркер")
+        stmt = kernel.sql_stmts()[0]
+        self.assertIn("box='nb-projects'", stmt)
+        self.assertIn("hpath like '/uwuwu/ADR/%'", stmt)
+
+    def test_probe_failure_degrades_to_notice_and_create_survives(self):
+        kernel = AdrNumberGuardKernel(sql_fails=True)
+        out, err = run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-034: Маркер")
+        self.assertIn("не состоялась", err)
+        self.assertIn("создан:", out)
+
+    def test_zero_padded_numbers_compare_numerically(self):
+        kernel = AdrNumberGuardKernel(siblings=["ADR-41: чужой док"])
+        _, err = run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-041: новый док")
+        self.assertIn("ПРЕДУПРЕЖДЕНИЕ", err)
+
+    def test_warning_names_numbering_canon_and_continuation(self):
+        kernel = AdrNumberGuardKernel(siblings=[self.KERNEL_DOC])
+        _, err = run_create_capture_stderr(kernel, "/uwuwu/ADR", "ADR-033: дубль")
+        self.assertIn("первый по времени", err)
+        self.assertIn("создание продолжено", err)
 
 
 class ParentResolution(unittest.TestCase):
