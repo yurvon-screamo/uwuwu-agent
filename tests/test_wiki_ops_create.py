@@ -8,7 +8,8 @@
      корень и неизвестный префикс — RuntimeError с вариантами/списком ноутбуков;
   3) пустой --parent — легаси-дефолт Projects;
   4) «metadata is not ready» в post(): ровно METADATA_BAIL_ATTEMPTS попыток с паузами
-     +2s/+5s → различимый bail с хинтом; прочие code≠0 и транспорт — прежние 6 ретраев.
+     +2s/+5s → различимый bail с хинтом; транспорт — прежний бюджет ретраев;
+     перманентный code≠0 — KernelRefused fail-fast (merge PR #80).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_create.py
@@ -219,7 +220,8 @@ class FakeTransport:
 
 
 class MetadataBailDiscipline(unittest.TestCase):
-    """post(): metadata-not-ready — ≤3 попытки → различимый bail; прочее — 6 ретраев."""
+    """post(): metadata-not-ready — ≤3 попытки → различимый bail; транспорт — полный
+    бюджет ретраев; перманентный code≠0 — KernelRefused fail-fast (merge PR #80)."""
 
     def setUp(self):
         self._url, self._token = wiki_ops.URL, wiki_ops.TOKEN
@@ -262,9 +264,13 @@ class MetadataBailDiscipline(unittest.TestCase):
         self.assertNotIn("тайтл", message)
         self.assertNotIn("родитель", message)
 
-    def test_other_error_code_keeps_full_retries(self):
+    def test_other_error_code_is_permanent_refusal_fail_fast(self):
+        # Объединённая семантика (merge PR #80): перманентный code≠0 — KernelRefused
+        # немедленно, без ретраев. Намерение исходного пина («прочее ≠ metadata-bail»)
+        # сохранено: класс отличен, bail-хинта в сообщении нет.
         transport, error = self._run_post([{"code": -1, "msg": "boom"}], "/api/query/sql")
-        self.assertEqual(len(transport.requests), 6)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsInstance(error, wiki_ops.KernelRefused)
         self.assertNotIn("metadata-bail", str(error))
 
     def test_transport_error_keeps_full_retries(self):

@@ -29,6 +29,10 @@ pub(crate) enum TaskSub {
             help = "Аттач в тело (repeatable)"
         )]
         attach: Vec<std::path::PathBuf>,
+        // Осмотр скелета без записи: живой create ради просмотра костяка
+        // кормит триаж-демон мусорными черновиками.
+        #[arg(long = "dry-run", help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)")]
+        dry_run: bool,
     },
     /// Очередь задач доски
     List {
