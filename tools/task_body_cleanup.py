@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import subprocess  # nosec B404 — argv списком, бинарь фиксирован shutil.which
@@ -58,10 +59,10 @@ def normalize(s: str) -> str:
     """Нормализованная форма для пост-чека «Комментов»: боевой нормализатор
     wiki_ops (пробельные разбеги, пайпы таблиц, separator-пэддинг, пустые
     строки — всё это ядро недетерминированно меняет при roundtrip) + вырез
-    zero-width, схлоп артефактных #-цепочек и снятие emphasis-маркеров
-    (ядро пере-токенизирует bold у спецсимволов: «**A & B**» → «**A** **&**
-    **B**» — формат-уровень, не потеря текста). Байтовая сверка невыполнима,
-    критерий — «текст без потерь»."""
+    zero-width, схлоп артефактных #-цепочек, снятие emphasis-маркеров
+    (ядро пере-токенизирует bold у спецсимволов) и unescape HTML-сущностей
+    (ядро то экранирует «<id>» как «&lt;id&gt;», то нет). Байтовая сверка
+    невыполнима, критерий — «текст без потерь»."""
     s = s.translate({ord(c): None for c in ZW})
     s = re.sub(r"(#+)(\s#+)+", r"\1", s)
     lines = wiki_ops._normalized_lines(s)
@@ -73,12 +74,23 @@ def normalize(s: str) -> str:
     # inline-кода нормализатор классифицирует как таблицы и несёт их
     # внутренние пробельные разбеги дословно — ядро же рефловит их при
     # реимпорте; для критерия «текст без потерь» пробельные разбеги — шум
-    return "\n".join(" ".join(line.split()) for line in joined.split("\n"))
+    return "\n".join(" ".join(line.split()) for line in html.unescape(joined).split("\n"))
+
+
+MIGRATED_COMMENTS_H2 = re.compile(r"^## Комменты( \(миграция из афины\))?\s*$", flags=re.M)
 
 
 def comments_section(export_md: str) -> str:
     i = export_md.find("\n## Комменты\n")
     return export_md[i + 1:] if i != -1 else ""
+
+
+def comments_block_any_name(export_md: str) -> str:
+    """Блок «Комменты» независимо от имени секции (системное или миграционное):
+    до-состояние сравнивается с после-состоянием без привязки к имени —
+    трансформ легитимно переименовывает миграционный заголовок."""
+    m = MIGRATED_COMMENTS_H2.search(export_md)
+    return export_md[m.start():] if m else ""
 
 
 def fresh(doc_id: str) -> str:
@@ -167,11 +179,46 @@ def _drop_stub_sections(content: str) -> str:
     return "\n".join(out)
 
 
+def _drop_log_sections(content: str) -> str:
+    """Секции логов хода («Ход работы/Лог/Прогресс/Шаг N/Итерация») — срез:
+    ход работы живёт в статусах и комментах, не в теле (канон). Лог-строки
+    вне таких секций (разбросанные коммит-хэши) — ручной режим."""
+    lines = content.split("\n")
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        if re.match(r"^## (Ход работы|Лог\b|Прогресс\b|Шаг \d|Итерация)", line):
+            skipping = True
+            continue
+        if skipping and re.match(r"^## ", line):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _demote_leading_h1(content: str) -> str:
+    """Content-H1 до первой H2-секции — псевдотитул старых тел («# Spike: …»,
+    не равный тайтлу дока): превращается в жирную строку. H1 в середине тела —
+    ручной режим (может быть осмысленным разделителем)."""
+    out, seen_h2, done = [], False, False
+    for line in content.split("\n"):
+        if not done and not seen_h2 and re.fullmatch(r"# .+", line):
+            out.append("**" + line[2:].strip() + "**")
+            done = True
+            continue
+        if re.match(r"^## ", line):
+            seen_h2 = True
+        out.append(line)
+    return "\n".join(out)
+
+
 def transform_mechanical(export_md: str, title: str) -> str:
     """Безопасные трансформы: срез content-H1 == тайтл; схлоп подряд пустых
     дублей H2; дроп секций-заглушек старого костяка; «Комменты (миграция из
-    афины)» → системное имя. Смысл текста не трогается. «## Комменты»
-    вырезаются здесь: досыпает их дословно apply_body — иначе задвоение."""
+    афины)» → системное имя; срез секций логов хода; демоция ведущего
+    content-H1. Смысл текста не трогается. «## Комменты» вырезаются здесь:
+    досыпает их дословно apply_body — иначе задвоение."""
     content_full = tba.content_of(export_md, title)
     content, _ = tba.cut_comments(content_full)
     content = "\n".join(
@@ -179,8 +226,17 @@ def transform_mechanical(export_md: str, title: str) -> str:
         if not re.fullmatch(rf"# {re.escape(title)}", line.strip()))
     content = _collapse_consecutive_dup_headers(content)
     content = _drop_stub_sections(content)
+    content = _drop_log_sections(content)
+    content = _demote_leading_h1(content)
     content = content.replace("## Комменты (миграция из афины)", "## Комменты")
     return content.rstrip() + "\n"
+
+
+def _records_of(block: str) -> str:
+    """Записи блока «Комменты» без строки заголовка: трансформ легитимно
+    переименовывает миграционный заголовок — сверяются записи, не имя."""
+    lines = block.split("\n")
+    return "\n".join(lines[1:]) if lines and lines[0].startswith("## ") else block
 
 
 def apply_body(doc_id: str, project: str, new_content: str,
@@ -198,7 +254,15 @@ def apply_body(doc_id: str, project: str, new_content: str,
     if not after.strip():
         print(f"FAIL {doc_id}: export пуст после replace — откат из undo-журнала")
         return False
-    before_c, after_c = comments_section(export_before), comments_section(after)
+    before_c = _records_of(comments_block_any_name(export_before))
+    # sync-lag guard: экспорт сразу после replace может отнести старьё
+    # (синк ядра бывает >2 с) — расхождение проверяется повторным экспортом
+    for attempt in range(2):
+        after_c = _records_of(comments_section(fresh(doc_id)))
+        if normalize(before_c) == normalize(after_c):
+            break
+        if attempt == 0:
+            time.sleep(4)
     if normalize(before_c) != normalize(after_c):
         print(f"FAIL {doc_id}: «## Комменты» потеряны/изменены — откат из undo-журнала; "
               f"diff: {scratch / f'{doc_id}.comments.diff'}")
