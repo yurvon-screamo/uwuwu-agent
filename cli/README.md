@@ -39,6 +39,7 @@ uwuwu-cli --help    # грамматика актуальна
 | --- | --- |
 | `projects` | реестр проектов (живой проход по организ-дереву, описания из README-доков) |
 | `read <slug>` | живое чтение: слаг → docId (hpath/тайтл через kernel API); markdown-экспорт дока |
+| `person show\|append\|replace` | персона владельца (SiYuan-док Experience:/personal/PERSON): show — markdown дока (агенты читают в начале работы, дока нет → честная ошибка с подсказкой); append — дописать долговременный факт (владелец/дример; дока нет → создать со скелетом: шапка приватности + секции; пост-чек дубля hpath → громкий отказ); replace — полная перезапись на месте (docId стабилен, дока нет → создать без скелета). Один инстанс SiYuan на все машины — синков и пуш-политики нет; env-шов UWUWU_PERSON_NOTEBOOK/UWUWU_PERSON_HPATH — только для e2e |
 | `blob <key> [--out f]` | скачать ассет из assets/ воркспейса SiYuan |
 | `kernel ping\|sql\|file\|ls\|export\|render [--timeout SECS]` | живые kernel-пробы из агентской сессии без env-токена (токен из конфигурации cli): one-shot без ретраев — сырое состояние ядра на первом ответе; вердикты (Bytes/Missing, пустой export/ls) → exit 0, неудача пробы (Failed/таймаут/код≠0/auth 401) → exit ≠0. Классы: живость+auth (`ping`), деградация индекса («metadata is not ready») и произвольная диагностика (`sql`), «tree not found»/FS-истина (`file`/`ls`), пустые экспорты (`export`), доски/пагинация строк (`render`: view.rowCount/view.rows as-is) |
 | `doctor [--project uwuwu] [--since MIN]` | диагностика деградации ядра (read-only): kernel live, wave-скан docker logs («commit tx failed»; DEGRADED при ≥5 за окно, меньше — шум), доска проекта (мёртвые привязки, пустые ZWJ-тела), FS↔SQL count по открытым ноутбукам. Exit 0/1/2: чисто / деградация (включая недоступное ядро) / пробы не выполнились. Контейнер — `UWUWU_SIYUAN_CONTAINER` (деф. siyuan-demo), FS-проба — локальный `UWUWU_SIYUAN_WS` |
@@ -59,12 +60,12 @@ cli/
 | --- | --- |
 | `siyuan.rs` | клиент SiYuan kernel (REST) + встроенный MCP (database) |
 | `siyuan_task.rs` | таск-модель: доски/строки/тела/комменты |
+| `siyuan_person.rs` | персона владельца: резолв/скелет/show/append/replace |
 | `cmd/sy_dispatch.rs` | хендлеры всех команд (единственный бекенд) |
     cmd/                 # clap-грамматика + диспетчер команд
   tests/
-    common/mod.rs        # mock-шлюз (сценарные шаги) + изоляция HOME
-    mcp_transport.rs     # интеграция: контракт MCP-транспорта vs mock-гейтвей
-    task_create_flow.rs  # интеграция: идемпотентность create, rm — против mock-гейтвея
+    read_e2e.rs          # e2e read на живом ядре (UWUWU_E2E=1, серийно)
+    person_e2e.rs        # e2e person на живом ядре (UWUWU_E2E=1, zz-e2e-док через env-шов)
 ```
 
 ## How search works
