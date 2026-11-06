@@ -19,6 +19,7 @@ import subprocess  # nosec B404 — фейковые CompletedProcess для к�
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 
@@ -106,6 +107,14 @@ class StartContainerTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("podman exploded", detail)
 
+    def test_missing_podman_binary_reports_failure_with_detail(self):
+        def runner(cmd, **_):
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'podman'")
+
+        ok, detail = siyuan_watch.start_container(runner=runner)
+        self.assertFalse(ok)
+        self.assertIn("No such file", detail)
+
 
 class IncidentRecordTests(unittest.TestCase):
     def test_record_carries_fixed_contract_fields(self):
@@ -175,6 +184,7 @@ class RunOnceTests(unittest.TestCase):
             read_state=lambda: {"container_status": "exited", "exit_code": 0, "restarts": 1},
             start=start,
             log_path=self.log_path,
+            sleeper=lambda _seconds: None,
         )
 
         self.assertEqual(exit_code, 0)
@@ -204,6 +214,7 @@ class RunOnceTests(unittest.TestCase):
             read_state=lambda: {"container_status": "exited", "exit_code": 0, "restarts": 0},
             start=lambda: (True, ""),
             log_path=self.log_path,
+            sleeper=lambda _seconds: None,
         )
 
         self.assertEqual(exit_code, 1)
@@ -216,11 +227,55 @@ class RunOnceTests(unittest.TestCase):
             read_state=lambda: {"container_status": "running", "exit_code": 0, "restarts": 0},
             start=lambda: (True, ""),
             log_path=self.log_path,
+            sleeper=lambda _seconds: None,
         )
 
         self.assertEqual(exit_code, 1)
         record = json.loads(self.log_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(record["container_status"], "running")
+
+    def test_heal_verifies_port_after_grace_not_immediately(self):
+        probes = iter([False, True])
+        sleeps = []
+
+        exit_code = siyuan_watch.run_once(
+            probe=lambda: next(probes),
+            read_state=lambda: {"container_status": "exited", "exit_code": 0, "restarts": 0},
+            start=lambda: (True, ""),
+            log_path=self.log_path,
+            sleeper=sleeps.append,
+            heal_grace_s=3.0,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sleeps, [3.0])
+
+    def test_healthy_tick_sleeps_nothing(self):
+        sleeps = []
+
+        exit_code = siyuan_watch.run_once(
+            probe=lambda: True,
+            read_state=lambda: {},
+            start=lambda: (True, ""),
+            log_path=self.log_path,
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sleeps, [])
+
+
+class DefaultWiringTests(unittest.TestCase):
+    """Дефолтная сборка run_once/main тянет модульные пробы, а не замыкание тестов."""
+
+    def test_run_once_defaults_delegate_to_module_probe(self):
+        with patch.object(siyuan_watch, "probe_tcp", return_value=True):
+            self.assertEqual(siyuan_watch.run_once(), 0)
+
+    def test_main_returns_run_once_verdict(self):
+        with patch.object(siyuan_watch, "run_once", return_value=0) as once:
+            self.assertEqual(siyuan_watch.main(), 0)
+            once.assert_called_once_with()
 
 
 if __name__ == "__main__":

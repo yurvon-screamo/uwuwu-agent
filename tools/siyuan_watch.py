@@ -26,6 +26,7 @@ import json
 import socket
 import subprocess  # nosec B404 — назначение скрипта: запуск podman с фиксированными аргументами
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -34,6 +35,9 @@ PROBE_PORT = 6806
 PROBE_TIMEOUT_S = 3
 CONTAINER = "siyuan-demo"
 LOG_FILE = Path.home() / ".local" / "state" / "siyuan-watch" / "watch.log"
+# podman start возвращается при старте PID 1 — слушателю ядра нужен короткий
+# грейс, иначе медленный бут даёт ложный «failed to heal» (ревью PR #85, Low#1)
+HEAL_GRACE_S = 3.0
 
 EVENT_DOWN = "container_down"
 
@@ -109,6 +113,8 @@ def run_once(
     read_state: Callable[[], dict] | None = None,
     start: Callable[[], tuple[bool, str]] | None = None,
     log_path: Path = LOG_FILE,
+    sleeper: Callable[[float], None] = time.sleep,
+    heal_grace_s: float = HEAL_GRACE_S,
     stderr=None,
 ) -> int:
     """Одна watchdog-итерация: 0 — здоров/вылечен, 1 — вниз и не подняли."""
@@ -125,6 +131,7 @@ def run_once(
     if not started:
         print(f"failed to start container {CONTAINER} due to {failure}", file=stderr)
         return 1
+    sleeper(heal_grace_s)
     if probe():
         print(f"started container {CONTAINER} after watchdog incident", file=stderr)
         return 0
@@ -132,5 +139,9 @@ def run_once(
     return 1
 
 
+def main() -> int:
+    return run_once()
+
+
 if __name__ == "__main__":
-    sys.exit(run_once())
+    sys.exit(main())
