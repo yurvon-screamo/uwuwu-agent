@@ -293,14 +293,15 @@ pub(crate) fn split_watermark(mark: &str) -> (String, String) {
 /// Шаг scan-page: страница дельты + точечный fetch полных строк по PK,
 /// индексированные по id — тяжёлый content не идёт через keyset-скан
 /// (ядро без индекса по updated, полный скан таскает мегабайты).
+/// Возвращает и ids страницы: они нужны delta_sync для indexed_rows.
 async fn fetch_classifiable_page(
     sy: &SiYuan,
     cursor_updated: &str,
     cursor_id: &str,
-) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>)> {
+) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>, Vec<String>)> {
     let rows = sy.sql(&delta_page_stmt(cursor_updated, cursor_id)).await?;
     if rows.is_empty() {
-        return Ok((rows, std::collections::HashMap::new()));
+        return Ok((rows, std::collections::HashMap::new(), Vec::new()));
     }
     let page_ids: Vec<String> = rows
         .iter()
@@ -311,7 +312,7 @@ async fn fetch_classifiable_page(
         .into_iter()
         .map(|row| (row.meta.block_id.clone(), row))
         .collect();
-    Ok((rows, by_id))
+    Ok((rows, by_id, page_ids))
 }
 
 /// Дельта-цикл: страницы → skip идемпотентного / фильтр длины → эмбедд
@@ -334,15 +335,11 @@ pub async fn delta_sync(
             report.budget_exhausted = true;
             break;
         }
-        let (rows, by_id) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
+        let (rows, by_id, page_ids) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
         if rows.is_empty() {
             break;
         }
         let page_len = rows.len();
-        let page_ids: Vec<String> = rows
-            .iter()
-            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
         let indexed = store.indexed_rows(&page_ids)?;
 
         let outcome = process_page(&rows, &by_id, &indexed);
