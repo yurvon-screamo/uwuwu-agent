@@ -247,13 +247,19 @@ export function spawnPrompt(
 /** Рестарт-промпт (сессия девелопера умерла/карантин → fresh spawn).
  *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
  *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
-export function continuePrompt(rowId: string, project: string, repo: string): string {
+export function continuePrompt(rowId: string, project: string, repo: string, env?: SpawnEnvContext): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
     "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+        ]
+      : []),
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
     "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
