@@ -237,7 +237,12 @@ def transform_mechanical(export_md: str, title: str) -> str:
     content = _drop_stub_sections(content)
     content = _drop_log_sections(content)
     content = _demote_leading_h1(content)
-    content = content.replace("## Комменты (миграция из афины)", "## Комменты")
+    # миграционный блок «Комменты (миграция из афины)» НЕ переименовывается:
+    # у тел с двумя блоками rename рождал дубль системного имени и двойной
+    # аппенд записей; аудит исключает оба имени из эвристик. Rename делает
+    # только apply — когда системного блока у тела нет вовсе.
+    # канон-имя bug-секции (вариант «BDD-сценарий» не матчится критериями типа)
+    content = content.replace("## BDD-сценарий", "## Сценарий (BDD)")
     return content.rstrip() + "\n"
 
 
@@ -248,12 +253,48 @@ def _records_of(block: str) -> str:
     return "\n".join(lines[1:]) if lines and lines[0].startswith("## ") else block
 
 
+def _rollback(doc_id: str, project: str, export_before: str, scratch: Path) -> None:
+    """Реальный откат тела в до-состояние (план п.11): payload без
+    frontmatter/рендер-строки — иначе восстановление само портит тело."""
+    m = re.search(r"^title: (.+)$", export_before, flags=re.M)
+    restore_payload = tba.content_of(export_before, m.group(1).strip() if m else "")
+    rollback_file = scratch / f"{doc_id}.rollback.md"
+    rollback_file.write_text(restore_payload, encoding="utf-8")
+    subprocess.run(  # nosec B603 — фиксированный бинарь
+        [UWUWU_CLI, "task", "body", doc_id, "--project", project, "--replace",
+         "--md", str(rollback_file)],
+        capture_output=True, text=True, check=True)
+
+
+def _comments_ok(doc_id: str, export_before: str, scratch: Path) -> bool:
+    """Пост-чек «Комментов» с sync-lag guard; при расхождении пишет diff."""
+    before_c = _records_of(comments_block_any_name(export_before))
+    after_c = ""
+    for attempt in range(2):
+        after_c = _records_of(comments_section(fresh(doc_id)))
+        if normalize(before_c) == normalize(after_c):
+            return True
+        if attempt == 0:
+            time.sleep(4)
+    (scratch / f"{doc_id}.comments.diff").write_text(
+        f"--- ДО\n{before_c}\n--- ПОСЛЕ\n{after_c}", encoding="utf-8")
+    return False
+
+
 def apply_body(doc_id: str, project: str, new_content: str,
                export_before: str, scratch: Path, label: str) -> bool:
     """Сборка нового тела (контент + блок «Комменты» любого имени дословно)
     → cli replace → пост-чек; при провале — РЕАЛЬНЫЙ откат тела в
     до-состояние (план п.11 обещает откат, а не рецепт)."""
-    payload = new_content.rstrip() + "\n\n" + comments_block_any_name(export_before).lstrip("\n")
+    payload = new_content.rstrip()
+    plain = comments_section(export_before)
+    if plain:
+        payload += "\n\n" + plain.lstrip("\n")
+    else:
+        migrated = comments_block_any_name(export_before)
+        if migrated:
+            payload += "\n\n" + migrated.replace(
+                "## Комменты (миграция из афины)", "## Комменты", 1).lstrip("\n")
     md_file = scratch / f"{doc_id}.{label}.md"
     md_file.write_text(payload, encoding="utf-8")
     subprocess.run(  # nosec B603 — фиксированный бинарь, аргументы из аудита
@@ -263,30 +304,9 @@ def apply_body(doc_id: str, project: str, new_content: str,
     after = fresh(doc_id)
     ok = bool(after.strip())
     if ok:
-        before_c = _records_of(comments_block_any_name(export_before))
-        # sync-lag guard: экспорт сразу после replace может отнести старьё
-        # (синк ядра бывает >2 с) — расхождение проверяется повторным экспортом
-        after_c = ""
-        for attempt in range(2):
-            after_c = _records_of(comments_section(fresh(doc_id)))
-            if normalize(before_c) == normalize(after_c):
-                break
-            if attempt == 0:
-                time.sleep(4)
-        ok = normalize(before_c) == normalize(after_c)
-        if not ok:
-            (scratch / f"{doc_id}.comments.diff").write_text(
-                f"--- ДО\n{before_c}\n--- ПОСЛЕ\n{after_c}", encoding="utf-8")
+        ok = _comments_ok(doc_id, export_before, scratch)
     if not ok:
-        # реальный откат: до-контент без frontmatter/рендер-строки (план п.11)
-        m = re.search(r"^title: (.+)$", export_before, flags=re.M)
-        restore_payload = tba.content_of(export_before, m.group(1).strip() if m else "")
-        rollback_file = scratch / f"{doc_id}.rollback.md"
-        rollback_file.write_text(restore_payload, encoding="utf-8")
-        subprocess.run(  # nosec B603 — фиксированный бинарь
-            [UWUWU_CLI, "task", "body", doc_id, "--project", project, "--replace",
-             "--md", str(rollback_file)],
-            capture_output=True, text=True, check=True)
+        _rollback(doc_id, project, export_before, scratch)
         print(f"FAIL {doc_id}: пост-чек не прошёл — тело откачено в до-состояние; "
               f"diff: {scratch / f'{doc_id}.comments.diff'}")
         return False
