@@ -15,7 +15,9 @@ kernel-транспорт (post, конфиг, константы) без выи
                                    одного ноутбука (/uwuwu/ADR → Projects, /affine →
                                    Experience); пустой --parent → Projects (легаси)
   append <docId> --md <файл> [--force]         дописать markdown-блоки в конец
-  replace <docId> --md <файл>        заменить док целиком
+  replace <docId> --md <файл> [--base <снапшот>] [--force]
+                                   заменить док целиком; --base — снапшот
+                                   свежести (нетронутый вывод export до правки)
   delete <docId> [--force]           снести док в корзину SiYuan (восстановимо)
   orgls                              дерево: ноутбуки + подпапки
   find "тайтл"                       поиск дока по заголовку
@@ -64,6 +66,19 @@ export и appendBlock идут attempts=1, единственный ретрай
 --force — осознанный дубль single-shot: одна отсылка без сверок и ретраев,
 сбой — громкая ошибка, повтор — за оператором (слепой луп за флагом вернул бы
 инцидент ×N).
+
+replace: полный rewrite — guard свежести по снапшоту (инцидент 05.11: rewrite
+«Стек и архитектура» пересоздал док и тихо затёр параллельный append другой
+сессии). Без --base и без --force — отказ с рецептом (тихая потеря чужого
+append невидима ни одному из параллельных писателей). --base — нетронутый
+вывод export, снятый до правки: exportMdContent байт-стабилен между вызовами
+и несёт updated дока в lastmod frontmatter (живые пробы 06.11), сверка со
+свежим export ловит любую правку после снапшота, не только bump updated;
+расхождение — отказ до removeDocByID (ничего не снесено) с рецептом «перечитай,
+влей дельту, пересними снапшот». Нормализация _normalized_lines гасит
+рендер-шум ядра. --force старше --base: осознанный overwrite single-shot без
+сверок, по образцу append --force. Остаточное TOCTOU-окно (секунды между
+сверкой и сносом) неустранимо без CAS ядра — как у append guard'а (ADR-038).
 
 orgls: каждый stmt несёт явный limit (ORG_LS_LIMIT) — ядро SiYuan без LIMIT
 молча отдаёт первые 64 строки (см. tests/test_wiki_ops_orgls.py).
@@ -415,6 +430,40 @@ def cmd_append(a):
             time.sleep(attempt)
 
 
+def _require_fresh_snapshot(doc_id: str, base_file: str | None) -> None:
+    """Guard lost-update перед remove+create (инцидент 05.11: полный rewrite
+    «Стек и архитектура» затёр параллельный append другой сессии). Снапшот
+    --base — нетронутый вывод wiki_ops export, снятый до правки: exportMdContent
+    байт-стабилен между вызовами и несёт updated дока в lastmod frontmatter
+    (живые пробы 06.11), поэтому сравнение со свежим export ловит любую правку
+    после снапшота, не только bump updated. Нормализация _normalized_lines гасит
+    известный рендер-шум ядра — ложный отказ на whitespace-дрейфе невозможен.
+    Отказ — строго до первой мутации (removeDocByID ещё не звался). Остаточное
+    TOCTOU-окно (секунды между сверкой и сносом) неустранимо без CAS ядра —
+    прецедент: append guard (ADR-038)."""
+    if base_file is None:
+        raise RuntimeError(
+            "replace требует --base <снапшот.md> — нетронутый вывод wiki_ops export, "
+            "снятый до правки (workflow: export → правь копию → replace --base снапшот), "
+            "или --force для осознанного overwrite без сверки: без снапшота параллельный "
+            "append другой сессии теряется тихо (инцидент 05.11, «Стек и архитектура»)"
+        )
+    base_text = Path(base_file).read_text()
+    try:
+        current = _export_content(doc_id)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"guard свежести не состоялся — export не читается ({exc}); "
+            "replace не выполнялся, повтори операцию целиком"
+        ) from None
+    if _normalized_lines(base_text) != _normalized_lines(current):
+        raise RuntimeError(
+            f"док {doc_id} менялся после снапшота (--base) — replace затёр бы чужие правки. "
+            f"Перечитай текущий контент: wiki_ops export {doc_id}; влей дельту в новый "
+            "контент, пересними снапшот и повтори; --force — overwrite без сверки"
+        )
+
+
 def cmd_replace(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
@@ -425,6 +474,10 @@ def cmd_replace(a):
     rows = _sql_rows(stmt)
     if not rows:
         raise RuntimeError("док не найден")
+    # guard свежести до первой мутации; --force старше --base — осознанный
+    # overwrite идёт без сверок, как append --force
+    if not a.force:
+        _require_fresh_snapshot(doc_id, a.base)
     hpath, box = rows[0]["hpath"], rows[0]["box"]
     nb_name = next((n["name"] for n in notebooks() if n["id"] == box), "Projects")
     post("/api/filetree/removeDocByID", {"id": a.docId})
@@ -870,6 +923,10 @@ def main():
     p = sub.add_parser("replace")
     p.add_argument("docId")
     p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--base", default=None,
+                   help="снапшот свежести: нетронутый вывод wiki_ops export этого дока, снятый до правки")
+    p.add_argument("--force", action="store_true",
+                   help="осознанный overwrite single-shot: без guard'а свежести, --base не требуется")
     p.set_defaults(fn=cmd_replace)
     p = sub.add_parser("delete")
     p.add_argument("docId")
