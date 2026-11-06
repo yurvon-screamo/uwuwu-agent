@@ -67,13 +67,12 @@ import {
   type ReviewKind,
   type FactoryState,
   type StartKind,
-  type KickoffMode,
   type SpawnEnvContext,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
 } from "./factory-lib"
-import { ensureEnv, cleanupEnv, sweepEnvs, type EnvDeps } from "./env"
+import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 // ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
@@ -1292,7 +1291,9 @@ async function main(): Promise<void> {
   if (!DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
     const sweep = sweepEnvs(envDeps(), {
       root: ENV_ROOT,
-      activeRowIds: new Set(Object.keys(state.tasks)),
+      // имена каталогов прошли sanitizeRowId (envPaths) — сравниваем в том же
+      // нормализованном виде (изменится формат id — живой env не снесётся)
+      activeRowIds: new Set(Object.keys(state.tasks).map(sanitizeRowId)),
       nowMs: Date.now(),
       maxAgeMs: ENV_MAX_AGE_MS,
     })

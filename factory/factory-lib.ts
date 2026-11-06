@@ -247,13 +247,19 @@ export function spawnPrompt(
 /** Рестарт-промпт (сессия девелопера умерла/карантин → fresh spawn).
  *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
  *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
-export function continuePrompt(rowId: string, project: string, repo: string): string {
+export function continuePrompt(rowId: string, project: string, repo: string, env?: SpawnEnvContext): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
     "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+        ]
+      : []),
     "",
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
     "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
@@ -262,11 +268,19 @@ export function continuePrompt(rowId: string, project: string, repo: string): st
 }
 
 /** Конфликт-kickoff: PR ветки задачи конфликтует с master (владелец флипнул
- *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте). */
-export function conflictFixPrompt(rowId: string, pr: string): string {
+ *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте).
+ *  env называет существующее окружение задачи — агент не плодит новое. */
+export function conflictFixPrompt(rowId: string, pr: string, env?: SpawnEnvContext): string {
   return [
     `[factory] Задача ${rowId}: PR ветки конфликтует с master (${pr}).`,
     "",
+    ...(env !== undefined
+      ? [
+          `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
+          `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+          "",
+        ]
+      : []),
     "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
     "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
     "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
@@ -281,13 +295,13 @@ export type StartKind = KickoffMode | "continue" | "conflict-fix"
 
 /** Единственная точка выбора стартового промпта по виду старта.
  *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR); env
- *  прокидывается в свежий спавн — work-line окружения задачи. */
+ *  сквозной для всех веток — рестарт env-задачи называет окружение. */
 export function promptForStart(
   start: StartKind, rowId: string, project: string, repo: string, pr: string,
   env?: SpawnEnvContext,
 ): string {
-  if (start === "continue") return continuePrompt(rowId, project, repo)
-  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr)
+  if (start === "continue") return continuePrompt(rowId, project, repo, env)
+  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, env)
   return spawnPrompt(rowId, project, repo, start, env)
 }
 

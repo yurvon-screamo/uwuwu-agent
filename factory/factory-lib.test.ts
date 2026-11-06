@@ -259,6 +259,19 @@ describe("continuePrompt", () => {
     expect(p).not.toContain("«Ревью плана»")
     expect(p).not.toContain("🤖")
   })
+  test("env-контекст: окружение уже существует — своё не создавай, пути названы", () => {
+    const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", {
+      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+    })
+    expect(p).toContain("уже существует — своё не создавай")
+    expect(p).toContain("/home/x/agents-env/r1/repo")
+    expect(p).toContain("work/task-r1")
+    expect(p).toContain("Незакоммиченное — там же")
+  })
+  test("без env-контекста (легаси/env:false) — строки окружения нет", () => {
+    const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
+    expect(p).not.toContain("своё не создавай")
+  })
 })
 
 describe("kickoffModeOf", () => {
@@ -405,6 +418,14 @@ describe("conflictFixPrompt", () => {
     expect(p).not.toContain("Стадия Design")
     expect(p).not.toContain("Ревью плана")
   })
+  test("env-контекст назван, чтобы агент не плодил окружение заново", () => {
+    const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", env)
+    expect(p).toContain(env.repoDir)
+    expect(p).toContain(env.branch)
+    expect(p).toContain("своё не создавай")
+    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9")).not.toContain("своё не создавай")
+  })
 })
 
 describe("promptForStart: единственная точка выбора стартового промпта", () => {
@@ -422,13 +443,18 @@ describe("promptForStart: единственная точка выбора ст�
     expect(promptForStart("implement", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
     expect(promptForStart("design", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
   })
-  test("env прокидывается в свежий спавн (work-line окружения)", () => {
+  test("env прокидывается во все ветки (work-line/окружение названо)", () => {
     const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
     expect(promptForStart("implement", ...args, env))
       .toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", env))
     expect(promptForStart("implement", ...args, env)).toContain(env.repoDir)
-    // conflict-fix и continue — env не нужен: инструкции ветко-относительны
-    expect(promptForStart("conflict-fix", ...args, env)).toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9"))
+    // рестарт env-задачи называет окружение — агент не плодит новое
+    expect(promptForStart("continue", ...args, env))
+      .toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", env))
+    expect(promptForStart("continue", ...args, env)).toContain(env.repoDir)
+    expect(promptForStart("conflict-fix", ...args, env))
+      .toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", env))
+    expect(promptForStart("conflict-fix", ...args, env)).toContain(env.repoDir)
   })
 })
 

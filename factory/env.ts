@@ -156,22 +156,28 @@ export interface SweepEnvsResult {
 }
 
 /** Старт-свип: env-каталоги без записи в state и attic старше maxAge —
- *  снос. Реестр самочистящийся: содержимое root ≈ активные задачи. */
+ *  снос. Реестр самочистящийся: содержимое root ≈ активные задачи.
+ *  Гонка с чисткой (каталог исчез между readdir и stat) — пропуск записи,
+ *  не падение старта демона. */
 export function sweepEnvs(deps: EnvDeps, args: SweepEnvsArgs): SweepEnvsResult {
   const result: SweepEnvsResult = { sweptEnvs: [], sweptAttic: [] }
   if (!existsSync(args.root)) return result
   for (const entry of readdirSync(args.root)) {
     const full = join(args.root, entry)
-    if (!statSync(full).isDirectory()) continue
-    if (entry === ATTIC_DIR) {
-      result.sweptAttic.push(...sweepAttic(deps, full, args.nowMs, args.maxAgeMs))
-      continue
+    try {
+      if (!statSync(full).isDirectory()) continue
+      if (entry === ATTIC_DIR) {
+        result.sweptAttic.push(...sweepAttic(deps, full, args.nowMs, args.maxAgeMs))
+        continue
+      }
+      if (args.activeRowIds.has(entry)) continue
+      if (args.nowMs - statSync(full).mtimeMs <= args.maxAgeMs) continue
+      rmSync(full, { recursive: true, force: true })
+      result.sweptEnvs.push(entry)
+      deps.log(`env ${entry}: сирота (нет в state, старше ${Math.round(args.maxAgeMs / 86_400_000)} суток) — снесена`)
+    } catch (e) {
+      deps.log(`свип: ${entry} — пропуск (${errText(e)})`)
     }
-    if (args.activeRowIds.has(entry)) continue
-    if (args.nowMs - statSync(full).mtimeMs <= args.maxAgeMs) continue
-    rmSync(full, { recursive: true, force: true })
-    result.sweptEnvs.push(entry)
-    deps.log(`env ${entry}: сирота (нет в state, старше ${Math.round(args.maxAgeMs / 86_400_000)} суток) — снесена`)
   }
   return result
 }
@@ -180,10 +186,14 @@ function sweepAttic(deps: EnvDeps, atticDir: string, nowMs: number, maxAgeMs: nu
   const swept: string[] = []
   for (const entry of readdirSync(atticDir)) {
     const full = join(atticDir, entry)
-    if (nowMs - statSync(full).mtimeMs <= maxAgeMs) continue
-    rmSync(full, { recursive: true, force: true })
-    swept.push(entry)
-    deps.log(`env attic/${entry}: старше ${Math.round(maxAgeMs / 86_400_000)} суток — снесена`)
+    try {
+      if (nowMs - statSync(full).mtimeMs <= maxAgeMs) continue
+      rmSync(full, { recursive: true, force: true })
+      swept.push(entry)
+      deps.log(`env attic/${entry}: старше ${Math.round(maxAgeMs / 86_400_000)} суток — снесена`)
+    } catch (e) {
+      deps.log(`свип attic: ${entry} — пропуск (${errText(e)})`)
+    }
   }
   return swept
 }
