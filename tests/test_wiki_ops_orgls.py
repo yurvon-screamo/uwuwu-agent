@@ -8,6 +8,12 @@ limit 100000 → все строки). Контракты:
   3) живой инвариант — вывод покрывает все корневые имена listDocsByPath
      и строки-документы каждой секции == count(*) блоков ноутбука.
 
+Контракты сбоя (задача 20261104072714 — «сбой маскируется под "не найден"»):
+  4) сбой SQL по ноутбуку посреди обхода → ошибка с именем ноутбука и
+     последней причиной, exit 1, stdout ПУСТ (атомарность: частичное
+     дерево нельзя прочитать как полное);
+  5) «не найден» в тексте ошибки нет — сбой ≠ not-found.
+
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_orgls.py
 """
@@ -15,8 +21,9 @@ import io
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,10 +43,12 @@ class FakeKernel:
     (для проверки клиентского капа).
     """
 
-    def __init__(self, notebook_count: int = 1, kernel_cuts_unlimited: bool = True):
+    def __init__(self, notebook_count: int = 1, kernel_cuts_unlimited: bool = True,
+                 fail_sql_for: str | None = None):
         self.calls: list[tuple[str, dict]] = []
         self.notebook_count = notebook_count
         self.kernel_cuts_unlimited = kernel_cuts_unlimited
+        self.fail_sql_for = fail_sql_for
 
     def post(self, path: str, body: dict, attempts: int = 6):
         self.calls.append((path, body))
@@ -48,6 +57,8 @@ class FakeKernel:
                          for i in range(self.notebook_count)]
             return {"notebooks": notebooks}
         if path == "/api/query/sql":
+            if self.fail_sql_for is not None and self.fail_sql_for in body["stmt"]:
+                raise RuntimeError(f"POST {path}: code=500 msg=boom")
             limit = self._stmt_limit(body["stmt"])
             if limit is None and self.kernel_cuts_unlimited:
                 limit = KERNEL_DEFAULT_LIMIT
@@ -139,6 +150,32 @@ class LiveWorkspaceInvariant(unittest.TestCase):
                                  f"строки-документы ({len(doc_names)}) != count(*) ({total[0]['c']})")
         self.assertGreaterEqual(len(sections.get("Experience", [])), EXPERIENCE_MIN_DOCS)
         self.assertGreaterEqual(len(sections.get("Projects", [])), PROJECTS_MIN_DOCS)
+
+
+class MidTreeFailureIsLoudAndAtomic(unittest.TestCase):
+    """Сбой SQL по ноутбуку посреди обхода ≠ «не найдено»: причина + пустой stdout."""
+
+    def run_orgls_via_main(self, kernel) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["wiki_ops.py", "orgls"]), \
+                patch.object(wiki_ops, "post", kernel.post), \
+                redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                wiki_ops.main()
+        self.assertEqual(cm.exception.code, 1,
+                         "сбой обхода обязан завершаться exit 1, а не молча/успешно")
+        return out.getvalue(), err.getvalue()
+
+    def test_mid_tree_sql_failure_names_notebook_and_keeps_stdout_empty(self):
+        kernel = FakeKernel(notebook_count=2, fail_sql_for="nb1")
+        out, err = self.run_orgls_via_main(kernel)
+        self.assertIn("ERROR:", err)
+        self.assertIn("orgls", err)
+        self.assertIn("NB1", err, "имя упавшего ноутбука не дошло до ошибки")
+        self.assertIn("code=500", err, "последняя причина не дошла до ошибки")
+        self.assertNotIn("не найден", err)
+        self.assertNotIn("не найдено", err)
+        self.assertEqual(out, "", "частичное дерево в stdout читается как полное")
 
 
 if __name__ == "__main__":
