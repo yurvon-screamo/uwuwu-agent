@@ -43,8 +43,11 @@ fn cron_keys(full: bool) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Сценарий cron-флоу: крон-доска uwuwu (ключи по сценарию) + фольга foilcap
-/// (полные ключи) — pause с --project целится в чужую доску.
-fn cron_scenario(cron_keys_full: bool) -> MockScenario {
+/// (полные ключи) — pause с --project целится в чужую доску. `inserted_title` —
+/// тайтл строки вставки в render (как реальное ядро рендерит block-контент):
+/// verify матчит по itemID, но посторонний тайтл сделал бы DuplicateTitle-
+/// сценарии тихо неработоспособными.
+fn cron_scenario(cron_keys_full: bool, inserted_title: &str) -> MockScenario {
     MockScenario {
         notebook: "nb-projects",
         boards: vec![
@@ -63,7 +66,7 @@ fn cron_scenario(cron_keys_full: bool) -> MockScenario {
             ("/uwuwu/Кроны uwuwu", vec![CRON_DOC]),
             ("/foilcap/Кроны foilcap", vec![FOIL_DOC]),
         ],
-        inserted_row: MockRow::new("item-mock", "новый крон"),
+        inserted_row: MockRow::new("item-mock", inserted_title),
         ..MockScenario::default()
     }
 }
@@ -92,13 +95,44 @@ async fn set_via_flow(server: &MockServer, title: &str) -> anyhow::Result<()> {
     .await
 }
 
+/// Полный Set для cron_run (Set-arm glue: cron_schedule + prompt + wiring).
+#[allow(clippy::too_many_arguments)]
+fn set_cmd(
+    title: &str,
+    r#in: Option<&str>,
+    every: Option<&str>,
+    at: Option<&str>,
+    cron_expr: Option<&str>,
+    project: Option<&str>,
+) -> CronSub {
+    CronSub::Set {
+        title: title.into(),
+        r#in: r#in.map(String::from),
+        every: every.map(String::from),
+        at: at.map(String::from),
+        cron_expr: cron_expr.map(String::from),
+        project: project.map(String::from),
+        stdin: false,
+    }
+}
+
+/// Env на заглушку: для тестов, где отказ случается до kernel-вызовов
+/// (cron_schedule), — без зависимости от env предыдущего serial-теста.
+fn set_env_on_placeholder() {
+    std::env::set_var("UWUWU_SIYUAN_URL", "http://127.0.0.1:1");
+    std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+}
+
 /// (1) легаси-доска без Schedule: громкий отказ, мутаций не было.
+/// Через cron_run (Set-arm glue: cron_schedule + prompt + production-пейсинг
+/// остаются транзитно покрытыми); бейл до verify-ретрая — спит ноль.
 #[tokio::test]
 #[serial_test::serial]
 async fn set_bails_loud_before_mutations_when_board_lacks_schedule_key() {
-    let (kernel, server) = MockKernel::start(cron_scenario(false)).await;
+    let (kernel, server) = MockKernel::start(cron_scenario(false, "ночной крон")).await;
+    set_env(&server);
 
-    let err = set_via_flow(&server, "ночной крон")
+    let err = cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
         .await
         .expect_err("доска без Schedule должна давать отказ");
 
@@ -117,14 +151,16 @@ async fn set_bails_loud_before_mutations_when_board_lacks_schedule_key() {
 }
 
 /// (2) полноценная доска: bound-строка, Schedule/Last Run текстом, Status mSelect.
+/// Через cron_run; confirm с первой попытки — до спящего ретрая не доходит.
 #[tokio::test]
 #[serial_test::serial]
 async fn set_creates_bound_row_and_fills_cells() {
-    let mut scenario = cron_scenario(true);
+    let mut scenario = cron_scenario(true, "ночной крон");
     scenario.row_visible_after_adds = 1;
     let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
 
-    set_via_flow(&server, "ночной крон")
+    cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
         .await
         .expect("set на полной доске");
 
@@ -174,14 +210,16 @@ async fn set_creates_bound_row_and_fills_cells() {
 }
 
 /// (3) тайтл уже жив строкой: отказ без мутаций (дедуп по строкам, не только телам).
+/// Через cron_run; бейл до вставки — спит ноль.
 #[tokio::test]
 #[serial_test::serial]
 async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
-    let mut scenario = cron_scenario(true);
+    let mut scenario = cron_scenario(true, "ночной крон");
     scenario.rows = vec![cron_row("20261105110000-live1", "ночной крон", "")];
     let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
 
-    let err = set_via_flow(&server, "ночной крон")
+    let err = cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
         .await
         .expect_err("дубль-тайтл в живых строках");
 
@@ -200,10 +238,13 @@ async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
 }
 
 /// (4) ядро «потеряло» вставку: после ретрая ×1 — громкий отказ.
+/// Единственный set-тест, доходящий до спящего ретрая — через
+/// cron_set_with_pacing с мгновенным пейсингом (тесты не наследуют
+/// прод-паузу 1.5 s, вынесенную в RowInsertPacing).
 #[tokio::test]
 #[serial_test::serial]
 async fn set_bails_when_row_never_appears_in_render() {
-    let mut scenario = cron_scenario(true);
+    let mut scenario = cron_scenario(true, "призрачный крон");
     scenario.row_visible_after_adds = usize::MAX;
     let (kernel, server) = MockKernel::start(scenario).await;
 
@@ -222,11 +263,42 @@ async fn set_bails_when_row_never_appears_in_render() {
     );
 }
 
+/// Валидация расписания: нужен ровно один из --in/--every/--at/--cron.
+/// Отказ до kernel-вызовов — мок не нужен.
+#[tokio::test]
+#[serial_test::serial]
+async fn set_schedule_requires_exactly_one_option() {
+    set_env_on_placeholder();
+
+    let err = cron_run(set_cmd("крон без опций", None, None, None, None, None))
+        .await
+        .expect_err("ноль опций — отказ");
+    assert!(
+        err.to_string().contains("ровно один"),
+        "суть отказа: {err}"
+    );
+
+    let err = cron_run(set_cmd(
+        "крон с двумя опциями",
+        Some("10m"),
+        Some("30m"),
+        None,
+        None,
+        None,
+    ))
+    .await
+    .expect_err("две опции — отказ");
+    assert!(
+        err.to_string().contains("ровно один"),
+        "суть отказа: {err}"
+    );
+}
+
 /// (5) pause с --project пишет Status на доске указанного проекта.
 #[tokio::test]
 #[serial_test::serial]
 async fn pause_targets_project_board() {
-    let mut scenario = cron_scenario(true);
+    let mut scenario = cron_scenario(true, "новый крон");
     scenario.rows = vec![cron_row("20261105110000-kc1", "крон foilcap", "")];
     let (kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
@@ -309,7 +381,7 @@ fn cron_family_accepts_project_flag() {
 /// Сценарий rm: крон-доска с одной живой строкой (привязка body-<item>);
 /// `binding_alive: false` — привязка мертва (block get — not found).
 fn rm_scenario(binding_alive: bool) -> MockScenario {
-    let mut scenario = cron_scenario(true);
+    let mut scenario = cron_scenario(true, "новый крон");
     scenario.rows = vec![cron_row("20261105120000-item01", "ночной крон", "")
         .with_doc("body-20261105120000-item01")];
     scenario.block_get_alive = binding_alive;

@@ -51,7 +51,9 @@ fn create_scenario(
     sc
 }
 
-async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
+/// Create идёт напрямую через create_with_pacing с мгновенным пейсингом
+/// (минуя dispatch-клей: attach/dry_run пути этих тестов не касаются).
+async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
     set_env(server);
     let sy = SiYuan::from_env()?;
     create_with_pacing(
@@ -73,7 +75,7 @@ async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
 async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
     let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, true)).await;
 
-    create_via_cli(&server)
+    create_via_flow(&server)
         .await
         .expect("ретрай перепривязывает сироту");
 
@@ -109,7 +111,7 @@ async fn create_retries_row_insert_once_when_render_lags() {
     let (kernel, server) =
         MockKernel::start(create_scenario(&["item-a", "item-row"], 2, false, false)).await;
 
-    create_via_cli(&server)
+    create_via_flow(&server)
         .await
         .expect("ретрай доводит строку до render");
 
@@ -140,7 +142,7 @@ async fn create_bails_when_render_shows_title_with_other_item() {
     let (kernel, server) =
         MockKernel::start(create_scenario(&["item-a"], usize::MAX, true, false)).await;
 
-    let err = create_via_cli(&server)
+    let err = create_via_flow(&server)
         .await
         .expect_err("чужая строка с тем же тайтлом — отказ");
 
@@ -167,7 +169,7 @@ async fn create_bails_loudly_when_row_missing_after_retry() {
     ))
     .await;
 
-    let err = create_via_cli(&server)
+    let err = create_via_flow(&server)
         .await
         .expect_err("строка так и не видна — громкая ошибка");
 

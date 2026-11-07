@@ -4,11 +4,12 @@
 //! сценарий — данными [`MockScenario`], исходы — observers [`MockKernel`]
 //! (журналы вызовов + render-состояние).
 //!
-//! Честность мока: render отдаёт строки первой страницей, страница ≥2 пустая
-//! (терминация пагинации); вставленная строка видна в render по порогу «лага»
-//! (`row_visible_after_adds`); appendBlock применяет блок в состояние дока и/или
-//! отвечает ошибкой — «потерянный ответ» и «честный сбой» различимы. Ассерты
-//! тестов — по исходам (что куда записалось), не по внутренним вызовам.
+//! Честность мока: render пагинируется как ядро — страница 1 несёт строки,
+//! страница ≥2 пустая (терминация клиента); вставленная строка видна в render
+//! по порогу «лага» (`row_visible_after_adds`); appendBlock применяет блок в
+//! состояние дока и/или отвечает ошибкой — «потерянный ответ» и «честный сбой»
+//! различимы. Ассерты тестов — по исходам (что куда записалось), не по
+//! внутренним вызовам.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -112,7 +113,7 @@ pub(crate) struct MockScenario {
     pub(crate) boards: Vec<MockBoard>,
     /// hpath → docIds (getIDsByHPath): доски и тела-сироты.
     pub(crate) hpath_ids: Vec<(&'static str, Vec<&'static str>)>,
-    /// Начальные строки render.
+    /// Начальные строки render (общий пул для всех досок сценария).
     pub(crate) rows: Vec<MockRow>,
     /// Строка вставки видна в render, когда item_add-ов ≥ порога
     /// (usize::MAX — не видна вовсе: «лаг» ядра для verify-ретрая).
@@ -575,7 +576,7 @@ impl MockKernel {
                         .unwrap_or("")
                         .to_string();
                     match action.as_str() {
-                        "render" => kernel.handle_render(),
+                        "render" => kernel.handle_render(&args),
                         "keys" => kernel.handle_keys(&id),
                         "item_add" => kernel.handle_item_add(&args),
                         "item_update" => kernel.handle_item_update(&args, &id),
@@ -636,17 +637,35 @@ impl MockKernel {
         json!(hits)
     }
 
-    fn handle_render(&self) -> ResponseTemplate {
-        let rows = self.rows.lock().unwrap().clone();
-        let view_rows: Vec<Value> = rows.iter().map(MockRow::cells_json).collect();
+    /// render: колонки по av-доске, строки — общий пул сценария (мультидосочные
+    /// сценарии с разными строками не моделируются); пагинация честная —
+    /// страница 1 несёт строки, страница ≥2 пустая (терминация клиента).
+    fn handle_render(&self, args: &Value) -> ResponseTemplate {
+        let av = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let page = args.get("page").and_then(|p| p.as_u64()).unwrap_or(1);
+        let view_rows: Vec<Value> = if page <= 1 {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(MockRow::cells_json)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let count = view_rows.len();
         let columns: Vec<Value> = self
             .sc
-            .boards[0]
-            .keys
+            .boards
             .iter()
-            .map(|(id, name)| json!({ "id": id, "name": name }))
-            .collect();
+            .find(|b| b.av_id == av)
+            .map(|b| {
+                b.keys
+                    .iter()
+                    .map(|(id, name)| json!({ "id": id, "name": name }))
+                    .collect()
+            })
+            .unwrap_or_default();
         mcp_text(json!({
             "action": "render",
             "data": { "view": { "columns": columns, "rowCount": count, "rows": view_rows } }
@@ -654,17 +673,19 @@ impl MockKernel {
     }
 
     fn handle_keys(&self, av: &str) -> ResponseTemplate {
-        let keys = self
+        // неизвестный av — пустой ответ без тихого fallback на чужую доску
+        let arr: Vec<Value> = self
             .sc
             .boards
             .iter()
             .find(|b| b.av_id == av)
-            .map(|b| b.keys.clone())
-            .unwrap_or_else(|| self.sc.boards[0].keys.clone());
-        let arr: Vec<Value> = keys
-            .iter()
-            .map(|(id, name)| json!({ "id": id, "name": name }))
-            .collect();
+            .map(|b| {
+                b.keys
+                    .iter()
+                    .map(|(id, name)| json!({ "id": id, "name": name }))
+                    .collect()
+            })
+            .unwrap_or_default();
         mcp_text(json!({ "action": "keys", "data": { "keys": arr } }))
     }
 
@@ -766,7 +787,7 @@ impl MockKernel {
         let text = if seq.len() > 1 {
             seq.remove(0)
         } else {
-            seq[0].clone()
+            seq.last().cloned().unwrap_or_default()
         };
         mcp_raw(text)
     }
