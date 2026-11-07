@@ -25,6 +25,7 @@ pub(crate) enum ProbeVerdict {
     Observed(String),
 }
 
+#[derive(Debug)]
 pub(crate) struct ProbeOutcome {
     pub name: &'static str,
     pub verdict: ProbeVerdict,
@@ -513,7 +514,10 @@ async fn board_orphans_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
         }
     };
     let bound_ids: HashSet<String> = rows.iter().filter_map(|r| r.body_doc.clone()).collect();
-    let row_titles: HashSet<String> = rows.iter().map(|r| syt::normalize_title(&r.title)).collect();
+    let row_titles: HashSet<String> = rows
+        .iter()
+        .map(|r| syt::normalize_title(&r.title))
+        .collect();
     let orphans = orphan_candidates(&children, &bound_ids, &row_titles);
     let detail = format!("детей-доков {}", children.len());
     if orphans.is_empty() {
@@ -658,7 +662,8 @@ mod tests {
             child("c-bound", "/uwuwu/Задачи uwuwu/привязанная задача", None),
             child("c-orphan", "/uwuwu/Задачи uwuwu/тело без строки", None),
         ];
-        let orphans = orphan_candidates(&children, &set(&["c-bound"]), &set(&["привязанная задача"]));
+        let orphans =
+            orphan_candidates(&children, &set(&["c-bound"]), &set(&["привязанная задача"]));
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].id, "c-orphan");
     }
@@ -666,11 +671,7 @@ mod tests {
     #[test]
     fn orphan_candidates_respects_title_fallback_of_detached_rows() {
         // Легаси/detached строка живёт без привязки — её тело не сирота.
-        let children = vec![child(
-            "c-legacy",
-            "/uwuwu/Задачи uwuwu/легаси задача",
-            None,
-        )];
+        let children = vec![child("c-legacy", "/uwuwu/Задачи uwuwu/легаси задача", None)];
         let orphans = orphan_candidates(&children, &HashSet::new(), &set(&["легаси задача"]));
         assert!(orphans.is_empty());
     }

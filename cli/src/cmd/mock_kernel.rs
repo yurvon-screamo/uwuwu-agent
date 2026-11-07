@@ -29,6 +29,9 @@ pub(crate) struct MockRow {
     pub(crate) doc: Option<String>,
 }
 
+/// Прямой ребёнок-док доски сценария: (docId, полный hpath, updated).
+pub(crate) type BoardChild = (&'static str, &'static str, &'static str);
+
 impl MockRow {
     pub(crate) fn new(item: &str, title: &str) -> Self {
         Self {
@@ -127,6 +130,11 @@ pub(crate) struct MockScenario {
     /// Атрибуты блоков (docId → [(имя, значение)]) для getBlockAttrs;
     /// doc без записи → 404-конверт «block not found» (честная деградация).
     pub(crate) block_attrs: Vec<(&'static str, Vec<(String, String)>)>,
+    /// Прямые дети-доки досок (проба board-orphans): hpath доски → дети
+    /// (docId, полный hpath, updated). Отказ SQL детей — `sql_children_fail`.
+    pub(crate) board_children: Vec<(&'static str, Vec<BoardChild>)>,
+    /// true — SQL-запрос детей доски отвечает HTTP 500 (честный SKIP пробы).
+    pub(crate) sql_children_fail: bool,
 }
 
 impl Default for MockScenario {
@@ -161,6 +169,8 @@ impl Default for MockScenario {
             missing_file_path: "",
             item_remove_drops_all: false,
             block_attrs: Vec::new(),
+            board_children: Vec::new(),
+            sql_children_fail: false,
         }
     }
 }
@@ -318,7 +328,13 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
-                    rest_ok(kernel.sql_data(stmt))
+                    let data = kernel.sql_data(stmt);
+                    if data.get("__sql_fail__").is_some() {
+                        return ResponseTemplate::new(500).set_body_string(
+                            r#"{"code":500,"msg":"metadata is not ready","data":[]}"#,
+                        );
+                    }
+                    rest_ok(data)
                 }
             })
             .mount(server)
@@ -634,6 +650,35 @@ impl MockKernel {
     // ——— MCP-действия над состоянием ———
 
     fn sql_data(&self, stmt: &str) -> Value {
+        // прямые дети-доки доски (проба board-orphans): type='d' +
+        // hpath like '<доска>/%' + not like '<доска>/%/%'
+        if stmt.contains("type='d'") && stmt.contains("hpath like") {
+            if self.sc.sql_children_fail {
+                // синтаксически валидный stmt — отказ ядра как HTTP 500
+                return json!({ "__sql_fail__": true });
+            }
+            if let Some((_, children)) = self
+                .sc
+                .board_children
+                .iter()
+                .find(|(hpath, _)| stmt.contains(&format!("hpath like '{hpath}/%'")))
+            {
+                let rows: Vec<Value> = children
+                    .iter()
+                    .map(|(id, child_hpath, updated)| {
+                        json!({
+                            "id": id,
+                            "hpath": child_hpath,
+                            "ial": format!(
+                                "{{: type=\"doc\" updated=\"{updated}\" id=\"{id}\" title=\"\"}}"
+                            ),
+                        })
+                    })
+                    .collect();
+                return json!(rows);
+            }
+            return json!([]);
+        }
         // дискавери досок задач (глобальный резолв без --project): hpath
         // сценария фильтруются той же конвенцией, что парсит резолв
         if stmt.contains("content like 'Задачи %'") {
