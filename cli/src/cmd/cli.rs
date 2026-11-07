@@ -3,8 +3,20 @@
 
 use clap::{Parser, Subcommand};
 
+/// Version line assembled at build time: semver + git revision + build date
+/// (see cli/build.rs). The clap built-in `--version` prints it and exits
+/// during parsing — before dispatch and any network access.
+const VERSION_STR: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("UWUWU_GIT_HASH"),
+    " ",
+    env!("UWUWU_BUILD_DATE"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "uwuwu-cli")]
+#[command(name = "uwuwu-cli", version = VERSION_STR)]
 #[command(about = "CLI for uwuwu/wiki: доступ агентам к платформе uwuwu (SiYuan)")]
 pub(crate) struct Cli {
     #[command(subcommand)]
