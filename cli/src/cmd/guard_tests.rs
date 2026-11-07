@@ -393,6 +393,32 @@ async fn rm_refuses_live_task_but_removes_contentful_draft() {
     );
 }
 
+/// (д-глоб) rm без --project: глобальный резолв + журнал с проектом доски
+/// (имя выводится из hpath — undo-валидация остаётся проектной).
+#[tokio::test]
+#[serial_test::serial]
+async fn rm_without_project_resolves_globally_and_journals_board_project() {
+    let (kernel, server) = MockKernel::start(guard_scenario(false, false)).await;
+    set_env(&server);
+
+    task_run(
+        "",
+        TaskSub::Rm {
+            id: "живой черновик".into(),
+        },
+    )
+    .await
+    .expect("rm без флага резолвит глобально и сносит контентный Draft");
+
+    assert_eq!(kernel.item_removes().len(), 1, "строка снята");
+    assert_eq!(kernel.put_files().len(), 1, "журнал до мутации");
+    let journal_path = &kernel.put_files()[0];
+    assert!(
+        journal_path.contains("-uwuwu-rm.json"),
+        "проект журнала — из доски (uwuwu), не пустая строка: {journal_path}"
+    );
+}
+
 /// (г) undo: восстанавливает строку из журнала (detached — тела не было);
 /// повторный undo — no-op: ни одного нового item_add.
 #[tokio::test]
