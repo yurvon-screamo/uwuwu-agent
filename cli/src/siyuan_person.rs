@@ -50,7 +50,8 @@ impl PersonTarget {
 /// docId персоны; None — дока нет. Дубль hpath (ядерный индекс отдал
 /// несколько id) — громкая ошибка: молча брать первый значит тихо потерять
 /// второй; чистится руками в UI (дисциплина task create).
-pub async fn resolve(sy: &SiYuan, target: &PersonTarget) -> Result<Option<String>> {    let Some(nb) = notebook_id_readonly(sy, &target.notebook).await? else {
+pub async fn resolve(sy: &SiYuan, target: &PersonTarget) -> Result<Option<String>> {
+    let Some(nb) = notebook_id_readonly(sy, &target.notebook).await? else {
         return Ok(None);
     };
     let ids = sy.doc_ids_by_hpath(&nb, &target.hpath).await?;
@@ -185,7 +186,6 @@ impl ConfirmPacing {
         }
     }
 }
-
 
 /// Верификация только что созданного дока: ждём индекс и сверяем резолвнутый
 /// id с возвращённым create'ом. Совпал — наш док и дублей нет (len>1 отловлен
@@ -374,7 +374,10 @@ mod tests {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string();
-                if matches!(behavior, AppendBehavior::Ok | AppendBehavior::AppliedButLost) {
+                if matches!(
+                    behavior,
+                    AppendBehavior::Ok | AppendBehavior::AppliedButLost
+                ) {
                     content_for_append
                         .lock()
                         .expect("content lock")
@@ -412,7 +415,9 @@ mod tests {
 
         let content = mock.content.lock().expect("content lock");
         assert_eq!(
-            content.matches("Предпочитает Rust для инструментов").count(),
+            content
+                .matches("Предпочитает Rust для инструментов")
+                .count(),
             1,
             "факт в доке ровно один (слепой ретрай дал бы копии): {content}"
         );

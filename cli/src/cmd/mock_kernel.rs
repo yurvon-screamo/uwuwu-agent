@@ -49,8 +49,6 @@ impl MockRow {
         self
     }
 
-
-
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
     fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
@@ -201,12 +199,7 @@ pub(crate) struct MockKernel {
 impl MockKernel {
     fn new(sc: MockScenario) -> Self {
         Self {
-            replies: Mutex::new(
-                sc.item_add_replies
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
+            replies: Mutex::new(sc.item_add_replies.iter().map(|s| s.to_string()).collect()),
             children: Mutex::new(sc.get_children_seq.clone()),
             doc_blocks: Mutex::new(
                 sc.doc_blocks
@@ -320,7 +313,9 @@ impl MockKernel {
             .respond_with({
                 let nb = self.sc.notebook;
                 move |_: &Request| {
-                    rest_ok(json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }))
+                    rest_ok(
+                        json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }),
+                    )
                 }
             })
             .mount(server)
@@ -564,10 +559,8 @@ impl MockKernel {
                         .map(|(_, a)| a.clone());
                     match attrs {
                         Some(attrs) => {
-                            let map: serde_json::Map<String, Value> = attrs
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json!(v)))
-                                .collect();
+                            let map: serde_json::Map<String, Value> =
+                                attrs.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                             rest_ok(Value::Object(map))
                         }
                         None => ResponseTemplate::new(200).set_body_string(
@@ -592,9 +585,8 @@ impl MockKernel {
                         .unwrap_or("")
                         .to_string();
                     let attrs = body.get("attrs").cloned().unwrap_or_default();
-                    if let Some((name, value)) = attrs
-                        .as_object()
-                        .and_then(|m| m.into_iter().next())
+                    if let Some((name, value)) =
+                        attrs.as_object().and_then(|m| m.into_iter().next())
                     {
                         kernel.attr_writes.lock().unwrap().push((
                             id,
@@ -761,9 +753,7 @@ impl MockKernel {
         if q.len() > 1 {
             q.remove(0)
         } else {
-            q.last()
-                .cloned()
-                .unwrap_or_else(|| "item-mock".to_string())
+            q.last().cloned().unwrap_or_else(|| "item-mock".to_string())
         }
     }
 
@@ -788,7 +778,10 @@ impl MockKernel {
                 .unwrap_or(&self.sc.inserted_row.title)
                 .to_string();
             rows.push(MockRow {
-                doc: args.get("blockID").and_then(|b| b.as_str()).map(String::from),
+                doc: args
+                    .get("blockID")
+                    .and_then(|b| b.as_str())
+                    .map(String::from),
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),

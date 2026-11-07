@@ -1220,7 +1220,8 @@ pub(crate) fn first_nonempty_line(md: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) -> bool {    let [only] = block_ids else {
+pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) -> bool {
+    let [only] = block_ids else {
         return block_ids.is_empty();
     };
     children_text
