@@ -341,11 +341,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 }
                 None => {
                     // тела нет вовсе: создаю по заголовку (не привязываю — itemID строки неприкосновенен)
+                    // титульный H1 стрипается: createDocWithMd оставил бы его
+                    // heading-блоком — док родился бы с дублем к заголовку
                     let initial = if replace || replace_section.is_some() {
                         fences.inline_md()
                     } else {
                         fences.inline_md().trim_start().to_string()
                     };
+                    let initial = markdown::strip_title_h1(&initial, &task.title);
                     sy.create_doc_md(&board.notebook, &body_path, &initial)
                         .await?
                 }
@@ -1458,6 +1461,9 @@ async fn write_body_in_place(
         return append_with_diagrams(sy, doc_id, content).await;
     };
     let inline = html_embed::parse_input(content)?.inline_md();
+    // титульный H1 из контента (снапшот-пасты) — дубль к док-заголовку:
+    // стрип до сборки и записи, инвариант «не более одного H1 = док-тайтл»
+    let inline = markdown::strip_title_h1(&inline, doc_title);
     let existing_raw = sy.export_md_by_id(doc_id).await.unwrap_or_default();
     let existing = markdown::strip_export_wrapper(&existing_raw, doc_title);
     let new_md = match rewrite.section {
