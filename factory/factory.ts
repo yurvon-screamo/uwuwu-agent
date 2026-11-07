@@ -610,9 +610,17 @@ const PROJECTS_NOTEBOOK = "Projects"
  *  ориентации). Деградация любого источника честная (null/пустой список
  *  + строка в блоке), спавн от полноты инита не зависит. */
 async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omit<SpawnInit, "task">> {
-  const notebookIds = (await mcp.tool<{ ids?: Record<string, string> }>("notebook_ids_by_names", {
-    names: [PERSON_NOTEBOOK, PROJECTS_NOTEBOOK],
-  })).ids ?? {}
+  // резолв ноутбуков — под тем же контрактом честной деградации, что и
+  // источники: сбой одного kernel-вызова не фейлит спавн (фетчеры увидят
+  // пустой id и отлогируют пропуск своего контура)
+  let notebookIds: Record<string, string> = {}
+  try {
+    notebookIds = (await mcp.tool<{ ids?: Record<string, string> }>("notebook_ids_by_names", {
+      names: [PERSON_NOTEBOOK, PROJECTS_NOTEBOOK],
+    })).ids ?? {}
+  } catch (e) {
+    log(`инит: резолв ноутбуков не удался (${errText(e)})`)
+  }
   const [person, projectDocs] = await Promise.all([
     fetchPersonMarkdown(notebookIds[PERSON_NOTEBOOK] ?? ""),
     fetchProjectDocSlugs(projectName, notebookIds[PROJECTS_NOTEBOOK] ?? ""),
