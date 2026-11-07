@@ -14,6 +14,8 @@ mod mock_kernel;
 #[cfg(test)]
 mod docs_tests;
 #[cfg(test)]
+mod read_resolve_tests;
+#[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
 mod claim_tests;
