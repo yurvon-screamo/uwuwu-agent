@@ -30,7 +30,8 @@ python3 -m siyuan_migrate.boards --comments       # доски «Задачи/К
 
 Параметры целевого инстанса: `--ws` (путь к workspace, для api-токена), `--url`
 (например http://127.0.0.1:6806). Инстанс-приёмник в демо-контуре: контейнер
-`siyuan-demo`, воркспейс `~/siyuan-demo-ws`, `--restart unless-stopped`.
+`siyuan-demo` (systemd user-юнит `siyuan-demo.service`, quadlet —
+`deploy/siyuan-demo/`), воркспейс `~/siyuan-demo-ws`.
 
 ## Трансформации контента
 
