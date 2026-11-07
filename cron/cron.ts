@@ -228,8 +228,8 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       bodyDoc: row.linkedDocId ?? "",
       title: (row.title ?? "").trim(),
       schedule: "",
-      plannedMs: row.cells?.["Запланировано"]?.dateMs ?? null,
-      scheduleCell: row.cells?.["Расписание"]?.value ?? "",
+      plannedMs: row.cells?.Запланировано?.dateMs ?? null,
+      scheduleCell: row.cells?.Расписание?.value ?? "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
     }))
 }
