@@ -48,6 +48,20 @@ export class KernelUnavailableError extends Error {
   }
 }
 
+/** Ядро в волне деградации индекса: «metadata is not ready» исчерпало ретраи —
+ *  это ответ ядра (code≠0 в конверте), не транспортный отказ, потому отдельный
+ *  класс поверх KernelUnavailableError: семантика родителя (ADR-033, «ядро
+ *  не ответило на транспорте») не расширяется, ветвление демонов
+ *  instanceof KernelUnavailableError сохраняется (наследник матчится).
+ *  Крон различает wave-тик точным instanceof — не считает его в
+ *  consecutiveFails: окно fail-fast разрядится само, рестарт не нужен. */
+export class KernelWaveError extends KernelUnavailableError {
+  constructor(message: string) {
+    super(message)
+    this.name = "KernelWaveError"
+  }
+}
+
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
  *  останавливать тик демона — класс «клиентские висы» (прод-контур).
  *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
@@ -63,6 +77,27 @@ function parseKernelTimeoutMs(raw: string | undefined): number {
 
 const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_MS)
 
+// ——— ядро: wave-дисциплина (зеркало cli/src/siyuan.rs WAVE_COOLDOWN_SECS) ———
+
+const WAVE_COOLDOWN_MS = 90_000
+const WAVE_HINT =
+  "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями"
+/** Паузы ретраев metadata-волны (начальная + до двух); инъекция для тестов —
+ *  мгновенный пейсинг (прецедент RowInsertPacing). */
+let waveRetryBackoffsMs = [2_000, 5_000]
+/** Шаг пауз прочих ошибок (транспорт/конверт), ms — 700·(попытка+1); инъекция
+ *  для тестов: транспортный отказ не должен задерживать свиту на секунды. */
+let otherRetryStepMs = 700
+/** Окно fail-fast волны (unix-ms истечения; 0 = не армировано), per-process:
+ *  после исчерпания ретраев последующие post() падают сразу, не долбя ядро. */
+let waveCooldownUntil = 0
+
+const armWaveCooldown = (): void => {
+  waveCooldownUntil = Date.now() + WAVE_COOLDOWN_MS
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms))
+
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
@@ -77,7 +112,13 @@ export function parseJsonContract(text: string, context: string): unknown {
 }
 
 async function post<T = Record<string, unknown>>(path: string, body: Record<string, unknown>, attempts = 4): Promise<T> {
+  // окно волны активно: вызовы падают сразу — волна кормится ретраями,
+  // клиент её не пробивает (семантика Rust post() wave-гейта)
+  if (Date.now() < waveCooldownUntil) {
+    throw new KernelWaveError(`siyuan POST ${path}: пропущено — ${WAVE_HINT} (окно fail-fast активно)`)
+  }
   let last: string | Error = "?"
+  let metadataAttempts = 0
   for (let i = 0; i < attempts; i++) {
     try {
       const r = await fetch(SIYUAN_URL + path, {
@@ -98,15 +139,25 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
       if (d.code === 0) return (d.data ?? {}) as T
       last = `code=${d.code} msg=${d.msg}`
       if (String(d.msg).includes("metadata is not ready")) {
-        await new Promise((res) => setTimeout(res, 1500 + i * 1000))
-        continue
+        const backoff = waveRetryBackoffsMs[metadataAttempts]
+        if (backoff !== undefined) {
+          metadataAttempts++
+          await sleep(backoff)
+          continue
+        }
+        // ретраи исчерпаны: армируем окно и падаем сразу — следующий вызов
+        // не долбит ядро в течение окна (терминальный throw, не в last)
+        armWaveCooldown()
+        throw new KernelWaveError(`siyuan POST ${path}: ${last} — ${WAVE_HINT}`)
       }
     } catch (e) {
-      // класс KernelUnavailableError переживёт цикл — по нему демоны
-      // отличают лежащее ядро; прочие — как раньше, строкой в last
+      // wave — терминальный исход: ре-throw мимо last (иначе цикл
+      // продолжил бы долбить ядро); прочий KernelUnavailableError
+      // переживёт цикл — по нему демоны отличают лежащее ядро
+      if (e instanceof KernelWaveError) throw e
       last = e instanceof KernelUnavailableError ? e : String(e)
     }
-    await new Promise((res) => setTimeout(res, 700 * (i + 1)))
+    await sleep(otherRetryStepMs * (i + 1))
   }
   // fetch-класс уже свёрстан как Error с контекстом — ре-throw без обёртки;
   // строковый last (code=… msg=… конверт ядра) — как раньше
@@ -644,5 +695,16 @@ export const __test = {
   expireSession: (): void => {
     mcpSession = ""
     mcpReady = false
+  },
+  /** Инъекции wave-тестов: мгновенный пейсинг ретраев и сброс окна
+   *  между тестами (module-level состояние изолируется руками). */
+  setWaveRetryBackoffsMs: (backoffs: number[]): void => {
+    waveRetryBackoffsMs = backoffs
+  },
+  setOtherRetryStepMs: (stepMs: number): void => {
+    otherRetryStepMs = stepMs
+  },
+  resetWaveCooldown: (): void => {
+    waveCooldownUntil = 0
   },
 }

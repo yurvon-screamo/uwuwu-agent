@@ -353,8 +353,21 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
 }
 
 /** Экспорт для юнит-тестов тика (демон стартует только как entry — import.meta.main). */
-export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
-  const rows = await readRows(board)
+/** Исход сбойного тика для главного цикла. Wave (KernelWaveError: ядро в волне
+ *  деградации, окно fail-fast) — штатная пауза контура: consecutiveFails не
+ *  трогается (ни инкремент, ни сброс — реальные фейлы по соседству копятся
+ *  и приведут к рестарту честно), сессия не пересобирается (ядро живо,
+ *  отвечает ошибками), рестарта нет — окно разрядится само, а рестарт
+ *  сбрасывал бы окно и реанимировал ретраи (TICK_SEC=60 при окне 90s давал
+ *  бы exit(1) на 5-м тике любой длинной волны). Прочие сбои копят счётчик:
+ *  5 подряд → рестарт (отравленное соединение/пул — свежий процесс чище). */
+export function tickFailOutcome(e: unknown, consecutiveFails: number): { fails: number; reconnect: boolean; restart: boolean } {
+  if (e instanceof mcp.KernelWaveError) return { fails: consecutiveFails, reconnect: false, restart: false }
+  const fails = consecutiveFails + 1
+  return { fails, reconnect: true, restart: fails >= 5 }
+}
+
+export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {  const rows = await readRows(board)
   const project = projectOfBoard(boardTitle)
 
   for (const row of rows) {
@@ -544,16 +557,18 @@ async function main(): Promise<void> {
       await tick(state)
       consecutiveFails = 0
     } catch (e) {
-      consecutiveFails++
+      const outcome = tickFailOutcome(e, consecutiveFails)
+      const isWave = e instanceof mcp.KernelWaveError
+      consecutiveFails = outcome.fails
       // сообщение и стек отдельными строками: bun у подклассов Error рендерит
       // stack без сообщения (прод-кейс 05.11: «tick: Error» без причины)
-      log(`tick (${consecutiveFails} подряд): ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? ""}` : String(e)}`)
-      if (consecutiveFails >= 5) {
+      log(`tick (${consecutiveFails} подряд${isWave ? ", wave" : ""}): ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? ""}` : String(e)}`)
+      if (outcome.restart) {
         // отравленное соединение/пул: свежий процесс чище вечных ретраев
         log("5 тиков подряд упали — рестартуюсь (systemd поднимет)")
         process.exit(1)
       }
-      await mcp.connect().catch(() => {}) // попробовать пересобрать сессию сразу
+      if (outcome.reconnect) await mcp.connect().catch(() => {}) // попробовать пересобрать сессию сразу
     }
     if (ONCE) {
       log("ONCE-режим: тик выполнен — выходим")
