@@ -138,7 +138,8 @@ TOKEN = None
 # (04.11: Experience 859 доков, orgls видел 64). Явный предел обязателен в каждом stmt.
 ORG_LS_LIMIT = 100000
 
-# export дока в markdown (cmd_export, _is_stub, _export_content).
+# export дока в markdown: единственный прямой референс — _export_content
+# (cmd_export/_is_stub/guard-шаги append/replace идут через него).
 EXPORT_MD_PATH = "/api/export/exportMdContent"
 
 # Content-Type JSON-конвертов kernel API (post-каналы: _post_once, _fs_file,
