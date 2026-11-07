@@ -560,7 +560,12 @@ async fn body_flow_mock(kernel: &Arc<BodyKernel>) -> MockServer {
     server
 }
 
-async fn body_via_cli(server: &MockServer, replace: bool, content: &str) -> anyhow::Result<()> {
+async fn body_via_cli(
+    server: &MockServer,
+    replace: bool,
+    replace_section: Option<&str>,
+    content: &str,
+) -> anyhow::Result<()> {
     set_env(server);
     let md = tempfile::NamedTempFile::new()?;
     std::fs::write(md.path(), content)?;
@@ -571,7 +576,7 @@ async fn body_via_cli(server: &MockServer, replace: bool, content: &str) -> anyh
             stdin: false,
             md: Some(md.path().to_string_lossy().into_owned()),
             replace,
-            replace_section: None,
+            replace_section: replace_section.map(str::to_string),
             // тест про docId-стабильность overwrite, не про freshness-гард (#119):
             // force возвращает исходную семантику «replace проходит» без снапшота
             base: None,
@@ -601,7 +606,7 @@ async fn body_replace_overwrites_doc_in_place_without_recreating() {
     });
     let server = body_flow_mock(&kernel).await;
 
-    body_via_cli(&server, true, "новое тело\n")
+    body_via_cli(&server, true, None, "новое тело\n")
         .await
         .expect("replace проходит");
 
@@ -621,6 +626,84 @@ async fn body_replace_overwrites_doc_in_place_without_recreating() {
     assert!(appends[0].contains(BOUND_DOC), "append в привязанный док");
 }
 
+/// Красный тест класса «дубль титульного H1» (20261107051501). Контент,
+/// собранный из get-снапшота, местами несёт титульную строку `# {тайтл}`
+/// (nmcfoxy 07.11 00:18: все блоки тела перезаписаны одним overwrite, h1
+/// пришёл в markdown записи) — write-путь стрипает титульные H1-строки
+/// до отправки: тело не получает дубль к док-заголовку.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_strips_title_h1_from_content() {
+    let kernel = Arc::new(BodyKernel {
+        bound: true,
+        get_children_seq: Mutex::new(vec![
+            format!("- [p] старый блок ({OLD_BLOCK})"),
+            String::new(),
+        ]),
+        export_md: "старый контент\n".into(),
+        creates: AtomicUsize::new(0),
+        create_calls: Mutex::new(Vec::new()),
+        deletes: Mutex::new(Vec::new()),
+        appends: Mutex::new(Vec::new()),
+    });
+    let server = body_flow_mock(&kernel).await;
+
+    let content = format!("# {TASK_TITLE}\n\nновое тело\n\n# {TASK_TITLE}\nещё текст\n");
+    body_via_cli(&server, true, None, &content)
+        .await
+        .expect("replace проходит");
+
+    let appends = kernel.appends.lock().unwrap();
+    assert_eq!(appends.len(), 1, "новый контент одним append");
+    assert!(
+        appends[0].contains("новое тело"),
+        "полезный контент записан: {appends:?}"
+    );
+    assert!(
+        !appends[0].contains(&format!("# {TASK_TITLE}")),
+        "титульный H1 не проходит в запись (дубль к док-заголовку): {appends:?}"
+    );
+}
+
+/// --replace-section: секционный контент с титульной строкой тоже не должен
+/// положить дубль в тело — секция вставляется под своим h2, титульный H1
+/// внутри неё стал бы вторым H1 в доке.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_section_strips_title_h1_from_content() {
+    let kernel = Arc::new(BodyKernel {
+        bound: true,
+        get_children_seq: Mutex::new(vec![String::new()]),
+        export_md: "# титул экспорта\n\n## Постановка\n\nстарая постановка\n\n## План\n\nплан\n"
+            .into(),
+        creates: AtomicUsize::new(0),
+        create_calls: Mutex::new(Vec::new()),
+        deletes: Mutex::new(Vec::new()),
+        appends: Mutex::new(Vec::new()),
+    });
+    let server = body_flow_mock(&kernel).await;
+
+    let content = format!("# {TASK_TITLE}\n\nновая постановка\n");
+    body_via_cli(&server, false, Some("Постановка"), &content)
+        .await
+        .expect("replace-section проходит");
+
+    let appends = kernel.appends.lock().unwrap();
+    assert_eq!(appends.len(), 1, "пересборка одним append");
+    assert!(
+        appends[0].contains("новая постановка"),
+        "секция заменена: {appends:?}"
+    );
+    assert!(
+        appends[0].contains("## План"),
+        "остальное тело сохранено: {appends:?}"
+    );
+    assert!(
+        !appends[0].contains(&format!("# {TASK_TITLE}")),
+        "титульный H1 из секционного контента не проходит в запись: {appends:?}"
+    );
+}
+
 /// Строка вовсе без тела: тело создаётся по заголовку с контентом,
 /// привязка строки (itemID) не трогается.
 #[tokio::test]
@@ -637,7 +720,7 @@ async fn body_on_row_without_body_creates_doc_by_title_without_binding() {
     });
     let server = body_flow_mock(&kernel).await;
 
-    body_via_cli(&server, false, "контент нового тела\n")
+    body_via_cli(&server, false, None, "контент нового тела\n")
         .await
         .expect("body на detached-строке создаёт тело");
 
