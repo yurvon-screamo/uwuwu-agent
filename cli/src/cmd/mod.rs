@@ -26,6 +26,8 @@ mod cron_tests;
 #[cfg(test)]
 mod goal_tests;
 #[cfg(test)]
+mod search_tests;
+#[cfg(test)]
 mod write_path_tests;
 
 pub use sy_dispatch::read_markdown;

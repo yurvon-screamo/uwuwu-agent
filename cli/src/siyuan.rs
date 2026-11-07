@@ -520,6 +520,23 @@ impl SiYuan {
         self.sql(&stmt).await
     }
 
+    /// hpath всех доков воркспейса с явным потолком. Заголовки (hpath)
+    /// контентный like не матчит — их резолвит doc-секция search.
+    /// Явный LIMIT обязателен: без него ядро капает выдачу на 64 строки
+    /// (проба 07.11: 1642 дока, truncated:true; limit 2000 — полный состав).
+    pub async fn doc_titles(&self, cap: usize) -> Result<Vec<String>> {
+        let rows = self
+            .sql(&format!(
+                "select hpath from blocks where type='d' limit {cap}"
+            ))
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get("hpath").and_then(|h| h.as_str()))
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Скачать файл из воркспейса (assets/…). Путь относительно data/
     /// (конвенция blob-команды: `assets/<key>`).
     pub async fn download_file(&self, path: &str) -> Result<Vec<u8>> {
