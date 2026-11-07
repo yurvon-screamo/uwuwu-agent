@@ -187,30 +187,42 @@ def mint_type_key(av_id: str) -> str:
     return key_id
 
 
+def raw_rows_of(view: dict) -> list[dict]:
+    """Строки/карточки страницы: table несёт rows, kanban — groups[].cards."""
+    rows = list(view.get("rows") or [])
+    for group in view.get("groups") or []:
+        rows.extend(group.get("cards") or [])
+    return rows
+
+
+def row_cells(row: dict, key_names: dict) -> tuple[str, str, str]:
+    """(item_id, body_doc_id, тип-значение) строки render."""
+    body_doc = ""
+    task_type = ""
+    row_id = ""
+    for cell in row.get("cells") or []:
+        value = cell.get("value") or {}
+        name = key_names.get(value.get("keyID"))
+        if value.get("type") == "block":
+            row_id = row.get("id") or value.get("blockID", "")
+            body_doc = (value.get("block") or {}).get("id", "")
+        elif name in TYPE_KEYS:
+            options = value.get("mSelect") or []
+            task_type = options[0].get("content", "") if options else ""
+    return row_id, body_doc, task_type
+
+
 def render_page(av_id: str, block_id: str, page: int) -> tuple[list[tuple[str, str, str]], dict]:
     """(item_id, body_doc_id, тип-значение) одной страницы render + view."""
     data = _db("render", id=av_id, blockID=block_id, page=page, pageSize=PAGE_SIZE).get("data") or {}
     view = data.get("view") or {}
     key_names = {c.get("id"): c.get("name") for c in view.get("columns") or []}
-    rows: list[tuple[str, str, str]] = []
-    raw_rows = view.get("rows") or []
-    for group in view.get("groups") or []:
-        raw_rows.extend(group.get("cards") or [])
-    for row in raw_rows:
-        body_doc = ""
-        task_type = ""
-        row_id = ""
-        for cell in row.get("cells") or []:
-            value = cell.get("value") or {}
-            name = key_names.get(value.get("keyID"))
-            if value.get("type") == "block":
-                row_id = row.get("id") or value.get("blockID", "")
-                body_doc = (value.get("block") or {}).get("id", "")
-            elif name in TYPE_KEYS:
-                options = value.get("mSelect") or []
-                task_type = (options[0].get("content", "") if options else "")
-        if row_id:
-            rows.append((row_id, body_doc, task_type))
+    rows = [
+        triple
+        for row in raw_rows_of(view)
+        for triple in [row_cells(row, key_names)]
+        if triple[0]
+    ]
     return rows, view
 
 
@@ -323,33 +335,54 @@ def dry_run(boards: list[dict], backup_dir: Path) -> None:
     print("dry-run: снапшот в", backup_dir)
 
 
+def migrate_cell(board: dict, av_id: str, key_id: str, cell: dict, stats: list[int]) -> None:
+    """Одна строка: клетка из тега + снос тегов; stats = [written, removed, already, weird]."""
+    if cell.get("tag") == ["MULTIPLE"]:
+        print(f"  ⚠ {board['doc']}: {cell['row']} — теги разных типов, не трогаю", file=sys.stderr)
+        stats[3] += 1
+        return
+    canon = cell.get("tag_type")
+    if not cell["type"] and canon:
+        _db("item_update", id=av_id, keyID=key_id, itemID=cell["row"],
+            value={"mSelect": [{"content": canon}]})
+        stats[0] += 1
+        time.sleep(0.3)
+    elif cell["type"]:
+        stats[2] += 1
+    for tag_id in cell.get("tag") or []:
+        if SY_ID.fullmatch(tag_id):
+            _post_json("/api/block/deleteBlock", {"id": tag_id})
+            stats[1] += 1
+            time.sleep(0.3)
+
+
 def migrate(boards: list[dict]) -> tuple[int, int, int, int]:
     """Клетка из тега + снос тегов. Возвращает (клеток записано, тегов снесено,
     уже заполнено, аномальных)."""
-    written = removed = already = weird = 0
+    stats = [0, 0, 0, 0]
     for board in boards:
         av_id = board["av_id"]
         key = board["key"]
         key_id = key["id"] if key else mint_type_key(av_id)
         for cell in board["cells"]:
-            if cell.get("tag") == ["MULTIPLE"]:
-                print(f"  ⚠ {board['doc']}: {cell['row']} — теги разных типов, не трогаю", file=sys.stderr)
-                weird += 1
-                continue
-            tag_ids, canon = cell.get("tag"), cell.get("tag_type")
-            if not cell["type"] and canon:
-                _db("item_update", id=av_id, keyID=key_id, itemID=cell["row"],
-                    value={"mSelect": [{"content": canon}]})
-                written += 1
-                time.sleep(0.3)
-            elif cell["type"]:
-                already += 1
-            for tag_id in tag_ids or []:
-                if SY_ID.fullmatch(tag_id):
-                    _post_json("/api/block/deleteBlock", {"id": tag_id})
-                    removed += 1
-                    time.sleep(0.3)
-    return written, removed, already, weird
+            migrate_cell(board, av_id, key_id, cell, stats)
+    return tuple(stats)
+
+
+def verify_cell(board: dict, after: dict, cell: dict, mismatches: list[str]) -> None:
+    """Одна строка: клетка несёт тип, теги снесены."""
+    expected = cell["type"] or cell.get("tag_type")
+    if cell.get("tag") == ["MULTIPLE"]:
+        return
+    now = after.get(cell["row"])
+    if expected and now != expected:
+        mismatches.append(
+            f"{board['doc']}: {cell['row']} клетка={now!r} (ожидался {expected!r})"
+        )
+    if cell.get("tag") and tag_blocks_of(cell["body"])[0]:
+        mismatches.append(
+            f"{board['doc']}: {cell['row']} тег не снесён ({cell.get('tag')})"
+        )
 
 
 def verify(boards: list[dict]) -> list[str]:
@@ -365,21 +398,19 @@ def verify(boards: list[dict]) -> list[str]:
             for row_id, _, task_type in render_all(board["av_id"], board["block_id"])
         }
         for cell in board["cells"]:
-            expected = cell["type"] or cell.get("tag_type")
-            if cell.get("tag") == ["MULTIPLE"]:
-                continue
-            now = after.get(cell["row"])
-            if expected and now != expected:
-                mismatches.append(
-                    f"{board['doc']}: {cell['row']} клетка={now!r} (ожидался {expected!r})"
-                )
-            if cell.get("tag"):
-                leftover = tag_blocks_of(cell["body"])[0]
-                if leftover:
-                    mismatches.append(
-                        f"{board['doc']}: {cell['row']} тег не снесён ({cell.get('tag')})"
-                    )
+            verify_cell(board, after, cell, mismatches)
     return mismatches
+
+
+def tag_boards(boards: list[dict]) -> None:
+    """Добавить в снапшот теги тел: (block_ids, канон) каждой строки."""
+    for board in boards:
+        for cell in board["cells"]:
+            if not cell["body"] or not SY_ID.fullmatch(cell["body"]):
+                cell["tag"], cell["tag_type"] = None, None
+                continue
+            tag, canon = tag_blocks_of(cell["body"])
+            cell["tag"], cell["tag_type"] = tag, canon
 
 
 def main() -> int:
@@ -390,13 +421,7 @@ def main() -> int:
     args = parser.parse_args()
 
     boards = collect_boards()
-    for board in boards:
-        for cell in board["cells"]:
-            if not cell["body"] or not SY_ID.fullmatch(cell["body"]):
-                cell["tag"], cell["tag_type"] = None, None
-                continue
-            tag, canon = tag_blocks_of(cell["body"])
-            cell["tag"], cell["tag_type"] = tag, canon
+    tag_boards(boards)
     if args.only:
         boards = [b for b in boards if b["av_id"] == args.only]
         if not boards:

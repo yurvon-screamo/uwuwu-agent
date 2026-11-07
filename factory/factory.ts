@@ -358,7 +358,7 @@ export async function readTasks(
       bodyDoc,
       title,
       status: row.cells?.Status?.value ?? "",
-      type: (row.cells?.["Тип"]?.value ?? "").trim(),
+      type: (row.cells?.Тип?.value ?? "").trim(),
       pr: row.cells?.PR?.value ?? "",
       branch: row.cells?.Branch?.value ?? "",
       devSession: (row.cells?.[DEV_SESSION_CELL]?.value ?? "").trim(),
