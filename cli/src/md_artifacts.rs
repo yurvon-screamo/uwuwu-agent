@@ -150,6 +150,11 @@ fn tight_hash_count(md: &str) -> usize {
             }
             let prev = i.checked_sub(1).map(|j| chars[j]);
             let next = chars.get(i + 1).copied();
+            // решётка на границе инлайн-кода (`#`) — safe-форма из проб,
+            // сам warning советует её; тег-матч на ней не стреляет
+            if prev == Some('`') || next == Some('`') {
+                continue;
+            }
             let tight = |c: Option<char>| matches!(c, Some(c) if !c.is_alphanumeric() && !c.is_whitespace());
             if tight(prev) && tight(next) {
                 count += 1;
@@ -290,6 +295,20 @@ mod tests {
             strip_zero_width(&format!("{ZWSP_LINE}\n")),
             "текст `code` хвост\n"
         );
+    }
+
+    #[test]
+    fn strip_zero_width_is_idempotent() {
+        let dirty =
+            "текст \u{200b}`code` \u{200d}хвост \u{200c}\u{feff}и \u{1F469}\u{200D}\u{1F469}\n";
+        let once = strip_zero_width(dirty);
+        assert_eq!(strip_zero_width(&once), once);
+    }
+
+    #[test]
+    fn inline_code_hashes_are_safe_from_trap_warning() {
+        let code_spans = "маркер `#` и код `y` между `#` и `#` же.\n";
+        assert!(tag_trap_warning(code_spans).is_none());
     }
 
     #[test]

@@ -216,11 +216,16 @@ describe("spawnPrompt", () => {
     expect(p).toContain("«Ревью плана»")
     // скан территории до плана (кейс vgcm1t5 ↔ PR #79: план, дублирующий чужой PR, мёртв при рождении)
     expect(p).toContain("скан территории")
-    expect(p).toContain("task list")
+    expect(p).toContain("task list --project uwuwu")
     expect(p).toContain("gh pr list")
     // живые указатели доски (кейс сводной dzype6z: 5 из 6 row-id мертвы — план адресовал фантомы)
     expect(p).toContain("указатели постановки")
     expect(p).toContain("гниёт")
+    // командные примеры с id и проектом (инцидент 05.11: вопросный канал без
+    // флага не приземлился — спавн знает оба)
+    expect(p).toContain("task get r1 --project uwuwu")
+    expect(p).toContain("task comment r1 --project uwuwu")
+    expect(p).toContain("task edit r1 --project uwuwu --status \"Needs attention\"")
   })
   test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
@@ -262,6 +267,10 @@ describe("continuePrompt", () => {
     expect(p).toContain("перезапущена")
     expect(p).toContain("AGENTS.md")
     expect(p).toContain("task get")
+    // командные примеры с id и проектом — тот же контракт вопросного канала
+    expect(p).toContain("task get r1 --project origa")
+    expect(p).toContain("task comment r1 --project origa")
+    expect(p).toContain("task edit r1 --project origa --status \"Needs attention\"")
     expect(p).not.toContain("Стадия Design")
     expect(p).not.toContain("«Ревью плана»")
     expect(p).not.toContain("🤖")

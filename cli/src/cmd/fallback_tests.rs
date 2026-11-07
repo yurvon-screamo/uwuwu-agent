@@ -1,15 +1,22 @@
-//! Резолв task-команд только по доске задач (задача 20261106182051-o5ejlte):
-//! крон-доски сняты (унификация кронов с задачами) — фоллбек «Задачи <proj>»
-//! → «Кроны <proj>» → чужие «Кроны %» выпилен. Мок-ядро держит легаси
-//! крон-доску намеренно: тесты доказывают, что она больше не обыскивается.
+//! Резолв task-команд: доска задач проекта (задача 20261106182051-o5ejlte,
+//! крон-доски сняты) + глобальный резолв без --project (доски всех проектов,
+//! уникальность обязательна — инцидент 05.11 «потерянный вопрос»). Легаси
+//! крон-доска в мок-ядре остаётся намеренно: тесты доказывают, что она не
+//! обыскивается ни явным, ни глобальным резолвом.
 //!
 //! Сценарии:
-//! 1. get точного id задачи — резолв по «Задачи», крон-доска не читается
+//! 1. get точного id задачи с --project — резолв по «Задачи», чужие доски не читаются
 //! 2. строка только на легаси крон-доске — НЕ находится (ошибка называет «Задачи»)
-//! 3. полный промах — ошибка перечисляет только доску задач
+//! 3. полный промах с --project — ошибка перечисляет только доску задач
 //! 4. неоднозначный префикс на «Задачи» — громкая раскладка без крон-досок
-//! 5. доска «Задачи» отсутствует (крон-доска есть) — отказ «доска не найдена»
+//! 5. доска «Задачи» отсутствует — отказ «доска не найдена»
 //! 6. сбой SQL ядра — громкая ошибка, не «не найдена»
+//! 7. get точного id без --project — глобальный резолв (фаза A)
+//! 8. comment без --project на подстроку чужой доски — приземлился (инцидент 05.11)
+//! 9. подстрока на двух досках — громкая ошибка с раскладкой обеих
+//! 10. неоднозначность на одной доске без --project — громкая ошибка
+//! 11. полный промах без --project — раскладка обысканных досок
+//! 12. list без --project — прежний отказ «--project обязателен»
 
 use crate::cmd::cli::TaskSub;
 use crate::cmd::sy_dispatch::task_run;
@@ -22,9 +29,12 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 const NB: &str = "nb-projects";
 
 /// Доски мок-ядра: doc → (av, av-носитель). CRON_* — легаси-доска для
-/// негативных тестов (в воркспейсе до сноса).
+/// негативных тестов (в воркспейсе до сноса). ORIGA_* — вторая задачная
+/// доска (глобальный резолв без --project).
 const TASKS_DOC: &str = "t-doc";
 const TASKS_AV: &str = "av-t";
+const ORIGA_DOC: &str = "o-doc";
+const ORIGA_AV: &str = "av-o";
 const CRON_DOC: &str = "k-doc";
 const CRON_AV: &str = "av-k";
 
@@ -63,11 +73,18 @@ const CRON_ROWS: &[Row] = &[Row {
     doc: Some("20261105000002-kbodyx2"),
 }];
 
+const ORIGA_ROWS: &[Row] = &[Row {
+    item: "20261105110000-otask1",
+    title: "origa-only задача",
+    status: "Todo",
+    doc: Some("20261105000003-obodyx3"),
+}];
+
 fn rows_for_av(av: &str) -> &'static [Row] {
-    if av == TASKS_AV {
-        TASKS_ROWS
-    } else {
-        CRON_ROWS
+    match av {
+        TASKS_AV => TASKS_ROWS,
+        ORIGA_AV => ORIGA_ROWS,
+        _ => CRON_ROWS,
     }
 }
 
@@ -140,14 +157,26 @@ fn mcp_text(payload: serde_json::Value) -> ResponseTemplate {
     )
 }
 
-/// id дока → doc-id-цепочка для getIDsByHPath: обе доски существуют
-/// (легаси-воркспейс до сноса крон-досок).
+/// id дока → doc-id-цепочка для getIDsByHPath: все три доски существуют
+/// (легаси-воркспейс до сноса крон-досок + вторая задачная доска origa),
+/// тела задач — саб-доки досок.
 fn doc_ids_by_path(p: &str) -> Vec<&'static str> {
     match p {
         "/uwuwu/Задачи uwuwu" => vec![TASKS_DOC],
+        "/origa/Задачи origa" => vec![ORIGA_DOC],
         "/uwuwu/Кроны uwuwu" => vec![CRON_DOC],
+        "/uwuwu/Задачи uwuwu/обычная задача" => vec!["20261105000001-tbodyx1"],
+        "/origa/Задачи origa/origa-only задача" => vec!["20261105000003-obodyx3"],
         _ => vec![],
     }
+}
+
+/// Живые дока-блока (MCP block get): тела задач трёх досок.
+fn doc_block_alive(id: &str) -> bool {
+    matches!(
+        id,
+        "20261105000001-tbodyx1" | "20261105000002-kbodyx2" | "20261105000003-obodyx3"
+    )
 }
 
 async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
@@ -163,6 +192,16 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 }
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
+                // дискавери досок задач (глобальный резолв без --project):
+                // обе задачные доски, легаси-крон-доска не «Задачи %»
+                if stmt.contains("content like 'Задачи %'") {
+                    let data = serde_json::json!([
+                        { "id": TASKS_DOC, "hpath": "/uwuwu/Задачи uwuwu" },
+                        { "id": ORIGA_DOC, "hpath": "/origa/Задачи origa" }
+                    ]);
+                    return ResponseTemplate::new(200)
+                        .set_body_string(serde_json::json!({ "code": 0, "data": data }).to_string());
+                }
                 let data = if let Some(root) = stmt
                     .split("root_id='")
                     .nth(1)
@@ -170,6 +209,7 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 {
                     let (doc, av) = match root {
                         TASKS_DOC => (TASKS_DOC, TASKS_AV),
+                        ORIGA_DOC => (ORIGA_DOC, ORIGA_AV),
                         CRON_DOC => (CRON_DOC, CRON_AV),
                         _ => ("", ""),
                     };
@@ -268,6 +308,24 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                     *kernel.render_calls.lock().unwrap().entry(av.clone()).or_insert(0) += 1;
                     return mcp_text(render_view(&av));
                 }
+                if action == "get" {
+                    // проба живости привязки строки (doc_block_exists):
+                    // живой док — дамп с «Type: NodeDocument», мёртвый — промах
+                    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if doc_block_alive(id) {
+                        return mcp_text(serde_json::json!({
+                            "action": "get", "data": format!("Type: NodeDocument\nID: {id}")
+                        }));
+                    }
+                    return ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 2,
+                            "result": { "content": [{ "type": "text",
+                                "text": "{\"code\":-1,\"msg\":\"block not found\"}" }] }
+                        })
+                        .to_string(),
+                    );
+                }
                 mcp_text(serde_json::json!({ "action": "unknown", "data": null }))
             }
         })
@@ -280,14 +338,21 @@ fn set_env(server: &MockServer) {
     std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
 }
 
-/// (1) get по точному id задачи — резолв по «Задачи»; крон-доска не читается.
-#[tokio::test]
-#[serial_test::serial]
-async fn get_resolves_on_tasks_board_without_cron_reads() {
+/// Общий пролог сценариев: мок-ядро с досками файла + env. Сервер живёт
+/// в возвращаемой паре до конца теста (drop убил бы мок до task_run).
+async fn spawn_kernel() -> (std::sync::Arc<Kernel>, MockServer) {
     let kernel = Kernel::new();
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
     set_env(&server);
+    (kernel, server)
+}
+
+/// (1) get по точному id задачи — резолв по «Задачи»; крон-доска не читается.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_resolves_on_tasks_board_without_cron_reads() {
+    let (kernel, _server) = spawn_kernel().await;
 
     task_run(
         "uwuwu",
@@ -305,6 +370,11 @@ async fn get_resolves_on_tasks_board_without_cron_reads() {
         0,
         "легаси крон-доска не обыскивается"
     );
+    assert_eq!(
+        kernel.render_count(ORIGA_AV),
+        0,
+        "чужая задачная доска при явном --project не читается"
+    );
 }
 
 /// (2) Строка только на легаси крон-доске — НЕ находится: ошибка называет
@@ -312,10 +382,7 @@ async fn get_resolves_on_tasks_board_without_cron_reads() {
 #[tokio::test]
 #[serial_test::serial]
 async fn cron_board_row_is_not_resolved_anymore() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -344,10 +411,7 @@ async fn cron_board_row_is_not_resolved_anymore() {
 #[tokio::test]
 #[serial_test::serial]
 async fn full_miss_lists_only_tasks_board() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -375,10 +439,7 @@ async fn full_miss_lists_only_tasks_board() {
 #[tokio::test]
 #[serial_test::serial]
 async fn ambiguous_prefix_is_loud_without_cron_boards() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -400,24 +461,21 @@ async fn ambiguous_prefix_is_loud_without_cron_boards() {
 #[tokio::test]
 #[serial_test::serial]
 async fn missing_tasks_board_bails_even_with_cron_board_present() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
-        "origa",
+        "foilcap",
         TaskSub::Get {
             id: "20261105100000-ttask1".into(),
             no_body: true,
         },
     )
     .await
-    .expect_err("доски задач origa нет");
+    .expect_err("доски задач foilcap нет");
 
     let msg = err.to_string();
     assert!(
-        msg.contains("Задачи origa") && msg.contains("не найдена"),
+        msg.contains("Задачи foilcap") && msg.contains("не найдена"),
         "отказ называет отсутствующую доску: {msg}"
     );
     assert_eq!(
@@ -431,10 +489,7 @@ async fn missing_tasks_board_bails_even_with_cron_board_present() {
 #[tokio::test]
 #[serial_test::serial]
 async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
     kernel.sql_fail.store(true, Ordering::SeqCst);
 
     let err = task_run(
@@ -450,5 +505,166 @@ async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
     assert!(
         !err.to_string().contains("не найдена"),
         "инфра-сбой не маскируется промахом: {err}"
+    );
+}
+
+/// (7) Глобальный резолв: точный id без --project — резолвится (фаза A).
+#[tokio::test]
+#[serial_test::serial]
+async fn global_resolve_exact_id_without_project() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    task_run(
+        "",
+        TaskSub::Get {
+            id: "20261105100000-ttask1".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("точный id резолвится глобально");
+}
+
+/// (8) comment без --project на подстроку задачи чужой доски — коммент
+/// приземлился в её тело (юзкейс инцидента 05.11: вопрос потерялся).
+#[tokio::test]
+#[serial_test::serial]
+async fn global_comment_without_project_lands_on_owning_board() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    task_run(
+        "",
+        TaskSub::Comment {
+            id: "origa-only".into(),
+            reply: None,
+            stdin: false,
+            text: vec!["вопрос владельцу: ЧТО РЕШИТЬ?".into()],
+        },
+    )
+    .await
+    .expect("коммент приземлился глобально");
+
+    let appends = kernel.appends_snapshot();
+    // секция «## Комменты» создаётся лениво (первый append) + строка коммента
+    assert_eq!(appends.len(), 2, "секция + коммент");
+    assert!(
+        appends.iter().all(|a| a.contains("20261105000003-obodyx3")),
+        "оба appendBlock — в тело origa-задачи: {appends:?}"
+    );
+    assert!(
+        appends.iter().any(|a| a.contains("вопрос владельцу")),
+        "текст коммента в append: {appends:?}"
+    );
+}
+
+/// (9) Подстрока матчится на двух досках — громкая ошибка с раскладкой
+/// обеих (тихий wrong-target исключён конструктивно).
+#[tokio::test]
+#[serial_test::serial]
+async fn global_substring_on_two_boards_is_loud_error() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    let err = task_run(
+        "",
+        TaskSub::Get {
+            id: "задача".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("подстрока на двух досках — неоднозначно");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("найдено на") && msg.contains("Задачи uwuwu") && msg.contains("Задачи origa"),
+        "раскладка называет обе доски: {msg}"
+    );
+}
+
+/// (10) Неоднозначность на одной доске без --project — громкая ошибка
+/// с раскладкой, чужая доска в ней не фигурирует.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_ambiguity_on_single_board_is_loud_error() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    let err = task_run(
+        "",
+        TaskSub::Get {
+            id: "alpha".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("двусмысленный фрагмент на одной доске");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("неоднозначно на") && msg.contains("Задачи uwuwu"),
+        "раскладка с доской и причиной: {msg}"
+    );
+    assert!(
+        !msg.contains("найдено на"),
+        "чужих матчей нет — «найдено на» не выводится: {msg}"
+    );
+}
+
+/// (11) Полный промах без --project — ошибка перечисляет обысканные доски.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_miss_lists_searched_boards() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    let err = task_run(
+        "",
+        TaskSub::Get {
+            id: "несуществующаяxyz".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("полный промах");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("не найдена") && msg.contains("обысканы доски"),
+        "честный промах с перечнем: {msg}"
+    );
+    assert!(
+        msg.contains("Задачи uwuwu") && msg.contains("Задачи origa"),
+        "обе задачные доски обысканы: {msg}"
+    );
+    assert!(
+        !msg.contains("Кроны"),
+        "крон-доски в глобальном обыске не участвуют: {msg}"
+    );
+}
+
+/// (12) list без --project — прежний отказ (board-bound, глобальной
+/// семантики нет).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_without_project_still_refuses() {
+    let (kernel, _server) = spawn_kernel().await;
+
+    let err = task_run(
+        "",
+        TaskSub::List {
+            status: None,
+            project: None,
+        },
+    )
+    .await
+    .expect_err("list без проекта — отказ");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--project"),
+        "отказ требует флаг проекта: {msg}"
+    );
+    assert_eq!(
+        kernel.render_count(TASKS_AV) + kernel.render_count(ORIGA_AV),
+        0,
+        "до отказа доски не читаются"
     );
 }

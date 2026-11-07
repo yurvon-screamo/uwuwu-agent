@@ -279,11 +279,10 @@ async fn search_lines_empty_everywhere_reports_no_hits_and_omits_doc_section() {
 
 #[tokio::test]
 async fn search_lines_propagates_fulltext_fetch_failure() {
-    // Arrange: ядро недоступно (порт закрыт) — мгновенный пейсинг ретраев
-    let server = MockServer::start().await;
-    let uri = server.uri();
-    drop(server);
-    let sy = SiYuan::for_tests(uri);
+    // Arrange: ядро недоступно — закрытый discard-порт (127.0.0.1:9) вместо
+    // drop(MockServer): освобождённый порт может быть тут же занят параллельным
+    // тестом, и fulltext уходил в чужой живый сервер → flake «ожидался Err»
+    let sy = SiYuan::for_tests("http://127.0.0.1:9".to_string());
 
     // Act
     let result = search_lines(&sy, "ADR-006", 10).await;
