@@ -212,6 +212,38 @@ export function syncDraftTracker(
   return { changed, fresh }
 }
 
+// ——— гейт громкого отказа тика draftWatcher ———
+
+/** Падений тика подряд до алерта владельцу: ниже порога — тихий self-heal
+ *  (транзиентные сбои шлюза ретраятся следующим тиком). */
+export const DRAFT_TICK_FAIL_ALERT_AFTER = 3
+/** Минимальный интервал повторных алертов, пока сбой продолжается. */
+export const DRAFT_TICK_FAIL_ALERT_EVERY_MS = 60 * 60_000
+
+/** Счётчик подряд-сбоев тика — в памяти процесса: рестарт сбрасывает
+ *  осознанно (стойкий сбой снова наберёт порог и уведомит). */
+export interface TickFailGate {
+  streak: number
+  nextAlertAt: number
+}
+
+export type TickKind = "fail" | "wave" | "ok"
+
+/** Исход тика → новый gate + нужен ли алерт. wave (волна деградации ядра,
+ *  KernelWaveError — штатная пауза контура) счётчик не меняет: ни инкремент,
+ *  ни сброс — как tickFailOutcome крона. fail на пороге и вне окна — алерт
+ *  (окно сдвигается от момента алерта). ok — полный сброс. */
+export function tickOutcome(gate: TickFailGate, now: number, kind: TickKind): { gate: TickFailGate; alert: boolean } {
+  if (kind === "ok") return { gate: { streak: 0, nextAlertAt: 0 }, alert: false }
+  if (kind === "wave") return { gate, alert: false }
+  const streak = gate.streak + 1
+  const due = streak >= DRAFT_TICK_FAIL_ALERT_AFTER && now >= gate.nextAlertAt
+  return {
+    gate: { streak, nextAlertAt: due ? now + DRAFT_TICK_FAIL_ALERT_EVERY_MS : gate.nextAlertAt },
+    alert: due,
+  }
+}
+
 // ——— seen/ack: запись исхода в трекер ———
 
 /** Запись ack: исход разбора + версия тела, с которой он согласован. Версия

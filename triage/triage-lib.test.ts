@@ -2,7 +2,7 @@
 // (bun test, без сети; ядро демона — lib/hub.ts, его тесты рядом с ним)
 import { test, expect } from "bun:test"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker, tickOutcome, validTriageExtras,
   DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS,
   type DraftRow,
   type DraftTrack,
@@ -142,6 +142,47 @@ test("syncDraftTracker: inFlight выживает вне seen, без мутац
   expect(state.drafts?.r2).toEqual(track({ docId: "doc-2" }))
   expect(changed).toBe(false)
   expect(fresh).toEqual([])
+})
+
+// ——— tickOutcome: гейт громкого отказа тика ———
+
+const HOUR = 60 * 60_000
+const gateAt = (streak: number, nextAlertAt = 0): { streak: number; nextAlertAt: number } => ({ streak, nextAlertAt })
+
+test("tickOutcome: алерт на пороговом сбое, повтор задушен часовым окном", () => {
+  // Arrange: два тихих сбоя
+  let gate = gateAt(0)
+  // Act/Assert: fail 1–2 без алерта
+  const first = tickOutcome(gate, 1000, "fail")
+  expect(first.alert).toBe(false)
+  gate = first.gate
+  const second = tickOutcome(gate, 2000, "fail")
+  expect(second.alert).toBe(false)
+  gate = second.gate
+  // третий подряд — алерт, окно сдвинулось на час
+  const third = tickOutcome(gate, 3000, "fail")
+  expect(third.alert).toBe(true)
+  expect(third.gate).toEqual(gateAt(3, 3000 + HOUR))
+  // повтор внутри окна задушен, streak копится
+  const fourth = tickOutcome(third.gate, 3000 + HOUR - 1, "fail")
+  expect(fourth.alert).toBe(false)
+  expect(fourth.gate.streak).toBe(4)
+  // после окна — снова алерт
+  const fifth = tickOutcome(fourth.gate, 3000 + HOUR, "fail")
+  expect(fifth.alert).toBe(true)
+})
+
+test("tickOutcome: wave — счётчик не меняется (штатная пауза), ok — сброс в ноль", () => {
+  // Arrange: счётчик с накопленным streak и активным окном алерта
+  const hot = gateAt(4, 3000 + HOUR)
+  // Act/Assert: wave ничего не трогает
+  const wave = tickOutcome(hot, 4000, "wave")
+  expect(wave.gate).toEqual(hot)
+  expect(wave.alert).toBe(false)
+  // успешный тик — полный сброс
+  const ok = tickOutcome(hot, 4000, "ok")
+  expect(ok.gate).toEqual(gateAt(0))
+  expect(ok.alert).toBe(false)
 })
 
 // ——— seen/ack: гейтинг и жизненный цикл ———
