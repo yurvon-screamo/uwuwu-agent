@@ -62,7 +62,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
-  hasSessionEvidence,
+  untrackedRowDecision,
   activeTaskGuards,
   parseAgentHeadTs,
   freshForeignComments,
@@ -79,6 +79,7 @@ import {
   type ReviewKind,
   type FactoryState,
   type StartKind,
+  type SessionLiveness,
   type SpawnEnvContext,
   type SpawnGuardHold,
   type TaskComment,
@@ -495,9 +496,7 @@ async function promptSession(sessionID: string, text: string): Promise<boolean> 
   }
 }
 
-type Liveness = "alive" | "dead" | "unknown"
-
-async function sessionLiveness(sessionID: string): Promise<Liveness> {
+async function sessionLiveness(sessionID: string): Promise<SessionLiveness> {
   if (sessionID === "") return "dead"
   try {
     await restCall(`/session/${sessionID}`)
@@ -1055,10 +1054,29 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   const untracked = untrackedTasks(spawnable, state)
 
   // ——— гард каскада: сверка state с доской до спавна (инцидент 06.11) ———
-  // сирота-спавн: сессионная ячейка непуста, а трека в state нет — state
-  // потерял трекинг (порча/перезапись/тест-запись). Спавнить их = гарантированный
-  // каскад re-spawn (19 агентов за тик) и параллельные сессии в одних ворктри.
-  const orphaned = untracked.filter((r) => hasSessionEvidence(r)).length
+  // Сирота-спавн: свидетельство спавна в строке без трека в state. Вердикт
+  // по каждой untracked строке — untrackedRowDecision (единственная точка):
+  // живая дев-заявка (task claim / фабричный спавн с потерей state) — внешняя
+  // работа идёт: не спавнить дубль и не считать сиротой; мёртвая — сирота как
+  // прежде и остаётся в дев-волне (ре-спавн при allow — автокомпенсация);
+  // ревью-свидетельство без трека — сирота как прежде. Спавнить сирот сверх
+  // lossMax = гарантированный каскад re-spawn и параллельные сессии.
+  // Liveness-пробы параллельны: сериальные await в цикле растягивали тик
+  // при волне заявленных строк (культура дев-волны 05.11).
+  const externalSkip = new Set<string>()
+  const verdicts = await Promise.all(untracked.map(async (r) => {
+    const devCell = r.devSession ?? ""
+    const liveness = devCell === "" ? "dead" : await sessionLiveness(devCell)
+    return { rowId: r.rowId, liveness, decision: untrackedRowDecision(r, liveness) }
+  }))
+  let orphaned = 0
+  for (const { rowId, liveness, decision } of verdicts) {
+    if (!decision.devWave) {
+      externalSkip.add(rowId)
+      log(`внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
+    }
+    if (decision.orphan) orphaned++
+  }
   const guard = spawnGuardVerdict(
     { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
     SPAWN_LIMITS,
@@ -1077,8 +1095,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // и fast-track In Progress владельца) получают сессии за ОДИН проход
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
   // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
+  // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
   const devWave = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) === null)
+    ? untracked.filter((t) => reviewKindOf(t.status) === null && !externalSkip.has(t.rowId))
     : []
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {

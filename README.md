@@ -70,7 +70,7 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 `factory/` — Bun/TS: конфиг board/repo/local/env, env-lifecycle (factory/env.ts,
 идемпотентный ensureEnv + cleanupEnv + старт-свип сирот), session-recovery MCP, state+reconcile.
 Имена ревью-статусов — контракт с колонками досок: константы `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`.
-Ячейки Path/«Сессия dev»/«Сессия ревью» — фабрика пишет best-effort (колонки заводит владелец).
+Ячейки Path/«Сессия dev»/«Сессия ревью» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает).
 Канон секций, шаблоны тел задач (dev, spike, bug) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
 ### Кроны (uwuwu-cron)

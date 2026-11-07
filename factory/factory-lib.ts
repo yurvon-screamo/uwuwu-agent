@@ -942,6 +942,7 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
   const text = reason === "state-loss"
     ? `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
       "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
+      "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
       "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон."
     : `[factory] Спавн задержан — за один тик набралось untracked=${f.totalUntracked} при пороге ${l.burstMax} ` +
       `(сирот-спавнов=${f.orphaned}): массовый импорт задач или потеря state без свидетелей-ячеек. ` +
@@ -953,6 +954,46 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
  *  undefined (TaskRef без нормализации) свидетельством НЕ является. */
 export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession">): boolean {
   return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== ""
+}
+
+/** Живость сессии по REST-пробе опенкода: "unknown" — проба не удалась
+ *  (транзиентный сбой), решение принимает вызывающий. */
+export type SessionLiveness = "alive" | "dead" | "unknown"
+
+/** Вердикт тика по untracked строке: спавнить ли её в дев-волне и считать ли
+ *  сиротой-спавном (корм гарда каскада). Единственная точка решения (по
+ *  образцу routeTask) — матрица плана задачи 20261105174319:
+ *  - дев-ячейка пуста → обычный путь (дев-волна решает по статусу), сирота
+ *    только при ревью-свидетельстве (карантинный спавн ревьювера пишет
+ *    только ревью-ячейку — защита инцидента 06.11 сохраняется);
+ *  - живая дев-заявка (task claim или фабричный спавн) → внешняя работа
+ *    идёт: не спавнить и не сирота;
+ *  - liveness-проба не удалась → трактуем как живую (прецедент routeTask):
+ *    транзиентный сбой REST не даёт ни спавна, ни orphan-счёта, следующий
+ *    тик перепроверит;
+ *  - мёртвая дев-заявка → сирота как прежде И остаётся в дев-волне: семантика
+ *    сирот не менялась — при allow ре-спавн компенсирует (это путь автоком-
+ *  пенсации lossMax-допуска: 1-2 сироты спавнятся, ≥3 — HOLD). Отличить
+ *  «мёртвый claim» от «потери state» по одной строке невозможно, поэтому
+ *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow. */
+export interface UntrackedRowDecision {
+  /** спавнить в дев-волне этого тика (финально фильтруется статусом) */
+  devWave: boolean
+  /** считать сиротой-спавном в подсчёте гарда */
+  orphan: boolean
+}
+
+export function untrackedRowDecision(
+  r: Pick<TaskRef, "devSession" | "reviewSession">,
+  liveness: SessionLiveness,
+): UntrackedRowDecision {
+  const devCell = r.devSession ?? ""
+  if (devCell === "") {
+    return { devWave: true, orphan: (r.reviewSession ?? "") !== "" }
+  }
+  // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
+  if (liveness !== "dead") return { devWave: false, orphan: false }
+  return { devWave: true, orphan: true }
 }
 
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →

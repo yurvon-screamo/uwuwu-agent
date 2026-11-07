@@ -68,6 +68,21 @@ pub(crate) enum TaskSub {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Заявить сессию на задачу: sessionID в ячейку «Сессия dev» — структурное
+    /// свидетельство «работу ведёт эта сессия». Фабрика живую заявку уважает:
+    /// не спавнит дубль и не считает строку сиротой. SessionID берётся из
+    /// --session либо из env OPENCODE_SESSION_ID; нет ни того, ни другого —
+    /// отказ. Колонка «Сессия dev» на доске обязательна (громкий отказ иначе).
+    Claim {
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
+        id: String,
+        #[arg(
+            long,
+            value_name = "SESSION_ID",
+            help = "Явный sessionID (иначе OPENCODE_SESSION_ID из env)"
+        )]
+        session: Option<String>,
+    },
     /// Коммент в док задачи (диалог юзер ↔ агент). Текст — единственный
     /// позиционный аргумент (или --stdin); читать комменты: task get / task thread.
     /// Токены-подкоманды и флаги в тексте отклоняются гвардом до отправки.

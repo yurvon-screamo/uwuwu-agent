@@ -44,6 +44,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  untrackedRowDecision,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
   type SpawnGuardLimits,
@@ -1179,6 +1180,41 @@ describe("alertTargetOf: фолбэк-цепочка адресата алерт
 
   test("пустой список — null", () => {
     expect(alertTargetOf([])).toBeNull()
+  })
+})
+
+describe("untrackedRowDecision: вердикт untracked строки (матрица плана 20261105174319)", () => {
+  const cell = (devSession?: string, reviewSession?: string): Pick<TaskRef, "devSession" | "reviewSession"> => ({
+    devSession,
+    reviewSession,
+  })
+
+  test("чистая fresh-строка без свидетельств — спавн обычного пути, не сирота", () => {
+    expect(untrackedRowDecision(cell(undefined, undefined), "alive")).toEqual({ devWave: true, orphan: false })
+    expect(untrackedRowDecision(cell("", ""), "dead")).toEqual({ devWave: true, orphan: false })
+  })
+
+  test("ревью-свидетельство без трека (дев пуста) — сирота как прежде, защита инцидента 06.11", () => {
+    expect(untrackedRowDecision(cell(undefined, "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "alive")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("живая дев-заявка (task claim) — внешняя работа идёт: не спавнить, не сирота", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "alive")).toEqual({ devWave: false, orphan: false })
+  })
+
+  test("liveness-проба не удалась — трактуем как живую (прецедент routeTask)", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "unknown")).toEqual({ devWave: false, orphan: false })
+  })
+
+  test("мёртвая дев-заявка — сирота как прежде и остаётся в дев-волне (ре-спавн при allow)", () => {
+    // «как прежде» = сирота в подсчёте гарда + спавн при allow: путь
+    // автокомпенсации lossMax-допуска (1-2 сироты спавнятся, ≥3 — HOLD)
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("мёртвый claim с ревью-свидетельством — сирота (любое свидетельство)", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
   })
 })
 

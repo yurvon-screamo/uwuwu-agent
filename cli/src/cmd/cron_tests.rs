@@ -538,6 +538,7 @@ fn list_table_carries_schedule_and_last_run_values() {
         pr: String::new(),
         schedule: "09:30".into(),
         last_run: "2026-11-05 09:30".into(),
+        dev_session: String::new(),
         body_doc: None,
     }];
     let table = format_cron_table(&rows);
