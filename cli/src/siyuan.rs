@@ -480,21 +480,21 @@ impl SiYuan {
         if let Err(rollback_err) = rollback.await {
             let dump_path =
                 std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
-            // 0600: пре-имидж может быть приватным (PERSON) — дамп не читаем
-            // другими пользователями хоста
-            let dump_result = std::fs::File::create(&dump_path)
-                .and_then(|file| {
-                    use std::io::Write;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                    }
-                    let mut file = file;
-                    file.write_all(pre_image.as_bytes())?;
-                    Ok(())
-                })
-                .map(|_| ());
+            // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
+            // с дефолтными правами между create и set_permissions исключено
+            let dump_result = (|| -> std::io::Result<()> {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&dump_path)?;
+                use std::io::Write;
+                file.write_all(pre_image.as_bytes())?;
+                Ok(())
+            })();
             let dump_note = match dump_result {
                 Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
                 Err(dump_err) => format!(
