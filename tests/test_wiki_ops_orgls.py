@@ -31,7 +31,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
-from tests.wiki_ops_testkit import kernel_post
+from tests.wiki_ops_testkit import kernel_post, run_cmd
 
 KERNEL_DEFAULT_LIMIT = 64
 FIXTURE_DOCS = 250
@@ -87,10 +87,8 @@ class FakeKernel:
 
 
 def run_orgls(post_impl) -> str:
-    buffer = io.StringIO()
-    with kernel_post(post_impl), redirect_stdout(buffer):
-        wiki_ops.cmd_orgls(type("Args", (), {})())
-    return buffer.getvalue()
+    out, _ = run_cmd(wiki_ops.cmd_orgls, type("Args", (), {})(), post_impl)
+    return out
 
 
 def parse_sections(output: str) -> dict[str, list[str]]:
