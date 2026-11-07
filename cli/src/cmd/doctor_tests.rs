@@ -5,7 +5,6 @@
 use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockRow, MockScenario};
 use crate::siyuan::SiYuan;
 use crate::siyuan_doctor::{run, ProbeOutcome, ProbeVerdict};
-use std::path::PathBuf;
 
 const BOARD_DOC: &str = "doc-board";
 const BOARD_AV: &str = "av-doctor";
@@ -34,11 +33,11 @@ fn orphan_scenario() -> MockScenario {
     }
 }
 
-/// Изоляция FS-пробы doctor'а от живого воркспейса: пустой WS → SKIP.
-fn isolated_workspace() -> PathBuf {
-    let ws = std::env::temp_dir().join(format!("uwuwu-doctor-test-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).expect("mkdir ws");
-    std::env::set_var("UWUWU_SIYUAN_WS", &ws);
+/// Изоляция FS-пробы doctor'а от живого воркспейса: пустой tempdir → SKIP;
+/// каталог удаляется на дропе (Guard держится до конца теста).
+fn isolated_workspace() -> tempfile::TempDir {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("UWUWU_SIYUAN_WS", ws.path());
     ws
 }
 
@@ -76,12 +75,13 @@ async fn board_orphans_probe_lists_unbound_doc() {
     let sy = SiYuan::from_env_with_timeout(10).expect("client");
     let outcomes = run(&sy, "uwuwu", 30).await;
     let (kind, what) = board_orphans_verdict(&outcomes);
-    assert_eq!(kind, "observed", "верdict board-orphans: {outcomes:?}");
+    assert_eq!(kind, "observed", "verdict board-orphans: {outcomes:?}");
     assert!(what.contains("тело без строки"), "{what}");
     assert!(what.contains("2026-11-08"), "{what}");
     assert!(!what.contains("привязанная задача"), "{what}");
     // exit-код здесь не ассертим: wave-проба теста видит живой docker
     // с реальными отказами ядра; семантика Observed покрыта юнит-тестом.
+    std::env::remove_var("UWUWU_SIYUAN_WS");
 }
 
 /// Дети с тайтлами легаси/detached строк (без привязки) сиротами не считаются.
@@ -107,6 +107,7 @@ async fn board_orphans_probe_respects_title_of_detached_row() {
     let outcomes = run(&sy, "uwuwu", 30).await;
     let (kind, verdict) = board_orphans_verdict(&outcomes);
     assert_eq!(kind, "clean", "легаси-тайтл не сирота: {verdict}");
+    std::env::remove_var("UWUWU_SIYUAN_WS");
 }
 
 /// SQL-отказ выборки детей — честный SKIP пробы (не молчаливый Clean).
@@ -128,4 +129,5 @@ async fn board_orphans_probe_skips_on_sql_failure() {
     let (kind, why) = board_orphans_verdict(&outcomes);
     assert_eq!(kind, "skipped", "SQL-отказ — SKIP: {outcomes:?}");
     assert!(why.contains("SQL детей доски"), "{why}");
+    std::env::remove_var("UWUWU_SIYUAN_WS");
 }

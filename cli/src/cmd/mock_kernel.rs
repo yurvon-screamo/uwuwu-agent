@@ -650,9 +650,9 @@ impl MockKernel {
     // ——— MCP-действия над состоянием ———
 
     fn sql_data(&self, stmt: &str) -> Value {
-        // прямые дети-доки доски (проба board-orphans): type='d' +
-        // hpath like '<доска>/%' + not like '<доска>/%/%'
-        if stmt.contains("type='d'") && stmt.contains("hpath like") {
+        // проба board-orphans: уникальная сигнатура stmt («select id,
+        // hpath, ial from blocks») — чужие SQL с hpath like не попадают
+        if stmt.contains("select id, hpath, ial from blocks") {
             if self.sc.sql_children_fail {
                 // синтаксически валидный stmt — отказ ядра как HTTP 500
                 return json!({ "__sql_fail__": true });
