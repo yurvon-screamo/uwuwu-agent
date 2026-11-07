@@ -275,6 +275,47 @@ pub(crate) enum CronSub {
     },
 }
 
+/// Реестр долгосрочных целей проекта: доска «Цели <proj>» (заводит владелец
+/// руками в UI — одноразовая настройка). Строки bound к телам-докам,
+/// статусы канонические: todo / in progress / done. Связей с задачами нет.
+#[derive(clap::Subcommand)]
+pub(crate) enum GoalSub {
+    /// Реестр целей доски проекта
+    List {
+        #[arg(long, help = "Фильтр по статусу (todo|in progress|done)")]
+        status: Option<String>,
+    },
+    /// Новая цель: строка + тело-док «## Суть» (контекст из stdin)
+    Add {
+        #[arg(long, help = "Заголовок цели")]
+        title: String,
+        #[arg(long, help = "Статус цели (деф. todo: todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Контекст цели из stdin (тело под «Суть»)")]
+        stdin: bool,
+    },
+    /// Правка цели: статус и заголовок (тело — в UI или task-механикой тел)
+    Edit {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+        #[arg(long, help = "Новый статус (todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Новый заголовок")]
+        title: Option<String>,
+    },
+    /// Снести цель: строка вниз + тело в трэш (undo-журнал)
+    Rm {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+    },
+}
+
 /// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без
 /// env-токена (токен берётся из конфигурации cli). One-shot, без ретраев —
 /// сырое состояние ядра видно на первом ответе. Диагностические вердикты
@@ -332,6 +373,12 @@ pub(crate) enum Commands {
     Read {
         #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
+    },
+    /// Перечисление доков по hpath-слагу: штатный путь «какие доки в
+    /// проекте/папке» (ADR-нумерация, Design-скан, гигиена доков).
+    Docs {
+        #[command(subcommand)]
+        command: DocsSub,
     },
     /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
@@ -395,6 +442,15 @@ pub(crate) enum Commands {
         #[arg(long, global = true)]
         project: Option<String>,
     },
+    /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
+    /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
+    Goal {
+        #[command(subcommand)]
+        command: GoalSub,
+        /// Project board (обязательно: uwuwu | origa | foilcap | …)
+        #[arg(long, global = true)]
+        project: Option<String>,
+    },
     /// Живые kernel-пробы SiYuan: ping/sql/file/ls/export/render —
     /// диагностика ядра из агентской сессии без env-токена.
     Kernel {
@@ -419,6 +475,19 @@ pub(crate) enum Commands {
         /// Окно wave-скана docker logs, минут
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
+    },
+}
+
+/// Сабкоманды `docs`.
+#[derive(Subcommand)]
+pub(crate) enum DocsSub {
+    /// Прямые дети hpath-префикса: доки именами, подпапки с хвостовым «/».
+    /// Адресация как у read (слаг без ведущего «/»): `uwuwu`,
+    /// `uwuwu/ADR`, `platform`. Неизвестное пространство — отказ
+    /// с раскладкой доступных; известное без доков — «пусто».
+    Ls {
+        #[arg(help = "hpath-слаг: <проект>[/<подпапка>]")]
+        prefix: String,
     },
 }
 

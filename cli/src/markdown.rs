@@ -28,6 +28,45 @@ pub(crate) fn strip_frontmatter(md: &str) -> String {
     }
 }
 
+/// Титульные H1-строки (`# {doc_title}`) в контенте записи — дубли к
+/// док-заголовку: контент, собранный из get-снапшота, местами несёт
+/// титульную строку, ядро пишет её реальным heading-блоком, и экспорт
+/// получает `# title` сразу за титульным (nmcfoxy 07.11 00:18, задача
+/// 20261107051501). Снимаются ВСЕ вхождения вне code-fence: канон тел
+/// запрещает H1 (ADR-046), любая титульная строка в контенте —
+/// дубль-кандидат. Матч построчный точный (`# {doc_title}`, хвостовые
+/// пробелы гасятся): заголовки с другим текстом и строки внутри фенсов
+/// (gherkin-примеры) не трогаются. Границы: варианты с двойным пробелом
+/// (`#  title`), сырым `/` в тайтле (док-тайтл path_safe-форма) и титульные
+/// строки внутри `~~~`-фенсов (fence-трекинг знает только тройные бэктики,
+/// как и normalized_lines) не матчатся — первые два не встречаются в
+/// снапшот-пастах / исключены конвенцией доски («сырой / в тайтле пишется
+/// как ∕»), третий — редкий стиль, цена ложного положительного — одна
+/// строка. Вход ожидается LF-нормализованным (агентские файлы, ядерный
+/// экспорт); CRLF-вход нормализуется к LF (`md.lines()`), байт-точность —
+/// на LF-пайплайне.
+pub(crate) fn strip_title_h1(md: &str, doc_title: &str) -> String {
+    let title_line = format!("# {doc_title}");
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in md.lines() {
+        if toggles_fence(line) {
+            in_fence = !in_fence;
+            out.push(line);
+            continue;
+        }
+        if !in_fence && line.trim_end() == title_line {
+            continue;
+        }
+        out.push(line);
+    }
+    let mut stripped = out.join("\n");
+    if md.ends_with('\n') && !stripped.ends_with('\n') {
+        stripped.push('\n');
+    }
+    stripped
+}
+
 /// Каноническая форма для сравнения контента: пробельные run'ы (включая
 /// переводы строк) схлопываются в один пробел, края обрезаются.
 pub(crate) fn collapse_whitespace(md: &str) -> String {
@@ -220,6 +259,43 @@ mod tests {
             strip_export_wrapper(md, "таск"),
             "# другой заголовок\nтекст\n"
         );
+    }
+
+    #[test]
+    fn strip_title_h1_removes_leading_and_repeated_title_lines() {
+        let md = "# таск\n\nтело\n\n# таск\n\nхвост\n";
+        assert_eq!(strip_title_h1(md, "таск"), "\nтело\n\n\nхвост\n");
+    }
+
+    #[test]
+    fn strip_title_h1_keeps_other_headings_and_mid_text() {
+        let md = "## Раздел\n\nупоминание # таск в строке\n\n# другой заголовок\n";
+        assert_eq!(
+            strip_title_h1(md, "таск"),
+            "## Раздел\n\nупоминание # таск в строке\n\n# другой заголовок\n"
+        );
+    }
+
+    #[test]
+    fn strip_title_h1_spares_title_inside_fence() {
+        let md = "```gherkin\n# таск\n```\nпосле фенса\n";
+        assert_eq!(
+            strip_title_h1(md, "таск"),
+            "```gherkin\n# таск\n```\nпосле фенса\n"
+        );
+    }
+
+    #[test]
+    fn strip_title_h1_requires_line_exact_match() {
+        // заголовок с дополнительным текстом — другой heading, не титул
+        let md = "# таск: детали\nтело\n";
+        assert_eq!(strip_title_h1(md, "таск"), md);
+    }
+
+    #[test]
+    fn strip_title_h1_preserves_trailing_newline() {
+        assert_eq!(strip_title_h1("# таск\nтело\n", "таск"), "тело\n");
+        assert_eq!(strip_title_h1("# таск", "таск"), "");
     }
 
     #[test]

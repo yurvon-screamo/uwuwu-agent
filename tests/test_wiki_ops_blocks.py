@@ -17,7 +17,12 @@
      data/assets/undo/wiki_ops/ (прямой FS-доступ с хоста невозможен: владелец —
      контейнер ядра), после insert дополняется new_ids; деградация журнала не
      валит операцию;
-  8) каждый SQL-stmt несёт явный LIMIT (правило проекта после orgls-инцидента).
+  8) каждый SQL-stmt несёт явный LIMIT (правило проекта после orgls-инцидента);
+  9) блок type='t' — контекст всей таблицы (пробы 06.11/07.11): update с payload
+     без separator-строки шапки (row-payload, не-табличный payload, fence с
+     таблицей внутри) и delete — отказ до мутации и до undo-журнала; payload
+     полной таблицы — осознанный rewrite (ядро переписывает ровно как задано);
+     insert-after — сиблинг-инсерт после таблицы, без гварда.
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_blocks.py
@@ -41,7 +46,10 @@ DOC_ID = "20261106030000-doc0001"
 BLOCK_ID = "20261106030000-blk0001"
 CHILD_ID = "20261106030000-chl0001"
 LIST_ID = "20261106030000-lst0001"
+TABLE_ID = "20261106030000-tbl0001"
 NEW_ID = "20261106040000-new0001"
+
+TABLE_MD = "| Колонка A | Колонка B |\n| --- | --- |\n| раз | один |\n| два | два |"
 
 MULTI_BLOCK_PAYLOAD = "Первый абзац нового.\n\nВторой абзац — должен исчезнуть."
 
@@ -239,6 +247,82 @@ class DocIdIsNotABlock(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             run_block(kernel, "delete", block_id=DOC_ID)
         self.assertEqual(kernel.mutations, [])
+
+
+class TableBlockGuard(unittest.TestCase):
+    """type='t' — контекст всей таблицы (пробы ядра 06.11/07.11, задача
+    20261106085434): update с payload без separator-строки шапки переписывает
+    таблицу целиком payload'ом (схлопывание, code=0), delete сносит её целиком —
+    оба отказа до мутации и до undo-журнала. Полная таблица — осознанный rewrite
+    (ядро переписывает ровно как задано, проба 07.11); insert-after — сиблинг
+    после таблицы, доброкачественный."""
+
+    def _table_kernel(self) -> FakeKernel:
+        return FakeKernel(blocks=[_block(TABLE_ID, btype="t", markdown=TABLE_MD)], docs=[_doc()])
+
+    def test_row_like_payload_update_is_refused_before_mutation_and_journal(self):
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", block_id=TABLE_ID, payload="| раз | правка |")
+        self.assertIn("таблица", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+        self.assertEqual(kernel.puts, [])
+
+    def test_data_row_with_hyphen_is_not_mistaken_for_separator(self):
+        # Ревью плана 07.11: наивный паттерн матчит дефис в data-строке
+        # («| 2026-11-07 | отчёт |») и молча пропускает схлопывание.
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError):
+            run_block(kernel, "update", block_id=TABLE_ID, payload="| 2026-11-07 | отчёт |")
+        self.assertEqual(kernel.mutations, [])
+
+    def test_non_table_payload_update_is_refused(self):
+        # Не-табличный одно-блочный payload переписал бы таблицу параграфом —
+        # конверсия 't' не через block-update (ревью плана 07.11).
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", block_id=TABLE_ID, payload="Просто параграф.")
+        self.assertIn("таблица", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+
+    def test_fenced_table_syntax_payload_is_refused(self):
+        # Separator внутри code-fence — не таблица: это конверсия в код-блок.
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError):
+            run_block(kernel, "update", block_id=TABLE_ID,
+                      payload="```markdown\n| a | b |\n| --- | --- |\n```")
+        self.assertEqual(kernel.mutations, [])
+
+    def test_tilde_fenced_table_syntax_payload_is_refused(self):
+        # Ревью кода 07.11: FENCE_RE ловил только backticks — ~~~-фенс с
+        # таблицей внутри проходил гвардом и молча заменял таблицу код-блоком.
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError):
+            run_block(kernel, "update", block_id=TABLE_ID,
+                      payload="~~~\n| a | b |\n| --- | --- |\n~~~")
+        self.assertEqual(kernel.mutations, [])
+
+    def test_full_table_payload_update_is_allowed(self):
+        kernel = self._table_kernel()
+        new_table = "| Новая шапка | Ц2 |\n| --- | --- |\n| альфа | 1 |"
+        run_block(kernel, "update", block_id=TABLE_ID, payload=new_table)
+        self.assertEqual(kernel.mutations,
+                         [("/api/block/updateBlock",
+                           {"dataType": "markdown", "data": new_table, "id": TABLE_ID}, 1)])
+
+    def test_delete_on_table_block_is_refused(self):
+        kernel = self._table_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "delete", block_id=TABLE_ID)
+        self.assertIn("таблица", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+        self.assertEqual(kernel.puts, [])
+
+    def test_insert_after_table_block_is_allowed(self):
+        kernel = self._table_kernel()
+        run_block(kernel, "insert-after", block_id=TABLE_ID, payload="Абзац после таблицы.")
+        self.assertEqual(kernel.mutations[0][0], "/api/block/insertBlock")
+        self.assertEqual(kernel.mutations[0][1]["previousID"], TABLE_ID)
 
 
 class BadInputs(unittest.TestCase):

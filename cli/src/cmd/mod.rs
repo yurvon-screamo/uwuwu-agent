@@ -1,6 +1,7 @@
 //! uwuwu-cli на SiYuan: единый диспетчер команд (единственный бекенд).
 
 mod cli;
+mod docs_ls;
 mod read_resolve;
 mod sy_dispatch;
 
@@ -11,6 +12,8 @@ mod create_tests;
 #[cfg(test)]
 mod mock_kernel;
 #[cfg(test)]
+mod docs_tests;
+#[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
 mod claim_tests;
@@ -20,6 +23,8 @@ mod fallback_tests;
 mod kernel_tests;
 #[cfg(test)]
 mod cron_tests;
+#[cfg(test)]
+mod goal_tests;
 #[cfg(test)]
 mod write_path_tests;
 
