@@ -2,15 +2,22 @@
 // (bun test, без сети; ядро демона — lib/hub.ts, его тесты рядом с ним)
 import { test, expect } from "bun:test"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker, validTriageExtras,
   DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS,
+  type DraftRow,
   type DraftTrack,
 } from "./triage-lib"
-import { validState } from "../lib/hub"
+import { validState, type HubState } from "../lib/hub"
 
 const track = (over: Partial<DraftTrack>): DraftTrack => ({
   project: "uwuwu", docId: "doc-1", title: "Черновик", seenAt: 0, updatedAt: 0, turns: 0, ...over,
 })
+
+const seenOf = (rows: Array<{ rowId: string; docId?: string; title?: string }>): Map<string, DraftRow> => {
+  const seen = new Map<string, DraftRow>()
+  for (const r of rows) seen.set(r.rowId, { rowId: r.rowId, docId: r.docId ?? "doc-1", title: r.title ?? "Черновик" })
+  return seen
+}
 
 /** validState с триаж-extras — так его вызывает демон триажа. */
 const validTriageState = (raw: unknown): ReturnType<typeof validState> => validState(raw, validTriageExtras)
@@ -83,6 +90,58 @@ test("composeDraftPrompt: только метаданные, длинный за
   const long = composeDraftPrompt("uwuwu", "r1", "д".repeat(200))
   expect(long.length).toBeLessThan(400)
   expect(long).toContain("…")
+})
+
+// ——— syncDraftTracker: трекер vs доски ———
+
+test("syncDraftTracker: отсутствующий трекер материализуется — TypeError тика закрыт", () => {
+  // Arrange: state после рестарта с пустым трекером — поля drafts нет вовсе
+  const state: Pick<HubState, "drafts" | "draftSkip"> = {}
+  // Act
+  const { changed, fresh } = syncDraftTracker(state, seenOf([{ rowId: "r1" }]), new Map([["r1", "uwuwu"]]), new Set(), 1000)
+  // Assert
+  expect(state.drafts?.r1).toEqual(track({ seenAt: 1000, updatedAt: 1000 }))
+  expect(changed).toBe(true)
+  expect(fresh).toEqual(["черновик: uwuwu r1 «Черновик»"])
+})
+
+test("syncDraftTracker: смена тайтла обновляет трек, пустой тайтл доски не затирает", () => {
+  // Arrange: r1 переименован на доске, r2 отдаёт пустой тайтл (линковка не досталась)
+  const state = { drafts: { r1: track({}), r2: track({ docId: "doc-2" }) } }
+  const seen = seenOf([{ rowId: "r1", title: "Новое имя" }, { rowId: "r2", title: "" }])
+  // Act
+  const { changed, fresh } = syncDraftTracker(state, seen, new Map(), new Set(), 1000)
+  // Assert
+  expect(state.drafts?.r1.title).toBe("Новое имя")
+  expect(state.drafts?.r2.title).toBe("Черновик") // пустота не затирает
+  expect(changed).toBe(true)
+  expect(fresh).toEqual([]) // оба sighting'а старые — новых лог-строк нет
+})
+
+test("syncDraftTracker: ушедший из Draft удаляется вместе со skip", () => {
+  // Arrange: r3 больше не в Draft, skip-запись ещё жива
+  const state = {
+    drafts: { r1: track({}), r3: track({ docId: "doc-3" }) },
+    draftSkip: { r3: 5 } as Record<string, number>,
+  }
+  // Act
+  const { changed } = syncDraftTracker(state, seenOf([{ rowId: "r1" }]), new Map(), new Set(), 1000)
+  // Assert
+  expect(state.drafts?.r3).toBeUndefined()
+  expect(state.draftSkip?.r3).toBeUndefined()
+  expect(state.drafts?.r1).toEqual(track({}))
+  expect(changed).toBe(true)
+})
+
+test("syncDraftTracker: inFlight выживает вне seen, без мутаций changed=false", () => {
+  // Arrange: r2 в очереди/ране (не в seen) — чистка его не трогает; r1 без изменений
+  const state = { drafts: { r1: track({}), r2: track({ docId: "doc-2" }) } }
+  // Act
+  const { changed, fresh } = syncDraftTracker(state, seenOf([{ rowId: "r1" }]), new Map(), new Set(["r2"]), 1000)
+  // Assert
+  expect(state.drafts?.r2).toEqual(track({ docId: "doc-2" }))
+  expect(changed).toBe(false)
+  expect(fresh).toEqual([])
 })
 
 // ——— seen/ack: гейтинг и жизненный цикл ———

@@ -186,6 +186,10 @@ export function syncDraftTracker(
 ): { changed: boolean; fresh: string[] } {
   let changed = false
   const fresh: string[] = []
+  // пустой/отсутствующий трекер (рестарт с разобранными черновиками) — не повод
+  // падать: материализуем поле в живой state, чтобы записи трекера персистились
+  // (`?? {}` на чтении писал бы в брошенный объект — трекер терялся бы каждый тик)
+  state.drafts ??= {}
   const drafts = state.drafts as Record<string, DraftTrack>
   for (const [rowId, d] of seen) {
     const t = drafts[rowId]
