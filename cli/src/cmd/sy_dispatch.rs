@@ -1,5 +1,6 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
+use super::docs_ls;
 use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::html_embed;
@@ -39,6 +40,7 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
             print!("{md}");
             Ok(())
         }
+        Commands::Docs { command } => docs_ls::docs_run(command).await,
         Commands::Blob { key, out } => blob_run(&key, out).await,
         Commands::Person { command } => person_run(command).await,
         Commands::Projects => projects_run().await,
