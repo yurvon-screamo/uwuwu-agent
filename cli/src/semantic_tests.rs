@@ -619,14 +619,16 @@ async fn delta_mountain_run2_does_not_reembed_committed_prefix() {
         .await
         .expect("дельта");
 
-    let embedded = inputs.lock().unwrap();
-    assert_eq!(
-        embedded.len(),
-        268,
-        "переэмбедден только хвост 0032..0299, не префикс: {}",
-        embedded.len()
-    );
-    assert!(!embedded.iter().any(|c| c.contains("номер 0 ")));
+    {
+        let embedded = inputs.lock().unwrap();
+        assert_eq!(
+            embedded.len(),
+            268,
+            "переэмбедден только хвост 0032..0299, не префикс: {}",
+            embedded.len()
+        );
+        assert!(!embedded.iter().any(|c| c.contains("номер 0 ")));
+    }
     assert_eq!(report.embedded, 268);
     let mark = store.meta("watermark").unwrap().unwrap();
     assert_eq!(
