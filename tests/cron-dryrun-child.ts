@@ -38,7 +38,7 @@ const calls: Call[] = []
 // CLI не зовётся в DRY_RUN: ран-карточка не создаётся. Патчим BEFORE tick:
 // реальный spawn писал бы в прод-воркспейс.
 const origSpawn = Bun.spawn
-;(Bun as unknown as { spawn: unknown }).spawn = ((cmd: unknown, opts?: unknown) => {
+;(Bun as unknown as { spawn: unknown }).spawn = ((cmd: unknown, _opts?: unknown) => {
   calls.push({ kind: "spawn", name: String(Array.isArray(cmd) ? cmd[0] : cmd) })
   throw new Error(`mock: DRY_RUN не должен спавнить процессы (${String(cmd)})`)
 }) as typeof Bun.spawn

@@ -230,7 +230,7 @@ async function scheduleOf(tool: PlatformTool, bodyDoc: string): Promise<string |
 async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string; password?: string }
   const base = (reg.url ?? "").replace("0.0.0.0", "127.0.0.1")
-  const auth = "Basic " + Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")
+  const auth = `Basic ${Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")}`
   const res = await fetch(`${base}/api${path}`, {
     method: init?.method ?? "GET",
     headers: { authorization: auth, "content-type": "application/json" },

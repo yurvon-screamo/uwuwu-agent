@@ -87,7 +87,7 @@ function scriptKernel(): { calls: KernelCall[] } {
         // FS-истина: блок жив — отказ экспорта не превращается в вердикт
         // «тела нет», это infra (ретрай следующим тиком)
         calls.push({ kind: "mcp-tool", name: "block:get-alive" })
-        return sse({ content: [{ type: "text", text: "Markdown: x\nId: " + BODY_DOC + "\nType: NodeDocument" }] })
+        return sse({ content: [{ type: "text", text: `Markdown: x\nId: ${BODY_DOC}\nType: NodeDocument` }] })
       }
       throw new Error(`mock: неожиданная mcp-тулза ${params.name}`)
     }
