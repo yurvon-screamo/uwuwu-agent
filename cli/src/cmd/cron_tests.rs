@@ -119,7 +119,8 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             } else {
                 vec![]
             };
-            ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": ids }).to_string())
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "code": 0, "data": ids }).to_string())
         })
         .mount(server)
         .await;
@@ -133,15 +134,14 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 match kernel.attrs_of(id) {
                     Some(attrs) => {
-                        let map: serde_json::Map<String, serde_json::Value> = attrs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), json!(v)))
-                            .collect();
+                        let map: serde_json::Map<String, serde_json::Value> =
+                            attrs.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                         ResponseTemplate::new(200)
                             .set_body_string(json!({ "code": 0, "data": map }).to_string())
                     }
-                    None => ResponseTemplate::new(200)
-                        .set_body_string(json!({ "code": -1, "msg": "block not found" }).to_string()),
+                    None => ResponseTemplate::new(200).set_body_string(
+                        json!({ "code": -1, "msg": "block not found" }).to_string(),
+                    ),
                 }
             }
         })

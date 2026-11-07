@@ -299,10 +299,7 @@ async fn get_resolves_on_tasks_board_without_cron_reads() {
     .await
     .expect("задача резолвится штатно");
 
-    assert!(
-        kernel.render_count(TASKS_AV) > 0,
-        "доска задач прочитана"
-    );
+    assert!(kernel.render_count(TASKS_AV) > 0, "доска задач прочитана");
     assert_eq!(
         kernel.render_count(CRON_AV),
         0,
@@ -363,8 +360,14 @@ async fn full_miss_lists_only_tasks_board() {
     .expect_err("полный промах");
 
     let msg = err.to_string();
-    assert!(msg.contains("Задачи uwuwu"), "обысканная доска в ошибке: {msg}");
-    assert!(!msg.contains("Кроны"), "крон-доски в обыске не участвуют: {msg}");
+    assert!(
+        msg.contains("Задачи uwuwu"),
+        "обысканная доска в ошибке: {msg}"
+    );
+    assert!(
+        !msg.contains("Кроны"),
+        "крон-доски в обыске не участвуют: {msg}"
+    );
 }
 
 /// (4) Неоднозначный префикс на «Задачи» — громкая раскладка; крон-доски
