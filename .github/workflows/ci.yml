@@ -1,0 +1,68 @@
+# CI на PR: fmt + clippy + test + qlty (delta).
+# Без concurrency: cancel-in-progress ест свои раны (опыт origa, док cicd).
+# Триггер только pull_request: CI-чек для branch protection прицепляется
+# именно к PR-ранам — dispatch/push чека на PR не дают.
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # Чекран называется по job name (не по id): required-контекст в branch
+    # protection — «CI», GitHub матчит посимвольно (инцидент: джоба без name
+    # давала чекран «ci» и гейт блокировал вообще все PR).
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # fetch-depth: 0 — нужна дельта origin/master...HEAD для qlty
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Пины по SHA: плавающие теги = supply-chain поверхность и
+      # невоспроизводимость ранов (правило ревью workflows, образец — origa).
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: cli
+
+      - name: cargo fmt
+        working-directory: cli
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: cli
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        # e2e-тесты требуют живое ядро SiYuan и гвардятся UWUWU_E2E=1:
+        # без переменной они сразу зелёные (см. cli/tests/*_e2e.rs).
+        working-directory: cli
+        run: cargo test
+
+      - name: Install qlty
+        run: curl -sSfL https://qlty.sh | sh
+
+      - name: qlty check (delta)
+        # Дельта PR по паттерну репо-конвенции (Lint-строка отчёта):
+        # --all падает на существующем baseline-долге, новое обязано быть
+        # чистым; --diff-filter=d исключает удалённые файлы (qlty падает
+        # на отсутствующих путях); пустая дельта (pure-deletion PR) —
+        # qlty-прогон не выполняется вовсе.
+        run: |
+          files=$(git diff --name-only --diff-filter=d origin/master...HEAD)
+          if [ -z "$files" ]; then
+            echo "Пустая дельта — qlty-прогон не требуется"
+            exit 0
+          fi
+          # xargs -d '\n': пути с пробелами не разлетаются (word-splitting);
+          # GNU xargs с пустым входом не запускает команду, if выше — для явного скипа
+          printf '%s\n' "$files" | xargs -r -d '\n' "$HOME/.qlty/bin/qlty" check --no-fix

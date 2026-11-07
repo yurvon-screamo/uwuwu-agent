@@ -7,6 +7,7 @@
 pub mod cmd;
 pub mod html_embed;
 pub mod markdown;
+pub mod md_artifacts;
 pub mod md_heading;
 pub mod path;
 pub mod schedule;

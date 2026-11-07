@@ -5,6 +5,7 @@ use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, GoalSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::html_embed;
 use crate::markdown;
+use crate::md_artifacts;
 use crate::md_heading;
 use crate::siyuan::find_marker_location as sy_find_marker_location;
 use crate::siyuan_goal as goal;
@@ -175,6 +176,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
                 };
+                for warning in md_artifacts::artifact_report(&md) {
+                    eprintln!("⚠ round-trip-артефакт: {warning}");
+                }
                 println!("\n----- тело -----\n{md}");
                 let assets = save_body_assets(&sy, &md, &task.item_id).await;
                 if !assets.is_empty() {
@@ -327,6 +331,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             text,
         } => {
             let msg = guarded_comment_text(stdin, &text)?;
+            // write-side превенция тег-матча ядра (см. body): предупреждение
+            // в stderr, запись не блокируется
+            if let Some(warning) = md_artifacts::tag_trap_warning(&msg) {
+                eprintln!("{warning}");
+            }
             let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             println!(
@@ -372,6 +381,12 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
+            // write-side превенция тег-матча ядра: голые решётки с пунктуацией
+            // вплотную съедают бэктики код-спанов на экспорте; предупреждение
+            // не блокирует запись (легитимные тела О самой порче триггерят)
+            if let Some(warning) = md_artifacts::tag_trap_warning(&content) {
+                eprintln!("{warning}");
+            }
             // фенс-вход валидируется до resolve/upload: отказ (дубль имени,
             // незакрытый фенс, пустая строка в html) не грузит ассеты
             let fences = html_embed::parse_input(&content)?;
@@ -1384,7 +1399,11 @@ pub async fn read_markdown(slug: &str) -> Result<String> {
     }
     let sy = SiYuan::from_env()?;
     let doc_id = read_resolve::resolve(&sy, slug).await?;
-    sy.export_md_by_id(&doc_id).await
+    let md = sy.export_md_by_id(&doc_id).await?;
+    for warning in md_artifacts::artifact_report(&md) {
+        eprintln!("⚠ round-trip-артефакт: {warning}");
+    }
+    Ok(md)
 }
 
 pub(crate) async fn blob_run(key: &str, out: Option<String>) -> Result<()> {
@@ -4695,7 +4714,7 @@ mod tests {
                 // поиск доски (doc_ids_by_hpath идёт через getIDsByHPath; здесь
                 // только av-носитель доски) и прочие выборки — пусто
                 let data = if stmt.contains("type='av'") {
-                    serde_json::json!([{ "id": "block-1", "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>") }])
+                    serde_json::json!([{ "id": "block-1", "markdown": "<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>" }])
                 } else {
                     serde_json::json!([])
                 };
@@ -4719,8 +4738,6 @@ mod tests {
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
                 let _data = if hpath == "/uwuwu/Задачи uwuwu" {
                     serde_json::json!([BOARD_DOC])
-                } else if hpath.contains("/таск") {
-                    serde_json::json!([])
                 } else {
                     serde_json::json!([])
                 };

@@ -92,7 +92,6 @@ fn rows_for_av(av: &str) -> &'static [Row] {
 /// (av, keyID, itemID), тела appendBlock, флаг сбоя SQL.
 struct Kernel {
     render_calls: Mutex<HashMap<String, usize>>,
-    item_updates: Mutex<Vec<(String, String, String)>>,
     appends: Mutex<Vec<String>>,
     sql_fail: AtomicBool,
 }
@@ -101,7 +100,6 @@ impl Kernel {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             render_calls: Mutex::new(HashMap::new()),
-            item_updates: Mutex::new(Vec::new()),
             appends: Mutex::new(Vec::new()),
             sql_fail: AtomicBool::new(false),
         })
@@ -118,10 +116,6 @@ impl Kernel {
 
     fn appends_snapshot(&self) -> Vec<String> {
         self.appends.lock().unwrap().clone()
-    }
-
-    fn updates_snapshot(&self) -> Vec<(String, String, String)> {
-        self.item_updates.lock().unwrap().clone()
     }
 }
 
@@ -411,7 +405,7 @@ async fn cron_board_row_is_not_resolved_anymore() {
 #[tokio::test]
 #[serial_test::serial]
 async fn full_miss_lists_only_tasks_board() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -439,7 +433,7 @@ async fn full_miss_lists_only_tasks_board() {
 #[tokio::test]
 #[serial_test::serial]
 async fn ambiguous_prefix_is_loud_without_cron_boards() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -512,7 +506,7 @@ async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_resolve_exact_id_without_project() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     task_run(
         "",
@@ -548,9 +542,7 @@ async fn global_comment_without_project_lands_on_owning_board() {
     // секция «## Комменты» создаётся лениво (первый append) + строка коммента
     assert_eq!(appends.len(), 2, "секция + коммент");
     assert!(
-        appends
-            .iter()
-            .all(|a| a.contains("20261105000003-obodyx3")),
+        appends.iter().all(|a| a.contains("20261105000003-obodyx3")),
         "оба appendBlock — в тело origa-задачи: {appends:?}"
     );
     assert!(
@@ -564,7 +556,7 @@ async fn global_comment_without_project_lands_on_owning_board() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_substring_on_two_boards_is_loud_error() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -588,7 +580,7 @@ async fn global_substring_on_two_boards_is_loud_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_ambiguity_on_single_board_is_loud_error() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -615,7 +607,7 @@ async fn global_ambiguity_on_single_board_is_loud_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_miss_lists_searched_boards() {
-    let (kernel, _server) = spawn_kernel().await;
+    let (_kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -649,9 +641,15 @@ async fn global_miss_lists_searched_boards() {
 async fn list_without_project_still_refuses() {
     let (kernel, _server) = spawn_kernel().await;
 
-    let err = task_run("", TaskSub::List { status: None, project: None })
-        .await
-        .expect_err("list без проекта — отказ");
+    let err = task_run(
+        "",
+        TaskSub::List {
+            status: None,
+            project: None,
+        },
+    )
+    .await
+    .expect_err("list без проекта — отказ");
 
     let msg = err.to_string();
     assert!(

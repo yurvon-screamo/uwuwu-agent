@@ -19,6 +19,7 @@ exclude_patterns = [
   "*.min.*",
   "**/.yarn/**",
   "**/*.d.ts",
+  "skills/stageshow/**", # vendored third-party skill (MIT, upstream benjitaylor/skills @ 299140f) — линтаем наш код, не апстрим
   "**/assets/**",
   "**/bower_components/**",
   "**/build/**",

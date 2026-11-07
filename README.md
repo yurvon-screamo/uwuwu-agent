@@ -22,9 +22,9 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (29)
+## Скиллы (30)
 
-- **UI (1)**: architect-ui-ux — дизайн-стратегия + правила имплементации (бывшая пара architect/rules-ui слита)
+- **UI (2)**: architect-ui-ux (дизайн-стратегия + правила имплементации; бывшая пара architect/rules-ui слита) · stageshow (faux-UI макеты, анимации, bento — vendored, MIT, upstream benjitaylor/skills @ 299140f)
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
 - **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
 - **Office (4)**: docx · pdf · pptx · xlsx
@@ -72,6 +72,15 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 Имена ревью-статусов — контракт с колонками досок: константы `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`.
 Ячейки Path/«Сессия dev»/«Сессия ревью» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает).
 Канон секций, шаблоны тел задач (dev, spike, bug) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
+
+### CI (GitHub Actions)
+
+`.github/workflows/ci.yml` — на каждый PR: cargo fmt --check, cargo clippy
+--all-targets -- -D warnings, cargo test (e2e скипаются без живого ядра) и
+qlty delta-check по конфигу репо. Зелёный CI — обязательное условие мержа
+(branch protection master, required check «CI»); ревьювер ручных прогонов
+не делает — опирается на CI-статусы. Локально то же самое: `cd cli && cargo
+fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 
 ### Кроны (uwuwu-cron)
 
