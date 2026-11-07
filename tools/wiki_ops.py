@@ -424,16 +424,22 @@ def _payload_empty_after_strip_error() -> RuntimeError:
         "без контента? Проверь файл --md")
 
 
+# Help для payload-аргументов всех трёх doc-level write-path'ов (S1192):
+# стрип-контракт одинаков, литерал один.
+PAYLOAD_STRIP_HELP = ("payload без экспорт-обвязки "
+                      "(frontmatter/ведущий title-H1 снимутся автоматически)")
+
+
 # Фолбэк docId-резолва (getIDsByHPath по файловому дереву): бюджет поллинга
 # на транзиент синка filetree; SQL-индекс не годится (лагает на create).
 DOC_ID_FALLBACK_ATTEMPTS = 3
 
 
-def _resolve_new_doc_id(nb_id: str, hpath: str, created) -> str | None:
+def _resolve_new_doc_id(nb_id: str, hpath: str, created: object) -> str | None:
     """docId свежесозданного дока (create/replace печатают его в выводе —
     replace пересоздаёт док с новым id, держатель старого иначе ретраит
-    мёртвый, инцидент 08.11). Первичный источник — data ответа
-    createDocWithMd: ядро возвращает id строкой (живая проба 08.11; cli её
+    мёртвый, инцидент 08.11). created — data ответа createDocWithMd; первичный
+    источник: ядро возвращает id строкой (живая проба 08.11; cli её
     не использовал). Фолбэк при не-строке — getIDsByHPath с ключом "path"
     (cli-контракт doc_ids_by_hpath, cli/src/siyuan.rs; неверный ключ — тихий
     null, проба 08.11): файловое дерево синхронно, поллинг — на транзиент
@@ -1687,20 +1693,20 @@ def main():
     p.set_defaults(fn=cmd_export)
     p = sub.add_parser("create")
     p.add_argument("title")
-    p.add_argument("file")
+    p.add_argument("file", help=PAYLOAD_STRIP_HELP)
     p.add_argument("--parent", default="")
     p.set_defaults(fn=cmd_create)
     p = sub.add_parser("append")
     p.add_argument("docId")
     p.add_argument("--md", dest="file", required=True,
-                   help="payload без экспорт-обвязки (frontmatter/ведущий title-H1 снимутся автоматически)")
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--force", action="store_true",
                    help="осознанный дубль single-shot: одна отсылка без guard'а и ретраев")
     p.set_defaults(fn=cmd_append)
     p = sub.add_parser("replace")
     p.add_argument("docId")
     p.add_argument("--md", dest="file", required=True,
-                   help="payload без экспорт-обвязки (frontmatter/ведущий title-H1 снимутся автоматически)")
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--base", default=None,
                    help="снапшот свежести: нетронутый вывод wiki_ops export этого дока, снятый до правки")
     p.add_argument("--force", action="store_true",
