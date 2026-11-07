@@ -332,4 +332,8 @@ fn semantic_subcommands_parse() {
         panic!("expected semantic");
     };
     assert!(matches!(command, SemanticSub::Status));
+    let Commands::Semantic { command } = parse_command(&["semantic", "sync"]).unwrap() else {
+        panic!("expected semantic");
+    };
+    assert!(matches!(command, SemanticSub::Sync));
 }

@@ -57,16 +57,29 @@ impl KernelMock {
             return vec![json!({ "c": count })];
         }
         if stmt.contains("count(*)") {
-            // честный count: только строки над watermark-предикатом
+            // честный count: строки над watermark-парой
+            // (updated > wu or (updated = wu and id > wi))
             let after = stmt
                 .split("updated > '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("0")
                 .to_string();
+            let id_marker = "and id > '";
+            let id_after = stmt
+                .split(id_marker)
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("")
+                .to_string();
             let count = blocks
                 .iter()
-                .filter(|b| b["updated"].as_str().unwrap_or("").as_bytes() > after.as_bytes())
+                .filter(|b| {
+                    let updated = b["updated"].as_str().unwrap_or("").as_bytes();
+                    let id = b["id"].as_str().unwrap_or("").as_bytes();
+                    updated > after.as_bytes()
+                        || (updated == after.as_bytes() && id > id_after.as_bytes())
+                })
                 .count();
             return vec![json!({ "c": count })];
         }
@@ -370,7 +383,9 @@ async fn delta_pages_through_equal_timestamp_run_without_loss() {
     assert_eq!(report.skipped_short, 52);
     assert_eq!(report.embedded, 468);
     assert_eq!(store.chunk_count().unwrap(), 468);
-    assert_eq!(store.meta("watermark").unwrap().as_deref(), Some(T1));
+    let (mark_updated, mark_id) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(mark_updated, T1);
+    assert_eq!(mark_id, "20261105-0519", "clean-end пишет курсор-пару");
     assert_eq!(store.meta("dim").unwrap().as_deref(), Some("3"));
     // каждый чанк эмбедден ровно один раз — 0 потерь, 0 дублей
     assert_eq!(inputs.lock().unwrap().len(), 468);
@@ -435,7 +450,8 @@ async fn delta_overlap_reembeds_same_second_edit_after_watermark() {
     sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
         .await
         .expect("первая дельта");
-    assert_eq!(store.meta("watermark").unwrap().as_deref(), Some(T0));
+    let (mark_updated, _) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(mark_updated, T0);
 
     // Правка a2 в ту же секунду, что watermark — после прохода курсора.
     {
@@ -450,9 +466,11 @@ async fn delta_overlap_reembeds_same_second_edit_after_watermark() {
     let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
         .await
         .expect("вторая дельта");
+    // отредактированная a2 переэмбеддится (content разошёлся), нетронутые
+    // a1/a3 — skip-unchanged без переэмбедда (пара в watermark различает)
     assert_eq!(
-        report.embedded, 3,
-        "overlap-окно переэмбеддит хвост секунды"
+        report.embedded, 1,
+        "overlap-окно переэмбеддит только правку"
     );
     assert_eq!(store.chunk_count().unwrap(), 3);
     let reembedded = inputs.lock().unwrap();
@@ -494,10 +512,305 @@ async fn delta_deadline_exhausted_embeds_nothing() {
     assert!(inputs.lock().unwrap().is_empty());
 }
 
+// ——— skip-unchanged: идемпотентность дельты без переэмбедда ———
+
+/// Строка, уже проиндексированная с теми же (updated, content), не
+/// переэмбеддится: overlap-перескан проходит её бесплатно, курсор двигается.
+#[tokio::test]
+async fn delta_skips_reembed_of_identical_rows() {
+    let content = "чанк с длинным содержанием, уже в индексе без изменений";
+    let blocks = vec![block("c1", T1, content, "/d")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "c1", T1, content, "/d");
+    store
+        .set_meta("watermark", &sync::watermark_composite(T0, "seed"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        0,
+        "идентичная строка не переэмбеддится"
+    );
+    assert_eq!(report.embedded, 0);
+    let mark = store.meta("watermark").unwrap().unwrap();
+    assert_eq!(
+        sync::split_watermark(&mark),
+        (T1.to_string(), "c1".to_string()),
+        "курсор прошёл пропущенную строку: {mark}"
+    );
+}
+
+/// Дрейф путей (hpath изменился при равных updated и content) чинится
+/// метаданными без переэмбедда — свежесть hpath не деградирует до суток.
+#[tokio::test]
+async fn delta_refreshes_path_drift_without_reembed() {
+    let content = "чанк с длинным содержанием, переехавший между доками";
+    let blocks = vec![block("c1", T1, content, "/new-place")];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "c1", T1, content, "/old-place");
+    store
+        .set_meta("watermark", &sync::watermark_composite(T0, "seed"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    assert_eq!(inputs.lock().unwrap().len(), 0, "переэмбедда нет");
+    assert_eq!(report.paths_refreshed, 1, "дрейф путей освежён");
+    let hpath = store
+        .chunk_metas()
+        .expect("меты чанков")
+        .into_iter()
+        .find(|m| m.block_id == "c1")
+        .expect("чанк на месте")
+        .hpath;
+    assert_eq!(hpath, "/new-place");
+}
+
+/// Анти-карусельный сценарий (диагноз 20261106182055): лавина одной
+/// секунды, префикс закоммичен прошлым прогоном (пара T1|0031) —
+/// следующий прогон переэмбеддит только незакрытый хвост, курсор доходит
+/// до конца лавины.
+#[tokio::test]
+async fn delta_mountain_run2_does_not_reembed_committed_prefix() {
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    // «Прогон 1»: префикс 0000..0031 закоммичен, курсор стоит на 0031
+    for i in 0..32 {
+        seed_indexed_chunk_at(
+            &mut store,
+            &format!("20261105-{i:04}"),
+            T1,
+            &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+            "/d",
+        );
+    }
+    store
+        .set_meta("watermark", &sync::watermark_composite(T1, "20261105-0031"))
+        .unwrap();
+
+    let report = sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    let embedded = inputs.lock().unwrap();
+    assert_eq!(
+        embedded.len(),
+        268,
+        "переэмбедден только хвост 0032..0299, не префикс: {}",
+        embedded.len()
+    );
+    assert!(!embedded.iter().any(|c| c.contains("номер 0 ")));
+    assert_eq!(report.embedded, 268);
+    let mark = store.meta("watermark").unwrap().unwrap();
+    assert_eq!(
+        sync::split_watermark(&mark),
+        (T1.to_string(), "20261105-0299".to_string()),
+        "курсор дошёл до конца лавины: {mark}"
+    );
+    let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
+    assert_eq!(backlog, 0, "очередь закрыта");
+}
+
 async fn kernel_server_blocks_only(blocks: Vec<Value>) -> (MockServer, Arc<Mutex<Vec<Value>>>) {
     let (server, blocks_handle, _) = kernel_server(blocks).await;
     (server, blocks_handle)
 }
+
+// ——— pair-watermark: лавина одной секунды (диагноз 20261106182055) ———
+
+/// Водяной знак несёт пару (updated, id): курсор дельты не теряет id-компоненту
+/// при записи — иначе лавина блоков одной секунды (булк-реимпорт тела задачи)
+/// замораживает прогресс: per-batch watermark равен текущему, MAX-гвард
+/// отвергает равенство, очередь «висит» вечно (факт: 267 блоков секунды
+/// 20261106223122, watermark стоял на ней же).
+#[tokio::test]
+async fn delta_watermark_pair_persists_after_full_mountain_pass() {
+    // 300 блоков одной секунды T1; watermark стоит на T1 (как оставил бы
+    // clean-end, пишущий голый updated без id-компоненты курсора).
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("watermark", T1).unwrap();
+
+    sync::delta_sync(&sy, &ollama(&embed.uri()), &mut store, &opts_no_deadline())
+        .await
+        .expect("дельта");
+
+    let mark = store.meta("watermark").unwrap().unwrap();
+    let (updated, id) = sync::split_watermark(&mark);
+    assert_eq!(updated, T1, "секунда курсора — секунда лавины");
+    assert_eq!(
+        id, "20261105-0299",
+        "id-компонента курсора сохранена: watermark = {mark}"
+    );
+}
+
+/// Бюджет умер посреди лавины — закоммиченный батч двигает пару: watermark
+/// указывает на последнюю строку закоммиченного батча, backlog считает
+/// незакрытый хвост (сегодня: пара не персистится, очередь «висит»).
+#[tokio::test]
+async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
+    let blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк лавины номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // батчи по 25ms — бюджет 100ms умирает посреди лавины: как вживую
+    // (EmbedError::Timeout), так и чистым budget_exhausted между батчами.
+    let (embed, _inputs) =
+        embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(25)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("watermark", T1).unwrap();
+
+    let report = sync::delta_sync(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &sync::SyncOptions {
+            since: None,
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            embed_timeout: Duration::from_secs(2),
+            page_delay: None,
+            on_batch: None,
+        },
+    )
+    .await;
+
+    // оба исхода честны: Ok(budget_exhausted) или Err(EmbedError::Timeout)
+    if let Ok(report) = report {
+        assert!(report.budget_exhausted, "бюджет умер: {:?}", report.budget_exhausted);
+    }
+    // закоммиченные строки берём из стора: счётчик инпутов мока считает
+    // отправленные запросы, а батч может умереть по таймауту уже после
+    // отправки — без коммита
+    let committed = store.chunk_count().unwrap() as usize;
+    assert!(committed >= 32, "первый батч успел закоммититься: {committed}");
+    assert!(committed < 300, "бюджет умер до конца лавины: {committed}");
+    let mark = store.meta("watermark").unwrap().unwrap();
+    let (updated, id) = sync::split_watermark(&mark);
+    assert_eq!(updated, T1);
+    assert_eq!(
+        id,
+        format!("20261105-{:04}", committed - 1),
+        "пара указывает на последнюю закоммиченную строку: {mark}"
+    );
+
+    // backlog над парой — незакрытый хвост лавины, а не вся секунда
+    let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
+    assert_eq!(
+        backlog,
+        (300 - committed) as u64,
+        "очередь над парой: {backlog}"
+    );
+}
+
+/// Пара монотонна и по id внутри секунды: откат id-компоненты не двигает
+/// курсор назад (resume с overlap-окном переезает секунды повторно).
+#[test]
+fn advance_watermark_pair_is_monotonic_within_second() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = seeded_store(dir.path());
+
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-0100"))
+        .unwrap();
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-0001"))
+        .unwrap();
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some("20261105000001|20261105-0100"),
+        "откат id внутри секунды отвергнут"
+    );
+    store
+        .advance_watermark(&sync::watermark_composite(T1, "20261105-9999"))
+        .unwrap();
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some("20261105000001|20261105-9999"),
+        "id вперёд внутри той же секунды принят"
+    );
+}
+
+/// Repair (reconcile) пишет watermark той же парой, но назад её двигать
+/// нельзя: stale-строка с updated ниже курсора отвергается MAX-гвардом,
+/// дельта не теряет хвост над парой (примечание ревью плана).
+#[tokio::test]
+async fn repair_does_not_rewind_watermark_pair() {
+    let blocks = vec![block(
+        "old-row",
+        T0,
+        "старый чанк с длинным содержанием для ремонта",
+        "/d",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    let ahead = sync::watermark_composite(T1, "20261105-5000");
+    store.set_meta("watermark", &ahead).unwrap();
+
+    let outcome =
+        sync::repair_missing(&sy, &ollama(&embed.uri()), &mut store, &["old-row".into()], None)
+            .await
+            .expect("repair");
+
+    assert_eq!(outcome.repaired, 1, "строка закоммичена в индекс");
+    assert_eq!(
+        store.meta("watermark").unwrap().as_deref(),
+        Some(ahead.as_str()),
+        "пара не откатилась stale-строкой"
+    );
+}
+
 
 // ——— reconcile: backfill / prune / дрейф ———
 
@@ -1012,38 +1325,168 @@ fn seed_indexed_chunk(dir: &std::path::Path) {
     tx.commit().unwrap();
 }
 
+/// Положить чанк в индекс от руки (срезы skip-unchanged/дрейфа).
+fn seed_indexed_chunk_at(store: &mut Store, block_id: &str, updated: &str, content: &str, hpath: &str) {
+    let chunk = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: block_id.into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: hpath.into(),
+            updated: updated.into(),
+        },
+        content: content.into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[chunk], None).unwrap();
+    tx.commit().unwrap();
+}
+
 #[tokio::test]
-async fn search_half_reports_timeout_when_budget_spent_by_sync() {
-    // Бюджет исчерпан синхронизацией: эмбедд запроса не выполняется,
-    // секция — честный «таймаут (бюджет 10s)», не «недоступен».
-    let (server, _) = kernel_server_blocks_only(vec![]).await;
+async fn sync_command_drains_queue_and_reports() {
+    // Ручная дотяжка вне бюджета поиска: очередь из трёх свежих строк
+    // закоммичена, отчёт содержит счётчики и нулевой backlog.
+    let blocks = vec![
+        block(
+            "s1",
+            "20261105000010",
+            "первый свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "s2",
+            "20261105000011",
+            "второй свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+        block(
+            "s3",
+            "20261105000012",
+            "третий свежий чанк с длинным содержанием для индексации",
+            "/d",
+        ),
+    ];
+    let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
-    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), &embed.uri());
-    seed_indexed_chunk(dir.path());
+    let mut store = index_ready_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    drop(store);
+
+    let lines = crate::semantic::sync_once(&sy, &cfg).await.expect("sync");
+
+    assert!(
+        lines.iter().any(|l| l.contains("3 чанков")),
+        "отчёт дельты: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("очередь дельты: 0")),
+        "очередь закрыта: {lines:?}"
+    );
+    let store = seeded_store(dir.path());
+    let (updated, id) = sync::split_watermark(&store.meta("watermark").unwrap().unwrap());
+    assert_eq!(updated, "20261105000012");
+    assert_eq!(id, "s3", "курсор-пара на последней строке: {id}");
+}
+
+#[tokio::test]
+async fn sync_command_refuses_while_rebuild_lock_held() {
+    // Advisory-лок: синк на сотни секунд записей не должен пересекаться
+    // с rebuild'ом — громкий отказ, а не взаимная порча индекса.
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    store.acquire_rebuild_lock().expect("чужой прогон");
+    drop(store);
+
+    let err = crate::semantic::sync_once(&sy, &cfg)
+        .await
+        .expect_err("лок держит живой прогон");
+    assert!(err.to_string().contains("уже идёт"), "{err}");
+}
+
+#[tokio::test]
+async fn sync_command_refuses_empty_index() {
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+
+    let err = crate::semantic::sync_once(&sy, &cfg)
+        .await
+        .expect_err("пустой индекс");
+    assert!(err.to_string().contains("индекс пуст"), "{err}");
+}
+
+#[tokio::test]
+async fn search_half_returns_results_when_sync_budget_dies() {
+    // Query-first: эмбедд запроса — первым (полный бюджет), sync — в
+    // остатке. Бюджет умер посреди синка — секция отдаёт РЕЗУЛЬТАТЫ и
+    // примечание о дельте, а не «таймаут: синхронизация не уложилась»
+    // (пункт «Что сделать» задачи 20261106182055: результаты не заложники
+    // синхронизации).
+    let mut blocks = Vec::new();
+    for i in 0..64 {
+        blocks.push(block(
+            &format!("fresh-{i:02}"),
+            "20261105000010",
+            &format!("свежий чанк очереди номер {i} с содержанием длиннее сорока символов"),
+            "/queue",
+        ));
+    }
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // батчи по 60ms — бюджет 150ms умирает посреди синка
+    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(60)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    let hit = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "hit-doc".into(),
+            root_id: "r".into(),
+            box_id: "b".into(),
+            hpath: "/важный/док".into(),
+            updated: T0.into(),
+        },
+        content: "важный документ с ответом на запрос".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[hit], None).unwrap();
+    tx.commit().unwrap();
+    drop(store);
 
     let section = crate::semantic::search_half_at(
         &sy,
         &cfg,
         &crate::semantic::SearchHalfRequest {
-            query: "запрос",
+            query: "важный запрос",
             limit: 10,
             threshold: 0.35,
         },
-        Instant::now() - Duration::from_millis(1),
+        Instant::now() + Duration::from_millis(150),
     )
     .await;
 
     assert!(
-        section.iter().any(|l| l.contains("таймаут (бюджет 10s)")),
-        "секция: {section:?}"
+        section.iter().any(|l| l.starts_with("1. /важный/док")),
+        "результаты в секции несмотря на смерть синка: {section:?}"
+    );
+    assert_eq!(
+        section.last().map(String::as_str),
+        Some("дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками"),
+        "примечание о дельте — последняя строка секции: {section:?}"
     );
     assert!(!section.iter().any(|l| l.contains("недоступен")));
-    assert!(
-        inputs.lock().unwrap().is_empty(),
-        "эмбедд запроса не выполнялся"
-    );
 }
 
 #[tokio::test]

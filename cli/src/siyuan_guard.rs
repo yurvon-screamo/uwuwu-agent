@@ -542,6 +542,7 @@ mod tests {
             status: status.into(),
             branch: String::new(),
             pr: String::new(),
+            dev_session: String::new(),
             body_doc: Some("doc-1".into()),
         }
     }

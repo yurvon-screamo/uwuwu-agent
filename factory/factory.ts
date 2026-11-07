@@ -24,15 +24,15 @@
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
+import { parseCommentsMarkdown } from "../lib/platform"
 import { REVIEWER_AGENT_ID } from "../lib/agents"
-import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
+import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
   isUserComment,
-  commentText,
   kickoffModeOf,
   promptForStart,
   prMergeableOf,
@@ -49,7 +49,6 @@ import {
   conflictFixPrompt,
   routeTask,
   rowMissingAction,
-  worktreeByBranch,
   runBatch,
   parseProjects,
   formatPassSummary,
@@ -63,8 +62,15 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
-  hasSessionEvidence,
-  stampLegacyEntries,
+  untrackedRowDecision,
+  activeTaskGuards,
+  parseAgentHeadTs,
+  freshForeignComments,
+  legacyRebaselineNeeded,
+  latestComment,
+  bodyContentHash,
+  bodyLastmodMs,
+  wakeupDedup,
   PATH_CELL,
   DEV_SESSION_CELL,
   REVIEW_SESSION_CELL,
@@ -73,6 +79,7 @@ import {
   type ReviewKind,
   type FactoryState,
   type StartKind,
+  type SessionLiveness,
   type SpawnEnvContext,
   type SpawnGuardHold,
   type TaskComment,
@@ -80,6 +87,7 @@ import {
   type TrackedTask,
 } from "./factory-lib"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
+import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 // ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
@@ -106,17 +114,27 @@ const DEFAULT_PROJECTS: Record<string, ProjectCfg> = {
     board: "Задачи true-washing",
     repo: "~/true-washing (detector, saas — репо в подпапках)",
     local: join(homedir(), "true-wash"),
-    env: false, // cfg.local — не git-репо: env-контракт невыполним, легаси-поведение
+    env: false, // cfg.local — не git-репо: env-контракт невыполним, агент сам делает ворктри
   },
 }
-// песочница: UWUWU_FACTORY_STATE_DIR двигает state+lock; в песочнице лог
-// тоже переезжает (прод-лог не засоряется смоук-тиками)
-const STATE_DIR_RAW = process.env.UWUWU_FACTORY_STATE_DIR
-const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-factory"))
+// state: песочница — UWUWU_FACTORY_STATE_DIR двигает state+lock, в песочнице
+// лог тоже переезжает (прод-лог не засоряется смоук-тиками). Дефолт-изоляция:
+// не-master чекаут без env получает свой state в branches/<ветка> и прод не
+// трогает (инцидент-класс 06.11 — прогон из ветки писал общий прод-state);
+// master — прежний прод-путь.
+const STATE_RESOLVED = resolveDaemonStateDir({
+  daemon: "uwuwu-factory",
+  envName: "UWUWU_FACTORY_STATE_DIR",
+  envRaw: process.env.UWUWU_FACTORY_STATE_DIR,
+  defaultDir: join(homedir(), ".local/state/uwuwu-factory"),
+  repoRoot: resolve(import.meta.dir, ".."),
+})
+const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
-const LOG_PATH = sandboxedStateDir(STATE_DIR_RAW)
-  ? join(STATE_DIR, "uwuwu-factory.log")
-  : join(homedir(), ".local/share/opencode/log/uwuwu-factory.log")
+const LOG_PATH = daemonLogPath({
+  stateDir: STATE_DIR, sandboxed: STATE_RESOLVED.sandboxed,
+  fileName: "uwuwu-factory.log", homeDir: homedir(),
+})
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 const POLL_SEC = Number(process.env.UWUWU_FACTORY_POLL_SEC ?? 180)
 /** порог тишины сессии: активный ход рождает сообщения на каждом шаге LLM —
@@ -151,10 +169,15 @@ const MAX_ATTEMPTS = 3
 const SPAWN_WAVE_CONCURRENCY = 4
 /** бот-аккаунт афины: его комменты — не сигналы юзера */
 const BOT_USER_ID = process.env.UWUWU_BOT_USER_ID ?? "df415887-98cc-4147-b5df-b6c71d8afeae"
+/** окно дедупа повторной доставки будильника (дефект №5.2: 7 будок за 9 минут) */
+const WAKEUP_DEDUP_MS = 10 * 60_000
 /** корень окружений задач: <root>/<row-id>/{repo,scratch,logs} (на /home,
  *  не tmpfs — урок SIGSEGV 03.11). Песочница переопределяет вместе с state. */
 const ENV_ROOT = process.env.UWUWU_FACTORY_ENV_ROOT ?? join(homedir(), "agents-env")
 const ENV_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** периодичность GC легаси-ворктри в тиках: при poll 180s ≈ раз в час.
+ *  Старт-проход отдельный — рестарт демона не обязан ждать час. */
+const GC_EVERY_TICKS = 20
 
 /** Исполнитель git-операций окружения: прод — фабричный sh() с таймаутом. */
 const envDeps = (): EnvDeps => ({ run: (cmd, cwd) => sh(cmd, { cwd }), log })
@@ -197,14 +220,6 @@ function loadState(): FactoryState {
           log(`state: запись ${k.slice(0, 10)} битая — пропущена`)
         }
       }
-    }
-    // переход на env-механику: записи, спавненные до неё (сессия была, envDir
-    // не заводился), доживают в старом поведении — рестарт не уводит их
-    // незакоммиченную работу в новый env
-    const stamped = stampLegacyEntries(out)
-    if (stamped.length > 0) {
-      saveState(out)
-      log(`переход: штамп легаси — ${stamped.map((id) => id.slice(0, 8)).join(", ")}`)
     }
     return out
   } catch {
@@ -371,74 +386,36 @@ async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string
   }
 }
 
-interface CommentEdge { node?: { id?: string; content?: unknown } }
-
-async function commentPage(bodyDoc: string, after: string): Promise<{
-  edges: CommentEdge[]
-  endCursor: string
-  hasNext: boolean
-}> {
-  const args: Record<string, unknown> = { docId: bodyDoc, first: 50 }
-  if (after !== "") args.after = after
-  const r = await mcp.tool<{
-    edges?: CommentEdge[]
-    pageInfo?: { hasNextPage?: boolean; endCursor?: string }
-  }>("list_comments", args)
-  return {
-    edges: r.edges ?? [],
-    endCursor: r.pageInfo?.endCursor ?? "",
-    hasNext: r.pageInfo?.hasNextPage === true,
-  }
-}
-
-/** ВСЕ комменты тела с relay-пагинацией (без досылки мост слепнет на
- *  задачах с длинной историей: 50-окно роняет свежие комменты).
- *  Разворачивает нативные треды афины (replies ноды) в плоский список —
- *  reply юзера помечается префиксом «(тред-ответ на «…»)», чтобы агент
- *  видел контекст в ленте; сам ответ агента в тред идёт через
- *  `task comment --reply` (uwuwu-cli). */
-async function taskComments(bodyDoc: string): Promise<TaskComment[]> {
+/** Комменты тела из экспорта + parseCommentsMarkdown (секции «## Комменты» и
+ *  трейлинг-хвост — CLI-аппенд в конец дока). exportCache — per-tick кэш
+ *  экспортов: тик читает тело один раз для комментов и хэша (дубль тяжёлого
+ *  вызова ядра — Low-1 ревью раунда 3). Тред-ответы — префикс-якорь родителя
+ *  для контекста ленты; сам ответ в тред — `task comment --reply` (uwuwu-cli). */
+async function taskComments(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<TaskComment[]> {
   if (bodyDoc === "") return []
+  const md = await bodyExport(bodyDoc, exportCache)
+  if (md === null) return []
+  const parsed = parseCommentsMarkdown(md, bodyDoc)
   const out: TaskComment[] = []
-  let cursor = ""
-  for (let page = 0; page < 10; page++) {
-    const { edges, endCursor, hasNext } = await commentPage(bodyDoc, cursor)
-    for (const e of edges) {
-      const n = e.node
-      if (n === undefined || typeof n.id !== "string") continue
-      const snap = (n.content as { snapshot?: { meta?: { createDate?: unknown } } } | undefined)?.snapshot
-      const created = typeof snap?.meta?.createDate === "number" ? snap.meta.createDate : 0
-      const text = commentText(n.content)
-      const userId = (n as { user?: { id?: unknown } }).user?.id
+  for (const c of parsed) {
+    out.push({
+      id: c.id,
+      text: c.text,
+      // ts из CLI-головы («AGENTS (2026-11-05 19:43): …») — UTC, надёжный
+      // порядок; 0 — легаси без времени (не срезается own-фильтром)
+      createdAt: parseAgentHeadTs(c.text) ?? 0,
+      userId: c.userId,
+    })
+    const parentHead = c.text.slice(0, 60)
+    for (const rep of c.replies) {
+      const repCreated = parseAgentHeadTs(rep.text)
       out.push({
-        id: n.id,
-        text,
-        createdAt: created,
-        ...(typeof userId === "string" ? { userId } : {}),
+        id: rep.id,
+        text: `(тред-ответ на «${parentHead}…») ${rep.text}`,
+        createdAt: repCreated ?? (out[out.length - 1].createdAt + 1),
+        userId: rep.userId,
       })
-      // тред-ответы (нативные replies афины): префикс-якорь родителя для контекста
-      const replies = (n as { replies?: unknown }).replies
-      if (Array.isArray(replies)) {
-        const parentHead = text.replace(/^\(в ответ на: [^)]*\)\s*/, "").slice(0, 60)
-        for (const rep of replies) {
-          const r = rep as { id?: unknown; content?: unknown; createdAt?: unknown; user?: { id?: unknown } }
-          if (typeof r.id !== "string") continue
-          const repText = commentText(r.content)
-          const repUser = r.user?.id
-          // GraphQL отдаёт createdAt ISO-строкой; число — только в snapshot
-          const repCreated =
-            typeof r.createdAt === "string" ? Date.parse(r.createdAt) : created + 1
-          out.push({
-            id: r.id,
-            text: `(тред-ответ на «${parentHead}…») ${repText}`,
-            createdAt: Number.isNaN(repCreated) ? created + 1 : repCreated,
-            ...(typeof repUser === "string" ? { userId: repUser } : {}),
-          })
-        }
-      }
     }
-    if (!hasNext || endCursor === "") break
-    cursor = endCursor
   }
   return out
 }
@@ -519,9 +496,7 @@ async function promptSession(sessionID: string, text: string): Promise<boolean> 
   }
 }
 
-type Liveness = "alive" | "dead" | "unknown"
-
-async function sessionLiveness(sessionID: string): Promise<Liveness> {
+async function sessionLiveness(sessionID: string): Promise<SessionLiveness> {
   if (sessionID === "") return "dead"
   try {
     await restCall(`/session/${sessionID}`)
@@ -556,6 +531,30 @@ async function bodyUpdatedAt(bodyDoc: string): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+/** Markdown-экспорт тела; null — экспорт не удался (гейты деградируют к будке —
+ *  тихий скип на сбое чтения потерял бы реальную правку владельца).
+ *  exportCache — per-tick мемоизация: тик читает тело один раз независимо от
+ *  числа потребителей (комменты, хэш, bodyEdit-гейт). */
+async function bodyExport(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<string | null> {
+  if (bodyDoc === "") return null
+  if (exportCache?.has(bodyDoc)) return exportCache.get(bodyDoc) ?? null
+  let result: string | null
+  try {
+    const r = await mcp.tool<{ markdown?: string; exists?: boolean }>("export_doc_markdown", { docId: bodyDoc })
+    result = r.exists === true ? r.markdown ?? "" : null
+  } catch {
+    result = null
+  }
+  if (exportCache !== undefined) exportCache.set(bodyDoc, result)
+  return result
+}
+
+/** Хэш норм-формы контента тела вне коммент-записей; null при сбое экспорта. */
+async function bodyHashOf(bodyDoc: string, exportCache?: Map<string, string | null>): Promise<string | null> {
+  const md = await bodyExport(bodyDoc, exportCache)
+  return md === null ? null : bodyContentHash(md)
 }
 
 // ——— жизненный цикл задачи ———
@@ -606,9 +605,8 @@ async function startTask(
     return
   }
   // env-механика: work/task-ветку и ворктри делает фабрика, сессия стартует
-  // cwd=repo. Легаси-штамп или env:false-проект → старое поведение (агент сам)
-  const prev = state.tasks[task.rowId]
-  const useEnv = cfg.env !== false && prev?.legacy !== true
+  // cwd=repo. env:false-проект → поведение вне механики (агент сам)
+  const useEnv = cfg.env !== false
   let envCtx: SpawnEnvContext | undefined
   let envDir: string | undefined
   if (useEnv) {
@@ -649,12 +647,10 @@ async function startTask(
   // граница комментов ДО старта — не будить агента старыми;
   // маркер = последний юзерский коммент (позиционный поиск в
   // newUserComments идёт по юзерскому списку)
-  const comments = (await taskComments(task.bodyDoc)).filter((c) =>
-    isUserComment(c, BOT_USER_ID),
+  const startExports = new Map<string, string | null>()
+  const last = latestComment(
+    (await taskComments(task.bodyDoc, startExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
   )
-  const last = comments.length > 0
-    ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
-    : null
 
   state.tasks[task.rowId] = {
     sessionID,
@@ -668,10 +664,10 @@ async function startTask(
     attempts: attemptsSeed,
     project: projectName,
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
+    bodyHash: (await bodyHashOf(task.bodyDoc, startExports)) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
-    ...(prev?.legacy === true ? { legacy: true } : {}),
   }
   saveState(state)
   await setCellsSafe(board, task.rowId, {
@@ -680,7 +676,28 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
-  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (легаси-поведение)"} (попыток до этого: ${attemptsSeed})`)
+  log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
+}
+
+/** GC легаси-корней ворктри проекта (wt/, .worktrees/ под cfg.local):
+ *  снос merged+clean по факту смержа PR с полным набором гардов.
+ *  Проекты без легаси-корней — мгновенный no-op внутри gcLegacyWorktrees. */
+async function gcLegacyRoots(name: string, cfg: ProjectCfg, state: FactoryState): Promise<void> {
+  const guards = activeTaskGuards(state)
+  const report = await gcLegacyWorktrees(envDeps(), {
+    local: cfg.local,
+    roots: [join(cfg.local, "wt"), join(cfg.local, ".worktrees")],
+    base: "origin/master",
+    protectedBranches: guards.branches,
+    protectedDirs: guards.dirs,
+    nowMs: Date.now(),
+    graceMs: MERGE_GRACE_MS_DEFAULT,
+  })
+  log(
+    `gc[${name}]: снесено=${report.removed.length}, веток=${report.branchesDeleted.length}, ` +
+      `пропущено=${report.skipped.length}, неудач=${report.failed.length}` +
+      (report.abortedReason !== undefined ? `, прерван: ${report.abortedReason}` : ""),
+  )
 }
 
 /** Чистка state (Done): гасим ОБЕ сессии задачи и сносим env (rm/attic +
@@ -832,16 +849,6 @@ async function restartTask(
 
 // ——— ревьювер: спавн/будильник на ревью-статусах ———
 
-/** Ворктри задачи по Branch-ячейке (легаси-fallback перехода: env-задачи
- *  берут repoDir из state). */
-async function resolveWorktree(local: string, branch: string): Promise<string> {
-  if (branch === "") return ""
-  try {
-    return worktreeByBranch(await sh(["git", "-C", local, "worktree", "list", "--porcelain"]), branch)
-  } catch { /* git недоступен — ревьюверу останется cfg.local/PR */ }
-  return ""
-}
-
 /** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
  *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
  *  поведение stall-сигнала, деградации нет. */
@@ -863,11 +870,10 @@ async function startReview(
     log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
     return
   }
-  // env-задача: repoDir из state (оба вида ревью — код живёт там);
-  // легаси-fallback: resolveWorktree по Branch-ячейке (переход)
-  const worktree = tracked.worktree !== ""
-    ? tracked.worktree
-    : kind === "result" ? await resolveWorktree(cfg.local, task.branch) : ""
+  // ворктри задачи из state (repoDir env-задачи, пишет фабрика на спавне);
+  // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
+  // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
+  const worktree = tracked.worktree
   const ctx = { branch: task.branch, worktree, pr: task.pr }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
@@ -944,12 +950,9 @@ async function dispatchReviewAction(
       return undefined
     }
     case "rerun-reviewer": {
-      const worktree = d.tracked.worktree !== ""
-        ? d.tracked.worktree
-        : action.kind === "result" ? await resolveWorktree(d.cfg.local, d.row.branch) : ""
       const ok = await promptSession(
         d.tracked.reviewSessionID ?? "",
-        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree, pr: d.row.pr }),
+        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr }),
       )
       if (ok) {
         d.consumeComments()
@@ -1026,6 +1029,9 @@ async function dispatchReviewAction(
 
 export async function tickProject(state: FactoryState, projectName: string, cfg: ProjectCfg): Promise<void> {
   const board = await findBoard(cfg.board)
+  // per-tick кэш экспортов тел: комменты, bodyEdit-гейт и comment-ветка
+  // читают один и тот же док одним физическим вызовом ядра (Low-1)
+  const bodyExports = new Map<string, string | null>()
   // known bodyDocs из state: detached-строки с излеченным треком идут мимо
   // фоллбека (без API-вызовов); читается до волны спавнов — новые старты
   // этого тика резолвятся фоллбеком как раньше
@@ -1048,10 +1054,29 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   const untracked = untrackedTasks(spawnable, state)
 
   // ——— гард каскада: сверка state с доской до спавна (инцидент 06.11) ———
-  // сирота-спавн: сессионная ячейка непуста, а трека в state нет — state
-  // потерял трекинг (порча/перезапись/тест-запись). Спавнить их = гарантированный
-  // каскад re-spawn (19 агентов за тик) и параллельные сессии в одних ворктри.
-  const orphaned = untracked.filter((r) => hasSessionEvidence(r)).length
+  // Сирота-спавн: свидетельство спавна в строке без трека в state. Вердикт
+  // по каждой untracked строке — untrackedRowDecision (единственная точка):
+  // живая дев-заявка (task claim / фабричный спавн с потерей state) — внешняя
+  // работа идёт: не спавнить дубль и не считать сиротой; мёртвая — сирота как
+  // прежде и остаётся в дев-волне (ре-спавн при allow — автокомпенсация);
+  // ревью-свидетельство без трека — сирота как прежде. Спавнить сирот сверх
+  // lossMax = гарантированный каскад re-spawn и параллельные сессии.
+  // Liveness-пробы параллельны: сериальные await в цикле растягивали тик
+  // при волне заявленных строк (культура дев-волны 05.11).
+  const externalSkip = new Set<string>()
+  const verdicts = await Promise.all(untracked.map(async (r) => {
+    const devCell = r.devSession ?? ""
+    const liveness = devCell === "" ? "dead" : await sessionLiveness(devCell)
+    return { rowId: r.rowId, liveness, decision: untrackedRowDecision(r, liveness) }
+  }))
+  let orphaned = 0
+  for (const { rowId, liveness, decision } of verdicts) {
+    if (!decision.devWave) {
+      externalSkip.add(rowId)
+      log(`внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
+    }
+    if (decision.orphan) orphaned++
+  }
   const guard = spawnGuardVerdict(
     { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
     SPAWN_LIMITS,
@@ -1070,8 +1095,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // и fast-track In Progress владельца) получают сессии за ОДИН проход
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
   // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
+  // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
   const devWave = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) === null)
+    ? untracked.filter((t) => reviewKindOf(t.status) === null && !externalSkip.has(t.rowId))
     : []
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
@@ -1101,10 +1127,10 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // ревью-статус без state (даунтайм демона при переходе) — карантинная
     // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
     // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
-    const comments = (await taskComments(task.bodyDoc)).filter((c) => isUserComment(c, BOT_USER_ID))
-    const last = comments.length > 0
-      ? comments.reduce((m, c) => (c.createdAt >= m.createdAt ? c : m), comments[0])
-      : null
+    const quarantineExports = new Map<string, string | null>()
+    const last = latestComment(
+      (await taskComments(task.bodyDoc, quarantineExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
+    )
     const entry: TrackedTask = {
       sessionID: "", worktree: "", branch: "",
       bodyDoc: task.bodyDoc, title: task.title, project: projectName,
@@ -1112,6 +1138,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
       lastStatus: task.status,
       bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
+      bodyHash: (await bodyHashOf(task.bodyDoc, quarantineExports)) ?? undefined,
     }
     state.tasks[task.rowId] = entry
     try {
@@ -1168,6 +1195,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         healed = true
       }
     }
+    // bodyHash здесь НЕ сеется: экспорт тяжёлый (интеграционный тест
+    // done-clean падал на таймауте мока), первая lastmod-дельта даст
+    // честную оценку без волны ложных будок
     if (healed) saveState(state)
 
     // Done (мерж-крон агента, Spike-агент, руки юзера) → чистка ворктри
@@ -1184,8 +1214,28 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
-    const comments = await taskComments(tracked.bodyDoc)
+    const comments = await taskComments(tracked.bodyDoc, bodyExports)
+    const users = comments.filter((c) => isUserComment(c, BOT_USER_ID))
+    // легаси-переход (деплой фильтра self-эха): старый id при нулевом времени —
+    // фоллбек по времени отдал бы всю историю чужих AGENTS-комментов одной волной
+    if (legacyRebaselineNeeded({ at: tracked.lastCommentAt, id: tracked.lastCommentId }, users)) {
+      const last = latestComment(users)
+      tracked.lastCommentAt = last?.createdAt ?? 0
+      tracked.lastCommentId = last?.id ?? ""
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: легаси-граница комментов — re-baseline на текущий срез без будки`)
+    }
     const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
+    // сесс-скопед срез self-эха: активность адресата по статусу (в ревью —
+    // ревьювер, иначе девелопер); сбой активности — без среза
+    const addresseeSession = reviewKindOf(row.status) !== null
+      ? tracked.reviewSessionID ?? ""
+      : tracked.sessionID
+    const activity = addresseeSession !== "" ? await lastSessionActivity(addresseeSession) : null
+    const { foreign, ownCount } = freshForeignComments(fresh, activity === "invalid" ? null : activity)
+    if (ownCount > 0) {
+      log(`задача ${rowId.slice(0, 8)}: self-эхо срезано (${ownCount}/${fresh.length} комментов)`)
+    }
     const reviewerLiveness = tracked.reviewSessionID === undefined || tracked.reviewSessionID === ""
       ? "dead"
       : await sessionLiveness(tracked.reviewSessionID)
@@ -1193,7 +1243,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
-      freshComments: fresh,
+      freshComments: foreign,
     })
     let commentsConsumed = false
     const consumeComments = (): void => {
@@ -1203,14 +1253,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.lastCommentId = lastComment.id
       commentsConsumed = true
     }
-    /** базлайн тела: дев правил тело перед передачей мяча — этим не будить */
+    /** базлайн тела: дев правил тело перед передачей мяча — этим не будить
+     *  (lastmod + хэш контента вне «Комменты»: собственные записи отчёта
+     *  меняют контент — без обновления хэша след lastmod-only дал бы будку) */
     const refreshBodyBaseline = async (): Promise<void> => {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
       if (updated !== null) tracked.bodyUpdated = updated
+      const hash = await bodyHashOf(tracked.bodyDoc, bodyExports)
+      if (hash !== null) tracked.bodyHash = hash
     }
 
     const skipRest = await dispatchReviewAction(action, {
-      row, tracked, project: tracked.project || projectName, cfg, board, state, fresh,
+      row, tracked, project: tracked.project || projectName, cfg, board, state, fresh: foreign,
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
@@ -1230,24 +1284,56 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // ——— пайп девелопера: комменты/тело/живость (комменты мог съесть ревьювер) ———
-    const devFresh = commentsConsumed ? [] : fresh
+    const devFresh = commentsConsumed ? [] : foreign
 
     // будильник правок ТЕЛА без комментов — до карантинных веток: адресат
-    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине)
+    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине).
+    // Гейт: lastmod двигают и UI-пересохранения, и собственные записи агента —
+    // будим только на контентную дельту (хэш норм-формы вне «Комменты») не из
+    // хода адресата (дефекты №3/№4/№5)
     if (devFresh.length === 0) {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
-      const bodyChanged = updated !== null
+      const lastmodChanged = updated !== null
         && (tracked.bodyUpdated ?? "") !== ""
         && updated > (tracked.bodyUpdated ?? "")
-      if (bodyChanged) {
+      if (lastmodChanged) {
         const inReview = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
         const target = inReview ? tracked.reviewSessionID ?? "" : tracked.sessionID
         if (target !== "") {
-          log(`задача ${rowId.slice(0, 8)}: тело менялось → wakeup немедленно (${inReview ? "ревьювер" : "девелопер"})`)
-          if (await promptSession(target, bodyEditPrompt(rowId))) {
+          const md = await bodyExport(tracked.bodyDoc, bodyExports)
+          // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
+          const hash = md === null ? null : bodyContentHash(md)
+          const lastmodMs = md === null ? null : bodyLastmodMs(md)
+          const activity = await lastSessionActivity(target)
+          const ownEdit = lastmodMs !== null && typeof activity === "number" && lastmodMs <= activity
+          const contentChanged = hash === null || hash !== (tracked.bodyHash ?? "")
+          if (!contentChanged) {
             tracked.bodyUpdated = updated
+            if (hash !== null) tracked.bodyHash = hash
             saveState(state)
-            counters.wakeups++
+            log(`задача ${rowId.slice(0, 8)}: lastmod-only правка тела (UI-пересохранение) — без будки`)
+          } else if (ownEdit) {
+            tracked.bodyUpdated = updated
+            if (hash !== null) tracked.bodyHash = hash
+            saveState(state)
+            log(`задача ${rowId.slice(0, 8)}: правка тела из хода адресата — без будки`)
+          } else {
+            const bodyKey = `body:${hash ?? updated}`
+            if (wakeupDedup(tracked.lastWakeup, bodyKey, Date.now(), WAKEUP_DEDUP_MS) === "skip") {
+              tracked.bodyUpdated = updated
+              if (hash !== null) tracked.bodyHash = hash
+              saveState(state)
+              log(`задача ${rowId.slice(0, 8)}: дубль bodyEdit-wakeup в окне дедупа — скип`)
+            } else {
+              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${inReview ? "ревьювер" : "девелопер"})`)
+              if (await promptSession(target, bodyEditPrompt(rowId))) {
+                tracked.bodyUpdated = updated
+                if (hash !== null) tracked.bodyHash = hash
+                tracked.lastWakeup = { key: bodyKey, at: Date.now() }
+                saveState(state)
+                counters.wakeups++
+              }
+            }
           }
           continue
         }
@@ -1301,9 +1387,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
-          // сигнала не строятся, git-проба ворктри тоже скипается
-          const branchInWorktree = !prMerged && stalled &&
-            (tracked.worktree !== "" || (await resolveWorktree(cfg.local, row.branch)) !== "")
+          // сигнала не строятся; ворктри из state — для env-задач он всегда
+          // записан фабрикой, env:false живёт вне механики
+          const branchInWorktree = !prMerged && stalled && tracked.worktree !== ""
           const verdict = stallVerdict({
             status: row.status,
             sessionAlive: true,
@@ -1356,23 +1442,38 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
 
     // правка ТЕЛА при наличии комментов: wakeup-комменты ниже разбудят той
-    // же пачкой — тело агент перечитает сам, двигаем только базлайн
+    // же пачкой — тело агент перечитает сам; хэш пересчитывается (юзерская
+    // правка тела могла прийти вместе с комментом), lastmod двигается
     const updatedWithComments = await bodyUpdatedAt(tracked.bodyDoc)
     if (
       updatedWithComments !== null &&
       (tracked.bodyUpdated ?? "") !== "" &&
       updatedWithComments > (tracked.bodyUpdated ?? "")
     ) {
+      const hashWithComments = await bodyHashOf(tracked.bodyDoc, bodyExports)
+      if (hashWithComments !== null) tracked.bodyHash = hashWithComments
       tracked.bodyUpdated = updatedWithComments
       saveState(state)
     }
 
+    if (devFresh.length === 0) continue
+    const wakeupKey = `comment:${devFresh.map((x) => x.id).join(",")}`
+    if (wakeupDedup(tracked.lastWakeup, wakeupKey, Date.now(), WAKEUP_DEDUP_MS) === "skip") {
+      // та же дельта уже доставлена — границу съедаем без повторной будки (№5.2)
+      const lastComment = devFresh[devFresh.length - 1]
+      tracked.lastCommentAt = lastComment.createdAt
+      tracked.lastCommentId = lastComment.id
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: дубль comment-wakeup в окне дедупа — скип`)
+      continue
+    }
     log(`задача ${rowId.slice(0, 8)}: ${devFresh.length} новых коммент(ов) → сессия`)
     if (await promptSession(tracked.sessionID, wakeupPrompt(rowId, devFresh))) {
       const lastComment = devFresh[devFresh.length - 1]
       tracked.lastCommentAt = lastComment.createdAt
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
+      tracked.lastWakeup = { key: wakeupKey, at: Date.now() }
       saveState(state)
       counters.wakeups++
     } else {
@@ -1405,8 +1506,9 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   // гард dry-run ДО лока: невалидный режим не должен даже притворяться
-  // демоном (фиктивные записи не должны попадать в прод-state)
-  if (DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  // демоном (фиктивные записи не должны попадать в прод-state). Эффективная
+  // песочница — с авто-изоляцией ветки: там прод-state и так недостижим.
+  if (DRY_RUN && !STATE_RESOLVED.sandboxed) {
     console.error("DRY_RUN требует UWUWU_FACTORY_STATE_DIR (песочница state) — фиктивные записи не должны попадать в прод-state")
     process.exit(1)
   }
@@ -1417,12 +1519,15 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
+  // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов
+  emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
   // старт-свип окружений: сироты без записи в state и старый attic — только
   // прод (песочница/DRY_RUN не трогают реальный ENV_ROOT)
-  if (!DRY_RUN && !sandboxedStateDir(STATE_DIR_RAW)) {
+  if (!DRY_RUN && !STATE_RESOLVED.sandboxed) {
     const sweep = sweepEnvs(envDeps(), {
       root: ENV_ROOT,
       // имена каталогов прошли sanitizeRowId (envPaths) — сравниваем в том же
@@ -1432,6 +1537,14 @@ async function main(): Promise<void> {
       maxAgeMs: ENV_MAX_AGE_MS,
     })
     log(`старт-свип env (${ENV_ROOT}): снесено сирот=${sweep.sweptEnvs.length}, attic=${sweep.sweptAttic.length}`)
+    // GC легаси-корней ворктри: старт-проход по всем проектам
+    for (const [name, cfg] of Object.entries(projects)) {
+      try {
+        await gcLegacyRoots(name, cfg, state)
+      } catch (e) {
+        log(`gc[${name}]: ${e}`)
+      }
+    }
   }
   while (true) {
     for (const [name, cfg] of Object.entries(projects)) {
@@ -1444,6 +1557,17 @@ async function main(): Promise<void> {
     }
     tickCount++
     if (tickCount % 10 === 0) rotateLog()
+    // GC легаси-ворктри: раз в GC_EVERY_TICKS тиков (≈час при poll 180s)
+    if (!DRY_RUN && !STATE_RESOLVED.sandboxed && tickCount % GC_EVERY_TICKS === 0) {
+      for (const [name, cfg] of Object.entries(projects)) {
+        if (drain.isStopping()) break
+        try {
+          await gcLegacyRoots(name, cfg, state)
+        } catch (e) {
+          log(`gc[${name}]: ${e}`)
+        }
+      }
+    }
     if (ONCE) {
       log("ONCE-режим: тик выполнен — выходим")
       process.exit(0)

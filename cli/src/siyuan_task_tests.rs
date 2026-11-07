@@ -578,6 +578,7 @@ fn test_task() -> SyTask {
         status: "Draft".into(),
         branch: String::new(),
         pr: String::new(),
+        dev_session: String::new(),
         body_doc: Some("20261105120000-bounddo1".into()),
     }
 }

@@ -30,6 +30,10 @@ describe("readTasks: фоллбек тела по тайтлу (detached-стр�
         ...process.env,
         HOME: home,
         UWUWU_SIYUAN_TOKEN: "test-token",
+        // явная песочница state: лог остаётся на пути, который читает ребёнок
+        // (при песочнице это state-каталог — правило daemonLogPath), а
+        // сидированный state не уводится в branches/<ветка> авто-изоляцией
+        UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
         ...(scenario !== undefined ? { SCENARIO: scenario } : {}),
       },
       stdout: "pipe", stderr: "pipe",

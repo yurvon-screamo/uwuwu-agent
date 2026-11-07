@@ -162,6 +162,8 @@ pub struct SyTask {
     pub status: String,
     pub branch: String,
     pub pr: String,
+    /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
+    pub dev_session: String,
     pub body_doc: Option<String>,
 }
 
@@ -262,6 +264,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         status: String::new(),
         branch: String::new(),
         pr: String::new(),
+        dev_session: String::new(),
         body_doc: None,
     };
     for cell in it
@@ -286,6 +289,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             }
             "Status" | "Статус" => t.status = value,
             "Branch" => t.branch = value,
+            DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
             _ => {}
         }
@@ -999,6 +1003,41 @@ pub async fn close(sy: &SiYuan, board: &SyBoard, task: &SyTask, note: Option<&st
     Ok(())
 }
 
+/// Имя сессионной ячейки строки — общий контракт с фабрикой (factory-lib
+/// DEV_SESSION_CELL): фабрика пишет её при спавне и читает для liveness-проб,
+/// stall-сигнала и гарда сирот; `task claim` пишет её от имени агента.
+pub const DEV_SESSION_CELL: &str = "Сессия dev";
+
+/// Заявка сессии на задачу: sessionID в text-ячейку «Сессия dev».
+/// Колонка обязательна — молчаливый no-op ядра на отсутствующей колонке
+/// оставил бы агента в уверенности, что он заявлен, и фабрика заспавнила бы
+/// дубль; поэтому отсутствие колонки — громкий отказ, а не best-effort.
+pub async fn claim(sy: &SiYuan, board: &SyBoard, task: &SyTask, session: &str) -> Result<()> {
+    let key = board_keys(sy, &board.av_id)
+        .await?
+        .into_iter()
+        .find(|(name, _)| name == DEV_SESSION_CELL)
+        .map(|(_, id)| id)
+        .context(format!(
+            "колонки «{DEV_SESSION_CELL}» нет на доске «{}» — попроси владельца добавить колонку: \
+             без ячейки заявка молча потеряется и фабрика заспавнит дубль",
+            board.hpath
+        ))?;
+    if !task.dev_session.is_empty() && task.dev_session != session {
+        eprintln!(
+            "⚠️ «{DEV_SESSION_CELL}» уже несёт чужую сессию {} — перезаписываю (перехват работы)",
+            task.dev_session
+        );
+    }
+    sy.mcp_tool(
+        "database",
+        serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": key,
+                "itemID": task.item_id, "value": { "text": { "content": session } } }),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Значение PR-ячейки (ключ типа url): пустая строка — очистка, иначе http(s)-ссылка.
 pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
     let pr = pr.trim();
@@ -1022,30 +1061,17 @@ pub async fn edit(
 ) -> Result<()> {
     // валидация PR до любых записей: без частичных обновлений
     let pr_value = pr.map(pr_cell_value).transpose()?;
-    let keys = sy
-        .mcp_tool(
-            "database",
-            serde_json::json!({ "action": "keys", "id": board.av_id }),
-        )
-        .await?;
-    let arr = keys
-        .pointer("/data/keys")
-        .or_else(|| keys.get("keys"))
-        .and_then(|k| k.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let find = |name: &str| -> Option<String> {
-        arr.iter()
-            .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(name))
-            .and_then(|k| k.get("id").and_then(|i| i.as_str()).map(String::from))
-    };
+    let find = |name: &str,
+                keys: &[(String, String)]|
+     -> Option<String> { keys.iter().find(|(k, _)| k == name).map(|(_, id)| id.clone()) };
+    let keys = board_keys(sy, &board.av_id).await?;
     if let Some(st) = status {
-        let k = find("Status").context("ключ Status не найден")?;
+        let k = find("Status", &keys).context("ключ Status не найден")?;
         sy.db_item_set_status(&board.av_id, &k, &task.item_id, st)
             .await?;
     }
     if let Some(v) = branch {
-        let k = find("Branch").context("ключ Branch не найден")?;
+        let k = find("Branch", &keys).context("ключ Branch не найден")?;
         sy.mcp_tool(
             "database",
             serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
@@ -1054,7 +1080,7 @@ pub async fn edit(
         .await?;
     }
     if let Some(value) = pr_value {
-        let k = find("PR").context("ключ PR не найден")?;
+        let k = find("PR", &keys).context("ключ PR не найден")?;
         sy.mcp_tool(
             "database",
             serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
@@ -1298,6 +1324,20 @@ mod tests {
         assert!(parse_render_row(&row, &keys).is_none());
     }
 
+    #[test]
+    fn parse_render_row_reads_dev_session_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-dev", "name": DEV_SESSION_CELL }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-dev", "type": "text", "text": { "content": "ses_read1" } }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.dev_session, "ses_read1");
+    }
+
     fn sy_task(item_id: &str, title: &str, body_doc: Option<&str>) -> SyTask {
         SyTask {
             item_id: item_id.to_string(),
@@ -1305,6 +1345,7 @@ mod tests {
             status: String::new(),
             branch: String::new(),
             pr: String::new(),
+            dev_session: String::new(),
             body_doc: body_doc.map(String::from),
         }
     }
@@ -1439,6 +1480,7 @@ mod tests {
             status: "Todo".into(),
             branch: String::new(),
             pr: String::new(),
+            dev_session: String::new(),
             body_doc: None,
         }
     }

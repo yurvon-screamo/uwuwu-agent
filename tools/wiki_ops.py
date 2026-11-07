@@ -13,7 +13,10 @@ kernel-транспорт (post, конфиг, константы) без выи
                                    Projects + hpath /uwuwu/ADR, /Experience/cli →
                                    Experience + hpath /cli) или корневая папка ровно
                                    одного ноутбука (/uwuwu/ADR → Projects, /affine →
-                                   Experience); пустой --parent → Projects (легаси)
+                                   Experience); пустой --parent → Projects (легаси).
+                                   Гард номера ADR: живой SQL-find по папке-приёмнику —
+                                   занятый «ADR-NNN» в тайтле даёт предупреждение в stderr
+                                   (гонка параллельных дримеров 06.11), создание продолжается
   append <docId> --md <файл> [--force]         дописать markdown-блоки в конец
   replace <docId> --md <файл> [--base <снапшот>] [--force]
                                    заменить док целиком; --base — снапшот
@@ -255,8 +258,16 @@ def _fs_file(path: str) -> str:
 
 
 def notebooks(attempts: int = 6) -> list[dict]:
-    return [nb for nb in post("/api/notebook/lsNotebooks", {}, attempts=attempts).get("notebooks", [])
-            if not nb.get("closed")]
+    """Конверт lsNotebooks обязан нести dict с list-полем "notebooks":
+    аномалия (None, dict без поля) — RuntimeError. Тихий [] здесь читался бы
+    как «пустой воркспейс» — та же маскировка сбоя под not-found, от которой
+    защищены SQL-конверты (задача 20261104072714, ревью PR #111 round-2).
+    Пустой notebooks (все закрыты/ни одного) — легитимный not-found."""
+    data = post("/api/notebook/lsNotebooks", {}, attempts=attempts)
+    if not (isinstance(data, dict) and isinstance(data.get("notebooks"), list)):
+        raise RuntimeError(
+            f"lsNotebooks вернул аномальный конверт (ожидался dict с list-полем notebooks): {data!r:.200}")
+    return [nb for nb in data["notebooks"] if not nb.get("closed")]
 
 
 def cmd_export(a):
@@ -264,12 +275,59 @@ def cmd_export(a):
     print((r or {}).get("content", ""))
 
 
+def path_safe(title: str) -> str:
+    """Тайтл → безопасный сегмент hpath: сырой «/» в нём — разделитель пути,
+    ядро молча строит цепочку доков-оболочек (инцидент 06.11, /devops).
+    Канвенция миграции bind_rows / cli path_safe (PR #36): «/» → U+2215."""
+    return title.replace("/", "\u2215")
+
+
 def cmd_create(a):
     md = Path(a.file).read_text()
     nb_id, nb_name, prefix = _resolve_parent(a.parent)
-    hpath = prefix.rstrip("/") + "/" + a.title.strip("/")
+    title = path_safe(a.title.strip("/"))
+    if not title:
+        raise RuntimeError(f"пустой тайтл: {a.title!r} состоит из одних слэшей — "
+                           "имя дока не может быть пустым")
+    hpath = prefix.rstrip("/") + "/" + title
+    _warn_if_adr_number_taken(nb_id, prefix.rstrip("/"), title)
     post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
     print(f"создан: [{nb_name}] {hpath}")
+
+
+ADR_NUMBER_RE = re.compile(r"ADR-(\d{2,4})\b")
+
+
+def _adr_number(title: str) -> int | None:
+    match = ADR_NUMBER_RE.search(title)
+    return int(match.group(1)) if match else None
+
+
+def _warn_if_adr_number_taken(notebook_id: str, folder_hpath: str, title: str) -> None:
+    """Живой find номера ADR в папке-приёмнике до создания дока (профилактика гонки).
+
+    Гонка параллельных дримеров реальна: двойные ADR-033/037/040 за один день
+    (06.11) — orgls-срез у каждого автора был до создания чужого дока. Номер
+    держит первый по времени (ADR-013). Проба косметическая: отказ ядра не
+    роняет создание — только глушит проверку; находка — предупреждение в stderr,
+    не отказ (занятый номер бывает осознанным переездом дока).
+    """
+    number = _adr_number(title)
+    if number is None:
+        return
+    stmt = (f"select content, hpath from blocks where type='d' and box='{notebook_id}' "
+            f"and hpath like '{_sql_str(folder_hpath)}/%' limit 200")  # nosec B608 — box из kernel API, hpath экранирован _sql_str
+    try:
+        rows = _sql_rows(stmt, attempts=1)
+    except Exception:
+        print("ПРЕДУПРЕЖДЕНИЕ: проба занятости ADR-номера не состоялась (ядро) — "
+              'сверь папку руками: wiki_ops.py find "<тайтл>"', file=sys.stderr)
+        return
+    taken_by = [r["hpath"] for r in rows if _adr_number(r.get("content") or "") == number]
+    if taken_by:
+        print(f"ПРЕДУПРЕЖДЕНИЕ: номер ADR-{number:03d} уже занят в {folder_hpath}: "
+              f"{'; '.join(taken_by)} — номер держит первый по времени (ADR-013); "
+              f"создание продолжено", file=sys.stderr)
 
 
 def _normalize_parent(parent: str) -> str:
@@ -488,13 +546,27 @@ def cmd_replace(a):
 
 
 def _sql_rows(stmt: str, attempts: int = 6) -> list[dict]:
+    """Конверт /api/query/sql обязан нести список строк: list — как есть;
+    dict с list-полем "data" — unwrap (совместимость); всё остальное —
+    аномальный конверт ядра. Пустой список здесь честный not-found (SELECT
+    не нашёл строк), аномалия — нет: молчаливый [] маскирует сбой под
+    «строк нет» (задача 20261104072714)."""
     rows = post("/api/query/sql", {"stmt": stmt}, attempts=attempts)
-    return rows if isinstance(rows, list) else rows.get("data", [])
+    if isinstance(rows, list):
+        return rows
+    if isinstance(rows, dict) and isinstance(rows.get("data"), list):
+        return rows["data"]
+    raise RuntimeError(f"SQL вернул аномальный конверт (ожидался список строк): {rows!r:.200}")
 
 
 def _sql_scalar(stmt: str) -> int:
+    # count-запрос на здоровом ядре всегда возвращает ровно одну строку:
+    # пустота = сбой, fail-closed (тихий 0 у delete-guard'ов означал бы
+    # «сноси без --force»).
     rows = _sql_rows(stmt)
-    return int(rows[0]["c"]) if rows else 0
+    if not rows:
+        raise RuntimeError(f"count-запрос вернул 0 строк (ожидалась ровно одна): {stmt}")
+    return int(rows[0]["c"])
 
 
 def _sql_str(value: str) -> str:
@@ -887,13 +959,25 @@ def cmd_block_delete(a):
 
 
 def cmd_orgls(a):
+    # Атомарный вывод: буфер печатается только при полном успехе обхода —
+    # частичное дерево в stdout при exit 1 читалось бы как полное (задача
+    # 20261104072714). Сбой SQL по ноутбуку называет ноутбук и последнюю
+    # причину — обход не маскируется под «не найдено».
+    lines: list[str] = []
     for nb in notebooks():
-        print(f"[{nb['name']}]")
+        lines.append(f"[{nb['name']}]")
         stmt = f"select hpath from blocks where type='d' and box='{nb['id']}' limit {ORG_LS_LIMIT}"  # nosec B608 — nb.id из kernel API
-        rows = _sql_rows(stmt)
+        try:
+            rows = _sql_rows(stmt)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"orgls: обход дерева прерван на ноутбуке «{nb['name']}» ({nb['id']}): {exc}"
+            ) from None
         for r in sorted(rows, key=lambda x: x["hpath"]):
             depth = r["hpath"].count("/") - 1
-            print("  " * (depth + 1) + r["hpath"].rstrip("/").split("/")[-1])
+            lines.append("  " * (depth + 1) + r["hpath"].rstrip("/").split("/")[-1])
+    if lines:
+        print("\n".join(lines))
 
 
 def cmd_find(a):
