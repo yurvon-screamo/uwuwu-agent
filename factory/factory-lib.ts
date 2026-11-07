@@ -528,6 +528,19 @@ export function spawnInitBlock(init: SpawnInit, rowId: string, project: string):
   ].join("\n")
 }
 
+/** Вопросный канал (одинаков в spawn/continue): команды канала сразу с id
+ *  и проектом — спавн знает оба (инцидент 05.11: вопросный коммент без
+ *  --project не приземлился, провал незаметен в длинном ходе). */
+function questionChannelLines(rowId: string, project: string): string[] {
+  return [
+    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
+    `вопросы — uwuwu-cli task comment ${rowId} --project ${project},`,
+    "результаты и выводы — task body; ждёшь ответа юзера →",
+    `uwuwu-cli task edit ${rowId} --project ${project} --status "Needs attention"`,
+    "и завершай ход. Ответ придёт комментом — тебя разбудят.",
+  ]
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
 export function spawnPrompt(
@@ -543,7 +556,8 @@ export function spawnPrompt(
       ]
     : [
         "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-        "пока ждёшь ответа). Перед планом — скан территории: uwuwu-cli task list на смежные задачи",
+        "пока ждёшь ответа). Перед планом — скан территории:",
+        `uwuwu-cli task list --project ${project} на смежные задачи`,
         "+ gh pr list --state all (батч-сводки/hygiene съедают срезы планов тихо).",
         "Строковые указатели постановки (row-id/тайтлы чужих задач) перепроверь живым",
         "uwuwu-cli task get до включения в план — доска гниёт быстрее мастера.",
@@ -562,7 +576,7 @@ export function spawnPrompt(
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
-    "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
+    `Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get ${rowId} --project ${project} — тело, тип, комменты.`,
     ...stage,
     ...workLine,
     "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
@@ -570,9 +584,7 @@ export function spawnPrompt(
     "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
     "Без пустого шума в комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
     "",
-    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
-    "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
-    "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
+    ...questionChannelLines(rowId, project),
   ].join("\n")
 }
 
@@ -587,7 +599,8 @@ export function continuePrompt(
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
-    "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
+    "Работай по AGENTS.md, раздел «Работа над задачей».",
+    `Перечитай uwuwu-cli task get ${rowId} --project ${project} —`,
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
     "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
     ...(env !== undefined
@@ -597,9 +610,7 @@ export function continuePrompt(
         ]
       : []),
     "",
-    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
-    "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
-    "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
+    ...questionChannelLines(rowId, project),
   ].join("\n")
 }
 
