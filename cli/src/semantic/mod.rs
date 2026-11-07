@@ -207,7 +207,8 @@ async fn sync_in_leftover(
     store: &mut Store,
     deadline: Instant,
 ) -> Option<String> {
-    let budget_note = "дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками";
+    let budget_note =
+        "дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками";
     let report = match sync::delta_sync(
         sy,
         ollama,
@@ -397,9 +398,7 @@ async fn sync_once_locked(
         ));
     }
     if delta.budget_exhausted {
-        lines.push(
-            "бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string(),
-        );
+        lines.push("бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string());
     }
     lines.push(format!("очередь дельты: {backlog} строк"));
     Ok(lines)

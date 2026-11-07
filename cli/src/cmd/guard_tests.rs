@@ -166,16 +166,8 @@ async fn clean_refuses_whole_batch_when_live_row_lacks_ack() {
         err.to_string().contains("живая задача"),
         "отказная строка названа: {err}"
     );
-    assert_eq!(
-        kernel.item_removes().len(),
-        0,
-        "ноль item_remove"
-    );
-    assert_eq!(
-        kernel.put_files().len(),
-        0,
-        "журнал не пишется до гейта"
-    );
+    assert_eq!(kernel.item_removes().len(), 0, "ноль item_remove");
+    assert_eq!(kernel.put_files().len(), 0, "журнал не пишется до гейта");
 }
 
 /// (б) Dead+DraftDead с --yes: снесены одним item_remove, журнал до мутации,
@@ -202,11 +194,7 @@ async fn clean_removes_dead_and_draft_rows_with_yes_and_writes_journal() {
         vec!["item-dead".to_string(), "item-draft".to_string()],
         "один item_remove массивом"
     );
-    assert_eq!(
-        kernel.put_files().len(),
-        1,
-        "write-ahead журнал записан"
-    );
+    assert_eq!(kernel.put_files().len(), 1, "write-ahead журнал записан");
     assert_eq!(
         kernel.removed_docs().len(),
         0,
@@ -240,11 +228,7 @@ async fn clean_marks_divergent_in_dry_run_and_refuses_execution() {
     )
     .await
     .expect("dry-run всегда проходит");
-    assert_eq!(
-        kernel.item_removes().len(),
-        0,
-        "dry-run не мутирует"
-    );
+    assert_eq!(kernel.item_removes().len(), 0, "dry-run не мутирует");
 
     let err = task_run(
         "uwuwu",
@@ -279,15 +263,8 @@ async fn clean_removes_draft_skeleton_and_trashes_body() {
     .expect("DraftSkeleton сносится без ack");
 
     assert_eq!(kernel.item_removes().len(), 1);
-    assert_eq!(
-        kernel.removed_docs().len(),
-        1,
-        "скелет тела в трэш"
-    );
-    assert!(!kernel
-        .rows()
-        .iter()
-        .any(|r| r.item == "item-skel"));
+    assert_eq!(kernel.removed_docs().len(), 1, "скелет тела в трэш");
+    assert!(!kernel.rows().iter().any(|r| r.item == "item-skel"));
 }
 
 /// (е) Контрольная проба доски: файла доски нет → аборт без мутаций.
@@ -313,11 +290,7 @@ async fn clean_aborts_without_mutations_when_board_file_missing() {
         "суть отказа: {err}"
     );
     assert_eq!(kernel.item_removes().len(), 0, "ноль мутаций");
-    assert_eq!(
-        kernel.put_files().len(),
-        0,
-        "журнал не пишется"
-    );
+    assert_eq!(kernel.put_files().len(), 0, "журнал не пишется");
 }
 
 /// (ж) Пост-чек: item_remove снял больше плана → громкая ошибка с журналом.
@@ -381,16 +354,8 @@ async fn rm_refuses_live_task_but_removes_contentful_draft() {
     .await
     .expect("контентный Draft (Live+Draft) сносится rm");
     assert_eq!(kernel.item_removes().len(), 1);
-    assert_eq!(
-        kernel.put_files().len(),
-        1,
-        "журнал до мутации"
-    );
-    assert_eq!(
-        kernel.removed_docs().len(),
-        1,
-        "тело черновика в трэш"
-    );
+    assert_eq!(kernel.put_files().len(), 1, "журнал до мутации");
+    assert_eq!(kernel.removed_docs().len(), 1, "тело черновика в трэш");
 }
 
 /// (д-глоб) rm без --project: глобальный резолв + журнал с проектом доски

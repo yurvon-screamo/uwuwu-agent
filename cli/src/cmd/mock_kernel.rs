@@ -667,9 +667,8 @@ impl MockKernel {
                 .hpath_ids
                 .iter()
                 .filter_map(|(hpath, ids)| {
-                    crate::siyuan_task::task_board_parts(hpath).and_then(|_| {
-                        ids.first().map(|id| json!({ "id": id, "hpath": hpath }))
-                    })
+                    crate::siyuan_task::task_board_parts(hpath)
+                        .and_then(|_| ids.first().map(|id| json!({ "id": id, "hpath": hpath })))
                 })
                 .collect();
             hits.sort_by(|a, b| {

@@ -29,6 +29,7 @@ import {
   reviewRerunPrompt,
   reviewCommentsPrompt,
   reviewReturnPrompt,
+  reviewStallVerdict,
   routeTask,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
@@ -37,6 +38,7 @@ import {
   stallVerdict,
   type FactoryState,
   type RouteFacts,
+  type ReviewStallFacts,
   type StallFacts,
   type TaskComment,
   type TaskRef,
@@ -963,6 +965,66 @@ describe("stallVerdict: зависший ход при живой сессии",
   })
   test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
     expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+})
+
+describe("reviewStallVerdict: недоставленный вердикт ревьювера (инцидент 07.11)", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const facts = (over: Partial<ReviewStallFacts> = {}): ReviewStallFacts => ({
+    status: REVIEW_RESULT_STATUS,
+    reviewerAlive: true,
+    lastActivityAt: NOW - 40 * MIN,
+    signaled: false,
+    now: NOW,
+    ...over,
+  })
+
+  test("ревью-статус + живой ревьювер + тишина > порога — signal; текст ведёт к будилке", () => {
+    const v = reviewStallVerdict(facts(), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // сценарий вопроса юзеру: ответ комментом — но перестановка ревью-статуса
+    // обязательный шаг обоих сценариев (коммент в Needs attention ревьюверу
+    // не доставляется — доставка только в ревью-статусе, comments-to-reviewer)
+    expect(v.text).toContain("ответь комментом")
+    expect(v.text).toContain("Затем переставь ревью-статус")
+    expect(v.text).toContain("треды")
+  })
+  test("оба ревью-статуса покрываются (план и результат)", () => {
+    expect(reviewStallVerdict(facts({ status: REVIEW_PLAN_STATUS }), 30 * MIN).t).toBe("signal")
+    expect(reviewStallVerdict(facts({ status: REVIEW_RESULT_STATUS }), 30 * MIN).t).toBe("signal")
+  })
+  test("не ревью-статус — none даже при застое", () => {
+    expect(reviewStallVerdict(facts({ status: "In Progress" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("свежая активность ревьювера — none (ход ещё идёт или вернулся)", () => {
+    expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 5 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("dead ревьювер — none (routeTask сам спавнит), unknown — none (пропуск тика)", () => {
+    expect(reviewStallVerdict(facts({ reviewerAlive: false }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ reviewerAlive: null }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
+    expect(reviewStallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("активность вернулась при стоявшем флаге — none (демон снимет флаг)", () => {
+    expect(reviewStallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("сообщений нет вовсе — signal (спавн не начал ход или потерялся)", () => {
+    const v = reviewStallVerdict(facts({ lastActivityAt: null }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("сообщений в сессии нет")
+  })
+  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
+    expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
   })
 })
 

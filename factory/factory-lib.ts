@@ -61,6 +61,10 @@ export interface TrackedTask {
    *  «раз за эпизод»; сброс делает демон: смена статуса — штатный путь,
    *  none-вердикт при стоявшем флаге — эпизод завершён) */
   stallSignaled?: boolean
+  /** сигнал ревью-тишины уже отправлен в этом эпизоде ревью-статуса
+   *  (анти-спам «раз за эпизод»; сброс — смена статуса или вернувшаяся
+   *  активность ревьювера; семантика зеркальна stallSignaled) */
+  reviewStallSignaled?: boolean
   /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
    *  env-механика к задаче не применялась */
   envDir?: string
@@ -985,6 +989,58 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   return { t: "signal", text }
 }
 
+// ——— гвард ревью-тишины: недоставленный вердикт ревьювера (инцидент 07.11,
+//      задача 20261107142321) ———
+
+export interface ReviewStallFacts {
+  /** статус строки сейчас */
+  status: string
+  /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем
+   *  решением none; dead — routeTask сам спавнит нового ревьювера) */
+  reviewerAlive: boolean | null
+  /** активность последнего сообщения ревью-сессии; null — сообщений нет
+   *  (= застой: спавн не начал ход или потерялся) */
+  lastActivityAt: number | null
+  /** сигнал уже отправлен в этом эпизоде ревью-статуса (анти-спам) */
+  signaled: boolean
+  now: number
+}
+
+export type ReviewStallVerdict =
+  | { t: "none" }
+  | { t: "signal"; text: string }
+  | { t: "silent" }
+
+/** Единственная точка решения о ревью-тишине (по образцу stallVerdict):
+ *  ревью-статус при живой ревью-сессии, молчащей дольше порога, и статусе,
+ *  не ушедшем из ревью, = ход ревьювера завершился без доставки (вердикт-
+ *  коммент/статус потерялись) или ревьювер ждёт юзера (вопрос в тредах).
+ *  routeTask в этой геометрии возвращает noop бессрочно — конвейер без
+ *  гварда висит тихо. Вердикт signal → эскалация юзеру (Needs attention,
+ *  восстановление штатными путями: перестановка ревью-статуса будит ту же
+ *  сессию доревью-промптом). Повторный сигнал в эпизоде глушится флагом
+ *  (silent); сброс — дело демона: смена статуса или вернувшаяся активность
+ *  ревьювера. */
+export function reviewStallVerdict(f: ReviewStallFacts, stallMs: number): ReviewStallVerdict {
+  if (reviewKindOf(f.status) === null) return { t: "none" }
+  if (f.reviewerAlive !== true) return { t: "none" }
+  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
+  if (!stalled) return { t: "none" }
+  if (f.signaled) return { t: "silent" }
+  const quietMin = f.lastActivityAt === null
+    ? null
+    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
+  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const text = [
+    `[factory] Задача в ревью-статусе, но сессия ревьювера молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин,`,
+    "статус из ревью не ушёл — ход завершился без доставки (вердикт-коммент/статус потерялись) или ревьювер ждёт тебя.",
+    "Проверь треды: если ревьювер задал вопрос — ответь комментом; если вердикта нет — это потеря доставки.",
+    "Затем переставь ревью-статус: сессия будет разбужена доревью-промптом, перечитает задачу с тредами",
+    "(увидит и твой ответ) и доставит недостающее.",
+  ].join(" ")
+  return { t: "signal", text }
+}
+
 // ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
 
 export const SPAWN_LOSS_MAX_DEFAULT = 2
@@ -1142,6 +1198,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
+  if (t.reviewStallSignaled !== undefined && typeof t.reviewStallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
   if (
     t.mergedPrUrl !== undefined &&
