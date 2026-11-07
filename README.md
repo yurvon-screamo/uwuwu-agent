@@ -26,7 +26,7 @@ AGENTS.md      системные инструкции (глобальные)
 
 - **Architect (1)**: architect-ui-ux
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
-- **Workflows (4)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review
+- **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
 - **Office (4)**: docx · pdf · pptx · xlsx
 - **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
 - **Visual (1)**: visual-diagrams
