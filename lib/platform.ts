@@ -347,6 +347,98 @@ async function updateDatabaseRow(args: Record<string, unknown>): Promise<Record<
   return { updated: true }
 }
 
+export interface ParsedComment {
+  id: string
+  text: string
+  userId: string
+  replies: { id: string; text: string; userId: string }[]
+}
+
+const TOP_COMMENT = /^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const TOP_COMMENT_DATED = /^- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+const REPLY_COMMENT = /^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const REPLY_COMMENT_DATED = /^ {2}- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+
+const padIdx = (i: number): string => String(i).padStart(4, "0")
+const commentHead = (m: RegExpMatchArray): string => `${m[1]} (${m[2]}): ${m[3]}`
+
+/** Разбор коммент-записей markdown-экспорта тела. Два источника:
+ *  (а) секция «## Комменты» — историческая конвенция;
+ *  (б) трейлинг-хвост после последней ## — CLI аппендит комменты appendBlock'ом
+ *  в конец дока, в телах с секциями после «## Комменты» (слияния дефектов —
+ *  регулярный паттерн владельца) свежие записи живут хвостом; без (б) comment-
+ *  канал слеп к ним — юзерский ответ не будит ни одним каналом (High-1 ревью
+ *  раунда 3). Хвост строгим матчем с датой — легитимные списки не комменты.
+ *  Продолжения блока (абзацы тела пункта — вердикты многострочные) конкатенируются
+ *  в text — будильник цитирует коммент целиком. id синтетические с паддингом —
+ *  лексикографический порядок стабилен (свежесть newUserComments держится на
+ *  позиционном findIndex). Replies несут id/userId: юзерский тред-ответ
+ *  детектится, агентский срезается own-фильтром. */
+export function parseCommentsMarkdown(md: string, docId: string): ParsedComment[] {
+  const lines = md.split("\n")
+  const comments: ParsedComment[] = []
+  let inSection = false
+  let topIdx = 0
+  let replyIdx = 0
+  let lastHeadIdx = -1
+  let lastHeadIsComments = false
+  const appendContinuation = (line: string): void => {
+    if (comments.length === 0 || line.trim() === "") return
+    const last = comments[comments.length - 1]
+    last.text = `${last.text}\n${line}`
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.startsWith("## ")) {
+      lastHeadIdx = i
+      lastHeadIsComments = /^## Комменты\s*$/.test(line)
+      inSection = lastHeadIsComments
+      if (inSection) replyIdx = 0
+      continue
+    }
+    if (!inSection) continue
+    const top = line.match(TOP_COMMENT)
+    if (top) {
+      replyIdx = 0
+      comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+      continue
+    }
+    const rep = line.match(REPLY_COMMENT)
+    if (rep && comments.length > 0) {
+      comments[comments.length - 1].replies.push({
+        id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(replyIdx++)}`,
+        text: commentHead(rep),
+        userId: rep[1],
+      })
+      continue
+    }
+    appendContinuation(line)
+  }
+  if (!lastHeadIsComments) {
+    let tailReplyIdx = 0
+    for (let i = lastHeadIdx + 1; i < lines.length; i++) {
+      const line = lines[i]
+      const top = line.match(TOP_COMMENT_DATED)
+      if (top) {
+        tailReplyIdx = 0
+        comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+        continue
+      }
+      const rep = line.match(REPLY_COMMENT_DATED)
+      if (rep && comments.length > 0) {
+        comments[comments.length - 1].replies.push({
+          id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(tailReplyIdx++)}`,
+          text: commentHead(rep),
+          userId: rep[1],
+        })
+        continue
+      }
+      if (i > lastHeadIdx) appendContinuation(line)
+    }
+  }
+  return comments
+}
+
 function commentToSnapshot(text: string): Record<string, unknown> {
   // шейп, который walk-ает snapshotText() фабрики
   return {
@@ -443,32 +535,21 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "list_comments": {
       const docId = String(args.docId ?? "")
       const md = await post<{ content?: string }>("/api/export/exportMdContent", { id: docId })
-      const lines = (md.content ?? "").split("\n")
       const edges: Record<string, unknown>[] = []
-      let inSection = false
-      let i = 0
-      for (const line of lines) {
-        if (line.startsWith("## ")) { inSection = line.startsWith("## Комменты"); continue }
-        if (!inSection) continue
-        const top = line.match(/^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
-        if (top) {
-          edges.push({
-            node: {
-              id: `c${docId}-${i++}`,
-              content: commentToSnapshot(`${top[1]} (${top[2]}): ${top[3]}`),
-              user: { name: top[1], id: top[1] },
-              replies: [],
-              resolved: false,
-            },
-          })
-          continue
-        }
-        const rep = line.match(/^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
-        if (rep && edges.length > 0) {
-          const node = edges[edges.length - 1].node as { replies?: Record<string, unknown>[] }
-          node.replies = node.replies ?? []
-          node.replies.push({ content: commentToSnapshot(`${rep[1]} (${rep[2]}): ${rep[3]}`), user: { name: rep[1] } })
-        }
+      for (const c of parseCommentsMarkdown(md.content ?? "", docId)) {
+        edges.push({
+          node: {
+            id: c.id,
+            content: commentToSnapshot(c.text),
+            user: { name: c.userId, id: c.userId },
+            replies: c.replies.map((r) => ({
+              id: r.id,
+              content: commentToSnapshot(r.text),
+              user: { name: r.userId, id: r.userId },
+            })),
+            resolved: false,
+          },
+        })
       }
       return { edges, pageInfo: { hasNextPage: false, endCursor: "" } } as T
     }
