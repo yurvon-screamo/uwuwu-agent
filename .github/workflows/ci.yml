@@ -12,6 +12,10 @@ permissions:
 
 jobs:
   ci:
+    # Чекран называется по job name (не по id): required-контекст в branch
+    # protection — «CI», GitHub матчит посимвольно (инцидент: джоба без name
+    # давала чекран «ci» и гейт блокировал вообще все PR).
+    name: CI
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -20,11 +24,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Пины по SHA: плавающие теги = supply-chain поверхность и
+      # невоспроизводимость ранов (правило ревью workflows, образец — origa).
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: cli
 
@@ -57,4 +63,6 @@ jobs:
             echo "Пустая дельта — qlty-прогон не требуется"
             exit 0
           fi
-          "$HOME/.qlty/bin/qlty" check --no-fix $files
+          # xargs -d '\n': пути с пробелами не разлетаются (word-splitting);
+          # GNU xargs с пустым входом не запускает команду, if выше — для явного скипа
+          printf '%s\n' "$files" | xargs -r -d '\n' "$HOME/.qlty/bin/qlty" check --no-fix
