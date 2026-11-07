@@ -16,7 +16,7 @@ tmp-каталог. Прогон: python3 -m unittest discover -s tests -t .  (�
 import datetime
 import json
 import socket
-import subprocess  # nosec B404 — фейковые CompletedProcess для контракта запуска podman
+import subprocess  # nosec B404 — фейковые CompletedProcess для контракта запуска podman/systemctl
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,8 +95,7 @@ class StartContainerTests(unittest.TestCase):
 
         ok, _ = siyuan_watch.start_container(runner=runner)
         self.assertTrue(ok)
-        self.assertEqual(calls[0][:2], ["systemctl", "--user"])
-        self.assertIn(siyuan_watch.SERVICE_UNIT, calls[0])
+        self.assertEqual(calls[0], ["systemctl", "--user", "start", siyuan_watch.SERVICE_UNIT])
 
     def test_failed_start_reports_failure_with_detail(self):
         def runner(cmd, **_):

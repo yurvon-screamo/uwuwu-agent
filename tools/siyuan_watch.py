@@ -26,7 +26,7 @@ from __future__ import annotations
 import datetime
 import json
 import socket
-import subprocess  # nosec B404 — назначение скрипта: запуск podman с фиксированными аргументами
+import subprocess  # nosec B404 — назначение скрипта: запуск podman inspect и systemctl start с фиксированными аргументами
 import sys
 import time
 from pathlib import Path
