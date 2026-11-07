@@ -824,7 +824,7 @@ Dual-mode by default. Never assume light-only unless the brief is print-emulatin
 - Respect `prefers-color-scheme: dark`. Default to system preference unless brand insists
 - **Page Theme Lock:** ONE theme (light, dark, or auto) for the whole page. Sections do not invert. Exception: one deliberate theme switch with strong transition
 - No pure `#000000` and no pure `#ffffff` — use off-black and off-white
-- **Muted-on-dark is where contrast dies.** Muted text on a dark surface must still pass WCAG AA (4.5:1 body, 3:1 large) - compute it, do not eyeball it. Same for opacity-dimmed elements: contrast is evaluated on the EFFECTIVE color (text color alpha-blended over its background), e.g. `#6b665a` at 60% opacity on `#f7f4ee` is ~2.4:1 - a fail invisible to any "just use a gray token" rule
+- **Muted-on-dark is where contrast dies.** Muted text on a dark surface must still pass WCAG AA (4.5:1 body, 3:1 large) - compute it, do not eyeball it. Same for opacity-dimmed elements: contrast is evaluated on the EFFECTIVE color (text color alpha-blended over its background) - e.g. `text-zinc-500` at 50% opacity on `zinc-900` blends to `#44444a`, ~1.8:1: a fail invisible to any "just use a gray token" rule
 - Test in both modes before finishing
 
 ---
