@@ -9,8 +9,8 @@
 //! 4. атрибут расписания отсутствует у всех → «Крон-задач нет»
 //! 5. сбои чтения атрибутов — громкая ошибка (инвентарь честный)
 
-use crate::cmd::cli::CronSub;
-use crate::cmd::sy_dispatch::cron_run;
+use crate::cmd::cli::{CronSub, TaskSub};
+use crate::cmd::sy_dispatch::{cron_run, task_run};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
@@ -26,6 +26,8 @@ type Attrs = Vec<(String, String)>;
 struct Kernel {
     /// docId тела → [(имя атрибута, значение)]
     attrs: Mutex<Vec<(String, Attrs)>>,
+    /// (docId, name, value) записей /api/attr/setBlockAttrs.
+    attr_writes: Mutex<Vec<(String, String, String)>>,
 }
 
 impl Kernel {
@@ -126,6 +128,34 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
         .await;
 
     Mock::given(method("POST"))
+        .and(path("/api/attr/setBlockAttrs"))
+        .respond_with({
+            let kernel = kernel.clone();
+            move |req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let id = body
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let attrs = body.get("attrs").cloned().unwrap_or_default();
+                if let Some((name, value)) =
+                    attrs.as_object().map(|m| m.into_iter().next()).flatten()
+                {
+                    kernel.attr_writes.lock().unwrap().push((
+                        id,
+                        name.clone(),
+                        value.as_str().unwrap_or("").to_string(),
+                    ));
+                }
+                ResponseTemplate::new(200)
+                    .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
+            }
+        })
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
         .and(path("/api/attr/getBlockAttrs"))
         .respond_with({
             let kernel = kernel.clone();
@@ -170,6 +200,10 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
             if action == "render" {
                 return mcp_text(render_view());
             }
+            if action == "get" {
+                // block get для doc_block_exists: привязанные тела живы
+                return mcp_text(json!({ "action": "get", "data": "Type: NodeDocument" }));
+            }
             mcp_text(json!({ "action": "unknown", "data": null }))
         })
         .mount(server)
@@ -201,6 +235,7 @@ fn state_dir_with(content: &str) -> tempfile::TempDir {
 #[serial_test::serial]
 async fn list_shows_master_with_schedule_and_last_run_from_state() {
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![(
             "body-master1".into(),
             vec![("custom-schedule".to_string(), "6h".to_string())],
@@ -225,6 +260,7 @@ async fn list_shows_master_with_schedule_and_last_run_from_state() {
 #[serial_test::serial]
 async fn list_skips_rows_without_schedule_attr() {
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![(
             "body-plain2".into(),
             vec![("custom-title".to_string(), "не расписание".to_string())],
@@ -243,6 +279,7 @@ async fn list_skips_rows_without_schedule_attr() {
 #[serial_test::serial]
 async fn list_works_without_state_file() {
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![(
             "body-master1".into(),
             vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())],
@@ -263,6 +300,7 @@ async fn list_works_without_state_file() {
 #[serial_test::serial]
 async fn list_reports_empty_inventory_without_masters() {
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![]),
     });
     let server = MockServer::start().await;
@@ -281,6 +319,7 @@ async fn list_skips_row_with_dead_binding_and_lists_the_rest() {
     // attrs-мок знает только тело обычной строки: master1 (unknown attrs)
     // пропускается, plain2 с расписанием попадает в инвентарь
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![(
             "body-plain2".into(),
             vec![("custom-schedule".to_string(), "30m".to_string())],
@@ -301,6 +340,7 @@ async fn list_skips_row_with_dead_binding_and_lists_the_rest() {
 #[serial_test::serial]
 async fn list_bails_when_board_missing() {
     let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
         attrs: Mutex::new(vec![]),
     });
     let server = MockServer::start().await;
@@ -325,4 +365,121 @@ fn format_local_renders_local_time() {
     assert_eq!(s.len(), 16, "«YYYY-MM-DD HH:MM»: {s}");
     assert_eq!(s.as_bytes()[10], b' ', "пробел между датой и временем: {s}");
     assert_eq!(s.as_bytes()[13], b':', "двоеточие в времени: {s}");
+}
+
+/// (8) task edit --schedule "6h": грамматика валидирована, атрибут записан.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_writes_custom_attr() {
+    let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
+        attrs: Mutex::new(vec![(
+            "body-plain2".into(),
+            vec![("custom-title".to_string(), "не расписание".to_string())],
+        )]),
+    });
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("6h".into()),
+        },
+    )
+    .await
+    .expect("edit --schedule ok");
+
+    let writes = kernel.attr_writes.lock().unwrap();
+    assert_eq!(writes.len(), 1, "ровно одна запись атрибута: {writes:?}");
+    assert_eq!(writes[0].0, "body-plain2", "атрибут на теле строки");
+    assert_eq!(writes[0].1, "custom-schedule");
+    assert_eq!(writes[0].2, "6h");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (9) task edit --schedule "": снятие без валидации грамматики — контракт
+/// «"" — снять» (ревью Common-1: ветка сидела за validate_schedule и была
+/// недостижима).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_empty_removes_attr_without_grammar_check() {
+    let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
+        attrs: Mutex::new(vec![]),
+    });
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("".into()),
+        },
+    )
+    .await
+    .expect("снятие расписания работает");
+
+    let writes = kernel.attr_writes.lock().unwrap();
+    assert_eq!(
+        writes.len(),
+        1,
+        "снятие = запись пустого значения: {writes:?}"
+    );
+    assert_eq!(writes[0].1, "custom-schedule");
+    assert_eq!(
+        writes[0].2, "",
+        "пустое значение — ядро удаляет ключ из IAL"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (10) task edit --schedule "мусор": грамматика отвергает ДО записи —
+/// атрибут не тронут.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_garbage_rejected_before_write() {
+    let kernel = Arc::new(Kernel {
+        attr_writes: Mutex::new(vec![]),
+        attrs: Mutex::new(vec![]),
+    });
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("раз в минутку".into()),
+        },
+    )
+    .await
+    .expect_err("мусорное расписание — отказ");
+
+    assert!(
+        err.to_string().contains("не разобрано"),
+        "ошибка валидации грамматики: {err}"
+    );
+    assert!(
+        kernel.attr_writes.lock().unwrap().is_empty(),
+        "записи не было: атрибут не тронут"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }

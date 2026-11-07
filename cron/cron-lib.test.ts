@@ -11,6 +11,7 @@ describe("parseSchedule", () => {
     expect(parseSchedule("5m")).toEqual({ kind: "interval", ms: 300_000 })
     expect(parseSchedule("2h")).toEqual({ kind: "interval", ms: 7_200_000 })
     expect(parseSchedule("1d")).toEqual({ kind: "interval", ms: 86_400_000 })
+    expect(parseSchedule("05m")).toEqual({ kind: "interval", ms: 300_000 })
     expect(parseSchedule("0m")).toBeNull()
     expect(parseSchedule("5s")).toBeNull()
   })
@@ -21,13 +22,19 @@ describe("parseSchedule", () => {
     // диапазоны даты — паритет с CLI-валидацией: иначе «легально» молчал бы вечно
     expect(parseSchedule("09:30 32.01")).toBeNull()
     expect(parseSchedule("09:30 01.13")).toBeNull()
+    // ведущие нули даты: TS-regex \d{1,2} отвергает, Rust-парсер тоже
+    expect(parseSchedule("09:30 001.12")).toBeNull()
+    // поле с ведущим нулём легально на обеих сторонах (\d+ / parse::<u32>)
+    expect(parseSchedule("01 * * * *")?.kind).toBe("cron")
   })
   test("cron-выражения", () => {
     expect(parseSchedule("*/30 * * * *")?.kind).toBe("cron")
     expect(parseSchedule("* * * *")).toBeNull()
     expect(parseSchedule("раз в минутку")).toBeNull()
-    // шаг 0 — «легальный» вечный ноль: отвергается на парсинге
+    // шаг 0 и ведущие нули шага — «легальный» вечный ноль: отвергаются
+    // на парсинге (Rust: [1-9]-чек, паритет)
     expect(parseSchedule("*/0 * * * *")).toBeNull()
+    expect(parseSchedule("*/01 * * * *")).toBeNull()
   })
 })
 

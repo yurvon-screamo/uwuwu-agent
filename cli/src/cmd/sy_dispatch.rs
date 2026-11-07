@@ -50,12 +50,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         r#type: ty,
         stdin,
         attach,
-        schedule: _,
+        schedule,
         dry_run: true,
     } = command
     {
         if !attach.is_empty() {
             anyhow::bail!("create --dry-run не аттачит: скелет печатается без записей в воркспейс — убери --attach");
+        }
+        // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)
+        if let Some(expr) = schedule.as_deref() {
+            crate::schedule::validate_schedule(expr)?;
+            println!("расписание: {expr} (будет записано атрибутом custom-schedule дока-тела)");
         }
         let ctx = if stdin { read_stdin()? } else { String::new() };
         println!(
@@ -156,6 +161,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
             if let Some(expr) = schedule.as_deref() {
+                if expr.is_empty() {
+                    anyhow::bail!(
+                        "на create пустое расписание бессмысленно — убери --schedule; снятие: task edit <id> --schedule \"\""
+                    );
+                }
                 crate::schedule::validate_schedule(expr)?;
             }
             // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
@@ -237,17 +247,24 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             )
             .await?;
             if let Some(expr) = schedule.as_deref() {
-                crate::schedule::validate_schedule(expr)?;
+                // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
+                // валидация — только для непустого значения: контракт «"" — снять»
+                // не должен упираться в отказ грамматики
+                if !expr.is_empty() {
+                    crate::schedule::validate_schedule(expr)?;
+                }
                 let body = syt::task_body_doc(&sy, &board, &task)
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "строка «{}» без тела (detached) — расписание некуда записать",
+                            "строка «{}» без тела (detached) — расписанию некуда записаться",
                             task.title
                         )
                     })?;
-                // пустая строка снимает атрибут (ядро удаляет ключ из IAL)
                 sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                if expr.is_empty() {
+                    println!("расписание снято: {}", task.title);
+                }
             }
             println!(
                 "обновлено: {}",
@@ -849,16 +866,40 @@ struct TrackedCronEntry {
 }
 
 fn read_cron_state() -> CronStateFile {
-    let dir = std::env::var("UWUWU_CRON_STATE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/state/uwuwu-cron")
-        });
-    let Ok(raw) = std::fs::read_to_string(dir.join("state.json")) else {
-        return CronStateFile::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+    // env — песочница: читается ТОЛЬКО она (изоляция тестов)
+    if let Ok(dir) = std::env::var("UWUWU_CRON_STATE_DIR") {
+        return read_state_file(std::path::PathBuf::from(dir).join("state.json"))
+            .unwrap_or_default();
+    }
+    // демон (master-чекаут) пишет прод-state; веточный чекаут демона —
+    // branches/<ветка>/ (изоляция resolveDaemonStateDir): мержим все,
+    // по строке побеждает свежайший lastFiredAt (живых веток обычно одна)
+    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".local/state/uwuwu-cron");
+    let mut merged = read_state_file(base.join("state.json")).unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(base.join("branches")) {
+        for entry in entries.flatten() {
+            let Some(other) = read_state_file(entry.path().join("state.json")).ok() else {
+                continue;
+            };
+            for (row, t) in other.crons {
+                let keep = merged
+                    .crons
+                    .get(&row)
+                    .map(|cur| t.last_fired_at > cur.last_fired_at)
+                    .unwrap_or(true);
+                if keep {
+                    merged.crons.insert(row, t);
+                }
+            }
+        }
+    }
+    merged
+}
+
+fn read_state_file(path: std::path::PathBuf) -> Result<CronStateFile> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
 /// Локальное время «YYYY-MM-DD HH:MM» из unix-ms — формат ячейки Last Run

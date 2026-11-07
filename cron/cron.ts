@@ -4,8 +4,9 @@
 // все задачные доски (собираются динамически из организ-дерева): строка
 // Вейт + валидное расписание + наступило время → создаются ран-карточка
 // (task create → Todo, запись запуска на доске) и OpenCode-сессия с промптом
-// из тела мастера. Здоровый ран тих (ран-карточка — сам факт); one-shot
-// после срабатывания не повторяется (state; закрытие карточки — за владельцем).
+// из тела мастера. Здоровый ран тих (ран-карточка — сам факт); разовые
+// (HH:MM [DD.MM]) после срабатывания снимают расписание — мастер не
+// повторится (reconcile-гейт 24ч страхует окно снятия).
 // Крон-доски «Кроны <proj>» и колонки Schedule/Status/Last Run сняты
 // (унификация кронов с задачами, задача 20261106182051-o5ejlte).
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
@@ -313,8 +314,8 @@ function runCardBody(masterTitle: string, schedule: string, instruction: string,
 /** Ран-карточка запуска: task create (Draft) → edit Todo. CLI зовётся
  *  процессом — боевой create с дедупом тайтла и verify вставки; дублировать
  *  write-путь в TS не делаем. rowId или null (создание не удалось —
- *  ретрай следующим тиком). */
-async function createRunCard(project: string, runTitle: string, bodyMd: string): Promise<string | null> {
+ *  ретрай следующим тиком). Экспорт — юнит-тесты позитивного пути. */
+export async function createRunCard(project: string, runTitle: string, bodyMd: string): Promise<string | null> {
   const create = Bun.spawn([CLI_BIN, "task", "create", "--project", project, "--title", runTitle, "--stdin"], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   })
@@ -374,9 +375,9 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     row.schedule = scheduleRaw
 
     const sched0 = parseSchedule(scheduleRaw)
-    // reconcile: разовый уже стрелял (демон упал до state-записи) → не
-    // повторяем. окно 24ч: юзерский re-arm (снова Вейт руками) вне окна не гасится.
-    // Status=fired больше не пишем (колонок нет) — закрытие карточек за владельцем
+    // reconcile: разовый уже стрелял (демон упал между карточкой и снятием
+    // расписания) → не повторяем в течение окна; штатно расписание снято
+    // сразу после карточки и мастер уходит из выборки до этого гейта
     const prevFire = state.crons[row.rowId]?.lastFiredAt ?? 0
     if (sched0 !== null && isOneShot(sched0) && prevFire > 0
         && now.getTime() - prevFire < 86_400_000) {
@@ -485,6 +486,20 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     // сессии хуже пропущенного рана (карточка = запись запуска)
     state.crons[row.rowId] = { sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
+    if (isOneShot(sched)) {
+      // разовый: расписание снимается сразу после карточки — мастер покидает
+      // крон-пул (старый контур писал Status=fired в ячейку; ячеек больше нет).
+      // Снятие ДО спавна: крах между шагами не даст дубль-ран следующим тиком.
+      // Повторный запуск — заново задать расписание (task edit --schedule).
+      try {
+        await mcp.tool("set_doc_attr", { docId: row.bodyDoc, name: "custom-schedule", value: "" })
+        log(`мастер «${masterTitle}»: разовый — расписание снято (повтор: task edit ${row.rowId} --schedule "…")`)
+      } catch (e) {
+        if (e instanceof mcp.KernelUnavailableError) throw e
+        // reconcile-гейт (окно 24ч по prevFire) прикроет рефайр до следующего тика
+        log(`мастер «${masterTitle}»: не смог снять расписание разового (${String(e)}) — держит reconcile-гейт`)
+      }
+    }
     const prompt = firePrompt({ title: row.title, schedule: row.schedule }, resolved.markdown, runRowId, project)
     const sessionID = await fireSession(runTitle, prompt)
     if (sessionID === null) {

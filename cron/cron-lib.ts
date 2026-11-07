@@ -138,7 +138,9 @@ export function due(sched: Sched, lastFiredAt: number, now: Date): boolean {
   }
 }
 
-/** Разовое расписание (at): после срабатывания демон ставит Status → fired. */
+/** Разовое расписание (at): после срабатывания демон снимает custom-schedule —
+ *  мастер покидает крон-пул и не повторится; повторный запуск — заново задать
+ *  расписание (task edit --schedule). */
 export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }

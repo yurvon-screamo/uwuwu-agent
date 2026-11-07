@@ -27,14 +27,16 @@ pub(crate) fn validate_schedule(raw: &str) -> Result<()> {
 
 /// `5m|2h|1d` → миллисекунды интервала; n = 0 отвергается (вечный ноль).
 pub(crate) fn parse_interval(s: &str) -> Option<u64> {
-    let (digits, unit) = s.split_at(s.len().checked_sub(1)?);
+    // срез по границе символа: не-ascii хвост («к») не должен паниковать
+    let unit = s.chars().next_back()?;
+    let digits = &s[..s.len() - unit.len_utf8()];
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let ms: u64 = match unit {
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
         _ => return None,
     };
     let n: u64 = digits.parse().ok()?;
@@ -57,6 +59,11 @@ pub(crate) fn parse_at(s: &str) -> Option<(u8, u8, Option<(u8, u8)>)> {
         None => None,
         Some(d) => {
             let (dd, mm) = d.split_once('.')?;
+            // 1–2 цифры на компонент (паритет с TS-regex \d{1,2}): «001.12»
+            // иначе разбирался бы Rust'ом и отвергался демоном
+            if dd.len() > 2 || mm.len() > 2 {
+                return None;
+            }
             let day: u8 = dd.parse().ok()?;
             let month: u8 = mm.parse().ok()?;
             if !(1..=31).contains(&day) || !(1..=12).contains(&month) {
@@ -88,10 +95,12 @@ pub(crate) fn parse_cron(s: &str) -> Option<Vec<String>> {
 fn valid_cron_field(field: &str, (min, max): (u32, u32)) -> bool {
     field.split(',').all(|part| {
         let range = match part.split_once('/') {
-            // шаг обязателен и ≥ 1: `/0` и мусор (`/`, `/x`) отвергаются
-            // обоими парсерами (Rust/TS), чтобы крон не «легально» молчал вечно
+            // шаг обязателен, ≥ 1 и без ведущих нулей (паритет с TS [1-9]\d*):
+            // `/0` и `/01` отвергаются обоими парсерами, чтобы крон не
+            // «легально» молчал вечно
             Some((r, step_str)) => {
-                if step_str.parse::<u32>().map(|n| n >= 1) != Ok(true) {
+                if step_str.starts_with('0') || step_str.parse::<u32>().map(|n| n >= 1) != Ok(true)
+                {
                     return false;
                 }
                 r
@@ -129,14 +138,17 @@ mod tests {
             "2h",
             "1d",
             "30m",
+            "05m",
             "09:30",
             "9:05",
             "09:30 01.12",
             "23:59 31.01",
+            "09:30 1.1",
             "*/5 * * * *",
             "0 9 * * 1-5",
             "15,45 */2 * * *",
             "0 0 1 1 *",
+            "01 * * * *",
         ] {
             assert!(validate_schedule(s).is_ok(), "«{s}» должен разбираться");
         }
@@ -154,10 +166,12 @@ mod tests {
             "09:5",
             "09:30 32.01",
             "09:30 01.13",
+            "09:30 001.12",
             "* * * *",
             "* * * * * *",
             "abc",
             "*/0 * * * *",
+            "*/01 * * * *",
             "60 * * * *",
             "* 24 * * *",
             "* * 0 * *",
