@@ -109,6 +109,8 @@ pub(crate) struct MockScenario {
     pub(crate) append_fail_posts: usize,
     /// Первые N deleteBlock POST отвечают 500 (одноразовый отказ удаления).
     pub(crate) delete_fail_posts: usize,
+    /// exportMdContent отвечает 500 (сбой чтения пре-имиджа overwrite).
+    pub(crate) export_fail: bool,
     /// Состояние доков (docId → блоки): seed + применённые append-ы;
     /// export отдаёт join.
     pub(crate) doc_blocks: Vec<(&'static str, Vec<String>)>,
@@ -158,6 +160,7 @@ impl Default for MockScenario {
             append_status: 200,
             append_fail_posts: 0,
             delete_fail_posts: 0,
+            export_fail: false,
             doc_blocks: Vec::new(),
             exports: Vec::new(),
             get_children_seq: vec![String::new()],
@@ -390,6 +393,9 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if kernel.sc.export_fail {
+                        return ResponseTemplate::new(500);
+                    }
                     let content = {
                         let blocks = kernel.doc_blocks.lock().unwrap();
                         match blocks.get(id) {

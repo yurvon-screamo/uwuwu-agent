@@ -373,6 +373,35 @@ async fn body_replace_delete_failure_restores_pre_image() {
     );
 }
 
+/// Сбой экспорта пре-имиджа: мутации отменены до очистки — док нетронут,
+/// сбой чтения не читается как «док был пуст» (класс PR #132).
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_export_failure_aborts_before_mutation() {
+    let mut scenario = body_scenario(true);
+    scenario.export_fail = true;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой чтения пре-имиджа — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("пре-имидж"),
+        "отказ указывает на пре-имидж: {err:#}"
+    );
+    assert!(
+        kernel.deletes().is_empty(),
+        "очистка не началась: {:?}",
+        kernel.deletes()
+    );
+    assert!(
+        kernel.appends().is_empty(),
+        "записей нет: {:?}",
+        kernel.appends()
+    );
+}
+
 /// Поле data из захваченного тела appendBlock (JSON-конверт) — для
 /// построчных ассертов по записанному markdown (сабстринг-поиск по JSON
 /// с экранированными \n хрупок).

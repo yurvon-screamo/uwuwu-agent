@@ -399,7 +399,11 @@ impl SiYuan {
         doc_title: &str,
         markdown: &str,
     ) -> Result<()> {
-        let raw = self.export_md_by_id(doc_id).await.unwrap_or_default();
+        // сбой чтения пре-имиджа ≠ «док был пуст»: Err экспорта отменяет
+        // overwrite до любой мутации (класс PR #132 — чтение не врёт о пустоте)
+        let raw = self.export_md_by_id(doc_id).await.with_context(|| {
+            format!("overwrite {doc_id}: пре-имидж не получен — мутации отменены")
+        })?;
         let pre_image = crate::markdown::strip_export_wrapper(&raw, doc_title);
 
         if let Err(err) = self.clear_doc_children(doc_id).await {
@@ -476,7 +480,22 @@ impl SiYuan {
         if let Err(rollback_err) = rollback.await {
             let dump_path =
                 std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
-            let dump_note = match std::fs::write(&dump_path, pre_image) {
+            // 0600: пре-имидж может быть приватным (PERSON) — дамп не читаем
+            // другими пользователями хоста
+            let dump_result = std::fs::File::create(&dump_path)
+                .and_then(|file| {
+                    use std::io::Write;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    let mut file = file;
+                    file.write_all(pre_image.as_bytes())?;
+                    Ok(())
+                })
+                .map(|_| ());
+            let dump_note = match dump_result {
                 Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
                 Err(dump_err) => format!(
                     "дамп пре-имиджа в {} не удался: {dump_err}",
@@ -1208,8 +1227,6 @@ pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
     ids
 }
 
-/// Пустой с точки зрения ядра док: детей нет, либо один параграф без
-/// контента/ZWJ (`- [p]  (id)`) — SiYuan не оставляет док без блока.
 /// Первая непустая строка markdown — маркер контрольного чтения записи
 /// (подстрочный матч экспорта: отступы/переносы ядра матчу не мешают).
 pub(crate) fn first_nonempty_line(md: &str) -> String {
@@ -1220,6 +1237,8 @@ pub(crate) fn first_nonempty_line(md: &str) -> String {
         .to_string()
 }
 
+/// Пустой с точки зрения ядра док: детей нет, либо один параграф без
+/// контента/ZWJ (`- [p]  (id)`) — SiYuan не оставляет док без блока.
 pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) -> bool {
     let [only] = block_ids else {
         return block_ids.is_empty();
