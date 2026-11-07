@@ -400,7 +400,8 @@ export function capUnchatBatch(items: Request[], max: number): Request[] {
  *  Доставка — по первому ненулевому chatID (чисто без-чатовый батч = 0,
  *  смешанный доставляется в ТГ как единый ход единого пайпа). */
 export function joinBatch(items: Request[]): Request {
-  const head = items[0]!
+  const head = items[0]
+  if (head === undefined) throw new Error("joinBatch: пустой батч")
   const withChat = items.find((i) => i.chatID !== 0)
   const attachments = items.flatMap((i) => i.attachments ?? [])
   const failed = [...new Set(items.flatMap((i) => i.failed ?? []))]
@@ -718,6 +719,9 @@ export interface HubProfile {
    *  Атрибут профиля: триаж — сутки (волны черновиков ежедневные), Lead —
    *  гэп ночного аудита ~сутки с запасом */
   silenceTimeoutMs: number
+  /** период тика silenceLoop, ms; дефолт минута. Инъекция для e2e —
+   *  прецедент ADR-061 («пейсинг ретраев — инъекция для тестов») */
+  silenceTickMs?: number
 }
 
 export interface Cfg {
@@ -884,10 +888,10 @@ export function createHub(profile: HubProfile): Hub {
     const html = profile.tgFormatter.htmlParts(text) ?? []
     if (html.length === 0) return sendPlain(chatID, text)
     const aligned = alignChunks(html, text)
-    for (let i = 0; i < html.length; i++) {
-      if (await attemptSend(chatID, html[i]!, true)) continue
-      for (let j = i; j < aligned.length; j++) {
-        if (!(await attemptSend(chatID, aligned[j]!, false))) return false
+    for (const [i, part] of html.entries()) {
+      if (await attemptSend(chatID, part, true)) continue
+      for (const tail of aligned.slice(i)) {
+        if (!(await attemptSend(chatID, tail, false))) return false
       }
       return true
     }
@@ -909,7 +913,7 @@ export function createHub(profile: HubProfile): Hub {
   async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
     const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string; password?: string }
     const base = (reg.url ?? "").replace("0.0.0.0", "127.0.0.1")
-    const auth = "Basic " + Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")
+    const auth = `Basic ${Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")}`
     const res = await fetch(`${base}/api${path}`, {
       method: init?.method ?? "GET",
       headers: { authorization: auth, "content-type": "application/json" },
@@ -1008,14 +1012,12 @@ export function createHub(profile: HubProfile): Hub {
       }
       if (alive === null) return state.session // неизвестно — не пересоздаём
       log(`сессия ${state.session} пропала — пересоздаю (контекст переписки потерян)`)
-      await recreateSession(true)
-      return state.session!
+      return await recreateSession(true)
     }
-    await recreateSession(false)
-    return state.session!
+    return await recreateSession(false)
   }
 
-  const recreateSession = async (notify: boolean): Promise<void> => {
+  const recreateSession = async (notify: boolean): Promise<string> => {
     syncAgentDef()
     const raw = await restCall("/session", {
       method: "POST",
@@ -1035,6 +1037,7 @@ export function createHub(profile: HubProfile): Hub {
     if (notify && state.chatID !== undefined) {
       await send(state.chatID, "ℹ️ Сессия диалога пересоздана — контекст переписки сброшен.")
     }
+    return id
   }
 
   /** Неудача попытки хода: transient или poison. Счётчик ведём на
@@ -1564,17 +1567,17 @@ export function createHub(profile: HubProfile): Hub {
       await send(state.chatID, "⚠️ Такой тип сообщения не разбираю (голосовые, стикеры и пр.) — опиши словами или пришли фото/файл/видео")
     } else if (out.kind === "edit") {
       // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
-      if (state.firing !== undefined && state.firing.msgIDs.includes(out.msg.message_id)) {
+      if (state.firing?.msgIDs.includes(out.msg.message_id) ?? false) {
         log(`edit msg${out.msg.message_id}: батч уже в полёте — правка не принята`)
         await send(state.chatID, "⏳ Успел раньше меня — сообщение уже у агента. Пришли правку новым сообщением.")
       } else {
         const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
-        if (i >= 0) {
+        const cur = i >= 0 ? state.queue[i] : undefined
+        if (cur !== undefined) {
           // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
           // пересобираем с маркерами (пути в ФС — агент фиксирует их в теле задачи)
           const hasNewMedia = mediaFiles(out.msg).length > 0
           const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
-          const cur = state.queue[i]!
           const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
           const failed = hasNewMedia ? dl.failed : (cur.failed ?? [])
           state.queue[i] = {
@@ -1629,10 +1632,20 @@ export function createHub(profile: HubProfile): Hub {
 
   // ——— liveness: луп тайм-аута тишины выходного потока ———
 
-  /** Период проверки тишины; первый тик — сразу после старта. */
+  /** Период проверки тишины; первый тик — сразу после старта. Переопределяется
+   *  профилем (silenceTickMs) — инъекция для e2e, прецедент ADR-061
+   *  («пейсинг ретраев — инъекция для тестов»). */
   const SILENCE_TICK_MS = 60_000
   const hoursOf = (ms: number): number => Math.round(ms / 3600_000)
   let silenceGate: SilenceGate = { nextAlertAt: 0 }
+
+  /** Громкая гарда вместо фолбэка-свежести: материализация при загрузке делает
+   *  ветку недостижимой; при нарушении тишина не должна молча притворяться свежей. */
+  const silenceStamp = (): number => {
+    const v = state.lastDeliveryAt
+    if (v === undefined) throw new Error("метка тишины не материализована при загрузке state")
+    return v
+  }
 
   /** Луп тайм-аута тишины (правило опыта «SiYuan-контур», Режим 5 дополнение:
    *  детектор демона-обработчика смотрит на ВЫХОД — доставку/финалы, не на
@@ -1645,10 +1658,10 @@ export function createHub(profile: HubProfile): Hub {
     while (true) {
       if (stopping) break
       try {
-        const r = silenceCheck(state.lastDeliveryAt ?? Date.now(), silenceGate, Date.now(), profile.silenceTimeoutMs)
+        const r = silenceCheck(silenceStamp(), silenceGate, Date.now(), profile.silenceTimeoutMs)
         silenceGate = r.gate
         if (r.alert) {
-          const h = Math.round(r.ageMs / 3600_000)
+          const h = hoursOf(r.ageMs)
           log(`тишина выходного потока ~${h} ч (порог ${hoursOf(profile.silenceTimeoutMs)} ч) — доставок и завершённых ходов нет`)
           if (state.chatID !== undefined) {
             const ok = await send(state.chatID, `🚨 ${profile.daemonName}: тишина выходного потока ~${h} ч (порог ${hoursOf(profile.silenceTimeoutMs)} ч) — доставок и завершённых ходов нет при живом процессе. Погляди лог и доску.`)
@@ -1660,7 +1673,7 @@ export function createHub(profile: HubProfile): Hub {
       } catch (e) {
         log(`silenceLoop: ${e}`)
       }
-      await sleep(SILENCE_TICK_MS)
+      await sleep(profile.silenceTickMs ?? SILENCE_TICK_MS)
     }
     loopDone.silence = true
     maybeExit()

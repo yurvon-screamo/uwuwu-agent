@@ -134,9 +134,10 @@ describe("hub silence e2e (mock-TG)", () => {
     if (first === undefined) throw new Error("алерт не доставлен")
     expect(first.chat_id).toBe(CHAT_ID)
     expect(first.text).toContain("тишина выходного потока")
-    // метка персистится: успешная доставка — выход, state.json уже с ней
-    // (follow-up тик не должен задублировать алерт — часы сброшены)
-    await new Promise((r) => setTimeout(r, 1_500))
+    // Дедубль на живом тике (тик 500мс — инъекция профиля): доставка алерта —
+    // send-успех, метка сброшена → ~4 последующих тика молчат; повтор был бы
+    // на первом же тике, если бы метка не обновилась
+    await new Promise((r) => setTimeout(r, 2_000))
     expect(sentMessages(sentLog).slice(before).length).toBe(1)
   }, 30_000)
 
@@ -144,9 +145,8 @@ describe("hub silence e2e (mock-TG)", () => {
     const before = sentMessages(sentLog).length
     const d = await spawnDemon(mock, Date.now())
     demons.push(d)
-    // наблюдение меньше порога (10с): первый тик — age≈0, второй тик за 60с —
-    // за пределами окна; за 6с алертов быть не должно
-    await new Promise((r) => setTimeout(r, 6_000))
+    // наблюдение меньше порога (10с) при тике 500мс: ~6 тиков — ни одного алерта
+    await new Promise((r) => setTimeout(r, 3_000))
     expect(sentMessages(sentLog).slice(before)).toEqual([])
   }, 20_000)
 })

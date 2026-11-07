@@ -499,23 +499,17 @@ test("stripDraftAcks: ack-строки уходят, остальной текс
 const DAY_MS = 24 * 3600_000
 
 test("silenceCheck: ниже порога — тихо, окно не тронуто", () => {
-  // Arrange
   const gate = { nextAlertAt: 0 }
-  // Act
   const r = silenceCheck(1_000, gate, 1_000 + DAY_MS - 1, DAY_MS)
-  // Assert
   expect(r.alert).toBe(false)
   expect(r.gate).toBe(gate)
   expect(r.ageMs).toBe(DAY_MS - 1)
 })
 
 test("silenceCheck: порог достигнут — алерт, окно сдвинуто на SILENCE_ALERT_RETRY_MS", () => {
-  // Arrange
   const bornAt = 10_000
   const now = bornAt + DAY_MS
-  // Act
   const r = silenceCheck(bornAt, { nextAlertAt: 0 }, now, DAY_MS)
-  // Assert
   expect(r.alert).toBe(true)
   expect(r.gate.nextAlertAt).toBe(now + SILENCE_ALERT_RETRY_MS)
 })
