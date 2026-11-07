@@ -124,8 +124,9 @@ uwuwu-проекта с пустым статусом (черновики вла
 
 ### CLI
 
-`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок; фоллбек — крон-доски проектов); аттачи в тело — `--attach` на `create`/`body`
+`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи (id/заголовок; id-команды
+без `--project` — глобальный резолв по доскам всех проектов с требованием уникальности: матчи на
+нескольких досках/неоднозначность — громкая ошибка); аттачи в тело — `--attach` на `create`/`body`
 (kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
 `edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search` (сервер Manticore + семантика),
 `read/blob/shot` (мультимодальное чтение), `person show/append/replace` — персона
