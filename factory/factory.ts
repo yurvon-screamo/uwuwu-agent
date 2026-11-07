@@ -59,6 +59,7 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
+  stripExportWrapper,
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
@@ -635,8 +636,8 @@ async function fetchPersonMarkdown(): Promise<string | null> {
       log(`инит: персона ${ids.length === 0 ? "не найдена" : `неоднозначна (${ids.length} id)`} — пропущена`)
       return null
     }
-    const doc = await mcp.tool<{ markdown?: string; exists?: boolean }>("export_doc_markdown", { docId: ids[0] as string })
-    const md = (doc.exists === true ? doc.markdown ?? "" : "").trim()
+    const doc = await mcp.tool<{ markdown?: string; exists?: boolean; title?: string }>("export_doc_markdown", { docId: ids[0] as string })
+    const md = stripExportWrapper(doc.exists === true ? doc.markdown ?? "" : "", doc.title ?? "").trim()
     if (md === "") {
       log("инит: экспорт персоны пуст — пропущена")
       return null

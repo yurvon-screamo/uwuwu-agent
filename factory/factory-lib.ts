@@ -462,6 +462,26 @@ export interface SpawnInit {
 
 const dash = (value: string): string => (value.trim() === "" ? "—" : value.trim())
 
+/** YAML frontmatter из начала markdown (--- … ---) — паритет CLI
+ *  markdown.rs strip_frontmatter: ядро в экспорте ведёт live-атрибуты дока. */
+export function stripFrontmatter(md: string): string {
+  if (!md.startsWith("---\n")) return md
+  const rest = md.slice("---\n".length)
+  const sep = rest.indexOf("\n---")
+  if (sep === -1) return md
+  return rest.slice(sep + "\n---".length).replace(/^\n+/, "")
+}
+
+/** Обёртка kernel-экспорта (frontmatter + строка `# <тайтл>`) — долой,
+ *  паритет CLI strip_export_wrapper: в спавн-промпт идёт чистое тело. */
+export function stripExportWrapper(md: string, docTitle: string): string {
+  const body = stripFrontmatter(md).replace(/^\s+/, "")
+  const titleHeading = `# ${docTitle}`
+  return body.startsWith(titleHeading)
+    ? body.slice(titleHeading.length).replace(/^\n+/, "")
+    : body
+}
+
 /** Блок инит-данных первого промпта: ориентация без стартового поиска
  *  (person show / доки проекта / task get ради «где я»). Компактный:
  *  суть здесь, глубокое чтение — по ссылке/команде. */

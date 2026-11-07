@@ -57,6 +57,8 @@ import {
   bodyLastmodMs,
   wakeupDedup,
   spawnInitBlock,
+  stripExportWrapper,
+  stripFrontmatter,
   type SpawnInit,
 } from "./factory-lib"
 import { parseCommentsMarkdown } from "../lib/platform"
@@ -474,6 +476,22 @@ describe("promptForStart: единственная точка выбора ст�
     expect(promptForStart("implement", ...args, undefined, init)).toContain("Инит-данные")
     expect(promptForStart("continue", ...args, undefined, init)).toContain("Инит-данные")
     expect(promptForStart("conflict-fix", ...args, undefined, init)).toContain("Инит-данные")
+  })
+})
+
+describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", () => {
+  test("frontmatter срезан, тело без потерь", () => {
+    expect(stripFrontmatter("---\ntitle: X\n---\n\nтело\n")).toBe("тело\n")
+  })
+  test("без frontmatter — дословно; незакрытый fence — дословно", () => {
+    expect(stripFrontmatter("тело\n")).toBe("тело\n")
+    expect(stripFrontmatter("---\ntitle: X\nтело\n")).toBe("---\ntitle: X\nтело\n")
+  })
+  test("обёртка экспорта: frontmatter + строка тайтла — долой", () => {
+    expect(stripExportWrapper("---\ntitle: таск\n---\n\n# таск\n\nтело\n", "таск")).toBe("тело\n")
+  })
+  test("чужой H1 в начале не срезается (не тайтл дока)", () => {
+    expect(stripExportWrapper("# другой заголовок\nтекст\n", "таск")).toBe("# другой заголовок\nтекст\n")
   })
 })
 
