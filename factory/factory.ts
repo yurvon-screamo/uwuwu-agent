@@ -46,6 +46,7 @@ import {
   reviewRerunPrompt,
   reviewCommentsPrompt,
   reviewReturnPrompt,
+  reviewStallVerdict,
   conflictFixPrompt,
   routeTask,
   rowMissingAction,
@@ -1392,7 +1393,60 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         delete tracked.stallSignaled
         log(`задача ${rowId.slice(0, 8)}: статус сменился — флаг застоя сброшен (новый эпизод)`)
       }
+      if (tracked.reviewStallSignaled === true) {
+        delete tracked.reviewStallSignaled
+        log(`задача ${rowId.slice(0, 8)}: статус сменился — флаг ревью-тишины сброшен (новый эпизод)`)
+      }
       saveState(state)
+    }
+
+    // ——— гвард ревью-тишины (инцидент 07.11, задача 20261107142321): ———
+    // ход ревьювера завершился, статус не ушёл из ревью — routeTask в этой
+    // геометрии вечный noop (живая сессия, нет свежих комментов). Тишина
+    // дольше порога → сигнал юзеру + Needs attention, раз за эпизод
+    // (флаг reviewStallSignaled; сброс — смена статуса выше или вернувшаяся
+    // активность ревьювера). Восстановление — штатные пути: перестановка
+    // ревью-статуса будит ту же сессию доревью-промптом (rerun).
+    // Только noop: spawn/rerun/comments только что побудили ревьювера —
+    // его активность ещё не отражает ход, детекция была бы ложной.
+    if (action.t === "noop" && reviewKindOf(row.status) !== null && reviewerLiveness === "alive") {
+      const activity = await lastSessionActivity(tracked.reviewSessionID ?? "")
+      if (activity === "invalid") {
+        log(`задача ${rowId.slice(0, 8)}: активность ревью-сессии неизвестна — пропуск тика`)
+      } else {
+        const verdict = reviewStallVerdict({
+          status: row.status,
+          reviewerAlive: reviewerLiveness === "alive",
+          lastActivityAt: activity,
+          signaled: tracked.reviewStallSignaled === true,
+          now: Date.now(),
+        }, STALL_MS)
+        if (verdict.t === "signal") {
+          // эскалация как failReview/stall: коммент + Needs attention;
+          // lastStatus сразу за доской — перестановка юзером ревью-статуса
+          // посчитается новым входом (rerun-reviewer). continue: «пайп
+          // девелопера» ниже может догнать свои уведомления (мёртвая дев-
+          // сессия) — двойной сигнал в один тик юзеру не нужен
+          log(`задача ${rowId.slice(0, 8)}: ревью-статус при живой ревью-сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
+          if (DRY_RUN) {
+            // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
+            // без флага анти-спам в песочнице не работает — сигнал повторялся
+            // бы каждые 2 тика (паритет дев-сталла, расхождение задокументировано логом)
+            log(`DRY_RUN: ревью-эскалация Needs attention + коммент — пропущены`)
+          } else {
+            await setCells(board, rowId, { Status: "Needs attention" })
+            tracked.reviewStallSignaled = true
+            tracked.lastStatus = "Needs attention"
+            saveState(state)
+            await notify(tracked, verdict.text)
+          }
+          continue
+        } else if (verdict.t === "none" && tracked.reviewStallSignaled === true) {
+          delete tracked.reviewStallSignaled
+          saveState(state)
+          log(`задача ${rowId.slice(0, 8)}: эпизод ревью-тишины завершён — флаг снят (активность ревьювера вернулась)`)
+        }
+      }
     }
 
     // ——— пайп девелопера: комменты/тело/живость (комменты мог съесть ревьювер) ———
