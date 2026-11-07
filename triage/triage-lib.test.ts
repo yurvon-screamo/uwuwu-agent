@@ -167,5 +167,6 @@ test("validTriageExtras: валидный ack персистится, битый
   }
   const cleaned = validTriageState(broken)
   expect(cleaned.drafts?.r1).toBeDefined() // трек жив
-  expect((cleaned.drafts?.r1 as DraftTrack).ack).toBeUndefined() // поле отброшено
+  const kept = cleaned.drafts?.r1
+  expect((kept as DraftTrack).ack).toBeUndefined() // поле отброшено
 })

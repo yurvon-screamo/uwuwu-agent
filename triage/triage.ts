@@ -9,7 +9,7 @@ import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   createHub, type Hub, type HubFinalHook, type HubProfile, type HubSource, type DraftRef, type DraftVerdict,
-  type HubState, type Request,
+  type Request,
 } from "../lib/hub"
 import {
   applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
@@ -145,7 +145,7 @@ interface DraftRow {
   title: string
 }
 
-async function readDraftRows(hub: Hub, board: BoardRef): Promise<DraftRow[]> {
+async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{
     rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
   }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
@@ -277,7 +277,7 @@ const draftWatcher: HubSource = {
         const projects = new Map<string, string>()
         for (const b of boards) {
           try {
-            for (const d of await readDraftRows(hub, b)) {
+            for (const d of await readDraftRows(b)) {
               seen.set(d.rowId, d)
               projects.set(d.rowId, b.project)
             }

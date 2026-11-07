@@ -9,7 +9,7 @@
 
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import {
-  createHub, type Hub, type HubProfile, type HubSource, type Request,
+  createHub, type HubProfile, type HubSource, type Request,
 } from "../lib/hub"
 import { auditDue, composeAuditPrompt, localDateKey, parseAuditAt, validLeadExtras, type AuditAt } from "./lead-lib"
 

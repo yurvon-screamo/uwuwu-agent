@@ -438,9 +438,9 @@ test("plainChunks: нарезка по лимиту без разрыва сур
 })
 
 test("plainChunks: лимит на стыке пары сдвигает границу (+1)", () => {
-  const s = "a" + "😀" // пара начинается на индексе 1, граница 3800 её не задевает — проверим узкий лимит
+  const s = "a😀" // пара начинается на индексе 1 — проверим узкий лимит
   expect(plainChunks(s, 1).join("")).toBe(s)
-  const pairAtLimit = "😀" + "b".repeat(3798) + "😀"
+  const pairAtLimit = `😀${"b".repeat(3798)}😀`
   const parts = plainChunks(pairAtLimit, 3800)
   expect(parts.join("")).toBe(pairAtLimit)
 })
@@ -474,7 +474,8 @@ test("parseDraftAcks: пары на одной и нескольких стро�
 })
 
 test("parseDraftAcks: нормализация токенов — бэктики, жирный, регистр, пробелы", () => {
-  expect(parseDraftAcks("draft-ack: `r1` = **TODO**")).toEqual({ r1: "todo" })
+  expect(parseDraftAcks("draft-ack: `r1` = **TO-DO**")).toEqual({}) // не в каноне вердиктов — игнор
+  expect(parseDraftAcks("draft-ack: `r1` = **todo**")).toEqual({ r1: "todo" })
   expect(parseDraftAcks("draft-ack: _r1_=Merge")).toEqual({ r1: "merge" })
 })
 
