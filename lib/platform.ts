@@ -374,6 +374,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
       let value = ""
       if (v.mSelect) value = v.mSelect.map((o) => o.content).join(",")
       else if (v.text) value = v.text.content ?? ""
+      else if (v.date) value = v.date.formattedContent ?? ""
       if (col !== "") cells[col] = { value }
     }
     rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })

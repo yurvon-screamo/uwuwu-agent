@@ -7,6 +7,10 @@ export interface CronRow {
   title: string
   /** Расписание из custom-schedule дока-тела; пусто для обычных задач. */
   schedule: string
+  /** Клетка «Запланировано» (formattedContent date-ячейки; "" — пусто). */
+  planned: string
+  /** Клетка «Расписание» (отображение custom-schedule; "" — пусто). */
+  scheduleCell: string
   /** Статус строки доски (mSelect, нижний регистр). Файр — только «вейт». */
   status: string
 }
@@ -22,6 +26,14 @@ export interface TrackedCron {
 
 export interface CronState {
   crons: Record<string, TrackedCron>
+}
+
+/** Локальное время «YYYY-MM-DD HH:MM» — метки запусков, клетки
+ *  «Запланировано» и раны читает юзер; формат стабилен для сравнения
+ *  reconcile демона (клетку пишет CLI тем же форматированием). */
+export function formatLocal(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 // ——— расписания ———
@@ -145,6 +157,44 @@ export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
 
+/** Следующее планируемое срабатывание после момента `after` (минутная
+ *  точность — compare с клеткой «Запланировано» доски). null — срабатываний
+ *  дальше нет (разовый в прошлом; cron-выражение, не совпадающее за год —
+ *  скан ограничен календарным годом, вечный молчун клетку не трогает).
+ *  Семантика зеркалит due(): интервал — от последнего файра (никогда не
+ *  стрелявший файрится следующим тиком, вызов передаёт now), at — момент
+ *  HH:MM [DD.MM], если он впереди. */
+export function nextFire(sched: Sched, after: Date): Date | null {
+  switch (sched.kind) {
+    case "interval": {
+      return new Date(minuteStart(after) + sched.ms)
+    }
+    case "at": {
+      // day и month приходят парой из parseSchedule (HH:MM DD.MM); без них —
+      // ежедневный at: сегодняшний момент, если он ещё впереди
+      const moment = new Date(
+        after.getFullYear(),
+        sched.month !== undefined ? sched.month - 1 : after.getMonth(),
+        sched.day ?? after.getDate(),
+        sched.hour,
+        sched.minute,
+      )
+      return moment.getTime() > after.getTime() ? moment : null
+    }
+    case "cron": {
+      const minuteMs = 60_000
+      const horizon = new Date(after.getFullYear() + 1, after.getMonth(), after.getDate()).getTime()
+      let t = minuteStart(after) + minuteMs
+      while (t < horizon) {
+        const candidate = new Date(t)
+        if (cronMatches(sched.fields, candidate)) return candidate
+        t += minuteMs
+      }
+      return null
+    }
+  }
+}
+
 /** Решение по свежему срезу доски прямо перед спавном: строка могла быть
  *  снята/закрыта/снята с Вейт, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
  *  (живой кейс 05.11: файр по строке, снятой в ходе тика) сужается до окна
@@ -157,6 +207,21 @@ export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "
 
 export function minuteStart(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()).getTime()
+}
+
+/** Расхождение клеток мастера с расписанием и last-fire: что CLI должен
+ *  дописать (пустой объект — доска честна). «Расписание» — отображение
+ *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
+ *  «Запланировано» — next-fire после последнего файра (никогда не стрелявший
+ *  файрится следующим тиком — compare от now). Чистая функция — юнит-тесты
+ *  без моков; применение — reconcileMasterCells (DRY_RUN-гвард там). */
+export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
+  const patch: { schedule?: string; planned?: string } = {}
+  if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
+  const next = nextFire(sched, prevFire > 0 ? new Date(prevFire) : now)
+  const planned = next !== null ? formatLocal(next) : ""
+  if (row.planned !== planned) patch.planned = planned
+  return patch
 }
 
 /** Валидация state-записи. */

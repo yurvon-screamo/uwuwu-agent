@@ -1,7 +1,7 @@
 // cron-lib.test.ts — расписания, границы, промпты.
 import { describe, expect, test } from "bun:test"
 import {
-  parseSchedule, fieldMatches, due, isOneShot, isValidTracked,
+  parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
 } from "./cron-lib"
@@ -140,8 +140,8 @@ describe("firePrompt", () => {
 
 describe("fireGate: файр только по живой Вейт-строке свежего среза", () => {
   const rows = [
-    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", status: "вейт" },
-    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", status: "in progress" },
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", planned: "", scheduleCell: "", status: "вейт" },
+    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", planned: "", scheduleCell: "", status: "in progress" },
   ]
   test("строка снята — removed, файра нет", () => {
     expect(fireGate(rows, "gone")).toBe("removed")
@@ -258,3 +258,96 @@ describe("isValidTracked: lastRefusal", () => {
   })
 })
 
+
+describe("nextFire: следующее планируемое срабатывание", () => {
+  const at = (y: number, m: number, d: number, h: number, min: number, s = 0) => new Date(y, m - 1, d, h, min, s)
+
+  test("интервал — от последнего файра", () => {
+    const sched = parseSchedule("6h")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 2, 34, 21)
+    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 8, 34))
+  })
+
+  test("cron-выражение — следующий совпавший минут-старт", () => {
+    const sched = parseSchedule("*/15 * * * *")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 10, 3)
+    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 10, 15))
+  })
+
+  test("cron-выражение с днём недели — не стреляет в прошедшие дни повторно", () => {
+    const sched = parseSchedule("0 9 * * 1")
+    expect(sched).not.toBeNull()
+    // 08.11.2026 — воскресенье: следующий понедельник 09.11
+    const last = at(2026, 11, 8, 9, 0)
+    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 9, 9, 0))
+  })
+
+  test("разовый HH:MM — сегодняшний момент, если он впереди", () => {
+    const sched = parseSchedule("18:00")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 10, 0)
+    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 18, 0))
+  })
+
+  test("разовый в прошлом → null (нечего планировать)", () => {
+    const sched = parseSchedule("09:30")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 10, 0)
+    expect(nextFire(sched!, last)).toBeNull()
+  })
+
+  test("разовый с датой — конкретный день, месяц из расписания", () => {
+    const sched = parseSchedule("09:30 01.12")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 10, 0)
+    expect(nextFire(sched!, last)).toEqual(at(2026, 12, 1, 9, 30))
+  })
+
+  test("вечный молчун (ни одного совпадения за год) → null, клетку не трогает", () => {
+    const sched = parseSchedule("0 0 30 2 *")
+    expect(sched).not.toBeNull()
+    const last = at(2026, 11, 8, 10, 0)
+    expect(nextFire(sched!, last)).toBeNull()
+  })
+})
+
+describe("cellPatches: расхождение клеток мастера", () => {
+  const at = (y: number, m: number, d: number, h: number, min: number) => new Date(y, m - 1, d, h, min)
+  const row = (over: Record<string, string> = {}) => ({
+    rowId: "row-1", bodyDoc: "doc-1", title: "мастер", schedule: "6h",
+    planned: "", scheduleCell: "", status: "вейт", ...over,
+  })
+  const sched = parseSchedule("6h")!
+
+  test("чистая доска — пустой патч (записей не нужно)", () => {
+    const r = row({ planned: "2026-11-08 08:34", scheduleCell: "6h" })
+    expect(cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))).toEqual({})
+  })
+
+  test("пустая клетка planned при живом файре — патч planned", () => {
+    const r = row({ planned: "", scheduleCell: "6h" })
+    const patch = cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))
+    expect(patch).toEqual({ planned: "2026-11-08 08:34" })
+  })
+
+  test("дрейф клетки «Расписание» — патч schedule значением attr", () => {
+    const r = row({ planned: "2026-11-08 08:34", scheduleCell: "" })
+    const patch = cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))
+    expect(patch).toEqual({ schedule: "6h" })
+  })
+
+  test("никогда не стрелявший (prevFire=0) — next от now", () => {
+    const r = row({ scheduleCell: "6h" })
+    const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
+    expect(patch).toEqual({ planned: "2026-11-08 16:00" })
+  })
+})
+
+describe("formatLocal", () => {
+  test("минутная точность с ведущими нулями", () => {
+    expect(formatLocal(new Date(2026, 10, 8, 2, 34))).toBe("2026-11-08 02:34")
+    expect(formatLocal(new Date(2026, 0, 5, 9, 5))).toBe("2026-01-05 09:05")
+  })
+})

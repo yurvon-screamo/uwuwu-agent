@@ -22,6 +22,7 @@ export interface RenderRow {
       isDetached?: boolean
       mSelect?: { content?: string }[]
       text?: { content?: string }
+      date?: { formattedContent?: string }
     }
   }[]
 }

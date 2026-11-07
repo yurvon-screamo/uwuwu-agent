@@ -17,9 +17,9 @@ import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
-  due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
+  due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
   stripNonContent, type PlatformTool,
-  type CronRow, type CronState,
+  type CronRow, type CronState, type Sched,
 } from "./cron-lib"
 
 // state: песочница — UWUWU_CRON_STATE_DIR двигает state+lock, в песочнице лог
@@ -36,11 +36,6 @@ const STATE_RESOLVED = resolveDaemonStateDir({
 const STATE_DIR = STATE_RESOLVED.stateDir
 const STATE_FILE = join(STATE_DIR, "state.json")
 
-/** Локальное время «YYYY-MM-DD HH:MM» — метки запусков в логе читает юзер. */
-function formatLocal(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, "0")
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** изолированный cwd крон-агентов: тело задачи редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
@@ -73,6 +68,25 @@ const CLI_BIN = process.env.UWUWU_CLI_BIN
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
+}
+
+/** task edit строки (колонки доски): единственный write-путь клеток — CLI.
+ *  stdout или null (сбой — вызывающий решает: ретрай следующим тиком).
+ *  Экспорт — юнит-тесты argv. */
+export async function runCliEdit(project: string, rowId: string, args: string[]): Promise<string | null> {
+  const proc = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, ...args], {
+    stdout: "pipe", stderr: "pipe",
+  })
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  if (code !== 0) {
+    log(`task edit ${args.join(" ")} упал (code ${code}): ${err.trim().slice(0, 200)}`)
+    return null
+  }
+  return out
 }
 
 // ——— одиночный инстанс ———
@@ -214,6 +228,8 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       bodyDoc: row.linkedDocId ?? "",
       title: (row.title ?? "").trim(),
       schedule: "",
+      planned: row.cells?.["Запланировано"]?.value ?? "",
+      scheduleCell: row.cells?.["Расписание"]?.value ?? "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
     }))
 }
@@ -311,11 +327,12 @@ function runCardBody(masterTitle: string, schedule: string, instruction: string,
   ].join("\n")
 }
 
-/** Ран-карточка запуска: task create (Draft) → edit Todo. CLI зовётся
- *  процессом — боевой create с дедупом тайтла и verify вставки; дублировать
- *  write-путь в TS не делаем. rowId или null (создание не удалось —
- *  ретрай следующим тиком). Экспорт — юнит-тесты позитивного пути. */
-export async function createRunCard(project: string, runTitle: string, bodyMd: string): Promise<string | null> {
+/** Ран-карточка запуска: task create (Draft) → edit Todo + planned. CLI
+ *  зовётся процессом — боевой create с дедупом тайтла и verify вставки;
+ *  дублировать write-путь в TS не делаем. Дата файра — колонка
+ *  «Запланировано» (минутная точность, формат сравнения reconcile).
+ *  rowId или null (создание не удалось — ретрай следующим тиком). */
+export async function createRunCard(project: string, runTitle: string, bodyMd: string, firedAt: Date): Promise<string | null> {
   const create = Bun.spawn([CLI_BIN, "task", "create", "--project", project, "--title", runTitle, "--stdin"], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   })
@@ -337,7 +354,7 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
   }
   // ран — запись запуска, тип не несёт: клетка «Тип» от create-дефолта (dev)
   // снимается в том же edit — без неё канбан-фильтры по типу не шумят ранами
-  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo", "--type", ""], {
+  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo", "--type", "", "--planned", formatLocal(firedAt)], {
     stdout: "pipe", stderr: "pipe",
   })
   const [, editErr, editCode] = await Promise.all([
@@ -348,8 +365,9 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
   if (editCode !== 0) {
     // не фатально: Draft-ран в окне дебаунса не поймается вотчером, а если
     // поймается — триаж переведёт сам («уже не Draft → пропусти» не сработает,
-    // вердикт Todo); ран не теряется в обоих исходах
-    log(`task edit Todo не прошёл (code ${editCode}): ${editErr.trim().slice(0, 200)} — ран останется Draft до триажа`)
+    // вердикт Todo); ран не теряется в обоих исходах. Пустая клетка даты
+    // видна на доске и правится руками — отдельного ретрая не строим.
+    log(`task edit Todo/planned не прошёл (code ${editCode}): ${editErr.trim().slice(0, 200)} — ран останется Draft до триажа`)
   }
   return rowId
 }
@@ -367,6 +385,22 @@ export function tickFailOutcome(e: unknown, consecutiveFails: number): { fails: 
   if (e instanceof mcp.KernelWaveError) return { fails: consecutiveFails, reconnect: false, restart: false }
   const fails = consecutiveFails + 1
   return { fails, reconnect: true, restart: fails >= 5 }
+}
+
+/** Reconcile клеток мастера: расхождение → одна CLI-запись обоих клеток.
+ *  DRY_RUN — только лог. */
+async function reconcileMasterCells(project: string, row: CronRow, sched: Sched, prevFire: number, now: Date): Promise<void> {
+  const patch = cellPatches(row, sched, prevFire, now)
+  const args: string[] = []
+  if (patch.schedule !== undefined) args.push("--schedule", patch.schedule)
+  if (patch.planned !== undefined) args.push("--planned", patch.planned)
+  if (args.length === 0) return
+  log(`мастер «${row.title || row.rowId.slice(0, 8)}»: клетки доски не сходятся (${args.join(" ")}) — синхронизирую`)
+  if (DRY_RUN) {
+    log(`DRY_RUN: запись клеток пропущена`)
+    return
+  }
+  await runCliEdit(project, row.rowId, args)
 }
 
 export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
@@ -426,6 +460,9 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
       }
       continue
     }
+    // клетки мастера сверяются каждый тик (не только при файре): смена
+    // расписания и дрейф клетки сходятся за минуту, доска не врёт
+    await reconcileMasterCells(project, row, sched, state.crons[row.rowId]?.lastFiredAt ?? 0, now)
 
     const tracked = state.crons[row.rowId]
     const lastFired = tracked?.lastFiredAt ?? 0
@@ -493,7 +530,7 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     }
     const runTitle = runCardTitle(row, now)
     const instruction = stripNonContent(resolved.markdown)
-    const runRowId = await createRunCard(project, runTitle, runCardBody(row.title, row.schedule, instruction, now))
+    const runRowId = await createRunCard(project, runTitle, runCardBody(row.title, row.schedule, instruction, now), now)
     if (runRowId === null) {
       log(`мастер «${masterTitle}»: ран-карточка не создана — ретрай следующим тиком`)
       continue
@@ -504,16 +541,17 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     saveState(state)
     if (isOneShot(sched)) {
       // разовый: расписание снимается сразу после карточки — мастер покидает
-      // крон-пул (старый контур писал Status=fired в ячейку; ячеек больше нет).
-      // Снятие ДО спавна: крах между шагами не даст дубль-ран следующим тиком.
-      // Повторный запуск — заново задать расписание (task edit --schedule).
-      try {
-        await mcp.tool("set_doc_attr", { docId: row.bodyDoc, name: "custom-schedule", value: "" })
+      // крон-пул (старый контур писал Status=fired в ячейку). Снятие ДО
+      // спавна: крах между шагами не даст дубль-ран следующим тиком. Повтор
+      // — заново задать расписание (task edit --schedule). Снятие — через
+      // CLI: он единственный write-путь колонок, чистит и attr, и ОБЕ клетки
+      // («Расписание», «Запланировано») одной командой.
+      const cleared = await runCliEdit(project, row.rowId, ["--schedule", "", "--planned", ""])
+      if (cleared !== null) {
         log(`мастер «${masterTitle}»: разовый — расписание снято (повтор: task edit ${row.rowId} --schedule "…")`)
-      } catch (e) {
-        if (e instanceof mcp.KernelUnavailableError) throw e
+      } else {
         // reconcile-гейт (окно 24ч по prevFire) прикроет рефайр до следующего тика
-        log(`мастер «${masterTitle}»: не смог снять расписание разового (${String(e)}) — держит reconcile-гейт`)
+        log(`мастер «${masterTitle}»: не смог снять расписание разового — держит reconcile-гейт`)
       }
     }
     const prompt = firePrompt({ title: row.title, schedule: row.schedule }, resolved.markdown, runRowId, project)
