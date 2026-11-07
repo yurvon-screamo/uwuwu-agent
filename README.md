@@ -8,7 +8,7 @@
 opencodereview/ правила ревью
 agents/        агенты: developer, dreamer, code-quality-reviewer (праймари — ревью-статусы фабрики)
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        31 скилл (см. ниже)
+skills/        29 скиллов (см. ниже)
 cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.cargo/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки + маршрутизатор ревью
 cron/          uwuwu-cron — планировщик крон-задач (доски «Задачи <Proj>» → ран-карточки → сессии)
@@ -22,13 +22,13 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (31)
+## Скиллы (29)
 
-- **Architect (1)**: architect-ui-ux
+- **UI (1)**: architect-ui-ux — дизайн-стратегия + правила имплементации (бывшая пара architect/rules-ui слита)
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
-- **Workflows (4)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review
+- **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
 - **Office (4)**: docx · pdf · pptx · xlsx
-- **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
+- **Rules (10)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing
 - **Visual (1)**: visual-diagrams
 - **Integrations (4)**: bunny-cli · hf-cli · stitch · use-railway
 
@@ -124,8 +124,9 @@ uwuwu-проекта с пустым статусом (черновики вла
 
 ### CLI
 
-`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок; фоллбек — крон-доски проектов); аттачи в тело — `--attach` на `create`/`body`
+`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи (id/заголовок; id-команды
+без `--project` — глобальный резолв по доскам всех проектов с требованием уникальности: матчи на
+нескольких досках/неоднозначность — громкая ошибка); аттачи в тело — `--attach` на `create`/`body`
 (kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
 `edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search` (сервер Manticore + семантика),
 `read/blob/shot` (мультимодальное чтение), `person show/append/replace` — персона

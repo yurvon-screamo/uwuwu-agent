@@ -684,6 +684,26 @@ impl MockKernel {
     // ——— MCP-действия над состоянием ———
 
     fn sql_data(&self, stmt: &str) -> Value {
+        // дискавери досок задач (глобальный резолв без --project): hpath
+        // сценария фильтруются той же конвенцией, что парсит резолв
+        if stmt.contains("content like 'Задачи %'") {
+            let mut hits: Vec<Value> = self
+                .sc
+                .hpath_ids
+                .iter()
+                .filter_map(|(hpath, ids)| {
+                    crate::siyuan_task::task_board_parts(hpath).and_then(|_| {
+                        ids.first().map(|id| json!({ "id": id, "hpath": hpath }))
+                    })
+                })
+                .collect();
+            hits.sort_by(|a, b| {
+                let pa = a.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
+                let pb = b.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
+                pa.cmp(pb)
+            });
+            return json!(hits);
+        }
         if let Some(root) = stmt
             .split("root_id='")
             .nth(1)

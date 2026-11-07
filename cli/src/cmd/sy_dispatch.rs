@@ -49,6 +49,21 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
     }
 }
 
+/// Резолв задачи для id-команд: с --project — доска проекта, без — глобально
+/// по доскам всех проектов (уникальность обязательна, раскладка «доска →
+/// совпадения» в ошибках).
+async fn resolve_task(
+    sy: &SiYuan,
+    project: &str,
+    needle: &str,
+) -> Result<(syt::SyBoard, syt::SyTask)> {
+    if project.is_empty() {
+        syt::resolve_global(sy, needle).await
+    } else {
+        syt::resolve_on_project(sy, project, needle).await
+    }
+}
+
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
@@ -86,8 +101,20 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     if let TaskSub::Comment { stdin, text, .. } = &command {
         pre_guard_positional_comment(*stdin, text)?;
     }
-    if project.is_empty() {
-        anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
+    // Board-bound подкоманды привязаны к доске/журналу — глобальной семантики
+    // нет. Id-семейство (get/edit/claim/comment/thread/close/body/rm) без
+    // --project резолвит глобально: resolve_task → resolve_global (доски всех
+    // проектов, уникальность обязательна).
+    if project.is_empty()
+        && matches!(
+            command,
+            TaskSub::List { .. }
+                | TaskSub::Create { .. }
+                | TaskSub::Clean { .. }
+                | TaskSub::Undo { .. }
+        )
+    {
+        anyhow::bail!("--project <имя> обязателен для list/create/clean/undo (uwuwu | origa | …)");
     }
     let sy = SiYuan::from_env()?;
     match command {
@@ -137,13 +164,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
             if !task.task_type.is_empty() {
                 println!("Тип:      {}", task.task_type);
             }
             println!("Строка:   {}", task.item_id);
+            // где приземлился резолв — особенно при глобальном (без --project)
+            println!("Доска:    {}", board.hpath);
             if !task.branch.is_empty() {
                 println!("Ветка:    {}", task.branch);
             }
@@ -263,7 +292,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             r#type: ty,
             schedule,
         } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             // валидация PR/типа до rename: без частичных обновлений (тайтл
             // сменился, а колонки нет — недопустимый разрыв); «» — снятие типа
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
@@ -322,7 +351,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     "sessionID не задан: нет --session и нет OPENCODE_SESSION_ID в env — заявись из сессии агента или передай id явно"
                 ))?,
             };
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::claim(&sy, &board, &task, &session).await?;
             println!("заявлено: {} ← {}", task.title, session);
             Ok(())
@@ -334,13 +363,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             text,
         } => {
             let msg = guarded_comment_text(stdin, &text)?;
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
-            println!("коммент отправлен: {}", truncate(&msg, 60));
+            println!(
+                "коммент отправлен на {}: {}",
+                board.hpath,
+                truncate(&msg, 60)
+            );
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                 None => String::new(),
@@ -349,7 +382,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
             Ok(())
@@ -386,7 +419,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ),
                 None => None,
             };
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             let body_path = board.body_hpath(&task.title);
             // upload до записи тела: сбой не оставляет тело без референсов
             let mut uploaded = Vec::new();
@@ -626,10 +659,20 @@ async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> R
 
 /// rm одной задачи под guard'ом: вердикт по источникам, отказ для живых
 /// не-Draft (задекларированный контракт команды), write-ahead журнал.
+/// Id-команда: без --project резолвит глобально; имя проекта для журнала
+/// при этом выводится из доски (undo-валидация остаётся проектной).
 async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
-    let board = syt::find_board(sy, project).await?;
+    let (board, task) = resolve_task(sy, project, id).await?;
+    let project = if project.is_empty() {
+        syt::board_project(&board)
+    } else {
+        project.to_string()
+    };
     let chain = syt::board_doc_chain(sy, &board).await?;
-    let task = syt::resolve(sy, &board, id).await?;
+    // Строка резолвилась на доске — повторный resolve не нужен: вердикт
+    // строится по найденной задаче (resolve внутри task_rm дублировал бы
+    // render; контракт guard'а — вердикт по независимым источникам, не
+    // по повторному матчингу).
     match row_verdict(sy, &board, &chain, &task).await? {
         Verdict::Divergent => bail!(
             "состояние строки «{}» неясно (FS/SQL-проба не состоялась) — rm отклонён, повтори позже",
@@ -642,7 +685,7 @@ async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
         ),
         _ => {}
     }
-    let mut journal = Journal::new(project, "rm", &board);
+    let mut journal = Journal::new(&project, "rm", &board);
     journal.rows.push(journal_row(sy, &board, &task).await?);
     let journal_path = journal.save(sy).await?;
     sy.mcp_tool(
@@ -3241,14 +3284,24 @@ mod tests {
         );
     }
 
-    /// Контроль: чистый позиционный текст при пустом --project — прежний bail
-    /// (проверка --project не размыта гвардом).
+    /// Контроль: чистый позиционный текст при пустом --project — гвард
+    /// пропускает, команда уходит в глобальный резолв (bail «--project
+    /// обязателен» для id-семейства снят задачей 20261106230303; промах
+    /// резолва честный, не «флаг не передан»).
     #[tokio::test]
-    async fn clean_comment_text_still_bails_on_missing_project() {
+    async fn clean_comment_text_without_project_goes_to_global_resolve() {
         let err = task_run("", comment_command(false, &["текст"]))
             .await
-            .expect_err("--project обязателен для чистого текста");
-        assert!(err.to_string().contains("обязателен"), "{err}");
+            .expect_err("глобальный резолв без ядра/досок — отказ");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("похож на флаг") && !msg.contains("подкоманд"),
+            "чистый текст гвардом не отклоняется: {msg}"
+        );
+        assert!(
+            !msg.contains("обязателен"),
+            "bail «--project обязателен» для comment снят: {msg}"
+        );
     }
 
     #[test]
