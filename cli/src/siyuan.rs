@@ -509,16 +509,20 @@ impl SiYuan {
         self.export_md_by_id(&id).await
     }
 
-    /// Экспорт дока в markdown по docId (exportMdContent).
+    /// Экспорт дока в markdown по docId (exportMdContent). Выход санитизируется
+    /// от zero-width-маркеров ядра (read-choke-point всех контент-потребителей);
+    /// сырая kernel-проба `kernel export` идёт мимо — через post_probe.
     pub async fn export_md_by_id(&self, doc_id: &str) -> Result<String> {
         crate::siyuan_id::ensure_node_id(doc_id, "doc_id")?;
         let v = self
             .post("/api/export/exportMdContent", json!({ "id": doc_id }))
             .await?;
-        Ok(v.pointer("/content")
+        let content = v
+            .pointer("/content")
             .and_then(|c| c.as_str())
             .unwrap_or("")
-            .to_string())
+            .to_string();
+        Ok(crate::md_artifacts::strip_zero_width(&content))
     }
 
     /// Полнотекстовый поиск по блокам.
@@ -1901,5 +1905,34 @@ mod tests {
             .expect("kernel success envelope (code=0) must pass");
 
         assert!(v.get("data").is_some(), "данные на месте: {v}");
+    }
+
+    #[tokio::test]
+    async fn export_md_by_id_strips_zero_width_but_keeps_fences_verbatim() {
+        let server = MockServer::start().await;
+        let noisy =
+            "текст \u{200b}`code`\u{200b} хвост\n\n```rust\nkeep \u{200b}\u{200d} inside\n```\n";
+        Mock::given(method("POST"))
+            .and(path("/api/export/exportMdContent"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                ResponseTemplate::new(200).set_body_string(
+                    json!({ "code": 0, "data": { "content": noisy, "id": id } }).to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let md = sy
+            .export_md_by_id("20261107123400-abcdef1")
+            .await
+            .expect("экспорт успешен");
+
+        assert_eq!(
+            md, "текст `code` хвост\n\n```rust\nkeep \u{200b}\u{200d} inside\n```\n",
+            "zero-width снят вне фенсов, фенс дословен"
+        );
     }
 }

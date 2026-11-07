@@ -25,9 +25,7 @@ pub(crate) async fn ls_run(prefix: &str) -> Result<()> {
     let sy = SiYuan::from_env()?;
     let listing = ls_listing(&sy, prefix, SUBTREE_LIMIT).await?;
     if listing.truncated {
-        eprintln!(
-            "docs ls: поддерево обрезано лимитом {SUBTREE_LIMIT} строк — вывод неполный"
-        );
+        eprintln!("docs ls: поддерево обрезано лимитом {SUBTREE_LIMIT} строк — вывод неполный");
     }
     // Some(vec) пустым не приходит: ноль детей уходит в «пусто»-ветку ls_listing
     match listing.children {
@@ -48,7 +46,11 @@ pub(super) struct Listing {
     pub(super) truncated: bool,
 }
 
-pub(super) async fn ls_listing(sy: &SiYuan, prefix_raw: &str, subtree_limit: usize) -> Result<Listing> {
+pub(super) async fn ls_listing(
+    sy: &SiYuan,
+    prefix_raw: &str,
+    subtree_limit: usize,
+) -> Result<Listing> {
     let prefix = prefix_raw.trim_matches('/');
     if prefix.is_empty() {
         let tops = top_segments(sy).await?;

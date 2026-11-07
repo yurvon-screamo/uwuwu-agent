@@ -22,9 +22,9 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (29)
+## Скиллы (30)
 
-- **UI (1)**: architect-ui-ux — дизайн-стратегия + правила имплементации (бывшая пара architect/rules-ui слита)
+- **UI (2)**: architect-ui-ux (дизайн-стратегия + правила имплементации; бывшая пара architect/rules-ui слита) · stageshow (faux-UI макеты, анимации, bento — vendored, MIT, upstream benjitaylor/skills @ 299140f)
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
 - **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
 - **Office (4)**: docx · pdf · pptx · xlsx
