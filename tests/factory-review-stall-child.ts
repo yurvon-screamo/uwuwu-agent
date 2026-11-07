@@ -44,9 +44,10 @@ function scriptTick(): string[] {
     const url = String(input)
     const method = init?.method ?? "GET"
     if (url.includes("/api/block/appendBlock")) {
-      // create_comment платформенного слоя пишет секцию «## Комменты» ядру напрямую
-      const payload = JSON.parse(String(init?.body ?? "{}")) as { parentID?: string }
-      calls.push(`comment:${payload.parentID}`)
+      // create_comment платформенного слоя пишет секцию «## Комменты» ядру напрямую;
+      // data несёт текст коммента («\n- **AGENTS** (ts): <текст>») — нужен ассерту сигнала
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { parentID?: string; data?: string }
+      calls.push(`comment:${payload.parentID}:${(payload.data ?? "").slice(0, 400)}`)
       return new Response(JSON.stringify({ code: 0, msg: "", data: [] }), { status: 200 })
     }
     if (url.includes("/api/export/exportMdContent")) {

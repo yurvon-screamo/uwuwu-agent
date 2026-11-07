@@ -71,6 +71,10 @@ describe("tickProject: гвард ревью-тишины (недоставле�
         // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
         // не должна уводить сидированный state в branches/<ветка>
         UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
+        // порог тишины фиксируем в дефолте (30 мин): сценарий stall сидирует
+        // активность 31-мин давности — экспортированный на машине прогонов
+        // UWUWU_FACTORY_STALL_MIN ≠ 30 не должен менять вердикт теста
+        UWUWU_FACTORY_STALL_MIN: "",
       },
       stdout: "pipe", stderr: "pipe",
     })
@@ -87,8 +91,11 @@ describe("tickProject: гвард ревью-тишины (недоставле�
     // тик 1: недоставка детектирована — статус и сигнал
     expect(v.tick1.itemUpdates).toContain("k-status=Needs attention")
     expect(v.tick1.comments).toHaveLength(1)
-    expect(v.tick1.comments[0]).toContain("20261107000000-doc1")
-    expect(v.tick1.comments[0]).not.toContain("needs attention")
+    // текст сигнала: ведёт юзера рабочим маршрутом — ответ комментом, затем
+    // перестановка ревью-статуса (коммент в Needs attention ревьюверу НЕ
+    // доставляется — comments-to-reviewer работает только в ревью-статусе)
+    expect(v.tick1.comments[0]).toContain("ответь комментом")
+    expect(v.tick1.comments[0]).toContain("переставь ревью-статус")
     expect(v.lastStatus).toBe("Needs attention")
     // флаг эпизода стоит — второй тик молчит (анти-спам)
     expect(v.reviewStallSignaled).toBe(true)

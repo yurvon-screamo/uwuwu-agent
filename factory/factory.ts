@@ -1409,8 +1409,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // ревью-статуса будит ту же сессию доревью-промптом (rerun).
     // Только noop: spawn/rerun/comments только что побудили ревьювера —
     // его активность ещё не отражает ход, детекция была бы ложной.
+    // Активность уже снята выше (addresseeSession в ревью-статусе — та же
+    // ревью-сессия; до этой ветки noop её не трогает) — не дублируем вызов.
     if (action.t === "noop" && reviewKindOf(row.status) !== null && reviewerLiveness === "alive") {
-      const activity = await lastSessionActivity(tracked.reviewSessionID ?? "")
       if (activity === "invalid") {
         log(`задача ${rowId.slice(0, 8)}: активность ревью-сессии неизвестна — пропуск тика`)
       } else {
@@ -1427,7 +1428,8 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           // посчитается новым входом (rerun-reviewer). continue: «пайп
           // девелопера» ниже может догнать свои уведомления (мёртвая дев-
           // сессия) — двойной сигнал в один тик юзеру не нужен
-          log(`задача ${rowId.slice(0, 8)}: ревью-статус при живой ревью-сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
+          const quietDiag = activity === null ? "сообщений в ревью-сессии нет" : `тишина > ${STALL_MIN} мин`
+          log(`задача ${rowId.slice(0, 8)}: ревью-статус при живой ревью-сессии (${quietDiag}) — сигнал + Needs attention`)
           if (DRY_RUN) {
             // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
             // без флага анти-спам в песочнице не работает — сигнал повторялся

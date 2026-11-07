@@ -978,8 +978,11 @@ describe("reviewStallVerdict: недоставленный вердикт рев
     expect(v.text).toContain("[factory]")
     expect(v.text).toContain("тишина 40 мин")
     expect(v.text).toContain("пороге 30 мин")
-    // совет называет рабочий путь: перестановка ревью-статуса → rerun той же сессии
-    expect(v.text).toContain("переставь ревью-статус")
+    // сценарий вопроса юзеру: ответ комментом — но перестановка ревью-статуса
+    // обязательный шаг обоих сценариев (коммент в Needs attention ревьюверу
+    // не доставляется — доставка только в ревью-статусе, comments-to-reviewer)
+    expect(v.text).toContain("ответь комментом")
+    expect(v.text).toContain("Затем переставь ревью-статус")
     expect(v.text).toContain("треды")
   })
   test("оба ревью-статуса покрываются (план и результат)", () => {

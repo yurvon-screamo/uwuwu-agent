@@ -1020,8 +1020,9 @@ export function reviewStallVerdict(f: ReviewStallFacts, stallMs: number): Review
   const text = [
     `[factory] Задача в ревью-статусе, но сессия ревьювера молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин,`,
     "статус из ревью не ушёл — ход завершился без доставки (вердикт-коммент/статус потерялись) или ревьювер ждёт тебя.",
-    "Проверь треды: если ревьювер задал вопрос — ответь комментом; если вердикта нет — переставь ревью-статус:",
-    "сессия будет разбужена доревью-промптом, перечитает задачу с тредами и доставит недостающее.",
+    "Проверь треды: если ревьювер задал вопрос — ответь комментом; если вердикта нет — это потеря доставки.",
+    "Затем переставь ревью-статус: сессия будет разбужена доревью-промптом, перечитает задачу с тредами",
+    "(увидит и твой ответ) и доставит недостающее.",
   ].join(" ")
   return { t: "signal", text }
 }
@@ -1183,6 +1184,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
+  if (t.reviewStallSignaled !== undefined && typeof t.reviewStallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
   if (
     t.mergedPrUrl !== undefined &&
