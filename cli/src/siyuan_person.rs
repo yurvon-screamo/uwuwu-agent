@@ -399,9 +399,14 @@ mod tests {
         .await;
         let sy = SiYuan::for_tests(mock.server.uri());
 
-        append(&sy, &target(), "Предпочитает Rust для инструментов")
-            .await
-            .expect("запись применена, ответ потерян — контрольное чтение узнаёт факт");
+        append_with_pacing(
+            &sy,
+            &target(),
+            "Предпочитает Rust для инструментов",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect("запись применена, ответ потерян — контрольное чтение узнаёт факт");
 
         let content = mock.content.lock().expect("content lock");
         assert_eq!(
@@ -420,6 +425,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fact_append_ok_writes_once_without_confirmation_roundtrip() {
+        let mock = spawn_person_mock(
+            "# PERSON\n\n## Кто владелец\n\nЮра. Тех. Лид.\n",
+            AppendBehavior::Ok,
+        )
+        .await;
+        let sy = SiYuan::for_tests(mock.server.uri());
+
+        append_with_pacing(
+            &sy,
+            &target(),
+            "Качество и процессы важнее скорости",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect("успешная запись проходит без контрольных чтений");
+
+        let content = mock.content.lock().expect("content lock");
+        assert_eq!(
+            content
+                .matches("Качество и процессы важнее скорости")
+                .count(),
+            1,
+            "happy-path без дублей: {content}"
+        );
+        let appends = mock.appends.lock().expect("appends lock");
+        assert_eq!(appends.len(), 1, "one-shot: ровно один POST");
+    }
+
+    #[tokio::test]
     async fn fact_append_transport_failure_surfaces_without_writing() {
         let mock = spawn_person_mock(
             "# PERSON\n\n## Кто владелец\n\nЮра. Тех. Лид.\n",
@@ -428,9 +463,14 @@ mod tests {
         .await;
         let sy = SiYuan::for_tests(mock.server.uri());
 
-        let err = append(&sy, &target(), "Уникальный факт про BDD")
-            .await
-            .expect_err("честный сбой записи не глотается");
+        let err = append_with_pacing(
+            &sy,
+            &target(),
+            "Уникальный факт про BDD",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect_err("честный сбой записи не глотается");
 
         assert!(!format!("{err}").is_empty());
         let content = mock.content.lock().expect("content lock");
