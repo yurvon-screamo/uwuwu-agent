@@ -85,6 +85,68 @@ pub(crate) fn artifact_report(md: &str) -> Vec<String> {
     report
 }
 
+/// Канон-строка маркера, замыкающего шапку карточки в выводе `task get`
+/// (sy_dispatch::strip_task_get_output срезает по ней снапшот --base).
+/// Единая константа для срезки и write-side детекции — сигнатуры не разъедутся.
+pub(crate) const TASK_GET_BODY_MARKER: &str = "----- тело -----";
+
+/// Write-side гард вставки обёртки вывода `task get` в контент записи task
+/// body (задача 202611080031: вход `--stdin`/`--md` пишется как есть, мусор
+/// ложится в тело и множится на replace-циклах). Возвращает сигнатуру для
+/// текста ошибки или None:
+/// - строка ровно «----- тело -----» вне code-fence — полный вывод get или
+///   контент, пересобранный из испорченного тела (рециркуляция вложенного
+///   мусора ловится тем же матчем);
+/// - вход (после ведущих пустых строк) начинается с YAML-frontmatter-шапки
+///   «--- / title: …» — хвост вывода get: шапку карточки срезали, frontmatter
+///   остался.
+///
+/// Построчный матч (lines() гасит CRLF) и точная строка маркера: легитимные
+/// цитаты не триггерят — маркер внутри текста/код-фенса (строка не ровно
+/// маркер), thematic break «---» без следующей строки «title:».
+/// Осознанная граница (ревью плана 08.11): шапка карточки «Задача:/Статус:…»
+/// без маркера и frontmatter (гипотетические срезки) проходит — наблюдаемые
+/// порчи закрыты маркером, расширение — по рецидиву.
+pub(crate) fn task_get_wrapper_signature(content: &str) -> Option<&'static str> {
+    let mut in_fence = false;
+    // кандидат на frontmatter-шапку живёт только в начале входа: первая
+    // содержательная линия «---», следующая (без пустой между ними) «title: …»
+    let mut at_start = true;
+    let mut expect_title = false;
+    for line in content.lines() {
+        if toggles_fence(line) {
+            in_fence = !in_fence;
+            at_start = false;
+            continue;
+        }
+        if in_fence {
+            at_start = false;
+            continue;
+        }
+        if line.trim_end() == TASK_GET_BODY_MARKER {
+            return Some("маркер «----- тело -----» — шапка вывода task get");
+        }
+        let trimmed = line.trim_end();
+        if at_start {
+            if trimmed.is_empty() {
+                continue;
+            }
+            at_start = false;
+            if trimmed == "---" {
+                expect_title = true;
+            }
+            continue;
+        }
+        if expect_title {
+            expect_title = false;
+            if trimmed.trim_start().starts_with("title:") {
+                return Some("YAML-frontmatter-шапка «--- / title: …» — хвост вывода task get");
+            }
+        }
+    }
+    None
+}
+
 /// Write-side превенция тег-матча: ≥2 «голых» решёток с пунктуацией
 /// вплотную с обеих сторон в одном параграфе (сигнатура `«#»`/`„#“`,
 /// пробированный триггер поедания бэктиков на экспорте). Предупреждение,
@@ -427,5 +489,93 @@ mod tests {
     fn clip_truncates_long_text_with_ellipsis() {
         let long = "а".repeat(100);
         assert_eq!(clip(&long, 60).chars().count(), 61);
+    }
+
+    // ——— task_get_wrapper_signature: write-side гард вставки get-обёртки ———
+
+    fn full_task_get_output() -> String {
+        format!(
+            "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\nДоска:    /uwuwu/Задачи uwuwu\n\n\
+             {TASK_GET_BODY_MARKER}\n\n---\ntitle: таск\ndate: 2026-11-08T00:00:00+08:00\n---\n\n\
+             ## Постановка\n\nсуть\n"
+        )
+    }
+
+    #[test]
+    fn full_task_get_output_hits_marker_signature() {
+        assert!(task_get_wrapper_signature(&full_task_get_output()).is_some());
+    }
+
+    #[test]
+    fn recycled_marker_inside_body_content_is_caught() {
+        // контент, пересобранный из испорченного тела: маркер в середине
+        let recycled = "## Постановка\n\nсуть\n\n----- тело -----\n\nмусор\n";
+        assert!(task_get_wrapper_signature(recycled).is_some());
+    }
+
+    #[test]
+    fn marker_inside_code_fence_is_legitimate_quote() {
+        let quoted = "снапшот выглядит так:\n\n```\n----- тело -----\n\nтело\n```\n";
+        assert_eq!(task_get_wrapper_signature(quoted), None);
+    }
+
+    #[test]
+    fn marker_inline_in_text_line_is_not_a_match() {
+        let inline = "граница — маркер «----- тело -----» между кавычек\n";
+        assert_eq!(task_get_wrapper_signature(inline), None);
+    }
+
+    #[test]
+    fn get_output_tail_frontmatter_is_caught() {
+        let tail = "\n\n---\ntitle: таск\ndate: 2026-11-08T00:00:00+08:00\n---\n\nтело\n";
+        assert!(task_get_wrapper_signature(tail).is_some());
+    }
+
+    #[test]
+    fn crlf_frontmatter_is_caught() {
+        let crlf = "---\r\ntitle: таск\r\n---\r\n\r\nтело\r\n";
+        assert!(task_get_wrapper_signature(crlf).is_some());
+    }
+
+    #[test]
+    fn thematic_break_without_title_field_passes() {
+        let brk = "разделитель\n\n---\n\nобычный текст после thematic break\n";
+        assert_eq!(task_get_wrapper_signature(brk), None);
+    }
+
+    #[test]
+    fn frontmatter_without_title_field_passes() {
+        let other = "---\nfoo: bar\n---\n\nтело\n";
+        assert_eq!(task_get_wrapper_signature(other), None);
+    }
+
+    #[test]
+    fn blank_line_between_dashes_and_title_passes() {
+        // пустая строка между «---» и «title:» — thematic break + параграф
+        let loose = "---\n\ntitle: таск\n";
+        assert_eq!(task_get_wrapper_signature(loose), None);
+    }
+
+    #[test]
+    fn title_only_after_later_dashes_is_not_frontmatter() {
+        // «---» не первой содержательной линией — кандидат закрыт
+        let late = "абзац\n\n---\ntitle: таск\n";
+        assert_eq!(task_get_wrapper_signature(late), None);
+    }
+
+    #[test]
+    fn plain_body_content_passes() {
+        assert_eq!(
+            task_get_wrapper_signature("## Постановка\n\nсуть и текст\n- пункт\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn card_header_without_marker_is_documented_boundary() {
+        // осознанная граница (ревью плана 08.11): шапка карточки без маркера
+        // и frontmatter (гипотетическая срезка) проходит — тест фиксирует контракт
+        let header_only = "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\nтело\n";
+        assert_eq!(task_get_wrapper_signature(header_only), None);
     }
 }

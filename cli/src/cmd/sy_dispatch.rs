@@ -417,6 +417,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
+            // гард вставки обёртки вывода task get в контент (202611080031):
+            // вход пишется как есть — шапка карточки, маркер и frontmatter от
+            // get-вывода ложатся в тело литерально и множатся на replace-циклах.
+            // Отказ до сети и записи (no-write); при --force тоже — санитария
+            // входа, инвариант, а не часть сверки свежести. Снапшот --base
+            // допустим полным: cli срезает обёртку при сверке сам.
+            if let Some(signature) = md_artifacts::task_get_wrapper_signature(&content) {
+                bail!(
+                    "вход несёт обёртку вывода task get ({signature}) — она легла бы в тело \
+                     литерально и множилась на replace-циклах. Скармливай контент тела: без \
+                     шапки карточки «Задача:/Статус:/Строка:…», маркера «----- тело -----» и \
+                     frontmatter — frontmatter дока ведёт ядро, титульный H1 пишется из \
+                     заголовка дока. Снапшот для --base можно не чистить: cli срезает обёртку \
+                     при сверке сам"
+                );
+            }
             // write-side превенция тег-матча ядра: голые решётки с пунктуацией
             // вплотную съедают бэктики код-спанов на экспорте; предупреждение
             // не блокирует запись (легитимные тела О самой порче триггерят)
@@ -1737,8 +1753,10 @@ async fn apply_diagram_op(sy: &SiYuan, doc_id: &str, op: html_embed::DiagramOp) 
 /// с путями ассетов после тела. Полный get-вывод, сырой экспорт и чистое
 /// тело сводятся к телу (контракт --base). Легитимные строки-маркеры в
 /// чистом теле срежут часть контента — false-mismatch, отказ (safe-направление).
+/// Маркер — общая константа с write-side детектором (md_artifacts):
+/// срезка снапшота и детекция входа не разъедутся.
 fn strip_task_get_output(raw: &str) -> String {
-    let body = match raw.split_once("----- тело -----") {
+    let body = match raw.split_once(md_artifacts::TASK_GET_BODY_MARKER) {
         Some((_, rest)) => rest,
         None => raw,
     };
