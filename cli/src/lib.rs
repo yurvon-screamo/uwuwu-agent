@@ -11,6 +11,7 @@ pub mod md_heading;
 pub mod path;
 pub mod semantic;
 pub mod siyuan;
+pub mod siyuan_goal;
 pub mod siyuan_id;
 pub mod siyuan_doctor;
 pub mod siyuan_guard;

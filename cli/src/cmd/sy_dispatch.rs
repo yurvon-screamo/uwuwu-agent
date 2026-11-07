@@ -1,11 +1,12 @@
 //! Handlers всех команд uwuwu-cli на SiYuan-бекенде (единственный).
 
 use super::read_resolve;
-use crate::cmd::cli::{Commands, CronSub, KernelSub, PersonSub, SemanticSub, TaskSub};
+use crate::cmd::cli::{Commands, CronSub, GoalSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::html_embed;
 use crate::markdown;
 use crate::md_heading;
 use crate::siyuan::find_marker_location as sy_find_marker_location;
+use crate::siyuan_goal as goal;
 use crate::siyuan_person as person;
 use crate::siyuan_person::person_target;
 use crate::siyuan::{FileFetch, SiYuan};
@@ -28,6 +29,10 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
         Commands::Task { command, project } => {
             let project = project.unwrap_or_default();
             task_run(&project, command).await
+        }
+        Commands::Goal { command, project } => {
+            let project = project.unwrap_or_default();
+            goal_run(&project, command).await
         }
         Commands::Cron { command } => cron_run(command).await,
         Commands::Search { query, limit, sofa, threshold } => {
@@ -361,6 +366,126 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ——— goal: реестр долгосрочных целей («Цели <proj>») ———
+
+/// Диспетчер цели-семьи: доску «Цели <proj>» заводит владелец руками в UI —
+/// CLI без неё громко отказывается с инструкцией (find_goal_board).
+pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<()> {
+    if project.is_empty() {
+        anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
+    }
+    let sy = SiYuan::from_env()?;
+    match command {
+        GoalSub::List { status } => {
+            let board = goal::find_goal_board(&sy, project).await?;
+            let rows = syt::read_rows(&sy, &board).await?;
+            let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
+            let mut filtered: Vec<_> = rows
+                .into_iter()
+                .filter(|r| {
+                    status
+                        .as_deref()
+                        .map(|s| r.status.to_lowercase().starts_with(&s.to_lowercase()))
+                        .unwrap_or(true)
+                })
+                .collect();
+            filtered.sort_by(|a, b| a.status.cmp(&b.status));
+            let table = format_goal_table(&filtered, &dead_bound);
+            println!("{table}");
+            Ok(())
+        }
+        GoalSub::Add {
+            title,
+            status,
+            stdin,
+        } => {
+            if title.trim().is_empty() {
+                anyhow::bail!("пустой тайтл — передай непустую строку в --title");
+            }
+            let ctx = if stdin { read_stdin()? } else { String::new() };
+            let canonical = status.as_deref().map(goal::canonical_status).transpose()?;
+            let (item, body) = goal::create(
+                &sy,
+                project,
+                &title,
+                canonical.as_deref().unwrap_or("todo"),
+                &ctx,
+            )
+            .await?;
+            println!("создана цель: {title}\n  строка: {item}\n  тело:   {body}");
+            Ok(())
+        }
+        GoalSub::Edit { id, status, title } => {
+            if status.is_none() && title.is_none() {
+                anyhow::bail!("нечего менять: передай --status и/или --title");
+            }
+            let board = goal::find_goal_board(&sy, project).await?;
+            let goal = syt::resolve(&sy, &board, &id).await?;
+            // канонизация статуса до любых записей: без частичных обновлений
+            let canonical = status.as_deref().map(goal::canonical_status).transpose()?;
+            if let Some(st) = canonical.as_deref() {
+                syt::edit(&sy, &board, &goal, Some(st), None, None).await?;
+            }
+            if let Some(raw) = title.as_deref() {
+                syt::edit_title(&sy, &board, &goal, raw).await?;
+            }
+            println!("обновлена цель: {}", goal.title);
+            Ok(())
+        }
+        GoalSub::Rm { id } => goal_rm(&sy, project, &id).await,
+    }
+}
+
+/// Таблица реестра целей: статус → строка → заголовок; `(!)` — мёртвая
+/// привязка тела (канон task list).
+pub(crate) fn format_goal_table(
+    rows: &[syt::SyTask],
+    dead_bound: &std::collections::HashSet<String>,
+) -> String {
+    if rows.is_empty() {
+        return "Целей нет.".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<13} {:<12} {:<34}\n",
+        "СТАТУС", "СТРОКА", "ЦЕЛЬ"
+    ));
+    for r in rows {
+        let marker = match r.body_doc.as_deref() {
+            Some(b) if dead_bound.contains(b) => " (!)",
+            _ => "",
+        };
+        out.push_str(&format!(
+            "{:<13} {:<12} {:<34}{}\n",
+            r.status,
+            &r.item_id[..r.item_id.len().min(12)],
+            truncate(&r.title, 32),
+            marker
+        ));
+    }
+    out
+}
+
+/// Снос цели: write-ahead undo-журнал → item_remove строки → тело в трэш
+/// (паттерн cron rm; Draft-вердикт task rm тут не нужен — цели всегда Live).
+async fn goal_rm(sy: &SiYuan, project: &str, id: &str) -> anyhow::Result<()> {
+    let board = goal::find_goal_board(sy, project).await?;
+    let goal = syt::resolve(sy, &board, id).await?;
+    let mut journal = Journal::new(project, "goal-rm", &board);
+    journal.rows.push(journal_row(sy, &board, &goal).await?);
+    let journal_path = journal.save(sy).await?;
+    sy.mcp_tool(
+        "database",
+        json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [goal.item_id] }),
+    )
+    .await?;
+    if let Some(doc) = syt::task_body_doc(sy, &board, &goal).await? {
+        let _ = sy.remove_doc(&doc).await;
+    }
+    println!("удалена цель: {} (undo-журнал: {journal_path})", goal.title);
+    Ok(())
 }
 
 // ——— guard: rm-вердикт, батч-снос, undo ———

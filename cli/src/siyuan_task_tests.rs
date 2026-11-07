@@ -15,12 +15,15 @@ use tokio::net::{TcpListener, TcpStream};
 /// Спека мок-доски: сколько строк всего, размер страницы, есть ли rowCount
 /// в ответе, инъекция дубля item_id последней строки предыдущей страницы
 /// в начало текущей (дрейф страниц при конкурентных правках доски).
+/// kanban=true → строки живут в view.groups[].cards (карточки), счётчик —
+/// cardCount: форма живого render канбан-досок целей.
 #[derive(Clone)]
 struct MockBoard {
     total_rows: u64,
     page_size: u64,
     show_row_count: bool,
     dup_last_of_prev: bool,
+    kanban: bool,
 }
 
 fn mock_board(total_rows: u64) -> MockBoard {
@@ -29,6 +32,7 @@ fn mock_board(total_rows: u64) -> MockBoard {
         page_size: 50,
         show_row_count: true,
         dup_last_of_prev: false,
+        kanban: false,
     }
 }
 
@@ -154,6 +158,8 @@ async fn read_request_body(stream: &mut TcpStream) -> Option<String> {
 }
 
 /// Страница доски в форме живого ответа: view.{columns, rows, rowCount}.
+/// kanban-доска: rows нет, строки — карточки в groups[].cards (values вместо
+/// cells), счётчик — cardCount.
 fn render_view(board: &MockBoard, page: u64) -> Value {
     let mut rows = Vec::new();
     if board.dup_last_of_prev && page > 1 {
@@ -167,14 +173,30 @@ fn render_view(board: &MockBoard, page: u64) -> Value {
         rows.push(mock_row(idx));
         idx += 1;
     }
-    let mut view = json!({
-        "columns": [
-            { "id": "key-title", "name": "Title" },
-            { "id": "key-status", "name": "Status" },
-        ],
-        "rows": rows,
-    });
-    if board.show_row_count {
+    let columns = json!([
+        { "id": "key-title", "name": "Title" },
+        { "id": "key-status", "name": "Status" },
+    ]);
+    let mut view = if board.kanban {
+        let mut cards = rows;
+        for card in cards.iter_mut() {
+            *card = json!({
+                "id": card["id"],
+                "values": card["cells"],
+            });
+        }
+        json!({
+            "fields": columns,
+            "cardCount": board.total_rows,
+            "groups": [
+                { "id": "g-todo", "name": "todo", "cardCount": 0, "cards": [] },
+                { "id": "g-active", "name": "in progress", "cardCount": cards.len(), "cards": cards },
+            ],
+        })
+    } else {
+        json!({ "columns": columns, "rows": rows })
+    };
+    if board.show_row_count && !board.kanban {
         view["rowCount"] = json!(board.total_rows);
     }
     view
@@ -184,8 +206,8 @@ fn mock_row(idx: u64) -> Value {
     json!({
         "id": format!("row-{idx:04}"),
         "cells": [
-            { "value": { "keyID": "key-title", "text": { "content": format!("Задача {idx:04}") } } },
-            { "value": { "keyID": "key-status", "mSelect": [{ "content": "Draft" }] } },
+            { "value": { "keyID": "key-title", "type": "block", "block": { "content": format!("Задача {idx:04}") } } },
+            { "value": { "keyID": "key-status", "type": "mSelect", "mSelect": [{ "content": "Draft" }] } },
         ],
     })
 }
@@ -266,6 +288,46 @@ async fn cap_is_loud_error() {
         pages.lock().expect("pages lock").len(),
         100,
         "запрошено ровно 100 страниц"
+    );
+}
+
+/// kanban-доска (цели): строки живут в groups[].cards со счётчиком cardCount —
+/// read_rows собирает все карточки, ровно один вызов render на одну страницу.
+#[tokio::test]
+async fn kanban_cards_collected_from_groups() {
+    let (rows, pages) = run_read_rows(MockBoard {
+        kanban: true,
+        ..mock_board(3)
+    })
+    .await;
+    let rows = rows.expect("kanban-карточки собираются из groups");
+    assert_eq!(rows.len(), 3, "все карточки видны");
+    assert_eq!(
+        rows[0].title, "Задача 0000",
+        "Title из block-клетки карточки"
+    );
+    assert_eq!(
+        *pages.lock().expect("pages lock"),
+        vec![1],
+        "cardCount терминирует после первой страницы"
+    );
+}
+
+/// kanban-доска с пагинацией: cardCount двигает страницы, вторая пустая
+/// (страница начинается ровно) — терминация по совпадению счётчика.
+#[tokio::test]
+async fn kanban_paginates_by_card_count() {
+    let (rows, pages) = run_read_rows(MockBoard {
+        kanban: true,
+        ..mock_board(105)
+    })
+    .await;
+    let rows = rows.expect("kanban-пагинация по cardCount");
+    assert_eq!(rows.len(), 105);
+    assert_eq!(
+        *pages.lock().expect("pages lock"),
+        vec![1, 2, 3],
+        "страницы 1–3: 50+50+5, cardCount исчерпан"
     );
 }
 
