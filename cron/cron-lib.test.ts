@@ -140,8 +140,8 @@ describe("firePrompt", () => {
 
 describe("fireGate: файр только по живой Вейт-строке свежего среза", () => {
   const rows = [
-    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", planned: "", scheduleCell: "", status: "вейт" },
-    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", planned: "", scheduleCell: "", status: "in progress" },
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", plannedMs: null, scheduleCell: "", status: "вейт" },
+    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", plannedMs: null, scheduleCell: "", status: "in progress" },
   ]
   test("строка снята — removed, файра нет", () => {
     expect(fireGate(rows, "gone")).toBe("removed")
@@ -315,25 +315,25 @@ describe("nextFire: следующее планируемое срабатыва
 
 describe("cellPatches: расхождение клеток мастера", () => {
   const at = (y: number, m: number, d: number, h: number, min: number) => new Date(y, m - 1, d, h, min)
-  const row = (over: Record<string, string> = {}) => ({
+  const row = (over: Record<string, unknown> = {}) => ({
     rowId: "row-1", bodyDoc: "doc-1", title: "мастер", schedule: "6h",
-    planned: "", scheduleCell: "", status: "вейт", ...over,
+    plannedMs: null, scheduleCell: "", status: "вейт", ...over,
   })
   const sched = parseSchedule("6h")!
 
   test("чистая доска — пустой патч (записей не нужно)", () => {
-    const r = row({ planned: "2026-11-08 08:34", scheduleCell: "6h" })
+    const r = row({ plannedMs: at(2026, 11, 8, 8, 34).getTime(), scheduleCell: "6h" })
     expect(cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))).toEqual({})
   })
 
   test("пустая клетка planned при живом файре — патч planned", () => {
-    const r = row({ planned: "", scheduleCell: "6h" })
+    const r = row({ scheduleCell: "6h" })
     const patch = cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))
     expect(patch).toEqual({ planned: "2026-11-08 08:34" })
   })
 
   test("дрейф клетки «Расписание» — патч schedule значением attr", () => {
-    const r = row({ planned: "2026-11-08 08:34", scheduleCell: "" })
+    const r = row({ plannedMs: at(2026, 11, 8, 8, 34).getTime(), scheduleCell: "" })
     const patch = cellPatches(r, sched, at(2026, 11, 8, 2, 34).getTime(), at(2026, 11, 8, 3, 0))
     expect(patch).toEqual({ schedule: "6h" })
   })

@@ -355,7 +355,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const c of view.columns) if (c.id && c.name) nameOf.set(c.id, c.name)
   const rows: Record<string, unknown>[] = []
   for (const row of view.rows) {
-    const cells: Record<string, { value?: string }> = {}
+    const cells: Record<string, { value?: string; dateMs?: number | null }> = {}
     let title = ""
     // Привязка строки к док-телу: value.block.id Primary Key-ячейки — docId
     // тела (у detached-строк поля нет → null). Готча: value.blockID — это
@@ -372,10 +372,18 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
         continue
       }
       let value = ""
+      /** epoch ms date-клетки (истина для compare демона; formattedContent
+       *  ядро перекрывает своим локалям-форматом — строкой сравнивать
+       *  нельзя, живая проба миграции: записали «2026-11-08 02:34», ядро
+       *  отдало «8 ноября 2026 г. 01:34»). */
+      let dateMs: number | null = null
       if (v.mSelect) value = v.mSelect.map((o) => o.content).join(",")
       else if (v.text) value = v.text.content ?? ""
-      else if (v.date) value = v.date.formattedContent ?? ""
-      if (col !== "") cells[col] = { value }
+      else if (v.date) {
+        dateMs = typeof v.date.content === "number" && v.date.content > 0 ? v.date.content : null
+        value = v.date.formattedContent ?? ""
+      }
+      if (col !== "") cells[col] = { value, dateMs }
     }
     rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })
   }

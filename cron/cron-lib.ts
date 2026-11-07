@@ -7,8 +7,9 @@ export interface CronRow {
   title: string
   /** Расписание из custom-schedule дока-тела; пусто для обычных задач. */
   schedule: string
-  /** Клетка «Запланировано» (formattedContent date-ячейки; "" — пусто). */
-  planned: string
+  /** Клетка «Запланировано» — epoch ms (сравнение по content: formatted
+   *  ядро перекрывает своей локалью); null — пусто/не задано. */
+  plannedMs: number | null
   /** Клетка «Расписание» (отображение custom-schedule; "" — пусто). */
   scheduleCell: string
   /** Статус строки доски (mSelect, нижний регистр). Файр — только «вейт». */
@@ -213,14 +214,17 @@ export function minuteStart(d: Date): number {
  *  дописать (пустой объект — доска честна). «Расписание» — отображение
  *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
  *  «Запланировано» — next-fire после последнего файра (никогда не стрелявший
- *  файрится следующим тиком — compare от now). Чистая функция — юнит-тесты
- *  без моков; применение — reconcileMasterCells (DRY_RUN-гвард там). */
+ *  файрится следующим тиком — compare от now). Сравнение даты — по epoch ms.
+ *  Чистая функция — юнит-тесты без моков; применение — reconcileMasterCells
+ *  (DRY_RUN-гвард там). */
 export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
   const patch: { schedule?: string; planned?: string } = {}
   if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
   const next = nextFire(sched, prevFire > 0 ? new Date(prevFire) : now)
-  const planned = next !== null ? formatLocal(next) : ""
-  if (row.planned !== planned) patch.planned = planned
+  // compare по epoch ms: formattedContent ядро перекрывает своей локалью
+  // (живая проба миграции) — строкой клетки и вычисления не совпадут никогда
+  const plannedMs = next !== null ? minuteStart(next) : null
+  if (row.plannedMs !== plannedMs) patch.planned = next !== null ? formatLocal(next) : ""
   return patch
 }
 

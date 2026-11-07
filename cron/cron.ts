@@ -218,7 +218,7 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       rowBlockId?: string
       linkedDocId?: string | null
       title?: string | null
-      cells?: Record<string, { value?: string }>
+      cells?: Record<string, { value?: string; dateMs?: number | null }>
     }[]
   }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
   return (r.rows ?? [])
@@ -228,7 +228,7 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       bodyDoc: row.linkedDocId ?? "",
       title: (row.title ?? "").trim(),
       schedule: "",
-      planned: row.cells?.["Запланировано"]?.value ?? "",
+      plannedMs: row.cells?.["Запланировано"]?.dateMs ?? null,
       scheduleCell: row.cells?.["Расписание"]?.value ?? "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
     }))
