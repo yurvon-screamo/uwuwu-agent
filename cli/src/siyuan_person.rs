@@ -121,16 +121,6 @@ async fn append_with_pacing(
     }
 }
 
-/// Маркер контрольного чтения: первая непустая строка факта. Подстрочный
-/// матч экспорта — отступы/переносы ядра матчу не мешают.
-fn fact_marker(md: &str) -> String {
-    md.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Идемпотентный аппенд факта: один POST без слепых ретраев — неидемпотентная
 /// запись при потерянном ответе дублируется (класс ses_e729d7329ffe, факт
 /// дублировался 4 копиями). При сбое — контрольное чтение с коротким
@@ -145,7 +135,7 @@ async fn append_once_confirmed(
     md: &str,
     pacing: ConfirmPacing,
 ) -> Result<()> {
-    let marker = fact_marker(md);
+    let marker = crate::siyuan::first_nonempty_line(md);
     if let Err(err) = sy.append_block_md_once(doc_id, md).await {
         for attempt in 0..pacing.attempts {
             if attempt > 0 {

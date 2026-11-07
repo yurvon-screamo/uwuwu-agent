@@ -367,7 +367,8 @@ export function tickFailOutcome(e: unknown, consecutiveFails: number): { fails: 
   return { fails, reconnect: true, restart: fails >= 5 }
 }
 
-export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {  const rows = await readRows(board)
+export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
+  const rows = await readRows(board)
   const project = projectOfBoard(boardTitle)
 
   for (const row of rows) {
