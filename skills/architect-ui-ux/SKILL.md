@@ -294,21 +294,6 @@ uv run skills/design-ui-ux/scripts/search.py "<keyword>" --domain <domain> [-n <
 | `web` | Web interface guidelines (aria, focus, semantic HTML) |
 | `prompt` | AI prompts, CSS keywords for style generation |
 
-### Step 3b: Generate UI Components with 21st.dev Magic (as needed)
-
-```bash
-bun skills/design-ui-ux/scripts/util_magic_ui_chat.ts <command> [options]
-```
-
-| Command | Use For |
-|---------|--------|
-| `21st-magic-component-builder` | Generate a UI component from description |
-| `21st-magic-component-inspiration` | Get design inspiration |
-| `21st-magic-component-refiner` | Refine an existing component |
-| `logo-search` | Search for brand logos |
-
-Run with `--help` on any command to see required flags.
-
 ### Step 4: Stack Guidelines (Default: html-tailwind)
 
 ```bash

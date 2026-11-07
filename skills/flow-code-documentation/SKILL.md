@@ -37,6 +37,8 @@ ADRs capture the reasoning behind significant technical decisions. They're the h
 
 Store ADRs in `docs/decisions/` with sequential numbering:
 
+> **uwuwu-проекты (репо с контуром uwuwu)**: ADR живут не в репо, а в вики проекта (`Projects/<proj>/ADR`), и ведёт их дример пост-фактум — решения фиксируй в теле задачи, дример разложит по ADR. Путь `docs/decisions/` — для generic-проектов без вики-канона.
+
 ```markdown
 # ADR-001: Use PostgreSQL for primary database
 
