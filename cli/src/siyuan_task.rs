@@ -591,16 +591,39 @@ pub async fn create(
     ty: &str,
     ctx: &str,
 ) -> Result<(String, String)> {
+    create_with_pacing(sy, project, title, ty, ctx, &RowInsertPacing::production()).await
+}
+
+/// create с инъекцией пейсинга verify-ретрая: прод ждёт лаг render перед
+/// повторной вставкой, тесты идут мгновенно (прецедент TitleSyncPacing).
+pub(crate) async fn create_with_pacing(
+    sy: &SiYuan,
+    project: &str,
+    title: &str,
+    ty: &str,
+    ctx: &str,
+    pacing: &RowInsertPacing,
+) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
     let tag = if ty.is_empty() { None } else { Some(ty) };
-    create_row_with_body(sy, &board, title, "Draft", &body_template(ty, ctx), tag).await
+    create_row_with_body(
+        sy,
+        &board,
+        title,
+        "Draft",
+        &body_template(ty, ctx),
+        tag,
+        pacing,
+    )
+    .await
 }
 
 /// Общий механизм создания bound-строки на готовой доске (task::create,
 /// goal::create): тело-саб-док (или перепривязка тела-сироты) + строка,
 /// привязанная к нему blockID, + начальный Status + verify вставки с
-/// ретраем ×1. `tag` — хэштег, дописываемый в тело после подтверждения.
-/// Возвращает (itemID, bodyDocID).
+/// ретраем ×1. `tag` — хэштег, дописываемый в тело после подтверждения;
+/// `pacing` — пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты
+/// мгновенно — см. RowInsertPacing). Возвращает (itemID, bodyDocID).
 pub async fn create_row_with_body(
     sy: &SiYuan,
     board: &SyBoard,
@@ -608,6 +631,7 @@ pub async fn create_row_with_body(
     initial_status: &str,
     template_md: &str,
     tag: Option<&str>,
+    pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     // идемпотентность: строка или тело с таким заголовком уже есть?
     // сравнение через нормализацию: ретрай с любым написанием слэша — дубль
@@ -651,7 +675,7 @@ pub async fn create_row_with_body(
                 "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
             ),
             RowInsertCheck::Missing if attempt == 0 => {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                tokio::time::sleep(pacing.retry_delay).await;
                 item = sy.db_item_add_bound(&board.av_id, &body).await?;
                 sy.db_item_set_status(&board.av_id, &sk, &item, initial_status)
                     .await?;
@@ -822,6 +846,29 @@ impl TitleSyncPacing {
         Self {
             attempts: 3,
             poll_delay: std::time::Duration::from_millis(1),
+        }
+    }
+}
+
+/// Пейсинг паузы перед повторной вставкой строки (verify-ретрай task create,
+/// cron set и общий create_row_with_body): производство с запасом на лаг
+/// render, тесты — мгновенные. Пауза — инъекция, чтобы тесты не наследовали
+/// прод-задержку.
+pub struct RowInsertPacing {
+    pub(crate) retry_delay: std::time::Duration,
+}
+
+impl RowInsertPacing {
+    pub(crate) fn production() -> Self {
+        Self {
+            retry_delay: std::time::Duration::from_millis(1500),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instant() -> Self {
+        Self {
+            retry_delay: std::time::Duration::from_millis(1),
         }
     }
 }

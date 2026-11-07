@@ -1,7 +1,8 @@
-//! Write-path тесты task create / body / comment на stateful wiremock-ядре
-//! (срез покрытия 20261105220435). Create — через task_run (orphan-rebind,
-//! verify-ретрай, дубль-тайтл в render, missing после ретрая); body — полный
-//! --replace (overwrite in place, docId стабилен) и строка вовсе без тела;
+//! Write-path тесты task create / body / comment на общем stateful
+//! wiremock-ядре (cmd::mock_kernel, дедуп мок-билдеров 20261107052603).
+//! Create — через create_with_pacing (orphan-rebind, verify-ретрай,
+//! дубль-тайтл в render, missing после ретрая); body — полный --replace
+//! (overwrite in place, docId стабилен) и строка вовсе без тела;
 //! comment — comment_with_ts (секция, маркер, потерянный ответ, сбой, reply).
 //!
 //! Мок имитирует ядро честно: render «лагает» (строка видна после N вставок),
@@ -9,300 +10,63 @@
 //! исходы (что куда записалось, что создано/не создано), не внутренние вызовы.
 
 use crate::cmd::cli::TaskSub;
+use crate::cmd::mock_kernel::{set_env, MockKernel, MockRow, MockScenario};
 use crate::cmd::sy_dispatch::task_run;
 use crate::siyuan::SiYuan;
-use crate::siyuan_task::{comment_with_ts, CommentDraft, SyBoard, SyTask};
-use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use crate::siyuan_task::{
+    comment_with_ts, create_with_pacing, CommentDraft, RowInsertPacing, SyBoard, SyTask,
+};
+use serde_json::Value;
+use wiremock::MockServer;
 
-const NB: &str = "nb-1";
 const BOARD_HPATH: &str = "/uwuwu/Задачи uwuwu";
-const BOARD_DOC: &str = "board-doc";
-const AV: &str = "av-1";
-const CARRIER: &str = "carrier-block";
-const TITLE_KEY: &str = "key-title";
-const STATUS_KEY: &str = "key-status";
-const ROW: &str = "item-row";
 const BOUND_DOC: &str = "20261106090000-boundd1";
 const ORPHAN_DOC: &str = "20261105090000-orpha1";
 const OTHER_ROW: &str = "item-other";
 const TASK_TITLE: &str = "таск";
 const NEW_TITLE: &str = "новая задача";
-
-fn set_env(server: &MockServer) {
-    std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
-    std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
-}
-
-fn kernel_rest_response(data: Value) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": data }).to_string())
-}
-
-/// MCP-ответ, где content[0].text — сериализованный payload (database tools).
-fn mcp_payload(payload: Value) -> ResponseTemplate {
-    mcp_raw_text(payload.to_string())
-}
-
-/// MCP-ответ, где content[0].text — сырой текст (block get / get_children).
-fn mcp_raw_text(text: String) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_string(
-        json!({
-            "jsonrpc": "2.0", "id": 2,
-            "result": { "content": [{ "type": "text", "text": text }] }
-        })
-        .to_string(),
-    )
-}
-
-fn mcp_initialize() -> ResponseTemplate {
-    ResponseTemplate::new(200)
-        .set_body_string(
-            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
-        )
-        .append_header("mcp-session-id", "sess-1")
-}
-
-fn mcp_initialized() -> ResponseTemplate {
-    ResponseTemplate::new(200)
-}
-
-fn row_json(item: &str, title: &str, block_id: Option<&str>) -> Value {
-    let mut block = json!({ "content": title, "refSubtype": "d" });
-    if let Some(id) = block_id {
-        block["id"] = json!(id);
-    }
-    json!({
-        "id": item,
-        "cells": [{ "value": { "keyID": TITLE_KEY, "type": "block", "block": block } }]
-    })
-}
-
-/// Страница render: пустая страница (page ≥ 2) терминирует пагинацию.
-fn render_payload(page: u64, rows: Vec<Value>) -> Value {
-    let rows = if page <= 1 { rows } else { Vec::new() };
-    json!({ "action": "render", "data": { "view": {
-        "columns": [{ "id": TITLE_KEY, "name": "Primary Key" }],
-        "rows": rows,
-        "rowCount": rows.len() } } })
-}
-
-async fn mount_kernel_shell(server: &MockServer) {
-    Mock::given(method("POST"))
-        .and(path("/api/notebook/lsNotebooks"))
-        .respond_with(|_req: &Request| {
-            kernel_rest_response(json!({ "notebooks": [{ "id": NB, "name": "Projects" }] }))
-        })
-        .mount(server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/query/sql"))
-        .respond_with(|req: &Request| {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
-            let data = if stmt.contains("type='av'") {
-                json!([{ "id": CARRIER,
-                    "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"{AV}\"></div>") }])
-            } else {
-                json!([])
-            };
-            kernel_rest_response(data)
-        })
-        .mount(server)
-        .await;
-}
-
-/// docId по hpath: доска всегда, тело — по сценарию (сирота/нет тела).
-async fn mount_hpath_lookup(server: &MockServer, body_title_ids: Arc<Mutex<Vec<String>>>) {
-    Mock::given(method("POST"))
-        .and(path("/api/filetree/getIDsByHPath"))
-        .respond_with(move |req: &Request| {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let data = if hpath == BOARD_HPATH {
-                json!([BOARD_DOC])
-            } else {
-                json!(body_title_ids.lock().unwrap().clone())
-            };
-            kernel_rest_response(data)
-        })
-        .mount(server)
-        .await;
-}
+const BODY_HPATH: &str = "/uwuwu/Задачи uwuwu/новая задача";
 
 // ——— create: orphan-rebind, verify-ретрай, дубль в render, missing ———
 
-struct CreateKernel {
-    /// docId по hpath тела; непустой = тело-сирота существует.
-    body_title_ids: Arc<Mutex<Vec<String>>>,
-    /// itemID-ответы item_add по порядку; последний повторяется.
-    item_add_replies: Mutex<Vec<String>>,
-    /// render показывает вставленную строку, когда item_adds >= порога.
-    row_visible_after_adds: AtomicUsize,
-    /// после первой вставки render показывает чужую строку с тем же тайтлом.
-    other_row_after_adds: bool,
-    creates: AtomicUsize,
-    item_adds: AtomicUsize,
-    item_add_bodies: Mutex<Vec<String>>,
-    status_updates: AtomicUsize,
-    /// тела appendBlock (тег типа — единственная запись после подтверждения).
-    appends: Mutex<Vec<String>>,
+/// Сценарий create-флоу: очередь itemID-ответов, лаг render, помеха чужой
+/// строкой, тело-сирота.
+fn create_scenario(
+    replies: &[&'static str],
+    visible_after: usize,
+    impedance: bool,
+    orphan: bool,
+) -> MockScenario {
+    let mut sc = MockScenario {
+        item_add_replies: replies.to_vec(),
+        row_visible_after_adds: visible_after,
+        inserted_row: MockRow::new("item-row", NEW_TITLE),
+        ..MockScenario::default()
+    };
+    if impedance {
+        sc.impedance_row = Some(MockRow::new(OTHER_ROW, NEW_TITLE).with_doc(ORPHAN_DOC));
+    }
+    if orphan {
+        sc.hpath_ids.push((BODY_HPATH, vec![ORPHAN_DOC]));
+    }
+    sc
 }
 
-impl CreateKernel {
-    /// `replies` — ответы item_add по порядку (последний повторяется);
-    /// `row_visible_after_adds` — лаг render (usize::MAX = строка не видна);
-    /// `orphan` — тело-сирота по заголовку уже существует.
-    fn new(
-        replies: &[&str],
-        row_visible_after_adds: usize,
-        other_row_after_adds: bool,
-        orphan: bool,
-    ) -> Self {
-        let body_title_ids = if orphan {
-            vec![ORPHAN_DOC.to_string()]
-        } else {
-            Vec::new()
-        };
-        Self {
-            body_title_ids: Arc::new(Mutex::new(body_title_ids)),
-            item_add_replies: Mutex::new(replies.iter().map(|s| s.to_string()).collect()),
-            row_visible_after_adds: AtomicUsize::new(row_visible_after_adds),
-            other_row_after_adds,
-            creates: AtomicUsize::new(0),
-            item_adds: AtomicUsize::new(0),
-            item_add_bodies: Mutex::new(Vec::new()),
-            status_updates: AtomicUsize::new(0),
-            appends: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn next_item(&self) -> String {
-        let mut replies = self.item_add_replies.lock().unwrap();
-        if replies.len() > 1 {
-            replies.remove(0)
-        } else {
-            replies.last().cloned().unwrap_or_default()
-        }
-    }
-
-    fn current_item(&self) -> String {
-        self.item_add_replies
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-async fn create_flow_mock(kernel: &Arc<CreateKernel>) -> MockServer {
-    let server = MockServer::start().await;
-    mount_kernel_shell(&server).await;
-    mount_hpath_lookup(&server, Arc::clone(&kernel.body_title_ids)).await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/filetree/createDocWithMd"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |_req: &Request| {
-                kernel.creates.fetch_add(1, Ordering::SeqCst);
-                kernel_rest_response(json!("doc-new"))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/block/appendBlock"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |req: &Request| {
-                kernel
-                    .appends
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&req.body).to_string());
-                kernel_rest_response(json!(null))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let mcp = Arc::clone(kernel);
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(move |req: &Request| {
-            let body = String::from_utf8_lossy(&req.body);
-            if body.contains("\"initialize\"") {
-                return mcp_initialize();
-            }
-            if body.contains("notifications/") {
-                return mcp_initialized();
-            }
-            if !body.contains("tools/call") {
-                return mcp_payload(json!({ "action": "unexpected", "data": null }));
-            }
-            if body.contains("\"item_add\"") {
-                mcp.item_adds.fetch_add(1, Ordering::SeqCst);
-                mcp.item_add_bodies.lock().unwrap().push(body.to_string());
-                let item = mcp.next_item();
-                return mcp_payload(json!({ "action": "item_add", "data": { "itemID": item } }));
-            }
-            if body.contains("\"item_update\"") {
-                mcp.status_updates.fetch_add(1, Ordering::SeqCst);
-                return mcp_payload(json!({ "action": "item_update", "data": null }));
-            }
-            if body.contains("\"keys\"") {
-                return mcp_payload(json!({ "action": "keys",
-                    "data": { "keys": [{ "id": STATUS_KEY, "name": "Status" }] } }));
-            }
-            if body.contains("\"render\"") {
-                let args: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let page = args
-                    .pointer("/params/arguments/page")
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(1);
-                let adds = mcp.item_adds.load(Ordering::SeqCst);
-                let mut rows: Vec<Value> = Vec::new();
-                if mcp.other_row_after_adds && adds >= 1 {
-                    rows.push(row_json(OTHER_ROW, NEW_TITLE, Some(ORPHAN_DOC)));
-                }
-                if adds >= mcp.row_visible_after_adds.load(Ordering::SeqCst) {
-                    let block = if mcp.body_title_ids.lock().unwrap().is_empty() {
-                        "doc-new"
-                    } else {
-                        ORPHAN_DOC
-                    };
-                    rows.push(row_json(&mcp.current_item(), NEW_TITLE, Some(block)));
-                }
-                return mcp_payload(render_payload(page, rows));
-            }
-            mcp_payload(json!({ "action": "unknown", "data": null }))
-        })
-        .mount(&server)
-        .await;
-    server
-}
-
-async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
+/// Create идёт напрямую через create_with_pacing с мгновенным пейсингом
+/// (минуя dispatch-клей: attach/dry_run пути этих тестов не касаются).
+async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
     set_env(server);
-    task_run(
+    let sy = SiYuan::from_env()?;
+    create_with_pacing(
+        &sy,
         "uwuwu",
-        TaskSub::Create {
-            title: NEW_TITLE.into(),
-            r#type: None,
-            stdin: false,
-            attach: Vec::<PathBuf>::new(),
-            schedule: None,
-            dry_run: false,
-        },
+        NEW_TITLE,
+        "dev",
+        "",
+        &RowInsertPacing::instant(),
     )
     .await
+    .map(|_| ())
 }
 
 /// Идемпотентный ретрай (ADR-009 «достроить сироту»): строка потерялась,
@@ -310,29 +74,28 @@ async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
-    let kernel = Arc::new(CreateKernel::new(&[ROW], 1, false, true));
-    let server = create_flow_mock(&kernel).await;
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, true)).await;
 
-    create_via_cli(&server)
+    create_via_flow(&server)
         .await
         .expect("ретрай перепривязывает сироту");
 
     assert_eq!(
-        kernel.creates.load(Ordering::SeqCst),
+        kernel.created_docs().len(),
         0,
         "новый док не минтится"
     );
     assert_eq!(
-        kernel.item_adds.load(Ordering::SeqCst),
+        kernel.item_add_count(),
         1,
         "одна вставка строки"
     );
-    let adds = kernel.item_add_bodies.lock().unwrap();
+    let args = kernel.item_add_args();
     assert!(
-        adds[0].contains(ORPHAN_DOC),
-        "item_add привязан к docId сироты: {adds:?}"
+        args[0].get("blockID").and_then(|b| b.as_str()) == Some(ORPHAN_DOC),
+        "item_add привязан к docId сироты: {args:?}"
     );
-    let appends = kernel.appends.lock().unwrap();
+    let appends = kernel.appends();
     assert_eq!(
         appends.len(),
         1,
@@ -346,29 +109,29 @@ async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
 #[tokio::test]
 #[serial_test::serial]
 async fn create_retries_row_insert_once_when_render_lags() {
-    let kernel = Arc::new(CreateKernel::new(&["item-a", ROW], 2, false, false));
-    let server = create_flow_mock(&kernel).await;
+    let (kernel, server) =
+        MockKernel::start(create_scenario(&["item-a", "item-row"], 2, false, false)).await;
 
-    create_via_cli(&server)
+    create_via_flow(&server)
         .await
         .expect("ретрай доводит строку до render");
 
     assert_eq!(
-        kernel.creates.load(Ordering::SeqCst),
+        kernel.created_docs().len(),
         1,
         "тело создаётся один раз"
     );
     assert_eq!(
-        kernel.item_adds.load(Ordering::SeqCst),
+        kernel.item_add_count(),
         2,
         "item_add + ретрай"
     );
     assert_eq!(
-        kernel.status_updates.load(Ordering::SeqCst),
+        kernel.item_updates().len(),
         2,
         "Draft проставляется каждой вставке"
     );
-    let appends = kernel.appends.lock().unwrap();
+    let appends = kernel.appends();
     assert_eq!(appends.len(), 1, "тег типа один, без дублей после ретрая");
 }
 
@@ -377,10 +140,10 @@ async fn create_retries_row_insert_once_when_render_lags() {
 #[tokio::test]
 #[serial_test::serial]
 async fn create_bails_when_render_shows_title_with_other_item() {
-    let kernel = Arc::new(CreateKernel::new(&["item-a"], usize::MAX, true, false));
-    let server = create_flow_mock(&kernel).await;
+    let (kernel, server) =
+        MockKernel::start(create_scenario(&["item-a"], usize::MAX, true, false)).await;
 
-    let err = create_via_cli(&server)
+    let err = create_via_flow(&server)
         .await
         .expect_err("чужая строка с тем же тайтлом — отказ");
 
@@ -388,9 +151,9 @@ async fn create_bails_when_render_shows_title_with_other_item() {
         err.to_string().contains("вторую строку не создаю"),
         "суть отказа: {err}"
     );
-    assert_eq!(kernel.item_adds.load(Ordering::SeqCst), 1, "ретрая не было");
+    assert_eq!(kernel.item_add_count(), 1, "ретрая не было");
     assert!(
-        kernel.appends.lock().unwrap().is_empty(),
+        kernel.appends().is_empty(),
         "тег не пишется в неустановленное тело"
     );
 }
@@ -399,15 +162,15 @@ async fn create_bails_when_render_shows_title_with_other_item() {
 #[tokio::test]
 #[serial_test::serial]
 async fn create_bails_loudly_when_row_missing_after_retry() {
-    let kernel = Arc::new(CreateKernel::new(
+    let (kernel, server) = MockKernel::start(create_scenario(
         &["item-a", "item-b"],
         usize::MAX,
         false,
         false,
-    ));
-    let server = create_flow_mock(&kernel).await;
+    ))
+    .await;
 
-    let err = create_via_cli(&server)
+    let err = create_via_flow(&server)
         .await
         .expect_err("строка так и не видна — громкая ошибка");
 
@@ -416,12 +179,12 @@ async fn create_bails_loudly_when_row_missing_after_retry() {
         "суть отказа: {err}"
     );
     assert_eq!(
-        kernel.item_adds.load(Ordering::SeqCst),
+        kernel.item_add_count(),
         2,
         "ровно ретрай ×1"
     );
     assert!(
-        kernel.appends.lock().unwrap().is_empty(),
+        kernel.appends().is_empty(),
         "тег не пишется в неподтверждённую задачу"
     );
 }
@@ -430,135 +193,23 @@ async fn create_bails_loudly_when_row_missing_after_retry() {
 
 const OLD_BLOCK: &str = "20261106090000-blk0001";
 
-struct BodyKernel {
-    /// render-строка несёт привязку (block.id).
-    bound: bool,
-    /// последовательные ответы get_children; последний повторяется.
-    get_children_seq: Mutex<Vec<String>>,
-    export_md: String,
-    creates: AtomicUsize,
-    create_calls: Mutex<Vec<(String, String)>>,
-    deletes: Mutex<Vec<String>>,
-    appends: Mutex<Vec<String>>,
-}
-
-async fn body_flow_mock(kernel: &Arc<BodyKernel>) -> MockServer {
-    let server = MockServer::start().await;
-    mount_kernel_shell(&server).await;
-    mount_hpath_lookup(&server, Arc::new(Mutex::new(Vec::new()))).await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/export/exportMdContent"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |_req: &Request| {
-                kernel_rest_response(json!({ "content": kernel.export_md.clone() }))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/filetree/createDocWithMd"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |req: &Request| {
-                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                kernel.create_calls.lock().unwrap().push((
-                    body.get("path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("")
-                        .into(),
-                    body.get("markdown")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .into(),
-                ));
-                kernel.creates.fetch_add(1, Ordering::SeqCst);
-                kernel_rest_response(json!("doc-new"))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/block/deleteBlock"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |req: &Request| {
-                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                kernel
-                    .deletes
-                    .lock()
-                    .unwrap()
-                    .push(body.get("id").and_then(|i| i.as_str()).unwrap_or("").into());
-                kernel_rest_response(json!(null))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/block/appendBlock"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |req: &Request| {
-                kernel
-                    .appends
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&req.body).to_string());
-                kernel_rest_response(json!(null))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let mcp = Arc::clone(kernel);
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(move |req: &Request| {
-            let body = String::from_utf8_lossy(&req.body);
-            if body.contains("\"initialize\"") {
-                return mcp_initialize();
-            }
-            if body.contains("notifications/") {
-                return mcp_initialized();
-            }
-            if !body.contains("tools/call") {
-                return mcp_payload(json!({ "action": "unexpected", "data": null }));
-            }
-            if body.contains("\"get_children\"") {
-                let mut seq = mcp.get_children_seq.lock().unwrap();
-                let text = if seq.len() > 1 {
-                    seq.remove(0)
-                } else {
-                    seq[0].clone()
-                };
-                return mcp_raw_text(text);
-            }
-            if body.contains("\"block\"") && body.contains("\"get\"") {
-                return mcp_raw_text(format!(
-                    "ID: {BOUND_DOC}\nType: NodeDocument\nHPath: {BOARD_HPATH}/{TASK_TITLE}"
-                ));
-            }
-            if body.contains("\"render\"") {
-                let args: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let page = args
-                    .pointer("/params/arguments/page")
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(1);
-                let bound = if mcp.bound { Some(BOUND_DOC) } else { None };
-                return mcp_payload(render_payload(
-                    page,
-                    vec![row_json("item-task", TASK_TITLE, bound)],
-                ));
-            }
-            mcp_payload(json!({ "action": "unknown", "data": null }))
-        })
-        .mount(&server)
-        .await;
-    server
+/// Сценарий body-флоу: строка задачи на доске (с привязкой или без),
+/// последовательность get_children, статический экспорт дока.
+fn body_scenario(bound: bool) -> MockScenario {
+    let mut row = MockRow::new("item-task", TASK_TITLE);
+    if bound {
+        row.doc = Some(BOUND_DOC.to_string());
+    }
+    MockScenario {
+        exports: vec![(BOUND_DOC, "старый контент\n".to_string())],
+        get_children_seq: if bound {
+            vec![format!("- [p] старый блок ({OLD_BLOCK})"), String::new()]
+        } else {
+            vec![String::new()]
+        },
+        rows: vec![row],
+        ..MockScenario::default()
+    }
 }
 
 async fn body_via_cli(
@@ -593,32 +244,20 @@ async fn body_via_cli(
 #[tokio::test]
 #[serial_test::serial]
 async fn body_replace_overwrites_doc_in_place_without_recreating() {
-    let kernel = Arc::new(BodyKernel {
-        bound: true,
-        get_children_seq: Mutex::new(vec![
-            format!("- [p] старый блок ({OLD_BLOCK})"),
-            String::new(),
-        ]),
-        export_md: "старый контент\n".into(),
-        creates: AtomicUsize::new(0),
-        create_calls: Mutex::new(Vec::new()),
-        deletes: Mutex::new(Vec::new()),
-        appends: Mutex::new(Vec::new()),
-    });
-    let server = body_flow_mock(&kernel).await;
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
 
     body_via_cli(&server, true, None, "новое тело\n")
         .await
         .expect("replace проходит");
 
     assert_eq!(
-        kernel.creates.load(Ordering::SeqCst),
+        kernel.created_docs().len(),
         0,
         "док не пересоздаётся"
     );
-    let deletes = kernel.deletes.lock().unwrap();
+    let deletes = kernel.deletes();
     assert_eq!(*deletes, vec![OLD_BLOCK.to_string()], "старый блок удалён");
-    let appends = kernel.appends.lock().unwrap();
+    let appends = kernel.appends();
     assert_eq!(appends.len(), 1, "новый контент одним append");
     assert!(
         appends[0].contains("новое тело"),
@@ -635,26 +274,14 @@ async fn body_replace_overwrites_doc_in_place_without_recreating() {
 #[tokio::test]
 #[serial_test::serial]
 async fn body_replace_strips_title_h1_from_content() {
-    let kernel = Arc::new(BodyKernel {
-        bound: true,
-        get_children_seq: Mutex::new(vec![
-            format!("- [p] старый блок ({OLD_BLOCK})"),
-            String::new(),
-        ]),
-        export_md: "старый контент\n".into(),
-        creates: AtomicUsize::new(0),
-        create_calls: Mutex::new(Vec::new()),
-        deletes: Mutex::new(Vec::new()),
-        appends: Mutex::new(Vec::new()),
-    });
-    let server = body_flow_mock(&kernel).await;
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
 
     let content = format!("# {TASK_TITLE}\n\nновое тело\n\n# {TASK_TITLE}\nещё текст\n");
     body_via_cli(&server, true, None, &content)
         .await
         .expect("replace проходит");
 
-    let appends = kernel.appends.lock().unwrap();
+    let appends = kernel.appends();
     assert_eq!(appends.len(), 1, "новый контент одним append");
     let data = append_data_field(&appends[0]);
     assert!(
@@ -675,24 +302,20 @@ async fn body_replace_strips_title_h1_from_content() {
 #[tokio::test]
 #[serial_test::serial]
 async fn body_replace_section_strips_title_h1_from_content() {
-    let kernel = Arc::new(BodyKernel {
-        bound: true,
-        get_children_seq: Mutex::new(vec![String::new()]),
-        export_md: "# титул экспорта\n\n## Постановка\n\nстарая постановка\n\n## План\n\nплан\n"
-            .into(),
-        creates: AtomicUsize::new(0),
-        create_calls: Mutex::new(Vec::new()),
-        deletes: Mutex::new(Vec::new()),
-        appends: Mutex::new(Vec::new()),
-    });
-    let server = body_flow_mock(&kernel).await;
+    let mut scenario = body_scenario(true);
+    scenario.exports = vec![(
+        BOUND_DOC,
+        "# титул экспорта\n\n## Постановка\n\nстарая постановка\n\n## План\n\nплан\n".to_string(),
+    )];
+    scenario.get_children_seq = vec![String::new()];
+    let (kernel, server) = MockKernel::start(scenario).await;
 
     let content = format!("# {TASK_TITLE}\n\nновая постановка\n");
     body_via_cli(&server, false, Some("Постановка"), &content)
         .await
         .expect("replace-section проходит");
 
-    let appends = kernel.appends.lock().unwrap();
+    let appends = kernel.appends();
     assert_eq!(appends.len(), 1, "пересборка одним append");
     let data = append_data_field(&appends[0]);
     assert!(
@@ -727,34 +350,25 @@ fn append_data_field(raw_append: &str) -> String {
 #[tokio::test]
 #[serial_test::serial]
 async fn body_on_row_without_body_creates_doc_by_title_without_binding() {
-    let kernel = Arc::new(BodyKernel {
-        bound: false,
-        get_children_seq: Mutex::new(vec![String::new()]),
-        export_md: String::new(),
-        creates: AtomicUsize::new(0),
-        create_calls: Mutex::new(Vec::new()),
-        deletes: Mutex::new(Vec::new()),
-        appends: Mutex::new(Vec::new()),
-    });
-    let server = body_flow_mock(&kernel).await;
+    let (kernel, server) = MockKernel::start(body_scenario(false)).await;
 
     body_via_cli(&server, false, None, "контент нового тела\n")
         .await
         .expect("body на detached-строке создаёт тело");
 
-    assert_eq!(kernel.creates.load(Ordering::SeqCst), 1, "один createDoc");
-    let calls = kernel.create_calls.lock().unwrap();
+    assert_eq!(kernel.created_docs().len(), 1, "один createDoc");
+    let created = kernel.created_docs();
     assert_eq!(
-        calls[0].0,
+        created[0].0,
         format!("{BOARD_HPATH}/{TASK_TITLE}"),
         "тело создаётся по заголовку строки"
     );
     assert!(
-        calls[0].1.contains("контент нового тела"),
+        created[0].1.contains("контент нового тела"),
         "контент в markdown"
     );
     assert!(
-        kernel.appends.lock().unwrap().is_empty(),
+        kernel.appends().is_empty(),
         "запись идёт createDocWithMd, не appendBlock"
     );
 }
@@ -763,95 +377,27 @@ async fn body_on_row_without_body_creates_doc_by_title_without_binding() {
 
 const COMMENT_TS: &str = "2026-11-06 12:00";
 
-struct CommentKernel {
-    /// применённые блоки дока (state экспорта).
-    blocks: Mutex<Vec<String>>,
-    /// appendBlock применяется и отвечает 200.
-    apply_on_append: AtomicBool,
-    /// appendBlock применяется, но отвечает 500 (потерянный ответ).
-    lost_response: AtomicBool,
-    /// тела всех попыток append.
-    appends: Mutex<Vec<String>>,
-}
-
-async fn comment_flow_mock(kernel: &Arc<CommentKernel>) -> MockServer {
-    let server = MockServer::start().await;
-    mount_kernel_shell(&server).await;
-    mount_hpath_lookup(&server, Arc::new(Mutex::new(Vec::new()))).await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/export/exportMdContent"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |_req: &Request| {
-                let md = kernel.blocks.lock().unwrap().join("\n");
-                kernel_rest_response(json!({ "content": md }))
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/block/appendBlock"))
-        .respond_with({
-            let kernel = Arc::clone(kernel);
-            move |req: &Request| {
-                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                kernel
-                    .appends
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&req.body).to_string());
-                let applies = kernel.apply_on_append.load(Ordering::SeqCst)
-                    || kernel.lost_response.load(Ordering::SeqCst);
-                if applies {
-                    let md = body
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("")
-                        .into();
-                    kernel.blocks.lock().unwrap().push(md);
-                }
-                if kernel.apply_on_append.load(Ordering::SeqCst) {
-                    kernel_rest_response(json!(null))
-                } else {
-                    ResponseTemplate::new(500)
-                }
-            }
-        })
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(|req: &Request| {
-            let body = String::from_utf8_lossy(&req.body);
-            if body.contains("\"initialize\"") {
-                return mcp_initialize();
-            }
-            if body.contains("notifications/") {
-                return mcp_initialized();
-            }
-            if body.contains("tools/call") && body.contains("\"block\"") && body.contains("\"get\"")
-            {
-                return mcp_raw_text(format!(
-                    "ID: {BOUND_DOC}\nType: NodeDocument\nHPath: {BOARD_HPATH}/{TASK_TITLE}"
-                ));
-            }
-            mcp_payload(json!({ "action": "unknown", "data": null }))
-        })
-        .mount(&server)
-        .await;
-    server
+/// Сценарий comment-флоу: док с начальными блоками, appendBlock применяет
+/// блок и/или отвечает ошибкой (потерянный ответ = применённый + 500).
+fn comment_scenario(blocks: &[&str], apply: bool, lost: bool) -> MockScenario {
+    MockScenario {
+        append_applies: apply || lost,
+        append_status: if apply { 200 } else { 500 },
+        doc_blocks: vec![(
+            BOUND_DOC,
+            blocks.iter().map(|s| s.to_string()).collect(),
+        )],
+        ..MockScenario::default()
+    }
 }
 
 fn comment_board() -> SyBoard {
     SyBoard {
-        doc_id: BOARD_DOC.into(),
-        av_id: AV.into(),
-        block_id: CARRIER.into(),
+        doc_id: "board-doc".into(),
+        av_id: "av-1".into(),
+        block_id: "carrier-block".into(),
         hpath: BOARD_HPATH.into(),
-        notebook: NB.into(),
+        notebook: "nb-1".into(),
     }
 }
 
@@ -882,13 +428,7 @@ async fn run_comment(
     text: &str,
     reply_to: Option<&str>,
 ) -> anyhow::Result<CommentOutcome> {
-    let kernel = Arc::new(CommentKernel {
-        blocks: Mutex::new(base_blocks.iter().map(|s| s.to_string()).collect()),
-        apply_on_append: AtomicBool::new(apply),
-        lost_response: AtomicBool::new(lost),
-        appends: Mutex::new(Vec::new()),
-    });
-    let server = comment_flow_mock(&kernel).await;
+    let (kernel, server) = MockKernel::start(comment_scenario(base_blocks, apply, lost)).await;
     set_env(&server);
     let sy = SiYuan::from_env()?;
     let draft = CommentDraft {
@@ -897,8 +437,8 @@ async fn run_comment(
         reply_to,
     };
     comment_with_ts(&sy, &comment_board(), &comment_task(), &draft, COMMENT_TS).await?;
-    let md = kernel.blocks.lock().unwrap().join("\n");
-    let append_attempts = kernel.appends.lock().unwrap().len();
+    let md = kernel.doc_blocks_of(BOUND_DOC).join("\n");
+    let append_attempts = kernel.appends().len();
     Ok(CommentOutcome {
         md,
         append_attempts,
