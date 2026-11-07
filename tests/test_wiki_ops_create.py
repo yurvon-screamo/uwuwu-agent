@@ -136,6 +136,22 @@ class AdrNumberGuard(unittest.TestCase):
         self.assertIn("box='nb-projects'", stmt)
         self.assertIn("hpath like '/uwuwu/ADR/%'", stmt)
 
+    def test_probe_escapes_like_wildcards_in_folder(self):
+        # Легаси-папка с «_»/«%» матчится буквально: без escape-паттерна «ADR_v2»
+        # собрал бы соседей «ADRХv2» (over-match → ложное предупреждение).
+        kernel = AdrNumberGuardKernel(siblings=[])
+        run_create(kernel, "/uwuwu/ADR_v2", "ADR-034: Маркер")
+        stmt = kernel.sql_stmts()[0]
+        self.assertIn("hpath like '/uwuwu/ADR\\_v2/%' escape '\\'", stmt)
+        self.assertNotIn("ADR_v2", stmt, "вайлкард папки ушёл в LIKE неэкранированным")
+
+    def test_root_parent_warning_names_notebook_root(self):
+        # Легаси-parent «/»: folder_hpath пуст — предупреждение не печатает
+        # «уже занят в :» с дыркой вместо папки, корень виден как «/».
+        kernel = AdrNumberGuardKernel(siblings=[self.KERNEL_DOC])
+        _, err = run_create(kernel, "/", "ADR-033: корневой док")
+        self.assertIn("уже занят в /:", err)
+
     def test_probe_failure_degrades_to_notice_and_create_survives(self):
         kernel = AdrNumberGuardKernel(sql_fails=True)
         out, err = run_create(kernel, "/uwuwu/ADR", "ADR-034: Маркер")
