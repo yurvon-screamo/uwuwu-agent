@@ -13,12 +13,16 @@
 use crate::siyuan::{doc_content_is_empty, parse_block_ids, workspace_root, SiYuan};
 use crate::siyuan_task as syt;
 use serde_json::json;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub(crate) enum ProbeVerdict {
     Clean,
     Degraded(String),
     Skipped(String),
+    /// Находка вне волны (осадок, наблюдение): печатается и не влияет
+    /// на exit-код — реакция владельца, не сигнал кронам.
+    Observed(String),
 }
 
 pub(crate) struct ProbeOutcome {
@@ -51,6 +55,7 @@ impl ProbeOutcome {
 const KERNEL: &str = "kernel";
 const WAVE: &str = "wave";
 const BOARD: &str = "board";
+const BOARD_ORPHANS: &str = "board-orphans";
 const FS_SQL: &str = "fs-sql";
 
 pub(crate) fn doctor_exit_code(outcomes: &[ProbeOutcome]) -> i32 {
@@ -76,6 +81,7 @@ pub(crate) fn report(outcomes: &[ProbeOutcome]) -> String {
             ProbeVerdict::Clean => format!("OK      {}: чисто", o.name),
             ProbeVerdict::Degraded(why) => format!("DEGRADED {}: {why}", o.name),
             ProbeVerdict::Skipped(why) => format!("SKIP    {}: {why}", o.name),
+            ProbeVerdict::Observed(what) => format!("OBSERVE {}: {what}", o.name),
         };
         match &o.detail {
             Some(detail) => lines.push(format!("{verdict_line} [{detail}]")),
@@ -249,6 +255,15 @@ pub(crate) async fn run(sy: &SiYuan, project: &str, since_min: u64) -> Vec<Probe
     });
 
     outcomes.push(if kernel_alive {
+        board_orphans_probe(sy, project).await
+    } else {
+        ProbeOutcome::new(
+            BOARD_ORPHANS,
+            ProbeVerdict::Skipped("kernel недоступен".into()),
+        )
+    });
+
+    outcomes.push(if kernel_alive {
         fs_sql_probe(sy).await
     } else {
         ProbeOutcome::new(FS_SQL, ProbeVerdict::Skipped("kernel недоступен".into()))
@@ -353,6 +368,168 @@ async fn empty_body_finding(sy: &SiYuan, doc_id: &str, title: &str) -> Option<St
     doc_content_is_empty(&ids, &text).then(|| format!("«{title}»: пустое тело (ZWJ-заглушка)"))
 }
 
+/// Прямой ребёнок-док доски (строка SQL-выборки).
+pub(crate) struct BoardChildDoc {
+    pub id: String,
+    pub hpath: String,
+    pub updated: Option<String>,
+}
+
+/// Дата из ial дока (created ядро в SQL не отдаёт — ближайший прокси
+/// возраста тела): "…updated=\"20261108010134\"…" → "2026-11-08".
+pub(crate) fn doc_updated_date(ial: &str) -> Option<String> {
+    let pos = ial.find("updated=\"")? + "updated=\"".len();
+    let digits: String = ial[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() < 8 {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}",
+        &digits[0..4],
+        &digits[4..6],
+        &digits[6..8]
+    ))
+}
+
+/// Кандидаты-сироты: дети-доки без живой строки. Строка живёт либо
+/// привязкой (bound_ids), либо тайтлом (row_titles — легаси/detached
+/// строки без привязки; тот же фоллбек, что у CLI-резолва задач).
+pub(crate) fn orphan_candidates<'a>(
+    children: &'a [BoardChildDoc],
+    bound_ids: &HashSet<String>,
+    row_titles: &HashSet<String>,
+) -> Vec<&'a BoardChildDoc> {
+    children
+        .iter()
+        .filter(|child| {
+            let title = child.hpath.rsplit('/').next().unwrap_or("");
+            !bound_ids.contains(&child.id) && !row_titles.contains(&syt::normalize_title(title))
+        })
+        .collect()
+}
+
+/// Компактный sample сирот: «id «тайтл» (updated)» через "; ", хвост счётчиком.
+pub(crate) fn orphan_sample(orphans: &[&BoardChildDoc], cap: usize) -> String {
+    let head: Vec<String> = orphans
+        .iter()
+        .take(cap)
+        .map(|child| {
+            let title = child.hpath.rsplit('/').next().unwrap_or("");
+            match &child.updated {
+                Some(date) => format!("{} «{title}» ({date})", child.id),
+                None => format!("{} «{title}»", child.id),
+            }
+        })
+        .collect();
+    let more = if orphans.len() > cap {
+        format!(" …+{}", orphans.len() - cap)
+    } else {
+        String::new()
+    };
+    format!("{}{more}", head.join("; "))
+}
+
+/// Прямые дети-доки доски. Фильтр type='d' обязателен: hpath в blocks
+/// несёт каждый блок (абзацы, заголовки) — без него выборка раздуется
+/// до всех блоков всех детей. Пагинация limit 500/offset — иммунитет
+/// к дефолт-капу ядра 64 строки.
+async fn board_child_docs(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+) -> Result<Vec<BoardChildDoc>, anyhow::Error> {
+    const PAGE: usize = 500;
+    let like = board.hpath.replace('\'', "''");
+    let mut docs = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let stmt = format!(
+            "select id, hpath, ial from blocks where type='d' \
+             and hpath like '{like}/%' and hpath not like '{like}/%/%' \
+             order by id limit {PAGE} offset {offset}"
+        );
+        let envelope = sy
+            .post_probe("/api/query/sql", json!({ "stmt": stmt }))
+            .await?;
+        let page: Vec<BoardChildDoc> = envelope
+            .pointer("/data")
+            .and_then(|d| d.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(BoardChildDoc {
+                            id: row.get("id")?.as_str()?.to_string(),
+                            hpath: row.get("hpath")?.as_str()?.to_string(),
+                            updated: row
+                                .get("ial")
+                                .and_then(|i| i.as_str())
+                                .and_then(doc_updated_date),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fetched = page.len();
+        docs.extend(page);
+        if fetched < PAGE {
+            return Ok(docs);
+        }
+        offset += fetched;
+    }
+}
+
+/// Тела-сироты: прямые дети-доки доски задач без живой строки (обратное
+/// направление board-пробы). Наблюдение, не деградация: осадок миграции
+/// (тела-дубли эпохи пересборок досок) живёт на досках до чистки
+/// владельцем — вердикт волны портить нельзя.
+async fn board_orphans_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
+    let board = match syt::find_board(sy, project).await {
+        Ok(board) => board,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("доска «{project}»: {e}")),
+            )
+        }
+    };
+    let rows = match syt::read_rows(sy, &board).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("render доски: {e}")),
+            )
+        }
+    };
+    let children = match board_child_docs(sy, &board).await {
+        Ok(children) => children,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("SQL детей доски: {e}")),
+            )
+        }
+    };
+    let bound_ids: HashSet<String> = rows.iter().filter_map(|r| r.body_doc.clone()).collect();
+    let row_titles: HashSet<String> = rows.iter().map(|r| syt::normalize_title(&r.title)).collect();
+    let orphans = orphan_candidates(&children, &bound_ids, &row_titles);
+    let detail = format!("детей-доков {}", children.len());
+    if orphans.is_empty() {
+        return ProbeOutcome::new(BOARD_ORPHANS, ProbeVerdict::Clean).with_detail(detail);
+    }
+    ProbeOutcome::new(
+        BOARD_ORPHANS,
+        ProbeVerdict::Observed(format!(
+            "кандидаты-сироты (тело без строки): {} — {}",
+            orphans.len(),
+            orphan_sample(&orphans, 5)
+        )),
+    )
+    .with_detail(detail)
+}
+
 async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
     let notebooks = match sy.post_probe("/api/notebook/lsNotebooks", json!({})).await {
         Ok(notebooks) => notebooks,
@@ -444,10 +621,103 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_sy_ids, diff_id_lists, doctor_exit_code, fs_sql_pair_verdict, report,
-        scan_kernel_log_for_waves, wave_verdict, ProbeOutcome, ProbeVerdict,
+        collect_sy_ids, diff_id_lists, doc_updated_date, doctor_exit_code, fs_sql_pair_verdict,
+        orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves, wave_verdict,
+        BoardChildDoc, ProbeOutcome, ProbeVerdict,
     };
+    use crate::siyuan_task as syt;
+    use std::collections::HashSet;
     use std::path::Path;
+
+    fn child(id: &str, hpath: &str, updated: Option<&str>) -> BoardChildDoc {
+        BoardChildDoc {
+            id: id.to_string(),
+            hpath: hpath.to_string(),
+            updated: updated.map(String::from),
+        }
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn doc_updated_date_formats_first_eight_digits() {
+        let ial = r#"{: type="doc" updated="20261108010134" id="20261104033524-4d37yk0"}"#;
+        assert_eq!(doc_updated_date(ial).as_deref(), Some("2026-11-08"));
+    }
+
+    #[test]
+    fn doc_updated_date_is_none_without_field() {
+        assert!(doc_updated_date(r#"{: type="doc" id="x"}"#).is_none());
+    }
+
+    #[test]
+    fn orphan_candidates_lists_doc_without_row() {
+        let children = vec![
+            child("c-bound", "/uwuwu/Задачи uwuwu/привязанная задача", None),
+            child("c-orphan", "/uwuwu/Задачи uwuwu/тело без строки", None),
+        ];
+        let orphans = orphan_candidates(&children, &set(&["c-bound"]), &set(&["привязанная задача"]));
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, "c-orphan");
+    }
+
+    #[test]
+    fn orphan_candidates_respects_title_fallback_of_detached_rows() {
+        // Легаси/detached строка живёт без привязки — её тело не сирота.
+        let children = vec![child(
+            "c-legacy",
+            "/uwuwu/Задачи uwuwu/легаси задача",
+            None,
+        )];
+        let orphans = orphan_candidates(&children, &HashSet::new(), &set(&["легаси задача"]));
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn orphan_candidates_normalizes_slash_title_variants() {
+        // Тайтл строки с ASCII-слэшем и тело с ∕ (U+2215) — одна задача;
+        // row_titles строится как в пробе — через normalize_title.
+        let children = vec![child(
+            "c-slash",
+            "/uwuwu/Задачи uwuwu/wiki_ops create: слэш в∕тайтле",
+            None,
+        )];
+        let row_titles = HashSet::from([syt::normalize_title("wiki_ops create: слэш в/тайтле")]);
+        let orphans = orphan_candidates(&children, &HashSet::new(), &row_titles);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn orphan_sample_cap_prints_head_and_tail_count() {
+        let orphans: Vec<BoardChildDoc> = (1..=4)
+            .map(|n| child(&format!("c{n}"), &format!("/b/тело{n}"), Some("2026-11-08")))
+            .collect();
+        let refs: Vec<&BoardChildDoc> = orphans.iter().collect();
+        let text = orphan_sample(&refs, 2);
+        assert!(text.contains("c1 «тело1» (2026-11-08)"), "{text}");
+        assert!(text.contains("c2 «тело2» (2026-11-08)"), "{text}");
+        assert!(text.contains("…+2"), "{text}");
+        assert!(!text.contains("тело3"), "{text}");
+    }
+
+    /// Сироты — наблюдение: exit-код остаётся чистым (сегмент волны
+    /// не портится находками осадка).
+    #[test]
+    fn observed_verdict_keeps_exit_code_clean() {
+        let outcomes = vec![
+            ProbeOutcome::new("kernel", ProbeVerdict::Clean),
+            ProbeOutcome::new(
+                "board-orphans",
+                ProbeVerdict::Observed("кандидаты-сироты: 1 — c1 «t»".into()),
+            ),
+        ];
+        assert_eq!(doctor_exit_code(&outcomes), 0);
+        let text = report(&outcomes);
+        assert!(text.contains("OBSERVE board-orphans"), "{text}");
+        assert!(text.contains("вердикт: 0"), "{text}");
+    }
 
     #[test]
     fn wave_scan_counts_both_signatures() {
