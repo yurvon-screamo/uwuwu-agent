@@ -575,7 +575,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "list_organize_nodes": {
       // Синтез организ-дерева афин-шейпа из доков SiYuan. Потребители ждут:
       // проекты — folder-узлы глубины 1 (data = тайтл), доски и доки глубже —
-      // doc-узлы (data = doc id): cron.ts cronBoardTitles, factory/cron
+      // doc-узлы (data = doc id): cron.ts taskBoardTitles, factory/cron
       // boardViaOrganize, triage.ts refreshBoards (tests/platform-organize.test.ts).
       const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
         "/api/notebook/lsNotebooks", {})

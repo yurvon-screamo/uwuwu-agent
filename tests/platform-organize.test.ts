@@ -90,7 +90,7 @@ describe("list_organize_nodes — шейп синтеза", () => {
 })
 
 describe("list_organize_nodes — контракты потребителей", () => {
-  test("cronBoardTitles: folder-дети Projects дают «Кроны <proj>»", async () => {
+  test("taskBoardTitles: folder-дети Projects дают «Задачи <proj>»", async () => {
     const nodes = await organizeNodes()
     const pid = nodes.find((n) => n.type === "folder" && n.data === "Projects")?.id
     expect(pid).toBe("nbProj")
@@ -99,7 +99,7 @@ describe("list_organize_nodes — контракты потребителей", 
       .map((n) => n.data as string)
       .sort()
     expect(projects).toEqual(["origa", "uwuwu"])
-    expect(projects.map((p) => `Кроны ${p}`)).toEqual(["Кроны origa", "Кроны uwuwu"])
+    expect(projects.map((p) => `Задачи ${p}`)).toEqual(["Задачи origa", "Задачи uwuwu"])
   })
 
   test("boardViaOrganize: folder data=proj → doc-дети data=docId → тайтл доски", async () => {
