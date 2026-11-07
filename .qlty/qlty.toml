@@ -20,6 +20,8 @@ exclude_patterns = [
   "**/.yarn/**",
   "**/*.d.ts",
   "skills/stageshow/**", # vendored third-party skill (MIT, upstream benjitaylor/skills @ 299140f) — линтаем наш код, не апстрим
+  "skills/office-coworker-*/**", # vendored third-party skills (proprietary LICENSE) — линтаем наш код, не апстрим
+  "skills/use-railway/**", # vendored third-party skill (upstream Railway) — линтаем наш код, не апстрим
   "**/assets/**",
   "**/bower_components/**",
   "**/build/**",
