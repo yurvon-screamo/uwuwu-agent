@@ -1226,12 +1226,14 @@ pub(super) fn doc_section_result_lines(
     }
 }
 
-/// Сборка stdout search до SOFA/семантики: голова, полнотекст, секция
-/// доков. Порядок и форматы — контракт парсинга фабричных агентов.
+/// Сборка stdout search между головой и SOFA/семантикой: полнотекст,
+/// секция доков. Порядок и форматы — контракт парсинга фабричных агентов.
+/// Голову печатает search_run ДО вызова — отказ полнотекстового фетча
+/// (`?` здесь) выходит, когда голова уже в stdout (семантика мастера).
 /// Публичный шов e2e (`cli/tests/search_e2e.rs`) — живое ядро гоняет
 /// полный production-путь через него.
 pub async fn search_lines(sy: &SiYuan, query: &str, limit: usize) -> Result<Vec<String>> {
-    let mut lines = vec![search_head(query), String::new()];
+    let mut lines = Vec::new();
     lines.extend(fulltext_lines(&sy.search(query, limit).await?));
     let fetch = sy.doc_titles(DOC_TITLES_CAP).await;
     lines.extend(doc_section_result_lines(query, limit, fetch));
@@ -1245,6 +1247,9 @@ pub(crate) async fn search_run(
     sofa: usize,
 ) -> Result<()> {
     let sy = SiYuan::from_env()?;
+    // Голова — до полнотекстового фетча: отказный путь stdout байт-в-байт
+    // прежний (голова + пустая строка, затем ошибка) — контракт парсинга.
+    println!("{}\n", search_head(query));
     for line in search_lines(&sy, query, limit).await? {
         println!("{line}");
     }

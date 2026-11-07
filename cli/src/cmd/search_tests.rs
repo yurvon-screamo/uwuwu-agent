@@ -249,12 +249,11 @@ async fn search_lines_orders_fulltext_then_doc_section() {
     // Act
     let lines = search_lines(&sy, "ADR-006", 10).await.unwrap();
 
-    // Assert
+    // Assert: без головы — её печатает search_run до фетча (отказный путь
+    // stdout прежний), полнотекст раньше doc-секции
     assert_eq!(
         lines,
         vec![
-            "Searching for: \"ADR-006\"".to_string(),
-            String::new(),
             "1. /affine/wiki_ops find/children".to_string(),
             "    ретраи по контракту ADR-006".to_string(),
             "Доки (по hpath):".to_string(),
@@ -275,12 +274,21 @@ async fn search_lines_empty_everywhere_reports_no_hits_and_omits_doc_section() {
     let lines = search_lines(&sy, "нет такого", 10).await.unwrap();
 
     // Assert: пустая doc-секция не печатается вовсе
-    assert_eq!(
-        lines,
-        vec![
-            "Searching for: \"нет такого\"".to_string(),
-            String::new(),
-            "ничего не найдено".to_string(),
-        ]
-    );
+    assert_eq!(lines, vec!["ничего не найдено".to_string()]);
+}
+
+#[tokio::test]
+async fn search_lines_propagates_fulltext_fetch_failure() {
+    // Arrange: ядро недоступно (порт закрыт) — мгновенный пейсинг ретраев
+    let server = MockServer::start().await;
+    let uri = server.uri();
+    drop(server);
+    let sy = SiYuan::for_tests(uri);
+
+    // Act
+    let result = search_lines(&sy, "ADR-006", 10).await;
+
+    // Assert: отказ полнотекста — Err (голова уже напечатана search_run),
+    // doc-секция со своей деградацией не маскирует сбой полнотекста
+    assert!(result.is_err(), "ожидался Err на недоступном ядре");
 }
