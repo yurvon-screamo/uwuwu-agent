@@ -218,7 +218,7 @@ pub async fn replace(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<Str
             verify_created(sy, target, &created).await?
         }
     };
-    sy.overwrite_doc_md(&doc_id, md).await?;
+    sy.overwrite_doc_md(&doc_id, target.title(), md).await?;
     Ok(doc_id)
 }
 

@@ -388,25 +388,108 @@ impl SiYuan {
     /// docId неизменен: контент перезаписывается на месте (привязка строк-канбана живёт).
     /// Очистка детей верифицируется повторным get_children; пустой док ядра —
     /// один ZWJ-параграф (SiYuan не оставляет док без блока).
-    pub async fn overwrite_doc_md(&self, doc_id: &str, markdown: &str) -> Result<()> {
+    /// Транзакционность на пре-имидже: до мутаций экспорт текущего контента;
+    /// сбой после начала очистки — авто-откат (дочистка остатков + аппенд
+    /// пре-имиджа once), двойной сбой — громкая ошибка с дампом пре-имиджа
+    /// в файл. Запись нового контента — once с контрольным чтением (sync-лаг
+    /// ядра прячет записанный блок — откат стёр бы легший контент).
+    pub async fn overwrite_doc_md(
+        &self,
+        doc_id: &str,
+        doc_title: &str,
+        markdown: &str,
+    ) -> Result<()> {
+        let raw = self.export_md_by_id(doc_id).await.unwrap_or_default();
+        let pre_image = crate::markdown::strip_export_wrapper(&raw, doc_title);
+
+        if let Err(err) = self.clear_doc_children(doc_id).await {
+            return self.restore_or_fail(doc_id, &pre_image, err).await;
+        }
+        if markdown.trim().is_empty() {
+            return Ok(());
+        }
+        if let Err(err) = self.append_block_md_once(doc_id, markdown).await {
+            let marker = first_nonempty_line(markdown);
+            if !marker.is_empty() && self.doc_contains_polled(doc_id, &marker).await {
+                self.drop_leading_blank_block(doc_id).await;
+                return Ok(());
+            }
+            return self.restore_or_fail(doc_id, &pre_image, err).await;
+        }
+        self.drop_leading_blank_block(doc_id).await;
+        Ok(())
+    }
+
+    /// Очистка детей дока до пустоты: волны get_children → delete_block.
+    /// Сбой удаления или блоки, живые после трёх волн, — Err: звавший
+    /// (overwrite) решает судьбу дока через авто-откат.
+    async fn clear_doc_children(&self, doc_id: &str) -> Result<()> {
         for _ in 0..3 {
             let text = self.block_children_text(doc_id).await?;
             let ids = parse_block_ids(&text);
             if doc_content_is_empty(&ids, &text) {
-                if !markdown.trim().is_empty() {
-                    self.append_block_md(doc_id, markdown).await?;
-                    self.drop_leading_blank_block(doc_id).await;
-                }
                 return Ok(());
             }
             for block_id in ids {
                 self.delete_block(&block_id).await?;
             }
         }
-        bail!(
-            "не удалось очистить контент дока {doc_id}: блоки остаются после {} волн удаления",
-            3
-        )
+        bail!("не удалось очистить контент дока {doc_id}: блоки остаются после 3 волн удаления")
+    }
+
+    /// Контрольное чтение после сбоя записи: маркер (первая непустая строка
+    /// записанного) в экспорте? Пауза между попытками — sync-лаг ядра прячет
+    /// только что записанный блок. true — запись легла, повторять нельзя.
+    async fn doc_contains_polled(&self, doc_id: &str, marker: &str) -> bool {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            if let Ok(exported) = self.export_md_by_id(doc_id).await {
+                if exported.contains(marker) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Авто-откат overwrite: док уже очищен (частично или полностью) — вернуть
+    /// пре-имидж: дочистка остатков + аппенд пре-имиджа once. Откат тоже не
+    /// удался → дамп пре-имиджа в файл, громкая ошибка с путём и обеими
+    /// причинами. Возвращается всегда Err (исходная причина): команда упала,
+    /// контент сохранён — повтор безопасен.
+    async fn restore_or_fail(
+        &self,
+        doc_id: &str,
+        pre_image: &str,
+        cause: anyhow::Error,
+    ) -> Result<()> {
+        if pre_image.trim().is_empty() {
+            // восстанавливать нечего: док был пуст до операции
+            return Err(cause);
+        }
+        let rollback = async {
+            self.clear_doc_children(doc_id).await?;
+            self.append_block_md_once(doc_id, pre_image).await
+        };
+        if let Err(rollback_err) = rollback.await {
+            let dump_path =
+                std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
+            let dump_note = match std::fs::write(&dump_path, pre_image) {
+                Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
+                Err(dump_err) => format!(
+                    "дамп пре-имиджа в {} не удался: {dump_err}",
+                    dump_path.display()
+                ),
+            };
+            bail!(
+                "overwrite {doc_id}: {cause:#}; откат не удался ({rollback_err:#}) — {dump_note}"
+            );
+        }
+        Err(cause.context(format!(
+            "исходный контент дока {doc_id} восстановлен из пре-имиджа"
+        )))
     }
 
     /// Пустой док ядра несёт ZWJ-заглушку; после записи контента в «пустой» док
@@ -1127,8 +1210,17 @@ pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
 
 /// Пустой с точки зрения ядра док: детей нет, либо один параграф без
 /// контента/ZWJ (`- [p]  (id)`) — SiYuan не оставляет док без блока.
-pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) -> bool {
-    let [only] = block_ids else {
+/// Первая непустая строка markdown — маркер контрольного чтения записи
+/// (подстрочный матч экспорта: отступы/переносы ядра матчу не мешают).
+pub(crate) fn first_nonempty_line(md: &str) -> String {
+    md.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) -> bool {    let [only] = block_ids else {
         return block_ids.is_empty();
     };
     children_text

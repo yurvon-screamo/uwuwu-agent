@@ -301,8 +301,7 @@ async fn body_replace_strips_title_h1_from_content() {
 /// внутри неё стал бы вторым H1 в доке.
 #[tokio::test]
 #[serial_test::serial]
-async fn body_replace_section_strips_title_h1_from_content() {
-    let mut scenario = body_scenario(true);
+async fn body_replace_section_strips_title_h1_from_content() {    let mut scenario = body_scenario(true);
     scenario.exports = vec![(
         BOUND_DOC,
         "# титул экспорта\n\n## Постановка\n\nстарая постановка\n\n## План\n\nплан\n".to_string(),
@@ -331,6 +330,65 @@ async fn body_replace_section_strips_title_h1_from_content() {
             .lines()
             .any(|l| l.trim_end() == format!("# {TASK_TITLE}")),
         "титульный H1 из секционного контента не проходит в запись: {appends:?}"
+    );
+}
+
+/// Сбой append после очистки: новый контент не записался → авто-откат
+/// возвращает пре-имидж, команда падает честно, контент не потерян.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_append_failure_restores_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.append_fail_posts = 1;
+    scenario.append_applies = true;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат репортится в ошибке: {err:#}"
+    );
+    let appends = kernel.appends();
+    assert_eq!(
+        appends.len(),
+        1,
+        "ровно восстановительный append (отказавший POST не в логе): {appends:?}"
+    );
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
+    );
+}
+
+/// Сбой delete в середине очистки (одноразовый latched отказ: первые 4 POST
+/// = первый delete_block со всеми ретраями) → авто-откат дочищает и
+/// возвращает пре-имидж.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_delete_failure_restores_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.append_applies = true;
+    scenario.delete_fail_posts = 4;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой очистки — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат репортится в ошибке: {err:#}"
+    );
+    let appends = kernel.appends();
+    assert_eq!(appends.len(), 1, "ровно восстановительный append: {appends:?}");
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
     );
 }
 
