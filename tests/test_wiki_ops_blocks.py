@@ -22,7 +22,17 @@
      без separator-строки шапки (row-payload, не-табличный payload, fence с
      таблицей внутри) и delete — отказ до мутации и до undo-журнала; payload
      полной таблицы — осознанный rewrite (ядро переписывает ровно как задано);
-     insert-after — сиблинг-инсерт после таблицы, без гварда.
+     insert-after — сиблинг-инсерт после таблицы, без гварда;
+ 10) якорь-item (type='i') для insert-after принимает payload строго одного
+     item'а: multi-item payload ядро молча обрезает до первого item'а с
+     фантомными id в ответе (проба 07.11), не-item блок после item'а ядро
+     отказывает громко; отказ гварда — до мутации и до undo-журнала;
+ 11) пост-чек материализации всех insert-after: напечатанные id сверяются
+     с фактом (SQL с ретраями, фолбэк .sy — FS-истина); фантомные id —
+     громкий отказ («напечатанные id» — не доказательство материала,
+     проба 07.11); пустой new_ids в ответе ядра — громкий отказ;
+     NodeList-обёртка markdown-парсера — транзиентна (ядро мержит item'ы
+     в существующий list и отбрасывает её, проба 07.11) — не фантом.
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_blocks.py
@@ -33,6 +43,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -47,8 +58,11 @@ DOC_ID = "20261106030000-doc0001"
 BLOCK_ID = "20261106030000-blk0001"
 CHILD_ID = "20261106030000-chl0001"
 LIST_ID = "20261106030000-lst0001"
+ITEM_ID = "20261106030000-itm0001"
 TABLE_ID = "20261106030000-tbl0001"
 NEW_ID = "20261106040000-new0001"
+NEW_ID_B = "20261106040000-new0002"
+WRAP_ID = "20261106040000-wrp0001"
 
 TABLE_MD = "| Колонка A | Колонка B |\n| --- | --- |\n| раз | один |\n| два | два |"
 
@@ -60,22 +74,33 @@ def _block(block_id=BLOCK_ID, btype="p", root_id=DOC_ID, parent_id=DOC_ID, markd
             "parent_id": parent_id, "markdown": markdown}
 
 
+BOX = "20261106030000"
+SY_PATH = "/20261106030000-doc0001.sy"
+
+
 def _doc(doc_id=DOC_ID, hpath="/Projects/Scratch/wiki-ops-probe"):
     return {"id": doc_id, "type": "d", "root_id": "", "parent_id": "",
-            "hpath": hpath, "markdown": ""}
+            "hpath": hpath, "box": BOX, "path": SY_PATH, "markdown": ""}
 
 
 class FakeKernel:
     """Двойник kernel API: blocks-таблица (id-резолв / дети по parent_id / hpath
-    рута), блочные мутации с записью вызовов и attempts, putFile-журнал."""
+    рута), блочные мутации с записью вызовов и attempts, putFile-журнал,
+    getFile-проба .sy (sy_tree), параметризация ответа insertBlock (insert_ids —
+    id в doOperations; materialize_ids — какие из них реально ложатся в blocks)."""
 
-    def __init__(self, blocks=(), docs=(), put_fails=False):
+    def __init__(self, blocks=(), docs=(), put_fails=False,
+                 insert_ids=(NEW_ID,), insert_types=None, materialize_ids=None, sy_tree=None):
         self.blocks = {b["id"]: dict(b) for b in blocks}
         self.docs = {d["id"]: dict(d) for d in docs}
         self.sql_stmts = []
         self.mutations = []
         self.puts = []
         self.put_fails = put_fails
+        self.insert_ids = list(insert_ids)
+        self.insert_types = dict(insert_types) if insert_types else {}
+        self.materialize_ids = list(materialize_ids) if materialize_ids is not None else list(insert_ids)
+        self.sy_tree = sy_tree
 
     def post(self, path: str, body: dict, attempts: int = 6):
         if path == "/api/query/sql":
@@ -83,11 +108,23 @@ class FakeKernel:
         if path in ("/api/block/updateBlock", "/api/block/insertBlock", "/api/block/deleteBlock"):
             self.mutations.append((path, dict(body), attempts))
             if path == "/api/block/insertBlock":
-                # Форма ответа ядра: insertBlock отдаёт список транзакций (проба 06.11).
-                return [{"timestamp": 0, "doOperations": [{"action": "insert", "data":
-                    f'<div data-node-id="{NEW_ID}" data-type="NodeParagraph"></div>'}]}]
+                # Форма ответа ядра: insertBlock отдаёт список транзакций (проба 06.11);
+                # doOperations несут data-node-id напечатанных id — материализуются
+                # не все (проба 07.11: multi-item payload → фантомные id; NodeList-
+                # обёртка транзиентна — мерж в существующий list).
+                data = "".join(f'<div data-node-id="{i}" data-type="{self.insert_types.get(i, "NodeParagraph")}"></div>'
+                               for i in self.insert_ids)
+                for i in self.materialize_ids:
+                    self.blocks[i] = {"id": i, "type": "p", "root_id": DOC_ID,
+                                      "parent_id": DOC_ID, "markdown": ""}
+                return [{"timestamp": 0, "doOperations": [{"action": "insert", "data": data}]}]
             return {"doOperations": []}
         raise AssertionError(f"неожиданный путь: {path}")
+
+    def get_file(self, ws_path: str) -> bytes:
+        if self.sy_tree is None:
+            raise FileNotFoundError(ws_path)
+        return json.dumps(self.sy_tree).encode()
 
     def put_file(self, ws_path: str, payload: bytes):
         if self.put_fails:
@@ -97,6 +134,9 @@ class FakeKernel:
     def _sql(self, stmt: str):
         self.sql_stmts.append(stmt)
         all_rows = list(self.docs.values()) + list(self.blocks.values())
+        if "id in (" in stmt:
+            ids = re.findall(r"'([^']+)'", stmt)
+            return [dict(r) for r in all_rows if r["id"] in ids]
         if "count(*)" in stmt:
             m = re.search(r"parent_id='([^']+)'", stmt)
             if m is None:
@@ -107,7 +147,7 @@ class FakeKernel:
             if m is None:
                 raise AssertionError(f"непонятный stmt: {stmt}")
             doc = self.docs.get(m.group(1))
-            return [{"hpath": doc["hpath"]}] if doc else []
+            return [dict(doc)] if doc else []
         m = re.search(r"where id='([^']+)' limit", stmt)
         if m is None:
             raise AssertionError(f"непонятный stmt: {stmt}")
@@ -131,14 +171,16 @@ def run_block(kernel: FakeKernel, command: str, block_id: str = BLOCK_ID, payloa
     fn = {"update": wiki_ops.cmd_block_update,
           "insert-after": wiki_ops.cmd_block_insert_after,
           "delete": wiki_ops.cmd_block_delete}[command]
-    original_put = wiki_ops._put_workspace_file
+    original = (wiki_ops._put_workspace_file, wiki_ops._get_workspace_file, wiki_ops.time)
     wiki_ops._put_workspace_file = kernel.put_file
+    wiki_ops._get_workspace_file = kernel.get_file
+    wiki_ops.time = SimpleNamespace(sleep=lambda seconds: None, time=time.time)
     try:
         buffer = io.StringIO()
         with kernel_post(kernel), redirect_stdout(buffer):
             fn(args)
     finally:
-        wiki_ops._put_workspace_file = original_put
+        (wiki_ops._put_workspace_file, wiki_ops._get_workspace_file, wiki_ops.time) = original
         if payload_file:
             os.unlink(payload_file)
     return buffer.getvalue()
@@ -377,6 +419,130 @@ class InsertAfterHappyPath(unittest.TestCase):
         self.assertEqual(entries[0]["payload_md"], "Вставленный блок.")
         self.assertEqual(entries[1]["new_ids"], [NEW_ID])
         self.assertEqual(kernel.puts[0][0], kernel.puts[1][0], "файл журнала тот же")
+
+
+class InsertAfterListItemGuard(unittest.TestCase):
+    """Якорь-item (type='i') принимает payload строго одного item'а (проба
+    07.11: multi-item payload ядро молча обрезает до первого с фантомными id
+    в ответе; не-item блок после item'а ядро отказывает громко). Отказ —
+    до мутации и до undo-журнала."""
+
+    def _item_kernel(self, **overrides) -> FakeKernel:
+        blocks = [_block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- якорь item"),
+                  _block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- якорь item")]
+        return FakeKernel(blocks=blocks, docs=[_doc()], **overrides)
+
+    def test_multi_item_payload_is_refused_before_mutation_and_journal(self):
+        kernel = self._item_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", block_id=ITEM_ID,
+                      payload="- первый пункт\n- второй пункт")
+        self.assertIn("по одному", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+        self.assertEqual(kernel.puts, [])
+
+    def test_non_item_payload_is_refused_with_recipe(self):
+        kernel = self._item_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", block_id=ITEM_ID, payload="Параграф после item'а.")
+        self.assertIn("list-контейнера", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+
+    def test_adjacent_text_and_list_payload_is_refused(self):
+        kernel = self._item_kernel()
+        with self.assertRaises(RuntimeError):
+            run_block(kernel, "insert-after", block_id=ITEM_ID, payload="текст абзаца\n- пункт")
+        self.assertEqual(kernel.mutations, [])
+
+    def test_single_item_payload_is_allowed(self):
+        kernel = self._item_kernel()
+        run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
+        self.assertEqual(kernel.mutations[0][0], "/api/block/insertBlock")
+        self.assertEqual(kernel.mutations[0][1]["previousID"], ITEM_ID)
+
+    def test_item_with_nested_content_is_allowed(self):
+        # Вложенные строки с отступом — не top-level item'ы: один item с
+        # вложенным контентом валиден; странности ядра ловит пост-чек.
+        kernel = self._item_kernel()
+        run_block(kernel, "insert-after", block_id=ITEM_ID,
+                  payload="- пункт\n  вложенное продолжение")
+        self.assertEqual(len(kernel.mutations), 1)
+
+    def test_fenced_code_payload_is_refused_as_non_item(self):
+        # Код-блок после item'а — не item: ядро отказало бы invalid structure
+        # громко, гвард отказывает до мутации с рецептом (вложение в item —
+        # «- пункт» с код-блоком с отступом, это items=1 и легально).
+        kernel = self._item_kernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", block_id=ITEM_ID,
+                      payload="```\n- раз\n- два\n```")
+        self.assertIn("не item", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+
+
+class InsertAfterMaterializationPostcheck(unittest.TestCase):
+    """Пост-чек всех insert-after: напечатанные id сверяются с фактом
+    (SQL-проба с ретраями, фолбэк .sy); фантомы — громкий отказ."""
+
+    def test_phantom_ids_are_refused_loudly(self):
+        # Ядро напечатало 2 id, материализовало 1 (проба 07.11) — отказ
+        # со списком фантомов; мутация ровно одна (пост-чек не ретраит мутацию).
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()],
+                            insert_ids=[NEW_ID, NEW_ID_B], materialize_ids=[NEW_ID],
+                            sy_tree={"Children": []})
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", payload="Первый.\n\nВторой.")
+        message = str(cm.exception)
+        self.assertIn("не материализовались", message)
+        self.assertIn(NEW_ID_B, message)
+        self.assertEqual(len(kernel.mutations), 1)
+
+    def test_all_ids_materialized_passes(self):
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()],
+                            insert_ids=[NEW_ID, NEW_ID_B])
+        output = run_block(kernel, "insert-after", payload="Первый.\n\nВторой.")
+        self.assertIn("вердикт по SQL", output)
+        self.assertIn(NEW_ID_B, output)
+
+    def test_empty_new_ids_is_refused(self):
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()], insert_ids=[])
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", payload="Один блок.")
+        self.assertIn("не вернул новые id", str(cm.exception))
+        self.assertEqual(len(kernel.mutations), 1)
+
+    def test_sy_fallback_rescues_lagging_index(self):
+        # SQL новых id не видит (лаг индекса), .sy-дерево содержит — успех
+        # с примечанием о фолбэке, а не ложный отказ.
+        sy_tree = {"Children": [{"ID": NEW_ID, "Type": "NodeParagraph"}]}
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()],
+                            insert_ids=[NEW_ID], materialize_ids=[], sy_tree=sy_tree)
+        output = run_block(kernel, "insert-after", payload="Один блок.")
+        self.assertIn("вердикт по .sy", output)
+
+    def test_merged_list_wrapper_is_not_a_phantom(self):
+        # Живая проба 07.11: single item после item'а ядро МЕРЖИТ в существующий
+        # list — NodeList-обёртка из markdown-парсера не материализуется, её
+        # отсутствие не потеря; вставленный item+p материализованы → успех.
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()],
+                            insert_ids=[NEW_ID, WRAP_ID],
+                            insert_types={NEW_ID: "NodeListItem", WRAP_ID: "NodeList"},
+                            materialize_ids=[NEW_ID], sy_tree={"Children": []})
+        output = run_block(kernel, "insert-after", payload="- один пункт")
+        self.assertIn("вердикт по SQL", output)
+        self.assertNotIn("потеря вставки", output)
+
+    def test_lost_item_behind_wrapper_is_still_a_phantom(self):
+        # Баговый кейс: обёртка транзиентна, но второй item+p потеряны ядром —
+        # отказ по фантомам остаётся.
+        kernel = FakeKernel(blocks=[_block()], docs=[_doc()],
+                            insert_ids=[NEW_ID, NEW_ID_B, WRAP_ID],
+                            insert_types={NEW_ID: "NodeListItem", NEW_ID_B: "NodeListItem",
+                                          WRAP_ID: "NodeList"},
+                            materialize_ids=[NEW_ID], sy_tree={"Children": []})
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "insert-after", payload="- первый\n- второй")
+        self.assertIn(NEW_ID_B, str(cm.exception))
 
 
 class MutationIsSingleAttempt(unittest.TestCase):
