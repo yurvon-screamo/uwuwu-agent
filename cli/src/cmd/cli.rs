@@ -275,6 +275,47 @@ pub(crate) enum CronSub {
     },
 }
 
+/// Реестр долгосрочных целей проекта: доска «Цели <proj>» (заводит владелец
+/// руками в UI — одноразовая настройка). Строки bound к телам-докам,
+/// статусы канонические: todo / in progress / done. Связей с задачами нет.
+#[derive(clap::Subcommand)]
+pub(crate) enum GoalSub {
+    /// Реестр целей доски проекта
+    List {
+        #[arg(long, help = "Фильтр по статусу (todo|in progress|done)")]
+        status: Option<String>,
+    },
+    /// Новая цель: строка + тело-док «## Суть» (контекст из stdin)
+    Add {
+        #[arg(long, help = "Заголовок цели")]
+        title: String,
+        #[arg(long, help = "Статус цели (деф. todo: todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Контекст цели из stdin (тело под «Суть»)")]
+        stdin: bool,
+    },
+    /// Правка цели: статус и заголовок (тело — в UI или task-механикой тел)
+    Edit {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+        #[arg(long, help = "Новый статус (todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Новый заголовок")]
+        title: Option<String>,
+    },
+    /// Снести цель: строка вниз + тело в трэш (undo-журнал)
+    Rm {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+    },
+}
+
 /// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без
 /// env-токена (токен берётся из конфигурации cli). One-shot, без ретраев —
 /// сырое состояние ядра видно на первом ответе. Диагностические вердикты
@@ -391,6 +432,15 @@ pub(crate) enum Commands {
     Task {
         #[command(subcommand)]
         command: TaskSub,
+        /// Project board (обязательно: uwuwu | origa | foilcap | …)
+        #[arg(long, global = true)]
+        project: Option<String>,
+    },
+    /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
+    /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
+    Goal {
+        #[command(subcommand)]
+        command: GoalSub,
         /// Project board (обязательно: uwuwu | origa | foilcap | …)
         #[arg(long, global = true)]
         project: Option<String>,

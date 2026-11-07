@@ -182,7 +182,7 @@ pub(crate) struct JournalRow {
 pub(crate) struct Journal {
     pub created: String,
     pub project: String,
-    /// clean | rm | cron-rm
+    /// clean | rm | cron-rm | goal-rm
     pub kind: String,
     pub av_id: String,
     pub board_doc: String,
