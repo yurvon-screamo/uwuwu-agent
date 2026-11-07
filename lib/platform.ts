@@ -35,6 +35,19 @@ const TOKEN = siyuanToken()
 
 export const mcpConfigured = (): boolean => TOKEN !== ""
 
+/** Ядро не ответило на транспорте (refused/DNS/таймаут/обрыв тела ответа) —
+ *  отличать от «ядро ответило ошибкой»: демоны решают по классу. Прод-кейс
+ *  05.11: лежащее ядро было невидимо в логе uwuwu-cron — пер-досочные
+ *  catch-скипы глотали голый TypeError, тик «успешно» проходил с пустым
+ *  списком досок. Имя класса задаётся явно: рендер лога «${e.name}:
+ *  ${e.message}» (cron.ts tick) иначе показывает безликое «Error:». */
+export class KernelUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "KernelUnavailableError"
+  }
+}
+
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
  *  останавливать тик демона — класс «клиентские висы» (прод-контур).
  *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
@@ -53,8 +66,9 @@ const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
- *  маскирующего причину (прод-кейс 04.11: «Unexpected identifier "session"» = 404 ядра). */
-function parseJsonContract(text: string, context: string): unknown {
+ *  маскирующего причину (прод-кейс 04.11: «Unexpected identifier "session"» = 404 ядра).
+ *  Экспорт: тот же контракт у транспорта opencode API в cron.ts. */
+export function parseJsonContract(text: string, context: string): unknown {
   try {
     return JSON.parse(text)
   } catch {
@@ -63,7 +77,7 @@ function parseJsonContract(text: string, context: string): unknown {
 }
 
 async function post<T = Record<string, unknown>>(path: string, body: Record<string, unknown>, attempts = 4): Promise<T> {
-  let last = "?"
+  let last: string | Error = "?"
   for (let i = 0; i < attempts; i++) {
     try {
       const r = await fetch(SIYUAN_URL + path, {
@@ -71,8 +85,15 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         headers: { Authorization: `Token ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+      }).catch((e: unknown) => {
+        throw new KernelUnavailableError(`siyuan POST ${path}: ядро недоступно (${String(e)})`)
       })
-      const text = await r.text()
+      const text = await r.text().catch((e: unknown) => {
+        // связь рвётся на середине тела ответа: тот же класс, что отказ
+        // коннекта — иначе TypeError схлопнется в строку last и catch-скипы
+        // демонов замаскируют деградацию ядра
+        throw new KernelUnavailableError(`siyuan POST ${path}: тело ответа оборвалось (${String(e)})`)
+      })
       const d = parseJsonContract(text, `siyuan POST ${path}: HTTP ${r.status}`) as { code?: number; msg?: string; data?: unknown }
       if (d.code === 0) return (d.data ?? {}) as T
       last = `code=${d.code} msg=${d.msg}`
@@ -81,11 +102,15 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
         continue
       }
     } catch (e) {
-      last = String(e)
+      // класс KernelUnavailableError переживёт цикл — по нему демоны
+      // отличают лежащее ядро; прочие — как раньше, строкой в last
+      last = e instanceof KernelUnavailableError ? e : String(e)
     }
     await new Promise((res) => setTimeout(res, 700 * (i + 1)))
   }
-  throw new Error(`siyuan POST ${path}: ${last}`)
+  // fetch-класс уже свёрстан как Error с контекстом — ре-throw без обёртки;
+  // строковый last (code=… msg=… конверт ядра) — как раньше
+  throw last instanceof Error ? last : new Error(`siyuan POST ${path}: ${last}`)
 }
 
 async function sql<T = Record<string, unknown>>(stmt: string): Promise<T[]> {
@@ -119,15 +144,24 @@ async function mcpRpcOnce(method: string, params: Record<string, unknown>): Prom
   }
   const hasSession = mcpSession !== ""
   if (hasSession) headers["Mcp-Session-Id"] = mcpSession
-  const r = await fetch(`${SIYUAN_URL}/mcp`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
-  })
+  let r: Response
+  try {
+    r = await fetch(`${SIYUAN_URL}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(KERNEL_TIMEOUT_MS),
+    })
+  } catch (e) {
+    throw new KernelUnavailableError(`mcp ${method}: ядро недоступно (${String(e)})`)
+  }
   const sid = r.headers.get("mcp-session-id")
   if (sid) mcpSession = sid
-  const text = await r.text()
+  const text = await r.text().catch((e: unknown) => {
+    // mid-body abort: тот же класс, что отказ коннекта — catch-скипы демонов
+    // (instanceof KernelUnavailableError) не должны глотать голый TypeError
+    throw new KernelUnavailableError(`mcp ${method}: тело ответа оборвалось (${String(e)})`)
+  })
   if (r.status === 404 && hasSession) throw new StaleMcpSessionError(mcpHttpError(method, r.status, text).message)
   if (text.trim() === "") return {}
   const dataLines = text.split("\n").filter((l) => l.startsWith("data: "))
@@ -272,16 +306,18 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const row of view.rows) {
     const cells: Record<string, { value?: string }> = {}
     let title = ""
-    // Primary Key-ячанка строки: линк на док-тело (refSubtype "d") —
-    // doc-id тела; раньше связка терялась (null) и весь wakeup-контур
-    // фабрики (комменты/правки тела) работал по пустому bodyDoc
+    // Привязка строки к док-телу: value.block.id Primary Key-ячейки — docId
+    // тела (у detached-строк поля нет → null). Готча: value.blockID — это
+    // id самой строки, не привязка. Извлечение безусловное — контракт CLI
+    // parse_render_row (siyuan_task.rs): guard на refSubtype терял бы
+    // легаси-строки, не прогнанные ядром через NormalizeBlockRefSubtype
     let linkedDocId: string | null = null
     for (const cell of row.cells ?? []) {
       const v = cell.value ?? {}
       const col = nameOf.get(v.keyID ?? "") ?? ""
       if (v.type === "block") {
         title = v.block?.content ?? ""
-        if (v.block?.refSubtype === "d" && v.block.id) linkedDocId = v.block.id
+        linkedDocId = v.block?.id ?? null
         continue
       }
       let value = ""
@@ -311,6 +347,98 @@ async function updateDatabaseRow(args: Record<string, unknown>): Promise<Record<
   return { updated: true }
 }
 
+export interface ParsedComment {
+  id: string
+  text: string
+  userId: string
+  replies: { id: string; text: string; userId: string }[]
+}
+
+const TOP_COMMENT = /^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const TOP_COMMENT_DATED = /^- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+const REPLY_COMMENT = /^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
+const REPLY_COMMENT_DATED = /^ {2}- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
+
+const padIdx = (i: number): string => String(i).padStart(4, "0")
+const commentHead = (m: RegExpMatchArray): string => `${m[1]} (${m[2]}): ${m[3]}`
+
+/** Разбор коммент-записей markdown-экспорта тела. Два источника:
+ *  (а) секция «## Комменты» — историческая конвенция;
+ *  (б) трейлинг-хвост после последней ## — CLI аппендит комменты appendBlock'ом
+ *  в конец дока, в телах с секциями после «## Комменты» (слияния дефектов —
+ *  регулярный паттерн владельца) свежие записи живут хвостом; без (б) comment-
+ *  канал слеп к ним — юзерский ответ не будит ни одним каналом (High-1 ревью
+ *  раунда 3). Хвост строгим матчем с датой — легитимные списки не комменты.
+ *  Продолжения блока (абзацы тела пункта — вердикты многострочные) конкатенируются
+ *  в text — будильник цитирует коммент целиком. id синтетические с паддингом —
+ *  лексикографический порядок стабилен (свежесть newUserComments держится на
+ *  позиционном findIndex). Replies несут id/userId: юзерский тред-ответ
+ *  детектится, агентский срезается own-фильтром. */
+export function parseCommentsMarkdown(md: string, docId: string): ParsedComment[] {
+  const lines = md.split("\n")
+  const comments: ParsedComment[] = []
+  let inSection = false
+  let topIdx = 0
+  let replyIdx = 0
+  let lastHeadIdx = -1
+  let lastHeadIsComments = false
+  const appendContinuation = (line: string): void => {
+    if (comments.length === 0 || line.trim() === "") return
+    const last = comments[comments.length - 1]
+    last.text = `${last.text}\n${line}`
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.startsWith("## ")) {
+      lastHeadIdx = i
+      lastHeadIsComments = /^## Комменты\s*$/.test(line)
+      inSection = lastHeadIsComments
+      if (inSection) replyIdx = 0
+      continue
+    }
+    if (!inSection) continue
+    const top = line.match(TOP_COMMENT)
+    if (top) {
+      replyIdx = 0
+      comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+      continue
+    }
+    const rep = line.match(REPLY_COMMENT)
+    if (rep && comments.length > 0) {
+      comments[comments.length - 1].replies.push({
+        id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(replyIdx++)}`,
+        text: commentHead(rep),
+        userId: rep[1],
+      })
+      continue
+    }
+    appendContinuation(line)
+  }
+  if (!lastHeadIsComments) {
+    let tailReplyIdx = 0
+    for (let i = lastHeadIdx + 1; i < lines.length; i++) {
+      const line = lines[i]
+      const top = line.match(TOP_COMMENT_DATED)
+      if (top) {
+        tailReplyIdx = 0
+        comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+        continue
+      }
+      const rep = line.match(REPLY_COMMENT_DATED)
+      if (rep && comments.length > 0) {
+        comments[comments.length - 1].replies.push({
+          id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(tailReplyIdx++)}`,
+          text: commentHead(rep),
+          userId: rep[1],
+        })
+        continue
+      }
+      if (i > lastHeadIdx) appendContinuation(line)
+    }
+  }
+  return comments
+}
+
 function commentToSnapshot(text: string): Record<string, unknown> {
   // шейп, который walk-ает snapshotText() фабрики
   return {
@@ -333,10 +461,12 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     }
     case "get_doc": {
       const docId = String(args.docId ?? "")
-      const rows = await sql<{ id: string; content: string; updated: string }>(
-        `select id, content, updated from blocks where type='d' and id='${docId}' limit 1`)
+      const rows = await sql<{ id: string; content: string; updated: string; box?: string; hpath?: string }>(
+        `select id, content, updated, box, hpath from blocks where type='d' and id='${docId}' limit 1`)
       const d = rows[0]
-      return (d ? { id: d.id, title: d.content, updatedAt: d.updated } : { id: docId, title: "", updatedAt: "" }) as T
+      return (d
+        ? { id: d.id, title: d.content, updatedAt: d.updated, box: d.box ?? "", hpath: d.hpath ?? "" }
+        : { id: docId, title: "", updatedAt: "", box: "", hpath: "" }) as T
     }
     case "read_doc": {
       const docId = String(args.docId ?? "")
@@ -353,13 +483,43 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "doc_exists": {
+      // Живость дока через MCP block get (не SQL): индекс blocks отстаёт от
+      // свежих доков, filetree/block — FS-истина. Ядро отвечает isError
+      // «was not found» за подтверждённо отсутствующий блок — это вердикт
+      // «дока нет»; прочие ошибки кидаются наверх как инфра-сбой
+      // (паритет CLI doc_block_exists). Известная хрупкость: матч по тексту
+      // ошибки ядра — смена формулировки при апгрейде ядра даст вечный
+      // infra-ретрай (крон перестаёт файрить, но и не сжигается: следить за
+      // логом «тело не разрешено» после апгрейдов SiYuan).
+      const docId = String(args.docId ?? "")
+      const r = await mcpRpc("tools/call", { name: "block", arguments: { action: "get", id: docId } })
+      const text = (r.content as { text?: string }[] | undefined)?.[0]?.text ?? ""
+      if (r.isError === true) {
+        if (text.includes("was not found")) return { exists: false } as T
+        throw new Error(`tool block: ${JSON.stringify(r.content)}`)
+      }
+      return { exists: text.includes("Type: NodeDocument") } as T
+    }
+    case "doc_ids_by_hpath": {
+      // FS-истина файлового дерева: без лага SQL-индекса (паритет CLI
+      // doc_ids_by_hpath); заголовки с '/' санитайзит вызывающий (pathSafe)
+      const data = await post<unknown>("/api/filetree/getIDsByHPath", {
+        notebook: String(args.notebook ?? ""), path: String(args.path ?? ""),
+      })
+      const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
+      return { ids } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {
         const r = await post<{ content?: string }>("/api/export/exportMdContent", { id: docId })
         const t = await sql<{ content: string }>(`select content from blocks where type='d' and id='${docId}' limit 1`)
         return { exists: true, markdown: r.content ?? "", title: t[0]?.content ?? docId } as T
-      } catch {
+      } catch (e) {
+        // ADR-033: лежащее ядро — не «дока нет»: транспортный класс проходит
+        // транзитом; {exists:false} — только сбой/отсутствие при живом ядре
+        if (e instanceof KernelUnavailableError) throw e
         return { exists: false, markdown: "", title: "" } as T
       }
     }
@@ -375,32 +535,21 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "list_comments": {
       const docId = String(args.docId ?? "")
       const md = await post<{ content?: string }>("/api/export/exportMdContent", { id: docId })
-      const lines = (md.content ?? "").split("\n")
       const edges: Record<string, unknown>[] = []
-      let inSection = false
-      let i = 0
-      for (const line of lines) {
-        if (line.startsWith("## ")) { inSection = line.startsWith("## Комменты"); continue }
-        if (!inSection) continue
-        const top = line.match(/^- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
-        if (top) {
-          edges.push({
-            node: {
-              id: `c${docId}-${i++}`,
-              content: commentToSnapshot(`${top[1]} (${top[2]}): ${top[3]}`),
-              user: { name: top[1], id: top[1] },
-              replies: [],
-              resolved: false,
-            },
-          })
-          continue
-        }
-        const rep = line.match(/^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/)
-        if (rep && edges.length > 0) {
-          const node = edges[edges.length - 1].node as { replies?: Record<string, unknown>[] }
-          node.replies = node.replies ?? []
-          node.replies.push({ content: commentToSnapshot(`${rep[1]} (${rep[2]}): ${rep[3]}`), user: { name: rep[1] } })
-        }
+      for (const c of parseCommentsMarkdown(md.content ?? "", docId)) {
+        edges.push({
+          node: {
+            id: c.id,
+            content: commentToSnapshot(c.text),
+            user: { name: c.userId, id: c.userId },
+            replies: c.replies.map((r) => ({
+              id: r.id,
+              content: commentToSnapshot(r.text),
+              user: { name: r.userId, id: r.userId },
+            })),
+            resolved: false,
+          },
+        })
       }
       return { edges, pageInfo: { hasNextPage: false, endCursor: "" } } as T
     }

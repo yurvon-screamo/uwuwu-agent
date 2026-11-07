@@ -29,6 +29,13 @@ pub(crate) enum TaskSub {
             help = "Аттач в тело (repeatable)"
         )]
         attach: Vec<std::path::PathBuf>,
+        // Осмотр скелета без записи: живой create ради просмотра костяка
+        // кормит триаж-демон мусорными черновиками.
+        #[arg(
+            long = "dry-run",
+            help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)"
+        )]
+        dry_run: bool,
     },
     /// Очередь задач доски
     List {
@@ -39,7 +46,10 @@ pub(crate) enum TaskSub {
     },
     /// Карточка задачи: колонки + свежие комменты
     Get {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / уникальный префикс")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / уникальный префикс"
+        )]
         id: String,
         /// Быстрая проверка статуса: без экспорта тела и картинок
         #[arg(long = "no-body")]
@@ -57,6 +67,21 @@ pub(crate) enum TaskSub {
         pr: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+    },
+    /// Заявить сессию на задачу: sessionID в ячейку «Сессия dev» — структурное
+    /// свидетельство «работу ведёт эта сессия». Фабрика живую заявку уважает:
+    /// не спавнит дубль и не считает строку сиротой. SessionID берётся из
+    /// --session либо из env OPENCODE_SESSION_ID; нет ни того, ни другого —
+    /// отказ. Колонка «Сессия dev» на доске обязательна (громкий отказ иначе).
+    Claim {
+        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
+        id: String,
+        #[arg(
+            long,
+            value_name = "SESSION_ID",
+            help = "Явный sessionID (иначе OPENCODE_SESSION_ID из env)"
+        )]
+        session: Option<String>,
     },
     /// Коммент в док задачи (диалог юзер ↔ агент). Текст — единственный
     /// позиционный аргумент (или --stdin); читать комменты: task get / task thread.
@@ -88,26 +113,73 @@ pub(crate) enum TaskSub {
         note: Option<String>,
     },
     /// Дописать markdown в тело задачи/крона (stdin или --md файл).
-    /// Фенсы ```html_embed [имя] конвертируются в живые embed_html-диаграммы:
-    /// именованный фенс заменяет прежнюю диаграмму с этим именем,
-    /// пустой (```html_embed имя без тела) — удаляет её.
+    /// Фенсы ```html_embed [имя] конвертируются в живые HTML-блоки:
+    /// именованный фенс заменяет прежнюю диаграмму с этим именем
+    /// (адресация по маркер-абзацу ⁂ diagram:<имя>),
+    /// пустой (```html_embed имя без тела) — удаляет её,
+    /// анонимный — вставляет html инлайн. Отказы до мутаций: дубль
+    /// имени фенса в вводе, пустая строка внутри html-тела.
+    /// --attach (repeatable) грузит файлы в assets/ и дописывает референсы
+    /// после контент-операции; вызов с одними аттачами (без --stdin/--md) валиден.
     Body {
-        #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс / подстрока заголовка")]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока заголовка"
+        )]
         id: String,
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
         #[arg(long, help = "Файл с markdown (иначе stdin)")]
         md: Option<String>,
         /// Заменить тело ЦЕЛИКОМ (агент читает task get, правит, шлёт новое).
-        /// Rich-контент (embed-диаграммы) не переживает — пересоздай фенсами.
+        /// Живые HTML-блоки тела переживают перезапись (экспорт ядра отдаёт
+        /// их сырым HTML); новые диаграммы вставляй фенсами ```html_embed —
+        /// именованные инлайнятся парами «⁂ diagram:<имя> + html».
+        /// Требует --base (снапшот свежести) или --force: без снапшота
+        /// параллельная правка тела теряется тихо. Секция «## Комменты»
+        /// системная: если новый контент её не несёт, существующая переносится
+        /// дословно в конец — осознанная замена/снос выражаются самим контентом.
         #[arg(long)]
         replace: bool,
+        /// Снапшот свежести для --replace: файл с выводом `task get` целиком,
+        /// сырым экспортом тела или чистым телом, снятый ДО правки. Replace
+        /// сверяет снапшот со свежим телом (нормализованно) и отказывает при
+        /// расхождении — параллельная правка не затирается. Комменты — после
+        /// replace: свой коммент между снапшотом и replace уронит сверку.
+        #[arg(
+            long,
+            value_name = "SNAPSHOT",
+            requires = "replace",
+            conflicts_with_all = ["replace_section", "force"]
+        )]
+        base: Option<String>,
+        /// Осознанный overwrite для --replace: пишет без сверки свежести
+        /// (--force старше --base). Секция «## Комменты» переносится как
+        /// и без --force — сила флага только в отказе от сверки.
+        #[arg(
+            long,
+            requires = "replace",
+            conflicts_with_all = ["replace_section", "base"]
+        )]
+        force: bool,
         /// Заменить содержимое секции по заголовку («Решение» или «## Решение»):
         /// блоки секции удаляются, новый markdown встаёт на их месте,
         /// заголовок и аттачи/эмбеды вне секции не трогаются. Markdown — БЕЗ
-        /// строки заголовка; пустой ввод очищает секцию.
+        /// строки заголовка; пустой ввод очищает секцию. Матч только ##:
+        /// ATX-префикс запроса срезается («## Решение» = «Решение»), тёзка
+        /// на уровне 1/≥3 (учёт двойных пробелов и ^block-id) — отказ
+        /// вместо тихого append-дубля в конец. html_embed-фенс в секции с
+        /// именем, уже живущим вне секции, даст два одинаковых маркера
+        /// ⁂ diagram:<имя> — последующий append адресует первый по порядку
+        /// (секция не ищет по всему доку).
         #[arg(long, value_name = "HEADING", conflicts_with = "replace")]
         replace_section: Option<String>,
+        #[arg(
+            long = "attach",
+            value_name = "FILE",
+            help = "Аттач в конец тела (repeatable)"
+        )]
+        attach: Vec<std::path::PathBuf>,
     },
     /// Удалить задачу: строка вниз + тело в трэш (восстановимо restore_doc).
     /// Только Draft-черновики (их чистит триаж); живые задачи — отказ.
@@ -203,6 +275,47 @@ pub(crate) enum CronSub {
     },
 }
 
+/// Реестр долгосрочных целей проекта: доска «Цели <proj>» (заводит владелец
+/// руками в UI — одноразовая настройка). Строки bound к телам-докам,
+/// статусы канонические: todo / in progress / done. Связей с задачами нет.
+#[derive(clap::Subcommand)]
+pub(crate) enum GoalSub {
+    /// Реестр целей доски проекта
+    List {
+        #[arg(long, help = "Фильтр по статусу (todo|in progress|done)")]
+        status: Option<String>,
+    },
+    /// Новая цель: строка + тело-док «## Суть» (контекст из stdin)
+    Add {
+        #[arg(long, help = "Заголовок цели")]
+        title: String,
+        #[arg(long, help = "Статус цели (деф. todo: todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Контекст цели из stdin (тело под «Суть»)")]
+        stdin: bool,
+    },
+    /// Правка цели: статус и заголовок (тело — в UI или task-механикой тел)
+    Edit {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+        #[arg(long, help = "Новый статус (todo | in progress | done)")]
+        status: Option<String>,
+        #[arg(long, help = "Новый заголовок")]
+        title: Option<String>,
+    },
+    /// Снести цель: строка вниз + тело в трэш (undo-журнал)
+    Rm {
+        #[arg(
+            allow_hyphen_values = true,
+            help = "row-id / doc-id / префикс / подстрока"
+        )]
+        id: String,
+    },
+}
+
 /// Живые kernel-пробы: диагностика уровня ядра из агентской сессии без
 /// env-токена (токен берётся из конфигурации cli). One-shot, без ретраев —
 /// сырое состояние ядра видно на первом ответе. Диагностические вердикты
@@ -214,7 +327,9 @@ pub(crate) enum KernelSub {
     Ping,
     /// SQL-проба: полный конверт ядра JSON (data + limit/truncated as-is)
     Sql {
-        #[arg(help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\"")]
+        #[arg(
+            help = "SQL одним аргументом (кавычь в шелле), например \"select count(*) as n from blocks\""
+        )]
         stmt: String,
     },
     /// getFile-проба: Bytes/Missing — диагностические ответы (exit 0),
@@ -259,6 +374,13 @@ pub(crate) enum Commands {
         #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
     },
+    /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
+    /// прочитать (агенты в начале работы), append — дописать долговременный
+    /// факт (владелец/дример), replace — полная перезапись на месте.
+    Person {
+        #[command(subcommand)]
+        command: PersonSub,
+    },
     /// Download a workspace asset (image/attachment) by key from assets/.
     Blob {
         #[arg(help = "Blob key, e.g. pixel.png")]
@@ -278,16 +400,27 @@ pub(crate) enum Commands {
         )]
         edgeless: bool,
     },
-    /// Полнотекстовый поиск по блокам SiYuan + опционально SOFA.
+    /// Универсальный поиск: полнотекст (SQL) + семантика (локальный
+    /// эмбеддинг-индекс) — top-n по каждому методу; опционально SOFA.
     Search {
         #[arg(help = "Search query")]
         query: String,
-        #[arg(long, default_value = "10", help = "hits limit")]
+        #[arg(long, default_value = "10", help = "hits limit per method")]
         limit: usize,
-        #[arg(long, default_value = "5", help = "SOFA public limit (0 = off)")]
+        #[arg(long, default_value = "0", help = "SOFA public limit (0 = off)")]
         sofa: usize,
-        #[arg(long, default_value = "0.3", help = "min score threshold (0..1)")]
+        #[arg(
+            long,
+            default_value = "0.35",
+            help = "semantic cosine threshold (0..1)"
+        )]
         threshold: f32,
+    },
+    /// Локальный эмбеддинг-индекс (семантическая половина поиска):
+    /// обслуживание — полный пересбор и статус.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticSub,
     },
     /// Кроны: строки доски «Кроны <Proj>» (SiYuan database).
     Cron {
@@ -299,6 +432,15 @@ pub(crate) enum Commands {
     Task {
         #[command(subcommand)]
         command: TaskSub,
+        /// Project board (обязательно: uwuwu | origa | foilcap | …)
+        #[arg(long, global = true)]
+        project: Option<String>,
+    },
+    /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
+    /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
+    Goal {
+        #[command(subcommand)]
+        command: GoalSub,
         /// Project board (обязательно: uwuwu | origa | foilcap | …)
         #[arg(long, global = true)]
         project: Option<String>,
@@ -328,4 +470,48 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
     },
+}
+
+/// Персона владельца: приватный SiYuan-док (Experience:/personal/PERSON).
+/// Один инстанс SiYuan на все машины — синков и пуш-политики нет.
+#[derive(Subcommand)]
+pub(crate) enum PersonSub {
+    /// Актуальная персона (markdown). Дока нет — честная ошибка с подсказкой
+    /// создания (не молчаливый пустой вывод).
+    Show,
+    /// Дописать markdown в конец (долговременный факт/секция). Дока нет —
+    /// создать со скелетом (шапка приватности + секции) и сразу с этим
+    /// текстом. Дедуп перед append — на пишущем: прочитай `person show`.
+    Append {
+        #[arg(long, conflicts_with = "text", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(trailing_var_arg = true, help = "Markdown-текст (факт или секция)")]
+        text: Vec<String>,
+    },
+    /// Перезаписать контент целиком на месте (docId стабилен); дока нет —
+    /// создать без скелета (полная ответственность пишущего за контент).
+    Replace {
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(long, help = "Файл с markdown (обязателен без --stdin)")]
+        md: Option<String>,
+    },
+}
+
+/// Сабкоманды uwuwu-cli semantic.
+#[derive(Subcommand)]
+pub(crate) enum SemanticSub {
+    /// Полный пересбор индекса (первичная инициализация ~55–70 мин
+    /// или смена модели/размерности). Прогресс — в stderr.
+    Rebuild {
+        /// Продолжить прерванный билд с watermark (не стирать готовые
+        /// чанки; сбой часового прогона не стоит часа GPU заново).
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Состояние индекса: чанки, модель, watermark, очередь дельты.
+    Status,
+    /// Ручная дотяжка дельты и reconcile вне бюджета поиска (очередь в
+    /// тысячи строк; хвост над бюджетом догоняется повтором команды).
+    Sync,
 }

@@ -51,18 +51,27 @@ cd uwuwu-agent
 
 Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa),
 тела задач = доки с тегом Dev/Spike/Bug, диалог = нативные комменты.
-Демон — **будильник + маршрутизатор ревью** (systemd, тик 3 мин): Design → OpenCode-сессия
-девелопера + короткий spawn; «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
-(праймари-агент `code-quality-reviewer`, 1 сессия на задачу, cwd = ворктри задачи);
-возврат статуса из ревью → wakeup девелопера; комменты юзера в ревью-статусах → ревьюверу;
-новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин → рестарт по комменту);
-Done (мерж-крон агента / Spike / руки) → чистка state + термин ревью-сессии.
+Демон — **будильник + маршрутизатор ревью + lifecycle окружений** (systemd, тик 3 мин):
+Design → окружение задачи `~/agents-env/<row-id>/{repo, scratch, logs}` (repo = git worktree
+от origin/master, ветка `work/task-<row-id>`; env-переменная `UWUWU_FACTORY_ENV_ROOT`) →
+OpenCode-сессия девелопера cwd=repo + короткий spawn; «Ревью плана»/«Ревью результата» →
+спавн/будильник ревьювера (праймари-агент `code-quality-reviewer`, 1 сессия на задачу,
+cwd = repo задачи); возврат статуса из ревью → wakeup девелопера; перевод владельцем
+трека в In Progress — будильник/рестарт девелопера (конфликтный PR даёт конфликт-kickoff);
+комменты юзера в ревью-статусах → ревьюверу; новые комменты/правки тела юзера → wakeup
+сессии (мёртвая → карантин → рестарт по комменту); Done (мерж-крон агента / Spike / руки)
+→ гашение обеих сессий + снос окружения (чистое → rm, грязное → attic без
+target/node_modules + коммент, ветка -d после prune) + чистка state. Проекты вне
+env-механики (`env: false` в конфиге — сейчас true-washing: cfg.local не git-репо) живут
+по-старому — агент сам делает ворктри.
 Решение маршрутизации — чистая функция `routeTask` (factory-lib, покрыта тестами).
 Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
-`factory/` — Bun/TS: конфиг board/repo/local, session-recovery MCP, state+reconcile.
+`factory/` — Bun/TS: конфиг board/repo/local/env, env-lifecycle (factory/env.ts,
+идемпотентный ensureEnv + cleanupEnv + старт-свип сирот), session-recovery MCP, state+reconcile.
 Имена ревью-статусов — контракт с колонками досок: константы `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`.
-Шаблоны тел задач (стандартный, spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
+Ячейки Path/«Сессия dev»/«Сессия ревью» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает).
+Канон секций, шаблоны тел задач (dev, spike, bug) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
 ### Кроны (uwuwu-cron)
 
@@ -116,8 +125,11 @@ uwuwu-проекта с пустым статусом (черновики вла
 ### CLI
 
 `uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи и кроны
-(id/заголовок; фоллбек — крон-доски проектов); `search` (сервер Manticore + семантика),
-`read/blob/shot` (мультимодальное чтение).
+(id/заголовок; фоллбек — крон-доски проектов); аттачи в тело — `--attach` на `create`/`body`
+(kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
+`edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search` (сервер Manticore + семантика),
+`read/blob/shot` (мультимодальное чтение), `person show/append/replace` — персона
+владельца (агенты читают в начале работы, дример пишет факты после сессий).
 
 Платформа — SiYuan (с 04.11.2026; до этого — закрытая платформа-предшественник). CLI ходит в
 kernel SiYuan (REST + встроенный MCP), единый воркспейс на всех машинах.
@@ -145,7 +157,7 @@ Folders handle organization; tags are only for lookup.
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot` — не портирован на SiYuan v1 (headless chromium + Access Auth Code при необходимости)
 - `projects` — live workspace project registry
-- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown (live diagrams: manual HTML block via SiYuan UI — ```html_embed fence conversion unimplemented on SiYuan v1, see `skills/visual-diagrams`)
+- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown (live diagrams: ```html_embed fences convert to SiYuan html-blocks, marker-addressed `⁂ diagram:<name>`, see `skills/visual-diagrams`)
 
 **Infrastructure**: ноут (docker: siyuan-demo :6806, воркспейс ~/siyuan-demo-ws), наружу — Railway-релей + rathole (временно дефолт-домен Railway из-за бага сертов)
 

@@ -67,6 +67,14 @@ pub enum FileFetch {
     Failed(String),
 }
 
+/// Загруженный ассет: оригинальное имя файла и финальный путь в assets/,
+/// сгенерированный ядром (`<stem>-<timestamp>-<random>.<ext>`).
+#[derive(Debug)]
+pub struct UploadedAsset {
+    pub original_name: String,
+    pub asset_path: String,
+}
+
 pub struct SiYuan {
     pub base: String,
     pub token: String,
@@ -96,8 +104,8 @@ impl SiYuan {
     /// с коротким (деф. 10s), чтобы тихий вис ядра различался быстро;
     /// штатные команды держат 120s.
     pub fn from_env_with_timeout(timeout_secs: u64) -> Result<Self> {
-        let base = std::env::var("UWUWU_SIYUAN_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:6806".into());
+        let base =
+            std::env::var("UWUWU_SIYUAN_URL").unwrap_or_else(|_| "http://127.0.0.1:6806".into());
         let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
@@ -162,7 +170,12 @@ impl SiYuan {
     /// Прочие ошибки (транспорт, code≠0) ретраются как прежде, 4 попытки,
     /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
     /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
-    async fn post_with_pacing(&self, path: &str, body: Value, pacing: RetryPacing) -> Result<Value> {
+    async fn post_with_pacing(
+        &self,
+        path: &str,
+        body: Value,
+        pacing: RetryPacing,
+    ) -> Result<Value> {
         if self.wave_cooldown_active() {
             bail!("POST {path}: пропущено — {WAVE_HINT} (окно fail-fast активно)");
         }
@@ -262,8 +275,7 @@ impl SiYuan {
 
     pub async fn notebooks(&self) -> Result<Vec<Value>> {
         let v = self.post("/api/notebook/lsNotebooks", json!({})).await?;
-        Ok(v
-            .pointer("/notebooks")
+        Ok(v.pointer("/notebooks")
             .and_then(|n| n.as_array())
             .cloned()
             .unwrap_or_default())
@@ -280,8 +292,7 @@ impl SiYuan {
         let v = self
             .post("/api/notebook/createNotebook", json!({ "name": name }))
             .await?;
-        Ok(v
-            .pointer("/notebook/id")
+        Ok(v.pointer("/notebook/id")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .into())
@@ -321,7 +332,12 @@ impl SiYuan {
             .collect())
     }
 
-    pub async fn create_doc_md(&self, notebook: &str, hpath: &str, markdown: &str) -> Result<String> {
+    pub async fn create_doc_md(
+        &self,
+        notebook: &str,
+        hpath: &str,
+        markdown: &str,
+    ) -> Result<String> {
         let v = self
             .post(
                 "/api/filetree/createDocWithMd",
@@ -383,7 +399,9 @@ impl SiYuan {
     /// Пустой док ядра несёт ZWJ-заглушку; после записи контента в «пустой» док
     /// заглушка остаётся первым блоком — снять её, пока контент уже на месте.
     async fn drop_leading_blank_block(&self, doc_id: &str) {
-        let Ok(text) = self.block_children_text(doc_id).await else { return };
+        let Ok(text) = self.block_children_text(doc_id).await else {
+            return;
+        };
         let ids = parse_block_ids(&text);
         if ids.len() >= 2 {
             let first_line = text.lines().next().unwrap_or("");
@@ -399,8 +417,71 @@ impl SiYuan {
     }
 
     pub async fn delete_block(&self, block_id: &str) -> Result<()> {
-        self.post("/api/block/deleteBlock", json!({ "id": block_id })).await?;
+        self.post("/api/block/deleteBlock", json!({ "id": block_id }))
+            .await?;
         Ok(())
+    }
+
+    /// Заменить содержимое блока (тип сохраняется: html-блок остаётся html).
+    pub async fn update_block_md(&self, block_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/updateBlock",
+            json!({ "dataType": "markdown", "data": markdown, "id": block_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Вставить markdown-блоки сразу после блока previous_id.
+    pub async fn insert_block_md_after(&self, previous_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/insertBlock",
+            json!({
+                "dataType": "markdown",
+                "data": markdown,
+                "previousID": previous_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Расположение .sy-файла дока в воркспейсе: (box, path от data/) —
+    /// FS-истина порядка детей (индекс ядра порядок не отдаёт).
+    pub async fn doc_file_location(&self, doc_id: &str) -> Result<(String, String)> {
+        let v = self
+            .post("/api/block/getBlockInfo", json!({ "id": doc_id }))
+            .await?;
+        let box_id = v
+            .pointer("/box")
+            .and_then(|b| b.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет box в ответе {v}"))?
+            .to_string();
+        let path = v
+            .pointer("/path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет path в ответе {v}"))?
+            .to_string();
+        Ok((box_id, path))
+    }
+
+    /// Упорядоченные дети дока верхнего уровня из .sy-файла ( Children массив
+    /// в порядке документа). Нужен для адресации «блок после маркера»:
+    /// SQL-индекс порядок детей не хранит, kramdown-пропы html-блоков
+    /// недокументированы — .sy детерминирован (NodeHTMLBlock).
+    pub(crate) async fn doc_children(&self, doc_id: &str) -> Result<Vec<DocChild>> {
+        let (box_id, path) = self.doc_file_location(doc_id).await?;
+        let bytes = match self
+            .fetch_workspace_file(&format!("data/{box_id}{path}"))
+            .await
+        {
+            FileFetch::Bytes(bytes) => bytes,
+            FileFetch::Missing => bail!("{}: .sy дока нет в data/ (box={box_id})", doc_id),
+            FileFetch::Failed(err) => bail!("getFile {doc_id}: {err}"),
+        };
+        let tree: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("{}: .sy не JSON", doc_id))?;
+        Ok(doc_children_from_sy(&tree))
     }
 
     /// Экспорт дока в markdown по hPath. `notebook_id` — **ИД** ноутбука
@@ -471,8 +552,9 @@ impl SiYuan {
                 Err(e) => FileFetch::Failed(e.to_string()),
             },
             status => {
-                let envelope: Value = serde_json::from_slice(&resp.bytes().await.unwrap_or_default())
-                    .unwrap_or(Value::Null);
+                let envelope: Value =
+                    serde_json::from_slice(&resp.bytes().await.unwrap_or_default())
+                        .unwrap_or(Value::Null);
                 if envelope.get("code").and_then(|c| c.as_i64()) == Some(404) {
                     FileFetch::Missing
                 } else {
@@ -507,6 +589,65 @@ impl SiYuan {
             return Ok(());
         }
         bail!("putFile {path}: HTTP {status}, {}", body)
+    }
+
+    /// Upload файла в assets/ воркспейса, контракт ядра 3.8.9: POST multipart
+    /// `/api/asset/upload` (`assetsDir` + `file[]`). Ровно один файл за вызов —
+    /// succMap ключуется оригинальным именем, два файла с одним basename в
+    /// одном вызове конфликтуют ключами. Уникальность финального имени даёт
+    /// ядро, своей naming-логики нет. One-shot (как putFile): сбой громкий.
+    pub async fn upload_asset(&self, file: &std::path::Path) -> Result<UploadedAsset> {
+        let bytes = std::fs::read(file)
+            .with_context(|| format!("чтение файла {}: недоступен", file.display()))?;
+        let original_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .with_context(|| format!("имя файла {} не UTF-8", file.display()))?;
+        let form = reqwest::multipart::Form::new()
+            .text("assetsDir", "assets".to_string())
+            .part(
+                "file[]",
+                reqwest::multipart::Part::bytes(bytes).file_name(original_name.clone()),
+            );
+        let resp = self
+            .client
+            .post(format!("{}/api/asset/upload", self.base))
+            .header("Authorization", format!("Token {}", self.token))
+            .multipart(form)
+            .send()
+            .await
+            .context("asset upload: транспорт недоступен")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if !status.is_success() || body.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            bail!("asset upload {original_name}: HTTP {status}, {body}");
+        }
+        let asset_path = body
+            .pointer("/data/succFiles/0/path")
+            .and_then(|p| p.as_str())
+            .map(String::from)
+            .with_context(|| {
+                format!("asset upload {original_name}: ядро не вернуло succFiles: {body}")
+            })?;
+        Ok(UploadedAsset {
+            original_name,
+            asset_path,
+        })
+    }
+
+    /// Переименовать док (kernel renameDoc): меняет тайтл дока и hpath-лист,
+    /// storage-путь (id-цепочка) и blockID неизменны — привязка строк канбанов
+    /// живёт. `path` — storage-путь ОТНОСИТЕЛЬНО КОРНЯ НОУТБУКА
+    /// (`/предки…/<docId>.sy`); kernel сам префиксует `data/<notebook>/`.
+    /// Ретраи — штатный post() (metadata-волна и транспорт).
+    pub async fn rename_doc(&self, notebook: &str, path: &str, title: &str) -> Result<()> {
+        self.post(
+            "/api/filetree/renameDoc",
+            json!({ "notebook": notebook, "path": path, "title": title }),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Список файлов директории воркспейса (POST JSON, контракт 3.8.9),
@@ -646,26 +787,51 @@ impl SiYuan {
                 }),
             )
             .await?;
-        let _ = self
-            .mcp_call("notifications/initialized", json!({}))
-            .await;
+        let _ = self.mcp_call("notifications/initialized", json!({})).await;
         Ok(r)
     }
 
     /// Ответ tools/call как исходный текст content[0] (markdown-инструменты: block).
     pub async fn mcp_tool_text(&self, name: &str, args: Value) -> Result<String> {
         self.ensure_mcp_session().await?;
-        let r = self.mcp_call("tools/call", json!({ "name": name, "arguments": args })).await?;
+        let r = self
+            .mcp_call("tools/call", json!({ "name": name, "arguments": args }))
+            .await?;
         if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
             bail!(
                 "tool {name}: {}",
-                r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("?")
+                r.pointer("/content/0/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
             );
         }
         Ok(r.pointer("/content/0/text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string())
+    }
+
+    /// Логический фейл шлюза/ядра внутри успешного MCP-ответа (HTTP 200,
+    /// isError:false) не должен проходить как данные: ok=false (конвенция
+    /// шлюза AFFiNE, ADR-006) или ядерный конверт code≠0 — это ошибка
+    /// операции. require_ok-барьер AFFiNE-эры (PR #17), перенесённый на
+    /// единый вход SiYuan-клиента.
+    fn require_payload_ok(tool: &str, payload: &Value) -> Result<()> {
+        if payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let msg = payload
+                .get("msg")
+                .or_else(|| payload.get("error"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            bail!("tool {tool}: ok=false: {msg}");
+        }
+        match payload.get("code").and_then(|c| c.as_i64()) {
+            Some(0) | None => Ok(()),
+            Some(code) => {
+                let msg = payload.get("msg").and_then(|m| m.as_str()).unwrap_or("?");
+                bail!("tool {tool}: code={code}: {msg}");
+            }
+        }
     }
 
     pub async fn mcp_tool(&self, name: &str, args: Value) -> Result<Value> {
@@ -677,15 +843,24 @@ impl SiYuan {
         if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
             bail!(
                 "tool {name}: {}",
-                r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("?")
+                r.pointer("/content/0/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
             );
         }
-        // structuredContent при наличии, иначе parse content[0].text
+        // structuredContent при наличии, иначе parse content[0].text;
+        // оба канала проходят барьер логического фейла
         if let Some(sc) = r.get("structuredContent") {
+            Self::require_payload_ok(name, sc)?;
             return Ok(sc.clone());
         }
-        let text = r.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or("{}");
-        Ok(serde_json::from_str(text).unwrap_or(Value::Null))
+        let text = r
+            .pointer("/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        Self::require_payload_ok(name, &parsed)?;
+        Ok(parsed)
     }
 
     async fn ensure_mcp_session(&self) -> Result<()> {
@@ -710,8 +885,11 @@ impl SiYuan {
 
     /// Поиск database по имени через MCP database search.
     pub async fn db_search(&self, keyword: &str) -> Result<Value> {
-        self.mcp_tool("database", json!({ "action": "search", "keyword": keyword }))
-            .await
+        self.mcp_tool(
+            "database",
+            json!({ "action": "search", "keyword": keyword }),
+        )
+        .await
     }
 
     /// Строки database (render): items с клетками; page с 1 (серверный
@@ -731,8 +909,7 @@ impl SiYuan {
                 json!({ "action": "item_add", "id": av_id, "detached": true, "content": title }),
             )
             .await?;
-        Ok(v
-            .pointer("/data/itemID")
+        Ok(v.pointer("/data/itemID")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .to_string())
@@ -746,14 +923,19 @@ impl SiYuan {
                 json!({ "action": "item_add", "id": av_id, "blockID": block_id }),
             )
             .await?;
-        Ok(v
-            .pointer("/data/itemID")
+        Ok(v.pointer("/data/itemID")
             .and_then(|i| i.as_str())
             .unwrap_or("")
             .to_string())
     }
 
-    pub async fn db_item_set_status(&self, av_id: &str, key_id: &str, item_id: &str, status: &str) -> Result<()> {
+    pub async fn db_item_set_status(
+        &self,
+        av_id: &str,
+        key_id: &str,
+        item_id: &str,
+        status: &str,
+    ) -> Result<()> {
         self.mcp_tool(
             "database",
             json!({ "action": "item_update", "id": av_id, "keyID": key_id,
@@ -763,7 +945,6 @@ impl SiYuan {
         Ok(())
     }
 }
-
 
 /// Голова тела ответа для сообщений об ошибках: диагностика без простыни.
 fn body_snippet(raw: &str) -> String {
@@ -775,12 +956,102 @@ fn body_snippet(raw: &str) -> String {
     head
 }
 
+/// Верхнеуровневые дети дока из .sy в порядке документа — минимум для
+/// адресации диаграмм по маркеру.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocChild {
+    pub(crate) id: String,
+    pub(crate) kind: DocChildKind,
+    /// Текст абзаца/заголовка (для html-блока — сам html).
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocChildKind {
+    Paragraph,
+    Heading,
+    Html,
+    Other,
+}
+
+/// Парсер Children массива .sy-дока (проба ядра 3.8.10: NodeParagraph /
+/// NodeHeading несут текст во вложенных NodeText.Data, NodeHTMLBlock —
+/// html в собственном Data).
+pub(crate) fn doc_children_from_sy(tree: &Value) -> Vec<DocChild> {
+    tree.get("Children")
+        .and_then(|c| c.as_array())
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|node| {
+                    let id = node.get("ID")?.as_str()?.to_string();
+                    let kind = match node.get("Type").and_then(|t| t.as_str()) {
+                        Some("NodeParagraph") => DocChildKind::Paragraph,
+                        Some("NodeHeading") => DocChildKind::Heading,
+                        Some("NodeHTMLBlock") => DocChildKind::Html,
+                        _ => DocChildKind::Other,
+                    };
+                    let text = match kind {
+                        DocChildKind::Html | DocChildKind::Other => node
+                            .get("Data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        DocChildKind::Paragraph | DocChildKind::Heading => node
+                            .get("Children")
+                            .and_then(|c| c.as_array())
+                            .map(|texts| {
+                                texts
+                                    .iter()
+                                    .filter(|t| {
+                                        t.get("Type").and_then(|v| v.as_str()) == Some("NodeText")
+                                    })
+                                    .filter_map(|t| t.get("Data").and_then(|d| d.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .unwrap_or_default(),
+                    };
+                    Some(DocChild { id, kind, text })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Адрес диаграммы: маркер-абзац `⁂ diagram:<имя>` и следующий блок.
+/// Маркеров с одним именем несколько → первое вхождение (детерминизм,
+/// как в replace_md_section); сосед маркера — любой вид, is_html решает
+/// операцию (update/delete против insert-after).
+pub(crate) fn find_marker_location(
+    children: &[DocChild],
+    marker_prefix: &str,
+    name: &str,
+) -> Option<crate::html_embed::MarkerLocation> {
+    let marker_text = format!("{marker_prefix}{name}");
+    let pos = children
+        .iter()
+        .position(|c| c.kind == DocChildKind::Paragraph && c.text == marker_text)?;
+    let following = children
+        .get(pos + 1)
+        .map(|next| crate::html_embed::FollowingBlock {
+            id: next.id.clone(),
+            is_html: next.kind == DocChildKind::Html,
+        });
+    Some(crate::html_embed::MarkerLocation {
+        marker_id: children[pos].id.clone(),
+        following,
+    })
+}
+
 /// id блоков из markdown-дампа get_children (строки вида `- [p] текст (20261104-x)`).
 /// id распознаётся по форме ядерного id: 14 цифр, дефис, 7 alnum.
 pub(crate) fn parse_block_ids(children_text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for line in children_text.lines() {
-        let Some(open) = line.rfind('(') else { continue };
+        let Some(open) = line.rfind('(') else {
+            continue;
+        };
         let candidate = line[open + 1..].trim_end_matches(')');
         // Кандидат — произвольный текст после последней '('; срезы по байтам
         // паникуют на не-ASCII (репро doctor'ом: 22-байтный текст с кириллицей).
@@ -824,7 +1095,8 @@ pub(crate) fn doc_content_is_empty(block_ids: &[String], children_text: &str) ->
 impl SiYuan {
     /// Удалить док по id.
     pub async fn remove_doc(&self, doc_id: &str) -> Result<()> {
-        self.post("/api/filetree/removeDocByID", json!({ "id": doc_id })).await?;
+        self.post("/api/filetree/removeDocByID", json!({ "id": doc_id }))
+            .await?;
         Ok(())
     }
 }
@@ -856,7 +1128,11 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let err = sy
-            .post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/block/appendBlock",
+                json!({"id": "x"}),
+                RetryPacing::instant(),
+            )
             .await
             .expect_err("persistent metadata error must bail");
 
@@ -881,14 +1157,22 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
-            .await
-            .expect("retry after transient lag must succeed");
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({"id": "x"}),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect("retry after transient lag must succeed");
 
         // Окно не армировано: следующий вызов доходит до мока.
-        sy.post_with_pacing("/api/block/appendBlock", json!({"id": "x"}), RetryPacing::instant())
-            .await
-            .expect("cooldown must stay disarmed after successful retry");
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({"id": "x"}),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect("cooldown must stay disarmed after successful retry");
     }
 
     #[tokio::test]
@@ -903,12 +1187,20 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let first = sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant(),
+            )
             .await;
         assert!(first.is_err(), "persistent wave must bail");
 
         let second = sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant(),
+            )
             .await;
         assert!(second.is_err(), "cooldown must fail fast the next call");
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
@@ -919,19 +1211,29 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": -1, "msg": "не найдено"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code": -1, "msg": "не найдено"})),
+            )
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
         assert!(sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant()
+            )
             .await
             .is_err());
 
         // Окно не армировано: следующий вызов доходит до мока (4+ запросов суммарно).
         assert!(sy
-            .post_with_pacing("/api/query/sql", json!({"stmt": "select 1"}), RetryPacing::instant())
+            .post_with_pacing(
+                "/api/query/sql",
+                json!({"stmt": "select 1"}),
+                RetryPacing::instant()
+            )
             .await
             .is_err());
     }
@@ -987,7 +1289,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("10201") && err.contains("metadata is not ready"), "{err}");
+        assert!(
+            err.contains("10201") && err.contains("metadata is not ready"),
+            "{err}"
+        );
         // expect(1): ровно один запрос — если бы проба ретраила, мок упал бы на съёмке
     }
 
@@ -996,9 +1301,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/query/sql"))
-            .respond_with(ResponseTemplate::new(401).set_body_string(
-                r#"{"code":-1,"msg":"Auth failed: invalid token"}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed: invalid token"}"#),
+            )
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
@@ -1026,13 +1332,20 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("не JSON") && err.contains("<html>login</html>"), "{err}");
+        assert!(
+            err.contains("не JSON") && err.contains("<html>login</html>"),
+            "{err}"
+        );
     }
 
     #[test]
     fn parse_block_ids_reads_trailing_kernel_ids() {
-        let text = "- [p] первый (20261104130857-b9drqmf)\n- [h] ## Заголовок (20261104130919-on7yaie)\n";
-        assert_eq!(parse_block_ids(text), vec!["20261104130857-b9drqmf", "20261104130919-on7yaie"]);
+        let text =
+            "- [p] первый (20261104130857-b9drqmf)\n- [h] ## Заголовок (20261104130919-on7yaie)\n";
+        assert_eq!(
+            parse_block_ids(text),
+            vec!["20261104130857-b9drqmf", "20261104130919-on7yaie"]
+        );
     }
 
     #[test]
@@ -1066,7 +1379,10 @@ mod tests {
         let ids_text = parse_block_ids(with_text);
         assert!(!doc_content_is_empty(&ids_text, with_text));
         assert!(!doc_content_is_empty(
-            &["20261104130857-b9drqmf".into(), "20261104131412-wbpz3sx".into()],
+            &[
+                "20261104130857-b9drqmf".into(),
+                "20261104131412-wbpz3sx".into()
+            ],
             "- a (20261104130857-b9drqmf)\n- b (20261104131412-wbpz3sx)\n"
         ));
     }
@@ -1081,11 +1397,17 @@ mod tests {
         assert_eq!(ids, vec!["20261105101010-abc1234".to_string()]);
     }
 
-
     #[test]
     fn doc_file_path_joins_notebook_ancestors_and_doc_id() {
-        let got = SiYuan::doc_file_path("20261103224312-fbrf5fp", &["20261103233646-vzgad8m"], "20261104215722-1p0eetv");
-        assert_eq!(got, "data/20261103224312-fbrf5fp/20261103233646-vzgad8m/20261104215722-1p0eetv.sy");
+        let got = SiYuan::doc_file_path(
+            "20261103224312-fbrf5fp",
+            &["20261103233646-vzgad8m"],
+            "20261104215722-1p0eetv",
+        );
+        assert_eq!(
+            got,
+            "data/20261103224312-fbrf5fp/20261103233646-vzgad8m/20261104215722-1p0eetv.sy"
+        );
         assert_eq!(
             SiYuan::doc_file_path("nb-1", &[], "20261103224557-4yurg8d"),
             "data/nb-1/20261103224557-4yurg8d.sy"
@@ -1111,15 +1433,24 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        assert_eq!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Bytes(b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec()));
-        assert_eq!(sy.fetch_workspace_file("data/nb/other.sy").await, FileFetch::Missing);
+        assert_eq!(
+            sy.fetch_workspace_file("data/nb/doc.sy").await,
+            FileFetch::Bytes(b"{\"ID\":\"doc\",\"Type\":\"NodeDocument\"}".to_vec())
+        );
+        assert_eq!(
+            sy.fetch_workspace_file("data/nb/other.sy").await,
+            FileFetch::Missing
+        );
     }
 
     #[tokio::test]
     async fn fetch_workspace_file_reports_failure_on_transport_error() {
         // несуществующий порт = соединение не состоялось → Failed, не Missing
         let sy = SiYuan::for_tests("http://127.0.0.1:9".into());
-        assert!(matches!(sy.fetch_workspace_file("data/nb/doc.sy").await, FileFetch::Failed(_)));
+        assert!(matches!(
+            sy.fetch_workspace_file("data/nb/doc.sy").await,
+            FileFetch::Failed(_)
+        ));
     }
 
     #[tokio::test]
@@ -1135,7 +1466,11 @@ mod tests {
                 if ok {
                     *stored_put.lock().unwrap() = req.body.clone();
                 }
-                ResponseTemplate::new(200).set_body_string(if ok { r#"{"code":0,"msg":"","data":null}"# } else { r#"{"code":-1}"# })
+                ResponseTemplate::new(200).set_body_string(if ok {
+                    r#"{"code":0,"msg":"","data":null}"#
+                } else {
+                    r#"{"code":-1}"#
+                })
             })
             .mount(&server)
             .await;
@@ -1149,11 +1484,16 @@ mod tests {
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        sy.put_workspace_file("data/assets/undo/j.json", b"{\"k\":1}").await.unwrap();
+        sy.put_workspace_file("data/assets/undo/j.json", b"{\"k\":1}")
+            .await
+            .unwrap();
         let read_back = sy.fetch_workspace_file("data/assets/undo/j.json").await;
         assert!(matches!(read_back, FileFetch::Bytes(_)));
         if let FileFetch::Bytes(bytes) = read_back {
-            assert!(bytes.windows(7).any(|w| w == b"{\"k\":1}"), "контент в multipart-теле: {bytes:?}");
+            assert!(
+                bytes.windows(7).any(|w| w == b"{\"k\":1}"),
+                "контент в multipart-теле: {bytes:?}"
+            );
         }
     }
 
@@ -1180,12 +1520,17 @@ mod tests {
         let sy = SiYuan::for_tests(server.uri());
 
         let names = sy.list_dir("data/assets/undo").await.unwrap();
-        assert_eq!(names, vec!["20261104-clean.json".to_string(), "sub".to_string()]);
-        let err = sy
-            .list_dir("data/assets/nowhere")
-            .await
-            .expect_err("list_dir честен: несуществующая директория — ошибка ядра, не пустой список");
-        assert!(err.to_string().contains("path does not exist"), "суть отказа: {err}");
+        assert_eq!(
+            names,
+            vec!["20261104-clean.json".to_string(), "sub".to_string()]
+        );
+        let err = sy.list_dir("data/assets/nowhere").await.expect_err(
+            "list_dir честен: несуществующая директория — ошибка ядра, не пустой список",
+        );
+        assert!(
+            err.to_string().contains("path does not exist"),
+            "суть отказа: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1195,20 +1540,266 @@ mod tests {
             .and(path("/api/file/readDir"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let envelope = if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
-                    serde_json::json!({ "code": 0, "data": [{ "name": "j.json" }] })
-                } else {
-                    serde_json::json!({ "code": 404, "msg": "path does not exist" })
-                };
+                let envelope =
+                    if body.get("path").and_then(|p| p.as_str()) == Some("data/assets/undo") {
+                        serde_json::json!({ "code": 0, "data": [{ "name": "j.json" }] })
+                    } else {
+                        serde_json::json!({ "code": 404, "msg": "path does not exist" })
+                    };
                 ResponseTemplate::new(200).set_body_string(envelope.to_string())
             })
             .mount(&server)
             .await;
         let sy = SiYuan::for_tests(server.uri());
 
-        let names = sy.try_list_dir("data/assets/undo").await.unwrap().expect("директория есть");
+        let names = sy
+            .try_list_dir("data/assets/undo")
+            .await
+            .unwrap()
+            .expect("директория есть");
         assert_eq!(names, vec!["j.json".to_string()]);
         let missing = sy.try_list_dir("data/assets/nowhere").await.unwrap();
         assert!(missing.is_none(), "нет директории — None, не ошибка");
+    }
+
+    #[tokio::test]
+    async fn upload_asset_returns_kernel_generated_path_from_succ_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with(|req: &wiremock::Request| {
+                // multipart: ядро ждёт assetsDir + file[] с оригинальным именем
+                let body = String::from_utf8_lossy(&req.body);
+                let ok = body.contains("name=\"assetsDir\"")
+                    && body.contains("name=\"file[]\"")
+                    && body.contains("filename=\"скрин 2.png\"")
+                    && body.contains("png-bytes");
+                if ok {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "code": 0,
+                        "data": { "succFiles": [{ "index": 0, "name": "скрин 2.png",
+                                  "path": "assets/скрин 2-20261106090000-abc1234.png" }] }
+                    }))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"code":-1,"msg":"нет полей multipart"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let file = dir.path().join("скрин 2.png");
+        std::fs::write(&file, b"png-bytes").expect("write fixture");
+
+        let asset = sy.upload_asset(&file).await.expect("upload ok");
+        assert_eq!(asset.original_name, "скрин 2.png");
+        assert_eq!(
+            asset.asset_path,
+            "assets/скрин 2-20261106090000-abc1234.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_asset_kernel_error_envelope_is_loud_bail() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/asset/upload"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"code":-1,"msg":"asset size exceeds limit"}"#),
+            )
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let file = dir.path().join("big.png");
+        std::fs::write(&file, b"bytes").expect("write fixture");
+
+        let err = sy
+            .upload_asset(&file)
+            .await
+            .expect_err("kernel code=-1 must bail");
+        assert!(
+            err.to_string().contains("asset size exceeds limit"),
+            "суть отказа ядра видна: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_asset_missing_file_bails_before_network() {
+        let server = MockServer::start().await;
+        // ни одного маунта: любой сетевой вызов упал бы по соединению —
+        // отказ обязан случиться раньше, на чтении файла
+        let sy = SiYuan::for_tests(server.uri());
+        let err = sy
+            .upload_asset(std::path::Path::new("/nonexistent/dir/x.png"))
+            .await
+            .expect_err("missing file must bail");
+        assert!(
+            err.to_string().contains("недоступен"),
+            "отказ на чтении файла: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_doc_sends_notebook_relative_path_and_title() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/renameDoc"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let ok = body.get("notebook").and_then(|n| n.as_str()) == Some("nb-1")
+                    && body.get("path").and_then(|p| p.as_str()) == Some("/root/board/doc-id.sy")
+                    && body.get("title").and_then(|t| t.as_str()) == Some("новый тайтл");
+                if ok {
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"code":-1,"msg":"rename request shape mismatch"}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.rename_doc("nb-1", "/root/board/doc-id.sy", "новый тайтл")
+            .await
+            .expect("rename ok");
+    }
+
+    /// Мок MCP-сервера: initialize по протоколу, tools/call — фиксированный result.
+    async fn mount_mcp_tool_result(server: &MockServer, result: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-ok-barrier");
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": 2, "result": result }).to_string(),
+                )
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_ok_false_in_structured_content() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"item_update\",\"ok\":false,\"msg\":\"WRITE_QUEUE_TIMEOUT\"}" }],
+                "structuredContent": { "action": "item_update", "ok": false, "msg": "WRITE_QUEUE_TIMEOUT" }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "item_update" }))
+            .await
+            .expect_err("ok=false inside a successful MCP response must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("ok=false"), "барьер называет форму: {text}");
+        assert!(
+            text.contains("WRITE_QUEUE_TIMEOUT"),
+            "причина шлюза: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_nonzero_code_in_structured_content() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"code\":-1,\"msg\":\"boom\"}" }],
+                "structuredContent": { "action": "keys", "code": -1, "msg": "boom" }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect_err("kernel envelope code=-1 without isError must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("code=-1"), "барьер называет код: {text}");
+        assert!(text.contains("boom"), "причина ядра: {text}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_nonzero_code_in_content_json() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"code\":10201,\"msg\":\"metadata is not ready\"}" }]
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect_err("kernel error envelope relayed as content JSON must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("10201"), "код назван: {text}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_passes_clean_structured_content_through() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"data\":{\"keys\":[]}}" }],
+                "structuredContent": { "action": "keys", "data": { "keys": ["k1"] } }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect("success envelope without error markers must pass");
+
+        assert_eq!(
+            v.pointer("/data/keys/0").and_then(|k| k.as_str()),
+            Some("k1")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_passes_kernel_success_envelope_in_content_json() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"render\",\"code\":0,\"msg\":\"\",\"data\":{\"rows\":[]}}" }]
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "render" }))
+            .await
+            .expect("kernel success envelope (code=0) must pass");
+
+        assert!(v.get("data").is_some(), "данные на месте: {v}");
     }
 }

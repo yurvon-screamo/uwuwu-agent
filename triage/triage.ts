@@ -18,16 +18,17 @@
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
-import { acquireLock } from "../lib/single-instance"
+import { acquireLock, branchLabel, detectBranch } from "../lib/single-instance"
+import { withE2ETag } from "../lib/e2e-tag"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import {
   alignChunks, applyBodyDelta, applyTurns, batchReadyAt, capDraftBatch, classifyUpdate, composeDraftPrompt, composeText,
-  draftReady, dropBatch, extractReplies, inboxToSessionMsgs, joinBatch, parseDraftAcks, plainChunks, parseWatchSec,
+  draftReady, dropBatch, extractReplies, inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, parseWatchSec,
   promptLandedAt, setDraftAck, steerCandidate, steerRecoveryBatch, SESSION_TITLE, stripDraftAcks, takeBatch, validState,
   DRAFT_BATCH_MAX, DRAFT_MAX_TURNS,
-  type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
+  type Attachment, type DraftRef, type DraftVerdict, type Reply, type Request, type RunState, type SessionMsg, type TgUpdate, type TriageState,
 } from "./triage-lib"
 
 const HERE = dirname(new URL(import.meta.url).pathname)
@@ -63,6 +64,10 @@ const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 /** API Telegram: дефолт — прод; override — mock-TG досмерджевого протокола
  *  (см. README «Проверка»). */
 const TG_API = process.env.UWUWU_TRIAGE_TG_API ?? "https://api.telegram.org"
+/** Маркер e2e-сессий: сессия диалога создаётся с префиксом `[e2e]`, дример
+ *  пропускает помеченные сессии при пост-обработке (конвенция lib/e2e-tag.ts).
+ *  Тестовый крюк, в systemd-юнит не задаётся. */
+const E2E_SESSIONS = process.env.UWUWU_TRIAGE_E2E === "1"
 
 // NaN/мусор из env → дефолт; hot-loop поллинга при 0 исключаем
 const POLL_SEC = Math.max(1, Number(process.env.UWUWU_TRIAGE_POLL_SEC ?? 5) || 5)
@@ -308,7 +313,7 @@ const recreateSession = async (notify: boolean): Promise<void> => {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: SESSION_TITLE,
+      title: E2E_SESSIONS ? withE2ETag(SESSION_TITLE) : SESSION_TITLE,
       agent: AGENT_NAME,
       // NB: model из дефа не применяется к primary-сессиям — передаём явно
       model: cfg.model ?? MODEL,
@@ -804,12 +809,13 @@ const runLoop = async (): Promise<void> => {
 
 // ——— вложения: ТГ-медиа → ФС (паттерн зоопарка: getFile → download) ———
 
-/** Выгрузить фото/документ из сообщения в MEDIA_DIR. Возвращает вложения и
- *  маркеры неудач (текст заявки честно скажет агенту, что не выгрузилось). */
-const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<{ attachments: { path: string; name: string }[]; failed: string[] }> => {
-  const out: { attachments: { path: string; name: string }[]; failed: string[] } = { attachments: [], failed: [] }
-  const save = async (fileId: string | undefined, name: string): Promise<void> => {
-    if (fileId === undefined) { out.failed.push(name); return }
+/** Выгрузить медиа из сообщения в MEDIA_DIR (состав и имена — mediaFiles
+ *  из lib: photo/document/video/animation/video_note/audio). Возвращает
+ *  вложения и маркеры неудач (текст заявки честно скажет агенту, что не
+ *  выгрузилось). */
+const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<{ attachments: Attachment[]; failed: string[] }> => {
+  const out: { attachments: Attachment[]; failed: string[] } = { attachments: [], failed: [] }
+  const save = async (fileId: string, name: string): Promise<void> => {
     try {
       const f = await tg("getFile", { file_id: fileId }) as { file_path?: string }
       if (typeof f.file_path !== "string") throw new Error("нет file_path")
@@ -826,14 +832,7 @@ const downloadAttachment = async (m: NonNullable<TgUpdate["message"]>): Promise<
       out.failed.push(name)
     }
   }
-  // фото: последний элемент массива = максимальное разрешение
-  const photo = Array.isArray(m.photo) ? m.photo[m.photo.length - 1] : undefined
-  if (photo !== undefined) await save(photo.file_id, `${m.message_id}.jpg`)
-  if (m.document?.file_id !== undefined) {
-    // имя файла из ТГ санитайзим (слэши/управляющие), режем до 80
-    const safe = (m.document.file_name ?? "file").replace(/[/\\\x00-\x1f]/g, "_").slice(0, 80)
-    await save(m.document.file_id, `${m.message_id}_${safe}`)
-  }
+  for (const { fileId, name } of mediaFiles(m)) await save(fileId, name)
   return out
 }
 
@@ -1095,7 +1094,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
     log(`сессия диалога сброшена /reset${wasRunning ? " (сброшен и активный ход)" : ""}`)
     await send(state.chatID, "♻️ Сессия сброшена — следующее сообщение начнёт диалог с чистого контекста (очередь сообщений сохранена).")
   } else if (out.kind === "media") {
-    await send(state.chatID, "⚠️ Такой тип медиа не разбираю (голос/видео/стикер) — опиши словами или пришли фото/файл")
+    await send(state.chatID, "⚠️ Такой тип сообщения не разбираю (голосовые, стикеры и пр.) — опиши словами или пришли фото/файл/видео")
   } else if (out.kind === "edit") {
     // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
     if (state.firing !== undefined && state.firing.msgIDs.includes(out.msg.message_id)) {
@@ -1106,7 +1105,7 @@ const handleUpdate = async (u: TgUpdate): Promise<void> => {
       if (i >= 0) {
         // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
         // пересобираем с маркерами (пути в ФС — агент фиксирует их в теле задачи; --attach — заглушка)
-        const hasNewMedia = (Array.isArray(out.msg.photo) && out.msg.photo.length > 0) || out.msg.document?.file_id !== undefined
+        const hasNewMedia = mediaFiles(out.msg).length > 0
         const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
         const cur = state.queue[i]!
         const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
@@ -1175,6 +1174,27 @@ const main = async (): Promise<void> => {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   gcMedia()
   syncAgentDef()
+  // громкий warning инцидент-класса 06.11: чекаут не master без явного
+  // UWUWU_TRIAGE_HOME — E2E/тестовый прогон трогает прод-state. Пути не
+  // переезжают (HOME-механика изолирует state+лог+workspace+media разом
+  // и остаётся явной), но молчать о риске нельзя.
+  const triageHome = process.env.UWUWU_TRIAGE_HOME?.trim()
+  if (triageHome === undefined || triageHome === "") {
+    const repoRoot = resolve(HERE, "..")
+    // label-логика (trim, «detached») — общая с резолюцией state (lib);
+    // null — git-детект не удался (копия чекаута без .git и т.п.): риск
+    // прод-контакта тот же, warning тем более — молчать нельзя
+    const label = branchLabel(detectBranch(repoRoot))
+    const warn = label === null
+      ? `uwuwu-triage: git-детект ветки не удался (${repoRoot}), UWUWU_TRIAGE_HOME не задан: state/лог/workspace идут в прод; для прогонов задай UWUWU_TRIAGE_HOME`
+      : label === "master"
+        ? null
+        : `uwuwu-triage: чекаут «${label}» — не master, UWUWU_TRIAGE_HOME не задан: state/лог/workspace идут в прод; для прогонов из ветки задай UWUWU_TRIAGE_HOME`
+    if (warn !== null) {
+      console.error(warn)
+      log(warn)
+    }
+  }
   const me = await tg("getMe") as { username?: string }
   const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }
   log(`uwuwu-triage: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${(cfg.model ?? MODEL).id}, опенкод=${reg.url ?? "?"}, вотчер=${WATCH_SEC > 0 ? `${WATCH_SEC}s` : "off"})`)

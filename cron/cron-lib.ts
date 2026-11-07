@@ -14,6 +14,9 @@ export interface TrackedCron {
   sessionID: string
   lastFiredAt: number
   firedAtIso: string
+  /** Причина последнего отказа (дедуп комментов: коммент — только при смене).
+   *  Сбрасывается при успешном файре. */
+  lastRefusal?: string
 }
 
 export interface CronState {
@@ -154,8 +157,128 @@ export function isValidTracked(v: unknown): v is TrackedCron {
   return (
     (t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))) &&
     typeof t.lastFiredAt === "number" &&
-    (t.firedAtIso === undefined || typeof t.firedAtIso === "string")
+    (t.firedAtIso === undefined || typeof t.firedAtIso === "string") &&
+    (t.lastRefusal === undefined || typeof t.lastRefusal === "string")
   )
+}
+
+// ——— резолв и валидация тела ———
+
+/** Тайтл → безопасный сегмент hpath (конвенция CLI path_safe: '/' → U+2215). */
+export function pathSafe(title: string): string {
+  return title.replace(/\//g, "∕")
+}
+
+/** Снятие экспорт-обвязки и невидимых символов: YAML-frontmatter, заголовок-эхо
+ *  дока (exportMdContent всегда препендит `# <title>` — это метаданные, не
+ *  постановка), HTML-комментарии (в т.ч. unsupported-легаси) и zero-width.
+ *  Экспорт тела, состоящего после этого из пустоты, рендерится агенту в
+ *  пустоту — инцидентный класс «тело из unsupported-комментариев → сессия
+ *  с пустым промптом». */
+export function stripNonContent(md: string): string {
+  let text = md.replace(/^---\n[\s\S]*?\n---\n/, "")
+  text = text.replace(/^\s*#[^\n]*\n?/, "")
+  text = text.replace(/<!--[\s\S]*?-->/g, "")
+  return text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()
+}
+
+/** Причина, по которой рендер тела непригоден как промпт; null = тело валидно. */
+export function bodyRenderIssue(md: string): string | null {
+  if (stripNonContent(md) === "") {
+    return "тело рендерится в пусто/unsupported-комментарии"
+  }
+  return null
+}
+
+export type BodyChoice =
+  | { kind: "doc"; docId: string }
+  | { kind: "missing" }
+  | { kind: "duplicates"; docIds: string[] }
+
+/** Паритет CLI choose_body_doc: живая привязка → она; мёртвая/отсутствующая →
+ *  fallback по заголовку: 0 доков → нет тела; 1 → он; ≥2 → дубли (ошибка). */
+export function chooseBodyDoc(bound: string, boundLive: boolean, titleDocIds: string[]): BodyChoice {
+  if (bound !== "" && boundLive) return { kind: "doc", docId: bound }
+  if (titleDocIds.length === 0) return { kind: "missing" }
+  const [only] = titleDocIds
+  if (titleDocIds.length === 1 && only !== undefined) return { kind: "doc", docId: only }
+  return { kind: "duplicates", docIds: titleDocIds }
+}
+
+/** Тайтл сессии из тела: первая содержательная строка после стрипа —
+ *  frontmatter и unsupported-мусор в имя сессии не попадают. */
+export function titleFromBody(body: string): string {
+  for (const line of stripNonContent(body).split("\n")) {
+    const t = line.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").trim()
+    if (t !== "") return t
+  }
+  return ""
+}
+
+// ——— резолв тела крона (оркестрация над инжектируемым платформенным tool) ———
+
+/** Структурный тип платформенного tool (инжект — юнит-тесты без ядра). */
+export type PlatformTool = <T = Record<string, unknown>>(name: string, args: Record<string, unknown>) => Promise<T>
+
+export type BodyResolution =
+  | { kind: "ok"; docId: string; markdown: string }
+  | { kind: "refuse"; reason: string }
+  | { kind: "infra"; error: string }
+
+/** Вердикт по рендеру тела: unsupported-комментарии/пустота → refuse. */
+function renderVerdict(docId: string, markdown: string): BodyResolution {
+  const issue = bodyRenderIssue(markdown)
+  if (issue !== null) {
+    return { kind: "refuse", reason: `${issue} (docId ${docId})` }
+  }
+  return { kind: "ok", docId, markdown }
+}
+
+/** Док-тело крона: привязка строки (id-first), мёртвая/отсутствующая →
+ *  title-fallback по hpath доски (контракт CLI choose_body_doc). Сбоям ядра
+ *  (infra) вердикт не выносится: refuse — только при подтверждённом
+ *  отсутствии/пустоте тела, иначе слот крона сжигался бы минутными сбоями. */
+export async function resolveBody(tool: PlatformTool, boardDocId: string, row: CronRow): Promise<BodyResolution> {
+  try {
+    if (row.bodyDoc !== "") {
+      const exported = await tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: row.bodyDoc })
+      if (exported.exists === true) {
+        return renderVerdict(row.bodyDoc, exported.markdown ?? "")
+      }
+      // export глотает любые ошибки в exists:false — мёртвую привязку
+      // отличаем от сбоя ядра пробой block get (FS-истина)
+      const live = await tool<{ exists?: boolean }>("doc_exists", { docId: row.bodyDoc })
+      if (live.exists === true) {
+        return { kind: "infra", error: `export дока ${row.bodyDoc} дал exists:false при живом блоке` }
+      }
+    }
+    if (row.title === "") {
+      return { kind: "refuse", reason: "строка без тела: нет ни привязки, ни заголовка для title-fallback" }
+    }
+    const info = await tool<{ box?: string; hpath?: string }>("get_doc", { docId: boardDocId })
+    // SQL-лаг индекса молча даёт пустые box/hpath — fallback с пустым
+    // notebook «подтвердил бы отсутствие» ложно: это infra, не вердикт
+    if ((info.box ?? "") === "" || (info.hpath ?? "") === "") {
+      return { kind: "infra", error: `доска ${boardDocId} без box/hpath в индексе (лаг SQL?)` }
+    }
+    const byTitle = await tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+      notebook: info.box, path: `${info.hpath}/${pathSafe(row.title)}`,
+    })
+    const choice = chooseBodyDoc(row.bodyDoc, false, byTitle.ids ?? [])
+    if (choice.kind === "duplicates") {
+      return { kind: "refuse", reason: `дубли тел по заголовку (${choice.docIds.join(", ")}) — вычисти сироты в UI` }
+    }
+    if (choice.kind === "missing") {
+      return { kind: "refuse", reason: `строка без тела: привязки нет, саб-дока «${row.title}» у доски нет` }
+    }
+    const exported = await tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: choice.docId })
+    if (exported.exists !== true) {
+      return { kind: "infra", error: `title-fallback док ${choice.docId}: export дал exists:false` }
+    }
+    return renderVerdict(choice.docId, exported.markdown ?? "")
+  } catch (e) {
+    return { kind: "infra", error: String(e) }
+  }
 }
 
 // ——— промпты ———
@@ -165,13 +288,15 @@ export function sanitizeBoundary(text: string): string {
 }
 
 /** Промпт срабатывания: тело крона + тихий протокол тика
- *  (коммент — только исключение; факт тика демон пишет в Last Run сам). */
+ *  (коммент — только исключение; факт тика демон пишет в Last Run сам).
+ *  Тело непусто по инварианту тика: гейт резолвит и валидирует его до
+ *  спавна — пустое/unsupported-тело не доходит до промпта (refuse). */
 export function firePrompt(row: CronRow, body: string, project: string): string {
   return [
     `Ты — исполнитель крон-задачи «${row.title.replace(/[\r\n]+/g, " ")}» (расписание: ${row.schedule}).`,
     "",
     "=== ТЕЛО КРОНА ===",
-    sanitizeBoundary(body || "(пусто — отработай по заголовку)"),
+    sanitizeBoundary(body),
     "=== КОНЕЦ ТЕЛА ===",
     "",
     "ПРАВИЛА:",

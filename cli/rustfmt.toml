@@ -1,0 +1,6 @@
+# Пин style_edition: формат-выход не дрейфует при обновлении тулчейна/edition crate.
+# reorder_* = false: cargo fmt меняет только пробелы и переносы — перестановки строк
+# (сортировка mod/use) отключены, чтобы формат-проход оставался строго пробельным.
+style_edition = "2021"
+reorder_modules = false
+reorder_imports = false

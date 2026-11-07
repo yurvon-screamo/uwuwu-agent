@@ -15,16 +15,25 @@ use tokio::net::{TcpListener, TcpStream};
 /// Спека мок-доски: сколько строк всего, размер страницы, есть ли rowCount
 /// в ответе, инъекция дубля item_id последней строки предыдущей страницы
 /// в начало текущей (дрейф страниц при конкурентных правках доски).
+/// kanban=true → строки живут в view.groups[].cards (карточки), счётчик —
+/// cardCount: форма живого render канбан-досок целей.
 #[derive(Clone)]
 struct MockBoard {
     total_rows: u64,
     page_size: u64,
     show_row_count: bool,
     dup_last_of_prev: bool,
+    kanban: bool,
 }
 
 fn mock_board(total_rows: u64) -> MockBoard {
-    MockBoard { total_rows, page_size: 50, show_row_count: true, dup_last_of_prev: false }
+    MockBoard {
+        total_rows,
+        page_size: 50,
+        show_row_count: true,
+        dup_last_of_prev: false,
+        kanban: false,
+    }
 }
 
 struct MockServer {
@@ -34,7 +43,9 @@ struct MockServer {
 
 /// Запустить мок MCP-сервера: base-URL + лог запрошенных страниц render.
 async fn spawn_mock(board: MockBoard) -> MockServer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
     let addr = listener.local_addr().expect("mock addr");
     let pages = Arc::new(Mutex::new(Vec::new()));
     let pages_for_tasks = pages.clone();
@@ -45,7 +56,10 @@ async fn spawn_mock(board: MockBoard) -> MockServer {
             tokio::spawn(async move { serve_one(stream, board, pages).await });
         }
     });
-    MockServer { base: format!("http://{addr}"), pages }
+    MockServer {
+        base: format!("http://{addr}"),
+        pages,
+    }
 }
 
 /// Один запрос на соединение: ответ с Connection: close, затем shutdown.
@@ -73,7 +87,10 @@ async fn serve_one(mut stream: TcpStream, board: MockBoard, pages: Arc<Mutex<Vec
             reply.to_string(),
         )
     } else if method == "tools/call" {
-        let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+        let args = req
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or(json!({}));
         let reply = match args.get("action").and_then(|a| a.as_str()) {
             Some("render") => {
                 let page = args.get("page").and_then(|p| p.as_u64()).unwrap_or(1);
@@ -141,6 +158,8 @@ async fn read_request_body(stream: &mut TcpStream) -> Option<String> {
 }
 
 /// Страница доски в форме живого ответа: view.{columns, rows, rowCount}.
+/// kanban-доска: rows нет, строки — карточки в groups[].cards (values вместо
+/// cells), счётчик — cardCount.
 fn render_view(board: &MockBoard, page: u64) -> Value {
     let mut rows = Vec::new();
     if board.dup_last_of_prev && page > 1 {
@@ -154,14 +173,30 @@ fn render_view(board: &MockBoard, page: u64) -> Value {
         rows.push(mock_row(idx));
         idx += 1;
     }
-    let mut view = json!({
-        "columns": [
-            { "id": "key-title", "name": "Title" },
-            { "id": "key-status", "name": "Status" },
-        ],
-        "rows": rows,
-    });
-    if board.show_row_count {
+    let columns = json!([
+        { "id": "key-title", "name": "Title" },
+        { "id": "key-status", "name": "Status" },
+    ]);
+    let mut view = if board.kanban {
+        let mut cards = rows;
+        for card in cards.iter_mut() {
+            *card = json!({
+                "id": card["id"],
+                "values": card["cells"],
+            });
+        }
+        json!({
+            "fields": columns,
+            "cardCount": board.total_rows,
+            "groups": [
+                { "id": "g-todo", "name": "todo", "cardCount": 0, "cards": [] },
+                { "id": "g-active", "name": "in progress", "cardCount": cards.len(), "cards": cards },
+            ],
+        })
+    } else {
+        json!({ "columns": columns, "rows": rows })
+    };
+    if board.show_row_count && !board.kanban {
         view["rowCount"] = json!(board.total_rows);
     }
     view
@@ -171,8 +206,10 @@ fn mock_row(idx: u64) -> Value {
     json!({
         "id": format!("row-{idx:04}"),
         "cells": [
-            { "value": { "keyID": "key-title", "text": { "content": format!("Задача {idx:04}") } } },
-            { "value": { "keyID": "key-status", "mSelect": [{ "content": "Draft" }] } },
+            // живая форма Title-клетки: block.id = docId тела (привязка строки)
+            { "value": { "keyID": "key-title", "type": "block",
+                         "block": { "content": format!("Задача {idx:04}"), "id": format!("doc-{idx:04}") } } },
+            { "value": { "keyID": "key-status", "type": "mSelect", "mSelect": [{ "content": "Draft" }] } },
         ],
     })
 }
@@ -196,7 +233,11 @@ async fn run_read_rows(board: MockBoard) -> (anyhow::Result<Vec<SyTask>>, Arc<Mu
 async fn pages_all_rows_collected() {
     let (rows, pages) = run_read_rows(mock_board(105)).await;
     let rows = rows.expect("read_rows должен собрать все страницы доски");
-    assert_eq!(rows.len(), 105, "видны все строки, а не только первая страница");
+    assert_eq!(
+        rows.len(),
+        105,
+        "видны все строки, а не только первая страница"
+    );
     assert_eq!(
         *pages.lock().expect("pages lock"),
         vec![1, 2, 3],
@@ -206,7 +247,11 @@ async fn pages_all_rows_collected() {
 
 #[tokio::test]
 async fn terminates_on_empty_page_without_rowcount() {
-    let (rows, pages) = run_read_rows(MockBoard { show_row_count: false, ..mock_board(57) }).await;
+    let (rows, pages) = run_read_rows(MockBoard {
+        show_row_count: false,
+        ..mock_board(57)
+    })
+    .await;
     let rows = rows.expect("терминация по пустой странице, без зависания");
     assert_eq!(rows.len(), 57);
     assert_eq!(
@@ -221,22 +266,80 @@ async fn single_page_no_extra_call() {
     let (rows, pages) = run_read_rows(mock_board(10)).await;
     let rows = rows.expect("read_rows на однопагинальной доске");
     assert_eq!(rows.len(), 10);
-    assert_eq!(*pages.lock().expect("pages lock"), vec![1], "ровно один вызов render");
+    assert_eq!(
+        *pages.lock().expect("pages lock"),
+        vec![1],
+        "ровно один вызов render"
+    );
 }
 
 #[tokio::test]
 async fn cap_is_loud_error() {
-    let (rows, pages) =
-        run_read_rows(MockBoard { show_row_count: false, ..mock_board(6000) }).await;
+    let (rows, pages) = run_read_rows(MockBoard {
+        show_row_count: false,
+        ..mock_board(6000)
+    })
+    .await;
     let err = rows.expect_err("кап страниц — громкая ошибка, не тихая усечка");
     let msg = format!("{err:#}");
-    assert!(msg.contains("усечена"), "диагностика усечки в ошибке: {msg}");
-    assert_eq!(pages.lock().expect("pages lock").len(), 100, "запрошено ровно 100 страниц");
+    assert!(
+        msg.contains("усечена"),
+        "диагностика усечки в ошибке: {msg}"
+    );
+    assert_eq!(
+        pages.lock().expect("pages lock").len(),
+        100,
+        "запрошено ровно 100 страниц"
+    );
+}
+
+/// kanban-доска (цели): строки живут в groups[].cards со счётчиком cardCount —
+/// read_rows собирает все карточки, ровно один вызов render на одну страницу.
+#[tokio::test]
+async fn kanban_cards_collected_from_groups() {
+    let (rows, pages) = run_read_rows(MockBoard {
+        kanban: true,
+        ..mock_board(3)
+    })
+    .await;
+    let rows = rows.expect("kanban-карточки собираются из groups");
+    assert_eq!(rows.len(), 3, "все карточки видны");
+    assert_eq!(
+        rows[0].title, "Задача 0000",
+        "Title из block-клетки карточки"
+    );
+    assert_eq!(
+        *pages.lock().expect("pages lock"),
+        vec![1],
+        "cardCount терминирует после первой страницы"
+    );
+}
+
+/// kanban-доска с пагинацией: cardCount двигает страницы, вторая пустая
+/// (страница начинается ровно) — терминация по совпадению счётчика.
+#[tokio::test]
+async fn kanban_paginates_by_card_count() {
+    let (rows, pages) = run_read_rows(MockBoard {
+        kanban: true,
+        ..mock_board(105)
+    })
+    .await;
+    let rows = rows.expect("kanban-пагинация по cardCount");
+    assert_eq!(rows.len(), 105);
+    assert_eq!(
+        *pages.lock().expect("pages lock"),
+        vec![1, 2, 3],
+        "страницы 1–3: 50+50+5, cardCount исчерпан"
+    );
 }
 
 #[tokio::test]
 async fn dedup_page_drift() {
-    let (rows, pages) = run_read_rows(MockBoard { dup_last_of_prev: true, ..mock_board(105) }).await;
+    let (rows, pages) = run_read_rows(MockBoard {
+        dup_last_of_prev: true,
+        ..mock_board(105)
+    })
+    .await;
     let rows = rows.expect("read_rows с инъекцией дубля на стыке страниц");
     assert_eq!(rows.len(), 105, "дубль на стыке страниц отфильтрован");
     assert_eq!(*pages.lock().expect("pages lock"), vec![1, 2, 3]);
@@ -281,10 +384,12 @@ async fn comment_creates_comments_section_once() {
         .and(path("/api/block/appendBlock"))
         .respond_with(move |req: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            appends_log
-                .lock()
-                .expect("appends lock")
-                .push(body.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string());
+            appends_log.lock().expect("appends lock").push(
+                body.get("data")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "msg": "", "data": null }))
         })
         .mount(&server)
@@ -299,7 +404,11 @@ async fn comment_creates_comments_section_once() {
         .expect("повторный вызов: без дубля заголовка");
 
     let appends = appends.lock().expect("appends lock");
-    assert_eq!(appends.len(), 1, "заголовок секции append'ится ровно один раз");
+    assert_eq!(
+        appends.len(),
+        1,
+        "заголовок секции append'ится ровно один раз"
+    );
     assert_eq!(appends[0], "## Комменты");
 }
 
@@ -340,7 +449,8 @@ async fn spawn_doc_mock(initial: &str, behavior: AppendBehavior) -> DocMock {
             } else {
                 json!([])
             };
-            ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": data }).to_string())
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "code": 0, "data": data }).to_string())
         })
         .mount(&server)
         .await;
@@ -349,8 +459,13 @@ async fn spawn_doc_mock(initial: &str, behavior: AppendBehavior) -> DocMock {
         .respond_with(|req: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
             let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let data = if hpath.ends_with("таск") { json!(["20261105120000-titleb2"]) } else { json!([]) };
-            ResponseTemplate::new(200).set_body_string(json!({ "code": 0, "data": data }).to_string())
+            let data = if hpath.ends_with("таск") {
+                json!(["20261105120000-titleb2"])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "code": 0, "data": data }).to_string())
         })
         .mount(&server)
         .await;
@@ -372,9 +487,19 @@ async fn spawn_doc_mock(initial: &str, behavior: AppendBehavior) -> DocMock {
         .and(path("/api/block/appendBlock"))
         .respond_with(move |req: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            let data = body.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
-            if matches!(behavior, AppendBehavior::Ok | AppendBehavior::AppliedButLost) {
-                content_for_append.lock().expect("content lock").push_str(&data);
+            let data = body
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            if matches!(
+                behavior,
+                AppendBehavior::Ok | AppendBehavior::AppliedButLost
+            ) {
+                content_for_append
+                    .lock()
+                    .expect("content lock")
+                    .push_str(&data);
             }
             appends_log.lock().expect("appends lock").push(data);
             // «применено, ответ потерян»: запись в контенте есть, клиент видит сбой
@@ -382,19 +507,28 @@ async fn spawn_doc_mock(initial: &str, behavior: AppendBehavior) -> DocMock {
                 AppendBehavior::Ok => 0,
                 AppendBehavior::AppliedButLost | AppendBehavior::Rejected => -1,
             };
-            ResponseTemplate::new(200).set_body_json(json!({ "code": code, "msg": "lost", "data": null }))
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "code": code, "msg": "lost", "data": null }))
         })
         .mount(&server)
         .await;
 
-    DocMock { server, content, appends }
+    DocMock {
+        server,
+        content,
+        appends,
+    }
 }
 
 const TS: &str = "2026-11-05 10:00";
 
 #[tokio::test]
 async fn comment_applied_but_lost_writes_recovered_without_duplicates() {
-    let mock = spawn_doc_mock("# Таск\n\n## Постановка\nтело\n", AppendBehavior::AppliedButLost).await;
+    let mock = spawn_doc_mock(
+        "# Таск\n\n## Постановка\nтело\n",
+        AppendBehavior::AppliedButLost,
+    )
+    .await;
     let sy = SiYuan::for_tests(mock.server.uri());
     let board = test_board();
     let task = test_task();
@@ -410,12 +544,18 @@ async fn comment_applied_but_lost_writes_recovered_without_duplicates() {
         "заголовок секции без дублей: {content}"
     );
     assert_eq!(
-        content.matches(&format!("- **AGENTS** ({TS}): привет")).count(),
+        content
+            .matches(&format!("- **AGENTS** ({TS}): привет"))
+            .count(),
         1,
         "коммент без дублей (слепой ретрай дал бы копии): {content}"
     );
     let appends = mock.appends.lock().expect("appends lock");
-    assert_eq!(appends.len(), 2, "ровно заголовок + коммент, без слепых ретраев");
+    assert_eq!(
+        appends.len(),
+        2,
+        "ровно заголовок + коммент, без слепых ретраев"
+    );
 }
 
 #[tokio::test]
@@ -450,7 +590,10 @@ async fn comment_precheck_matches_indented_reply_lines() {
         .expect("реплай-дубль узнаётся по контенту строки без отступа");
 
     let appends = mock.appends.lock().expect("appends lock");
-    assert!(appends.is_empty(), "отступ не ломает матчинг дубля: {appends:?}");
+    assert!(
+        appends.is_empty(),
+        "отступ не ломает матчинг дубля: {appends:?}"
+    );
 }
 
 #[tokio::test]
@@ -463,7 +606,10 @@ async fn comment_honest_failure_when_write_not_applied() {
     let err = crate::siyuan_task::comment_with_ts(&sy, &board, &task, &draft(None), TS)
         .await
         .expect_err("запись не применена — честный отказ без выдуманного успеха");
-    assert!(err.to_string().contains("appendBlock"), "суть сбоя названа: {err}");
+    assert!(
+        err.to_string().contains("appendBlock"),
+        "суть сбоя названа: {err}"
+    );
     assert_eq!(
         mock.appends.lock().expect("appends lock").len(),
         1,
@@ -472,7 +618,11 @@ async fn comment_honest_failure_when_write_not_applied() {
 }
 
 fn draft<'a>(reply_to: Option<&'a str>) -> crate::siyuan_task::CommentDraft<'a> {
-    crate::siyuan_task::CommentDraft { author: "AGENTS", text: "привет", reply_to }
+    crate::siyuan_task::CommentDraft {
+        author: "AGENTS",
+        text: "привет",
+        reply_to,
+    }
 }
 
 fn test_board() -> SyBoard {
@@ -494,6 +644,7 @@ fn test_task() -> SyTask {
         pr: String::new(),
         schedule: String::new(),
         last_run: String::new(),
+        dev_session: String::new(),
         body_doc: Some("20261105120000-bounddo1".into()),
     }
 }

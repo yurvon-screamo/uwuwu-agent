@@ -7,7 +7,7 @@
 
 use crate::markdown::{collapse_whitespace, strip_export_wrapper};
 use crate::siyuan::{FileFetch, SiYuan};
-use crate::siyuan_task::{body_template, normalize_title, SyBoard, SyTask};
+use crate::siyuan_task::{body_template, legacy_body_template, normalize_title, SyBoard, SyTask};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -61,7 +61,10 @@ impl Verdict {
     /// Снос разрешён с `--yes` (Dead — с owner-подтверждением по процедуре
     /// dry-run → владелец → --yes).
     pub(crate) fn is_removable(self) -> bool {
-        matches!(self, Verdict::DraftSkeleton | Verdict::DraftDead | Verdict::Dead)
+        matches!(
+            self,
+            Verdict::DraftSkeleton | Verdict::DraftDead | Verdict::Dead
+        )
     }
 
     /// Снос только по явному per-row ack.
@@ -108,9 +111,8 @@ pub(crate) fn verdict(evidence: &RowEvidence) -> Verdict {
     if !evidence.in_render {
         return Verdict::Phantom;
     }
-    let body_alive = evidence.fs == Probe::Found
-        || evidence.sql == Probe::Found
-        || evidence.title_body_found;
+    let body_alive =
+        evidence.fs == Probe::Found || evidence.sql == Probe::Found || evidence.title_body_found;
     // DraftSkeleton стоит ПЕРЕД Live: исключение возможно только при явном
     // гейте Draft — иначе ветка сносила бы нетронутые костяки живых задач.
     if evidence.status_is_draft && evidence.fs == Probe::Found && evidence.skeleton_match {
@@ -133,6 +135,15 @@ pub(crate) fn verdict(evidence: &RowEvidence) -> Verdict {
 /// `#dev/#spike/#bug` (её дописывает create) вырезается, пробельные run'ы
 /// схлопываются; сравнение против всех трёх шаблонов — тип задачи живёт
 /// в теле, не в строке.
+/// Тело равно пустому шаблону? Экспортная обёртка снимается, тег-строка
+/// `#dev/#spike/#bug` (её дописывает create) вырезается, пробельные run'ы
+/// схлопываются. Сверка против нового костяка и легаси всех трёх типов
+/// (тип задачи живёт в теле, не в строке): новый костяк от тайтла не
+/// зависит, легаси (до 06.11, `# {title}`-блок в контенте и полный
+/// dev-набор Решение/Юзкейсы/Сиквенсы) — зависит. Легаси-ветка
+/// обязательна: нетронутые скелеты, созданные до смены шаблона, иначе
+/// матчатся как Live → task clean теряет брошенные Draft-черновики
+/// (уходят в ручной --live-режим).
 pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
     let stripped = strip_export_wrapper(export_md, title);
     let without_type_tag: String = stripped
@@ -141,9 +152,10 @@ pub(crate) fn body_is_skeleton(export_md: &str, title: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
     let normalized = collapse_whitespace(&without_type_tag);
-    ["dev", "spike", "bug"]
-        .iter()
-        .any(|ty| collapse_whitespace(&body_template(title, ty, "")) == normalized)
+    ["dev", "spike", "bug"].iter().any(|ty| {
+        collapse_whitespace(&body_template(ty, "")) == normalized
+            || collapse_whitespace(&legacy_body_template(title, ty)) == normalized
+    })
 }
 
 // ——— undo-журнал: write-ahead в data/assets/undo/ ———
@@ -170,7 +182,7 @@ pub(crate) struct JournalRow {
 pub(crate) struct Journal {
     pub created: String,
     pub project: String,
-    /// clean | rm | cron-rm
+    /// clean | rm | cron-rm | goal-rm
     pub kind: String,
     pub av_id: String,
     pub board_doc: String,
@@ -228,8 +240,9 @@ impl Journal {
             format!("{UNDO_DIR}/{name_or_path}")
         };
         match sy.fetch_workspace_file(&path).await {
-            FileFetch::Bytes(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("журнал {path} не парсится")),
+            FileFetch::Bytes(bytes) => {
+                serde_json::from_slice(&bytes).with_context(|| format!("журнал {path} не парсится"))
+            }
             FileFetch::Missing => bail!("журнала {path} нет (список: task undo --list)"),
             FileFetch::Failed(err) => bail!("журнал {path} не прочитан: {err}"),
         }
@@ -287,7 +300,12 @@ pub(crate) fn evidence_from_sources(
 
 /// FS-проба тела строки: docId известен — путь по id-цепочке доски
 /// (индекс и тайтлы не участвуют); detached-строка — проба невозможна.
-pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, chain: &[String], task: &SyTask) -> Probe {
+pub(crate) async fn probe_body_fs(
+    sy: &SiYuan,
+    board: &SyBoard,
+    chain: &[String],
+    task: &SyTask,
+) -> Probe {
     let Some(doc) = task.body_doc.as_deref() else {
         return Probe::NotPossible;
     };
@@ -297,7 +315,10 @@ pub(crate) async fn probe_body_fs(sy: &SiYuan, board: &SyBoard, chain: &[String]
         FileFetch::Bytes(_) => Probe::Found,
         FileFetch::Missing => Probe::Absent,
         FileFetch::Failed(err) => {
-            eprintln!("предупреждение: FS-проба тела {} не состоялась: {err}", task.item_id);
+            eprintln!(
+                "предупреждение: FS-проба тела {} не состоялась: {err}",
+                task.item_id
+            );
             Probe::Failed
         }
     }
@@ -316,10 +337,19 @@ pub(crate) async fn probe_body_sql(sy: &SiYuan, task: &SyTask) -> Probe {
         ))
         .await;
     match rows {
-        Ok(rows) if rows.iter().any(|r| r.get("id").and_then(|i| i.as_str()) == Some(doc)) => Probe::Found,
+        Ok(rows)
+            if rows
+                .iter()
+                .any(|r| r.get("id").and_then(|i| i.as_str()) == Some(doc)) =>
+        {
+            Probe::Found
+        }
         Ok(_) => Probe::Absent,
         Err(err) => {
-            eprintln!("предупреждение: SQL-проба тела {} не состоялась: {err}", task.item_id);
+            eprintln!(
+                "предупреждение: SQL-проба тела {} не состоялась: {err}",
+                task.item_id
+            );
             Probe::Failed
         }
     }
@@ -328,8 +358,15 @@ pub(crate) async fn probe_body_sql(sy: &SiYuan, task: &SyTask) -> Probe {
 /// Контрольная проба доски: файл самого док-доски обязан существовать.
 /// Мисс — резолв доски подозрителен (find_board мог соврать), все FS-пробы
 /// тел были бы ложно мертвы → аборт без мутаций.
-pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard, chain: &[String]) -> Result<()> {
-    let ancestors: Vec<&str> = chain[..chain.len().saturating_sub(1)].iter().map(String::as_str).collect();
+pub(crate) async fn control_probe_board(
+    sy: &SiYuan,
+    board: &SyBoard,
+    chain: &[String],
+) -> Result<()> {
+    let ancestors: Vec<&str> = chain[..chain.len().saturating_sub(1)]
+        .iter()
+        .map(String::as_str)
+        .collect();
     let path = SiYuan::doc_file_path(&board.notebook, &ancestors, &board.doc_id);
     match sy.fetch_workspace_file(&path).await {
         FileFetch::Bytes(_) => Ok(()),
@@ -338,29 +375,6 @@ pub(crate) async fn control_probe_board(sy: &SiYuan, board: &SyBoard, chain: &[S
         ),
         FileFetch::Failed(err) => bail!("контрольная проба доски не состоялась: {err}"),
     }
-}
-
-/// Цепочка doc-id от корня ноутбука до дока доски: getIDsByHPath отдаёт id
-/// последнего сегмента пути — идём по префиксам hpath. Хвост цепочки обязан
-/// совпасть с doc_id доски (расхождение = резолв доски расходится с деревом).
-pub(crate) async fn board_doc_chain(sy: &SiYuan, board: &SyBoard) -> Result<Vec<String>> {
-    let segments: Vec<&str> = board.hpath.split('/').filter(|s| !s.is_empty()).collect();
-    let mut chain = Vec::with_capacity(segments.len());
-    for i in 1..=segments.len() {
-        let prefix = format!("/{}", segments[..i].join("/"));
-        let ids = sy.doc_ids_by_hpath(&board.notebook, &prefix).await?;
-        let Some(id) = ids.first() else {
-            bail!("цепочка доков доски оборвана на «{prefix}»: деревья по пути нет");
-        };
-        chain.push(id.clone());
-    }
-    if chain.last().map(String::as_str) != Some(board.doc_id.as_str()) {
-        bail!(
-            "цепочка доков ({:?}) не сходится с доской {} — резолв доски расходится с деревом",
-            chain, board.doc_id
-        );
-    }
-    Ok(chain)
 }
 
 /// Пост-чек: лишние пропажи тайтлов. Ожидание: после = до − план.
@@ -465,7 +479,14 @@ mod tests {
     #[test]
     fn title_body_found_on_detached_row_is_live() {
         // сломанная привязка при живом теле (класс P0-бага привязки)
-        let ev = evidence(true, false, Probe::NotPossible, Probe::NotPossible, true, false);
+        let ev = evidence(
+            true,
+            false,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            true,
+            false,
+        );
         assert_eq!(verdict(&ev), Verdict::Live);
     }
 
@@ -494,9 +515,23 @@ mod tests {
 
     #[test]
     fn detached_row_without_title_body_is_dead_by_status() {
-        let draft = evidence(true, true, Probe::NotPossible, Probe::NotPossible, false, false);
+        let draft = evidence(
+            true,
+            true,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            false,
+            false,
+        );
         assert_eq!(verdict(&draft), Verdict::DraftDead);
-        let live_status = evidence(true, false, Probe::NotPossible, Probe::NotPossible, false, false);
+        let live_status = evidence(
+            true,
+            false,
+            Probe::NotPossible,
+            Probe::NotPossible,
+            false,
+            false,
+        );
         assert_eq!(verdict(&live_status), Verdict::Dead);
     }
 
@@ -509,19 +544,48 @@ mod tests {
             pr: String::new(),
             schedule: String::new(),
             last_run: String::new(),
+            dev_session: String::new(),
             body_doc: Some("doc-1".into()),
         }
     }
 
     fn skeleton_export(title: &str, ty: &str) -> String {
-        format!("---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n", body_template(title, ty, ""))
+        format!(
+            "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n",
+            body_template(ty, "")
+        )
+    }
+
+    /// Экспорт нетронутого скелета эпохи до 06.11: рендер-строка имени
+    /// плюс легаси-костяк со своим `# {title}` heading-блоком в контенте
+    /// (живая проба: у свежих Draft-скелетов той эпохи в экспорте два H1;
+    /// strip_export_wrapper снимает только рендер-строку — блок остаётся).
+    fn legacy_skeleton_export(title: &str, ty: &str) -> String {
+        format!(
+            "---\ntitle: {title}\n---\n\n# {title}\n\n{}\n\n#{ty}\n",
+            legacy_body_template(title, ty)
+        )
     }
 
     #[test]
     fn body_is_skeleton_matches_all_three_templates_with_export_wrapper_and_tag() {
         for ty in ["dev", "spike", "bug"] {
             let export = skeleton_export("таск", ty);
-            assert!(body_is_skeleton(&export, "таск"), "шаблон {ty} должен совпасть");
+            assert!(
+                body_is_skeleton(&export, "таск"),
+                "шаблон {ty} должен совпасть"
+            );
+        }
+    }
+
+    #[test]
+    fn body_is_skeleton_matches_legacy_skeletons_of_all_three_types() {
+        for ty in ["dev", "spike", "bug"] {
+            let export = legacy_skeleton_export("таск", ty);
+            assert!(
+                body_is_skeleton(&export, "таск"),
+                "легаси-шаблон {ty} должен совпасть"
+            );
         }
     }
 
@@ -529,14 +593,23 @@ mod tests {
     fn body_is_skeleton_rejects_body_with_user_content() {
         let export = format!(
             "---\ntitle: таск\n---\n\n# таск\n\n{}\nзаметка владельца\n",
-            body_template("таск", "dev", "")
+            body_template("dev", "")
+        );
+        assert!(!body_is_skeleton(&export, "таск"));
+    }
+
+    #[test]
+    fn body_is_skeleton_rejects_legacy_skeleton_with_extra_user_line() {
+        let export = format!(
+            "{}\nзаметка владельца\n",
+            legacy_skeleton_export("таск", "spike")
         );
         assert!(!body_is_skeleton(&export, "таск"));
     }
 
     #[test]
     fn body_is_skeleton_normalizes_whitespace_runs() {
-        let raw = body_template("т", "dev", "").replace('\n', "\n\n  \n");
+        let raw = body_template("dev", "").replace('\n', "\n\n  \n");
         let export = format!("---\ntitle: т\n---\n\n# т\n\n{raw}\n");
         assert!(body_is_skeleton(&export, "т"));
     }
@@ -562,23 +635,36 @@ mod tests {
     fn frag_matches_by_item_id_prefix_and_title_substring() {
         let mut task = sy_task("Пилот RU\u{2215}EN: старт", "Todo");
         task.item_id = "20261104215724-iso1ra4".into();
-        assert!(frag_matches("20261104215724-iso1ra4", &task), "равенство полного id");
+        assert!(
+            frag_matches("20261104215724-iso1ra4", &task),
+            "равенство полного id"
+        );
         assert!(frag_matches("20261104", &task), "префикс id");
-        assert!(frag_matches("-iso1ra4", &task), "суффикс id с ведущим дефисом, как в resolve");
-        assert!(frag_matches("пилот ru/en", &task), "подстрока нормализованного тайтла");
+        assert!(
+            frag_matches("-iso1ra4", &task),
+            "суффикс id с ведущим дефисом, как в resolve"
+        );
+        assert!(
+            frag_matches("пилот ru/en", &task),
+            "подстрока нормализованного тайтла"
+        );
         assert!(!frag_matches("чужое", &task));
         assert!(!frag_matches("", &task));
     }
 
     #[test]
     fn journal_save_and_load_roundtrip_via_workspace_file() {
-        let mut journal = Journal::new("uwuwu", "clean", &SyBoard {
-            doc_id: "board-doc".into(),
-            av_id: "av-1".into(),
-            block_id: "block-1".into(),
-            hpath: "/uwuwu/Задачи uwuwu".into(),
-            notebook: "20261103224312-fbrf5fp".into(),
-        });
+        let mut journal = Journal::new(
+            "uwuwu",
+            "clean",
+            &SyBoard {
+                doc_id: "board-doc".into(),
+                av_id: "av-1".into(),
+                block_id: "block-1".into(),
+                hpath: "/uwuwu/Задачи uwuwu".into(),
+                notebook: "20261103224312-fbrf5fp".into(),
+            },
+        );
         journal.rows.push(JournalRow {
             item_id: "item-1".into(),
             title: "таск".into(),
@@ -595,12 +681,18 @@ mod tests {
         let parsed: Journal = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.rows.len(), 1);
         assert_eq!(parsed.rows[0].title, "таск");
-        assert_eq!(parsed.rows[0].extra_text_cells, vec![("Schedule".to_string(), "*/5 * * * *".to_string())]);
+        assert_eq!(
+            parsed.rows[0].extra_text_cells,
+            vec![("Schedule".to_string(), "*/5 * * * *".to_string())]
+        );
         assert_eq!(parsed.kind, "clean");
         assert_eq!(parsed.av_id, "av-1");
         let name = parsed.file_name();
         assert!(name.ends_with("-uwuwu-clean.json"));
-        assert!(!name.contains(':'), "колонки недопустимы в имени файла: {name}");
+        assert!(
+            !name.contains(':'),
+            "колонки недопустимы в имени файла: {name}"
+        );
         assert!(parsed.path().starts_with("data/assets/undo/"));
     }
 }
