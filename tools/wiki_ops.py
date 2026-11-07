@@ -715,7 +715,12 @@ def cmd_delete(a):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     row = _doc_row(doc_id)
     if not row:
-        raise RuntimeError(f"док {doc_id} не найден (уже удалён?) — проверь wiki_ops find")
+        # False not-found на живом доке — реальность by-id проб на свежих доках
+        # (лаг SQL-индекса, корень задачи 20261107000209): отказ fail-closed
+        # безопасен (дублей delete не создаёт, пост-чек FS страхует), поэтому
+        # различение не строим — оператору достаточно подсказки в причине.
+        raise RuntimeError(f"док {doc_id} не найден в SQL-индексе (уже удалён? — или док свежий "
+                           "и индекс его ещё не видит: проверь wiki_ops find, повтори позже)")
     children = _children_count(row["path"])
     if children and not a.force:
         raise RuntimeError(f"у дока «{row['hpath']}» есть дочерние доки ({children}) — снос унесёт subtree; подтверди --force")
