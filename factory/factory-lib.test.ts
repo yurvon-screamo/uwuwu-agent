@@ -33,7 +33,6 @@ import {
   routeTask,
   sessionSlotOf,
   TESTING_STATUS,
-  TEST_SESSION_CELL,
   testingSpawnPrompt,
   testingRerunPrompt,
   testingCommentsPrompt,
