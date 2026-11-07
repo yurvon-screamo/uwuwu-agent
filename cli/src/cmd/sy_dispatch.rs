@@ -823,7 +823,7 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
     }
 }
 
-// ——— cron: строки доски «Кроны <proj>» ———
+// ——— cron: инвентарь крон-задач (мастера с расписанием на доске задач) ———
 
 pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
