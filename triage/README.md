@@ -9,7 +9,7 @@
 создаётся с `agent: "triage"`. Агент сам решает: поболтать / ответить на
 вопрос / разобрать заявку (классификация проект+тип, дедуп через
 `uwuwu-cli search`/`task list`, сверка с целями через `uwuwu-cli goal list`) →
-`task create` (сразу `--status Todo`) или
+`task create` (ставит Draft, затем `task edit --status Todo`) или
 коммент в существующую → сводка доставляется в ТГ. Занят → сообщение
 вбрасывается в текущий ход (нативный steer). Референс — origa marketing zoo
 (вечная сессия на личность; опыт `opencode-tg-hub-daemon`,
