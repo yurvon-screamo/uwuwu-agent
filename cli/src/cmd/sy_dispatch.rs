@@ -4714,7 +4714,7 @@ mod tests {
                 // поиск доски (doc_ids_by_hpath идёт через getIDsByHPath; здесь
                 // только av-носитель доски) и прочие выборки — пусто
                 let data = if stmt.contains("type='av'") {
-                    serde_json::json!([{ "id": "block-1", "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>") }])
+                    serde_json::json!([{ "id": "block-1", "markdown": "<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>" }])
                 } else {
                     serde_json::json!([])
                 };
@@ -4738,8 +4738,6 @@ mod tests {
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
                 let _data = if hpath == "/uwuwu/Задачи uwuwu" {
                     serde_json::json!([BOARD_DOC])
-                } else if hpath.contains("/таск") {
-                    serde_json::json!([])
                 } else {
                     serde_json::json!([])
                 };
