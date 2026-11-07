@@ -465,7 +465,7 @@ const dash = (value: string): string => (value.trim() === "" ? "—" : value.tri
 /** Блок инит-данных первого промпта: ориентация без стартового поиска
  *  (person show / доки проекта / task get ради «где я»). Компактный:
  *  суть здесь, глубокое чтение — по ссылке/команде. */
-export function spawnInitBlock(init: SpawnInit, rowId: string, project: string, env?: SpawnEnvContext): string {
+export function spawnInitBlock(init: SpawnInit, rowId: string, project: string): string {
   const taskLine =
     `Задача: «${init.task.title}», статус ${dash(init.task.status)},` +
     ` ветка ${dash(init.task.branch)}, PR ${dash(init.task.pr)}.`
@@ -523,7 +523,7 @@ export function spawnPrompt(
       ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
-    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     ...stage,
@@ -547,7 +547,7 @@ export function continuePrompt(
 ): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
-    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
@@ -575,7 +575,7 @@ export function conflictFixPrompt(
 ): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с master (${pr}).`,
-    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
     ...(env !== undefined
       ? [
