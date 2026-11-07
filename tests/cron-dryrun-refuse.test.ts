@@ -1,12 +1,10 @@
 // tests/cron-dryrun-refuse.test.ts — композиция merge origin/master (sandbox
 // DRY_RUN × refuse-ветка): в DRY_RUN refuse-семантика сохраняется (state
 // получает lastRefusal — решения не отменяются), но записей нет нигде:
-// коммент отказа и saveState гардируются (DRY_RUN-контракт «чтение, спавны
-// и записи — заменяются логом»; setCells гардится сам, create_comment и
-// saveState — точки композиции этого репо). Сценарий гоняется в дочернем
-// процессе (cron-dryrun-child.ts): DRY_RUN — константа модуля демона,
-// в общем процессе bun test её не изолировать без утечки в соседние файлы
-// (паттерн single-instance-child.ts).
+// коммент отказа, state.json и ран-карточка (CLI spawn) гардятся. Сценарий
+// гоняется в дочернем процессе (cron-dryrun-child.ts): DRY_RUN — константа
+// модуля демона, в общем процессе bun test её не изолировать без утечки в
+// соседние файлы (паттерн single-instance-child.ts).
 import { describe, expect, test } from "bun:test"
 import { existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
@@ -32,26 +30,29 @@ async function runChild(): Promise<ChildReport> {
   return JSON.parse(line) as ChildReport
 }
 
-describe("tick × DRY_RUN: refuse без записей в доску", () => {
-  test("refuse фиксируется в state, но create_comment/item_update не вызываются", async () => {
+describe("tick × DRY_RUN: refuse без записей в доки и без рана", () => {
+  test("refuse фиксируется в state, но коммент/state.json/CLI-спавн не случаются", async () => {
     // чистая песочница child: ассерт «state.json не появился» должен быть
     // о именно этом прогоне, а не о хвосте прошлого
     rmSync(CHILD_STATE_DIR, { recursive: true, force: true })
     const report = await runChild()
     expect(report.error ?? "").toBe("")
-    // refuse-семантика жива: слот сожжён (lastRefusal) — DRY_RUN заменяет
-    // записи логом, но решения не отменяет
-    const tracked = report.state?.["20261106000000-row0001"]
-    expect(tracked?.lastRefusal ?? "").toContain("строка без тела")
-    // точка композиции: коммент отказа в DRY_RUN не уходит в док доски
-    expect(report.calls.filter((c) => c.name.startsWith("create_comment"))).toEqual([])
-    // гард setCells из master: ячейки Last Run/Status не пишутся
+    // refuse-семантика жива: причина зафиксирована (дедуп повторов),
+    // DRY_RUN заменяет записи логом, но решения не отменяет
+    const tracked = report.state?.["20261107000000-row0001"]
+    expect(tracked?.lastRefusal ?? "").toContain("тело рендерится в пусто")
+    // точка композиции: коммент отказа в DRY_RUN не уходит в тело мастера
+    expect(report.calls.filter((c) => c.name.includes("appendBlock"))).toEqual([])
+    // новый демон вообще не пишет ячейки досок (Last Run/Status сняты)
     expect(report.calls.filter((c) => c.name.includes("item_update"))).toEqual([])
+    // ран-карточка не создаётся: ни одного CLI-спавна в DRY_RUN
+    expect(report.calls.filter((c) => c.kind === "spawn")).toEqual([])
     // инвариант «DRY_RUN ⇒ ни одной записи» на уровне API (гард saveState,
     // ревью раунд 4 High): state.json не появляется даже в песочнице child —
     // refuse фиксируется только в in-memory state
     expect(existsSync(join(CHILD_STATE_DIR, "state.json"))).toBeFalse()
-    // отказ дошёл до title-fallback (get_doc доски + getIDsByHPath)
-    expect(report.calls.some((c) => c.name === "getIDsByHPath")).toBe(true)
+    // тик дошёл до атрибутов расписания и экспорта тела мастера
+    expect(report.calls.some((c) => c.name === "getBlockAttrs")).toBe(true)
+    expect(report.calls.some((c) => c.name === "exportMdContent")).toBe(true)
   })
 })

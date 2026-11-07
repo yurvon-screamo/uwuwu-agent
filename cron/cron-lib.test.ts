@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked,
-  firePrompt, cronBodyStub, minuteStart, fireGate,
+  firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
 } from "./cron-lib"
 
@@ -18,11 +18,16 @@ describe("parseSchedule", () => {
     expect(parseSchedule("09:30")).toEqual({ kind: "at", hour: 9, minute: 30 })
     expect(parseSchedule("23:59 01.12")).toEqual({ kind: "at", hour: 23, minute: 59, day: 1, month: 12 })
     expect(parseSchedule("25:00")).toBeNull()
+    // диапазоны даты — паритет с CLI-валидацией: иначе «легально» молчал бы вечно
+    expect(parseSchedule("09:30 32.01")).toBeNull()
+    expect(parseSchedule("09:30 01.13")).toBeNull()
   })
   test("cron-выражения", () => {
     expect(parseSchedule("*/30 * * * *")?.kind).toBe("cron")
     expect(parseSchedule("* * * *")).toBeNull()
     expect(parseSchedule("раз в минутку")).toBeNull()
+    // шаг 0 — «легальный» вечный ноль: отвергается на парсинге
+    expect(parseSchedule("*/0 * * * *")).toBeNull()
   })
 })
 
@@ -90,60 +95,54 @@ describe("isValidTracked", () => {
 })
 
 describe("firePrompt", () => {
-  const row = { rowId: "r1", bodyDoc: "d1", title: "Проверка X", schedule: "*/30 * * * *", status: "active", lastRun: "" }
+  const master = { title: "Проверка X", schedule: "*/30 * * * *" }
   test("тихий тик: без обязательного отчётного коммента и [DONE]", () => {
-    const p = firePrompt(row, "проверь и молчи", "1xgames")
+    const p = firePrompt(master, "проверь и молчи", "20261107090000-run001", "1xgames")
     expect(p).not.toContain("Доложи результат")
-    expect(p).toContain("Здоровый тик — тихий")
-    expect(p).toContain("демон сам пишет в Last Run")
+    expect(p).toContain("Здоровый ран — тихий")
+    expect(p).toContain("ран-карточка — запись запуска")
     expect(p).not.toContain("[DONE]")
     expect(p).not.toContain("🤖")
   })
-  test("правки, предписанные телом крона, не запрещены (ревью Common-3)", () => {
-    const p = firePrompt(row, "", "uwuwu")
-    expect(p).toContain("Правки и записи, которые предписывает само тело крона")
-    expect(p).toContain("запрещён только шум ради отчёта")
+  test("ран-карточка названа: агент не работает по ней и статус не меняет", () => {
+    const p = firePrompt(master, "", "20261107090000-run001", "uwuwu")
+    expect(p).toContain("Ран-карточка этого запуска — задача 20261107090000-run001")
+    expect(p).toContain("статус не меняй (закрывает владелец)")
   })
-  test("исключение: команда коммента с project и ЧТО РЕШИТЬ", () => {
-    const p = firePrompt(row, "=== СЕКРЕТ ===\nпроверь", "1xgames")
-    expect(p).toContain("uwuwu-cli task comment r1 --project 1xgames")
+  test("исключение: команда коммента на ран с project и ЧТО РЕШИТЬ", () => {
+    const p = firePrompt(master, "=== СЕКРЕТ ===\nпроверь", "20261107090000-run001", "1xgames")
+    expect(p).toContain("uwuwu-cli task comment 20261107090000-run001 --project 1xgames")
     expect(p).toContain("ЧТО РЕШИТЬ")
     expect(p).toContain("ТОЛЬКО исключение")
     expect(p).toContain("≡")
   })
-  test("строка снята в полёте — завершить ход молча (ревью Common-2/решение владельца)", () => {
-    const p = firePrompt(row, "", "uwuwu")
+  test("блокер: Needs attention на ране тем же ходом", () => {
+    const p = firePrompt(master, "", "20261107090000-run001", "uwuwu")
+    expect(p).toContain('task edit 20261107090000-run001 --project uwuwu --status "Needs attention"')
+  })
+  test("ран снят в полёте — завершить ход молча (ревью Common-2/решение владельца)", () => {
+    const p = firePrompt(master, "", "20261107090000-run001", "uwuwu")
     expect(p).toContain("заверши ход молча")
   })
   test("тело уходит в промпт как есть — стаба пустого тела нет (гейт не пускает пустое)", () => {
-    const p = firePrompt(row, "делай работу", "uwuwu")
-    expect(p).toContain("=== ТЕЛО КРОНА ===\nделай работу\n=== КОНЕЦ ТЕЛА ===")
+    const p = firePrompt(master, "делай работу", "20261107090000-run001", "uwuwu")
+    expect(p).toContain("=== ТЕЛО ЗАДАЧИ ===\nделай работу\n=== КОНЕЦ ТЕЛА ===")
     expect(p).not.toContain("пусто — отработай по заголовку")
   })
 })
 
-describe("cronBodyStub", () => {
-  test("структура тела", () => {
-    const md = cronBodyStub("Проверка Y", "5m")
-    expect(md).toContain("# Проверка Y")
-    expect(md).toContain("`5m`")
-    expect(md).toContain("## Комменты")
-    expect(md).toContain("только исключение")
-  })
-})
-
-describe("fireGate: файр только по живой активной строке свежего среза", () => {
+describe("fireGate: файр только по живой Вейт-строке свежего среза", () => {
   const rows = [
-    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", status: "active", lastRun: "" },
-    { rowId: "zomb", bodyDoc: "d", title: "T", schedule: "5m", status: "paused", lastRun: "" },
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", status: "вейт" },
+    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", status: "in progress" },
   ]
-  test("строка снята (cron rm/clean) — removed, файра нет", () => {
+  test("строка снята — removed, файра нет", () => {
     expect(fireGate(rows, "gone")).toBe("removed")
   })
-  test("строка паузнута после среза — paused, файра нет", () => {
-    expect(fireGate(rows, "zomb")).toBe("paused")
+  test("строка снята с Вейт после среза — not-wait, файра нет", () => {
+    expect(fireGate(rows, "moved")).toBe("not-wait")
   })
-  test("живая активная строка — fire", () => {
+  test("живая Вейт-строка — fire", () => {
     expect(fireGate(rows, "alive")).toBe("fire")
   })
 })
@@ -184,9 +183,6 @@ describe("bodyRenderIssue: тело, рендерящееся агенту в п
   test("пустая строка → причина", () => {
     expect(bodyRenderIssue("")).not.toBeNull()
     expect(bodyRenderIssue("  \n\n")).not.toBeNull()
-  })
-  test("стаб cron set — валидное тело (заголовок-эхо срезан, постановка осталась)", () => {
-    expect(bodyRenderIssue(cronBodyStub("Проверка Z", "5m"))).toBeNull()
   })
   test("av-экспорт доски (таблица) читаем — валиден", () => {
     const md = "# Доска\n\n| Заголовок | Status |\n| --- | --- |\n| строка | active |\n"

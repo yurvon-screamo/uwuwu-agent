@@ -1,10 +1,13 @@
-// uwuwu-cron — демон кронов (SiYuan).
-// Поллит все крон-доски: глобальную «Crons» + «Кроны <Proj>» по папкам Projects
-// (собираются динамически, отсутствующие доски тихо скипаются): строка = крон
-// (Schedule/Status/Last Run, промпт в теле). Наступило расписание → OpenCode-сессия
-// с промптом из тела; здоровый тик тихий (факт — ячейка Last Run, коммент агента —
-// только исключение); разовые (at) после срабатывания → fired (paused — только
-// явное решение юзера).
+// uwuwu-cron — планировщик крон-задач (SiYuan).
+// Крон = обычная задача на доске «Задачи <proj>»: расписание — custom-атрибут
+// custom-schedule в доке-теле, мастер живёт в статусе «Вейт». Демон поллит
+// все задачные доски (собираются динамически из организ-дерева): строка
+// Вейт + валидное расписание + наступило время → создаются ран-карточка
+// (task create → Todo, запись запуска на доске) и OpenCode-сессия с промптом
+// из тела мастера. Здоровый ран тих (ран-карточка — сам факт); one-shot
+// после срабатывания не повторяется (state; закрытие карточки — за владельцем).
+// Крон-доски «Кроны <proj>» и колонки Schedule/Status/Last Run сняты
+// (унификация кронов с задачами, задача 20261106182051-o5ejlte).
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
@@ -14,6 +17,7 @@ import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain, resolveStateDir, sandboxedStateDir } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, parseSchedule, firePrompt, resolveBody, titleFromBody,
+  stripNonContent, type PlatformTool,
   type CronRow, type CronState,
 } from "./cron-lib"
 
@@ -23,13 +27,13 @@ const STATE_DIR_RAW = process.env.UWUWU_CRON_STATE_DIR
 const STATE_DIR = resolveStateDir(STATE_DIR_RAW, join(homedir(), ".local/state/uwuwu-cron"))
 const STATE_FILE = join(STATE_DIR, "state.json")
 
-/** Локальное время «YYYY-MM-DD HH:MM» — Last Run на доске должен читаться юзером, не UTC. */
+/** Локальное время «YYYY-MM-DD HH:MM» — метки запусков в логе читает юзер. */
 function formatLocal(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0")
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
-/** изолированный cwd крон-агентов: тело крона редактируемо удалённо —
+/** изолированный cwd крон-агентов: тело задачи редактируемо удалённо —
  *  исполняющая среда не должна видеть весь домашний каталог */
 const WORKSPACE = join(homedir(), ".local/share/uwuwu-cron/workspace")
 /** Путь лога: env-override (тесты тика пишут в tmp — os.homedir() в Bun
@@ -41,14 +45,21 @@ const LOG_PATH = process.env.UWUWU_CRON_LOG ?? (sandboxedStateDir(STATE_DIR_RAW)
   : join(homedir(), ".local/share/opencode/log/uwuwu-cron.log"))
 const TICK_SEC = Number(process.env.UWUWU_CRON_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_CRON_ONCE === "1"
-/** DRY_RUN: полный цикл решений по реальным крон-доскам (чтение), спавны
- *  и записи ячеек заменяются логом. Требует песочницу state — гард в main().
- *  Без него песочный state опасен сам по себе: чистый state делает все
- *  периодические кроны due → реальные спавны на прод-досках. */
+/** DRY_RUN: полный цикл решений по реальным доскам (чтение), спавны,
+ *  ран-карточки и state-записи заменяются логом. Требует песочницу state —
+ *  гард в main(). Без него песочный state опасен сам по себе: чистый state
+ *  делает все периодические мастера due → реальные спавны на прод-досках. */
 const DRY_RUN = process.env.UWUWU_CRON_DRY_RUN === "1"
-/** пауза между срабатываниями одного крона пока жива его сессия */
+/** пауза между срабатываниями одного мастера, пока жива его сессия */
 const SESSION_COOLDOWN_MS = 10 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
+
+/** Бинарь CLI для ран-карточек: прод — ~/.cargo/bin (systemd PATH не несёт
+ *  его); UWUWU_CLI_BIN переопределяет (тесты/нестандартная установка). */
+const CLI_BIN = process.env.UWUWU_CLI_BIN
+  ?? (existsSync(join(homedir(), ".cargo/bin/uwuwu-cli"))
+    ? join(homedir(), ".cargo/bin/uwuwu-cli")
+    : "uwuwu-cli")
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}
@@ -100,12 +111,10 @@ function saveState(state: CronState): void {
 
 interface BoardIds { docId: string; dbId: string }
 
-/** Крон-доски: глобальная «Crons» + «Кроны <proj>» по папкам Projects
- *  (динамически — новые проекты подхватываются без правки демона).
- *  Отсутствующие доски тихо скипаются (создаёт юзер руками). */
-const GLOBAL_CRON_BOARD = "Crons"
-
-async function cronBoardTitles(): Promise<string[]> {
+/** Задачные доски: «Задачи <proj>» по папкам Projects (динамически — новые
+ *  проекты подхватываются без правки демона). Отсутствующие доски тихо
+ *  скипаются (кроны живут там же, где обычные задачи). */
+async function taskBoardTitles(): Promise<string[]> {
   try {
     const r = await mcp.tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>(
       "list_organize_nodes", {})
@@ -115,10 +124,10 @@ async function cronBoardTitles(): Promise<string[]> {
       .filter(n => n.type === "folder" && n.parentId === pid)
       .map(n => n.data)
       .filter((d): d is string => typeof d === "string")
-    return [GLOBAL_CRON_BOARD, ...projects.map(p => `Кроны ${p}`)]
+    return projects.map(p => `Задачи ${p}`)
   } catch (e) {
     if (e instanceof mcp.KernelUnavailableError) throw e // лежащее ядро не маскировать фоллбеком
-    return [GLOBAL_CRON_BOARD]
+    return []
   }
 }
 
@@ -127,8 +136,8 @@ async function findBoard(title: string): Promise<BoardIds | null> {
   let docId = r.matches?.find(m => m.inTrash !== true)?.id
   if (docId === undefined) {
     // индекс тайтлов отстаёт от свежих/переименованных доков — фоллбек
-    // через организ-дерево: «Кроны X» → папка X → дети по точному тайтлу
-    const proj = title.startsWith("Кроны ") ? title.slice("Кроны ".length) : null
+    // через организ-дерево: «Задачи X» → папка X → дети по точному тайтлу
+    const proj = title.startsWith("Задачи ") ? title.slice("Задачи ".length) : null
     if (proj !== null) docId = await boardViaOrganize(proj, title) ?? undefined
   }
   if (docId === undefined) return null
@@ -138,7 +147,7 @@ async function findBoard(title: string): Promise<BoardIds | null> {
   return { docId, dbId }
 }
 
-/** Доска без поискового индекса: «Кроны <proj>» → папка <proj> → доки. */
+/** Доска без поискового индекса: «Задачи <proj>» → папка <proj> → доки. */
 async function boardViaOrganize(proj: string, title: string): Promise<string | null> {
   try {
     const r = await mcp.tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>(
@@ -162,9 +171,9 @@ async function boardViaOrganize(proj: string, title: string): Promise<string | n
   return null
 }
 
-async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
+async function findTaskBoards(): Promise<{ title: string; board: BoardIds }[]> {
   const out: { title: string; board: BoardIds }[] = []
-  for (const title of await cronBoardTitles()) {
+  for (const title of await taskBoardTitles()) {
     try {
       const board = await findBoard(title)
       if (board !== null) out.push({ title, board })
@@ -176,7 +185,10 @@ async function findCronBoards(): Promise<{ title: string; board: BoardIds }[]> {
   return out
 }
 
-async function readCrons(board: BoardIds): Promise<CronRow[]> {
+/** Срез доски: строки задач (Title/Status/привязка тела). Расписание —
+ *  не колонка: читается из атрибутов дока-тела отдельно, только для
+ *  Вейт-строк (стоимость тика не растёт по всей доске). */
+async function readRows(board: BoardIds): Promise<CronRow[]> {
   const r = await mcp.tool<{
     rows?: {
       rowBlockId?: string
@@ -191,18 +203,17 @@ async function readCrons(board: BoardIds): Promise<CronRow[]> {
       rowId: row.rowBlockId as string,
       bodyDoc: row.linkedDocId ?? "",
       title: (row.title ?? "").trim(),
-      schedule: row.cells?.Schedule?.value?.trim() ?? "",
+      schedule: "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
-      lastRun: row.cells?.["Last Run"]?.value ?? "",
     }))
 }
 
-async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
-  if (DRY_RUN) {
-    log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
-    return
-  }
-  await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
+/** Расписание мастера: custom-schedule из атрибутов дока-тела; null —
+ *  атрибута нет (обычная припаркованная в Вейт задача, не крон).
+ *  REST getBlockAttrs, не SQL: колонка ial отстаёт от свежих записей. */
+async function scheduleOf(tool: PlatformTool, bodyDoc: string): Promise<string | null> {
+  const attrs = await tool<{ [k: string]: string }>("get_doc_attrs", { docId: bodyDoc })
+  return attrs["custom-schedule"] ?? null
 }
 
 // ——— opencode REST ———
@@ -228,7 +239,7 @@ async function fireSession(title: string, prompt: string): Promise<string | null
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: `⏰ ${title.replace(/[\r\n]+/g, " ").slice(0, 60)}`,
+      title: title.replace(/[\r\n]+/g, " ").slice(0, 60),
       model: { providerID: MODEL.providerID, id: MODEL.id },
       location: { directory: WORKSPACE },
     },
@@ -258,33 +269,135 @@ async function sessionAlive(sessionID: string): Promise<boolean | null> {
 // ——— тик ———
 
 async function tick(state: CronState): Promise<void> {
-  const boards = await findCronBoards()
+  const boards = await findTaskBoards()
   const now = new Date()
   for (const { title: boardTitle, board } of boards) {
     await tickBoard(state, board, boardTitle, now)
   }
 }
 
+/** Проект из тайтла доски («Задачи <proj>»): явный --project в дологе
+ *  рана и комментов — агенту не нужно угадывать. */
+function projectOfBoard(boardTitle: string): string {
+  return boardTitle.startsWith("Задачи ") ? boardTitle.slice("Задачи ".length) : "uwuwu"
+}
+
+/** Тайтл ран-карточки: метка времени делает его уникальным на доске
+ *  (дубли тайтлов строк CLI ловит как ошибку). */
+function runCardTitle(master: CronRow, now: Date): string {
+  const sec = String(now.getSeconds()).padStart(2, "0")
+  return `⏰ ${master.title || master.rowId.slice(0, 8)} · ${formatLocal(now)}:${sec}`
+}
+
+/** Тело ран-карточки: шапка запуска + копия инструкции мастера на момент
+ *  файра (владелец видит, ЧТО выполнялось; промпт сессии несёт то же тело). */
+function runCardBody(masterTitle: string, schedule: string, instruction: string, now: Date): string {
+  return [
+    `Ран крон-задачи «${masterTitle.replace(/[\r\n]+/g, " ")}» (расписание: \`${schedule}\`), запуск ${formatLocal(now)}.`,
+    "Закрывает владелец; агент работает по инструкции из промпта сессии (копия ниже).",
+    "",
+    "## Инструкция мастера",
+    instruction,
+  ].join("\n")
+}
+
+/** Ран-карточка запуска: task create (Draft) → edit Todo. CLI зовётся
+ *  процессом — боевой create с дедупом тайтла и verify вставки; дублировать
+ *  write-путь в TS не делаем. rowId или null (создание не удалось —
+ *  ретрай следующим тиком). */
+async function createRunCard(project: string, runTitle: string, bodyMd: string): Promise<string | null> {
+  const create = Bun.spawn([CLI_BIN, "task", "create", "--project", project, "--title", runTitle, "--stdin"], {
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  })
+  create.stdin.write(bodyMd)
+  create.stdin.end()
+  const [out, err, code] = await Promise.all([
+    new Response(create.stdout).text(),
+    new Response(create.stderr).text(),
+    create.exited,
+  ])
+  if (code !== 0) {
+    log(`task create упал (code ${code}): ${err.trim().slice(0, 200)}`)
+    return null
+  }
+  const rowId = /строка: (\S+)/.exec(out)?.[1]
+  if (rowId === undefined) {
+    log(`task create без строки в выводе: ${out.trim().slice(0, 200)}`)
+    return null
+  }
+  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo"], {
+    stdout: "pipe", stderr: "pipe",
+  })
+  const [, editErr, editCode] = await Promise.all([
+    new Response(edit.stdout).text(),
+    new Response(edit.stderr).text(),
+    edit.exited,
+  ])
+  if (editCode !== 0) {
+    // не фатально: Draft-ран в окне дебаунса не поймается вотчером, а если
+    // поймается — триаж переведёт сам («уже не Draft → пропусти» не сработает,
+    // вердикт Todo); ран не теряется в обоих исходах
+    log(`task edit Todo не прошёл (code ${editCode}): ${editErr.trim().slice(0, 200)} — ран останется Draft до триажа`)
+  }
+  return rowId
+}
+
 /** Экспорт для юнит-тестов тика (демон стартует только как entry — import.meta.main). */
 export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
-  const rows = await readCrons(board)
+  const rows = await readRows(board)
+  const project = projectOfBoard(boardTitle)
 
   for (const row of rows) {
-    if (row.status !== "active") continue
-    const sched0 = parseSchedule(row.schedule)
-    // reconcile: разовый уже стрелял (демон упал до setCells) → дозаповедать.
-    // окно 24ч: юзерский re-arm (paused→active руками) вне окна не гасится
+    if (row.status !== "вейт") continue
+    // Вейт без тела или без custom-schedule — обычная припаркованная задача
+    // (Вейт общий для некронов), не крон-мастер: тихий скип
+    if (row.bodyDoc === "") continue
+    let scheduleRaw: string
+    try {
+      const found = await scheduleOf(mcp.tool, row.bodyDoc)
+      if (found === null) continue
+      scheduleRaw = found
+    } catch (e) {
+      if (e instanceof mcp.KernelUnavailableError) throw e
+      log(`мастер «${row.title || row.rowId.slice(0, 8)}»: атрибуты тела не прочитаны (${String(e)}) — пропуск, ретрай следующим тиком`)
+      continue
+    }
+    row.schedule = scheduleRaw
+
+    const sched0 = parseSchedule(scheduleRaw)
+    // reconcile: разовый уже стрелял (демон упал до state-записи) → не
+    // повторяем. окно 24ч: юзерский re-arm (снова Вейт руками) вне окна не гасится.
+    // Status=fired больше не пишем (колонок нет) — закрытие карточек за владельцем
     const prevFire = state.crons[row.rowId]?.lastFiredAt ?? 0
     if (sched0 !== null && isOneShot(sched0) && prevFire > 0
         && now.getTime() - prevFire < 86_400_000) {
-      await setCells(board, row.rowId, { Status: "fired" })
-      log(`крон «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — fired (reconcile)`)
+      log(`мастер «${row.title || row.rowId.slice(0, 8)}»: разовый уже стрелял — скип (reconcile)`)
       continue
     }
     const sched = sched0
     if (sched === null) {
-      // диагностика: молчащий навсегда крон — худший режим отказа
-      log(`крон «${row.title || row.rowId.slice(0, 8)}»: кривое расписание «${row.schedule}» — пропущен`)
+      // диагностика: молчащий навсегда мастер — худший режим отказа;
+      // коммент с дедупом (не спамим каждым тиком). Слот НЕ сжигается:
+      // фиксированное расписание не должно упираться в отказное prevFire
+      // (reconcile разового ложно «стрелял» бы)
+      const reason = `кривое расписание «${scheduleRaw}» — жди 5m|2h|1d, HH:MM [DD.MM] или cron из 5 полей`
+      log(`мастер «${row.title || row.rowId.slice(0, 8)}»: ${reason}`)
+      const prev = state.crons[row.rowId]
+      if (prev?.lastRefusal !== reason) {
+        if (DRY_RUN) {
+          log(`DRY_RUN: коммент отказа пропущен`)
+        } else {
+          await mcp.tool("create_comment", {
+            docId: row.bodyDoc,
+            content: `крон-мастер не запускается: ${reason}. Почини расписание (task edit ${row.rowId} --schedule "…") — следующий файр подхватит.`,
+          })
+        }
+        state.crons[row.rowId] = {
+          ...(prev ?? { sessionID: "", lastFiredAt: 0, firedAtIso: "" }),
+          lastRefusal: reason,
+        }
+        if (!DRY_RUN) saveState(state)
+      }
       continue
     }
 
@@ -299,80 +412,79 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     }
 
     if (!due(sched, lastFired, now)) continue
-    // стоп-сигнал: не спавним новую работу — крон доедет при следующем старте
+    // стоп-сигнал: не спавним новую работу — мастер доедет при следующем старте
     if (drain.isStopping()) break
 
-    // проект из тайтла доски («Кроны <proj>»): явный --project в дологе —
-    // агенту не нужно угадывать (глобальная доска «Crons» не используется)
-    const project = boardTitle.startsWith("Кроны ") ? boardTitle.slice("Кроны ".length) : "uwuwu"
-    // срез доски прочитан в начале тика — перед спавном строка перепроверяется;
-    // резолв+валидация тела стоят в гейтовом окне ПОСЛЕ перепроверки: коммент
-    // отказа не уйдёт в доску по уже снятой/паузнутой строке
-    const gate = fireGate(await readCrons(board), row.rowId)
+    // срез доски прочитан в начале тика — перед спавном строка перепроверяется:
+    // мастер мог быть закрыт/снят с Вейт, пока тик обрабатывал очередь
+    const gate = fireGate(await readRows(board), row.rowId)
     if (gate !== "fire") {
-      log(`крон «${row.title || row.rowId.slice(0, 8)}»: ${gate === "removed" ? "строка снята" : "строка паузнута"} — пропуск`)
+      log(`мастер «${row.title || row.rowId.slice(0, 8)}»: ${gate === "removed" ? "строка снята" : "статус не Вейт"} — пропуск`)
       continue
     }
     const resolved = await resolveBody(mcp.tool, board.docId, row)
-    // linked-строки несут заголовок в теле: деривируем из первой содержательной строки
-    const title = row.title !== "" ? row.title
-      : titleFromBody(resolved.kind === "ok" ? resolved.markdown : "") || `крон ${row.rowId.slice(0, 8)}`
+    const masterTitle = row.title !== "" ? row.title
+      : titleFromBody(resolved.kind === "ok" ? resolved.markdown : "") || `мастер ${row.rowId.slice(0, 8)}`
     if (resolved.kind === "infra") {
-      // сбой ядра ≠ вердикт «тела нет»: state/Last Run/one-shot не трогаем —
-      // ретрай следующим тиком (пропущенная cron-минута ждёт следующей
-      // матчера-минуты, семантика классического cron)
-      log(`крон «${title}»: тело не разрешено (сбой ядра?) — ${resolved.error} — ретрай следующим тиком`)
+      // сбой ядра ≠ вердикт «тела нет»: state не трогаем — ретрай следующим
+      // тиком (пропущенная минута ждёт следующей матчера-минуты, семантика
+      // классического cron)
+      log(`мастер «${masterTitle}»: тело не разрешено (сбой ядра?) — ${resolved.error} — ретрай следующим тиком`)
       continue
     }
     if (resolved.kind === "refuse") {
-      // отказ вместо спавна: коммент причины с дедупом (только при смене),
-      // lastFiredAt/Last Run фиксируем — иначе ретрай каждым тиком = спам.
-      // Коммент — в док доски, НЕ в тело: коммент в опустошённом теле делал
-      // его «непустым», и следующий цикл файрил мусор (e2e 05.11)
-      log(`крон «${title}»: отказ — ${resolved.reason}`)
-      if (state.crons[row.rowId]?.lastRefusal !== resolved.reason) {
-        if (DRY_RUN) {
-          log(`DRY_RUN: крон «${row.title || row.rowId.slice(0, 8)}» — коммент отказа пропущен`)
-        } else {
+      // отказ вместо спавна: коммент причины в тело мастера с дедупом.
+      // Слот сжигается (lastFiredAt=now): due уже прошёл — без сожжения
+      // каждый тик той же матчера-минуты повторял бы отказ; ретрай — на
+      // следующем слоте расписания (семантика старого контура)
+      log(`мастер «${masterTitle}»: отказ — ${resolved.reason}`)
+      const deduped = state.crons[row.rowId]?.lastRefusal === resolved.reason
+      // решения не отменяются и в DRY_RUN: lastRefusal в in-memory state,
+      // записи (коммент/state.json) — заменяются логом
+      state.crons[row.rowId] = {
+        sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString(),
+        lastRefusal: resolved.reason,
+      }
+      if (DRY_RUN) {
+        log(`DRY_RUN: коммент отказа пропущен`)
+      } else {
+        if (!deduped) {
           await mcp.tool("create_comment", {
-            docId: board.docId,
-            content: `крон «${row.title || row.rowId.slice(0, 8)}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
+            docId: row.bodyDoc,
+            content: `крон-мастер «${masterTitle}» не запущен: ${resolved.reason}. Почини постановку (тело/привязку строки) — следующий файр подхватит.`,
           })
         }
-      }
-      state.crons[row.rowId] = {
-        sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString(), lastRefusal: resolved.reason,
-      }
-      saveState(state)
-      await setCells(board, row.rowId, { "Last Run": formatLocal(now) })
-      if (isOneShot(sched)) {
-        await setCells(board, row.rowId, { Status: "fired" })
-        log(`крон «${title}»: разовый — отказ, fired`)
+        saveState(state)
       }
       continue
     }
-    // DRY_RUN: до спавна — расписание признано due, гейт пройден, тело валидно; сессию не создаём
+    // DRY_RUN: до спавна — мастер due, гейт пройден, тело валидно; ран и
+    // сессию не создаём
     if (DRY_RUN) {
-      log(`DRY_RUN: крон «${title}» — сессия не спавнилась (промпт ${firePrompt({ ...row, title }, resolved.markdown, project).length} байт)`)
+      const promptLen = firePrompt({ title: row.title, schedule: row.schedule }, resolved.markdown, "0000000000000000-run", project).length
+      log(`DRY_RUN: мастер «${masterTitle}» — ран-карточка и сессия не созданы (промпт ${promptLen} байт)`)
       continue
     }
-    const sessionID = await fireSession(title, firePrompt({ ...row, title }, resolved.markdown, project))
-    if (sessionID === null) {
-      log(`крон «${title}»: сессия не поднялась`)
+    const runTitle = runCardTitle(row, now)
+    const instruction = stripNonContent(resolved.markdown)
+    const runRowId = await createRunCard(project, runTitle, runCardBody(row.title, row.schedule, instruction, now))
+    if (runRowId === null) {
+      log(`мастер «${masterTitle}»: ран-карточка не создана — ретрай следующим тиком`)
       continue
     }
-    // семантика v1: lastFiredAt = факт ухода промпта, не отчёта агента
-    // (здоровый тик тихий по контракту промпта; исход видит юзер по Last Run)
-    state.crons[row.rowId] = { sessionID, lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
+    // факт файра фиксируется созданной карточкой: дубль-ран на упавшей
+    // сессии хуже пропущенного рана (карточка = запись запуска)
+    state.crons[row.rowId] = { sessionID: "", lastFiredAt: now.getTime(), firedAtIso: now.toISOString() }
     saveState(state)
-    await setCells(board, row.rowId, { "Last Run": formatLocal(now) })
-    if (isOneShot(sched)) {
-      // fired ≠ paused: разовый сработал и завершён (самообъясняюще из
-      // таблицы); paused — только явное решение юзера остановить повторяющийся
-      await setCells(board, row.rowId, { Status: "fired" })
-      log(`крон «${title}»: разовый — сработал, fired`)
+    const prompt = firePrompt({ title: row.title, schedule: row.schedule }, resolved.markdown, runRowId, project)
+    const sessionID = await fireSession(runTitle, prompt)
+    if (sessionID === null) {
+      log(`мастер «${masterTitle}»: ран ${runRowId} создан, сессия не поднялась`)
+      continue
     }
-    log(`крон «${title}»: сработал → сессия ${sessionID}`)
+    state.crons[row.rowId].sessionID = sessionID
+    saveState(state)
+    log(`мастер «${masterTitle}»: ран ${runRowId} → сессия ${sessionID}`)
   }
 }
 
@@ -396,7 +508,7 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
-  log(`uwuwu-cron: старт (глобальная + кроны проектов, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-cron: старт (задачные доски «Задачи <proj>», гейт Вейт, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${sandboxedStateDir(STATE_DIR_RAW) ? `, state=${STATE_DIR}` : ""})`)
   const state = loadState()
   log(`кронов в state: ${Object.keys(state.crons).length}`)
   let consecutiveFails = 0
