@@ -1599,18 +1599,19 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     "",
     "## Дефект", "", "текст после секции",
   ].join("\n")
-  test("комменты секции: паддированный id, автор в userId, голова в тексте", () => {
+  test("комменты секции: контент-хэш id, автор в userId, голова в тексте", () => {
     const parsed = parseCommentsMarkdown(MD, "DOC")
     expect(parsed.length).toBe(2)
-    expect(parsed[0].id).toBe("cDOC-0000")
+    expect(parsed[0].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
     expect(parsed[0].userId).toBe("AGENTS")
     expect(parsed[0].text).toBe("AGENTS (2026-11-05 19:43): вопрос агента")
-    expect(parsed[1].id).toBe("cDOC-0001")
+    expect(parsed[1].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
+    expect(parsed[1].id).not.toBe(parsed[0].id)
   })
   test("тред-ответы несут id и userId — юзерский ответ тредом детектится", () => {
     const parsed = parseCommentsMarkdown(MD, "DOC")
     expect(parsed[0].replies.length).toBe(1)
-    expect(parsed[0].replies[0].id).toBe("rDOC-0000-0000")
+    expect(parsed[0].replies[0].id).toMatch(/^rDOC-[0-9a-f]{8}$/)
     expect(parsed[0].replies[0].userId).toBe("Юра")
     expect(parsed[0].replies[0].text).toContain("ответ владельца")
   })
@@ -1629,7 +1630,7 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     const parsed = parseCommentsMarkdown(MD_TAIL, "DOC")
     // старая секция + оба хвостовых пункта
     expect(parsed.length).toBe(3)
-    expect(parsed[1].id).toBe("cDOC-0001")
+    expect(parsed[1].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
     expect(parsed[1].text).toContain("PR готов к ревью")
     // продолжение блока (тело вердикта) входит в text пункта
     expect(parsed[1].text).toContain("подробности вердикта")
@@ -1647,5 +1648,82 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     const parsed = parseCommentsMarkdown(MD_LEAD, "DOC")
     expect(parsed.length).toBe(1)
     expect(parsed[0].text).not.toContain("абзац отчёта")
+  })
+  test("id контент-стабильны: снос верхнего коммента остальные id не меняет", () => {
+    const MD_FULL = [
+      "- **Юра** (2026-11-07 09:00): первый вопрос",
+      "- **AGENTS** (2026-11-07 09:05): ответ агента",
+      "- **Юра** (2026-11-07 09:10): уточнение",
+    ].join("\n")
+    const before = parseCommentsMarkdown(MD_FULL, "DOC")
+    const MD_TOP_DELETED = MD_FULL.split("\n").slice(1).join("\n")
+    const after = parseCommentsMarkdown(MD_TOP_DELETED, "DOC")
+    expect(after.map((c) => c.id)).toEqual(before.slice(1).map((c) => c.id))
+    // формат: префикс + контент-хэш (hex), не позиционный индекс
+    for (const c of after) expect(c.id).toMatch(/^cDOC-[0-9a-f]{8}$/)
+  })
+  test("идентичные replies — один хэш на контент, дубль не зацикливает будильник", () => {
+    const reply = "  - **Юра** (2026-11-07 09:00): дублированный ответ"
+    const MD_DUP_REPLY = [
+      "- **AGENTS** (2026-11-07 08:55): вопрос агента",
+      reply,
+      reply,
+    ].join("\n")
+    const parsed = parseCommentsMarkdown(MD_DUP_REPLY, "DOC")
+    expect(parsed[0].replies.length).toBe(2)
+    expect(parsed[0].replies[0].id).toBe(parsed[0].replies[1].id)
+    const comments: TaskComment[] = parsed.flatMap((c) => [
+      { id: c.id, text: c.text, createdAt: 1, userId: c.userId },
+      ...c.replies.map((r) => ({ id: r.id, text: r.text, createdAt: 2, userId: r.userId })),
+    ])
+    // lastSeen по первому дублю: свежих быть не должно — second копия уже
+    // «прожита» (findIndex по первому вхождению вернул бы будку на неё вновь)
+    const fresh = newUserComments(comments, { at: 0, id: parsed[0].replies[0].id }, "BOT")
+    expect(fresh).toEqual([])
+  })
+})
+
+describe("newUserComments — свежесть после сноса коммента (сдвиг позиционных id)", () => {
+  const line = (user: string, ts: string, text: string): string => `- **${user}** (${ts}): ${text}`
+  const toTaskComments = (md: string): TaskComment[] =>
+    parseCommentsMarkdown(md, "DOC").map((c, i) => ({
+      id: c.id,
+      text: c.text,
+      createdAt: i + 1,
+      userId: c.userId,
+    }))
+
+  test("снос обработанного коммента сверху не подменяет lastSeen и не теряет свежий", () => {
+    const MD_THREE = [
+      line("Юра", "2026-11-07 09:00", "старый обработанный"),
+      line("Юра", "2026-11-07 09:05", "последний обработанный"),
+      line("Юра", "2026-11-07 09:10", "новый после последнего захода"),
+    ].join("\n")
+    const seen = toTaskComments(MD_THREE)
+    const lastSeen = { at: 3, id: seen[2].id }
+    expect(newUserComments(seen, lastSeen, "BOT")).toEqual([])
+
+    const MD_TOP_DELETED = MD_THREE.split("\n").slice(1).join("\n")
+    const remaining = toTaskComments(MD_TOP_DELETED)
+    // после сноса id оставшихся не сдвинулись: свежих нет, дублей будки нет
+    expect(newUserComments(remaining, lastSeen, "BOT")).toEqual([])
+  })
+
+  test("снос коммента ВЫШЕ lastSeen не глотает свежий: сдвиг позиционных id подменял матч", () => {
+    const MD_THREE = [
+      line("Юра", "2026-11-07 09:00", "старый обработанный"),
+      line("Юра", "2026-11-07 09:05", "последний обработанный"),
+      line("Юра", "2026-11-07 09:10", "новый после последнего захода"),
+    ].join("\n")
+    const seen = toTaskComments(MD_THREE)
+    const lastSeen = { at: 2, id: seen[1].id }
+    // свежий C не заходил: на полном наборе он и есть свежий
+    expect(newUserComments(seen, lastSeen, "BOT").length).toBe(1)
+
+    const MD_TOP_DELETED = MD_THREE.split("\n").slice(1).join("\n")
+    const remaining = toTaskComments(MD_TOP_DELETED)
+    const fresh = newUserComments(remaining, lastSeen, "BOT")
+    expect(fresh.length).toBe(1)
+    expect(fresh[0].text).toContain("новый после последнего захода")
   })
 })
