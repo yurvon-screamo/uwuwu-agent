@@ -121,34 +121,44 @@ describe("hub silence e2e (mock-TG)", () => {
     const before = sentMessages(sentLog).length
     const d = await spawnDemon(mock, Date.now() - 60_000)
     demons.push(d)
-    const deadline = Date.now() + 20_000
-    while (sentMessages(sentLog).length === before) {
-      if (Date.now() > deadline) {
-        throw new Error(`алерт не доставлен за 20с; лог демона:\n${existsSync(d.daemonLog) ? readFileSync(d.daemonLog, "utf-8") : "(нет)"}`)
+    // демон гасится в finally — сценарий 2 не должен видеть его тиков даже
+    // при падении/замедлении этого (перс-демона per-test, не afterAll)
+    try {
+      const deadline = Date.now() + 20_000
+      while (sentMessages(sentLog).length === before) {
+        if (Date.now() > deadline) {
+          throw new Error(`алерт не доставлен за 20с; лог демона:\n${existsSync(d.daemonLog) ? readFileSync(d.daemonLog, "utf-8") : "(нет)"}`)
+        }
+        await new Promise((r) => setTimeout(r, 100))
       }
-      await new Promise((r) => setTimeout(r, 100))
+      const msgs = sentMessages(sentLog).slice(before)
+      if (msgs.length !== 1) throw new Error(`ожидался один алерт, доставлено: ${msgs.length}`)
+      const first = msgs.at(0)
+      if (first === undefined) throw new Error("алерт не доставлен")
+      expect(first.chat_id).toBe(CHAT_ID)
+      expect(first.text).toContain("тишина выходного потока")
+      // Изолированный mark-wiring: окно ретрая инъектировано в 500мс (= тик),
+      // поэтому если бы «send-успех → метка» был сломан, повтор пришёл бы на
+      // втором тике (age ≥ порога, окно открыто). Ровно один алерт за ~4 тика —
+      // доставка алерта реально сбросила часы тишины. Недоставленный путь
+      // (ретрай по окну) — юнит silenceCheck с retryMs.
+      await new Promise((r) => setTimeout(r, 2_000))
+      expect(sentMessages(sentLog).slice(before).length).toBe(1)
+    } finally {
+      try { d.proc.kill("SIGKILL") } catch { /* уже мёртв */ }
     }
-    const msgs = sentMessages(sentLog).slice(before)
-    if (msgs.length !== 1) throw new Error(`ожидался один алерт, доставлено: ${msgs.length}`)
-    const first = msgs.at(0)
-    if (first === undefined) throw new Error("алерт не доставлен")
-    expect(first.chat_id).toBe(CHAT_ID)
-    expect(first.text).toContain("тишина выходного потока")
-    // Изолированный mark-wiring: окно ретрая инъектировано в 500мс (= тик),
-    // поэтому если бы «send-успех → метка» был сломан, повтор пришёл бы на
-    // втором тике (age ≥ порога, окно открыто). Ровно один алерт за ~4 тика —
-    // доставка алерта реально сбросила часы тишины. Недоставленный путь
-    // (ретрай по окну) — юнит silenceCheck с retryMs.
-    await new Promise((r) => setTimeout(r, 2_000))
-    expect(sentMessages(sentLog).slice(before).length).toBe(1)
   }, 30_000)
 
   test("свежая метка → тишина, алертов нет", async () => {
     const before = sentMessages(sentLog).length
     const d = await spawnDemon(mock, Date.now())
     demons.push(d)
-    // наблюдение меньше порога (10с) при тике 500мс: ~6 тиков — ни одного алерта
-    await new Promise((r) => setTimeout(r, 3_000))
-    expect(sentMessages(sentLog).slice(before)).toEqual([])
+    try {
+      // наблюдение меньше порога (10с) при тике 500мс: ~6 тиков — ни одного алерта
+      await new Promise((r) => setTimeout(r, 3_000))
+      expect(sentMessages(sentLog).slice(before)).toEqual([])
+    } finally {
+      try { d.proc.kill("SIGKILL") } catch { /* уже мёртв */ }
+    }
   }, 20_000)
 })
