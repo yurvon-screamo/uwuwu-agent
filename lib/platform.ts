@@ -548,6 +548,25 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       })
       return { created: true } as T
     }
+    case "get_doc_attrs": {
+      // Атрибуты блока (IAL): custom-* — носитель расписания крон-задач.
+      // REST, не SQL-колонка ial: та отстаёт от свежих записей атрибутов.
+      const docId = String(args.docId ?? "")
+      const data = await post<Record<string, unknown>>("/api/attr/getBlockAttrs", { id: docId })
+      const out: Record<string, string> = {}
+      for (const [k, v] of Object.entries(data)) {
+        if (typeof v === "string") out[k] = v
+      }
+      return out as T
+    }
+    case "set_doc_attr": {
+      // Запись атрибута; пустое значение снимает (ядро удаляет ключ из IAL)
+      const docId = String(args.docId ?? "")
+      const name = String(args.name ?? "")
+      const value = String(args.value ?? "")
+      await post("/api/attr/setBlockAttrs", { id: docId, attrs: { [name]: value } })
+      return { set: true } as T
+    }
     case "list_comments": {
       const docId = String(args.docId ?? "")
       const md = await post<{ content?: string }>("/api/export/exportMdContent", { id: docId })
@@ -572,7 +591,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "list_organize_nodes": {
       // Синтез организ-дерева афин-шейпа из доков SiYuan. Потребители ждут:
       // проекты — folder-узлы глубины 1 (data = тайтл), доски и доки глубже —
-      // doc-узлы (data = doc id): cron.ts cronBoardTitles, factory/cron
+      // doc-узлы (data = doc id): cron.ts taskBoardTitles, factory/cron
       // boardViaOrganize, triage.ts refreshBoards (tests/platform-organize.test.ts).
       const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
         "/api/notebook/lsNotebooks", {})

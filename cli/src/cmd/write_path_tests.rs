@@ -298,6 +298,7 @@ async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
             r#type: None,
             stdin: false,
             attach: Vec::<PathBuf>::new(),
+            schedule: None,
             dry_run: false,
         },
     )
@@ -861,8 +862,6 @@ fn comment_task() -> SyTask {
         status: "Draft".into(),
         branch: String::new(),
         pr: String::new(),
-        schedule: String::new(),
-        last_run: String::new(),
         dev_session: String::new(),
         body_doc: Some(BOUND_DOC.into()),
     }
