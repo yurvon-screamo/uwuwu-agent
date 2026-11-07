@@ -446,10 +446,57 @@ export interface SpawnEnvContext {
   scratchDir: string
 }
 
+/** Инит-данные первого промпта сессии: юзер (персона), проект (живые доки,
+ *  чекаут для env:false), задача (метаданные строки доски). Пустые/null
+ *  источники — честные строки в блоке; спавн от полноты инита не зависит. */
+export interface SpawnInit {
+  /** markdown персоны владельца; null — дока нет/не резолвится */
+  person: string | null
+  /** слаги живых доков проекта для uwuwu-cli read («<proj>/README») */
+  projectDocs: string[]
+  /** локальный чекаут env:false-проекта; env-задачам не нужен — пути в env-строке промпта */
+  localPath?: string
+  /** метаданные задачи с доски */
+  task: { title: string; status: string; branch: string; pr: string }
+}
+
+const dash = (value: string): string => (value.trim() === "" ? "—" : value.trim())
+
+/** Блок инит-данных первого промпта: ориентация без стартового поиска
+ *  (person show / доки проекта / task get ради «где я»). Компактный:
+ *  суть здесь, глубокое чтение — по ссылке/команде. */
+export function spawnInitBlock(init: SpawnInit, rowId: string, project: string, env?: SpawnEnvContext): string {
+  const taskLine =
+    `Задача: «${init.task.title}», статус ${dash(init.task.status)},` +
+    ` ветка ${dash(init.task.branch)}, PR ${dash(init.task.pr)}.`
+  const bodyLine = `Тело и треды — uwuwu-cli task get ${rowId} --project ${project} (содержание работы, не ориентация).`
+  const projectParts = [
+    ...(init.localPath !== undefined ? [`чекаут ${init.localPath} (env:false — ворктри/ветка сам)`] : []),
+    init.projectDocs.length > 0
+      ? `живые доки — uwuwu-cli read ${init.projectDocs.map((s) => `"${s}"`).join(", ")}`
+      : "канон-доки (README/Домены/Стек/Деплоймент) не нашлись — глубокое чтение по месту",
+  ]
+  const projectLine = `Проект: ${projectParts.join("; ")}.`
+  const personLine = init.person === null
+    ? "Персона владельца: недоступна (uwuwu-cli person show пуст/сбой) — работай без неё."
+    : [
+        "Персона владельца (язык/стиль/анти-паттерны):",
+        ...init.person.split("\n").map((line) => `  ${line}`),
+      ].join("\n")
+  return [
+    "Инит-данные (первичный источник ориентации; глубокое чтение — по необходимости):",
+    taskLine,
+    bodyLine,
+    projectLine,
+    personLine,
+  ].join("\n")
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
 export function spawnPrompt(
-  rowId: string, project: string, repo: string, mode: KickoffMode = "design", env?: SpawnEnvContext,
+  rowId: string, project: string, repo: string, mode: KickoffMode = "design",
+  env?: SpawnEnvContext, init?: SpawnInit,
 ): string {
   const stage = mode === "implement"
     ? [
@@ -476,6 +523,7 @@ export function spawnPrompt(
       ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
     ...stage,
@@ -494,9 +542,12 @@ export function spawnPrompt(
 /** Рестарт-промпт (сессия девелопера умерла/карантин → fresh spawn).
  *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
  *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
-export function continuePrompt(rowId: string, project: string, repo: string, env?: SpawnEnvContext): string {
+export function continuePrompt(
+  rowId: string, project: string, repo: string, env?: SpawnEnvContext, init?: SpawnInit,
+): string {
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
     "",
     "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
@@ -516,10 +567,15 @@ export function continuePrompt(rowId: string, project: string, repo: string, env
 
 /** Конфликт-kickoff: PR ветки задачи конфликтует с master (владелец флипнул
  *  статус в In Progress — «поправь», или ревью вернуло задачу при конфликте).
- *  env называет существующее окружение задачи — агент не плодит новое. */
-export function conflictFixPrompt(rowId: string, pr: string, env?: SpawnEnvContext): string {
+ *  env называет существующее окружение задачи — агент не плодит новое.
+ *  init — только на свежесозданной сессии (через promptForStart/startTask);
+ *  живая сессия инит при спавне уже получила — будильник без init (дельта). */
+export function conflictFixPrompt(
+  rowId: string, pr: string, project: string, env?: SpawnEnvContext, init?: SpawnInit,
+): string {
   return [
-    `[factory] Задача ${rowId}: PR ветки конфликтует с master (${pr}).`,
+    `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с master (${pr}).`,
+    ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project, env)] : []),
     "",
     ...(env !== undefined
       ? [
@@ -542,14 +598,16 @@ export type StartKind = KickoffMode | "continue" | "conflict-fix"
 
 /** Единственная точка выбора стартового промпта по виду старта.
  *  pr нужен конфликт-режиму (конфликт-kickoff ссылается на PR); env
- *  сквозной для всех веток — рестарт env-задачи называет окружение. */
+ *  сквозной для всех веток — рестарт env-задачи называет окружение;
+ *  init (инит-блок первого промпта) — сквозной: все три вида старта
+ *  создают свежую сессию, которой нужен полный инит. */
 export function promptForStart(
   start: StartKind, rowId: string, project: string, repo: string, pr: string,
-  env?: SpawnEnvContext,
+  env?: SpawnEnvContext, init?: SpawnInit,
 ): string {
-  if (start === "continue") return continuePrompt(rowId, project, repo, env)
-  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, env)
-  return spawnPrompt(rowId, project, repo, start, env)
+  if (start === "continue") return continuePrompt(rowId, project, repo, env, init)
+  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, project, env, init)
+  return spawnPrompt(rowId, project, repo, start, env, init)
 }
 
 /** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.
