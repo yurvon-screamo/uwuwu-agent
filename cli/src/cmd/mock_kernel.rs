@@ -26,6 +26,7 @@ pub(crate) struct MockRow {
     pub(crate) item: String,
     pub(crate) title: String,
     pub(crate) status: String,
+    pub(crate) task_type: String,
     pub(crate) doc: Option<String>,
 }
 
@@ -35,6 +36,7 @@ impl MockRow {
             item: item.to_string(),
             title: title.to_string(),
             status: String::new(),
+            task_type: String::new(),
             doc: None,
         }
     }
@@ -44,12 +46,15 @@ impl MockRow {
         self
     }
 
+    pub(crate) fn with_type(mut self, task_type: &str) -> Self {
+        self.task_type = task_type.to_string();
+        self
+    }
+
     pub(crate) fn with_doc(mut self, doc: &str) -> Self {
         self.doc = Some(doc.to_string());
         self
     }
-
-
 
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
     fn cells_json(&self) -> Value {
@@ -64,6 +69,12 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-status", "type": "mSelect",
                            "mSelect": [{ "content": self.status }] }
+            }));
+        }
+        if !self.task_type.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-type", "type": "mSelect",
+                           "mSelect": [{ "content": self.task_type }] }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -141,6 +152,7 @@ impl Default for MockScenario {
                 keys: vec![
                     ("key-title", "Primary Key"),
                     ("key-status", "Status"),
+                    ("key-type", "Тип"),
                     ("key-branch", "Branch"),
                     ("key-pr", "PR"),
                 ],
@@ -185,6 +197,8 @@ pub(crate) struct MockKernel {
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
+    /// (av, keyName, keyType) всех addAttributeViewKey (минт колонок).
+    add_cols: Mutex<Vec<(String, String, String)>>,
     doc_blocks: Mutex<HashMap<String, Vec<String>>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -192,12 +206,7 @@ pub(crate) struct MockKernel {
 impl MockKernel {
     fn new(sc: MockScenario) -> Self {
         Self {
-            replies: Mutex::new(
-                sc.item_add_replies
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
+            replies: Mutex::new(sc.item_add_replies.iter().map(|s| s.to_string()).collect()),
             children: Mutex::new(sc.get_children_seq.clone()),
             doc_blocks: Mutex::new(
                 sc.doc_blocks
@@ -219,6 +228,7 @@ impl MockKernel {
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
+            add_cols: Mutex::new(Vec::new()),
         }
     }
 
@@ -290,6 +300,11 @@ impl MockKernel {
         self.attr_writes.lock().unwrap().clone()
     }
 
+    /// (av, keyName, keyType) всех addAttributeViewKey.
+    pub(crate) fn add_cols(&self) -> Vec<(String, String, String)> {
+        self.add_cols.lock().unwrap().clone()
+    }
+
     /// Состояние дока (применённые блоки) для ассертов comment-флоу.
     pub(crate) fn doc_blocks_of(&self, doc: &str) -> Vec<String> {
         self.doc_blocks
@@ -309,7 +324,9 @@ impl MockKernel {
             .respond_with({
                 let nb = self.sc.notebook;
                 move |_: &Request| {
-                    rest_ok(json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }))
+                    rest_ok(
+                        json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }),
+                    )
                 }
             })
             .mount(server)
@@ -545,10 +562,8 @@ impl MockKernel {
                         .map(|(_, a)| a.clone());
                     match attrs {
                         Some(attrs) => {
-                            let map: serde_json::Map<String, Value> = attrs
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json!(v)))
-                                .collect();
+                            let map: serde_json::Map<String, Value> =
+                                attrs.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                             rest_ok(Value::Object(map))
                         }
                         None => ResponseTemplate::new(200).set_body_string(
@@ -573,9 +588,8 @@ impl MockKernel {
                         .unwrap_or("")
                         .to_string();
                     let attrs = body.get("attrs").cloned().unwrap_or_default();
-                    if let Some((name, value)) = attrs
-                        .as_object()
-                        .and_then(|m| m.into_iter().next())
+                    if let Some((name, value)) =
+                        attrs.as_object().and_then(|m| m.into_iter().next())
                     {
                         kernel.attr_writes.lock().unwrap().push((
                             id,
@@ -583,6 +597,34 @@ impl MockKernel {
                             value.as_str().unwrap_or("").to_string(),
                         ));
                     }
+                    ResponseTemplate::new(200)
+                        .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
+                }
+            })
+            .mount(server)
+            .await;
+
+        // REST: создание колонки database (минт «Тип») — наблюдатель
+        Mock::given(method("POST"))
+            .and(path("/api/av/addAttributeViewKey"))
+            .respond_with({
+                let kernel = Arc::clone(self);
+                move |req: &Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    kernel.add_cols.lock().unwrap().push((
+                        body.get("avID")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ));
                     ResponseTemplate::new(200)
                         .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
                 }
@@ -742,9 +784,7 @@ impl MockKernel {
         if q.len() > 1 {
             q.remove(0)
         } else {
-            q.last()
-                .cloned()
-                .unwrap_or_else(|| "item-mock".to_string())
+            q.last().cloned().unwrap_or_else(|| "item-mock".to_string())
         }
     }
 
@@ -769,10 +809,14 @@ impl MockKernel {
                 .unwrap_or(&self.sc.inserted_row.title)
                 .to_string();
             rows.push(MockRow {
-                doc: args.get("blockID").and_then(|b| b.as_str()).map(String::from),
+                doc: args
+                    .get("blockID")
+                    .and_then(|b| b.as_str())
+                    .map(String::from),
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),
+                task_type: self.sc.inserted_row.task_type.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))

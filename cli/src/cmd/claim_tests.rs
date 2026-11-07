@@ -124,6 +124,7 @@ fn probe_task(dev_session: &str) -> SyTask {
         item_id: "item-1".into(),
         title: "таск".into(),
         status: "In Progress".into(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: dev_session.into(),
@@ -193,7 +194,10 @@ async fn claim_overwrites_foreign_session_cell() {
     let updates = kernel.updates();
     assert_eq!(updates.len(), 1, "перезапись состоялась");
     assert_eq!(
-        updates[0].2.pointer("/text/content").and_then(|v| v.as_str()),
+        updates[0]
+            .2
+            .pointer("/text/content")
+            .and_then(|v| v.as_str()),
         Some("ses_claim1"),
         "новая сессия вытеснила чужую"
     );

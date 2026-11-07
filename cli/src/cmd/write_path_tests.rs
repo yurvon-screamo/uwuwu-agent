@@ -14,7 +14,8 @@ use crate::cmd::mock_kernel::{set_env, MockKernel, MockRow, MockScenario};
 use crate::cmd::sy_dispatch::task_run;
 use crate::siyuan::SiYuan;
 use crate::siyuan_task::{
-    comment_with_ts, create_with_pacing, CommentDraft, RowInsertPacing, SyBoard, SyTask,
+    comment_with_ts, create_row_with_body, create_with_pacing, CommentDraft, RowInsertPacing,
+    SyBoard, SyTask,
 };
 use serde_json::Value;
 use wiremock::MockServer;
@@ -80,28 +81,31 @@ async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
         .await
         .expect("ретрай перепривязывает сироту");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        0,
-        "новый док не минтится"
-    );
-    assert_eq!(
-        kernel.item_add_count(),
-        1,
-        "одна вставка строки"
-    );
+    assert_eq!(kernel.created_docs().len(), 0, "новый док не минтится");
+    assert_eq!(kernel.item_add_count(), 1, "одна вставка строки");
     let args = kernel.item_add_args();
     assert!(
         args[0].get("blockID").and_then(|b| b.as_str()) == Some(ORPHAN_DOC),
         "item_add привязан к docId сироты: {args:?}"
     );
     let appends = kernel.appends();
-    assert_eq!(
-        appends.len(),
-        1,
-        "после подтверждения пишется только тег типа"
+    assert!(
+        appends.is_empty(),
+        "тег типа в тело больше не пишется: {appends:?}"
     );
-    assert!(appends[0].contains("#dev"), "тег типа: {appends:?}");
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, v)| {
+            key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+        })
+        .collect();
+    assert_eq!(
+        type_writes.len(),
+        1,
+        "тип dev записан в колонку «Тип» ровно один раз"
+    );
 }
 
 /// Verify-вставки: success item_add не виден в render (лаг ядра) → ретрай ×1,
@@ -116,23 +120,24 @@ async fn create_retries_row_insert_once_when_render_lags() {
         .await
         .expect("ретрай доводит строку до render");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        1,
-        "тело создаётся один раз"
-    );
-    assert_eq!(
-        kernel.item_add_count(),
-        2,
-        "item_add + ретрай"
-    );
+    assert_eq!(kernel.created_docs().len(), 1, "тело создаётся один раз");
+    assert_eq!(kernel.item_add_count(), 2, "item_add + ретрай");
     assert_eq!(
         kernel.item_updates().len(),
-        2,
-        "Draft проставляется каждой вставке"
+        3,
+        "Draft каждой вставке (×2) + тип один раз"
     );
     let appends = kernel.appends();
-    assert_eq!(appends.len(), 1, "тег типа один, без дублей после ретрая");
+    assert_eq!(appends.len(), 0, "тег типа в тело больше не пишется");
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, v)| {
+            key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+        })
+        .collect();
+    assert_eq!(type_writes.len(), 1, "тип без дублей после ретрая");
 }
 
 /// Дедуп по факту render: в ленте появилась чужая строка с тем же тайтлом →
@@ -152,9 +157,14 @@ async fn create_bails_when_render_shows_title_with_other_item() {
         "суть отказа: {err}"
     );
     assert_eq!(kernel.item_add_count(), 1, "ретрая не было");
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, _)| key == "key-type")
+        .collect();
     assert!(
-        kernel.appends().is_empty(),
-        "тег не пишется в неустановленное тело"
+        type_writes.is_empty(),
+        "тип не пишется в неустановленное тело"
     );
 }
 
@@ -178,14 +188,215 @@ async fn create_bails_loudly_when_row_missing_after_retry() {
         err.to_string().contains("после вставки и ретрая"),
         "суть отказа: {err}"
     );
-    assert_eq!(
-        kernel.item_add_count(),
-        2,
-        "ровно ретрай ×1"
-    );
+    assert_eq!(kernel.item_add_count(), 2, "ровно ретрай ×1");
     assert!(
         kernel.appends().is_empty(),
         "тег не пишется в неподтверждённую задачу"
+    );
+}
+
+/// Минт колонки «Тип»: на доске без колонки create создаёт select-колонку
+/// через addAttributeViewKey и записывает клетку (ревью Common: goal-путь
+/// (None) колонку не минтит — отдельный тест ниже).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_mints_type_column_when_board_lacks_it() {
+    let mut sc = create_scenario(&["item-row"], 1, false, false);
+    sc.boards[0].keys.retain(|(_, name)| *name != "Тип");
+    let (kernel, server) = MockKernel::start(sc).await;
+
+    create_via_flow(&server)
+        .await
+        .expect("create на доске без «Тип» минтит колонку");
+
+    assert_eq!(
+        kernel.add_cols(),
+        vec![("av-1".to_string(), "Тип".to_string(), "select".to_string())],
+        "одна новая select-колонка «Тип»"
+    );
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, _, _, v)| {
+            v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+        })
+        .collect();
+    assert_eq!(
+        type_writes.len(),
+        1,
+        "клетка типа записана на новой колонке"
+    );
+}
+
+/// Goal-путь (ty=None) не минтит колонку «Тип» и не пишет клетку —
+/// доски «Цели <proj>» остаются без лишней колонки (ревью Common).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_none_type_does_not_mint_type_column() {
+    let mut sc = create_scenario(&["item-row"], 1, false, false);
+    sc.boards[0].keys.retain(|(_, name)| *name != "Тип");
+    let (kernel, server) = MockKernel::start(sc).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+
+    create_row_with_body(
+        &sy,
+        &SyBoard {
+            doc_id: "board-doc".into(),
+            av_id: "av-1".into(),
+            block_id: "board-block".into(),
+            hpath: BOARD_HPATH.into(),
+            notebook: "nb-1".into(),
+        },
+        NEW_TITLE,
+        "todo",
+        "## Суть\nконтекст\n",
+        None,
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("goal-путь создаёт строку");
+
+    assert!(
+        kernel.add_cols().is_empty(),
+        "колонка «Тип» не минтится: {:?}",
+        kernel.add_cols()
+    );
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, v)| {
+            key == "key-type"
+                || v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+        })
+        .collect();
+    assert!(type_writes.is_empty(), "клетка типа не пишется");
+}
+
+/// create на доске с колонкой «Тип» не дёргает addAttributeViewKey
+/// (ensure экономит мутацию).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_reuses_existing_type_column_without_mint() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    create_via_flow(&server)
+        .await
+        .expect("create на доске с «Тип»");
+
+    assert!(
+        kernel.add_cols().is_empty(),
+        "колонка уже есть — минта нет: {:?}",
+        kernel.add_cols()
+    );
+}
+
+// ——— edit --type: запись, снятие, отказ до записей ———
+
+/// Сценарий edit-флоу: строка с привязанным телом на доске с колонкой «Тип».
+fn edit_type_scenario() -> MockScenario {
+    let mut sc = MockScenario {
+        rows: vec![
+            MockRow::new("item-t1", "таск с типом")
+                .with_status("Todo")
+                .with_type("dev")
+                .with_doc(BOUND_DOC),
+            MockRow::new("item-t2", "таск без типа")
+                .with_status("Todo")
+                .with_doc(BOUND_DOC),
+        ],
+        ..MockScenario::default()
+    };
+    sc.block_attrs = vec![(BOUND_DOC, vec![])]; // getBlockAttrs жив (body_doc резолв)
+    sc
+}
+
+async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> anyhow::Result<()> {
+    set_env(server);
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: id.into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: ty.map(String::from),
+            schedule: None,
+        },
+    )
+    .await
+}
+
+/// edit --type пишет клетку: mSelect content — канон типа.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_type_writes_type_cell() {
+    let (kernel, server) = MockKernel::start(edit_type_scenario()).await;
+
+    edit_type_via_cli(&server, "item-t2", Some("BUG"))
+        .await
+        .expect("edit --type ok");
+
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, item, _)| key == "key-type" && item == "item-t2")
+        .collect();
+    assert_eq!(type_writes.len(), 1, "одна запись клетки: {type_writes:?}");
+    assert_eq!(
+        type_writes[0]
+            .3
+            .pointer("/mSelect/0/content")
+            .and_then(|c| c.as_str()),
+        Some("bug"),
+        "канон типа в нижнем регистре"
+    );
+}
+
+/// edit --type "" очищает клетку: пустой mSelect без опций.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_type_empty_clears_type_cell() {
+    let (kernel, server) = MockKernel::start(edit_type_scenario()).await;
+
+    edit_type_via_cli(&server, "item-t1", Some(""))
+        .await
+        .expect("edit --type \"\" ok");
+
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, item, _)| key == "key-type" && item == "item-t1")
+        .collect();
+    assert_eq!(type_writes.len(), 1, "одна запись клетки: {type_writes:?}");
+    let cleared = type_writes[0]
+        .3
+        .get("mSelect")
+        .and_then(|m| m.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false);
+    assert!(cleared, "пустой mSelect — очистка: {:?}", type_writes[0].3);
+}
+
+/// edit --type с мусором — громкий отказ до любых записей (паритет pr).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_type_invalid_value_bails_before_any_write() {
+    let (kernel, server) = MockKernel::start(edit_type_scenario()).await;
+
+    let err = edit_type_via_cli(&server, "item-t2", Some("feature"))
+        .await
+        .expect_err("мусорный тип — отказ");
+
+    assert!(
+        err.to_string().contains("dev | spike | bug"),
+        "суть отказа: {err}"
+    );
+    assert!(
+        kernel.item_updates().is_empty(),
+        "ни одной записи до отказа: {:?}",
+        kernel.item_updates()
     );
 }
 
@@ -250,11 +461,7 @@ async fn body_replace_overwrites_doc_in_place_without_recreating() {
         .await
         .expect("replace проходит");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        0,
-        "док не пересоздаётся"
-    );
+    assert_eq!(kernel.created_docs().len(), 0, "док не пересоздаётся");
     let deletes = kernel.deletes();
     assert_eq!(*deletes, vec![OLD_BLOCK.to_string()], "старый блок удалён");
     let appends = kernel.appends();
@@ -383,10 +590,7 @@ fn comment_scenario(blocks: &[&str], apply: bool, lost: bool) -> MockScenario {
     MockScenario {
         append_applies: apply || lost,
         append_status: if apply { 200 } else { 500 },
-        doc_blocks: vec![(
-            BOUND_DOC,
-            blocks.iter().map(|s| s.to_string()).collect(),
-        )],
+        doc_blocks: vec![(BOUND_DOC, blocks.iter().map(|s| s.to_string()).collect())],
         ..MockScenario::default()
     }
 }
@@ -406,6 +610,7 @@ fn comment_task() -> SyTask {
         item_id: "item-1".into(),
         title: TASK_TITLE.into(),
         status: "Draft".into(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),

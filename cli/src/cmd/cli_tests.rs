@@ -110,6 +110,51 @@ fn hyphen_leading_id_parses_and_flag_after_id_stays_flag() {
 }
 
 #[test]
+fn type_flag_parses_on_create_edit_and_list() {
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "create",
+        "--title",
+        "т",
+        "--type",
+        "bug",
+    ])
+    .unwrap();
+    let Commands::Task {
+        command: TaskSub::Create { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task create");
+    };
+    assert_eq!(r#type.as_deref(), Some("bug"));
+
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "edit", "abc", "--type", ""]).unwrap();
+    let Commands::Task {
+        command: TaskSub::Edit { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task edit");
+    };
+    assert_eq!(r#type.as_deref(), Some(""), "пустой флаг — снятие");
+
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "list", "--type", "spike"]).unwrap();
+    let Commands::Task {
+        command: TaskSub::List { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task list");
+    };
+    assert_eq!(r#type.as_deref(), Some("spike"));
+}
+
+#[test]
 fn clean_ids_value_parses_with_hyphen_leading_fragments() {
     let Commands::Task {
         command: TaskSub::Clean { ids, .. },

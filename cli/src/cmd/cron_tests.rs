@@ -54,7 +54,10 @@ fn list_scenario() -> MockScenario {
 #[serial_test::serial]
 async fn list_shows_master_with_schedule_and_last_run_from_state() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "6h".to_string())])];
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
     let (kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
     let _state = state_dir_with(
@@ -77,11 +80,16 @@ async fn list_shows_master_with_schedule_and_last_run_from_state() {
 #[serial_test::serial]
 async fn list_skips_rows_without_schedule_attr() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-title".to_string(), "не расписание".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
-    cron_run(CronSub::List { project: None }).await.expect("list ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -90,13 +98,18 @@ async fn list_skips_rows_without_schedule_attr() {
 #[serial_test::serial]
 async fn list_works_without_state_file() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())])];
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("UWUWU_CRON_STATE_DIR", dir.path().join("несуществующее"));
 
-    cron_run(CronSub::List { project: None }).await.expect("list без state ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list без state ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -107,7 +120,9 @@ async fn list_reports_empty_inventory_without_masters() {
     let (_kernel, server) = MockKernel::start(list_scenario()).await;
     set_env(&server);
 
-    cron_run(CronSub::List { project: None }).await.expect("пустой инвентарь ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("пустой инвентарь ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -119,7 +134,10 @@ async fn list_skips_row_with_dead_binding_and_lists_the_rest() {
     // attrs-мок знает только тело обычной строки: master1 (unknown attrs)
     // пропускается, plain2 с расписанием попадает в инвентарь
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-schedule".to_string(), "30m".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-schedule".to_string(), "30m".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
@@ -163,7 +181,10 @@ fn format_local_renders_local_time() {
 #[serial_test::serial]
 async fn edit_schedule_writes_custom_attr() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-title".to_string(), "не расписание".to_string())],
+    )];
     let (kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
@@ -175,6 +196,7 @@ async fn edit_schedule_writes_custom_attr() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("6h".into()),
         },
     )
@@ -206,6 +228,7 @@ async fn edit_schedule_empty_removes_attr_without_grammar_check() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("".into()),
         },
     )
@@ -238,6 +261,7 @@ async fn edit_schedule_garbage_rejected_before_write() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("раз в минутку".into()),
         },
     )
