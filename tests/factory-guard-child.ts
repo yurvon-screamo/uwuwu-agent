@@ -89,6 +89,11 @@ function scriptTick(): string[] {
         data: { content: `# ${row?.title ?? "таск"}\n\nтело задачи\n`, path: "/Задачи x/таск" },
       }), { status: 200 })
     }
+    if (url.includes("/api/notebook/lsNotebooks")) {
+      // инит-блок спавна (fetchSpawnInit): песочница без ноутбуков —
+      // персона/доки проекта честно деградируют, спавн продолжается
+      return new Response(JSON.stringify({ code: 0, msg: "", data: { notebooks: [] } }), { status: 200 })
+    }
     if (url.includes("/api/query/sql")) {
       const payload = JSON.parse(String(init?.body ?? "{}")) as { stmt?: string }
       const stmt = payload.stmt ?? ""
