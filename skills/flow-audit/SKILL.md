@@ -5,7 +5,7 @@ description: Invoke this skill when you need to audit the codebase — find code
 
 # flow-audit
 
-Act as a senior engineer and architect — conduct a systematic codebase audit to identify code smells, technical debt, cumulative complexity, and information security vulnerabilities. The goal is to provide a **complete and objective picture of the codebase health** with prioritized issues. Remediation planning is outside this flow's scope (see `flow-task` → refactor).
+Act as a senior engineer and architect — conduct a systematic codebase audit to identify code smells, technical debt, cumulative complexity, and information security vulnerabilities. The goal is to provide a **complete and objective picture of the codebase health** with prioritized issues. Remediation planning is outside this flow's scope — findings go into audit-tracker issues (uwuwu tasks) or a follow-up PR.
 
 > **Checklists live in `rules-*` skills.** This flow orchestrates them — do not duplicate the rules here.
 > - Code smells → `rules-clean-code`

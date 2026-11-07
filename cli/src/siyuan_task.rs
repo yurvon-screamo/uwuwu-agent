@@ -902,8 +902,7 @@ pub(crate) enum NeedleMatch {
     },
 }
 
-/// Матчинг фрагмента по готовым строкам: та же семантика, что у resolve()
-/// (id: равенство/префикс/суффикс → docId-префикс по саб-докам → подстрока
+/// Матчинг фрагмента по готовым строкам: семантика резолва задачи (id: равенство/префикс/суффикс → docId-префикс по саб-докам → подстрока
 /// нормализованного тайтла). `subdoc_ids` — docId саб-доков доски (одна
 /// выборка на доску, не на фрагмент).
 pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str) -> NeedleMatch {
@@ -971,11 +970,6 @@ pub(crate) async fn board_subdoc_ids(sy: &SiYuan, board: &SyBoard) -> Result<Vec
         .collect())
 }
 
-/// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
-pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
-    resolve_entity(sy, board, needle, "задача").await
-}
-
 /// То же с именем сущности в сообщениях об ошибках (доска целей говорит
 /// «цель … не найдена», а не «задача …» — доска задач тут ни при чём).
 pub async fn resolve_entity(
@@ -1031,6 +1025,145 @@ pub async fn resolve_on_project(
             board.hpath
         ),
     }
+}
+
+/// Глобальный резолв по доскам всех проектов (task-семейство без --project).
+///
+/// Фаза A — точный item-id по доскам в порядке дискавери, первый матч
+/// выигрывает: itemID ядра глобально уникальны, автопуть с полным rowId
+/// детерминирован (ADR-026), ради теоретической коллизии доски не
+/// перечитываются. Фаза B — нечёткий матч собирается со всех досок:
+/// ровно один матч и ноль неоднозначностей → он; матчи на нескольких
+/// досках или неоднозначность хоть на одной — громкая ошибка с раскладкой
+/// «доска → совпадения» (тихий wrong-target исключён конструктивно).
+/// Формат ошибок mirrored на resolve_on_project + подсказка «--project».
+pub async fn resolve_global(sy: &SiYuan, needle: &str) -> Result<(SyBoard, SyTask)> {
+    let mut boards = discover_task_boards(sy).await?;
+    if boards.is_empty() {
+        bail!("доски задач не найдены: в Projects нет ни одного дока «Задачи <proj>»");
+    }
+    let mut rows_cache: Vec<Option<Vec<SyTask>>> = vec![None; boards.len()];
+
+    // Фаза A: точный id
+    let exact = needle.trim_start_matches('-');
+    for (idx, board) in boards.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        if let Some(task) = rows.iter().find(|r| r.item_id == exact) {
+            return Ok((board.clone(), task.clone()));
+        }
+    }
+
+    // Фаза B: нечёткий матч по всем доскам
+    let mut found: Vec<(usize, SyTask)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for (idx, board) in boards.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        let subdoc_ids = board_subdoc_ids(sy, board).await?;
+        match match_needle(&rows, &subdoc_ids, needle) {
+            NeedleMatch::Found(task) => found.push((idx, task)),
+            NeedleMatch::Ambiguous { reason, matches } => {
+                ambiguous.push(format!("{} ({}: {matches})", board.hpath, reason));
+            }
+            NeedleMatch::NotFound => {}
+        }
+    }
+    if found.len() == 1 && ambiguous.is_empty() {
+        let (idx, task) = found.remove(0);
+        // порядок досок дальше не используется: swap_remove достаёт элемент
+        // напрямую, без Option/expect (idx из enumerate той же boards)
+        let board = boards.swap_remove(idx);
+        return Ok((board, task));
+    }
+
+    let searched: Vec<String> = boards.iter().map(|b| b.hpath.clone()).collect();
+    let mut parts: Vec<String> = Vec::new();
+    if !found.is_empty() {
+        let boards_hit: Vec<String> = found
+            .iter()
+            .map(|(i, _)| boards[*i].hpath.clone())
+            .collect();
+        parts.push(format!("найдено на: {}", boards_hit.join(", ")));
+    }
+    if !ambiguous.is_empty() {
+        parts.push(format!("неоднозначно на: {}", ambiguous.join("; ")));
+    }
+    if parts.is_empty() {
+        bail!(
+            "задача «{needle}» не найдена; обысканы доски: {} — укажи --project, если доска известна",
+            searched.join(", ")
+        );
+    }
+    bail!(
+        "задача «{needle}»: {} (обысканы доски: {}) — уточни --project или id",
+        parts.join("; "),
+        searched.join(", ")
+    )
+}
+
+/// Доски задач всех проектов: SQL-дискавери доков «Задачи %» одним уровнем
+/// под проектами (доски задач живут только там по конвенции). Дубли доков
+/// одного проекта после пересозданий — первый по сортированному hpath.
+/// Дока нет — доски нет (benign); битая доска/инфра-сбой — громкая ошибка
+/// (таксономия find_board_titled_opt). Паттерн — выпиленный крон-дискавери
+/// (ADR-026, коммит 59d9da4).
+pub async fn discover_task_boards(sy: &SiYuan) -> Result<Vec<SyBoard>> {
+    let rows = sy
+        .sql("select id, hpath from blocks where type='d' and content like 'Задачи %' limit 200")
+        .await?;
+    let mut hpaths: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("hpath").and_then(|h| h.as_str()).map(String::from))
+        .collect();
+    hpaths.sort();
+    hpaths.dedup();
+    let mut out = Vec::new();
+    let mut seen_projects = HashSet::new();
+    for hpath in hpaths {
+        let Some((project, title)) = task_board_parts(&hpath) else {
+            continue;
+        };
+        if !seen_projects.insert(project.clone()) {
+            continue;
+        }
+        if let Some(board) = find_board_titled_opt(sy, &project, &title).await? {
+            out.push(board);
+        }
+    }
+    Ok(out)
+}
+
+/// /<proj>/Задачи <proj> → Some((proj, «Задачи <proj>»)); прочие пути — None
+/// (доски задач вглубь иерархии не вкладываются). pub(crate) для мок-ядра:
+/// дискавери-ответ строится по той же конвенции, что парсит резолв.
+pub(crate) fn task_board_parts(hpath: &str) -> Option<(String, String)> {
+    let rest = hpath.strip_prefix('/')?;
+    let (project, title) = rest.split_once('/')?;
+    let expected = format!("Задачи {project}");
+    (title == expected).then_some((project.to_string(), expected))
+}
+
+/// Проект доски из её hpath. Для досок из дискавери/резолва конвенция
+/// соблюдена; фоллбек — полный hpath (undo-журнал остаётся адресуемым).
+pub fn board_project(board: &SyBoard) -> String {
+    task_board_parts(&board.hpath)
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| board.hpath.clone())
+}
+
+/// Строки доски с кэшем между фазами: render — самая дорогая операция
+/// резолва, каждая доска читается один раз.
+async fn cached_rows(
+    sy: &SiYuan,
+    board: &SyBoard,
+    cache: &mut [Option<Vec<SyTask>>],
+    idx: usize,
+) -> Result<Vec<SyTask>> {
+    if let Some(rows) = &cache[idx] {
+        return Ok(rows.clone());
+    }
+    let rows = read_rows(sy, board).await?;
+    cache[idx] = Some(rows.clone());
+    Ok(rows)
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).

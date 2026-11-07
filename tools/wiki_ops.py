@@ -34,9 +34,15 @@ kernel-транспорт (post, конфиг, константы) без выи
                                          update переписывает таблицу ЦЕЛИКОМ,
                                          row-payload схлопывает её тихо, code=0
                                          (пробы 06.11/07.11)
-  block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален);
-                                         на 't' — сиблинг после таблицы, таблица цела
-                                         (проба 07.11)
+  block-insert-after <blockID> --md <файл>   вставка после блока; multi-block
+                                         легален вне списков, якорь-item
+                                         (type='i') — payload строго один item
+                                         (проба 07.11: multi-item payload ядро
+                                         молча обрезает до первого с фантомными
+                                         id); печатает новые block id, пост-чек
+                                         материализации (SQL + фолбэк .sy) —
+                                         фантомы громкие; на 't' — сиблинг после
+                                         таблицы, таблица цела (проба 07.11)
   block-insert-html <docId|blockID> --html <файл> [--after-marker <имя>]
                                          вставка живого HTML-блока (dataType="dom",
                                          dom мимо markdown-парсера — тот деградирует
@@ -995,6 +1001,55 @@ def _payload_chunk_count(markdown: str) -> int:
     return chunk_count
 
 
+def _top_level_list_item_count(markdown: str) -> int:
+    """Число top-level list-маркеров (item'ов) в payload: строки list-старта
+    вне фенсов и без ведущего отступа; строки с отступом — вложенные списки
+    и продолжения, не item'ы. Для гварда якоря-item'а: два item'а списка для
+    чанк-парсера — ОДИН блок (одно-родственные строки), поэтому критерий
+    гварда — счёт маркеров, а не чанков (проба 07.11)."""
+    item_count = 0
+    in_code = False
+    fence_char = ""
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        transition = _fence_transition(line, in_code, fence_char)
+        if transition == "open":
+            in_code, fence_char = True, line[0]
+            continue
+        if transition == "close":
+            in_code = False
+            continue
+        if in_code or raw_line[:1].isspace():
+            continue
+        if _marker_kind(line) == "list":
+            item_count += 1
+    return item_count
+
+
+def _assert_single_list_item(payload: str, row: dict) -> None:
+    """Якорь-item (type='i') принимает payload строго одного item'а:
+    multi-item payload ядро молча обрезает до первого item'а с фантомными id
+    в ответе (проба 07.11), не-item блок после item'а ядро отказывает громко
+    (invalid block structure) — отказ с рецептом лучше обеих судьб."""
+    items = _top_level_list_item_count(payload)
+    chunks = _payload_chunk_count(payload)
+    if items == 1 and chunks == 1:
+        return
+    if items > 1:
+        reason = (f"payload несёт {items} top-level item'а — multi-item payload ядро молча "
+                  "обрезает до первого с фантомными id в ответе (проба 07.11): "
+                  "вставляй item'ы по одному за вызов")
+    elif chunks > 1:
+        reason = f"payload несёт {chunks} блока(ов) — после item'а допустим только один item"
+    else:
+        reason = ("payload — не item: ядро отказывает вставке не-item блока внутрь "
+                  "list-контейнера (invalid block structure, проба 07.11)")
+    raise RuntimeError(
+        f"якорь {row['id']} — item списка (type='i'): payload обязан быть одним item'ом. "
+        f"{reason}; не-item контент — вставляй после list-контейнера "
+        f"(id {row['parent_id']}, type='l') или в конец дока (doc-level append)")
+
+
 UNDO_DIR = "data/assets/undo/wiki_ops"
 
 
@@ -1103,6 +1158,32 @@ def _new_block_ids(resp) -> list[str]:
     return block_ids
 
 
+def _checked_block_ids(resp) -> list[str]:
+    """data-node-id узлов вставки, чьё отсутствие в доке означает потерю
+    контента. Исключение — NodeList-обёртка markdown-парсера: при вставке в
+    существующий list ядро мержит item'ы и отбрасывает обёртку (проба 07.11:
+    op.parentID — существующий list, id обёртки не материализуется, op.id —
+    верхний вставленный item), так что её отсутствие — мерж, не потеря.
+    Тип узла читается из того же тега (data-type рядом с data-node-id);
+    все прочие узлы (item'ы, параграфы, код-блоки) проверяются пост-чеком."""
+    ops: list[dict] = []
+    if isinstance(resp, list):
+        ops = [op for tx in resp for op in tx.get("doOperations", [])]
+    elif isinstance(resp, dict):
+        ops = resp.get("doOperations", [])
+    ids: list[str] = []
+    for op in ops:
+        for tag in re.findall(r"<div[^>]*>", op.get("data") or ""):
+            node_id = re.search(r'data-node-id="(\d{14}-[a-z0-9]{7})"', tag)
+            if not node_id:
+                continue
+            node_type = re.search(r'data-type="(Node\w+)"', tag)
+            if node_type and node_type.group(1) == "NodeList":
+                continue
+            ids.append(node_id.group(1))
+    return ids
+
+
 def _read_payload(filename: str) -> str:
     try:
         payload = Path(filename).read_text()
@@ -1137,18 +1218,29 @@ def cmd_block_update(a):
 def cmd_block_insert_after(a):
     payload = _read_payload(a.file)
     row = _resolved_block(a.blockID.strip())
+    if row["type"] == "i":
+        _assert_single_list_item(payload, row)
     journal = _undo_write("insert-after", row["id"], {
         "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
         "payload_md": payload,
     })
     resp = _mutate("/api/block/insertBlock", {"dataType": "markdown", "data": payload, "previousID": row["id"]})
     new_ids = _new_block_ids(resp)
+    if not new_ids:
+        raise RuntimeError("ядро не вернул новые id в ответе — вставка могла примениться; "
+                           "сверь export/SQL до повтора")
+    checked_ids = _checked_block_ids(resp)
+    if not checked_ids:
+        raise RuntimeError("в ответе ядра нет проверяемых id (только NodeList-обёртки) — "
+                           "сверь export/SQL до повтора")
     if journal:
         print(f"  undo-журнал: {UNDO_DIR}/{journal['_name']} (откат: block-delete новых блоков)")
     _undo_patch(journal, {"new_ids": new_ids})
+    verdict = _verify_materialized(checked_ids, row["root_id"])
     print(f"вставлено после {row['id']} (тип {row['type']}), новых блоков: {len(new_ids)}")
     for block_id in new_ids:
         print(f"  новый блок: {block_id}")
+    print(f"  {verdict}")
 
 
 # --- block-insert-html: живой HTML-блок через dataType="dom" ---
@@ -1160,9 +1252,9 @@ MARKER_PREFIX = "⁂ diagram:"
 # позади хоста JST) — id/updated генерируются согласованно с его форматом.
 KERNEL_TZ = timezone(timedelta(hours=8))
 
-# Пост-чек материализации: SQL-проба новых id (индекс отстаёт от мутаций
-# секундами) до фолбэка на .sy.
-HTML_POSTCHECK_ATTEMPTS = 3
+# Пост-чек материализации вставки (insert-after и insert-html): SQL-проба
+# новых id (индекс отстаёт от мутаций секундами) до фолбэка на .sy.
+POSTCHECK_ATTEMPTS = 3
 
 # Канонический dom-каркас NodeHTMLBlock, снят с живого ядра 07.11 (рецепт
 # опыт-дока: короткая markdown-вставка → doOperations[0].data). ZWJ (\u200b)
@@ -1238,12 +1330,14 @@ def _sy_find_with_next(tree: dict, block_id: str) -> tuple[dict, dict | None] | 
     return walk(tree)
 
 
-def _sy_html_block_ids(tree: dict) -> set[str]:
-    """Множество ID всех NodeHTMLBlock в дереве .sy."""
+def _sy_block_ids(tree: dict, node_type: str | None = None) -> set[str]:
+    """Множество ID узлов дерева .sy (PascalCase Children); node_type — фильтр
+    по Type (например NodeHTMLBlock), None — все блоки дерева (пост-чек
+    markdown-вставки не знает тип нового блока — проверяет только наличие)."""
     ids: set[str] = set()
 
     def walk(node: dict) -> None:
-        if node.get("Type") == "NodeHTMLBlock":
+        if node_type is None or node.get("Type") == node_type:
             ids.add(node.get("ID"))
         for child in node.get("Children") or []:
             walk(child)
@@ -1303,37 +1397,56 @@ def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
     return marker_id, doc_id
 
 
-def _verify_html_materialized(new_ids: list[str], doc_id: str) -> str:
-    """Пост-чек деградации (два источника вердикта, принцип ADR-025: один лагающий
-    источник ≠ истина). Основной — SQL-проба новых id (пробы с паузами: индекс
-    отстаёт от мутаций секундами); подтверждённый type≠'html' — немедленный громкий
-    отказ. SQL не сошёлся (аномалия/сбой/лаг после всех проб) — фолбэк на .sy
-    (FS-истина без лага): новые id как NodeHTMLBlock → успех с примечанием.
-    Оба источника молчат → RuntimeError без команды сноса — агент не должен
-    удалить реально вставленную диаграмму по ложному негативу."""
+def _verify_materialized(new_ids: list[str], doc_id: str, expect_type: str | None = None) -> str:
+    """Пост-чек материализации вставки (два источника вердикта, принцип ADR-025:
+    один лагающий источник ≠ истина). expect_type задан — каждый новый id обязан
+    существовать и нести этот тип ('html': dom-вставка может деградировать до
+    параграфа); None — достаточно существования (markdown-вставка: типы — вопрос
+    payload'а, не вставки). Основной источник — SQL-проба новых id (пробы с
+    паузами: индекс отстаёт от мутаций секундами); подтверждённый чужой тип —
+    немедленный громкий отказ. Недостающие по SQL id — фолбэк на .sy (FS-истина
+    без лага): подтверждены деревом → успех с примечанием; для markdown иначе —
+    фантомные id ядра, потеря подтверждена двумя источниками, громкий отказ с
+    рецептом; для html отказ без рецепта сноса — агент не должен удалить реально
+    вставленную диаграмму по противоречию источников."""
     ids_csv = ", ".join(f"'{_sql_str(i)}'" for i in new_ids)
     stmt = f"select id, type from blocks where id in ({ids_csv}) limit {len(new_ids)}"  # nosec B608 — id валидированы форматом (ответ ядра), count явный
-    for _ in range(HTML_POSTCHECK_ATTEMPTS):
+    missing = list(new_ids)
+    for _ in range(POSTCHECK_ATTEMPTS):
         try:
             rows = _sql_rows(stmt, attempts=1)
         except Exception:
             break  # индекс не отвечает корректным конвертом — фолбэк на .sy
         by_id = {r["id"]: r.get("type") for r in rows}
-        if all(by_id.get(i) == "html" for i in new_ids):
+        if expect_type:
+            degraded = [f"{i} → {by_id[i]}" for i in new_ids
+                        if by_id.get(i) not in (None, expect_type)]
+            if degraded:
+                raise RuntimeError(
+                    f"деградация вставки: {', '.join(degraded)} — вставка не материализовалась "
+                    f"ожидаемым типом '{expect_type}'; "
+                    f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
+        missing = [i for i in new_ids if i not in by_id]
+        if not missing:
             return "вердикт по SQL"
-        degraded = [f"{i} → {by_id[i]}" for i in new_ids if by_id.get(i) not in (None, "html")]
-        if degraded:
-            raise RuntimeError(
-                f"деградация вставки: {', '.join(degraded)} — живой html-блок не материализовался; "
-                f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
         time.sleep(1)  # id ещё не в индексе — лаг, пробуем снова
-    tree = _sy_tree(doc_id)
-    html_ids = _sy_html_block_ids(tree)
-    if all(i in html_ids for i in new_ids):
-        return f"вердикт по .sy (SQL-проба не сошлась за {HTML_POSTCHECK_ATTEMPTS} попыток)"
+    sy_type = "NodeHTMLBlock" if expect_type else None
+    sy_ids = _sy_block_ids(_sy_tree(doc_id), node_type=sy_type)
+    # html — все новые id обязаны быть в FS-истине (найденные SQL 'html' не
+    # исключение); markdown — только недостающие по SQL (найденные материализованы).
+    required_in_sy = list(new_ids) if expect_type else missing
+    if required_in_sy and all(i in sy_ids for i in required_in_sy):
+        return f"вердикт по .sy (SQL-проба не сошлась за {POSTCHECK_ATTEMPTS} попыток)"
+    unconfirmed = [i for i in required_in_sy if i not in sy_ids]
+    if expect_type:
+        raise RuntimeError(
+            f"материализация вставки не подтверждена (SQL-проба не сошлась, .sy новых id не содержит) — "
+            f"сверь export {doc_id} и SQL вручную до любых действий по откату (undo-журнал выше)")
     raise RuntimeError(
-        f"материализация вставки не подтверждена (SQL-проба не сошлась, .sy новых id не содержит) — "
-        f"сверь export {doc_id} и SQL вручную до любых действий по откату (undo-журнал выше)")
+        f"потеря вставки: {len(unconfirmed)} из {len(new_ids)} новых id не материализовались "
+        f"(фантомные: {', '.join(unconfirmed)}) — напечатанные ядром id не доказательство "
+        f"материала (проба 07.11); сверь export {doc_id}, хвост payload'а досоставь "
+        "по одному блоку за вызов; откат вставленного — block-delete (undo-журнал выше)")
 
 
 def cmd_block_insert_html(a):
@@ -1372,7 +1485,7 @@ def cmd_block_insert_html(a):
                            "сверь export/SQL до повтора")
     journal_name = journal["_name"] if journal else None
     _undo_patch(journal, {"new_ids": new_ids})
-    verdict = _verify_html_materialized(new_ids, doc_id)
+    verdict = _verify_materialized(new_ids, doc_id, expect_type="html")
     print(f"вставлен html-блок после {anchor}, новых блоков: {len(new_ids)}")
     for block_id in new_ids:
         print(f"  новый блок: {block_id}")

@@ -1,3 +1,8 @@
+---
+name: rules-text-writing
+description: Prose quality rules for technical and public-facing text — human writing principles, controlled language (ASD-STE100 for English, УТР for Russian), forbidden AI-style patterns, AI-cliché dictionary, final self-check. Use when writing technical documentation, instructions, READMEs, reports, marketing copy, or agent-facing text that must read as human-written. Not for casual chat replies or code comments.
+---
+
 ## 1. PRINCIPLES OF HUMAN WRITING
 
 ### ✅ Do this
