@@ -37,6 +37,19 @@ kernel-транспорт (post, конфиг, константы) без выи
   block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален);
                                          на 't' — сиблинг после таблицы, таблица цела
                                          (проба 07.11)
+  block-insert-html <docId|blockID> --html <файл> [--after-marker <имя>]
+                                         вставка живого HTML-блока (dataType="dom",
+                                         dom мимо markdown-парсера — тот деградирует
+                                         длинные/сложные div'ы до параграфов). Без
+                                         маркера — сразу после блока (паритет
+                                         block-insert-after); с --after-marker — после
+                                         маркер-абзаца «⁂ diagram:<имя>» (ADR-052) в
+                                         доке: маркер уникален (0/>1 — отказ с
+                                         раскладкой), сосед NodeHTMLBlock в .sy →
+                                         отказ «уже вставлена» (обновление:
+                                         block-delete соседа → повтор). Пост-чек:
+                                         SQL type='html' по новым id с фолбэком на
+                                         .sy (FS-истина) — деградация не молчалива
   block-delete <blockID>                 снос leaf-блока; контейнер с детьми или
                                          таблица — отказ (ядро сносит контекст целиком
                                          и тихо; снос list — update контейнера:
@@ -106,12 +119,15 @@ post(): «metadata is not ready» — ≤3 попытки (+2s/+5s) → разл
 from __future__ import annotations
 
 import argparse
+import html as html_module
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -243,7 +259,7 @@ def _fs_file(path: str) -> str:
     выстрел без ретраев — проба существования должна быть быстрой и честной.
     "found" — HTTP 200 с байтами (ядро читает диск, индекс не участвует);
     "missing" — конверт code 404 (файла нет, приходит как HTTP 202);
-    "failed" — проба не состоялась: транспорт, прочий code, не-JSON, 200 с
+    "failed" — проба не состоялась: транспорт, прочий код, не-JSON, 200 с
     пустым телом (пустое тело это промах, не успех — правило write-path).
     """
     _conf()
@@ -697,7 +713,7 @@ def cmd_delete(a):
     print(f"  ({verdict})")
 
 
-# --- блочная хирургия: block-update / block-insert-after / block-delete ---
+# --- блочная хирургия: block-update / block-insert-after / block-insert-html / block-delete ---
 
 def _block_row(block_id: str) -> dict | None:
     stmt = f"select id, type, root_id, parent_id, markdown from blocks where id='{block_id}' limit 1"  # nosec B608 — blockID валидирован DOC_ID_RE
@@ -852,6 +868,34 @@ def _payload_chunk_count(markdown: str) -> int:
 UNDO_DIR = "data/assets/undo/wiki_ops"
 
 
+def _get_workspace_file(ws_path: str) -> bytes:
+    """Сырое чтение файла воркспейса через getFile (FS-истина ядра, ADR-025).
+    FileNotFoundError — конверт code 404 (файла нет); RuntimeError — транспорт,
+    прочий код, не-JSON, 200 без байт. Причины различимы намеренно: транспортный
+    сбой ≠ отсутствие файла (ревью плана round-1)."""
+    _conf()
+    req = urllib.request.Request(URL + GET_FILE_PATH, data=json.dumps({"path": ws_path}).encode(),
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
+            body = r.read()
+            status = getattr(r, "status", None)
+    except Exception as exc:
+        raise RuntimeError(f"getFile {ws_path}: {exc}") from None
+    if status == 200:
+        if not body:
+            raise RuntimeError(f"getFile {ws_path}: 200 без байт — промах, не успех")
+        return body
+    try:
+        envelope = json.loads(body)
+    except Exception:
+        raise RuntimeError(f"getFile {ws_path}: не-JSON ответ (status={status})") from None
+    if envelope.get("code") == 404:
+        raise FileNotFoundError(ws_path)
+    raise RuntimeError(f"getFile {ws_path}: code={envelope.get('code')} msg={envelope.get('msg')}")
+
+
 def _put_workspace_file(ws_path: str, payload: bytes) -> None:
     """Запись файла в воркспейс, контракт ядра 3.8.9: POST multipart (path от
     корня воркспейса + поле file), ядро создаёт недостающие директории и пишет
@@ -977,6 +1021,208 @@ def cmd_block_insert_after(a):
         print(f"  новый блок: {block_id}")
 
 
+# --- block-insert-html: живой HTML-блок через dataType="dom" ---
+
+# Префикс маркер-абзаца диаграммы (ADR-052, конвенция cli html_embed).
+MARKER_PREFIX = "⁂ diagram:"
+
+# Часовой пояс контейнера ядра (проба 07.11: updated свежей вставки на час
+# позади хоста JST) — id/updated генерируются согласованно с его форматом.
+KERNEL_TZ = timezone(timedelta(hours=8))
+
+# Пост-чек материализации: SQL-проба новых id (индекс отстаёт от мутаций
+# секундами) до фолбэка на .sy.
+HTML_POSTCHECK_ATTEMPTS = 3
+
+# Канонический dom-каркас NodeHTMLBlock, снят с живого ядра 07.11 (рецепт
+# опыт-дока: короткая markdown-вставка → doOperations[0].data). ZWJ (\u200b)
+# в хвостовом span и protyle-attr — часть каркаса ядра, не мусор; data-content
+# несёт HTML-эскейп сырого HTML (кавычки обязательны — атрибут в двойных
+# кавычках). Маркеры подстановки для str.format, `{`/`}` HTML здесь не несёт.
+HTML_BLOCK_DOM_TEMPLATE = (
+    '<div data-node-id="{block_id}" data-node-index="1" data-type="NodeHTMLBlock" '
+    'class="render-node" updated="{updated}" data-subtype="block">'
+    '<div class="protyle-icons">'
+    '<span class="ariaLabel protyle-icon protyle-icon--first protyle-action__edit" data-position="4north">'
+    '<svg><use xlink:href="#iconEdit"></use></svg></span>'
+    '<span class="ariaLabel protyle-icon protyle-action__menu protyle-icon--last" data-position="4north">'
+    '<svg><use xlink:href="#iconMore"></use></svg></span></div>'
+    '<div><protyle-html data-content="{escaped_html}"></protyle-html>'
+    '<span style="position: absolute">\u200b</span></div>'
+    '<div class="protyle-attr" contenteditable="false">\u200b</div></div>'
+)
+
+
+def _generate_block_id() -> str:
+    """Свежий id в формате ядра: 14 цифр (таймстамп в TZ ядра) + '-' + 7 [a-z0-9]."""
+    stamp = datetime.now(KERNEL_TZ).strftime("%Y%m%d%H%M%S")
+    tail = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(7))
+    return f"{stamp}-{tail}"
+
+
+def _build_html_block_dom(raw_html: str, block_id: str, updated: str) -> str:
+    return HTML_BLOCK_DOM_TEMPLATE.format(
+        block_id=block_id, updated=updated,
+        escaped_html=html_module.escape(raw_html.strip(), quote=True))
+
+
+def _sy_tree(doc_id: str) -> dict:
+    """Дерево дока из .sy (FS-истина ядра, ADR-025): getFile data/<box><path>.
+    RuntimeError с различимыми причинами — транспортный сбой ≠ отсутствие файла
+    (ревью плана round-1)."""
+    row = _doc_row(doc_id)
+    if not row:
+        raise RuntimeError(f"док {doc_id} не найден в индексе — .sy-проба невозможна")
+    fs_path = _doc_fs_path(row)
+    try:
+        raw = _get_workspace_file(fs_path)
+    except FileNotFoundError:
+        raise RuntimeError(f".sy-файл дока отсутствует ({fs_path}) — проверь uwuwu-cli doctor") from None
+    except RuntimeError:
+        raise RuntimeError(f".sy-файл дока не читается ({fs_path}) — транспорт/ядро; проверь uwuwu-cli doctor") from None
+    return json.loads(raw)
+
+
+def _sy_find_with_next(tree: dict, block_id: str) -> tuple[dict, dict | None] | None:
+    """(узел, следующий сиблинг) по ID в дереве .sy (PascalCase Children); None — не найден."""
+    def walk(node: dict) -> tuple[dict, dict | None] | None:
+        children = node.get("Children") or []
+        for index, child in enumerate(children):
+            if child.get("ID") == block_id:
+                nxt = children[index + 1] if index + 1 < len(children) else None
+                return child, nxt
+            found = walk(child)
+            if found:
+                return found
+        return None
+    return walk(tree)
+
+
+def _sy_html_block_ids(tree: dict) -> set[str]:
+    """Множество ID всех NodeHTMLBlock в дереве .sy."""
+    ids: set[str] = set()
+
+    def walk(node: dict) -> None:
+        if node.get("Type") == "NodeHTMLBlock":
+            ids.add(node.get("ID"))
+        for child in node.get("Children") or []:
+            walk(child)
+    walk(tree)
+    return ids
+
+
+def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
+    """Маркер-режим: имя → (blockID маркер-абзаца, root_id дока).
+
+    Уникальность по SQL (порядок детей через индекс невыразим — пробы 07.11):
+    0 → отказ с раскладкой маркеров дока; >1 → отказ с раскладкой вхождений.
+    Сосед маркера определяется по .sy (FS-истина, паритет cli find_marker_location):
+    NodeHTMLBlock-сосед → отказ «диаграмма уже вставлена» с рецептом обновления —
+    иначе повторный вызов тихо плодит вторую диаграмму под тем же маркером.
+    """
+    root_row = _doc_row(doc_id)
+    if not root_row:
+        raise RuntimeError(f"док {doc_id} не найден — возьми id из wiki_ops find")
+    stmt = (f"select id, content from blocks where root_id='{doc_id}' "
+            f"and content like '{_sql_str(MARKER_PREFIX)}%' limit 20")  # nosec B608 — docId валидирован DOC_ID_RE, префикс константа
+    rows = _sql_rows(stmt)
+    markers = [r for r in rows if r.get("content") == MARKER_PREFIX + marker_name]
+    known = "; ".join(sorted({r["content"] for r in rows})) or "нет"
+    if len(markers) > 1:
+        listing = "; ".join(m["id"] for m in markers)
+        raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не уникален в доке ({listing}) — "
+                           "уточни имя или удали лишние маркер-абзацы")
+    if not markers:
+        raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не найден в доке {doc_id}; "
+                           f"маркеры в доке: {known}")
+    marker_id = markers[0]["id"]
+    tree = _sy_tree(doc_id)
+    found = _sy_find_with_next(tree, marker_id)
+    if not found:
+        raise RuntimeError(f"маркер {marker_id} есть в индексе, но не найден в .sy — "
+                           "FS и индекс разошлись; проверь uwuwu-cli doctor")
+    sibling = found[1]
+    if sibling and sibling.get("Type") == "NodeHTMLBlock":
+        raise RuntimeError(f"диаграмма по маркеру «{MARKER_PREFIX}{marker_name}» уже вставлена "
+                           f"({sibling['ID']}) — обновление: block-delete {sibling['ID']} → "
+                           "повтор block-insert-html")
+    return marker_id, doc_id
+
+
+def _verify_html_materialized(new_ids: list[str], doc_id: str) -> str:
+    """Пост-чек деградации (два источника вердикта, принцип ADR-025: один лагающий
+    источник ≠ истина). Основной — SQL-проба новых id (пробы с паузами: индекс
+    отстаёт от мутаций секундами); подтверждённый type≠'html' — немедленный громкий
+    отказ. SQL не сошёлся (аномалия/сбой/лаг после всех проб) — фолбэк на .sy
+    (FS-истина без лага): новые id как NodeHTMLBlock → успех с примечанием.
+    Оба источника молчат → RuntimeError без команды сноса — агент не должен
+    удалить реально вставленную диаграмму по ложному негативу."""
+    ids_csv = ", ".join(f"'{_sql_str(i)}'" for i in new_ids)
+    stmt = f"select id, type from blocks where id in ({ids_csv}) limit {len(new_ids)}"  # nosec B608 — id валидированы форматом (ответ ядра), count явный
+    for _ in range(HTML_POSTCHECK_ATTEMPTS):
+        try:
+            rows = _sql_rows(stmt, attempts=1)
+        except Exception:
+            break  # индекс не отвечает корректным конвертом — фолбэк на .sy
+        by_id = {r["id"]: r.get("type") for r in rows}
+        if all(by_id.get(i) == "html" for i in new_ids):
+            return "вердикт по SQL"
+        degraded = [f"{i} → {by_id[i]}" for i in new_ids if by_id.get(i) not in (None, "html")]
+        if degraded:
+            raise RuntimeError(
+                f"деградация вставки: {', '.join(degraded)} — живой html-блок не материализовался; "
+                f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
+        time.sleep(1)  # id ещё не в индексе — лаг, пробуем снова
+    tree = _sy_tree(doc_id)
+    html_ids = _sy_html_block_ids(tree)
+    if all(i in html_ids for i in new_ids):
+        return f"вердикт по .sy (SQL-проба не сошлась за {HTML_POSTCHECK_ATTEMPTS} попыток)"
+    raise RuntimeError(
+        f"материализация вставки не подтверждена (SQL-проба не сошлась, .sy новых id не содержит) — "
+        f"сверь export {doc_id} и SQL вручную до любых действий по откату (undo-журнал выше)")
+
+
+def cmd_block_insert_html(a):
+    raw_html = _read_payload(a.file)
+    target = a.target.strip()
+    if not DOC_ID_RE.fullmatch(target):
+        raise RuntimeError(f"неверный id: {target!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
+    marker_name = a.after_marker
+    if marker_name and marker_name.startswith(MARKER_PREFIX):
+        marker_name = marker_name[len(MARKER_PREFIX):]
+    if marker_name:
+        root_probe = _doc_row(target)
+        if root_probe:
+            doc_id = target
+        else:
+            row = _resolved_block(target)
+            doc_id = row["root_id"]
+        anchor, doc_id = _resolve_marker_anchor(doc_id, marker_name.strip())
+    else:
+        row = _resolved_block(target)
+        anchor, doc_id = row["id"], row["root_id"]
+    journal = _undo_write("insert-html", anchor, {
+        "root_id": doc_id, "hpath": _root_hpath(doc_id),
+        "payload_html": raw_html,
+    })
+    dom = _build_html_block_dom(raw_html, _generate_block_id(),
+                                datetime.now(KERNEL_TZ).strftime("%Y%m%d%H%M%S"))
+    resp = _mutate("/api/block/insertBlock", {"dataType": "dom", "data": dom, "previousID": anchor})
+    new_ids = _new_block_ids(resp)
+    if not new_ids:
+        raise RuntimeError("ядро не вернул новые id в ответе — вставка могла примениться; "
+                           "сверь export/SQL до повтора")
+    journal_name = journal["_name"] if journal else None
+    _undo_patch(journal, {"new_ids": new_ids})
+    verdict = _verify_html_materialized(new_ids, doc_id)
+    print(f"вставлен html-блок после {anchor}, новых блоков: {len(new_ids)}")
+    for block_id in new_ids:
+        print(f"  новый блок: {block_id}")
+    print(f"  {verdict}: type='html'")
+    if journal_name:
+        print(f"  undo-журнал: {UNDO_DIR}/{journal_name} (откат: block-delete новых блоков)")
+
+
 def cmd_block_delete(a):
     row = _resolved_block(a.blockID.strip())
     if row["type"] == "t":
@@ -1061,6 +1307,12 @@ def main():
     p.add_argument("blockID")
     p.add_argument("--md", dest="file", required=True)
     p.set_defaults(fn=cmd_block_insert_after)
+    p = sub.add_parser("block-insert-html")
+    p.add_argument("target", help="docId или blockID: без --after-marker — вставка сразу после блока")
+    p.add_argument("--html", dest="file", required=True)
+    p.add_argument("--after-marker", default=None, metavar="ИМЯ",
+                   help="вставка после маркер-абзаца «⁂ diagram:ИМЯ» в доке (target — docId или blockID того дока)")
+    p.set_defaults(fn=cmd_block_insert_html)
     p = sub.add_parser("block-delete")
     p.add_argument("blockID")
     p.set_defaults(fn=cmd_block_delete)
