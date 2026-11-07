@@ -1,456 +1,265 @@
-//! cron set/list/pause/resume на общем stateful wiremock-ядре
-//! (cmd::mock_kernel, дедуп мок-билдеров 20261107052603): колонки крон-доски
-//! валидируются до мутаций (без сирот), строка привязана к телу (blockID),
-//! Status — mSelect, список печатает Schedule/Last Run, семья pause/resume/
-//! list умеет --project.
+//! cron list на общем stateful wiremock-ядре (cmd::mock_kernel, дедуп
+//! мок-билдеров 20261107052603; кроны унифицированы с задачами —
+//! 20261106182051): инвентарь мастеров крон-задач — строки задачной доски
+//! с custom-schedule в доке-теле; last run/сессия из state демона
+//! (UWUWU_CRON_STATE_DIR песочница).
 //!
 //! Сценарии:
-//! 1. доска без колонки Schedule → громкий отказ ДО создания тела/строки
-//! 2. полноценная доска → bound-строка + Schedule/Status(mSelect)/Last Run
-//! 3. дубль-тайтла в живых строках → отказ без мутаций
-//! 4. item_add без строки в render → отказ после ретрая ×1 (verify вставки)
-//! 5. pause с --project пишет Status на доске указанного проекта
-//! 6. таблица list несёт значения Schedule и Last Run
-//! 7. парс: --project у list/pause/resume/rm, дефолт None
+//! 1. Вейт-строка с расписанием в атрибутах → строка таблицы с last run из state
+//! 2. строки без атрибута расписания → в инвентарь не попадают
+//! 3. пустой state (нет файла) → last run пуст, инвентарь работает
+//! 4. атрибут расписания отсутствует у всех → «Крон-задач нет»
+//! 5. сбои чтения атрибутов — громкая ошибка (инвентарь честный)
+//! 6. доска проекта не найдена — отказ с именем доски
+//! 7. формат last run: локальное «YYYY-MM-DD HH:MM» из unix-ms state
+//! 8. task edit --schedule "6h": грамматика валидирована, атрибут записан
+//! 9. task edit --schedule "": снятие без валидации грамматики
 
-use crate::cmd::cli::CronSub;
-use crate::cmd::mock_kernel::{set_env, MockKernel, MockRow, MockScenario, MockBoard};
-use crate::cmd::sy_dispatch::{cron_run, cron_set_with_pacing, format_cron_table};
-use crate::siyuan::SiYuan;
-use crate::siyuan_task::{RowInsertPacing, SyTask};
-use serde_json::json;
-use wiremock::MockServer;
+use crate::cmd::cli::{CronSub, TaskSub};
+use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockRow, MockScenario};
+use crate::cmd::sy_dispatch::{cron_run, task_run};
 
-const CRON_DOC: &str = "k-doc";
-const CRON_AV: &str = "av-k";
-const FOIL_DOC: &str = "f-doc";
-const FOIL_AV: &str = "av-f";
+const BOARD_DOC: &str = "t-doc";
+const BOARD_AV: &str = "av-t";
+const MASTER_DOC: &str = "body-master1";
+const PLAIN_DOC: &str = "body-plain2";
 
-/// Колонки крон-доски: полный набор (ветки/расписание) или легаси-шаблон
-/// без Schedule/Last Run.
-fn cron_keys(full: bool) -> Vec<(&'static str, &'static str)> {
-    let mut keys = vec![
-        ("key-title", "Первичный ключ"),
-        ("key-status", "Status"),
-        ("key-branch", "Branch"),
-        ("key-pr", "PR"),
-    ];
-    if full {
-        keys.push(("key-schedule", "Schedule"));
-        keys.push(("key-lastrun", "Last Run"));
-    }
-    keys
-}
-
-/// Сценарий cron-флоу: крон-доска uwuwu (ключи по сценарию) + фольга foilcap
-/// (полные ключи) — pause с --project целится в чужую доску. `inserted_title` —
-/// тайтл строки вставки в render (как реальное ядро рендерит block-контент):
-/// verify матчит по itemID, но посторонний тайтл сделал бы DuplicateTitle-
-/// сценарии тихо неработоспособными.
-fn cron_scenario(cron_keys_full: bool, inserted_title: &str) -> MockScenario {
+/// Сценарий инвентаря: задачная доска с двумя строками — крон-мастер
+/// («stable-ватчер SiYuan», Вейт) и обычная задача («обычная задача», Todo),
+/// обе привязаны к телам; attrs по сценариям.
+fn list_scenario() -> MockScenario {
     MockScenario {
         notebook: "nb-projects",
-        boards: vec![
-            MockBoard {
-                doc_id: CRON_DOC,
-                av_id: CRON_AV,
-                keys: cron_keys(cron_keys_full),
-            },
-            MockBoard {
-                doc_id: FOIL_DOC,
-                av_id: FOIL_AV,
-                keys: cron_keys(true),
-            },
+        boards: vec![MockBoard {
+            doc_id: BOARD_DOC,
+            av_id: BOARD_AV,
+            keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+        }],
+        hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec![BOARD_DOC])],
+        rows: vec![
+            MockRow::new("20261107090000-master1", "stable-ватчер SiYuan")
+                .with_status("Вейт")
+                .with_doc(MASTER_DOC),
+            MockRow::new("20261107090000-plain2", "обычная задача")
+                .with_status("Todo")
+                .with_doc(PLAIN_DOC),
         ],
-        hpath_ids: vec![
-            ("/uwuwu/Кроны uwuwu", vec![CRON_DOC]),
-            ("/foilcap/Кроны foilcap", vec![FOIL_DOC]),
-        ],
-        inserted_row: MockRow::new("item-mock", inserted_title),
         ..MockScenario::default()
     }
 }
 
-/// Строка крон-доски: активная, с расписанием (render-вид кронов).
-fn cron_row(item: &str, title: &str, last_run: &str) -> MockRow {
-    MockRow::new(item, title)
-        .with_status("active")
-        .with_schedule("*/5 * * * *")
-        .with_last_run(last_run)
+/// (1) Вейт-строка с расписанием → инвентарь без отказа; state с живой
+/// записью мастера читается (last run/сессия дополняют таблицу).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_shows_master_with_schedule_and_last_run_from_state() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "6h".to_string())])];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let _state = state_dir_with(
+        r#"{ "crons": { "20261107090000-master1": { "sessionID": "ses_abc123def", "lastFiredAt": 1762498200000, "firedAtIso": "2026-11-07T09:30:00+09:00" } } }"#,
+    );
+
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list: мастер найден, state прочитан");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "list — read-only инвентарь"
+    );
 }
 
-/// set через cron_set_with_pacing с мгновенным пейсингом: тесты не наследуют
-/// прод-паузу verify-ретрая (пауза 1.5 s вынесена в RowInsertPacing).
-async fn set_via_flow(server: &MockServer, title: &str) -> anyhow::Result<()> {
-    set_env(server);
-    let sy = SiYuan::from_env()?;
-    cron_set_with_pacing(
-        &sy,
+/// (2) Строка без атрибута расписания в инвентарь не попадает: таблица
+/// печатает только мастеров (мок: у обеих строк атрибутов нет → пусто).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_skips_rows_without_schedule_attr() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    cron_run(CronSub::List { project: None }).await.expect("list ok");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (3) State отсутствует — инвентарь работает без last run.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_works_without_state_file() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())])];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("UWUWU_CRON_STATE_DIR", dir.path().join("несуществующее"));
+
+    cron_run(CronSub::List { project: None }).await.expect("list без state ok");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (4) Ни у одной строки нет расписания → честное «нет» вместо пустой таблицы.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_reports_empty_inventory_without_masters() {
+    let (_kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    cron_run(CronSub::List { project: None }).await.expect("пустой инвентарь ok");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (5) Мёртвая привязка тела одной строки — скип с предупреждением,
+/// остальной инвентарь живёт (инвентарь не роняется одной битой строкой).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_skips_row_with_dead_binding_and_lists_the_rest() {
+    // attrs-мок знает только тело обычной строки: master1 (unknown attrs)
+    // пропускается, plain2 с расписанием попадает в инвентарь
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-schedule".to_string(), "30m".to_string())])];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("битая строка не роняет инвентарь");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (6) Доска проекта не найдена — отказ с именем доски.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_bails_when_board_missing() {
+    let (_kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    let err = cron_run(CronSub::List {
+        project: Some("неттакого".into()),
+    })
+    .await
+    .expect_err("доска не найдена — отказ");
+    assert!(
+        err.to_string().contains("Задачи неттакого"),
+        "ошибка называет доску: {err}"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (7) Формат last run: локальное «YYYY-MM-DD HH:MM» из unix-ms state.
+#[test]
+fn format_local_renders_local_time() {
+    // Формат не зависит от зоны прогона: проверяем шейп (длина, разделители)
+    let s = crate::cmd::sy_dispatch::format_local(1762477800000);
+    assert_eq!(s.len(), 16, "«YYYY-MM-DD HH:MM»: {s}");
+    assert_eq!(s.as_bytes()[10], b' ', "пробел между датой и временем: {s}");
+    assert_eq!(s.as_bytes()[13], b':', "двоеточие в времени: {s}");
+}
+
+/// (8) task edit --schedule "6h": грамматика валидирована, атрибут записан.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_writes_custom_attr() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    task_run(
         "uwuwu",
-        title,
-        "10m",
-        "<промпт крона>",
-        &RowInsertPacing::instant(),
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("6h".into()),
+        },
     )
     .await
+    .expect("edit --schedule ok");
+
+    let writes = kernel.attr_writes();
+    assert_eq!(writes.len(), 1, "ровно одна запись атрибута: {writes:?}");
+    assert_eq!(writes[0].0, PLAIN_DOC, "атрибут на теле строки");
+    assert_eq!(writes[0].1, "custom-schedule");
+    assert_eq!(writes[0].2, "6h");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
-/// Полный Set для cron_run (Set-arm glue: cron_schedule + prompt + wiring).
-#[allow(clippy::too_many_arguments)]
-fn set_cmd(
-    title: &str,
-    r#in: Option<&str>,
-    every: Option<&str>,
-    at: Option<&str>,
-    cron_expr: Option<&str>,
-    project: Option<&str>,
-) -> CronSub {
-    CronSub::Set {
-        title: title.into(),
-        r#in: r#in.map(String::from),
-        every: every.map(String::from),
-        at: at.map(String::from),
-        cron_expr: cron_expr.map(String::from),
-        project: project.map(String::from),
-        stdin: false,
-    }
-}
-
-/// Env на заглушку: для тестов, где отказ случается до kernel-вызовов
-/// (cron_schedule), — без зависимости от env предыдущего serial-теста.
-fn set_env_on_placeholder() {
-    std::env::set_var("UWUWU_SIYUAN_URL", "http://127.0.0.1:1");
-    std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
-}
-
-/// (1) легаси-доска без Schedule: громкий отказ, мутаций не было.
-/// Через cron_run (Set-arm glue: cron_schedule + prompt + production-пейсинг
-/// остаются транзитно покрытыми); бейл до verify-ретрая — спит ноль.
+/// (9) task edit --schedule "": снятие без валидации грамматики — контракт
+/// «"" — снять» (ревью Common-1: ветка сидела за validate_schedule и была
+/// недостижима).
 #[tokio::test]
 #[serial_test::serial]
-async fn set_bails_loud_before_mutations_when_board_lacks_schedule_key() {
-    let (kernel, server) = MockKernel::start(cron_scenario(false, "ночной крон")).await;
+async fn edit_schedule_empty_removes_attr_without_grammar_check() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
     set_env(&server);
 
-    let err = cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
-        .await
-        .expect_err("доска без Schedule должна давать отказ");
-
-    assert!(
-        err.to_string().contains("Schedule"),
-        "сообщение должно называть недостающую колонку: {err}"
-    );
-    assert!(
-        kernel.created_docs().is_empty(),
-        "тело не должно создаваться до валидации колонок"
-    );
-    assert!(
-        kernel.item_add_count() == 0,
-        "строка не должна создаваться до валидации колонок"
-    );
-}
-
-/// (2) полноценная доска: bound-строка, Schedule/Last Run текстом, Status mSelect.
-/// Через cron_run; confirm с первой попытки — до спящего ретрая не доходит.
-#[tokio::test]
-#[serial_test::serial]
-async fn set_creates_bound_row_and_fills_cells() {
-    let mut scenario = cron_scenario(true, "ночной крон");
-    scenario.row_visible_after_adds = 1;
-    let (kernel, server) = MockKernel::start(scenario).await;
-    set_env(&server);
-
-    cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
-        .await
-        .expect("set на полной доске");
-
-    let created = kernel.created_docs();
-    assert_eq!(created.len(), 1, "ровно одно тело");
-    assert!(
-        created[0].0.contains("ночной крон"),
-        "тело по hpath тайтла: {:?}",
-        created[0]
-    );
-
-    let adds = kernel.item_add_args();
-    assert_eq!(adds.len(), 1, "одна вставка строки (verify с первого раза)");
-    let bound = adds[0]
-        .get("blockID")
-        .and_then(|b| b.as_str())
-        .unwrap_or("");
-    assert!(
-        !bound.is_empty(),
-        "строка привязана к телу (blockID), не detached: {:?}",
-        adds[0]
-    );
-    assert!(
-        adds[0].get("detached").is_none(),
-        "флаг detached не используется: {:?}",
-        adds[0]
-    );
-
-    let updates = kernel.item_updates();
-    let by_key = |name: &str| updates.iter().find(|(_, k, _, _)| k == name);
-    let status = by_key("key-status").expect("Status записан");
-    assert_eq!(
-        status.3,
-        json!({ "mSelect": [{ "content": "active" }] }),
-        "Status через mSelect"
-    );
-    let schedule = by_key("key-schedule").expect("Schedule записан");
-    assert_eq!(
-        schedule.3,
-        json!({ "text": { "content": "10m" } }),
-        "Schedule текстом"
-    );
-    assert!(
-        by_key("key-lastrun").is_some(),
-        "Last Run записан (пустое значение)"
-    );
-}
-
-/// (3) тайтл уже жив строкой: отказ без мутаций (дедуп по строкам, не только телам).
-/// Через cron_run; бейл до вставки — спит ноль.
-#[tokio::test]
-#[serial_test::serial]
-async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
-    let mut scenario = cron_scenario(true, "ночной крон");
-    scenario.rows = vec![cron_row("20261105110000-live1", "ночной крон", "")];
-    let (kernel, server) = MockKernel::start(scenario).await;
-    set_env(&server);
-
-    let err = cron_run(set_cmd("ночной крон", Some("10m"), None, None, None, None))
-        .await
-        .expect_err("дубль-тайтл в живых строках");
-
-    assert!(
-        err.to_string().contains("уже есть"),
-        "сообщение про дубль: {err}"
-    );
-    assert!(
-        kernel.created_docs().is_empty(),
-        "тело не создано"
-    );
-    assert!(
-        kernel.item_add_count() == 0,
-        "строка не создана"
-    );
-}
-
-/// (4) ядро «потеряло» вставку: после ретрая ×1 — громкий отказ.
-/// Единственный set-тест, доходящий до спящего ретрая — через
-/// cron_set_with_pacing с мгновенным пейсингом (тесты не наследуют
-/// прод-паузу 1.5 s, вынесенную в RowInsertPacing).
-#[tokio::test]
-#[serial_test::serial]
-async fn set_bails_when_row_never_appears_in_render() {
-    let mut scenario = cron_scenario(true, "призрачный крон");
-    scenario.row_visible_after_adds = usize::MAX;
-    let (kernel, server) = MockKernel::start(scenario).await;
-
-    let err = set_via_flow(&server, "призрачный крон")
-        .await
-        .expect_err("строка не появилась в render");
-
-    assert!(
-        err.to_string().contains("не появилась"),
-        "отказ объясняет причину: {err}"
-    );
-    assert_eq!(
-        kernel.item_add_count(),
-        2,
-        "ровно один ретрай вставки"
-    );
-}
-
-/// Валидация расписания: нужен ровно один из --in/--every/--at/--cron.
-/// Отказ до kernel-вызовов — мок не нужен.
-#[tokio::test]
-#[serial_test::serial]
-async fn set_schedule_requires_exactly_one_option() {
-    set_env_on_placeholder();
-
-    let err = cron_run(set_cmd("крон без опций", None, None, None, None, None))
-        .await
-        .expect_err("ноль опций — отказ");
-    assert!(
-        err.to_string().contains("ровно один"),
-        "суть отказа: {err}"
-    );
-
-    let err = cron_run(set_cmd(
-        "крон с двумя опциями",
-        Some("10m"),
-        Some("30m"),
-        None,
-        None,
-        None,
-    ))
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("".into()),
+        },
+    )
     .await
-    .expect_err("две опции — отказ");
-    assert!(
-        err.to_string().contains("ровно один"),
-        "суть отказа: {err}"
+    .expect("снятие расписания работает");
+
+    let writes = kernel.attr_writes();
+    assert_eq!(writes.len(), 1, "снятие = запись пустого значения");
+    assert_eq!(writes[0].1, "custom-schedule");
+    assert_eq!(
+        writes[0].2, "",
+        "пустое значение — ядро удаляет ключ из IAL"
     );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
-/// (5) pause с --project пишет Status на доске указанного проекта.
+/// (10) task edit --schedule "мусор": грамматика отвергает ДО записи —
+/// атрибут не тронут.
 #[tokio::test]
 #[serial_test::serial]
-async fn pause_targets_project_board() {
-    let mut scenario = cron_scenario(true, "новый крон");
-    scenario.rows = vec![cron_row("20261105110000-kc1", "крон foilcap", "")];
-    let (kernel, server) = MockKernel::start(scenario).await;
+async fn edit_schedule_garbage_rejected_before_write() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
     set_env(&server);
 
-    cron_run(CronSub::Pause {
-        id: "kc1".into(),
-        project: Some("foilcap".into()),
-    })
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            schedule: Some("раз в минутку".into()),
+        },
+    )
     .await
-    .expect("pause на доске foilcap");
+    .expect_err("мусорное расписание — отказ");
 
-    let updates = kernel.item_updates();
-    let status = updates
-        .iter()
-        .find(|(av, k, _, _)| av == FOIL_AV && k == "key-status")
-        .expect("Status записан на доске foilcap");
-    assert_eq!(
-        status.3,
-        json!({ "mSelect": [{ "content": "paused" }] }),
-        "paused через mSelect"
-    );
-}
-
-/// (6) таблица list несёт значения Schedule и Last Run.
-#[test]
-fn list_table_carries_schedule_and_last_run_values() {
-    let rows = vec![SyTask {
-        item_id: "20261105110000-kc9".into(),
-        title: "утренний дайджест".into(),
-        status: "active".into(),
-        branch: String::new(),
-        pr: String::new(),
-        schedule: "09:30".into(),
-        last_run: "2026-11-05 09:30".into(),
-        dev_session: String::new(),
-        body_doc: None,
-    }];
-    let table = format_cron_table(&rows);
-    assert!(table.contains("09:30"), "Schedule виден: {table}");
     assert!(
-        table.contains("2026-11-05 09:30"),
-        "Last Run виден: {table}"
+        err.to_string().contains("не разобрано"),
+        "ошибка валидации грамматики: {err}"
     );
     assert!(
-        table.contains("утренний дайджест"),
-        "заголовок виден: {table}"
+        kernel.attr_writes().is_empty(),
+        "записи не было: атрибут не тронут"
     );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
-/// (7) парс: --project у всей семьи, дефолт — None (uwuwu).
-#[test]
-fn cron_family_accepts_project_flag() {
-    use super::cli::{Cli, Commands};
-    use clap::Parser as _;
-
-    let mut argv: Vec<String> = vec!["uwuwu-cli".into()];
-    argv.extend(["cron", "pause", "kc1", "--project", "foilcap"].map(String::from));
-    let Commands::Cron { command } = Cli::try_parse_from(argv).unwrap().command else {
-        panic!("expected cron");
-    };
-    let super::cli::CronSub::Pause { id, project } = command else {
-        panic!("expected pause");
-    };
-    assert_eq!(id, "kc1");
-    assert_eq!(project.as_deref(), Some("foilcap"));
-
-    let mut argv: Vec<String> = vec!["uwuwu-cli".into()];
-    argv.extend(["cron", "list"].map(String::from));
-    let Commands::Cron { command } = Cli::try_parse_from(argv).unwrap().command else {
-        panic!("expected cron");
-    };
-    let super::cli::CronSub::List { project } = command else {
-        panic!("expected list");
-    };
-    assert!(project.is_none(), "дефолт — глобальная uwuwu");
-}
-
-// ——— cron rm (срез покрытия 20261105220435): журнал → строка → тело ———
-
-/// Сценарий rm: крон-доска с одной живой строкой (привязка body-<item>);
-/// `binding_alive: false` — привязка мертва (block get — not found).
-fn rm_scenario(binding_alive: bool) -> MockScenario {
-    let mut scenario = cron_scenario(true, "новый крон");
-    scenario.rows = vec![cron_row("20261105120000-item01", "ночной крон", "")
-        .with_doc("body-20261105120000-item01")];
-    scenario.block_get_alive = binding_alive;
-    scenario
-}
-
-/// cron rm: write-ahead undo-журнал ДО мутаций → item_remove строки →
-/// тело (живая привязка) в трэш.
-#[tokio::test]
-#[serial_test::serial]
-async fn rm_removes_row_and_trashes_body_with_undo_journal() {
-    let (kernel, server) = MockKernel::start(rm_scenario(true)).await;
-    set_env(&server);
-
-    cron_run(CronSub::Rm {
-        id: "20261105120000-item01".into(),
-        project: None,
-    })
-    .await
-    .expect("rm на живом кроне");
-
-    let removes = kernel.item_removes();
-    assert_eq!(
-        removes,
-        vec!["20261105120000-item01".to_string()],
-        "строка снята item_remove"
-    );
-    let removed_docs = kernel.removed_docs();
-    assert_eq!(
-        removed_docs,
-        vec![format!("body-{}", removes[0])],
-        "привязанное тело в трэш (removeDocByID)"
-    );
-    let journals = kernel.put_files();
-    assert_eq!(journals.len(), 1, "write-ahead журнал один");
-    assert!(
-        journals[0].ends_with("-uwuwu-cron-rm.json"),
-        "журнал kind=cron-rm: {:?}",
-        journals
-    );
-}
-
-/// cron rm при мёртвой привязке тела: строка снимается, трэш не зовётся
-/// (тела нет — удалять нечего), журнал всё равно пишется.
-#[tokio::test]
-#[serial_test::serial]
-async fn rm_skips_body_trash_when_binding_is_dead() {
-    let (kernel, server) = MockKernel::start(rm_scenario(false)).await;
-    set_env(&server);
-
-    cron_run(CronSub::Rm {
-        id: "20261105120000-item01".into(),
-        project: None,
-    })
-    .await
-    .expect("rm проходит и с мёртвой привязкой");
-
-    assert_eq!(
-        *kernel.item_removes(),
-        vec!["20261105120000-item01".to_string()],
-        "строка снята"
-    );
-    assert!(
-        kernel.removed_docs().is_empty(),
-        "мёртвая привязка — removeDocByID не зовётся"
-    );
-    assert_eq!(
-        kernel.put_files().len(),
-        1,
-        "журнал написан"
-    );
+/// State-dir песочница: отдельный tempdir с state.json.
+fn state_dir_with(content: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(dir.path().join("state/state.json"), content).unwrap();
+    std::env::set_var("UWUWU_CRON_STATE_DIR", dir.path().join("state"));
+    dir
 }

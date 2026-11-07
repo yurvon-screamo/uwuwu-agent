@@ -162,10 +162,6 @@ pub struct SyTask {
     pub status: String,
     pub branch: String,
     pub pr: String,
-    /// Крон-доски: значение колонки Schedule (на задачных досках пусто).
-    pub schedule: String,
-    /// Крон-доски: значение колонки Last Run (пишет демон после тика).
-    pub last_run: String,
     /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
     pub dev_session: String,
     pub body_doc: Option<String>,
@@ -317,8 +313,6 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         status: String::new(),
         branch: String::new(),
         pr: String::new(),
-        schedule: String::new(),
-        last_run: String::new(),
         dev_session: String::new(),
         body_doc: None,
     };
@@ -354,8 +348,6 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         match name.as_str() {
             "Status" | "Статус" => t.status = value,
             "Branch" => t.branch = value,
-            "Schedule" => t.schedule = value,
-            "Last Run" => t.last_run = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
             _ => {}
@@ -553,38 +545,6 @@ pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, Str
 /// id колонок крон-доски, обязательных для работы демона: Schedule/Status/Last Run.
 /// Громкий отказ с перечнем недостающих — ДО любых мутаций (строка без
 /// Schedule демону не видна, тело без строки — сирота).
-pub(crate) fn require_cron_keys(keys: &[(String, String)], board_hpath: &str) -> Result<CronKeys> {
-    let id_of = |name: &str| {
-        keys.iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, id)| id.clone())
-    };
-    let required = ["Schedule", "Status", "Last Run"];
-    let missing: Vec<&str> = required
-        .iter()
-        .filter(|name| id_of(name).is_none())
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "на доске {board_hpath} нет колонок: {} — крон не поставлен (колонки добавляет владелец доски)",
-            missing.join(", ")
-        );
-    }
-    Ok(CronKeys {
-        schedule: id_of("Schedule").expect("проверено выше"),
-        status: id_of("Status").expect("проверено выше"),
-        last_run: id_of("Last Run").expect("проверено выше"),
-    })
-}
-
-/// id обязательных колонок крон-доски (см. require_cron_keys).
-pub(crate) struct CronKeys {
-    pub schedule: String,
-    pub status: String,
-    pub last_run: String,
-}
-
 /// Костяк тела задачи по типу. H1 в контенте не пишем: имя дока SiYuan уже
 /// рендерится заголовком, а `# {title}` ядро импортирует реальным
 /// heading-блоком — экспорт получает дубль-H1 (канон тел, задача
@@ -1035,161 +995,42 @@ pub async fn resolve_entity(
     }
 }
 
-/// Где нашлась строка: штатная доска задач или крон-доска (свой/чужой проект).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResolveOrigin {
-    Tasks,
-    CronProject,
-    CronForeign,
-}
-
-/// Резолв с фоллбеком на крон-доски (контракт AGENTS.md): «Задачи <proj>» →
-/// «Кроны <proj>» → чужие «Кроны %».
+/// Резолв строки на доске задач проекта. Крон-доски сняты (унификация
+/// кронов с задачами) — кандидат один.
 ///
-/// Фаза A — точный item-id по доскам в порядке приоритета, первый точный
-/// матч выигрывает (автопуть крон-агента с полным rowId детерминирован).
-/// Фаза B — нечёткий матч (префиксы/подстрока) собирается со всех досок:
-/// матч ровно на одной доске → она (независимо от приоритета); матчи на
-/// нескольких или неоднозначность хоть на одной — громкая ошибка с раскладкой
-/// (тихий wrong-target исключён конструктивно).
+/// Фаза A — точный item-id; фаза B — нечёткий матч (префиксы/подстрока):
+/// неоднозначность — громкая ошибка с раскладкой (тихий wrong-target
+/// исключён конструктивно).
 pub async fn resolve_on_project(
     sy: &SiYuan,
     project: &str,
     needle: &str,
-) -> Result<(SyBoard, SyTask, ResolveOrigin)> {
-    let candidates = resolve_candidates(sy, project).await?;
-    if candidates.is_empty() {
-        bail!("доски проекта «{project}» не найдены: нет ни «Задачи {project}», ни «Кроны {project}», чужих крон-досок тоже");
-    }
-    let mut rows_cache: Vec<Option<Vec<SyTask>>> = vec![None; candidates.len()];
+) -> Result<(SyBoard, SyTask)> {
+    let Some(board) = find_board_titled_opt(sy, project, &format!("Задачи {project}")).await?
+    else {
+        bail!("доска «Задачи {project}» не найдена");
+    };
+    let rows = read_rows(sy, &board).await?;
 
-    // Фаза A: точный id
     let exact = needle.trim_start_matches('-');
-    for (idx, (board, origin)) in candidates.iter().enumerate() {
-        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
-        if let Some(task) = rows.iter().find(|r| r.item_id == exact) {
-            return Ok((board.clone(), task.clone(), *origin));
-        }
+    if let Some(task) = rows.iter().find(|r| r.item_id == exact) {
+        return Ok((board, task.clone()));
     }
 
-    // Фаза B: нечёткий матч по всем доскам
-    let mut found: Vec<(usize, SyTask)> = Vec::new();
-    let mut ambiguous: Vec<String> = Vec::new();
-    for (idx, (board, _origin)) in candidates.iter().enumerate() {
-        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
-        let subdoc_ids = board_subdoc_ids(sy, board).await?;
-        match match_needle(&rows, &subdoc_ids, needle) {
-            NeedleMatch::Found(task) => found.push((idx, task)),
-            NeedleMatch::Ambiguous { reason, matches } => {
-                ambiguous.push(format!("{} ({}: {matches})", board.hpath, reason));
-            }
-            NeedleMatch::NotFound => {}
-        }
-    }
-    if found.len() == 1 && ambiguous.is_empty() {
-        let (idx, task) = found.remove(0);
-        let (board, origin) = candidates
-            .into_iter()
-            .nth(idx)
-            .expect("idx из той же выборки");
-        return Ok((board, task, origin));
-    }
-
-    let searched: Vec<String> = candidates.iter().map(|(b, _)| b.hpath.clone()).collect();
-    let mut parts: Vec<String> = Vec::new();
-    if !found.is_empty() {
-        let boards: Vec<String> = found
-            .iter()
-            .map(|(i, _)| candidates[*i].0.hpath.clone())
-            .collect();
-        parts.push(format!("найдено на: {}", boards.join(", ")));
-    }
-    if !ambiguous.is_empty() {
-        parts.push(format!("неоднозначно на: {}", ambiguous.join("; ")));
-    }
-    if parts.is_empty() {
-        bail!(
+    let subdoc_ids = board_subdoc_ids(sy, &board).await?;
+    match match_needle(&rows, &subdoc_ids, needle) {
+        NeedleMatch::Found(task) => Ok((board, task)),
+        NeedleMatch::Ambiguous { reason, matches } => bail!(
+            "задача «{needle}»: неоднозначно на: {} ({}: {matches}); обысканы доски: {} — уточни id",
+            board.hpath,
+            reason,
+            board.hpath
+        ),
+        NeedleMatch::NotFound => bail!(
             "задача «{needle}» не найдена; обысканы доски: {}",
-            searched.join(", ")
-        );
+            board.hpath
+        ),
     }
-    bail!(
-        "задача «{needle}»: {} (обысканы доски: {}) — уточни id",
-        parts.join("; "),
-        searched.join(", ")
-    )
-}
-
-/// Кандидаты досок по приоритету. Отсутствие дока — benign (доски нет);
-/// битая доска / инфра-сбой — громкая ошибка (таксономия find_board_titled_opt).
-async fn resolve_candidates(sy: &SiYuan, project: &str) -> Result<Vec<(SyBoard, ResolveOrigin)>> {
-    let mut out = Vec::new();
-    if let Some(board) = find_board_titled_opt(sy, project, &format!("Задачи {project}")).await?
-    {
-        out.push((board, ResolveOrigin::Tasks));
-    }
-    if let Some(board) = find_board_titled_opt(sy, project, &format!("Кроны {project}")).await?
-    {
-        out.push((board, ResolveOrigin::CronProject));
-    }
-    for board in discover_foreign_cron_boards(sy, project).await? {
-        out.push((board, ResolveOrigin::CronForeign));
-    }
-    Ok(out)
-}
-
-/// Чужие крон-доски: SQL-дискавери доков «Кроны %» одним уровнем под проектами
-/// (кроны живут только там по конвенции). Дубли доков одного проекта после
-/// пересозданий — первый по сортированному hpath.
-async fn discover_foreign_cron_boards(sy: &SiYuan, project: &str) -> Result<Vec<SyBoard>> {
-    let rows = sy
-        .sql("select id, hpath from blocks where type='d' and content like 'Кроны %' limit 200")
-        .await?;
-    let mut hpaths: Vec<String> = rows
-        .iter()
-        .filter_map(|r| r.get("hpath").and_then(|h| h.as_str()).map(String::from))
-        .collect();
-    hpaths.sort();
-    hpaths.dedup();
-    let mut out = Vec::new();
-    let mut seen_projects = HashSet::new();
-    for hpath in hpaths {
-        let Some((other, title)) = foreign_board_parts(&hpath) else {
-            continue;
-        };
-        if other == project || !seen_projects.insert(other.clone()) {
-            continue;
-        }
-        if let Some(board) = find_board_titled_opt(sy, &other, &title).await? {
-            out.push(board);
-        }
-    }
-    Ok(out)
-}
-
-/// /<proj>/Кроны <proj> → Some((proj, «Кроны <proj>»)); прочие пути — None
-/// (кроны вглубь иерархии не вкладываются).
-fn foreign_board_parts(hpath: &str) -> Option<(String, String)> {
-    let rest = hpath.strip_prefix('/')?;
-    let (project, title) = rest.split_once('/')?;
-    let expected = format!("Кроны {project}");
-    (title == expected).then_some((project.to_string(), expected))
-}
-
-/// Строки доски с кэшем между фазами: render — самая дорогая операция
-/// резолва, каждая доска читается один раз.
-async fn cached_rows(
-    sy: &SiYuan,
-    board: &SyBoard,
-    cache: &mut [Option<Vec<SyTask>>],
-    idx: usize,
-) -> Result<Vec<SyTask>> {
-    if let Some(rows) = &cache[idx] {
-        return Ok(rows.clone());
-    }
-    let rows = read_rows(sy, board).await?;
-    cache[idx] = Some(rows.clone());
-    Ok(rows)
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).
@@ -1385,11 +1226,6 @@ pub async fn edit(
         .await?;
     }
     Ok(())
-}
-
-/// Доска кронов: док /<project>/Кроны <project> с database-блоком.
-pub async fn find_board_cron(sy: &SiYuan, project: &str) -> Result<SyBoard> {
-    find_board_titled(sy, project, &format!("Кроны {project}")).await
 }
 
 #[cfg(test)]
@@ -1691,8 +1527,6 @@ mod tests {
             status: String::new(),
             branch: String::new(),
             pr: String::new(),
-            schedule: String::new(),
-            last_run: String::new(),
             dev_session: String::new(),
             body_doc: body_doc.map(String::from),
         }
@@ -1828,8 +1662,6 @@ mod tests {
             status: "Todo".into(),
             branch: String::new(),
             pr: String::new(),
-            schedule: String::new(),
-            last_run: String::new(),
             dev_session: String::new(),
             body_doc: None,
         }

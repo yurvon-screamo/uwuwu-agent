@@ -5,9 +5,10 @@ export interface CronRow {
   rowId: string
   bodyDoc: string
   title: string
+  /** Расписание из custom-schedule дока-тела; пусто для обычных задач. */
   schedule: string
+  /** Статус строки доски (mSelect, нижний регистр). Файр — только «вейт». */
   status: string
-  lastRun: string
 }
 
 export interface TrackedCron {
@@ -44,16 +45,22 @@ export function parseSchedule(s: string): Sched | null {
   if (m !== null) {
     const hour = Number(m[1]), minute = Number(m[2])
     if (hour > 23 || minute > 59) return null
+    const day = m[3] !== undefined ? Number(m[3]) : undefined
+    const month = m[4] !== undefined ? Number(m[4]) : undefined
+    // диапазоны даты проверяются на парсинге (паритет с CLI-валидацией):
+    // «45.13» иначе разбирался бы «легально» и молча не срабатывал никогда
+    if (day !== undefined && (day < 1 || day > 31)) return null
+    if (month !== undefined && (month < 1 || month > 12)) return null
     return {
       kind: "at", hour, minute,
-      ...(m[3] !== undefined ? { day: Number(m[3]), month: Number(m[4]) } : {}),
+      ...(day !== undefined ? { day, month } : {}),
     }
   }
   const fields = t.split(/\s+/)
   if (fields.length !== 5) return null
-  // каждое поле: запятая-список из (*|N[-M])[/step] — мусор вида "abc"
+  // каждое поле: запятая-список из (*|N[-M])[/step≥1] — мусор вида "abc"
   // иначе парсится «легально» и молча не срабатывает никогда
-  const partRe = /^(\*|\d+(?:-\d+)?)(?:\/\d+)?$/
+  const partRe = /^(\*|\d+(?:-\d+)?)(?:\/[1-9]\d*)?$/
   const ranges: Array<[number, number]> = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]]
   const valid = fields.every((f, i) => {
     const [min, max] = ranges[i]!
@@ -131,19 +138,21 @@ export function due(sched: Sched, lastFiredAt: number, now: Date): boolean {
   }
 }
 
-/** Разовое расписание (at): после срабатывания демон ставит Status → fired. */
+/** Разовое расписание (at): после срабатывания демон снимает custom-schedule —
+ *  мастер покидает крон-пул и не повторится; повторный запуск — заново задать
+ *  расписание (task edit --schedule). */
 export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
 
-/** Решение по свежему срезу доски прямо перед спавном: строка могла быть снята
- *  (cron rm/clean) или паузнута, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
+/** Решение по свежему срезу доски прямо перед спавном: строка могла быть
+ *  снята/закрыта/снята с Вейт, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
  *  (живой кейс 05.11: файр по строке, снятой в ходе тика) сужается до окна
- *  render → POST. */
-export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "paused" {
+ *  render → POST. Файр — только строка в статусе «вейт» (мастер крон-задачи). */
+export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "not-wait" {
   const row = rows.find((r) => r.rowId === rowId)
   if (row === undefined) return "removed"
-  return row.status === "active" ? "fire" : "paused"
+  return row.status === "вейт" ? "fire" : "not-wait"
 }
 
 export function minuteStart(d: Date): number {
@@ -287,40 +296,31 @@ export function sanitizeBoundary(text: string): string {
   return text.replace(/^\s*===.*$/gm, "≡")
 }
 
-/** Промпт срабатывания: тело крона + тихий протокол тика
- *  (коммент — только исключение; факт тика демон пишет в Last Run сам).
+/** Промпт срабатывания: тело мастера + тихий протокол рана. Ран-карточка —
+ *  запись запуска (создаёт демон до спавна); коммент агента идёт на ран.
  *  Тело непусто по инварианту тика: гейт резолвит и валидирует его до
  *  спавна — пустое/unsupported-тело не доходит до промпта (refuse). */
-export function firePrompt(row: CronRow, body: string, project: string): string {
+export function firePrompt(
+  master: { title: string; schedule: string },
+  body: string,
+  runRowId: string,
+  project: string,
+): string {
   return [
-    `Ты — исполнитель крон-задачи «${row.title.replace(/[\r\n]+/g, " ")}» (расписание: ${row.schedule}).`,
+    `Ты — запуск крон-задачи «${master.title.replace(/[\r\n]+/g, " ")}» (расписание: ${master.schedule}).`,
+    `Ран-карточка этого запуска — задача ${runRowId} на доске «Задачи ${project}»: она уже создана, работать по ней не нужно.`,
     "",
-    "=== ТЕЛО КРОНА ===",
+    "=== ТЕЛО ЗАДАЧИ ===",
     sanitizeBoundary(body),
     "=== КОНЕЦ ТЕЛА ===",
     "",
     "ПРАВИЛА:",
-    "1. Выполни задачу из тела. Это периодическая проверка/работа — работай автономно.",
-    "2. Здоровый тик — тихий: никаких отчётных комментов и доков-отчётов; факт тика демон сам пишет в Last Run доски. Правки и записи, которые предписывает само тело крона (обновить док, заполнить ячейку), — нормальны; запрещён только шум ради отчёта.",
+    "1. Выполни работу из тела. Это периодическая проверка/работа — работай автономно.",
+    "2. Здоровый ран — тихий: никаких отчётных комментов и доков-отчётов; ран-карточка — запись запуска, её статус не меняй (закрывает владелец). Правки и записи, которые предписывает само тело задачи, — нормальны; запрещён только шум ради отчёта.",
     "3. Коммент — ТОЛЬКО исключение (падение проверки, блокер, вопрос человеку):",
-    `   uwuwu-cli task comment ${row.rowId} --project ${project} "<что случилось; для вопроса — явно ЧТО РЕШИТЬ>"`,
+    `   uwuwu-cli task comment ${runRowId} --project ${project} "<что случилось; для вопроса — явно ЧТО РЕШИТЬ>"`,
+    `   Блокер/вопрос — тем же ходом поставь рану Needs attention: uwuwu-cli task edit ${runRowId} --project ${project} --status "Needs attention".`,
     "   Пиши от себя (коммент идёт с бот-аккаунта, автор и так виден).",
-    "4. Коммент не ушёл (строка/тело сняты в полёте) — повторов и запасных мест нет: заверши ход молча.",
-  ].join("\n")
-}
-
-/** Заголовок док-тела нового крона (стаб при создании). */
-export function cronBodyStub(title: string, schedule: string): string {
-  return [
-    `# ${title}`,
-    "",
-    `Расписание: \`${schedule}\` · Status: active/paused в колонке доски.`,
-    "",
-    "## Что делать на каждом срабатывании",
-    "(опиши работу агента)",
-    "",
-    "## Комменты",
-    "_Здоровый тик тихий (факт тика — в Last Run). Коммент — только исключение:_",
-    "_падение/блокер/вопрос владельцу (uwuwu-cli task comment) — в эту секцию._",
+    "4. Коммент не ушёл (ран/тело сняты в полёте) — повторов и запасных мест нет: заверши ход молча.",
   ].join("\n")
 }

@@ -56,6 +56,10 @@ import {
   bodyContentHash,
   bodyLastmodMs,
   wakeupDedup,
+  spawnInitBlock,
+  stripExportWrapper,
+  stripFrontmatter,
+  type SpawnInit,
 } from "./factory-lib"
 import { parseCommentsMarkdown } from "../lib/platform"
 
@@ -234,7 +238,9 @@ describe("spawnPrompt", () => {
   })
   test("env-контекст: работа в готовом окружении, старой строки «создай worktree» нет", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", {
-      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      env: {
+        repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      },
     })
     expect(p).toContain("/home/x/agents-env/r1/repo")
     expect(p).toContain("work/task-r1")
@@ -262,7 +268,9 @@ describe("continuePrompt", () => {
   })
   test("env-контекст: окружение уже существует — своё не создавай, пути названы", () => {
     const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", {
-      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      env: {
+        repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      },
     })
     expect(p).toContain("уже существует — своё не создавай")
     expect(p).toContain("/home/x/agents-env/r1/repo")
@@ -334,6 +342,17 @@ describe("routeTask", () => {
     reviewerAlive: null,
     freshComments: [],
     ...over,
+  })
+  test("Вейт-факты — фабрика немая: крон-мастера и ран-карточки ей невидимы", () => {
+    // крон-мастер в Вейт (файр его — работа планировщика, не фабрики)
+    expect(routeTask(facts({ status: "Вейт", lastStatus: "Todo" }))).toEqual({ t: "noop" })
+    expect(routeTask(facts({ status: "Вейт", lastStatus: "" }))).toEqual({ t: "noop" })
+    // ран-карточка в Todo (создана планировщиком) — тоже не роутится
+    expect(routeTask(facts({ status: "Todo", lastStatus: "" }))).toEqual({ t: "noop" })
+    // ран из Вейт переброшен владельцем в In Progress — штатный fast-track
+    // «вмешайся и почини» (возврат девелоперу, спавн фильтром spawnable)
+    const live = routeTask(facts({ status: "In Progress", lastStatus: "Вейт", reviewerAlive: false }))
+    expect(live).toEqual({ t: "return-to-dev" })
   })
   test("вход в ревью-статус без сессии → спавн", () => {
     expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: false })))
@@ -412,8 +431,9 @@ describe("routeTask", () => {
 
 describe("conflictFixPrompt", () => {
   test("конфликт-kickoff: PR, путь починки и возврат в «Ревью результата», без Design-стадии", () => {
-    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9")
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu")
     expect(p).toContain("r1")
+    expect(p).toContain("проект uwuwu")
     expect(p).toContain("https://github.com/x/pull/9")
     expect(p).toContain("конфликт")
     expect(p).toContain(REVIEW_RESULT_STATUS)
@@ -423,41 +443,129 @@ describe("conflictFixPrompt", () => {
   })
   test("env-контекст назван, чтобы агент не плодил окружение заново", () => {
     const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
-    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", env)
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { env })
     expect(p).toContain(env.repoDir)
     expect(p).toContain(env.branch)
     expect(p).toContain("своё не создавай")
-    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9")).not.toContain("своё не создавай")
+    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu")).not.toContain("своё не создавай")
+  })
+  test("живая сессия (будильник мимо startTask) — без инит-блока: дельта-принцип", () => {
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu")
+    expect(p).not.toContain("Инит-данные")
   })
 })
 
 describe("promptForStart: единственная точка выбора стартового промпта", () => {
-  const args = ["r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "https://github.com/x/pull/9"] as const
+  const target = {
+    rowId: "r1", project: "uwuwu", repo: "yurvon-screamo/uwuwu-agent", pr: "https://github.com/x/pull/9",
+  }
   test("conflict-fix → конфликт-kickoff", () => {
-    const p = promptForStart("conflict-fix", ...args)
-    expect(p).toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9"))
+    const p = promptForStart("conflict-fix", target)
+    expect(p).toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu"))
   })
   test("continue → рестарт без предписания стадии", () => {
-    const p = promptForStart("continue", ...args)
+    const p = promptForStart("continue", target)
     expect(p).toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent"))
     expect(p).not.toContain("Стадия Design")
   })
   test("implement/design → spawnPrompt соответствующего режима", () => {
-    expect(promptForStart("implement", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
-    expect(promptForStart("design", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
+    expect(promptForStart("implement", target)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
+    expect(promptForStart("design", target)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
   })
   test("env прокидывается во все ветки (work-line/окружение названо)", () => {
     const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
-    expect(promptForStart("implement", ...args, env))
-      .toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", env))
-    expect(promptForStart("implement", ...args, env)).toContain(env.repoDir)
+    expect(promptForStart("implement", target, { env }))
+      .toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", { env }))
+    expect(promptForStart("implement", target, { env })).toContain(env.repoDir)
     // рестарт env-задачи называет окружение — агент не плодит новое
-    expect(promptForStart("continue", ...args, env))
-      .toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", env))
-    expect(promptForStart("continue", ...args, env)).toContain(env.repoDir)
-    expect(promptForStart("conflict-fix", ...args, env))
-      .toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", env))
-    expect(promptForStart("conflict-fix", ...args, env)).toContain(env.repoDir)
+    expect(promptForStart("continue", target, { env }))
+      .toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", { env }))
+    expect(promptForStart("continue", target, { env })).toContain(env.repoDir)
+    expect(promptForStart("conflict-fix", target, { env }))
+      .toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { env }))
+    expect(promptForStart("conflict-fix", target, { env })).toContain(env.repoDir)
+  })
+  test("init прокидывается во все ветки — все три вида старта создают свежую сессию", () => {
+    const init: SpawnInit = {
+      person: null, projectDocs: [],
+      task: { title: "Т", status: "Design", branch: "", pr: "" },
+    }
+    expect(promptForStart("implement", target, { init })).toContain("Инит-данные")
+    expect(promptForStart("continue", target, { init })).toContain("Инит-данные")
+    expect(promptForStart("conflict-fix", target, { init })).toContain("Инит-данные")
+  })
+})
+
+describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", () => {
+  test("frontmatter срезан, тело без потерь", () => {
+    expect(stripFrontmatter("---\ntitle: X\n---\n\nтело\n")).toBe("тело\n")
+  })
+  test("без frontmatter — дословно; незакрытый fence — дословно", () => {
+    expect(stripFrontmatter("тело\n")).toBe("тело\n")
+    expect(stripFrontmatter("---\ntitle: X\nтело\n")).toBe("---\ntitle: X\nтело\n")
+  })
+  test("обёртка экспорта: frontmatter + строка тайтла — долой", () => {
+    expect(stripExportWrapper("---\ntitle: таск\n---\n\n# таск\n\nтело\n", "таск")).toBe("тело\n")
+  })
+  test("чужой H1 в начале не срезается (не тайтл дока)", () => {
+    expect(stripExportWrapper("# другой заголовок\nтекст\n", "таск")).toBe("# другой заголовок\nтекст\n")
+  })
+})
+
+describe("spawnInitBlock: инит-данные первого промпта", () => {
+  const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
+  const baseInit: SpawnInit = {
+    person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
+    projectDocs: ["uwuwu/README", "uwuwu/Домены"],
+    task: { title: "Фича", status: "Design", branch: "work/task-r1", pr: "" },
+  }
+  test("строка задачи: тайтл/статус/ячейки, пустые — тире", () => {
+    const b = spawnInitBlock(baseInit, "r1", "uwuwu")
+    expect(b).toContain("Задача: «Фича», статус Design, ветка work/task-r1, PR —.")
+    expect(b).toContain('uwuwu-cli task get r1 --project uwuwu')
+  })
+  test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
+    const b = spawnInitBlock(baseInit, "r1", "uwuwu")
+    expect(b).toContain('uwuwu-cli read "uwuwu/README", "uwuwu/Домены"')
+    expect(b).not.toContain("чекаут")
+  })
+  test("проект без живых доков — честная строка вместо заглушек", () => {
+    const b = spawnInitBlock({ ...baseInit, projectDocs: [] }, "r1", "uwuwu")
+    expect(b).toContain("канон-доки (README/Домены/Стек/Деплоймент) не нашлись")
+    expect(b).not.toContain("uwuwu-cli read")
+  })
+  test("env:false-проект: чекаут назван с маркером env:false", () => {
+    const b = spawnInitBlock({ ...baseInit, localPath: "/srv/origa" }, "r1", "uwuwu")
+    expect(b).toContain("чекаут /srv/origa (env:false — ворктри/ветка сам)")
+  })
+  test("персона: целиком с отступом, помечена как язык/стиль/анти-паттерны", () => {
+    const b = spawnInitBlock(baseInit, "r1", "uwuwu")
+    expect(b).toContain("Персона владельца (язык/стиль/анти-паттерны):")
+    expect(b).toContain("  Язык — русский.")
+    expect(b).toContain("  Анти-паттерн: не дробить задачи.")
+  })
+  test("персона недоступна — честная строка, спавн не зависит от инита", () => {
+    const b = spawnInitBlock({ ...baseInit, person: null }, "r1", "uwuwu")
+    expect(b).toContain("Персона владельца: недоступна")
+    expect(b).toContain("работай без неё")
+  })
+  test("шапка блока несёт конвенцию «первичный источник»", () => {
+    const b = spawnInitBlock(baseInit, "r1", "uwuwu")
+    expect(b).toContain("первичный источник ориентации")
+    expect(b).toContain("глубокое чтение — по необходимости")
+  })
+  test("spawnPrompt с init: блок после шапки, до инструкций; без init — блока нет", () => {
+    const withInit = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design", { env, init: baseInit })
+    const header = withInit.indexOf("Задача r1")
+    const block = withInit.indexOf("Инит-данные")
+    const instructions = withInit.indexOf("Работай по AGENTS.md")
+    expect(block).toBeGreaterThan(header)
+    expect(block).toBeLessThan(instructions)
+    expect(withInit).toContain("Персона владельца")
+    expect(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")).not.toContain("Инит-данные")
+    expect(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")).not.toContain("Инит-данные")
+    expect(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", { init: baseInit })).toContain("Инит-данные")
+    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { init: baseInit })).toContain("Инит-данные")
   })
 })
 

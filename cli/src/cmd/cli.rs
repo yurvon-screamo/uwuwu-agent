@@ -29,6 +29,14 @@ pub(crate) enum TaskSub {
             help = "Аттач в тело (repeatable)"
         )]
         attach: Vec<std::path::PathBuf>,
+        /// Расписание крона: атрибут custom-schedule в доке-теле; демона
+        /// файрит задачу в статусе Вейт по этому расписанию
+        #[arg(
+            long = "schedule",
+            value_name = "EXPR",
+            help = "Расписание: 5m|2h|1d | HH:MM [DD.MM] | cron 5 полей"
+        )]
+        schedule: Option<String>,
         // Осмотр скелета без записи: живой create ради просмотра костяка
         // кормит триаж-демон мусорными черновиками.
         #[arg(
@@ -67,6 +75,14 @@ pub(crate) enum TaskSub {
         pr: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// Расписание крона: записать/сменить; пустая строка снимает
+        /// (пауза = закрыть задачу, расписания без задачи не бывает)
+        #[arg(
+            long = "schedule",
+            value_name = "EXPR",
+            help = "Расписание: 5m|2h|1d | HH:MM [DD.MM] | cron 5 полей; \"\" — снять"
+        )]
+        schedule: Option<String>,
     },
     /// Заявить сессию на задачу: sessionID в ячейку «Сессия dev» — структурное
     /// свидетельство «работу ведёт эта сессия». Фабрика живую заявку уважает:
@@ -224,53 +240,16 @@ pub(crate) enum TaskSub {
     },
 }
 
-/// Кроны на доске Crons: агентские отложенные/периодические работы.
-/// Дефолтный механизм: сессионный cron_set умирает с сессией — эти живут.
+/// Кроны — задачи с расписанием (custom-schedule в доке-теле, статус Вейт):
+/// `cron list` — инвентарь мастеров доски (расписание + last run из state
+/// демона). Установка/снятие — task create/edit --schedule; сессионные
+/// set/pause/resume/rm выпилены вместе с крон-досками (унификация кронов
+/// с задачами).
 #[derive(clap::Subcommand)]
 pub(crate) enum CronSub {
-    /// Поставить крон (тело = промпт из stdin или заглушка).
-    /// --project <proj> → доска «Кроны <proj>» в папке проекта,
-    /// без --project → глобальная доска «Crons».
-    Set {
-        #[arg(long, help = "Заголовок крона")]
-        title: String,
-        #[arg(long, value_name = "10m|90s|2h", help = "Разово через N (one-shot)")]
-        r#in: Option<String>,
-        #[arg(long, value_name = "5m|2h|1d", help = "Повторять каждые N")]
-        every: Option<String>,
-        #[arg(long, value_name = "09:30 [01.12]", help = "Разово в указанное время")]
-        at: Option<String>,
-        #[arg(long, value_name = "EXPR", help = "Cron-выражение (5 полей)")]
-        cron_expr: Option<String>,
-        #[arg(long, help = "Проект (доска «Кроны <proj>» в папке проекта)")]
-        project: Option<String>,
-        #[arg(long, help = "Промпт из stdin (иначе заглушка)")]
-        stdin: bool,
-    },
-    /// Все кроны доски (--project → «Кроны <proj>», деф. uwuwu)
+    /// Мастера крон-задач доски проекта (--project, деф. uwuwu)
     List {
-        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
-        project: Option<String>,
-    },
-    /// Остановить (Status=paused)
-    Pause {
-        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
-        id: String,
-        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
-        project: Option<String>,
-    },
-    /// Запустить обратно (Status=active)
-    Resume {
-        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
-        id: String,
-        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
-        project: Option<String>,
-    },
-    /// Удалить крон (строка + тело в трэш)
-    Rm {
-        #[arg(allow_hyphen_values = true, help = "row-id / префикс")]
-        id: String,
-        #[arg(long, help = "Проект (доска «Кроны <proj>»; деф. uwuwu)")]
+        #[arg(long, help = "Проект (доска «Задачи <proj>»; деф. uwuwu)")]
         project: Option<String>,
     },
 }
@@ -428,7 +407,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: SemanticSub,
     },
-    /// Кроны: строки доски «Кроны <Proj>» (SiYuan database).
+    /// Кроны: инвентарь крон-задач (расписание в доке-теле задачи).
     Cron {
         #[command(subcommand)]
         command: CronSub,

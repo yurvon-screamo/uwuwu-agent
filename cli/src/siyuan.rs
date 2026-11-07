@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -645,6 +646,33 @@ impl SiYuan {
         self.post(
             "/api/filetree/renameDoc",
             json!({ "notebook": notebook, "path": path, "title": title }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Атрибуты блока (IAL): /api/attr/getBlockAttrs. Кастом-атрибуты
+    /// (`custom-*`) — носитель расписания крон-задач; чтение мгновенное
+    /// (SQL-колонка ial отстаёт от свежих записей атрибутов).
+    pub async fn get_block_attrs(&self, block_id: &str) -> Result<HashMap<String, String>> {
+        let data = self
+            .post("/api/attr/getBlockAttrs", json!({ "id": block_id }))
+            .await?;
+        let map = data
+            .as_object()
+            .ok_or_else(|| anyhow!("attr getBlockAttrs {block_id}: ожидался объект"))?;
+        Ok(map
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+    }
+
+    /// Записать атрибут блока (/api/attr/setBlockAttrs). Пустое значение
+    /// снимает атрибут (ядро удаляет ключ из IAL — проба 07.11).
+    pub async fn set_block_attr(&self, block_id: &str, name: &str, value: &str) -> Result<()> {
+        self.post(
+            "/api/attr/setBlockAttrs",
+            json!({ "id": block_id, "attrs": { name: value } }),
         )
         .await
         .map(|_| ())

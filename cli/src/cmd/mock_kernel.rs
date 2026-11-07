@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-/// Строка render в мок-ядре. Пустые необязательные поля (status/schedule/
-/// last_run) не дают клетку — как доска без колонки; `doc` — привязка
+/// Строка render в мок-ядре. Пустое поле `status` не даёт клетку — как
+/// доска без колонки; `doc` — привязка
 /// (block.id в Title-клетке).
 #[derive(Clone)]
 pub(crate) struct MockRow {
@@ -27,8 +27,6 @@ pub(crate) struct MockRow {
     pub(crate) title: String,
     pub(crate) status: String,
     pub(crate) doc: Option<String>,
-    pub(crate) schedule: String,
-    pub(crate) last_run: String,
 }
 
 impl MockRow {
@@ -38,8 +36,6 @@ impl MockRow {
             title: title.to_string(),
             status: String::new(),
             doc: None,
-            schedule: String::new(),
-            last_run: String::new(),
         }
     }
 
@@ -53,18 +49,9 @@ impl MockRow {
         self
     }
 
-    pub(crate) fn with_schedule(mut self, schedule: &str) -> Self {
-        self.schedule = schedule.to_string();
-        self
-    }
 
-    pub(crate) fn with_last_run(mut self, last_run: &str) -> Self {
-        self.last_run = last_run.to_string();
-        self
-    }
 
-    /// Строка render как JSON: Title-клетка всегда, статус/schedule/last_run —
-    /// по заполненности.
+    /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
     fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
         if let Some(doc) = &self.doc {
@@ -77,18 +64,6 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-status", "type": "mSelect",
                            "mSelect": [{ "content": self.status }] }
-            }));
-        }
-        if !self.schedule.is_empty() {
-            cells.push(json!({
-                "value": { "keyID": "key-schedule", "type": "text",
-                           "text": { "content": self.schedule } }
-            }));
-        }
-        if !self.last_run.is_empty() {
-            cells.push(json!({
-                "value": { "keyID": "key-lastrun", "type": "text",
-                           "text": { "content": self.last_run } }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -106,7 +81,7 @@ pub(crate) struct MockBoard {
 
 /// Сценарий мок-ядра: статические данные поверх stateful-билдера. Дефолт —
 /// одна доска uwuwu с полным набором колонок, вставка видна сразу.
-/// `inserted_row` описывает строку вставки (title/status/schedule/last_run;
+/// `inserted_row` описывает строку вставки (title/status;
 /// item берётся из очереди ответов, doc — из blockID аргумента item_add).
 pub(crate) struct MockScenario {
     pub(crate) notebook: &'static str,
@@ -151,6 +126,9 @@ pub(crate) struct MockScenario {
     pub(crate) missing_file_path: &'static str,
     /// item_remove снимает ВСЕ строки (симулятор runaway-удаления пост-чека).
     pub(crate) item_remove_drops_all: bool,
+    /// Атрибуты блоков (docId → [(имя, значение)]) для getBlockAttrs;
+    /// doc без записи → 404-конверт «block not found» (честная деградация).
+    pub(crate) block_attrs: Vec<(&'static str, Vec<(String, String)>)>,
 }
 
 impl Default for MockScenario {
@@ -184,6 +162,7 @@ impl Default for MockScenario {
             files: Vec::new(),
             missing_file_path: "",
             item_remove_drops_all: false,
+            block_attrs: Vec::new(),
         }
     }
 }
@@ -205,6 +184,7 @@ pub(crate) struct MockKernel {
     deletes: Mutex<Vec<String>>,
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
+    attr_writes: Mutex<Vec<(String, String, String)>>,
     doc_blocks: Mutex<HashMap<String, Vec<String>>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -238,6 +218,7 @@ impl MockKernel {
             deletes: Mutex::new(Vec::new()),
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
+            attr_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -302,6 +283,11 @@ impl MockKernel {
     /// workspace-пути всех putFile (undo-журналы).
     pub(crate) fn put_files(&self) -> Vec<String> {
         self.put_files.lock().unwrap().clone()
+    }
+
+    /// (blockId, имя атрибута, значение) всех setBlockAttrs.
+    pub(crate) fn attr_writes(&self) -> Vec<(String, String, String)> {
+        self.attr_writes.lock().unwrap().clone()
     }
 
     /// Состояние дока (применённые блоки) для ассертов comment-флоу.
@@ -542,6 +528,68 @@ impl MockKernel {
             .mount(server)
             .await;
 
+        // REST: атрибуты блоков — чтение (custom-schedule крон-мастеров);
+        // блок без записи в сценарии → 404-конверт «block not found»
+        Mock::given(method("POST"))
+            .and(path("/api/attr/getBlockAttrs"))
+            .respond_with({
+                let kernel = Arc::clone(self);
+                move |req: &Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let attrs = kernel
+                        .sc
+                        .block_attrs
+                        .iter()
+                        .find(|(doc, _)| *doc == id)
+                        .map(|(_, a)| a.clone());
+                    match attrs {
+                        Some(attrs) => {
+                            let map: serde_json::Map<String, Value> = attrs
+                                .iter()
+                                .map(|(k, v)| (k.clone(), json!(v)))
+                                .collect();
+                            rest_ok(Value::Object(map))
+                        }
+                        None => ResponseTemplate::new(200).set_body_string(
+                            json!({ "code": -1, "msg": "block not found" }).to_string(),
+                        ),
+                    }
+                }
+            })
+            .mount(server)
+            .await;
+
+        // REST: запись атрибутов — ровно первая пара attrs-объекта (наблюдатель)
+        Mock::given(method("POST"))
+            .and(path("/api/attr/setBlockAttrs"))
+            .respond_with({
+                let kernel = Arc::clone(self);
+                move |req: &Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    let id = body
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let attrs = body.get("attrs").cloned().unwrap_or_default();
+                    if let Some((name, value)) = attrs
+                        .as_object()
+                        .and_then(|m| m.into_iter().next())
+                    {
+                        kernel.attr_writes.lock().unwrap().push((
+                            id,
+                            name.clone(),
+                            value.as_str().unwrap_or("").to_string(),
+                        ));
+                    }
+                    ResponseTemplate::new(200)
+                        .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
+                }
+            })
+            .mount(server)
+            .await;
+
         // MCP: initialize → notifications → tools/call по action
         Mock::given(method("POST"))
             .and(path("/mcp"))
@@ -725,8 +773,6 @@ impl MockKernel {
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),
-                schedule: self.sc.inserted_row.schedule.clone(),
-                last_run: self.sc.inserted_row.last_run.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))

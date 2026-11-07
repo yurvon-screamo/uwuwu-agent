@@ -1,11 +1,13 @@
 // tests/cron-infra-tick.test.ts — контракт тика на инфра-сбое ядра (ревью
-// раунда 1, Common-2): resolveBody → infra → тик НЕ пишет state, НЕ трогает
-// доску (Last Run/Status → one-shot жив), НЕ спавнит сессию. Сценарий —
-// SQL-лаг индекса доски (get_doc без box/hpath, детач-строка): быстрый
-// infra-путь без ретраев адаптера. Лог демона изолируется явным env
-// UWUWU_CRON_LOG ДО импорта: os.homedir() в Bun не следует за runtime-
-// подменой process.env.HOME — HOME-изоляция каталога лога не работает
-// (ревью раунда 2). fetch скриптуется на все транспортные пути.
+// раунда 1, Common-2): resolveBody → infra → тик НЕ пишет state, НЕ спавнит
+// сессию и не создаёт ран-карточку. Сценарий: экспорт тела мастера отвечает
+// отказом ядра (exists:false при живой привязке) — вердикт откладывается до
+// подтверждения doc_exists (block get), который подтверждает живость →
+// infra-путь (ретрай следующим тиком, семантика классического cron).
+// Лог демона изолируется явным env UWUWU_CRON_LOG ДО импорта: os.homedir()
+// в Bun не следует за runtime-подменой process.env.HOME — HOME-изоляция
+// каталога лога не работает (ревью раунда 2). fetch скриптуется на все
+// транспортные пути.
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
@@ -20,12 +22,14 @@ const originalFetch = globalThis.fetch
 
 const AV_ID = "20260101000000-abcdef"
 const TITLE_KEY = "k-title"
-const SCHED_KEY = "k-sched"
 const STATUS_KEY = "k-status"
-const RUN_KEY = "k-run"
+const BOARD_DOC = "20261107000000-board1"
+const AV_BLOCK = "20261107000000-avblk1"
+const ROW_ID = "20261107000000-row0001"
+const BODY_DOC = "20261107000000-body001"
 
 interface KernelCall {
-  kind: "mcp-tool" | "sql"
+  kind: "mcp-tool" | "rest"
   name: string
 }
 
@@ -34,17 +38,25 @@ function scriptKernel(): { calls: KernelCall[] } {
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+    if (url.includes("/api/attr/getBlockAttrs")) {
+      calls.push({ kind: "rest", name: "getBlockAttrs" })
+      return json({ code: 0, msg: "", data: { "custom-schedule": "5m" } })
+    }
+    if (url.includes("/api/export/exportMdContent")) {
+      calls.push({ kind: "rest", name: "exportMdContent" })
+      // отказ ядра на экспорте: exists:false — distinguishable from infra
+      // только пробой block get (см. resolveBody)
+      return json({ code: -1, msg: "kernel boom" })
+    }
     if (url.includes("/api/query/sql")) {
       const stmt = String(body.stmt ?? "")
-      calls.push({ kind: "sql", name: stmt })
-      // доска не в индексе (лаг SQL) — get_doc молча без box/hpath → infra
-      if (stmt.includes("box, hpath from blocks")) return json({ code: 0, msg: "", data: [] })
+      calls.push({ kind: "rest", name: stmt.slice(0, 40) })
       if (stmt.includes("select markdown from blocks")) {
         return json({ code: 0, msg: "", data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }] })
       }
       return json({ code: 0, msg: "", data: [] })
     }
-    if (url.includes("/api/export/exportMdContent") || url.includes("/api/block/appendBlock") || url.includes("/api/filetree/")) {
+    if (url.includes("/api/block/appendBlock") || url.includes("/api/filetree/")) {
       throw new Error(`mock: неожиданная REST-запись/чтение ${url}`)
     }
     if (!url.includes("/mcp")) throw new Error(`mock: неожиданный путь ${url} (opencode REST не должен зваться)`)
@@ -54,28 +66,28 @@ function scriptKernel(): { calls: KernelCall[] } {
       const params = body.params as { name?: string; arguments?: { action?: string; page?: number } }
       calls.push({ kind: "mcp-tool", name: `${params.name}:${params.arguments?.action ?? "?"}` })
       if (params.name === "database" && params.arguments?.action === "render") {
-        // страница 1 каждого прохода (начальный срез + гейт) — со строками
         if (params.arguments.page === 1) {
           return sse({ structuredContent: { view: {
             columns: [
-              { id: TITLE_KEY, name: "Title" }, { id: SCHED_KEY, name: "Schedule" },
-              { id: STATUS_KEY, name: "Status" }, { id: RUN_KEY, name: "Last Run" },
+              { id: TITLE_KEY, name: "Title" }, { id: STATUS_KEY, name: "Status" },
             ],
             rows: [{
-              id: "20261105210000-row0001",
+              id: ROW_ID,
               cells: [
-                // detached-строка (без block.id): резолв сразу в title-fallback,
-                // где get_doc упирается в лаг индекса → infra без медленных ретраев
-                { value: { keyID: TITLE_KEY, type: "block", block: { content: "крон X" } } },
-                { value: { keyID: SCHED_KEY, type: "text", text: { content: "09:30" } } },
-                { value: { keyID: STATUS_KEY, type: "mSelect", mSelect: [{ content: "active" }] } },
-                { value: { keyID: RUN_KEY, type: "text", text: { content: "" } } },
+                { value: { keyID: TITLE_KEY, type: "block", block: { content: "мастер X", refSubtype: "d", id: BODY_DOC } } },
+                { value: { keyID: STATUS_KEY, type: "mSelect", mSelect: [{ content: "Вейт" }] } },
               ],
             }],
             rowCount: 1,
           } } })
         }
-        return sse({ structuredContent: { view: { rows: [] } } })
+        return sse({ structuredContent: { view: { columns: [], rows: [], rowCount: 0 } } })
+      }
+      if (params.name === "block" && params.arguments?.action === "get") {
+        // FS-истина: блок жив — отказ экспорта не превращается в вердикт
+        // «тела нет», это infra (ретрай следующим тиком)
+        calls.push({ kind: "mcp-tool", name: "block:get-alive" })
+        return sse({ content: [{ type: "text", text: `Markdown: x\nId: ${BODY_DOC}\nType: NodeDocument` }] })
       }
       throw new Error(`mock: неожиданная mcp-тулза ${params.name}`)
     }
@@ -97,19 +109,21 @@ afterEach(() => {
   globalThis.fetch = originalFetch
 })
 
-describe("tick: инфра-сбой ядра ≠ вердикт — слот крона не сжигается", () => {
-  test("SQL-лаг доски → infra: state пуст, доска не пишется, сессии нет", async () => {
+describe("tick: инфра-сбой ядра ≠ вердикт — слот мастера не сжигается", () => {
+  // Отказ экспорта ретраится адаптером (4 попытки с паузами) — окно > дефолта
+  test("экспорт тела падает при живом блоке → infra: state пуст, ран не создаётся", async () => {
     const { calls } = scriptKernel()
-    // литерал без каста: tickBoard принимает CronState (Record<string, TrackedCron>)
     const state = { crons: {} }
-    // 09:35 при расписании 09:30 — due (догон); one-shot: гасился бы в fired
-    // при refuse, но infra не имеет права тронуть ни state, ни доску
-    await cron.tickBoard(state, { docId: "20261105210000-board1", dbId: "20261105210000-avblock1" }, "Кроны uwuwu", new Date("2026-11-05T09:35:00"))
+    await cron.tickBoard(state, { docId: BOARD_DOC, dbId: AV_BLOCK }, "Задачи uwuwu", new Date("2026-11-07T09:35:00"))
     expect(Object.keys(state.crons)).toEqual([])
-    const writes = calls.filter((c) => c.name.includes("item_update"))
-    expect(writes).toEqual([])
-    // тик дошёл до резолва (get_doc доски) и до обоих срезов (начальный + гейт)
-    expect(calls.some((c) => c.kind === "sql" && c.name.includes("box, hpath from blocks"))).toBe(true)
+    // тик дошёл до атрибутов и экспорта, отличил infra от отсутствия тела
+    // пробой block get
+    expect(calls.some((c) => c.name === "getBlockAttrs")).toBe(true)
+    expect(calls.some((c) => c.name === "exportMdContent")).toBe(true)
+    expect(calls.some((c) => c.name === "block:get-alive")).toBe(true)
+    // гейт-срез состоял (начальный + гейт)
     expect(calls.filter((c) => c.name === "database:render").length).toBeGreaterThanOrEqual(2)
-  })
+    // ран-карточка и сессия не создавались: ни одного CLI-спавна
+    expect(calls.filter((c) => c.kind === "mcp-tool" && (c.name.includes("create_comment") || c.name.includes("item_update")))).toEqual([])
+  }, 20_000)
 })

@@ -408,8 +408,6 @@ fn comment_task() -> SyTask {
         status: "Draft".into(),
         branch: String::new(),
         pr: String::new(),
-        schedule: String::new(),
-        last_run: String::new(),
         dev_session: String::new(),
         body_doc: Some(BOUND_DOC.into()),
     }

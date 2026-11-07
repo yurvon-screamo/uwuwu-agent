@@ -16,6 +16,7 @@ fn create(dry_run: bool) -> TaskSub {
         r#type: Some("bug".into()),
         stdin: false,
         attach: Vec::<PathBuf>::new(),
+        schedule: None,
         dry_run,
     }
 }

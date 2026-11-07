@@ -510,6 +510,22 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
       return { ids } as T
     }
+    case "notebook_ids_by_names": {
+      // id ноутбуков по именам одним lsNotebooks (getIDsByHPath принимает
+      // только id — паритет CLI siyuan_id); демонам без дока-якоря
+      // (инит-блок спавна: персона Experience, доки проекта Projects).
+      // Отсутствующие/закрытые имена в ответе отсутствуют.
+      const wanted = (Array.isArray(args.names) ? args.names : []).map(String)
+      const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
+        "/api/notebook/lsNotebooks", {})
+      const ids: Record<string, string> = {}
+      for (const nb of nbs.notebooks ?? []) {
+        if (nb.closed !== true && typeof nb.id === "string" && wanted.includes(nb.name ?? "")) {
+          ids[nb.name as string] = nb.id
+        }
+      }
+      return { ids } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {
@@ -531,6 +547,25 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
         dataType: "markdown", data: `\n- **AGENTS** (${ts}): ${text}`, parentID: docId,
       })
       return { created: true } as T
+    }
+    case "get_doc_attrs": {
+      // Атрибуты блока (IAL): custom-* — носитель расписания крон-задач.
+      // REST, не SQL-колонка ial: та отстаёт от свежих записей атрибутов.
+      const docId = String(args.docId ?? "")
+      const data = await post<Record<string, unknown>>("/api/attr/getBlockAttrs", { id: docId })
+      const out: Record<string, string> = {}
+      for (const [k, v] of Object.entries(data)) {
+        if (typeof v === "string") out[k] = v
+      }
+      return out as T
+    }
+    case "set_doc_attr": {
+      // Запись атрибута; пустое значение снимает (ядро удаляет ключ из IAL)
+      const docId = String(args.docId ?? "")
+      const name = String(args.name ?? "")
+      const value = String(args.value ?? "")
+      await post("/api/attr/setBlockAttrs", { id: docId, attrs: { [name]: value } })
+      return { set: true } as T
     }
     case "list_comments": {
       const docId = String(args.docId ?? "")
@@ -556,7 +591,7 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
     case "list_organize_nodes": {
       // Синтез организ-дерева афин-шейпа из доков SiYuan. Потребители ждут:
       // проекты — folder-узлы глубины 1 (data = тайтл), доски и доки глубже —
-      // doc-узлы (data = doc id): cron.ts cronBoardTitles, factory/cron
+      // doc-узлы (data = doc id): cron.ts taskBoardTitles, factory/cron
       // boardViaOrganize, triage.ts refreshBoards (tests/platform-organize.test.ts).
       const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
         "/api/notebook/lsNotebooks", {})
