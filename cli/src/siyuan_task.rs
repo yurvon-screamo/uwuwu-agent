@@ -1038,7 +1038,7 @@ pub async fn resolve_on_project(
 /// «доска → совпадения» (тихий wrong-target исключён конструктивно).
 /// Формат ошибок mirrored на resolve_on_project + подсказка «--project».
 pub async fn resolve_global(sy: &SiYuan, needle: &str) -> Result<(SyBoard, SyTask)> {
-    let boards = discover_task_boards(sy).await?;
+    let mut boards = discover_task_boards(sy).await?;
     if boards.is_empty() {
         bail!("доски задач не найдены: в Projects нет ни одного дока «Задачи <proj>»");
     }
@@ -1069,7 +1069,9 @@ pub async fn resolve_global(sy: &SiYuan, needle: &str) -> Result<(SyBoard, SyTas
     }
     if found.len() == 1 && ambiguous.is_empty() {
         let (idx, task) = found.remove(0);
-        let board = boards.into_iter().nth(idx).expect("idx из той же выборки");
+        // порядок досок дальше не используется: swap_remove достаёт элемент
+        // напрямую, без Option/expect (idx из enumerate той же boards)
+        let board = boards.swap_remove(idx);
         return Ok((board, task));
     }
 

@@ -338,14 +338,21 @@ fn set_env(server: &MockServer) {
     std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
 }
 
-/// (1) get по точному id задачи — резолв по «Задачи»; крон-доска не читается.
-#[tokio::test]
-#[serial_test::serial]
-async fn get_resolves_on_tasks_board_without_cron_reads() {
+/// Общий пролог сценариев: мок-ядро с досками файла + env. Сервер живёт
+/// в возвращаемой паре до конца теста (drop убил бы мок до task_run).
+async fn spawn_kernel() -> (std::sync::Arc<Kernel>, MockServer) {
     let kernel = Kernel::new();
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
     set_env(&server);
+    (kernel, server)
+}
+
+/// (1) get по точному id задачи — резолв по «Задачи»; крон-доска не читается.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_resolves_on_tasks_board_without_cron_reads() {
+    let (kernel, _server) = spawn_kernel().await;
 
     task_run(
         "uwuwu",
@@ -375,10 +382,7 @@ async fn get_resolves_on_tasks_board_without_cron_reads() {
 #[tokio::test]
 #[serial_test::serial]
 async fn cron_board_row_is_not_resolved_anymore() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -407,10 +411,7 @@ async fn cron_board_row_is_not_resolved_anymore() {
 #[tokio::test]
 #[serial_test::serial]
 async fn full_miss_lists_only_tasks_board() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -438,10 +439,7 @@ async fn full_miss_lists_only_tasks_board() {
 #[tokio::test]
 #[serial_test::serial]
 async fn ambiguous_prefix_is_loud_without_cron_boards() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "uwuwu",
@@ -463,10 +461,7 @@ async fn ambiguous_prefix_is_loud_without_cron_boards() {
 #[tokio::test]
 #[serial_test::serial]
 async fn missing_tasks_board_bails_even_with_cron_board_present() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "foilcap",
@@ -494,10 +489,7 @@ async fn missing_tasks_board_bails_even_with_cron_board_present() {
 #[tokio::test]
 #[serial_test::serial]
 async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
     kernel.sql_fail.store(true, Ordering::SeqCst);
 
     let err = task_run(
@@ -520,10 +512,7 @@ async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_resolve_exact_id_without_project() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     task_run(
         "",
@@ -541,10 +530,7 @@ async fn global_resolve_exact_id_without_project() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_comment_without_project_lands_on_owning_board() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     task_run(
         "",
@@ -578,10 +564,7 @@ async fn global_comment_without_project_lands_on_owning_board() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_substring_on_two_boards_is_loud_error() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -605,10 +588,7 @@ async fn global_substring_on_two_boards_is_loud_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_ambiguity_on_single_board_is_loud_error() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -635,10 +615,7 @@ async fn global_ambiguity_on_single_board_is_loud_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn global_miss_lists_searched_boards() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run(
         "",
@@ -670,10 +647,7 @@ async fn global_miss_lists_searched_boards() {
 #[tokio::test]
 #[serial_test::serial]
 async fn list_without_project_still_refuses() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
+    let (kernel, _server) = spawn_kernel().await;
 
     let err = task_run("", TaskSub::List { status: None, project: None })
         .await
