@@ -4,10 +4,11 @@
 //! (Experience), одиночный слаг дневника (Daily), одиночный заголовок дока.
 //! Дерево резолва: точный hpath-матч `/{slug}` по всем ноутбукам; фолбэк по
 //! заголовку (последний сегмент слага, прежнее поведение); на промахе —
-//! hpath like-кандидаты (сначала в контексте проектной части слага, при
-//! нуле — глобально): один кандидат — авторезолв с пометкой в stderr,
-//! несколько — отказ со списком (hpath, ноутбук, docId — docId даёт агенту
-//! готовый обход find → export).
+//! like-кандидаты по hpath ступенями (контекст проектной части слага →
+//! глобальный contains → word-AND «каждое слово сегмента содержится в hpath»):
+//! один кандидат — авторезолв с пометкой в stderr, несколько — отказ со
+//! списком (hpath, ноутбук, docId — docId даёт агенту готовый обход find →
+//! export).
 
 use crate::siyuan::SiYuan;
 use anyhow::{anyhow, Result};
@@ -49,7 +50,7 @@ pub(crate) async fn resolve(sy: &SiYuan, slug_raw: &str) -> Result<String> {
     if candidates.hits.len() == 1 {
         let hit = &candidates.hits[0];
         eprintln!(
-            "read: слаг «{slug_raw}» — префикс-матч дока {}",
+            "read: слаг «{slug_raw}» — найден единственный похожий док: {}",
             describe_hit(hit, &notebook_names(sy).await.unwrap_or_default())
         );
         return Ok(hit.id.clone());
@@ -60,8 +61,9 @@ pub(crate) async fn resolve(sy: &SiYuan, slug_raw: &str) -> Result<String> {
     Err(anyhow!(similar_message(slug_raw, &candidates, sy).await))
 }
 
-/// like-кандидаты на промахе: сначала в контексте слага (проектная часть
-/// как hpath-префикс), при нуле — глобально по последнему сегменту.
+/// like-кандидаты на промахе, ступени (первая непустая даёт результат):
+/// контекст слага (проектная часть как hpath-префикс) → глобальный contains
+/// → word-AND (каждое слово сегмента в hpath — ловит серединные расхождения).
 struct Candidates {
     hits: Vec<DocHit>,
     /// Упёрлись в CANDIDATE_LIMIT — список неполный (пометка в отказе).
