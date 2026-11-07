@@ -335,7 +335,7 @@ async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> a
 async fn edit_type_writes_type_cell() {
     let (kernel, server) = MockKernel::start(edit_type_scenario()).await;
 
-    edit_type_via_cli(&server, "item-t2", Some("BUG"))
+    edit_type_via_cli(&server, "item-t2", Some("Bug"))
         .await
         .expect("edit --type ok");
 

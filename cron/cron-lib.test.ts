@@ -6,6 +6,15 @@ import {
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
 } from "./cron-lib"
 
+/** Парс с громким сбоем вместо non-null assertion: расписание в тестах
+ *  обязано разбираться — иначе тест сам себе врёт. */
+const mustParse = (s: string) => {
+  const sched = parseSchedule(s)
+  if (sched === null) throw new Error(`parseSchedule сломан: ${s}`)
+  return sched
+}
+
+
 describe("parseSchedule", () => {
   test("интервалы", () => {
     expect(parseSchedule("5m")).toEqual({ kind: "interval", ms: 300_000 })
@@ -57,17 +66,17 @@ describe("fieldMatches", () => {
 
 describe("due", () => {
   test("interval: первый раз — сразу", () => {
-    const s = parseSchedule("5m")!
+    const s = mustParse("5m")
     expect(due(s, 0, new Date())).toBe(true)
   })
   test("interval: не раньше N", () => {
-    const s = parseSchedule("5m")!
+    const s = mustParse("5m")
     const now = new Date("2026-10-25T12:00:00")
     expect(due(s, now.getTime() - 4 * 60_000, now)).toBe(false)
     expect(due(s, now.getTime() - 5 * 60_000, now)).toBe(true)
   })
   test("cron: минута совпала и не стреляли в эту минуту", () => {
-    const s = parseSchedule("*/30 * * * *")!
+    const s = mustParse("*/30 * * * *")
     const now = new Date("2026-10-25T12:30:00")
     expect(due(s, minuteStart(now) - 60_000, now)).toBe(true)
     expect(due(s, minuteStart(now), now)).toBe(false) // уже стреляли
@@ -75,20 +84,20 @@ describe("due", () => {
     expect(due(s, 0, off)).toBe(false)
   })
   test("at: своя минута и догон, один раз", () => {
-    const s = parseSchedule("09:30")!
+    const s = mustParse("09:30")
     expect(due(s, 0, new Date("2026-10-25T09:30:00"))).toBe(true)
     expect(due(s, minuteStart(new Date("2026-10-25T09:30:00")), new Date("2026-10-25T09:30:30"))).toBe(false)
     expect(due(s, 0, new Date("2026-10-25T09:31:00"))).toBe(true) // догон после дауна
     expect(due(s, 0, new Date("2026-10-25T09:29:00"))).toBe(false) // рано
   })
   test("at с датой", () => {
-    const s = parseSchedule("09:30 01.12")!
+    const s = mustParse("09:30 01.12")
     expect(due(s, 0, new Date("2026-12-01T09:30:00"))).toBe(true)
     expect(due(s, 0, new Date("2026-11-30T09:30:00"))).toBe(false)
   })
   test("isOneShot", () => {
-    expect(isOneShot(parseSchedule("09:30")!)).toBe(true)
-    expect(isOneShot(parseSchedule("5m")!)).toBe(false)
+    expect(isOneShot(mustParse("09:30"))).toBe(true)
+    expect(isOneShot(mustParse("5m"))).toBe(false)
   })
 })
 
@@ -165,11 +174,11 @@ describe("parseSchedule: мусорные cron-поля", () => {
 
 describe("at: догон пропущенной минуты", () => {
   test("минута прошла пока демон лежал — стреляем поздно", () => {
-    const s = parseSchedule("09:30")!
+    const s = mustParse("09:30")
     expect(due(s, 0, new Date("2026-10-25T09:37:12"))).toBe(true)
   })
   test("минута ещё не наступила — нет", () => {
-    const s = parseSchedule("09:30")!
+    const s = mustParse("09:30")
     expect(due(s, 0, new Date("2026-10-25T09:29:00"))).toBe(false)
   })
 })
@@ -259,14 +268,6 @@ describe("isValidTracked: lastRefusal", () => {
 })
 
 
-/** Парс с громким сбоем вместо non-null assertion: расписание в тестах
- *  обязано разбираться — иначе тест сам себе врёт. */
-const mustParse = (s: string) => {
-  const sched = parseSchedule(s)
-  if (sched === null) throw new Error(`parseSchedule сломан: ${s}`)
-  return sched
-}
-
 describe("nextFire: следующее планируемое срабатывание", () => {
   const at = (y: number, m: number, d: number, h: number, min: number, s = 0) => new Date(y, m - 1, d, h, min, s)
 
@@ -339,8 +340,14 @@ describe("cellPatches: расхождение клеток мастера", () =
     expect(patch).toEqual({ schedule: "6h" })
   })
 
-  test("никогда не стрелявший (prevFire=0) — next от now", () => {
+  test("never-fired + пустая клетка — гард: без вычисления next (вечный молчун не сканит год каждым тиком)", () => {
     const r = row({ scheduleCell: "6h" })
+    const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
+    expect(patch).toEqual({})
+  })
+
+  test("never-fired + ненулевая клетка — next от now (легаси/ручная клетка сходится)", () => {
+    const r = row({ plannedMs: at(2026, 11, 1, 8, 0).getTime(), scheduleCell: "6h" })
     const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
     expect(patch).toEqual({ planned: "2026-11-08 16:00" })
   })

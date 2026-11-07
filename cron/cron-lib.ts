@@ -76,10 +76,13 @@ export function parseSchedule(s: string): Sched | null {
   const partRe = /^(\*|\d+(?:-\d+)?)(?:\/[1-9]\d*)?$/
   const ranges: Array<[number, number]> = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]]
   const valid = fields.every((f, i) => {
-    const [min, max] = ranges[i]!
+    const range = ranges[i]
+    if (range === undefined) return false
+    const [min, max] = range
     return f.split(",").every(p => {
       if (!partRe.test(p) || p.endsWith("/")) return false
-      const m = /^(\*|\d+)(?:-(\d+))?/.exec(p)!
+      const m = /^(\*|\d+)(?:-(\d+))?/.exec(p)
+      if (m === null || m[1] === undefined) return false
       const lo = m[1] === "*" ? min : Number(m[1])
       const hi = m[2] !== undefined ? Number(m[2]) : lo
       return lo >= min && hi <= max && lo <= hi
@@ -213,13 +216,18 @@ export function minuteStart(d: Date): number {
 /** Расхождение клеток мастера с расписанием и last-fire: что CLI должен
  *  дописать (пустой объект — доска честна). «Расписание» — отображение
  *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
- *  «Запланировано» — next-fire после последнего файра (никогда не стрелявший
- *  файрится следующим тиком — compare от now). Сравнение даты — по epoch ms.
- *  Чистая функция — юнит-тесты без моков; применение — reconcileMasterCells
- *  (DRY_RUN-гвард там). */
+ *  «Запланировано» — next-fire после последнего файра. Сравнение даты —
+ *  по epoch ms. Чистая функция — юнит-тесты без моков; применение —
+ *  reconcileMasterCells (DRY_RUN-гвард там). */
 export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
   const patch: { schedule?: string; planned?: string } = {}
   if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
+  // гард вечного молчуна: never-fired + пустая клетка — вычислять next нечего.
+  // due при lastFired=0 файрит следующим тиком (интервал — всегда, cron/at —
+  // на первом совпадении), после файра reconcile посчитает next от prevFire.
+  // Без гарда грамматически валидный cron без совпадений за год («0 0 30 2 *»)
+  // гонял бы полный годовой скан каждым тиком вечно
+  if (prevFire === 0 && row.plannedMs === null) return patch
   const next = nextFire(sched, prevFire > 0 ? new Date(prevFire) : now)
   // compare по epoch ms: formattedContent ядро перекрывает своей локалью
   // (живая проба миграции) — строкой клетки и вычисления не совпадут никогда
