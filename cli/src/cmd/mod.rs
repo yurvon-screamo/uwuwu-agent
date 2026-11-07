@@ -31,6 +31,7 @@ mod search_tests;
 mod write_path_tests;
 
 pub use sy_dispatch::read_markdown;
+pub use sy_dispatch::search_lines;
 
 use anyhow::Result;
 use clap::Parser as _;

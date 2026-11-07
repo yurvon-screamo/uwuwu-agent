@@ -1231,7 +1231,9 @@ pub(super) fn doc_section_result_lines(
 
 /// Сборка stdout search до SOFA/семантики: голова, полнотекст, секция
 /// доков. Порядок и форматы — контракт парсинга фабричных агентов.
-pub(super) async fn search_lines(sy: &SiYuan, query: &str, limit: usize) -> Result<Vec<String>> {
+/// Публичный шов e2e (`cli/tests/search_e2e.rs`) — живое ядро гоняет
+/// полный production-путь через него.
+pub async fn search_lines(sy: &SiYuan, query: &str, limit: usize) -> Result<Vec<String>> {
     let mut lines = vec![search_head(query), String::new()];
     lines.extend(fulltext_lines(&sy.search(query, limit).await?));
     let fetch = sy.doc_titles(DOC_TITLES_CAP).await;
