@@ -374,6 +374,12 @@ pub(crate) enum Commands {
         #[arg(help = "Slug: project/doc | topic/doc | слаг Daily | Заголовок | sofa/<post_id>")]
         slug: String,
     },
+    /// Перечисление доков по hpath-слагу: штатный путь «какие доки в
+    /// проекте/папке» (ADR-нумерация, Design-скан, гигиена доков).
+    Docs {
+        #[command(subcommand)]
+        command: DocsSub,
+    },
     /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
     /// факт (владелец/дример), replace — полная перезапись на месте.
@@ -469,6 +475,19 @@ pub(crate) enum Commands {
         /// Окно wave-скана docker logs, минут
         #[arg(long, default_value = "30", value_name = "MIN")]
         since: u64,
+    },
+}
+
+/// Сабкоманды `docs`.
+#[derive(Subcommand)]
+pub(crate) enum DocsSub {
+    /// Прямые дети hpath-префикса: доки именами, подпапки с хвостовым «/».
+    /// Адресация как у read (слаг без ведущего «/»): `uwuwu`,
+    /// `uwuwu/ADR`, `platform`. Неизвестное пространство — отказ
+    /// с раскладкой доступных; известное без доков — «пусто».
+    Ls {
+        #[arg(help = "hpath-слаг: <проект>[/<подпапка>]")]
+        prefix: String,
     },
 }
 
