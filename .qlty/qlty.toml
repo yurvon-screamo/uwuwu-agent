@@ -65,6 +65,11 @@ default = true
 [[plugin]]
 name = "bandit"
 
+# qlty osv-scanner plugin file_types не знает bun.lock (только npm/pnpm/yarn локи) —
+# без этого JS-зависимости фабрики/демонов вне радара CVE
+[file_types.osv-scanner]
+globs = ["**/bun.lock"]
+
 [[plugin]]
 name = "clippy"
 
