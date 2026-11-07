@@ -641,6 +641,8 @@ export interface HubProfile {
   here: string
   /** имя нативного деф-агента сессии */
   agentName: string
+  /** имя файла дефа в here (дефолт agent.md — как у триажа) */
+  agentDefFile?: string
   /** тайтл вечной сессии диалога */
   sessionTitle: string
   /** /start справка */
@@ -700,7 +702,7 @@ export interface Hub {
 
 export function createHub(profile: HubProfile): Hub {
   const CFG = join(profile.here, "hub.json")
-  const AGENT_DEF_SRC = join(profile.here, "agent.md")
+  const AGENT_DEF_SRC = join(profile.here, profile.agentDefFile ?? "agent.md")
   /** Корень рантайм-путей: дефолт — прод (systemd); override — только
    *  досмерджевый протокол (mock-TG E2E рядом с живым демоном не должен
    *  трогать прод-state, прод-воркспейс и прод-лог). */

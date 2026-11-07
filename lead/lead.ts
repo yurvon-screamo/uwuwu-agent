@@ -78,6 +78,7 @@ const profile: HubProfile = {
   daemonName: "uwuwu-lead",
   here: HERE,
   agentName: "lead",
+  agentDefFile: "lead-agent.md",
   sessionTitle: "🌙 Lead uwuwu",
   help: HELP,
   homeEnv: "UWUWU_LEAD_HOME",
