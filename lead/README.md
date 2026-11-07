@@ -93,7 +93,7 @@ systemctl --user daemon-reload && systemctl --user enable --now uwuwu-lead
 ```bash
 # изолированный рантайм демона
 export UWUWU_LEAD_HOME=/tmp/uwuwu-lead-e2e
-bun lead/mock-tg.ts --port 8098 --log /tmp/uwuwu-lead-e2e/mock-tg-sent.jsonl &   # из triage/
+bun triage/mock-tg.ts --port 8098 --log /tmp/uwuwu-lead-e2e/mock-tg-sent.jsonl &   # mock живёт в triage/
 export UWUWU_LEAD_TG_API=http://127.0.0.1:8098
 # апдейт владельца снаружи: /start лочит чат (обязательный шаг — до него
 # аудит-сводки уходят в лог)
