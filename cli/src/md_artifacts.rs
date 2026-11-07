@@ -263,11 +263,14 @@ fn is_html_line(line: &str) -> bool {
     }
 }
 
-fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut first_seen: Vec<String> = Vec::new();
-    let lines = content_lines(md);
-    let skip_h1 = h1_prepend_index(&lines, frontmatter_title(md));
+/// Строки контента для duplicate-скана после precision-скипов: frontmatter
+/// (content_lines), фенсы (маркеры и содержимое), секция «## Комменты»
+/// (повторы вердиктов между раундами ревью — закономерный контент, до
+/// следующего ##-заголовка), html-строки живых блоков (дубли inline-CSS
+/// диаграмм — закономерная разметка) и экспорт-препенд H1 (генезис create
+/// с ведущим `# <тайтл>`, не round-trip порча).
+fn duplicate_scan_lines<'a>(lines: &[&'a str], skip_h1: Option<usize>) -> Vec<&'a str> {
+    let mut scanned = Vec::new();
     let mut in_fence = false;
     let mut in_comments = false;
     for (index, line) in lines.iter().copied().enumerate() {
@@ -295,6 +298,17 @@ fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
         if is_html_line(line) {
             continue;
         }
+        scanned.push(line);
+    }
+    scanned
+}
+
+fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut first_seen: Vec<String> = Vec::new();
+    let lines = content_lines(md);
+    let skip_h1 = h1_prepend_index(&lines, frontmatter_title(md));
+    for line in duplicate_scan_lines(&lines, skip_h1) {
         let normalized = crate::markdown::collapse_whitespace(line);
         for segment in normalized.split([',', ';', '.', '!', '?', '…']) {
             let phrase = segment.trim();
