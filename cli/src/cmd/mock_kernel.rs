@@ -117,6 +117,13 @@ pub(crate) struct MockScenario {
     /// HTTP-статус appendBlock: 200; 500 — применённый блок при lost_response
     /// либо честный сбой (в паре с append_applies).
     pub(crate) append_status: u16,
+    /// Первые N appendBlock POST отвечают 500 без применения (одноразовый
+    /// отказ записи: последующие POST проходят штатно).
+    pub(crate) append_fail_posts: usize,
+    /// Первые N deleteBlock POST отвечают 500 (одноразовый отказ удаления).
+    pub(crate) delete_fail_posts: usize,
+    /// exportMdContent отвечает 500 (сбой чтения пре-имиджа overwrite).
+    pub(crate) export_fail: bool,
     /// Состояние доков (docId → блоки): seed + применённые append-ы;
     /// export отдаёт join.
     pub(crate) doc_blocks: Vec<(&'static str, Vec<String>)>,
@@ -165,6 +172,9 @@ impl Default for MockScenario {
             item_add_replies: Vec::new(),
             append_applies: false,
             append_status: 200,
+            append_fail_posts: 0,
+            delete_fail_posts: 0,
+            export_fail: false,
             doc_blocks: Vec::new(),
             exports: Vec::new(),
             get_children_seq: vec![String::new()],
@@ -194,6 +204,8 @@ pub(crate) struct MockKernel {
     created_docs: Mutex<Vec<(String, String)>>,
     appends: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
+    append_posts: AtomicUsize,
+    delete_posts: AtomicUsize,
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
@@ -225,6 +237,8 @@ impl MockKernel {
             created_docs: Mutex::new(Vec::new()),
             appends: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            append_posts: AtomicUsize::new(0),
+            delete_posts: AtomicUsize::new(0),
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
@@ -401,6 +415,9 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if kernel.sc.export_fail {
+                        return ResponseTemplate::new(500);
+                    }
                     let content = {
                         let blocks = kernel.doc_blocks.lock().unwrap();
                         match blocks.get(id) {
@@ -428,6 +445,10 @@ impl MockKernel {
                 move |req: &Request| {
                     let raw = String::from_utf8_lossy(&req.body).to_string();
                     let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+                    let post_no = kernel.append_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.append_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.appends.lock().unwrap().push(raw);
                     if kernel.sc.append_applies {
                         let doc = parsed
@@ -470,6 +491,10 @@ impl MockKernel {
                         .and_then(|i| i.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let post_no = kernel.delete_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.delete_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.deletes.lock().unwrap().push(id);
                     rest_ok(json!(null))
                 }

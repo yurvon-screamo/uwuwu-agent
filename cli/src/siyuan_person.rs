@@ -95,12 +95,21 @@ pub async fn show(sy: &SiYuan, target: &PersonTarget) -> Result<String> {
 /// → громкий отказ resolve, невидимый индексом дубль — расхождением id).
 /// Возвращает docId.
 pub async fn append(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<String> {
+    append_with_pacing(sy, target, md, ConfirmPacing::production()).await
+}
+
+async fn append_with_pacing(
+    sy: &SiYuan,
+    target: &PersonTarget,
+    md: &str,
+    pacing: ConfirmPacing,
+) -> Result<String> {
     if md.trim().is_empty() {
         bail!("append: пустой текст — нечего дописывать");
     }
     match resolve(sy, target).await? {
         Some(doc_id) => {
-            sy.append_block_md(&doc_id, md).await?;
+            append_once_confirmed(sy, &doc_id, md, pacing).await?;
             Ok(doc_id)
         }
         None => {
@@ -108,6 +117,62 @@ pub async fn append(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<Stri
             let combined = format!("{}\n{}", skeleton(target), md.trim_end());
             let created = sy.create_doc_md(&nb, &target.hpath, &combined).await?;
             verify_created(sy, target, &created).await
+        }
+    }
+}
+
+/// Идемпотентный аппенд факта: один POST без слепых ретраев — неидемпотентная
+/// запись при потерянном ответе дублируется (класс ses_e729d7329ffe, факт
+/// дублировался 4 копиями). При сбое — контрольное чтение с коротким
+/// поллингом (sync-лаг ядра прячет только что записанный блок): маркер в
+/// доке → запись легла, успех без повтора. Пре-чека нет: легитимный
+/// повторный append того же факта сохраняется («дедуп — сначала show»).
+/// Все попытки мимо → честный сбой с пометкой «могло примениться» — слепой
+/// повтор вызывающим опасен.
+async fn append_once_confirmed(
+    sy: &SiYuan,
+    doc_id: &str,
+    md: &str,
+    pacing: ConfirmPacing,
+) -> Result<()> {
+    let marker = crate::siyuan::first_nonempty_line(md);
+    if let Err(err) = sy.append_block_md_once(doc_id, md).await {
+        for attempt in 0..pacing.attempts {
+            if attempt > 0 {
+                tokio::time::sleep(pacing.poll_delay).await;
+            }
+            let Ok(exported) = sy.export_md_by_id(doc_id).await else {
+                continue;
+            };
+            if exported.contains(&marker) {
+                return Ok(());
+            }
+        }
+        bail!("{err}; запись могла примениться — проверь `person show` перед повтором");
+    }
+    Ok(())
+}
+
+/// Пейсинг контрольного чтения после сбоя append: производство с запасом на
+/// sync-лаг ядра, тесты — мгновенные.
+struct ConfirmPacing {
+    attempts: u32,
+    poll_delay: std::time::Duration,
+}
+
+impl ConfirmPacing {
+    fn production() -> Self {
+        Self {
+            attempts: 3,
+            poll_delay: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[cfg(test)]
+    fn instant() -> Self {
+        Self {
+            attempts: 3,
+            poll_delay: std::time::Duration::from_millis(1),
         }
     }
 }
@@ -143,7 +208,7 @@ pub async fn replace(sy: &SiYuan, target: &PersonTarget, md: &str) -> Result<Str
             verify_created(sy, target, &created).await?
         }
     };
-    sy.overwrite_doc_md(&doc_id, md).await?;
+    sy.overwrite_doc_md(&doc_id, target.title(), md).await?;
     Ok(doc_id)
 }
 
@@ -178,6 +243,8 @@ pub fn skeleton(target: &PersonTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
 
     fn target() -> PersonTarget {
         PersonTarget {
@@ -221,5 +288,201 @@ mod tests {
     #[test]
     fn skeleton_names_canonical_command() {
         assert!(skeleton(&target()).contains("uwuwu-cli person show"));
+    }
+
+    /// Поведение appendBlock мока: успех; «применено, ответ потерян» (запись
+    /// в контенте есть, клиент видит code≠0); отказ без применения.
+    #[derive(Clone, Copy)]
+    enum AppendBehavior {
+        Ok,
+        AppliedButLost,
+        Rejected,
+    }
+
+    /// Мок-док персоны: resolve (ноутбук + hpath), экспорт отдаёт текущий
+    /// контент, appendBlock мутирует его и/или «роняет» ответ по behavior.
+    struct PersonMock {
+        server: wiremock::MockServer,
+        content: Arc<Mutex<String>>,
+        appends: Arc<Mutex<Vec<String>>>,
+    }
+
+    const PERSON_DOC: &str = "20261107000000-persond1";
+
+    async fn spawn_person_mock(initial: &str, behavior: AppendBehavior) -> PersonMock {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let content = Arc::new(Mutex::new(initial.to_string()));
+        let appends = Arc::new(Mutex::new(Vec::new()));
+
+        Mock::given(method("POST"))
+            .and(path("/api/notebook/lsNotebooks"))
+            .respond_with(|_req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "code": 0,
+                    "data": { "notebooks": [{ "id": "nb1", "name": "Experience", "closed": false }] }
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/filetree/getIDsByHPath"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let data = if hpath == "/personal/PERSON" {
+                    json!([PERSON_DOC])
+                } else {
+                    json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(json!({ "code": 0, "data": data }))
+            })
+            .mount(&server)
+            .await;
+
+        let content_for_export = content.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/export/exportMdContent"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let md = content_for_export.lock().expect("content lock").clone();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "code": 0, "msg": "", "data": { "content": md } }))
+            })
+            .mount(&server)
+            .await;
+
+        let content_for_append = content.clone();
+        let appends_log = appends.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let data = body
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if matches!(
+                    behavior,
+                    AppendBehavior::Ok | AppendBehavior::AppliedButLost
+                ) {
+                    content_for_append
+                        .lock()
+                        .expect("content lock")
+                        .push_str(&data);
+                }
+                appends_log.lock().expect("appends lock").push(data);
+                let code = match behavior {
+                    AppendBehavior::Ok => 0,
+                    AppendBehavior::AppliedButLost | AppendBehavior::Rejected => -1,
+                };
+                ResponseTemplate::new(200).set_body_json(json!({ "code": code, "msg": "lost" }))
+            })
+            .mount(&server)
+            .await;
+
+        PersonMock {
+            server,
+            content,
+            appends,
+        }
+    }
+
+    #[tokio::test]
+    async fn fact_applied_but_lost_is_written_exactly_once() {
+        let mock = spawn_person_mock(
+            "# PERSON\n\n## Кто владелец\n\nЮра. Тех. Лид.\n",
+            AppendBehavior::AppliedButLost,
+        )
+        .await;
+        let sy = SiYuan::for_tests(mock.server.uri());
+
+        append_with_pacing(
+            &sy,
+            &target(),
+            "Предпочитает Rust для инструментов",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect("запись применена, ответ потерян — контрольное чтение узнаёт факт");
+
+        let content = mock.content.lock().expect("content lock");
+        assert_eq!(
+            content
+                .matches("Предпочитает Rust для инструментов")
+                .count(),
+            1,
+            "факт в доке ровно один (слепой ретрай дал бы копии): {content}"
+        );
+        let appends = mock.appends.lock().expect("appends lock");
+        assert_eq!(
+            appends.len(),
+            1,
+            "appendBlock вызван ровно один раз, без слепых ретраев"
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_append_ok_writes_once_without_confirmation_roundtrip() {
+        let mock = spawn_person_mock(
+            "# PERSON\n\n## Кто владелец\n\nЮра. Тех. Лид.\n",
+            AppendBehavior::Ok,
+        )
+        .await;
+        let sy = SiYuan::for_tests(mock.server.uri());
+
+        append_with_pacing(
+            &sy,
+            &target(),
+            "Качество и процессы важнее скорости",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect("успешная запись проходит без контрольных чтений");
+
+        let content = mock.content.lock().expect("content lock");
+        assert_eq!(
+            content
+                .matches("Качество и процессы важнее скорости")
+                .count(),
+            1,
+            "happy-path без дублей: {content}"
+        );
+        let appends = mock.appends.lock().expect("appends lock");
+        assert_eq!(appends.len(), 1, "one-shot: ровно один POST");
+    }
+
+    #[tokio::test]
+    async fn fact_append_transport_failure_surfaces_without_writing() {
+        let mock = spawn_person_mock(
+            "# PERSON\n\n## Кто владелец\n\nЮра. Тех. Лид.\n",
+            AppendBehavior::Rejected,
+        )
+        .await;
+        let sy = SiYuan::for_tests(mock.server.uri());
+
+        let err = append_with_pacing(
+            &sy,
+            &target(),
+            "Уникальный факт про BDD",
+            ConfirmPacing::instant(),
+        )
+        .await
+        .expect_err("честный сбой записи не глотается");
+
+        assert!(!format!("{err}").is_empty());
+        let content = mock.content.lock().expect("content lock");
+        assert!(
+            !content.contains("Уникальный факт про BDD"),
+            "отклонённая запись в док не попадает: {content}"
+        );
+        let appends = mock.appends.lock().expect("appends lock");
+        assert_eq!(
+            appends.len(),
+            1,
+            "once-запись: ровно один POST, без слепых ретраев"
+        );
     }
 }

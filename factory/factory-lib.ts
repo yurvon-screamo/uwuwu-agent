@@ -373,7 +373,10 @@ export function newUserComments(
     .filter((c) => isUserComment(c, botUserId))
     .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt))
   if (lastSeen.id === "" && lastSeen.at === 0) return users
-  const idx = users.findIndex((c) => c.id === lastSeen.id)
+  // lastIndexOf, не findIndex: бит-в-бит дубль (тот же контент-хэш id)
+  // сматчится по последнему вхождению — будильник не зациклится на хвостовой
+  // копии, а снос комментов сверху не подменяет контентные id вовсе
+  const idx = users.map((c) => c.id).lastIndexOf(lastSeen.id)
   if (idx >= 0) return users.slice(idx + 1)
   return users.filter((c) => c.createdAt > lastSeen.at)
 }
