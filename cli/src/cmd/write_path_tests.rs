@@ -655,12 +655,15 @@ async fn body_replace_strips_title_h1_from_content() {
 
     let appends = kernel.appends.lock().unwrap();
     assert_eq!(appends.len(), 1, "новый контент одним append");
+    let data = append_data_field(&appends[0]);
     assert!(
-        appends[0].contains("новое тело"),
+        data.contains("новое тело"),
         "полезный контент записан: {appends:?}"
     );
     assert!(
-        !appends[0].contains(&format!("# {TASK_TITLE}")),
+        !data
+            .lines()
+            .any(|l| l.trim_end() == format!("# {TASK_TITLE}")),
         "титульный H1 не проходит в запись (дубль к док-заголовку): {appends:?}"
     );
 }
@@ -690,18 +693,32 @@ async fn body_replace_section_strips_title_h1_from_content() {
 
     let appends = kernel.appends.lock().unwrap();
     assert_eq!(appends.len(), 1, "пересборка одним append");
+    let data = append_data_field(&appends[0]);
     assert!(
-        appends[0].contains("новая постановка"),
+        data.contains("новая постановка"),
         "секция заменена: {appends:?}"
     );
     assert!(
-        appends[0].contains("## План"),
+        data.contains("## План"),
         "остальное тело сохранено: {appends:?}"
     );
     assert!(
-        !appends[0].contains(&format!("# {TASK_TITLE}")),
+        !data
+            .lines()
+            .any(|l| l.trim_end() == format!("# {TASK_TITLE}")),
         "титульный H1 из секционного контента не проходит в запись: {appends:?}"
     );
+}
+
+/// Поле data из захваченного тела appendBlock (JSON-конверт) — для
+/// построчных ассертов по записанному markdown (сабстринг-поиск по JSON
+/// с экранированными \n хрупок).
+fn append_data_field(raw_append: &str) -> String {
+    let body: Value = serde_json::from_str(raw_append).expect("appendBlock body — JSON");
+    body.get("data")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Строка вовсе без тела: тело создаётся по заголовку с контентом,
