@@ -35,6 +35,7 @@ fn now_unix_secs() -> u64 {
 /// Паузы ретраев post(): `metadata_backoffs` — паузы на «metadata is not ready»
 /// (исчерпание = bail с хинтом + окно волны), `other_step_ms` — шаг прочих
 /// ошибок (800·(n+1)ms, как прежде; окно НЕ армится).
+#[derive(Clone)]
 struct RetryPacing {
     metadata_backoffs: Vec<Duration>,
     other_step_ms: u64,
@@ -84,6 +85,9 @@ pub struct SiYuan {
     mcp_sid: std::sync::Mutex<Option<String>>,
     /// 90s fail-fast окно волны (unix-secs истечения; 0 = не армировано).
     wave_cooldown_until: AtomicU64,
+    /// Инъекция мгновенного пейсинга ретраев для тестов (RowInsertPacing-прецедент
+    /// PR #125): None в проде — production-константы в post().
+    test_pacing: Option<RetryPacing>,
 }
 
 /// Корень воркспейса (FS-пробы doctor'а, конфиг-фоллбек токена):
@@ -133,6 +137,7 @@ impl SiYuan {
                 .build()?,
             mcp_sid: std::sync::Mutex::new(None),
             wave_cooldown_until: AtomicU64::new(0),
+            test_pacing: None,
         })
     }
 
@@ -149,6 +154,10 @@ impl SiYuan {
                 .expect("test reqwest client"),
             mcp_sid: std::sync::Mutex::new(None),
             wave_cooldown_until: AtomicU64::new(0),
+            test_pacing: Some(RetryPacing {
+                metadata_backoffs: vec![Duration::from_millis(5), Duration::from_millis(5)],
+                other_step_ms: 1,
+            }),
         }
     }
 
@@ -162,8 +171,11 @@ impl SiYuan {
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        self.post_with_pacing(path, body, RetryPacing::production())
-            .await
+        let pacing = self
+            .test_pacing
+            .clone()
+            .unwrap_or_else(RetryPacing::production);
+        self.post_with_pacing(path, body, pacing).await
     }
 
     /// post() с инъекцией ретрай-пауз — тесты зовут с мгновенным пейсингом,
@@ -518,6 +530,23 @@ impl SiYuan {
             n = limit
         );
         self.sql(&stmt).await
+    }
+
+    /// hpath всех доков воркспейса с явным потолком. Заголовки (hpath)
+    /// контентный like не матчит — их резолвит doc-секция search.
+    /// Явный LIMIT обязателен: без него ядро капает выдачу на 64 строки
+    /// (проба 07.11: 1642 дока, truncated:true; limit 2000 — полный состав).
+    pub async fn doc_titles(&self, cap: usize) -> Result<Vec<String>> {
+        let rows = self
+            .sql(&format!(
+                "select hpath from blocks where type='d' limit {cap}"
+            ))
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get("hpath").and_then(|h| h.as_str()))
+            .map(str::to_string)
+            .collect())
     }
 
     /// Скачать файл из воркспейса (assets/…). Путь относительно data/

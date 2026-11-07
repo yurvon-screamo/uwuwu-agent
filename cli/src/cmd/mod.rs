@@ -28,9 +28,12 @@ mod cron_tests;
 #[cfg(test)]
 mod goal_tests;
 #[cfg(test)]
+mod search_tests;
+#[cfg(test)]
 mod write_path_tests;
 
 pub use sy_dispatch::read_markdown;
+pub use sy_dispatch::search_lines;
 
 use anyhow::Result;
 use clap::Parser as _;
