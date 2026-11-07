@@ -218,7 +218,8 @@ export function minuteStart(d: Date): number {
  *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
  *  «Запланировано» — next-fire после последнего файра. Сравнение даты —
  *  по epoch ms. Чистая функция — юнит-тесты без моков; применение —
- *  reconcileMasterCells (DRY_RUN-гвард там). */export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
+ *  reconcileMasterCells (DRY_RUN-гвард там). */
+export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
   const patch: { schedule?: string; planned?: string } = {}
   if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
   // never-fired интервал: due файрит следующим тиком — плановое время now
