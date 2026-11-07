@@ -95,7 +95,10 @@ fn sql_router(
 ) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
     move |req: &wiremock::Request| {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-        let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or_default();
+        let stmt = body
+            .get("stmt")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
         let data = if stmt.contains("distinct substr") {
             &tops
         } else {
@@ -142,7 +145,9 @@ async fn known_space_without_children_is_empty() {
     mount_sql_router(&server, vec![], vec![json!({ "top": "uwuwu" })]).await;
     let sy = SiYuan::for_tests(server.uri());
 
-    let listing = ls_listing(&sy, "uwuwu/нет-такой-папки", 10000).await.unwrap();
+    let listing = ls_listing(&sy, "uwuwu/нет-такой-папки", 10000)
+        .await
+        .unwrap();
 
     assert_eq!(listing.children, None);
     assert!(!listing.truncated);

@@ -548,9 +548,7 @@ async fn global_comment_without_project_lands_on_owning_board() {
     // секция «## Комменты» создаётся лениво (первый append) + строка коммента
     assert_eq!(appends.len(), 2, "секция + коммент");
     assert!(
-        appends
-            .iter()
-            .all(|a| a.contains("20261105000003-obodyx3")),
+        appends.iter().all(|a| a.contains("20261105000003-obodyx3")),
         "оба appendBlock — в тело origa-задачи: {appends:?}"
     );
     assert!(
@@ -649,9 +647,15 @@ async fn global_miss_lists_searched_boards() {
 async fn list_without_project_still_refuses() {
     let (kernel, _server) = spawn_kernel().await;
 
-    let err = task_run("", TaskSub::List { status: None, project: None })
-        .await
-        .expect_err("list без проекта — отказ");
+    let err = task_run(
+        "",
+        TaskSub::List {
+            status: None,
+            project: None,
+        },
+    )
+    .await
+    .expect_err("list без проекта — отказ");
 
     let msg = err.to_string();
     assert!(

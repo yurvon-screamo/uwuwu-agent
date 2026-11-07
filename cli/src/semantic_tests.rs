@@ -725,13 +725,20 @@ async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
 
     // оба исхода честны: Ok(budget_exhausted) или Err(EmbedError::Timeout)
     if let Ok(report) = report {
-        assert!(report.budget_exhausted, "бюджет умер: {:?}", report.budget_exhausted);
+        assert!(
+            report.budget_exhausted,
+            "бюджет умер: {:?}",
+            report.budget_exhausted
+        );
     }
     // закоммиченные строки берём из стора: счётчик инпутов мока считает
     // отправленные запросы, а батч может умереть по таймауту уже после
     // отправки — без коммита
     let committed = store.chunk_count().unwrap() as usize;
-    assert!(committed >= 32, "первый батч успел закоммититься: {committed}");
+    assert!(
+        committed >= 32,
+        "первый батч успел закоммититься: {committed}"
+    );
     assert!(committed < 300, "бюджет умер до конца лавины: {committed}");
     let mark = store.meta("watermark").unwrap().unwrap();
     let (updated, id) = sync::split_watermark(&mark);
@@ -798,10 +805,15 @@ async fn repair_does_not_rewind_watermark_pair() {
     let ahead = sync::watermark_composite(T1, "20261105-5000");
     store.set_meta("watermark", &ahead).unwrap();
 
-    let outcome =
-        sync::repair_missing(&sy, &ollama(&embed.uri()), &mut store, &["old-row".into()], None)
-            .await
-            .expect("repair");
+    let outcome = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["old-row".into()],
+        None,
+    )
+    .await
+    .expect("repair");
 
     assert_eq!(outcome.repaired, 1, "строка закоммичена в индекс");
     assert_eq!(
@@ -810,7 +822,6 @@ async fn repair_does_not_rewind_watermark_pair() {
         "пара не откатилась stale-строкой"
     );
 }
-
 
 // ——— reconcile: backfill / prune / дрейф ———
 
@@ -1326,7 +1337,13 @@ fn seed_indexed_chunk(dir: &std::path::Path) {
 }
 
 /// Положить чанк в индекс от руки (срезы skip-unchanged/дрейфа).
-fn seed_indexed_chunk_at(store: &mut Store, block_id: &str, updated: &str, content: &str, hpath: &str) {
+fn seed_indexed_chunk_at(
+    store: &mut Store,
+    block_id: &str,
+    updated: &str,
+    content: &str,
+    hpath: &str,
+) {
     let chunk = ChunkRecord {
         meta: ChunkMeta {
             block_id: block_id.into(),
@@ -1373,7 +1390,13 @@ async fn sync_command_drains_queue_and_reports() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), &embed.uri());
     let mut store = index_ready_store(dir.path());
-    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    seed_indexed_chunk_at(
+        &mut store,
+        "seed",
+        T0,
+        "чанк с длинным содержанием для индексации",
+        "/d",
+    );
     drop(store);
 
     let lines = crate::semantic::sync_once(&sy, &cfg).await.expect("sync");
@@ -1402,7 +1425,13 @@ async fn sync_command_refuses_while_rebuild_lock_held() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), &embed.uri());
     let mut store = index_ready_store(dir.path());
-    seed_indexed_chunk_at(&mut store, "seed", T0, "чанк с длинным содержанием для индексации", "/d");
+    seed_indexed_chunk_at(
+        &mut store,
+        "seed",
+        T0,
+        "чанк с длинным содержанием для индексации",
+        "/d",
+    );
     store.acquire_rebuild_lock().expect("чужой прогон");
     drop(store);
 
