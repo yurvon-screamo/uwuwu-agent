@@ -510,6 +510,17 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       const ids = Array.isArray(data) ? data.filter((x): x is string => typeof x === "string") : []
       return { ids } as T
     }
+    case "notebook_id_by_name": {
+      // id ноутбука по имени: getIDsByHPath принимает только id (паритет
+      // CLI siyuan_id) — демонам без дока-якоря (инит-блок спавна:
+      // персона Experience, доки проекта Projects)
+      const wanted = String(args.name ?? "")
+      const nbs = await post<{ notebooks?: { id?: string; name?: string; closed?: boolean }[] }>(
+        "/api/notebook/lsNotebooks", {})
+      const nb = (nbs.notebooks ?? []).find(
+        (n) => n.name === wanted && n.closed !== true && typeof n.id === "string")
+      return { id: typeof nb?.id === "string" ? nb.id : "" } as T
+    }
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       try {
