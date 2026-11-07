@@ -64,9 +64,14 @@ kernel-транспорт (post, конфиг, константы) без выи
                                          ребёнка — посерийный снос item'ов невозможен)
 
 Guard'ы блочных команд до любой мутации: формат id до любого SQL; блок резолвится
-в индексе (LIMIT 1); doc-id (type='d') — отказ всем трём (update на doc-id молча
-стирает весь док; правка/снос дока — append/replace/delete). Каждый stmt несёт
-явный LIMIT. Мутация — один сетевой вызов (post attempts=1) без авто-ретрая:
+в индексе (LIMIT 1), на промахе — второе мнение дерева ядра (getBlockInfo:
+blocktrees синхронен, SQL-индекс лагает — пробы 07.11): живой блок докатывается
+тем же бюджетом (INDEX_CATCHUP_BACKOFF), отказы различимы — absent «ни в
+индексе, ни в дереве» / lag «жив, индекс не догнал» / занятость ядра — честный
+RuntimeError (задача 20261107000209: ложный «не найден» на живом блоке читался
+агентом как «мутация не применилась»); doc-id (type='d') — отказ всем трём
+(update на doc-id молча стирает весь док; правка/снос дока — append/replace/delete).
+Каждый stmt несёт явный LIMIT. Мутация — один сетевой вызов (post attempts=1) без авто-ретрая:
 ретрай после потери ответа — класс дубля вставки, не самоисправление. Undo-журнал
 пишется ДО мутации через kernel putFile в data/assets/undo/wiki_ops/<unixts>-<op>-<id>.json
 (before_md / after_md / payload_md / new_ids): ядро пишет файл под своим uid — прямой
@@ -177,6 +182,11 @@ SEPARATOR_ROW_RE = re.compile(r"(?=.*\|)[\s|:\-]*-[\s|:\-]*")
 # одного post() не достигает порога), бюджет ретраев держит сам луп.
 METADATA_BAIL_ATTEMPTS = 3
 METADATA_BAIL_BACKOFF = (2, 5)
+
+# Докатывание SQL-индекса после tree-подтверждения живого блока/дока: лаг
+# индексации от секунд под нагрузкой (пробы 07.11, задача 20261107000209);
+# бюджет по прецедентам append guard / METADATA_BAIL_BACKOFF.
+INDEX_CATCHUP_BACKOFF = (2, 4)
 
 
 class KernelRefused(RuntimeError):
@@ -290,6 +300,26 @@ def _fs_file(path: str) -> str:
     except Exception:
         return "failed"
     return "missing" if envelope.get("code") == 404 else "failed"
+
+
+def _post_envelope(path: str, body: dict) -> tuple[int, object, str]:
+    """Один POST к ядру со структурным конвертом (code, data, msg) — для проб,
+    которым нужно различать коды отказа (post()/KernelRefused прячут код в
+    тексте). Транспорт/не-JSON/конверт без числового code — честный RuntimeError,
+    не маскировка (дисциплина конвертов, PR #111)."""
+    _conf()
+    req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Token {TOKEN}",
+                                          "Content-Type": JSON_CONTENT_TYPE}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
+            envelope = json.loads(r.read())
+    except Exception as exc:
+        raise RuntimeError(f"POST {path}: транспорт/конверт не разобран: {exc}") from None
+    code = envelope.get("code")
+    if not isinstance(code, int):
+        raise RuntimeError(f"POST {path}: конверт без числового code: {envelope!r:.200}")
+    return code, envelope.get("data"), str(envelope.get("msg", ""))
 
 
 def notebooks(attempts: int = 6) -> list[dict]:
@@ -748,10 +778,76 @@ def cmd_delete(a):
 
 # --- блочная хирургия: block-update / block-insert-after / block-insert-html / block-delete ---
 
+def _block_row_stmt(block_id: str) -> str:
+    return (f"select id, type, root_id, parent_id, markdown from blocks "
+            f"where id='{block_id}' limit 1")  # nosec B608 — blockID валидирован DOC_ID_RE
+
+
 def _block_row(block_id: str) -> dict | None:
-    stmt = f"select id, type, root_id, parent_id, markdown from blocks where id='{block_id}' limit 1"  # nosec B608 — blockID валидирован DOC_ID_RE
-    rows = _sql_rows(stmt)
+    rows = _sql_rows(_block_row_stmt(block_id))
     return rows[0] if rows else None
+
+
+def _tree_block_info(block_id: str) -> dict | None:
+    """Второе мнение дерева ядра (blocktrees синхронен, SQL-индекс лагает —
+    пробы 07.11, задача 20261107000209). getBlockInfo по исходнику эндпоинта:
+    code 0 — жив (rootID/box/path); code -1 — ядро id не подтверждает
+    (ErrSpecTooNew / ErrBoxUnindexed / GetBlock==nil — «не существует или не
+    подтверждается этим ядром») → None; прочие коды (вкл. 3 ErrIndexing) —
+    RuntimeError: занятость ≠ отсутствие (fail-closed, ADR-025). Побочный
+    эффект для неизвестных id — ФС-переиндексация, санкционирована самим
+    эндпоинтом (комментарий «仅在此处使用» в его исходнике), мутаций не делает."""
+    code, data, msg = _post_envelope("/api/block/getBlockInfo", {"id": block_id})
+    if code == 0:
+        shape = (isinstance(data, dict)
+                 and all(isinstance(data.get(k), str) and data.get(k)
+                         for k in ("rootID", "box", "path")))
+        if not shape:
+            raise RuntimeError(f"getBlockInfo {block_id}: аномальный конверт "
+                               f"(code=0 без rootID/box/path): {data!r:.200}")
+        return data
+    if code == -1:
+        return None
+    raise RuntimeError(f"getBlockInfo {block_id}: code={code} {msg} — ядро не подтверждает "
+                       "и не отрицает блок (индексация занята?); повтори позже, "
+                       "мутаций не было")
+
+
+def _tree_root_id(block_id: str) -> str | None:
+    info = _tree_block_info(block_id)
+    return info["rootID"] if info else None
+
+
+def _catchup_rows(stmt: str) -> list[dict] | None:
+    """Докатывание SQL-индекса: stmt с паузами INDEX_CATCHUP_BACKOFF до первых
+    строк; бюджет исчерпан — None (вызывающий различает лаг и отсутствие)."""
+    for delay in INDEX_CATCHUP_BACKOFF:
+        time.sleep(delay)
+        rows = _sql_rows(stmt, attempts=1)
+        if rows:
+            return rows
+    return None
+
+
+def _resolve_target(target_id: str) -> tuple[str, dict | str | None]:
+    """Единый резолв id с вторым мнением дерева:
+    ("block", row) — блок с guard-данными (type/root_id/markdown);
+    ("doc", row) — док, ряд найден; ("doc", None) — док подтверждён только
+    деревом (свежий, ряд лагает);
+    ("absent", None) — нет ни в SQL-индексе, ни в дереве;
+    ("lag", root_id) — жив по дереву, SQL-ряд не догнал за бюджет
+    (гварду нужны данные ряда — строгому резолву отказ; marker-пути хватает
+    root_id из дерева)."""
+    row = _block_row(target_id)
+    if row:
+        return ("doc", row) if row["type"] == "d" else ("block", row)
+    root_id = _tree_root_id(target_id)
+    if root_id is None:
+        return ("absent", None)
+    if root_id == target_id:
+        return ("doc", None)
+    rows = _catchup_rows(_block_row_stmt(target_id))
+    return ("block", rows[0]) if rows else ("lag", root_id)
 
 
 def _block_children_count(parent_id: str) -> int:
@@ -791,16 +887,23 @@ def _payload_has_table_separator(markdown: str) -> bool:
 
 
 def _resolved_block(block_id: str) -> dict:
-    """Формат id до любого SQL (инъекция/мусор отсечены), резолв в индексе,
+    """Формат id до любого SQL (инъекция/мусор отсечены), резолв через
+    _resolve_target: индекс → второе мнение дерева → докатывание индекса.
     doc-id (type='d') — не блок: update на doc-id молча стирает весь док."""
     if not DOC_ID_RE.fullmatch(block_id):
         raise RuntimeError(f"неверный blockID: {block_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
-    row = _block_row(block_id)
-    if not row:
-        raise RuntimeError(f"блок {block_id} не найден в индексе — возьми id из wiki_ops export или SQL по доку")
-    if row["type"] == "d":
+    kind, resolved = _resolve_target(block_id)
+    if kind == "absent":
+        raise RuntimeError(f"блок {block_id} не найден ни в SQL-индексе, ни в дереве ядра "
+                           "(не существует или не поддерживается этим ядром) — "
+                           "возьми id из wiki_ops export или SQL по доку")
+    if kind == "doc":
         raise RuntimeError("doc-id не блок: правка контента дока — append/replace, снос дока — wiki_ops delete")
-    return row
+    if kind == "lag":
+        raise RuntimeError(f"блок {block_id} жив (дерево ядра, root {resolved}), но SQL-индекс его "
+                           "ещё не видит (лаг индексации) — повтори команду через ~минуту; "
+                           "мутации не было, повтор идемпотентен")
+    return resolved
 
 
 def _mutate(path: str, body: dict) -> dict:
@@ -1187,12 +1290,19 @@ def _build_html_block_dom(raw_html: str, block_id: str, updated: str) -> str:
 
 def _sy_tree(doc_id: str) -> dict:
     """Дерево дока из .sy (FS-истина ядра, ADR-025): getFile data/<box><path>.
-    RuntimeError с различимыми причинами — транспортный сбой ≠ отсутствие файла
-    (ревью плана round-1)."""
+    Док-ряд на лаге индекса подтверждает дерево — box/path в ответе
+    getBlockInfo (blocktrees синхронен, пробы 07.11). RuntimeError с
+    различимыми причинами — транспортный сбой ≠ отсутствие файла (ревью
+    плана round-1)."""
     row = _doc_row(doc_id)
-    if not row:
-        raise RuntimeError(f"док {doc_id} не найден в индексе — .sy-проба невозможна")
-    fs_path = _doc_fs_path(row)
+    if row:
+        fs_path = _doc_fs_path(row)
+    else:
+        info = _tree_block_info(doc_id)
+        if not info or info.get("rootID") != doc_id:
+            raise RuntimeError(f"док {doc_id} не найден ни в SQL-индексе, ни в дереве ядра — "
+                               ".sy-проба невозможна")
+        fs_path = f"data/{info['box']}{info['path']}"
     try:
         raw = _get_workspace_file(fs_path)
     except FileNotFoundError:
@@ -1246,11 +1356,20 @@ def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
     """
     root_row = _doc_row(doc_id)
     if not root_row:
-        raise RuntimeError(f"док {doc_id} не найден — возьми id из wiki_ops find")
+        # Лаг индекса: свежий док в дереве есть (blocktrees синхронен) — флоу
+        # продолжается; иначе тот же absent-класс отказа, что у резолва блока.
+        if _tree_root_id(doc_id) != doc_id:
+            raise RuntimeError(f"док {doc_id} не найден ни в SQL-индексе, ни в дереве ядра — "
+                               "возьми id из wiki_ops find")
     stmt = (f"select id, content from blocks where root_id='{doc_id}' "
             f"and content like '{_sql_str(MARKER_PREFIX)}%' limit 20")  # nosec B608 — docId валидирован DOC_ID_RE, префикс константа
     rows = _sql_rows(stmt)
     markers = [r for r in rows if r.get("content") == MARKER_PREFIX + marker_name]
+    if not markers:
+        # Uniform-лаг: свежий маркер невидим вместе с рядом дока — докатываем
+        # тем же бюджетом, что и резолв блока (INDEX_CATCHUP_BACKOFF).
+        rows = _catchup_rows(stmt) or []
+        markers = [r for r in rows if r.get("content") == MARKER_PREFIX + marker_name]
     # Раскладка «маркеры в доке» — по срезу LIMIT 20: при упоре в лимит помечаем
     # усечение явно (молчаливая обрезка раскладки — та же маскировка сбоя).
     known = "; ".join(sorted({r["content"] for r in rows})) or "нет"
@@ -1261,8 +1380,9 @@ def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
         raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не уникален в доке ({listing}) — "
                            "уточни имя или удали лишние маркер-абзацы")
     if not markers:
-        raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не найден в доке {doc_id}; "
-                           f"маркеры в доке: {known}")
+        raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не найден в доке {doc_id} "
+                           f"(дерево подтверждает док — при свежем маркере это лаг индексации, "
+                           f"повтори через ~минуту); маркеры в доке: {known}")
     marker_id = markers[0]["id"]
     tree = _sy_tree(doc_id)
     found = _sy_find_with_next(tree, marker_id)
@@ -1337,12 +1457,16 @@ def cmd_block_insert_html(a):
     if marker_name and marker_name.startswith(MARKER_PREFIX):
         marker_name = marker_name[len(MARKER_PREFIX):]
     if marker_name:
-        root_probe = _doc_row(target)
-        if root_probe:
+        kind, resolved = _resolve_target(target)
+        if kind == "absent":
+            raise RuntimeError(f"цель {target} не найдена ни в SQL-индексе, ни в дереве ядра — "
+                               "возьми id из wiki_ops export/find")
+        if kind == "doc":
             doc_id = target
-        else:
-            row = _resolved_block(target)
-            doc_id = row["root_id"]
+        elif kind == "block":
+            doc_id = resolved["root_id"]
+        else:  # lag: SQL-ряд цели не догнал, root_id даёт дерево (якорь ищется по маркеру)
+            doc_id = resolved
         anchor, doc_id = _resolve_marker_anchor(doc_id, marker_name.strip())
     else:
         row = _resolved_block(target)

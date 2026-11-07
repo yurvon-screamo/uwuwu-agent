@@ -1,75 +1,11 @@
-// triage-lib.ts — чистые функции uwuwu-triage: разбор ТГ-апдейтов, состояние,
-// извлечение финала хода. Без сети и токенов (тестируемо).
+// triage-lib.ts — чистые функции черновик-контура uwuwu-triage: вотчер досок,
+// трекер черновиков (state.json), seen/ack-гейтинг, промпт разбора.
+// Общее ядро демона (типы/батчи/стирт/доставка/state) — lib/hub.ts; здесь
+// только специфика вотчера Draft. Тесты без сети: `bun test`.
 
-export interface TgMessage {
-  message_id: number
-  date: number
-  chat: { id: number; type: string }
-  from?: { username?: string; is_bot?: boolean }
-  text?: string
-  caption?: string
-  photo?: { file_id?: string }[]
-  document?: { file_id?: string; file_name?: string }
-  video?: { file_id?: string; file_name?: string }
-  animation?: { file_id?: string; file_name?: string }
-  video_note?: { file_id?: string }
-  audio?: { file_id?: string; file_name?: string }
-}
+import { DRAFT_VERDICTS, type DraftVerdict, type HubState } from "../lib/hub"
 
-export interface TgUpdate {
-  update_id: number
-  message?: TgMessage
-  edited_message?: TgMessage
-}
-
-/** Вложение заявки: файл уже выгружен в ФС (демон), путь — для агента
- *  (фиксирует в теле задачи; uwuwu-cli --attach — заглушка SiYuan v1). */
-export interface Attachment {
-  path: string
-  name: string
-}
-
-/** Сообщение владельца, прошедшее фильтр. attempts — число неудачных попыток
- *  поднять прогон (poison-защита очереди); msgIDs — состав батча (склейка
- *  потока сообщений) для удаления из очереди одним юнитом. */
-export interface Request {
-  text: string
-  /** ТГ-чат доставки финала. 0 = доставки нет (черновик-вход с досок). */
-  chatID: number
-  /** ТГ message_id (>0); черновики — синтетические отрицательные id демона. */
-  msgID: number
-  receivedAt: number // ms
-  attempts?: number
-  msgIDs?: number[]
-  attachments?: Attachment[]
-  /** имена вложений, НЕ выгрузившихся при приёме (маркеры в тексте
-   *  пересобираются при правке — знание о неудаче переживает edit) */
-  failed?: string[]
-  /** черновики задач в заявке (вотчер досок); у ТГ-сообщений отсутствует */
-  drafts?: DraftRef[]
-}
-
-/** Черновик задачи со строки доски «Задачи <proj>» (вотчер демона). */
-export interface DraftRef {
-  project: string
-  rowId: string
-  /** док-тело черновика — источник updatedAt для дебаунса тишины */
-  docId: string
-  title: string
-}
-
-/** Вердикт агента по черновику (seen-ack). Канон — ровно эти токены: парсер
- *  и методичка agent.md согласованы, псевдонимов нет. */
-export type DraftVerdict = "todo" | "merge" | "rm" | "пишется" | "обсуждение"
-
-/** Полный канонический набор — валидация парсера и state.json. */
-export const DRAFT_VERDICTS: readonly DraftVerdict[] = ["todo", "merge", "rm", "пишется", "обсуждение"]
-
-/** Терминальные вердикты: строка легитимно остаётся в Draft — гейт тишины
- *  до правки тела. Не-терминальные (todo/merge/rm при строке, оставшейся в
- *  Draft после упавшей команды агента) в гейтинге не участвуют — работает
- *  прежняя анти-петля (фолбэк = safety-net). */
-export const DRAFT_ACK_TERMINAL: readonly DraftVerdict[] = ["пишется", "обсуждение"]
+// ——— трекер черновика ———
 
 /** Ack черновика: исход разбора + версия тела (doc.updatedAt ms), с которой
  *  вердикт согласован. */
@@ -96,74 +32,11 @@ export interface DraftTrack {
   ack?: DraftAck
 }
 
-/** Активный ход в вечной сессии (персистится — рестарт демона не теряет ход).
- *  startedAt = 0 → промпт ещё не подтверждён (окно отправки). */
-export interface RunState {
-  sessionID: string
-  startedAt: number // ms, момент отправки prompt
-  req: Request
-  /** msg-id assistant-сообщений, уже доставленных в ТГ в этом ходе:
-   *  дедуп инкрементальной доставки при повторных тиках и рестартах */
-  delivered?: string[]
-  /** time.created последнего приземлившегося стирта (из ответа POST /prompt).
-   *  Граница «done» в sessionStatus: сервер всю фазу исполнения, начатого
-   *  стиртом по idle-сессии, отдаёт стухший outcome и старый time.idle —
-   *  без этой границы ход был бы объявлен готовым в первый тик. */
-  steerAt?: number
-}
-
-export interface TriageState {
-  offset: number
-  chatID?: number
-  /** вечная сессия диалога — единый контекст всей переписки */
-  session?: string
-  queue: Request[]
-  run?: RunState
-  /** ms последнего push/редакта в очередь — опора дебаунса батча */
-  lastPushAt?: number
-  /** батч в полёте (взят из очереди, промпт ещё не подтверждён): edit-ветка
-   *  отличает «ещё в очереди — можно править» от «уже пошло агенту» */
-  firing?: { at: number; msgIDs: number[] }
-  /** трекер черновиков досок: rowId → наблюдение вотчера */
-  drafts?: Record<string, DraftTrack>
-  /** черновики, застрявшие в Draft после DRAFT_MAX_TURNS ходов: не слать */
-  draftSkip?: Record<string, number>
-  /** последний выданный синтетический msgID черновика (отрицательные) */
-  nextDraftMsgID?: number
-}
-
-// ——— состояние ———
-
-const isReq = (v: unknown): v is Request => {
-  if (v === null || typeof v !== "object") return false
-  const r = v as Record<string, unknown>
-  const attemptsOk = r.attempts === undefined
-    || (Number.isInteger(r.attempts) && (r.attempts as number) >= 0)
-  const msgIDsOk = r.msgIDs === undefined
-    || (Array.isArray(r.msgIDs) && (r.msgIDs as unknown[]).length <= 100
-      && (r.msgIDs as unknown[]).every((m) => Number.isInteger(m)))
-  const attOk = r.attachments === undefined
-    || (Array.isArray(r.attachments) && (r.attachments as unknown[]).length <= 20
-      && (r.attachments as unknown[]).every((a) => {
-        if (a === null || typeof a !== "object") return false
-        const x = a as Record<string, unknown>
-        return typeof x.path === "string" && x.path.length <= 512
-          && typeof x.name === "string" && x.name.length <= 200
-      }))
-  // drafts валидируется в validState (битое поле стрипится, заявка остаётся)
-  return typeof r.text === "string" && r.text.trim() !== ""
-    && Number.isFinite(r.chatID) && Number.isInteger(r.msgID)
-    && attemptsOk && msgIDsOk && attOk
-}
-
-/** Форма черновика-ссылки (строки с капами длины — мусор стрипится). */
-export function isDraftRef(v: unknown): v is DraftRef {
-  if (v === null || typeof v !== "object") return false
-  const x = v as Record<string, unknown>
-  const str = (k: string, cap: number): boolean =>
-    typeof x[k] === "string" && (x[k] as string).length <= cap
-  return str("project", 64) && str("rowId", 128) && str("docId", 128) && str("title", 300)
-}
+/** Терминальные вердикты: строка легитимно остаётся в Draft — гейт тишины
+ *  до правки тела. Не-терминальные (todo/merge/rm при строке, оставшейся в
+ *  Draft после упавшей команды агента) в гейтинге не участвуют — работает
+ *  прежняя анти-петля (фолбэк = safety-net). */
+export const DRAFT_ACK_TERMINAL: readonly DraftVerdict[] = ["пишется", "обсуждение"]
 
 /** Форма трекера черновика (битое поле — строка выбрасывается целиком:
  *  вотчер пересоздаст наблюдение на следующем тике). rowId — ключ Record. */
@@ -181,10 +54,6 @@ const isDraftTrack = (v: unknown): v is DraftTrack => {
     && Number.isInteger(x.turns) && (x.turns as number) >= 0 && (x.turns as number) <= 999
 }
 
-/** Форма failed-поля (стрипится отдельно — битное поле не роняет заявку). */
-const failedShapeOk = (v: unknown): boolean =>
-  Array.isArray(v) && v.length <= 10 && v.every((n) => typeof n === "string" && n.length <= 200)
-
 /** Форма ack-поля трекера (битое стрипится отдельно — трек жив, анти-петля
  *  продолжается без тишины; state.json пишет только демон — вердикт строгий). */
 const isDraftAck = (v: unknown): v is DraftAck => {
@@ -196,44 +65,9 @@ const isDraftAck = (v: unknown): v is DraftAck => {
     && ms("updatedAt") && ms("at")
 }
 
-/** Санитайз state.json: битые поля отбрасываем, always-on демон не роняем. */
-export function validState(raw: unknown): TriageState {
-  const out: TriageState = { offset: 0, queue: [] }
-  if (raw === null || typeof raw !== "object") return out
-  const r = raw as Record<string, unknown>
-  if (Number.isInteger(r.offset) && (r.offset as number) >= 0) out.offset = r.offset as number
-  if (Number.isFinite(r.chatID)) out.chatID = r.chatID as number
-  if (typeof r.session === "string" && r.session.startsWith("ses_")) out.session = r.session
-  if (Number.isFinite(r.lastPushAt) && (r.lastPushAt as number) >= 0) {
-    out.lastPushAt = r.lastPushAt as number
-  }
-  const firing = r.firing
-  if (firing !== null && typeof firing === "object") {
-    const f = firing as Record<string, unknown>
-    if (Number.isFinite(f.at) && (f.at as number) >= 0 && Array.isArray(f.msgIDs)
-      && (f.msgIDs as unknown[]).length <= 100 && (f.msgIDs as unknown[]).every((m) => Number.isInteger(m))) {
-      out.firing = { at: f.at as number, msgIDs: f.msgIDs as number[] }
-    }
-  }
-  if (Array.isArray(r.queue)) {
-    out.queue = r.queue.filter(isReq).map((q) => {
-      // битный failed — стрип поля, не заявки (ручная правка state.json не
-      // должна стоить юзеру сообщения)
-      if (q.failed !== undefined && !failedShapeOk(q.failed)) {
-        const { failed: _drop, ...rest } = q
-        return rest
-      }
-      if (q.drafts !== undefined) {
-        const ok = Array.isArray(q.drafts) && (q.drafts as unknown[]).length <= 20
-          && (q.drafts as unknown[]).every(isDraftRef)
-        if (!ok) {
-          const { drafts: _drop, ...rest } = q
-          return rest
-        }
-      }
-      return q
-    })
-  }
+/** Extra-валидатор state.json триажа (хук validState в lib/hub): поля
+ *  черновик-контура — трекер, skip-list, счётчик синтетических msgID. */
+export function validTriageExtras(r: Record<string, unknown>, out: HubState): void {
   if (r.drafts !== null && typeof r.drafts === "object" && !Array.isArray(r.drafts)) {
     const tracks: Record<string, DraftTrack> = {}
     for (const [rowId, v] of Object.entries(r.drafts as Record<string, unknown>)) {
@@ -256,228 +90,6 @@ export function validState(raw: unknown): TriageState {
   if (Number.isInteger(r.nextDraftMsgID) && (r.nextDraftMsgID as number) < 0) {
     out.nextDraftMsgID = r.nextDraftMsgID as number
   }
-  const run = r.run
-  if (run !== null && typeof run === "object") {
-    const rn = run as Record<string, unknown>
-    if (typeof rn.sessionID === "string" && rn.sessionID.startsWith("ses_")
-        && Number.isFinite(rn.startedAt) && isReq(rn.req)) {
-      const outRun: RunState = {
-        sessionID: rn.sessionID,
-        startedAt: rn.startedAt as number,
-        req: rn.req as Request,
-      }
-      // битый delivered — почастичный стрип: невалидные id выбрасываются,
-      // валидные остаются (полная потеря переотправила бы ВСЕ ответы хода);
-      // при переполнении остаются свежайшие (старьё доставлено давно)
-      if (Array.isArray(rn.delivered)) {
-        const ids = (rn.delivered as unknown[])
-          .filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 128)
-          .slice(-100)
-        if (ids.length > 0) outRun.delivered = ids
-      }
-      if (typeof rn.steerAt === "number" && Number.isFinite(rn.steerAt) && rn.steerAt >= 0) {
-        outRun.steerAt = rn.steerAt
-      }
-      out.run = outRun
-    }
-  }
-  return out
-}
-
-// ——— апдейты ТГ ———
-
-/** Медиа-вложение: файл выгружается демоном в MEDIA_DIR под именем `name`. */
-export interface MediaFile {
-  fileId: string
-  name: string
-}
-
-/** Имя файла вложения: message_id-префикс гарантирует уникальность внутри
- *  батча (два безымянных видео форварда-альбома не перезаписывают друг
- *  друга), слэши и управляющие символы имени — санитизируются. */
-function attachmentName(messageId: number, fileName: string | undefined, fallback: string): string {
-  const raw = fileName !== undefined && fileName.trim() !== "" ? fileName : fallback
-  const safe = raw.replace(/[/\\]/g, "_").replace(/\p{Cc}/gu, "_").slice(0, 80)
-  return `${messageId}_${safe}`
-}
-
-/** Медиа-вложения сообщения: что демон выгружает в ФС (photo/document/
- *  video/animation/video_note/audio). Единый маппинг для классификации и
- *  выгрузки — записи без file_id вложением не считаются (выгрузка
- *  невозможна по определению). Голосовые/стикеры не входят: отбиваются
- *  демоном явно (kind: "media"). */
-export function mediaFiles(m: TgMessage): MediaFile[] {
-  const out: MediaFile[] = []
-  const add = (fileId: string | undefined, name: string): void => {
-    if (fileId !== undefined) out.push({ fileId, name })
-  }
-  // фото: последний элемент массива = максимальное разрешение
-  const photo = Array.isArray(m.photo) ? m.photo[m.photo.length - 1] : undefined
-  add(photo?.file_id, `${m.message_id}.jpg`)
-  add(m.document?.file_id, attachmentName(m.message_id, m.document?.file_name, "file"))
-  add(m.video?.file_id, attachmentName(m.message_id, m.video?.file_name, "video.mp4"))
-  add(m.animation?.file_id, attachmentName(m.message_id, m.animation?.file_name, "animation.mp4"))
-  add(m.video_note?.file_id, `${m.message_id}.mp4`)
-  add(m.audio?.file_id, attachmentName(m.message_id, m.audio?.file_name, "audio.mp3"))
-  return out
-}
-
-export type UpdateOutcome =
-  | { kind: "skip" } // не владелец / бот / не сообщение — тихо
-  | { kind: "help"; msg: TgMessage } // /start | /help
-  | { kind: "reset"; msg: TgMessage } // /reset — пересоздать сессию диалога
-  | { kind: "media"; msg: TgMessage } // не-текстовый вход без выгружаемых вложений (голос/стикер и пр.) — bounce владельцу
-  | { kind: "req"; msg: TgMessage; text: string } // текст и/или выгружаемые вложения идут заявкой (text может быть пустым)
-  | { kind: "edit"; msg: TgMessage; text: string } // edited_message от владельца
-
-/** Разбор апдейта. Владелец один (owner по username) — остальные входы тихо
- *  скипаются: бот публичный, чужим не отвечаем и не раскрываем формат. */
-export function classifyUpdate(u: TgUpdate, owner: string): UpdateOutcome {
-  const isEdit = u.message === undefined && u.edited_message !== undefined
-  const m = u.message ?? u.edited_message
-  if (m === undefined) return { kind: "skip" }
-  if (m.from?.is_bot === true) return { kind: "skip" }
-  if (m.from?.username !== owner) return { kind: "skip" }
-  if (m.chat.type !== "private") return { kind: "skip" }
-  const t = (m.text ?? m.caption ?? "").trim()
-  const hasAttachment = mediaFiles(m).length > 0
-  if (isEdit) return t === "" && !hasAttachment ? { kind: "skip" } : { kind: "edit", msg: m, text: t }
-  if (t === "" && !hasAttachment) return { kind: "media", msg: m }
-  if (t === "/start" || t === "/help") return { kind: "help", msg: m }
-  if (t === "/reset") return { kind: "reset", msg: m }
-  return { kind: "req", msg: m, text: t }
-}
-
-// ——— батчинг потока сообщений ———
-
-/** Когда головной батч готов: тишина DELAY после последнего push/редакта
- *  (поток писел склеивается целиком), но самое старое сообщение не ждёт
- *  дольше MAX (бесконечный поток не откладывает обработку навсегда).
- *  null — очередь пуста. */
-export function batchReadyAt(queue: Request[], lastPushAt: number, delayMs: number, maxMs: number): number | null {
-  const head = queue[0]
-  if (head === undefined) return null
-  const last = Math.max(lastPushAt, head.receivedAt)
-  return Math.min(last + delayMs, head.receivedAt + maxMs)
-}
-
-/** Головной батч: всё, что пришло ДО момента готовности (сообщения,
- *  прилетевшие позже, — следующий батч, батчи не смешиваются). */
-export function takeBatch(queue: Request[], readyAt: number): Request[] {
-  const out: Request[] = []
-  for (const r of queue) {
-    if (r.receivedAt > readyAt) break
-    out.push(r)
-  }
-  return out
-}
-
-/** Текст заявки: слова юзера + маркеры вложений (путь в ФС — агент фиксирует
- *  его в теле задачи; --attach — заглушка SiYuan v1) + маркеры неудач выгрузки. */
-export function composeText(text: string, attachments: Attachment[], failed: string[]): string {
-  return [
-    text,
-    ...attachments.map((a) => `[вложение: ${a.name} — файл в ФС: ${a.path}]`),
-    ...failed.map((n) => `[вложение ${n} не выгрузилось — попроси юзера продублировать]`),
-  ].filter((s) => s !== "").join("\n")
-}
-
-/** Батч как один ход диалога: тексты склеены, вложения объединены, msgIDs —
- *  состав для удаления из очереди одним юнитом (dead-letter/recovery).
- *  Доставка — по первому ненулевому chatID (чисто черновичый батч = 0,
- *  смешанный доставляется в ТГ как единый ход единого пайпа). */
-export function joinBatch(items: Request[]): Request {
-  const head = items[0]!
-  const withChat = items.find((i) => i.chatID !== 0)
-  const attachments = items.flatMap((i) => i.attachments ?? [])
-  const failed = [...new Set(items.flatMap((i) => i.failed ?? []))]
-  const drafts = items.flatMap((i) => i.drafts ?? [])
-  return {
-    text: items.map((i) => i.text).join("\n\n"),
-    chatID: withChat !== undefined ? withChat.chatID : 0,
-    msgID: head.msgID,
-    receivedAt: head.receivedAt,
-    ...(items.length > 1 ? { msgIDs: items.map((i) => i.msgID) } : {}),
-    ...(attachments.length > 0 ? { attachments: attachments.slice(0, ATT_BATCH_MAX) } : {}),
-    ...(failed.length > 0 ? { failed: failed.slice(0, 10) } : {}),
-    ...(drafts.length > 0 ? { drafts: drafts.slice(0, 20) } : {}),
-  }
-}
-
-/** Кап вложений батча: маркеры в тексте и files-состав не расходятся. */
-export const ATT_BATCH_MAX = 20
-
-/** Порция черновиков в батче: ТГ-заявки не режем (старое поведение), а
- *  черновиков берём максимум `max` — накопившийся бэклог (29 шт.) одним
- *  ходом деградирует вечную сессию (контекст/компакция). Невошедшие
- *  черновики остаются в очереди — следующий ход. */
-export function capDraftBatch(items: Request[], max: number): Request[] {
-  return [
-    ...items.filter((i) => i.chatID !== 0),
-    ...items.filter((i) => i.chatID === 0).slice(0, Math.max(0, max)),
-  ]
-}
-
-/** Удалить из очереди все сообщения батча (по msgID). */
-export function dropBatch(queue: Request[], req: Request): Request[] {
-  const ids = new Set(req.msgIDs ?? [req.msgID])
-  return queue.filter((r) => !ids.has(r.msgID))
-}
-
-// ——— стирт: вброс сообщения владельца в активный ход ———
-
-/** Кандидат на стирт: ТГ-подмножество очереди (черновики досок в стирт не
- *  входят — дождутся конца хода в очереди), тот же дебаунс, что у старта
- *  (тишина delayMs, кап maxMs от самого старого). null — ТГ-батча нет. */
-export function steerCandidate(
-  queue: Request[],
-  lastPushAt: number,
-  delayMs: number,
-  maxMs: number,
-): { batch: Request; readyAt: number } | null {
-  const tg = queue.filter((r) => r.chatID !== 0)
-  const readyAt = batchReadyAt(tg, lastPushAt, delayMs, maxMs)
-  if (readyAt === null) return null
-  const items = takeBatch(tg, readyAt)
-  if (items.length === 0) return null
-  return { batch: joinBatch(items), readyAt }
-}
-
-/** Батч краш-восстановления по персистентному firing-маркеру: точная персона
- *  стиртованного батча (msgIDs), НЕ пересборка по готовности — новое сообщение,
- *  пришедшее до рестарта, могло бы прицепиться к дедупу и быть потеряно или
- *  уйти агенту дважды вместе со стиртованным. null — персоны в очереди нет
- *  (маркер стух без батча). Порядок — как в очереди. */
-export function steerRecoveryBatch(queue: Request[], msgIDs: number[]): Request | null {
-  const ids = new Set(msgIDs)
-  const items = queue.filter((r) => ids.has(r.msgID))
-  return items.length > 0 ? joinBatch(items) : null
-}
-
-/** Признанные (admitted), но ещё не потреблённые стирты: эндпоинт /inbox
- *  показывает их раньше, чем они материализуются в /message (потребление —
- *  следующим шагом агент-лупа). Без этого дедуп рестарт-окна слеп в краше
- *  «POST приземлился — save не пережил» и пере-POST-ил бы уже приземлённый
- *  стирт (эмпирика 2.2.5: ответ POST = admission, /message отдаёт сообщение
- *  только после потребления). Мусор стрипится почастино. */
-export function inboxToSessionMsgs(entries: unknown[]): SessionMsg[] {
-  const out: SessionMsg[] = []
-  for (const e of entries) {
-    if (e === null || typeof e !== "object") continue
-    const x = e as Record<string, unknown>
-    if (x.type !== "user") continue
-    const payload = x.payload as Record<string, unknown> | undefined
-    const text = payload?.text
-    const created = (x.time as { created?: unknown } | undefined)?.created
-    if (typeof text !== "string" || text.trim() === "" || typeof created !== "number" || !Number.isFinite(created)) continue
-    out.push({
-      id: typeof x.id === "string" ? x.id : undefined,
-      type: "user",
-      time: { created },
-      text,
-    })
-  }
-  return out
 }
 
 // ——— черновики задач (вотчер досок) ———
@@ -501,8 +113,6 @@ export const DRAFT_CAP_MS = 10 * 60_000
 export const DRAFT_REPOST_COOLDOWN_MS = 10 * 60_000
 /** Холостых оборотов (черновик остался в Draft после хода) → skip-list. */
 export const DRAFT_MAX_TURNS = 5
-/** Черновиков в одном ходе: бэклок идёт порциями, монстр-ход деградирует сессию. */
-export const DRAFT_BATCH_MAX = 5
 
 /** Черновик готов к отправке. Первая: тишина по sighting'у и по телу, кап
  *  принудительно. Повторная (после хода триажа, оставившего Draft): кулдаун
@@ -557,45 +167,7 @@ export function composeDraftPrompt(project: string, rowId: string, title: string
   ].join("\n")
 }
 
-// ——— seen/ack: канал исхода разбора ———
-
-/** Префикс машиночитаемой строки исхода в финале хода (методичка agent.md). */
-const ACK_LINE_PREFIX = "draft-ack:"
-
-/** Срез markdown-обвеса по краям токена (бэктики/кавычки/жирный/подчёрк):
- *  LLM любит украшать, ids на доске «голые». */
-const stripMdEdge = (raw: string): string =>
-  raw.replace(/^[`'"*_]+/, "").replace(/[`'"*_]+$/, "").trim()
-
-/** Разбор draft-ack строк финала: `draft-ack: <rowId>=<вердикт> …` — пары
- *  через пробел/запятую/`;` (пробелы вокруг `=` тоже терпимы), строк может
- *  быть несколько, позиция в строке любая. Токен вердикта нормализуется
- *  (обвес/trim/lower), неизвестный вердикт или кривая пара — игнор (не ack →
- *  фолбэк анти-петли). Повтор rowId в разных строках — last-wins (агент
- *  передумал в ходе). */
-export function parseDraftAcks(text: string): Record<string, DraftVerdict> {
-  const out: Record<string, DraftVerdict> = {}
-  for (const line of text.split("\n")) {
-    const at = line.indexOf(ACK_LINE_PREFIX)
-    if (at === -1) continue
-    const segment = line.slice(at + ACK_LINE_PREFIX.length)
-    for (const m of segment.matchAll(/([^\s,;=]+)\s*=\s*([^\s,;=]+)/g)) {
-      const rawRowId = m[1]
-      const rawVerdict = m[2]
-      if (rawRowId === undefined || rawVerdict === undefined) continue
-      const rowId = stripMdEdge(rawRowId)
-      const verdict = DRAFT_VERDICTS.find((v) => v === stripMdEdge(rawVerdict).toLowerCase())
-      if (rowId !== "" && verdict !== undefined) out[rowId] = verdict
-    }
-  }
-  return out
-}
-
-/** Вырезание draft-ack строк из финала: технический канал демона не светит
- *  владельцу в ТГ-доставке. */
-export function stripDraftAcks(text: string): string {
-  return text.split("\n").filter((line) => !line.includes(ACK_LINE_PREFIX)).join("\n").trim()
-}
+// ——— seen/ack: запись исхода в трекер ———
 
 /** Запись ack: исход разбора + версия тела, с которой он согласован. Версия
  *  синхронизирует буфер тишины — дальнейшая дельта тела считается от неё
@@ -622,124 +194,4 @@ export function applyBodyDelta(t: DraftTrack, updatedAt: number): boolean {
     delete t.lastTurnAt
   }
   return true
-}
-
-// ——— финал хода ———
-
-export interface SessionMsg {
-  id?: string
-  type?: string
-  time?: { created?: number; completed?: number }
-  /** user-сообщения: API отдаёт текст верхним уровнем (Session.Message.User
-   *  в 2.2.5, content отсутствует) */
-  text?: string
-  content?: { type?: string; text?: string }[]
-}
-
-/** Готовый ответ агента: склейка text-частей одного assistant-сообщения. */
-export interface Reply {
-  id: string
-  text: string
-  at: number // ms time.created
-}
-
-/** Ответы хода по порядку (ASC): assistant-сообщения новее sinceMs с непустым
- *  текстом, не из delivered (дедуп инкрементальной доставки). completedOnly
- *  отсекает незавершённые (стрим идёт); для хвоста финала — false: оборванный
- *  ход доставляет частичный текст, как до инкрементальной доставки. API отдаёт
- *  DESC — реверсим. */
-export function extractReplies(
-  msgs: SessionMsg[],
-  sinceMs: number,
-  delivered: readonly string[] = [],
-  completedOnly = true,
-): Reply[] {
-  const seen = new Set(delivered)
-  const out: Reply[] = []
-  for (const m of msgs) {
-    if (m.type !== "assistant") continue
-    if (completedOnly && m.time?.completed === undefined) continue
-    const at = m.time?.created ?? 0
-    if (at < sinceMs) continue
-    if (m.id === undefined || seen.has(m.id)) continue
-    const text = textOf(m)
-    if (text === "") continue
-    out.push({ id: m.id, text, at })
-  }
-  return out.reverse()
-}
-
-/** Текст сообщения сессии: user-сообщения API отдаёт текстом верхнего уровня
- *  (Session.Message.User, 2.2.5 — content у них отсутствует), assistant —
- *  content-частями. Читаем обе формы — promptLandedAt без этого не матчится. */
-const textOf = (m: SessionMsg): string => {
-  if (typeof m.text === "string" && m.text.trim() !== "") return m.text.trim()
-  return (m.content ?? [])
-    .filter((p) => p?.type === "text" && typeof p.text === "string")
-    .map((p) => p.text as string)
-    .join("\n")
-    .trim()
-}
-
-/** Дошёл ли наш промпт до сессии: user-сообщение новее границы с ЭТИМ
- *  текстом (точное или префикс-80 — длинные промпты могли пережать на
- *  несколько сообщений) → его время создания (точный startedAt хода:
- *  ответы строго после него), иначе null. Текст — дискриминатор от промпта
- *  предыдущего хода: быстрый double-text ≤2с ловился бы на голой границе. */
-export function promptLandedAt(msgs: SessionMsg[], sinceMs: number, text: string): number | null {
-  const needle = text.trim()
-  const prefix = needle.slice(0, 80)
-  let found: number | null = null
-  for (const m of msgs) {
-    if (m.type !== "user") continue
-    const t = m.time?.created ?? 0
-    if (t < sinceMs) continue
-    const body = textOf(m)
-    if (body !== needle && !body.startsWith(prefix)) continue
-    if (found === null || t < found) found = t
-  }
-  return found
-}
-
-// ——— заголовок ———
-
-/** Заголовок вечной сессии диалога. */
-export const SESSION_TITLE = "📥 Триаж uwuwu"
-
-// ——— доставка в ТГ ———
-
-/** Граница среза, не рвущая суррогатную пару (4-байтные эмодзи): одиночный
- *  суррогат в sendMessage = reject TG-API. */
-const cutSafe = (s: string, end: number): number => {
-  if (end >= s.length) return end
-  const prev = s.charCodeAt(end - 1)
-  return prev >= 0xd800 && prev <= 0xdbff ? end + 1 : end
-}
-
-/** Нарезка под лимит ТГ. */
-export function plainChunks(s: string, limit = 3800): string[] {
-  const out: string[] = []
-  let i = 0
-  while (i < s.length) {
-    const end = cutSafe(s, Math.min(i + limit, s.length))
-    out.push(s.slice(i, end))
-    i = end
-  }
-  return out
-}
-
-/** Выравнивание html-частей под куски исходного текста (plain-фолбэк
- *  доставки): при провале HTML-части досылаем ровно соответствующий кусок
- *  исходника — уже отправленное не дублируется, теги в чат не утекают. */
-export function alignChunks(htmlParts: string[], source: string): string[] {
-  const total = htmlParts.reduce((s, p) => s + p.length, 0) || 1
-  let pos = 0
-  return htmlParts.map((p) => {
-    let end = pos + Math.ceil((p.length / total) * source.length)
-    if (end > source.length) end = source.length
-    end = cutSafe(source, end)
-    const slice = source.slice(pos, end)
-    pos = end
-    return slice
-  })
 }
