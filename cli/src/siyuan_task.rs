@@ -539,6 +539,9 @@ pub fn validate_task_type(raw: &str) -> Result<String> {
 /// keyID колонки «Тип»: существующая («Тип»/"Type") или свежесозданная
 /// select-колонка (addAttributeViewKey). Отказ API — громкий: молча no-op
 /// оставил бы агента в уверенности, что тип записан (прецедент claim).
+/// Read-then-mint без блокировки: параллельные create в миллисекундном
+/// окне могут заминтить дубли «Тип» — писатели доски практически сериальны,
+/// при признаках дубля колонки чистить руками в UI.
 pub(crate) async fn ensure_type_key(sy: &SiYuan, av: &str) -> Result<String> {
     let keys = board_keys(sy, av).await?;
     if let Some((_, id)) = keys

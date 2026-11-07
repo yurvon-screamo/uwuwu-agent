@@ -72,9 +72,10 @@ describe("createRunCard: позитивный путь", () => {
     // от машины/порядка импортов — не ассертим)
     expect(createCall?.argv.slice(1, 5)).toEqual(["task", "create", "--project", "uwuwu"])
     expect(createCall?.stdinWritten).toContain("## Инструкция мастера")
-    // edit: тот же rowId, статус Todo (stdin не пайп — тело не несёт)
+    // edit: тот же rowId, статус Todo + снятие типа-дефолта (ран не несёт тип;
+    // stdin не пайп — тело не несёт)
     expect(editCall?.argv.slice(1)).toEqual([
-      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo",
+      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo", "--type", "",
     ])
     expect(editCall?.stdinWritten).toBe("(не пайп)")
   })

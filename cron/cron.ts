@@ -335,7 +335,9 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
     log(`task create без строки в выводе: ${out.trim().slice(0, 200)}`)
     return null
   }
-  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo"], {
+  // ран — запись запуска, тип не несёт: клетка «Тип» от create-дефолта (dev)
+  // снимается в том же edit — без неё канбан-фильтры по типу не шумят ранами
+  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo", "--type", ""], {
     stdout: "pipe", stderr: "pipe",
   })
   const [, editErr, editCode] = await Promise.all([

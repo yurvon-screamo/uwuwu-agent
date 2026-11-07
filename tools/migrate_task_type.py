@@ -328,20 +328,37 @@ def dry_run(boards: list[dict], backup_dir: Path) -> None:
     for b in boards:
         tagged = sum(1 for c in b["cells"] if c.get("tag"))
         weird = sum(1 for c in b["cells"] if c.get("tag") == ["MULTIPLE"])
+        conflict = sum(
+            1 for c in b["cells"]
+            if c["type"] and c.get("tag_type") and c.get("tag_type") != c["type"]
+        )
         suffix = f", с тегом {tagged}" if tagged else ""
         suffix += f", аномальных {weird}" if weird else ""
+        suffix += f", конфликтов {conflict}" if conflict else ""
         key = "есть" if b["key"] else "НЕТ (будет создана)"
         print(f"  {b['doc']} [{key}] строк {len(b['cells'])}{suffix}")
     print("dry-run: снапшот в", backup_dir)
 
 
 def migrate_cell(board: dict, av_id: str, key_id: str, cell: dict, stats: list[int]) -> None:
-    """Одна строка: клетка из тега + снос тегов; stats = [written, removed, already, weird]."""
+    """Одна строка: клетка из тега + снос тегов.
+    stats = [written, removed, already, weird, conflicts].
+    Конфликт «клетка заполнена другим каноном» (например dev vs #bug) — лог +
+    не трогать (ни клетку, ни тег): сигнал расхождения не исчезает без следа."""
     if cell.get("tag") == ["MULTIPLE"]:
         print(f"  ⚠ {board['doc']}: {cell['row']} — теги разных типов, не трогаю", file=sys.stderr)
         stats[3] += 1
         return
     canon = cell.get("tag_type")
+    conflicted = bool(cell["type"]) and bool(canon) and canon != cell["type"]
+    if conflicted:
+        print(
+            f"  ⚠ {board['doc']}: {cell['row']} — клетка={cell['type']!r}, "
+            f"тег={canon!r}: расхождение, не трогаю ни клетку, ни тег",
+            file=sys.stderr,
+        )
+        stats[4] += 1
+        return
     if not cell["type"] and canon:
         _db("item_update", id=av_id, keyID=key_id, itemID=cell["row"],
             value={"mSelect": [{"content": canon}]})
@@ -356,10 +373,10 @@ def migrate_cell(board: dict, av_id: str, key_id: str, cell: dict, stats: list[i
             time.sleep(0.3)
 
 
-def migrate(boards: list[dict]) -> tuple[int, int, int, int]:
+def migrate(boards: list[dict]) -> tuple[int, int, int, int, int]:
     """Клетка из тега + снос тегов. Возвращает (клеток записано, тегов снесено,
-    уже заполнено, аномальных)."""
-    stats = [0, 0, 0, 0]
+    уже заполнено, аномальных, конфликтов клетка/тег)."""
+    stats = [0, 0, 0, 0, 0]
     for board in boards:
         av_id = board["av_id"]
         key = board["key"]
@@ -370,7 +387,8 @@ def migrate(boards: list[dict]) -> tuple[int, int, int, int]:
 
 
 def verify_cell(board: dict, after: dict, cell: dict, mismatches: list[str]) -> None:
-    """Одна строка: клетка несёт тип, теги снесены."""
+    """Одна строка: клетка несёт тип, теги снесены. Конфликтная строка
+    (клетка≠тег, не тронута) — только клетка сверяется, тег остаётся."""
     expected = cell["type"] or cell.get("tag_type")
     if cell.get("tag") == ["MULTIPLE"]:
         return
@@ -379,10 +397,11 @@ def verify_cell(board: dict, after: dict, cell: dict, mismatches: list[str]) -> 
         mismatches.append(
             f"{board['doc']}: {cell['row']} клетка={now!r} (ожидался {expected!r})"
         )
-    if cell.get("tag") and tag_blocks_of(cell["body"])[0]:
-        mismatches.append(
-            f"{board['doc']}: {cell['row']} тег не снесён ({cell.get('tag')})"
-        )
+    if cell.get("tag") and not (cell["type"] and cell.get("tag_type") != cell["type"]):
+        if tag_blocks_of(cell["body"])[0]:
+            mismatches.append(
+                f"{board['doc']}: {cell['row']} тег не снесён ({cell.get('tag')})"
+            )
 
 
 def verify(boards: list[dict]) -> list[str]:
@@ -441,8 +460,11 @@ def main() -> int:
     backup(boards, backup_dir)
     print("бэкап:", backup_dir)
 
-    written, removed, already, weird = migrate(boards)
-    print(f"клеток записано: {written}, тегов снесено: {removed}, уже заполнено: {already}, аномальных: {weird}")
+    written, removed, already, weird, conflicts = migrate(boards)
+    print(
+        f"клеток записано: {written}, тегов снесено: {removed}, уже заполнено: {already}, "
+        f"аномальных: {weird}, конфликтов клетка/тег: {conflicts}"
+    )
 
     mismatches = verify(boards)
     if mismatches:
