@@ -66,15 +66,17 @@ describe("createRunCard: позитивный путь", () => {
     )
 
     expect(rowId).toBe("20261107090000-run001")
-    expect(calls.length).toBe(2, "create + edit")
+    // bun-types: .toBe(value) — 1-аргенная сигнатура, сообщение = название теста
+    expect(calls.length).toBe(2)
     const [createCall, editCall] = calls
     // create: заголовок и тело через stdin (argv[0] — бинарь, путь зависит
     // от машины/порядка импортов — не ассертим)
     expect(createCall?.argv.slice(1, 5)).toEqual(["task", "create", "--project", "uwuwu"])
     expect(createCall?.stdinWritten).toContain("## Инструкция мастера")
-    // edit: тот же rowId, статус Todo (stdin не пайп — тело не несёт)
+    // edit: тот же rowId, статус Todo + снятие типа-дефолта (ран не несёт тип;
+    // stdin не пайп — тело не несёт)
     expect(editCall?.argv.slice(1)).toEqual([
-      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo",
+      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo", "--type", "",
     ])
     expect(editCall?.stdinWritten).toBe("(не пайп)")
   })
@@ -86,7 +88,7 @@ describe("createRunCard: позитивный путь", () => {
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ дубль", "тело")
     expect(rowId).toBeNull()
-    expect(calls.length).toBe(1, "edit после неудачного create не вызывается")
+    expect(calls.length).toBe(1)
   })
 
   test("stdout без строки «строка: …» → null (дрейф формата не минтит раны)", async () => {
@@ -96,6 +98,6 @@ describe("createRunCard: позитивный путь", () => {
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело")
     expect(rowId).toBeNull()
-    expect(calls.length).toBe(1, "edit не зовётся без rowId")
+    expect(calls.length).toBe(1)
   })
 })

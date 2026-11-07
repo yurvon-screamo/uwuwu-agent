@@ -645,6 +645,7 @@ async fn list_without_project_still_refuses() {
         "",
         TaskSub::List {
             status: None,
+            r#type: None,
             project: None,
         },
     )

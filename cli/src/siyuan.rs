@@ -963,6 +963,31 @@ impl SiYuan {
         .await
     }
 
+    /// Новая колонка database (/api/av/addAttributeViewKey): keyID генерится
+    /// клиентом — ядро обязывает передавать валидный node-id; data:null,
+    /// возвращаем сгенерённый id.
+    pub async fn add_attr_view_key(
+        &self,
+        av_id: &str,
+        name: &str,
+        key_type: &str,
+    ) -> Result<String> {
+        let key_id = crate::siyuan_id::new_node_id();
+        self.post(
+            "/api/av/addAttributeViewKey",
+            json!({
+                "avID": av_id,
+                "keyID": key_id,
+                "keyName": name,
+                "keyType": key_type,
+                "keyIcon": "",
+                "previousKeyID": ""
+            }),
+        )
+        .await?;
+        Ok(key_id)
+    }
+
     pub async fn db_item_add(&self, av_id: &str, title: &str) -> Result<String> {
         let v = self
             .mcp_tool(
@@ -997,10 +1022,28 @@ impl SiYuan {
         item_id: &str,
         status: &str,
     ) -> Result<()> {
+        self.db_item_set_select(av_id, key_id, item_id, status)
+            .await
+    }
+
+    /// Значение select/mSelect-ячейки: ядро апсертит опцию по content
+    /// (прецедент Status). Пустой content — очистка клетки (пустой mSelect).
+    pub async fn db_item_set_select(
+        &self,
+        av_id: &str,
+        key_id: &str,
+        item_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let options = if content.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "content": content })]
+        };
         self.mcp_tool(
             "database",
             json!({ "action": "item_update", "id": av_id, "keyID": key_id,
-                    "itemID": item_id, "value": { "mSelect": [{ "content": status }] } }),
+                    "itemID": item_id, "value": { "mSelect": options } }),
         )
         .await?;
         Ok(())

@@ -26,6 +26,7 @@ pub(crate) struct MockRow {
     pub(crate) item: String,
     pub(crate) title: String,
     pub(crate) status: String,
+    pub(crate) task_type: String,
     pub(crate) doc: Option<String>,
 }
 
@@ -35,12 +36,18 @@ impl MockRow {
             item: item.to_string(),
             title: title.to_string(),
             status: String::new(),
+            task_type: String::new(),
             doc: None,
         }
     }
 
     pub(crate) fn with_status(mut self, status: &str) -> Self {
         self.status = status.to_string();
+        self
+    }
+
+    pub(crate) fn with_type(mut self, task_type: &str) -> Self {
+        self.task_type = task_type.to_string();
         self
     }
 
@@ -62,6 +69,12 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-status", "type": "mSelect",
                            "mSelect": [{ "content": self.status }] }
+            }));
+        }
+        if !self.task_type.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-type", "type": "mSelect",
+                           "mSelect": [{ "content": self.task_type }] }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -139,6 +152,7 @@ impl Default for MockScenario {
                 keys: vec![
                     ("key-title", "Primary Key"),
                     ("key-status", "Status"),
+                    ("key-type", "Тип"),
                     ("key-branch", "Branch"),
                     ("key-pr", "PR"),
                 ],
@@ -183,6 +197,8 @@ pub(crate) struct MockKernel {
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
+    /// (av, keyName, keyType) всех addAttributeViewKey (минт колонок).
+    add_cols: Mutex<Vec<(String, String, String)>>,
     doc_blocks: Mutex<HashMap<String, Vec<String>>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -212,6 +228,7 @@ impl MockKernel {
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
+            add_cols: Mutex::new(Vec::new()),
         }
     }
 
@@ -281,6 +298,11 @@ impl MockKernel {
     /// (blockId, имя атрибута, значение) всех setBlockAttrs.
     pub(crate) fn attr_writes(&self) -> Vec<(String, String, String)> {
         self.attr_writes.lock().unwrap().clone()
+    }
+
+    /// (av, keyName, keyType) всех addAttributeViewKey.
+    pub(crate) fn add_cols(&self) -> Vec<(String, String, String)> {
+        self.add_cols.lock().unwrap().clone()
     }
 
     /// Состояние дока (применённые блоки) для ассертов comment-флоу.
@@ -582,6 +604,34 @@ impl MockKernel {
             .mount(server)
             .await;
 
+        // REST: создание колонки database (минт «Тип») — наблюдатель
+        Mock::given(method("POST"))
+            .and(path("/api/av/addAttributeViewKey"))
+            .respond_with({
+                let kernel = Arc::clone(self);
+                move |req: &Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    kernel.add_cols.lock().unwrap().push((
+                        body.get("avID")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ));
+                    ResponseTemplate::new(200)
+                        .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
+                }
+            })
+            .mount(server)
+            .await;
+
         // MCP: initialize → notifications → tools/call по action
         Mock::given(method("POST"))
             .and(path("/mcp"))
@@ -785,6 +835,7 @@ impl MockKernel {
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),
+                task_type: self.sc.inserted_row.task_type.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))

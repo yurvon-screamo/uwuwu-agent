@@ -19,7 +19,11 @@ pub(crate) enum TaskSub {
     Create {
         #[arg(long, help = "Заголовок задачи")]
         title: String,
-        #[arg(long, help = "Тип: dev | spike | bug (тег + шаблон тела)")]
+        #[arg(
+            long,
+            value_name = "TYPE",
+            help = "Тип: dev | spike | bug (колонка «Тип» доски + шаблон тела); без флага — dev"
+        )]
         r#type: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
@@ -49,6 +53,8 @@ pub(crate) enum TaskSub {
     List {
         #[arg(long, help = "Фильтр по статусу (todo|design|in progress|…)")]
         status: Option<String>,
+        #[arg(long, help = "Фильтр по типу (bug|dev|spike)")]
+        r#type: Option<String>,
         #[arg(long, help = "Проект (переопределяет --project задачи)")]
         project: Option<String>,
     },
@@ -75,6 +81,14 @@ pub(crate) enum TaskSub {
         pr: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// Тип задачи: колонка «Тип» доски; пустая строка снимает
+        /// (клетка очищается — тип «не задан»)
+        #[arg(
+            long,
+            value_name = "TYPE",
+            help = "Тип: dev | spike | bug; \"\" — снять"
+        )]
+        r#type: Option<String>,
         /// Расписание крона: записать/сменить; пустая строка снимает
         /// (пауза = закрыть задачу, расписания без задачи не бывает)
         #[arg(

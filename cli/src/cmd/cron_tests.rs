@@ -196,6 +196,7 @@ async fn edit_schedule_writes_custom_attr() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("6h".into()),
         },
     )
@@ -227,6 +228,7 @@ async fn edit_schedule_empty_removes_attr_without_grammar_check() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("".into()),
         },
     )
@@ -259,6 +261,7 @@ async fn edit_schedule_garbage_rejected_before_write() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("раз в минутку".into()),
         },
     )
