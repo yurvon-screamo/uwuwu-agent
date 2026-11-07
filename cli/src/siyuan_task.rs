@@ -719,7 +719,8 @@ pub async fn create_row_with_body(
                 item = sy.db_item_add_bound(&board.av_id, &body).await?;
                 sy.db_item_set_status(&board.av_id, &sk, &item, initial_status)
                     .await?;
-            }            RowInsertCheck::Missing => bail!(
+            }
+            RowInsertCheck::Missing => bail!(
                 "строка «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); строка видна только как док"
             ),
         }
