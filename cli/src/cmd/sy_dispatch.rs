@@ -1184,10 +1184,7 @@ pub(super) fn fulltext_lines(rows: &[Value]) -> Vec<String> {
 /// lowercase-запрос даёт пусто). Ранжирование: точный подстрочный матч
 /// всего запроса раньше AND-токенов; пустой матч → секция не печатается.
 pub(super) fn doc_section_lines(query: &str, hpaths: &[String], limit: usize) -> Vec<String> {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect();
+    let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     if tokens.is_empty() {
         return Vec::new();
     }
