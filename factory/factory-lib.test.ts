@@ -335,6 +335,17 @@ describe("routeTask", () => {
     freshComments: [],
     ...over,
   })
+  test("Вейт-факты — фабрика немая: крон-мастера и ран-карточки ей невидимы", () => {
+    // крон-мастер в Вейт (файр его — работа планировщика, не фабрики)
+    expect(routeTask(facts({ status: "Вейт", lastStatus: "Todo" }))).toEqual({ t: "noop" })
+    expect(routeTask(facts({ status: "Вейт", lastStatus: "" }))).toEqual({ t: "noop" })
+    // ран-карточка в Todo (создана планировщиком) — тоже не роутится
+    expect(routeTask(facts({ status: "Todo", lastStatus: "" }))).toEqual({ t: "noop" })
+    // ран из Вейт переброшен владельцем в In Progress — штатный fast-track
+    // «вмешайся и почини» (возврат девелоперу, спавн фильтром spawnable)
+    const live = routeTask(facts({ status: "In Progress", lastStatus: "Вейт", reviewerAlive: false }))
+    expect(live).toEqual({ t: "return-to-dev" })
+  })
   test("вход в ревью-статус без сессии → спавн", () => {
     expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: false })))
       .toEqual({ t: "spawn-reviewer", kind: "plan" })
