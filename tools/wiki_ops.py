@@ -1423,7 +1423,8 @@ def _verify_materialized(new_ids: list[str], doc_id: str, expect_type: str | Non
                         if by_id.get(i) not in (None, expect_type)]
             if degraded:
                 raise RuntimeError(
-                    f"деградация вставки: {', '.join(degraded)} — живой html-блок не материализовался; "
+                    f"деградация вставки: {', '.join(degraded)} — вставка не материализовалась "
+                    f"ожидаемым типом '{expect_type}'; "
                     f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
         missing = [i for i in new_ids if i not in by_id]
         if not missing:
