@@ -164,10 +164,24 @@ fn tight_hash_count(md: &str) -> usize {
     count
 }
 
+/// Строки контента для сканеров: frontmatter-блок в начале — структурная
+/// обёртка экспорта (title/date/lastmod), не контент; без её среза
+/// `title:`-строка дублирует титульную H1 и даёт систематический ложный
+/// «дословный дубль фразы» на каждом длиннотайтловом доке (ревью-раунд 5).
+fn content_lines(md: &str) -> Vec<&str> {
+    let mut rest = md;
+    if md.starts_with("---\n") {
+        if let Some((_, after)) = md.split_once("\n---") {
+            rest = after.trim_start_matches('\n');
+        }
+    }
+    rest.lines().collect()
+}
+
 fn hash_run_warnings(md: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut in_fence = false;
-    for line in md.lines() {
+    for line in content_lines(md) {
         if toggles_fence(line) {
             in_fence = !in_fence;
             continue;
@@ -212,7 +226,7 @@ fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut first_seen: Vec<String> = Vec::new();
     let mut in_fence = false;
-    for line in md.lines() {
+    for line in content_lines(md) {
         if toggles_fence(line) {
             in_fence = !in_fence;
             continue;
@@ -309,6 +323,24 @@ mod tests {
     fn inline_code_hashes_are_safe_from_trap_warning() {
         let code_spans = "маркер `#` и код `y` между `#` и `#` же.\n";
         assert!(tag_trap_warning(code_spans).is_none());
+    }
+
+    #[test]
+    fn frontmatter_title_pair_with_h1_stays_silent() {
+        let noisy = "---\ntitle: SiYuan write-path: round-trip калечит markdown тел — дубли фраз, \
+                     съедение пустых строк — локализовать слой\n---\n\n# SiYuan write-path: \
+                     round-trip калечит markdown тел — дубли фраз, съедение пустых строк — \
+                     локализовать слой\n\nштатное тело\n";
+        assert!(artifact_report(noisy).is_empty());
+    }
+
+    #[test]
+    fn frontmatter_dropped_without_shadowing_real_duplicates() {
+        let noisy = "---\ntitle: какой-то тайтл задачи\n---\n\nформулировка проверки задачи \
+                     полностью уникальная, формулировка проверки задачи полностью уникальная\n";
+        let report = artifact_report(noisy);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("дословный дубль фразы"));
     }
 
     #[test]
