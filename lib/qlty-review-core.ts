@@ -102,7 +102,17 @@ export function parseSarif(raw: string, label: string): { findings: QltyFinding[
 
 // ——— фильтры ———
 
-const LEVEL_RANK: Record<string, number> = { note: 0, low: 1, medium: 2, high: 3 }
+// SARIF-уровни грубее qlty severity: error — верхний ранг (не отсекается
+// никогда при пороге ≤ high), warning — низкий (проходит при low/note),
+// note — отсекается любым порогом выше note.
+const LEVEL_RANK: Record<string, number> = {
+  note: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  warning: 1,
+  error: 3,
+}
 
 function globToRegExp(glob: string): RegExp {
   let re = ""

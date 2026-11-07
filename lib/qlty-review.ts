@@ -73,7 +73,7 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
   const notes: string[] = []
   if (input.scope === "commit") {
     if (!input.commit) throw new Error("scope=commit требует commit (SHA/реф)")
-    paths = (await deps.git(["diff-tree", "--no-commit-id", "--name-only", "-r", input.commit], dir))
+    paths = (await deps.git(["diff-tree", "--no-commit-id", "--name-only", "--diff-filter=d", "-r", input.commit], dir))
       .split("\n")
       .filter(Boolean)
     notes.push(
@@ -83,6 +83,20 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
     const changed = (await deps.git(["diff", "--name-only", "--diff-filter=d", base], dir)).split("\n").filter(Boolean)
     const untracked = (await deps.git(["ls-files", "--others", "--exclude-standard"], dir)).split("\n").filter(Boolean)
     paths = [...new Set([...changed, ...untracked])]
+  }
+
+  // Явный ранний выход: пустая дельта (синхронизированная ветка или
+  // pure-deletion) — прогон не требуется (паритет guard'а CI-дельты,
+  // ADR-063); безаргументный qlty check — семантика по случайности.
+  if (paths.length === 0) {
+    const scopePart = `scope \`${input.scope}\`${input.commit ? ` (\`${input.commit}\`)` : ""}`
+    return {
+      markdown: `**Машинный ревью (qlty)** — ${scopePart} · upstream \`${upstream}\` · ${dir}\n\n> ⚠ Изменённых путей нет (синхронизированная ветка или pure-deletion) — машинный ревью n/a, прогон не требуется.\n\nИтог: n/a.`,
+      qltyVersion: "n/a",
+      introduced: 0,
+      baseline: 0,
+      smells: 0,
+    }
   }
 
   const currentRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", ...paths], dir)

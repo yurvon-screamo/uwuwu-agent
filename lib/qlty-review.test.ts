@@ -135,6 +135,18 @@ describe("applyFilters — paths и level", () => {
   test("level=note + paths вместе", () => {
     expect(applyFilters(findings, { paths: ["cli/**"], level: "note" })).toHaveLength(2)
   })
+
+  test("SARIF-error не отсекается никогда (medium/high)", () => {
+    const withError = [
+      f({ path: "cli/src/a.ts", level: "warning" }),
+      f({ path: "cli/src/a.ts", line: 7, level: "error", ruleId: "osv-scanner:GO-2026-1234" }),
+    ]
+    expect(applyFilters(withError, { level: "medium" })).toHaveLength(1)
+    expect(applyFilters(withError, { level: "medium" })[0].level).toBe("error")
+    expect(applyFilters(withError, { level: "high" })).toHaveLength(1)
+    expect(applyFilters(withError, { level: "high" })[0].level).toBe("error")
+    expect(applyFilters(withError, { level: "low" })).toHaveLength(2)
+  })
 })
 
 describe("classifyDelta — multiset-сверка без line", () => {
@@ -326,7 +338,7 @@ describe("runReview — оркестрация на fake-deps", () => {
     const repo: FakeRepo = {
       git: {
         "merge-base origin/master HEAD": "abcbase123",
-        "diff-tree --no-commit-id --name-only -r feedbac4": "src/changed.py\n",
+        "diff-tree --no-commit-id --name-only --diff-filter=d -r feedbac4": "src/changed.py\n",
         "ls-tree -r --name-only abcbase123": "src/changed.py\n",
       },
       qltyByCwd: (_cwd, args) => (args[0] === "smells" ? SMELLS_EMPTY : CURRENT_SARIF),
@@ -359,6 +371,45 @@ describe("runReview — оркестрация на fake-deps", () => {
     // baseline-прогон пропущен (basePaths пуст) → всё current идёт в introduced
     expect(r.introduced).toBe(2)
     expect(r.baseline).toBe(0)
+  })
+
+  test("commit с удалённым файлом: --diff-filter=d отсекает путь → n/a-выход без вызова qlty", async () => {
+    const repo: FakeRepo = {
+      git: {
+        "merge-base origin/master HEAD": "abcbase123",
+        // удалённый файл единственный в коммите — фильтр даёт пустой список
+        "diff-tree --no-commit-id --name-only --diff-filter=d -r deadcafe": "",
+        "ls-tree -r --name-only abcbase123": "",
+      },
+      qltyByCwd: () => {
+        throw new Error("qlty не должен вызываться на пустой дельте")
+      },
+      tmpWorktrees: [],
+    }
+    const r = await runReview(
+      { scope: "commit", directory: "/repo", commit: "deadcafe" },
+      fakeDeps(repo),
+    )
+    expect(r.markdown).toContain("Изменённых путей нет")
+    expect(r.markdown).toContain("Итог: n/a.")
+    expect(r.qltyVersion).toBe("n/a")
+  })
+
+  test("diff: пустая дельта → n/a-выход без вызова qlty", async () => {
+    const repo: FakeRepo = {
+      git: {
+        "merge-base origin/master HEAD": "abcbase123",
+        "diff --name-only --diff-filter=d abcbase123": "",
+        "ls-files --others --exclude-standard": "",
+      },
+      qltyByCwd: () => {
+        throw new Error("qlty не должен вызываться на пустой дельте")
+      },
+      tmpWorktrees: [],
+    }
+    const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
+    expect(r.markdown).toContain("машинный ревью n/a, прогон не требуется")
+    expect(r.introduced).toBe(0)
   })
 
   test("пустой merge-base — громкая ошибка", async () => {

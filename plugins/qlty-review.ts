@@ -62,7 +62,7 @@ export default Plugin.define({
               type: "string",
               enum: ["note", "low", "medium", "high"],
               description:
-                "Порог находок: note — показывать всё (включая SARIF-note); низкие пороги отсекают note. Дефолт low. SARIF не различает low/medium/high — warning/error проходят всегда.",
+                "Порог находок: note — показывать всё; low — отсекает SARIF-note (дефолт); medium/high — оставляют только SARIF-error (warning/error в SARIF не различаются по исходной severity, error не отсекается никогда).",
             },
           },
           required: ["scope"],
