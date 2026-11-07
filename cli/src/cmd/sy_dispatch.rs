@@ -13,14 +13,6 @@ use crate::siyuan_task as syt;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-/// Заметка о фоллбеке: строка найдена не на штатной доске задач — прозрачность
-/// пути резолва в выводе команды.
-fn note_fallback_board(origin: syt::ResolveOrigin, board: &syt::SyBoard) {
-    if origin != syt::ResolveOrigin::Tasks {
-        println!("доска: {} (фоллбек)", board.hpath);
-    }
-}
-
 pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Task { command, project } => {
@@ -56,6 +48,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         r#type: ty,
         stdin,
         attach,
+        schedule: _,
         dry_run: true,
     } = command
     {
@@ -116,8 +109,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
             println!("Строка:   {}", task.item_id);
@@ -127,8 +119,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if !task.pr.is_empty() {
                 println!("PR:       {}", task.pr);
             }
+            let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
+            if let Some(doc) = body_doc.as_deref() {
+                if let Ok(attrs) = sy.get_block_attrs(doc).await {
+                    if let Some(schedule) = attrs.get("custom-schedule") {
+                        println!("Расписание: {schedule} (крон: файр в статусе Вейт)");
+                    }
+                }
+            }
             if !no_body {
-                let md = match syt::task_body_doc(&sy, &board, &task).await? {
+                let md = match body_doc {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
                 };
@@ -148,10 +148,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             r#type: ty,
             stdin,
             attach,
+            schedule,
             ..
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
+            if let Some(expr) = schedule.as_deref() {
+                crate::schedule::validate_schedule(expr)?;
+            }
             // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
             // должен грузить ассеты впустую (внутренний чек create остаётся
             // авторитетным — гонка между чеками ловится им же)
@@ -177,6 +181,18 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             let (item, body) =
                 syt::create(&sy, project, &title, ty.as_deref().unwrap_or("dev"), &ctx).await?;
+            if let Some(expr) = schedule.as_deref() {
+                // сбой после create не теряет задачу: атрибут доставляется
+                // повторным task edit --schedule (создание уже свершилось)
+                sy.set_block_attr(&body, "custom-schedule", expr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "задача создана (строка {item}, тело {body}), но расписание \
+                             не записано — доставь: task edit {item} --schedule \"{expr}\""
+                        )
+                    })?;
+            }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
                 sy.append_block_md(&body, &refs).await.with_context(|| {
@@ -199,9 +215,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             title,
             pr,
             branch,
+            schedule,
         } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             // валидация PR до rename: без частичных обновлений (тайтл сменился,
             // а колонки нет — недопустимый разрыв)
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
@@ -218,6 +234,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 pr.as_deref(),
             )
             .await?;
+            if let Some(expr) = schedule.as_deref() {
+                crate::schedule::validate_schedule(expr)?;
+                let body = syt::task_body_doc(&sy, &board, &task)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "строка «{}» без тела (detached) — расписание некуда записать",
+                            task.title
+                        )
+                    })?;
+                // пустая строка снимает атрибут (ядро удаляет ключ из IAL)
+                sy.set_block_attr(&body, "custom-schedule", expr).await?;
+            }
             println!(
                 "обновлено: {}",
                 final_title.as_deref().unwrap_or(&task.title)
@@ -231,15 +260,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             text,
         } => {
             let msg = guarded_comment_text(stdin, &text)?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             println!("коммент отправлен: {}", truncate(&msg, 60));
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                 None => String::new(),
@@ -248,8 +275,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
             Ok(())
@@ -273,8 +299,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
-            let (board, task, origin) = syt::resolve_on_project(&sy, project, &id).await?;
-            note_fallback_board(origin, &board);
+            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
             let body_path = board.body_hpath(&task.title);
             // upload до записи тела: сбой не оставляет тело без референсов
             let mut uploaded = Vec::new();
@@ -360,18 +385,13 @@ async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> R
         Some(doc) => sy.export_md_by_id(doc).await.ok(),
         None => None,
     };
-    let extra_text_cells = if task.schedule.is_empty() {
-        Vec::new()
-    } else {
-        vec![("Schedule".to_string(), task.schedule.clone())]
-    };
     Ok(JournalRow {
         item_id: task.item_id.clone(),
         title: task.title.clone(),
         status: task.status.clone(),
         branch: task.branch.clone(),
         pr: task.pr.clone(),
-        extra_text_cells,
+        extra_text_cells: Vec::new(),
         body_doc: task.body_doc.clone(),
         body_hpath: board.body_hpath(&task.title),
         body_md,
@@ -602,10 +622,9 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
             journal.project
         );
     }
-    let board = match journal.kind.as_str() {
-        "cron-rm" => syt::find_board_cron(sy, project).await?,
-        _ => syt::find_board(sy, project).await?,
-    };
+    // Легаси "cron-rm"-журналы (крон-доски сняты) уводятся на задачную доску
+    // и честно падают по av-mismatch ниже — восстанавливать вручную.
+    let board = syt::find_board(sy, project).await?;
     if board.av_id != journal.av_id {
         bail!(
             "доска пересоздана (av {} ≠ {} из журнала) — авто-undo невозможен, восстанавливай вручную",
@@ -631,7 +650,7 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
         } else {
             sy.db_item_add_bound(&board.av_id, &body_doc).await?
         };
-        restore_journal_cells(sy, &board, &journal.kind, &item, row).await?;
+        restore_journal_cells(sy, &board, &item, row).await?;
         println!(
             "  восстановлена: «{}» — строка {item} (была {}), тело {}",
             row.title,
@@ -682,33 +701,15 @@ async fn restore_journal_body(
     }
 }
 
-/// Клетки восстановленной строки: крон-доски — текстовые ячейки
-/// (Schedule/Status), задачные — Status (mSelect) + Branch + PR (url).
+/// Клетки восстановленной строки: Status (mSelect) + Branch + PR (url).
+/// Легаси "cron-rm"-журналы (крон-доски сняты) не восстанавливаются:
+/// undo уводится на задачную доску и честно падает по av-mismatch.
 async fn restore_journal_cells(
     sy: &SiYuan,
     board: &syt::SyBoard,
-    kind: &str,
     item: &str,
     row: &JournalRow,
 ) -> Result<()> {
-    if kind == "cron-rm" {
-        // Status у кронов — mSelect (единый контур с task-путями); Schedule —
-        // текстовая клетка из extra
-        if !row.status.is_empty() {
-            let sk = syt::status_key(sy, &board.av_id).await?;
-            sy.db_item_set_status(&board.av_id, &sk, item, &row.status)
-                .await?;
-        }
-        if row.extra_text_cells.is_empty() {
-            return Ok(());
-        }
-        let cells: Vec<(&str, &str)> = row
-            .extra_text_cells
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        return set_text_cells(sy, &board.av_id, item, &cells).await;
-    }
     if !row.status.is_empty() {
         let sk = syt::status_key(sy, &board.av_id).await?;
         sy.db_item_set_status(&board.av_id, &sk, item, &row.status)
@@ -793,131 +794,111 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
 
 pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
-    match command {
-        CronSub::List { project } => cron_list(&sy, &cron_project(project)).await,
-        CronSub::Set {
-            title,
-            r#in,
-            every,
-            at,
-            cron_expr,
-            project,
-            stdin,
-        } => {
-            let schedule = cron_schedule(&r#in, &every, &at, &cron_expr)?;
-            let prompt = if stdin {
-                read_stdin()?
-            } else {
-                "<промпт крона>".into()
-            };
-            let proj = cron_project(project);
-            let board = syt::find_board_cron(&sy, &proj).await?;
-            // колонки — до мутаций: строка без Schedule демону не видна,
-            // а тело/строка, созданные впустую, — сироты (репро 04.11)
-            let keys = syt::board_keys(&sy, &board.av_id).await?;
-            let cron_keys = syt::require_cron_keys(&keys, &board.hpath)?;
-            // дубль-тайтл: живая строка или тело-сирота (дедуп как в task create)
-            let canon = syt::normalize_title(&title);
-            if syt::read_rows(&sy, &board)
-                .await?
-                .iter()
-                .any(|r| syt::normalize_title(&r.title) == canon)
-            {
-                anyhow::bail!("крон «{title}» уже есть (живая строка на {})", board.hpath);
+    let CronSub::List { project } = command;
+    cron_list(&sy, project.as_deref().unwrap_or("uwuwu")).await
+}
+
+/// State демона uwuwu-cron: пер-машинский файл (~/.local/state/uwuwu-cron,
+/// песочница двигает UWUWU_CRON_STATE_DIR). Отсутствует/бит — пусто: инвентарь
+/// живёт на доске, state только дополняет last run/сессией.
+#[derive(serde::Deserialize, Default)]
+struct CronStateFile {
+    #[serde(default)]
+    crons: std::collections::HashMap<String, TrackedCronEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct TrackedCronEntry {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    last_fired_at: u64,
+}
+
+fn read_cron_state() -> CronStateFile {
+    let dir = std::env::var("UWUWU_CRON_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".local/state/uwuwu-cron")
+        });
+    let Ok(raw) = std::fs::read_to_string(dir.join("state.json")) else {
+        return CronStateFile::default();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Локальное время «YYYY-MM-DD HH:MM» из unix-ms — формат ячейки Last Run
+/// демона (читается юзером, не UTC). pub(crate) для тестов cron list.
+pub(crate) fn format_local(unix_ms: u64) -> String {
+    use chrono::TimeZone;
+    let dt = chrono::Local
+        .timestamp_millis_opt(unix_ms as i64)
+        .single()
+        .unwrap_or_default();
+    dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Инвентарь мастеров крон-задач доски проекта: строки с custom-schedule
+/// в доке-теле. Скедул — атрибут, last run/сессия — state демона.
+async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
+    let board = syt::find_board(sy, project).await?;
+    let rows = syt::read_rows(sy, &board).await?;
+    let state = read_cron_state();
+    let mut masters: Vec<(String, String, String, String, String)> = Vec::new();
+    for r in &rows {
+        let Some(doc) = r.body_doc.as_deref() else {
+            continue;
+        };
+        let attrs = match sy.get_block_attrs(doc).await {
+            Ok(a) => a,
+            // мёртвая привязка/сбой одной строки не роняет инвентарь:
+            // строка пропускается с предупреждением (честность = stderr-нота,
+            // не отказ всей команды)
+            Err(e) => {
+                eprintln!("  ⚠ «{}» ({doc}): атрибуты не прочитаны ({e}) — строка пропущена", r.title);
+                continue;
             }
-            if !syt::body_doc_by_title(&sy, &board, &title)
-                .await?
-                .is_empty()
-            {
-                anyhow::bail!("тело крона «{title}» уже есть");
-            }
-            // тело → bound-строка (клик по карточке открывает промпт) →
-            // клетки → verify вставки в render (репро 04.11 08:27: success
-            // item_add не гарантирует строку), паттерн task create
-            let body_h = board.body_hpath(&title);
-            let body = sy
-                .create_doc_md(&board.notebook, &body_h, &cron_body_md(&title, &prompt))
-                .await?;
-            let mut item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
-            for attempt in 0..=1u8 {
-                let rows = syt::read_rows(&sy, &board).await?;
-                match syt::check_row_insert(&rows, &item, &title) {
-                    syt::RowInsertCheck::Confirmed => {
-                        println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
-                        return Ok(());
-                    }
-                    syt::RowInsertCheck::DuplicateTitle => bail!(
-                        "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
-                    ),
-                    syt::RowInsertCheck::Missing if attempt == 0 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
-                    }
-                    syt::RowInsertCheck::Missing => bail!(
-                        "строка крона «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); крон виден только как док"
-                    ),
-                }
-            }
-            unreachable!("цикл verify завершается return или bail")
-        }
-        CronSub::Pause { id, project } => {
-            cron_set_status(&sy, &id, "paused", "остановлен", &cron_project(project)).await
-        }
-        CronSub::Resume { id, project } => {
-            cron_set_status(&sy, &id, "active", "запущен", &cron_project(project)).await
-        }
-        CronSub::Rm { id, project } => {
-            let proj = cron_project(project);
-            let board = match syt::find_board_cron(&sy, &proj).await {
-                Ok(b) => b,
-                Err(_) => syt::find_board(&sy, &proj).await?,
-            };
-            let task = syt::resolve(&sy, &board, &id).await?;
-            // undo-журнал до мутации: Schedule в extra-клетках, промпт — body_md
-            let mut journal = Journal::new(&proj, "cron-rm", &board);
-            journal.rows.push(journal_row(&sy, &board, &task).await?);
-            let journal_path = journal.save(&sy).await?;
-            sy.mcp_tool(
-                "database",
-                json!({ "action": "item_remove", "id": board.av_id, "itemIDs": [task.item_id] }),
-            )
-            .await?;
-            if let Some(doc) = syt::task_body_doc(&sy, &board, &task).await? {
-                let _ = sy.remove_doc(&doc).await;
-            }
-            println!("крон удалён: {} (undo-журнал: {journal_path})", task.title);
-            Ok(())
-        }
+        };
+        let Some(schedule) = attrs.get("custom-schedule") else {
+            continue;
+        };
+        let last_run = state
+            .crons
+            .get(&r.item_id)
+            .filter(|t| t.last_fired_at > 0)
+            .map(|t| {
+                let session = if t.session_id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", &t.session_id[..t.session_id.len().min(10)])
+                };
+                format!("{}{}", format_local(t.last_fired_at), session)
+            })
+            .unwrap_or_default();
+        masters.push((
+            r.status.clone(),
+            r.item_id.chars().take(12).collect(),
+            truncate(&r.title, 26),
+            truncate(schedule, 13),
+            last_run,
+        ));
     }
+    if masters.is_empty() {
+        println!("Крон-задач нет (расписание — task create/edit --schedule, статус Вейт).");
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<12} {:<28} {:<14} LAST RUN",
+        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE"
+    );
+    for m in masters {
+        println!("{:<10} {:<12} {:<28} {:<14} {}", m.0, m.1, m.2, m.3, m.4);
+    }
+    Ok(())
 }
 
-/// Дефолтная доска кронов — «Кроны uwuwu».
-fn cron_project(project: Option<String>) -> String {
-    project.unwrap_or_else(|| "uwuwu".into())
-}
-
-fn cron_body_md(title: &str, prompt: &str) -> String {
-    format!("# {title}\n\n```\n{prompt}\n```\n")
-}
-
-/// Bound-строка крона + клетки: Status через mSelect (единый контур с
-/// task-путями), Schedule/Last Run текстом.
-async fn insert_cron_row(
-    sy: &SiYuan,
-    board: &syt::SyBoard,
-    keys: &syt::CronKeys,
-    body: &str,
-    schedule: &str,
-) -> Result<String> {
-    let item = sy.db_item_add_bound(&board.av_id, body).await?;
-    sy.db_item_set_status(&board.av_id, &keys.status, &item, "active")
-        .await?;
-    write_text_cell(sy, &board.av_id, &keys.schedule, &item, schedule).await?;
-    write_text_cell(sy, &board.av_id, &keys.last_run, &item, "").await?;
-    Ok(item)
-}
-
-/// Одна text-клетка (keyID уже валидирован — см. require_cron_keys).
+/// Одна text-клетка (keyID от board_keys).
 async fn write_text_cell(sy: &SiYuan, av: &str, key: &str, item: &str, value: &str) -> Result<()> {
     sy.mcp_tool(
         "database",
@@ -928,52 +909,8 @@ async fn write_text_cell(sy: &SiYuan, av: &str, key: &str, item: &str, value: &s
     Ok(())
 }
 
-async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
-    let board = syt::find_board_cron(sy, project).await?;
-    let rows = syt::read_rows(sy, &board).await?;
-    print!("{}", format_cron_table(&rows));
-    Ok(())
-}
-
-/// Таблица кронов: СТАТУС/СТРОКА/ЗАГОЛОВОК/SCHEDULE/LAST RUN — значения
-/// всех колонок (раньше шапка обещала SCHEDULE/LAST RUN, а строка их не несла).
-pub(crate) fn format_cron_table(rows: &[syt::SyTask]) -> String {
-    let mut out = format!(
-        "{:<10} {:<12} {:<28} {:<14} LAST RUN\n",
-        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE"
-    );
-    for r in rows {
-        out.push_str(&format!(
-            "{:<10} {:<12} {:<28} {:<14} {}\n",
-            r.status,
-            &r.item_id[..r.item_id.len().min(12)],
-            truncate(&r.title, 26),
-            truncate(&r.schedule, 13),
-            r.last_run
-        ));
-    }
-    out
-}
-
-async fn cron_set_status(
-    sy: &SiYuan,
-    id: &str,
-    status: &str,
-    verb: &str,
-    project: &str,
-) -> Result<()> {
-    let board = syt::find_board_cron(sy, project).await?;
-    let task = syt::resolve(sy, &board, id).await?;
-    let key = syt::status_key(sy, &board.av_id).await?;
-    sy.db_item_set_status(&board.av_id, &key, &task.item_id, status)
-        .await?;
-    println!("крон {verb}: {}", task.title);
-    Ok(())
-}
-
 /// Текстовые клетки по именам колонок. Отсутствующая колонка — ошибка:
-/// тихий скип оставлял строки без Schedule — демон не видел расписание
-/// (репро 04.11, задача 20261104220156).
+/// тихий скип маскировал незаписанную ячейку (репро 04.11, задача 20261104220156).
 async fn set_text_cells(sy: &SiYuan, av: &str, item: &str, cells: &[(&str, &str)]) -> Result<()> {
     let keys = syt::board_keys(sy, av).await?;
     for (name, value) in cells {
@@ -987,25 +924,6 @@ async fn set_text_cells(sy: &SiYuan, av: &str, item: &str, cells: &[(&str, &str)
         write_text_cell(sy, av, key, item, value).await?;
     }
     Ok(())
-}
-
-fn cron_schedule(
-    in_: &Option<String>,
-    every: &Option<String>,
-    at: &Option<String>,
-    expr: &Option<String>,
-) -> Result<String> {
-    let opts = [
-        in_.as_deref(),
-        every.as_deref(),
-        at.as_deref(),
-        expr.as_deref(),
-    ];
-    let n = opts.iter().filter(|o| o.is_some()).count();
-    if n != 1 {
-        anyhow::bail!("нужен ровно один из --in / --every / --at / --cron (получено {n})");
-    }
-    Ok(opts.into_iter().flatten().next().unwrap().to_string())
 }
 
 // ——— docs/search/blob/projects ———
@@ -2875,8 +2793,6 @@ mod tests {
             status: String::new(),
             branch: String::new(),
             pr: String::new(),
-            schedule: String::new(),
-            last_run: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
     }
@@ -3266,6 +3182,7 @@ mod tests {
                 r#type: None,
                 stdin: false,
                 attach: attach.to_vec(),
+                schedule: None,
                 dry_run: false,
             },
         )

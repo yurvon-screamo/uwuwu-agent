@@ -8,6 +8,7 @@ pub mod cmd;
 pub mod markdown;
 pub mod md_heading;
 pub mod path;
+pub mod schedule;
 pub mod semantic;
 pub mod siyuan;
 pub mod siyuan_id;

@@ -122,14 +122,25 @@ fn clean_ids_value_parses_with_hyphen_leading_fragments() {
 }
 
 #[test]
-fn cron_pause_hyphen_leading_id_parses() {
-    let Commands::Cron { command } = parse_command(&["cron", "pause", "-abc123"]).unwrap() else {
-        panic!("expected cron subcommand");
+fn cron_list_project_flag_parses() {
+    let Commands::Cron {
+        command: super::cli::CronSub::List { project },
+    } = parse_command(&["cron", "list", "--project", "origa"]).unwrap()
+    else {
+        panic!("expected cron list");
     };
-    match command {
-        super::cli::CronSub::Pause { id, .. } => assert_eq!(id, "-abc123"),
-        _other => panic!("expected cron pause"),
-    }
+    assert_eq!(project.as_deref(), Some("origa"));
+}
+
+#[test]
+fn cron_list_defaults_to_uwuwu() {
+    let Commands::Cron {
+        command: super::cli::CronSub::List { project },
+    } = parse_command(&["cron", "list"]).unwrap()
+    else {
+        panic!("expected cron list");
+    };
+    assert!(project.is_none(), "дефолт — uwuwu");
 }
 
 fn expect_undo(command: Commands) -> (Option<String>, bool) {

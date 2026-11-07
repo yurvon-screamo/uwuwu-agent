@@ -1,17 +1,15 @@
-//! Фоллбек task-команд на крон-доски (задача 20261104231734): резолв по
-//! доскам «Задачи <proj>» → «Кроны <proj>» → чужие «Кроны %» на wiremock-ядре.
+//! Резолв task-команд только по доске задач (задача 20261106182051-o5ejlte):
+//! крон-доски сняты (унификация кронов с задачами) — фоллбек «Задачи <proj>»
+//! → «Кроны <proj>» → чужие «Кроны %» выпилен. Мок-ядро держит легаси
+//! крон-доску намеренно: тесты доказывают, что она больше не обыскивается.
 //!
-//! Сценарии плана (раунд 2):
-//! 1. get точного id крона — фоллбек на «Кроны uwuwu» (+ render крон-доски)
-//! 2. comment кладёт коммент в «## Комменты» тела крона
-//! 3. полный промах — ошибка перечисляет все обысканные доски
-//! 4. кросс-проект: строка «Кроны 1xgames» находится с --project uwuwu
-//! 5. точный id задачи на «Задачи» — без захода на крон-доску (фаза A, ранний возврат)
-//! 6. одинаковый тайтл на двух чужих крон-досках — громкая ошибка со списком
-//! 7. Ambiguous на «Задачи» + Found на кронах — громкая раскладка, не тихий выбор
-//! 8. полный id крона бьёт префикс-коллизию (same-minute задача); минутный
-//!    префикс, матчащий обе доски — громкая ошибка
-//! 9. сбой SQL ядра — громкая ошибка, не «не найдена»
+//! Сценарии:
+//! 1. get точного id задачи — резолв по «Задачи», крон-доска не читается
+//! 2. строка только на легаси крон-доске — НЕ находится (ошибка называет «Задачи»)
+//! 3. полный промах — ошибка перечисляет только доску задач
+//! 4. неоднозначный префикс на «Задачи» — громкая раскладка без крон-досок
+//! 5. доска «Задачи» отсутствует (крон-доска есть) — отказ «доска не найдена»
+//! 6. сбой SQL ядра — громкая ошибка, не «не найдена»
 
 use crate::cmd::cli::TaskSub;
 use crate::cmd::sy_dispatch::task_run;
@@ -23,22 +21,18 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const NB: &str = "nb-projects";
 
-/// Доски мок-ядра: doc → (av, av-носитель), av → строки.
+/// Доски мок-ядра: doc → (av, av-носитель). CRON_* — легаси-доска для
+/// негативных тестов (в воркспейсе до сноса).
 const TASKS_DOC: &str = "t-doc";
 const TASKS_AV: &str = "av-t";
 const CRON_DOC: &str = "k-doc";
 const CRON_AV: &str = "av-k";
-const K1_DOC: &str = "k1-doc";
-const K1_AV: &str = "av-k1";
-const K2_DOC: &str = "k2-doc";
-const K2_AV: &str = "av-k2";
 
 struct Row {
     item: &'static str,
     title: &'static str,
     status: &'static str,
     doc: Option<&'static str>,
-    schedule: &'static str,
 }
 
 const TASKS_ROWS: &[Row] = &[
@@ -47,79 +41,33 @@ const TASKS_ROWS: &[Row] = &[
         title: "обычная задача",
         status: "In Progress",
         doc: Some("20261105000001-tbodyx1"),
-        schedule: "",
     },
     Row {
         item: "item-alpha1",
         title: "Alpha task",
         status: "Todo",
         doc: None,
-        schedule: "",
     },
     Row {
         item: "item-alpha2",
         title: "Alpha second",
         status: "Todo",
         doc: None,
-        schedule: "",
     },
 ];
 
-const CRON_ROWS: &[Row] = &[
-    Row {
-        item: "20261105100000-kcron1",
-        title: "крон задач",
-        status: "fired",
-        doc: Some("20261105000002-kbodyx2"),
-        schedule: "*/5 * * * *",
-    },
-    Row {
-        item: "item-kcron2",
-        title: "другой крон",
-        status: "active",
-        doc: Some("20261105000003-kbodyx3"),
-        schedule: "1d",
-    },
-    Row {
-        item: "item-kalpha",
-        title: "Alpha cron",
-        status: "active",
-        doc: None,
-        schedule: "",
-    },
-];
-
-const K1_ROWS: &[Row] = &[
-    Row {
-        item: "20261104120000-kxgame",
-        title: "чужой крон",
-        status: "active",
-        doc: None,
-        schedule: "",
-    },
-    Row {
-        item: "20261104120000-kxdup1",
-        title: "Дубль-тайтл",
-        status: "active",
-        doc: None,
-        schedule: "",
-    },
-];
-
-const K2_ROWS: &[Row] = &[Row {
-    item: "20261104130000-kodup1",
-    title: "Дубль-тайтл",
-    status: "active",
-    doc: None,
-    schedule: "",
+const CRON_ROWS: &[Row] = &[Row {
+    item: "20261105100000-kcron1",
+    title: "легаси крон",
+    status: "fired",
+    doc: Some("20261105000002-kbodyx2"),
 }];
 
 fn rows_for_av(av: &str) -> &'static [Row] {
-    match av {
-        TASKS_AV => TASKS_ROWS,
-        CRON_AV => CRON_ROWS,
-        K1_AV => K1_ROWS,
-        _ => K2_ROWS,
+    if av == TASKS_AV {
+        TASKS_ROWS
+    } else {
+        CRON_ROWS
     }
 }
 
@@ -165,26 +113,18 @@ fn render_row(row: &Row) -> serde_json::Value {
     if let Some(doc) = row.doc {
         block["id"] = serde_json::json!(doc);
     }
-    let mut cells = vec![
+    let cells = vec![
         serde_json::json!({ "value": { "keyID": "key-title", "type": "block", "block": block } }),
         serde_json::json!({ "value": { "keyID": "key-status", "type": "mSelect", "mSelect": [{ "content": row.status }] } }),
     ];
-    if !row.schedule.is_empty() {
-        cells.push(serde_json::json!({
-            "value": { "keyID": "key-schedule", "type": "text", "text": { "content": row.schedule } }
-        }));
-    }
     serde_json::json!({ "id": row.item, "cells": cells })
 }
 
 fn render_view(av: &str) -> serde_json::Value {
-    let mut columns = vec![
+    let columns = vec![
         serde_json::json!({ "id": "key-title", "name": "Primary Key" }),
         serde_json::json!({ "id": "key-status", "name": "Status" }),
     ];
-    if av != TASKS_AV {
-        columns.push(serde_json::json!({ "id": "key-schedule", "name": "Schedule" }));
-    }
     let rows: Vec<serde_json::Value> = rows_for_av(av).iter().map(render_row).collect();
     let count = rows.len();
     serde_json::json!({ "action": "render", "data": { "view": { "columns": columns, "rowCount": count, "rows": rows } } })
@@ -200,21 +140,18 @@ fn mcp_text(payload: serde_json::Value) -> ResponseTemplate {
     )
 }
 
-/// id дока → doc-id-цепочка для getIDsByHPath: доски по точному пути,
-/// тела кронов — как саб-доки крон-доски.
+/// id дока → doc-id-цепочка для getIDsByHPath: обе доски существуют
+/// (легаси-воркспейс до сноса крон-досок).
 fn doc_ids_by_path(p: &str) -> Vec<&'static str> {
     match p {
         "/uwuwu/Задачи uwuwu" => vec![TASKS_DOC],
         "/uwuwu/Кроны uwuwu" => vec![CRON_DOC],
-        "/1xgames/Кроны 1xgames" => vec![K1_DOC],
-        "/origa/Кроны origa" => vec![K2_DOC],
-        p if p.starts_with("/uwuwu/Кроны uwuwu/") => vec!["k-doc-body"],
         _ => vec![],
     }
 }
 
 async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
-    // — REST: SQL-роутер (av-носители, дискавери крон-досок, саб-доки) —
+    // — REST: SQL-роутер (av-носители) —
     Mock::given(method("POST"))
         .and(path("/api/query/sql"))
         .respond_with({
@@ -226,18 +163,14 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 }
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
-                let data = if stmt.contains("content like 'Кроны %'") {
-                    serde_json::json!([
-                        { "id": K1_DOC, "hpath": "/1xgames/Кроны 1xgames" },
-                        { "id": K2_DOC, "hpath": "/origa/Кроны origa" },
-                        { "id": CRON_DOC, "hpath": "/uwuwu/Кроны uwuwu" },
-                    ])
-                } else if let Some(root) = stmt.split("root_id='").nth(1).map(|s| s.split('\'').next().unwrap_or("")) {
+                let data = if let Some(root) = stmt
+                    .split("root_id='")
+                    .nth(1)
+                    .map(|s| s.split('\'').next().unwrap_or(""))
+                {
                     let (doc, av) = match root {
                         TASKS_DOC => (TASKS_DOC, TASKS_AV),
                         CRON_DOC => (CRON_DOC, CRON_AV),
-                        K1_DOC => (K1_DOC, K1_AV),
-                        K2_DOC => (K2_DOC, K2_AV),
                         _ => ("", ""),
                     };
                     if doc.is_empty() {
@@ -300,20 +233,17 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
         .respond_with({
             let kernel = kernel.clone();
             move |req: &Request| {
-                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let data = body
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                kernel.appends.lock().unwrap().push(data);
-                ResponseTemplate::new(200).set_body_string(r#"{"code":0,"data":null}"#)
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                kernel.appends.lock().unwrap().push(body);
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "code": 0, "data": { "doNotify": true } }).to_string(),
+                )
             }
         })
         .mount(server)
         .await;
 
-    // — MCP: initialize + database render/keys/item_update + block get —
+    // — MCP: render досок —
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .respond_with({
@@ -330,52 +260,13 @@ async fn mount_kernel(server: &MockServer, kernel: &Arc<Kernel>) {
                 if body.contains("notifications/initialized") {
                     return ResponseTemplate::new(200);
                 }
-                if !body.contains("tools/call") {
-                    return ResponseTemplate::new(200)
-                        .set_body_string(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#);
-                }
                 let parsed: serde_json::Value = body.parse().unwrap_or_default();
                 let args = parsed.pointer("/params/arguments").cloned().unwrap_or_default();
                 let action = args.get("action").and_then(|a| a.as_str()).unwrap_or("");
-                if body.contains("\"database\"") && action == "render" {
-                    let av = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if !rows_for_av(av).is_empty() {
-                        *kernel.render_calls.lock().unwrap().entry(av.to_string()).or_insert(0) += 1;
-                        return mcp_text(render_view(av));
-                    }
-                    return mcp_text(serde_json::json!({ "action": "render", "data": { "view": { "columns": [], "rowCount": 0, "rows": [] } } }));
-                }
-                if body.contains("\"database\"") && action == "keys" {
-                    let av = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let mut keys = vec![
-                        serde_json::json!({ "id": "key-title", "name": "Primary Key" }),
-                        serde_json::json!({ "id": "key-status", "name": "Status" }),
-                    ];
-                    if av == TASKS_AV {
-                        keys.push(serde_json::json!({ "id": "key-branch", "name": "Branch" }));
-                        keys.push(serde_json::json!({ "id": "key-pr", "name": "PR" }));
-                    } else {
-                        keys.push(serde_json::json!({ "id": "key-schedule", "name": "Schedule" }));
-                        keys.push(serde_json::json!({ "id": "key-lastrun", "name": "Last Run" }));
-                    }
-                    return mcp_text(serde_json::json!({ "action": "keys", "data": { "keys": keys } }));
-                }
-                if body.contains("\"database\"") && action == "item_update" {
-                    let av = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let item = args.get("itemID").and_then(|v| v.as_str()).unwrap_or("");
-                    let key = args.get("keyID").and_then(|v| v.as_str()).unwrap_or("");
-                    kernel.item_updates.lock().unwrap().push((av.to_string(), key.to_string(), item.to_string()));
-                    return mcp_text(serde_json::json!({ "action": "item_update", "data": null }));
-                }
-                if body.contains("\"block\"") && action == "get" {
-                    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    return ResponseTemplate::new(200).set_body_string(
-                        serde_json::json!({
-                            "jsonrpc": "2.0", "id": 2,
-                            "result": { "content": [{ "type": "text", "text": format!("ID: {id}\nType: NodeDocument\n") }] }
-                        })
-                        .to_string(),
-                    );
+                if action == "render" {
+                    let av = args.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    *kernel.render_calls.lock().unwrap().entry(av.clone()).or_insert(0) += 1;
+                    return mcp_text(render_view(&av));
                 }
                 mcp_text(serde_json::json!({ "action": "unknown", "data": null }))
             }
@@ -389,124 +280,10 @@ fn set_env(server: &MockServer) {
     std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
 }
 
-/// (1) get точного id крона: фоллбек на «Кроны uwuwu» (render крон-доски случился).
+/// (1) get по точному id задачи — резолв по «Задачи»; крон-доска не читается.
 #[tokio::test]
 #[serial_test::serial]
-async fn get_resolves_cron_row_via_fallback() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    task_run(
-        "uwuwu",
-        TaskSub::Get {
-            id: "20261105100000-kcron1".into(),
-            no_body: true,
-        },
-    )
-    .await
-    .expect("крон-строка резолвится через фоллбек");
-
-    assert!(kernel.render_count(CRON_AV) >= 1, "крон-доска опрошена");
-}
-
-/// (2) comment крон-строке: секция «Комменты» создаётся, коммент кладётся в тело.
-#[tokio::test]
-#[serial_test::serial]
-async fn comment_lands_in_cron_body_comments_section() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    task_run(
-        "uwuwu",
-        TaskSub::Comment {
-            id: "item-kcron2".into(),
-            reply: None,
-            stdin: false,
-            text: vec!["отчёт: ok".into()],
-        },
-    )
-    .await
-    .expect("коммент крон-строке уходит");
-
-    let appends = kernel.appends_snapshot();
-    assert!(
-        appends.iter().any(|a| a.contains("## Комменты")),
-        "секция Комменты создана: {appends:?}"
-    );
-    assert!(
-        appends
-            .iter()
-            .any(|a| a.contains("**AGENTS**") && a.contains("отчёт: ok")),
-        "коммент в теле крона: {appends:?}"
-    );
-}
-
-/// (3) полный промах: ошибка перечисляет все обысканные доски.
-#[tokio::test]
-#[serial_test::serial]
-async fn full_miss_lists_all_searched_boards() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    let err = task_run(
-        "uwuwu",
-        TaskSub::Get {
-            id: "совсем нет".into(),
-            no_body: true,
-        },
-    )
-    .await
-    .expect_err("полный промах — ошибка");
-
-    let msg = err.to_string();
-    for board in [
-        "/uwuwu/Задачи uwuwu",
-        "/uwuwu/Кроны uwuwu",
-        "/1xgames/Кроны 1xgames",
-        "/origa/Кроны origa",
-    ] {
-        assert!(
-            msg.contains(board),
-            "обысканная доска названа ({board}): {msg}"
-        );
-    }
-}
-
-/// (4) кросс-проект: строка «Кроны 1xgames» находится с --project uwuwu.
-#[tokio::test]
-#[serial_test::serial]
-async fn cross_project_cron_row_found_from_other_project() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    task_run(
-        "uwuwu",
-        TaskSub::Get {
-            id: "20261104120000-kxgame".into(),
-            no_body: true,
-        },
-    )
-    .await
-    .expect("чужая крон-строка находится по контракту «всех проектов»");
-
-    assert!(
-        kernel.render_count(K1_AV) >= 1,
-        "крон-доска 1xgames опрошена"
-    );
-}
-
-/// (5) точный id задачи на «Задачи»: фаза A возвращает сразу, крон-доска не читается.
-#[tokio::test]
-#[serial_test::serial]
-async fn exact_task_id_on_tasks_board_wins_without_cron_reads() {
+async fn get_resolves_on_tasks_board_without_cron_reads() {
     let kernel = Kernel::new();
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
@@ -522,22 +299,22 @@ async fn exact_task_id_on_tasks_board_wins_without_cron_reads() {
     .await
     .expect("задача резолвится штатно");
 
-    assert_eq!(
-        kernel.render_count(TASKS_AV),
-        1,
-        "задачная доска прочитана один раз"
+    assert!(
+        kernel.render_count(TASKS_AV) > 0,
+        "доска задач прочитана"
     );
     assert_eq!(
         kernel.render_count(CRON_AV),
         0,
-        "крон-доска не читается (ранний возврат фазы A)"
+        "легаси крон-доска не обыскивается"
     );
 }
 
-/// (6) одинаковый тайтл на двух чужих крон-досках — громкая ошибка со списком.
+/// (2) Строка только на легаси крон-доске — НЕ находится: ошибка называет
+/// доску задач (крон-строки мертвы вместе с контуром).
 #[tokio::test]
 #[serial_test::serial]
-async fn same_title_on_two_foreign_cron_boards_is_a_loud_error() {
+async fn cron_board_row_is_not_resolved_anymore() {
     let kernel = Kernel::new();
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
@@ -546,89 +323,30 @@ async fn same_title_on_two_foreign_cron_boards_is_a_loud_error() {
     let err = task_run(
         "uwuwu",
         TaskSub::Get {
-            id: "Дубль-тайтл".into(),
-            no_body: true,
-        },
-    )
-    .await
-    .expect_err("неоднозначность между чужими досками — ошибка");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("/1xgames/Кроны 1xgames"),
-        "доска 1xgames названа: {msg}"
-    );
-    assert!(
-        msg.contains("/origa/Кроны origa"),
-        "доска origa названа: {msg}"
-    );
-}
-
-/// (7) Ambiguous на «Задачи» + единственный Found на кронах — громкая раскладка.
-#[tokio::test]
-#[serial_test::serial]
-async fn ambiguous_on_tasks_plus_found_on_cron_is_loud_not_silent() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    let err = task_run(
-        "uwuwu",
-        TaskSub::Get {
-            id: "Alpha".into(),
-            no_body: true,
-        },
-    )
-    .await
-    .expect_err("неоднозначный матч не уходит в тихий выбор доски");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Задачи uwuwu"),
-        "задачная доска с Ambiguous названа: {msg}"
-    );
-    assert!(
-        msg.contains("Кроны uwuwu"),
-        "крон-доска с Found названа: {msg}"
-    );
-}
-
-/// (8а) полный id крона побеждает same-minute префикс-коллизию на «Задачи».
-#[tokio::test]
-#[serial_test::serial]
-async fn full_cron_row_id_beats_prefix_collision_on_tasks_board() {
-    let kernel = Kernel::new();
-    let server = MockServer::start().await;
-    mount_kernel(&server, &kernel).await;
-    set_env(&server);
-
-    task_run(
-        "uwuwu",
-        TaskSub::Edit {
             id: "20261105100000-kcron1".into(),
-            status: Some("Review".into()),
-            title: None,
-            pr: None,
-            branch: None,
+            no_body: true,
         },
     )
     .await
-    .expect("edit по полному id крона уходит на крон-строку");
+    .expect_err("крон-строка больше не резолвится");
 
-    let updates = kernel.updates_snapshot();
+    let msg = err.to_string();
+    assert!(msg.contains("не найдена"), "честный промах: {msg}");
     assert!(
-        updates
-            .iter()
-            .any(|(av, _, item)| av == CRON_AV && item == "20261105100000-kcron1"),
-        "статус выставлен крон-строке, не same-minute задаче: {updates:?}"
+        msg.contains("Задачи uwuwu"),
+        "обыскана только доска задач: {msg}"
+    );
+    assert_eq!(
+        kernel.appends_snapshot().len(),
+        0,
+        "никаких записей по промаху"
     );
 }
 
-/// (8б) минутный префикс, матчащий обе доски, — громкая ошибка, не тихий wrong-target.
+/// (3) Полный промах — ошибка перечисляет только доску задач.
 #[tokio::test]
 #[serial_test::serial]
-async fn minute_prefix_matching_both_boards_is_a_loud_error() {
+async fn full_miss_lists_only_tasks_board() {
     let kernel = Kernel::new();
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
@@ -637,22 +355,76 @@ async fn minute_prefix_matching_both_boards_is_a_loud_error() {
     let err = task_run(
         "uwuwu",
         TaskSub::Get {
-            id: "20261105100000".into(),
+            id: "20261199999999-none".into(),
             no_body: true,
         },
     )
     .await
-    .expect_err("префикс двух досок обязан ошибиться громко");
+    .expect_err("полный промах");
+
+    let msg = err.to_string();
+    assert!(msg.contains("Задачи uwuwu"), "обысканная доска в ошибке: {msg}");
+    assert!(!msg.contains("Кроны"), "крон-доски в обыске не участвуют: {msg}");
+}
+
+/// (4) Неоднозначный префикс на «Задачи» — громкая раскладка; крон-доски
+/// в раскладке не фигурируют.
+#[tokio::test]
+#[serial_test::serial]
+async fn ambiguous_prefix_is_loud_without_cron_boards() {
+    let kernel = Kernel::new();
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "item-alpha".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("двусмысленный префикс");
+
+    let msg = err.to_string();
+    assert!(msg.contains("неоднозначно"), "раскладка: {msg}");
+    assert!(!msg.contains("Кроны"), "крон-досок в обыске нет: {msg}");
+}
+
+/// (5) Доска «Задачи» отсутствует (легаси крон-доска есть) — отказ
+/// «доска не найдена», фоллбека на кроны нет.
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_tasks_board_bails_even_with_cron_board_present() {
+    let kernel = Kernel::new();
+    let server = MockServer::start().await;
+    mount_kernel(&server, &kernel).await;
+    set_env(&server);
+
+    let err = task_run(
+        "origa",
+        TaskSub::Get {
+            id: "20261105100000-ttask1".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect_err("доски задач origa нет");
 
     let msg = err.to_string();
     assert!(
-        msg.contains("Задачи uwuwu"),
-        "задачная доска названа: {msg}"
+        msg.contains("Задачи origa") && msg.contains("не найдена"),
+        "отказ называет отсутствующую доску: {msg}"
     );
-    assert!(msg.contains("Кроны uwuwu"), "крон-доска названа: {msg}");
+    assert_eq!(
+        kernel.render_count(CRON_AV),
+        0,
+        "крон-доска не подменяет доску задач"
+    );
 }
 
-/// (9) сбой SQL ядра — громкая ошибка, не «не найдена» (таксономия ошибок).
+/// (6) Сбой SQL ядра — громкая ошибка, не «не найдена».
 #[tokio::test]
 #[serial_test::serial]
 async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
@@ -665,20 +437,15 @@ async fn kernel_sql_failure_is_loud_not_reported_as_not_found() {
     let err = task_run(
         "uwuwu",
         TaskSub::Get {
-            id: "что угодно".into(),
+            id: "20261105100000-ttask1".into(),
             no_body: true,
         },
     )
     .await
-    .expect_err("инфра-сбой не маскируется под «не найдена»");
+    .expect_err("сбой ядра — отказ");
 
-    let msg = err.to_string();
     assert!(
-        msg.contains("POST /api/query/sql"),
-        "инфра-сбой назван: {msg}"
-    );
-    assert!(
-        !msg.contains("не найдена"),
-        "нет маскировки под промах: {msg}"
+        !err.to_string().contains("не найдена"),
+        "инфра-сбой не маскируется промахом: {err}"
     );
 }
