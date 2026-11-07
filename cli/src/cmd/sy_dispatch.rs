@@ -1566,7 +1566,7 @@ async fn write_body_in_place(
             carry_over_comments_section(doc_title, &existing, &inline)?
         }
     };
-    sy.overwrite_doc_md(doc_id, &new_md).await
+    sy.overwrite_doc_md(doc_id, doc_title, &new_md).await
 }
 
 /// append-путь с фенсами: именованные — block-хирургия в доке (адресация

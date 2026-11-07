@@ -49,8 +49,6 @@ impl MockRow {
         self
     }
 
-
-
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
     fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
@@ -106,6 +104,13 @@ pub(crate) struct MockScenario {
     /// HTTP-статус appendBlock: 200; 500 — применённый блок при lost_response
     /// либо честный сбой (в паре с append_applies).
     pub(crate) append_status: u16,
+    /// Первые N appendBlock POST отвечают 500 без применения (одноразовый
+    /// отказ записи: последующие POST проходят штатно).
+    pub(crate) append_fail_posts: usize,
+    /// Первые N deleteBlock POST отвечают 500 (одноразовый отказ удаления).
+    pub(crate) delete_fail_posts: usize,
+    /// exportMdContent отвечает 500 (сбой чтения пре-имиджа overwrite).
+    pub(crate) export_fail: bool,
     /// Состояние доков (docId → блоки): seed + применённые append-ы;
     /// export отдаёт join.
     pub(crate) doc_blocks: Vec<(&'static str, Vec<String>)>,
@@ -153,6 +158,9 @@ impl Default for MockScenario {
             item_add_replies: Vec::new(),
             append_applies: false,
             append_status: 200,
+            append_fail_posts: 0,
+            delete_fail_posts: 0,
+            export_fail: false,
             doc_blocks: Vec::new(),
             exports: Vec::new(),
             get_children_seq: vec![String::new()],
@@ -182,6 +190,8 @@ pub(crate) struct MockKernel {
     created_docs: Mutex<Vec<(String, String)>>,
     appends: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
+    append_posts: AtomicUsize,
+    delete_posts: AtomicUsize,
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
@@ -192,12 +202,7 @@ pub(crate) struct MockKernel {
 impl MockKernel {
     fn new(sc: MockScenario) -> Self {
         Self {
-            replies: Mutex::new(
-                sc.item_add_replies
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
+            replies: Mutex::new(sc.item_add_replies.iter().map(|s| s.to_string()).collect()),
             children: Mutex::new(sc.get_children_seq.clone()),
             doc_blocks: Mutex::new(
                 sc.doc_blocks
@@ -216,6 +221,8 @@ impl MockKernel {
             created_docs: Mutex::new(Vec::new()),
             appends: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            append_posts: AtomicUsize::new(0),
+            delete_posts: AtomicUsize::new(0),
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
@@ -309,7 +316,9 @@ impl MockKernel {
             .respond_with({
                 let nb = self.sc.notebook;
                 move |_: &Request| {
-                    rest_ok(json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }))
+                    rest_ok(
+                        json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }),
+                    )
                 }
             })
             .mount(server)
@@ -384,6 +393,9 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if kernel.sc.export_fail {
+                        return ResponseTemplate::new(500);
+                    }
                     let content = {
                         let blocks = kernel.doc_blocks.lock().unwrap();
                         match blocks.get(id) {
@@ -411,6 +423,10 @@ impl MockKernel {
                 move |req: &Request| {
                     let raw = String::from_utf8_lossy(&req.body).to_string();
                     let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+                    let post_no = kernel.append_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.append_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.appends.lock().unwrap().push(raw);
                     if kernel.sc.append_applies {
                         let doc = parsed
@@ -453,6 +469,10 @@ impl MockKernel {
                         .and_then(|i| i.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let post_no = kernel.delete_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.delete_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.deletes.lock().unwrap().push(id);
                     rest_ok(json!(null))
                 }
@@ -545,10 +565,8 @@ impl MockKernel {
                         .map(|(_, a)| a.clone());
                     match attrs {
                         Some(attrs) => {
-                            let map: serde_json::Map<String, Value> = attrs
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json!(v)))
-                                .collect();
+                            let map: serde_json::Map<String, Value> =
+                                attrs.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                             rest_ok(Value::Object(map))
                         }
                         None => ResponseTemplate::new(200).set_body_string(
@@ -573,9 +591,8 @@ impl MockKernel {
                         .unwrap_or("")
                         .to_string();
                     let attrs = body.get("attrs").cloned().unwrap_or_default();
-                    if let Some((name, value)) = attrs
-                        .as_object()
-                        .and_then(|m| m.into_iter().next())
+                    if let Some((name, value)) =
+                        attrs.as_object().and_then(|m| m.into_iter().next())
                     {
                         kernel.attr_writes.lock().unwrap().push((
                             id,
@@ -762,9 +779,7 @@ impl MockKernel {
         if q.len() > 1 {
             q.remove(0)
         } else {
-            q.last()
-                .cloned()
-                .unwrap_or_else(|| "item-mock".to_string())
+            q.last().cloned().unwrap_or_else(|| "item-mock".to_string())
         }
     }
 
@@ -789,7 +804,10 @@ impl MockKernel {
                 .unwrap_or(&self.sc.inserted_row.title)
                 .to_string();
             rows.push(MockRow {
-                doc: args.get("blockID").and_then(|b| b.as_str()).map(String::from),
+                doc: args
+                    .get("blockID")
+                    .and_then(|b| b.as_str())
+                    .map(String::from),
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),

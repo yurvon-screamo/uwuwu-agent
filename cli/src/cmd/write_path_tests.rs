@@ -80,16 +80,8 @@ async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
         .await
         .expect("ретрай перепривязывает сироту");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        0,
-        "новый док не минтится"
-    );
-    assert_eq!(
-        kernel.item_add_count(),
-        1,
-        "одна вставка строки"
-    );
+    assert_eq!(kernel.created_docs().len(), 0, "новый док не минтится");
+    assert_eq!(kernel.item_add_count(), 1, "одна вставка строки");
     let args = kernel.item_add_args();
     assert!(
         args[0].get("blockID").and_then(|b| b.as_str()) == Some(ORPHAN_DOC),
@@ -116,16 +108,8 @@ async fn create_retries_row_insert_once_when_render_lags() {
         .await
         .expect("ретрай доводит строку до render");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        1,
-        "тело создаётся один раз"
-    );
-    assert_eq!(
-        kernel.item_add_count(),
-        2,
-        "item_add + ретрай"
-    );
+    assert_eq!(kernel.created_docs().len(), 1, "тело создаётся один раз");
+    assert_eq!(kernel.item_add_count(), 2, "item_add + ретрай");
     assert_eq!(
         kernel.item_updates().len(),
         2,
@@ -178,11 +162,7 @@ async fn create_bails_loudly_when_row_missing_after_retry() {
         err.to_string().contains("после вставки и ретрая"),
         "суть отказа: {err}"
     );
-    assert_eq!(
-        kernel.item_add_count(),
-        2,
-        "ровно ретрай ×1"
-    );
+    assert_eq!(kernel.item_add_count(), 2, "ровно ретрай ×1");
     assert!(
         kernel.appends().is_empty(),
         "тег не пишется в неподтверждённую задачу"
@@ -250,11 +230,7 @@ async fn body_replace_overwrites_doc_in_place_without_recreating() {
         .await
         .expect("replace проходит");
 
-    assert_eq!(
-        kernel.created_docs().len(),
-        0,
-        "док не пересоздаётся"
-    );
+    assert_eq!(kernel.created_docs().len(), 0, "док не пересоздаётся");
     let deletes = kernel.deletes();
     assert_eq!(*deletes, vec![OLD_BLOCK.to_string()], "старый блок удалён");
     let appends = kernel.appends();
@@ -334,6 +310,98 @@ async fn body_replace_section_strips_title_h1_from_content() {
     );
 }
 
+/// Сбой append после очистки: новый контент не записался → авто-откат
+/// возвращает пре-имидж, команда падает честно, контент не потерян.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_append_failure_restores_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.append_fail_posts = 1;
+    scenario.append_applies = true;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат репортится в ошибке: {err:#}"
+    );
+    let appends = kernel.appends();
+    assert_eq!(
+        appends.len(),
+        1,
+        "ровно восстановительный append (отказавший POST не в логе): {appends:?}"
+    );
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
+    );
+}
+
+/// Сбой delete в середине очистки (одноразовый latched отказ: первые 4 POST
+/// = первый delete_block со всеми ретраями) → авто-откат дочищает и
+/// возвращает пре-имидж.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_delete_failure_restores_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.append_applies = true;
+    scenario.delete_fail_posts = 4;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой очистки — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат репортится в ошибке: {err:#}"
+    );
+    let appends = kernel.appends();
+    assert_eq!(
+        appends.len(),
+        1,
+        "ровно восстановительный append: {appends:?}"
+    );
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
+    );
+}
+
+/// Сбой экспорта пре-имиджа: мутации отменены до очистки — док нетронут,
+/// сбой чтения не читается как «док был пуст» (класс PR #132).
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_export_failure_aborts_before_mutation() {
+    let mut scenario = body_scenario(true);
+    scenario.export_fail = true;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой чтения пре-имиджа — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("пре-имидж"),
+        "отказ указывает на пре-имидж: {err:#}"
+    );
+    assert!(
+        kernel.deletes().is_empty(),
+        "очистка не началась: {:?}",
+        kernel.deletes()
+    );
+    assert!(
+        kernel.appends().is_empty(),
+        "записей нет: {:?}",
+        kernel.appends()
+    );
+}
+
 /// Поле data из захваченного тела appendBlock (JSON-конверт) — для
 /// построчных ассертов по записанному markdown (сабстринг-поиск по JSON
 /// с экранированными \n хрупок).
@@ -383,10 +451,7 @@ fn comment_scenario(blocks: &[&str], apply: bool, lost: bool) -> MockScenario {
     MockScenario {
         append_applies: apply || lost,
         append_status: if apply { 200 } else { 500 },
-        doc_blocks: vec![(
-            BOUND_DOC,
-            blocks.iter().map(|s| s.to_string()).collect(),
-        )],
+        doc_blocks: vec![(BOUND_DOC, blocks.iter().map(|s| s.to_string()).collect())],
         ..MockScenario::default()
     }
 }
