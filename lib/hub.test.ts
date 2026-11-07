@@ -515,14 +515,16 @@ test("silenceCheck: порог достигнут — алерт, окно сд�
 })
 
 test("silenceCheck: недоставленный алерт ретраится не чаще окна (метка продолжает стареть)", () => {
-  // Arrange: первый алерт на пороге, ТГ лежит — выхода нет, тишина растёт
-  const first = silenceCheck(0, { nextAlertAt: 0 }, DAY_MS, DAY_MS)
+  // первый алерт на пороге, ТГ лежит — выхода нет, тишина растёт;
+  // окно ретрая инъектируемое (silenceAlertRetryMs профиля), дефолт — константа
+  const first = silenceCheck(0, { nextAlertAt: 0 }, DAY_MS, DAY_MS, 1_000)
   expect(first.alert).toBe(true)
-  // Act/Assert: повтор внутри окна задушен
-  const retry = silenceCheck(0, first.gate, DAY_MS + SILENCE_ALERT_RETRY_MS - 1, DAY_MS)
+  expect(first.gate.nextAlertAt).toBe(DAY_MS + 1_000)
+  // повтор внутри окна задушен
+  const retry = silenceCheck(0, first.gate, DAY_MS + 1_000 - 1, DAY_MS, 1_000)
   expect(retry.alert).toBe(false)
   // после окна — попытка снова
-  const again = silenceCheck(0, first.gate, DAY_MS + SILENCE_ALERT_RETRY_MS, DAY_MS)
+  const again = silenceCheck(0, first.gate, DAY_MS + 1_000, DAY_MS, 1_000)
   expect(again.alert).toBe(true)
 })
 

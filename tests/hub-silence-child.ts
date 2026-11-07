@@ -24,7 +24,8 @@ const profile: HubProfile = {
   tgFormatter: { htmlParts: () => null },
   sources: [],
   silenceTimeoutMs: Number(timeoutMs),
-  silenceTickMs: 500, // инъекция: реальный второй тик в окне теста (дедубль)
+  silenceTickMs: 500, // инъекция: реальный второй тик в окне теста
+  silenceAlertRetryMs: 500, // инъекция: изолированный mark-wiring (см. e2e-тест)
 }
 
 const hub = createHub(profile)

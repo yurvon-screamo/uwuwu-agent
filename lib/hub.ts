@@ -273,17 +273,19 @@ export interface SilenceGate {
 /** Проверка тишины: `alert = (age ≥ timeout) && (now ≥ gate.nextAlertAt)`.
  *  Свежая доставка (метка обновлена) гасит алерт первым условием — повторного
  *  алерта на живом потоке нет; недоставленный алерт метку не трогает, тишина
- *  продолжает расти, окно душит попытки до одной на SILENCE_ALERT_RETRY_MS. */
+ *  продолжает расти, окно душит попытки до одной на retryMs (дефолт —
+ *  SILENCE_ALERT_RETRY_MS; инъекция для e2e — прецедент ADR-061). */
 export function silenceCheck(
   lastDeliveryAt: number,
   gate: SilenceGate,
   now: number,
   timeoutMs: number,
+  retryMs: number = SILENCE_ALERT_RETRY_MS,
 ): { gate: SilenceGate; alert: boolean; ageMs: number } {
   const ageMs = now - lastDeliveryAt
   const alert = ageMs >= timeoutMs && now >= gate.nextAlertAt
   return {
-    gate: alert ? { nextAlertAt: now + SILENCE_ALERT_RETRY_MS } : gate,
+    gate: alert ? { nextAlertAt: now + retryMs } : gate,
     alert,
     ageMs,
   }
@@ -722,6 +724,9 @@ export interface HubProfile {
   /** период тика silenceLoop, ms; дефолт минута. Инъекция для e2e —
    *  прецедент ADR-061 («пейсинг ретраев — инъекция для тестов») */
   silenceTickMs?: number
+  /** окно ретрая недоставленного алерта, ms; дефолт SILENCE_ALERT_RETRY_MS.
+   *  Инъекция для e2e — паритет silenceTickMs */
+  silenceAlertRetryMs?: number
 }
 
 export interface Cfg {
@@ -1658,7 +1663,7 @@ export function createHub(profile: HubProfile): Hub {
     while (true) {
       if (stopping) break
       try {
-        const r = silenceCheck(silenceStamp(), silenceGate, Date.now(), profile.silenceTimeoutMs)
+        const r = silenceCheck(silenceStamp(), silenceGate, Date.now(), profile.silenceTimeoutMs, profile.silenceAlertRetryMs)
         silenceGate = r.gate
         if (r.alert) {
           const h = hoursOf(r.ageMs)
