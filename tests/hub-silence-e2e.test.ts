@@ -129,9 +129,11 @@ describe("hub silence e2e (mock-TG)", () => {
       await new Promise((r) => setTimeout(r, 100))
     }
     const msgs = sentMessages(sentLog).slice(before)
-    expect(msgs.length).toBe(1)
-    expect(msgs[0]!.chat_id).toBe(CHAT_ID)
-    expect(msgs[0]!.text).toContain("тишина выходного потока")
+    if (msgs.length !== 1) throw new Error(`ожидался один алерт, доставлено: ${msgs.length}`)
+    const first = msgs.at(0)
+    if (first === undefined) throw new Error("алерт не доставлен")
+    expect(first.chat_id).toBe(CHAT_ID)
+    expect(first.text).toContain("тишина выходного потока")
     // метка персистится: успешная доставка — выход, state.json уже с ней
     // (follow-up тик не должен задублировать алерт — часы сброшены)
     await new Promise((r) => setTimeout(r, 1_500))
