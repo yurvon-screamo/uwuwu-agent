@@ -279,11 +279,13 @@ async fn search_lines_empty_everywhere_reports_no_hits_and_omits_doc_section() {
 
 #[tokio::test]
 async fn search_lines_propagates_fulltext_fetch_failure() {
-    // Arrange: ядро недоступно (порт закрыт) — мгновенный пейсинг ретраев
-    let server = MockServer::start().await;
-    let uri = server.uri();
-    drop(server);
-    let sy = SiYuan::for_tests(uri);
+    // Arrange: детерминированный мёртвый адрес — порт 1 loopback: refused
+    // мгновенно, непривилегированный тест-процесс привилегированный порт
+    // не займёт. Прежний «drop(wiremock) → мёртвый ephemeral-порт» гонился
+    // с параллельными серверами сьюта: переиспользованный порт отвечал Ok
+    // на «мёртвом» адресе (репро ревью раунда 2 — 5/5 красных полных
+    // прогонов ветки при чистом мастере). Мгновенный пейсинг ретраев.
+    let sy = SiYuan::for_tests("http://127.0.0.1:1".to_string());
 
     // Act
     let result = search_lines(&sy, "ADR-006", 10).await;
