@@ -167,6 +167,47 @@ export function composeDraftPrompt(project: string, rowId: string, title: string
   ].join("\n")
 }
 
+/** Строка доски в статусе Draft (вотчер демона). */
+export interface DraftRow {
+  rowId: string
+  docId: string
+  title: string
+}
+
+/** Синк трекера vs доски: новые sighting'и, смена тайтла, чистка ушедших из
+ *  Draft (вместе со снятием skip). Мутирует state-поля; fresh — готовые
+ *  лог-строки новых sighting'ов (демон отдаёт в hub.log). */
+export function syncDraftTracker(
+  state: Pick<HubState, "drafts" | "draftSkip">,
+  seen: Map<string, DraftRow>,
+  projects: Map<string, string>,
+  inFlight: Set<string>,
+  now: number,
+): { changed: boolean; fresh: string[] } {
+  let changed = false
+  const fresh: string[] = []
+  const drafts = state.drafts as Record<string, DraftTrack>
+  for (const [rowId, d] of seen) {
+    const t = drafts[rowId]
+    if (t === undefined) {
+      const project = projects.get(rowId) ?? "?"
+      drafts[rowId] = { project, docId: d.docId, title: d.title, seenAt: now, updatedAt: now, turns: 0 }
+      fresh.push(`черновик: ${project} ${rowId} «${d.title.slice(0, 60)}»`)
+      changed = true
+    } else if (t.title !== d.title && d.title !== "") {
+      t.title = d.title
+      changed = true
+    }
+  }
+  for (const rowId of Object.keys(drafts)) {
+    if (seen.has(rowId) || inFlight.has(rowId)) continue
+    delete drafts[rowId]
+    delete state.draftSkip?.[rowId] // ушёл из Draft → skip снят
+    changed = true
+  }
+  return { changed, fresh }
+}
+
 // ——— seen/ack: запись исхода в трекер ———
 
 /** Запись ack: исход разбора + версия тела, с которой он согласован. Версия

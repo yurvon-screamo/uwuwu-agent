@@ -12,8 +12,9 @@ import {
   type Request,
 } from "../lib/hub"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker as syncDraftTrackerState, validTriageExtras,
   DRAFT_MAX_TURNS,
+  type DraftRow,
   type DraftTrack,
 } from "./triage-lib"
 
@@ -139,12 +140,6 @@ async function refreshBoards(hub: Hub): Promise<BoardRef[]> {
   return boards
 }
 
-interface DraftRow {
-  rowId: string
-  docId: string
-  title: string
-}
-
 async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{
     rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
@@ -188,34 +183,8 @@ const draftRowIdsInPipeline = (hub: Hub): Set<string> => {
 
 /** Трекер vs доски: новые sighting'и, смена тайтла, чистка ушедших из Draft. */
 const syncDraftTracker = (hub: Hub, seen: Map<string, DraftRow>, projects: Map<string, string>): void => {
-  const now = Date.now()
-  let changed = false
-  const drafts = hub.state.drafts as Record<string, DraftTrack>
-  for (const [rowId, d] of seen) {
-    const t = drafts[rowId]
-    if (t === undefined) {
-      drafts[rowId] = {
-        project: projects.get(rowId) ?? "?",
-        docId: d.docId,
-        title: d.title,
-        seenAt: now,
-        updatedAt: now,
-        turns: 0,
-      }
-      hub.log(`черновик: ${projects.get(rowId) ?? "?"} ${rowId} «${d.title.slice(0, 60)}»`)
-      changed = true
-    } else if (t.title !== d.title && d.title !== "") {
-      t.title = d.title
-      changed = true
-    }
-  }
-  const inFlight = draftRowIdsInPipeline(hub)
-  for (const rowId of Object.keys(drafts)) {
-    if (seen.has(rowId) || inFlight.has(rowId)) continue
-    delete drafts[rowId]
-    delete hub.state.draftSkip?.[rowId] // ушёл из Draft → skip снят
-    changed = true
-  }
+  const { changed, fresh } = syncDraftTrackerState(hub.state, seen, projects, draftRowIdsInPipeline(hub), Date.now())
+  for (const line of fresh) hub.log(line)
   if (changed) hub.save()
 }
 
