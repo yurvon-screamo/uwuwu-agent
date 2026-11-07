@@ -13,11 +13,12 @@ export interface TaskRef {
   type: string
   pr: string
   branch: string
-  /** сессионные ячейки строки («Сессия dev»/«Сессия ревью»): непустые —
-   *  фабрика спавнила задачу раньше (свидетель спавна, переживает потерю
-   *  state); "" — свидетельства нет (легитимно новая строка) */
+  /** сессионные ячейки строки («Сессия dev»/«Сессия ревью»/«Сессия тест»):
+   *  непустые — фабрика спавнила задачу раньше (свидетель спавна, переживает
+   *  потерю state); "" — свидетельства нет (легитимно новая строка) */
   devSession?: string
   reviewSession?: string
+  testSession?: string
 }
 
 export interface TaskComment {
@@ -54,6 +55,10 @@ export interface TrackedTask {
   reviewSessionID?: string
   /** неудачные спавны ревьювера подряд (эскалация до Needs attention) */
   reviewAttempts?: number
+  /** сессия тестировщика (1 на задачу; "" — нет или умерла) */
+  testSessionID?: string
+  /** неудачные спавны тестировщика подряд (эскалация до Needs attention) */
+  testAttempts?: number
   /** ISO первой пропажи строки из скана доски (suspect); undefined —
    *  строка наблюдалась. Чистка finishTask необратима (delete state +
    *  DELETE ревью-сессии) — только при пропаже в двух проходах подряд:
@@ -99,6 +104,7 @@ export const AGENT_MARK = "🤖"
 
 export const REVIEW_PLAN_STATUS = "Ревью плана"
 export const REVIEW_RESULT_STATUS = "Ревью результата"
+export const TESTING_STATUS = "Тестирование"
 
 export type ReviewKind = "plan" | "result"
 
@@ -107,6 +113,17 @@ export function reviewKindOf(status: string): ReviewKind | null {
   if (status === REVIEW_PLAN_STATUS) return "plan"
   if (status === REVIEW_RESULT_STATUS) return "result"
   return null
+}
+
+/** Кому фабрика адресует агентскую сессию в этом статусе: ревью-статусы →
+ *  ревьювер («review»), «Тестирование» → тестировщик («test»), остальное →
+ *  девелопер («dev»). Единственная точка выбора адресата для self-эхо-среза,
+ *  bodyEdit-будки и гварда тишины. */
+export type SessionSlot = "review" | "test" | "dev"
+
+export function sessionSlotOf(status: string): SessionSlot {
+  if (reviewKindOf(status) !== null) return "review"
+  return status === TESTING_STATUS ? "test" : "dev"
 }
 
 /** Юзерский коммент: не наш (🤖), не служебный ([factory]).
@@ -771,9 +788,9 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
       : [
-          "   approve → Review",
+          "   approve (чистый или дельта-апрув) → Тестирование",
           "   approve с мелкими замечаниями (все находки Low) → In Progress —",
-          "   следующее ревью с тем же ревьювером (дельта), после дельта-апрува → Review владельцу",
+          "   следующее ревью с тем же ревьювером (дельта), после дельта-апрува → Тестирование",
           "   request_changes → In Progress",
         ].join("\n"),
     "5. Вопросы юзеру — комментом без смены статуса; код и тело задачи не правь.",
@@ -793,7 +810,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
       (kind === "plan"
         ? "(approve → In Progress · request_changes → Design)."
         : [
-            "(approve → Review · approve с мелкими замечаниями (все находки Low) → In Progress ·",
+            "(approve, чистый или дельта-апрув → Тестирование · approve с мелкими замечаниями (все находки Low) → In Progress ·",
             "request_changes → In Progress).",
           ].join("\n")),
     ...(kind === "result"
@@ -822,19 +839,84 @@ export function reviewCommentsPrompt(rowId: string, comments: TaskComment[]): st
   ].join("\n")
 }
 
+// ——— промпты тестировщика (праймари-агент на «Тестировании») ———
+
+/** Контекст агентской стадии задачи — тот же шейп, что у ревью. */
+export type TestContext = ReviewContext
+
+/** Стартовый промпт тестировщика: фабрика спавнит сессию на «Тестировании». */
+export function testingSpawnPrompt(rowId: string, project: string, ctx: TestContext): string {
+  const lines = [
+    `[factory] Задача ${rowId} (проект ${project}): стадия тестирования.`,
+    "",
+    "Ты — праймари-агент tester, фабрика назначила тебя тестировщиком этой задачи",
+    "(1 задача = 1 твоя сессия; повторные входы придут сюда же wakeup'ом).",
+    "Работай по секции «Тестирование задач фабрики uwuwu» своей методички:",
+    "",
+    `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи (постановка, план/решение,`,
+    "   юзкейсы и «Проверка», отчёт инженера) и треды комментов (прошлые твои раунды, баг-репорты).",
+    "2. Изменения: ветка против origin/master в ворктри задачи; PR (gh pr view/diff) —",
+    ...(ctx.worktree !== ""
+      ? [`   Ворктри задачи: ${ctx.worktree}`]
+      : [`   Ворктри задачи не найден — работай по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+         `   (git-команды из каталога сессии; ворктри не обязателен).`]),
+    ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
+    ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
+    "3. Отчёт — комментом в задачу (uwuwu-cli task comment): что проверено мануально (команды,",
+    "   скрины), что покрыто тестами (файлы, коммиты), прочие проверки; вердикт-строка",
+    "   «Статус: pass|fail» обязательна.",
+    "4. Статус после вердикта (uwuwu-cli task edit):",
+    "   pass → Review · fail (баг-репорт с репро-шагами) → In Progress.",
+    "5. Тестовые коммиты — пуш до вердикта (чистое состояние ворктри); прод-код не трогай:",
+    "   проблема в прод-коде = баг → fail.",
+    "6. Вопросы юзеру — комментом без смены статуса.",
+  ]
+  return lines.join("\n")
+}
+
+/** Будильник тестировщика: баг устранён, задача снова на «Тестировании». */
+export function testingRerunPrompt(rowId: string, ctx: TestContext): string {
+  return [
+    `[factory] Задача ${rowId}: девелопер устранил баг — статус снова «${TESTING_STATUS}».`,
+    "",
+    "Дотестируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
+    "проверь устранение своего баг-репорта (прошлый отчёт в тредах), всё заново",
+    "не пересматривай. Отчёт комментом, статус по вердикту",
+    "(pass → Review · fail → In Progress). Новое покрытие — по методичке.",
+    ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
+    ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`Тип задачи: ${ctx.type}`] : []),
+  ].join("\n")
+}
+
+/** Будильник тестировщика: свежие комменты юзера в статусе «Тестирование». */
+export function testingCommentsPrompt(rowId: string, comments: TaskComment[]): string {
+  const quoted = comments.map((c) => c.text.trim()).join("\n---\n")
+  return [
+    `[factory] В задаче ${rowId} (стадия тестирования) новые комментарии от пользователя:`,
+    "",
+    quoted,
+    "",
+    "Ответь/учти по своему протоколу тестирования: ответ юзеру — uwuwu-cli task comment.",
+  ].join("\n")
+}
+
 /** Будильник девелоперу: задача вернулась к разработке (вердикт ревьювера
- *  или ручной перевод владельца в Design). */
+ *  или тестировщика, либо ручной перевод владельца в Design). */
 export function reviewReturnPrompt(rowId: string): string {
   return [
-    `[factory] Задача ${rowId} вернулась к разработке — статус сменил ревьювер (вердикт) или владелец.`,
+    `[factory] Задача ${rowId} вернулась к разработке — статус сменил ревьювер или тестировщик (вердикт) либо владелец.`,
     "",
     "Перечитай uwuwu-cli task get + треды и действуй по пайпу:",
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
     "- результат: approve с мелкими замечаниями → дофикси мелочи из отчёта ревьювера,",
     "  запушь и сразу «Ревью результата» — та же ревью-сессия делает дельта-проверку",
-    "  (следующее ревью с тем же ревьювером; после дельта-апрува мяч у юзера);",
-    "- результат approved (чистый) → мяч у юзера, от тебя ничего не требуется;",
+    "  (следующее ревью с тем же ревьювером; после дельта-апрува задача уйдёт на «Тестирование»);",
+    "- результат approved (чистый) → задача ушла на «Тестирование», от тебя ничего не требуется;",
+    "- баг-репорт тестировщика (возврат из «Тестирования») → устрани баг, прогони self-check,",
+    "  запушь и поставь «Ревью результата» — код-ревью обязателен перед возвратом тестировщику;",
     "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
     "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
@@ -849,6 +931,8 @@ export interface RouteFacts {
   lastStatus: string
   /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем решением noop) */
   reviewerAlive: boolean | null
+  /** жива ли сессия тестировщика (null — liveness неизвестна: тик пропускаем решением noop) */
+  testerAlive: boolean | null
   /** свежие комменты юзера */
   freshComments: TaskComment[]
 }
@@ -857,13 +941,17 @@ export type RouteAction =
   | { t: "spawn-reviewer"; kind: ReviewKind }
   | { t: "rerun-reviewer"; kind: ReviewKind }
   | { t: "comments-to-reviewer" }
+  | { t: "spawn-tester" }
+  | { t: "rerun-tester" }
+  | { t: "comments-to-tester" }
   | { t: "return-to-dev" }
   | { t: "noop" }
 
 /** Решение по задаче на один тик. Приоритет порядка: спавн ревьювера →
- *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → возврат
- *  девелоперу (из ревью-статуса по вердикту, ручной перевод в Design или
- *  fast-track флип владельца в In Progress — «вмешайся и почини») → noop. */
+ *  доревью (вход/смена вида ревью) → комменты юзера ревьюверу → стадия
+ *  тестирования (спавн/дотест/комменты тестировщику) → возврат девелоперу
+ *  (из ревью-статуса или «Тестирования» по вердикту, ручной перевод в Design
+ *  или fast-track флип владельца в In Progress — «вмешайся и почини») → noop. */
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
@@ -874,8 +962,15 @@ export function routeTask(f: RouteFacts): RouteAction {
     if (f.freshComments.length > 0) return { t: "comments-to-reviewer" }
     return { t: "noop" }
   }
-  // возврат мяча девелоперу: из ревью-статуса по вердикту ревьювера…
-  if (reviewKindOf(f.lastStatus) !== null &&
+  if (f.status === TESTING_STATUS) {
+    if (f.testerAlive === false) return { t: "spawn-tester" }
+    if (f.lastStatus !== TESTING_STATUS) return { t: "rerun-tester" }
+    if (f.freshComments.length > 0) return { t: "comments-to-tester" }
+    return { t: "noop" }
+  }
+  // возврат мяча девелоперу: из ревью-статуса по вердикту ревьювера или из
+  // «Тестирования» по fail-вердикту тестировщика…
+  if ((reviewKindOf(f.lastStatus) !== null || f.lastStatus === TESTING_STATUS) &&
       (f.status === "Design" || f.status === "In Progress")) {
     return { t: "return-to-dev" }
   }
@@ -1002,10 +1097,11 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
 export interface ReviewStallFacts {
   /** статус строки сейчас */
   status: string
-  /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем
-   *  решением none; dead — routeTask сам спавнит нового ревьювера) */
-  reviewerAlive: boolean | null
-  /** активность последнего сообщения ревью-сессии; null — сообщений нет
+  /** жива ли сессия держателя статуса (ревьювер/тестировщик; null —
+   *  liveness неизвестна: тик пропускаем решением none; dead — routeTask
+   *  сам спавнит нового держателя) */
+  holderAlive: boolean | null
+  /** активность последнего сообщения сессии держателя; null — сообщений нет
    *  (= застой: спавн не начал ход или потерялся) */
   lastActivityAt: number | null
   /** сигнал уже отправлен в этом эпизоде ревью-статуса (анти-спам) */
@@ -1018,31 +1114,31 @@ export type ReviewStallVerdict =
   | { t: "signal"; text: string }
   | { t: "silent" }
 
-/** Единственная точка решения о ревью-тишине (по образцу stallVerdict):
- *  ревью-статус при живой ревью-сессии, молчащей дольше порога, и статусе,
- *  не ушедшем из ревью, = ход ревьювера завершился без доставки (вердикт-
- *  коммент/статус потерялись) или ревьювер ждёт юзера (вопрос в тредах).
- *  routeTask в этой геометрии возвращает noop бессрочно — конвейер без
- *  гварда висит тихо. Вердикт signal → эскалация юзеру (Needs attention,
- *  восстановление штатными путями: перестановка ревью-статуса будит ту же
- *  сессию доревью-промптом). Повторный сигнал в эпизоде глушится флагом
- *  (silent); сброс — дело демона: смена статуса или вернувшаяся активность
- *  ревьювера. */
+/** Единственная точка решения о тишине держателя ревью/тест-статуса (по
+ *  образцу stallVerdict): агентская стадия при живой сессии держателя,
+ *  молчащей дольше порога, и статусе, не ушедшем из стадии, = ход завершился
+ *  без доставки (вердикт-коммент/статус потерялись) или агент ждёт юзера
+ *  (вопрос в тредах). routeTask в этой геометрии возвращает noop бессрочно —
+ *  конвейер без гарда висит тихо. Вердикт signal → эскалация юзеру (Needs
+ *  attention, восстановление штатными путями: перестановка статуса будит ту
+ *  же сессию доревью-промптом). Повторный сигнал в эпизоде глушится флагом
+ *  (silent); сброс — дело демона: смена статуса или вернувшаяся активность. */
 export function reviewStallVerdict(f: ReviewStallFacts, stallMs: number): ReviewStallVerdict {
-  if (reviewKindOf(f.status) === null) return { t: "none" }
-  if (f.reviewerAlive !== true) return { t: "none" }
+  if (sessionSlotOf(f.status) === "dev") return { t: "none" }
+  if (f.holderAlive !== true) return { t: "none" }
   const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
   if (!stalled) return { t: "none" }
   if (f.signaled) return { t: "silent" }
+  const who = f.status === TESTING_STATUS ? "тестировщика" : "ревьювера"
   const quietMin = f.lastActivityAt === null
     ? null
     : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
   const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
   const text = [
-    `[factory] Задача в ревью-статусе, но сессия ревьювера молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин,`,
-    "статус из ревью не ушёл — ход завершился без доставки (вердикт-коммент/статус потерялись) или ревьювер ждёт тебя.",
-    "Проверь треды: если ревьювер задал вопрос — ответь комментом; если вердикта нет — это потеря доставки.",
-    "Затем переставь ревью-статус: сессия будет разбужена доревью-промптом, перечитает задачу с тредами",
+    `[factory] Задача в статусе «${f.status}», но сессия ${who} молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин,`,
+    "статус из стадии не ушёл — ход завершился без доставки (вердикт-коммент/статус потерялись) или агент ждёт тебя.",
+    "Проверь треды: если агент задал вопрос — ответь комментом; если вердикта нет — это потеря доставки.",
+    "Затем переставь статус стадии: сессия будет разбужена дельта-промптом, перечитает задачу с тредами",
     "(увидит и твой ответ) и доставит недостающее.",
   ].join(" ")
   return { t: "signal", text }
@@ -1123,8 +1219,8 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
 
 /** Свидетель спавна в строке: сессионная ячейка непуста. Поля опциональны —
  *  undefined (TaskRef без нормализации) свидетельством НЕ является. */
-export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession">): boolean {
-  return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== ""
+export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession" | "testSession">): boolean {
+  return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== "" || (r.testSession ?? "") !== ""
 }
 
 /** Живость сессии по REST-пробе опенкода: "unknown" — проба не удалась
@@ -1135,8 +1231,8 @@ export type SessionLiveness = "alive" | "dead" | "unknown"
  *  сиротой-спавном (корм гарда каскада). Единственная точка решения (по
  *  образцу routeTask) — матрица плана задачи 20261105174319:
  *  - дев-ячейка пуста → обычный путь (дев-волна решает по статусу), сирота
- *    только при ревью-свидетельстве (карантинный спавн ревьювера пишет
- *    только ревью-ячейку — защита инцидента 06.11 сохраняется);
+ *    при ревью- или тест-свидетельстве (карантинный спавн ревьювера/тестировщика
+ *    пишет только свою ячейку — защита инцидента 06.11 сохраняется);
  *  - живая дев-заявка (task claim или фабричный спавн) → внешняя работа
  *    идёт: не спавнить и не сирота;
  *  - liveness-проба не удалась → трактуем как живую (прецедент routeTask):
@@ -1155,12 +1251,12 @@ export interface UntrackedRowDecision {
 }
 
 export function untrackedRowDecision(
-  r: Pick<TaskRef, "devSession" | "reviewSession">,
+  r: Pick<TaskRef, "devSession" | "reviewSession" | "testSession">,
   liveness: SessionLiveness,
 ): UntrackedRowDecision {
   const devCell = r.devSession ?? ""
   if (devCell === "") {
-    return { devWave: true, orphan: (r.reviewSession ?? "") !== "" }
+    return { devWave: true, orphan: (r.reviewSession ?? "") !== "" || (r.testSession ?? "") !== "" }
   }
   // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
   if (liveness !== "dead") return { devWave: false, orphan: false }
@@ -1181,6 +1277,7 @@ export function alertTargetOf(candidates: TaskRef[]): TaskRef | null {
 export const PATH_CELL = "Path"
 export const DEV_SESSION_CELL = "Сессия dev"
 export const REVIEW_SESSION_CELL = "Сессия ревью"
+export const TEST_SESSION_CELL = "Сессия тест"
 
 /** Валидация записи state.json. Легальные форматы: полный (ses_ + пути),
  *  чистый карантин (всё пусто) и гибрид (сессия умерла, пути живы — работа
@@ -1225,6 +1322,11 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
   ) return false
   if (t.reviewAttempts !== undefined && typeof t.reviewAttempts !== "number") return false
+  if (
+    t.testSessionID !== undefined &&
+    !(t.testSessionID === "" || (typeof t.testSessionID === "string" && t.testSessionID.startsWith("ses_")))
+  ) return false
+  if (t.testAttempts !== undefined && typeof t.testAttempts !== "number") return false
   const sesOk = t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))
   if (!sesOk) return false
   if (t.worktree === "" && t.branch === "") return true
@@ -1314,6 +1416,8 @@ export interface PassCounters {
   devSpawned: number
   /** спавн/рестарт ревьюверов */
   reviewSpawned: number
+  /** спавн/рестарт тестировщиков */
+  testerSpawned: number
   /** доставки промптов за тик: спавн/реран ревьювера, комменты ревьюверу,
    *  возврат девелоперу, wakeup по комментам/правкам тела */
   wakeups: number
@@ -1341,6 +1445,6 @@ export function formatPassSummary(project: string, c: PassCounters): string {
   const heldPart = c.held !== undefined && c.held > 0
     ? `, задержано гардом=${c.held}${c.heldReason !== undefined ? ` (${c.heldReason})` : ""}`
     : ""
-  return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned}` +
+  return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned} тест=${c.testerSpawned}` +
     `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}${heldPart}, наблюдение=${c.watched}${failures}`
 }

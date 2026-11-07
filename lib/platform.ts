@@ -388,7 +388,10 @@ async function updateDatabaseRow(args: Record<string, unknown>): Promise<Record<
   const cells = (args.cells ?? {}) as Record<string, string>
   const keys = await avKeys(avId)
   for (const [name, value] of Object.entries(cells)) {
-    const keyId = keys.get(name) ?? keys.get("Status")
+    // колонки нет → true no-op (best-effort контракт setCellsSafe): запись в
+    // чужой ключ (Status) исказила бы чужую ячейку; Status-запись на доске с
+    // колонкой «Статус» резолвится по русскому имени (паритет typed-чека ниже)
+    const keyId = keys.get(name) ?? (name === "Status" ? keys.get("Статус") : undefined)
     if (!keyId) continue
     const typed = name === "Status" || name === "Статус"
       ? { mSelect: [{ content: String(value) }] }

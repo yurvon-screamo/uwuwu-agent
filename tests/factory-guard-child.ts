@@ -148,6 +148,7 @@ function scriptTick(): string[] {
                         { id: "k-status", name: "Status" },
                         { id: "k-dev", name: "Сессия dev" },
                         { id: "k-rev", name: "Сессия ревью" },
+                        { id: "k-test", name: "Сессия тест" },
                       ],
                       rowCount: rows.length,
                       rows: rows.map((r) => ({
@@ -166,6 +167,9 @@ function scriptTick(): string[] {
                           ...(r.reviewSession !== undefined
                             ? [{ value: { keyID: "k-rev", type: "text", text: { content: r.reviewSession } } }]
                             : []),
+                          ...(r.testSession !== undefined
+                            ? [{ value: { keyID: "k-test", type: "text", text: { content: r.testSession } } }]
+                            : []),
                         ],
                       })),
                     },
@@ -176,7 +180,12 @@ function scriptTick(): string[] {
         } else if (action === "keys") {
           result = {
             structuredContent: {
-              data: { keys: [{ id: "k-status", name: "Status" }, { id: "k-dev", name: "Сессия dev" }, { id: "k-rev", name: "Сессия ревью" }] },
+              data: { keys: [
+                { id: "k-status", name: "Status" },
+                { id: "k-dev", name: "Сессия dev" },
+                { id: "k-rev", name: "Сессия ревью" },
+                { id: "k-test", name: "Сессия тест" },
+              ] },
             },
           }
         } else if (action === "item_update") {
