@@ -373,7 +373,10 @@ fn version_flag_prints_semver_revision_and_build_date() {
         revision == "unknown" || is_alphanumeric_revision,
         "unexpected revision format: {revision}"
     );
-    assert!(is_iso_date(build_date), "unexpected date format: {build_date}");
+    assert!(
+        is_iso_date(build_date),
+        "unexpected date format: {build_date}"
+    );
 }
 
 fn is_iso_date(s: &str) -> bool {
