@@ -572,6 +572,19 @@ pub async fn create(
     ty: &str,
     ctx: &str,
 ) -> Result<(String, String)> {
+    create_with_pacing(sy, project, title, ty, ctx, &RowInsertPacing::production()).await
+}
+
+/// create с инъекцией пейсинга verify-ретрая: прод ждёт лаг render перед
+/// повторной вставкой, тесты идут мгновенно (прецедент TitleSyncPacing).
+pub(crate) async fn create_with_pacing(
+    sy: &SiYuan,
+    project: &str,
+    title: &str,
+    ty: &str,
+    ctx: &str,
+    pacing: &RowInsertPacing,
+) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
     // идемпотентность: строка или тело с таким заголовком уже есть?
     // сравнение через нормализацию: ретрай с любым написанием слэша — дубль
@@ -615,7 +628,7 @@ pub async fn create(
                 "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
             ),
             RowInsertCheck::Missing if attempt == 0 => {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                tokio::time::sleep(pacing.retry_delay).await;
                 item = sy.db_item_add_bound(&board.av_id, &body).await?;
                 sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
             }
@@ -785,6 +798,28 @@ impl TitleSyncPacing {
         Self {
             attempts: 3,
             poll_delay: std::time::Duration::from_millis(1),
+        }
+    }
+}
+
+/// Пейсинг паузы перед повторной вставкой строки (verify-ретрай task create
+/// и cron set): производство с запасом на лаг render, тесты — мгновенные.
+/// Пауза — инъекция, чтобы тесты не наследовали прод-задержку.
+pub(crate) struct RowInsertPacing {
+    pub(crate) retry_delay: std::time::Duration,
+}
+
+impl RowInsertPacing {
+    pub(crate) fn production() -> Self {
+        Self {
+            retry_delay: std::time::Duration::from_millis(1500),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instant() -> Self {
+        Self {
+            retry_delay: std::time::Duration::from_millis(1),
         }
     }
 }

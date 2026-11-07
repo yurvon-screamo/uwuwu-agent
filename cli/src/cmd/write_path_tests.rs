@@ -11,9 +11,10 @@
 use crate::cmd::cli::TaskSub;
 use crate::cmd::sy_dispatch::task_run;
 use crate::siyuan::SiYuan;
-use crate::siyuan_task::{comment_with_ts, CommentDraft, SyBoard, SyTask};
+use crate::siyuan_task::{
+    comment_with_ts, create_with_pacing, CommentDraft, RowInsertPacing, SyBoard, SyTask,
+};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
@@ -291,17 +292,17 @@ async fn create_flow_mock(kernel: &Arc<CreateKernel>) -> MockServer {
 
 async fn create_via_cli(server: &MockServer) -> anyhow::Result<()> {
     set_env(server);
-    task_run(
+    let sy = SiYuan::from_env()?;
+    create_with_pacing(
+        &sy,
         "uwuwu",
-        TaskSub::Create {
-            title: NEW_TITLE.into(),
-            r#type: None,
-            stdin: false,
-            attach: Vec::<PathBuf>::new(),
-            dry_run: false,
-        },
+        NEW_TITLE,
+        "dev",
+        "",
+        &RowInsertPacing::instant(),
     )
     .await
+    .map(|_| ())
 }
 
 /// Идемпотентный ретрай (ADR-009 «достроить сироту»): строка потерялась,

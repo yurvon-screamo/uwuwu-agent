@@ -845,54 +845,15 @@ pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
                 "<промпт крона>".into()
             };
             let proj = cron_project(project);
-            let board = syt::find_board_cron(&sy, &proj).await?;
-            // колонки — до мутаций: строка без Schedule демону не видна,
-            // а тело/строка, созданные впустую, — сироты (репро 04.11)
-            let keys = syt::board_keys(&sy, &board.av_id).await?;
-            let cron_keys = syt::require_cron_keys(&keys, &board.hpath)?;
-            // дубль-тайтл: живая строка или тело-сирота (дедуп как в task create)
-            let canon = syt::normalize_title(&title);
-            if syt::read_rows(&sy, &board)
-                .await?
-                .iter()
-                .any(|r| syt::normalize_title(&r.title) == canon)
-            {
-                anyhow::bail!("крон «{title}» уже есть (живая строка на {})", board.hpath);
-            }
-            if !syt::body_doc_by_title(&sy, &board, &title)
-                .await?
-                .is_empty()
-            {
-                anyhow::bail!("тело крона «{title}» уже есть");
-            }
-            // тело → bound-строка (клик по карточке открывает промпт) →
-            // клетки → verify вставки в render (репро 04.11 08:27: success
-            // item_add не гарантирует строку), паттерн task create
-            let body_h = board.body_hpath(&title);
-            let body = sy
-                .create_doc_md(&board.notebook, &body_h, &cron_body_md(&title, &prompt))
-                .await?;
-            let mut item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
-            for attempt in 0..=1u8 {
-                let rows = syt::read_rows(&sy, &board).await?;
-                match syt::check_row_insert(&rows, &item, &title) {
-                    syt::RowInsertCheck::Confirmed => {
-                        println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
-                        return Ok(());
-                    }
-                    syt::RowInsertCheck::DuplicateTitle => bail!(
-                        "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
-                    ),
-                    syt::RowInsertCheck::Missing if attempt == 0 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        item = insert_cron_row(&sy, &board, &cron_keys, &body, &schedule).await?;
-                    }
-                    syt::RowInsertCheck::Missing => bail!(
-                        "строка крона «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); крон виден только как док"
-                    ),
-                }
-            }
-            unreachable!("цикл verify завершается return или bail")
+            cron_set_with_pacing(
+                &sy,
+                &proj,
+                &title,
+                &schedule,
+                &prompt,
+                &syt::RowInsertPacing::production(),
+            )
+            .await
         }
         CronSub::Pause { id, project } => {
             cron_set_status(&sy, &id, "paused", "остановлен", &cron_project(project)).await
@@ -932,6 +893,68 @@ fn cron_project(project: Option<String>) -> String {
 
 fn cron_body_md(title: &str, prompt: &str) -> String {
     format!("# {title}\n\n```\n{prompt}\n```\n")
+}
+
+/// Постановка крона: колонки до мутаций (без сирот) → дедуп → тело →
+/// bound-строка → verify-ретрай ×1. Пейсинг повторной вставки — инъекция
+/// (RowInsertPacing): прод ждёт лаг render, тесты идут мгновенно
+/// (прецедент create_with_pacing).
+pub(crate) async fn cron_set_with_pacing(
+    sy: &SiYuan,
+    proj: &str,
+    title: &str,
+    schedule: &str,
+    prompt: &str,
+    pacing: &syt::RowInsertPacing,
+) -> Result<()> {
+    let board = syt::find_board_cron(sy, proj).await?;
+    // колонки — до мутаций: строка без Schedule демону не видна,
+    // а тело/строка, созданные впустую, — сироты (репро 04.11)
+    let keys = syt::board_keys(sy, &board.av_id).await?;
+    let cron_keys = syt::require_cron_keys(&keys, &board.hpath)?;
+    // дубль-тайтл: живая строка или тело-сирота (дедуп как в task create)
+    let canon = syt::normalize_title(title);
+    if syt::read_rows(sy, &board)
+        .await?
+        .iter()
+        .any(|r| syt::normalize_title(&r.title) == canon)
+    {
+        anyhow::bail!("крон «{title}» уже есть (живая строка на {})", board.hpath);
+    }
+    if !syt::body_doc_by_title(sy, &board, title)
+        .await?
+        .is_empty()
+    {
+        anyhow::bail!("тело крона «{title}» уже есть");
+    }
+    // тело → bound-строка (клик по карточке открывает промпт) →
+    // клетки → verify вставки в render (репро 04.11 08:27: success
+    // item_add не гарантирует строку), паттерн task create
+    let body_h = board.body_hpath(title);
+    let body = sy
+        .create_doc_md(&board.notebook, &body_h, &cron_body_md(title, prompt))
+        .await?;
+    let mut item = insert_cron_row(sy, &board, &cron_keys, &body, schedule).await?;
+    for attempt in 0..=1u8 {
+        let rows = syt::read_rows(sy, &board).await?;
+        match syt::check_row_insert(&rows, &item, title) {
+            syt::RowInsertCheck::Confirmed => {
+                println!("крон поставлен: {title}\n  расписание: {schedule}\n  строка: {item}\n  тело:   {body}");
+                return Ok(());
+            }
+            syt::RowInsertCheck::DuplicateTitle => bail!(
+                "строка «{title}» уже видна в render с другим itemID — вставка {item} не подтвердилась, вторую строку не создаю"
+            ),
+            syt::RowInsertCheck::Missing if attempt == 0 => {
+                tokio::time::sleep(pacing.retry_delay).await;
+                item = insert_cron_row(sy, &board, &cron_keys, &body, schedule).await?;
+            }
+            syt::RowInsertCheck::Missing => bail!(
+                "строка крона «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); крон виден только как док"
+            ),
+        }
+    }
+    unreachable!("цикл verify завершается return или bail")
 }
 
 /// Bound-строка крона + клетки: Status через mSelect (единый контур с

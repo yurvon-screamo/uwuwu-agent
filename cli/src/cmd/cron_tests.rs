@@ -13,8 +13,9 @@
 //! 7. парс: --project у list/pause/resume/rm, дефолт None
 
 use crate::cmd::cli::CronSub;
-use crate::cmd::sy_dispatch::{cron_run, format_cron_table};
-use crate::siyuan_task::SyTask;
+use crate::cmd::sy_dispatch::{cron_run, cron_set_with_pacing, format_cron_table};
+use crate::siyuan::SiYuan;
+use crate::siyuan_task::{RowInsertPacing, SyTask};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
@@ -334,16 +335,20 @@ fn set_env(server: &MockServer) {
     std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
 }
 
-fn set_cmd(title: &str, project: Option<&str>) -> CronSub {
-    CronSub::Set {
-        title: title.into(),
-        r#in: Some("10m".into()),
-        every: None,
-        at: None,
-        cron_expr: None,
-        project: project.map(String::from),
-        stdin: false,
-    }
+/// set через cron_set_with_pacing с мгновенным пейсингом: тесты не наследуют
+/// прод-паузу verify-ретрая (пауза 1.5 s вынесена в RowInsertPacing).
+async fn set_via_flow(server: &MockServer, title: &str) -> anyhow::Result<()> {
+    set_env(server);
+    let sy = SiYuan::from_env()?;
+    cron_set_with_pacing(
+        &sy,
+        "uwuwu",
+        title,
+        "10m",
+        "<промпт крона>",
+        &RowInsertPacing::instant(),
+    )
+    .await
 }
 
 /// (1) легаси-доска без Schedule: громкий отказ, мутаций не было.
@@ -354,9 +359,8 @@ async fn set_bails_loud_before_mutations_when_board_lacks_schedule_key() {
     *kernel.cron_keys_full.lock().unwrap() = false;
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
-    set_env(&server);
 
-    let err = cron_run(set_cmd("ночной крон", None))
+    let err = set_via_flow(&server, "ночной крон")
         .await
         .expect_err("доска без Schedule должна давать отказ");
 
@@ -383,9 +387,8 @@ async fn set_creates_bound_row_and_fills_cells() {
     *kernel.render_confirms_insert.lock().unwrap() = true;
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
-    set_env(&server);
 
-    cron_run(set_cmd("ночной крон", None))
+    set_via_flow(&server, "ночной крон")
         .await
         .expect("set на полной доске");
 
@@ -447,9 +450,8 @@ async fn set_rejects_duplicate_title_in_live_rows_without_mutation() {
     });
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
-    set_env(&server);
 
-    let err = cron_run(set_cmd("ночной крон", None))
+    let err = set_via_flow(&server, "ночной крон")
         .await
         .expect_err("дубль-тайтл в живых строках");
 
@@ -476,9 +478,8 @@ async fn set_bails_when_row_never_appears_in_render() {
     *kernel.render_confirms_insert.lock().unwrap() = false;
     let server = MockServer::start().await;
     mount_kernel(&server, &kernel).await;
-    set_env(&server);
 
-    let err = cron_run(set_cmd("призрачный крон", None))
+    let err = set_via_flow(&server, "призрачный крон")
         .await
         .expect_err("строка не появилась в render");
 
