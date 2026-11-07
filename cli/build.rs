@@ -49,15 +49,15 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn emit_git_rerun_triggers() {
-    // The crate dir is cli/, the repo root two levels up.
-    let git_meta = Path::new("../../.git");
+    // The crate dir is cli/; the repo root is its parent (one level up).
+    let git_meta = Path::new("../.git");
     if git_meta.is_dir() {
-        println!("cargo:rerun-if-changed=../../.git/HEAD");
-        println!("cargo:rerun-if-changed=../../.git/refs/heads");
+        println!("cargo:rerun-if-changed=../.git/HEAD");
+        println!("cargo:rerun-if-changed=../.git/refs/heads");
     } else if git_meta.is_file() {
         // Worktree: `.git` is a gitdir pointer file whose contents do not
         // change on new commits — incremental rebuilds may keep a stale
-        // hash (`touch cli/build.rs` forces a refresh).
-        println!("cargo:rerun-if-changed=../../.git");
+        // hash (`touch build.rs` forces a refresh).
+        println!("cargo:rerun-if-changed=../.git");
     }
 }
