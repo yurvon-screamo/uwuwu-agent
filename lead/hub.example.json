@@ -1,0 +1,5 @@
+{
+  "token": "<TG-бот Lead>",
+  "owner": "<username владельца>",
+  "model": { "providerID": "zai-coding-plan", "id": "glm-5.3", "variant": "max" }
+}

@@ -131,6 +131,11 @@ class InsertHtmlKernel:
                 self.sy_tree.setdefault("Children", []).append(_sy_node(i, "NodeHTMLBlock"))
         return [{"timestamp": 0, "doOperations": [{"action": "insert", "data": data}]}]
 
+    def envelope(self, path: str, body: dict):
+        # Проба дерева (getBlockInfo) в сценариях этого двойника: id неизвестных
+        # блоков ядро не знает — честный −1 (резолв уйдёт в absent-отказ).
+        return (-1, None, "Содержимое блока с id [...] не найдено")
+
     def get_file(self, ws_path: str) -> bytes:
         if self.sy_missing:
             raise FileNotFoundError(ws_path)
@@ -175,9 +180,10 @@ def run_insert_html(kernel: InsertHtmlKernel, target: str, html_payload: str = D
     f.write(html_payload)
     f.close()
     args = SimpleNamespace(target=target, file=f.name, after_marker=after_marker)
-    original = (wiki_ops.post, wiki_ops._put_workspace_file,
+    original = (wiki_ops.post, wiki_ops._post_envelope, wiki_ops._put_workspace_file,
                 wiki_ops._get_workspace_file, wiki_ops.time)
     wiki_ops.post = kernel.post
+    wiki_ops._post_envelope = kernel.envelope
     wiki_ops._put_workspace_file = kernel.put_file
     wiki_ops._get_workspace_file = kernel.get_file
     wiki_ops.time = SimpleNamespace(sleep=lambda seconds: None, time=time.time)
@@ -186,7 +192,7 @@ def run_insert_html(kernel: InsertHtmlKernel, target: str, html_payload: str = D
         with redirect_stdout(buffer):
             wiki_ops.cmd_block_insert_html(args)
     finally:
-        (wiki_ops.post, wiki_ops._put_workspace_file,
+        (wiki_ops.post, wiki_ops._post_envelope, wiki_ops._put_workspace_file,
          wiki_ops._get_workspace_file, wiki_ops.time) = original
         os.unlink(f.name)
     return buffer.getvalue()
