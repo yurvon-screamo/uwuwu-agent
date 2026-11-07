@@ -3,8 +3,9 @@
 Контракт (задача 20261105224609, план-срез 1; BDD в теле задачи):
   1) проба OK → тихий exit 0: старта нет, строк инцидента нет;
   2) проба fail → state-факты контейнера + одна JSON-строка инцидента в лог
-     {ts, event, container_status, exit_code, restarts} + `podman start
-     siyuan-demo` (на running — no-op) + верификационная перепроба;
+     {ts, event, container_status, exit_code, restarts} + `systemctl --user
+     start siyuan-demo.service` (на active — no-op) + верификационная
+     перепроба;
   3) старт не удался (и перепроба не спасла) → exit 1, инцидент уже в логе;
   4) контейнера нет вовсе → state "missing" (факты None), та же логика.
 
@@ -85,31 +86,29 @@ class ReadContainerStateTests(unittest.TestCase):
 
 
 class StartContainerTests(unittest.TestCase):
-    def test_successful_start_is_reported_as_success(self):
+    def test_start_goes_through_systemd_user_unit(self):
+        calls = []
+
         def runner(cmd, **_):
-            return completed(stdout="siyuan-demo\n")
+            calls.append(cmd)
+            return completed(stdout="siyuan-demo.service\n")
 
         ok, _ = siyuan_watch.start_container(runner=runner)
         self.assertTrue(ok)
-
-    def test_already_running_container_counts_as_success(self):
-        def runner(cmd, **_):
-            return completed(returncode=1, stderr="container is already running")
-
-        ok, _ = siyuan_watch.start_container(runner=runner)
-        self.assertTrue(ok)
+        self.assertEqual(calls[0][:2], ["systemctl", "--user"])
+        self.assertIn(siyuan_watch.SERVICE_UNIT, calls[0])
 
     def test_failed_start_reports_failure_with_detail(self):
         def runner(cmd, **_):
-            return completed(returncode=125, stderr="podman exploded")
+            return completed(returncode=1, stderr="Unit siyuan-demo.service failed to start")
 
         ok, detail = siyuan_watch.start_container(runner=runner)
         self.assertFalse(ok)
-        self.assertIn("podman exploded", detail)
+        self.assertIn("failed to start", detail)
 
-    def test_missing_podman_binary_reports_failure_with_detail(self):
+    def test_missing_systemctl_binary_reports_failure_with_detail(self):
         def runner(cmd, **_):
-            raise FileNotFoundError("[Errno 2] No such file or directory: 'podman'")
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'systemctl'")
 
         ok, detail = siyuan_watch.start_container(runner=runner)
         self.assertFalse(ok)

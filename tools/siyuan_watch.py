@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""siyuan_watch — watchdog-итерация контейнера siyuan-demo (rootless podman).
+"""siyuan_watch — watchdog-итерация контейнера siyuan-demo (quadlet-юнит).
 
 Одна итерация (запуск systemd user-таймером каждую минуту):
   1. TCP-проба 127.0.0.1:6806 (транспорт-детект, timeout 3s);
   2. проба fail → state-факты контейнера (`podman inspect`), инцидент-строка
      в ~/.local/state/siyuan-watch/watch.log — JSON с фиксированными полями
      {ts, event, container_status, exit_code, restarts} — затем
-     `podman start siyuan-demo` (на running — no-op, безопасно);
+     `systemctl --user start siyuan-demo.service` (юнит active — no-op,
+     безопасно; хил именно через systemd: контейнер под quadlet пересоздаётся
+     при каждом старте, снаружи поднимать нельзя — сломает связку с юнитом);
   3. верификационная перепроба: поднялся → exit 0, нет → exit 1 (деталь —
      в stderr, виден в journalctl siyuan-watch.service).
 
@@ -34,9 +36,11 @@ PROBE_HOST = "127.0.0.1"
 PROBE_PORT = 6806
 PROBE_TIMEOUT_S = 3
 CONTAINER = "siyuan-demo"
+SERVICE_UNIT = f"{CONTAINER}.service"
 LOG_FILE = Path.home() / ".local" / "state" / "siyuan-watch" / "watch.log"
-# podman start возвращается при старте PID 1 — слушателю ядра нужен короткий
-# грейс, иначе медленный бут даёт ложный «failed to heal» (ревью PR #85, Low#1)
+# systemctl start возвращается при старте контейнера (Type=notify/conmon) —
+# слушателю ядра нужен короткий грейс, иначе медленный бут даёт ложный
+# «failed to heal» (ревью PR #85, Low#1)
 HEAL_GRACE_S = 3.0
 
 EVENT_DOWN = "container_down"
@@ -58,7 +62,12 @@ def _missing_state() -> dict:
 
 
 def read_container_state(container: str = CONTAINER, runner: Runner = subprocess.run) -> dict:
-    """State-факты из `podman inspect`: статус, exit-код последнего выхода, счётчик рестартов."""
+    """State-факты из `podman inspect`: статус, exit-код последнего выхода, счётчик рестартов.
+
+    Под quadlet контейнер пересоздаётся юнитом при каждом старте (--rm), поэтому
+    «missing» при дауне — норма миграции, а не деградация; сигнатура hang-класса
+    (running + мёртвый порт) остаётся различимой.
+    """
     try:
         proc = runner(["podman", "inspect", container, "--format", "{{json .}}"], capture_output=True, text=True)
     except OSError:
@@ -77,16 +86,19 @@ def read_container_state(container: str = CONTAINER, runner: Runner = subprocess
     }
 
 
-def start_container(container: str = CONTAINER, runner: Runner = subprocess.run) -> tuple[bool, str]:
-    """`podman start`: на running-контейнере — no-op (exit 0); «already running» чужого хила тоже успех."""
+def start_container(unit: str = SERVICE_UNIT, runner: Runner = subprocess.run) -> tuple[bool, str]:
+    """`systemctl --user start`: на active-юните — no-op (exit 0).
+
+    Хил только через systemd: контейнер под quadlet пересоздаётся юнитом
+    (`podman run --replace --rm` на каждый старт), внешний `podman start`
+    поднял бы его мимо юнита и сломал связку (конфликт имён на следующем
+    рестарте юнита).
+    """
     try:
-        proc = runner(["podman", "start", container], capture_output=True, text=True)
+        proc = runner(["systemctl", "--user", "start", unit], capture_output=True, text=True)
     except OSError as error:
         return False, str(error)
     if proc.returncode == 0:
-        return True, ""
-    output = f"{proc.stdout}\n{proc.stderr}".lower()
-    if "already running" in output:
         return True, ""
     return False, (proc.stderr or proc.stdout).strip()
 

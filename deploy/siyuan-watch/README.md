@@ -1,10 +1,10 @@
 # siyuan-watch — вотчер контейнера siyuan-demo
 
-Минутный systemd user-таймер, который держит прод-контур SiYuan поднятым:
+Минутный systemd user-таймер — второй слой хила прод-контура SiYuan:
 TCP-проба `127.0.0.1:6806` (транспорт-детект) → если порт мёртв, инцидент-строка
-в `~/.local/state/siyuan-watch/watch.log` и `podman start siyuan-demo`
-(на running-контейнере — no-op, безопасно). Hang-классы (контейнер Up, порт
-мёртв — pasta-клин / вис туннеля) вотчер только детектит и логирует; их
+в `~/.local/state/siyuan-watch/watch.log` и `systemctl --user start
+siyuan-demo.service` (юнит active — no-op, безопасно). Hang-классы (контейнер Up,
+порт мёртв — pasta-клин / вис туннеля) вотчер только детектит и логирует; их
 хил-лестница — осознанно вне среза (задача 20261105224609).
 
 Контекст класса «тихие остановки» и рецепт атрибуции SIGTERM —
@@ -12,11 +12,17 @@ TCP-проба `127.0.0.1:6806` (транспорт-детект) → если �
 
 ## Зачем
 
-- rootless podman без `podman-system-service` не обслуживает container-level
-  рестарт-политику: `unless-stopped` инертен, при смерти/ребуте контейнер не
-  поднимет никто (факт верифицирован 05.11, см. режим 8).
-- Watchdog — минимальное закрытие дыры без миграции контейнера на quadlet
-  (quadlet — отдельно, по желанию владельца).
+- С 07.11.2026 контейнер живёт под quadlet-юнитом `siyuan-demo.service`
+  (deploy/siyuan-demo/): рестарт при любом exit и автостарт на буте —
+  первичный хил systemd. Вотчер дублит хил осознанно (внешний детект
+  transport-класса с минутной гранулярностью) и остаётся единственным
+  детектором hang-классов, которые systemd не видит.
+- До миграции вотчер был единственным механизмом автоподъёма: rootless
+  podman без `podman-system-service` не обслуживал container-level
+  рестарт-политику (факт верифицирован 05.11, режим 8).
+- Хил только через systemd: контейнер под quadlet пересоздаётся юнитом
+  (`podman run --replace --rm` на каждый старт), внешний `podman start`
+  поднял бы его мимо юнита и сломал связку.
 
 ## Установка
 
@@ -49,11 +55,15 @@ journalctl --user -u siyuan-watch.service -n 20
 Живое даун-окно (осознанный прод-эксперимент, ~минута 502 на публичном UI):
 
 ```sh
-docker stop siyuan-demo    # docker на хосте — shim над podman
+systemctl --user stop siyuan-demo.service   # юнит-стоп: Restart=always на stop не срабатывает
 sleep 70
-docker ps --filter name=siyuan-demo   # контейнер снова Up
+systemctl --user is-active siyuan-demo.service   # active — вотчер поднял
 cat ~/.local/state/siyuan-watch/watch.log   # инцидент-строка с state-фактами
 ```
+
+`podman kill siyuan-demo` как сценарий даун-окна больше не годится: смерть
+контейнера юнит ловит сам за RestartSec=5 — вотчер не успевает; это и есть
+работа первичного хила.
 
 ## Контракт лога
 
