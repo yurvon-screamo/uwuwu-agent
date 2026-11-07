@@ -66,7 +66,8 @@ describe("createRunCard: позитивный путь", () => {
     )
 
     expect(rowId).toBe("20261107090000-run001")
-    expect(calls.length).toBe(2, "create + edit")
+    // bun-types: .toBe(value) — 1-аргенная сигнатура, сообщение = название теста
+    expect(calls.length).toBe(2)
     const [createCall, editCall] = calls
     // create: заголовок и тело через stdin (argv[0] — бинарь, путь зависит
     // от машины/порядка импортов — не ассертим)
@@ -87,7 +88,7 @@ describe("createRunCard: позитивный путь", () => {
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ дубль", "тело")
     expect(rowId).toBeNull()
-    expect(calls.length).toBe(1, "edit после неудачного create не вызывается")
+    expect(calls.length).toBe(1)
   })
 
   test("stdout без строки «строка: …» → null (дрейф формата не минтит раны)", async () => {
@@ -97,6 +98,6 @@ describe("createRunCard: позитивный путь", () => {
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело")
     expect(rowId).toBeNull()
-    expect(calls.length).toBe(1, "edit не зовётся без rowId")
+    expect(calls.length).toBe(1)
   })
 })
