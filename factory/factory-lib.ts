@@ -462,6 +462,22 @@ export interface SpawnInit {
 
 const dash = (value: string): string => (value.trim() === "" ? "—" : value.trim())
 
+/** Идентификация задачи для стартовых промптов: одна шапка на все ветки
+ *  promptForStart (спавну нужен repo, конфликт-ветке — pr). */
+export interface PromptTarget {
+  rowId: string
+  project: string
+  repo: string
+  /** PR строки; конфликт-kickoff ссылается на него */
+  pr: string
+}
+
+/** Общий хвост параметров стартовых промптов: окружение задачи и инит-блок
+ *  первого промпта. undefined-поля — легитимные режимы (env:false, без инита). */
+export interface PromptContext {
+  env?: SpawnEnvContext
+  init?: SpawnInit
+}
 /** YAML frontmatter из начала markdown (--- … ---) — паритет CLI
  *  markdown.rs strip_frontmatter: ядро в экспорте ведёт live-атрибуты дока. */
 export function stripFrontmatter(md: string): string {
@@ -516,8 +532,9 @@ export function spawnInitBlock(init: SpawnInit, rowId: string, project: string):
  *  демон знает только «какая задача» и «где работать». */
 export function spawnPrompt(
   rowId: string, project: string, repo: string, mode: KickoffMode = "design",
-  env?: SpawnEnvContext, init?: SpawnInit,
+  ctx: PromptContext = {},
 ): string {
+  const { env, init } = ctx
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -563,8 +580,9 @@ export function spawnPrompt(
  *  Стадию НЕ предписываем: fast-track в In Progress продолжит реализацию,
  *  Design-задача — утряску; фаза живёт в теле задачи и текущем статусе. */
 export function continuePrompt(
-  rowId: string, project: string, repo: string, env?: SpawnEnvContext, init?: SpawnInit,
+  rowId: string, project: string, repo: string, ctx: PromptContext = {},
 ): string {
+  const { env, init } = ctx
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
@@ -591,8 +609,9 @@ export function continuePrompt(
  *  init — только на свежесозданной сессии (через promptForStart/startTask);
  *  живая сессия инит при спавне уже получила — будильник без init (дельта). */
 export function conflictFixPrompt(
-  rowId: string, pr: string, project: string, env?: SpawnEnvContext, init?: SpawnInit,
+  rowId: string, pr: string, project: string, ctx: PromptContext = {},
 ): string {
+  const { env, init } = ctx
   return [
     `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с master (${pr}).`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
@@ -621,13 +640,10 @@ export type StartKind = KickoffMode | "continue" | "conflict-fix"
  *  сквозной для всех веток — рестарт env-задачи называет окружение;
  *  init (инит-блок первого промпта) — сквозной: все три вида старта
  *  создают свежую сессию, которой нужен полный инит. */
-export function promptForStart(
-  start: StartKind, rowId: string, project: string, repo: string, pr: string,
-  env?: SpawnEnvContext, init?: SpawnInit,
-): string {
-  if (start === "continue") return continuePrompt(rowId, project, repo, env, init)
-  if (start === "conflict-fix") return conflictFixPrompt(rowId, pr, project, env, init)
-  return spawnPrompt(rowId, project, repo, start, env, init)
+export function promptForStart(start: StartKind, target: PromptTarget, ctx: PromptContext = {}): string {
+  if (start === "continue") return continuePrompt(target.rowId, target.project, target.repo, ctx)
+  if (start === "conflict-fix") return conflictFixPrompt(target.rowId, target.pr, target.project, ctx)
+  return spawnPrompt(target.rowId, target.project, target.repo, start, ctx)
 }
 
 /** mergeable-статус PR из вывода `gh pr view <pr> --json mergeable`.

@@ -238,7 +238,9 @@ describe("spawnPrompt", () => {
   })
   test("env-контекст: работа в готовом окружении, старой строки «создай worktree» нет", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", {
-      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      env: {
+        repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      },
     })
     expect(p).toContain("/home/x/agents-env/r1/repo")
     expect(p).toContain("work/task-r1")
@@ -266,7 +268,9 @@ describe("continuePrompt", () => {
   })
   test("env-контекст: окружение уже существует — своё не создавай, пути названы", () => {
     const p = continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", {
-      repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      env: {
+        repoDir: "/home/x/agents-env/r1/repo", branch: "work/task-r1", scratchDir: "/home/x/agents-env/r1/scratch",
+      },
     })
     expect(p).toContain("уже существует — своё не создавай")
     expect(p).toContain("/home/x/agents-env/r1/repo")
@@ -428,7 +432,7 @@ describe("conflictFixPrompt", () => {
   })
   test("env-контекст назван, чтобы агент не плодил окружение заново", () => {
     const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
-    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", env)
+    const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { env })
     expect(p).toContain(env.repoDir)
     expect(p).toContain(env.branch)
     expect(p).toContain("своё не создавай")
@@ -441,41 +445,43 @@ describe("conflictFixPrompt", () => {
 })
 
 describe("promptForStart: единственная точка выбора стартового промпта", () => {
-  const args = ["r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "https://github.com/x/pull/9"] as const
+  const target = {
+    rowId: "r1", project: "uwuwu", repo: "yurvon-screamo/uwuwu-agent", pr: "https://github.com/x/pull/9",
+  }
   test("conflict-fix → конфликт-kickoff", () => {
-    const p = promptForStart("conflict-fix", ...args)
+    const p = promptForStart("conflict-fix", target)
     expect(p).toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu"))
   })
   test("continue → рестарт без предписания стадии", () => {
-    const p = promptForStart("continue", ...args)
+    const p = promptForStart("continue", target)
     expect(p).toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent"))
     expect(p).not.toContain("Стадия Design")
   })
   test("implement/design → spawnPrompt соответствующего режима", () => {
-    expect(promptForStart("implement", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
-    expect(promptForStart("design", ...args)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
+    expect(promptForStart("implement", target)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement"))
+    expect(promptForStart("design", target)).toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design"))
   })
   test("env прокидывается во все ветки (work-line/окружение названо)", () => {
     const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
-    expect(promptForStart("implement", ...args, env))
-      .toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", env))
-    expect(promptForStart("implement", ...args, env)).toContain(env.repoDir)
+    expect(promptForStart("implement", target, { env }))
+      .toBe(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", { env }))
+    expect(promptForStart("implement", target, { env })).toContain(env.repoDir)
     // рестарт env-задачи называет окружение — агент не плодит новое
-    expect(promptForStart("continue", ...args, env))
-      .toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", env))
-    expect(promptForStart("continue", ...args, env)).toContain(env.repoDir)
-    expect(promptForStart("conflict-fix", ...args, env))
-      .toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", env))
-    expect(promptForStart("conflict-fix", ...args, env)).toContain(env.repoDir)
+    expect(promptForStart("continue", target, { env }))
+      .toBe(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", { env }))
+    expect(promptForStart("continue", target, { env })).toContain(env.repoDir)
+    expect(promptForStart("conflict-fix", target, { env }))
+      .toBe(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { env }))
+    expect(promptForStart("conflict-fix", target, { env })).toContain(env.repoDir)
   })
   test("init прокидывается во все ветки — все три вида старта создают свежую сессию", () => {
     const init: SpawnInit = {
       person: null, projectDocs: [],
       task: { title: "Т", status: "Design", branch: "", pr: "" },
     }
-    expect(promptForStart("implement", ...args, undefined, init)).toContain("Инит-данные")
-    expect(promptForStart("continue", ...args, undefined, init)).toContain("Инит-данные")
-    expect(promptForStart("conflict-fix", ...args, undefined, init)).toContain("Инит-данные")
+    expect(promptForStart("implement", target, { init })).toContain("Инит-данные")
+    expect(promptForStart("continue", target, { init })).toContain("Инит-данные")
+    expect(promptForStart("conflict-fix", target, { init })).toContain("Инит-данные")
   })
 })
 
@@ -538,7 +544,7 @@ describe("spawnInitBlock: инит-данные первого промпта", 
     expect(b).toContain("глубокое чтение — по необходимости")
   })
   test("spawnPrompt с init: блок после шапки, до инструкций; без init — блока нет", () => {
-    const withInit = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design", env, baseInit)
+    const withInit = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "design", { env, init: baseInit })
     const header = withInit.indexOf("Задача r1")
     const block = withInit.indexOf("Инит-данные")
     const instructions = withInit.indexOf("Работай по AGENTS.md")
@@ -547,8 +553,8 @@ describe("spawnInitBlock: инит-данные первого промпта", 
     expect(withInit).toContain("Персона владельца")
     expect(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")).not.toContain("Инит-данные")
     expect(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")).not.toContain("Инит-данные")
-    expect(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", env, baseInit)).toContain("Инит-данные")
-    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", env, baseInit)).toContain("Инит-данные")
+    expect(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", { init: baseInit })).toContain("Инит-данные")
+    expect(conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu", { init: baseInit })).toContain("Инит-данные")
   })
 })
 

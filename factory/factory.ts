@@ -601,14 +601,21 @@ async function prConflicted(pr: string, cwd: string): Promise<boolean> {
  *  (слаг для агента — «<proj>/<сегмент>»). */
 const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
 
+/** Идентификаторы ядерных контуров инита: резолвятся одним lsNotebooks. */
+const PERSON_NOTEBOOK = process.env.UWUWU_PERSON_NOTEBOOK ?? "Experience"
+const PROJECTS_NOTEBOOK = "Projects"
+
 /** Инит-блок спавна (постановка: фабрика знает юзер/проект/задачу ДО
  *  спавна — агент не тратит ход на person show/доки/task get ради
  *  ориентации). Деградация любого источника честная (null/пустой список
  *  + строка в блоке), спавн от полноты инита не зависит. */
 async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omit<SpawnInit, "task">> {
+  const notebookIds = (await mcp.tool<{ ids?: Record<string, string> }>("notebook_ids_by_names", {
+    names: [PERSON_NOTEBOOK, PROJECTS_NOTEBOOK],
+  })).ids ?? {}
   const [person, projectDocs] = await Promise.all([
-    fetchPersonMarkdown(),
-    fetchProjectDocSlugs(projectName),
+    fetchPersonMarkdown(notebookIds[PERSON_NOTEBOOK] ?? ""),
+    fetchProjectDocSlugs(projectName, notebookIds[PROJECTS_NOTEBOOK] ?? ""),
   ])
   return {
     person,
@@ -622,16 +629,14 @@ async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omi
 /** Персона владельца: Experience:/personal/PERSON (env-шов паритета CLI).
  *  null — дока нет, дубль hpath (≥2 id — не угадываем, паритет person show)
  *  или сбой ядра: во всех случаях пропуск источника, не ошибка спавна. */
-async function fetchPersonMarkdown(): Promise<string | null> {
+async function fetchPersonMarkdown(personNotebookId: string): Promise<string | null> {
   try {
-    const notebook = process.env.UWUWU_PERSON_NOTEBOOK ?? "Experience"
     const hpath = process.env.UWUWU_PERSON_HPATH ?? "/personal/PERSON"
-    const nbId = (await mcp.tool<{ id?: string }>("notebook_id_by_name", { name: notebook })).id ?? ""
-    if (nbId === "") {
-      log(`инит: ноутбук «${notebook}» не найден — персона пропущена`)
+    if (personNotebookId === "") {
+      log(`инит: ноутбук «${PERSON_NOTEBOOK}» не найден — персона пропущена`)
       return null
     }
-    const ids = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", { notebook: nbId, path: hpath })).ids ?? []
+    const ids = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", { notebook: personNotebookId, path: hpath })).ids ?? []
     if (ids.length !== 1) {
       log(`инит: персона ${ids.length === 0 ? "не найдена" : `неоднозначна (${ids.length} id)`} — пропущена`)
       return null
@@ -650,19 +655,22 @@ async function fetchPersonMarkdown(): Promise<string | null> {
 }
 
 /** Слаги живых доков канон-четвёрки проекта (uwuwu-cli read «<proj>/<док>»).
- *  Мёртвый/неоднозначный hpath — док пропускается, не угадываем. */
-async function fetchProjectDocSlugs(projectName: string): Promise<string[]> {
+ *  Мёртвый/неоднозначный hpath — док пропускается, не угадываем; четвёрка
+ *  резолвится параллельно (порядок слагов — порядок PROJECT_INIT_DOCS). */
+async function fetchProjectDocSlugs(projectName: string, projectsNotebookId: string): Promise<string[]> {
   try {
-    const nbId = (await mcp.tool<{ id?: string }>("notebook_id_by_name", { name: "Projects" })).id ?? ""
-    if (nbId === "") {
-      log("инит: ноутбук «Projects» не найден — доки проекта пропущены")
+    if (projectsNotebookId === "") {
+      log(`инит: ноутбук «${PROJECTS_NOTEBOOK}» не найден — доки проекта пропущены`)
       return []
     }
+    const resolved = await Promise.all(PROJECT_INIT_DOCS.map(async (title) => ({
+      title,
+      ids: (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
+        notebook: projectsNotebookId, path: `/${projectName}/${title}`,
+      })).ids ?? [],
+    })))
     const slugs: string[] = []
-    for (const title of PROJECT_INIT_DOCS) {
-      const ids = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-        notebook: nbId, path: `/${projectName}/${title}`,
-      })).ids ?? []
+    for (const { title, ids } of resolved) {
       if (ids.length === 1) slugs.push(`${projectName}/${title}`)
       else log(`инит: док «${projectName}/${title}» ${ids.length === 0 ? "не найден" : `неоднозначен (${ids.length} id)`} — пропущен`)
     }
@@ -719,7 +727,11 @@ async function startTask(
   })
   if (sessionID === null) throw new Error("сессия не создалась")
 
-  const sent = await promptSession(sessionID, promptForStart(start, task.rowId, projectName, cfg.repo, task.pr, envCtx, init))
+  const sent = await promptSession(sessionID, promptForStart(
+    start,
+    { rowId: task.rowId, project: projectName, repo: cfg.repo, pr: task.pr },
+    { env: envCtx, init },
+  ))
   if (!sent) throw new Error("spawn-промпт не ушёл")
 
   // живость сразу после спавна: «фиктивные sessionID» (create ок, сессии
