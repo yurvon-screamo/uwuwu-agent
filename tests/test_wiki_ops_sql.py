@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import kernel_post
 
 COUNT_STMT = "select count(*) c from blocks where type='d' limit 1"
 
@@ -32,21 +33,13 @@ def post_returning(payload):
 
 
 def run_sql_rows(payload):
-    original_post = wiki_ops.post
-    wiki_ops.post = post_returning(payload)
-    try:
+    with kernel_post(post_returning(payload)):
         return wiki_ops._sql_rows("select 1 limit 1")
-    finally:
-        wiki_ops.post = original_post
 
 
 def run_sql_scalar(payload):
-    original_post = wiki_ops.post
-    wiki_ops.post = post_returning(payload)
-    try:
+    with kernel_post(post_returning(payload)):
         return wiki_ops._sql_scalar(COUNT_STMT)
-    finally:
-        wiki_ops.post = original_post
 
 
 class RowsEnvelopeDiscipline(unittest.TestCase):

@@ -31,6 +31,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import kernel_post
 
 KERNEL_DEFAULT_LIMIT = 64
 FIXTURE_DOCS = 250
@@ -86,14 +87,9 @@ class FakeKernel:
 
 
 def run_orgls(post_impl) -> str:
-    original_post = wiki_ops.post
-    wiki_ops.post = post_impl
-    try:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            wiki_ops.cmd_orgls(type("Args", (), {})())
-    finally:
-        wiki_ops.post = original_post
+    buffer = io.StringIO()
+    with kernel_post(post_impl), redirect_stdout(buffer):
+        wiki_ops.cmd_orgls(type("Args", (), {})())
     return buffer.getvalue()
 
 
@@ -197,21 +193,13 @@ class NotebooksEnvelopeIsClassified(OrglsMainHarness):
 
     def test_empty_notebooks_is_legitimate_not_found(self):
         kernel = FakeKernel(notebook_count=0)
-        original_post = wiki_ops.post
-        wiki_ops.post = kernel.post
-        try:
+        with kernel_post(kernel):
             self.assertEqual(wiki_ops.notebooks(), [])
-        finally:
-            wiki_ops.post = original_post
 
     def test_closed_notebooks_filtered_out(self):
         kernel = FakeKernel(notebook_count=3, closed_count=1)
-        original_post = wiki_ops.post
-        wiki_ops.post = kernel.post
-        try:
+        with kernel_post(kernel):
             names = [nb["name"] for nb in wiki_ops.notebooks()]
-        finally:
-            wiki_ops.post = original_post
         self.assertEqual(names, ["NB0", "NB1"],
                          "закрытый NB2 обязан отфильтровываться (иначе тест пустой)")
 

@@ -19,12 +19,10 @@
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_delete.py
 """
-import io
 import json
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,6 +30,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import run_cmd
 
 BOX = "20261103224312-fbrf5fp"
 CANON_ID = "20261105122006-zw94m4h"
@@ -127,21 +126,17 @@ class FakeKernel:
 
 def run_delete(kernel: FakeKernel, doc_id: str, force: bool = False) -> str:
     args = SimpleNamespace(docId=doc_id, force=force)
-    original_post = wiki_ops.post
     original_fs_file = getattr(wiki_ops, "_fs_file", None)
-    wiki_ops.post = kernel.post
     wiki_ops._fs_file = kernel.fs_probe
     try:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer), patch.object(wiki_ops.time, "sleep", lambda s: None):
-            wiki_ops.cmd_delete(args)
+        with patch.object(wiki_ops.time, "sleep", lambda s: None):
+            out, _ = run_cmd(wiki_ops.cmd_delete, args, kernel)
     finally:
-        wiki_ops.post = original_post
         if original_fs_file is not None:
             wiki_ops._fs_file = original_fs_file
         else:
             del wiki_ops._fs_file
-    return buffer.getvalue()
+    return out
 
 
 class StubDuplicateIsRemoved(unittest.TestCase):
