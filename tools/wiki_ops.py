@@ -141,6 +141,10 @@ ORG_LS_LIMIT = 100000
 # export дока в markdown (cmd_export, _is_stub, _export_content).
 EXPORT_MD_PATH = "/api/export/exportMdContent"
 
+# Content-Type JSON-конвертов kernel API (post-каналы: _post_once, _fs_file,
+# _get_workspace_file) — один литерал вместо трёх копий (S1192).
+JSON_CONTENT_TYPE = "application/json"
+
 # getFile-проба файла воркспейса (пост-чек delete, ADR-025 файловый контракт).
 GET_FILE_PATH = "/api/file/getFile"
 
@@ -207,7 +211,7 @@ def _post_once(path: str, body: dict) -> tuple[str, object, str]:
     kind — ok | network | metadata | code; last — текст последней ошибки."""
     req = urllib.request.Request(URL + path, data=json.dumps(body).encode(),
                                  headers={"Authorization": f"Token {TOKEN}",
-                                          "Content-Type": "application/json"}, method="POST")
+                                          "Content-Type": JSON_CONTENT_TYPE}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — схема http/https из UWUWU_SIYUAN_URL
             d = json.loads(r.read())
@@ -265,7 +269,7 @@ def _fs_file(path: str) -> str:
     _conf()
     req = urllib.request.Request(URL + GET_FILE_PATH, data=json.dumps({"path": path}).encode(),
                                  headers={"Authorization": f"Token {TOKEN}",
-                                          "Content-Type": "application/json"}, method="POST")
+                                          "Content-Type": JSON_CONTENT_TYPE}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
             body = r.read()
@@ -876,7 +880,7 @@ def _get_workspace_file(ws_path: str) -> bytes:
     _conf()
     req = urllib.request.Request(URL + GET_FILE_PATH, data=json.dumps({"path": ws_path}).encode(),
                                  headers={"Authorization": f"Token {TOKEN}",
-                                          "Content-Type": "application/json"}, method="POST")
+                                          "Content-Type": JSON_CONTENT_TYPE}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 — URL из _conf (scheme-guard http/https), путь — константа kernel API
             body = r.read()
@@ -1080,7 +1084,10 @@ def _sy_tree(doc_id: str) -> dict:
         raise RuntimeError(f".sy-файл дока отсутствует ({fs_path}) — проверь uwuwu-cli doctor") from None
     except RuntimeError:
         raise RuntimeError(f".sy-файл дока не читается ({fs_path}) — транспорт/ядро; проверь uwuwu-cli doctor") from None
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f".sy-файл дока повреждён ({fs_path}) — не JSON; проверь uwuwu-cli doctor") from None
 
 
 def _sy_find_with_next(tree: dict, block_id: str) -> tuple[dict, dict | None] | None:
@@ -1127,7 +1134,11 @@ def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
             f"and content like '{_sql_str(MARKER_PREFIX)}%' limit 20")  # nosec B608 — docId валидирован DOC_ID_RE, префикс константа
     rows = _sql_rows(stmt)
     markers = [r for r in rows if r.get("content") == MARKER_PREFIX + marker_name]
+    # Раскладка «маркеры в доке» — по срезу LIMIT 20: при упоре в лимит помечаем
+    # усечение явно (молчаливая обрезка раскладки — та же маскировка сбоя).
     known = "; ".join(sorted({r["content"] for r in rows})) or "нет"
+    if len(rows) == 20:
+        known += " (усечено до 20 — раскладка неполна)"
     if len(markers) > 1:
         listing = "; ".join(m["id"] for m in markers)
         raise RuntimeError(f"маркер «{MARKER_PREFIX}{marker_name}» не уникален в доке ({listing}) — "
