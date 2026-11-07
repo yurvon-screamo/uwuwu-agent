@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use super::ollama::OllamaClient;
-use super::store::{ChunkMeta, ChunkRecord, Store};
+use super::store::{ChunkMeta, ChunkRecord, IndexedRow, Store};
 use super::SEARCH_EMBED_TIMEOUT;
 
 /// Целевые типы блоков-чанков (контентные; l/d/av/tb — не чанки).
@@ -63,6 +63,9 @@ pub struct SyncReport {
     pub skipped_long: usize,
     /// Строк, вычищенных из индекса (усохшие/переросшие чанки) — per-run.
     pub pruned: usize,
+    /// Дрейф путей, освежённый без переэмбедда (hpath/box/root при
+    /// неизменных updated и content).
+    pub paths_refreshed: usize,
     /// Бюджет исчерпан до полной дотяжки — хвост останется над watermark.
     pub budget_exhausted: bool,
 }
@@ -187,6 +190,9 @@ struct PageOutcome {
     /// Усохшие/переросшие строки — prune-кандидаты (DELETE отсутствующих
     /// no-op по PK; вернуть блок может правка).
     prune_ids: Vec<String>,
+    /// Дрейф метаданных (hpath/box/root) при неизменных (updated, content) —
+    /// освежается без переэмбедда.
+    drift: Vec<ChunkMeta>,
     cursor_updated: String,
     cursor_id: String,
     skipped_short: usize,
@@ -195,14 +201,19 @@ struct PageOutcome {
 
 /// Классификация страницы дельты: курсор двигается по всем найденным
 /// строкам (включая пропущенные по длине), исчезнувшие между сканом и
-/// fetch'ем курсор не двигают — их поймает reconcile.
+/// fetch'ем курсор не двигают — их поймает reconcile. Строка, уже
+/// проиндексированная с теми же (updated, content), — чистый skip:
+/// overlap-перескан не переэмбеддит идемпотентное (анти-карусель
+/// 20261106182055), а расхождение только в путях — дрейф без эмбедда.
 fn process_page(
     rows: &[Value],
     by_id: &std::collections::HashMap<String, KernelRow>,
+    indexed: &std::collections::HashMap<String, IndexedRow>,
 ) -> PageOutcome {
     let mut outcome = PageOutcome {
         pending: Vec::with_capacity(rows.len()),
         prune_ids: Vec::new(),
+        drift: Vec::new(),
         cursor_updated: String::new(),
         cursor_id: String::new(),
         skipped_short: 0,
@@ -217,6 +228,19 @@ fn process_page(
         };
         outcome.cursor_updated = kernel_row.meta.updated.clone();
         outcome.cursor_id = kernel_row.meta.block_id.clone();
+        if let Some(already) = indexed.get(id) {
+            if already.meta.updated == kernel_row.meta.updated
+                && already.content == kernel_row.content
+            {
+                let drifted = already.meta.hpath != kernel_row.meta.hpath
+                    || already.meta.box_id != kernel_row.meta.box_id
+                    || already.meta.root_id != kernel_row.meta.root_id;
+                if drifted {
+                    outcome.drift.push(kernel_row.meta.clone());
+                }
+                continue;
+            }
+        }
         match length_class(&kernel_row.content) {
             LengthClass::TooShort => {
                 outcome.skipped_short += 1;
@@ -234,28 +258,50 @@ fn process_page(
 
 /// Стартовый курсор дельты: явный since (rebuild) или watermark минус
 /// overlap; пустой watermark — с нуля; мусор в meta — громкая ошибка.
+/// Overlap сдвигает только секунду: id-компонента пары на resume не
+/// сужает перескан (тот же at-least-once, что у голого watermark).
 fn starting_cursor(store: &Store, since: &Option<String>) -> Result<(String, String)> {
     let updated = match since {
         Some(since) => since.clone(),
         None => match store.meta("watermark")? {
-            Some(mark) => since_with_overlap(&mark)?,
+            Some(mark) => {
+                let (watermark_updated, _) = split_watermark(&mark);
+                since_with_overlap(&watermark_updated)?
+            }
             None => "0".to_string(),
         },
     };
     Ok((updated, String::new()))
 }
 
+/// Композитный курсор «updated|id»: лексикография = порядок (updated, id)
+/// (updated фиксированной ширины 14 цифр; id сравнивается строкой — тот же
+/// порядок, что keyset ядра). Сепаратор '|' в обеих частях не встречается.
+pub(crate) fn watermark_composite(updated: &str, id: &str) -> String {
+    format!("{updated}|{id}")
+}
+
+/// Обратный разбор композита; legacy-значение без '|' (водяной знак
+/// до pair-фикса) — секунда известна, id-курсор пуст.
+pub(crate) fn split_watermark(mark: &str) -> (String, String) {
+    match mark.split_once('|') {
+        Some((updated, id)) => (updated.to_string(), id.to_string()),
+        None => (mark.to_string(), String::new()),
+    }
+}
+
 /// Шаг scan-page: страница дельты + точечный fetch полных строк по PK,
 /// индексированные по id — тяжёлый content не идёт через keyset-скан
 /// (ядро без индекса по updated, полный скан таскает мегабайты).
+/// Возвращает и ids страницы: они нужны delta_sync для indexed_rows.
 async fn fetch_classifiable_page(
     sy: &SiYuan,
     cursor_updated: &str,
     cursor_id: &str,
-) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>)> {
+) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>, Vec<String>)> {
     let rows = sy.sql(&delta_page_stmt(cursor_updated, cursor_id)).await?;
     if rows.is_empty() {
-        return Ok((rows, std::collections::HashMap::new()));
+        return Ok((rows, std::collections::HashMap::new(), Vec::new()));
     }
     let page_ids: Vec<String> = rows
         .iter()
@@ -266,10 +312,11 @@ async fn fetch_classifiable_page(
         .into_iter()
         .map(|row| (row.meta.block_id.clone(), row))
         .collect();
-    Ok((rows, by_id))
+    Ok((rows, by_id, page_ids))
 }
 
-/// Дельта-цикл: страницы → фильтр длины → эмбедд батчами → upsert+watermark.
+/// Дельта-цикл: страницы → skip идемпотентного / фильтр длины → эмбедд
+/// батчами → upsert+watermark-пара.
 ///
 /// EmbedError пробрасывается корнем anyhow-цепочки (search-путь даункастит
 /// его в статус); kernel-ошибки — anyhow-контекст (маршрут ядра уже
@@ -288,13 +335,14 @@ pub async fn delta_sync(
             report.budget_exhausted = true;
             break;
         }
-        let (rows, by_id) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
+        let (rows, by_id, page_ids) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
         if rows.is_empty() {
             break;
         }
         let page_len = rows.len();
+        let indexed = store.indexed_rows(&page_ids)?;
 
-        let outcome = process_page(&rows, &by_id);
+        let outcome = process_page(&rows, &by_id, &indexed);
         cursor_updated = outcome.cursor_updated;
         cursor_id = outcome.cursor_id;
         report.skipped_short += outcome.skipped_short;
@@ -305,6 +353,11 @@ pub async fn delta_sync(
         // устаревший контент с вектором (п.1 ревью PR #78).
         if !outcome.prune_ids.is_empty() {
             report.pruned += store.prune(&outcome.prune_ids)?;
+        }
+        // Дрейф путей живёт без переэмбедда: сменился hpath/box/root при
+        // неизменных (updated, content) — метаданные в том же прогоне.
+        if !outcome.drift.is_empty() {
+            report.paths_refreshed += store.refresh_paths(&outcome.drift)?;
         }
 
         if !embed_batches(
@@ -320,9 +373,9 @@ pub async fn delta_sync(
         }
         if page_len < PAGE {
             // Чистый конец: весь просмотренный диапазон обработан — watermark
-            // на крайний курсор (включая пропущенные по длине строки);
+            // на крайний курсор-пару (включая пропущенные по длине строки);
             // запись — с MAX-гвардом (только вперёд).
-            store.advance_watermark(&cursor_updated)?;
+            store.advance_watermark(&watermark_composite(&cursor_updated, &cursor_id))?;
             break;
         }
         if let Some(delay) = opts.page_delay {
@@ -395,7 +448,9 @@ async fn embed_and_upsert(
             vec,
         })
         .collect();
-    let watermark = rows.last().map(|r| r.meta.updated.clone());
+    let watermark = rows
+        .last()
+        .map(|r| watermark_composite(&r.meta.updated, &r.meta.block_id));
     let tx = store.begin()?;
     Store::upsert_batch(&tx, &records, watermark.as_deref())?;
     tx.commit()?;

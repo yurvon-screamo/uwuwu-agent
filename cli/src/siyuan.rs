@@ -422,6 +422,68 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Заменить содержимое блока (тип сохраняется: html-блок остаётся html).
+    pub async fn update_block_md(&self, block_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/updateBlock",
+            json!({ "dataType": "markdown", "data": markdown, "id": block_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Вставить markdown-блоки сразу после блока previous_id.
+    pub async fn insert_block_md_after(&self, previous_id: &str, markdown: &str) -> Result<()> {
+        self.post(
+            "/api/block/insertBlock",
+            json!({
+                "dataType": "markdown",
+                "data": markdown,
+                "previousID": previous_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Расположение .sy-файла дока в воркспейсе: (box, path от data/) —
+    /// FS-истина порядка детей (индекс ядра порядок не отдаёт).
+    pub async fn doc_file_location(&self, doc_id: &str) -> Result<(String, String)> {
+        let v = self
+            .post("/api/block/getBlockInfo", json!({ "id": doc_id }))
+            .await?;
+        let box_id = v
+            .pointer("/box")
+            .and_then(|b| b.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет box в ответе {v}"))?
+            .to_string();
+        let path = v
+            .pointer("/path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("getBlockInfo {doc_id}: нет path в ответе {v}"))?
+            .to_string();
+        Ok((box_id, path))
+    }
+
+    /// Упорядоченные дети дока верхнего уровня из .sy-файла ( Children массив
+    /// в порядке документа). Нужен для адресации «блок после маркера»:
+    /// SQL-индекс порядок детей не хранит, kramdown-пропы html-блоков
+    /// недокументированы — .sy детерминирован (NodeHTMLBlock).
+    pub(crate) async fn doc_children(&self, doc_id: &str) -> Result<Vec<DocChild>> {
+        let (box_id, path) = self.doc_file_location(doc_id).await?;
+        let bytes = match self
+            .fetch_workspace_file(&format!("data/{box_id}{path}"))
+            .await
+        {
+            FileFetch::Bytes(bytes) => bytes,
+            FileFetch::Missing => bail!("{}: .sy дока нет в data/ (box={box_id})", doc_id),
+            FileFetch::Failed(err) => bail!("getFile {doc_id}: {err}"),
+        };
+        let tree: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("{}: .sy не JSON", doc_id))?;
+        Ok(doc_children_from_sy(&tree))
+    }
+
     /// Экспорт дока в markdown по hPath. `notebook_id` — **ИД** ноутбука
     /// (формат 20261103224312-fbrf5fp, как возвращает `ensure_notebook`),
     /// не имя: kernel getIDsByHPath принимает только ID (см. `siyuan_id`).
@@ -749,6 +811,29 @@ impl SiYuan {
             .to_string())
     }
 
+    /// Логический фейл шлюза/ядра внутри успешного MCP-ответа (HTTP 200,
+    /// isError:false) не должен проходить как данные: ok=false (конвенция
+    /// шлюза AFFiNE, ADR-006) или ядерный конверт code≠0 — это ошибка
+    /// операции. require_ok-барьер AFFiNE-эры (PR #17), перенесённый на
+    /// единый вход SiYuan-клиента.
+    fn require_payload_ok(tool: &str, payload: &Value) -> Result<()> {
+        if payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let msg = payload
+                .get("msg")
+                .or_else(|| payload.get("error"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            bail!("tool {tool}: ok=false: {msg}");
+        }
+        match payload.get("code").and_then(|c| c.as_i64()) {
+            Some(0) | None => Ok(()),
+            Some(code) => {
+                let msg = payload.get("msg").and_then(|m| m.as_str()).unwrap_or("?");
+                bail!("tool {tool}: code={code}: {msg}");
+            }
+        }
+    }
+
     pub async fn mcp_tool(&self, name: &str, args: Value) -> Result<Value> {
         // ленивая инициализация MCP-сессии при первом обращении
         self.ensure_mcp_session().await?;
@@ -763,15 +848,19 @@ impl SiYuan {
                     .unwrap_or("?")
             );
         }
-        // structuredContent при наличии, иначе parse content[0].text
+        // structuredContent при наличии, иначе parse content[0].text;
+        // оба канала проходят барьер логического фейла
         if let Some(sc) = r.get("structuredContent") {
+            Self::require_payload_ok(name, sc)?;
             return Ok(sc.clone());
         }
         let text = r
             .pointer("/content/0/text")
             .and_then(|t| t.as_str())
             .unwrap_or("{}");
-        Ok(serde_json::from_str(text).unwrap_or(Value::Null))
+        let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        Self::require_payload_ok(name, &parsed)?;
+        Ok(parsed)
     }
 
     async fn ensure_mcp_session(&self) -> Result<()> {
@@ -865,6 +954,94 @@ fn body_snippet(raw: &str) -> String {
         head.push('…');
     }
     head
+}
+
+/// Верхнеуровневые дети дока из .sy в порядке документа — минимум для
+/// адресации диаграмм по маркеру.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocChild {
+    pub(crate) id: String,
+    pub(crate) kind: DocChildKind,
+    /// Текст абзаца/заголовка (для html-блока — сам html).
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocChildKind {
+    Paragraph,
+    Heading,
+    Html,
+    Other,
+}
+
+/// Парсер Children массива .sy-дока (проба ядра 3.8.10: NodeParagraph /
+/// NodeHeading несут текст во вложенных NodeText.Data, NodeHTMLBlock —
+/// html в собственном Data).
+pub(crate) fn doc_children_from_sy(tree: &Value) -> Vec<DocChild> {
+    tree.get("Children")
+        .and_then(|c| c.as_array())
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|node| {
+                    let id = node.get("ID")?.as_str()?.to_string();
+                    let kind = match node.get("Type").and_then(|t| t.as_str()) {
+                        Some("NodeParagraph") => DocChildKind::Paragraph,
+                        Some("NodeHeading") => DocChildKind::Heading,
+                        Some("NodeHTMLBlock") => DocChildKind::Html,
+                        _ => DocChildKind::Other,
+                    };
+                    let text = match kind {
+                        DocChildKind::Html | DocChildKind::Other => node
+                            .get("Data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        DocChildKind::Paragraph | DocChildKind::Heading => node
+                            .get("Children")
+                            .and_then(|c| c.as_array())
+                            .map(|texts| {
+                                texts
+                                    .iter()
+                                    .filter(|t| {
+                                        t.get("Type").and_then(|v| v.as_str()) == Some("NodeText")
+                                    })
+                                    .filter_map(|t| t.get("Data").and_then(|d| d.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .unwrap_or_default(),
+                    };
+                    Some(DocChild { id, kind, text })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Адрес диаграммы: маркер-абзац `⁂ diagram:<имя>` и следующий блок.
+/// Маркеров с одним именем несколько → первое вхождение (детерминизм,
+/// как в replace_md_section); сосед маркера — любой вид, is_html решает
+/// операцию (update/delete против insert-after).
+pub(crate) fn find_marker_location(
+    children: &[DocChild],
+    marker_prefix: &str,
+    name: &str,
+) -> Option<crate::html_embed::MarkerLocation> {
+    let marker_text = format!("{marker_prefix}{name}");
+    let pos = children
+        .iter()
+        .position(|c| c.kind == DocChildKind::Paragraph && c.text == marker_text)?;
+    let following = children
+        .get(pos + 1)
+        .map(|next| crate::html_embed::FollowingBlock {
+            id: next.id.clone(),
+            is_html: next.kind == DocChildKind::Html,
+        });
+    Some(crate::html_embed::MarkerLocation {
+        marker_id: children[pos].id.clone(),
+        following,
+    })
 }
 
 /// id блоков из markdown-дампа get_children (строки вида `- [p] текст (20261104-x)`).
@@ -1489,5 +1666,140 @@ mod tests {
         sy.rename_doc("nb-1", "/root/board/doc-id.sy", "новый тайтл")
             .await
             .expect("rename ok");
+    }
+
+    /// Мок MCP-сервера: initialize по протоколу, tools/call — фиксированный result.
+    async fn mount_mcp_tool_result(server: &MockServer, result: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-ok-barrier");
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": 2, "result": result }).to_string(),
+                )
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_ok_false_in_structured_content() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"item_update\",\"ok\":false,\"msg\":\"WRITE_QUEUE_TIMEOUT\"}" }],
+                "structuredContent": { "action": "item_update", "ok": false, "msg": "WRITE_QUEUE_TIMEOUT" }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "item_update" }))
+            .await
+            .expect_err("ok=false inside a successful MCP response must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("ok=false"), "барьер называет форму: {text}");
+        assert!(
+            text.contains("WRITE_QUEUE_TIMEOUT"),
+            "причина шлюза: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_nonzero_code_in_structured_content() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"code\":-1,\"msg\":\"boom\"}" }],
+                "structuredContent": { "action": "keys", "code": -1, "msg": "boom" }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect_err("kernel envelope code=-1 without isError must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("code=-1"), "барьер называет код: {text}");
+        assert!(text.contains("boom"), "причина ядра: {text}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_bails_on_nonzero_code_in_content_json() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"code\":10201,\"msg\":\"metadata is not ready\"}" }]
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect_err("kernel error envelope relayed as content JSON must not pass as data");
+
+        let text = err.to_string();
+        assert!(text.contains("10201"), "код назван: {text}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_passes_clean_structured_content_through() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"keys\",\"data\":{\"keys\":[]}}" }],
+                "structuredContent": { "action": "keys", "data": { "keys": ["k1"] } }
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "keys" }))
+            .await
+            .expect("success envelope without error markers must pass");
+
+        assert_eq!(
+            v.pointer("/data/keys/0").and_then(|k| k.as_str()),
+            Some("k1")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_passes_kernel_success_envelope_in_content_json() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_result(
+            &server,
+            json!({
+                "content": [{ "type": "text", "text": "{\"action\":\"render\",\"code\":0,\"msg\":\"\",\"data\":{\"rows\":[]}}" }]
+            }),
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "render" }))
+            .await
+            .expect("kernel success envelope (code=0) must pass");
+
+        assert!(v.get("data").is_some(), "данные на месте: {v}");
     }
 }

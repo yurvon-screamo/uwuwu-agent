@@ -42,13 +42,16 @@ describe("tickProject: гард каскада при потере state", () =>
   })
 
   async function runTick(
-    scenario: "hold" | "done-clean" | "resolve", stateJson: string,
+    scenario: "hold" | "done-clean" | "resolve" | "claim-skip" | "claim-dead", stateJson: string,
   ): Promise<GuardVerdict> {
     // Arrange: state и service.json песочницы — до старта ребёнка
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), stateJson)
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
         ...process.env, HOME: home, UWUWU_SIYUAN_TOKEN: "test-token", GUARD_SCENARIO: scenario,
+        // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
+        // не должна уводить сидированный state в branches/<ветка>
+        UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
         // фиксируем дефолтные пороги: тест не зависит от env окружения
         UWUWU_FACTORY_SPAWN_LOSS_MAX: "", UWUWU_FACTORY_SPAWN_BURST_MAX: "",
       },
@@ -152,5 +155,34 @@ describe("tickProject: гард каскада при потере state", () =>
     // Assert: Hold-эпизода нет — легитимная чистка не алертит
     expect(verdict.holdSignaled).toBeNull()
     expect(verdict.comments).toEqual([])
+  })
+
+  test("claim-skip: живая дев-заявка без трека — не спавнится, HOLD-эпизода нет", async () => {
+    // Act: пустой state + untracked In Progress с непустой «Сессия dev»
+    // (мок сессии отвечает живостью)
+    const verdict = await runTick("claim-skip", JSON.stringify({ tasks: {} }))
+
+    // Assert: фабрика не заспавнила дубль — внешняя работа уже идёт
+    expect(verdict.sessionCreates).toBe(0)
+    expect(verdict.prompts).toBe(0)
+    // Assert: живая заявка — не сирота: HOLD-эпизод не открыт, алерта нет
+    expect(verdict.holdSignaled).toBeNull()
+    expect(verdict.comments).toEqual([])
+    expect(verdict.taskCount).toBe(0)
+  })
+
+  test("claim-dead: мёртвая дев-заявка без трека — сирота как прежде, спавнится при allow", async () => {
+    // Act: пустой state + untracked In Progress с мёртвой ячейкой (мок 404);
+    // сирот = 1 ≤ lossMax → allow
+    const verdict = await runTick("claim-dead", JSON.stringify({ tasks: {} }))
+
+    // Assert: ре-спавн компенсирует мёртвую заявку (без него — зомби-строка:
+    // ни спавна, ни stall-сигнала, ни wakeup-роутинга)
+    expect(verdict.sessionCreates).toBe(1)
+    expect(verdict.prompts).toBe(1)
+    // Assert: 1 сирота в пределах lossMax — HOLD-эпизода нет
+    expect(verdict.holdSignaled).toBeNull()
+    expect(verdict.comments).toEqual([])
+    expect(verdict.taskCount).toBe(1)
   })
 })

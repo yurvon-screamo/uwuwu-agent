@@ -5,16 +5,24 @@
 //   resolve    — доска без spawnable-строк: allow при стоящем флаге эпизода —
 //                демон обязан снять holdSignaled (выход из эпизода);
 //   done-clean — трекнутая Done-строка с сессионными ячейками: чистка state
-//                + очистка ячеек (инвариант гарда), ноль спавнов.
+//                + очистка ячеек (инвариант гарда), ноль спавнов;
+//   claim-skip — пустой state + untracked In Progress с живой дев-заявкой
+//                (task claim): внешняя работа идёт — не спавнить дубль,
+//                HOLD-эпизода нет (20261105174319);
+//   claim-dead — пустой state + untracked In Progress с мёртвой дев-заявкой:
+//                сирота как прежде и остаётся в дев-волне — при allow
+//                ре-спавн компенсирует (автокомпенсация lossMax-допуска).
 // HOME задаются родителем ДО старта процесса: os.homedir() в bun читает env
 // только на старте (инцидент 06.11: тест с runtime-HOME ходил в прод-state).
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const SCENARIO = process.env.GUARD_SCENARIO === "done-clean"
   ? "done-clean"
-  : process.env.GUARD_SCENARIO === "resolve" ? "resolve" : "hold"
+  : process.env.GUARD_SCENARIO === "claim-skip" || process.env.GUARD_SCENARIO === "claim-dead"
+    ? process.env.GUARD_SCENARIO
+    : process.env.GUARD_SCENARIO === "resolve" ? "resolve" : "hold"
 const AV_ID = "20260101000000-abcdef"
 
 interface MockRow {
@@ -45,7 +53,20 @@ const DONE_ROWS: MockRow[] = [{
 // resolve: доска без spawnable-строк — сирот и untracked нет, allow при любом флаге
 const RESOLVE_ROWS: MockRow[] = HOLD_ROWS.map((r) => ({ ...r, status: "Todo", devSession: undefined }))
 
-const rows = SCENARIO === "done-clean" ? DONE_ROWS : SCENARIO === "resolve" ? RESOLVE_ROWS : HOLD_ROWS
+// claim-skip: untracked In Progress с живой дев-заявкой (мок /api/session/:id отвечает 200)
+const CLAIM_ROWS: MockRow[] = [{
+  id: "20261107000000-row1",
+  status: "In Progress",
+  devSession: "ses_ext1",
+  bodyDoc: "20261107000000-doc1",
+  title: "Заявленная задача",
+}]
+
+const rows = SCENARIO === "done-clean"
+  ? DONE_ROWS
+  : SCENARIO === "claim-skip" || SCENARIO === "claim-dead"
+    ? CLAIM_ROWS
+    : SCENARIO === "resolve" ? RESOLVE_ROWS : HOLD_ROWS
 
 function scriptTick(): string[] {
   const calls: string[] = []
@@ -57,6 +78,16 @@ function scriptTick(): string[] {
       const payload = JSON.parse(String(init?.body ?? "{}")) as { parentID?: string }
       calls.push(`comment:${payload.parentID}`)
       return new Response(JSON.stringify({ code: 0, msg: "", data: [] }), { status: 200 })
+    }
+    if (url.includes("/api/export/exportMdContent")) {
+      // спавн-путь читает тело задачи (kickoff-промпт/adoptBodyDoc)
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string }
+      const row = rows.find((r) => r.bodyDoc === payload.id)
+      calls.push("export")
+      return new Response(JSON.stringify({
+        code: 0, msg: "",
+        data: { content: `# ${row?.title ?? "таск"}\n\nтело задачи\n`, path: "/Задачи x/таск" },
+      }), { status: 200 })
     }
     if (url.includes("/api/query/sql")) {
       const payload = JSON.parse(String(init?.body ?? "{}")) as { stmt?: string }
@@ -166,7 +197,17 @@ function scriptTick(): string[] {
         return new Response(JSON.stringify({}), { status: 200 })
       }
       calls.push("session-get")
-      return new Response(JSON.stringify({ id: "ses_x" }), { status: 200 })
+      // Мёртвые id по сценарию: hold — сироты ses_old* (404 → state-loss
+      // сигнатура); claim-skip — заявка жива (внешняя работа); claim-dead —
+      // заявка ses_ext1 мертва, а свежая фабричная сессия после спавна жива.
+      const sid = url.split("/api/session/")[1]?.split(/[/?]/)[0] ?? ""
+      const deadIds = SCENARIO === "claim-dead"
+        ? ["ses_ext1"]
+        : SCENARIO === "claim-skip" ? [] : ["ses_old1", "ses_old2", "ses_old3"]
+      if (deadIds.includes(sid)) {
+        return new Response(JSON.stringify({ code: -1, msg: "session gone" }), { status: 404 })
+      }
+      return new Response(JSON.stringify({ id: sid || "ses_x" }), { status: 200 })
     }
     if (url.includes("/api/session")) {
       calls.push("session-create")
@@ -183,9 +224,27 @@ mkdirSync(join(home, ".local/share/opencode/log"), { recursive: true })
 const stateFile = join(home, ".local/state/uwuwu-factory/state.json")
 const state = JSON.parse(readFileSync(stateFile, "utf-8"))
 
+// claim-dead: спавн проходит env-механику (ensureEnv по cfg.local) — нужен
+// реальный git-чекоут с локальным ref origin/master (fetch best-effort упадёт
+// на фиктивном remote — env.ts продолжает на локальных рефах). Чекоут живёт
+// в HOME-песочнице: /tmp/x переживал бы прогоны с остаточными ветками
+// (worktree add -b падает «branch already exists» → карантин вместо спавна).
+const localCheckout = join(home, "main-checkout")
+if (SCENARIO === "claim-dead") {
+  mkdirSync(localCheckout, { recursive: true })
+  const run = (args: string[]): void => {
+    Bun.spawnSync(args, { cwd: localCheckout, stdout: "ignore", stderr: "ignore" })
+  }
+  run(["git", "init", "-b", "master", localCheckout])
+  writeFileSync(join(localCheckout, "README.md"), "guard-child probe\n")
+  run(["git", "-C", localCheckout, "add", "."])
+  run(["git", "-C", localCheckout, "-c", "user.email=probe@local", "-c", "user.name=probe", "commit", "-m", "init"])
+  run(["git", "-C", localCheckout, "update-ref", "refs/remotes/origin/master", "HEAD"])
+}
+
 const calls = scriptTick()
 const { tickProject } = await import("../factory/factory")
-await tickProject(state, "t", { board: "Задачи x", repo: "r/x", local: "/tmp/x" })
+await tickProject(state, "t", { board: "Задачи x", repo: "r/x", local: SCENARIO === "claim-dead" ? localCheckout : "/tmp/x" })
 
 const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   tasks: Record<string, unknown>

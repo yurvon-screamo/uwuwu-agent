@@ -11,11 +11,15 @@ mod create_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod claim_tests;
+#[cfg(test)]
 mod fallback_tests;
 #[cfg(test)]
 mod kernel_tests;
 #[cfg(test)]
 mod cron_tests;
+#[cfg(test)]
+mod write_path_tests;
 
 pub use sy_dispatch::read_markdown;
 

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
 // Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
@@ -62,13 +64,17 @@ export interface TrackedTask {
   /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
    *  env-механика к задаче не применялась */
   envDir?: string
-  /** задача доживает в старом поведении (cwd = cfg.local, агент сам делает
-   *  ворктри): штамп loadState для записей, спавненных до env-механики */
-  legacy?: boolean
   /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
    *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
    *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
   mergedPrUrl?: string
+  /** хэш норм-формы контента тела вне секции «Комменты» — bodyEdit-гейт:
+   *  lastmod двигают UI-пересохранения и собственные записи агента, хэш —
+   *  только контентные дельты (дефекты №3/№5) */
+  bodyHash?: string
+  /** последний доставленный будильник: идентичный ключ в коротком окне не
+   *  ставится в сессию повторно (дефект №5.2, дубль-доставка) */
+  lastWakeup?: WakeupStamp
 }
 
 export interface FactoryState {
@@ -90,19 +96,6 @@ export const REVIEW_RESULT_STATUS = "Ревью результата"
 
 export type ReviewKind = "plan" | "result"
 
-/** Ворктри задачи по Branch-ячейке из `git worktree list --porcelain`.
- *  Точное сравнение refs/heads/<branch> — суффикс-матч ловил чужие ветки
- *  (commits совпадал с auto-atomic-commits). */
-export function worktreeByBranch(porcelain: string, branch: string): string {
-  if (branch === "") return ""
-  let worktree = ""
-  for (const line of porcelain.split("\n")) {
-    if (line.startsWith("worktree ")) worktree = line.slice("worktree ".length)
-    else if (line === `branch refs/heads/${branch}` && worktree !== "") return worktree
-  }
-  return ""
-}
-
 /** Ревью-статус → вид ревью; null — обычный статус (мяч у девелопера/юзера). */
 export function reviewKindOf(status: string): ReviewKind | null {
   if (status === REVIEW_PLAN_STATUS) return "plan"
@@ -110,16 +103,193 @@ export function reviewKindOf(status: string): ReviewKind | null {
   return null
 }
 
-/** Юзерский коммент: не наш (🤖), не служебный ([factory]). */
+/** Юзерский коммент: не наш (🤖), не служебный ([factory]).
+ *  Маркеры проверяются ПОСЛЕ снятия CLI-обёртки «AGENTS (ts): » — CLI выносит
+ *  автора вперёд, без среза фабричные notify проходят как юзерские (дефект №2). */
 export function isUserComment(c: TaskComment, botUserId?: string): boolean {
   // точный фильтр: комменты бот-аккаунта — не юзер (независимо от текста)
   if (botUserId !== undefined && c.userId !== undefined && c.userId === botUserId) {
     return false
   }
-  const body = c.text.trimStart()
+  const body = stripAgentHead(c.text.trimStart())
   if (body.startsWith(AGENT_MARK)) return false
   if (body.startsWith("[factory]")) return false
   return body.trim() !== ""
+}
+
+// ——— self-эхо wakeup-контура: маркеры, время, сесс-скопед срез (20261106032707) ———
+
+/** Автор агентских комментов CLI (sy_dispatch): обёртка «- **AGENTS** (ts): …».
+ *  Автор-скопед фильтр по этой строке — ловушка (вердики ревьювера и триаж
+ *  приходят тем же маркером): здесь только признак «мог быть от сессии». */
+export const AGENT_COMMENT_USER = "AGENTS"
+
+const THREAD_REPLY_PREFIX = /^\(тред-ответ на [^)]*\)\s*/
+const AGENT_HEAD = /^AGENTS \(([^)]*)\): /
+
+/** Срезает тред-префикс и голову «AGENTS (ts): » из текста коммента. */
+export function stripAgentHead(text: string): string {
+  return text.replace(THREAD_REPLY_PREFIX, "").replace(AGENT_HEAD, "")
+}
+
+/** ms из головы «(2026-11-05 19:43)» коммента. CLI пишет toISOString (UTC,
+ *  без зоны) — парс строго как UTC: локальная зона рантайма (демон в JST)
+ *  занизила бы время на 9ч и перевернула own-срез в потерю чужих комментов. */
+export function parseAgentHeadTs(text: string): number | null {
+  const m = text.replace(THREAD_REPLY_PREFIX, "").match(AGENT_HEAD)
+  if (m === null) return null
+  const p = m[1].trim().split(/[-: ]+/).map(Number)
+  if (p.length < 5 || p.some((x) => Number.isNaN(x))) return null
+  // диапазоны: Date.UTC молча переливает («2026-13-45 99:99», «2026-02-30») в
+  // валидные ms — битый ts не должен притворяться живым временем own-среза
+  const [, , , , , second] = p
+  const [year, month, day, hour, minute] = p
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || (second !== undefined && second > 59)) return null
+  const ms = Date.UTC(year, month - 1, day, hour, minute, second ?? 0)
+  const d = new Date(ms)
+  if (d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null
+  return ms
+}
+
+export interface FreshSplit {
+  /** комменты, будящие адресата (юзерские и чужие агентские) */
+  foreign: TaskComment[]
+  /** срезанные собственные комменты сессии */
+  ownCount: number
+}
+
+/** Сесс-скопед срез self-эха (дефект №1): коммент — «свой» для сессии-адресата,
+ *  если он агентский (userId AGENTS), время в нём живое и не позже последнего
+ *  сообщения сессии (CLI-вызов идёт из хода, ход после коммита двигает
+ *  активность). Чужие AGENTS (вердикт ревьювера, триаж) и юзерские будят.
+ *  activityAt null — активность неизвестна: без среза (лишняя эхо-будка вместо
+ *  потерянного коммента). ts=0 (легаси) не срезаем — неизвестное время не
+ *  доказательство «своего». */
+export function freshForeignComments(fresh: TaskComment[], agentActivityAt: number | null): FreshSplit {
+  if (agentActivityAt === null) return { foreign: fresh, ownCount: 0 }
+  let ownCount = 0
+  const foreign = fresh.filter((c) => {
+    const own = c.userId === AGENT_COMMENT_USER && c.createdAt > 0 && c.createdAt <= agentActivityAt
+    if (own) ownCount++
+    return !own
+  })
+  return { foreign, ownCount }
+}
+
+/** Легаси-переход после деплоя (ревью раунд-2): треки держат lastCommentId в
+ *  старом непаддированном формате при lastCommentAt = 0 (createdAt комментов
+ *  не жил до оживления ts). Без этой проверки фоллбек newUserComments по
+ *  времени отдал бы ВСЕ чужие AGENTS-комменты одной волной будок. Идемпотентно:
+ *  re-baseline двигает at, условие больше не срабатывает. Свежий спавн
+ *  (id = "") и несматченный id при живом времени (штатный фоллбек) не сюда. */
+export function legacyRebaselineNeeded(lastSeen: { at: number; id: string }, userComments: TaskComment[]): boolean {
+  if (lastSeen.id === "" || lastSeen.at !== 0) return false
+  return !userComments.some((c) => c.id === lastSeen.id)
+}
+
+/** Последний коммент по (createdAt, id) — точка спавн-границ и re-baseline. */
+export function latestComment(comments: TaskComment[]): TaskComment | null {
+  if (comments.length === 0) return null
+  return comments.reduce((m, c) =>
+    c.createdAt > m.createdAt || (c.createdAt === m.createdAt && c.id.localeCompare(m.id) > 0) ? c : m)
+}
+
+// ——— bodyEdit: контент-хэш тела вне «Комменты» (дефекты №3/№5) ———
+
+// весь класс Format-символов (Cf): ZWSP/ZWNJ/ZWJ/WORD JOINER/BOM — рендер-
+// артефакты SiYuan-экспорта (инвентарь опыта «wakeup по собственному комменту»)
+const ZERO_WIDTH = /\p{Cf}/gu
+
+/** Контент тела вне коммент-записей: (а) секция «## Комменты» (от неё до
+ *  следующего ##) — историческая конвенция; (б) хвост после последней ## —
+ *  CLI аппендит комменты appendBlock'ом в конец дока, в телах с секциями
+ *  после «## Комменты» свежие записи живут хвостом (тела вердиктов уходят
+ *  с блоками). Коммент-аппенды иммунны к хэшу — comment-контур не дублируется
+ *  bodyEdit-будкой (дефект №4). Контент ДО первого хвостового пункта
+ *  (абзацы отчёта и т.п.) сохраняется — его правки видны хэшу. */
+export function bodyOutsideComments(md: string): string {
+  const out: string[] = []
+  let inComments = false
+  for (const line of md.split("\n")) {
+    if (/^## Комменты\s*$/.test(line)) {
+      inComments = true
+      continue
+    }
+    if (inComments && /^## /.test(line)) inComments = false
+    if (!inComments) out.push(line)
+  }
+  let lastHead = -1
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (/^## /.test(out[i])) {
+      lastHead = i
+      break
+    }
+  }
+  for (let i = lastHead + 1; i < out.length; i++) {
+    if (/^- \*\*[^*]+\*\* \(\d{4}-\d{2}-\d{2}[^)]*\): /.test(out[i])) {
+      out.length = i
+      break
+    }
+  }
+  return out.join("\n")
+}
+
+/** Норм-форма markdown тела: frontmatter срезается (lastmod двигает каждое
+ *  UI-пересохранение — дефект №5), format-символы SiYuan, \r\n, trailing,
+ *  схлопывание пустых строк, канонизация таблиц (пэддинг/выравнивание ячеек
+ *  перестраивается при UI-save — инвентарь round-trip артефактов) и пробелов
+ *  после inline-bold. Правки «только форматирование» не будят; содержательные
+ *  (слова, секции, порядок) — будят. */
+export function normalizeBodyMd(md: string): string {
+  return md
+    .replace(/^---\n[\s\S]*?\n---\n/, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(ZERO_WIDTH, "")
+    .split("\n")
+    .map((line) => line.startsWith("|") ? canonicalizeTableRow(line) : line.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\*\* +/g, "** ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+}
+
+/** Ячейка таблицы: trim + схлопывание внутренних пробелов; separator
+ *  (дефисы/двоеточия любой длины) канонизуется — выравнивание колонок при
+ *  UI-save меняет пэддинг, контент не меняется. */
+function canonicalizeTableRow(line: string): string {
+  return line.split("|").map((cell) => {
+    const trimmed = cell.trim().replace(/ {2,}/g, " ")
+    return /^[-: ]+$/.test(trimmed) && trimmed !== "" ? "---" : trimmed
+  }).join("|")
+}
+
+/** Хэш норм-формы контента тела вне «Комменты». */
+export function bodyContentHash(md: string): string {
+  return createHash("sha256").update(normalizeBodyMd(bodyOutsideComments(md))).digest("hex")
+}
+
+/** Время правки тела из frontmatter lastmod — ядро пишет с суффиксом зоны,
+ *  парсится в корректный ms (SQL updated живёт в зоне контейнера, демону не
+ *  видной). null — строки нет или битая дата. */
+export function bodyLastmodMs(md: string): number | null {
+  const m = md.match(/^lastmod:\s*(.+)$/m)
+  if (m === null) return null
+  const ms = Date.parse(m[1].trim())
+  return Number.isNaN(ms) ? null : ms
+}
+
+// ——— дедуп доставки будильников (дефект №5.2) ———
+
+export interface WakeupStamp {
+  key: string
+  at: number
+}
+
+/** Идентичный ключ в окне — скип (дельта уже доставлена); другой ключ или
+ *  окно истекло — доставка. */
+export function wakeupDedup(prev: WakeupStamp | undefined, key: string, now: number, windowMs: number): "deliver" | "skip" {
+  if (prev !== undefined && prev.key === key && now - prev.at < windowMs) return "skip"
+  return "deliver"
 }
 
 /** Самоисцеление трека: пустой bodyDoc в state (след спавна до-фиксного
@@ -207,6 +377,19 @@ export function untrackedTasks(rows: TaskRef[], state: FactoryState): TaskRef[] 
   return rows.filter((r) => state.tasks[r.rowId] === undefined)
 }
 
+/** Гارد-наборы GC ворктри: ветки и каталоги всего, что числится в state,
+ *  снос легаси-ворктри не трогает никогда. */
+export function activeTaskGuards(state: FactoryState): { branches: Set<string>; dirs: Set<string> } {
+  const branches = new Set<string>()
+  const dirs = new Set<string>()
+  for (const task of Object.values(state.tasks)) {
+    if (task.branch !== "") branches.add(task.branch)
+    if (task.worktree !== "") dirs.add(task.worktree)
+    if (task.envDir !== undefined && task.envDir !== "") dirs.add(task.envDir)
+  }
+  return { branches, dirs }
+}
+
 /** Текст коммента с контекстом ответа: page-режим (ответ цитатой на кусок
  *  дока/коммента) несёт preview = цитата-якорь; треды — см. taskComments. */
 export function commentText(content: unknown): string {
@@ -255,8 +438,8 @@ export function kickoffModeOf(status: string): KickoffMode {
 }
 
 /** Контекст окружения задачи для промптов: пути приходят из ensureEnv.
- *  undefined — env-механика не применяется (легаси-штамп или env:false-проект),
- *  агент действует по старым строкам (сам создаёт ворктри/ветку). */
+ *  undefined — проект вне env-механики (env:false), агент действует по
+ *  прежним строкам (сам создаёт ворктри/ветку и заполняет Branch-ячейку). */
 export interface SpawnEnvContext {
   repoDir: string
   branch: string
@@ -403,13 +586,17 @@ export function mergeablePollStep(
   return attempt + 1 < maxAttempts ? { t: "retry" } : { t: "degrade" }
 }
 
-/** Будильник: юзер отредактировал ТЕЛО задачи (не коммент). */
+/** Будильник: тело задачи изменено контентно и не из хода адресата. Формулировка
+ *  нейтральная (дополнение №3): до агента доходят только не-own дельты, но
+ *  «чья правка» проверяется по телу — не дисконтировать реальную правку
+ *  владельца как своё эхо. */
 export function bodyEditPrompt(rowId: string): string {
   return [
-    `[factory] Юзер отредактировал ТЕЛО задачи ${rowId} (не коммент).`,
+    `[factory] Тело задачи ${rowId} изменено (не коммент).`,
     "",
-    "Перечитай тело (uwuwu-cli task get — печатает тело целиком), найди что изменилось,",
-    "учти изменения в работе. Ответь/доложи по пайпу — комментом.",
+    "Перечитай тело (uwuwu-cli task get), определи чью это правку и учти её.",
+    "Хинт: единый updated у всех блоков = механическая перезапись, точечные updated = ручная правка.",
+    "Если это собственная запись тебя или пайпа — эхо: тихий конец хода, без коммента и без смены статуса.",
   ].join("\n")
 }
 
@@ -443,6 +630,8 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     "Работай по секции «Ревью задач фабрики uwuwu» своей методики:",
     "",
     `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи и треды комментов.`,
+    "   Если в тредах есть прошлые раунды ревью этой задачи (твоя сессия пересоздана) —",
+    "   это продолжение: проверь устранение прошлых замечаний, не начинай с нуля.",
     kind === "plan"
       ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
       : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
@@ -458,11 +647,17 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
-    "   вердикт-строка «Статус: approve|request_changes» обязательна.",
+    "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
+    kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
     "4. Статус после вердикта (uwuwu-cli task edit):",
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
-      : "   approve → Review · request_changes → In Progress",
+      : [
+          "   approve → Review",
+          "   approve с мелкими замечаниями (все находки Low) → In Progress —",
+          "   следующее ревью с тем же ревьювером (дельта), после дельта-апрува → Review владельцу",
+          "   request_changes → In Progress",
+        ].join("\n"),
     "5. Вопросы юзеру — комментом без смены статуса; код и тело задачи не правь.",
   ]
   return lines.join("\n")
@@ -476,7 +671,21 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
     "",
     "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
     "проверь устранение своих прошлых замечаний, отчёт комментом,",
-    `статус по вердикту (${kind === "plan" ? "approve → In Progress · request_changes → Design" : "approve → Review · request_changes → In Progress"}).`,
+    "статус по вердикту " +
+      (kind === "plan"
+        ? "(approve → In Progress · request_changes → Design)."
+        : [
+            "(approve → Review · approve с мелкими замечаниями (все находки Low) → In Progress ·",
+            "request_changes → In Progress).",
+          ].join("\n")),
+    ...(kind === "result"
+      ? [
+          "Прошлый раунд был «approve с мелкими замечаниями» (свой прошлый отчёт в тредах)?",
+          "Тогда это дельта-раунд: проверь только устранение тех мелочей, всё заново не пересматривай;",
+          "новые High/Common — обычный request_changes. Второй раз подряд approve-with-notes не выдавай:",
+          "те же мелочи не устранены → request_changes («мелочи повторно не устранены»).",
+        ]
+      : []),
     ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
     ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
   ].join("\n")
@@ -503,7 +712,10 @@ export function reviewReturnPrompt(rowId: string): string {
     "Перечитай uwuwu-cli task get + треды и действуй по пайпу:",
     "- есть замечания ревьювера → устрани, запушь, снова поставь ревью-статус;",
     "- план approved → реализуй;",
-    "- результат approved → мяч у юзера, от тебя ничего не требуется;",
+    "- результат: approve с мелкими замечаниями → дофикси мелочи из отчёта ревьювера,",
+    "  запушь и сразу «Ревью результата» — та же ревью-сессия делает дельта-проверку",
+    "  (следующее ревью с тем же ревьювером; после дельта-апрува мяч у юзера);",
+    "- результат approved (чистый) → мяч у юзера, от тебя ничего не требуется;",
     "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
     "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
   ].join("\n")
@@ -730,6 +942,7 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
   const text = reason === "state-loss"
     ? `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
       "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
+      "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
       "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон."
     : `[factory] Спавн задержан — за один тик набралось untracked=${f.totalUntracked} при пороге ${l.burstMax} ` +
       `(сирот-спавнов=${f.orphaned}): массовый импорт задач или потеря state без свидетелей-ячеек. ` +
@@ -741,6 +954,46 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
  *  undefined (TaskRef без нормализации) свидетельством НЕ является. */
 export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSession">): boolean {
   return (r.devSession ?? "") !== "" || (r.reviewSession ?? "") !== ""
+}
+
+/** Живость сессии по REST-пробе опенкода: "unknown" — проба не удалась
+ *  (транзиентный сбой), решение принимает вызывающий. */
+export type SessionLiveness = "alive" | "dead" | "unknown"
+
+/** Вердикт тика по untracked строке: спавнить ли её в дев-волне и считать ли
+ *  сиротой-спавном (корм гарда каскада). Единственная точка решения (по
+ *  образцу routeTask) — матрица плана задачи 20261105174319:
+ *  - дев-ячейка пуста → обычный путь (дев-волна решает по статусу), сирота
+ *    только при ревью-свидетельстве (карантинный спавн ревьювера пишет
+ *    только ревью-ячейку — защита инцидента 06.11 сохраняется);
+ *  - живая дев-заявка (task claim или фабричный спавн) → внешняя работа
+ *    идёт: не спавнить и не сирота;
+ *  - liveness-проба не удалась → трактуем как живую (прецедент routeTask):
+ *    транзиентный сбой REST не даёт ни спавна, ни orphan-счёта, следующий
+ *    тик перепроверит;
+ *  - мёртвая дев-заявка → сирота как прежде И остаётся в дев-волне: семантика
+ *    сирот не менялась — при allow ре-спавн компенсирует (это путь автоком-
+ *  пенсации lossMax-допуска: 1-2 сироты спавнятся, ≥3 — HOLD). Отличить
+ *  «мёртвый claim» от «потери state» по одной строке невозможно, поэтому
+ *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow. */
+export interface UntrackedRowDecision {
+  /** спавнить в дев-волне этого тика (финально фильтруется статусом) */
+  devWave: boolean
+  /** считать сиротой-спавном в подсчёте гарда */
+  orphan: boolean
+}
+
+export function untrackedRowDecision(
+  r: Pick<TaskRef, "devSession" | "reviewSession">,
+  liveness: SessionLiveness,
+): UntrackedRowDecision {
+  const devCell = r.devSession ?? ""
+  if (devCell === "") {
+    return { devWave: true, orphan: (r.reviewSession ?? "") !== "" }
+  }
+  // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
+  if (liveness !== "dead") return { devWave: false, orphan: false }
+  return { devWave: true, orphan: true }
 }
 
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →
@@ -758,25 +1011,10 @@ export const PATH_CELL = "Path"
 export const DEV_SESSION_CELL = "Сессия dev"
 export const REVIEW_SESSION_CELL = "Сессия ревью"
 
-/** Штамп перехода: записи state, спавненные до env-механики, доживают в
- *  старом поведении (рестарт не уводит незакоммиченную работу в новый env).
- *  envDir отсутствует И сессия была спавнена → легаси; карантинные записи
- *  без сессии не штампуются — их спавн ещё попробует env-механику. */
-export function stampLegacyEntries(state: FactoryState): string[] {
-  const stamped: string[] = []
-  for (const [rowId, tracked] of Object.entries(state.tasks)) {
-    if (tracked.envDir !== undefined || tracked.legacy === true) continue
-    if (tracked.sessionID === "") continue
-    tracked.legacy = true
-    stamped.push(rowId)
-  }
-  return stamped
-}
-
 /** Валидация записи state.json. Легальные форматы: полный (ses_ + пути),
  *  чистый карантин (всё пусто) и гибрид (сессия умерла, пути живы — работа
  *  сохраняется до решения юзера). worktree = repoDir env-задачи; branch —
- *  производное имя ветки (пишет фабрика) или легаси-имя агента. */
+ *  производное имя ветки (пишет фабрика). */
 export function isValidTracked(v: unknown): v is TrackedTask {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
@@ -797,10 +1035,18 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
-  if (t.legacy !== undefined && typeof t.legacy !== "boolean") return false
   if (
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
+  ) return false
+  if (t.bodyHash !== undefined && typeof t.bodyHash !== "string") return false
+  if (
+    t.lastWakeup !== undefined &&
+    !(
+      typeof t.lastWakeup === "object" && t.lastWakeup !== null &&
+      typeof (t.lastWakeup as WakeupStamp).key === "string" &&
+      typeof (t.lastWakeup as WakeupStamp).at === "number"
+    )
   ) return false
   if (
     t.reviewSessionID !== undefined &&
@@ -850,8 +1096,8 @@ export interface ProjectCfg {
   repo: string
   local: string
   /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
-   *  вне механики (cfg.local не git-репо → контракт невыполним): легаси-
-   *  поведение, агент сам делает ворктри/ветку. Дефолт true. */
+   *  вне механики (cfg.local не git-репо → контракт невыполним): агент сам
+   *  делает ворктри/ветку и заполняет Branch-ячейку. Дефолт true. */
   env?: boolean
 }
 
