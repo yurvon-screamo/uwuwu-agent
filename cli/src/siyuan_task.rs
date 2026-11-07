@@ -160,6 +160,8 @@ pub struct SyTask {
     pub item_id: String,
     pub title: String,
     pub status: String,
+    /// Классификация задачи из колонки «Тип» (bug/dev/spike; "" — не задан).
+    pub task_type: String,
     pub branch: String,
     pub pr: String,
     /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
@@ -311,6 +313,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         item_id: it.get("id").and_then(|i| i.as_str()).unwrap_or("").into(),
         title: String::new(),
         status: String::new(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
@@ -347,6 +350,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         }
         match name.as_str() {
             "Status" | "Статус" => t.status = value,
+            TYPE_CELL | "Type" => t.task_type = value,
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
@@ -518,6 +522,34 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("ключ Status не найден в database"))
 }
 
+/// Имя колонки типа на досках задач: парс клеток принимает «Тип»/"Type"
+/// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
+pub const TYPE_CELL: &str = "Тип";
+
+/// Канон типа задачи: trim + нижний регистр, ∈ {bug, dev, spike},
+/// иначе человеческий отказ.
+pub fn validate_task_type(raw: &str) -> Result<String> {
+    let canon = raw.trim().to_lowercase();
+    match canon.as_str() {
+        "bug" | "dev" | "spike" => Ok(canon),
+        _ => bail!("тип «{raw}» не разобран: жди dev | spike | bug (колонка «{TYPE_CELL}» доски)"),
+    }
+}
+
+/// keyID колонки «Тип»: существующая («Тип»/"Type") или свежесозданная
+/// select-колонка (addAttributeViewKey). Отказ API — громкий: молча no-op
+/// оставил бы агента в уверенности, что тип записан (прецедент claim).
+pub(crate) async fn ensure_type_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys
+        .iter()
+        .find(|(name, _)| name == TYPE_CELL || name == "Type")
+    {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, TYPE_CELL, "select").await
+}
+
 /// Колонки database: (имя → id) в порядке объявления на доске.
 pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, String)>> {
     let v = sy
@@ -605,14 +637,13 @@ pub(crate) async fn create_with_pacing(
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
-    let tag = if ty.is_empty() { None } else { Some(ty) };
     create_row_with_body(
         sy,
         &board,
         title,
         "Draft",
         &body_template(ty, ctx),
-        tag,
+        Some(ty),
         pacing,
     )
     .await
@@ -621,16 +652,18 @@ pub(crate) async fn create_with_pacing(
 /// Общий механизм создания bound-строки на готовой доске (task::create,
 /// goal::create): тело-саб-док (или перепривязка тела-сироты) + строка,
 /// привязанная к нему blockID, + начальный Status + verify вставки с
-/// ретраем ×1. `tag` — хэштег, дописываемый в тело после подтверждения;
-/// `pacing` — пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты
-/// мгновенно — см. RowInsertPacing). Возвращает (itemID, bodyDocID).
+/// ретраем ×1. `ty` — канон типа задачи: Some — ensure колонки «Тип» и
+/// запись клетки после подтверждения вставки (дефолт dev тоже пишется);
+/// None — goal-путь, колонка не минтится и клетка не пишется. `pacing` —
+/// пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты мгновенно —
+/// см. RowInsertPacing). Возвращает (itemID, bodyDocID).
 pub async fn create_row_with_body(
     sy: &SiYuan,
     board: &SyBoard,
     title: &str,
     initial_status: &str,
     template_md: &str,
-    tag: Option<&str>,
+    ty: Option<&str>,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     // идемпотентность: строка или тело с таким заголовком уже есть?
@@ -665,9 +698,21 @@ pub async fn create_row_with_body(
         let rows = read_rows(sy, board).await?;
         match check_row_insert(&rows, &item, title) {
             RowInsertCheck::Confirmed => {
-                // тип — тег в теле
-                if let Some(tag) = tag {
-                    let _ = sy.append_block_md(&body, &format!("\n#{tag}\n")).await;
+                // тип — колонка «Тип» доски: сбой записи после create не теряет
+                // задачу, тип доставляется повторным task edit --type
+                if let Some(ty) = ty {
+                    let tk = ensure_type_key(sy, &board.av_id).await.with_context(|| {
+                        format!(
+                            "задача «{title}» создана (строка {item}, тело {body}), но колонка \
+                             «{TYPE_CELL}» не создана — доставь тип: task edit {item} --type {ty}"
+                        )
+                    })?;
+                    sy.db_item_set_select(&board.av_id, &tk, &item, ty).await.with_context(|| {
+                        format!(
+                            "задача «{title}» создана (строка {item}, тело {body}), но тип не \
+                             записан — доставь: task edit {item} --type {ty}"
+                        )
+                    })?;
                 }
                 return Ok((item, body));
             }
@@ -1318,7 +1363,9 @@ pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
     Ok(serde_json::json!({ "url": { "content": pr } }))
 }
 
-/// Смена статуса/branch/pr (title-переименование не поддерживаем v1).
+/// Смена статуса/branch/pr/типа (title-переименование не поддерживаем v1).
+/// Тип: Some("") — снятие (пустой mSelect), Some(canon) — запись, None —
+/// не менять. Валидация типа до любых записей (паритет pr).
 pub async fn edit(
     sy: &SiYuan,
     board: &SyBoard,
@@ -1326,9 +1373,16 @@ pub async fn edit(
     status: Option<&str>,
     branch: Option<&str>,
     pr: Option<&str>,
+    ty: Option<&str>,
 ) -> Result<()> {
-    // валидация PR до любых записей: без частичных обновлений
+    // валидация PR до любых записей: без частичных обновлений;
+    // пустой ty — снятие (клетка очищается), валидация — только непустому
     let pr_value = pr.map(pr_cell_value).transpose()?;
+    let ty_canonical = match ty {
+        Some("") => Some(String::new()),
+        Some(raw) => Some(validate_task_type(raw)?),
+        None => None,
+    };
     let find = |name: &str, keys: &[(String, String)]| -> Option<String> {
         keys.iter()
             .find(|(k, _)| k == name)
@@ -1357,6 +1411,12 @@ pub async fn edit(
                     "itemID": task.item_id, "value": value }),
         )
         .await?;
+    }
+    if let Some(canon) = ty_canonical {
+        // ensure колонки и здесь: легаси-строки живут на досках без «Тип»
+        let k = ensure_type_key(sy, &board.av_id).await?;
+        sy.db_item_set_select(&board.av_id, &k, &task.item_id, &canon)
+            .await?;
     }
     Ok(())
 }
@@ -1653,11 +1713,52 @@ mod tests {
         assert_eq!(t.dev_session, "ses_read1");
     }
 
+    #[test]
+    fn parse_render_row_reads_type_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-type", "name": TYPE_CELL }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-type", "type": "mSelect",
+                       "mSelect": [{ "content": "bug" }] }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.task_type, "bug");
+    }
+
+    #[test]
+    fn parse_render_row_reads_english_type_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-type", "name": "Type" }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-type", "type": "mSelect",
+                       "mSelect": [{ "content": "spike" }] }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.task_type, "spike");
+    }
+
+    #[test]
+    fn validate_task_type_canonizes_case_and_rejects_unknown() {
+        assert_eq!(validate_task_type(" Bug ").unwrap(), "bug");
+        assert_eq!(validate_task_type("DEV").unwrap(), "dev");
+        assert_eq!(validate_task_type("Spike").unwrap(), "spike");
+        let err = validate_task_type("feature").unwrap_err().to_string();
+        assert!(err.contains("dev | spike | bug"), "суть отказа: {err}");
+        assert!(validate_task_type("").is_err(), "пустой тип — отказ");
+    }
+
     fn sy_task(item_id: &str, title: &str, body_doc: Option<&str>) -> SyTask {
         SyTask {
             item_id: item_id.to_string(),
             title: title.to_string(),
             status: String::new(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
@@ -1793,6 +1894,7 @@ mod tests {
             item_id: item_id.to_string(),
             title: title.to_string(),
             status: "Todo".into(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),

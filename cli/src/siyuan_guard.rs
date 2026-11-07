@@ -540,6 +540,7 @@ mod tests {
             item_id: "item-1".into(),
             title: title.into(),
             status: status.into(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),

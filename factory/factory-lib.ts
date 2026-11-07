@@ -9,6 +9,8 @@ export interface TaskRef {
   bodyDoc: string
   title: string
   status: string
+  /** тип задачи из колонки «Тип» (bug/dev/spike); "" — легаси-строка без типа */
+  type: string
   pr: string
   branch: string
   /** сессионные ячейки строки («Сессия dev»/«Сессия ревью»): непустые —
@@ -457,7 +459,7 @@ export interface SpawnInit {
   /** локальный чекаут env:false-проекта; env-задачам не нужен — пути в env-строке промпта */
   localPath?: string
   /** метаданные задачи с доски */
-  task: { title: string; status: string; branch: string; pr: string }
+  task: { title: string; status: string; type: string; branch: string; pr: string }
 }
 
 const dash = (value: string): string => (value.trim() === "" ? "—" : value.trim())
@@ -504,6 +506,7 @@ export function stripExportWrapper(md: string, docTitle: string): string {
 export function spawnInitBlock(init: SpawnInit, rowId: string, project: string): string {
   const taskLine =
     `Задача: «${init.task.title}», статус ${dash(init.task.status)},` +
+    ` тип ${dash(init.task.type)},` +
     ` ветка ${dash(init.task.branch)}, PR ${dash(init.task.pr)}.`
   const bodyLine = `Тело и треды — uwuwu-cli task get ${rowId} --project ${project} (содержание работы, не ориентация).`
   const projectParts = [
@@ -723,6 +726,8 @@ export interface ReviewContext {
   branch: string
   worktree: string
   pr: string
+  /** тип задачи из колонки «Тип»: ревьювер сверяет канон типа (Bug→TDD, Spike→без кода) */
+  type?: string
 }
 
 /** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
@@ -751,6 +756,7 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
         : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
     "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
     kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
@@ -792,6 +798,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
         ]
       : []),
     ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`Тип задачи: ${ctx.type}`] : []),
     ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
   ].join("\n")
 }

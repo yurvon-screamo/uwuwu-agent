@@ -640,6 +640,7 @@ fn test_task() -> SyTask {
         item_id: "item-1".into(),
         title: "таск".into(),
         status: "Draft".into(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),

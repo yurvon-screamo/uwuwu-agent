@@ -106,8 +106,8 @@ describe("newUserComments", () => {
 describe("untrackedTasks", () => {
   test("только новые rowId", () => {
     const rows: TaskRef[] = [
-      { rowId: "r1", bodyDoc: "d1", title: "a", status: "Todo", pr: "", branch: "" },
-      { rowId: "r2", bodyDoc: "d2", title: "b", status: "Todo", pr: "", branch: "" },
+      { rowId: "r1", bodyDoc: "d1", title: "a", status: "Todo", type: "", pr: "", branch: "" },
+      { rowId: "r2", bodyDoc: "d2", title: "b", status: "Todo", type: "", pr: "", branch: "" },
     ]
     const state: FactoryState = { tasks: { r1: {} as never } }
     expect(untrackedTasks(rows, state).map((r) => r.rowId)).toEqual(["r2"])
@@ -497,7 +497,7 @@ describe("promptForStart: единственная точка выбора ст�
   test("init прокидывается во все ветки — все три вида старта создают свежую сессию", () => {
     const init: SpawnInit = {
       person: null, projectDocs: [],
-      task: { title: "Т", status: "Design", branch: "", pr: "" },
+      task: { title: "Т", status: "Design", type: "", branch: "", pr: "" },
     }
     expect(promptForStart("implement", target, { init })).toContain("Инит-данные")
     expect(promptForStart("continue", target, { init })).toContain("Инит-данные")
@@ -526,12 +526,16 @@ describe("spawnInitBlock: инит-данные первого промпта", 
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
     projectDocs: ["uwuwu/README", "uwuwu/Домены"],
-    task: { title: "Фича", status: "Design", branch: "work/task-r1", pr: "" },
+    task: { title: "Фича", status: "Design", type: "dev", branch: "work/task-r1", pr: "" },
   }
-  test("строка задачи: тайтл/статус/ячейки, пустые — тире", () => {
+  test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain("Задача: «Фича», статус Design, ветка work/task-r1, PR —.")
+    expect(b).toContain("Задача: «Фича», статус Design, тип dev, ветка work/task-r1, PR —.")
     expect(b).toContain('uwuwu-cli task get r1 --project uwuwu')
+  })
+  test("легаси-строка без типа — тире в слоте типа", () => {
+    const b = spawnInitBlock({ ...baseInit, task: { ...baseInit.task, type: "" } }, "r1", "uwuwu")
+    expect(b).toContain("Задача: «Фича», статус Design, тип —, ветка work/task-r1, PR —.")
   })
   test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
@@ -645,6 +649,12 @@ describe("reviewSpawnPrompt", () => {
     const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
     expect(p).not.toContain("Ворктри задачи не найден")
   })
+  test("тип задачи инжектится в ревью-промпт (роутинг Bug/Spike по свойству)", () => {
+    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" })
+    expect(p).toContain("Тип задачи: bug")
+    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" })
+    expect(empty).not.toContain("Тип задачи")
+  })
 })
 
 describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => {
@@ -655,6 +665,12 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain("approve → Review")
     expect(p).toContain("request_changes → In Progress")
     expect(p).toContain("https://pr/1")
+  })
+  test("rerun: тип задачи инжектится, пустой — не появляется", () => {
+    const p = reviewRerunPrompt("r3", "result", { branch: "b", worktree: "", pr: "https://pr/1", type: "spike" })
+    expect(p).toContain("Тип задачи: spike")
+    const empty = reviewRerunPrompt("r4", "result", { branch: "b", worktree: "", pr: "https://pr/1" })
+    expect(empty).not.toContain("Тип задачи")
   })
   test("rerun result: дельта-ветка approve-with-notes + эскалация повторных мелочей", () => {
     const p = reviewRerunPrompt("r2", "result", { branch: "", worktree: "", pr: "" })
@@ -973,7 +989,7 @@ describe("adoptBodyDoc: самоисцеление пустого bodyDoc тре
     createdAt: 1, attempts: 0, project: "t",
   })
   const row = (bodyDoc: string): TaskRef => ({
-    rowId: "row1", bodyDoc, title: "Задача", status: "In Progress", pr: "", branch: "",
+    rowId: "row1", bodyDoc, title: "Задача", status: "In Progress", type: "", pr: "", branch: "",
   })
 
   test("пустой трек + резолв строки — тело принято", () => {
@@ -1084,7 +1100,7 @@ describe("createBoardPathOnce — ленивый мемоизер пути до�
 // ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
 
 const ref = (overrides: Partial<TaskRef> & { rowId: string }): TaskRef => ({
-  bodyDoc: "", title: "Задача", status: "Design", pr: "", branch: "",
+  bodyDoc: "", title: "Задача", status: "Design", type: "", pr: "", branch: "",
   devSession: "", reviewSession: "", // явная нормализация: undefined тестируется отдельным кейсом
   ...overrides,
 })

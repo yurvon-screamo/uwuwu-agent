@@ -358,6 +358,7 @@ export async function readTasks(
       bodyDoc,
       title,
       status: row.cells?.Status?.value ?? "",
+      type: (row.cells?.Тип?.value ?? "").trim(),
       pr: row.cells?.PR?.value ?? "",
       branch: row.cells?.Branch?.value ?? "",
       devSession: (row.cells?.[DEV_SESSION_CELL]?.value ?? "").trim(),
@@ -725,7 +726,7 @@ async function startTask(
   const initBase = await fetchSpawnInit(projectName, cfg)
   const init: SpawnInit = {
     ...initBase,
-    task: { title, status: task.status, branch: task.branch, pr: task.pr },
+    task: { title, status: task.status, type: task.type, branch: task.branch, pr: task.pr },
   }
 
   // имя сессии «проект: тайтл» — осмысленно в списке сессий опенкода
@@ -982,7 +983,7 @@ async function startReview(
   // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
   // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
   const worktree = tracked.worktree
-  const ctx = { branch: task.branch, worktree, pr: task.pr }
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
@@ -1060,7 +1061,7 @@ async function dispatchReviewAction(
     case "rerun-reviewer": {
       const ok = await promptSession(
         d.tracked.reviewSessionID ?? "",
-        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr }),
+        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr, type: d.row.type }),
       )
       if (ok) {
         d.consumeComments()
