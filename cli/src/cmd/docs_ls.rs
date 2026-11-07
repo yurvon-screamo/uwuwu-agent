@@ -58,9 +58,9 @@ pub(super) async fn ls_listing(sy: &SiYuan, prefix_raw: &str, subtree_limit: usi
         ));
     }
 
-    let rows = sy.sql(&subtree_stmt(prefix, subtree_limit)).await?;
-    let truncated = rows.len() >= subtree_limit;
-    let children = direct_children(prefix, hpaths(&rows));
+    let rows = sy.sql(&subtree_stmt(prefix, subtree_limit + 1)).await?;
+    let truncated = rows.len() > subtree_limit;
+    let children = direct_children(prefix, hpaths(&rows[..subtree_limit.min(rows.len())]));
     if !children.is_empty() {
         return Ok(Listing {
             children: Some(children),
@@ -87,16 +87,17 @@ pub(super) async fn ls_listing(sy: &SiYuan, prefix_raw: &str, subtree_limit: usi
 
 /// SQL выборки поддерева: substr-префикс вместо LIKE (вайлкарды %/_ в
 /// именах не интерпретируются); substr в SQLite считает символы, не байты —
-/// кириллические hpath требуют chars().count(). Строки == лимиту читаются
-/// как обрезанные (громкое предупреждение), не как полные.
-pub(super) fn subtree_stmt(prefix: &str, subtree_limit: usize) -> String {
+/// кириллические hpath требуют chars().count(). Запрашивается
+/// fetch_limit = subtree_limit + 1: обрезка читается с факта перебора
+/// (строк > лимита), не с угадывания «ровно лимит = обрезано».
+pub(super) fn subtree_stmt(prefix: &str, fetch_limit: usize) -> String {
     let query_prefix = format!("/{}/", prefix);
     let chars = query_prefix.chars().count();
     let escaped = query_prefix.replace('\'', "''");
     format!(
         "select hpath from blocks where type='d' \
          and substr(hpath,1,{chars})='{escaped}' \
-         order by hpath limit {subtree_limit}"
+         order by hpath limit {fetch_limit}"
     )
 }
 
@@ -131,20 +132,27 @@ where
 }
 
 /// Первый сегмент hpath (запасной «/» в конкатенации — для одиночных
-/// сегментов Daily) — только сегменты-папки (есть доки глубже): раскладка
-/// доступных пространств для отказов и «пусто». Одиночные hpath (доки
-/// Daily и корневые доки Experience) пространствами не считаются —
-/// иначе раскладка превращается в перечень сотен имён.
+/// сегментов Daily) — только сегменты с хотя бы одним дочерним доком
+/// (hpath ≥2 сегментов): раскладка доступных пространств для отказов и
+/// «пусто». Одиночные hpath (доки Daily и корневые доки Experience)
+/// пространствами не считаются — иначе раскладка превращается в перечень
+/// сотен имён. Фильтр глубины согласован с subtree-матчем ls_listing:
+/// пространство с прямыми доками без подпапок — тоже известное.
 async fn top_segments(sy: &SiYuan) -> Result<Vec<String>> {
-    let stmt = "select distinct substr(hpath, 2, instr(substr(hpath, 2) || '/', '/') - 1) as top \
-                from blocks where type='d' and hpath like '/%/%/%' order by top limit 1000";
-    let rows = sy.sql(stmt).await?;
+    let rows = sy.sql(top_segments_stmt()).await?;
     Ok(rows
         .iter()
         .filter_map(|row| row.get("top").and_then(|v| v.as_str()))
         .filter(|top| !top.is_empty())
         .map(String::from)
         .collect())
+}
+
+/// SQL раскладки пространств — отдельная функция ради пин-теста
+/// согласованности глубин с subtree-матчем.
+pub(super) fn top_segments_stmt() -> &'static str {
+    "select distinct substr(hpath, 2, instr(substr(hpath, 2) || '/', '/') - 1) as top \
+     from blocks where type='d' and hpath like '/%/%' order by top limit 1000"
 }
 
 fn hpaths(rows: &[Value]) -> impl Iterator<Item = &str> {

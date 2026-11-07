@@ -4,7 +4,7 @@
 //! доступных / обрезка лимита).
 
 use super::cli::{Cli, Commands, DocsSub};
-use super::docs_ls::{direct_children, ls_listing, subtree_stmt};
+use super::docs_ls::{direct_children, ls_listing, subtree_stmt, top_segments_stmt};
 use crate::siyuan::SiYuan;
 use clap::Parser as _;
 use serde_json::{json, Value};
@@ -42,9 +42,9 @@ fn subtree_stmt_counts_chars_not_bytes() {
 
 #[test]
 fn subtree_stmt_escapes_quotes_and_carries_limit_and_order() {
-    let stmt = subtree_stmt("it's/ADR", 500);
+    let stmt = subtree_stmt("it's/ADR", 501);
     assert!(stmt.contains("'/it''s/ADR/'"), "{stmt}");
-    assert!(stmt.contains("limit 500"), "{stmt}");
+    assert!(stmt.contains("limit 501"), "{stmt}");
     assert!(stmt.contains("type='d'"), "{stmt}");
     assert!(stmt.contains("order by hpath"), "{stmt}");
 }
@@ -75,6 +75,16 @@ fn children_merge_folder_doc_with_its_dir_entry() {
     let hpaths = ["/uwuwu/ADR", "/uwuwu/ADR/ADR-001: x", "/uwuwu/README"];
     let children = direct_children("uwuwu", hpaths.into_iter());
     assert_eq!(children, vec!["ADR/", "README"]);
+}
+
+#[test]
+fn top_segments_depth_matches_subtree_semantics() {
+    // раскладка признаёт пространство с прямыми доками (глубина ≥2 сегментов)
+    // — иначе плоские пространства ловят ложный отказ «не найдено»
+    // (ревью PR #124, Common); одиночные hpath Daily/Experience отсечены
+    let stmt = top_segments_stmt();
+    assert!(stmt.contains("hpath like '/%/%'"), "{stmt}");
+    assert!(!stmt.contains("hpath like '/%/%/%'"), "{stmt}");
 }
 
 /// Роутер SQL-конвертов: top_segments-запрос (distinct substr) отвечает
@@ -159,7 +169,34 @@ async fn unknown_space_bails_with_available_spaces() {
 }
 
 #[tokio::test]
-async fn subtree_at_limit_is_marked_truncated() {
+async fn subtree_beyond_limit_is_marked_truncated() {
+    // subtree_limit=2, ядро отдало fetch_limit+1=3 строку — обрезка по факту
+    let server = MockServer::start().await;
+    mount_sql_router(
+        &server,
+        vec![
+            json!({ "hpath": "/uwuwu/ADR/ADR-001: x" }),
+            json!({ "hpath": "/uwuwu/ADR/ADR-002: y" }),
+            json!({ "hpath": "/uwuwu/ADR/ADR-003: z" }),
+        ],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "uwuwu/ADR", 2).await.unwrap();
+
+    assert!(listing.truncated);
+    assert_eq!(
+        listing.children,
+        Some(vec!["ADR-001: x".to_string(), "ADR-002: y".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn subtree_exactly_at_limit_is_not_truncated() {
+    // ровно лимит строк при fetch limit+1 — обрезки нет, ложный warning
+    // пограничником исключён
     let server = MockServer::start().await;
     mount_sql_router(
         &server,
@@ -174,8 +211,11 @@ async fn subtree_at_limit_is_marked_truncated() {
 
     let listing = ls_listing(&sy, "uwuwu/ADR", 2).await.unwrap();
 
-    assert!(listing.truncated);
-    assert_eq!(listing.children, Some(vec!["ADR-001: x".to_string(), "ADR-002: y".to_string()]));
+    assert!(!listing.truncated);
+    assert_eq!(
+        listing.children,
+        Some(vec!["ADR-001: x".to_string(), "ADR-002: y".to_string()])
+    );
 }
 
 #[tokio::test]
