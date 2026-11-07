@@ -1,0 +1,8 @@
+# EOL-политика репо (мульти-машинная разработка: Linux-агенты + Windows-машины владельца).
+# Индекс — канон LF для всех текстовых файлов; git сравнивает диффы после нормализации,
+# поэтому EOL-флипы инструментов (edit-тул агента — LF, opencode на Windows — CRLF) невидимы git'у.
+# Worktree-стиль остаётся платформенным: Linux — LF, Windows — по core.autocrlf.
+# Переходный период после ренормализации (15 файлов переведены CRLF→LF в индексе):
+# ветки от pre-ренормального master, правящие эти файлы, мержить с merge.renormalize=true
+# (git -c merge.renormalize=true merge ...), иначе whole-file EOL-конфликт.
+* text=auto

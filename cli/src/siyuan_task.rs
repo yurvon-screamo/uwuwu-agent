@@ -179,6 +179,45 @@ struct BoardView {
     items: Vec<Value>,
 }
 
+/// Одна страница render: колонки (fields у kanban), счётчик терминации
+/// (rowCount у table, cardCount у kanban), строки/карточки.
+struct BoardPage {
+    columns: Vec<Value>,
+    row_count: Option<u64>,
+    items: Vec<Value>,
+}
+
+/// Разбор страницы render: table несёт `rows`/`rowCount`; kanban — карточки
+/// в `groups[].cards` со счётчиком `cardCount` и колонками `fields` (форма
+/// value-ячеек та же). Чистая функция — collect_board_view только мёржит.
+fn parse_board_page(data: &Value) -> BoardPage {
+    let view = data.get("view").unwrap_or(&Value::Null);
+    let columns = view
+        .pointer("/columns")
+        .or_else(|| view.pointer("/fields"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let row_count = view
+        .get("rowCount")
+        .or_else(|| view.get("cardCount"))
+        .and_then(|r| r.as_u64());
+    let mut items = view
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        // kanban: карточки живут в groups[].cards, форма value-ячеек та же
+        items.extend(kanban_cards(view));
+    }
+    BoardPage {
+        columns,
+        row_count,
+        items,
+    }
+}
+
 /// Полная выборка доски по страницам render: терминация по валидному rowCount
 /// или пустой странице, дедуп по id, кап страниц с громкой ошибкой.
 async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
@@ -193,25 +232,17 @@ async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
         let v = sy.db_render(&board.av_id, &board.block_id, page).await?;
         // structuredContent = {action, data:{...}} — берём data
         let data = v.get("data").unwrap_or(&v);
+        let parsed = parse_board_page(data);
         if page == 1 {
-            view.columns = data
-                .pointer("/view/columns")
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default();
-            row_count = data.pointer("/view/rowCount").and_then(|r| r.as_u64());
+            view.columns = parsed.columns;
+            row_count = parsed.row_count;
         }
-        let items = data
-            .pointer("/view/rows")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if items.is_empty() {
+        if parsed.items.is_empty() {
             // терминация всегда: rowCount невалиден (0/отсутствует) или устарел
             // вниз при конкурентных удалениях — счётчик не используется
             break;
         }
-        for it in items {
+        for it in parsed.items {
             // дедуп по id: дрейф страниц при конкурентных правках доски даёт
             // дубль строки на стыке, а тот сломал бы resolve id-first
             // («неоднозначный id»); пустые id не дедупятся
@@ -236,6 +267,21 @@ async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
     Ok(view)
 }
 
+/// Карточки kanban-страницы: строки живут в `view.groups[].cards`
+/// (форма value-ячеек та же, что у table-строк). Для table-render — пусто
+/// (groups отсутствуют), вызов безопасен всегда.
+fn kanban_cards(view: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(groups) = view.pointer("/groups").and_then(|g| g.as_array()) {
+        for group in groups {
+            if let Some(cards) = group.get("cards").and_then(|c| c.as_array()) {
+                out.extend(cards.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Строки доски через MCP database render (полная выборка, постранично).
 pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
     let view = collect_board_view(sy, board).await?;
@@ -250,6 +296,9 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
 
 /// Строка render → SyTask. Title из primary-клетки; body_doc — docId из
 /// value.block.id той же клетки (привязка строки к документу-телу).
+/// Primary-клетка узнаётся по value.type=block (pk в SiYuan всегда block,
+/// имя ключа произвольно: «Title», «Первичный ключ», «Цель»…), остальные
+/// клетки — по имени колонки.
 fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
     let key_name = |id: &str| -> String {
         keys.iter()
@@ -269,6 +318,7 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
     };
     for cell in it
         .get("cells")
+        .or_else(|| it.get("values"))
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default()
@@ -279,14 +329,23 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             .unwrap_or("");
         let name = key_name(kid);
         let value = cell_value(&cell);
+        let legacy_title_name = matches!(
+            name.as_str(),
+            "Primary Key" | "Title" | "Название" | "Первичный ключ"
+        );
+        // pk в SiYuan всегда block, но имя ключа произвольно («Цель», «Задача»…);
+        // клетки без type (старые доски) матчатся по legacy-именам
+        let is_primary = cell.pointer("/value/type").and_then(|t| t.as_str()) == Some("block")
+            || legacy_title_name;
+        if is_primary {
+            t.title = value;
+            t.body_doc = cell
+                .pointer("/value/block/id")
+                .and_then(|i| i.as_str())
+                .map(String::from);
+            continue;
+        }
         match name.as_str() {
-            "Primary Key" | "Title" | "Название" | "Первичный ключ" => {
-                t.title = value;
-                t.body_doc = cell
-                    .pointer("/value/block/id")
-                    .and_then(|i| i.as_str())
-                    .map(String::from);
-            }
             "Status" | "Статус" => t.status = value,
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
@@ -533,16 +592,33 @@ pub async fn create(
     ctx: &str,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
+    let tag = if ty.is_empty() { None } else { Some(ty) };
+    create_row_with_body(sy, &board, title, "Draft", &body_template(ty, ctx), tag).await
+}
+
+/// Общий механизм создания bound-строки на готовой доске (task::create,
+/// goal::create): тело-саб-док (или перепривязка тела-сироты) + строка,
+/// привязанная к нему blockID, + начальный Status + verify вставки с
+/// ретраем ×1. `tag` — хэштег, дописываемый в тело после подтверждения.
+/// Возвращает (itemID, bodyDocID).
+pub async fn create_row_with_body(
+    sy: &SiYuan,
+    board: &SyBoard,
+    title: &str,
+    initial_status: &str,
+    template_md: &str,
+    tag: Option<&str>,
+) -> Result<(String, String)> {
     // идемпотентность: строка или тело с таким заголовком уже есть?
     // сравнение через нормализацию: ретрай с любым написанием слэша — дубль
-    let rows = read_rows(sy, &board).await?;
+    let rows = read_rows(sy, board).await?;
     let canon = normalize_title(title);
     if rows.iter().any(|r| normalize_title(&r.title) == canon) {
         bail!("живая строка с тайтлом «{title}» уже есть на доске — дубль");
     }
     // идемпотентность ретрая (ADR-009 «достроить сироту»): строка потерялась,
     // а тело-сирота цело → перепривязываем строку к нему, docId сохраняется
-    let title_ids = body_doc_by_title(sy, &board, title).await?;
+    let title_ids = body_doc_by_title(sy, board, title).await?;
     let reused = choose_body_doc(None, false, &title_ids)?;
     // тело сначала (или сирота), затем СТРОКА ПРИВЯЗАНАЯ к нему (blockID):
     // клик по карточке открывает документ; detached-строки не создаём
@@ -550,7 +626,7 @@ pub async fn create(
     let body = match reused {
         Some(existing) => existing,
         None => {
-            sy.create_doc_md(&board.notebook, &body_path, &body_template(ty, ctx))
+            sy.create_doc_md(&board.notebook, &body_path, template_md)
                 .await?
         }
     };
@@ -559,15 +635,15 @@ pub async fn create(
     // с ретраем ×1; дедуп по тайтлу не даёт ретраю минтить вторую строку
     let sk = status_key(sy, &board.av_id).await?;
     let mut item = sy.db_item_add_bound(&board.av_id, &body).await?;
-    sy.db_item_set_status(&board.av_id, &sk, &item, "Draft")
+    sy.db_item_set_status(&board.av_id, &sk, &item, initial_status)
         .await?;
     for attempt in 0..=1u8 {
-        let rows = read_rows(sy, &board).await?;
+        let rows = read_rows(sy, board).await?;
         match check_row_insert(&rows, &item, title) {
             RowInsertCheck::Confirmed => {
                 // тип — тег в теле
-                if !ty.is_empty() {
-                    let _ = sy.append_block_md(&body, &format!("\n#{ty}\n")).await;
+                if let Some(tag) = tag {
+                    let _ = sy.append_block_md(&body, &format!("\n#{tag}\n")).await;
                 }
                 return Ok((item, body));
             }
@@ -577,10 +653,11 @@ pub async fn create(
             RowInsertCheck::Missing if attempt == 0 => {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 item = sy.db_item_add_bound(&board.av_id, &body).await?;
-                sy.db_item_set_status(&board.av_id, &sk, &item, "Draft").await?;
+                sy.db_item_set_status(&board.av_id, &sk, &item, initial_status)
+                    .await?;
             }
             RowInsertCheck::Missing => bail!(
-                "строка задачи «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); задача видна только как док"
+                "строка «{title}» не появилась в database после вставки и ретрая (item {item}, тело {body}); строка видна только как док"
             ),
         }
     }
@@ -849,11 +926,22 @@ pub(crate) async fn board_subdoc_ids(sy: &SiYuan, board: &SyBoard) -> Result<Vec
 
 /// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
 pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
+    resolve_entity(sy, board, needle, "задача").await
+}
+
+/// То же с именем сущности в сообщениях об ошибках (доска целей говорит
+/// «цель … не найдена», а не «задача …» — доска задач тут ни при чём).
+pub async fn resolve_entity(
+    sy: &SiYuan,
+    board: &SyBoard,
+    needle: &str,
+    entity: &str,
+) -> Result<SyTask> {
     let rows = read_rows(sy, board).await?;
     let subdoc_ids = board_subdoc_ids(sy, board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
         NeedleMatch::Found(task) => Ok(task),
-        NeedleMatch::NotFound => bail!("задача «{needle}» не найдена"),
+        NeedleMatch::NotFound => bail!("{entity} «{needle}» не найдена"),
         NeedleMatch::Ambiguous { reason, matches } => {
             bail!("неоднозначный {reason}: {matches} совпадений")
         }
@@ -1061,9 +1149,11 @@ pub async fn edit(
 ) -> Result<()> {
     // валидация PR до любых записей: без частичных обновлений
     let pr_value = pr.map(pr_cell_value).transpose()?;
-    let find = |name: &str,
-                keys: &[(String, String)]|
-     -> Option<String> { keys.iter().find(|(k, _)| k == name).map(|(_, id)| id.clone()) };
+    let find = |name: &str, keys: &[(String, String)]| -> Option<String> {
+        keys.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, id)| id.clone())
+    };
     let keys = board_keys(sy, &board.av_id).await?;
     if let Some(st) = status {
         let k = find("Status", &keys).context("ключ Status не найден")?;
@@ -1252,6 +1342,51 @@ mod tests {
             "doc-77",
         );
         assert_eq!(hit, Some(("av-9".into(), "doc-77".into())));
+    }
+
+    /// Kanban-карточка: values вместо cells, primary-ключ назван «Цель» —
+    /// title узнаётся по value.type=block, имя ключа произвольно.
+    #[test]
+    fn parse_render_row_reads_kanban_card_with_custom_primary_name() {
+        let columns = json!([
+            { "id": "key-goal", "name": "Цель" },
+            { "id": "key-status", "name": "Status" },
+        ]);
+        let card = json!({
+            "id": "item-1",
+            "values": [
+                { "value": { "keyID": "key-goal", "type": "block",
+                             "block": { "content": "Отказ от SiYuan", "id": "doc-body-1" } } },
+                { "value": { "keyID": "key-status", "type": "mSelect",
+                             "mSelect": [{ "content": "in progress" }] } },
+            ],
+        });
+        let parsed = parse_render_row(&card, columns.as_array().expect("columns"))
+            .expect("карточка парсится");
+        assert_eq!(parsed.title, "Отказ от SiYuan");
+        assert_eq!(parsed.status, "in progress");
+        assert_eq!(parsed.body_doc.as_deref(), Some("doc-body-1"));
+    }
+
+    /// Клетка Title без value.type (старые доски): матч по legacy-именам.
+    #[test]
+    fn parse_render_row_falls_back_to_legacy_title_names() {
+        let columns = json!([
+            { "id": "key-title", "name": "Title" },
+            { "id": "key-status", "name": "Status" },
+        ]);
+        let row = json!({
+            "id": "item-2",
+            "cells": [
+                { "value": { "keyID": "key-title", "text": { "content": "Простая задача" } } },
+                { "value": { "keyID": "key-status", "mSelect": [{ "content": "todo" }] } },
+            ],
+        });
+        let parsed =
+            parse_render_row(&row, columns.as_array().expect("columns")).expect("строка парсится");
+        assert_eq!(parsed.title, "Простая задача");
+        assert_eq!(parsed.status, "todo");
+        assert_eq!(parsed.body_doc, None, "block-id в значении нет — тела нет");
     }
 
     #[test]
