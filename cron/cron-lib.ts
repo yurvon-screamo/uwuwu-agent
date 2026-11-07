@@ -218,16 +218,22 @@ export function minuteStart(d: Date): number {
  *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
  *  «Запланировано» — next-fire после последнего файра. Сравнение даты —
  *  по epoch ms. Чистая функция — юнит-тесты без моков; применение —
- *  reconcileMasterCells (DRY_RUN-гвард там). */
-export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
+ *  reconcileMasterCells (DRY_RUN-гвард там). */export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
   const patch: { schedule?: string; planned?: string } = {}
   if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
-  // гард вечного молчуна: never-fired + пустая клетка — вычислять next нечего.
-  // due при lastFired=0 файрит следующим тиком (интервал — всегда, cron/at —
-  // на первом совпадении), после файра reconcile посчитает next от prevFire.
-  // Без гарда грамматически валидный cron без совпадений за год («0 0 30 2 *»)
-  // гонял бы полный годовой скан каждым тиком вечно
-  if (prevFire === 0 && row.plannedMs === null) return patch
+  // never-fired интервал: due файрит следующим тиком — плановое время now
+  // (now+interval появился бы только после файра)
+  if (prevFire === 0 && sched.kind === "interval") {
+    const plannedMs = minuteStart(now)
+    if (row.plannedMs !== plannedMs) patch.planned = formatLocal(now)
+    return patch
+  }
+  // гард вечного молчуна: полный годовой скан дорог только в cron-ветке
+  // nextFire (интервал/at — O(1), считаются всегда). never-fired cron-мастер
+  // с пустой клеткой не сканируем: due файрит на первом совпадении, после
+  // файра reconcile посчитает next от prevFire. Без гарда «0 0 30 2 *» гонял
+  // бы скан каждым тиком вечно
+  if (prevFire === 0 && row.plannedMs === null && sched.kind === "cron") return patch
   const next = nextFire(sched, prevFire > 0 ? new Date(prevFire) : now)
   // compare по epoch ms: formattedContent ядро перекрывает своей локалью
   // (живая проба миграции) — строкой клетки и вычисления не совпадут никогда

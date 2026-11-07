@@ -340,16 +340,30 @@ describe("cellPatches: расхождение клеток мастера", () =
     expect(patch).toEqual({ schedule: "6h" })
   })
 
-  test("never-fired + пустая клетка — гард: без вычисления next (вечный молчун не сканит год каждым тиком)", () => {
-    const r = row({ scheduleCell: "6h" })
-    const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
+  test("never-fired cron + пустая клетка — гард: без вычисления next (вечный молчун не сканит год каждым тиком)", () => {
+    const cronSched = mustParse("*/15 * * * *")
+    const r = row({ schedule: "*/15 * * * *", scheduleCell: "*/15 * * * *" })
+    const patch = cellPatches(r, cronSched, 0, at(2026, 11, 8, 10, 0))
     expect(patch).toEqual({})
   })
 
-  test("never-fired + ненулевая клетка — next от now (легаси/ручная клетка сходится)", () => {
+  test("never-fired interval — плановое время now (due файрит следующим тиком, не now+interval)", () => {
+    const r = row({ scheduleCell: "6h" })
+    const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
+    expect(patch).toEqual({ planned: "2026-11-08 10:00" })
+  })
+
+  test("never-fired at — момент HH:MM без гарда (O(1), доска отвечает сразу)", () => {
+    const atSched = mustParse("18:00")
+    const r = row({ schedule: "18:00", scheduleCell: "18:00" })
+    const patch = cellPatches(r, atSched, 0, at(2026, 11, 8, 10, 0))
+    expect(patch).toEqual({ planned: "2026-11-08 18:00" })
+  })
+
+  test("never-fired interval с ненулевой клеткой — сходится к now (легаси/ручная дата не переживает семантику due)", () => {
     const r = row({ plannedMs: at(2026, 11, 1, 8, 0).getTime(), scheduleCell: "6h" })
     const patch = cellPatches(r, sched, 0, at(2026, 11, 8, 10, 0))
-    expect(patch).toEqual({ planned: "2026-11-08 16:00" })
+    expect(patch).toEqual({ planned: "2026-11-08 10:00" })
   })
 })
 
