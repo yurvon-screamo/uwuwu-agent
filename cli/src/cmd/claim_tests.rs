@@ -128,6 +128,8 @@ fn probe_task(dev_session: &str) -> SyTask {
         branch: String::new(),
         pr: String::new(),
         dev_session: dev_session.into(),
+        planned: String::new(),
+        schedule_cell: String::new(),
         body_doc: None,
     }
 }

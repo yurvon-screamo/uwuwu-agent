@@ -544,6 +544,8 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: Some("doc-1".into()),
         }
     }

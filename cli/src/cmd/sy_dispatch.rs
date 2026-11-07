@@ -180,6 +180,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if !task.pr.is_empty() {
                 println!("PR:       {}", task.pr);
             }
+            if !task.planned.is_empty() {
+                println!("Запланировано: {}", task.planned);
+            }
             let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
             if let Some(doc) = body_doc.as_deref() {
                 if let Ok(attrs) = sy.get_block_attrs(doc).await {
@@ -270,6 +273,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                              не записано — доставь: task edit {item} --schedule \"{expr}\""
                         )
                     })?;
+                // колонка «Расписание» — синхронно с attr (доску create не
+                // возвращает; повторный find — две read-пробы, только при --schedule)
+                let board = syt::find_board(&sy, project).await.with_context(|| {
+                    format!(
+                        "задача создана (строка {item}), но клетку «{}» доставь: \
+                         task edit {item} --schedule \"{expr}\"",
+                        syt::SCHEDULE_CELL
+                    )
+                })?;
+                syt::sync_schedule_cell(&sy, &board, &item, expr).await?;
             }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
@@ -295,16 +308,21 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             branch,
             r#type: ty,
             schedule,
+            planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            // валидация PR/типа до rename: без частичных обновлений (тайтл
-            // сменился, а колонки нет — недопустимый разрыв); «» — снятие типа
+            // валидация PR/типа/planned до rename: без частичных обновлений
+            // (тайтл сменился, а колонки нет — недопустимый разрыв);
+            // «» — снятие типа/даты
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
             let ty_canonical = match ty.as_deref() {
                 Some("") => Some(String::new()),
                 Some(raw) => Some(syt::validate_task_type(raw)?),
                 None => None,
             };
+            if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
+                syt::parse_planned(raw)?;
+            }
             let final_title = match title.as_deref() {
                 Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
                 None => None,
@@ -319,8 +337,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ty_canonical.as_deref(),
             )
             .await?;
+            if let Some(raw) = planned.as_deref() {
+                syt::set_planned(&sy, &board, &task, raw).await?;
+            }
             if ty_canonical.as_deref() == Some("") {
                 println!("тип снят: {}", task.title);
+            }
+            match planned.as_deref() {
+                Some("") => println!("запланировано снято: {}", task.title),
+                Some(raw) => {
+                    let (_, formatted) = syt::parse_planned(raw)?;
+                    println!("запланировано: {formatted}");
+                }
+                None => {}
             }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
@@ -338,6 +367,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         )
                     })?;
                 sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                // колонка «Расписание» — отображение attr: пишется синхронно
+                // в единственной точке записи расписания (снятие чистит клетку)
+                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
                 if expr.is_empty() {
                     println!("расписание снято: {}", task.title);
                 }
@@ -775,7 +807,7 @@ async fn task_clean(
                     task.item_id,
                     hint
                 );
-                planned.push((frag, task, verdict));
+                planned.push((frag, *task, verdict));
             }
             syt::NeedleMatch::NotFound => {
                 println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю")
@@ -3659,6 +3691,8 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
     }

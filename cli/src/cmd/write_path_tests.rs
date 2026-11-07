@@ -323,6 +323,7 @@ async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> a
             branch: None,
             r#type: ty.map(String::from),
             schedule: None,
+            planned: None,
         },
     )
     .await
@@ -706,6 +707,8 @@ fn comment_task() -> SyTask {
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
+        planned: String::new(),
+        schedule_cell: String::new(),
         body_doc: Some(BOUND_DOC.into()),
     }
 }

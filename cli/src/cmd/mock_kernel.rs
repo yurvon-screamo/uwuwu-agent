@@ -27,6 +27,10 @@ pub(crate) struct MockRow {
     pub(crate) title: String,
     pub(crate) status: String,
     pub(crate) task_type: String,
+    /// Клетка «Запланировано» (formattedContent date-ячейки; "" — нет клетки).
+    pub(crate) planned: String,
+    /// Клетка «Расписание» (text; "" — нет клетки).
+    pub(crate) schedule: String,
     pub(crate) doc: Option<String>,
 }
 
@@ -37,6 +41,8 @@ impl MockRow {
             title: title.to_string(),
             status: String::new(),
             task_type: String::new(),
+            planned: String::new(),
+            schedule: String::new(),
             doc: None,
         }
     }
@@ -51,13 +57,23 @@ impl MockRow {
         self
     }
 
+    pub(crate) fn with_planned(mut self, planned: &str) -> Self {
+        self.planned = planned.to_string();
+        self
+    }
+
+    pub(crate) fn with_schedule(mut self, schedule: &str) -> Self {
+        self.schedule = schedule.to_string();
+        self
+    }
+
     pub(crate) fn with_doc(mut self, doc: &str) -> Self {
         self.doc = Some(doc.to_string());
         self
     }
 
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
-    fn cells_json(&self) -> Value {
+    pub(crate) fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
         if let Some(doc) = &self.doc {
             block["id"] = json!(doc);
@@ -75,6 +91,18 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-type", "type": "mSelect",
                            "mSelect": [{ "content": self.task_type }] }
+            }));
+        }
+        if !self.planned.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-planned", "type": "date",
+                           "date": { "formattedContent": self.planned } }
+            }));
+        }
+        if !self.schedule.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-schedule", "type": "text",
+                           "text": { "content": self.schedule } }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -162,6 +190,8 @@ impl Default for MockScenario {
                     ("key-type", "Тип"),
                     ("key-branch", "Branch"),
                     ("key-pr", "PR"),
+                    ("key-planned", "Запланировано"),
+                    ("key-schedule", "Расписание"),
                 ],
             }],
             hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["board-doc"])],
@@ -861,6 +891,8 @@ impl MockKernel {
                 title,
                 status: self.sc.inserted_row.status.clone(),
                 task_type: self.sc.inserted_row.task_type.clone(),
+                planned: self.sc.inserted_row.planned.clone(),
+                schedule: self.sc.inserted_row.schedule.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))
