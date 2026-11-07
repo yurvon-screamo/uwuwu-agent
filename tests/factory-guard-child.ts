@@ -30,6 +30,7 @@ interface MockRow {
   status: string
   devSession?: string
   reviewSession?: string
+  testSession?: string
   bodyDoc: string
   title: string
 }
