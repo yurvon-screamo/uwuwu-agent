@@ -183,11 +183,47 @@ struct BoardView {
     items: Vec<Value>,
 }
 
+/// Одна страница render: колонки (fields у kanban), счётчик терминации
+/// (rowCount у table, cardCount у kanban), строки/карточки.
+struct BoardPage {
+    columns: Vec<Value>,
+    row_count: Option<u64>,
+    items: Vec<Value>,
+}
+
+/// Разбор страницы render: table несёт `rows`/`rowCount`; kanban — карточки
+/// в `groups[].cards` со счётчиком `cardCount` и колонками `fields` (форма
+/// value-ячеек та же). Чистая функция — collect_board_view только мёржит.
+fn parse_board_page(data: &Value) -> BoardPage {
+    let view = data.get("view").unwrap_or(&Value::Null);
+    let columns = view
+        .pointer("/columns")
+        .or_else(|| view.pointer("/fields"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let row_count = view
+        .get("rowCount")
+        .or_else(|| view.get("cardCount"))
+        .and_then(|r| r.as_u64());
+    let mut items = view
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        // kanban: карточки живут в groups[].cards, форма value-ячеек та же
+        items.extend(kanban_cards(view));
+    }
+    BoardPage {
+        columns,
+        row_count,
+        items,
+    }
+}
+
 /// Полная выборка доски по страницам render: терминация по валидному rowCount
 /// или пустой странице, дедуп по id, кап страниц с громкой ошибкой.
-/// Table-layout несёт строки в `view.rows` (счётчик rowCount); kanban-layout
-/// (доски целей) — в `view.groups[].cards` (счётчик cardCount): пустой rows
-/// при наличии groups переключает источник на карточки групп.
 async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
     let mut view = BoardView {
         columns: Vec::new(),
@@ -200,39 +236,17 @@ async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
         let v = sy.db_render(&board.av_id, &board.block_id, page).await?;
         // structuredContent = {action, data:{...}} — берём data
         let data = v.get("data").unwrap_or(&v);
+        let parsed = parse_board_page(data);
         if page == 1 {
-            view.columns = data
-                .pointer("/view/columns")
-                .or_else(|| data.pointer("/view/fields"))
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default();
-            row_count = data
-                .pointer("/view/rowCount")
-                .or_else(|| data.pointer("/view/cardCount"))
-                .and_then(|r| r.as_u64());
+            view.columns = parsed.columns;
+            row_count = parsed.row_count;
         }
-        let mut items = data
-            .pointer("/view/rows")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if items.is_empty() {
-            // kanban: карточки живут в groups[].cards, форма value-ячеек та же
-            if let Some(groups) = data.pointer("/view/groups").and_then(|g| g.as_array()) {
-                for group in groups {
-                    if let Some(cards) = group.get("cards").and_then(|c| c.as_array()) {
-                        items.extend(cards.clone());
-                    }
-                }
-            }
-        }
-        if items.is_empty() {
+        if parsed.items.is_empty() {
             // терминация всегда: rowCount невалиден (0/отсутствует) или устарел
             // вниз при конкурентных удалениях — счётчик не используется
             break;
         }
-        for it in items {
+        for it in parsed.items {
             // дедуп по id: дрейф страниц при конкурентных правках доски даёт
             // дубль строки на стыке, а тот сломал бы resolve id-first
             // («неоднозначный id»); пустые id не дедупятся
@@ -255,6 +269,21 @@ async fn collect_board_view(sy: &SiYuan, board: &SyBoard) -> Result<BoardView> {
         }
     }
     Ok(view)
+}
+
+/// Карточки kanban-страницы: строки живут в `view.groups[].cards`
+/// (форма value-ячеек та же, что у table-строк). Для table-render — пусто
+/// (groups отсутствуют), вызов безопасен всегда.
+fn kanban_cards(view: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(groups) = view.pointer("/groups").and_then(|g| g.as_array()) {
+        for group in groups {
+            if let Some(cards) = group.get("cards").and_then(|c| c.as_array()) {
+                out.extend(cards.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Строки доски через MCP database render (полная выборка, постранично).
@@ -937,11 +966,22 @@ pub(crate) async fn board_subdoc_ids(sy: &SiYuan, board: &SyBoard) -> Result<Vec
 
 /// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
 pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
+    resolve_entity(sy, board, needle, "задача").await
+}
+
+/// То же с именем сущности в сообщениях об ошибках (доска целей говорит
+/// «цель … не найдена», а не «задача …» — доска задач тут ни при чём).
+pub async fn resolve_entity(
+    sy: &SiYuan,
+    board: &SyBoard,
+    needle: &str,
+    entity: &str,
+) -> Result<SyTask> {
     let rows = read_rows(sy, board).await?;
     let subdoc_ids = board_subdoc_ids(sy, board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
         NeedleMatch::Found(task) => Ok(task),
-        NeedleMatch::NotFound => bail!("задача «{needle}» не найдена"),
+        NeedleMatch::NotFound => bail!("{entity} «{needle}» не найдена"),
         NeedleMatch::Ambiguous { reason, matches } => {
             bail!("неоднозначный {reason}: {matches} совпадений")
         }

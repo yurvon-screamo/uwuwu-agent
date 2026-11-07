@@ -206,7 +206,9 @@ fn mock_row(idx: u64) -> Value {
     json!({
         "id": format!("row-{idx:04}"),
         "cells": [
-            { "value": { "keyID": "key-title", "type": "block", "block": { "content": format!("Задача {idx:04}") } } },
+            // живая форма Title-клетки: block.id = docId тела (привязка строки)
+            { "value": { "keyID": "key-title", "type": "block",
+                         "block": { "content": format!("Задача {idx:04}"), "id": format!("doc-{idx:04}") } } },
             { "value": { "keyID": "key-status", "type": "mSelect", "mSelect": [{ "content": "Draft" }] } },
         ],
     })

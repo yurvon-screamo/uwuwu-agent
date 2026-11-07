@@ -382,7 +382,7 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             let board = goal::find_goal_board(&sy, project).await?;
             let rows = syt::read_rows(&sy, &board).await?;
             let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
-            let mut filtered: Vec<_> = rows
+            let filtered: Vec<_> = rows
                 .into_iter()
                 .filter(|r| {
                     status
@@ -391,7 +391,6 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
                         .unwrap_or(true)
                 })
                 .collect();
-            filtered.sort_by(|a, b| a.status.cmp(&b.status));
             let table = format_goal_table(&filtered, &dead_bound);
             println!("{table}");
             Ok(())
@@ -422,7 +421,7 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
                 anyhow::bail!("нечего менять: передай --status и/или --title");
             }
             let board = goal::find_goal_board(&sy, project).await?;
-            let goal = syt::resolve(&sy, &board, &id).await?;
+            let goal = syt::resolve_entity(&sy, &board, &id, "цель").await?;
             // канонизация статуса до любых записей: без частичных обновлений
             let canonical = status.as_deref().map(goal::canonical_status).transpose()?;
             if let Some(st) = canonical.as_deref() {
@@ -439,7 +438,8 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
 }
 
 /// Таблица реестра целей: статус → строка → заголовок; `(!)` — мёртвая
-/// привязка тела (канон task list).
+/// привязка тела (канон task list). Строки сортируются по статусу
+/// (группировка канбана: done-цели не теряются среди активных).
 pub(crate) fn format_goal_table(
     rows: &[syt::SyTask],
     dead_bound: &std::collections::HashSet<String>,
@@ -447,12 +447,22 @@ pub(crate) fn format_goal_table(
     if rows.is_empty() {
         return "Целей нет.".to_string();
     }
+    let mut sorted: Vec<&syt::SyTask> = rows.iter().collect();
+    // канонический порядок статусов (лестница прогресса todo → in progress →
+    // done), не алфавит: группы канбана читаются сверху вниз по фазе цели;
+    // вне-канонные статусы — в конец
+    sorted.sort_by_key(|r| {
+        goal::GOAL_STATUSES
+            .iter()
+            .position(|canon| canon.eq_ignore_ascii_case(&r.status))
+            .unwrap_or(goal::GOAL_STATUSES.len())
+    });
     let mut out = String::new();
     out.push_str(&format!(
         "{:<13} {:<12} {:<34}\n",
         "СТАТУС", "СТРОКА", "ЦЕЛЬ"
     ));
-    for r in rows {
+    for r in sorted {
         let marker = match r.body_doc.as_deref() {
             Some(b) if dead_bound.contains(b) => " (!)",
             _ => "",
@@ -472,7 +482,7 @@ pub(crate) fn format_goal_table(
 /// (паттерн cron rm; Draft-вердикт task rm тут не нужен — цели всегда Live).
 async fn goal_rm(sy: &SiYuan, project: &str, id: &str) -> anyhow::Result<()> {
     let board = goal::find_goal_board(sy, project).await?;
-    let goal = syt::resolve(sy, &board, id).await?;
+    let goal = syt::resolve_entity(sy, &board, id, "цель").await?;
     let mut journal = Journal::new(project, "goal-rm", &board);
     journal.rows.push(journal_row(sy, &board, &goal).await?);
     let journal_path = journal.save(sy).await?;
@@ -763,6 +773,8 @@ async fn task_undo(sy: &SiYuan, project: &str, journal_name: Option<&str>) -> Re
     }
     let board = match journal.kind.as_str() {
         "cron-rm" => syt::find_board_cron(sy, project).await?,
+        // цели: доска «Цели <proj>» (владелец завёл один раз) — не доска задач
+        "goal-rm" => goal::find_goal_board(sy, project).await?,
         _ => syt::find_board(sy, project).await?,
     };
     if board.av_id != journal.av_id {
