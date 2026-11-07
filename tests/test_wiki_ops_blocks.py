@@ -41,6 +41,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import kernel_post
 
 DOC_ID = "20261106030000-doc0001"
 BLOCK_ID = "20261106030000-blk0001"
@@ -130,16 +131,13 @@ def run_block(kernel: FakeKernel, command: str, block_id: str = BLOCK_ID, payloa
     fn = {"update": wiki_ops.cmd_block_update,
           "insert-after": wiki_ops.cmd_block_insert_after,
           "delete": wiki_ops.cmd_block_delete}[command]
-    original_post = wiki_ops.post
     original_put = wiki_ops._put_workspace_file
-    wiki_ops.post = kernel.post
     wiki_ops._put_workspace_file = kernel.put_file
     try:
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        with kernel_post(kernel), redirect_stdout(buffer):
             fn(args)
     finally:
-        wiki_ops.post = original_post
         wiki_ops._put_workspace_file = original_put
         if payload_file:
             os.unlink(payload_file)

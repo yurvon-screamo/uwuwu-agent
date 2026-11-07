@@ -26,6 +26,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import run_cmd
 
 DOC_ID = "20261105181106-3kvzcuv"
 DOC = {"id": DOC_ID, "hpath": "/Experience/platform/Хвосты amend'а merge-коммита",
@@ -51,15 +52,8 @@ class FakeKernel:
 
 def run_find(kernel: FakeKernel, title: str) -> str:
     args = type("Args", (), {"title": title})()
-    original_post = wiki_ops.post
-    wiki_ops.post = kernel.post
-    try:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            wiki_ops.cmd_find(args)
-    finally:
-        wiki_ops.post = original_post
-    return buffer.getvalue()
+    out, _ = run_cmd(wiki_ops.cmd_find, args, kernel)
+    return out
 
 
 class TitleEscaping(unittest.TestCase):

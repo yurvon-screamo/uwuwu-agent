@@ -324,7 +324,7 @@ def _warn_if_adr_number_taken(notebook_id: str, folder_hpath: str, title: str) -
     if number is None:
         return
     stmt = (f"select content, hpath from blocks where type='d' and box='{notebook_id}' "
-            f"and hpath like '{_sql_str(folder_hpath)}/%' limit 200")  # nosec B608 — box из kernel API, hpath экранирован _sql_str
+            f"and hpath like '{_sql_like(folder_hpath)}/%' escape '\\' limit 200")  # nosec B608 — box из kernel API, hpath экранирован _sql_like
     try:
         rows = _sql_rows(stmt, attempts=1)
     except Exception:
@@ -333,7 +333,7 @@ def _warn_if_adr_number_taken(notebook_id: str, folder_hpath: str, title: str) -
         return
     taken_by = [r["hpath"] for r in rows if _adr_number(r.get("content") or "") == number]
     if taken_by:
-        print(f"ПРЕДУПРЕЖДЕНИЕ: номер ADR-{number:03d} уже занят в {folder_hpath}: "
+        print(f"ПРЕДУПРЕЖДЕНИЕ: номер ADR-{number:03d} уже занят в {folder_hpath or '/'}: "
               f"{'; '.join(taken_by)} — номер держит первый по времени (ADR-013); "
               f"создание продолжено", file=sys.stderr)
 
@@ -580,6 +580,14 @@ def _sql_scalar(stmt: str) -> int:
 def _sql_str(value: str) -> str:
     # Одинарная кавычка в SQL-литерале экранируется удвоением (SQLite kernel).
     return value.replace("'", "''")
+
+
+def _sql_like(value: str) -> str:
+    """value → тело LIKE-паттерна: строковый слой _sql_str плюс паттерн-слой
+    (\\ % _ под бэкслэш; SQLite LIKE без ESCAPE не знает «\\» — stmt обязан нести
+    escape '\\'). Легаси-имена папок с вайлкардами матчатся буквально."""
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return _sql_str(escaped)
 
 
 def _doc_row(doc_id: str, attempts: int = 6) -> dict | None:

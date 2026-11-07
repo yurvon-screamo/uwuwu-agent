@@ -17,12 +17,10 @@
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_replace.py
 """
-import io
 import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +28,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import run_cmd
 
 BOX = "20261103224312-fbrf5fp"
 NB_PROJECTS = {"id": BOX, "name": "Projects", "closed": False}
@@ -84,15 +83,9 @@ class FakeKernel:
 def run_replace(kernel: FakeKernel, doc_id: str, file: str,
                 base: str | None = None, force: bool = False) -> str:
     args = SimpleNamespace(docId=doc_id, file=file, base=base, force=force)
-    original_post = wiki_ops.post
-    wiki_ops.post = kernel.post
-    try:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer), patch.object(wiki_ops.time, "sleep", lambda s: None):
-            wiki_ops.cmd_replace(args)
-    finally:
-        wiki_ops.post = original_post
-    return buffer.getvalue()
+    with patch.object(wiki_ops.time, "sleep", lambda s: None):
+        out, _ = run_cmd(wiki_ops.cmd_replace, args, kernel)
+    return out
 
 
 class MalformedDocId(unittest.TestCase):

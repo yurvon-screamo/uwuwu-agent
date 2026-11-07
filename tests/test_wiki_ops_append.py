@@ -23,14 +23,12 @@
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_append.py
 """
-import io
 import json
 import os
 import sys
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,6 +36,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools.wiki_ops as wiki_ops
+from tests.wiki_ops_testkit import run_cmd
 
 DOC = "20261106000000-abcdefg"
 
@@ -78,15 +77,9 @@ def run_append(kernel: FakeKernel, doc_id: str, md: str, force: bool = False) ->
         md_file = Path(tmp) / "append.md"
         md_file.write_text(md, encoding="utf-8")
         args = SimpleNamespace(docId=doc_id, file=str(md_file), force=force)
-        original_post = wiki_ops.post
-        wiki_ops.post = kernel.post
-        try:
-            buffer = io.StringIO()
-            with redirect_stdout(buffer), patch.object(wiki_ops.time, "sleep", lambda s: None):
-                wiki_ops.cmd_append(args)
-        finally:
-            wiki_ops.post = original_post
-    return buffer.getvalue()
+        with patch.object(wiki_ops.time, "sleep", lambda s: None):
+            out, _ = run_cmd(wiki_ops.cmd_append, args, kernel)
+    return out
 
 
 class IncidentReplay(unittest.TestCase):
