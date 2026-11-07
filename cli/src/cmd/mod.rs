@@ -9,6 +9,8 @@ mod cli_tests;
 #[cfg(test)]
 mod create_tests;
 #[cfg(test)]
+mod mock_kernel;
+#[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
 mod claim_tests;
