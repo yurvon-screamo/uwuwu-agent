@@ -19,14 +19,22 @@ def kernel_post(kernel):
     """wiki_ops.post → post двойника на время блока, восстановление в finally.
 
     Принимает двойника ядра (объект с .post) или сырую post-функцию
-    (main/orgls-стиль лямбд)."""
+    (main/orgls-стиль лямбд). Резолв-контур блочных команд ходит и мимо post —
+    проба дерева _post_envelope (getBlockInfo, задача 20261107000209) — поэтому
+    патчится и она: kernel.envelope если двойник её несёт, иначе дефолт «дерево
+    не знает» (code −1) — для неизвестных id это честное поведение живого ядра.
+    """
     impl = kernel.post if hasattr(kernel, "post") else kernel
-    original = wiki_ops.post
+    envelope = getattr(kernel, "envelope", None) or (
+        lambda path, body: (-1, None, "Содержимое блока не найдено"))
+    original_post, original_envelope = wiki_ops.post, wiki_ops._post_envelope
     wiki_ops.post = impl
+    wiki_ops._post_envelope = envelope
     try:
         yield
     finally:
-        wiki_ops.post = original
+        wiki_ops.post = original_post
+        wiki_ops._post_envelope = original_envelope
 
 
 def run_cmd(cmd, args, kernel) -> tuple[str, str]:
