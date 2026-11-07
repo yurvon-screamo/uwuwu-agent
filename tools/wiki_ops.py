@@ -299,8 +299,7 @@ def notebooks(attempts: int = 6) -> list[dict]:
 
 
 def cmd_export(a):
-    r = post(EXPORT_MD_PATH, {"id": a.docId})
-    print((r or {}).get("content", ""))
+    print(_export_content(a.docId))
 
 
 def path_safe(title: str) -> str:
@@ -409,9 +408,20 @@ def _resolve_parent(parent: str) -> tuple[str, str, str]:
                        f"примеры: /Experience/cli, /uwuwu/ADR")
 
 
-def _export_content(doc_id: str) -> str:
-    r = post(EXPORT_MD_PATH, {"id": doc_id}, attempts=1)
-    return (r or {}).get("content", "")
+def _export_content(doc_id: str, attempts: int = 6) -> str:
+    """Конверт exportMdContent обязан нести dict со str-полем "content":
+    аномалия (None, dict без поля, content не строка) — RuntimeError с repr
+    ответа; голая «(r or {}).get(...)» читала бы сбой как «док пуст» (граница
+    класса PR #111, задача 20261107033538). Пустой content при здоровом
+    конверте легитимен: ядро отвечает им и на пустой док, и на несуществующий
+    (проба 07.11: code=0, data={hPath: '', content: ''}) — конвенция
+    «успех — тихий» читает это как честный not-found. Guard-шаги append/
+    replace зовут с attempts=1 — бюджет ретраев держит вызывающий луп."""
+    data = post(EXPORT_MD_PATH, {"id": doc_id}, attempts=attempts)
+    if not (isinstance(data, dict) and isinstance(data.get("content"), str)):
+        raise RuntimeError(
+            f"exportMdContent вернул аномальный конверт (ожидался dict со str-полем content): {data!r:.200}")
+    return data["content"]
 
 
 def _normalized_lines(text: str) -> list[str]:
@@ -499,7 +509,7 @@ def cmd_append(a):
         return
     for attempt in range(1, APPEND_ATTEMPTS + 1):
         try:
-            if _tail_already_applied(_export_content(doc_id), md):
+            if _tail_already_applied(_export_content(doc_id, attempts=1), md):
                 print(f"already applied: {doc_id} — контент уже в хвосте дока, append не выполнялся")
                 return
             _append_block(doc_id, md)
@@ -536,7 +546,7 @@ def _require_fresh_snapshot(doc_id: str, base_file: str | None) -> None:
         )
     base_text = Path(base_file).read_text()
     try:
-        current = _export_content(doc_id)
+        current = _export_content(doc_id, attempts=1)
     except RuntimeError as exc:
         raise RuntimeError(
             f"guard свежести не состоялся — export не читается ({exc}); "
@@ -632,8 +642,7 @@ def _siblings_count(box: str, hpath: str) -> int:
 
 def _is_stub(doc_id: str) -> bool:
     # Заглушка дубля: строка-цитата с «⚠️» И словом «канон»/«заглушк» на той же строке.
-    r = post(EXPORT_MD_PATH, {"id": doc_id})
-    content = (r or {}).get("content", "")
+    content = _export_content(doc_id)
     for line in content.splitlines():
         if not line.lstrip().startswith(">"):
             continue
