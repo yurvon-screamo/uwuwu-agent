@@ -259,57 +259,58 @@ describe("isValidTracked: lastRefusal", () => {
 })
 
 
+/** Парс с громким сбоем вместо non-null assertion: расписание в тестах
+ *  обязано разбираться — иначе тест сам себе врёт. */
+const mustParse = (s: string) => {
+  const sched = parseSchedule(s)
+  if (sched === null) throw new Error(`parseSchedule сломан: ${s}`)
+  return sched
+}
+
 describe("nextFire: следующее планируемое срабатывание", () => {
   const at = (y: number, m: number, d: number, h: number, min: number, s = 0) => new Date(y, m - 1, d, h, min, s)
 
   test("интервал — от последнего файра", () => {
-    const sched = parseSchedule("6h")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("6h")
     const last = at(2026, 11, 8, 2, 34, 21)
-    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 8, 34))
+    expect(nextFire(sched, last)).toEqual(at(2026, 11, 8, 8, 34))
   })
 
   test("cron-выражение — следующий совпавший минут-старт", () => {
-    const sched = parseSchedule("*/15 * * * *")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("*/15 * * * *")
     const last = at(2026, 11, 8, 10, 3)
-    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 10, 15))
+    expect(nextFire(sched, last)).toEqual(at(2026, 11, 8, 10, 15))
   })
 
   test("cron-выражение с днём недели — не стреляет в прошедшие дни повторно", () => {
-    const sched = parseSchedule("0 9 * * 1")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("0 9 * * 1")
     // 08.11.2026 — воскресенье: следующий понедельник 09.11
     const last = at(2026, 11, 8, 9, 0)
-    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 9, 9, 0))
+    expect(nextFire(sched, last)).toEqual(at(2026, 11, 9, 9, 0))
   })
 
   test("разовый HH:MM — сегодняшний момент, если он впереди", () => {
-    const sched = parseSchedule("18:00")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("18:00")
     const last = at(2026, 11, 8, 10, 0)
-    expect(nextFire(sched!, last)).toEqual(at(2026, 11, 8, 18, 0))
+    expect(nextFire(sched, last)).toEqual(at(2026, 11, 8, 18, 0))
   })
 
   test("разовый в прошлом → null (нечего планировать)", () => {
-    const sched = parseSchedule("09:30")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("09:30")
     const last = at(2026, 11, 8, 10, 0)
-    expect(nextFire(sched!, last)).toBeNull()
+    expect(nextFire(sched, last)).toBeNull()
   })
 
   test("разовый с датой — конкретный день, месяц из расписания", () => {
-    const sched = parseSchedule("09:30 01.12")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("09:30 01.12")
     const last = at(2026, 11, 8, 10, 0)
-    expect(nextFire(sched!, last)).toEqual(at(2026, 12, 1, 9, 30))
+    expect(nextFire(sched, last)).toEqual(at(2026, 12, 1, 9, 30))
   })
 
   test("вечный молчун (ни одного совпадения за год) → null, клетку не трогает", () => {
-    const sched = parseSchedule("0 0 30 2 *")
-    expect(sched).not.toBeNull()
+    const sched = mustParse("0 0 30 2 *")
     const last = at(2026, 11, 8, 10, 0)
-    expect(nextFire(sched!, last)).toBeNull()
+    expect(nextFire(sched, last)).toBeNull()
   })
 })
 
@@ -319,7 +320,7 @@ describe("cellPatches: расхождение клеток мастера", () =
     rowId: "row-1", bodyDoc: "doc-1", title: "мастер", schedule: "6h",
     plannedMs: null, scheduleCell: "", status: "вейт", ...over,
   })
-  const sched = parseSchedule("6h")!
+  const sched = mustParse("6h")
 
   test("чистая доска — пустой патч (записей не нужно)", () => {
     const r = row({ plannedMs: at(2026, 11, 8, 8, 34).getTime(), scheduleCell: "6h" })
