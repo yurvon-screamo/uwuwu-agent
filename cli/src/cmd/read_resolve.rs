@@ -267,7 +267,10 @@ mod tests {
     fn like_condition_escapes_like_wildcards_in_segment() {
         // вайлкарды в слаге — литералы, не шаблон (конвенция wiki_ops-гарда)
         let stmt = hpath_condition("100%_done", "uwuwu/");
-        assert!(stmt.contains("hpath like '/uwuwu/%100\\%\\_done%'"), "{stmt}");
+        assert!(
+            stmt.contains("hpath like '/uwuwu/%100\\%\\_done%'"),
+            "{stmt}"
+        );
         assert!(stmt.contains("escape '\\'"), "{stmt}");
     }
 

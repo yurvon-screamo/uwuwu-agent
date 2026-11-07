@@ -298,7 +298,11 @@ async fn fetch_classifiable_page(
     sy: &SiYuan,
     cursor_updated: &str,
     cursor_id: &str,
-) -> Result<(Vec<Value>, std::collections::HashMap<String, KernelRow>, Vec<String>)> {
+) -> Result<(
+    Vec<Value>,
+    std::collections::HashMap<String, KernelRow>,
+    Vec<String>,
+)> {
     let rows = sy.sql(&delta_page_stmt(cursor_updated, cursor_id)).await?;
     if rows.is_empty() {
         return Ok((rows, std::collections::HashMap::new(), Vec::new()));
@@ -335,7 +339,8 @@ pub async fn delta_sync(
             report.budget_exhausted = true;
             break;
         }
-        let (rows, by_id, page_ids) = fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
+        let (rows, by_id, page_ids) =
+            fetch_classifiable_page(sy, &cursor_updated, &cursor_id).await?;
         if rows.is_empty() {
             break;
         }
