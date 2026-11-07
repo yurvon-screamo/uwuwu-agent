@@ -138,7 +138,8 @@ TOKEN = None
 # (04.11: Experience 859 доков, orgls видел 64). Явный предел обязателен в каждом stmt.
 ORG_LS_LIMIT = 100000
 
-# export дока в markdown (cmd_export, _is_stub, _export_content).
+# export дока в markdown: единственный прямой референс — _export_content
+# (cmd_export/_is_stub/guard-шаги append/replace идут через него).
 EXPORT_MD_PATH = "/api/export/exportMdContent"
 
 # Content-Type JSON-конвертов kernel API (post-каналы: _post_once, _fs_file,
@@ -299,8 +300,7 @@ def notebooks(attempts: int = 6) -> list[dict]:
 
 
 def cmd_export(a):
-    r = post(EXPORT_MD_PATH, {"id": a.docId})
-    print((r or {}).get("content", ""))
+    print(_export_content(a.docId))
 
 
 def path_safe(title: str) -> str:
@@ -409,9 +409,20 @@ def _resolve_parent(parent: str) -> tuple[str, str, str]:
                        f"примеры: /Experience/cli, /uwuwu/ADR")
 
 
-def _export_content(doc_id: str) -> str:
-    r = post(EXPORT_MD_PATH, {"id": doc_id}, attempts=1)
-    return (r or {}).get("content", "")
+def _export_content(doc_id: str, attempts: int = 6) -> str:
+    """Конверт exportMdContent обязан нести dict со str-полем "content":
+    аномалия (None, dict без поля, content не строка) — RuntimeError с repr
+    ответа; голая «(r or {}).get(...)» читала бы сбой как «док пуст» (граница
+    класса PR #111, задача 20261107033538). Пустой content при здоровом
+    конверте легитимен: ядро отвечает им и на пустой док, и на несуществующий
+    (проба 07.11: code=0, data={hPath: '', content: ''}) — конвенция
+    «успех — тихий» читает это как честный not-found. Guard-шаги append/
+    replace зовут с attempts=1 — бюджет ретраев держит вызывающий луп."""
+    data = post(EXPORT_MD_PATH, {"id": doc_id}, attempts=attempts)
+    if not (isinstance(data, dict) and isinstance(data.get("content"), str)):
+        raise RuntimeError(
+            f"exportMdContent вернул аномальный конверт (ожидался dict со str-полем content): {data!r:.200}")
+    return data["content"]
 
 
 def _normalized_lines(text: str) -> list[str]:
@@ -499,7 +510,7 @@ def cmd_append(a):
         return
     for attempt in range(1, APPEND_ATTEMPTS + 1):
         try:
-            if _tail_already_applied(_export_content(doc_id), md):
+            if _tail_already_applied(_export_content(doc_id, attempts=1), md):
                 print(f"already applied: {doc_id} — контент уже в хвосте дока, append не выполнялся")
                 return
             _append_block(doc_id, md)
@@ -536,7 +547,7 @@ def _require_fresh_snapshot(doc_id: str, base_file: str | None) -> None:
         )
     base_text = Path(base_file).read_text()
     try:
-        current = _export_content(doc_id)
+        current = _export_content(doc_id, attempts=1)
     except RuntimeError as exc:
         raise RuntimeError(
             f"guard свежести не состоялся — export не читается ({exc}); "
@@ -632,8 +643,7 @@ def _siblings_count(box: str, hpath: str) -> int:
 
 def _is_stub(doc_id: str) -> bool:
     # Заглушка дубля: строка-цитата с «⚠️» И словом «канон»/«заглушк» на той же строке.
-    r = post(EXPORT_MD_PATH, {"id": doc_id})
-    content = (r or {}).get("content", "")
+    content = _export_content(doc_id)
     for line in content.splitlines():
         if not line.lstrip().startswith(">"):
             continue
@@ -706,7 +716,12 @@ def cmd_delete(a):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
     row = _doc_row(doc_id)
     if not row:
-        raise RuntimeError(f"док {doc_id} не найден (уже удалён?) — проверь wiki_ops find")
+        # False not-found на живом доке — реальность by-id проб на свежих доках
+        # (лаг SQL-индекса, корень задачи 20261107000209): отказ fail-closed
+        # безопасен (дублей delete не создаёт, пост-чек FS страхует), поэтому
+        # различение не строим — оператору достаточно подсказки в причине.
+        raise RuntimeError(f"док {doc_id} не найден в SQL-индексе (уже удалён? — или док свежий "
+                           "и индекс его ещё не видит: проверь wiki_ops find, повтори позже)")
     children = _children_count(row["path"])
     if children and not a.force:
         raise RuntimeError(f"у дока «{row['hpath']}» есть дочерние доки ({children}) — снос унесёт subtree; подтверди --force")

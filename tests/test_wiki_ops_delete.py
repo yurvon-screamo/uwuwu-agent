@@ -239,6 +239,16 @@ class BadInputs(unittest.TestCase):
         self.assertIn("не найден", str(cm.exception))
         self.assertEqual(kernel.removed, [])
 
+    def test_missing_doc_refusal_carries_index_lag_hint(self):
+        # Отказ «не найден» на живом доке бывает на свежих доках (лаг SQL-индекса,
+        # корень задачи 20261107000209): подсказка в причине — способ разобрать
+        # false not-found без различающего механизма (delete fail-closed безопасен).
+        kernel = FakeKernel(docs=[])
+        with self.assertRaises(RuntimeError) as cm:
+            run_delete(kernel, STUB_ID)
+        self.assertIn("индекс его ещё не видит", str(cm.exception))
+        self.assertEqual(kernel.removed, [])
+
 
 class PostCheck(unittest.TestCase):
     """Вердикт после ok — по файловой пробе (FS-истина); лагающий индекс
