@@ -55,6 +55,10 @@ async function makeRepo(): Promise<TestRepo> {
   mkdirSync(local)
   writeFileSync(join(local, "seed.txt"), "seed\n")
   await sh(["git", "-C", local, "init", "-b", "master"])
+  // identity локально в temp-репо: без неё merge падает на машинах
+  // без глобального git-конфига (CI-раннеры)
+  await sh(["git", "-C", local, "config", "user.name", "t"])
+  await sh(["git", "-C", local, "config", "user.email", "t@t"])
   await sh(["git", "-C", local, "add", "."])
   await sh(["git", "-C", local, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"])
   return { root, local, wtRoot: join(local, "wt"), legacyRoot: join(local, ".worktrees") }

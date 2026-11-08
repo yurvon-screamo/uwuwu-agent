@@ -19,6 +19,23 @@ mkdirSync(dirname(TEST_LOG), { recursive: true })
 const cron = await import("../cron/cron")
 const mcp = await import("../lib/platform")
 const originalFetch = globalThis.fetch
+const originalSpawn = Bun.spawn
+
+/** CLI-спавны скриптуются: дефолт CLI_BIN резолвится в ~/.cargo/bin/uwuwu-cli,
+ *  которого на CI-раннере нет — Bun.spawn кинул бы ENOENT. argv фиксируется:
+ *  reconcile клеток мастера честно спавнит task edit (ассерт в тесте). */
+const spawnArgv: string[][] = []
+function scriptSpawn(): void {
+  spawnArgv.length = 0
+  ;(Bun as unknown as { spawn: unknown }).spawn = ((argv: string[]) => {
+    spawnArgv.push(argv.map(String))
+    return {
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+      exited: Promise.resolve(0),
+    } as unknown as ReturnType<typeof Bun.spawn>
+  }) as typeof Bun.spawn
+}
 
 const AV_ID = "20260101000000-abcdef"
 const TITLE_KEY = "k-title"
@@ -103,10 +120,12 @@ const sse = (result: unknown, sessionId?: string): Response =>
 
 beforeEach(() => {
   mcp.__test.expireSession()
+  scriptSpawn()
 })
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  ;(Bun as unknown as { spawn: unknown }).spawn = originalSpawn
 })
 
 describe("tick: инфра-сбой ядра ≠ вердикт — слот мастера не сжигается", () => {
@@ -123,7 +142,12 @@ describe("tick: инфра-сбой ядра ≠ вердикт — слот м�
     expect(calls.some((c) => c.name === "block:get-alive")).toBe(true)
     // гейт-срез состоял (начальный + гейт)
     expect(calls.filter((c) => c.name === "database:render").length).toBeGreaterThanOrEqual(2)
-    // ран-карточка и сессия не создавались: ни одного CLI-спавна
+    // ран-карточка и сессия не создавались — оба пути письма:
+    // MCP-тулзы (create_comment/item_update) и CLI-спавны
     expect(calls.filter((c) => c.kind === "mcp-tool" && (c.name.includes("create_comment") || c.name.includes("item_update")))).toEqual([])
+    expect(spawnArgv.some((a) => a[1] === "task" && a[2] === "create")).toBe(false)
+    // CLI-спавны есть (reconcile клеток мастера) — и все это task edit
+    expect(spawnArgv.length).toBeGreaterThan(0)
+    expect(spawnArgv.every((a) => a[1] === "task" && a[2] === "edit")).toBe(true)
   }, 20_000)
 })
