@@ -193,6 +193,7 @@ const draftRowIdsInPipeline = (hub: Hub): Set<string> => {
 const syncDraftTracker = (hub: Hub, seen: Map<string, DraftRow>, projects: Map<string, string>): void => {
   const now = Date.now()
   let changed = false
+  hub.state.drafts ??= {}
   const drafts = hub.state.drafts as Record<string, DraftTrack>
   for (const [rowId, d] of seen) {
     const t = drafts[rowId]

@@ -149,7 +149,7 @@ test("validTriageExtras: черновики персистятся; битые �
   }
   const cleaned = validTriageState(broken)
   expect(cleaned.queue).toEqual([{ text: "t", chatID: 0, msgID: -1, receivedAt: 0 }]) // drafts-мусор в заявке стрипнут
-  expect(cleaned.drafts).toBeUndefined()
+  expect(cleaned.drafts).toEqual({}) // поле материализовано всегда: пустой стейт не крашит трекер (hotfix 20261108094925)
   expect(cleaned.draftSkip).toBeUndefined()
   expect(cleaned.nextDraftMsgID).toBeUndefined()
 })
