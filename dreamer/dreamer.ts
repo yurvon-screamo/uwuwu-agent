@@ -345,6 +345,7 @@ async function startTaskRun(state: DreamerState, db: Database, rowId: string, tr
     tracked.status = "done"
     tracked.at = Date.now()
     dropTaskActiveSessions(state.activeSessions, rowId)
+    saveState(state)
     log(`задача ${rowId.slice(0, 8)}: сессий по истории корней нет в БД — прогон закрыт без анализа`)
     return
   }
@@ -483,9 +484,14 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     return
   }
   const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
+  // слот = дример-сессия, реально живущая в опенкоде (running). Pending —
+  // очередь, не слот: задачный трек стоит pending между тиками (done-сигнал
+  // ставит, спавн делает этот же тик) — счёт его в слоте с CONCURRENCY=1
+  // блокировал спавн самим собой навсегда (баг-репорт тестирования 09.11).
+  // Спавн в цикле кандидатов сразу ставит running — слот уважается.
   const activeRuns = (): number =>
-    Object.values(state.sessions).filter((t) => t.status === "running" || t.status === "pending").length +
-    Object.values(state.taskRuns).filter((t) => t.status === "running" || t.status === "pending").length
+    Object.values(state.sessions).filter((t) => t.status === "running").length +
+    Object.values(state.taskRuns).filter((t) => t.status === "running").length
   log(`очередь: ${candidates.length} кандидатов, активных прогонов: ${activeRuns()}`)
   for (const cand of candidates) {
     if (activeRuns() >= CONCURRENCY) break

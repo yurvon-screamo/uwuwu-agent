@@ -22,6 +22,8 @@ mkdirSync(queueDir, { recursive: true })
 mkdirSync(join(home, ".local/share/opencode"), { recursive: true })
 
 // ——— фейк opencode REST: ловим спавн/промпт, отдаём живую дример-сессию ———
+// restCall демона ходит на `/api${path}` — вердикт и ассерты нормализуют путь
+// (path без /api-префикса, как в контракте REST демона).
 const calls: Array<{ method: string; path: string; body: unknown }> = []
 const server = Bun.serve({
   hostname: "127.0.0.1",
@@ -29,14 +31,15 @@ const server = Bun.serve({
   fetch: async (req) => {
     const url = new URL(req.url)
     const body = req.method === "POST" ? await req.json().catch(() => null) : null
-    calls.push({ method: req.method, path: url.pathname, body })
-    if (req.method === "POST" && url.pathname === "/session") {
+    const path = url.pathname.startsWith("/api") ? url.pathname.slice("/api".length) : url.pathname
+    calls.push({ method: req.method, path, body })
+    if (req.method === "POST" && path === "/session") {
       return Response.json({ id: dreamerSes })
     }
-    if (req.method === "GET" && url.pathname === "/session/active") {
+    if (req.method === "GET" && path === "/session/active") {
       return Response.json({ [dreamerSes]: { type: "running" } })
     }
-    if (req.method === "GET" && url.pathname.startsWith("/session/")) {
+    if (req.method === "GET" && path.startsWith("/session/")) {
       return Response.json({ id: dreamerSes })
     }
     return Response.json({})
