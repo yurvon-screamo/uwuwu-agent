@@ -85,6 +85,68 @@ pub(crate) fn artifact_report(md: &str) -> Vec<String> {
     report
 }
 
+/// Канон-строка маркера, замыкающего шапку карточки в выводе `task get`
+/// (sy_dispatch::strip_task_get_output срезает по ней снапшот --base).
+/// Единая константа для срезки и write-side детекции — сигнатуры не разъедутся.
+pub(crate) const TASK_GET_BODY_MARKER: &str = "----- тело -----";
+
+/// Write-side гард вставки обёртки вывода `task get` в контент записи task
+/// body (задача 202611080031: вход `--stdin`/`--md` пишется как есть, мусор
+/// ложится в тело и множится на replace-циклах). Возвращает сигнатуру для
+/// текста ошибки или None:
+/// - строка ровно «----- тело -----» вне code-fence — полный вывод get или
+///   контент, пересобранный из испорченного тела (рециркуляция вложенного
+///   мусора ловится тем же матчем);
+/// - вход (после ведущих пустых строк) начинается с YAML-frontmatter-шапки
+///   «--- / title: …» — хвост вывода get: шапку карточки срезали, frontmatter
+///   остался.
+///
+/// Построчный матч (lines() гасит CRLF) и точная строка маркера: легитимные
+/// цитаты не триггерят — маркер внутри текста/код-фенса (строка не ровно
+/// маркер), thematic break «---» без следующей строки «title:».
+/// Осознанная граница (ревью плана 08.11): шапка карточки «Задача:/Статус:…»
+/// без маркера и frontmatter (гипотетические срезки) проходит — наблюдаемые
+/// порчи закрыты маркером, расширение — по рецидиву.
+pub(crate) fn task_get_wrapper_signature(content: &str) -> Option<&'static str> {
+    let mut in_fence = false;
+    // кандидат на frontmatter-шапку живёт только в начале входа: первая
+    // содержательная линия «---», следующая (без пустой между ними) «title: …»
+    let mut at_start = true;
+    let mut expect_title = false;
+    for line in content.lines() {
+        if toggles_fence(line) {
+            in_fence = !in_fence;
+            at_start = false;
+            continue;
+        }
+        if in_fence {
+            at_start = false;
+            continue;
+        }
+        if line.trim_end() == TASK_GET_BODY_MARKER {
+            return Some("маркер «----- тело -----» — шапка вывода task get");
+        }
+        let trimmed = line.trim_end();
+        if at_start {
+            if trimmed.is_empty() {
+                continue;
+            }
+            at_start = false;
+            if trimmed == "---" {
+                expect_title = true;
+            }
+            continue;
+        }
+        if expect_title {
+            expect_title = false;
+            if trimmed.trim_start().starts_with("title:") {
+                return Some("YAML-frontmatter-шапка «--- / title: …» — хвост вывода task get");
+            }
+        }
+    }
+    None
+}
+
 /// Write-side превенция тег-матча: ≥2 «голых» решёток с пунктуацией
 /// вплотную с обеих сторон в одном параграфе (сигнатура `«#»`/`„#“`,
 /// пробированный триггер поедания бэктиков на экспорте). Предупреждение,
@@ -222,18 +284,93 @@ fn max_hash_run(line: &str) -> Option<usize> {
     (best >= 3).then_some(best)
 }
 
-fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut first_seen: Vec<String> = Vec::new();
+/// Title из frontmatter-блока экспорта (`title:` — первая строка блока).
+/// None — frontmatter нет или без title: матч экспорт-препенд H1 не
+/// выполняется, поведение скана прежнее.
+fn frontmatter_title(md: &str) -> Option<&str> {
+    let rest = md.strip_prefix("---\n")?;
+    let (frontmatter, _) = rest.split_once("\n---")?;
+    let title_line = frontmatter.lines().next()?;
+    title_line.strip_prefix("title:").map(str::trim)
+}
+
+/// Индекс первой непустой контент-строки, если она — H1, дословно равная
+/// title (collapse-нормализация обеих сторон). Сигнатура экспорт-препенда:
+/// create с ведущим `# <тайтл>` в payload даёт в экспорте две одинаковые
+/// H1 подряд (ядерный prepend + payload) — генезис write-path, не
+/// round-trip порча (кейсы ADR-063 и cicd-док, 08.11). Осознанный
+/// trade-off: дубль титульной H1 детектором больше не флагается — живой
+/// класс round-trip порчи такой сигнатуры не показан.
+fn h1_prepend_index(lines: &[&str], title: Option<&str>) -> Option<usize> {
+    let title = title?;
+    let prepend_h1 = format!("# {}", crate::markdown::collapse_whitespace(title));
+    let index = lines.iter().position(|line| !line.trim().is_empty())?;
+    let first = crate::markdown::collapse_whitespace(lines[index].trim());
+    (first == prepend_h1).then_some(index)
+}
+
+/// Строка живого HTML-блока: экспорт ядра отдаёт блок одной строкой,
+/// начинающейся с открывающего (`<div …`) или закрывающего (`</div …`)
+/// тега. Дубли inline-CSS/разметки между диаграммами rich-доков —
+/// закономерная структура, не round-trip (кейс «Стек и архитектура»:
+/// все предупреждения на чтении — от CSS-фрагментов внутри html-строк).
+fn is_html_line(line: &str) -> bool {
+    let Some(after_open) = line.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    match after_open.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => true,
+        Some('/') => true,
+        _ => false,
+    }
+}
+
+/// Строки контента для duplicate-скана после precision-скипов: frontmatter
+/// (content_lines), фенсы (маркеры и содержимое), секция «## Комменты»
+/// (повторы вердиктов между раундами ревью — закономерный контент, до
+/// следующего ##-заголовка), html-строки живых блоков (дубли inline-CSS
+/// диаграмм — закономерная разметка) и экспорт-препенд H1 (генезис create
+/// с ведущим `# <тайтл>`, не round-trip порча).
+fn duplicate_scan_lines<'a>(lines: &[&'a str], skip_h1: Option<usize>) -> Vec<&'a str> {
+    let mut scanned = Vec::new();
     let mut in_fence = false;
-    for line in content_lines(md) {
+    let mut in_comments = false;
+    for (index, line) in lines.iter().copied().enumerate() {
         if toggles_fence(line) {
             in_fence = !in_fence;
             continue;
         }
-        if in_fence {
+        if in_fence || Some(index) == skip_h1 {
             continue;
         }
+        let trimmed = line.trim();
+        if trimmed == "## Комменты" {
+            in_comments = true;
+            continue;
+        }
+        if in_comments {
+            // секция закрыта следующим ##-заголовком — контент после неё
+            // снова сканируется
+            if trimmed.starts_with("## ") {
+                in_comments = false;
+            } else {
+                continue;
+            }
+        }
+        if is_html_line(line) {
+            continue;
+        }
+        scanned.push(line);
+    }
+    scanned
+}
+
+fn duplicate_phrase_warnings(md: &str) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut first_seen: Vec<String> = Vec::new();
+    let lines = content_lines(md);
+    let skip_h1 = h1_prepend_index(&lines, frontmatter_title(md));
+    for line in duplicate_scan_lines(&lines, skip_h1) {
         let normalized = crate::markdown::collapse_whitespace(line);
         for segment in normalized.split([',', ';', '.', '!', '?', '…']) {
             let phrase = segment.trim();
@@ -390,6 +527,99 @@ mod tests {
         assert!(artifact_report(noisy).is_empty());
     }
 
+    #[test]
+    fn comments_section_duplicates_stay_silent() {
+        let noisy = "штатное тело с дублем фразы целиком, штатное тело с дублем фразы целиком\n\
+                     \n\
+                     ## Комменты\n\
+                     \n\
+                     - **AGENTS**: Вердикт: request_changes — доработать срез плана целиком\n\
+                     \n\
+                     - **AGENTS**: Вердикт: request_changes — доработать срез плана целиком\n";
+        let report = artifact_report(noisy);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("штатное тело"));
+    }
+
+    #[test]
+    fn comments_section_resumes_after_next_heading() {
+        let noisy = "## Комменты\n\
+                     \n\
+                     - **AGENTS**: повтор вердикта ревью внутри секции комментов задачи\n\
+                     \n\
+                     - **AGENTS**: повтор вердикта ревью внутри секции комментов задачи\n\
+                     \n\
+                     ## Проверка\n\
+                     \n\
+                     живой дубль после закрытия секции комментов, живой дубль после закрытия \
+                     секции комментов\n";
+        let report = artifact_report(noisy);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("живой дубль"));
+    }
+
+    #[test]
+    fn html_block_style_duplicates_stay_silent() {
+        let noisy = "<div style=\"border:1px solid #2E2E2E;font-size:11px;color:#ffffff\">\
+                     Акторы</div>\n\
+                     \n\
+                     <div style=\"border:1px solid #2E2E2E;font-size:11px;color:#ffffff\">\
+                     Платформа</div>\n\
+                     \n\
+                     текстовый дубль вне диаграмм ловится, текстовый дубль вне диаграмм ловится\n";
+        let report = artifact_report(noisy);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("текстовый дубль"));
+    }
+
+    #[test]
+    fn html_line_predicate_matches_open_and_close_tags() {
+        assert!(is_html_line("<div style=\"color:#fff\">x</div>"));
+        assert!(is_html_line("  </div>"));
+        assert!(!is_html_line("просто текст со <тегом> в середине"));
+        assert!(!is_html_line("неравенство: a < b > c"));
+    }
+
+    #[test]
+    fn export_prepended_h1_pair_stays_silent() {
+        let noisy = "---\ntitle: ADR-063: CI-гейт на PR — required check вместо ручных прогонов\n\
+                     ---\n\
+                     \n\
+                     # ADR-063: CI-гейт на PR — required check вместо ручных прогонов\n\
+                     \n\
+                     # ADR-063: CI-гейт на PR — required check вместо ручных прогонов\n\
+                     \n\
+                     ## Статус\n\
+                     \n\
+                     Accepted\n";
+        assert!(artifact_report(noisy).is_empty());
+    }
+
+    #[test]
+    fn h1_duplicate_after_body_text_stays_reported() {
+        let noisy = "вводный параграф до заголовков, вводный параграф до заголовков\n\
+                     \n\
+                     # длинный тайтл без режущей пунктуации из двадцати знаков\n\
+                     \n\
+                     # длинный тайтл без режущей пунктуации из двадцати знаков\n";
+        let report = artifact_report(noisy);
+        assert!(report.iter().any(|w| w.contains("длинный тайтл")));
+    }
+
+    #[test]
+    fn nested_task_get_header_duplicates_survive() {
+        let title = "какой-то тайтл задачи длиннее двадцати символов";
+        let header = format!(
+            "Задача:   {title}  \nСтатус:   Design  \nСтрока:   20261108003111-q0m3974  \n"
+        );
+        let noisy = format!(
+            "---\ntitle: {title}\n---\n\n# {title}\n\n{header}\n\n----- тело -----\n\n\
+             {header}\n\n## Постановка\nштатное тело\n"
+        );
+        let report = artifact_report(&noisy);
+        assert!(report.iter().any(|w| w.contains("Задача:")));
+    }
+
     // ——— tag_trap_warning: write-side превенция тег-матча ———
 
     #[test]
@@ -427,5 +657,93 @@ mod tests {
     fn clip_truncates_long_text_with_ellipsis() {
         let long = "а".repeat(100);
         assert_eq!(clip(&long, 60).chars().count(), 61);
+    }
+
+    // ——— task_get_wrapper_signature: write-side гард вставки get-обёртки ———
+
+    fn full_task_get_output() -> String {
+        format!(
+            "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\nДоска:    /uwuwu/Задачи uwuwu\n\n\
+             {TASK_GET_BODY_MARKER}\n\n---\ntitle: таск\ndate: 2026-11-08T00:00:00+08:00\n---\n\n\
+             ## Постановка\n\nсуть\n"
+        )
+    }
+
+    #[test]
+    fn full_task_get_output_hits_marker_signature() {
+        assert!(task_get_wrapper_signature(&full_task_get_output()).is_some());
+    }
+
+    #[test]
+    fn recycled_marker_inside_body_content_is_caught() {
+        // контент, пересобранный из испорченного тела: маркер в середине
+        let recycled = "## Постановка\n\nсуть\n\n----- тело -----\n\nмусор\n";
+        assert!(task_get_wrapper_signature(recycled).is_some());
+    }
+
+    #[test]
+    fn marker_inside_code_fence_is_legitimate_quote() {
+        let quoted = "снапшот выглядит так:\n\n```\n----- тело -----\n\nтело\n```\n";
+        assert_eq!(task_get_wrapper_signature(quoted), None);
+    }
+
+    #[test]
+    fn marker_inline_in_text_line_is_not_a_match() {
+        let inline = "граница — маркер «----- тело -----» между кавычек\n";
+        assert_eq!(task_get_wrapper_signature(inline), None);
+    }
+
+    #[test]
+    fn get_output_tail_frontmatter_is_caught() {
+        let tail = "\n\n---\ntitle: таск\ndate: 2026-11-08T00:00:00+08:00\n---\n\nтело\n";
+        assert!(task_get_wrapper_signature(tail).is_some());
+    }
+
+    #[test]
+    fn crlf_frontmatter_is_caught() {
+        let crlf = "---\r\ntitle: таск\r\n---\r\n\r\nтело\r\n";
+        assert!(task_get_wrapper_signature(crlf).is_some());
+    }
+
+    #[test]
+    fn thematic_break_without_title_field_passes() {
+        let brk = "разделитель\n\n---\n\nобычный текст после thematic break\n";
+        assert_eq!(task_get_wrapper_signature(brk), None);
+    }
+
+    #[test]
+    fn frontmatter_without_title_field_passes() {
+        let other = "---\nfoo: bar\n---\n\nтело\n";
+        assert_eq!(task_get_wrapper_signature(other), None);
+    }
+
+    #[test]
+    fn blank_line_between_dashes_and_title_passes() {
+        // пустая строка между «---» и «title:» — thematic break + параграф
+        let loose = "---\n\ntitle: таск\n";
+        assert_eq!(task_get_wrapper_signature(loose), None);
+    }
+
+    #[test]
+    fn title_only_after_later_dashes_is_not_frontmatter() {
+        // «---» не первой содержательной линией — кандидат закрыт
+        let late = "абзац\n\n---\ntitle: таск\n";
+        assert_eq!(task_get_wrapper_signature(late), None);
+    }
+
+    #[test]
+    fn plain_body_content_passes() {
+        assert_eq!(
+            task_get_wrapper_signature("## Постановка\n\nсуть и текст\n- пункт\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn card_header_without_marker_is_documented_boundary() {
+        // осознанная граница (ревью плана 08.11): шапка карточки без маркера
+        // и frontmatter (гипотетическая срезка) проходит — тест фиксирует контракт
+        let header_only = "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\nтело\n";
+        assert_eq!(task_get_wrapper_signature(header_only), None);
     }
 }

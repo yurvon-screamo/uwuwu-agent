@@ -166,6 +166,11 @@ pub struct SyTask {
     pub pr: String,
     /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
     pub dev_session: String,
+    /// Дата из колонки «Запланировано» (formattedContent date-клетки;
+    /// "" — пусто). Кроны: ран — фактический файр, мастер — next-fire.
+    pub planned: String,
+    /// Значение колонки «Расписание» (отображение custom-schedule мастера).
+    pub schedule_cell: String,
     pub body_doc: Option<String>,
 }
 
@@ -301,7 +306,7 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
 /// Primary-клетка узнаётся по value.type=block (pk в SiYuan всегда block,
 /// имя ключа произвольно: «Title», «Первичный ключ», «Цель»…), остальные
 /// клетки — по имени колонки.
-fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
+pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
     let key_name = |id: &str| -> String {
         keys.iter()
             .find(|k| k.get("id").and_then(|i| i.as_str()) == Some(id))
@@ -317,6 +322,8 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
+        planned: String::new(),
+        schedule_cell: String::new(),
         body_doc: None,
     };
     for cell in it
@@ -354,6 +361,8 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
+            PLANNED_CELL => t.planned = value,
+            SCHEDULE_CELL => t.schedule_cell = value,
             _ => {}
         }
     }
@@ -379,6 +388,7 @@ fn cell_value(cell: &Value) -> String {
         Some("url") => single("/url/content"),
         Some("email") => single("/email/content"),
         Some("phone") => single("/phone/content"),
+        Some("date") => single("/date/formattedContent"),
         Some("select") | Some("mSelect") => {
             return c
                 .get("mSelect")
@@ -536,6 +546,29 @@ pub fn validate_task_type(raw: &str) -> Result<String> {
     }
 }
 
+/// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
+/// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
+/// (время файра), в клетке живут с минутной точностью — формат сравнения
+/// стабилен для reconcile демона. Формат не интерпретируется дальше:
+/// семантика расписаний — в TS демона.
+pub fn parse_planned(raw: &str) -> Result<(i64, String)> {
+    use chrono::TimeZone;
+    let s = raw.trim();
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M"))
+        .map_err(|_| {
+            anyhow!("дата «{raw}» не разобрана: жди «YYYY-MM-DD HH:MM» или «YYYY-MM-DD HH:MM:SS»")
+        })?;
+    let local = chrono::Local
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| anyhow!("«{raw}» неоднозначно в локальной зоне (переход времени?)"))?;
+    Ok((
+        local.timestamp_millis(),
+        local.format("%Y-%m-%d %H:%M").to_string(),
+    ))
+}
+
 /// keyID колонки «Тип»: существующая («Тип»/"Type") или свежесозданная
 /// select-колонка (addAttributeViewKey). Отказ API — громкий: молча no-op
 /// оставил бы агента в уверенности, что тип записан (прецедент claim).
@@ -551,6 +584,31 @@ pub(crate) async fn ensure_type_key(sy: &SiYuan, av: &str) -> Result<String> {
         return Ok(id.clone());
     }
     sy.add_attr_view_key(av, TYPE_CELL, "select").await
+}
+
+/// Колонка «Запланировано» (date) и «Расписание» (text) — свойства
+/// крон-семьи на доске задач (ран — фактический файр, мастер — next-fire;
+/// расписание — отображение custom-schedule). Обычные задачи клетки не несут.
+pub const PLANNED_CELL: &str = "Запланировано";
+pub const SCHEDULE_CELL: &str = "Расписание";
+
+/// keyID колонки «Запланировано»: существующая или свежесозданная date-
+/// колонка (ensure-паттерн «Тип»).
+pub(crate) async fn ensure_planned_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == PLANNED_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, PLANNED_CELL, "date").await
+}
+
+/// keyID колонки «Расписание»: существующая или свежесозданная text-колонка.
+pub(crate) async fn ensure_schedule_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == SCHEDULE_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, SCHEDULE_CELL, "text").await
 }
 
 /// Колонки database: (имя → id) в порядке объявления на доске.
@@ -940,7 +998,9 @@ pub(crate) enum RowInsertCheck {
 /// Исход матчинга фрагмента по готовым строкам render (без I/O).
 #[derive(Clone, Debug)]
 pub(crate) enum NeedleMatch {
-    Found(SyTask),
+    /// SyTask в боксе: enum на 240+ байт из-за роста SyTask ловит
+    /// clippy::large_enum_variant — разница Found/NotFound уходит в кучу.
+    Found(Box<SyTask>),
     /// Ни id, ни docId-префикс, ни подстрока тайтла не совпали.
     NotFound,
     /// Фрагмент матчит несколько строк: «id», «doc-id» или «подстрока».
@@ -962,7 +1022,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         })
         .collect();
     if by_id.len() == 1 {
-        return NeedleMatch::Found(by_id[0].clone());
+        return NeedleMatch::Found(Box::new(by_id[0].clone()));
     }
     if !by_id.is_empty() {
         return NeedleMatch::Ambiguous {
@@ -980,7 +1040,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         }
     }
     if by_doc_prefix.len() == 1 {
-        return NeedleMatch::Found(by_doc_prefix[0].clone());
+        return NeedleMatch::Found(Box::new(by_doc_prefix[0].clone()));
     }
     if by_doc_prefix.len() > 1 {
         return NeedleMatch::Ambiguous {
@@ -993,7 +1053,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         .filter(|r| normalize_title(&r.title).contains(&normalize_title(needle)))
         .collect();
     if by_title.len() == 1 {
-        return NeedleMatch::Found(by_title[0].clone());
+        return NeedleMatch::Found(Box::new(by_title[0].clone()));
     }
     if by_title.len() > 1 {
         return NeedleMatch::Ambiguous {
@@ -1029,7 +1089,7 @@ pub async fn resolve_entity(
     let rows = read_rows(sy, board).await?;
     let subdoc_ids = board_subdoc_ids(sy, board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
-        NeedleMatch::Found(task) => Ok(task),
+        NeedleMatch::Found(task) => Ok(*task),
         NeedleMatch::NotFound => bail!("{entity} «{needle}» не найдена"),
         NeedleMatch::Ambiguous { reason, matches } => {
             bail!("неоднозначный {reason}: {matches} совпадений")
@@ -1061,7 +1121,7 @@ pub async fn resolve_on_project(
 
     let subdoc_ids = board_subdoc_ids(sy, &board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
-        NeedleMatch::Found(task) => Ok((board, task)),
+        NeedleMatch::Found(task) => Ok((board, *task)),
         NeedleMatch::Ambiguous { reason, matches } => bail!(
             "задача «{needle}»: неоднозначно на: {} ({}: {matches}); обысканы доски: {} — уточни id",
             board.hpath,
@@ -1108,7 +1168,7 @@ pub async fn resolve_global(sy: &SiYuan, needle: &str) -> Result<(SyBoard, SyTas
         let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
         let subdoc_ids = board_subdoc_ids(sy, board).await?;
         match match_needle(&rows, &subdoc_ids, needle) {
-            NeedleMatch::Found(task) => found.push((idx, task)),
+            NeedleMatch::Found(task) => found.push((idx, *task)),
             NeedleMatch::Ambiguous { reason, matches } => {
                 ambiguous.push(format!("{} ({}: {matches})", board.hpath, reason));
             }
@@ -1421,6 +1481,71 @@ pub async fn edit(
         sy.db_item_set_select(&board.av_id, &k, &task.item_id, &canon)
             .await?;
     }
+    Ok(())
+}
+
+/// Дата в колонку «Запланировано» (кроны: ран — фактический файр, мастер —
+/// next-fire). «» — очистка клетки. Валидация формата — в dispatch до
+/// мутаций; здесь ensure date-колонки + запись ValueDate. Отдельно от edit:
+/// канон задач правит 7 колонок, planned — семейство кронов.
+pub(crate) async fn set_planned(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    planned: &str,
+) -> Result<()> {
+    let (ms, is_not_empty, formatted) = if planned.is_empty() {
+        (0, false, String::new())
+    } else {
+        let (ms, formatted) = parse_planned(planned)?;
+        (ms, true, formatted)
+    };
+    let k = ensure_planned_key(sy, &board.av_id)
+        .await
+        .with_context(|| {
+            format!(
+                "колонка «{PLANNED_CELL}» не создана — повтори: task edit {} --planned",
+                task.item_id
+            )
+        })?;
+    sy.db_item_set_date(
+        &board.av_id,
+        &k,
+        &task.item_id,
+        ms,
+        is_not_empty,
+        &formatted,
+    )
+    .await
+    .with_context(|| format!("клетка «{PLANNED_CELL}» не записана — повтор идемпотентен"))?;
+    Ok(())
+}
+
+/// Синхронизировать колонку «Расписание» со значением custom-schedule:
+/// единственная точка записи клетки — пути --schedule (create/edit), чтобы
+/// attr и отображение не расходились. Пустое расписание — очистка клетки.
+pub(crate) async fn sync_schedule_cell(
+    sy: &SiYuan,
+    board: &SyBoard,
+    item_id: &str,
+    expr: &str,
+) -> Result<()> {
+    let k = ensure_schedule_key(sy, &board.av_id).await.with_context(|| {
+        format!(
+            "колонка «{SCHEDULE_CELL}» не создана — доставь повтором: task edit {item_id} --schedule \"{expr}\""
+        )
+    })?;
+    sy.mcp_tool(
+        "database",
+        serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
+                "itemID": item_id, "value": { "text": { "content": expr } } }),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "клетка «{SCHEDULE_CELL}» не записана — доставь повтором: task edit {item_id} --schedule \"{expr}\""
+        )
+    })?;
     Ok(())
 }
 
@@ -1765,6 +1890,8 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: body_doc.map(String::from),
         }
     }
@@ -1901,6 +2028,8 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: None,
         }
     }

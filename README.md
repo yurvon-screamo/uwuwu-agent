@@ -8,8 +8,8 @@
 opencodereview/ правила ревью
 agents/        агенты: developer, dreamer, code-quality-reviewer (праймари — ревью-статусы фабрики)
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        29 скиллов (см. ниже)
-cli/           uwuwu-cli — memory-база, projects-docs, SOFA (бинарь: ~/.cargo/bin/uwuwu-cli)
+skills/        скиллы (см. ниже)
+cli/           uwuwu-cli — задачи/кроны, поиск, вики-чтение, персона (бинарь: ~/.cargo/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки + маршрутизатор ревью
 cron/          uwuwu-cron — планировщик крон-задач (доски «Задачи <Proj>» → ран-карточки → сессии)
 dreamer/       uwuwu-dreamer — дример: пост-обработка сессий (idle → агент dreamer)
@@ -44,13 +44,13 @@ cd uwuwu-agent
 
 ## SiYuan-first 
 
-Вся база знаний живёт в SiYuan: статьи опыта и проектные доки через `uwuwu-cli`,
-прямой доступ к докам — MCP-шлюз (107 tools).
+Вся база знаний живёт в SiYuan: статьи опыта и проектные доки через `uwuwu-cli`
+(kernel SiYuan — REST + встроенный MCP; `uwuwu-cli read/docs ls/...`).
 
 ### Фабрика разработки (uwuwu-factory)
 
 Issue-driven → **task-driven**: задачи = строки канбан-досок «Задачи <Proj>» (uwuwu, origa),
-тела задач = доки с тегом Dev/Spike/Bug, диалог = нативные комменты.
+тела задач = доки с тегом Dev/Spike/Bug, диалог = комменты в теле задачи (секция «Комменты»).
 Демон — **будильник + маршрутизатор ревью и тестирования + lifecycle окружений** (systemd, тик 3 мин):
 Design → окружение задачи `~/agents-env/<row-id>/{repo, scratch, logs}` (repo = git worktree
 от origin/master, ветка `work/task-<row-id>`; env-переменная `UWUWU_FACTORY_ENV_ROOT`) →
@@ -90,18 +90,37 @@ fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 Кроны унифицированы с задачами — выделенный контур снесён. Крон = обычная
 задача на доске **«Задачи <Proj>»** с расписанием в доке-теле: атрибут
 `custom-schedule` (грамматика: cron-expr | `5m/2h/1d` | разовое `09:30 [01.12]`),
-ставится `task create/edit --schedule "…"` с валидацией при записи. Мастер
-живёт в статусе **Вейт** (после валидации триажем — грамматика + разумность;
-Draft не файрится). Планировщик (тик 1 мин) по расписанию создаёт **ран-карточку**
-— новую задачу «⏰ <мастер> · <дата время>» в Todo (запись запуска: владелец
-видит, что происходило; закрывает сам) — и OpenCode-сессию с промптом из тела
-мастера (изолированный workspace). Коммент агента — только исключение (на ран;
-блокер/вопрос → Needs attention на ране). Перед спавном мастер перепроверяется
-по свежему срезу доски (гонка со снятием строки); файр — только из Вейт,
-Done = остановлено навсегда. State: `~/.local/state/uwuwu-cron/` (пер-машинный),
-CLI: `cron list [--project <proj>]` — мастера + last run (вне прод-машины
-last run пуст). Доски «Кроны <Proj>», их колонки и CLI set/pause/resume/rm
-сняты (задача 20261106182051-o5ejlte).
+ставится `task create/edit --schedule "…"` с валидацией при записи; та же
+команда синхронно пишет колонку **«Расписание»** на доске (отображение attr —
+хранилище остаётся в доке-теле). Дата запуска — свойство строки:
+**«Запланировано»** (date-колонка, сортировка/фильтр/группировка штатно).
+У ран-карточки — фактическое время файра (`task edit --planned`; тайтловая
+метка остаётся только для уникальности тайтла), у мастера — вычисленный
+next-fire: демон сверяет клетки каждым тиком (compare по epoch ms —
+formattedContent ядро перекрывает своей локалью) и дописывает при
+расхождении; интервал/разовое отвечают сразу, у свежего cron-мастера до
+первого файра клетка пуста (файр на первом совпадении — reconcile заполняет
+после, вечный молчун годовым сканом тик не таскает). Мастер живёт в статусе **Вейт** = «ждёт файра планировщика»
+(файр-гейт демона читает именно его; после валидации триажем — грамматика +
+разумность; Draft не файрится). Статус-модель крон-семьи: **Todo** (ран) =
+«запуск состоялся, работа выполняется агентом», **Done** = тихий успех
+(агент рана закрывает свой ран сам в финале прогона — ран запись запуска,
+не задача, приёмки успешного тика не требуется), **Needs attention** —
+блокер/вопрос владельцу. Планировщик
+(тик 1 мин) по расписанию создаёт **ран-карточку** — новую задачу
+«⏰ <мастер> · <дата время>» в Todo с датой файра — и OpenCode-сессию с
+промптом из тела мастера (изолированный workspace); запись запуска: владелец
+видит ЧТО и КОГДА происходило; ран, оставшийся в Todo после тика, — сигнал
+сбоя (сессия не дошла до финала), разбор владельцем.
+Коммент агента — только исключение (на ран; блокер/вопрос → Needs attention
+на ране). Перед спавном мастер перепроверяется по свежему срезу доски
+(гонка со снятием строки); файр — только из Вейт, Done = остановлено
+навсегда. Разовый мастер после файра снимает расписание одной CLI-командой
+(`task edit --schedule "" --planned ""` — attr и обе клетки). State:
+`~/.local/state/uwuwu-cron/` (пер-машинный), CLI: `cron list [--project
+<proj>]` — мастера + last run (вне прод-машины last run пуст). Доски «Кроны
+<Proj>», их колонки и CLI set/pause/resume/rm сняты (задача
+20261106182051-o5ejlte).
 
 ### Триаж (uwuwu-triage)
 
@@ -136,13 +155,16 @@ uwuwu-проекта с пустым статусом (черновики вла
 
 ### CLI
 
-`uwuwu-cli task create/list/get/edit/comment/close [--project X]` — задачи (id/заголовок; id-команды
-без `--project` — глобальный резолв по доскам всех проектов с требованием уникальности: матчи на
-нескольких досках/неоднозначность — громкая ошибка); аттачи в тело — `--attach` на `create`/`body`
+`uwuwu-cli task create/list/get/edit/comment/thread/body/close/rm [--project X]` — задачи
+(id/заголовок; id-команды без `--project` — глобальный резолв по доскам всех проектов
+с требованием уникальности: матчи на нескольких досках/неоднозначность — громкая ошибка;
+доска «Задачи <proj>», крон-доски сняты; кроны — `--schedule` у task, мастера в Вейт,
+инвентарь `cron list`); аттачи в тело — `--attach` на `create`/`body`
 (kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
-`edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search` (сервер Manticore + семантика),
-`read/blob/shot` (мультимодальное чтение), `person show/append/replace` — персона
-владельца (агенты читают в начале работы, дример пишет факты после сессий).
+`edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search`
+(полнотекст + доки по заголовкам + семантика локального эмбеддинг-индекса),
+`read/blob` (мультимодальное чтение; `shot` не портирован), `person show/append/replace` —
+персона владельца (агенты читают в начале работы, дример пишет факты после сессий).
 
 Платформа — SiYuan (с 04.11.2026; до этого — закрытая платформа-предшественник). CLI ходит в
 kernel SiYuan (REST + встроенный MCP), единый воркспейс на всех машинах.
@@ -165,13 +187,13 @@ Folders handle organization; tags are only for lookup.
 
 **Commands**:
 
-- `search` — полнотекст по блокам SiYuan (SQL kernel API); optional `--sofa`
-- `read` — live doc read (slug resolves via migration map → tags/title through the gateway); rich content rendered inline (databases → tables, mindmaps → trees, canvas → shapes/connectors)
+- `search` — universal: полнотекст по блокам SiYuan (SQL kernel API) + доки по заголовкам + семантика локального эмбеддинг-индекса; `--limit/--threshold/--sofa`
+- `read` — live doc read (slug → docId через kernel API, markdown-экспорт ядра); rich content rendered inline
 - `blob <key>` — download workspace blobs (images/attachments)
 - `shot` — не портирован на SiYuan v1 (headless chromium + Access Auth Code при необходимости)
 - `projects` — live workspace project registry
-- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), durable crons, task-body markdown (live diagrams: ```html_embed fences convert to SiYuan html-blocks, marker-addressed `⁂ diagram:<name>`, see `skills/visual-diagrams`)
+- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), кроны = задачи с расписанием (`--schedule`, мастера в **Вейт**) + `cron list`, task-body markdown (live diagrams: ```html_embed fences convert to SiYuan html-blocks, marker-addressed `⁂ diagram:<name>`, see `skills/visual-diagrams`)
 
 **Infrastructure**: ноут (docker: siyuan-demo :6806, воркспейс ~/siyuan-demo-ws), наружу — Railway-релей + rathole (временно дефолт-домен Railway из-за бага сертов)
 
-- Redis; Ollama relay (rathole tunnel from laptop); DNS on Bunny.
+- DNS on Bunny (siyuan.uwuwu.net за Pull Zone — ждёт фикс сертов Railway); Ollama — локальная на ноуте (semantic-индекс cli, localhost-only; релей rathole-ollama погашен 05.11). Redis афин-стека не живёт (афина остановлена).

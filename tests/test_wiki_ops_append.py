@@ -18,7 +18,11 @@
      ошибка;
   5) tail-семантика: идентичное в середине дока — не no-op; --force обходит
      guard;
-  6) docId валидируется до любых вызовов API.
+  6) docId валидируется до любых вызовов API;
+  7) payload сырым export'ом (frontmatter + ведущий title-H1 по fm-title)
+     стрипается до appendBlock и до guard'а — идемпотентность ретрая сверяет
+     чистый контент (инцидент 08.11); payload, пустой после стрипа, — отказ
+     до любых вызовов API.
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_append.py
@@ -236,6 +240,41 @@ class FailureSemantics(unittest.TestCase):
         output = run_append(kernel, DOC, "текст\n")
         self.assertEqual(len(kernel.appends), 1)
         self.assertIn("дописано", output)
+
+
+class ExportWrapperStrip(unittest.TestCase):
+    """Payload сырым export'ом стрипается до appendBlock (инцидент 08.11);
+    guard идемпотентности работает на чистом контенте; --force тоже стрипает."""
+
+    WRAPPED = ("---\ntitle: Базовый\n---\n\n# Базовый\n\nНовый блок.\n")
+
+    def test_raw_export_payload_is_stripped_before_append(self):
+        kernel = FakeKernel(contents={DOC: "base\n"})
+        run_append(kernel, DOC, self.WRAPPED)
+        self.assertEqual(kernel.appends, ["Новый блок.\n"])
+
+    def test_already_applied_detected_on_stripped_payload(self):
+        # Ретрай roundtrip: контент уже в хвосте, payload с обвязкой —
+        # no-op по чистому контенту, дубль обвязки не множится.
+        kernel = FakeKernel(contents={DOC: "base\n\nНовый блок.\n"})
+        output = run_append(kernel, DOC, self.WRAPPED)
+        self.assertEqual(kernel.appends, [])
+        self.assertIn("already applied", output)
+
+    def test_force_strips_wrapper_too(self):
+        # «Осознанный дубль» — про контент, не про обвязку: стрип на входе
+        # любого write-path.
+        kernel = FakeKernel(contents={DOC: "base\n"})
+        run_append(kernel, DOC, self.WRAPPED, force=True)
+        self.assertEqual(kernel.appends, ["Новый блок.\n"])
+
+    def test_empty_after_strip_refused_before_any_api(self):
+        kernel = FakeKernel(contents={DOC: "base\n"})
+        with self.assertRaises(RuntimeError) as cm:
+            run_append(kernel, DOC, "---\ntitle: x\n---\n")
+        self.assertIn("пуст после снятия экспорт-обвязки", str(cm.exception))
+        self.assertEqual(kernel.appends, [])
+        self.assertEqual(kernel.export_calls, 0)
 
 
 class InputValidation(unittest.TestCase):

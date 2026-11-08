@@ -26,6 +26,8 @@ mod kernel_tests;
 #[cfg(test)]
 mod cron_tests;
 #[cfg(test)]
+mod doctor_tests;
+#[cfg(test)]
 mod goal_tests;
 #[cfg(test)]
 mod search_tests;

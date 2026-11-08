@@ -167,6 +167,83 @@ export function composeDraftPrompt(project: string, rowId: string, title: string
   ].join("\n")
 }
 
+/** Строка доски в статусе Draft (вотчер демона). */
+export interface DraftRow {
+  rowId: string
+  docId: string
+  title: string
+}
+
+/** Синк трекера vs доски: новые sighting'и, смена тайтла, чистка ушедших из
+ *  Draft (вместе со снятием skip). Мутирует state-поля; fresh — готовые
+ *  лог-строки новых sighting'ов (демон отдаёт в hub.log). */
+export function syncDraftTracker(
+  state: Pick<HubState, "drafts" | "draftSkip">,
+  seen: Map<string, DraftRow>,
+  projects: Map<string, string>,
+  inFlight: Set<string>,
+  now: number,
+): { changed: boolean; fresh: string[] } {
+  let changed = false
+  const fresh: string[] = []
+  // пустой/отсутствующий трекер (рестарт с разобранными черновиками) — не повод
+  // падать: материализуем поле в живой state, чтобы записи трекера персистились
+  // (`?? {}` на чтении писал бы в брошенный объект — трекер терялся бы каждый тик)
+  state.drafts ??= {}
+  const drafts = state.drafts as Record<string, DraftTrack>
+  for (const [rowId, d] of seen) {
+    const t = drafts[rowId]
+    if (t === undefined) {
+      const project = projects.get(rowId) ?? "?"
+      drafts[rowId] = { project, docId: d.docId, title: d.title, seenAt: now, updatedAt: now, turns: 0 }
+      fresh.push(`черновик: ${project} ${rowId} «${d.title.slice(0, 60)}»`)
+      changed = true
+    } else if (t.title !== d.title && d.title !== "") {
+      t.title = d.title
+      changed = true
+    }
+  }
+  for (const rowId of Object.keys(drafts)) {
+    if (seen.has(rowId) || inFlight.has(rowId)) continue
+    delete drafts[rowId]
+    delete state.draftSkip?.[rowId] // ушёл из Draft → skip снят
+    changed = true
+  }
+  return { changed, fresh }
+}
+
+// ——— гейт громкого отказа тика draftWatcher ———
+
+/** Падений тика подряд до алерта владельцу: ниже порога — тихий self-heal
+ *  (транзиентные сбои шлюза ретраятся следующим тиком). */
+export const DRAFT_TICK_FAIL_ALERT_AFTER = 3
+/** Минимальный интервал повторных алертов, пока сбой продолжается. */
+export const DRAFT_TICK_FAIL_ALERT_EVERY_MS = 60 * 60_000
+
+/** Счётчик подряд-сбоев тика — в памяти процесса: рестарт сбрасывает
+ *  осознанно (стойкий сбой снова наберёт порог и уведомит). */
+export interface TickFailGate {
+  streak: number
+  nextAlertAt: number
+}
+
+export type TickKind = "fail" | "wave" | "ok"
+
+/** Исход тика → новый gate + нужен ли алерт. wave (волна деградации ядра,
+ *  KernelWaveError — штатная пауза контура) счётчик не меняет: ни инкремент,
+ *  ни сброс — как tickFailOutcome крона. fail на пороге и вне окна — алерт
+ *  (окно сдвигается от момента алерта). ok — полный сброс. */
+export function tickOutcome(gate: TickFailGate, now: number, kind: TickKind): { gate: TickFailGate; alert: boolean } {
+  if (kind === "ok") return { gate: { streak: 0, nextAlertAt: 0 }, alert: false }
+  if (kind === "wave") return { gate, alert: false }
+  const streak = gate.streak + 1
+  const due = streak >= DRAFT_TICK_FAIL_ALERT_AFTER && now >= gate.nextAlertAt
+  return {
+    gate: { streak, nextAlertAt: due ? now + DRAFT_TICK_FAIL_ALERT_EVERY_MS : gate.nextAlertAt },
+    alert: due,
+  }
+}
+
 // ——— seen/ack: запись исхода в трекер ———
 
 /** Запись ack: исход разбора + версия тела, с которой он согласован. Версия

@@ -13,14 +13,20 @@
 use crate::siyuan::{doc_content_is_empty, parse_block_ids, workspace_root, SiYuan};
 use crate::siyuan_task as syt;
 use serde_json::json;
+use std::collections::HashSet;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub(crate) enum ProbeVerdict {
     Clean,
     Degraded(String),
     Skipped(String),
+    /// Находка вне волны (осадок, наблюдение): печатается и не влияет
+    /// на exit-код — реакция владельца, не сигнал кронам.
+    Observed(String),
 }
 
+#[derive(Debug)]
 pub(crate) struct ProbeOutcome {
     pub name: &'static str,
     pub verdict: ProbeVerdict,
@@ -51,7 +57,13 @@ impl ProbeOutcome {
 const KERNEL: &str = "kernel";
 const WAVE: &str = "wave";
 const BOARD: &str = "board";
+const BOARD_ORPHANS: &str = "board-orphans";
 const FS_SQL: &str = "fs-sql";
+const HISTORY_DELETES: &str = "history-deletes";
+
+/// Окно пробы history-deletes: межаудитный интервал lead (суточный
+/// цикл ночного аудита). Константа — проба наблюдения, без интерфейса.
+const HISTORY_DELETES_WINDOW: Duration = Duration::from_secs(24 * 3600);
 
 pub(crate) fn doctor_exit_code(outcomes: &[ProbeOutcome]) -> i32 {
     let any_ran = outcomes
@@ -76,6 +88,7 @@ pub(crate) fn report(outcomes: &[ProbeOutcome]) -> String {
             ProbeVerdict::Clean => format!("OK      {}: чисто", o.name),
             ProbeVerdict::Degraded(why) => format!("DEGRADED {}: {why}", o.name),
             ProbeVerdict::Skipped(why) => format!("SKIP    {}: {why}", o.name),
+            ProbeVerdict::Observed(what) => format!("OBSERVE {}: {what}", o.name),
         };
         match &o.detail {
             Some(detail) => lines.push(format!("{verdict_line} [{detail}]")),
@@ -249,10 +262,23 @@ pub(crate) async fn run(sy: &SiYuan, project: &str, since_min: u64) -> Vec<Probe
     });
 
     outcomes.push(if kernel_alive {
+        board_orphans_probe(sy, project).await
+    } else {
+        ProbeOutcome::new(
+            BOARD_ORPHANS,
+            ProbeVerdict::Skipped("kernel недоступен".into()),
+        )
+    });
+
+    outcomes.push(if kernel_alive {
         fs_sql_probe(sy).await
     } else {
         ProbeOutcome::new(FS_SQL, ProbeVerdict::Skipped("kernel недоступен".into()))
     });
+
+    // Чисто FS-проба: вне kernel-гейта — след сноса в истории воркспейса
+    // переживает смерть ядра.
+    outcomes.push(history_deletes_probe());
 
     outcomes
 }
@@ -353,6 +379,171 @@ async fn empty_body_finding(sy: &SiYuan, doc_id: &str, title: &str) -> Option<St
     doc_content_is_empty(&ids, &text).then(|| format!("«{title}»: пустое тело (ZWJ-заглушка)"))
 }
 
+/// Прямой ребёнок-док доски (строка SQL-выборки).
+pub(crate) struct BoardChildDoc {
+    pub id: String,
+    pub hpath: String,
+    pub updated: Option<String>,
+}
+
+/// Дата из ial дока (created ядро в SQL не отдаёт — ближайший прокси
+/// возраста тела): "…updated=\"20261108010134\"…" → "2026-11-08".
+pub(crate) fn doc_updated_date(ial: &str) -> Option<String> {
+    let pos = ial.find("updated=\"")? + "updated=\"".len();
+    let digits: String = ial[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() < 8 {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}",
+        &digits[0..4],
+        &digits[4..6],
+        &digits[6..8]
+    ))
+}
+
+/// Кандидаты-сироты: дети-доки без живой строки. Строка живёт либо
+/// привязкой (bound_ids), либо тайтлом (row_titles — легаси/detached
+/// строки без привязки; тот же фоллбек, что у CLI-резолва задач).
+pub(crate) fn orphan_candidates<'a>(
+    children: &'a [BoardChildDoc],
+    bound_ids: &HashSet<String>,
+    row_titles: &HashSet<String>,
+) -> Vec<&'a BoardChildDoc> {
+    children
+        .iter()
+        .filter(|child| {
+            let title = child.hpath.rsplit('/').next().unwrap_or("");
+            !bound_ids.contains(&child.id) && !row_titles.contains(&syt::normalize_title(title))
+        })
+        .collect()
+}
+
+/// Компактный sample сирот: «id «тайтл» (updated)» через "; ", хвост счётчиком.
+pub(crate) fn orphan_sample(orphans: &[&BoardChildDoc], cap: usize) -> String {
+    let head: Vec<String> = orphans
+        .iter()
+        .take(cap)
+        .map(|child| {
+            let title = child.hpath.rsplit('/').next().unwrap_or("");
+            match &child.updated {
+                Some(date) => format!("{} «{title}» ({date})", child.id),
+                None => format!("{} «{title}»", child.id),
+            }
+        })
+        .collect();
+    let more = if orphans.len() > cap {
+        format!(" …+{}", orphans.len() - cap)
+    } else {
+        String::new()
+    };
+    format!("{}{more}", head.join("; "))
+}
+
+/// Прямые дети-доки доски. Фильтр type='d' обязателен: hpath в blocks
+/// несёт каждый блок (абзацы, заголовки) — без него выборка раздуется
+/// до всех блоков всех детей. Пагинация limit 500/offset — иммунитет
+/// к дефолт-капу ядра 64 строки.
+async fn board_child_docs(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+) -> Result<Vec<BoardChildDoc>, anyhow::Error> {
+    const PAGE: usize = 500;
+    let like = board.hpath.replace('\'', "''");
+    let mut docs = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let stmt = format!(
+            "select id, hpath, ial from blocks where type='d' \
+             and hpath like '{like}/%' and hpath not like '{like}/%/%' \
+             order by id limit {PAGE} offset {offset}"
+        );
+        let envelope = sy
+            .post_probe("/api/query/sql", json!({ "stmt": stmt }))
+            .await?;
+        let page: Vec<BoardChildDoc> = envelope
+            .pointer("/data")
+            .and_then(|d| d.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(BoardChildDoc {
+                            id: row.get("id")?.as_str()?.to_string(),
+                            hpath: row.get("hpath")?.as_str()?.to_string(),
+                            updated: row
+                                .get("ial")
+                                .and_then(|i| i.as_str())
+                                .and_then(doc_updated_date),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fetched = page.len();
+        docs.extend(page);
+        if fetched < PAGE {
+            return Ok(docs);
+        }
+        offset += fetched;
+    }
+}
+
+/// Тела-сироты: прямые дети-доки доски задач без живой строки (обратное
+/// направление board-пробы). Наблюдение, не деградация: осадок миграции
+/// (тела-дубли эпохи пересборок досок) живёт на досках до чистки
+/// владельцем — вердикт волны портить нельзя.
+async fn board_orphans_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
+    let board = match syt::find_board(sy, project).await {
+        Ok(board) => board,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("доска «{project}»: {e}")),
+            )
+        }
+    };
+    let rows = match syt::read_rows(sy, &board).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("render доски: {e}")),
+            )
+        }
+    };
+    let children = match board_child_docs(sy, &board).await {
+        Ok(children) => children,
+        Err(e) => {
+            return ProbeOutcome::new(
+                BOARD_ORPHANS,
+                ProbeVerdict::Skipped(format!("SQL детей доски: {e}")),
+            )
+        }
+    };
+    let bound_ids: HashSet<String> = rows.iter().filter_map(|r| r.body_doc.clone()).collect();
+    let row_titles: HashSet<String> = rows
+        .iter()
+        .map(|r| syt::normalize_title(&r.title))
+        .collect();
+    let orphans = orphan_candidates(&children, &bound_ids, &row_titles);
+    let detail = format!("детей-доков {}", children.len());
+    if orphans.is_empty() {
+        return ProbeOutcome::new(BOARD_ORPHANS, ProbeVerdict::Clean).with_detail(detail);
+    }
+    ProbeOutcome::new(
+        BOARD_ORPHANS,
+        ProbeVerdict::Observed(format!(
+            "кандидаты-сироты (тело без строки): {} — {}",
+            orphans.len(),
+            orphan_sample(&orphans, 5)
+        )),
+    )
+    .with_detail(detail)
+}
+
 async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
     let notebooks = match sy.post_probe("/api/notebook/lsNotebooks", json!({})).await {
         Ok(notebooks) => notebooks,
@@ -441,13 +632,264 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
     }
 }
 
+/// Событие сноса из FS-истории ядра: docId — стем .sy файла, тайтл —
+/// Properties.title стаба (стаб без Content: ключи ID, Spec, Type,
+/// Properties, Children); snapshot_at — mtime каталога снапшота (окно
+/// сноса) для порядка сводки — свежие первыми.
+#[derive(Debug)]
+pub(crate) struct DeleteEvent {
+    pub doc_id: String,
+    pub title: Option<String>,
+    pub snapshot_at: SystemTime,
+}
+
+/// Каталог снапшота истории `<YYYY-MM-DD-HHMMSS>-<op>`; события сноса —
+/// суффикс `-delete` (объектные снапшоты — `-update`, не сносы).
+pub(crate) fn is_delete_snapshot_dir(name: &str) -> bool {
+    name.ends_with("-delete")
+}
+
+/// Свежесть события по mtime (POSIX-время — TZ-независимо: имя каталога
+/// пишет ядро в своей таймзоне, не хоста). mtime в будущем (дрейф
+/// часов) — считаем свежим: наблюдение не теряет событие из-за сдвига.
+pub(crate) fn delete_in_window(mtime: SystemTime, now: SystemTime, window: Duration) -> bool {
+    now.duration_since(mtime)
+        .map(|age| age <= window)
+        .unwrap_or(true)
+}
+
+/// Тайтл снесённого дока: `Properties.title` .sy стаба. Кривой JSON или
+/// отсутствие поля — None (событие без тайтла), сбор не роняем.
+fn delete_title(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.pointer("/Properties/title")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Рекурсивный сбор событий из каталога снапшота (внутри — дерево
+/// ноутбук/родители/лист).
+fn collect_snapshot_events(
+    dir: &std::path::Path,
+    snapshot_at: SystemTime,
+    events: &mut Vec<DeleteEvent>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_snapshot_events(&path, snapshot_at, events)?;
+        } else if path.extension().is_some_and(|ext| ext == "sy") {
+            let doc_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            events.push(DeleteEvent {
+                doc_id,
+                title: delete_title(&path),
+                snapshot_at,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Свежие сносы первыми: порядок OBSERVE-строки читабелен и устойчив —
+/// свежее событие не затерто хвостом старых.
+pub(crate) fn sort_events_newest_first(events: &mut [DeleteEvent]) {
+    events.sort_by_key(|e| std::cmp::Reverse(e.snapshot_at));
+}
+
+/// Сбор событий сноса из каталога истории воркспейса: каталоги
+/// `*-delete` первого уровня с mtime в окне. Каждый removeDoc ядра
+/// (UI, raw API, task rm — мимо CLI-guard в том числе) кладёт такой
+/// каталог со снапшотами снесённого.
+pub(crate) fn collect_delete_events(
+    history_dir: &std::path::Path,
+    now: SystemTime,
+    window: Duration,
+) -> std::io::Result<Vec<DeleteEvent>> {
+    let mut events = Vec::new();
+    for entry in std::fs::read_dir(history_dir)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let is_delete = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_delete_snapshot_dir);
+        let meta = entry.metadata()?;
+        if !is_delete || !delete_in_window(meta.modified()?, now, window) {
+            continue;
+        }
+        collect_snapshot_events(&entry.path(), meta.modified()?, &mut events)?;
+    }
+    Ok(events)
+}
+
+/// Формат события в OBSERVE-строке.
+fn format_event(e: &DeleteEvent) -> String {
+    match &e.title {
+        Some(title) => format!("{} «{title}»", e.doc_id),
+        None => format!("{} (без тайтла)", e.doc_id),
+    }
+}
+
+/// OBSERVE-строка без cap: оборот сносов на живой доске 100+/сутки —
+/// сэмпл head-5 не доносит снос тела задачи до наблюдателя (ревью:
+/// потерянный док на 71-й позиции из 107). Канал «событие сноса →
+/// сводка lead» обязан работать целиком; цена — длинная строка при
+/// батч-чистках, осознанный компромисс наблюдения.
+pub(crate) fn format_event_list(events: &[DeleteEvent]) -> String {
+    events
+        .iter()
+        .map(format_event)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Сносы доков за окно из истории воркспейса `<ws>/history`. Проба
+/// чисто FS: работает и при лежащем ядре, закрывает класс «снос мимо
+/// CLI-guard без следа» — undo-журнал cli такие сносы не пишет.
+/// Сносы — события/осадок, не деградация: OBSERVE, exit не трогает.
+fn history_deletes_probe() -> ProbeOutcome {
+    let history_dir = workspace_root().join("history");
+    if !history_dir.is_dir() {
+        return ProbeOutcome::new(
+            HISTORY_DELETES,
+            ProbeVerdict::Skipped(format!(
+                "нет истории ядра {} (мульти-PC или не создавалась)",
+                history_dir.display()
+            )),
+        );
+    }
+    let mut events =
+        match collect_delete_events(&history_dir, SystemTime::now(), HISTORY_DELETES_WINDOW) {
+            Ok(events) => events,
+            Err(e) => {
+                return ProbeOutcome::new(
+                    HISTORY_DELETES,
+                    ProbeVerdict::Skipped(format!("чтение истории: {e}")),
+                )
+            }
+        };
+    sort_events_newest_first(&mut events);
+    if events.is_empty() {
+        return ProbeOutcome::new(HISTORY_DELETES, ProbeVerdict::Clean)
+            .with_detail("сносов в окне нет".into());
+    }
+    ProbeOutcome::new(
+        HISTORY_DELETES,
+        ProbeVerdict::Observed(format!(
+            "сносы доков за окно: {} — {}",
+            events.len(),
+            format_event_list(&events)
+        )),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_sy_ids, diff_id_lists, doctor_exit_code, fs_sql_pair_verdict, report,
-        scan_kernel_log_for_waves, wave_verdict, ProbeOutcome, ProbeVerdict,
+        collect_delete_events, collect_sy_ids, delete_in_window, diff_id_lists, doc_updated_date,
+        doctor_exit_code, format_event_list, fs_sql_pair_verdict, is_delete_snapshot_dir,
+        orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves,
+        sort_events_newest_first, wave_verdict, BoardChildDoc, ProbeOutcome, ProbeVerdict,
     };
+    use crate::siyuan_task as syt;
+    use std::collections::HashSet;
     use std::path::Path;
+    use std::time::Duration;
+
+    fn child(id: &str, hpath: &str, updated: Option<&str>) -> BoardChildDoc {
+        BoardChildDoc {
+            id: id.to_string(),
+            hpath: hpath.to_string(),
+            updated: updated.map(String::from),
+        }
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn doc_updated_date_formats_first_eight_digits() {
+        let ial = r#"{: type="doc" updated="20261108010134" id="20261104033524-4d37yk0"}"#;
+        assert_eq!(doc_updated_date(ial).as_deref(), Some("2026-11-08"));
+    }
+
+    #[test]
+    fn doc_updated_date_is_none_without_field() {
+        assert!(doc_updated_date(r#"{: type="doc" id="x"}"#).is_none());
+    }
+
+    #[test]
+    fn orphan_candidates_lists_doc_without_row() {
+        let children = vec![
+            child("c-bound", "/uwuwu/Задачи uwuwu/привязанная задача", None),
+            child("c-orphan", "/uwuwu/Задачи uwuwu/тело без строки", None),
+        ];
+        let orphans =
+            orphan_candidates(&children, &set(&["c-bound"]), &set(&["привязанная задача"]));
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, "c-orphan");
+    }
+
+    #[test]
+    fn orphan_candidates_respects_title_fallback_of_detached_rows() {
+        // Легаси/detached строка живёт без привязки — её тело не сирота.
+        let children = vec![child("c-legacy", "/uwuwu/Задачи uwuwu/легаси задача", None)];
+        let orphans = orphan_candidates(&children, &HashSet::new(), &set(&["легаси задача"]));
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn orphan_candidates_normalizes_slash_title_variants() {
+        // Тайтл строки с ASCII-слэшем и тело с ∕ (U+2215) — одна задача;
+        // row_titles строится как в пробе — через normalize_title.
+        let children = vec![child(
+            "c-slash",
+            "/uwuwu/Задачи uwuwu/wiki_ops create: слэш в∕тайтле",
+            None,
+        )];
+        let row_titles = HashSet::from([syt::normalize_title("wiki_ops create: слэш в/тайтле")]);
+        let orphans = orphan_candidates(&children, &HashSet::new(), &row_titles);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn orphan_sample_cap_prints_head_and_tail_count() {
+        let orphans: Vec<BoardChildDoc> = (1..=4)
+            .map(|n| child(&format!("c{n}"), &format!("/b/тело{n}"), Some("2026-11-08")))
+            .collect();
+        let refs: Vec<&BoardChildDoc> = orphans.iter().collect();
+        let text = orphan_sample(&refs, 2);
+        assert!(text.contains("c1 «тело1» (2026-11-08)"), "{text}");
+        assert!(text.contains("c2 «тело2» (2026-11-08)"), "{text}");
+        assert!(text.contains("…+2"), "{text}");
+        assert!(!text.contains("тело3"), "{text}");
+    }
+
+    /// Сироты — наблюдение: exit-код остаётся чистым (сегмент волны
+    /// не портится находками осадка).
+    #[test]
+    fn observed_verdict_keeps_exit_code_clean() {
+        let outcomes = vec![
+            ProbeOutcome::new("kernel", ProbeVerdict::Clean),
+            ProbeOutcome::new(
+                "board-orphans",
+                ProbeVerdict::Observed("кандидаты-сироты: 1 — c1 «t»".into()),
+            ),
+        ];
+        assert_eq!(doctor_exit_code(&outcomes), 0);
+        let text = report(&outcomes);
+        assert!(text.contains("OBSERVE board-orphans"), "{text}");
+        assert!(text.contains("вердикт: 0"), "{text}");
+    }
 
     #[test]
     fn wave_scan_counts_both_signatures() {
@@ -586,5 +1028,198 @@ mod tests {
         assert!(text.contains("SKIP    wave"));
         assert!(text.contains("[строк 5, легаси без привязки 2]"));
         assert!(text.contains("вердикт: 1"));
+    }
+
+    #[test]
+    fn delete_snapshot_dir_matches_only_delete_suffix() {
+        assert!(is_delete_snapshot_dir("2026-11-08-021321-delete"));
+        assert!(!is_delete_snapshot_dir("2026-11-08-010616-update"));
+        assert!(!is_delete_snapshot_dir("storage"));
+    }
+
+    #[test]
+    fn delete_in_window_filters_by_age() {
+        let now = std::time::SystemTime::now();
+        let fresh = now - Duration::from_secs(3600);
+        let stale = std::time::SystemTime::UNIX_EPOCH;
+        let window = Duration::from_secs(24 * 3600);
+        assert!(delete_in_window(fresh, now, window));
+        assert!(!delete_in_window(stale, now, window));
+        // mtime в будущем (дрейф часов) — событие свежим, не теряется.
+        assert!(delete_in_window(now + Duration::from_secs(60), now, window));
+    }
+
+    /// Стаб .sy по живому набору ключей: ID, Spec, Type, Properties,
+    /// Children (Content у стаба нет вовсе).
+    fn write_delete_snapshot(history: &Path, dir: &str, doc_id: &str, title: Option<&str>) {
+        let snapshot = history.join(dir);
+        std::fs::create_dir_all(snapshot.join("nb/parents")).expect("mkdir");
+        let props = match title {
+            Some(t) => format!(r#"{{"title":"{t}"}}"#),
+            None => r#"{}"#.to_string(),
+        };
+        let stub = format!(
+            r#"{{"ID":"{doc_id}","Spec":1,"Type":"NodeDocument","Properties":{props},"Children":[]}}"#
+        );
+        std::fs::write(snapshot.join(format!("nb/parents/{doc_id}.sy")), stub).expect("write");
+    }
+
+    /// Невалидный JSON в стабе (обрыв записи ядра) — событие без тайтла,
+    /// сбор не падает.
+    fn write_broken_snapshot(history: &Path, dir: &str, doc_id: &str) {
+        let snapshot = history.join(dir);
+        std::fs::create_dir_all(snapshot.join("nb")).expect("mkdir");
+        let broken = format!(r#"{{"ID":"{doc_id}"#);
+        std::fs::write(snapshot.join(format!("nb/{doc_id}.sy")), broken).expect("write");
+    }
+
+    #[test]
+    fn collect_delete_events_reads_stubs_of_fresh_delete_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = dir.path().join("history");
+        write_delete_snapshot(
+            &history,
+            "2026-11-08-021321-delete",
+            "20261104033524-4d37yk0",
+            Some("SiYuan: таймер бэкапов воркспейса (rsync-restic)"),
+        );
+        write_delete_snapshot(
+            &history,
+            "2026-11-08-021322-delete",
+            "20261104112902-uh1u34q",
+            None,
+        );
+        // update-снапшот — не событие сноса.
+        std::fs::create_dir_all(history.join("2026-11-08-010616-update/nb")).expect("mkdir");
+        std::fs::write(
+            history.join("2026-11-08-010616-update/nb/20261108000000-x.sy"),
+            "{}",
+        )
+        .expect("write");
+
+        let events = collect_delete_events(
+            &history,
+            std::time::SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .expect("collect");
+        assert_eq!(events.len(), 2, "{events:?}");
+        let lost = events
+            .iter()
+            .find(|e| e.doc_id == "20261104033524-4d37yk0")
+            .expect("lost doc event");
+        assert_eq!(
+            lost.title.as_deref(),
+            Some("SiYuan: таймер бэкапов воркспейса (rsync-restic)")
+        );
+        let untitled = events
+            .iter()
+            .find(|e| e.doc_id == "20261104112902-uh1u34q")
+            .expect("untitled event");
+        assert!(untitled.title.is_none());
+    }
+
+    /// Фильтр окна — по mtime, не по имени каталога: старое имя при
+    /// свежем mtime включается (имя пишет ядро в своей таймзоне, окно
+    /// считает POSIX-время). «Вне окна» покрыто юнитом delete_in_window.
+    #[test]
+    fn collect_delete_events_filters_by_mtime_not_dir_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = dir.path().join("history");
+        write_delete_snapshot(
+            &history,
+            "2026-01-01-000000-delete",
+            "20261101000000-old",
+            Some("старое имя, свежий mtime"),
+        );
+        std::fs::write(history.join("loose.txt"), "x").expect("write");
+
+        let events = collect_delete_events(
+            &history,
+            std::time::SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .expect("collect");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].doc_id, "20261101000000-old");
+    }
+
+    #[test]
+    fn collect_delete_events_fails_loud_on_missing_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("history");
+        assert!(collect_delete_events(
+            &missing,
+            std::time::SystemTime::now(),
+            Duration::from_secs(3600)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collect_delete_events_reads_broken_stub_without_title() {
+        // Кривой JSON стаба (обрыв записи) — событие сохраняется, тайтл
+        // отсутствует: сбор не падает на частичной записи ядра.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = dir.path().join("history");
+        write_broken_snapshot(
+            &history,
+            "2026-11-08-021321-delete",
+            "20261104033524-4d37yk0",
+        );
+
+        let events = collect_delete_events(
+            &history,
+            std::time::SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .expect("collect");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].doc_id, "20261104033524-4d37yk0");
+        assert!(events[0].title.is_none());
+    }
+
+    #[test]
+    fn format_event_list_lists_every_event_without_cap() {
+        // Канал «событие сноса → сводка» обязан работать при реальном
+        // обороте: перечисление без cap — свежий снос тела задачи не
+        // срезается cap'ом (ревью: инцидент на 71-й позиции из 107).
+        let events: Vec<super::DeleteEvent> = (1..=70)
+            .map(|n| super::DeleteEvent {
+                doc_id: format!("doc{n}"),
+                title: Some(format!("тайтл{n}")),
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
+            })
+            .chain([super::DeleteEvent {
+                doc_id: "lost".into(),
+                title: Some("таймер бэкапов".into()),
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
+            }])
+            .collect();
+        let text = format_event_list(&events);
+        assert!(text.contains("lost «таймер бэкапов»"), "{text}");
+        assert!(text.contains("doc1 «тайтл1»"), "{text}");
+        assert!(text.contains("doc70 «тайтл70»"), "{text}");
+        assert!(!text.contains("…+"), "без cap нет хвостовой метки: {text}");
+    }
+
+    #[test]
+    fn sort_events_newest_first_puts_fresh_snapshot_ahead() {
+        let now = std::time::SystemTime::now();
+        let mut events = vec![
+            super::DeleteEvent {
+                doc_id: "old".into(),
+                title: None,
+                snapshot_at: now - Duration::from_secs(3600),
+            },
+            super::DeleteEvent {
+                doc_id: "fresh".into(),
+                title: None,
+                snapshot_at: now,
+            },
+        ];
+        sort_events_newest_first(&mut events);
+        assert_eq!(events[0].doc_id, "fresh");
+        assert_eq!(events[1].doc_id, "old");
     }
 }

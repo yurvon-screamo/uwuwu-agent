@@ -12,7 +12,15 @@
      мутации; протухший снапшот (контент ядра менялся после снятия base) —
      отказ до removeDocByID; свежий снапшот — replace проходит; --force старше
      --base (осознанный overwrite без сверок, как append --force); нормализация
-     гасит рендер-шум ядра; сбой export для сверки — громкая ошибка, мутаций нет.
+     гасит рендер-шум ядра; сбой export для сверки — громкая ошибка, мутаций нет;
+  5) payload сырым export'ом (frontmatter + ведущий title-H1) стрипается до
+     ядра — «правь копию export» не портит док (инцидент 08.11); payload,
+     пустой после стрипа, — отказ до guard'а и сноса; гард --base со
+     снапшотом в экспорт-форме жив со стрипом payload'а;
+  6) вывод несёт НОВЫЙ docId (replace пересоздаёт док, старый id мёртв —
+     держатель иначе ретраит мёртвый, инцидент 08.11): первичный источник —
+     data createDocWithMd, фолбэк getIDsByHPath; не резолвился — warning с
+     рецептом find, rc 0 (мутация применена).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_replace.py
@@ -41,9 +49,17 @@ BASE_CONTENT = ("---\ntitle: РБ\ndate: 2026-11-05T12:20:06+08:00\n"
 
 
 class FakeKernel:
-    """Двойник kernel API для replace: id-резолв, ноутбуки, export, remove/create."""
+    """Двойник kernel API для replace: id-резолв, ноутбуки, export, remove/create.
 
-    def __init__(self, docs, content=BASE_CONTENT, notebooks=(NB_PROJECTS,)):
+    create_returns — data ответа createDocWithMd (живое ядро возвращает docId
+    строкой, проба 08.11); hpath_ids — массив ответа getIDsByHPath (фолбэк).
+    """
+
+    DEFAULT_ID = "20261108000000-repla00"
+
+    def __init__(self, docs, content=BASE_CONTENT, notebooks=(NB_PROJECTS,),
+                 create_returns: object = DEFAULT_ID,
+                 hpath_ids: list[str] | None = None):
         self.docs = {d["id"]: dict(d) for d in docs}
         self.content = content
         self.notebooks = list(notebooks)
@@ -52,8 +68,12 @@ class FakeKernel:
         self.created = []
         self.export_calls = 0
         self.export_attempts = []
+        self.create_returns = create_returns
+        self.hpath_ids = hpath_ids or []
+        self.calls: list[tuple[str, dict]] = []
 
     def post(self, path: str, body: dict, attempts: int = 6):
+        self.calls.append((path, body))
         if path == "/api/query/sql":
             return self._sql(body["stmt"])
         if path == "/api/notebook/lsNotebooks":
@@ -68,7 +88,9 @@ class FakeKernel:
         if path == "/api/filetree/createDocWithMd":
             self.created.append({"notebook": body["notebook"], "path": body["path"],
                                  "markdown": body["markdown"]})
-            return None
+            return self.create_returns
+        if path == "/api/filetree/getIDsByHPath":
+            return list(self.hpath_ids)
         raise AssertionError(f"неожиданный путь: {path}")
 
     def _sql(self, stmt: str):
@@ -247,6 +269,118 @@ class ResolveStmtLimit(unittest.TestCase):
         self.assertTrue(kernel.sql_stmts, "replace не выполнил ни одного sql-запроса")
         for stmt in kernel.sql_stmts:
             self.assertIn(" limit 1", stmt, f"stmt без явного LIMIT: {stmt}")
+
+
+class ExportWrapperAndDocId(unittest.TestCase):
+    """Payload сырым export'ом не портит док (инцидент 08.11); вывод несёт
+    НОВЫЙ docId — replace пересоздаёт док, старый id мёртв."""
+
+    def test_raw_export_payload_is_stripped_before_recreate(self):
+        kernel = FakeKernel(docs=[DOC])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "снапшот.md"
+            base.write_text(BASE_CONTENT)
+            md = Path(tmp) / "док.md"
+            md.write_text(BASE_CONTENT)  # «правь копию export» без правок
+            with patch.object(wiki_ops.time, "sleep", lambda s: None):
+                out, err = run_cmd(wiki_ops.cmd_replace,
+                                   SimpleNamespace(docId=DOC_ID, file=str(md),
+                                                   base=str(base), force=False),
+                                   kernel)
+        self.assertEqual(kernel.created[0]["markdown"], "Тело.\n")
+        self.assertIn("снята экспорт-обвязка", err)
+        self.assertIn("новый docId", out)
+        self.assertIn(FakeKernel.DEFAULT_ID, out)
+        self.assertIn(f"старый {DOC_ID} мёртв", out)
+
+    def test_create_response_id_used_before_fallback(self):
+        kernel = FakeKernel(docs=[DOC])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "снапшот.md"
+            base.write_text(BASE_CONTENT)
+            md = Path(tmp) / "док.md"
+            md.write_text("Тело.\n")
+            with patch.object(wiki_ops.time, "sleep", lambda s: None):
+                run_cmd(wiki_ops.cmd_replace,
+                        SimpleNamespace(docId=DOC_ID, file=str(md),
+                                        base=str(base), force=False),
+                        kernel)
+        self.assertEqual([p for p, _ in kernel.calls
+                          if p == "/api/filetree/getIDsByHPath"], [],
+                         "строка в data createDocWithMd — фолбэк не зовётся")
+
+    def test_unresolved_new_id_warns_and_replacement_stays(self):
+        kernel = FakeKernel(docs=[DOC], create_returns=None, hpath_ids=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "снапшот.md"
+            base.write_text(BASE_CONTENT)
+            md = Path(tmp) / "док.md"
+            md.write_text("Тело.\n")
+            with patch.object(wiki_ops.time, "sleep", lambda s: None):
+                out, err = run_cmd(wiki_ops.cmd_replace,
+                                   SimpleNamespace(docId=DOC_ID, file=str(md),
+                                                   base=str(base), force=False),
+                                   kernel)
+        self.assertIn("заменён:", out)  # мутация применена — rc 0
+        self.assertIn("ПРЕДУПРЕЖДЕНИЕ", err)
+        self.assertIn('wiki_ops find "РБ"', err)
+
+    def test_empty_after_strip_refused_before_guard_and_removal(self):
+        # «Один export без правок» минус обвязка — пусто: отказ до guard'а и
+        # removeDocByID (снос живого дока ради пустого — недопустим).
+        kernel = FakeKernel(docs=[DOC])
+        with tempfile.TemporaryDirectory() as tmp:
+            md = Path(tmp) / "док.md"
+            md.write_text("---\ntitle: РБ\n---\n")
+            with self.assertRaises(RuntimeError) as cm:
+                run_replace(kernel, DOC_ID, str(md), base="снапшот")
+        self.assertIn("пуст после снятия экспорт-обвязки", str(cm.exception))
+        self.assertEqual(kernel.removed, [])
+        self.assertEqual(kernel.created, [])
+
+    def test_snapshot_in_raw_export_format_survives_payload_strip(self):
+        # Гард --base не ломается стрипом payload'а: снапшот — сырой export
+        # (с обвязкой), payload — почищенный контент; сверка идёт по снапшоту
+        # и свежему export, оба в экспорт-форме.
+        kernel = FakeKernel(docs=[DOC], content=BASE_CONTENT)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "снапшот.md"
+            base.write_text(BASE_CONTENT)
+            md = Path(tmp) / "док.md"
+            md.write_text("Переписанное тело без обвязки.\n")
+            with patch.object(wiki_ops.time, "sleep", lambda s: None):
+                run_cmd(wiki_ops.cmd_replace,
+                        SimpleNamespace(docId=DOC_ID, file=str(md),
+                                        base=str(base), force=False),
+                        kernel)
+        self.assertEqual(kernel.removed, [DOC_ID])
+        self.assertEqual(len(kernel.created), 1)
+        self.assertEqual(kernel.created[0]["markdown"], "Переписанное тело без обвязки.\n")
+
+    def test_replace_twice_by_printed_ids_keeps_chain_alive(self):
+        # «replace дважды подряд по id из вывода»: id из первого вывода — живая
+        # цель второго; export по цепочке не даёт пустоты.
+        kernel = FakeKernel(docs=[DOC], content=BASE_CONTENT)
+        seen_ids = [DOC_ID]
+        for step in range(2):
+            new_id = f"20261108000000-chain{step:02d}"
+            kernel.create_returns = new_id
+            kernel.docs[new_id] = dict(DOC, id=new_id)
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp) / "снапшот.md"
+                base.write_text(BASE_CONTENT)
+                md = Path(tmp) / "док.md"
+                md.write_text(f"Тело шага {step}.\n")
+                with patch.object(wiki_ops.time, "sleep", lambda s: None):
+                    out, _ = run_cmd(wiki_ops.cmd_replace,
+                                     SimpleNamespace(docId=seen_ids[-1], file=str(md),
+                                                     base=str(base), force=False),
+                                     kernel)
+            self.assertIn(f"новый docId: {new_id}", out)
+            seen_ids.append(new_id)
+        self.assertEqual(kernel.removed, seen_ids[:-1])
+        self.assertEqual([c["markdown"] for c in kernel.created],
+                         ["Тело шага 0.\n", "Тело шага 1.\n"])
 
 
 if __name__ == "__main__":

@@ -422,6 +422,7 @@ LLMs default to clichés. Override these defaults proactively.
 ### Materiality, Shadows, Cards
 
 - Use cards ONLY when elevation communicates real hierarchy. Otherwise group with `border-t`, `divide-y`, or negative space
+- **NO CARD INSIDE A CARD.** A bordered/shadowed card nested inside another card reads as two competing objects. Pick ONE level of container: group inner content with spacing, `divide-y`, or a progress/hairline strip. Exception: a documented border-style system (e.g. framed print/terminal aesthetics) may use one inner level, never two
 - When a shadow is used, tint it to the background hue. No pure-black drop shadows on light backgrounds
 - **SHAPE CONSISTENCY LOCK:** Pick ONE corner-radius scale for the page and stick to it. Mixed systems are allowed only with a documented rule followed everywhere
 
@@ -451,6 +452,7 @@ Always implement full cycles:
 - **No greeting headlines** (`Welcome back, Name! 👋`). The title names the context: page name or period (`October 2026`)
 - **Short labels.** `Search`, not `Search anything...`
 - **Every change cites its base.** `+12% vs last month`, `3 fewer vs last month` — never a bare `+12%`
+- **Captions add information, never restate.** A subtitle/label under a headline that says the same thing in other words is noise: delete it or replace it with new information. Sibling metrics that happen to share a value are fine, keep them distinguishable by label
 - **Numbers: one format per screen, `tabular-nums`.** `$48,210` and `$124,860` — not one with cents and one without. Mock data looks real (plausible values), never `[X]` or `123456`
 
 ---
@@ -563,6 +565,7 @@ Avoid these signatures unless the brief explicitly asks for them.
 - **NO excessive gradient text** for large headers
 - **NO custom mouse cursors.** Accessibility-hostile, perf-hostile
 - **NO three-column equal feature cards.** The generic "three identical cards" row is banned
+- **NO rainbow icon tiles.** Icons sitting in colored rounded squares/chips are an AI signature when the tints are arbitrary. Allowed only as a system role: ONE tint per semantic role from the theme palette, ONE radius, ONE size - otherwise the icon stands alone
 
 ### Typography
 
@@ -623,6 +626,17 @@ Avoid these signatures unless the brief explicitly asks for them.
 **Lists & dividers:**
 - NO `border-t` + `border-b` on every row of long lists. Pick one, use sparsely
 - NO scoring/progress bars with filled background tracks on landing pages
+
+### Neuroslop Checklist (6 questions, run on every screen)
+
+A mechanical pass over the finished screen. Any "yes" is a fix before ship:
+
+1. **Icon tiles:** an icon sitting in a colored chip? Allowed only as one system role (single tint from the palette, one radius); arbitrary rainbow tints - remove the tile
+2. **Contrast:** does every text pass WCAG AA (4.5:1 normal, 3:1 large) on its ACTUAL background, after opacity/alpha blending, in BOTH themes? Compute, never eyeball - "looks fine on my monitor" is how gray-on-dark ships
+3. **Middle dots:** more than one `·` separator in a line? Collapse. Metadata strips carry at most one
+4. **Nested cards:** a card inside a card? Drop to one container level; group with spacing, `divide-y`, or a hairline
+5. **Caption = headline?** A label/subtitle repeating its heading in other words? Delete it or make it carry new information
+6. **Debris:** would the screen lose anything if this element disappeared (pointless badges, filler sparklines, decorative strips)? Remove it. Stat cards are label + number + change WITH a base (`+40 vs yesterday`), never a bare `+40`
 
 ---
 
@@ -810,6 +824,7 @@ Dual-mode by default. Never assume light-only unless the brief is print-emulatin
 - Respect `prefers-color-scheme: dark`. Default to system preference unless brand insists
 - **Page Theme Lock:** ONE theme (light, dark, or auto) for the whole page. Sections do not invert. Exception: one deliberate theme switch with strong transition
 - No pure `#000000` and no pure `#ffffff` — use off-black and off-white
+- **Muted-on-dark is where contrast dies.** Muted text on a dark surface must still pass WCAG AA (4.5:1 body, 3:1 large) - compute it, do not eyeball it. Same for opacity-dimmed elements: contrast is evaluated on the EFFECTIVE color (text color alpha-blended over its background) - e.g. `text-zinc-500` at 50% opacity on `zinc-900` blends to `#44444a`, ~1.8:1: a fail invisible to any "just use a gray token" rule
 - Test in both modes before finishing
 
 ---
@@ -925,6 +940,7 @@ Run this before delivering code. **If any box fails, the output is not done.**
 - [ ] Color is not the only indicator?
 - [ ] `prefers-reduced-motion` respected?
 - [ ] Light mode text contrast 4.5:1 minimum?
+- [ ] Dark mode + opacity-dimmed text contrast 4.5:1 minimum (computed on the effective blended color)?
 - [ ] Glass/transparent elements visible in light mode?
 - [ ] Borders visible in both modes?
 
@@ -943,6 +959,12 @@ Run this before delivering code. **If any box fails, the output is not done.**
 - [ ] No micro-meta-sentences under eyebrows?
 - [ ] No locale / city / time / weather strips (unless brief demands)?
 - [ ] No decorative status dots (unless semantic state)?
+
+### Neuroslop checklist (see AI Tells > Neuroslop Checklist)
+- [ ] No arbitrary-colored icon tiles? (tiles only as one system role: single tint, one radius)
+- [ ] No card nested inside a card?
+- [ ] No caption/subtitle that restates its headline?
+- [ ] Every visible delta/change cites its base (`+40 vs yesterday`, not bare `+40`)?
 
 If a single checkbox cannot be honestly ticked, the page is not done. Fix it before delivering.
 

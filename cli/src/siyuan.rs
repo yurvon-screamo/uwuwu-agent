@@ -1150,6 +1150,30 @@ impl SiYuan {
         .await?;
         Ok(())
     }
+
+    /// Значение date-ячейки: content — epoch ms, formattedContent — строка
+    /// отображения (шейп kernel av.ValueDate). isNotEmpty=false — очистка
+    /// клетки (kernel считает date пустой по флагу, не по content).
+    pub async fn db_item_set_date(
+        &self,
+        av_id: &str,
+        key_id: &str,
+        item_id: &str,
+        content_ms: i64,
+        is_not_empty: bool,
+        formatted: &str,
+    ) -> Result<()> {
+        self.mcp_tool(
+            "database",
+            json!({ "action": "item_update", "id": av_id, "keyID": key_id,
+                    "itemID": item_id,
+                    "value": { "date": { "content": content_ms,
+                                          "isNotEmpty": is_not_empty,
+                                          "formattedContent": formatted } } }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Голова тела ответа для сообщений об ошибках: диагностика без простыни.

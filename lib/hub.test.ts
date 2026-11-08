@@ -3,8 +3,9 @@
 import { test, expect } from "bun:test"
 import {
   alignChunks, batchReadyAt, capUnchatBatch, classifyUpdate, composeText, dropBatch, extractReplies,
-  inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, promptLandedAt, steerCandidate,
-  steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
+  inboxToSessionMsgs, joinBatch, mediaFiles, parseDraftAcks, plainChunks, promptLandedAt, silenceCheck,
+  steerCandidate, steerRecoveryBatch, stripDraftAcks, takeBatch, validState,
+  SILENCE_ALERT_RETRY_MS,
   type Request, type SessionMsg, type TgUpdate,
 } from "./hub"
 
@@ -491,4 +492,58 @@ test("stripDraftAcks: ack-строки уходят, остальной текс
   const text = "первая\nmiddle draft-ack: r1=todo\nвторая"
   expect(stripDraftAcks(text)).toBe("первая\nвторая")
   expect(stripDraftAcks("draft-ack: r1=todo")).toBe("")
+})
+
+// ——— silenceCheck: тайм-аут тишины выходного потока ———
+
+const DAY_MS = 24 * 3600_000
+
+test("silenceCheck: ниже порога — тихо, окно не тронуто", () => {
+  const gate = { nextAlertAt: 0 }
+  const r = silenceCheck(1_000, gate, 1_000 + DAY_MS - 1, DAY_MS)
+  expect(r.alert).toBe(false)
+  expect(r.gate).toBe(gate)
+  expect(r.ageMs).toBe(DAY_MS - 1)
+})
+
+test("silenceCheck: порог достигнут — алерт, окно сдвинуто на SILENCE_ALERT_RETRY_MS", () => {
+  const bornAt = 10_000
+  const now = bornAt + DAY_MS
+  const r = silenceCheck(bornAt, { nextAlertAt: 0 }, now, DAY_MS)
+  expect(r.alert).toBe(true)
+  expect(r.gate.nextAlertAt).toBe(now + SILENCE_ALERT_RETRY_MS)
+})
+
+test("silenceCheck: недоставленный алерт ретраится не чаще окна (метка продолжает стареть)", () => {
+  // первый алерт на пороге, ТГ лежит — выхода нет, тишина растёт;
+  // окно ретрая инъектируемое (silenceAlertRetryMs профиля), дефолт — константа
+  const first = silenceCheck(0, { nextAlertAt: 0 }, DAY_MS, DAY_MS, 1_000)
+  expect(first.alert).toBe(true)
+  expect(first.gate.nextAlertAt).toBe(DAY_MS + 1_000)
+  // повтор внутри окна задушен
+  const retry = silenceCheck(0, first.gate, DAY_MS + 1_000 - 1, DAY_MS, 1_000)
+  expect(retry.alert).toBe(false)
+  // после окна — попытка снова
+  const again = silenceCheck(0, first.gate, DAY_MS + 1_000, DAY_MS, 1_000)
+  expect(again.alert).toBe(true)
+})
+
+test("silenceCheck: сутки wave-тиков без выходов метку не глушат — тишина растёт до алерта; свежая доставка гасит", () => {
+  // Arrange: wave-тики не обновляют метку (обновляют только send/финал) —
+  // возраст растёт сквозь них и алертит
+  const waves = silenceCheck(0, { nextAlertAt: 0 }, DAY_MS + 3600_000, DAY_MS)
+  expect(waves.alert).toBe(true)
+  // Act: выход (доставка/финал) обновил метку — возраст обнулился
+  const fresh = silenceCheck(DAY_MS + 3600_000, waves.gate, DAY_MS + 3600_000 + 1, DAY_MS)
+  // Assert
+  expect(fresh.alert).toBe(false)
+})
+
+// ——— validState: lastDeliveryAt ———
+
+test("validState: lastDeliveryAt валидное сохраняется, мусор и отсутствие — undefined", () => {
+  expect(validState({ offset: 0, lastDeliveryAt: 123, queue: [] }).lastDeliveryAt).toBe(123)
+  expect(validState({ offset: 0, lastDeliveryAt: "мусор", queue: [] }).lastDeliveryAt).toBeUndefined()
+  expect(validState({ offset: 0, lastDeliveryAt: -5, queue: [] }).lastDeliveryAt).toBeUndefined()
+  expect(validState({}).lastDeliveryAt).toBeUndefined()
 })

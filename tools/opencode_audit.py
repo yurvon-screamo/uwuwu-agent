@@ -42,9 +42,6 @@ from pathlib import Path
 DEFAULT_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 DEFAULT_WIKI = Path(os.environ.get("UWUWU_WIKI", str(Path.home() / ".uwuwu")))
 
-# opencode v2: живая таблица сессий (легаси `session` заморожена на миграции)
-SESSION_TABLE = "session_v2"
-
 # Truncation defaults (per-item)
 LIMIT_USER_MSGS = 5
 LIMIT_ASST_TEXTS = 3
@@ -89,10 +86,10 @@ def q_sessions_in_range(
     con: sqlite3.Connection, start_ms: int, end_ms: int
 ) -> list[dict]:
     cur = con.execute(
-        f"""SELECT id, slug, title, agent, directory, parent_id,
+        """SELECT id, slug, title, agent, directory, parent_id,
                   summary_additions, summary_deletions, summary_files,
                   time_created, time_updated
-           FROM {SESSION_TABLE}
+           FROM session_v2
            WHERE time_created >= ? AND time_created < ?
            ORDER BY time_created""",
         (start_ms, end_ms),
@@ -410,7 +407,7 @@ def q_kids_summary(
     con: sqlite3.Connection, parent_id: str, limit_titles: int
 ) -> dict[str, dict]:
     cur = con.execute(
-        f"""SELECT agent, title FROM {SESSION_TABLE}
+        """SELECT agent, title FROM session_v2
            WHERE parent_id = ? ORDER BY time_created""",
         (parent_id,),
     )
@@ -431,10 +428,10 @@ def q_kids_list(con: sqlite3.Connection, parent_id: str) -> list[dict]:
     For spotting which subagent did real work.
     """
     cur = con.execute(
-        f"""SELECT id, slug, title, agent, directory,
+        """SELECT id, slug, title, agent, directory,
                   summary_additions, summary_deletions, summary_files,
                   time_created, time_updated
-           FROM {SESSION_TABLE} WHERE parent_id = ?
+           FROM session_v2 WHERE parent_id = ?
            ORDER BY time_created""",
         (parent_id,),
     )
@@ -611,7 +608,7 @@ def cmd_day(args: argparse.Namespace) -> dict:
         if pid not in parent_meta:
             # Parent may be outside this day (long-running session started earlier)
             cur = con.execute(
-                f"SELECT slug, title, agent, directory FROM {SESSION_TABLE} WHERE id = ?",
+                "SELECT slug, title, agent, directory FROM session_v2 WHERE id = ?",
                 (pid,),
             )
             row = cur.fetchone()
@@ -660,10 +657,10 @@ def cmd_day(args: argparse.Namespace) -> dict:
     # 24–27.09 не фактизировались, пока сессия не завершится). Доросшие
     # сессии принадлежат дню создания (time_created). Каждой — native_day.
     upgrown_rows = con.execute(
-        f"""SELECT s.id, s.slug, s.title, s.agent, s.directory, s.parent_id,
+        """SELECT s.id, s.slug, s.title, s.agent, s.directory, s.parent_id,
                    s.summary_additions, s.summary_deletions, s.summary_files,
                    s.time_created, s.time_updated
-            FROM {SESSION_TABLE} s
+            FROM session_v2 s
             WHERE s.time_created < ?
               AND s.parent_id IS NULL
               AND EXISTS (SELECT 1 FROM session_message m
@@ -752,10 +749,10 @@ def cmd_session(args: argparse.Namespace) -> dict:
     """Forensic dump of a single session."""
     con = connect(args.db)
     cur = con.execute(
-        f"""SELECT id, slug, title, agent, directory, parent_id,
+        """SELECT id, slug, title, agent, directory, parent_id,
                   summary_additions, summary_deletions, summary_files,
                   time_created, time_updated
-           FROM {SESSION_TABLE} WHERE id = ?""",
+           FROM session_v2 WHERE id = ?""",
         (args.session_id,),
     )
     row = cur.fetchone()
@@ -766,7 +763,7 @@ def cmd_session(args: argparse.Namespace) -> dict:
     parent = None
     if s["parent_id"]:
         cur = con.execute(
-            f"SELECT id, slug, title, agent, directory FROM {SESSION_TABLE} WHERE id = ?",
+            "SELECT id, slug, title, agent, directory FROM session_v2 WHERE id = ?",
             (s["parent_id"],),
         )
         prow = cur.fetchone()
@@ -774,7 +771,7 @@ def cmd_session(args: argparse.Namespace) -> dict:
             parent = dict(prow)
 
     cur = con.execute(
-        f"""SELECT id, slug, title, agent, directory FROM {SESSION_TABLE}
+        """SELECT id, slug, title, agent, directory FROM session_v2
            WHERE parent_id = ? ORDER BY time_created""",
         (args.session_id,),
     )

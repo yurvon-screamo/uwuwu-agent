@@ -180,6 +180,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if !task.pr.is_empty() {
                 println!("PR:       {}", task.pr);
             }
+            if !task.planned.is_empty() {
+                println!("Запланировано: {}", task.planned);
+            }
             let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
             if let Some(doc) = body_doc.as_deref() {
                 if let Ok(attrs) = sy.get_block_attrs(doc).await {
@@ -270,6 +273,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                              не записано — доставь: task edit {item} --schedule \"{expr}\""
                         )
                     })?;
+                // колонка «Расписание» — синхронно с attr (доску create не
+                // возвращает; повторный find — две read-пробы, только при --schedule)
+                let board = syt::find_board(&sy, project).await.with_context(|| {
+                    format!(
+                        "задача создана (строка {item}), но клетку «{}» доставь: \
+                         task edit {item} --schedule \"{expr}\"",
+                        syt::SCHEDULE_CELL
+                    )
+                })?;
+                syt::sync_schedule_cell(&sy, &board, &item, expr).await?;
             }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
@@ -295,16 +308,21 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             branch,
             r#type: ty,
             schedule,
+            planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            // валидация PR/типа до rename: без частичных обновлений (тайтл
-            // сменился, а колонки нет — недопустимый разрыв); «» — снятие типа
+            // валидация PR/типа/planned до rename: без частичных обновлений
+            // (тайтл сменился, а колонки нет — недопустимый разрыв);
+            // «» — снятие типа/даты
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
             let ty_canonical = match ty.as_deref() {
                 Some("") => Some(String::new()),
                 Some(raw) => Some(syt::validate_task_type(raw)?),
                 None => None,
             };
+            if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
+                syt::parse_planned(raw)?;
+            }
             let final_title = match title.as_deref() {
                 Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
                 None => None,
@@ -319,8 +337,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ty_canonical.as_deref(),
             )
             .await?;
+            if let Some(raw) = planned.as_deref() {
+                syt::set_planned(&sy, &board, &task, raw).await?;
+            }
             if ty_canonical.as_deref() == Some("") {
                 println!("тип снят: {}", task.title);
+            }
+            match planned.as_deref() {
+                Some("") => println!("запланировано снято: {}", task.title),
+                Some(raw) => {
+                    let (_, formatted) = syt::parse_planned(raw)?;
+                    println!("запланировано: {formatted}");
+                }
+                None => {}
             }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
@@ -338,6 +367,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         )
                     })?;
                 sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                // колонка «Расписание» — отображение attr: пишется синхронно
+                // в единственной точке записи расписания (снятие чистит клетку)
+                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
                 if expr.is_empty() {
                     println!("расписание снято: {}", task.title);
                 }
@@ -417,6 +449,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
+            // гард вставки обёртки вывода task get в контент (202611080031):
+            // вход пишется как есть — шапка карточки, маркер и frontmatter от
+            // get-вывода ложатся в тело литерально и множатся на replace-циклах.
+            // Отказ до сети и записи (no-write); при --force тоже — санитария
+            // входа, инвариант, а не часть сверки свежести. Снапшот --base
+            // допустим полным: cli срезает обёртку при сверке сам.
+            if let Some(signature) = md_artifacts::task_get_wrapper_signature(&content) {
+                bail!(
+                    "вход несёт обёртку вывода task get ({signature}) — она легла бы в тело \
+                     литерально и множилась на replace-циклах. Скармливай контент тела: без \
+                     шапки карточки «Задача:/Статус:/Строка:…», маркера «----- тело -----» и \
+                     frontmatter — frontmatter дока ведёт ядро, титульный H1 пишется из \
+                     заголовка дока. Снапшот для --base можно не чистить: cli срезает обёртку \
+                     при сверке сам"
+                );
+            }
             // write-side превенция тег-матча ядра: голые решётки с пунктуацией
             // вплотную съедают бэктики код-спанов на экспорте; предупреждение
             // не блокирует запись (легитимные тела О самой порче триггерят)
@@ -775,7 +823,7 @@ async fn task_clean(
                     task.item_id,
                     hint
                 );
-                planned.push((frag, task, verdict));
+                planned.push((frag, *task, verdict));
             }
             syt::NeedleMatch::NotFound => {
                 println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю")
@@ -1737,18 +1785,51 @@ async fn apply_diagram_op(sy: &SiYuan, doc_id: &str, op: html_embed::DiagramOp) 
 /// с путями ассетов после тела. Полный get-вывод, сырой экспорт и чистое
 /// тело сводятся к телу (контракт --base). Легитимные строки-маркеры в
 /// чистом теле срежут часть контента — false-mismatch, отказ (safe-направление).
+/// Маркер — общая константа с write-side детектором (md_artifacts):
+/// срезка снапшота и детекция входа не разъедутся.
+///
+/// Построчный точный матч (задача 20261108045651, по образцу
+/// task_get_wrapper_signature): граница — строка, trim_end() которой ровно
+/// маркер, вне код-фенса. Матч по ПОДСТРОКЕ ломал срезку на легитимных
+/// тайтлах с маркером внутри (строка шапки «Задача:   … «----- тело -----»…»
+/// матчилась раньше настоящего маркера — остаток мусорный, сверка --base
+/// ложно отказывала). Хвост «Аттачи:» — тем же построчным принципом
+/// (префикс-старт строки, паритет с прежним "\nАттачи:"), фенсы не граница.
 fn strip_task_get_output(raw: &str) -> String {
-    let body = match raw.split_once("----- тело -----") {
-        Some((_, rest)) => rest,
-        None => raw,
-    };
-    let body = match body.split_once("\nАттачи:") {
-        Some((body, _)) => body.to_string(),
-        None => body.to_string(),
-    };
+    let mut body_start: Option<usize> = None;
+    let mut attach_start: Option<usize> = None;
+    let mut in_fence = false;
+    let mut offset = 0usize;
+    for line in raw.lines() {
+        let line_end = offset + line.len();
+        // lines() режет CRLF-пару: реальный шаг до следующей строки — 2 байта
+        // на "\r\n", иначе 1 ("\n" или конец входа)
+        let step = if raw[line_end..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        if md_heading::toggles_fence(line) {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if body_start.is_none() && line.trim_end() == md_artifacts::TASK_GET_BODY_MARKER {
+                body_start = Some(line_end + step);
+            } else if line.starts_with("Аттачи:") && offset > 0 {
+                // срез с ведущим "\n" — паритет прежнего матча "\nАттачи:"
+                attach_start = Some(offset - 1);
+                break;
+            }
+        }
+        offset = line_end + step;
+    }
+    let start = body_start.unwrap_or(0);
+    let end = attach_start.unwrap_or(raw.len());
+    // срез дословный (байтовые границы между строками): трейлинг-переводы
+    // и CRLF-хвосты строк сохраняются, как при прежнем split_once
+    let body = if start >= end { "" } else { &raw[start..end] };
     // ведущие переводы после маркера срезаются: strip_frontmatter дальше
     // требует строгий префикс «---\n» — "\n\n---\n…" свёл бы сверку вразнос
-    body.trim_start_matches('\n').to_string()
+    body.trim_start_matches(['\r', '\n']).to_string()
 }
 
 /// Итог секционной правки: заменено (со счётчиком удалённых дублей) или добавлено.
@@ -2202,7 +2283,11 @@ mod tests {
     const ORPHAN_DOC: &str = "20261105090000-orphan1";
 
     fn render_rows(with_binding: bool) -> serde_json::Value {
-        let mut block = serde_json::json!({ "content": "таск", "refSubtype": "d" });
+        render_rows_titled(with_binding, "таск")
+    }
+
+    fn render_rows_titled(with_binding: bool, title: &str) -> serde_json::Value {
+        let mut block = serde_json::json!({ "content": title, "refSubtype": "d" });
         if with_binding {
             block["id"] = serde_json::json!(BOUND_DOC);
         }
@@ -2218,6 +2303,18 @@ mod tests {
     /// Ответ MCP tools/call(database render) как текст content[0].
     fn mcp_render_response(with_binding: bool) -> String {
         let mut view = render_rows(with_binding);
+        view["rowCount"] = serde_json::json!(1);
+        let payload = serde_json::json!({ "action": "render", "data": { "view": view } });
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "content": [{ "type": "text", "text": payload.to_string() }] }
+        })
+        .to_string()
+    }
+
+    /// Ответ MCP render с тайтлом задачи, отличным от дефолтного «таск».
+    fn mcp_render_response_titled(with_binding: bool, title: &str) -> String {
+        let mut view = render_rows_titled(with_binding, title);
         view["rowCount"] = serde_json::json!(1);
         let payload = serde_json::json!({ "action": "render", "data": { "view": view } });
         serde_json::json!({
@@ -2250,6 +2347,22 @@ mod tests {
         title_doc_ids: Vec<String>,
         with_binding: bool,
         export_content: String,
+    ) -> (
+        MockServer,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
+        mock_siyuan_with_export_titled(title_doc_ids, with_binding, export_content, "таск").await
+    }
+
+    /// Вариант с тайтлом задачи, отличным от дефолтного «таск» (регресс
+    /// маркер-подстроки в шапке get-вывода, задача 20261108003111).
+    async fn mock_siyuan_with_export_titled(
+        title_doc_ids: Vec<String>,
+        with_binding: bool,
+        export_content: String,
+        title: &str,
     ) -> (
         MockServer,
         Arc<AtomicUsize>,
@@ -2316,6 +2429,10 @@ mod tests {
             .await;
 
         let ids = title_docs.clone();
+        let task_hpath = format!("/uwuwu/Задачи uwuwu/{title}");
+        let export_hpath = task_hpath.clone();
+        let block_hpath = task_hpath.clone();
+        let render_title = title.to_string();
         Mock::given(method("POST"))
             .and(path("/api/filetree/getIDsByHPath"))
             .respond_with(move |req: &wiremock::Request| {
@@ -2323,7 +2440,7 @@ mod tests {
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
                 let data = if hpath == "/uwuwu/Задачи uwuwu" {
                     serde_json::json!([BOARD_DOC])
-                } else if hpath == "/uwuwu/Задачи uwuwu/таск" {
+                } else if hpath == task_hpath {
                     serde_json::json!(ids)
                 } else {
                     // прочие пути (крон-доски и пр.) в этом сценарии не существуют
@@ -2350,7 +2467,7 @@ mod tests {
             .and(path("/api/export/exportMdContent"))
             .respond_with(move |_req: &wiremock::Request| {
                 ResponseTemplate::new(200).set_body_string(
-                    serde_json::json!({ "code": 0, "data": { "hPath": "/uwuwu/Задачи uwuwu/таск", "content": export_content } })
+                    serde_json::json!({ "code": 0, "data": { "hPath": export_hpath, "content": export_content } })
                         .to_string(),
                 )
             })
@@ -2374,7 +2491,7 @@ mod tests {
                         // doc_block_exists: живой bound-док → NodeDocument
                         ResponseTemplate::new(200).set_body_string(
                             format!(
-                                r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ID: {BOUND_DOC}\nType: NodeDocument\nHPath: /uwuwu/Задачи uwuwu/таск"}}]}}}}"#
+                                r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"ID: {BOUND_DOC}\nType: NodeDocument\nHPath: {block_hpath}"}}]}}}}"#
                             ),
                         )
                     } else if body.contains("\"block\"") && body.contains("get_children") {
@@ -2383,7 +2500,8 @@ mod tests {
                             r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":""}]}}"#,
                         )
                     } else {
-                        ResponseTemplate::new(200).set_body_string(mcp_render_response(with_binding))
+                        ResponseTemplate::new(200)
+                            .set_body_string(mcp_render_response_titled(with_binding, &render_title))
                     }
                 } else {
                     ResponseTemplate::new(200).set_body_string(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#)
@@ -2393,6 +2511,32 @@ mod tests {
             .await;
 
         (server, create_calls, append_bodies, delete_calls)
+    }
+
+    /// task body --replace (force: false) через task_run: контент пишется в
+    /// temp-файл, снапшот --base опционален. Result — для unwrap_err на
+    /// тестах отказного пути.
+    async fn run_body_replace(
+        id: &str,
+        snapshot: Option<&std::path::Path>,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), content).unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: id.into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: snapshot.map(|p| p.to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
     }
 
     async fn write_body_via_cli(server: &MockServer) -> anyhow::Result<()> {
@@ -2563,23 +2707,9 @@ mod tests {
             mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        let err = task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: None,
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = run_body_replace("таск", None, "новое тело\n")
+            .await
+            .unwrap_err();
 
         let msg = err.to_string();
         assert!(
@@ -2617,24 +2747,44 @@ mod tests {
             "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n\n## Комменты\n\n\n- коммент\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n",
         )
         .unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        run_body_replace("таск", Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap();
 
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0);
+        {
+            let appends = append_bodies.lock().unwrap();
+            assert!(
+                appends.iter().any(|p| p.contains("новое тело")),
+                "запись состоялась: {:?}",
+                *appends
+            );
+        }
+    }
+
+    /// Свежий снапшот на тайтле с маркер-подстрокой (живой кейс
+    /// 20261108003111): срезка --base по ровной строке маркера — replace
+    /// пишет, ложно отказа «тело менялось» нет.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_replace_with_fresh_snapshot_with_marker_title_writes() {
+        let title = "тайтл с «----- тело -----» внутри";
+        let export = format!("---\ntitle: {title}\n---\n\n# {title}\n\nтело\n");
+        let (server, create_calls, append_bodies, _deletes) =
+            mock_siyuan_with_export_titled(vec![BOUND_DOC.to_string()], true, export, title).await;
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            snapshot.path(),
+            format!(
+                "Задача:   {title}\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: {title}\n---\n\n# {title}\n\nтело\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n"
+            ),
+        )
+        .unwrap();
+        run_body_replace(title, Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap();
         assert_eq!(create_calls.load(Ordering::SeqCst), 0);
         {
             let appends = append_bodies.lock().unwrap();
@@ -2658,23 +2808,9 @@ mod tests {
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
         let snapshot = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(snapshot.path(), "----- тело -----\n\nтело\n").unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        let err = task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = run_body_replace("таск", Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap_err();
 
         let msg = err.to_string();
         assert!(
@@ -2748,23 +2884,9 @@ mod tests {
             "----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n",
         )
         .unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "переписанное тело\n").unwrap();
-        task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        run_body_replace("таск", Some(snapshot.path()), "переписанное тело\n")
+            .await
+            .unwrap();
 
         {
             let appends = append_bodies.lock().unwrap();
@@ -2791,6 +2913,59 @@ mod tests {
         assert_eq!(strip_task_get_output(raw_export), raw_export);
         let clean_body = "тело без разметки\n";
         assert_eq!(strip_task_get_output(clean_body), clean_body);
+    }
+
+    /// Регресс 20261108003111 (BDD-сценарий задачи 20261108045651): тайтл с
+    /// маркер-подстрокой попадает в шапку get-вывода раньше настоящего
+    /// маркера — срезка по ПОДСТРОКЕ (split_once) даёт мусорный остаток
+    /// («…» внутри\nСтатус: …»), сверка --base ложно отказывает. Построчный
+    /// матч по ровной строке маркера остаток не портит.
+    #[test]
+    fn strip_task_get_output_survives_marker_substring_in_header() {
+        let full_get = "Задача:   тайтл с «----- тело -----» внутри\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\nтело\n";
+        let stripped = strip_task_get_output(full_get);
+        assert!(
+            stripped.starts_with("---\ntitle: таск"),
+            "остаток = тело, получено: {stripped:?}"
+        );
+    }
+
+    /// Ровная строка маркера внутри код-фенса чистого тела — не граница
+    /// шапки (зеркало write-side тестов task_get_wrapper_signature): вход
+    /// проходит насквозь без срезки.
+    #[test]
+    fn strip_task_get_output_marker_line_in_fence_is_not_boundary() {
+        let clean_body = "текст\n\n```gherkin\n----- тело -----\n```\n\nхвост\n";
+        assert_eq!(strip_task_get_output(clean_body), clean_body);
+    }
+
+    /// Строка «Аттачи:» внутри код-фенса тела — не граница хвоста: срезка —
+    /// по настоящему «Аттачи:» вне фенса.
+    #[test]
+    fn strip_task_get_output_attach_line_in_fence_is_not_tail_boundary() {
+        let full_get = "Задача:   таск\nСтатус:   Design\n\n----- тело -----\n\nшапка тела\n\n```\nАттачи:\n```\n\nхвост тела\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n";
+        let stripped = strip_task_get_output(full_get);
+        assert!(
+            stripped.contains("```\nАттачи:\n```"),
+            "фенс-«Аттачи:» не граница: {stripped:?}"
+        );
+        assert!(
+            stripped.ends_with("хвост тела\n"),
+            "срезано по настоящему хвосту: {stripped:?}"
+        );
+    }
+
+    /// CRLF-вход: lines()+trim_end гасит \r — маркер и «Аттачи:» матчатся,
+    /// ведущие пустые строки после маркера срезаются без \r-остатка.
+    #[test]
+    fn strip_task_get_output_handles_crlf_lines() {
+        let full_get = "Задача:   таск\r\nСтатус:   Design\r\n\r\n----- тело -----\r\n\r\nтело\r\n\r\nАттачи:\r\n  /tmp/x.png\r\n";
+        let stripped = strip_task_get_output(full_get);
+        assert!(
+            stripped.starts_with("тело"),
+            "остаток после CRLF: {stripped:?}"
+        );
+        assert!(!stripped.contains("Аттачи:"), "хвост срезан: {stripped:?}");
     }
 
     #[test]
@@ -3659,6 +3834,8 @@ mod tests {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
     }

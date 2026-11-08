@@ -18,6 +18,11 @@ const HERE = import.meta.dir
 /** Тик шедулера: гейт файра дешёвый (локальное время + state-ключ). */
 const AUDIT_TICK_MS = 60_000
 
+/** Порог тишины выходного потока: гэп между финалами ночного аудита ~24ч,
+ *  запас на продолжительность хода и сдвиг слота. Критерий пересмотра:
+ *  первый ложняк после выката (ход аудита длиннее запаса) — порог вверх. */
+const LEAD_SILENCE_TIMEOUT_MS = 26 * 3600_000
+
 const HELP = [
   "🌙 Lead uwuwu — ночной аудитор платформы.",
   "",
@@ -96,6 +101,7 @@ const profile: HubProfile = {
   },
   sources: [auditScheduler],
   validateState: validLeadExtras,
+  silenceTimeoutMs: LEAD_SILENCE_TIMEOUT_MS,
 }
 
 const hub = createHub(profile)

@@ -27,8 +27,15 @@ pub(crate) struct MockRow {
     pub(crate) title: String,
     pub(crate) status: String,
     pub(crate) task_type: String,
+    /// Клетка «Запланировано» (formattedContent date-ячейки; "" — нет клетки).
+    pub(crate) planned: String,
+    /// Клетка «Расписание» (text; "" — нет клетки).
+    pub(crate) schedule: String,
     pub(crate) doc: Option<String>,
 }
+
+/// Прямой ребёнок-док доски сценария: (docId, полный hpath, updated).
+pub(crate) type BoardChild = (&'static str, &'static str, &'static str);
 
 impl MockRow {
     pub(crate) fn new(item: &str, title: &str) -> Self {
@@ -37,6 +44,8 @@ impl MockRow {
             title: title.to_string(),
             status: String::new(),
             task_type: String::new(),
+            planned: String::new(),
+            schedule: String::new(),
             doc: None,
         }
     }
@@ -51,13 +60,23 @@ impl MockRow {
         self
     }
 
+    pub(crate) fn with_planned(mut self, planned: &str) -> Self {
+        self.planned = planned.to_string();
+        self
+    }
+
+    pub(crate) fn with_schedule(mut self, schedule: &str) -> Self {
+        self.schedule = schedule.to_string();
+        self
+    }
+
     pub(crate) fn with_doc(mut self, doc: &str) -> Self {
         self.doc = Some(doc.to_string());
         self
     }
 
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
-    fn cells_json(&self) -> Value {
+    pub(crate) fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
         if let Some(doc) = &self.doc {
             block["id"] = json!(doc);
@@ -75,6 +94,18 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-type", "type": "mSelect",
                            "mSelect": [{ "content": self.task_type }] }
+            }));
+        }
+        if !self.planned.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-planned", "type": "date",
+                           "date": { "formattedContent": self.planned } }
+            }));
+        }
+        if !self.schedule.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-schedule", "type": "text",
+                           "text": { "content": self.schedule } }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -147,6 +178,11 @@ pub(crate) struct MockScenario {
     /// Атрибуты блоков (docId → [(имя, значение)]) для getBlockAttrs;
     /// doc без записи → 404-конверт «block not found» (честная деградация).
     pub(crate) block_attrs: Vec<(&'static str, Vec<(String, String)>)>,
+    /// Прямые дети-доки досок (проба board-orphans): hpath доски → дети
+    /// (docId, полный hpath, updated). Отказ SQL детей — `sql_children_fail`.
+    pub(crate) board_children: Vec<(&'static str, Vec<BoardChild>)>,
+    /// true — SQL-запрос детей доски отвечает HTTP 500 (честный SKIP пробы).
+    pub(crate) sql_children_fail: bool,
 }
 
 impl Default for MockScenario {
@@ -162,6 +198,8 @@ impl Default for MockScenario {
                     ("key-type", "Тип"),
                     ("key-branch", "Branch"),
                     ("key-pr", "PR"),
+                    ("key-planned", "Запланировано"),
+                    ("key-schedule", "Расписание"),
                 ],
             }],
             hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["board-doc"])],
@@ -185,6 +223,8 @@ impl Default for MockScenario {
             missing_file_path: "",
             item_remove_drops_all: false,
             block_attrs: Vec::new(),
+            board_children: Vec::new(),
+            sql_children_fail: false,
         }
     }
 }
@@ -354,7 +394,13 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
-                    rest_ok(kernel.sql_data(stmt))
+                    let data = kernel.sql_data(stmt);
+                    if data.get("__sql_fail__").is_some() {
+                        return ResponseTemplate::new(500).set_body_string(
+                            r#"{"code":500,"msg":"metadata is not ready","data":[]}"#,
+                        );
+                    }
+                    rest_ok(data)
                 }
             })
             .mount(server)
@@ -709,6 +755,35 @@ impl MockKernel {
     // ——— MCP-действия над состоянием ———
 
     fn sql_data(&self, stmt: &str) -> Value {
+        // проба board-orphans: уникальная сигнатура stmt («select id,
+        // hpath, ial from blocks») — чужие SQL с hpath like не попадают
+        if stmt.contains("select id, hpath, ial from blocks") {
+            if self.sc.sql_children_fail {
+                // синтаксически валидный stmt — отказ ядра как HTTP 500
+                return json!({ "__sql_fail__": true });
+            }
+            if let Some((_, children)) = self
+                .sc
+                .board_children
+                .iter()
+                .find(|(hpath, _)| stmt.contains(&format!("hpath like '{hpath}/%'")))
+            {
+                let rows: Vec<Value> = children
+                    .iter()
+                    .map(|(id, child_hpath, updated)| {
+                        json!({
+                            "id": id,
+                            "hpath": child_hpath,
+                            "ial": format!(
+                                "{{: type=\"doc\" updated=\"{updated}\" id=\"{id}\" title=\"\"}}"
+                            ),
+                        })
+                    })
+                    .collect();
+                return json!(rows);
+            }
+            return json!([]);
+        }
         // дискавери досок задач (глобальный резолв без --project): hpath
         // сценария фильтруются той же конвенцией, что парсит резолв
         if stmt.contains("content like 'Задачи %'") {
@@ -861,6 +936,8 @@ impl MockKernel {
                 title,
                 status: self.sc.inserted_row.status.clone(),
                 task_type: self.sc.inserted_row.task_type.clone(),
+                planned: self.sc.inserted_row.planned.clone(),
+                schedule: self.sc.inserted_row.schedule.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))

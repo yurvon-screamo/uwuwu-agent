@@ -22,6 +22,9 @@ export interface RenderRow {
       isDetached?: boolean
       mSelect?: { content?: string }[]
       text?: { content?: string }
+      /** date-клетка: content — epoch ms (истина), formattedContent —
+       *  дисплей ядра (локаль ядра, перекрывает записанную строку). */
+      date?: { content?: number; formattedContent?: string }
     }
   }[]
 }

@@ -43,7 +43,8 @@ def valid_day(s: str) -> bool:
 
 def sha1_norm(text: str) -> str:
     norm = " ".join(unicodedata.normalize("NFKC", text).lower().split())
-    return hashlib.sha1(norm.encode()).hexdigest()
+    # dedup fingerprint, not a security primitive
+    return hashlib.sha1(norm.encode(), usedforsecurity=False).hexdigest()
 
 
 def statement_of(body: str) -> str | None:

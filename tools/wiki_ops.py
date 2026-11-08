@@ -25,6 +25,17 @@ kernel-транспорт (post, конфиг, константы) без выи
   orgls                              дерево: ноутбуки + подпапки
   find "тайтл"                       поиск дока по заголовку
 
+Экспорт-обвязка не проходит write-path: payload create/append/replace стрипается
+от frontmatter-блока и ведущей title-H1-строки (_strip_export_wrapper, паритет
+cli strip_export_wrapper; канон — опыт «SiYuan kernel write-path…», инцидент
+08.11 — литеральные дубли обвязки в доках). Снятое — однострочное примечание в
+stderr, payload, пустой после стрипа («один export без правок»), — отказ.
+create и replace печатают docId свежего дока: replace пересоздаёт док с новым
+id, держатель старого иначе ретраит мёртвый (инцидент 08.11). Первичный
+источник id — data ответа createDocWithMd (проба 08.11), фолбэк — getIDsByHPath
+по файловому дереву (SQL-индекс лагает, [] сразу после create); не резолвился —
+warning с рецептом find, rc 0 (мутация применена — после неё не падаем).
+
 Блочная хирургия — точечная правка rich-доков по blockID (doc-level append умеет
 только «в конец», replace пересоздаёт док и теряет привязки/живые HTML-блоки):
   block-update <blockID> --md <файл>     правка блока; payload строго один блок —
@@ -346,17 +357,134 @@ def path_safe(title: str) -> str:
     return title.replace("/", "\u2215")
 
 
+# Экспорт-обвязка ядра: frontmatter-блок + ведущая title-H1-строка поверх
+# блоков (канон — опыт «SiYuan kernel write-path…», дельта 08.11).
+FRONTMATTER_TITLE_RE = re.compile(r"^title:\s*(.+)$", re.MULTILINE)
+
+
+def _strip_export_wrapper(payload: str,
+                          title_candidates: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+    """Снятие экспорт-обвязки на входе doc-level write-path (create/replace/append):
+    frontmatter-блок («--- … ---» в самом начале) — безусловно (frontmatter дока
+    ведёт ядро, в контенте он всегда артефакт kernel markdown-export, инцидент
+    08.11); ведущая title-H1-строка («# {title}») — только при совпадении с
+    кандидатом: title_candidates (create — сырая форма тайтла и path_safe-форма;
+    replace — последний сегмент hpath) плюс title из снятого frontmatter
+    (roundtrip: fm-title — тайтл того же дока, а ведущий H1 из того же export'а
+    — артефакт, не осознанный контент). Чужая ведущая H1 и H1 в середине дока
+    не трогаются (scope — первая строка; повторные титульные строки — контракт
+    cli strip_title_h1, у wiki_ops его нет). Возврат (clean_md, список снятого):
+    вызывающий печатает примечание в stderr, когда снято что-то — трансформация
+    payload'а видима оператору, не маскировка.
+
+    LF-контракт (паритет cli): вход ожидается LF-нормализованным — kernel-экспорт
+    и агентские файлы LF; CRLF-payload fm-префикс не матчит, обвязка пройдёт
+    насквозь без стрипа и без предупреждения.
+
+    hr-коллизия (осознанный край безусловного fm-стрипа): payload, начинающийся
+    с тематик-брейка «---» и несущий второй «---» ниже (сырые YAML-примеры без
+    фенсов), потеряет текст между брейками; примечание в stderr делает
+    трансформацию видимой, канон объявляет frontmatter в контенте мусором.
+    """
+    notes: list[str] = []
+    body = payload
+    fm_title = None
+    if body.startswith("---\n"):
+        rest = body[len("---\n"):]
+        end = rest.find("\n---")
+        if end != -1:
+            match = FRONTMATTER_TITLE_RE.search(rest[:end])
+            if match:
+                fm_title = match.group(1).strip()
+            body = rest[end + len("\n---"):].lstrip("\n")
+            notes.append("frontmatter")
+    candidates = [c for c in (*title_candidates, fm_title) if c]
+    if candidates:
+        stripped = body.lstrip("\n")
+        newline = stripped.find("\n")
+        first_line = stripped if newline == -1 else stripped[:newline]
+        remainder = "" if newline == -1 else stripped[newline + 1:]
+        if any(first_line.rstrip() == f"# {c}" for c in candidates):
+            body = remainder.lstrip("\n")
+            notes.append("title-H1")
+    return body, notes
+
+
+def _note_stripped(stripped: list[str]) -> None:
+    """Примечание о снятой обвязке (вариант «strip с примечанием» задачи
+    202611080017): оператор видит, что payload преобразился, — не маскировка."""
+    if stripped:
+        print(f"payload: снята экспорт-обвязка ({', '.join(stripped)}) — "
+              "в док идёт контент без неё", file=sys.stderr)
+
+
+def _payload_empty_after_strip_error() -> RuntimeError:
+    return RuntimeError(
+        "payload пуст после снятия экспорт-обвязки — не остался ли один export "
+        "без контента? Проверь файл --md")
+
+
+# Help для payload-аргументов всех трёх doc-level write-path'ов (S1192):
+# стрип-контракт одинаков, литерал один.
+PAYLOAD_STRIP_HELP = ("payload без экспорт-обвязки "
+                      "(frontmatter/ведущий title-H1 снимутся автоматически)")
+
+
+# Фолбэк docId-резолва (getIDsByHPath по файловому дереву): бюджет поллинга
+# на транзиент синка filetree; SQL-индекс не годится (лагает на create).
+DOC_ID_FALLBACK_ATTEMPTS = 3
+
+
+def _resolve_new_doc_id(nb_id: str, hpath: str, created: object) -> str | None:
+    """docId свежесозданного дока (create/replace печатают его в выводе —
+    replace пересоздаёт док с новым id, держатель старого иначе ретраит
+    мёртвый, инцидент 08.11). created — data ответа createDocWithMd; первичный
+    источник: ядро возвращает id строкой (живая проба 08.11; cli её
+    не использовал). Фолбэк при не-строке — getIDsByHPath с ключом "path"
+    (cli-контракт doc_ids_by_hpath, cli/src/siyuan.rs; неверный ключ — тихий
+    null, проба 08.11): файловое дерево синхронно, поллинг — на транзиент
+    синка. SQL-индекс не годится ([] сразу после create — та же проба).
+    Несколько id на путь (легаси-дубли тайтлов) — None: однозначности нет.
+    None — вызывающий печатает warning с рецептом find, rc 0 (мутация
+    применена — после неё не падаем)."""
+    if isinstance(created, str) and created:
+        return created
+    for attempt in range(DOC_ID_FALLBACK_ATTEMPTS):
+        if attempt:
+            time.sleep(1)
+        ids = post("/api/filetree/getIDsByHPath", {"notebook": nb_id, "path": hpath})
+        if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], str):
+            return ids[0]
+        if isinstance(ids, list) and len(ids) > 1:
+            return None
+    return None
+
+
+def _warn_doc_id_unresolved(title_hint: str) -> None:
+    print(f"ПРЕДУПРЕЖДЕНИЕ: docId нового дока не резолвится (лаг filetree или "
+          f"дубли пути) — возьми из: wiki_ops find \"{title_hint}\"", file=sys.stderr)
+
+
 def cmd_create(a):
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
     nb_id, nb_name, prefix = _resolve_parent(a.parent)
     title = path_safe(a.title.strip("/"))
     if not title:
         raise RuntimeError(f"пустой тайтл: {a.title!r} состоит из одних слэшей — "
                            "имя дока не может быть пустым")
+    md, stripped = _strip_export_wrapper(raw_md, (a.title.strip("/"), title))
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     hpath = prefix.rstrip("/") + "/" + title
     _warn_if_adr_number_taken(nb_id, prefix.rstrip("/"), title)
-    post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
+    created = post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
     print(f"создан: [{nb_name}] {hpath}")
+    new_id = _resolve_new_doc_id(nb_id, hpath, created)
+    if new_id:
+        print(f"  docId: {new_id}")
+    else:
+        _warn_doc_id_unresolved(a.title.strip("/"))
 
 
 ADR_NUMBER_RE = re.compile(r"ADR-(\d{2,4})\b")
@@ -535,7 +663,13 @@ def cmd_append(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
+    # Стрип до guard'а: идемпотентность ретрая сверяет чистый контент, а не
+    # обвязку (иначе ретрай roundtrip-пейлоада множил бы дубль в хвосте)
+    md, stripped = _strip_export_wrapper(raw_md)
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     if a.force:
         # Осознанный дубль — single-shot: одна отсылка, без сверок и ретраев
         # (слепой луп за флагом вернул бы инцидент ×N: ядро применило, ответ
@@ -601,12 +735,17 @@ def cmd_replace(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
     # найти док → пересоздать
     stmt = f"select hpath, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
     rows = _sql_rows(stmt)
     if not rows:
         raise RuntimeError("док не найден")
+    doc_title = rows[0]["hpath"].rstrip("/").rsplit("/", 1)[-1]
+    md, stripped = _strip_export_wrapper(raw_md, (doc_title,))
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     # guard свежести до первой мутации; --force старше --base — осознанный
     # overwrite идёт без сверок, как append --force
     if not a.force:
@@ -616,8 +755,13 @@ def cmd_replace(a):
     post("/api/filetree/removeDocByID", {"id": a.docId})
     time.sleep(1)
     nb = next(n["id"] for n in notebooks() if n["name"] == nb_name)
-    post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
+    created = post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
     print(f"заменён: {hpath}")
+    new_id = _resolve_new_doc_id(nb, hpath, created)
+    if new_id:
+        print(f"  новый docId: {new_id} (старый {doc_id} мёртв — перевяжи держателей)")
+    else:
+        _warn_doc_id_unresolved(doc_title)
 
 
 def _sql_rows(stmt: str, attempts: int = 6) -> list[dict]:
@@ -1549,18 +1693,20 @@ def main():
     p.set_defaults(fn=cmd_export)
     p = sub.add_parser("create")
     p.add_argument("title")
-    p.add_argument("file")
+    p.add_argument("file", help=PAYLOAD_STRIP_HELP)
     p.add_argument("--parent", default="")
     p.set_defaults(fn=cmd_create)
     p = sub.add_parser("append")
     p.add_argument("docId")
-    p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--md", dest="file", required=True,
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--force", action="store_true",
                    help="осознанный дубль single-shot: одна отсылка без guard'а и ретраев")
     p.set_defaults(fn=cmd_append)
     p = sub.add_parser("replace")
     p.add_argument("docId")
-    p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--md", dest="file", required=True,
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--base", default=None,
                    help="снапшот свежести: нетронутый вывод wiki_ops export этого дока, снятый до правки")
     p.add_argument("--force", action="store_true",
