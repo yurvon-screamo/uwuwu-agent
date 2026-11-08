@@ -696,8 +696,8 @@ fn collect_snapshot_events(
     Ok(())
 }
 
-/// Свежие сносы первыми: сэмпл сводки cap'ится, свежий снос тела
-/// задачи не должен срезаться хвостом старых событий.
+/// Свежие сносы первыми: порядок OBSERVE-строки читабелен и устойчив —
+/// свежее событие не затерто хвостом старых.
 pub(crate) fn sort_events_newest_first(events: &mut [DeleteEvent]) {
     events.sort_by_key(|e| std::cmp::Reverse(e.snapshot_at));
 }
@@ -721,31 +721,34 @@ pub(crate) fn collect_delete_events(
             .file_name()
             .to_str()
             .is_some_and(is_delete_snapshot_dir);
-        if !is_delete || !delete_in_window(entry.metadata()?.modified()?, now, window) {
+        let meta = entry.metadata()?;
+        if !is_delete || !delete_in_window(meta.modified()?, now, window) {
             continue;
         }
-        let snapshot_at = entry.metadata()?.modified()?;
-        collect_snapshot_events(&entry.path(), snapshot_at, &mut events)?;
+        collect_snapshot_events(&entry.path(), meta.modified()?, &mut events)?;
     }
     Ok(events)
 }
 
-/// Сэмпл событий: head cap + «…+N» (паттерн orphan_sample).
-pub(crate) fn delete_sample(events: &[DeleteEvent], cap: usize) -> String {
-    let head: Vec<String> = events
+/// Формат события в OBSERVE-строке.
+fn format_event(e: &DeleteEvent) -> String {
+    match &e.title {
+        Some(title) => format!("{} «{title}»", e.doc_id),
+        None => format!("{} (без тайтла)", e.doc_id),
+    }
+}
+
+/// OBSERVE-строка без cap: оборот сносов на живой доске 100+/сутки —
+/// сэмпл head-5 не доносит снос тела задачи до наблюдателя (ревью:
+/// потерянный док на 71-й позиции из 107). Канал «событие сноса →
+/// сводка lead» обязан работать целиком; цена — длинная строка при
+/// батч-чистках, осознанный компромисс наблюдения.
+pub(crate) fn format_event_list(events: &[DeleteEvent]) -> String {
+    events
         .iter()
-        .take(cap)
-        .map(|e| match &e.title {
-            Some(title) => format!("{} «{title}»", e.doc_id),
-            None => format!("{} (без тайтла)", e.doc_id),
-        })
-        .collect();
-    let more = if events.len() > cap {
-        format!(" …+{}", events.len() - cap)
-    } else {
-        String::new()
-    };
-    format!("{}{more}", head.join("; "))
+        .map(format_event)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Сносы доков за окно из истории воркспейса `<ws>/history`. Проба
@@ -783,7 +786,7 @@ fn history_deletes_probe() -> ProbeOutcome {
         ProbeVerdict::Observed(format!(
             "сносы доков за окно: {} — {}",
             events.len(),
-            delete_sample(&events, 5)
+            format_event_list(&events)
         )),
     )
 }
@@ -791,8 +794,8 @@ fn history_deletes_probe() -> ProbeOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_delete_events, collect_sy_ids, delete_in_window, delete_sample, diff_id_lists,
-        doc_updated_date, doctor_exit_code, fs_sql_pair_verdict, is_delete_snapshot_dir,
+        collect_delete_events, collect_sy_ids, delete_in_window, diff_id_lists, doc_updated_date,
+        doctor_exit_code, format_event_list, fs_sql_pair_verdict, is_delete_snapshot_dir,
         orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves,
         sort_events_newest_first, wave_verdict, BoardChildDoc, ProbeOutcome, ProbeVerdict,
     };
@@ -1061,6 +1064,15 @@ mod tests {
         std::fs::write(snapshot.join(format!("nb/parents/{doc_id}.sy")), stub).expect("write");
     }
 
+    /// Невалидный JSON в стабе (обрыв записи ядра) — событие без тайтла,
+    /// сбор не падает.
+    fn write_broken_snapshot(history: &Path, dir: &str, doc_id: &str) {
+        let snapshot = history.join(dir);
+        std::fs::create_dir_all(snapshot.join("nb")).expect("mkdir");
+        let broken = format!(r#"{{"ID":"{doc_id}"#);
+        std::fs::write(snapshot.join(format!("nb/{doc_id}.sy")), broken).expect("write");
+    }
+
     #[test]
     fn collect_delete_events_reads_stubs_of_fresh_delete_dirs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1145,29 +1157,50 @@ mod tests {
     }
 
     #[test]
-    fn delete_sample_caps_head_and_marks_untitled() {
-        let events = vec![
-            super::DeleteEvent {
-                doc_id: "doc-1".into(),
+    fn collect_delete_events_reads_broken_stub_without_title() {
+        // Кривой JSON стаба (обрыв записи) — событие сохраняется, тайтл
+        // отсутствует: сбор не падает на частичной записи ядра.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = dir.path().join("history");
+        write_broken_snapshot(
+            &history,
+            "2026-11-08-021321-delete",
+            "20261104033524-4d37yk0",
+        );
+
+        let events = collect_delete_events(
+            &history,
+            std::time::SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .expect("collect");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].doc_id, "20261104033524-4d37yk0");
+        assert!(events[0].title.is_none());
+    }
+
+    #[test]
+    fn format_event_list_lists_every_event_without_cap() {
+        // Канал «событие сноса → сводка» обязан работать при реальном
+        // обороте: перечисление без cap — свежий снос тела задачи не
+        // срезается cap'ом (ревью: инцидент на 71-й позиции из 107).
+        let events: Vec<super::DeleteEvent> = (1..=70)
+            .map(|n| super::DeleteEvent {
+                doc_id: format!("doc{n}"),
+                title: Some(format!("тайтл{n}")),
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
+            })
+            .chain([super::DeleteEvent {
+                doc_id: "lost".into(),
                 title: Some("таймер бэкапов".into()),
                 snapshot_at: std::time::SystemTime::UNIX_EPOCH,
-            },
-            super::DeleteEvent {
-                doc_id: "doc-2".into(),
-                title: None,
-                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
-            },
-            super::DeleteEvent {
-                doc_id: "doc-3".into(),
-                title: Some("третий".into()),
-                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
-            },
-        ];
-        let text = delete_sample(&events, 2);
-        assert!(text.contains("doc-1 «таймер бэкапов»"), "{text}");
-        assert!(text.contains("doc-2 (без тайтла)"), "{text}");
-        assert!(text.contains("…+1"), "{text}");
-        assert!(!text.contains("третий"), "{text}");
+            }])
+            .collect();
+        let text = format_event_list(&events);
+        assert!(text.contains("lost «таймер бэкапов»"), "{text}");
+        assert!(text.contains("doc1 «тайтл1»"), "{text}");
+        assert!(text.contains("doc70 «тайтл70»"), "{text}");
+        assert!(!text.contains("…+"), "без cap нет хвостовой метки: {text}");
     }
 
     #[test]
