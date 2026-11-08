@@ -10,16 +10,12 @@ import { fetchSessionsByParents, fetchSessionById, type SessionRow } from "./ses
 // ——— типы ———
 
 /** Сигнал спавна сессии задачи (фабрика пишет при каждом старте
- *  дев/ревью/тест-сессии, включая рестарты — история корней не теряется). */
+ *  дев/ревью/тест-сессии, включая рестарты — история корней не теряется).
+ *  Минимальный контракт: дример читает только sessionID→rowId для активного
+ *  набора; ts — фильтр запоздалых сигналов закрытых циклов. */
 export interface TaskStartSignal {
   rowId: string
-  project: string
-  title: string
   sessionID: string
-  /** каталог env-задачи; "" — env:false (сессия живёт в directory) */
-  envDir: string
-  /** мастер-чекаут проекта — cwd дример-сессии задачного прогона */
-  directory: string
   ts: number
 }
 
@@ -137,17 +133,11 @@ const isRowId = (v: unknown): v is string => typeof v === "string" && /^[0-9]{14
 
 function parseStartSignal(raw: Record<string, unknown>): TaskStartSignal | null {
   if (!isRowId(raw.rowId)) return null
-  if (typeof raw.project !== "string" || typeof raw.title !== "string") return null
   if (typeof raw.sessionID !== "string" || !raw.sessionID.startsWith("ses_")) return null
-  if (typeof raw.envDir !== "string" || typeof raw.directory !== "string") return null
   if (typeof raw.ts !== "number") return null
   return {
     rowId: raw.rowId,
-    project: raw.project,
-    title: raw.title,
     sessionID: raw.sessionID,
-    envDir: raw.envDir,
-    directory: raw.directory,
     ts: raw.ts,
   }
 }
@@ -233,6 +223,34 @@ export function batchMaxUpdated(sessions: SessionRow[]): number {
 }
 
 // ——— state-машина задачного прогона ———
+
+/** Кандидат задачного прогона: pending (первый) или failed при живых попытках
+ *  (ретрай — паритет посессионного pickCandidates "retry"). */
+export interface TaskRunCandidate {
+  rowId: string
+  tracked: TrackedTaskRun
+  /** wakeup — живая дример-сессия из state (демон верифицирует REST);
+   *  spawn — нет сессии или мёртвая */
+  action: "spawn" | "wakeup"
+}
+
+/** Адмиссия задачных прогонов: pending всегда, failed — пока попытки живы.
+ *  running реконсилируется отдельно; done/gave_up — финал (gave_up снимает
+ *  активный набор, повторный прогон — только новым done-сигналом). */
+export function pickTaskRunCandidates(
+  taskRuns: Record<string, TrackedTaskRun>,
+  maxAttempts: number,
+): TaskRunCandidate[] {
+  const out: TaskRunCandidate[] = []
+  for (const [rowId, tracked] of Object.entries(taskRuns)) {
+    if (tracked.status === "pending") {
+      out.push({ rowId, tracked, action: tracked.dreamerSes !== null ? "wakeup" : "spawn" })
+    } else if (tracked.status === "failed" && tracked.attempts < maxAttempts) {
+      out.push({ rowId, tracked, action: tracked.dreamerSes !== null ? "wakeup" : "spawn" })
+    }
+  }
+  return out
+}
 
 export interface TaskRunOutcome {
   /** сессия дримера отвечала (assistant-сообщение) — работа сделана */

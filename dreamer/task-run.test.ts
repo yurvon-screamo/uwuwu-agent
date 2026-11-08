@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite"
 import {
   acceptDoneSignal, applyTaskRunOutcome, batchMaxUpdated, collectTaskSessions,
   dropTaskActiveSessions, mergeActiveSession, normalizeActiveSessions,
-  normalizeTrackedRun, parseQueuedSignal, taskRunPrompt,
+  normalizeTrackedRun, parseQueuedSignal, pickTaskRunCandidates, taskRunPrompt,
   type TaskDoneSignal, type TrackedTaskRun,
 } from "./task-run-lib"
 import { fetchRootSessions } from "./dreamer-lib"
@@ -33,11 +33,7 @@ afterAll(() => db.close())
 
 const startSignal = {
   rowId: "20261108000000-abc123",
-  project: "uwuwu",
-  title: "задача",
   sessionID: "ses_dev1",
-  envDir: "/home/x/agents-env/r/repo",
-  directory: "/home/x/uwuwu-agent",
   ts: 1_000,
 }
 
@@ -98,6 +94,53 @@ describe("active sessions helpers", () => {
   test("normalize фильтрует мусор state", () => {
     const active = normalizeActiveSessions({ ses_ok: "row-1", junk: "row-2", ses_bad: 42 })
     expect(active).toEqual({ ses_ok: "row-1" })
+  })
+})
+
+// ——— адмиссия задачных прогонов (ретраи failed) ———
+
+describe("pickTaskRunCandidates", () => {
+  const track = (over: Partial<TrackedTaskRun>): TrackedTaskRun => ({
+    status: "pending", project: "uwuwu", title: "t", rootSessions: ["ses_a"],
+    branch: "b", pr: "", envDir: "", directory: "/x", closedAt: 1,
+    lastProcessedUpdate: 0, attempts: 0, dreamerSes: null, wokenAt: 0, at: 0,
+    ...over,
+  })
+
+  test("pending без дример-сессии — spawn", () => {
+    const cands = pickTaskRunCandidates({ row1: track({}) }, 3)
+    expect(cands).toHaveLength(1)
+    expect(cands[0]).toMatchObject({ rowId: "row1", action: "spawn" })
+  })
+
+  test("pending с живой дример-сессией (stuck-pending) — wakeup", () => {
+    const cands = pickTaskRunCandidates({ row1: track({ dreamerSes: "ses_dream" }) }, 3)
+    expect(cands[0]?.action).toBe("wakeup")
+  })
+
+  test("failed с живыми попытками — ретрай (wakeup той же сессии)", () => {
+    const cands = pickTaskRunCandidates({ row1: track({ status: "failed", attempts: 1, dreamerSes: "ses_dream" }) }, 3)
+    expect(cands).toHaveLength(1)
+    expect(cands[0]?.action).toBe("wakeup")
+  })
+
+  test("failed с живыми попытками и без дример-сессии — respawn", () => {
+    const cands = pickTaskRunCandidates({ row1: track({ status: "failed", attempts: 2 }) }, 3)
+    expect(cands).toHaveLength(1)
+    expect(cands[0]?.action).toBe("spawn")
+  })
+
+  test("failed на исчерпании попыток — не кандидат (gave_up снимет активный набор в реконсиле)", () => {
+    expect(pickTaskRunCandidates({ row1: track({ status: "failed", attempts: 3 }) }, 3)).toEqual([])
+  })
+
+  test("running и финальные статусы — не кандидаты", () => {
+    const cands = pickTaskRunCandidates({
+      row_running: track({ status: "running", dreamerSes: "ses_d" }),
+      row_done: track({ status: "done" }),
+      row_gave_up: track({ status: "gave_up", attempts: 3 }),
+    }, 3)
+    expect(cands).toEqual([])
   })
 })
 

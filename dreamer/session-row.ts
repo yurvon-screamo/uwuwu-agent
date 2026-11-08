@@ -10,9 +10,10 @@ import { E2E_SESSION_PREFIX } from "../lib/e2e-tag"
 export const E2E_SKIP_LIKE = `${E2E_SESSION_PREFIX}%`
 
 /** SQL-хвост исключений сессий дримера и e2e-синтетики — общий для всех
- *  выборок (посессионный пул, backlog-разметка, сбор сессий задачи). */
+ *  выборок (посессионный пул, backlog-разметка, сбор сессий задачи).
+ *  Плейсхолдер LIKE-паттерна — второй параметр вызова. */
 export const SESSION_EXCLUSIONS_SQL =
-  `COALESCE(agent, '') != 'dreamer' AND COALESCE(title, '') NOT LIKE ${"?"}`
+  `COALESCE(agent, '') != 'dreamer' AND COALESCE(title, '') NOT LIKE ?`
 
 export interface SessionRow {
   id: string

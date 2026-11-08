@@ -19,7 +19,7 @@ import {
 import {
   acceptDoneSignal, applyTaskRunOutcome, batchMaxUpdated, collectTaskSessions,
   dropTaskActiveSessions, mergeActiveSession, normalizeActiveSessions,
-  normalizeTrackedRun, parseQueuedSignal, taskRunPrompt,
+  normalizeTrackedRun, parseQueuedSignal, pickTaskRunCandidates, taskRunPrompt,
   type TaskDoneSignal, type TrackedTaskRun,
 } from "./task-run-lib"
 import { fetchSessionById, sessionTimedOut } from "./session-row"
@@ -333,8 +333,10 @@ function taskRunPromptFor(
   })
 }
 
-/** Открыть задачный прогон: собрать пакет сессий, зафиксировать границу дедупа,
- *  спавнить дример-сессию в мастер-чекауте проекта (без parentID — env снесён). */
+/** Открыть задачный прогон: собрать пакет сессий, спавнить дример-сессию
+ *  в мастер-чекауте проекта (без parentID — env снесён). Границу дедупа
+ *  продвигает ТОЛЬКО финал прогона (applyTaskRunOutcome по replied): при
+ *  провале граница не должна врать «пакет анализировался». */
 async function startTaskRun(state: DreamerState, db: Database, rowId: string, tracked: TrackedTaskRun): Promise<void> {
   const sessions = collectTaskSessions(db, tracked.rootSessions)
   if (sessions.length === 0) {
@@ -346,7 +348,6 @@ async function startTaskRun(state: DreamerState, db: Database, rowId: string, tr
     log(`задача ${rowId.slice(0, 8)}: сессий по истории корней нет в БД — прогон закрыт без анализа`)
     return
   }
-  tracked.lastProcessedUpdate = Math.max(tracked.lastProcessedUpdate, batchMaxUpdated(sessions))
   tracked.status = "running"
   tracked.at = Date.now()
   saveState(state)
@@ -559,16 +560,18 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     saveState(state)
   }
 
-  // ——— задачные кандидаты: pending-треки (done-сигналы фабрики). Слот
-  //     общий с посессионными прогонами; ретрай — wakeup живой дример-сессии
-  //     (инвариант 1=1), spawn при мёртвой/отсутствующей. ———
-  for (const [rowId, tracked] of Object.entries(state.taskRuns)) {
-    if (tracked.status !== "pending") continue
+  // ——— задачные кандидаты: pending и failed-ретраи (паритет посессионного
+  //     pickCandidates "retry"). Слот общий с посессионными прогонами; ретрай —
+  //     wakeup живой дример-сессии (инвариант 1=1), spawn при мёртвой/отсутствующей.
+  //     Граница дедупа и активный набор живут до финала прогона —
+  //     applyTaskRunOutcome/dropTaskActiveSessions на done/gave_up. ———
+  for (const cand of pickTaskRunCandidates(state.taskRuns, MAX_ATTEMPTS)) {
+    const { rowId, tracked } = cand
     if (activeRuns() >= CONCURRENCY) break
     if (drain.isStopping()) break
-    if (tracked.dreamerSes !== null) {
-      // ретрай failed: живой дример получает повторный промпт (помнит контекст)
-      const alive = await sessionAlive(tracked.dreamerSes)
+    if (cand.action === "wakeup") {
+      // верификация живости: либа детерминирована от state, REST — здесь
+      const alive = await sessionAlive(tracked.dreamerSes as string)
       if (alive === true) {
         // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
         // закроет как failed+attempt, восстановления без потерь)
@@ -592,7 +595,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
       }
       if (alive === null) continue // неизвестно — не решаем
       // 404/400: дример-сессия удалена → spawn-fallback
-      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${tracked.dreamerSes.slice(0, 8)} мертва — пересоздание`)
+      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${tracked.dreamerSes?.slice(0, 8)} мертва — пересоздание`)
       tracked.dreamerSes = null
     }
     if (DRY_RUN) {

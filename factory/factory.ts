@@ -812,7 +812,7 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
-  writeTaskStartSignal(task.rowId, entry, sessionID, envDir ?? "", envCtx?.repoDir ?? cfg.local)
+  writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
 
@@ -855,7 +855,15 @@ async function finishTask(
     return
   }
   log(`задача ${rowId.slice(0, 8)}: Done — done-сигнал дримеру + чистка state`)
-  writeTaskDoneSignal(rowId, tracked, cfg)
+  // запись сигнала обязательна: при сбое (диск/права) чистка откладывается —
+  // трек жив, Done-строка в скане → ретрай finishTask следующим тиком.
+  // Удаление state без сигнала = тихая полная потеря пост-обработки задачи
+  // (сессии остались бы и в активном наборе дримера — посессионный пул
+  // скипал бы их вечно).
+  if (!writeTaskDoneSignal(rowId, tracked, cfg)) {
+    log(`задача ${rowId.slice(0, 8)}: done-сигнал не записан — чистка отложена, ретрай следующим тиком`)
+    return
+  }
   const hasEnv = tracked.envDir !== undefined || tracked.worktree !== ""
   if (hasEnv) {
     const outcome = await cleanupEnv(envDeps(), {
@@ -893,40 +901,40 @@ type QueueSignalTask = Pick<TrackedTask,
   | "reviewSessionID" | "testSessionID" | "branch" | "mergedPrUrl">
 
 /** Атомарная запись файла очереди (tmp + rename): дример забирает готовый
- *  JSON, полуфайлов не видит. */
-function writeQueueSignal(fileName: string, payload: Record<string, unknown>): void {
+ *  JSON, полуфайлов не видит. true = записан; false = сбой (диск/права) —
+ *  вызывающий решает (done — чистка откладывается, start — деградация к
+ *  посессионной обработке). */
+function writeQueueSignal(fileName: string, payload: Record<string, unknown>): boolean {
   try {
     mkdirSync(DREAMER_QUEUE_DIR, { recursive: true })
     const tmp = join(DREAMER_QUEUE_DIR, `${fileName}.tmp`)
     writeFileSync(tmp, JSON.stringify(payload))
     renameSync(tmp, join(DREAMER_QUEUE_DIR, fileName))
     log(`очередь дримера: ${fileName} записан`)
+    return true
   } catch (e) {
-    // потеря сигнала = деградация к посессионной обработке сессий задачи;
-    // не валим спавн/чистку, но громко в лог
     log(`очередь дримера: ${fileName} не записан — ${e}`)
+    return false
   }
 }
 
 /** Start-сигнал: сессия задачи известна активному набору дримера —
  *  посессионный контур скипает её до закрытия задачи (все проекты единообразно). */
-function writeTaskStartSignal(rowId: string, tracked: QueueSignalTask, sessionID: string, envDir: string, directory: string): void {
-  writeQueueSignal(`start-${rowId}.json`, {
-    rowId, project: tracked.project, title: tracked.title,
-    sessionID, envDir, directory, ts: Date.now(),
-  })
+function writeTaskStartSignal(rowId: string, sessionID: string): void {
+  writeQueueSignal(`start-${rowId}.json`, { rowId, sessionID, ts: Date.now() })
 }
 
 /** Done-сигнал: постановка задачного прогона. rootSessions — полная история
- *  корней (sessionHistory + текущие id легаси-треков без истории). */
-function writeTaskDoneSignal(rowId: string, tracked: QueueSignalTask, cfg: ProjectCfg): void {
+ *  корней (sessionHistory + текущие id легаси-треков без истории).
+ *  true = записан; false — вызывающий обязан отложить чистку (см. finishTask). */
+function writeTaskDoneSignal(rowId: string, tracked: QueueSignalTask, cfg: ProjectCfg): boolean {
   const rootSessions = [...new Set([
     ...(tracked.sessionHistory ?? []),
     tracked.sessionID,
     tracked.reviewSessionID ?? "",
     tracked.testSessionID ?? "",
   ].filter((s) => s.startsWith("ses_")))]
-  writeQueueSignal(`done-${rowId}.json`, {
+  return writeQueueSignal(`done-${rowId}.json`, {
     rowId, project: tracked.project, title: tracked.title,
     rootSessions,
     branch: tracked.branch, pr: mergedPrUrlOf(tracked),
@@ -1101,7 +1109,7 @@ async function startReview(
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
   await setCellsSafe(board, task.rowId, { [REVIEW_SESSION_CELL]: sessionID })
-  writeTaskStartSignal(task.rowId, tracked, sessionID, tracked.envDir ?? "", worktree !== "" ? worktree : cfg.local)
+  writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: ревью-сессия ${sessionID} (${kind})`)
 }
 
@@ -1155,7 +1163,7 @@ async function startTesting(
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
   await setCellsSafe(board, task.rowId, { [TEST_SESSION_CELL]: sessionID })
-  writeTaskStartSignal(task.rowId, tracked, sessionID, tracked.envDir ?? "", worktree !== "" ? worktree : cfg.local)
+  writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: тест-сессия ${sessionID}`)
 }
 

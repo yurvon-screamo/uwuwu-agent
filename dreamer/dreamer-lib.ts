@@ -4,7 +4,7 @@
 // дримеру. Сессии живых задач скипаются по активному набору (task-run-lib —
 // задачный контур). SQLite — bun:sqlite, всегда readonly.
 
-import type { Database } from "bun:sqlite"
+import type { Database, SQLQueryBindings } from "bun:sqlite"
 import {
   E2E_SKIP_LIKE, fetchSessionById, hasAssistantReply, hasAssistantReplySince,
   rowToSession, sessionTimedOut, SESSION_EXCLUSIONS_SQL, type SessionRow,
@@ -109,9 +109,14 @@ export function fetchRootSessions(
   // Исключён только сам dreamer — его прогоны не анализируют сами себя.
   // Помеченные e2e-сессии (конвенция lib/e2e-tag.ts) — синтетика, не пост-
   // обрабатывается: риг 04.11 без маркера породил 30 прогонов на 31 смоке.
-  // Сессии живых задач (активный набор из start-сигналов фабрики) скипаются:
-  // задачи пост-обрабатываются пакетом после закрытия (task-run-lib) — единый
-  // критерий принадлежности для всех проектов, без directory-эвристик.
+  // Сессии живых задач (активный набор из start-сигналов фабрики) скипаются
+  // в SQL до LIMIT: задачи пост-обрабатываются пакетом после закрытия
+  // (task-run-lib) — единый критерий принадлежности для всех проектов,
+  // без directory-эвристик; активные строки не съедают слоты выборки.
+  const activeIds = Object.keys(activeSessions)
+  const activeFilter = activeIds.length > 0
+    ? ` AND id NOT IN (${activeIds.map(() => "?").join(", ")})`
+    : ""
   const rows = db
     .query(
       `SELECT id, title, directory, agent, parent_id, time_created, time_updated
@@ -119,14 +124,12 @@ export function fetchRootSessions(
        WHERE COALESCE(agent, '') != 'dreamer'
          AND parent_id IS NULL
          AND time_updated < ?
-         AND COALESCE(title, '') NOT LIKE ?
+         AND COALESCE(title, '') NOT LIKE ?${activeFilter}
        ORDER BY time_updated DESC
        LIMIT ?`,
     )
-    .all(beforeMs, E2E_SKIP_LIKE, limit) as Array<Record<string, unknown>>
-  return rows
-    .map(rowToSession)
-    .filter((row) => activeSessions[row.id] === undefined)
+    .all(...([beforeMs, E2E_SKIP_LIKE, ...activeIds, limit] as SQLQueryBindings[])) as Array<Record<string, unknown>>
+  return rows.map(rowToSession)
 }
 
 export type CandidateReason = "new" | "revived" | "retry" | "stuck-pending"
