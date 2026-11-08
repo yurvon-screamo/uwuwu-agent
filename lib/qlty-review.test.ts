@@ -5,7 +5,6 @@
 import { describe, expect, test } from "bun:test"
 import {
   applyFilters,
-  classifyDelta,
   parseSarif,
   renderReport,
   SARIF_CONTRACT_FIELDS,
@@ -149,42 +148,6 @@ describe("applyFilters — paths и level", () => {
   })
 })
 
-describe("classifyDelta — multiset-сверка без line", () => {
-  test("сдвиг строки не делает pre-existing «введённым»", () => {
-    const current = [f({ line: 42 })]
-    const baseline = [f({ line: 17 })]
-    const { introduced, baselineMatched } = classifyDelta(current, baseline)
-    expect(introduced).toHaveLength(0)
-    expect(baselineMatched).toHaveLength(1)
-  })
-
-  test("новый ключ → introduced", () => {
-    const current = [f({ line: 42 }), f({ ruleId: "ruff:F841", line: 50, message: "Local variable `z` is assigned to but never used" })]
-    const baseline = [f({ line: 17 })]
-    const { introduced, baselineMatched } = classifyDelta(current, baseline)
-    expect(introduced).toHaveLength(1)
-    expect(introduced[0].ruleId).toBe("ruff:F841")
-    expect(baselineMatched).toHaveLength(1)
-  })
-
-  test("count-разница: второй дубль того же ключа → introduced", () => {
-    const current = [f({ line: 1 }), f({ line: 9 })]
-    const baseline = [f({ line: 3 })]
-    const { introduced, baselineMatched } = classifyDelta(current, baseline)
-    expect(introduced).toHaveLength(1)
-    expect(introduced[0].line).toBe(9)
-    expect(baselineMatched).toHaveLength(1)
-  })
-
-  test("разные файлы с одинаковым message — разные ключи", () => {
-    const current = [f({ path: "src/other.py", line: 1 })]
-    const baseline = [f({ path: "src/a.py", line: 1 })]
-    const { introduced, baselineMatched } = classifyDelta(current, baseline)
-    expect(introduced).toHaveLength(1)
-    expect(baselineMatched).toHaveLength(0)
-  })
-})
-
 describe("renderReport — формат по мотивам qltysh", () => {
   test("группы, атрибуция [plugin:rule], итог", () => {
     const md = renderReport({
@@ -193,17 +156,15 @@ describe("renderReport — формат по мотивам qltysh", () => {
       upstream: "origin/master",
       directory: "/repo",
       notes: [],
-      introduced: [f({ ruleId: "ruff:F401", path: "src/new.py", line: 3 })],
-      baselineMatched: [f({ ruleId: "clippy:needless_range_loop", path: "cli/src/old.rs", line: 88, level: "warning", message: "this for-loop..." })],
+      delta: [f({ ruleId: "ruff:F401", path: "src/new.py", line: 3 })],
       smells: [f({ ruleId: "qlty:similar-code", path: "src/x.py", line: 10, level: "warning", message: "Found 16 lines of similar code in 2 locations (mass = 53)" })],
     })
     expect(md).toContain("**Машинный ревью (qlty v0.661.0)** — scope `diff`")
-    expect(md).toContain("**Введено веткой (delta)**")
+    expect(md).toContain("**Delta (qlty check --upstream: находки в изменённых строках)**")
     expect(md).toContain("- [ruff:F401] src/new.py:3 (warning) — `os` imported but unused")
-    expect(md).toContain("**Baseline (pre-existing, не от этой ветки)**")
-    expect(md).toContain("- [clippy:needless_range_loop] cli/src/old.rs:88")
     expect(md).toContain("**Smells (qlty smells, новые против upstream)**")
-    expect(md).toContain("Итог: 1 введено + 1 baseline + 1 smells.")
+    expect(md).toContain("- [qlty:similar-code] src/x.py:10")
+    expect(md).toContain("Итог: 1 delta + 1 smells.")
   })
 
   test("чистый прогон — без групп, ✅-итог", () => {
@@ -213,12 +174,12 @@ describe("renderReport — формат по мотивам qltysh", () => {
       upstream: "origin/master",
       directory: "/repo",
       notes: [],
-      introduced: [],
-      baselineMatched: [],
+      delta: [],
       smells: [],
     })
-    expect(md).toContain("✅ новых машинных находок нет (baseline: 0)")
-    expect(md).not.toContain("**Введено веткой")
+    expect(md).toContain("✅ новых машинных находок нет.")
+    expect(md).not.toContain("**Delta (")
+    expect(md).not.toContain("**Smells (")
   })
 
   test("notes идут предупреждениями в шапку", () => {
@@ -229,8 +190,7 @@ describe("renderReport — формат по мотивам qltysh", () => {
       directory: "/repo",
       commit: "abc123",
       notes: ["scope=commit: прогон по рабочей копии."],
-      introduced: [],
-      baselineMatched: [],
+      delta: [],
       smells: [],
     })
     expect(md).toContain("scope `commit` (`abc123`)")
@@ -243,29 +203,22 @@ describe("renderReport — формат по мотивам qltysh", () => {
 interface FakeRepo {
   /** вывод git-команд по первому аргументу */
   git: Record<string, string>
-  /** SARIF по cwd: текущий репо vs baseline-ворктри */
-  qltyByCwd: (cwd: string, args: string[]) => string
-  tmpWorktrees: string[]
+  /** ответ qlty по аргументам; throw в fake —qlty не должен был вызываться */
+  qlty: (args: string[]) => string
 }
 
 function fakeDeps(repo: FakeRepo): ReviewDeps {
   return {
     git: async (args: string[], _cwd: string) => {
-      const head = args[0]
-      if (head === "worktree" && args[1] === "add") {
-        repo.tmpWorktrees.push(args[3])
-        return ""
-      }
-      if (head === "worktree" && args[1] === "remove") return ""
       const key = args.join(" ")
       if (!(key in repo.git)) throw new Error(`fake git: нет сценария для «${key}»`)
       return repo.git[key]
     },
-    qlty: async (args: string[], cwd: string) => repo.qltyByCwd(cwd, args),
+    qlty: async (args: string[]) => repo.qlty(args),
   }
 }
 
-const CURRENT_SARIF = JSON.stringify({
+const DELTA_SARIF = JSON.stringify({
   runs: [
     {
       tool: { driver: { semanticVersion: "0.661.0" } },
@@ -287,136 +240,97 @@ const CURRENT_SARIF = JSON.stringify({
   ],
 })
 
-const BASELINE_SARIF = JSON.stringify({
-  runs: [
-    {
-      tool: { driver: { semanticVersion: "0.661.0" } },
-      results: [
-        {
-          ruleId: "clippy:needless_return",
-          level: "warning",
-          message: { text: "unneeded `return` statement" },
-          locations: [{ physicalLocation: { artifactLocation: { uri: "src/changed.py" }, region: { startLine: 7 } } }],
-        },
-      ],
-    },
-  ],
-})
-
 const SMELLS_EMPTY = JSON.stringify({ runs: [{ tool: { driver: { semanticVersion: "0.661.0" } }, results: [] }] })
 
+// qlty на пустой дельте отвечает текстом, не SARIF (живая проба 08.11)
+const NO_MODIFIED = "No modified files for checks were found on your branch.\n✔ No issues\n"
+
+const isSmellsCall = (args: string[]) => args[0] === "smells"
+
 describe("runReview — оркестрация на fake-deps", () => {
-  test("diff: delta-классификация против baseline-ворктри на merge-base", async () => {
+  test("diff: строковая дельта против merge-base через qlty --upstream", async () => {
+    let upstreamArg: string | undefined
     const repo: FakeRepo = {
-      git: {
-        "merge-base origin/master HEAD": "abcbase123",
-        "diff --name-only --diff-filter=d abcbase123": "src/changed.py\n",
-        "ls-files --others --exclude-standard": "src/untracked.py\n",
-        "ls-tree -r --name-only abcbase123": "src/changed.py\n",
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      qlty: (args) => {
+        if (isSmellsCall(args)) {
+          upstreamArg = args[args.indexOf("--upstream") + 1]
+          return SMELLS_EMPTY
+        }
+        expect(args).toContain("--upstream")
+        expect(args).toContain("abcbase123")
+        return DELTA_SARIF
       },
-      qltyByCwd: (cwd, args) => {
-        if (args[0] === "smells") return SMELLS_EMPTY
-        return cwd.includes("qlty-review-baseline") ? BASELINE_SARIF : CURRENT_SARIF
-      },
-      tmpWorktrees: [],
     }
-    const r = await runReview(
-      { scope: "diff", directory: "/repo", upstream: "origin/master" },
-      fakeDeps(repo),
-    )
-    // needless_return есть и в baseline (строка сдвинулась 7→9) → baseline;
-    // F401 — только в current → введено; untracked в путях прогона
-    expect(r.introduced).toBe(1)
-    expect(r.baseline).toBe(1)
+    const r = await runReview({ scope: "diff", directory: "/repo", upstream: "origin/master" }, fakeDeps(repo))
+    expect(r.delta).toBe(2)
     expect(r.smells).toBe(0)
+    expect(r.qltyVersion).toBe("0.661.0")
     expect(r.markdown).toContain("[ruff:F401] src/changed.py:1")
-    expect(r.markdown).toContain("Baseline (pre-existing")
-    expect(repo.tmpWorktrees).toHaveLength(1)
+    expect(r.markdown).toContain("Delta (qlty check --upstream")
+    // smells — против той же базы merge-base
+    expect(upstreamArg).toBe("abcbase123")
   })
 
-  test("commit: пути из diff-tree + note в отчёте", async () => {
+  test("commit: база — родитель коммита (rev-parse ^), note в отчёте", async () => {
     const repo: FakeRepo = {
-      git: {
-        "merge-base origin/master HEAD": "abcbase123",
-        "diff-tree --no-commit-id --name-only --diff-filter=d -r feedbac4": "src/changed.py\n",
-        "ls-tree -r --name-only abcbase123": "src/changed.py\n",
+      git: { "rev-parse feedbac4^": "abcbase123" },
+      qlty: (args) => {
+        if (isSmellsCall(args)) return SMELLS_EMPTY
+        expect(args).toContain("abcbase123")
+        return DELTA_SARIF
       },
-      qltyByCwd: (_cwd, args) => (args[0] === "smells" ? SMELLS_EMPTY : CURRENT_SARIF),
-      tmpWorktrees: [],
     }
-    const r = await runReview(
-      { scope: "commit", directory: "/repo", commit: "feedbac4" },
-      fakeDeps(repo),
-    )
+    const r = await runReview({ scope: "commit", directory: "/repo", commit: "feedbac4" }, fakeDeps(repo))
     expect(r.markdown).toContain("scope `commit` (`feedbac4`)")
     expect(r.markdown).toContain("> ⚠ scope=commit: прогон по рабочей копии")
+    expect(r.delta).toBe(2)
   })
 
-  test("новые файлы не попадают в baseline-пробу", async () => {
+  test("commit без родителя (корневой) — громкая ошибка", async () => {
     const repo: FakeRepo = {
-      git: {
-        "merge-base origin/master HEAD": "abcbase123",
-        "diff --name-only --diff-filter=d abcbase123": "src/new_file.py\n",
-        "ls-files --others --exclude-standard": "",
-        "ls-tree -r --name-only abcbase123": "src/other.py\n",
+      git: { "rev-parse rootcafe^": "" },
+      qlty: () => {
+        throw new Error("qlty не должен вызываться без базы")
       },
-      qltyByCwd: (cwd, args) => {
-        if (args[0] === "smells") return SMELLS_EMPTY
-        if (cwd.includes("qlty-review-baseline")) throw new Error("baseline-прогон не должен был случиться: путь не существует на base")
-        return CURRENT_SARIF
+    }
+    expect(
+      runReview({ scope: "commit", directory: "/repo", commit: "rootcafe" }, fakeDeps(repo)),
+    ).rejects.toThrow(/нет родителя/)
+  })
+
+  test("пустая дельта — qlty отвечает «No modified files» → n/a, smells не вызывается", async () => {
+    const repo: FakeRepo = {
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      qlty: (args) => {
+        if (isSmellsCall(args)) throw new Error("smells не должен вызываться на пустой дельте")
+        expect(args).toContain("--upstream")
+        return NO_MODIFIED
       },
-      tmpWorktrees: [],
     }
     const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    // baseline-прогон пропущен (basePaths пуст) → всё current идёт в introduced
-    expect(r.introduced).toBe(2)
-    expect(r.baseline).toBe(0)
-  })
-
-  test("commit с удалённым файлом: --diff-filter=d отсекает путь → n/a-выход без вызова qlty", async () => {
-    const repo: FakeRepo = {
-      git: {
-        "merge-base origin/master HEAD": "abcbase123",
-        // удалённый файл единственный в коммите — фильтр даёт пустой список
-        "diff-tree --no-commit-id --name-only --diff-filter=d -r deadcafe": "",
-        "ls-tree -r --name-only abcbase123": "",
-      },
-      qltyByCwd: () => {
-        throw new Error("qlty не должен вызываться на пустой дельте")
-      },
-      tmpWorktrees: [],
-    }
-    const r = await runReview(
-      { scope: "commit", directory: "/repo", commit: "deadcafe" },
-      fakeDeps(repo),
-    )
-    expect(r.markdown).toContain("Изменённых путей нет")
+    expect(r.markdown).toContain("Изменённых путей против upstream нет")
     expect(r.markdown).toContain("Итог: n/a.")
     expect(r.qltyVersion).toBe("n/a")
+    expect(r.delta).toBe(0)
   })
 
-  test("diff: пустая дельта → n/a-выход без вызова qlty", async () => {
+  test("paths-фильтр режет дельту отчёта (считаются отфильтрованные)", async () => {
     const repo: FakeRepo = {
-      git: {
-        "merge-base origin/master HEAD": "abcbase123",
-        "diff --name-only --diff-filter=d abcbase123": "",
-        "ls-files --others --exclude-standard": "",
-      },
-      qltyByCwd: () => {
-        throw new Error("qlty не должен вызываться на пустой дельте")
-      },
-      tmpWorktrees: [],
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : DELTA_SARIF),
     }
-    const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    expect(r.markdown).toContain("машинный ревью n/a, прогон не требуется")
-    expect(r.introduced).toBe(0)
+    const r = await runReview({ scope: "diff", directory: "/repo", paths: ["src/changed.py"] }, fakeDeps(repo))
+    expect(r.delta).toBe(2)
+    const filtered = await runReview({ scope: "diff", directory: "/repo", paths: ["docs/*"] }, fakeDeps(repo))
+    expect(filtered.delta).toBe(0)
+    expect(filtered.markdown).toContain("✅ новых машинных находок нет.")
   })
 
   test("пустой merge-base — громкая ошибка", async () => {
     const repo: FakeRepo = {
       git: { "merge-base origin/master HEAD": "" },
-      qltyByCwd: () => "",
-      tmpWorktrees: [],
+      qlty: () => "",
     }
     expect(
       runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo)),
