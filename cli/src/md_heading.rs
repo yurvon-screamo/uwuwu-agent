@@ -134,6 +134,46 @@ pub(crate) fn extract_h2_section(md: &str, name: &str) -> Option<String> {
     section.map(|lines| lines.join("\n") + "\n")
 }
 
+/// Хвост markdown ПОСЛЕ закрытия h2-секции с именем: от следующего заголовка
+/// уровня ≤ 2 (вне фенсов) до конца текста, включая сам закрывающий заголовок.
+/// None — секции нет; пустая строка — секция замыкает документ. Компаньон
+/// extract_h2_section: в фрагментированном теле extracted-секция — головной
+/// фрагмент, хвост за чужим h2 (поздние комменты, аппенденные в конец дока)
+/// виден только здесь — структурный гард полного replace (инцидент 08.11).
+pub(crate) fn tail_after_h2_section(md: &str, name: &str) -> Option<String> {
+    let want = normalize_heading_text(name);
+    let mut opened = false;
+    let mut closed = false;
+    let mut tail: Vec<String> = Vec::new();
+    let mut fenced = false;
+    for line in md.lines() {
+        if toggles_fence(line) {
+            fenced = !fenced;
+            if closed {
+                tail.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some((level, text)) = heading_of(line).filter(|_| !fenced) {
+            if level <= 2 {
+                if opened && !closed {
+                    closed = true;
+                } else if !closed && level == 2 && text == want {
+                    opened = true;
+                    continue;
+                }
+            }
+        }
+        if closed {
+            tail.push(line.to_string());
+        }
+    }
+    if !opened {
+        return None;
+    }
+    Some(tail.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +315,54 @@ mod tests {
     #[test]
     fn has_h2_section_ignores_other_levels() {
         assert!(!has_h2_section("### Комменты\n", "Комменты"));
+    }
+
+    #[test]
+    fn tail_after_h2_section_starts_at_closing_heading() {
+        let md = "## Постановка\nтекст\n## Комменты\n- коммент\n\n## qlty\nнаходки\nхвост\n";
+        let tail = tail_after_h2_section(md, "Комменты").unwrap();
+        assert!(
+            tail.starts_with("## qlty\n"),
+            "хвост с закрывающего h2: {tail:?}"
+        );
+        assert!(tail.contains("находки") && tail.contains("хвост"));
+        assert!(!tail.contains("## Комменты") && !tail.contains("- коммент"));
+    }
+
+    #[test]
+    fn tail_after_h2_section_none_without_section_and_empty_when_unclosed() {
+        assert!(tail_after_h2_section("## А\nтекст\n", "Комменты").is_none());
+        let unclosed =
+            tail_after_h2_section("## А\n## Комменты\nдо конца дока\n", "Комменты").unwrap();
+        assert_eq!(unclosed, "", "секция до конца дока — хвост пуст");
+    }
+
+    #[test]
+    fn tail_after_h2_section_closes_only_on_real_heading_outside_fence() {
+        let md = "## Комменты\n```\n## не заголовок — фенс\n```\n### вложенный\n- коммент\n## Закрывающая\nхвост\n";
+        let tail = tail_after_h2_section(md, "Комменты").unwrap();
+        assert!(
+            tail.starts_with("## Закрывающая\n"),
+            "закрытие настоящим h2: {tail:?}"
+        );
+        assert!(
+            !tail.contains("не заголовок"),
+            "фенс-строка осталась в секции: {tail:?}"
+        );
+        assert!(
+            !tail.contains("### вложенный"),
+            "h3 не закрывает секцию: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn tail_after_h2_section_with_duplicate_sections_tails_from_first_close() {
+        let md = "## Комменты\n- первый\n## Комменты\n- второй\nхвост\n";
+        let tail = tail_after_h2_section(md, "Комменты").unwrap();
+        assert!(
+            tail.contains("- второй") && tail.contains("хвост"),
+            "вторая секция — уже хвост первой: {tail:?}"
+        );
+        assert!(!tail.contains("- первый"));
     }
 }

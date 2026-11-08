@@ -1726,7 +1726,43 @@ fn carry_over_comments_section(
     carried.push_str("\n\n");
     carried.push_str(comments.trim_end());
     carried.push('\n');
+    refuse_fragmented_comment_tail(doc_title, existing, &carried)?;
     Ok(carried)
+}
+
+/// Хвостовой гард фрагментации «Комменты» (инцидент 08.11, 20261108044740):
+/// чужой h2 после секции (replace-section «не найдена — в конец») закрывает
+/// её, поздние комменты (task comment аппендит в конец дока) остаются за
+/// пределами — авто-перенос берёт только головной фрагмент, хвост пропадает
+/// молча. Свежесть --base тут бессильна: снапшот несёт ту же фрагментацию,
+/// нормализованная сверка сходится. Комменты хвоста, отсутствующие в
+/// carried (контент + перенесённая секция), — отказ с перечнем, пока потеря
+/// поправима; влитые агентом в контент матчатся подстрокой — гард молчит.
+/// Осознанная замена истории (контент с собственной «## Комменты») сюда
+/// не доходит — ветка выше.
+fn refuse_fragmented_comment_tail(
+    doc_title: &str,
+    existing: &str,
+    carried: &str,
+) -> anyhow::Result<()> {
+    let Some(tail) = crate::md_heading::tail_after_h2_section(existing, "Комменты") else {
+        return Ok(());
+    };
+    let lost: Vec<String> = syt::comment_lines(&tail)
+        .into_iter()
+        .filter(|line| !carried.contains(line.as_str()))
+        .collect();
+    if lost.is_empty() {
+        return Ok(());
+    }
+    let listed: String = lost.iter().map(|line| format!("  {line}\n")).collect();
+    bail!(
+        "секция «Комменты» в теле «{doc_title}» фрагментирована чужим h2: за её пределами сидят \
+         хвостовые комменты — полный replace переносит только головную секцию, хвост пропал бы \
+         молча:\n{listed}Влей перечисленные комменты в контент (в секцию ## Комменты нового тела) \
+         и повтори; осознанный снос хвоста — включи в контент собственную секцию ## Комменты \
+         (замена истории)"
+    );
 }
 
 /// Freshness-гард полного --replace (потеря апдейта — класс инцидента 05.11
@@ -3018,6 +3054,78 @@ mod tests {
     fn carry_over_comments_noop_without_existing_section() {
         let out = carry_over_comments_section("таск", "старое без секции\n", "новое\n").unwrap();
         assert_eq!(out, "новое\n");
+    }
+
+    /// Фикстура инцидента 08.11 (20261108044740): qlty-секция вставилась после
+    /// «Комменты» (replace-section «не найдена — в конец»), поздние комменты
+    /// легли за чужим h2 (task comment аппендит в конец дока).
+    fn fragmented_existing() -> String {
+        "\
+старое тело
+
+## Комменты
+- **AGENTS** (2026-11-08 10:00): головной коммент
+
+## Машинный ревью (qlty)
+находки линтера
+
+- **AGENTS** (2026-11-08 11:00): PR готов к мержу
+- **Юра** (2026-11-08 11:30): мержу сам
+"
+        .to_string()
+    }
+
+    #[test]
+    fn carry_over_comments_refuses_fragmented_section_tail_loss() {
+        let err = carry_over_comments_section("таск", &fragmented_existing(), "новое тело\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("фрагментирована"), "суть ошибки: {msg}");
+        assert!(
+            msg.contains("PR готов к мержу") && msg.contains("мержу сам"),
+            "перечень хвостовых комментов: {msg}"
+        );
+        assert!(
+            !msg.contains("головной коммент"),
+            "головной коммент переносится, в потерях не числится: {msg}"
+        );
+    }
+
+    #[test]
+    fn carry_over_comments_passes_when_tail_comments_inlined_into_content() {
+        let content = "\
+новое тело
+
+## Машинный ревью (qlty)
+находки линтера
+
+- **AGENTS** (2026-11-08 11:00): PR готов к мержу
+- **Юра** (2026-11-08 11:30): мержу сам
+";
+        let out = carry_over_comments_section("таск", &fragmented_existing(), content).unwrap();
+        assert!(out.contains("PR готов к мержу"), "хвост сохранён: {out}");
+        assert!(
+            out.contains("## Комменты\n- **AGENTS** (2026-11-08 10:00): головной коммент"),
+            "головная секция перенесена: {out}"
+        );
+    }
+
+    #[test]
+    fn carry_over_comments_allows_conscious_replacement_despite_fragmentation() {
+        let out = carry_over_comments_section(
+            "таск",
+            &fragmented_existing(),
+            "новое\n\n## Комменты\n- новая история\n",
+        )
+        .unwrap();
+        assert_eq!(out, "новое\n\n## Комменты\n- новая история\n");
+    }
+
+    #[test]
+    fn carry_over_comments_tolerates_foreign_tail_without_comment_lines() {
+        let existing = "старое\n\n## Комменты\n- **AGENTS** (2026-11-08 10:00): головной\n\n## Машинный ревью (qlty)\nнаходки линтера\n";
+        let out = carry_over_comments_section("таск", existing, "новое\n").unwrap();
+        assert!(out.contains("головной"), "секция перенесена: {out}");
     }
 
     /// Detached-строка (привязки нет) + ≥2 доков с тем же заголовком →
