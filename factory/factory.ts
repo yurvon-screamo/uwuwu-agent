@@ -800,6 +800,9 @@ async function startTask(
     agentActive: true, // spawn отправлен — агент работает
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
+    // история корней: append при каждом спавне (рестарты не теряют прошлые
+    // поколения сессий — BFS задачного прогона накрывает осиротевших)
+    sessionHistory: [...(state.tasks[task.rowId]?.sessionHistory ?? []), sessionID],
   }
   saveState(state)
   await setCellsSafe(board, task.rowId, {
@@ -808,6 +811,7 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
+  writeTaskStartSignal(task.rowId, state.tasks[task.rowId]!, sessionID, envDir ?? "", envCtx?.repoDir ?? cfg.local)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
 
@@ -833,29 +837,24 @@ async function gcLegacyRoots(name: string, cfg: ProjectCfg, state: FactoryState)
 }
 
 /** Чистка state (Done): гасим ОБЕ сессии задачи и сносим env (rm/attic +
- *  prune + branch -d). Живой дев-ход умирает вместе с задачей — Done
- *  означает мяч у владельца; данные при незакоммиченном — в attic. */
+ *  prune + branch -d). Сессии задачи НЕ удаляются из opencode.db (решение
+ *  владельца 08.11: переоткрытие задачи должно находить все сессии; чистку
+ *  БД не делаем ни фабрике при Done, ни дримеру после прогона) — вместо
+ *  терминирования в state дримера уходит done-сигнал: задачный прогон
+ *  пост-обработает пакет сессий задачи. */
 async function finishTask(
   rowId: string, tracked: TrackedTask, cfg: ProjectCfg, state: FactoryState, counters?: PassCounters,
 ): Promise<void> {
-  // DRY_RUN: чистка в песочный state безвредна, но термин реальных сессий
-  // и снос реального env — side-effect на прод-сервере — не делаем
+  // DRY_RUN: чистка в песочный state безвредна, но done-сигнал и снос
+  // реального env — side-effect на прод-сервере — не делаем
   if (DRY_RUN) {
-    log(`DRY_RUN: Done-чистка ${rowId.slice(0, 8)} — state-запись удалена бы, сессии не терминируются, env не сносится`)
+    log(`DRY_RUN: Done-чистка ${rowId.slice(0, 8)} — state-запись удалена бы, done-сигнал не пишется, env не сносится`)
     delete state.tasks[rowId]
     saveState(state)
     return
   }
-  log(`задача ${rowId.slice(0, 8)}: Done — чистка state`)
-  if (tracked.sessionID !== "") {
-    await restCall(`/session/${tracked.sessionID}`, { method: "DELETE" }).catch(() => {})
-  }
-  if (tracked.reviewSessionID !== undefined && tracked.reviewSessionID !== "") {
-    await restCall(`/session/${tracked.reviewSessionID}`, { method: "DELETE" }).catch(() => {})
-  }
-  if (tracked.testSessionID !== undefined && tracked.testSessionID !== "") {
-    await restCall(`/session/${tracked.testSessionID}`, { method: "DELETE" }).catch(() => {})
-  }
+  log(`задача ${rowId.slice(0, 8)}: Done — done-сигнал дримеру + чистка state`)
+  writeTaskDoneSignal(rowId, tracked, cfg)
   const hasEnv = tracked.envDir !== undefined || tracked.worktree !== ""
   if (hasEnv) {
     const outcome = await cleanupEnv(envDeps(), {
@@ -871,11 +870,68 @@ async function finishTask(
         `[factory] Задача закрыта, но в окружении осталось незакоммиченное — env переехал в attic (${ENV_ROOT}/.attic), тяжёлые каталоги вырезаны. Разобрать или дослить — руками.`)
     } else if (outcome === "failed") {
       await notify(tracked,
-        `[factory] Задача закрыта, но снос окружения не удался — каталог оставлен как есть, разбери ${ENV_ROOT} руками.`)
+        `[factory] Задача закрыта, но снос окружения не удался — каталог оставлен как есть, разбори ${ENV_ROOT} руками.`)
     }
   }
   delete state.tasks[rowId]
   saveState(state)
+}
+
+// ——— очередь сигналов дримеру (start/done) ———
+
+/** Каталог очереди дримера: дефолт — state дримера на той же ноде; env
+ *  UWUWU_DREAMER_QUEUE_DIR общий с демоном (он же читатель) — тесты уводят
+ *  обе стороны в одну tmp-песочницу. */
+const DREAMER_QUEUE_DIR = process.env.UWUWU_DREAMER_QUEUE_DIR
+  ?? join(homedir(), ".local", "state", "uwuwu-dreamer", "queue")
+
+/** Атомарная запись файла очереди (tmp + rename): дример забирает готовый
+ *  JSON, полуфайлов не видит. */
+function writeQueueSignal(fileName: string, payload: Record<string, unknown>): void {
+  try {
+    mkdirSync(DREAMER_QUEUE_DIR, { recursive: true })
+    const tmp = join(DREAMER_QUEUE_DIR, `${fileName}.tmp`)
+    writeFileSync(tmp, JSON.stringify(payload))
+    renameSync(tmp, join(DREAMER_QUEUE_DIR, fileName))
+    log(`очередь дримера: ${fileName} записан`)
+  } catch (e) {
+    // потеря сигнала = деградация к посессионной обработке сессий задачи;
+    // не валим спавн/чистку, но громко в лог
+    log(`очередь дримера: ${fileName} не записан — ${e}`)
+  }
+}
+
+/** Start-сигнал: сессия задачи известна активному набору дримера —
+ *  посессионный контур скипает её до закрытия задачи (все проекты единообразно). */
+function writeTaskStartSignal(rowId: string, tracked: TrackedTask, sessionID: string, envDir: string, directory: string): void {
+  writeQueueSignal(`start-${rowId}.json`, {
+    rowId, project: tracked.project, title: tracked.title,
+    sessionID, envDir, directory, ts: Date.now(),
+  })
+}
+
+/** Done-сигнал: постановка задачного прогона. rootSessions — полная история
+ *  корней (sessionHistory + текущие id легаси-треков без истории). */
+function writeTaskDoneSignal(rowId: string, tracked: TrackedTask, cfg: ProjectCfg): void {
+  const rootSessions = [...new Set([
+    ...(tracked.sessionHistory ?? []),
+    tracked.sessionID,
+    tracked.reviewSessionID ?? "",
+    tracked.testSessionID ?? "",
+  ].filter((s) => s.startsWith("ses_")))]
+  writeQueueSignal(`done-${rowId}.json`, {
+    rowId, project: tracked.project, title: tracked.title,
+    rootSessions,
+    branch: tracked.branch, pr: mergedPrUrlOf(tracked),
+    envDir: tracked.envDir ?? "", directory: cfg.local,
+    closedAt: Date.now(),
+  })
+}
+
+/** PR задачи: кэш смерженного приоритетнее ячейки (ячейку мог очистить
+ *  Done-проход фабрики). */
+function mergedPrUrlOf(tracked: TrackedTask): string {
+  return tracked.mergedPrUrl ?? ""
 }
 
 async function notify(task: TrackedTask, body: string): Promise<void> {
@@ -1034,8 +1090,11 @@ async function startReview(
   }
   tracked.reviewSessionID = sessionID
   tracked.reviewAttempts = 0
+  // история корней: ревьювер — корневая сессия задачи, дример должен её видеть
+  tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
   await setCellsSafe(board, task.rowId, { [REVIEW_SESSION_CELL]: sessionID })
+  writeTaskStartSignal(task.rowId, tracked, sessionID, tracked.envDir ?? "", worktree !== "" ? worktree : cfg.local)
   log(`задача ${task.rowId.slice(0, 8)}: ревью-сессия ${sessionID} (${kind})`)
 }
 
@@ -1086,8 +1145,10 @@ async function startTesting(
   }
   tracked.testSessionID = sessionID
   tracked.testAttempts = 0
+  tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
   await setCellsSafe(board, task.rowId, { [TEST_SESSION_CELL]: sessionID })
+  writeTaskStartSignal(task.rowId, tracked, sessionID, tracked.envDir ?? "", worktree !== "" ? worktree : cfg.local)
   log(`задача ${task.rowId.slice(0, 8)}: тест-сессия ${sessionID}`)
 }
 

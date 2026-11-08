@@ -75,6 +75,10 @@ export interface TrackedTask {
   /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
    *  env-механика к задаче не применялась */
   envDir?: string
+  /** полная история корневых сессий задачи (append при каждом спавне
+   *  дев/ревью/тест, включая рестарты) — уходит в done-сигнал дримеру:
+   *  BFS от полной истории накрывает осиротевшие сессии прошлых поколений */
+  sessionHistory?: string[]
   /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
    *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
    *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
@@ -1308,6 +1312,8 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
   if (t.reviewStallSignaled !== undefined && typeof t.reviewStallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
+  if (t.sessionHistory !== undefined && !(Array.isArray(t.sessionHistory)
+    && t.sessionHistory.every((s) => typeof s === "string" && s.startsWith("ses_")))) return false
   if (
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))

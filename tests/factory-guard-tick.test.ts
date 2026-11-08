@@ -22,6 +22,8 @@ interface GuardVerdict {
   prompts: number
   comments: string[]
   itemUpdates: string[]
+  /** очередь сигналов дримеру: имя файла → содержимое (done-контракт) */
+  queueSignals: Record<string, string>
 }
 
 describe("tickProject: гард каскада при потере state", () => {
@@ -46,12 +48,15 @@ describe("tickProject: гард каскада при потере state", () =>
   ): Promise<GuardVerdict> {
     // Arrange: state и service.json песочницы — до старта ребёнка
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), stateJson)
+    const queueDir = join(home, "dreamer-queue")
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
         ...process.env, HOME: home, UWUWU_SIYUAN_TOKEN: "test-token", GUARD_SCENARIO: scenario,
         // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
         // не должна уводить сидированный state в branches/<ветка>
         UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
+        // песочница очереди дримера: фабрика пишет сигналы сюда, не в прод
+        UWUWU_DREAMER_QUEUE_DIR: queueDir,
         // фиксируем дефолтные пороги: тест не зависит от env окружения
         UWUWU_FACTORY_SPAWN_LOSS_MAX: "", UWUWU_FACTORY_SPAWN_BURST_MAX: "",
       },
@@ -130,8 +135,8 @@ describe("tickProject: гард каскада при потере state", () =>
     expect(savedState().holdSignaled === flag1).toBe(false)
   })
 
-  test("done-clean: чистка трека при Done — сессионные ячейки строки очищены (инвариант гарда)", async () => {
-    // Arrange: трекнутая задача с сессией; строка доски Done с ячейкой «Сессия dev»
+  test("done-clean: чистка трека при Done — сессионные ячейки очищены, done-сигнал дримеру (сессии НЕ удаляются)", async () => {
+    // Arrange: трекнутая задача с сессией и историей корней; строка доски Done
     const state = {
       tasks: {
         "20261105000000-row1": {
@@ -139,6 +144,7 @@ describe("tickProject: гард каскада при потере state", () =>
           bodyDoc: "20261105000000-doc1", title: "Закрытая задача",
           lastCommentAt: 0, lastCommentId: "",
           createdAt: 1, attempts: 0, project: "t", lastStatus: "In Progress",
+          sessionHistory: ["ses_gen0", "ses_old1"],
         },
       },
     }
@@ -146,12 +152,24 @@ describe("tickProject: гард каскада при потере state", () =>
     // Act
     const verdict = await runTick("done-clean", JSON.stringify(state))
 
-    // Assert: трек удалён, сессия погашена, спавнов нет
+    // Assert: трек удалён, сессии НЕ удаляются из опенкода (решение владельца
+    // 08.11: переоткрытие задачи должно находить все сессии)
     expect(verdict.taskCount).toBe(0)
-    expect(verdict.sessionDeletes).toBe(1)
+    expect(verdict.sessionDeletes).toBe(0)
     expect(verdict.sessionCreates).toBe(0)
     // Assert: все сессионные ячейки очищены на строке (пустой текст)
     expect(verdict.itemUpdates).toEqual(["k-dev=", "k-rev=", "k-test="])
+    // Assert: done-сигнал в очереди — полная история корней (включая легаси
+    // текущий sessionID), мастер-чекаут проекта как directory
+    const doneKey = Object.keys(verdict.queueSignals).find((k) => k.startsWith("done-"))
+    expect(doneKey).toBe("done-20261105000000-row1.json")
+    const done = JSON.parse(verdict.queueSignals[doneKey as string]) as {
+      rowId: string; project: string; rootSessions: string[]; directory: string
+    }
+    expect(done.rowId).toBe("20261105000000-row1")
+    expect(done.project).toBe("t")
+    expect(done.rootSessions.sort()).toEqual(["ses_gen0", "ses_old1"])
+    expect(done.directory).toBe("/tmp/x")
     // Assert: Hold-эпизода нет — легитимная чистка не алертит
     expect(verdict.holdSignaled).toBeNull()
     expect(verdict.comments).toEqual([])
