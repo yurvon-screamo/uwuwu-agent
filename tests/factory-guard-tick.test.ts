@@ -150,8 +150,8 @@ describe("tickProject: гард каскада при потере state", () =>
     expect(verdict.taskCount).toBe(0)
     expect(verdict.sessionDeletes).toBe(1)
     expect(verdict.sessionCreates).toBe(0)
-    // Assert: обе сессионные ячейки очищены на строке (пустой текст)
-    expect(verdict.itemUpdates).toEqual(["k-dev=", "k-rev="])
+    // Assert: все сессионные ячейки очищены на строке (пустой текст)
+    expect(verdict.itemUpdates).toEqual(["k-dev=", "k-rev=", "k-test="])
     // Assert: Hold-эпизода нет — легитимная чистка не алертит
     expect(verdict.holdSignaled).toBeNull()
     expect(verdict.comments).toEqual([])

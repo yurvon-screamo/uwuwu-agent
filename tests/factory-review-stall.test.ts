@@ -92,10 +92,10 @@ describe("tickProject: гвард ревью-тишины (недоставле�
     expect(v.tick1.itemUpdates).toContain("k-status=Needs attention")
     expect(v.tick1.comments).toHaveLength(1)
     // текст сигнала: ведёт юзера рабочим маршрутом — ответ комментом, затем
-    // перестановка ревью-статуса (коммент в Needs attention ревьюверу НЕ
-    // доставляется — comments-to-reviewer работает только в ревью-статусе)
+    // перестановка статуса стадии (коммент в Needs attention агенту НЕ
+    // доставляется — доставка только в агентском статусе)
     expect(v.tick1.comments[0]).toContain("ответь комментом")
-    expect(v.tick1.comments[0]).toContain("переставь ревью-статус")
+    expect(v.tick1.comments[0]).toContain("переставь статус стадии")
     expect(v.lastStatus).toBe("Needs attention")
     // флаг эпизода стоит — второй тик молчит (анти-спам)
     expect(v.reviewStallSignaled).toBe(true)

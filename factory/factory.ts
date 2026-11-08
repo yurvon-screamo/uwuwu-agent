@@ -11,8 +11,10 @@
 //      конфликт-kickoff (разреши, запушь, верни в «Ревью результата»)
 //   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
 //      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
-//      задачи); возврат статуса из ревью → wakeup девелопера; комменты
-//      юзера в ревью-статусах — ревьюверу
+//      задачи); «Тестирование» → спавн/будильник тестировщика (праймари
+//      tester, тоже 1 сессия на задачу); возврат статуса из ревью/тестирования
+//      → wakeup девелопера; комменты юзера в агентских статусах — держателю
+//      сессии
 //   3. новые комменты/правки тела юзера → wakeup сессии (мёртвая → карантин,
 //      коммент юзера → рестарт)
 //   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
@@ -27,7 +29,7 @@ import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
-import { REVIEWER_AGENT_ID } from "../lib/agents"
+import { REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
@@ -47,6 +49,12 @@ import {
   reviewCommentsPrompt,
   reviewReturnPrompt,
   reviewStallVerdict,
+  sessionSlotOf,
+  TESTING_STATUS,
+  TEST_SESSION_CELL,
+  testingSpawnPrompt,
+  testingRerunPrompt,
+  testingCommentsPrompt,
   conflictFixPrompt,
   routeTask,
   rowMissingAction,
@@ -164,6 +172,15 @@ const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
  *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
  *  синхронно: модель сессии спавна главнее для фабричных сессий. */
 const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
+/** тестировщик стадии «Тестирование»: праймари-агент, качество фичи важнее
+ *  цены будильника; модель flash в max-вариации — единственная мультимодальная
+ *  (визуальная проверка вёрстки/скринов). Модель дублирует agents/tester.md
+ *  (frontmatter) — править синхронно: модель сессии спавна главнее для фабричных
+ *  сессий. */
+const TESTER = {
+  agent: TESTER_AGENT_ID,
+  model: { providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: "max" },
+} as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
@@ -364,6 +381,7 @@ export async function readTasks(
       branch: row.cells?.Branch?.value ?? "",
       devSession: (row.cells?.[DEV_SESSION_CELL]?.value ?? "").trim(),
       reviewSession: (row.cells?.[REVIEW_SESSION_CELL]?.value ?? "").trim(),
+      testSession: (row.cells?.[TEST_SESSION_CELL]?.value ?? "").trim(),
     })
   }
   if (orphans.length > 0) {
@@ -469,7 +487,9 @@ interface SessionSpec {
   directory: string
   title: string
   agent?: string
-  model?: { providerID: string; id: string }
+  /** Model.Ref (opencode /api/session): id + providerID обязательны, variant
+   *  опционален («provider/model#variant» в объектной форме) */
+  model?: { providerID: string; id: string; variant?: string }
 }
 
 async function createSession(spec: SessionSpec): Promise<string | null> {
@@ -831,6 +851,9 @@ async function finishTask(
   if (tracked.reviewSessionID !== undefined && tracked.reviewSessionID !== "") {
     await restCall(`/session/${tracked.reviewSessionID}`, { method: "DELETE" }).catch(() => {})
   }
+  if (tracked.testSessionID !== undefined && tracked.testSessionID !== "") {
+    await restCall(`/session/${tracked.testSessionID}`, { method: "DELETE" }).catch(() => {})
+  }
   const hasEnv = tracked.envDir !== undefined || tracked.worktree !== ""
   if (hasEnv) {
     const outcome = await cleanupEnv(envDeps(), {
@@ -930,6 +953,20 @@ async function registerFailure(
   }
 }
 
+/** Пережить агентские сессии задачи при замене записи state (рестарт
+ *  девелопера): инвариант 1 задача = 1 ревьювер и 1 тестировщик — их сессии
+ *  не пересоздаются, продолжение через rerun-промпты. */
+function preserveAgentSessions(from: TrackedTask, to: TrackedTask): void {
+  if (from.reviewSessionID !== undefined) {
+    to.reviewSessionID = from.reviewSessionID
+    to.reviewAttempts = from.reviewAttempts
+  }
+  if (from.testSessionID !== undefined) {
+    to.testSessionID = from.testSessionID
+    to.testAttempts = from.testAttempts
+  }
+}
+
 async function restartTask(
   task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState, fresh: TaskComment[],
 ): Promise<void> {
@@ -940,16 +977,12 @@ async function restartTask(
   tracked.lastCommentAt = last.createdAt
   tracked.lastCommentId = last.id
   tracked.sessionID = "" // карантин до успеха старта
-  // ревью-сессию переживаем рестартом девелопера (1 задача = 1 ревьювер)
-  const savedReview = tracked.reviewSessionID
-  const savedReviewAttempts = tracked.reviewAttempts
   saveState(state)
   try {
     await startTask(task, projectName, cfg, board, state, seed, "continue")
     const reborn = state.tasks[task.rowId]
-    if (reborn !== undefined && savedReview !== undefined) {
-      reborn.reviewSessionID = savedReview
-      reborn.reviewAttempts = savedReviewAttempts
+    if (reborn !== undefined) {
+      preserveAgentSessions(tracked, reborn)
       saveState(state)
     }
   } catch (e) {
@@ -1025,6 +1058,58 @@ async function failReview(
   }
 }
 
+/** Спавн тестировщика: 1 сессия на задачу (cwd = ворктри задачи — там код,
+ *  который он гоняет и допокрывает тестами). Выбрасывает при фейле. */
+async function startTesting(
+  task: TaskRef, projectName: string, cfg: ProjectCfg, board: BoardIds, state: FactoryState,
+  tracked: TrackedTask,
+): Promise<void> {
+  if (DRY_RUN) {
+    log(`DRY_RUN: спавн тестировщика над ${task.rowId.slice(0, 8)} — пропущен`)
+    return
+  }
+  const worktree = tracked.worktree
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
+  const sessionID = await createSession({
+    directory: worktree !== "" ? worktree : cfg.local,
+    title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
+    agent: TESTER.agent,
+    model: TESTER.model,
+  })
+  if (sessionID === null) throw new Error("тест-сессия не создалась")
+  const sent = await promptSession(sessionID, testingSpawnPrompt(task.rowId, projectName, ctx))
+  if (!sent) {
+    await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
+    throw new Error("тест-промпт не ушёл")
+  }
+  tracked.testSessionID = sessionID
+  tracked.testAttempts = 0
+  saveState(state)
+  await setCellsSafe(board, task.rowId, { [TEST_SESSION_CELL]: sessionID })
+  log(`задача ${task.rowId.slice(0, 8)}: тест-сессия ${sessionID}`)
+}
+
+/** Эскалация фейлов спавна тестировщика: 3 подряд → Needs attention. */
+async function failTesting(
+  task: TaskRef, board: BoardIds, tracked: TrackedTask, state: FactoryState, seed: number, err: unknown,
+): Promise<void> {
+  const attempts = seed + 1
+  tracked.testAttempts = attempts
+  tracked.testSessionID = ""
+  saveState(state)
+  log(`задача ${task.rowId.slice(0, 8)}: тест-старт не удался (попытка ${attempts}) — ${err}`)
+  if (attempts >= MAX_ATTEMPTS) {
+    await setCells(board, task.rowId, { Status: "Needs attention" })
+    // lastStatus — сразу за доской: перестановка статуса юзером посчитается
+    // новым входом (seed=0), паритет failReview
+    tracked.lastStatus = "Needs attention"
+    saveState(state)
+    await notify(tracked,
+      `[factory] тестировщик не смог завестись (попытка ${attempts}). Проверь лог ${LOG_PATH}; ` +
+      "чтобы перезапустить тестирование — переставь статус «Тестирование» (счётчик попыток обнулится).")
+  }
+}
+
 interface ReviewDeps {
   row: TaskRef
   tracked: TrackedTask
@@ -1083,6 +1168,45 @@ async function dispatchReviewAction(
       }
       return undefined
     }
+    case "spawn-tester": {
+      // новый вход в «Тестирование» = свежая попытка (сброс счётчика фейлов):
+      // ревьювер поставил статус заново после Needs attention или баг-петли
+      const entering = (d.tracked.lastStatus ?? "") !== TESTING_STATUS
+      const seed = entering ? 0 : d.tracked.testAttempts ?? 0
+      try {
+        await startTesting(d.row, d.project, d.cfg, d.board, d.state, d.tracked)
+        d.consumeComments()
+        await d.refreshBodyBaseline()
+        saveState(d.state)
+      } catch (e) {
+        await failTesting(d.row, d.board, d.tracked, d.state, seed, e)
+      }
+      return undefined
+    }
+    case "rerun-tester": {
+      const ok = await promptSession(
+        d.tracked.testSessionID ?? "",
+        testingRerunPrompt(d.row.rowId, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr, type: d.row.type }),
+      )
+      if (ok) {
+        d.consumeComments()
+        await d.refreshBodyBaseline()
+        saveState(d.state)
+      } else {
+        log(`задача ${shortId}: дотест-промпт не ушёл — следующий тик перепроверит сессию`)
+      }
+      return undefined
+    }
+    case "comments-to-tester": {
+      const ok = await promptSession(d.tracked.testSessionID ?? "", testingCommentsPrompt(d.row.rowId, d.fresh))
+      if (ok) {
+        d.consumeComments()
+        saveState(d.state)
+      } else {
+        log(`задача ${shortId}: комменты тестировщику не ушли — граница не сдвинута`)
+      }
+      return undefined
+    }
     case "return-to-dev": {
       const devLiveness = d.tracked.sessionID === "" ? "dead" : await sessionLiveness(d.tracked.sessionID)
       if (devLiveness === "unknown") {
@@ -1114,20 +1238,19 @@ async function dispatchReviewAction(
         return undefined
       }
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
-      // ревью-сессию сохраняем: инвариант 1 задача = 1 ревьювер.
-      // startTask заменяет запись state — дальше по циклу не идём:
-      // свежая сессия уже получила рестарт-промпт (конфликтный или нейтральный)
-      const savedReview = d.tracked.reviewSessionID
-      const savedReviewAttempts = d.tracked.reviewAttempts
+      // агентские сессии сохраняем: инвариант 1 задача = 1 ревьювер и
+      // 1 тестировщик. startTask заменяет запись state — дальше по циклу
+      // не идём: свежая сессия уже получила рестарт-промпт (конфликтный или
+      // нейтральный)
+      const agentSessions = d.tracked
       try {
         await startTask(
           d.row, d.project, d.cfg, d.board, d.state, d.tracked.attempts,
           conflicted ? "conflict-fix" : "continue",
         )
         const reborn = d.state.tasks[d.row.rowId]
-        if (reborn !== undefined && savedReview !== undefined) {
-          reborn.reviewSessionID = savedReview
-          reborn.reviewAttempts = savedReviewAttempts
+        if (reborn !== undefined) {
+          preserveAgentSessions(agentSessions, reborn)
           saveState(d.state)
         }
         log(`задача ${shortId}: возврат из ревью при мёртвом девелопере — рестарт сессии${conflicted ? " (конфликт-fix)" : ""}`)
@@ -1154,17 +1277,19 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // наблюдаемость полноты скана: N сверяемо со счётчиком ядра (view.rowCount)
   log(`проход ${projectName}: строк ${rows.length}`)
   const counters: PassCounters = {
-    devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0,
+    devSpawned: 0, reviewSpawned: 0, testerSpawned: 0, wakeups: 0, cleanups: 0,
     envCreated: 0, envRemoved: 0, envAtticked: 0,
     watched: 0, failures: [],
   }
 
   // 1. новые задачи: Design → девелопер (утряска), In Progress без state →
-  //    девелопер (fast-track владельца: сразу реализация), ревью-статус → ревьювер
-  //    (Draft = черновик триажа, пустой = легаси — оба не спавнят)
+  //    девелопер (fast-track владельца: сразу реализация), ревью-статус → ревьювер,
+  //    «Тестирование» → тестировщик (Draft = черновик триажа, пустой = легаси —
+  //    оба не спавнят)
   const started = new Set<string>()
   const spawnable = rows.filter(
-    (r) => r.status === "Design" || r.status === "In Progress" || reviewKindOf(r.status) !== null)
+    (r) => r.status === "Design" || r.status === "In Progress" ||
+      reviewKindOf(r.status) !== null || r.status === TESTING_STATUS)
   const untracked = untrackedTasks(spawnable, state)
 
   // ——— гард каскада: сверка state с доской до спавна (инцидент 06.11) ———
@@ -1211,7 +1336,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
   // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
   const devWave = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) === null && !externalSkip.has(t.rowId))
+    ? untracked.filter((t) => reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId))
     : []
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
@@ -1230,17 +1355,17 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }, SPAWN_WAVE_CONCURRENCY)
   }
 
-  // ревью-спавны untracked: тоже под гардом (HOLD глушит — каскад ревьюверов
-  // так же опасен, как дев-волна)
-  const reviewUntracked = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) !== null)
+  // карантинные спавны untracked (ревьювер/тестировщик): тоже под гардом
+  // (HOLD глушит — каскад агентских сессий так же опасен, как дев-волна)
+  const agentUntracked = guard.t === "allow"
+    ? untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
     : []
-  for (const task of reviewUntracked) {
+  for (const task of agentUntracked) {
     const kind = reviewKindOf(task.status)
-    if (kind === null) continue // защищённость от перефильтра выше
-    // ревью-статус без state (даунтайм демона при переходе) — карантинная
-    // запись (девелопер неизвестен) + спавн ревьювера; lastStatus = текущий,
-    // чтобы следующий тик не принял спавн за новый вход (паразитный rerun)
+    // ревью-статус/«Тестирование» без state (даунтайм демона при переходе) —
+    // карантинная запись (девелопер неизвестен) + спавн держателя сессии;
+    // lastStatus = текущий, чтобы следующий тик не принял спавн за новый вход
+    // (паразитный rerun)
     const quarantineExports = new Map<string, string | null>()
     const last = latestComment(
       (await taskComments(task.bodyDoc, quarantineExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
@@ -1249,17 +1374,23 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       sessionID: "", worktree: "", branch: "",
       bodyDoc: task.bodyDoc, title: task.title, project: projectName,
       lastCommentAt: last?.createdAt ?? 0, lastCommentId: last?.id ?? "",
-      createdAt: Date.now(), attempts: 0, reviewAttempts: 0,
+      createdAt: Date.now(), attempts: 0, reviewAttempts: 0, testAttempts: 0,
       lastStatus: task.status,
       bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
       bodyHash: (await bodyHashOf(task.bodyDoc, quarantineExports)) ?? undefined,
     }
     state.tasks[task.rowId] = entry
     try {
-      await startReview(task, projectName, cfg, board, state, kind, entry)
-      counters.reviewSpawned++
+      if (kind !== null) {
+        await startReview(task, projectName, cfg, board, state, kind, entry)
+        counters.reviewSpawned++
+      } else {
+        await startTesting(task, projectName, cfg, board, state, entry)
+        counters.testerSpawned++
+      }
     } catch (e) {
-      await failReview(task, board, entry, state, 0, e)
+      if (kind !== null) await failReview(task, board, entry, state, 0, e)
+      else await failTesting(task, board, entry, state, 0, e)
       counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
     }
     started.add(task.rowId)
@@ -1321,7 +1452,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       // переоткрытие не выглядит сиротой-спавном. Только путь Done (строка
       // наблюдается в скане): suspect-clean пишет ячейки в пустоту —
       // setCellsSafe дал бы шумный catch-лог на каждой чистке
-      await setCellsSafe(board, rowId, { [DEV_SESSION_CELL]: "", [REVIEW_SESSION_CELL]: "" })
+      await setCellsSafe(board, rowId, { [DEV_SESSION_CELL]: "", [REVIEW_SESSION_CELL]: "", [TEST_SESSION_CELL]: "" })
       await finishTask(rowId, tracked, cfg, state, counters)
       counters.cleanups++
       continue
@@ -1341,10 +1472,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     }
     const fresh = newUserComments(comments, { at: tracked.lastCommentAt, id: tracked.lastCommentId }, BOT_USER_ID)
     // сесс-скопед срез self-эха: активность адресата по статусу (в ревью —
-    // ревьювер, иначе девелопер); сбой активности — без среза
-    const addresseeSession = reviewKindOf(row.status) !== null
+    // ревьювер, в «Тестировании» — тестировщик, иначе девелопер); сбой
+    // активности — без среза
+    const slot = sessionSlotOf(row.status)
+    const addresseeSession = slot === "review"
       ? tracked.reviewSessionID ?? ""
-      : tracked.sessionID
+      : slot === "test"
+        ? tracked.testSessionID ?? ""
+        : tracked.sessionID
     const activity = addresseeSession !== "" ? await lastSessionActivity(addresseeSession) : null
     const { foreign, ownCount } = freshForeignComments(fresh, activity === "invalid" ? null : activity)
     if (ownCount > 0) {
@@ -1353,10 +1488,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     const reviewerLiveness = tracked.reviewSessionID === undefined || tracked.reviewSessionID === ""
       ? "dead"
       : await sessionLiveness(tracked.reviewSessionID)
+    const testerLiveness = tracked.testSessionID === undefined || tracked.testSessionID === ""
+      ? "dead"
+      : await sessionLiveness(tracked.testSessionID)
     const action = routeTask({
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
+      testerAlive: testerLiveness === "alive" ? true : testerLiveness === "dead" ? false : null,
       freshComments: foreign,
     })
     let commentsConsumed = false
@@ -1401,36 +1540,38 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       saveState(state)
     }
 
-    // ——— гвард ревью-тишины (инцидент 07.11, задача 20261107142321): ———
-    // ход ревьювера завершился, статус не ушёл из ревью — routeTask в этой
-    // геометрии вечный noop (живая сессия, нет свежих комментов). Тишина
-    // дольше порога → сигнал юзеру + Needs attention, раз за эпизод
-    // (флаг reviewStallSignaled; сброс — смена статуса выше или вернувшаяся
-    // активность ревьювера). Восстановление — штатные пути: перестановка
-    // ревью-статуса будит ту же сессию доревью-промптом (rerun).
-    // Только noop: spawn/rerun/comments только что побудили ревьювера —
+    // ——— гвард тишины агентской стадии (инцидент 07.11, задача 20261107142321):
+    // ход держателя сессии (ревьювер/тестировщик) завершился, статус не ушёл
+    // из стадии — routeTask в этой геометрии вечный noop (живая сессия,
+    // нет свежих комментов). Тишина дольше порога → сигнал юзеру +
+    // Needs attention, раз за эпизод (флаг reviewStallSignaled; сброс —
+    // смена статуса выше или вернувшаяся активность держателя).
+    // Восстановление — штатные пути: перестановка статуса будит ту же сессию
+    // дельта-промптом (rerun).
+    // Только noop: spawn/rerun/comments только что побудили держателя —
     // его активность ещё не отражает ход, детекция была бы ложной.
-    // Активность уже снята выше (addresseeSession в ревью-статусе — та же
-    // ревью-сессия; до этой ветки noop её не трогает) — не дублируем вызов.
-    if (action.t === "noop" && reviewKindOf(row.status) !== null && reviewerLiveness === "alive") {
+    // Активность уже снята выше (addresseeSession в агентском статусе — та же
+    // сессия; до этой ветки noop её не трогает) — не дублируем вызов.
+    const holderLiveness = slot === "review" ? reviewerLiveness : testerLiveness
+    if (action.t === "noop" && slot !== "dev" && holderLiveness === "alive") {
       if (activity === "invalid") {
-        log(`задача ${rowId.slice(0, 8)}: активность ревью-сессии неизвестна — пропуск тика`)
+        log(`задача ${rowId.slice(0, 8)}: активность сессии держателя неизвестна — пропуск тика`)
       } else {
         const verdict = reviewStallVerdict({
           status: row.status,
-          reviewerAlive: reviewerLiveness === "alive",
+          holderAlive: holderLiveness === "alive",
           lastActivityAt: activity,
           signaled: tracked.reviewStallSignaled === true,
           now: Date.now(),
         }, STALL_MS)
         if (verdict.t === "signal") {
           // эскалация как failReview/stall: коммент + Needs attention;
-          // lastStatus сразу за доской — перестановка юзером ревью-статуса
-          // посчитается новым входом (rerun-reviewer). continue: «пайп
+          // lastStatus сразу за доской — перестановка юзером статуса стадии
+          // посчитается новым входом (rerun). continue: «пайп
           // девелопера» ниже может догнать свои уведомления (мёртвая дев-
           // сессия) — двойной сигнал в один тик юзеру не нужен
-          const quietDiag = activity === null ? "сообщений в ревью-сессии нет" : `тишина > ${STALL_MIN} мин`
-          log(`задача ${rowId.slice(0, 8)}: ревью-статус при живой ревью-сессии (${quietDiag}) — сигнал + Needs attention`)
+          const quietDiag = activity === null ? "сообщений в сессии нет" : `тишина > ${STALL_MIN} мин`
+          log(`задача ${rowId.slice(0, 8)}: агентский статус при живой сессии держателя (${quietDiag}) — сигнал + Needs attention`)
           if (DRY_RUN) {
             // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
             // без флага анти-спам в песочнице не работает — сигнал повторялся
@@ -1447,7 +1588,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         } else if (verdict.t === "none" && tracked.reviewStallSignaled === true) {
           delete tracked.reviewStallSignaled
           saveState(state)
-          log(`задача ${rowId.slice(0, 8)}: эпизод ревью-тишины завершён — флаг снят (активность ревьювера вернулась)`)
+          log(`задача ${rowId.slice(0, 8)}: эпизод тишины агентской стадии завершён — флаг снят (активность держателя вернулась)`)
         }
       }
     }
@@ -1456,18 +1597,19 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     const devFresh = commentsConsumed ? [] : foreign
 
     // будильник правок ТЕЛА без комментов — до карантинных веток: адресат
-    // по статусу (в ревью — ревьюверу, даже если девелопер в карантине).
-    // Гейт: lastmod двигают и UI-пересохранения, и собственные записи агента —
-    // будим только на контентную дельту (хэш норм-формы вне «Комменты») не из
-    // хода адресата (дефекты №3/№4/№5)
+    // по статусу (в агентской стадии — держатель сессии, даже если девелопер
+    // в карантине). Гейт: lastmod двигают и UI-пересохранения, и собственные
+    // записи агента — будим только на контентную дельту (хэш норм-формы вне
+    // «Комменты») не из хода адресата (дефекты №3/№4/№5)
     if (devFresh.length === 0) {
       const updated = await bodyUpdatedAt(tracked.bodyDoc)
       const lastmodChanged = updated !== null
         && (tracked.bodyUpdated ?? "") !== ""
         && updated > (tracked.bodyUpdated ?? "")
       if (lastmodChanged) {
-        const inReview = reviewKindOf(row.status) !== null && (tracked.reviewSessionID ?? "") !== ""
-        const target = inReview ? tracked.reviewSessionID ?? "" : tracked.sessionID
+        const inAgentStage = slot !== "dev" && addresseeSession !== ""
+        const target = inAgentStage ? addresseeSession : tracked.sessionID
+        const targetRole = slot === "review" ? "ревьювер" : slot === "test" ? "тестировщик" : "девелопер"
         if (target !== "") {
           const md = await bodyExport(tracked.bodyDoc, bodyExports)
           // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
@@ -1494,7 +1636,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
               saveState(state)
               log(`задача ${rowId.slice(0, 8)}: дубль bodyEdit-wakeup в окне дедупа — скип`)
             } else {
-              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${inReview ? "ревьювер" : "девелопер"})`)
+              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${targetRole})`)
               if (await promptSession(target, bodyEditPrompt(rowId))) {
                 tracked.bodyUpdated = updated
                 if (hash !== null) tracked.bodyHash = hash
@@ -1506,7 +1648,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           }
           continue
         }
-        // таргета нет (дев в карантине, ревью-сессии тоже) — базлайн не двигаем:
+        // таргета нет (дев в карантине, сессии держателя тоже) — базлайн не двигаем:
         // добудим адресата на следующем тике
       }
     }

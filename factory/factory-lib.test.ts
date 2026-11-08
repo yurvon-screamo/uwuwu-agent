@@ -31,6 +31,11 @@ import {
   reviewReturnPrompt,
   reviewStallVerdict,
   routeTask,
+  sessionSlotOf,
+  TESTING_STATUS,
+  testingSpawnPrompt,
+  testingRerunPrompt,
+  testingCommentsPrompt,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
   stallMinutesFromEnv,
@@ -351,6 +356,7 @@ describe("routeTask", () => {
     status: "In Progress",
     lastStatus: "In Progress",
     reviewerAlive: null,
+    testerAlive: null,
     freshComments: [],
     ...over,
   })
@@ -631,7 +637,11 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain(ctx.worktree)
     expect(p).toContain(ctx.branch)
     expect(p).toContain(ctx.pr)
-    expect(p).toContain("approve → Review")
+    // канон: approve (чистый или дельта) ведёт в «Тестирование», не в Review
+    expect(p).toContain("approve (чистый или дельта-апрув) → Тестирование")
+    expect(p).toContain("после дельта-апрува → Тестирование")
+    expect(p).not.toContain("approve → Review")
+    expect(p).not.toContain("→ Review владельцу")
     expect(p).toContain("request_changes → In Progress")
     expect(p).not.toContain("request_changes → Design")
   })
@@ -664,7 +674,8 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     const p = reviewRerunPrompt("r1", "result", { branch: "b", worktree: "/w", pr: "https://pr/1" })
     expect(p).toContain(REVIEW_RESULT_STATUS)
     expect(p).toContain("устранение своих прошлых замечаний")
-    expect(p).toContain("approve → Review")
+    expect(p).toContain("чистый или дельта-апрув → Тестирование")
+    expect(p).not.toContain("approve → Review")
     expect(p).toContain("request_changes → In Progress")
     expect(p).toContain("https://pr/1")
   })
@@ -701,16 +712,25 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     // фаст-трек владельца — тот же возврат: продолжай/почини без Design
     expect(p).toContain("In Progress")
   })
-  test("return: approve-with-notes → дофикси и сразу «Ревью результата», чистый approve — мяч юзеру", () => {
+  test("return: approve-with-notes → дофикси и «Ревью результата» с дельтой; чистый approve — тоже «Тестирование»", () => {
     const p = reviewReturnPrompt("r4")
     expect(p).toContain("approve с мелкими замечаниями")
     expect(p).toContain(REVIEW_RESULT_STATUS)
     expect(p).toContain("дельта")
     expect(p).toContain("чистый")
+    // канон: оба пути апрува ведут в «Тестирование», мяч юзеру не через Review напрямую
+    expect(p).toContain(TESTING_STATUS)
+    expect(p).not.toContain("мяч у юзера, от тебя ничего")
+  })
+  test("return: баг-репорт тестировщика — фикс → «Ревью результата» перед возвратом тестировщику", () => {
+    const p = reviewReturnPrompt("r5")
+    expect(p).toContain("баг-репорт тестировщика")
+    expect(p).toContain(TESTING_STATUS)
+    expect(p).toContain("код-ревью обязателен перед возвратом тестировщику")
   })
 })
 
-describe("isValidTracked: ревью-поля", () => {
+describe("isValidTracked: ревью- и тест-поля", () => {
   const base = {
     sessionID: "ses_1", worktree: "", branch: "",
     bodyDoc: "d", title: "t", project: "uwuwu",
@@ -725,6 +745,108 @@ describe("isValidTracked: ревью-поля", () => {
     expect(isValidTracked({ ...base, reviewSessionID: "junk" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: "1" })).toBe(false)
     expect(isValidTracked({ ...base, reviewAttempts: 2 })).toBe(true)
+  })
+  test("testSessionID: отсутствует / пусто / ses_ — валидны", () => {
+    expect(isValidTracked({ ...base, testSessionID: "" })).toBe(true)
+    expect(isValidTracked({ ...base, testSessionID: "ses_t1" })).toBe(true)
+  })
+  test("testSessionID мусор и testAttempts не-число — невалидны", () => {
+    expect(isValidTracked({ ...base, testSessionID: "junk" })).toBe(false)
+    expect(isValidTracked({ ...base, testAttempts: "1" })).toBe(false)
+    expect(isValidTracked({ ...base, testAttempts: 2 })).toBe(true)
+  })
+})
+
+describe("sessionSlotOf: адресат агентской сессии по статусу", () => {
+  test("ревью-статусы → review, «Тестирование» → test, остальное → dev", () => {
+    expect(sessionSlotOf(REVIEW_PLAN_STATUS)).toBe("review")
+    expect(sessionSlotOf(REVIEW_RESULT_STATUS)).toBe("review")
+    expect(sessionSlotOf(TESTING_STATUS)).toBe("test")
+    expect(sessionSlotOf("Design")).toBe("dev")
+    expect(sessionSlotOf("In Progress")).toBe("dev")
+    expect(sessionSlotOf("Review")).toBe("dev")
+    expect(sessionSlotOf("")).toBe("dev")
+  })
+})
+
+describe("routeTask: стадия «Тестирование»", () => {
+  const facts = (over: Partial<RouteFacts>): RouteFacts => ({
+    status: TESTING_STATUS,
+    lastStatus: TESTING_STATUS,
+    reviewerAlive: null,
+    testerAlive: null,
+    freshComments: [],
+    ...over,
+  })
+  test("вход в «Тестирование» без тест-сессии → спавн тестировщика", () => {
+    // первый вход (после approve ревьювера) и повторный вход после баг-петли:
+    // мёртвая сессия — всегда спавн (reuse только живой сессии)
+    expect(routeTask(facts({ status: TESTING_STATUS, lastStatus: REVIEW_RESULT_STATUS, testerAlive: false })))
+      .toEqual({ t: "spawn-tester" })
+    expect(routeTask(facts({ status: TESTING_STATUS, lastStatus: TESTING_STATUS, testerAlive: false })))
+      .toEqual({ t: "spawn-tester" })
+  })
+  test("живая тест-сессия + вход/смена статуса → дельта-промпт (rerun)", () => {
+    expect(routeTask(facts({ status: TESTING_STATUS, lastStatus: REVIEW_RESULT_STATUS, testerAlive: true })))
+      .toEqual({ t: "rerun-tester" })
+    expect(routeTask(facts({ status: TESTING_STATUS, lastStatus: "In Progress", testerAlive: true })))
+      .toEqual({ t: "rerun-tester" })
+  })
+  test("живая сессия в том же статусе: комменты юзера → тестировщику, тишина → noop", () => {
+    expect(routeTask(facts({ testerAlive: true, freshComments: [c("x", "а скрин где?", 1)] })))
+      .toEqual({ t: "comments-to-tester" })
+    expect(routeTask(facts({ testerAlive: true }))).toEqual({ t: "noop" })
+  })
+  test("liveness тест-сессии неизвестна → сессию считаем живой (спавнов не плодим)", () => {
+    expect(routeTask(facts({ status: TESTING_STATUS, lastStatus: REVIEW_RESULT_STATUS, testerAlive: null })))
+      .toEqual({ t: "rerun-tester" })
+  })
+  test("fail-вердикт тестировщика: In Progress из «Тестирования» → возврат девелоперу", () => {
+    expect(routeTask(facts({ status: "In Progress", lastStatus: TESTING_STATUS })))
+      .toEqual({ t: "return-to-dev" })
+    expect(routeTask(facts({ status: "Design", lastStatus: TESTING_STATUS })))
+      .toEqual({ t: "return-to-dev" })
+  })
+  test("pass-вердикт тестировщика: Review из «Тестирования» → noop (мяч у юзера)", () => {
+    expect(routeTask(facts({ status: "Review", lastStatus: TESTING_STATUS }))).toEqual({ t: "noop" })
+    expect(routeTask(facts({ status: "Needs attention", lastStatus: TESTING_STATUS }))).toEqual({ t: "noop" })
+  })
+})
+
+describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () => {
+  const ctx = { branch: "work/task-x", worktree: "/env/x/repo", pr: "https://github.com/x/pull/2" }
+  test("spawn: методичка, канал чтения, вердикты pass/fail и переходы", () => {
+    const p = testingSpawnPrompt("r1", "uwuwu", ctx)
+    expect(p).toContain("стадия тестирования")
+    expect(p).toContain("uwuwu-cli task get r1 --project uwuwu")
+    expect(p).toContain(ctx.worktree)
+    expect(p).toContain(ctx.branch)
+    expect(p).toContain(ctx.pr)
+    expect(p).toContain("Статус: pass|fail")
+    expect(p).toContain("pass → Review")
+    expect(p).toContain("fail (баг-репорт с репро-шагами) → In Progress")
+    // запрет прод-кода и чистое состояние — contractual строки методички
+    expect(p).toContain("прод-код не трогай")
+    expect(p).toContain("пуш до вердикта")
+  })
+  test("spawn без ворктри — честная строка про diff/PR, не пустота", () => {
+    const p = testingSpawnPrompt("r2", "uwuwu", { branch: "feat/y", worktree: "", pr: "" })
+    expect(p).toContain("Ворктри задачи не найден")
+    expect(p).toContain("diff origin/master…feat/y")
+  })
+  test("rerun: дельта-режим устранения баг-репорта, не пересмотр с нуля", () => {
+    const p = testingRerunPrompt("r3", ctx)
+    expect(p).toContain(TESTING_STATUS)
+    expect(p).toContain("проверь устранение своего баг-репорта")
+    expect(p).toContain("всё заново")
+    expect(p).toContain("pass → Review")
+    expect(p).toContain("https://github.com/x/pull/2")
+  })
+  test("comments: цитаты юзера + ответ комментом", () => {
+    const p = testingCommentsPrompt("r4", [c("a", "тест упал у меня", 1)])
+    expect(p).toContain("стадия тестирования")
+    expect(p).toContain("тест упал у меня")
+    expect(p).toContain("uwuwu-cli task comment")
   })
 })
 
@@ -823,27 +945,27 @@ describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () =
 describe("formatPassSummary: одна строка о проходе", () => {
   test("полная сводка с фейлами перечисляет причины", () => {
     const line = formatPassSummary("uwuwu", {
-      devSpawned: 4, reviewSpawned: 1, wakeups: 2, cleanups: 1,
+      devSpawned: 4, reviewSpawned: 1, testerSpawned: 1, wakeups: 2, cleanups: 1,
       envCreated: 2, envRemoved: 1, envAtticked: 1, watched: 12,
       failures: ["20261105ab: сессия мертва после спавна"],
     })
     expect(line).toBe(
-      "проход uwuwu: спавн dev=4 ревью=1, будильники=2, чистки=1, env=+2/-1/attic:1, наблюдение=12" +
+      "проход uwuwu: спавн dev=4 ревью=1 тест=1, будильники=2, чистки=1, env=+2/-1/attic:1, наблюдение=12" +
       ", фейлы=1 (20261105ab: сессия мертва после спавна)")
   })
 
   test("тихий тик без событий всё равно виден (наблюдение=0)", () => {
     const line = formatPassSummary("origa", {
-      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0,
+      devSpawned: 0, reviewSpawned: 0, testerSpawned: 0, wakeups: 0, cleanups: 0,
       envCreated: 0, envRemoved: 0, envAtticked: 0,
       watched: 0, failures: [],
     })
-    expect(line).toBe("проход origa: спавн dev=0 ревью=0, будильники=0, чистки=0, env=+0/-0/attic:0, наблюдение=0")
+    expect(line).toBe("проход origa: спавн dev=0 ревью=0 тест=0, будильники=0, чистки=0, env=+0/-0/attic:0, наблюдение=0")
   })
 
   test("задержанные гардом спавны видны в сводке", () => {
     const line = formatPassSummary("uwuwu", {
-      devSpawned: 0, reviewSpawned: 0, wakeups: 0, cleanups: 0,
+      devSpawned: 0, reviewSpawned: 0, testerSpawned: 0, wakeups: 0, cleanups: 0,
       envCreated: 0, envRemoved: 0, envAtticked: 0,
       watched: 3, failures: [], held: 15, heldReason: "state-loss",
     })
@@ -984,47 +1106,55 @@ describe("stallVerdict: зависший ход при живой сессии",
   })
 })
 
-describe("reviewStallVerdict: недоставленный вердикт ревьювера (инцидент 07.11)", () => {
+describe("reviewStallVerdict: недоставленный вердикт держателя стадии (инцидент 07.11)", () => {
   const NOW = 1_000_000_000_000
   const MIN = 60_000
   const facts = (over: Partial<ReviewStallFacts> = {}): ReviewStallFacts => ({
     status: REVIEW_RESULT_STATUS,
-    reviewerAlive: true,
+    holderAlive: true,
     lastActivityAt: NOW - 40 * MIN,
     signaled: false,
     now: NOW,
     ...over,
   })
 
-  test("ревью-статус + живой ревьювер + тишина > порога — signal; текст ведёт к будилке", () => {
+  test("агентская стадия + живой держатель + тишина > порога — signal; текст ведёт к будилке", () => {
     const v = reviewStallVerdict(facts(), 30 * MIN)
     expect(v.t).toBe("signal")
     if (v.t !== "signal") return
     expect(v.text).toContain("[factory]")
     expect(v.text).toContain("тишина 40 мин")
     expect(v.text).toContain("пороге 30 мин")
-    // сценарий вопроса юзеру: ответ комментом — но перестановка ревью-статуса
-    // обязательный шаг обоих сценариев (коммент в Needs attention ревьюверу
-    // не доставляется — доставка только в ревью-статусе, comments-to-reviewer)
+    // сценарий вопроса юзеру: ответ комментом — но перестановка статуса
+    // обязательный шаг обоих сценариев (коммент в Needs attention агенту
+    // не доставляется — доставка только в агентском статусе)
     expect(v.text).toContain("ответь комментом")
-    expect(v.text).toContain("Затем переставь ревью-статус")
+    expect(v.text).toContain("Затем переставь статус стадии")
     expect(v.text).toContain("треды")
   })
   test("оба ревью-статуса покрываются (план и результат)", () => {
     expect(reviewStallVerdict(facts({ status: REVIEW_PLAN_STATUS }), 30 * MIN).t).toBe("signal")
     expect(reviewStallVerdict(facts({ status: REVIEW_RESULT_STATUS }), 30 * MIN).t).toBe("signal")
   })
-  test("не ревью-статус — none даже при застое", () => {
+  test("«Тестирование» покрывается — текст называет тестировщика, не ревьювера", () => {
+    const v = reviewStallVerdict(facts({ status: TESTING_STATUS }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("сессия тестировщика молчит")
+    expect(v.text).not.toContain("ревьювера")
+  })
+  test("не агентская стадия — none даже при застое", () => {
     expect(reviewStallVerdict(facts({ status: "In Progress" }), 30 * MIN)).toEqual({ t: "none" })
     expect(reviewStallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
     expect(reviewStallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ status: "Review" }), 30 * MIN)).toEqual({ t: "none" })
   })
-  test("свежая активность ревьювера — none (ход ещё идёт или вернулся)", () => {
+  test("свежая активность держателя — none (ход ещё идёт или вернулся)", () => {
     expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 5 * MIN }), 30 * MIN)).toEqual({ t: "none" })
   })
-  test("dead ревьювер — none (routeTask сам спавнит), unknown — none (пропуск тика)", () => {
-    expect(reviewStallVerdict(facts({ reviewerAlive: false }), 30 * MIN)).toEqual({ t: "none" })
-    expect(reviewStallVerdict(facts({ reviewerAlive: null }), 30 * MIN)).toEqual({ t: "none" })
+  test("dead держатель — none (routeTask сам спавнит), unknown — none (пропуск тика)", () => {
+    expect(reviewStallVerdict(facts({ holderAlive: false }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ holderAlive: null }), 30 * MIN)).toEqual({ t: "none" })
   })
   test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
     expect(reviewStallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
@@ -1379,19 +1509,28 @@ describe("alertTargetOf: фолбэк-цепочка адресата алерт
 })
 
 describe("untrackedRowDecision: вердикт untracked строки (матрица плана 20261105174319)", () => {
-  const cell = (devSession?: string, reviewSession?: string): Pick<TaskRef, "devSession" | "reviewSession"> => ({
+  const cell = (devSession?: string, reviewSession?: string, testSession?: string)
+    : Pick<TaskRef, "devSession" | "reviewSession" | "testSession"> => ({
     devSession,
     reviewSession,
+    testSession,
   })
 
   test("чистая fresh-строка без свидетельств — спавн обычного пути, не сирота", () => {
     expect(untrackedRowDecision(cell(undefined, undefined), "alive")).toEqual({ devWave: true, orphan: false })
-    expect(untrackedRowDecision(cell("", ""), "dead")).toEqual({ devWave: true, orphan: false })
+    expect(untrackedRowDecision(cell("", "", ""), "dead")).toEqual({ devWave: true, orphan: false })
   })
 
   test("ревью-свидетельство без трека (дев пуста) — сирота как прежде, защита инцидента 06.11", () => {
     expect(untrackedRowDecision(cell(undefined, "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
     expect(untrackedRowDecision(cell("", "ses_rev01"), "alive")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("тест-свидетельство без трека — сирота (паритет ревью-свидетельства)", () => {
+    expect(untrackedRowDecision(cell(undefined, undefined, "ses_test01"), "dead"))
+      .toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("", "", "ses_test01"), "alive"))
+      .toEqual({ devWave: true, orphan: true })
   })
 
   test("живая дев-заявка (task claim) — внешняя работа идёт: не спавнить, не сирота", () => {

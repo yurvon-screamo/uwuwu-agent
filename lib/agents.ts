@@ -5,3 +5,6 @@
 
 /** Праймари-агент ревью фабрики (спавнится на «Ревью плана»/«Ревью результата»). */
 export const REVIEWER_AGENT_ID = "code-quality-reviewer"
+
+/** Праймари-агент тестирования фабрики (спавнится на «Тестирование»). */
+export const TESTER_AGENT_ID = "tester"
