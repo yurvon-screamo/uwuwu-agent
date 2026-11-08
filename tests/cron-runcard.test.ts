@@ -52,6 +52,17 @@ afterEach(() => {
   ;(Bun as unknown as { spawn: unknown }).spawn = originalSpawn
 })
 
+describe("runCardBody: шапка ран-карточки", () => {
+  test("шапка предписывает агенту закрыть успешный ран сам — без «Закрывает владелец»", () => {
+    const body = cron.runCardBody("мастер X", "6h", "проверь SiYuan", new Date(2026, 10, 7, 9, 30))
+    expect(body).toContain("закрывает агент рана")
+    expect(body).not.toContain("Закрывает владелец")
+    expect(body).toContain("## Инструкция мастера")
+    expect(body).toContain("проверь SiYuan")
+    expect(body).toContain("расписание: `6h`")
+  })
+})
+
 describe("createRunCard: позитивный путь", () => {
   test("парсит rowId из stdout create и переводит ран в Todo", async () => {
     const { calls } = scriptSpawn([
