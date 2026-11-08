@@ -126,6 +126,10 @@ export interface HubState {
   run?: RunState
   /** ms последнего push/редакта в очередь — опора дебаунса батча */
   lastPushAt?: number
+  /** ms последнего выхода демона (успешная доставка в ТГ / завершённый
+   *  финал хода) — опора тайм-аута тишины выходного потока (silenceCheck);
+   *  материализует createHub при загрузке */
+  lastDeliveryAt?: number
   /** батч в полёте (взят из очереди, промпт ещё не подтверждён): edit-ветка
    *  отличает «ещё в очереди — можно править» от «уже пошло агенту» */
   firing?: { at: number; msgIDs: number[] }
@@ -190,6 +194,9 @@ export function validState(
   if (Number.isFinite(r.lastPushAt) && (r.lastPushAt as number) >= 0) {
     out.lastPushAt = r.lastPushAt as number
   }
+  if (Number.isFinite(r.lastDeliveryAt) && (r.lastDeliveryAt as number) >= 0) {
+    out.lastDeliveryAt = r.lastDeliveryAt as number
+  }
   const firing = r.firing
   if (firing !== null && typeof firing === "object") {
     const f = firing as Record<string, unknown>
@@ -244,6 +251,44 @@ export function validState(
   }
   extra?.(r, out)
   return out
+}
+
+// ——— liveness: тайм-аут тишины выходного потока ———
+// Правило опыта «SiYuan-контур uwuwu» (Режим 5, дополнение): liveness-детектор
+// демона-обработчика потока обязан смотреть на ВЫХОД (доставки/выходные
+// записи), не только на процесс/journal-болтовню — «тишина исходящего потока»
+// включает «живость процесса».
+
+/** Минимальный интервал повторных ПОПЫТОК доставки алерта тишины, пока
+ *  выходов нет (ТГ недоступен). Успешный алерт — это send-успех: он обновляет
+ *  метку тишины сам, на success-пути окно не участвует. */
+export const SILENCE_ALERT_RETRY_MS = 60 * 60_000
+
+/** Окно ретрая недоставленного алерта — в памяти процесса (рестарт сбрасывает:
+ *  метка тишины персистится, недоставленный алерт ретраится сразу). */
+export interface SilenceGate {
+  nextAlertAt: number
+}
+
+/** Проверка тишины: `alert = (age ≥ timeout) && (now ≥ gate.nextAlertAt)`.
+ *  Свежая доставка (метка обновлена) гасит алерт первым условием — повторного
+ *  алерта на живом потоке нет; недоставленный алерт метку не трогает, тишина
+ *  продолжает расти, окно душит попытки до одной на retryMs (дефолт —
+ *  SILENCE_ALERT_RETRY_MS; инъекция для e2e — прецедент ADR-061). */
+export function silenceCheck(
+  lastDeliveryAt: number,
+  gate: SilenceGate,
+  now: number,
+  timeoutMs: number,
+  retryMs: number = SILENCE_ALERT_RETRY_MS,
+): { gate: SilenceGate; alert: boolean; ageMs: number } {
+  const ageMs = now - lastDeliveryAt
+  const alert = ageMs >= timeoutMs && now >= gate.nextAlertAt
+  return {
+    gate: alert ? { nextAlertAt: now + retryMs } : gate,
+    alert,
+    ageMs,
+  }
 }
 
 // ——— апдейты ТГ ———
@@ -357,7 +402,8 @@ export function capUnchatBatch(items: Request[], max: number): Request[] {
  *  Доставка — по первому ненулевому chatID (чисто без-чатовый батч = 0,
  *  смешанный доставляется в ТГ как единый ход единого пайпа). */
 export function joinBatch(items: Request[]): Request {
-  const head = items[0]!
+  const head = items[0]
+  if (head === undefined) throw new Error("joinBatch: пустой батч")
   const withChat = items.find((i) => i.chatID !== 0)
   const attachments = items.flatMap((i) => i.attachments ?? [])
   const failed = [...new Set(items.flatMap((i) => i.failed ?? []))]
@@ -670,6 +716,17 @@ export interface HubProfile {
   /** extra-валидатор state.json входа (черновик-трекер триажа, крон Lead):
    *  битые поля стрипятся внутри хука, база не роняется */
   validateState?: (raw: Record<string, unknown>, out: HubState) => void
+  /** порог тишины выходного потока, ms: доставок и завершённых ходов нет
+   *  дольше порога при живом процессе → алерт владельцу (silenceLoop).
+   *  Атрибут профиля: триаж — сутки (волны черновиков ежедневные), Lead —
+   *  гэп ночного аудита ~сутки с запасом */
+  silenceTimeoutMs: number
+  /** период тика silenceLoop, ms; дефолт минута. Инъекция для e2e —
+   *  прецедент ADR-061 («пейсинг ретраев — инъекция для тестов») */
+  silenceTickMs?: number
+  /** окно ретрая недоставленного алерта, ms; дефолт SILENCE_ALERT_RETRY_MS.
+   *  Инъекция для e2e — паритет silenceTickMs */
+  silenceAlertRetryMs?: number
 }
 
 export interface Cfg {
@@ -758,6 +815,11 @@ export function createHub(profile: HubProfile): Hub {
     try { state = validState(JSON.parse(readFileSync(STATE_FILE, "utf-8")), profile.validateState) }
     catch (e) { log(`state.json битый — стартую с пустого (${e})`) }
   }
+  // материализация метки тишины — мутатор, а не валидатор (паттерн инцидента
+  // draftLoop: опц-поле материализует место мутации, контракт валидатора
+  // «стрипать битое» остаётся честным). Апгрейд живого state без ложного
+  // алерта: метка стартует с момента первого запуска нового кода.
+  state.lastDeliveryAt ??= Date.now()
   const save = (): void => {
     mkdirSync(STATE_DIR, { recursive: true })
     if (existsSync(STATE_FILE)) {
@@ -771,7 +833,7 @@ export function createHub(profile: HubProfile): Hub {
   // координированный останов: все циклы доходят до безопасной точки, процесс
   // выходит сам; grace-таймаут в acquireLock — страховка от зависшего drainage
   let stopping = false
-  const loopDone: Record<string, boolean> = { run: false, poll: false }
+  const loopDone: Record<string, boolean> = { run: false, poll: false, silence: false }
   for (const s of profile.sources) loopDone[s.name] = false
   const maybeExit = (): void => {
     if (Object.values(loopDone).every((v) => v)) {
@@ -827,18 +889,27 @@ export function createHub(profile: HubProfile): Hub {
    *  уже отправленное не дублируется, теги в чат не утекают. Ошибки глотает:
    *  false = не доставлено (никогда не реджектит — вызывающие ветки сами
    *  решают, что делать). */
-  const send = async (chatID: number, text: string): Promise<boolean> => {
+  const sendRaw = async (chatID: number, text: string): Promise<boolean> => {
     const html = profile.tgFormatter.htmlParts(text) ?? []
     if (html.length === 0) return sendPlain(chatID, text)
     const aligned = alignChunks(html, text)
-    for (let i = 0; i < html.length; i++) {
-      if (await attemptSend(chatID, html[i]!, true)) continue
-      for (let j = i; j < aligned.length; j++) {
-        if (!(await attemptSend(chatID, aligned[j]!, false))) return false
+    for (const [i, part] of html.entries()) {
+      if (await attemptSend(chatID, part, true)) continue
+      for (const tail of aligned.slice(i)) {
+        if (!(await attemptSend(chatID, tail, false))) return false
       }
       return true
     }
     return true
+  }
+
+  /** Доставка в ТГ + учёт выхода тишины: успех = выходной поток жив, метка
+   *  обновлена; неудача метку не трогает — тишина продолжает расти и задетектится
+   *  silenceLoop (в т.ч. ретрай недоставленного алерта по своему окну). */
+  const send = async (chatID: number, text: string): Promise<boolean> => {
+    const ok = await sendRaw(chatID, text)
+    if (ok) state.lastDeliveryAt = Date.now()
+    return ok
   }
 
   // ——— opencode REST (registration-файл фонового сервиса; перечитываем на
@@ -847,7 +918,7 @@ export function createHub(profile: HubProfile): Hub {
   async function restCall(path: string, init?: { method?: string; body?: unknown }): Promise<unknown> {
     const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string; password?: string }
     const base = (reg.url ?? "").replace("0.0.0.0", "127.0.0.1")
-    const auth = "Basic " + Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")
+    const auth = `Basic ${Buffer.from(`opencode:${reg.password ?? ""}`).toString("base64")}`
     const res = await fetch(`${base}/api${path}`, {
       method: init?.method ?? "GET",
       headers: { authorization: auth, "content-type": "application/json" },
@@ -946,14 +1017,12 @@ export function createHub(profile: HubProfile): Hub {
       }
       if (alive === null) return state.session // неизвестно — не пересоздаём
       log(`сессия ${state.session} пропала — пересоздаю (контекст переписки потерян)`)
-      await recreateSession(true)
-      return state.session!
+      return await recreateSession(true)
     }
-    await recreateSession(false)
-    return state.session!
+    return await recreateSession(false)
   }
 
-  const recreateSession = async (notify: boolean): Promise<void> => {
+  const recreateSession = async (notify: boolean): Promise<string> => {
     syncAgentDef()
     const raw = await restCall("/session", {
       method: "POST",
@@ -973,6 +1042,7 @@ export function createHub(profile: HubProfile): Hub {
     if (notify && state.chatID !== undefined) {
       await send(state.chatID, "ℹ️ Сессия диалога пересоздана — контекст переписки сброшен.")
     }
+    return id
   }
 
   /** Неудача попытки хода: transient или poison. Счётчик ведём на
@@ -1164,6 +1234,10 @@ export function createHub(profile: HubProfile): Hub {
    *  контекста — только ручной /reset). allowSilent (крон-промпты): ход без
    *  единого ответа — молчание, не «(пустой ответ)»; оборванный — пометка. */
   const deliverFinal = async (run: RunState): Promise<void> => {
+    // финал хода = выходная запись тишины при любом исходе (включая unchat-
+    // финалы черновиков и тихие ходы): ход завершился — пайп жив и отработал;
+    // недоставленность ответов ловит send-метка (не обновится при провале)
+    state.lastDeliveryAt = Date.now()
     let broken = false
     try {
       const s = await restCall(`/session/${run.sessionID}`) as { outcome?: string }
@@ -1498,17 +1572,17 @@ export function createHub(profile: HubProfile): Hub {
       await send(state.chatID, "⚠️ Такой тип сообщения не разбираю (голосовые, стикеры и пр.) — опиши словами или пришли фото/файл/видео")
     } else if (out.kind === "edit") {
       // правка в окне дебаунса: подменяем текст, пока батч не ушёл агенту
-      if (state.firing !== undefined && state.firing.msgIDs.includes(out.msg.message_id)) {
+      if (state.firing?.msgIDs.includes(out.msg.message_id) ?? false) {
         log(`edit msg${out.msg.message_id}: батч уже в полёте — правка не принята`)
         await send(state.chatID, "⏳ Успел раньше меня — сообщение уже у агента. Пришли правку новым сообщением.")
       } else {
         const i = state.queue.findIndex((r) => r.msgID === out.msg.message_id)
-        if (i >= 0) {
+        const cur = i >= 0 ? state.queue[i] : undefined
+        if (cur !== undefined) {
           // правка может нести НОВОЕ вложение (заменил фото) — выгружаем; текст
           // пересобираем с маркерами (пути в ФС — агент фиксирует их в теле задачи)
           const hasNewMedia = mediaFiles(out.msg).length > 0
           const dl = hasNewMedia ? await downloadAttachment(out.msg) : { attachments: [], failed: [] }
-          const cur = state.queue[i]!
           const attachments = hasNewMedia ? dl.attachments : (cur.attachments ?? [])
           const failed = hasNewMedia ? dl.failed : (cur.failed ?? [])
           state.queue[i] = {
@@ -1558,6 +1632,55 @@ export function createHub(profile: HubProfile): Hub {
       }
     }
     loopDone.poll = true
+    maybeExit()
+  }
+
+  // ——— liveness: луп тайм-аута тишины выходного потока ———
+
+  /** Период проверки тишины; первый тик — сразу после старта. Переопределяется
+   *  профилем (silenceTickMs) — инъекция для e2e, прецедент ADR-061
+   *  («пейсинг ретраев — инъекция для тестов»). */
+  const SILENCE_TICK_MS = 60_000
+  const hoursOf = (ms: number): number => Math.round(ms / 3600_000)
+  let silenceGate: SilenceGate = { nextAlertAt: 0 }
+
+  /** Громкая гарда вместо фолбэка-свежести: материализация при загрузке делает
+   *  ветку недостижимой; при нарушении тишина не должна молча притворяться свежей. */
+  const silenceStamp = (): number => {
+    const v = state.lastDeliveryAt
+    if (v === undefined) throw new Error("метка тишины не материализована при загрузке state")
+    return v
+  }
+
+  /** Луп тайм-аута тишины (правило опыта «SiYuan-контур», Режим 5 дополнение:
+   *  детектор демона-обработчика смотрит на ВЫХОД — доставку/финалы, не на
+   *  процесс). ИНВАРИАНТ: никаких kernel/MCP вызовов — только pure-check по
+   *  state + ТГ-fetch со своим таймаутом; детектор обязан переживать
+   *  деградацию ядра (вечный await клиентов) — он для таких режимов и заведён.
+   *  Тик в try/catch (формат runLoop/pollLoop); loopDone.silence выставляется
+   *  всегда — краш тика не подвешивает graceful-stop. */
+  const silenceLoop = async (): Promise<void> => {
+    while (true) {
+      if (stopping) break
+      try {
+        const r = silenceCheck(silenceStamp(), silenceGate, Date.now(), profile.silenceTimeoutMs, profile.silenceAlertRetryMs)
+        silenceGate = r.gate
+        if (r.alert) {
+          const h = hoursOf(r.ageMs)
+          log(`тишина выходного потока ~${h} ч (порог ${hoursOf(profile.silenceTimeoutMs)} ч) — доставок и завершённых ходов нет`)
+          if (state.chatID !== undefined) {
+            const ok = await send(state.chatID, `🚨 ${profile.daemonName}: тишина выходного потока ~${h} ч (порог ${hoursOf(profile.silenceTimeoutMs)} ч) — доставок и завершённых ходов нет при живом процессе. Погляди лог и доску.`)
+            if (!ok) log("тишина-алерт не доставлен (ТГ недоступен?) — ретрай по окну")
+          } else {
+            log("тишина-алерт НЕ доставлен: chatID не залочен — владелец ни разу не писал боту")
+          }
+        }
+      } catch (e) {
+        log(`silenceLoop: ${e}`)
+      }
+      await sleep(profile.silenceTickMs ?? SILENCE_TICK_MS)
+    }
+    loopDone.silence = true
     maybeExit()
   }
 
@@ -1612,11 +1735,17 @@ export function createHub(profile: HubProfile): Hub {
         }
       }
       const me = await tg("getMe") as { username?: string }
-      const reg = JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }
+      // терпеливое чтение: чистая машина без зарегистрированного opencode-сервиса
+      // не должна валить старт демона (reg перечитывается на каждом restCall —
+      // поздняя регистрация подхватится)
+      let regUrl: string | undefined
+      try { regUrl = (JSON.parse(readFileSync(SERVICE_REG, "utf-8")) as { url?: string }).url } catch {}
       const m = sessionModel()
-      log(`${profile.daemonName}: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${m.id}${m.variant !== undefined ? `#${m.variant}` : ""}, опенкод=${reg.url ?? "?"})`)
+      log(`${profile.daemonName}: старт (бот @${me.username ?? "?"}, owner @${cfg.owner}, chat=${state.chatID ?? "—"}, сессия=${state.session ?? "создастся по первому сообщению"}, model=${m.id}${m.variant !== undefined ? `#${m.variant}` : ""}, опенкод=${regUrl ?? "?"})`)
+      log(`silence-watch: порог ${hoursOf(profile.silenceTimeoutMs)} ч`)
       void runLoop()
       void pollLoop()
+      void silenceLoop()
       for (const s of profile.sources) {
         void s.start(hub, {
           stopping: () => stopping,
