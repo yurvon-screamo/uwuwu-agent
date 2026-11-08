@@ -92,6 +92,70 @@ export function validTriageExtras(r: Record<string, unknown>, out: HubState): vo
   }
 }
 
+// ——— тик вотчера: синхронизация трекера с досками ———
+
+/** Строка доски, увиденная вотчером (read_database_cells). */
+export interface DraftRow {
+  rowId: string
+  docId: string
+  title: string
+}
+
+/** Черновики, уже находящиеся в очереди или активном ходе (не дублируем пуши). */
+export const draftRowIdsInPipeline = (state: HubState): Set<string> => {
+  const ids = new Set<string>()
+  for (const r of state.queue) {
+    for (const d of r.drafts ?? []) ids.add(d.rowId)
+  }
+  if (state.run !== undefined) {
+    for (const d of state.run.req.drafts ?? []) ids.add(d.rowId)
+  }
+  return ids
+}
+
+/** Трекер vs доски: новые sighting'и, смена тайтла, чистка ушедших из Draft.
+ *  Поле drafts материализует сам (контракт «мутатор материализует поле»,
+ *  инцидент 07.11: валидатор ставил поле только непустым — на пустом стейте
+ *  трекер разыменовывал undefined и падал каждый тик, ни один черновик
+ *  не доезжал до стейта). true = состояние изменилось (нужен save). */
+export const syncDraftTracker = (
+  state: HubState,
+  seen: Map<string, DraftRow>,
+  projects: Map<string, string>,
+  now: number,
+  log: (m: string) => void,
+): boolean => {
+  let changed = false
+  state.drafts ??= {}
+  const drafts = state.drafts as Record<string, DraftTrack>
+  for (const [rowId, d] of seen) {
+    const t = drafts[rowId]
+    if (t === undefined) {
+      drafts[rowId] = {
+        project: projects.get(rowId) ?? "?",
+        docId: d.docId,
+        title: d.title,
+        seenAt: now,
+        updatedAt: now,
+        turns: 0,
+      }
+      log(`черновик: ${projects.get(rowId) ?? "?"} ${rowId} «${d.title.slice(0, 60)}»`)
+      changed = true
+    } else if (t.title !== d.title && d.title !== "") {
+      t.title = d.title
+      changed = true
+    }
+  }
+  const inFlight = draftRowIdsInPipeline(state)
+  for (const rowId of Object.keys(drafts)) {
+    if (seen.has(rowId) || inFlight.has(rowId)) continue
+    delete drafts[rowId]
+    delete state.draftSkip?.[rowId] // ушёл из Draft → skip снят
+    changed = true
+  }
+  return changed
+}
+
 // ——— черновики задач (вотчер досок) ———
 
 /** Тик вотчера черновиков, сек. «0» — kill-switch (вотчер off); мусор и

@@ -2,11 +2,12 @@
 // (bun test, без сети; ядро демона — lib/hub.ts, его тесты рядом с ним)
 import { test, expect } from "bun:test"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker, validTriageExtras,
   DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS,
+  type DraftRow,
   type DraftTrack,
 } from "./triage-lib"
-import { validState } from "../lib/hub"
+import { validState, type HubState } from "../lib/hub"
 
 const track = (over: Partial<DraftTrack>): DraftTrack => ({
   project: "uwuwu", docId: "doc-1", title: "Черновик", seenAt: 0, updatedAt: 0, turns: 0, ...over,
@@ -62,6 +63,43 @@ test("applyTurns: неизвестные rowId и пустые входы сос
   expect(applyTurns(undefined, ["r1"], 500)).toBe(false)
   expect(applyTurns(drafts, undefined, 500)).toBe(false)
   expect(applyTurns(drafts, [], 500)).toBe(false)
+})
+
+// ——— тик вотчера: синхронизация трекера (инцидент 07.11: пустой стейт) ———
+
+/** Стейт без поля drafts — свежий демон или старый state.json (вход
+ *  валидатора мог и не материализовать: контракт мутатора самодостаточен). */
+const rawEmptyState = (): HubState => ({ offset: 0, queue: [] })
+
+test("syncDraftTracker: пустой стейт — тик без падений, drafts материализуется, sighting трекается", () => {
+  const state = rawEmptyState()
+  const logs: string[] = []
+  const seen = new Map<string, DraftRow>([["r1", { rowId: "r1", docId: "d1", title: "Черновик" }]])
+  const projects = new Map([["r1", "uwuwu"]])
+  expect(syncDraftTracker(state, seen, projects, 1000, (m) => logs.push(m))).toBe(true)
+  // до фикса: валидатор ставил drafts только непустым, мутатор разыменовывал
+  // undefined — TypeError каждый тик, ни один черновик не доезжал до стейта
+  expect(state.drafts?.r1).toEqual({ project: "uwuwu", docId: "d1", title: "Черновик", seenAt: 1000, updatedAt: 1000, turns: 0 })
+  expect(logs).toEqual(["черновик: uwuwu r1 «Черновик»"])
+})
+
+test("syncDraftTracker: пустой стейт и пустые доски — drafts {} без save", () => {
+  const state = rawEmptyState()
+  expect(syncDraftTracker(state, new Map(), new Map(), 1000, () => {})).toBe(false)
+  expect(state.drafts).toEqual({})
+})
+
+test("syncDraftTracker: ушедший из Draft чистится со skip'ом, кандидат в полёте остаётся", () => {
+  const state: HubState = {
+    offset: 0,
+    queue: [{ text: "t", chatID: 0, msgID: -1, receivedAt: 0, drafts: [{ project: "uwuwu", rowId: "r2", docId: "d2", title: "T2" }] }],
+    drafts: { r1: track({}), r2: track({}) },
+    draftSkip: { r1: 5 },
+  }
+  expect(syncDraftTracker(state, new Map(), new Map(), 1000, () => {})).toBe(true)
+  expect(state.drafts?.r1).toBeUndefined() // ушёл с доски — трек снесён
+  expect(state.draftSkip?.r1).toBeUndefined() // и skip снят
+  expect(state.drafts?.r2).toBeDefined() // в очереди/полёте — не чистим (не дублируем пуш)
 })
 
 test("parseWatchSec: 0 — kill-switch (не съедается falsy-дефолтом); мусор — дефолт", () => {

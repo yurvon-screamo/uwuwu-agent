@@ -12,8 +12,10 @@ import {
   type Request,
 } from "../lib/hub"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, draftRowIdsInPipeline, parseWatchSec,
+  setDraftAck, syncDraftTracker, validTriageExtras,
   DRAFT_MAX_TURNS,
+  type DraftRow,
   type DraftTrack,
 } from "./triage-lib"
 
@@ -142,12 +144,6 @@ async function refreshBoards(hub: Hub): Promise<BoardRef[]> {
   return boards
 }
 
-interface DraftRow {
-  rowId: string
-  docId: string
-  title: string
-}
-
 async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{
     rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
@@ -177,56 +173,10 @@ async function docUpdatedAt(docId: string): Promise<number | null> {
   return Number.isFinite(ms) ? ms : null
 }
 
-/** Черновики, уже находящиеся в очереди или активном ходе (не дублируем пуши). */
-const draftRowIdsInPipeline = (hub: Hub): Set<string> => {
-  const ids = new Set<string>()
-  for (const r of hub.state.queue) {
-    for (const d of r.drafts ?? []) ids.add(d.rowId)
-  }
-  if (hub.state.run !== undefined) {
-    for (const d of hub.state.run.req.drafts ?? []) ids.add(d.rowId)
-  }
-  return ids
-}
-
-/** Трекер vs доски: новые sighting'и, смена тайтла, чистка ушедших из Draft. */
-const syncDraftTracker = (hub: Hub, seen: Map<string, DraftRow>, projects: Map<string, string>): void => {
-  const now = Date.now()
-  let changed = false
-  hub.state.drafts ??= {}
-  const drafts = hub.state.drafts as Record<string, DraftTrack>
-  for (const [rowId, d] of seen) {
-    const t = drafts[rowId]
-    if (t === undefined) {
-      drafts[rowId] = {
-        project: projects.get(rowId) ?? "?",
-        docId: d.docId,
-        title: d.title,
-        seenAt: now,
-        updatedAt: now,
-        turns: 0,
-      }
-      hub.log(`черновик: ${projects.get(rowId) ?? "?"} ${rowId} «${d.title.slice(0, 60)}»`)
-      changed = true
-    } else if (t.title !== d.title && d.title !== "") {
-      t.title = d.title
-      changed = true
-    }
-  }
-  const inFlight = draftRowIdsInPipeline(hub)
-  for (const rowId of Object.keys(drafts)) {
-    if (seen.has(rowId) || inFlight.has(rowId)) continue
-    delete drafts[rowId]
-    delete hub.state.draftSkip?.[rowId] // ушёл из Draft → skip снят
-    changed = true
-  }
-  if (changed) hub.save()
-}
-
 /** Готовые (тишина/кап) черновики → общая очередь; застрявшие → skip-list. */
 const queueReadyDrafts = async (hub: Hub): Promise<void> => {
   const now = Date.now()
-  const inFlight = draftRowIdsInPipeline(hub)
+  const inFlight = draftRowIdsInPipeline(hub.state)
   const drafts = hub.state.drafts as Record<string, DraftTrack> | undefined
   for (const [rowId, t] of Object.entries(drafts ?? {})) {
     if (inFlight.has(rowId) || hub.state.draftSkip?.[rowId] !== undefined) continue
@@ -290,7 +240,8 @@ const draftWatcher: HubSource = {
             boardCacheAt = 0 // сбой чтения → дискавери на следующем тике
           }
         }
-        syncDraftTracker(hub, seen, projects)
+        // трекер vs доски; changed → save (поле drafts материализует lib-мутатор)
+        if (syncDraftTracker(hub.state, seen, projects, Date.now(), (m) => hub.log(m))) hub.save()
         await queueReadyDrafts(hub)
       } catch (e) {
         hub.log(`draftLoop: ${e}`) // транзиентный сбой шлюза — ретрай следующим тиком
