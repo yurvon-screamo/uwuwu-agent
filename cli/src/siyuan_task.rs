@@ -1302,6 +1302,73 @@ pub(crate) struct CommentDraft<'a> {
     pub reply_to: Option<&'a str>,
 }
 
+/// Строки-комменты в markdown: формат маркера comment_with_ts —
+/// `- **author** (YYYY-MM-DD[ HH:MM]): текст`, реплай — с отступом.
+/// Вне кодовых фенсов; строки нормализованы trim'ом — отступ реплая
+/// подстрочному матчу не мешает. Структурный гард хвостовых комментов
+/// полного replace (инцидент 08.11): комменты за пределами секции
+/// «Комменты» переносом не берутся — их перечень живёт здесь.
+pub(crate) fn comment_lines(md: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut fenced = false;
+    for line in md.lines() {
+        if crate::md_heading::toggles_fence(line) {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced && is_comment_line(line) {
+            found.push(line.trim().to_string());
+        }
+    }
+    found
+}
+
+/// Похожа ли строка на коммент: `- **author** (ts): текст`, ts —
+/// YYYY-MM-DD или YYYY-MM-DD HH:MM (грамматика comment_with_ts).
+fn is_comment_line(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("- **") else {
+        return false;
+    };
+    let Some((author, rest)) = rest.split_once("**") else {
+        return false;
+    };
+    if author.is_empty() || author.contains('*') {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix(" (") else {
+        return false;
+    };
+    let Some((ts, rest)) = rest.split_once(')') else {
+        return false;
+    };
+    is_comment_timestamp(ts) && rest.starts_with(':')
+}
+
+fn is_comment_timestamp(ts: &str) -> bool {
+    match ts.split_once(' ') {
+        Some((date, time)) => is_comment_date(date) && is_comment_clock(time),
+        None => is_comment_date(ts),
+    }
+}
+
+fn is_comment_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+fn is_comment_clock(time: &str) -> bool {
+    let bytes = time.as_bytes();
+    bytes.len() == 5
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            2 => *b == b':',
+            _ => b.is_ascii_digit(),
+        })
+}
+
 /// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
 /// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
 /// поэтому ts вычисляется один раз на вызов.
@@ -1576,6 +1643,45 @@ mod tests {
     fn path_safe_leaves_text_without_slash_untouched() {
         assert_eq!(path_safe("обычный тайтл (v2)"), "обычный тайтл (v2)");
         assert_eq!(path_safe("уже ∕ санитизирован"), "уже ∕ санитизирован");
+    }
+
+    #[test]
+    fn comment_lines_finds_marker_lines_and_replies() {
+        let md = "\
+ввод
+
+## Комменты
+- **AGENTS** (2026-11-08 10:00): головной
+  - **Юра** (2026-11-08 10:05): ответ
+- **AGENTS** (2026-11-07): статусный без времени
+";
+        assert_eq!(
+            comment_lines(md),
+            vec![
+                "- **AGENTS** (2026-11-08 10:00): головной",
+                "- **Юра** (2026-11-08 10:05): ответ",
+                "- **AGENTS** (2026-11-07): статусный без времени",
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_lines_ignores_fenced_examples_and_non_comment_bullets() {
+        let md = "\
+- просто буллет
+- **жирный** без даты
+- **a** (не дата): текст
+```
+- **AGENTS** (2026-11-08 10:00): пример в фенсе
+```
+";
+        assert!(comment_lines(md).is_empty(), "не-комменты не матчатся");
+    }
+
+    #[test]
+    fn comment_lines_rejects_nested_bold_author() {
+        let md = "- **a *b* c** (2026-11-08 10:00): не наш формат\n";
+        assert!(comment_lines(md).is_empty());
     }
 
     #[test]
