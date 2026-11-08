@@ -391,7 +391,8 @@ async fn edit_type_invalid_value_bails_before_any_write() {
         .expect_err("мусорный тип — отказ");
 
     assert!(
-        err.to_string().contains("dev | spike | bug"),
+        err.to_string()
+            .contains("dev | spike | bug | analys | docs | other"),
         "суть отказа: {err}"
     );
     assert!(
