@@ -30,7 +30,7 @@ interface ChildReport {
 }
 
 async function runChild(): Promise<ChildReport> {
-  if (!existsSync(SERVICE_REG)) throw new Error(`нет ${SERVICE_REG} — restCall демона не чем кормить`)
+  if (!hasServiceReg) throw new Error("скип-гард должен был отсечь прогон без реестра")
   rmSync(CHILD_HOME, { recursive: true, force: true })
   mkdirSync(join(CHILD_HOME, ".local/state/opencode"), { recursive: true })
   cpSync(SERVICE_REG, join(CHILD_HOME, ".local/state/opencode/service.json"))
@@ -49,7 +49,12 @@ async function runChild(): Promise<ChildReport> {
 
 const ROW = "20261109000000-master"
 
-describe("tick × боевой файр вечного мастера (custom-agent)", () => {
+/** Интеграционный риг с mock-границами, но живой реестр opencode-сервиса
+ *  нужен демону (restCall читает его на каждый вызов) — без него скип
+ *  (паттерн само-гарда интеграционных тестов, CI реестра не имеет). */
+const hasServiceReg = existsSync(SERVICE_REG)
+
+describe.skipIf(!hasServiceReg)("tick × боевой файр вечного мастера (custom-agent)", () => {
   test("gone→prompt создаёт сессию и ран; running→steer; failed POST→pendingRun; ретрай без due закрывает приземлением", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
