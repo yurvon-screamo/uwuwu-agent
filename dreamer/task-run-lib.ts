@@ -5,7 +5,7 @@
 // Чистые функции: демон (dreamer.ts) несёт REST/FS-обвязку.
 
 import type { Database } from "bun:sqlite"
-import { E2E_SKIP_LIKE, fetchSessionsByParents, fetchSessionById, type SessionRow } from "./session-row"
+import { fetchSessionsByParents, fetchSessionById, type SessionRow } from "./session-row"
 
 // ——— типы ———
 

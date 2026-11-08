@@ -784,7 +784,7 @@ async function startTask(
     (await taskComments(task.bodyDoc, startExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
   )
 
-  state.tasks[task.rowId] = {
+  const entry: TrackedTask = {
     sessionID,
     worktree: envCtx?.repoDir ?? "",
     branch: envCtx?.branch ?? "",
@@ -804,6 +804,7 @@ async function startTask(
     // поколения сессий — BFS задачного прогона накрывает осиротевших)
     sessionHistory: [...(state.tasks[task.rowId]?.sessionHistory ?? []), sessionID],
   }
+  state.tasks[task.rowId] = entry
   saveState(state)
   await setCellsSafe(board, task.rowId, {
     ...(envCtx !== undefined
@@ -811,7 +812,7 @@ async function startTask(
       : {}),
     [DEV_SESSION_CELL]: sessionID,
   })
-  writeTaskStartSignal(task.rowId, state.tasks[task.rowId]!, sessionID, envDir ?? "", envCtx?.repoDir ?? cfg.local)
+  writeTaskStartSignal(task.rowId, entry, sessionID, envDir ?? "", envCtx?.repoDir ?? cfg.local)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
 
@@ -885,6 +886,12 @@ async function finishTask(
 const DREAMER_QUEUE_DIR = process.env.UWUWU_DREAMER_QUEUE_DIR
   ?? join(homedir(), ".local", "state", "uwuwu-dreamer", "queue")
 
+/** Трек задачи для очереди-сигналов: пишущий ход обязан передать запись,
+ *  не hope-читать по key после перезаписи entry. */
+type QueueSignalTask = Pick<TrackedTask,
+  "project" | "title" | "envDir" | "sessionHistory" | "sessionID"
+  | "reviewSessionID" | "testSessionID" | "branch" | "mergedPrUrl">
+
 /** Атомарная запись файла очереди (tmp + rename): дример забирает готовый
  *  JSON, полуфайлов не видит. */
 function writeQueueSignal(fileName: string, payload: Record<string, unknown>): void {
@@ -903,7 +910,7 @@ function writeQueueSignal(fileName: string, payload: Record<string, unknown>): v
 
 /** Start-сигнал: сессия задачи известна активному набору дримера —
  *  посессионный контур скипает её до закрытия задачи (все проекты единообразно). */
-function writeTaskStartSignal(rowId: string, tracked: TrackedTask, sessionID: string, envDir: string, directory: string): void {
+function writeTaskStartSignal(rowId: string, tracked: QueueSignalTask, sessionID: string, envDir: string, directory: string): void {
   writeQueueSignal(`start-${rowId}.json`, {
     rowId, project: tracked.project, title: tracked.title,
     sessionID, envDir, directory, ts: Date.now(),
@@ -912,7 +919,7 @@ function writeTaskStartSignal(rowId: string, tracked: TrackedTask, sessionID: st
 
 /** Done-сигнал: постановка задачного прогона. rootSessions — полная история
  *  корней (sessionHistory + текущие id легаси-треков без истории). */
-function writeTaskDoneSignal(rowId: string, tracked: TrackedTask, cfg: ProjectCfg): void {
+function writeTaskDoneSignal(rowId: string, tracked: QueueSignalTask, cfg: ProjectCfg): void {
   const rootSessions = [...new Set([
     ...(tracked.sessionHistory ?? []),
     tracked.sessionID,
@@ -930,7 +937,7 @@ function writeTaskDoneSignal(rowId: string, tracked: TrackedTask, cfg: ProjectCf
 
 /** PR задачи: кэш смерженного приоритетнее ячейки (ячейку мог очистить
  *  Done-проход фабрики). */
-function mergedPrUrlOf(tracked: TrackedTask): string {
+function mergedPrUrlOf(tracked: QueueSignalTask): string {
   return tracked.mergedPrUrl ?? ""
 }
 

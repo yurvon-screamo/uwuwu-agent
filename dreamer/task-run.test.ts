@@ -12,7 +12,6 @@ import { fetchRootSessions } from "./dreamer-lib"
 
 // ——— фикстурная БД: минимальная схема session_v2 ———
 
-let seq = 0
 const db = new Database(":memory:")
 db.exec(`CREATE TABLE session_v2 (
   id TEXT PRIMARY KEY, title TEXT, directory TEXT, agent TEXT, parent_id TEXT,

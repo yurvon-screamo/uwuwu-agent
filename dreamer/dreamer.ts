@@ -18,8 +18,8 @@ import {
 } from "./dreamer-lib"
 import {
   acceptDoneSignal, applyTaskRunOutcome, batchMaxUpdated, collectTaskSessions,
-  dropTaskActiveSessions, isValidTrackedRun, mergeActiveSession,
-  normalizeActiveSessions, normalizeTrackedRun, parseQueuedSignal, taskRunPrompt,
+  dropTaskActiveSessions, mergeActiveSession, normalizeActiveSessions,
+  normalizeTrackedRun, parseQueuedSignal, taskRunPrompt,
   type TaskDoneSignal, type TrackedTaskRun,
 } from "./task-run-lib"
 import { fetchSessionById, sessionTimedOut } from "./session-row"
