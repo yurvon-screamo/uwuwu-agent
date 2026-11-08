@@ -1305,20 +1305,48 @@ pub(crate) struct CommentDraft<'a> {
 /// Строки-комменты в markdown: формат маркера comment_with_ts —
 /// `- **author** (YYYY-MM-DD[ HH:MM]): текст`, реплай — с отступом.
 /// Вне кодовых фенсов; строки нормализованы trim'ом — отступ реплая
-/// подстрочному матчу не мешает. Структурный гард хвостовых комментов
-/// полного replace (инцидент 08.11): комменты за пределами секции
-/// «Комменты» переносом не берутся — их перечень живёт здесь.
+/// подстрочному матчу не мешает. Многострочный коммент (--stdin — штатный
+/// путь длинных текстов) — маркер плюс continuation-строки (непустые,
+/// не маркерные, не заголовочные) до границы: пустая строка, заголовок,
+/// новый маркер, фенс — иначе хвост тела выпадал бы из перечня и матча
+/// (дельта-ревью 08.11). Структурный гард хвостовых комментов полного
+/// replace (инцидент 08.11): комменты за пределами секции «Комменты»
+/// переносом не берутся — их перечень живёт здесь.
 pub(crate) fn comment_lines(md: &str) -> Vec<String> {
     let mut found = Vec::new();
+    let mut current: Option<String> = None;
     let mut fenced = false;
     for line in md.lines() {
         if crate::md_heading::toggles_fence(line) {
             fenced = !fenced;
+            if let Some(block) = current.take() {
+                found.push(block);
+            }
             continue;
         }
-        if !fenced && is_comment_line(line) {
-            found.push(line.trim().to_string());
+        if fenced {
+            continue;
         }
+        if is_comment_line(line) {
+            if let Some(block) = current.take() {
+                found.push(block);
+            }
+            current = Some(line.trim().to_string());
+            continue;
+        }
+        let Some(block) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || crate::md_heading::heading_of(line).is_some() {
+            found.push(current.take().expect("блок открыт выше"));
+        } else {
+            block.push('\n');
+            block.push_str(trimmed);
+        }
+    }
+    if let Some(block) = current {
+        found.push(block);
     }
     found
 }
@@ -1682,6 +1710,40 @@ mod tests {
     fn comment_lines_rejects_nested_bold_author() {
         let md = "- **a *b* c** (2026-11-08 10:00): не наш формат\n";
         assert!(comment_lines(md).is_empty());
+    }
+
+    #[test]
+    fn comment_lines_captures_multiline_comment_body() {
+        let md = "\
+- **AGENTS** (2026-11-08 10:00): голова вердикта
+  0 high, продолжение
+  ещё строка тела
+";
+        assert_eq!(
+            comment_lines(md),
+            vec!["- **AGENTS** (2026-11-08 10:00): голова вердикта\n0 high, продолжение\nещё строка тела"]
+        );
+    }
+
+    #[test]
+    fn comment_lines_ends_block_at_blank_line_heading_and_next_marker() {
+        let md = "\
+- **AGENTS** (2026-11-08 10:00): первый
+
+хвост после пустой строки
+### Заголовок рвёт
+- **Юра** (2026-11-08 10:05): второй
+- **AGENTS** (2026-11-08 10:06): третий
+";
+        assert_eq!(
+            comment_lines(md),
+            vec![
+                "- **AGENTS** (2026-11-08 10:00): первый",
+                "- **Юра** (2026-11-08 10:05): второй",
+                "- **AGENTS** (2026-11-08 10:06): третий",
+            ],
+            "пустая/заголовок/новый маркер — границы блока; текст вне блока не захватывается"
+        );
     }
 
     #[test]
