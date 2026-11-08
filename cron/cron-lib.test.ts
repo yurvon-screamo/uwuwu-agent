@@ -120,10 +120,17 @@ describe("firePrompt", () => {
     expect(p).not.toContain("[DONE]")
     expect(p).not.toContain("🤖")
   })
-  test("ран-карточка названа: агент не работает по ней и статус не меняет", () => {
+  test("ран-карточка названа: агент не работает по ней, успешный ран закрывает сам", () => {
     const p = firePrompt(master, "", "20261107090000-run001", "uwuwu")
     expect(p).toContain("Ран-карточка этого запуска — задача 20261107090000-run001")
-    expect(p).toContain("статус не меняй (закрывает владелец)")
+    expect(p).toContain("uwuwu-cli task edit 20261107090000-run001 --project uwuwu --status Done")
+    expect(p).not.toContain("статус не меняй")
+    expect(p).not.toContain("закрывает владелец")
+  })
+  test("неуверенность в исходе: ран не закрывается — Todo-хвост сигнал сбоя", () => {
+    const p = firePrompt(master, "", "20261107090000-run001", "uwuwu")
+    expect(p).toContain("не закрывай")
+    expect(p).toContain("сигнал сбоя")
   })
   test("исключение: команда коммента на ран с project и ЧТО РЕШИТЬ", () => {
     const p = firePrompt(master, "=== СЕКРЕТ ===\nпроверь", "20261107090000-run001", "1xgames")
