@@ -63,7 +63,10 @@ describe("tickProject: гвард ревью-тишины (недоставле�
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), JSON.stringify(state))
   }
 
-  async function runTick(scenario: "stall" | "healthy" | "recovered" | "dead"): Promise<StallVerdict> {
+  async function runTick(
+    scenario: "stall" | "recent" | "healthy" | "recovered" | "dead",
+    opts: { stallMin?: string } = {},
+  ): Promise<StallVerdict> {
     seatState(scenario)
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
@@ -71,10 +74,12 @@ describe("tickProject: гвард ревью-тишины (недоставле�
         // явная песочница state: дефолт-изоляция ветки (задача 20261106082216)
         // не должна уводить сидированный state в branches/<ветка>
         UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
-        // порог тишины фиксируем в дефолте (30 мин): сценарий stall сидирует
-        // активность 31-мин давности — экспортированный на машине прогонов
-        // UWUWU_FACTORY_STALL_MIN ≠ 30 не должен менять вердикт теста
-        UWUWU_FACTORY_STALL_MIN: "",
+        // порог тишины фиксируем в дефолте (6 ч): сценарий stall сидирует
+        // активность 6ч+1мин давности, recent — реплику инцидента 07.11
+        // (31 мин) — экспортированный на машине прогонов
+        // UWUWU_FACTORY_STALL_MIN ≠ 360 не должен менять вердикт теста;
+        // opts.stallMin переопределяет для теста env-ручки (PR #182)
+        UWUWU_FACTORY_STALL_MIN: opts.stallMin ?? "",
       },
       stdout: "pipe", stderr: "pipe",
     })
@@ -99,6 +104,29 @@ describe("tickProject: гвард ревью-тишины (недоставле�
     expect(v.lastStatus).toBe("Needs attention")
     // флаг эпизода стоит — второй тик молчит (анти-спам)
     expect(v.reviewStallSignaled).toBe(true)
+    expect(v.tick2.itemUpdates).toHaveLength(0)
+    expect(v.tick2.comments).toHaveLength(0)
+  })
+
+  test("recent: реплика инцидента 07.11 — тишина 31 мин при пороге 6 ч (фоновая сборка) — гвард молчит", async () => {
+    const v = await runTick("recent")
+    expect(v.tick1.itemUpdates).toHaveLength(0)
+    expect(v.tick1.comments).toHaveLength(0)
+    expect(v.tick2.itemUpdates).toHaveLength(0)
+    expect(v.tick2.comments).toHaveLength(0)
+    expect(v.reviewStallSignaled).toBe(null)
+    expect(v.lastStatus).toBe("Ревью результата")
+  })
+
+  test("env-ручка: UWUWU_FACTORY_STALL_MIN=30 — тишина 31 мин снова ловится живым тиком (откат порога на машине)", async () => {
+    // вайринг env → STALL_MIN → гвард на живом тике (PR #182): тот же сид
+    // recent (31 мин тишины), но порог из env 30 — за порогом
+    const v = await runTick("recent", { stallMin: "30" })
+    expect(v.tick1.itemUpdates).toContain("k-status=Needs attention")
+    expect(v.tick1.comments).toHaveLength(1)
+    expect(v.lastStatus).toBe("Needs attention")
+    expect(v.reviewStallSignaled).toBe(true)
+    // анти-спам: второй тик молчит
     expect(v.tick2.itemUpdates).toHaveLength(0)
     expect(v.tick2.comments).toHaveLength(0)
   })

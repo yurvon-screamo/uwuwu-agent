@@ -992,16 +992,16 @@ describe("parseProjects: семантическая валидация", () => {
 // ——— сигнал о застое: env-парсер / парсер сообщений / вердикт ———
 
 describe("stallMinutesFromEnv: UWUWU_FACTORY_STALL_MIN", () => {
-  test("таблица: дефолт 30 на пустоту/мусор, валидное число — оно", () => {
-    expect(stallMinutesFromEnv(undefined)).toBe(30)
-    expect(stallMinutesFromEnv("")).toBe(30)
-    expect(stallMinutesFromEnv("  ")).toBe(30)
+  test("таблица: дефолт 360 (6 ч) на пустоту/мусор, валидное число — оно", () => {
+    expect(stallMinutesFromEnv(undefined)).toBe(360)
+    expect(stallMinutesFromEnv("")).toBe(360)
+    expect(stallMinutesFromEnv("  ")).toBe(360)
     expect(stallMinutesFromEnv("15")).toBe(15)
     expect(stallMinutesFromEnv("7.5")).toBe(7.5)
-    expect(stallMinutesFromEnv("0")).toBe(30) // сигнал на каждой паузе — мёртвый режим
-    expect(stallMinutesFromEnv("-5")).toBe(30)
-    expect(stallMinutesFromEnv("abc")).toBe(30)
-    expect(stallMinutesFromEnv("NaN")).toBe(30)
+    expect(stallMinutesFromEnv("0")).toBe(360) // сигнал на каждой паузе — мёртвый режим
+    expect(stallMinutesFromEnv("-5")).toBe(360)
+    expect(stallMinutesFromEnv("abc")).toBe(360)
+    expect(stallMinutesFromEnv("NaN")).toBe(360)
   })
 })
 
@@ -1171,6 +1171,70 @@ describe("reviewStallVerdict: недоставленный вердикт дер
   })
   test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
     expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+})
+
+// Дефолт-порог 6 ч (трейд владельца 08.11, задача 20261108161255-rmw1ryj):
+// глубокие фоновые прогоны — сборки/e2e/глубокое тестирование — легитимно
+// молчат часами. Реплика инцидента 07.11 (задача 20261107154637): агент ушёл
+// в холодную Railway-сборку, фабрика дала ложный stall на 31-й минуте при
+// ~90 минутах реальной работы. Оба вердикта на ПРОИЗВОДСТВЕННОМ дефолте.
+describe("дефолт-порог 6 ч: реплика инцидента 07.11 и настоящий завис", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const DEFAULT_MIN = stallMinutesFromEnv(undefined)
+  const DEFAULT_MS = DEFAULT_MIN * MIN // вердикты принимают миллисекунды (STALL_MS = STALL_MIN * 60_000)
+  const devFacts = (lastActivityAt: number | null): StallFacts => ({
+    status: "In Progress",
+    sessionAlive: true,
+    lastActivityAt,
+    branch: "work/task-abc",
+    branchInWorktree: true,
+    prMerged: false,
+    signaled: false,
+    now: NOW,
+  })
+  const holderFacts = (lastActivityAt: number | null): ReviewStallFacts => ({
+    status: TESTING_STATUS,
+    holderAlive: true,
+    lastActivityAt,
+    signaled: false,
+    now: NOW,
+  })
+
+  test("порог по умолчанию — 360 мин (6 ч)", () => {
+    expect(DEFAULT_MIN).toBe(360)
+  })
+  test("реплика 07.11: тишина 31 мин (ложный сталл инцидента) — none в обоих вердиктах", () => {
+    expect(stallVerdict(devFacts(NOW - 31 * MIN), DEFAULT_MS).t).toBe("none")
+    expect(reviewStallVerdict(holderFacts(NOW - 31 * MIN), DEFAULT_MS).t).toBe("none")
+  })
+  test("фоновая сборка ~90 мин (дамп сессии 07.11) — none", () => {
+    expect(stallVerdict(devFacts(NOW - 90 * MIN), DEFAULT_MS).t).toBe("none")
+    expect(reviewStallVerdict(holderFacts(NOW - 90 * MIN), DEFAULT_MS).t).toBe("none")
+  })
+  test("глубокое тестирование 5 ч — none (класс жалобы владельца)", () => {
+    expect(reviewStallVerdict(holderFacts(NOW - 5 * 60 * MIN), DEFAULT_MS).t).toBe("none")
+  })
+  test("настоящее зависание: тишина 6 ч + 1 мин — signal в обоих вердиктах", () => {
+    expect(stallVerdict(devFacts(NOW - 361 * MIN), DEFAULT_MS).t).toBe("signal")
+    expect(reviewStallVerdict(holderFacts(NOW - 361 * MIN), DEFAULT_MS).t).toBe("signal")
+  })
+  test("env-ручка: UWUWU_FACTORY_STALL_MIN=30 возвращает старый порог — тишина 31 мин снова ловится", () => {
+    // откат порога на машине без кода (ручка совместимости, PR #182):
+    // парсер → вердикт целиком, не только таблица парсера
+    const old30Ms = stallMinutesFromEnv("30") * MIN
+    expect(stallVerdict(devFacts(NOW - 31 * MIN), old30Ms).t).toBe("signal")
+    expect(reviewStallVerdict(holderFacts(NOW - 31 * MIN), old30Ms).t).toBe("signal")
+  })
+  test("env-ручка: порог 90 мин закрывает окно фоновых сборок — 31 и 90 мин молчат, 91 ловится", () => {
+    const p90Ms = stallMinutesFromEnv("90") * MIN
+    expect(reviewStallVerdict(holderFacts(NOW - 90 * MIN), p90Ms).t).toBe("none")
+    expect(reviewStallVerdict(holderFacts(NOW - 91 * MIN), p90Ms).t).toBe("signal")
+  })
+  test("ровно 6 ч — ещё none (возраст строго больше порога)", () => {
+    expect(stallVerdict(devFacts(NOW - 360 * MIN), DEFAULT_MS).t).toBe("none")
+    expect(reviewStallVerdict(holderFacts(NOW - 360 * MIN), DEFAULT_MS).t).toBe("none")
   })
 })
 
