@@ -74,7 +74,7 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 Имена ревью-статусов и стадии тестирования — контракт с колонками досок: константы
 `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`/`TESTING_STATUS` (factory-lib).
 Ячейки Path/«Сессия dev»/«Сессия ревью»/«Сессия тест» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает).
-Канон секций, шаблоны тел задач (dev, spike, bug) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
+Канон секций, шаблоны тел задач (dev, spike, bug — docs/other делят dev-костяк, analys делит spike) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
 ### CI (GitHub Actions)
 
