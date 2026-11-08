@@ -22,7 +22,7 @@ interface TickVerdict {
   } | null
   activeSessions: Record<string, string> | null
   queue: string[]
-  sessionCreates: Array<{ body: { agent?: string; location?: { directory?: string } } }>
+  sessionCreates: Array<{ body: { agent?: string; parentID?: string; location?: { directory?: string } } }>
   prompts: Array<{ body: { text?: string } }>
   sessionDeletes: unknown[]
 }
