@@ -78,7 +78,7 @@ export function validTriageExtras(r: Record<string, unknown>, out: HubState): vo
         tracks[rowId] = v
       }
     }
-    if (Object.keys(tracks).length > 0) out.drafts = tracks
+    out.drafts = tracks
   }
   if (r.draftSkip !== null && typeof r.draftSkip === "object" && !Array.isArray(r.draftSkip)) {
     const skip: Record<string, number> = {}
