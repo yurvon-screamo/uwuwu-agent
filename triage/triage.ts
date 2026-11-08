@@ -12,9 +12,11 @@ import {
   type Request,
 } from "../lib/hub"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker as syncDraftTrackerState, tickOutcome, validTriageExtras,
   DRAFT_MAX_TURNS,
+  type DraftRow,
   type DraftTrack,
+  type TickFailGate,
 } from "./triage-lib"
 
 const HERE = import.meta.dir
@@ -142,12 +144,6 @@ async function refreshBoards(hub: Hub): Promise<BoardRef[]> {
   return boards
 }
 
-interface DraftRow {
-  rowId: string
-  docId: string
-  title: string
-}
-
 async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{
     rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
@@ -191,34 +187,8 @@ const draftRowIdsInPipeline = (hub: Hub): Set<string> => {
 
 /** Трекер vs доски: новые sighting'и, смена тайтла, чистка ушедших из Draft. */
 const syncDraftTracker = (hub: Hub, seen: Map<string, DraftRow>, projects: Map<string, string>): void => {
-  const now = Date.now()
-  let changed = false
-  const drafts = hub.state.drafts as Record<string, DraftTrack>
-  for (const [rowId, d] of seen) {
-    const t = drafts[rowId]
-    if (t === undefined) {
-      drafts[rowId] = {
-        project: projects.get(rowId) ?? "?",
-        docId: d.docId,
-        title: d.title,
-        seenAt: now,
-        updatedAt: now,
-        turns: 0,
-      }
-      hub.log(`черновик: ${projects.get(rowId) ?? "?"} ${rowId} «${d.title.slice(0, 60)}»`)
-      changed = true
-    } else if (t.title !== d.title && d.title !== "") {
-      t.title = d.title
-      changed = true
-    }
-  }
-  const inFlight = draftRowIdsInPipeline(hub)
-  for (const rowId of Object.keys(drafts)) {
-    if (seen.has(rowId) || inFlight.has(rowId)) continue
-    delete drafts[rowId]
-    delete hub.state.draftSkip?.[rowId] // ушёл из Draft → skip снят
-    changed = true
-  }
+  const { changed, fresh } = syncDraftTrackerState(hub.state, seen, projects, draftRowIdsInPipeline(hub), Date.now())
+  for (const line of fresh) hub.log(line)
   if (changed) hub.save()
 }
 
@@ -272,8 +242,10 @@ const draftWatcher: HubSource = {
       ctl.done()
       return
     }
+    let tickGate: TickFailGate = { streak: 0, nextAlertAt: 0 }
     while (true) {
       if (ctl.stopping()) break
+      let failed: unknown = null
       try {
         const boards = await refreshBoards(hub)
         const seen = new Map<string, DraftRow>()
@@ -292,7 +264,31 @@ const draftWatcher: HubSource = {
         syncDraftTracker(hub, seen, projects)
         await queueReadyDrafts(hub)
       } catch (e) {
-        hub.log(`draftLoop: ${e}`) // транзиентный сбой шлюза — ретрай следующим тиком
+        failed = e
+      }
+      if (failed === null) {
+        tickGate = tickOutcome(tickGate, Date.now(), "ok").gate
+      } else {
+        // wave-класс (KernelWaveError, «волна деградации ядра — штатная пауза»)
+        // появляется с #145; распознавание по имени — сборка не зависит от
+        // несмерженного PR, после мерджа ветка активируется сама (переименование
+        // класса деградирует к «все сбои считаются» — не хуже прежнего поведения)
+        const isWave = failed instanceof Error && failed.name === "KernelWaveError"
+        const detail = failed instanceof Error ? `${failed.name}: ${failed.message}` : String(failed)
+        const { gate, alert } = tickOutcome(tickGate, Date.now(), isWave ? "wave" : "fail")
+        tickGate = gate
+        if (isWave) {
+          hub.log(`draftLoop: ${detail} — волна ядра, счётчик сбоев не тронут`)
+        } else if (alert) {
+          hub.log(`draftLoop: ${detail} (${gate.streak} подряд) — ГРОМКИЙ СБОЙ ТИКА`)
+          if (hub.state.chatID !== undefined) {
+            await hub.send(hub.state.chatID, `⚠️ draftLoop триажа падает ${gate.streak} тиков подряд: ${detail} — черновики не доставляются, глянь лог.`)
+          } else {
+            hub.log(`тик-алерт НЕ доставлен: chatID не залочен — только лог`)
+          }
+        } else {
+          hub.log(`draftLoop: ${detail}`) // транзиентный сбой шлюза — ретрай следующим тиком
+        }
       }
       await new Promise((r) => setTimeout(r, WATCH_SEC * 1000))
     }
