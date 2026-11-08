@@ -173,9 +173,14 @@ const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
  *  синхронно: модель сессии спавна главнее для фабричных сессий. */
 const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 /** тестировщик стадии «Тестирование»: праймари-агент, качество фичи важнее
- *  цены будильника. Модель дублирует agents/tester.md (frontmatter) — править
- *  синхронно: модель сессии спавна главнее для фабричных сессий. */
-const TESTER = { agent: TESTER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
+ *  цены будильника; модель flash в max-вариации — единственная мультимодальная
+ *  (визуальная проверка вёрстки/скринов). Модель дублирует agents/tester.md
+ *  (frontmatter) — править синхронно: модель сессии спавна главнее для фабричных
+ *  сессий. */
+const TESTER = {
+  agent: TESTER_AGENT_ID,
+  model: { providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: "max" },
+} as const
 const SPAWN_TIMEOUT_MS = 60_000
 const REST_TIMEOUT_MS = 15_000
 const MAX_ATTEMPTS = 3
@@ -482,7 +487,9 @@ interface SessionSpec {
   directory: string
   title: string
   agent?: string
-  model?: { providerID: string; id: string }
+  /** Model.Ref (opencode /api/session): id + providerID обязательны, variant
+   *  опционален («provider/model#variant» в объектной форме) */
+  model?: { providerID: string; id: string; variant?: string }
 }
 
 async function createSession(spec: SessionSpec): Promise<string | null> {
