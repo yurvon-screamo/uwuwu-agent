@@ -634,6 +634,136 @@ async fn body_replace_export_failure_aborts_before_mutation() {
     );
 }
 
+// ——— гард вставки обёртки task get в контент (202611080031) ———
+
+/// Полный вывод `task get` вокруг тела — снапшот-форма, которую гард
+/// должен встречать на входе контента (но принимать на --base).
+fn get_output_snapshot(body: &str) -> String {
+    format!(
+        "Задача:   {TASK_TITLE}\nСтатус:   Design\nСтрока:   item-task\nДоска:    {BOARD_HPATH}\n\n\
+         ----- тело -----\n\n{body}\n"
+    )
+}
+
+async fn body_via_cli_gated(
+    server: &MockServer,
+    replace: bool,
+    replace_section: Option<&str>,
+    content: &str,
+    base: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
+    set_env(server);
+    let md = tempfile::NamedTempFile::new()?;
+    std::fs::write(md.path(), content)?;
+    let base_file = base.map(|text| {
+        let f = tempfile::NamedTempFile::new().expect("temp-снапшот");
+        std::fs::write(f.path(), text).expect("снапшот записан");
+        f
+    });
+    task_run(
+        "uwuwu",
+        TaskSub::Body {
+            id: TASK_TITLE.into(),
+            stdin: false,
+            md: Some(md.path().to_string_lossy().into_owned()),
+            replace,
+            replace_section: replace_section.map(str::to_string),
+            // as_ref, не map: NamedTempFile дропает файл при move — путь
+            // должен пережить task_run
+            base: base_file
+                .as_ref()
+                .map(|f| f.path().to_string_lossy().into_owned()),
+            force,
+            attach: Vec::new(),
+        },
+    )
+    .await
+}
+
+fn assert_no_write(kernel: &MockKernel, why: &'static str) {
+    assert!(kernel.created_docs().is_empty(), "{why}");
+    assert!(kernel.deletes().is_empty(), "{why}: {:?}", kernel.deletes());
+    assert!(kernel.appends().is_empty(), "{why}: {:?}", kernel.appends());
+}
+
+/// Replace с полным выводом get — отказ с рецептом, ноль мутаций ядра.
+/// --force не обходит: санитария входа — инвариант, не часть сверки свежести.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_with_full_task_get_output_rejects_without_write() {
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
+
+    let content = get_output_snapshot("## Постановка\n\nсуть\n");
+    let err = body_via_cli_gated(&server, true, None, &content, None, true)
+        .await
+        .expect_err("полный вывод get на входе — отказ");
+
+    assert!(
+        format!("{err:#}").contains("обёртку вывода task get"),
+        "отказ называет обёртку и рецепт: {err:#}"
+    );
+    assert_no_write(&kernel, "отказ гарда до записи");
+}
+
+/// Append с маркером — тот же отказ: гард один на все контентные пути.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_append_with_task_get_marker_rejects_without_write() {
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
+
+    let content = "дополнение\n\n----- тело -----\n\nмусор\n";
+    let err = body_via_cli_gated(&server, false, None, content, None, false)
+        .await
+        .expect_err("маркер в append-входе — отказ");
+
+    assert!(
+        format!("{err:#}").contains("обёртку вывода task get"),
+        "отказ называет обёртку: {err:#}"
+    );
+    assert_no_write(&kernel, "отказ гарда до записи");
+}
+
+/// Replace-section с frontmatter-хвостом get (шапку срезали, frontmatter
+/// остался) — второй сигнатурный путь, отказ до записи.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_section_with_frontmatter_tail_rejects_without_write() {
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
+
+    let content = "---\ntitle: таск\n---\n\nновая постановка\n";
+    let err = body_via_cli_gated(&server, true, Some("Постановка"), content, None, false)
+        .await
+        .expect_err("frontmatter-шапка на входе — отказ");
+
+    assert!(
+        format!("{err:#}").contains("frontmatter"),
+        "отказ называет frontmatter-сигнатуру: {err:#}"
+    );
+    assert_no_write(&kernel, "отказ гарда до записи");
+}
+
+/// Регресс-паритет с контрактом --base (ADR-053): снапшот полным выводом
+/// get + чистый контент — гард молчит, cli срезает обёртку при сверке сам,
+/// replace проходит.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_snapshot_as_full_get_output_passes() {
+    let (kernel, server) = MockKernel::start(body_scenario(true)).await;
+
+    let snapshot = get_output_snapshot("старый контент");
+    body_via_cli_gated(&server, true, None, "новое тело\n", Some(&snapshot), false)
+        .await
+        .expect("снапшот --base допустим полным выводом get");
+
+    let appends = kernel.appends();
+    assert_eq!(appends.len(), 1, "новый контент одним append");
+    assert!(
+        append_data_field(&appends[0]).contains("новое тело"),
+        "контент записан: {appends:?}"
+    );
+}
+
 /// Поле data из захваченного тела appendBlock (JSON-конверт) — для
 /// построчных ассертов по записанному markdown (сабстринг-поиск по JSON
 /// с экранированными \n хрупок).
