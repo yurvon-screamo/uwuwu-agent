@@ -44,7 +44,9 @@ pub(crate) fn parse_interval(s: &str) -> Option<u64> {
 }
 
 /// `HH:MM` с опциональной датой `DD.MM` (пробел-разделитель).
-pub(crate) fn parse_at(s: &str) -> Option<(u8, u8, Option<(u8, u8)>)> {
+pub(crate) type ParsedAt = (u8, u8, Option<(u8, u8)>);
+
+pub(crate) fn parse_at(s: &str) -> Option<ParsedAt> {
     let (time, date) = match s.split_once(' ') {
         Some((t, d)) => (t, Some(d)),
         None => (s, None),

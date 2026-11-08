@@ -21,7 +21,10 @@ fn doc(id: &str, hpath: &str, box_id: &str) -> Value {
 /// Роутер SQL-конвертов: stmt → строки по первой подошедшей подстроке
 /// (специфичные фрагменты держать раньше общих: like-паттерн содержит
 /// глобальный фрагмент как подстроку).
-fn log_router(routes: Vec<(&'static str, Vec<Value>)>, log: StmtLog) -> impl Fn(&Request) -> ResponseTemplate {
+fn log_router(
+    routes: Vec<(&'static str, Vec<Value>)>,
+    log: StmtLog,
+) -> impl Fn(&Request) -> ResponseTemplate {
     move |req: &Request| {
         let stmt = serde_json::from_slice::<Value>(&req.body)
             .unwrap_or_default()
@@ -80,7 +83,11 @@ async fn exact_hpath_slug_resolves_without_like_queries() {
 
     assert_eq!(id, "d-readme");
     // только точный hpath-запрос — like-ступень не выполняется
-    assert!(logged(&log).iter().all(|stmt| !stmt.contains("like")), "{:?}", logged(&log));
+    assert!(
+        logged(&log).iter().all(|stmt| !stmt.contains("like")),
+        "{:?}",
+        logged(&log)
+    );
 }
 
 #[tokio::test]
@@ -92,7 +99,9 @@ async fn exact_title_of_last_segment_resolves() {
     .await;
     let sy = SiYuan::for_tests(server.uri());
 
-    let id = resolve(&sy, "uwuwu/ADR-030: Тихий протокол тика крона").await.unwrap();
+    let id = resolve(&sy, "uwuwu/ADR-030: Тихий протокол тика крона")
+        .await
+        .unwrap();
 
     assert_eq!(id, "d-exact");
 }
@@ -130,7 +139,9 @@ async fn scoped_prefix_matching_one_doc_auto_resolves() {
 
     assert_eq!(id, "d-uwuwu-030");
     assert!(
-        logged(&log).iter().any(|stmt| stmt.contains("like '/uwuwu/%ADR-030%'")),
+        logged(&log)
+            .iter()
+            .any(|stmt| stmt.contains("like '/uwuwu/%ADR-030%'")),
         "{:?}",
         logged(&log)
     );
@@ -211,7 +222,9 @@ async fn wrong_project_prefix_unique_fallback_auto_resolves() {
 
     assert_eq!(id, "d-housekeep");
     assert!(
-        logged(&log).iter().any(|stmt| stmt.contains("like '/origa/%хаускип%'")),
+        logged(&log)
+            .iter()
+            .any(|stmt| stmt.contains("like '/origa/%хаускип%'")),
         "{:?}",
         logged(&log)
     );
@@ -257,7 +270,11 @@ async fn trailing_slash_slug_skips_like_queries() {
     let err = resolve(&sy, "uwuwu/").await.unwrap_err().to_string();
 
     assert_eq!(err, "док «uwuwu/» не найден");
-    assert!(logged(&log).iter().all(|stmt| !stmt.contains("like")), "{:?}", logged(&log));
+    assert!(
+        logged(&log).iter().all(|stmt| !stmt.contains("like")),
+        "{:?}",
+        logged(&log)
+    );
 }
 
 #[tokio::test]
@@ -273,7 +290,9 @@ async fn apostrophe_in_slug_is_escaped_in_like_stmt() {
 
     assert_eq!(id, "d-apost");
     assert!(
-        logged(&log).iter().any(|stmt| stmt.contains("like '/it''s/%ADR-030%'")),
+        logged(&log)
+            .iter()
+            .any(|stmt| stmt.contains("like '/it''s/%ADR-030%'")),
         "{:?}",
         logged(&log)
     );
@@ -294,10 +313,15 @@ async fn leading_slash_is_normalized_before_matching() {
     assert_eq!(id, "d-uwuwu-030");
     let stmts = logged(&log);
     assert!(
-        stmts.iter().any(|stmt| stmt.contains("like '/uwuwu/%ADR-030%'")),
+        stmts
+            .iter()
+            .any(|stmt| stmt.contains("like '/uwuwu/%ADR-030%'")),
         "{stmts:?}"
     );
-    assert!(stmts.iter().all(|stmt| !stmt.contains("'//uwuwu")), "{stmts:?}");
+    assert!(
+        stmts.iter().all(|stmt| !stmt.contains("'//uwuwu")),
+        "{stmts:?}"
+    );
 }
 
 #[tokio::test]
@@ -331,7 +355,10 @@ async fn truncated_candidate_list_marks_omission() {
 
     let err = resolve(&sy, "uwuwu/ADR-05").await.unwrap_err().to_string();
 
-    assert!(err.contains("показаны первые 5, кандидатов больше"), "{err}");
+    assert!(
+        err.contains("показаны первые 5, кандидатов больше"),
+        "{err}"
+    );
     for i in 0..5 {
         assert!(err.contains(&format!("ADR-05{i}")), "{err}");
     }

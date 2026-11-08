@@ -640,9 +640,12 @@ fn test_task() -> SyTask {
         item_id: "item-1".into(),
         title: "таск".into(),
         status: "Draft".into(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
+        planned: String::new(),
+        schedule_cell: String::new(),
         body_doc: Some("20261105120000-bounddo1".into()),
     }
 }

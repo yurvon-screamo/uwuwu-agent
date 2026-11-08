@@ -25,6 +25,17 @@ kernel-транспорт (post, конфиг, константы) без выи
   orgls                              дерево: ноутбуки + подпапки
   find "тайтл"                       поиск дока по заголовку
 
+Экспорт-обвязка не проходит write-path: payload create/append/replace стрипается
+от frontmatter-блока и ведущей title-H1-строки (_strip_export_wrapper, паритет
+cli strip_export_wrapper; канон — опыт «SiYuan kernel write-path…», инцидент
+08.11 — литеральные дубли обвязки в доках). Снятое — однострочное примечание в
+stderr, payload, пустой после стрипа («один export без правок»), — отказ.
+create и replace печатают docId свежего дока: replace пересоздаёт док с новым
+id, держатель старого иначе ретраит мёртвый (инцидент 08.11). Первичный
+источник id — data ответа createDocWithMd (проба 08.11), фолбэк — getIDsByHPath
+по файловому дереву (SQL-индекс лагает, [] сразу после create); не резолвился —
+warning с рецептом find, rc 0 (мутация применена — после неё не падаем).
+
 Блочная хирургия — точечная правка rich-доков по blockID (doc-level append умеет
 только «в конец», replace пересоздаёт док и теряет привязки/живые HTML-блоки):
   block-update <blockID> --md <файл>     правка блока; payload строго один блок —
@@ -34,9 +45,15 @@ kernel-транспорт (post, конфиг, константы) без выи
                                          update переписывает таблицу ЦЕЛИКОМ,
                                          row-payload схлопывает её тихо, code=0
                                          (пробы 06.11/07.11)
-  block-insert-after <blockID> --md <файл>   вставка после блока (multi-block легален);
-                                         на 't' — сиблинг после таблицы, таблица цела
-                                         (проба 07.11)
+  block-insert-after <blockID> --md <файл>   вставка после блока; multi-block
+                                         легален вне списков, якорь-item
+                                         (type='i') — payload строго один item
+                                         (проба 07.11: multi-item payload ядро
+                                         молча обрезает до первого с фантомными
+                                         id); печатает новые block id, пост-чек
+                                         материализации (SQL + фолбэк .sy) —
+                                         фантомы громкие; на 't' — сиблинг после
+                                         таблицы, таблица цела (проба 07.11)
   block-insert-html <docId|blockID> --html <файл> [--after-marker <имя>]
                                          вставка живого HTML-блока (dataType="dom",
                                          dom мимо markdown-парсера — тот деградирует
@@ -340,17 +357,134 @@ def path_safe(title: str) -> str:
     return title.replace("/", "\u2215")
 
 
+# Экспорт-обвязка ядра: frontmatter-блок + ведущая title-H1-строка поверх
+# блоков (канон — опыт «SiYuan kernel write-path…», дельта 08.11).
+FRONTMATTER_TITLE_RE = re.compile(r"^title:\s*(.+)$", re.MULTILINE)
+
+
+def _strip_export_wrapper(payload: str,
+                          title_candidates: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+    """Снятие экспорт-обвязки на входе doc-level write-path (create/replace/append):
+    frontmatter-блок («--- … ---» в самом начале) — безусловно (frontmatter дока
+    ведёт ядро, в контенте он всегда артефакт kernel markdown-export, инцидент
+    08.11); ведущая title-H1-строка («# {title}») — только при совпадении с
+    кандидатом: title_candidates (create — сырая форма тайтла и path_safe-форма;
+    replace — последний сегмент hpath) плюс title из снятого frontmatter
+    (roundtrip: fm-title — тайтл того же дока, а ведущий H1 из того же export'а
+    — артефакт, не осознанный контент). Чужая ведущая H1 и H1 в середине дока
+    не трогаются (scope — первая строка; повторные титульные строки — контракт
+    cli strip_title_h1, у wiki_ops его нет). Возврат (clean_md, список снятого):
+    вызывающий печатает примечание в stderr, когда снято что-то — трансформация
+    payload'а видима оператору, не маскировка.
+
+    LF-контракт (паритет cli): вход ожидается LF-нормализованным — kernel-экспорт
+    и агентские файлы LF; CRLF-payload fm-префикс не матчит, обвязка пройдёт
+    насквозь без стрипа и без предупреждения.
+
+    hr-коллизия (осознанный край безусловного fm-стрипа): payload, начинающийся
+    с тематик-брейка «---» и несущий второй «---» ниже (сырые YAML-примеры без
+    фенсов), потеряет текст между брейками; примечание в stderr делает
+    трансформацию видимой, канон объявляет frontmatter в контенте мусором.
+    """
+    notes: list[str] = []
+    body = payload
+    fm_title = None
+    if body.startswith("---\n"):
+        rest = body[len("---\n"):]
+        end = rest.find("\n---")
+        if end != -1:
+            match = FRONTMATTER_TITLE_RE.search(rest[:end])
+            if match:
+                fm_title = match.group(1).strip()
+            body = rest[end + len("\n---"):].lstrip("\n")
+            notes.append("frontmatter")
+    candidates = [c for c in (*title_candidates, fm_title) if c]
+    if candidates:
+        stripped = body.lstrip("\n")
+        newline = stripped.find("\n")
+        first_line = stripped if newline == -1 else stripped[:newline]
+        remainder = "" if newline == -1 else stripped[newline + 1:]
+        if any(first_line.rstrip() == f"# {c}" for c in candidates):
+            body = remainder.lstrip("\n")
+            notes.append("title-H1")
+    return body, notes
+
+
+def _note_stripped(stripped: list[str]) -> None:
+    """Примечание о снятой обвязке (вариант «strip с примечанием» задачи
+    202611080017): оператор видит, что payload преобразился, — не маскировка."""
+    if stripped:
+        print(f"payload: снята экспорт-обвязка ({', '.join(stripped)}) — "
+              "в док идёт контент без неё", file=sys.stderr)
+
+
+def _payload_empty_after_strip_error() -> RuntimeError:
+    return RuntimeError(
+        "payload пуст после снятия экспорт-обвязки — не остался ли один export "
+        "без контента? Проверь файл --md")
+
+
+# Help для payload-аргументов всех трёх doc-level write-path'ов (S1192):
+# стрип-контракт одинаков, литерал один.
+PAYLOAD_STRIP_HELP = ("payload без экспорт-обвязки "
+                      "(frontmatter/ведущий title-H1 снимутся автоматически)")
+
+
+# Фолбэк docId-резолва (getIDsByHPath по файловому дереву): бюджет поллинга
+# на транзиент синка filetree; SQL-индекс не годится (лагает на create).
+DOC_ID_FALLBACK_ATTEMPTS = 3
+
+
+def _resolve_new_doc_id(nb_id: str, hpath: str, created: object) -> str | None:
+    """docId свежесозданного дока (create/replace печатают его в выводе —
+    replace пересоздаёт док с новым id, держатель старого иначе ретраит
+    мёртвый, инцидент 08.11). created — data ответа createDocWithMd; первичный
+    источник: ядро возвращает id строкой (живая проба 08.11; cli её
+    не использовал). Фолбэк при не-строке — getIDsByHPath с ключом "path"
+    (cli-контракт doc_ids_by_hpath, cli/src/siyuan.rs; неверный ключ — тихий
+    null, проба 08.11): файловое дерево синхронно, поллинг — на транзиент
+    синка. SQL-индекс не годится ([] сразу после create — та же проба).
+    Несколько id на путь (легаси-дубли тайтлов) — None: однозначности нет.
+    None — вызывающий печатает warning с рецептом find, rc 0 (мутация
+    применена — после неё не падаем)."""
+    if isinstance(created, str) and created:
+        return created
+    for attempt in range(DOC_ID_FALLBACK_ATTEMPTS):
+        if attempt:
+            time.sleep(1)
+        ids = post("/api/filetree/getIDsByHPath", {"notebook": nb_id, "path": hpath})
+        if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], str):
+            return ids[0]
+        if isinstance(ids, list) and len(ids) > 1:
+            return None
+    return None
+
+
+def _warn_doc_id_unresolved(title_hint: str) -> None:
+    print(f"ПРЕДУПРЕЖДЕНИЕ: docId нового дока не резолвится (лаг filetree или "
+          f"дубли пути) — возьми из: wiki_ops find \"{title_hint}\"", file=sys.stderr)
+
+
 def cmd_create(a):
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
     nb_id, nb_name, prefix = _resolve_parent(a.parent)
     title = path_safe(a.title.strip("/"))
     if not title:
         raise RuntimeError(f"пустой тайтл: {a.title!r} состоит из одних слэшей — "
                            "имя дока не может быть пустым")
+    md, stripped = _strip_export_wrapper(raw_md, (a.title.strip("/"), title))
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     hpath = prefix.rstrip("/") + "/" + title
     _warn_if_adr_number_taken(nb_id, prefix.rstrip("/"), title)
-    post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
+    created = post("/api/filetree/createDocWithMd", {"notebook": nb_id, "path": hpath, "markdown": md})
     print(f"создан: [{nb_name}] {hpath}")
+    new_id = _resolve_new_doc_id(nb_id, hpath, created)
+    if new_id:
+        print(f"  docId: {new_id}")
+    else:
+        _warn_doc_id_unresolved(a.title.strip("/"))
 
 
 ADR_NUMBER_RE = re.compile(r"ADR-(\d{2,4})\b")
@@ -529,7 +663,13 @@ def cmd_append(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
+    # Стрип до guard'а: идемпотентность ретрая сверяет чистый контент, а не
+    # обвязку (иначе ретрай roundtrip-пейлоада множил бы дубль в хвосте)
+    md, stripped = _strip_export_wrapper(raw_md)
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     if a.force:
         # Осознанный дубль — single-shot: одна отсылка, без сверок и ретраев
         # (слепой луп за флагом вернул бы инцидент ×N: ядро применило, ответ
@@ -595,12 +735,17 @@ def cmd_replace(a):
     doc_id = a.docId.strip()
     if not DOC_ID_RE.fullmatch(doc_id):
         raise RuntimeError(f"неверный docId: {doc_id!r} — ожидается формат SiYuan (14 цифр + '-' + 7 символов)")
-    md = Path(a.file).read_text()
+    raw_md = Path(a.file).read_text()
     # найти док → пересоздать
     stmt = f"select hpath, box from blocks where type='d' and id='{doc_id}' limit 1"  # nosec B608 — docId валидирован DOC_ID_RE
     rows = _sql_rows(stmt)
     if not rows:
         raise RuntimeError("док не найден")
+    doc_title = rows[0]["hpath"].rstrip("/").rsplit("/", 1)[-1]
+    md, stripped = _strip_export_wrapper(raw_md, (doc_title,))
+    _note_stripped(stripped)
+    if not md.strip():
+        raise _payload_empty_after_strip_error()
     # guard свежести до первой мутации; --force старше --base — осознанный
     # overwrite идёт без сверок, как append --force
     if not a.force:
@@ -610,8 +755,13 @@ def cmd_replace(a):
     post("/api/filetree/removeDocByID", {"id": a.docId})
     time.sleep(1)
     nb = next(n["id"] for n in notebooks() if n["name"] == nb_name)
-    post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
+    created = post("/api/filetree/createDocWithMd", {"notebook": nb, "path": hpath, "markdown": md})
     print(f"заменён: {hpath}")
+    new_id = _resolve_new_doc_id(nb, hpath, created)
+    if new_id:
+        print(f"  новый docId: {new_id} (старый {doc_id} мёртв — перевяжи держателей)")
+    else:
+        _warn_doc_id_unresolved(doc_title)
 
 
 def _sql_rows(stmt: str, attempts: int = 6) -> list[dict]:
@@ -995,6 +1145,55 @@ def _payload_chunk_count(markdown: str) -> int:
     return chunk_count
 
 
+def _top_level_list_item_count(markdown: str) -> int:
+    """Число top-level list-маркеров (item'ов) в payload: строки list-старта
+    вне фенсов и без ведущего отступа; строки с отступом — вложенные списки
+    и продолжения, не item'ы. Для гварда якоря-item'а: два item'а списка для
+    чанк-парсера — ОДИН блок (одно-родственные строки), поэтому критерий
+    гварда — счёт маркеров, а не чанков (проба 07.11)."""
+    item_count = 0
+    in_code = False
+    fence_char = ""
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        transition = _fence_transition(line, in_code, fence_char)
+        if transition == "open":
+            in_code, fence_char = True, line[0]
+            continue
+        if transition == "close":
+            in_code = False
+            continue
+        if in_code or raw_line[:1].isspace():
+            continue
+        if _marker_kind(line) == "list":
+            item_count += 1
+    return item_count
+
+
+def _assert_single_list_item(payload: str, row: dict) -> None:
+    """Якорь-item (type='i') принимает payload строго одного item'а:
+    multi-item payload ядро молча обрезает до первого item'а с фантомными id
+    в ответе (проба 07.11), не-item блок после item'а ядро отказывает громко
+    (invalid block structure) — отказ с рецептом лучше обеих судьб."""
+    items = _top_level_list_item_count(payload)
+    chunks = _payload_chunk_count(payload)
+    if items == 1 and chunks == 1:
+        return
+    if items > 1:
+        reason = (f"payload несёт {items} top-level item'а — multi-item payload ядро молча "
+                  "обрезает до первого с фантомными id в ответе (проба 07.11): "
+                  "вставляй item'ы по одному за вызов")
+    elif chunks > 1:
+        reason = f"payload несёт {chunks} блока(ов) — после item'а допустим только один item"
+    else:
+        reason = ("payload — не item: ядро отказывает вставке не-item блока внутрь "
+                  "list-контейнера (invalid block structure, проба 07.11)")
+    raise RuntimeError(
+        f"якорь {row['id']} — item списка (type='i'): payload обязан быть одним item'ом. "
+        f"{reason}; не-item контент — вставляй после list-контейнера "
+        f"(id {row['parent_id']}, type='l') или в конец дока (doc-level append)")
+
+
 UNDO_DIR = "data/assets/undo/wiki_ops"
 
 
@@ -1103,6 +1302,32 @@ def _new_block_ids(resp) -> list[str]:
     return block_ids
 
 
+def _checked_block_ids(resp) -> list[str]:
+    """data-node-id узлов вставки, чьё отсутствие в доке означает потерю
+    контента. Исключение — NodeList-обёртка markdown-парсера: при вставке в
+    существующий list ядро мержит item'ы и отбрасывает обёртку (проба 07.11:
+    op.parentID — существующий list, id обёртки не материализуется, op.id —
+    верхний вставленный item), так что её отсутствие — мерж, не потеря.
+    Тип узла читается из того же тега (data-type рядом с data-node-id);
+    все прочие узлы (item'ы, параграфы, код-блоки) проверяются пост-чеком."""
+    ops: list[dict] = []
+    if isinstance(resp, list):
+        ops = [op for tx in resp for op in tx.get("doOperations", [])]
+    elif isinstance(resp, dict):
+        ops = resp.get("doOperations", [])
+    ids: list[str] = []
+    for op in ops:
+        for tag in re.findall(r"<div[^>]*>", op.get("data") or ""):
+            node_id = re.search(r'data-node-id="(\d{14}-[a-z0-9]{7})"', tag)
+            if not node_id:
+                continue
+            node_type = re.search(r'data-type="(Node\w+)"', tag)
+            if node_type and node_type.group(1) == "NodeList":
+                continue
+            ids.append(node_id.group(1))
+    return ids
+
+
 def _read_payload(filename: str) -> str:
     try:
         payload = Path(filename).read_text()
@@ -1137,18 +1362,29 @@ def cmd_block_update(a):
 def cmd_block_insert_after(a):
     payload = _read_payload(a.file)
     row = _resolved_block(a.blockID.strip())
+    if row["type"] == "i":
+        _assert_single_list_item(payload, row)
     journal = _undo_write("insert-after", row["id"], {
         "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
         "payload_md": payload,
     })
     resp = _mutate("/api/block/insertBlock", {"dataType": "markdown", "data": payload, "previousID": row["id"]})
     new_ids = _new_block_ids(resp)
+    if not new_ids:
+        raise RuntimeError("ядро не вернул новые id в ответе — вставка могла примениться; "
+                           "сверь export/SQL до повтора")
+    checked_ids = _checked_block_ids(resp)
+    if not checked_ids:
+        raise RuntimeError("в ответе ядра нет проверяемых id (только NodeList-обёртки) — "
+                           "сверь export/SQL до повтора")
     if journal:
         print(f"  undo-журнал: {UNDO_DIR}/{journal['_name']} (откат: block-delete новых блоков)")
     _undo_patch(journal, {"new_ids": new_ids})
+    verdict = _verify_materialized(checked_ids, row["root_id"])
     print(f"вставлено после {row['id']} (тип {row['type']}), новых блоков: {len(new_ids)}")
     for block_id in new_ids:
         print(f"  новый блок: {block_id}")
+    print(f"  {verdict}")
 
 
 # --- block-insert-html: живой HTML-блок через dataType="dom" ---
@@ -1160,9 +1396,9 @@ MARKER_PREFIX = "⁂ diagram:"
 # позади хоста JST) — id/updated генерируются согласованно с его форматом.
 KERNEL_TZ = timezone(timedelta(hours=8))
 
-# Пост-чек материализации: SQL-проба новых id (индекс отстаёт от мутаций
-# секундами) до фолбэка на .sy.
-HTML_POSTCHECK_ATTEMPTS = 3
+# Пост-чек материализации вставки (insert-after и insert-html): SQL-проба
+# новых id (индекс отстаёт от мутаций секундами) до фолбэка на .sy.
+POSTCHECK_ATTEMPTS = 3
 
 # Канонический dom-каркас NodeHTMLBlock, снят с живого ядра 07.11 (рецепт
 # опыт-дока: короткая markdown-вставка → doOperations[0].data). ZWJ (\u200b)
@@ -1238,12 +1474,14 @@ def _sy_find_with_next(tree: dict, block_id: str) -> tuple[dict, dict | None] | 
     return walk(tree)
 
 
-def _sy_html_block_ids(tree: dict) -> set[str]:
-    """Множество ID всех NodeHTMLBlock в дереве .sy."""
+def _sy_block_ids(tree: dict, node_type: str | None = None) -> set[str]:
+    """Множество ID узлов дерева .sy (PascalCase Children); node_type — фильтр
+    по Type (например NodeHTMLBlock), None — все блоки дерева (пост-чек
+    markdown-вставки не знает тип нового блока — проверяет только наличие)."""
     ids: set[str] = set()
 
     def walk(node: dict) -> None:
-        if node.get("Type") == "NodeHTMLBlock":
+        if node_type is None or node.get("Type") == node_type:
             ids.add(node.get("ID"))
         for child in node.get("Children") or []:
             walk(child)
@@ -1303,37 +1541,56 @@ def _resolve_marker_anchor(doc_id: str, marker_name: str) -> tuple[str, str]:
     return marker_id, doc_id
 
 
-def _verify_html_materialized(new_ids: list[str], doc_id: str) -> str:
-    """Пост-чек деградации (два источника вердикта, принцип ADR-025: один лагающий
-    источник ≠ истина). Основной — SQL-проба новых id (пробы с паузами: индекс
-    отстаёт от мутаций секундами); подтверждённый type≠'html' — немедленный громкий
-    отказ. SQL не сошёлся (аномалия/сбой/лаг после всех проб) — фолбэк на .sy
-    (FS-истина без лага): новые id как NodeHTMLBlock → успех с примечанием.
-    Оба источника молчат → RuntimeError без команды сноса — агент не должен
-    удалить реально вставленную диаграмму по ложному негативу."""
+def _verify_materialized(new_ids: list[str], doc_id: str, expect_type: str | None = None) -> str:
+    """Пост-чек материализации вставки (два источника вердикта, принцип ADR-025:
+    один лагающий источник ≠ истина). expect_type задан — каждый новый id обязан
+    существовать и нести этот тип ('html': dom-вставка может деградировать до
+    параграфа); None — достаточно существования (markdown-вставка: типы — вопрос
+    payload'а, не вставки). Основной источник — SQL-проба новых id (пробы с
+    паузами: индекс отстаёт от мутаций секундами); подтверждённый чужой тип —
+    немедленный громкий отказ. Недостающие по SQL id — фолбэк на .sy (FS-истина
+    без лага): подтверждены деревом → успех с примечанием; для markdown иначе —
+    фантомные id ядра, потеря подтверждена двумя источниками, громкий отказ с
+    рецептом; для html отказ без рецепта сноса — агент не должен удалить реально
+    вставленную диаграмму по противоречию источников."""
     ids_csv = ", ".join(f"'{_sql_str(i)}'" for i in new_ids)
     stmt = f"select id, type from blocks where id in ({ids_csv}) limit {len(new_ids)}"  # nosec B608 — id валидированы форматом (ответ ядра), count явный
-    for _ in range(HTML_POSTCHECK_ATTEMPTS):
+    missing = list(new_ids)
+    for _ in range(POSTCHECK_ATTEMPTS):
         try:
             rows = _sql_rows(stmt, attempts=1)
         except Exception:
             break  # индекс не отвечает корректным конвертом — фолбэк на .sy
         by_id = {r["id"]: r.get("type") for r in rows}
-        if all(by_id.get(i) == "html" for i in new_ids):
+        if expect_type:
+            degraded = [f"{i} → {by_id[i]}" for i in new_ids
+                        if by_id.get(i) not in (None, expect_type)]
+            if degraded:
+                raise RuntimeError(
+                    f"деградация вставки: {', '.join(degraded)} — вставка не материализовалась "
+                    f"ожидаемым типом '{expect_type}'; "
+                    f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
+        missing = [i for i in new_ids if i not in by_id]
+        if not missing:
             return "вердикт по SQL"
-        degraded = [f"{i} → {by_id[i]}" for i in new_ids if by_id.get(i) not in (None, "html")]
-        if degraded:
-            raise RuntimeError(
-                f"деградация вставки: {', '.join(degraded)} — живой html-блок не материализовался; "
-                f"сверь export {doc_id}, откат — block-delete (undo-журнал выше)")
         time.sleep(1)  # id ещё не в индексе — лаг, пробуем снова
-    tree = _sy_tree(doc_id)
-    html_ids = _sy_html_block_ids(tree)
-    if all(i in html_ids for i in new_ids):
-        return f"вердикт по .sy (SQL-проба не сошлась за {HTML_POSTCHECK_ATTEMPTS} попыток)"
+    sy_type = "NodeHTMLBlock" if expect_type else None
+    sy_ids = _sy_block_ids(_sy_tree(doc_id), node_type=sy_type)
+    # html — все новые id обязаны быть в FS-истине (найденные SQL 'html' не
+    # исключение); markdown — только недостающие по SQL (найденные материализованы).
+    required_in_sy = list(new_ids) if expect_type else missing
+    if required_in_sy and all(i in sy_ids for i in required_in_sy):
+        return f"вердикт по .sy (SQL-проба не сошлась за {POSTCHECK_ATTEMPTS} попыток)"
+    unconfirmed = [i for i in required_in_sy if i not in sy_ids]
+    if expect_type:
+        raise RuntimeError(
+            f"материализация вставки не подтверждена (SQL-проба не сошлась, .sy новых id не содержит) — "
+            f"сверь export {doc_id} и SQL вручную до любых действий по откату (undo-журнал выше)")
     raise RuntimeError(
-        f"материализация вставки не подтверждена (SQL-проба не сошлась, .sy новых id не содержит) — "
-        f"сверь export {doc_id} и SQL вручную до любых действий по откату (undo-журнал выше)")
+        f"потеря вставки: {len(unconfirmed)} из {len(new_ids)} новых id не материализовались "
+        f"(фантомные: {', '.join(unconfirmed)}) — напечатанные ядром id не доказательство "
+        f"материала (проба 07.11); сверь export {doc_id}, хвост payload'а досоставь "
+        "по одному блоку за вызов; откат вставленного — block-delete (undo-журнал выше)")
 
 
 def cmd_block_insert_html(a):
@@ -1372,7 +1629,7 @@ def cmd_block_insert_html(a):
                            "сверь export/SQL до повтора")
     journal_name = journal["_name"] if journal else None
     _undo_patch(journal, {"new_ids": new_ids})
-    verdict = _verify_html_materialized(new_ids, doc_id)
+    verdict = _verify_materialized(new_ids, doc_id, expect_type="html")
     print(f"вставлен html-блок после {anchor}, новых блоков: {len(new_ids)}")
     for block_id in new_ids:
         print(f"  новый блок: {block_id}")
@@ -1436,18 +1693,20 @@ def main():
     p.set_defaults(fn=cmd_export)
     p = sub.add_parser("create")
     p.add_argument("title")
-    p.add_argument("file")
+    p.add_argument("file", help=PAYLOAD_STRIP_HELP)
     p.add_argument("--parent", default="")
     p.set_defaults(fn=cmd_create)
     p = sub.add_parser("append")
     p.add_argument("docId")
-    p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--md", dest="file", required=True,
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--force", action="store_true",
                    help="осознанный дубль single-shot: одна отсылка без guard'а и ретраев")
     p.set_defaults(fn=cmd_append)
     p = sub.add_parser("replace")
     p.add_argument("docId")
-    p.add_argument("--md", dest="file", required=True)
+    p.add_argument("--md", dest="file", required=True,
+                   help=PAYLOAD_STRIP_HELP)
     p.add_argument("--base", default=None,
                    help="снапшот свежести: нетронутый вывод wiki_ops export этого дока, снятый до правки")
     p.add_argument("--force", action="store_true",

@@ -54,7 +54,10 @@ fn list_scenario() -> MockScenario {
 #[serial_test::serial]
 async fn list_shows_master_with_schedule_and_last_run_from_state() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "6h".to_string())])];
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
     let (kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
     let _state = state_dir_with(
@@ -77,11 +80,16 @@ async fn list_shows_master_with_schedule_and_last_run_from_state() {
 #[serial_test::serial]
 async fn list_skips_rows_without_schedule_attr() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-title".to_string(), "не расписание".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
-    cron_run(CronSub::List { project: None }).await.expect("list ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -90,13 +98,18 @@ async fn list_skips_rows_without_schedule_attr() {
 #[serial_test::serial]
 async fn list_works_without_state_file() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(MASTER_DOC, vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())])];
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "*/5 * * * *".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("UWUWU_CRON_STATE_DIR", dir.path().join("несуществующее"));
 
-    cron_run(CronSub::List { project: None }).await.expect("list без state ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list без state ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -107,7 +120,9 @@ async fn list_reports_empty_inventory_without_masters() {
     let (_kernel, server) = MockKernel::start(list_scenario()).await;
     set_env(&server);
 
-    cron_run(CronSub::List { project: None }).await.expect("пустой инвентарь ok");
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("пустой инвентарь ok");
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -119,7 +134,10 @@ async fn list_skips_row_with_dead_binding_and_lists_the_rest() {
     // attrs-мок знает только тело обычной строки: master1 (unknown attrs)
     // пропускается, plain2 с расписанием попадает в инвентарь
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-schedule".to_string(), "30m".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-schedule".to_string(), "30m".to_string())],
+    )];
     let (_kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
@@ -163,7 +181,10 @@ fn format_local_renders_local_time() {
 #[serial_test::serial]
 async fn edit_schedule_writes_custom_attr() {
     let mut scenario = list_scenario();
-    scenario.block_attrs = vec![(PLAIN_DOC, vec![("custom-title".to_string(), "не расписание".to_string())])];
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-title".to_string(), "не расписание".to_string())],
+    )];
     let (kernel, server) = MockKernel::start(scenario).await;
     set_env(&server);
 
@@ -175,7 +196,9 @@ async fn edit_schedule_writes_custom_attr() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("6h".into()),
+            planned: None,
         },
     )
     .await
@@ -206,7 +229,9 @@ async fn edit_schedule_empty_removes_attr_without_grammar_check() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("".into()),
+            planned: None,
         },
     )
     .await
@@ -238,7 +263,9 @@ async fn edit_schedule_garbage_rejected_before_write() {
             title: None,
             pr: None,
             branch: None,
+            r#type: None,
             schedule: Some("раз в минутку".into()),
+            planned: None,
         },
     )
     .await
@@ -262,4 +289,276 @@ fn state_dir_with(content: &str) -> tempfile::TempDir {
     std::fs::write(dir.path().join("state/state.json"), content).unwrap();
     std::env::set_var("UWUWU_CRON_STATE_DIR", dir.path().join("state"));
     dir
+}
+
+// ——— planned: колонка «Запланировано» (date-клетка) ———
+
+/// (11) parse_planned: оба формата, formatted — минутная точность.
+#[test]
+fn parse_planned_accepts_minute_and_second_formats() {
+    let (ms, formatted) = crate::siyuan_task::parse_planned("2026-11-08 02:34:21").unwrap();
+    assert_eq!(formatted, "2026-11-08 02:34");
+    let (ms_minute, _) = crate::siyuan_task::parse_planned("2026-11-08 02:34").unwrap();
+    assert_eq!(
+        ms - ms_minute,
+        21_000,
+        "секунды попадают в ms, formatted усечён до минуты"
+    );
+}
+
+/// (12) parse_planned: мусор, кривые диапазоны — человеческий отказ.
+#[test]
+fn parse_planned_rejects_garbage_and_out_of_range() {
+    for bad in [
+        "вчера",
+        "2026-11-08",
+        "2026-13-01 10:00",
+        "2026-11-08 25:00",
+        "2026-11-08 10:61",
+    ] {
+        let err = crate::siyuan_task::parse_planned(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("не разобран") || err.contains("вне диапазона"),
+            "«{bad}»: неожиданный отказ: {err}"
+        );
+    }
+}
+
+/// (13) edit --planned: date-клетка записана в колонку «Запланировано»,
+/// шейп значения — kernel ValueDate (content ms + isNotEmpty + formatted).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_planned_writes_date_cell() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            planned: Some("2026-11-08 02:34:21".into()),
+        },
+    )
+    .await
+    .expect("edit --planned ok");
+
+    // доска сценария без колонки: ensure заминтил date-колонку
+    assert_eq!(
+        kernel.add_cols(),
+        vec![(
+            BOARD_AV.to_string(),
+            "Запланировано".to_string(),
+            "date".to_string()
+        )],
+        "минт колонки «Запланировано» типом date"
+    );
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "ровно одна запись клетки: {writes:?}");
+    let (av, key, item, value) = &writes[0];
+    assert_eq!(av, BOARD_AV);
+    assert!(!key.is_empty(), "ключ заминченной колонки");
+    assert_eq!(item, "20261107090000-plain2");
+    let date = value.get("date").expect("date-шейп значения");
+    assert!(date.get("content").and_then(|c| c.as_i64()).unwrap() > 0);
+    assert_eq!(date.get("isNotEmpty"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        date.get("formattedContent").and_then(|f| f.as_str()),
+        Some("2026-11-08 02:34"),
+        "formatted — минутная точность (стабильный формат сравнения демона)"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (14) edit --planned "": очистка клетки — isNotEmpty=false, content=0.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_planned_empty_clears_cell() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            planned: Some("".into()),
+        },
+    )
+    .await
+    .expect("очистка planned ok");
+
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (_, _, _, value) = &writes[0];
+    let date = value.get("date").expect("date-шейп значения");
+    assert_eq!(date.get("content"), Some(&serde_json::json!(0)));
+    assert_eq!(date.get("isNotEmpty"), Some(&serde_json::json!(false)));
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (15) edit --plained мусор: отказ ДО записей (без частичных обновлений).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_planned_garbage_rejected_before_write() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            planned: Some("завтра утром".into()),
+        },
+    )
+    .await
+    .expect_err("мусорная дата — отказ");
+
+    assert!(
+        err.to_string().contains("не разобран"),
+        "суть отказа: {err}"
+    );
+    assert!(
+        kernel.item_updates().is_empty(),
+        "записей нет: валидация до мутаций"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (16) edit --schedule: sync колонки «Расписание» — клетка записана тем же
+/// значением, что и attr (единая точка записи, отображение не отстаёт).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_syncs_schedule_cell() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: Some("6h".into()),
+            planned: None,
+        },
+    )
+    .await
+    .expect("edit --schedule ok");
+
+    assert_eq!(
+        kernel.add_cols(),
+        vec![(
+            BOARD_AV.to_string(),
+            "Расписание".to_string(),
+            "text".to_string()
+        )],
+        "минт колонки «Расписание» типом text"
+    );
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "ровно клетка «Расписание»: {writes:?}");
+    let (av, key, item, value) = &writes[0];
+    assert_eq!(av, BOARD_AV);
+    assert!(!key.is_empty());
+    assert_eq!(item, "20261107090000-plain2");
+    assert_eq!(
+        value
+            .get("text")
+            .and_then(|t| t.get("content"))
+            .and_then(|c| c.as_str()),
+        Some("6h"),
+        "клетка дублирует значение attr"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (17) edit --schedule "": снятие чистит и attr, и клетку.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_schedule_empty_clears_schedule_cell_too() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: Some("".into()),
+            planned: None,
+        },
+    )
+    .await
+    .expect("снятие расписания ok");
+
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (_, key, _, value) = &writes[0];
+    assert!(!key.is_empty());
+    assert_eq!(
+        value
+            .get("text")
+            .and_then(|t| t.get("content"))
+            .and_then(|c| c.as_str()),
+        Some(""),
+        "пустая клетка — снятие"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (18) parse_render_row: date-клетка (formattedContent) читается в planned,
+/// text-клетка — в schedule_cell; обычные задачи несут пусто.
+#[test]
+fn render_row_parses_planned_and_schedule_cells() {
+    let master = MockRow::new("item-1", "мастер")
+        .with_status("Вейт")
+        .with_planned("2026-11-08 08:34")
+        .with_schedule("6h");
+    let plain = MockRow::new("item-2", "обычная").with_status("Todo");
+    let scenario = MockScenario {
+        rows: vec![master, plain],
+        ..MockScenario::default()
+    };
+    let json_rows: Vec<serde_json::Value> = scenario.rows.iter().map(|r| r.cells_json()).collect();
+    // прямой вызов парсера: mock-строки → SyTask
+    let keys = vec![
+        serde_json::json!({"id": "key-title", "name": "Primary Key"}),
+        serde_json::json!({"id": "key-status", "name": "Status"}),
+        serde_json::json!({"id": "key-planned", "name": "Запланировано"}),
+        serde_json::json!({"id": "key-schedule", "name": "Расписание"}),
+    ];
+    let parsed: Vec<crate::siyuan_task::SyTask> = json_rows
+        .iter()
+        .filter_map(|it| crate::siyuan_task::parse_render_row(it, &keys))
+        .collect();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].planned, "2026-11-08 08:34");
+    assert_eq!(parsed[0].schedule_cell, "6h");
+    assert_eq!(parsed[1].planned, "");
+    assert_eq!(parsed[1].schedule_cell, "");
 }

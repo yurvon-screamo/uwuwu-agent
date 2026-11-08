@@ -8,7 +8,7 @@
 opencodereview/ правила ревью
 agents/        агенты: developer, dreamer, code-quality-reviewer (праймари — ревью-статусы фабрики)
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        31 скилл (см. ниже)
+skills/        30 скиллов (см. ниже)
 cli/           uwuwu-cli — задачи/кроны, поиск, вики-чтение, персона (бинарь: ~/.cargo/bin/uwuwu-cli)
 factory/       uwuwu-factory — будильник разработки + маршрутизатор ревью
 cron/          uwuwu-cron — планировщик крон-задач (доски «Задачи <Proj>» → ран-карточки → сессии)
@@ -22,13 +22,13 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-## Скиллы (31)
+## Скиллы (30)
 
-- **Architect (1)**: architect-ui-ux
+- **UI (2)**: architect-ui-ux (дизайн-стратегия + правила имплементации; бывшая пара architect/rules-ui слита) · stageshow (faux-UI макеты, анимации, bento — vendored, MIT, upstream benjitaylor/skills @ 299140f)
 - **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
-- **Workflows (4)**: flow-agents-md-writer · flow-audit · flow-code-documentation · flow-merge-review
+- **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
 - **Office (4)**: docx · pdf · pptx · xlsx
-- **Rules (11)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing · ui
+- **Rules (10)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing
 - **Visual (1)**: visual-diagrams
 - **Integrations (4)**: bunny-cli · hf-cli · stitch · use-railway
 
@@ -73,23 +73,49 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 Ячейки Path/«Сессия dev»/«Сессия ревью» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает).
 Канон секций, шаблоны тел задач (dev, spike, bug) и правила формата — [factory/TASK-TEMPLATE.md](factory/TASK-TEMPLATE.md).
 
+### CI (GitHub Actions)
+
+`.github/workflows/ci.yml` — на каждый PR: cargo fmt --check, cargo clippy
+--all-targets -- -D warnings, cargo test (e2e скипаются без живого ядра) и
+qlty delta-check по конфигу репо. Зелёный CI — обязательное условие мержа
+(branch protection master, required check «CI»); ревьювер ручных прогонов
+не делает — опирается на CI-статусы. Локально то же самое: `cd cli && cargo
+fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+
 ### Кроны (uwuwu-cron)
 
 Кроны унифицированы с задачами — выделенный контур снесён. Крон = обычная
 задача на доске **«Задачи <Proj>»** с расписанием в доке-теле: атрибут
 `custom-schedule` (грамматика: cron-expr | `5m/2h/1d` | разовое `09:30 [01.12]`),
-ставится `task create/edit --schedule "…"` с валидацией при записи. Мастер
-живёт в статусе **Вейт** (после валидации триажем — грамматика + разумность;
-Draft не файрится). Планировщик (тик 1 мин) по расписанию создаёт **ран-карточку**
-— новую задачу «⏰ <мастер> · <дата время>» в Todo (запись запуска: владелец
-видит, что происходило; закрывает сам) — и OpenCode-сессию с промптом из тела
-мастера (изолированный workspace). Коммент агента — только исключение (на ран;
-блокер/вопрос → Needs attention на ране). Перед спавном мастер перепроверяется
-по свежему срезу доски (гонка со снятием строки); файр — только из Вейт,
-Done = остановлено навсегда. State: `~/.local/state/uwuwu-cron/` (пер-машинный),
-CLI: `cron list [--project <proj>]` — мастера + last run (вне прод-машины
-last run пуст). Доски «Кроны <Proj>», их колонки и CLI set/pause/resume/rm
-сняты (задача 20261106182051-o5ejlte).
+ставится `task create/edit --schedule "…"` с валидацией при записи; та же
+команда синхронно пишет колонку **«Расписание»** на доске (отображение attr —
+хранилище остаётся в доке-теле). Дата запуска — свойство строки:
+**«Запланировано»** (date-колонка, сортировка/фильтр/группировка штатно).
+У ран-карточки — фактическое время файра (`task edit --planned`; тайтловая
+метка остаётся только для уникальности тайтла), у мастера — вычисленный
+next-fire: демон сверяет клетки каждым тиком (compare по epoch ms —
+formattedContent ядро перекрывает своей локалью) и дописывает при
+расхождении; интервал/разовое отвечают сразу, у свежего cron-мастера до
+первого файра клетка пуста (файр на первом совпадении — reconcile заполняет
+после, вечный молчун годовым сканом тик не таскает). Мастер живёт в статусе **Вейт** = «ждёт файра планировщика»
+(файр-гейт демона читает именно его; после валидации триажем — грамматика +
+разумность; Draft не файрится). Статус-модель крон-семьи: **Todo** (ран) =
+«запуск состоялся, работа выполняется агентом и ждёт приёмки», **Done** =
+принял владелец (автосигнала конца сессии нет — статусы ранов демон не
+двигает), **Needs attention** — блокер/вопрос владельцу. Планировщик
+(тик 1 мин) по расписанию создаёт **ран-карточку** — новую задачу
+«⏰ <мастер> · <дата время>» в Todo с датой файра — и OpenCode-сессию с
+промптом из тела мастера (изолированный workspace); запись запуска: владелец
+видит ЧТО и КОГДА происходило, закрывает сам (батч-приёмка по колонке даты).
+Коммент агента — только исключение (на ран; блокер/вопрос → Needs attention
+на ране). Перед спавном мастер перепроверяется по свежему срезу доски
+(гонка со снятием строки); файр — только из Вейт, Done = остановлено
+навсегда. Разовый мастер после файра снимает расписание одной CLI-командой
+(`task edit --schedule "" --planned ""` — attr и обе клетки). State:
+`~/.local/state/uwuwu-cron/` (пер-машинный), CLI: `cron list [--project
+<proj>]` — мастера + last run (вне прод-машины last run пуст). Доски «Кроны
+<Proj>», их колонки и CLI set/pause/resume/rm сняты (задача
+20261106182051-o5ejlte).
 
 ### Триаж (uwuwu-triage)
 
@@ -125,8 +151,10 @@ uwuwu-проекта с пустым статусом (черновики вла
 ### CLI
 
 `uwuwu-cli task create/list/get/edit/comment/thread/body/close/rm [--project X]` — задачи
-(id/заголовок; доска «Задачи <proj>», крон-доски сняты; кроны — `--schedule` у task,
-мастера в Вейт, инвентарь `cron list`); аттачи в тело — `--attach` на `create`/`body`
+(id/заголовок; id-команды
+без `--project` — глобальный резолв по доскам всех проектов с требованием уникальности: матчи на
+нескольких досках/неоднозначность — громкая ошибка; доска «Задачи <proj>», крон-доски сняты;
+кроны — `--schedule` у task, мастера в Вейт, инвентарь `cron list`); аттачи в тело — `--attach` на `create`/`body`
 (kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
 `edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search`
 (полнотекст + доки по заголовкам + семантика локального эмбеддинг-индекса),

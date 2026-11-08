@@ -110,6 +110,51 @@ fn hyphen_leading_id_parses_and_flag_after_id_stays_flag() {
 }
 
 #[test]
+fn type_flag_parses_on_create_edit_and_list() {
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "create",
+        "--title",
+        "т",
+        "--type",
+        "bug",
+    ])
+    .unwrap();
+    let Commands::Task {
+        command: TaskSub::Create { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task create");
+    };
+    assert_eq!(r#type.as_deref(), Some("bug"));
+
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "edit", "abc", "--type", ""]).unwrap();
+    let Commands::Task {
+        command: TaskSub::Edit { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task edit");
+    };
+    assert_eq!(r#type.as_deref(), Some(""), "пустой флаг — снятие");
+
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "list", "--type", "spike"]).unwrap();
+    let Commands::Task {
+        command: TaskSub::List { r#type, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task list");
+    };
+    assert_eq!(r#type.as_deref(), Some("spike"));
+}
+
+#[test]
 fn clean_ids_value_parses_with_hyphen_leading_fragments() {
     let Commands::Task {
         command: TaskSub::Clean { ids, .. },
@@ -336,4 +381,52 @@ fn semantic_subcommands_parse() {
         panic!("expected semantic");
     };
     assert!(matches!(command, SemanticSub::Sync));
+}
+
+#[test]
+fn version_flag_prints_semver_revision_and_build_date() {
+    use clap::error::ErrorKind;
+
+    let error = match Cli::try_parse_from(["uwuwu-cli", "--version"]) {
+        Ok(_) => panic!("--version must not parse into a command"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+
+    let rendered = error.render().to_string();
+    let version_line = rendered
+        .lines()
+        .find(|line| line.contains(env!("CARGO_PKG_VERSION")))
+        .expect("version line present")
+        .to_string();
+    let metadata = version_line
+        .split('(')
+        .nth(1)
+        .expect("parenthesised build metadata")
+        .trim_end_matches(')');
+
+    let mut tokens = metadata.split_whitespace();
+    let revision = tokens.next().expect("revision token");
+    let build_date = tokens.next().expect("build date token");
+    // Hex revision or `unknown` fallback from build.rs; `-dirty` suffix when
+    // the tree was dirty. Tag-like names (e.g. `v0.5.0` on an exact tag) are
+    // also valid describe output — hyphen-separated parts stay alphanumeric.
+    let is_alphanumeric_revision = revision
+        .split('-')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert!(
+        revision == "unknown" || is_alphanumeric_revision,
+        "unexpected revision format: {revision}"
+    );
+    assert!(
+        is_iso_date(build_date),
+        "unexpected date format: {build_date}"
+    );
+}
+
+fn is_iso_date(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && s.chars().filter(|c| *c != '-').all(|c| c.is_ascii_digit())
 }

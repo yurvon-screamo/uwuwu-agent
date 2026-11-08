@@ -48,6 +48,20 @@ export class KernelUnavailableError extends Error {
   }
 }
 
+/** Ядро в волне деградации индекса: «metadata is not ready» исчерпало ретраи —
+ *  это ответ ядра (code≠0 в конверте), не транспортный отказ, потому отдельный
+ *  класс поверх KernelUnavailableError: семантика родителя (ADR-033, «ядро
+ *  не ответило на транспорте») не расширяется, ветвление демонов
+ *  instanceof KernelUnavailableError сохраняется (наследник матчится).
+ *  Крон различает wave-тик точным instanceof — не считает его в
+ *  consecutiveFails: окно fail-fast разрядится само, рестарт не нужен. */
+export class KernelWaveError extends KernelUnavailableError {
+  constructor(message: string) {
+    super(message)
+    this.name = "KernelWaveError"
+  }
+}
+
 /** Таймаут одного kernel-вызова (REST и /mcp): зависший TCP не должен
  *  останавливать тик демона — класс «клиентские висы» (прод-контур).
  *  Валидация обязательна: Number("") = 0 дал бы AbortSignal.timeout(0) —
@@ -63,6 +77,27 @@ function parseKernelTimeoutMs(raw: string | undefined): number {
 
 const KERNEL_TIMEOUT_MS = parseKernelTimeoutMs(process.env.UWUWU_KERNEL_TIMEOUT_MS)
 
+// ——— ядро: wave-дисциплина (зеркало cli/src/siyuan.rs WAVE_COOLDOWN_SECS) ———
+
+const WAVE_COOLDOWN_MS = 90_000
+const WAVE_HINT =
+  "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями"
+/** Паузы ретраев metadata-волны (начальная + до двух); инъекция для тестов —
+ *  мгновенный пейсинг (прецедент RowInsertPacing). */
+let waveRetryBackoffsMs = [2_000, 5_000]
+/** Шаг пауз прочих ошибок (транспорт/конверт), ms — 700·(попытка+1); инъекция
+ *  для тестов: транспортный отказ не должен задерживать свиту на секунды. */
+let otherRetryStepMs = 700
+/** Окно fail-fast волны (unix-ms истечения; 0 = не армировано), per-process:
+ *  после исчерпания ретраев последующие post() падают сразу, не долбя ядро. */
+let waveCooldownUntil = 0
+
+const armWaveCooldown = (): void => {
+  waveCooldownUntil = Date.now() + WAVE_COOLDOWN_MS
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms))
+
 // ——— ядро: REST ———
 
 /** JSON.parse с честной ошибкой: HTTP-статус и сниппет тела вместо голого SyntaxError,
@@ -77,7 +112,13 @@ export function parseJsonContract(text: string, context: string): unknown {
 }
 
 async function post<T = Record<string, unknown>>(path: string, body: Record<string, unknown>, attempts = 4): Promise<T> {
+  // окно волны активно: вызовы падают сразу — волна кормится ретраями,
+  // клиент её не пробивает (семантика Rust post() wave-гейта)
+  if (Date.now() < waveCooldownUntil) {
+    throw new KernelWaveError(`siyuan POST ${path}: пропущено — ${WAVE_HINT} (окно fail-fast активно)`)
+  }
   let last: string | Error = "?"
+  let metadataAttempts = 0
   for (let i = 0; i < attempts; i++) {
     try {
       const r = await fetch(SIYUAN_URL + path, {
@@ -98,15 +139,25 @@ async function post<T = Record<string, unknown>>(path: string, body: Record<stri
       if (d.code === 0) return (d.data ?? {}) as T
       last = `code=${d.code} msg=${d.msg}`
       if (String(d.msg).includes("metadata is not ready")) {
-        await new Promise((res) => setTimeout(res, 1500 + i * 1000))
-        continue
+        const backoff = waveRetryBackoffsMs[metadataAttempts]
+        if (backoff !== undefined) {
+          metadataAttempts++
+          await sleep(backoff)
+          continue
+        }
+        // ретраи исчерпаны: армируем окно и падаем сразу — следующий вызов
+        // не долбит ядро в течение окна (терминальный throw, не в last)
+        armWaveCooldown()
+        throw new KernelWaveError(`siyuan POST ${path}: ${last} — ${WAVE_HINT}`)
       }
     } catch (e) {
-      // класс KernelUnavailableError переживёт цикл — по нему демоны
-      // отличают лежащее ядро; прочие — как раньше, строкой в last
+      // wave — терминальный исход: ре-throw мимо last (иначе цикл
+      // продолжил бы долбить ядро); прочий KernelUnavailableError
+      // переживёт цикл — по нему демоны отличают лежащее ядро
+      if (e instanceof KernelWaveError) throw e
       last = e instanceof KernelUnavailableError ? e : String(e)
     }
-    await new Promise((res) => setTimeout(res, 700 * (i + 1)))
+    await sleep(otherRetryStepMs * (i + 1))
   }
   // fetch-класс уже свёрстан как Error с контекстом — ре-throw без обёртки;
   // строковый last (code=… msg=… конверт ядра) — как раньше
@@ -304,7 +355,7 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
   for (const c of view.columns) if (c.id && c.name) nameOf.set(c.id, c.name)
   const rows: Record<string, unknown>[] = []
   for (const row of view.rows) {
-    const cells: Record<string, { value?: string }> = {}
+    const cells: Record<string, { value?: string; dateMs?: number | null }> = {}
     let title = ""
     // Привязка строки к док-телу: value.block.id Primary Key-ячейки — docId
     // тела (у detached-строк поля нет → null). Готча: value.blockID — это
@@ -321,9 +372,18 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
         continue
       }
       let value = ""
+      /** epoch ms date-клетки (истина для compare демона; formattedContent
+       *  ядро перекрывает своим локалям-форматом — строкой сравнивать
+       *  нельзя, живая проба миграции: записали «2026-11-08 02:34», ядро
+       *  отдало «8 ноября 2026 г. 01:34»). */
+      let dateMs: number | null = null
       if (v.mSelect) value = v.mSelect.map((o) => o.content).join(",")
       else if (v.text) value = v.text.content ?? ""
-      if (col !== "") cells[col] = { value }
+      else if (v.date) {
+        dateMs = typeof v.date.content === "number" && v.date.content > 0 ? v.date.content : null
+        value = v.date.formattedContent ?? ""
+      }
+      if (col !== "") cells[col] = { value, dateMs }
     }
     rows.push({ rowBlockId: row.id ?? "", linkedDocId, title, cells })
   }
@@ -359,8 +419,23 @@ const TOP_COMMENT_DATED = /^- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
 const REPLY_COMMENT = /^ {2}- \*\*(.+?)\*\* \(([^)]*)\): (.*)$/
 const REPLY_COMMENT_DATED = /^ {2}- \*\*(.+?)\*\* \((\d{4}-\d{2}-\d{2}[^)]*)\): (.*)$/
 
-const padIdx = (i: number): string => String(i).padStart(4, "0")
 const commentHead = (m: RegExpMatchArray): string => `${m[1]} (${m[2]}): ${m[3]}`
+
+/** FNV-1a (32-bit) → 8 hex-символов: контентный хэш стабильных id комментов. */
+const fnv1aHex = (input: string): string => {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, "0")
+}
+
+/** Стабильный id коммента: хэш (автор ‖ финальный текст с датой и
+ *  континуациями). Позиция в доке в id не входит — снос/сдвиг чужих
+ *  комментов id не меняет, lastCommentId треков не подменяется. */
+const stableCommentId = (kind: "c" | "r", docId: string, userId: string, text: string): string =>
+  `${kind}${docId}-${fnv1aHex(`${userId}\u0000${text}`)}`
 
 /** Разбор коммент-записей markdown-экспорта тела. Два источника:
  *  (а) секция «## Комменты» — историческая конвенция;
@@ -370,16 +445,16 @@ const commentHead = (m: RegExpMatchArray): string => `${m[1]} (${m[2]}): ${m[3]}
  *  канал слеп к ним — юзерский ответ не будит ни одним каналом (High-1 ревью
  *  раунда 3). Хвост строгим матчем с датой — легитимные списки не комменты.
  *  Продолжения блока (абзацы тела пункта — вердикты многострочные) конкатенируются
- *  в text — будильник цитирует коммент целиком. id синтетические с паддингом —
- *  лексикографический порядок стабилен (свежесть newUserComments держится на
- *  позиционном findIndex). Replies несут id/userId: юзерский тред-ответ
- *  детектится, агентский срезается own-фильтром. */
+ *  в text — будильник цитирует коммент целиком. id двухпроходные: скан
+ *  собирает финальные тексты, после скана id = контентный хэш — позиция
+ *  в доке не участвует, снос старого коммента сверху id остальных не
+ *  двигает (позиционные сдвигались и подменяли lastCommentId треков).
+ *  Replies несут id/userId: юзерский тред-ответ детектится, агентский
+ *  срезается own-фильтром. */
 export function parseCommentsMarkdown(md: string, docId: string): ParsedComment[] {
   const lines = md.split("\n")
   const comments: ParsedComment[] = []
   let inSection = false
-  let topIdx = 0
-  let replyIdx = 0
   let lastHeadIdx = -1
   let lastHeadIsComments = false
   const appendContinuation = (line: string): void => {
@@ -393,48 +468,40 @@ export function parseCommentsMarkdown(md: string, docId: string): ParsedComment[
       lastHeadIdx = i
       lastHeadIsComments = /^## Комменты\s*$/.test(line)
       inSection = lastHeadIsComments
-      if (inSection) replyIdx = 0
       continue
     }
     if (!inSection) continue
     const top = line.match(TOP_COMMENT)
     if (top) {
-      replyIdx = 0
-      comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+      comments.push({ id: "", text: commentHead(top), userId: top[1], replies: [] })
       continue
     }
     const rep = line.match(REPLY_COMMENT)
     if (rep && comments.length > 0) {
-      comments[comments.length - 1].replies.push({
-        id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(replyIdx++)}`,
-        text: commentHead(rep),
-        userId: rep[1],
-      })
+      comments[comments.length - 1].replies.push({ id: "", text: commentHead(rep), userId: rep[1] })
       continue
     }
     appendContinuation(line)
   }
   if (!lastHeadIsComments) {
-    let tailReplyIdx = 0
     for (let i = lastHeadIdx + 1; i < lines.length; i++) {
       const line = lines[i]
       const top = line.match(TOP_COMMENT_DATED)
       if (top) {
-        tailReplyIdx = 0
-        comments.push({ id: `c${docId}-${padIdx(topIdx++)}`, text: commentHead(top), userId: top[1], replies: [] })
+        comments.push({ id: "", text: commentHead(top), userId: top[1], replies: [] })
         continue
       }
       const rep = line.match(REPLY_COMMENT_DATED)
       if (rep && comments.length > 0) {
-        comments[comments.length - 1].replies.push({
-          id: `r${docId}-${padIdx(topIdx - 1)}-${padIdx(tailReplyIdx++)}`,
-          text: commentHead(rep),
-          userId: rep[1],
-        })
+        comments[comments.length - 1].replies.push({ id: "", text: commentHead(rep), userId: rep[1] })
         continue
       }
       if (i > lastHeadIdx) appendContinuation(line)
     }
+  }
+  for (const c of comments) {
+    c.id = stableCommentId("c", docId, c.userId, c.text)
+    for (const r of c.replies) r.id = stableCommentId("r", docId, r.userId, r.text)
   }
   return comments
 }
@@ -637,5 +704,16 @@ export const __test = {
   expireSession: (): void => {
     mcpSession = ""
     mcpReady = false
+  },
+  /** Инъекции wave-тестов: мгновенный пейсинг ретраев и сброс окна
+   *  между тестами (module-level состояние изолируется руками). */
+  setWaveRetryBackoffsMs: (backoffs: number[]): void => {
+    waveRetryBackoffsMs = backoffs
+  },
+  setOtherRetryStepMs: (stepMs: number): void => {
+    otherRetryStepMs = stepMs
+  },
+  resetWaveCooldown: (): void => {
+    waveCooldownUntil = 0
   },
 }

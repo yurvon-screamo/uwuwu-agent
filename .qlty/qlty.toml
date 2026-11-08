@@ -19,6 +19,9 @@ exclude_patterns = [
   "*.min.*",
   "**/.yarn/**",
   "**/*.d.ts",
+  "skills/stageshow/**", # vendored third-party skill (MIT, upstream benjitaylor/skills @ 299140f) — линтаем наш код, не апстрим
+  "skills/office-coworker-*/**", # vendored third-party skills (proprietary LICENSE) — линтаем наш код, не апстрим
+  "skills/use-railway/**", # vendored third-party skill (upstream Railway) — линтаем наш код, не апстрим
   "**/assets/**",
   "**/bower_components/**",
   "**/build/**",
@@ -56,6 +59,28 @@ test_patterns = [
 [smells]
 mode = "comment"
 
+# plugins/bun.lock — осознанный waiver (не прятание): 3 advisory pinned exact бета-SDK
+# @opencode/plugin (otel exact-семья — версии компонент должны совпадать), glob/minimatch —
+# cross-major. zod 4.6.6 и @babel/core 7.29.6 закрыты overrides в plugins/package.json.
+# Разбор, обоснование и план (релиз SDK приоритетно, overrides с живой проверкой — резерв):
+# задача 20261108001115-o3eqg2g. Rule-level, не файл-level: НОВЫЕ advisory на этот лок
+# остаются в радаре и будут красить CI-дельту — так и задумано, новая уязвимость = сигнал
+# к действию.
+[[triage]]
+match.rules = ["osv-scanner:CVE-2026-54285"]
+match.file_patterns = ["plugins/bun.lock"]
+set.ignored = true
+
+[[triage]]
+match.rules = ["osv-scanner:CVE-2026-118773"]
+match.file_patterns = ["plugins/bun.lock"]
+set.ignored = true
+
+[[triage]]
+match.rules = ["osv-scanner:CVE-2026-118764"]
+match.file_patterns = ["plugins/bun.lock"]
+set.ignored = true
+
 [[source]]
 name = "default"
 default = true
@@ -63,6 +88,11 @@ default = true
 
 [[plugin]]
 name = "bandit"
+
+# qlty osv-scanner plugin file_types не знает bun.lock (только npm/pnpm/yarn локи) —
+# без этого JS-зависимости фабрики/демонов вне радара CVE
+[file_types.osv-scanner]
+globs = ["**/bun.lock"]
 
 [[plugin]]
 name = "clippy"

@@ -29,6 +29,7 @@ import {
   reviewRerunPrompt,
   reviewCommentsPrompt,
   reviewReturnPrompt,
+  reviewStallVerdict,
   routeTask,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
@@ -37,6 +38,7 @@ import {
   stallVerdict,
   type FactoryState,
   type RouteFacts,
+  type ReviewStallFacts,
   type StallFacts,
   type TaskComment,
   type TaskRef,
@@ -106,8 +108,8 @@ describe("newUserComments", () => {
 describe("untrackedTasks", () => {
   test("только новые rowId", () => {
     const rows: TaskRef[] = [
-      { rowId: "r1", bodyDoc: "d1", title: "a", status: "Todo", pr: "", branch: "" },
-      { rowId: "r2", bodyDoc: "d2", title: "b", status: "Todo", pr: "", branch: "" },
+      { rowId: "r1", bodyDoc: "d1", title: "a", status: "Todo", type: "", pr: "", branch: "" },
+      { rowId: "r2", bodyDoc: "d2", title: "b", status: "Todo", type: "", pr: "", branch: "" },
     ]
     const state: FactoryState = { tasks: { r1: {} as never } }
     expect(untrackedTasks(rows, state).map((r) => r.rowId)).toEqual(["r2"])
@@ -216,11 +218,16 @@ describe("spawnPrompt", () => {
     expect(p).toContain("«Ревью плана»")
     // скан территории до плана (кейс vgcm1t5 ↔ PR #79: план, дублирующий чужой PR, мёртв при рождении)
     expect(p).toContain("скан территории")
-    expect(p).toContain("task list")
+    expect(p).toContain("task list --project uwuwu")
     expect(p).toContain("gh pr list")
     // живые указатели доски (кейс сводной dzype6z: 5 из 6 row-id мертвы — план адресовал фантомы)
     expect(p).toContain("указатели постановки")
     expect(p).toContain("гниёт")
+    // командные примеры с id и проектом (инцидент 05.11: вопросный канал без
+    // флага не приземлился — спавн знает оба)
+    expect(p).toContain("task get r1 --project uwuwu")
+    expect(p).toContain("task comment r1 --project uwuwu")
+    expect(p).toContain("task edit r1 --project uwuwu --status \"Needs attention\"")
   })
   test("implement-режим (fast-track): без предписания план-ревью, сразу реализация → «Ревью результата»", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
@@ -262,6 +269,10 @@ describe("continuePrompt", () => {
     expect(p).toContain("перезапущена")
     expect(p).toContain("AGENTS.md")
     expect(p).toContain("task get")
+    // командные примеры с id и проектом — тот же контракт вопросного канала
+    expect(p).toContain("task get r1 --project origa")
+    expect(p).toContain("task comment r1 --project origa")
+    expect(p).toContain("task edit r1 --project origa --status \"Needs attention\"")
     expect(p).not.toContain("Стадия Design")
     expect(p).not.toContain("«Ревью плана»")
     expect(p).not.toContain("🤖")
@@ -488,7 +499,7 @@ describe("promptForStart: единственная точка выбора ст�
   test("init прокидывается во все ветки — все три вида старта создают свежую сессию", () => {
     const init: SpawnInit = {
       person: null, projectDocs: [],
-      task: { title: "Т", status: "Design", branch: "", pr: "" },
+      task: { title: "Т", status: "Design", type: "", branch: "", pr: "" },
     }
     expect(promptForStart("implement", target, { init })).toContain("Инит-данные")
     expect(promptForStart("continue", target, { init })).toContain("Инит-данные")
@@ -517,12 +528,16 @@ describe("spawnInitBlock: инит-данные первого промпта", 
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
     projectDocs: ["uwuwu/README", "uwuwu/Домены"],
-    task: { title: "Фича", status: "Design", branch: "work/task-r1", pr: "" },
+    task: { title: "Фича", status: "Design", type: "dev", branch: "work/task-r1", pr: "" },
   }
-  test("строка задачи: тайтл/статус/ячейки, пустые — тире", () => {
+  test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain("Задача: «Фича», статус Design, ветка work/task-r1, PR —.")
+    expect(b).toContain("Задача: «Фича», статус Design, тип dev, ветка work/task-r1, PR —.")
     expect(b).toContain('uwuwu-cli task get r1 --project uwuwu')
+  })
+  test("легаси-строка без типа — тире в слоте типа", () => {
+    const b = spawnInitBlock({ ...baseInit, task: { ...baseInit.task, type: "" } }, "r1", "uwuwu")
+    expect(b).toContain("Задача: «Фича», статус Design, тип —, ветка work/task-r1, PR —.")
   })
   test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
@@ -636,6 +651,12 @@ describe("reviewSpawnPrompt", () => {
     const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
     expect(p).not.toContain("Ворктри задачи не найден")
   })
+  test("тип задачи инжектится в ревью-промпт (роутинг Bug/Spike по свойству)", () => {
+    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" })
+    expect(p).toContain("Тип задачи: bug")
+    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" })
+    expect(empty).not.toContain("Тип задачи")
+  })
 })
 
 describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => {
@@ -646,6 +667,12 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain("approve → Review")
     expect(p).toContain("request_changes → In Progress")
     expect(p).toContain("https://pr/1")
+  })
+  test("rerun: тип задачи инжектится, пустой — не появляется", () => {
+    const p = reviewRerunPrompt("r3", "result", { branch: "b", worktree: "", pr: "https://pr/1", type: "spike" })
+    expect(p).toContain("Тип задачи: spike")
+    const empty = reviewRerunPrompt("r4", "result", { branch: "b", worktree: "", pr: "https://pr/1" })
+    expect(empty).not.toContain("Тип задачи")
   })
   test("rerun result: дельта-ветка approve-with-notes + эскалация повторных мелочей", () => {
     const p = reviewRerunPrompt("r2", "result", { branch: "", worktree: "", pr: "" })
@@ -957,6 +984,66 @@ describe("stallVerdict: зависший ход при живой сессии",
   })
 })
 
+describe("reviewStallVerdict: недоставленный вердикт ревьювера (инцидент 07.11)", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const facts = (over: Partial<ReviewStallFacts> = {}): ReviewStallFacts => ({
+    status: REVIEW_RESULT_STATUS,
+    reviewerAlive: true,
+    lastActivityAt: NOW - 40 * MIN,
+    signaled: false,
+    now: NOW,
+    ...over,
+  })
+
+  test("ревью-статус + живой ревьювер + тишина > порога — signal; текст ведёт к будилке", () => {
+    const v = reviewStallVerdict(facts(), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // сценарий вопроса юзеру: ответ комментом — но перестановка ревью-статуса
+    // обязательный шаг обоих сценариев (коммент в Needs attention ревьюверу
+    // не доставляется — доставка только в ревью-статусе, comments-to-reviewer)
+    expect(v.text).toContain("ответь комментом")
+    expect(v.text).toContain("Затем переставь ревью-статус")
+    expect(v.text).toContain("треды")
+  })
+  test("оба ревью-статуса покрываются (план и результат)", () => {
+    expect(reviewStallVerdict(facts({ status: REVIEW_PLAN_STATUS }), 30 * MIN).t).toBe("signal")
+    expect(reviewStallVerdict(facts({ status: REVIEW_RESULT_STATUS }), 30 * MIN).t).toBe("signal")
+  })
+  test("не ревью-статус — none даже при застое", () => {
+    expect(reviewStallVerdict(facts({ status: "In Progress" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("свежая активность ревьювера — none (ход ещё идёт или вернулся)", () => {
+    expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 5 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("dead ревьювер — none (routeTask сам спавнит), unknown — none (пропуск тика)", () => {
+    expect(reviewStallVerdict(facts({ reviewerAlive: false }), 30 * MIN)).toEqual({ t: "none" })
+    expect(reviewStallVerdict(facts({ reviewerAlive: null }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
+    expect(reviewStallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("активность вернулась при стоявшем флаге — none (демон снимет флаг)", () => {
+    expect(reviewStallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("сообщений нет вовсе — signal (спавн не начал ход или потерялся)", () => {
+    const v = reviewStallVerdict(facts({ lastActivityAt: null }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("сообщений в сессии нет")
+  })
+  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
+    expect(reviewStallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+  })
+})
+
 describe("adoptBodyDoc: самоисцеление пустого bodyDoc трека", () => {
   const tracked = (bodyDoc: string): TrackedTask => ({
     sessionID: "ses_x", worktree: "", branch: "", bodyDoc,
@@ -964,7 +1051,7 @@ describe("adoptBodyDoc: самоисцеление пустого bodyDoc тре
     createdAt: 1, attempts: 0, project: "t",
   })
   const row = (bodyDoc: string): TaskRef => ({
-    rowId: "row1", bodyDoc, title: "Задача", status: "In Progress", pr: "", branch: "",
+    rowId: "row1", bodyDoc, title: "Задача", status: "In Progress", type: "", pr: "", branch: "",
   })
 
   test("пустой трек + резолв строки — тело принято", () => {
@@ -1075,7 +1162,7 @@ describe("createBoardPathOnce — ленивый мемоизер пути до�
 // ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
 
 const ref = (overrides: Partial<TaskRef> & { rowId: string }): TaskRef => ({
-  bodyDoc: "", title: "Задача", status: "Design", pr: "", branch: "",
+  bodyDoc: "", title: "Задача", status: "Design", type: "", pr: "", branch: "",
   devSession: "", reviewSession: "", // явная нормализация: undefined тестируется отдельным кейсом
   ...overrides,
 })
@@ -1599,18 +1686,19 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     "",
     "## Дефект", "", "текст после секции",
   ].join("\n")
-  test("комменты секции: паддированный id, автор в userId, голова в тексте", () => {
+  test("комменты секции: контент-хэш id, автор в userId, голова в тексте", () => {
     const parsed = parseCommentsMarkdown(MD, "DOC")
     expect(parsed.length).toBe(2)
-    expect(parsed[0].id).toBe("cDOC-0000")
+    expect(parsed[0].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
     expect(parsed[0].userId).toBe("AGENTS")
     expect(parsed[0].text).toBe("AGENTS (2026-11-05 19:43): вопрос агента")
-    expect(parsed[1].id).toBe("cDOC-0001")
+    expect(parsed[1].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
+    expect(parsed[1].id).not.toBe(parsed[0].id)
   })
   test("тред-ответы несут id и userId — юзерский ответ тредом детектится", () => {
     const parsed = parseCommentsMarkdown(MD, "DOC")
     expect(parsed[0].replies.length).toBe(1)
-    expect(parsed[0].replies[0].id).toBe("rDOC-0000-0000")
+    expect(parsed[0].replies[0].id).toMatch(/^rDOC-[0-9a-f]{8}$/)
     expect(parsed[0].replies[0].userId).toBe("Юра")
     expect(parsed[0].replies[0].text).toContain("ответ владельца")
   })
@@ -1629,7 +1717,7 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     const parsed = parseCommentsMarkdown(MD_TAIL, "DOC")
     // старая секция + оба хвостовых пункта
     expect(parsed.length).toBe(3)
-    expect(parsed[1].id).toBe("cDOC-0001")
+    expect(parsed[1].id).toMatch(/^cDOC-[0-9a-f]{8}$/)
     expect(parsed[1].text).toContain("PR готов к ревью")
     // продолжение блока (тело вердикта) входит в text пункта
     expect(parsed[1].text).toContain("подробности вердикта")
@@ -1647,5 +1735,82 @@ describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-э
     const parsed = parseCommentsMarkdown(MD_LEAD, "DOC")
     expect(parsed.length).toBe(1)
     expect(parsed[0].text).not.toContain("абзац отчёта")
+  })
+  test("id контент-стабильны: снос верхнего коммента остальные id не меняет", () => {
+    const MD_FULL = [
+      "- **Юра** (2026-11-07 09:00): первый вопрос",
+      "- **AGENTS** (2026-11-07 09:05): ответ агента",
+      "- **Юра** (2026-11-07 09:10): уточнение",
+    ].join("\n")
+    const before = parseCommentsMarkdown(MD_FULL, "DOC")
+    const MD_TOP_DELETED = MD_FULL.split("\n").slice(1).join("\n")
+    const after = parseCommentsMarkdown(MD_TOP_DELETED, "DOC")
+    expect(after.map((c) => c.id)).toEqual(before.slice(1).map((c) => c.id))
+    // формат: префикс + контент-хэш (hex), не позиционный индекс
+    for (const c of after) expect(c.id).toMatch(/^cDOC-[0-9a-f]{8}$/)
+  })
+  test("идентичные replies — один хэш на контент, дубль не зацикливает будильник", () => {
+    const reply = "  - **Юра** (2026-11-07 09:00): дублированный ответ"
+    const MD_DUP_REPLY = [
+      "- **AGENTS** (2026-11-07 08:55): вопрос агента",
+      reply,
+      reply,
+    ].join("\n")
+    const parsed = parseCommentsMarkdown(MD_DUP_REPLY, "DOC")
+    expect(parsed[0].replies.length).toBe(2)
+    expect(parsed[0].replies[0].id).toBe(parsed[0].replies[1].id)
+    const comments: TaskComment[] = parsed.flatMap((c) => [
+      { id: c.id, text: c.text, createdAt: 1, userId: c.userId },
+      ...c.replies.map((r) => ({ id: r.id, text: r.text, createdAt: 2, userId: r.userId })),
+    ])
+    // lastSeen по первому дублю: свежих быть не должно — second копия уже
+    // «прожита» (findIndex по первому вхождению вернул бы будку на неё вновь)
+    const fresh = newUserComments(comments, { at: 0, id: parsed[0].replies[0].id }, "BOT")
+    expect(fresh).toEqual([])
+  })
+})
+
+describe("newUserComments — свежесть после сноса коммента (сдвиг позиционных id)", () => {
+  const line = (user: string, ts: string, text: string): string => `- **${user}** (${ts}): ${text}`
+  const toTaskComments = (md: string): TaskComment[] =>
+    parseCommentsMarkdown(md, "DOC").map((c, i) => ({
+      id: c.id,
+      text: c.text,
+      createdAt: i + 1,
+      userId: c.userId,
+    }))
+
+  test("снос обработанного коммента сверху не подменяет lastSeen и не теряет свежий", () => {
+    const MD_THREE = [
+      line("Юра", "2026-11-07 09:00", "старый обработанный"),
+      line("Юра", "2026-11-07 09:05", "последний обработанный"),
+      line("Юра", "2026-11-07 09:10", "новый после последнего захода"),
+    ].join("\n")
+    const seen = toTaskComments(MD_THREE)
+    const lastSeen = { at: 3, id: seen[2].id }
+    expect(newUserComments(seen, lastSeen, "BOT")).toEqual([])
+
+    const MD_TOP_DELETED = MD_THREE.split("\n").slice(1).join("\n")
+    const remaining = toTaskComments(MD_TOP_DELETED)
+    // после сноса id оставшихся не сдвинулись: свежих нет, дублей будки нет
+    expect(newUserComments(remaining, lastSeen, "BOT")).toEqual([])
+  })
+
+  test("снос коммента ВЫШЕ lastSeen не глотает свежий: сдвиг позиционных id подменял матч", () => {
+    const MD_THREE = [
+      line("Юра", "2026-11-07 09:00", "старый обработанный"),
+      line("Юра", "2026-11-07 09:05", "последний обработанный"),
+      line("Юра", "2026-11-07 09:10", "новый после последнего захода"),
+    ].join("\n")
+    const seen = toTaskComments(MD_THREE)
+    const lastSeen = { at: 2, id: seen[1].id }
+    // свежий C не заходил: на полном наборе он и есть свежий
+    expect(newUserComments(seen, lastSeen, "BOT").length).toBe(1)
+
+    const MD_TOP_DELETED = MD_THREE.split("\n").slice(1).join("\n")
+    const remaining = toTaskComments(MD_TOP_DELETED)
+    const fresh = newUserComments(remaining, lastSeen, "BOT")
+    expect(fresh.length).toBe(1)
+    expect(fresh[0].text).toContain("новый после последнего захода")
   })
 })

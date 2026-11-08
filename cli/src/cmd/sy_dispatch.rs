@@ -5,6 +5,7 @@ use super::read_resolve;
 use crate::cmd::cli::{Commands, CronSub, GoalSub, KernelSub, PersonSub, SemanticSub, TaskSub};
 use crate::html_embed;
 use crate::markdown;
+use crate::md_artifacts;
 use crate::md_heading;
 use crate::siyuan::find_marker_location as sy_find_marker_location;
 use crate::siyuan_goal as goal;
@@ -49,6 +50,21 @@ pub(crate) async fn dispatch(command: Commands) -> anyhow::Result<()> {
     }
 }
 
+/// Резолв задачи для id-команд: с --project — доска проекта, без — глобально
+/// по доскам всех проектов (уникальность обязательна, раскладка «доска →
+/// совпадения» в ошибках).
+async fn resolve_task(
+    sy: &SiYuan,
+    project: &str,
+    needle: &str,
+) -> Result<(syt::SyBoard, syt::SyTask)> {
+    if project.is_empty() {
+        syt::resolve_global(sy, needle).await
+    } else {
+        syt::resolve_on_project(sy, project, needle).await
+    }
+}
+
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
@@ -64,16 +80,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         if !attach.is_empty() {
             anyhow::bail!("create --dry-run не аттачит: скелет печатается без записей в воркспейс — убери --attach");
         }
+        // --type валидируется и в осмотре: флаг не молчит (ревью Low)
+        let ty = match ty.as_deref() {
+            Some(raw) => syt::validate_task_type(raw)?,
+            None => "dev".to_string(),
+        };
         // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)
         if let Some(expr) = schedule.as_deref() {
             crate::schedule::validate_schedule(expr)?;
             println!("расписание: {expr} (будет записано атрибутом custom-schedule дока-тела)");
         }
+        println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
-        println!(
-            "{}",
-            syt::body_template(ty.as_deref().unwrap_or("dev"), &ctx)
-        );
+        println!("{}", syt::body_template(&ty, &ctx));
         return Ok(());
     }
     // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
@@ -83,12 +102,26 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     if let TaskSub::Comment { stdin, text, .. } = &command {
         pre_guard_positional_comment(*stdin, text)?;
     }
-    if project.is_empty() {
-        anyhow::bail!("--project <имя> обязателен (uwuwu | origa | …)");
+    // Board-bound подкоманды привязаны к доске/журналу — глобальной семантики
+    // нет. Id-семейство (get/edit/claim/comment/thread/close/body/rm) без
+    // --project резолвит глобально: resolve_task → resolve_global (доски всех
+    // проектов, уникальность обязательна).
+    if project.is_empty()
+        && matches!(
+            command,
+            TaskSub::List { .. }
+                | TaskSub::Create { .. }
+                | TaskSub::Clean { .. }
+                | TaskSub::Undo { .. }
+        )
+    {
+        anyhow::bail!("--project <имя> обязателен для list/create/clean/undo (uwuwu | origa | …)");
     }
     let sy = SiYuan::from_env()?;
     match command {
-        TaskSub::List { status, .. } => {
+        TaskSub::List {
+            status, r#type: ty, ..
+        } => {
             let board = syt::find_board(&sy, project).await?;
             let rows = syt::read_rows(&sy, &board).await?;
             let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
@@ -100,11 +133,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         .map(|s| r.status.to_lowercase().starts_with(&s.to_lowercase()))
                         .unwrap_or(true)
                 })
+                .filter(|r| {
+                    ty.as_deref()
+                        .map(|t| r.task_type.eq_ignore_ascii_case(t))
+                        .unwrap_or(true)
+                })
                 .collect();
             if filtered.is_empty() {
                 println!("Задач нет.");
             }
-            println!("{:<13} {:<12} {:<34} PR", "СТАТУС", "СТРОКА", "ЗАГОЛОВОК");
+            println!(
+                "{:<13} {:<6} {:<12} {:<34} PR",
+                "СТАТУС", "ТИП", "СТРОКА", "ЗАГОЛОВОК"
+            );
             filtered.sort_by(|a, b| a.status.cmp(&b.status));
             for r in &filtered {
                 let marker = match r.body_doc.as_deref() {
@@ -112,8 +153,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     _ => "",
                 };
                 println!(
-                    "{:<13} {:<12} {:<34} {}{}",
+                    "{:<13} {:<6} {:<12} {:<34} {}{}",
                     r.status,
+                    r.task_type,
                     &r.item_id[..r.item_id.len().min(12)],
                     truncate(&r.title, 32),
                     r.pr,
@@ -123,15 +165,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             println!("Задача:   {}", task.title);
             println!("Статус:   {}", task.status);
+            if !task.task_type.is_empty() {
+                println!("Тип:      {}", task.task_type);
+            }
             println!("Строка:   {}", task.item_id);
+            // где приземлился резолв — особенно при глобальном (без --project)
+            println!("Доска:    {}", board.hpath);
             if !task.branch.is_empty() {
                 println!("Ветка:    {}", task.branch);
             }
             if !task.pr.is_empty() {
                 println!("PR:       {}", task.pr);
+            }
+            if !task.planned.is_empty() {
+                println!("Запланировано: {}", task.planned);
             }
             let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
             if let Some(doc) = body_doc.as_deref() {
@@ -146,6 +196,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
                 };
+                for warning in md_artifacts::artifact_report(&md) {
+                    eprintln!("⚠ round-trip-артефакт: {warning}");
+                }
                 println!("\n----- тело -----\n{md}");
                 let assets = save_body_assets(&sy, &md, &task.item_id).await;
                 if !assets.is_empty() {
@@ -167,6 +220,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
+            // тип валидируется до любых записей: пустой на create
+            // бессмысленен (паритет расписания), канон — дефолт dev тоже
+            // пишется в колонку
+            let ty_canonical = match ty.as_deref() {
+                Some("") => anyhow::bail!(
+                    "на create пустой тип бессмысленен — убери --type; снятие: task edit <id> --type \"\""
+                ),
+                Some(raw) => syt::validate_task_type(raw)?,
+                None => "dev".to_string(),
+            };
             if let Some(expr) = schedule.as_deref() {
                 if expr.is_empty() {
                     anyhow::bail!(
@@ -198,8 +261,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) =
-                syt::create(&sy, project, &title, ty.as_deref().unwrap_or("dev"), &ctx).await?;
+            let (item, body) = syt::create(&sy, project, &title, &ty_canonical, &ctx).await?;
             if let Some(expr) = schedule.as_deref() {
                 // сбой после create не теряет задачу: атрибут доставляется
                 // повторным task edit --schedule (создание уже свершилось)
@@ -211,6 +273,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                              не записано — доставь: task edit {item} --schedule \"{expr}\""
                         )
                     })?;
+                // колонка «Расписание» — синхронно с attr (доску create не
+                // возвращает; повторный find — две read-пробы, только при --schedule)
+                let board = syt::find_board(&sy, project).await.with_context(|| {
+                    format!(
+                        "задача создана (строка {item}), но клетку «{}» доставь: \
+                         task edit {item} --schedule \"{expr}\"",
+                        syt::SCHEDULE_CELL
+                    )
+                })?;
+                syt::sync_schedule_cell(&sy, &board, &item, expr).await?;
             }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
@@ -234,12 +306,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             title,
             pr,
             branch,
+            r#type: ty,
             schedule,
+            planned,
         } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
-            // валидация PR до rename: без частичных обновлений (тайтл сменился,
-            // а колонки нет — недопустимый разрыв)
+            let (board, task) = resolve_task(&sy, project, &id).await?;
+            // валидация PR/типа/planned до rename: без частичных обновлений
+            // (тайтл сменился, а колонки нет — недопустимый разрыв);
+            // «» — снятие типа/даты
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
+            let ty_canonical = match ty.as_deref() {
+                Some("") => Some(String::new()),
+                Some(raw) => Some(syt::validate_task_type(raw)?),
+                None => None,
+            };
+            if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
+                syt::parse_planned(raw)?;
+            }
             let final_title = match title.as_deref() {
                 Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
                 None => None,
@@ -251,8 +334,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 status.as_deref(),
                 branch.as_deref(),
                 pr.as_deref(),
+                ty_canonical.as_deref(),
             )
             .await?;
+            if let Some(raw) = planned.as_deref() {
+                syt::set_planned(&sy, &board, &task, raw).await?;
+            }
+            if ty_canonical.as_deref() == Some("") {
+                println!("тип снят: {}", task.title);
+            }
+            match planned.as_deref() {
+                Some("") => println!("запланировано снято: {}", task.title),
+                Some(raw) => {
+                    let (_, formatted) = syt::parse_planned(raw)?;
+                    println!("запланировано: {formatted}");
+                }
+                None => {}
+            }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
                 // валидация — только для непустого значения: контракт «"" — снять»
@@ -269,6 +367,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         )
                     })?;
                 sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                // колонка «Расписание» — отображение attr: пишется синхронно
+                // в единственной точке записи расписания (снятие чистит клетку)
+                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
                 if expr.is_empty() {
                     println!("расписание снято: {}", task.title);
                 }
@@ -286,7 +387,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     "sessionID не задан: нет --session и нет OPENCODE_SESSION_ID в env — заявись из сессии агента или передай id явно"
                 ))?,
             };
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::claim(&sy, &board, &task, &session).await?;
             println!("заявлено: {} ← {}", task.title, session);
             Ok(())
@@ -298,13 +399,22 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             text,
         } => {
             let msg = guarded_comment_text(stdin, &text)?;
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            // write-side превенция тег-матча ядра (см. body): предупреждение
+            // в stderr, запись не блокируется
+            if let Some(warning) = md_artifacts::tag_trap_warning(&msg) {
+                eprintln!("{warning}");
+            }
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
-            println!("коммент отправлен: {}", truncate(&msg, 60));
+            println!(
+                "коммент отправлен на {}: {}",
+                board.hpath,
+                truncate(&msg, 60)
+            );
             Ok(())
         }
         TaskSub::Thread { id } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             let md = match syt::task_body_doc(&sy, &board, &task).await? {
                 Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                 None => String::new(),
@@ -313,7 +423,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Ok(())
         }
         TaskSub::Close { id, note } => {
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::close(&sy, &board, &task, note.as_deref()).await?;
             println!("закрыта: {}", task.title);
             Ok(())
@@ -339,6 +449,28 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         } => {
             let attach_files = validate_attach_files(&attach)?;
             let content = read_body_input(md.as_deref(), stdin, !attach_files.is_empty())?;
+            // гард вставки обёртки вывода task get в контент (202611080031):
+            // вход пишется как есть — шапка карточки, маркер и frontmatter от
+            // get-вывода ложатся в тело литерально и множатся на replace-циклах.
+            // Отказ до сети и записи (no-write); при --force тоже — санитария
+            // входа, инвариант, а не часть сверки свежести. Снапшот --base
+            // допустим полным: cli срезает обёртку при сверке сам.
+            if let Some(signature) = md_artifacts::task_get_wrapper_signature(&content) {
+                bail!(
+                    "вход несёт обёртку вывода task get ({signature}) — она легла бы в тело \
+                     литерально и множилась на replace-циклах. Скармливай контент тела: без \
+                     шапки карточки «Задача:/Статус:/Строка:…», маркера «----- тело -----» и \
+                     frontmatter — frontmatter дока ведёт ядро, титульный H1 пишется из \
+                     заголовка дока. Снапшот для --base можно не чистить: cli срезает обёртку \
+                     при сверке сам"
+                );
+            }
+            // write-side превенция тег-матча ядра: голые решётки с пунктуацией
+            // вплотную съедают бэктики код-спанов на экспорте; предупреждение
+            // не блокирует запись (легитимные тела О самой порче триггерят)
+            if let Some(warning) = md_artifacts::tag_trap_warning(&content) {
+                eprintln!("{warning}");
+            }
             // фенс-вход валидируется до resolve/upload: отказ (дубль имени,
             // незакрытый фенс, пустая строка в html) не грузит ассеты
             let fences = html_embed::parse_input(&content)?;
@@ -350,7 +482,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ),
                 None => None,
             };
-            let (board, task) = syt::resolve_on_project(&sy, project, &id).await?;
+            let (board, task) = resolve_task(&sy, project, &id).await?;
             let body_path = board.body_hpath(&task.title);
             // upload до записи тела: сбой не оставляет тело без референсов
             let mut uploaded = Vec::new();
@@ -471,7 +603,7 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             // канонизация статуса до любых записей: без частичных обновлений
             let canonical = status.as_deref().map(goal::canonical_status).transpose()?;
             if let Some(st) = canonical.as_deref() {
-                syt::edit(&sy, &board, &goal, Some(st), None, None).await?;
+                syt::edit(&sy, &board, &goal, Some(st), None, None, None).await?;
             }
             if let Some(raw) = title.as_deref() {
                 syt::edit_title(&sy, &board, &goal, raw).await?;
@@ -590,10 +722,20 @@ async fn journal_row(sy: &SiYuan, board: &syt::SyBoard, task: &syt::SyTask) -> R
 
 /// rm одной задачи под guard'ом: вердикт по источникам, отказ для живых
 /// не-Draft (задекларированный контракт команды), write-ahead журнал.
+/// Id-команда: без --project резолвит глобально; имя проекта для журнала
+/// при этом выводится из доски (undo-валидация остаётся проектной).
 async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
-    let board = syt::find_board(sy, project).await?;
+    let (board, task) = resolve_task(sy, project, id).await?;
+    let project = if project.is_empty() {
+        syt::board_project(&board)
+    } else {
+        project.to_string()
+    };
     let chain = syt::board_doc_chain(sy, &board).await?;
-    let task = syt::resolve(sy, &board, id).await?;
+    // Строка резолвилась на доске — повторный resolve не нужен: вердикт
+    // строится по найденной задаче (resolve внутри task_rm дублировал бы
+    // render; контракт guard'а — вердикт по независимым источникам, не
+    // по повторному матчингу).
     match row_verdict(sy, &board, &chain, &task).await? {
         Verdict::Divergent => bail!(
             "состояние строки «{}» неясно (FS/SQL-проба не состоялась) — rm отклонён, повтори позже",
@@ -606,7 +748,7 @@ async fn task_rm(sy: &SiYuan, project: &str, id: &str) -> Result<()> {
         ),
         _ => {}
     }
-    let mut journal = Journal::new(project, "rm", &board);
+    let mut journal = Journal::new(&project, "rm", &board);
     journal.rows.push(journal_row(sy, &board, &task).await?);
     let journal_path = journal.save(sy).await?;
     sy.mcp_tool(
@@ -681,7 +823,7 @@ async fn task_clean(
                     task.item_id,
                     hint
                 );
-                planned.push((frag, task, verdict));
+                planned.push((frag, *task, verdict));
             }
             syt::NeedleMatch::NotFound => {
                 println!("  [Phantom]     «{frag}» — не найдена в render, не трогаю")
@@ -1341,7 +1483,11 @@ pub async fn read_markdown(slug: &str) -> Result<String> {
     }
     let sy = SiYuan::from_env()?;
     let doc_id = read_resolve::resolve(&sy, slug).await?;
-    sy.export_md_by_id(&doc_id).await
+    let md = sy.export_md_by_id(&doc_id).await?;
+    for warning in md_artifacts::artifact_report(&md) {
+        eprintln!("⚠ round-trip-артефакт: {warning}");
+    }
+    Ok(md)
 }
 
 pub(crate) async fn blob_run(key: &str, out: Option<String>) -> Result<()> {
@@ -1523,7 +1669,7 @@ async fn write_body_in_place(
             carry_over_comments_section(doc_title, &existing, &inline)?
         }
     };
-    sy.overwrite_doc_md(doc_id, &new_md).await
+    sy.overwrite_doc_md(doc_id, doc_title, &new_md).await
 }
 
 /// append-путь с фенсами: именованные — block-хирургия в доке (адресация
@@ -1639,8 +1785,10 @@ async fn apply_diagram_op(sy: &SiYuan, doc_id: &str, op: html_embed::DiagramOp) 
 /// с путями ассетов после тела. Полный get-вывод, сырой экспорт и чистое
 /// тело сводятся к телу (контракт --base). Легитимные строки-маркеры в
 /// чистом теле срежут часть контента — false-mismatch, отказ (safe-направление).
+/// Маркер — общая константа с write-side детектором (md_artifacts):
+/// срезка снапшота и детекция входа не разъедутся.
 fn strip_task_get_output(raw: &str) -> String {
-    let body = match raw.split_once("----- тело -----") {
+    let body = match raw.split_once(md_artifacts::TASK_GET_BODY_MARKER) {
         Some((_, rest)) => rest,
         None => raw,
     };
@@ -3205,14 +3353,24 @@ mod tests {
         );
     }
 
-    /// Контроль: чистый позиционный текст при пустом --project — прежний bail
-    /// (проверка --project не размыта гвардом).
+    /// Контроль: чистый позиционный текст при пустом --project — гвард
+    /// пропускает, команда уходит в глобальный резолв (bail «--project
+    /// обязателен» для id-семейства снят задачей 20261106230303; промах
+    /// резолва честный, не «флаг не передан»).
     #[tokio::test]
-    async fn clean_comment_text_still_bails_on_missing_project() {
+    async fn clean_comment_text_without_project_goes_to_global_resolve() {
         let err = task_run("", comment_command(false, &["текст"]))
             .await
-            .expect_err("--project обязателен для чистого текста");
-        assert!(err.to_string().contains("обязателен"), "{err}");
+            .expect_err("глобальный резолв без ядра/досок — отказ");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("похож на флаг") && !msg.contains("подкоманд"),
+            "чистый текст гвардом не отклоняется: {msg}"
+        );
+        assert!(
+            !msg.contains("обязателен"),
+            "bail «--project обязателен» для comment снят: {msg}"
+        );
     }
 
     #[test]
@@ -3547,9 +3705,12 @@ mod tests {
             item_id: ROW_ID.into(),
             title: "таск".into(),
             status: String::new(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
     }
@@ -3881,7 +4042,10 @@ mod tests {
                         json!({ "action": "item_add", "data": { "itemID": ROW_ID } }).to_string()
                     } else if body.contains("\"keys\"") {
                         json!({ "action": "keys",
-                                "data": { "keys": [{ "id": TITLE_KEY, "name": "Status" }] } }).to_string()
+                                "data": { "keys": [
+                                    { "id": TITLE_KEY, "name": "Status" },
+                                    { "id": "key-type", "name": "Тип" }
+                                ] } }).to_string()
                     } else if body.contains("\"render\"") {
                         let page_done = body.contains("\"page\":2");
                         let existing = initial_for_mcp.clone().map(|t| serde_json::json!({
@@ -3962,16 +4126,11 @@ mod tests {
 
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["upload", "upload", "create", "item_add", "append", "append"],
-            "порядок: upload все → createDoc → строка → тег типа → референсы"
+            vec!["upload", "upload", "create", "item_add", "append"],
+            "порядок: upload все → createDoc → строка → референсы (тип — клетка доски, не append)"
         );
         let appends = appends.lock().unwrap();
-        assert!(
-            appends[0].contains("#dev"),
-            "первый append — тег типа: {}",
-            appends[0]
-        );
-        let refs_md: String = serde_json::from_str::<serde_json::Value>(&appends[1])
+        let refs_md: String = serde_json::from_str::<serde_json::Value>(&appends[0])
             .expect("appendBlock body — json")
             .get("data")
             .and_then(|d| d.as_str())
@@ -4642,7 +4801,7 @@ mod tests {
                 // поиск доски (doc_ids_by_hpath идёт через getIDsByHPath; здесь
                 // только av-носитель доски) и прочие выборки — пусто
                 let data = if stmt.contains("type='av'") {
-                    serde_json::json!([{ "id": "block-1", "markdown": format!("<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>") }])
+                    serde_json::json!([{ "id": "block-1", "markdown": "<div data-type=\"NodeAttributeView\" data-av-id=\"av-1\"></div>" }])
                 } else {
                     serde_json::json!([])
                 };
@@ -4666,8 +4825,6 @@ mod tests {
                 let hpath = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
                 let _data = if hpath == "/uwuwu/Задачи uwuwu" {
                     serde_json::json!([BOARD_DOC])
-                } else if hpath.contains("/таск") {
-                    serde_json::json!([])
                 } else {
                     serde_json::json!([])
                 };

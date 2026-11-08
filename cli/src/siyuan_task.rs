@@ -160,10 +160,17 @@ pub struct SyTask {
     pub item_id: String,
     pub title: String,
     pub status: String,
+    /// Классификация задачи из колонки «Тип» (bug/dev/spike; "" — не задан).
+    pub task_type: String,
     pub branch: String,
     pub pr: String,
     /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
     pub dev_session: String,
+    /// Дата из колонки «Запланировано» (formattedContent date-клетки;
+    /// "" — пусто). Кроны: ран — фактический файр, мастер — next-fire.
+    pub planned: String,
+    /// Значение колонки «Расписание» (отображение custom-schedule мастера).
+    pub schedule_cell: String,
     pub body_doc: Option<String>,
 }
 
@@ -299,7 +306,7 @@ pub async fn read_rows(sy: &SiYuan, board: &SyBoard) -> Result<Vec<SyTask>> {
 /// Primary-клетка узнаётся по value.type=block (pk в SiYuan всегда block,
 /// имя ключа произвольно: «Title», «Первичный ключ», «Цель»…), остальные
 /// клетки — по имени колонки.
-fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
+pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
     let key_name = |id: &str| -> String {
         keys.iter()
             .find(|k| k.get("id").and_then(|i| i.as_str()) == Some(id))
@@ -311,9 +318,12 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         item_id: it.get("id").and_then(|i| i.as_str()).unwrap_or("").into(),
         title: String::new(),
         status: String::new(),
+        task_type: String::new(),
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
+        planned: String::new(),
+        schedule_cell: String::new(),
         body_doc: None,
     };
     for cell in it
@@ -347,9 +357,12 @@ fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         }
         match name.as_str() {
             "Status" | "Статус" => t.status = value,
+            TYPE_CELL | "Type" => t.task_type = value,
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
+            PLANNED_CELL => t.planned = value,
+            SCHEDULE_CELL => t.schedule_cell = value,
             _ => {}
         }
     }
@@ -375,6 +388,7 @@ fn cell_value(cell: &Value) -> String {
         Some("url") => single("/url/content"),
         Some("email") => single("/email/content"),
         Some("phone") => single("/phone/content"),
+        Some("date") => single("/date/formattedContent"),
         Some("select") | Some("mSelect") => {
             return c
                 .get("mSelect")
@@ -518,6 +532,85 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("ключ Status не найден в database"))
 }
 
+/// Имя колонки типа на досках задач: парс клеток принимает «Тип»/"Type"
+/// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
+pub const TYPE_CELL: &str = "Тип";
+
+/// Канон типа задачи: trim + нижний регистр, ∈ {bug, dev, spike},
+/// иначе человеческий отказ.
+pub fn validate_task_type(raw: &str) -> Result<String> {
+    let canon = raw.trim().to_lowercase();
+    match canon.as_str() {
+        "bug" | "dev" | "spike" => Ok(canon),
+        _ => bail!("тип «{raw}» не разобран: жди dev | spike | bug (колонка «{TYPE_CELL}» доски)"),
+    }
+}
+
+/// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
+/// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
+/// (время файра), в клетке живут с минутной точностью — формат сравнения
+/// стабилен для reconcile демона. Формат не интерпретируется дальше:
+/// семантика расписаний — в TS демона.
+pub fn parse_planned(raw: &str) -> Result<(i64, String)> {
+    use chrono::TimeZone;
+    let s = raw.trim();
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M"))
+        .map_err(|_| {
+            anyhow!("дата «{raw}» не разобрана: жди «YYYY-MM-DD HH:MM» или «YYYY-MM-DD HH:MM:SS»")
+        })?;
+    let local = chrono::Local
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| anyhow!("«{raw}» неоднозначно в локальной зоне (переход времени?)"))?;
+    Ok((
+        local.timestamp_millis(),
+        local.format("%Y-%m-%d %H:%M").to_string(),
+    ))
+}
+
+/// keyID колонки «Тип»: существующая («Тип»/"Type") или свежесозданная
+/// select-колонка (addAttributeViewKey). Отказ API — громкий: молча no-op
+/// оставил бы агента в уверенности, что тип записан (прецедент claim).
+/// Read-then-mint без блокировки: параллельные create в миллисекундном
+/// окне могут заминтить дубли «Тип» — писатели доски практически сериальны,
+/// при признаках дубля колонки чистить руками в UI.
+pub(crate) async fn ensure_type_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys
+        .iter()
+        .find(|(name, _)| name == TYPE_CELL || name == "Type")
+    {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, TYPE_CELL, "select").await
+}
+
+/// Колонка «Запланировано» (date) и «Расписание» (text) — свойства
+/// крон-семьи на доске задач (ран — фактический файр, мастер — next-fire;
+/// расписание — отображение custom-schedule). Обычные задачи клетки не несут.
+pub const PLANNED_CELL: &str = "Запланировано";
+pub const SCHEDULE_CELL: &str = "Расписание";
+
+/// keyID колонки «Запланировано»: существующая или свежесозданная date-
+/// колонка (ensure-паттерн «Тип»).
+pub(crate) async fn ensure_planned_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == PLANNED_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, PLANNED_CELL, "date").await
+}
+
+/// keyID колонки «Расписание»: существующая или свежесозданная text-колонка.
+pub(crate) async fn ensure_schedule_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == SCHEDULE_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, SCHEDULE_CELL, "text").await
+}
+
 /// Колонки database: (имя → id) в порядке объявления на доске.
 pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, String)>> {
     let v = sy
@@ -605,14 +698,13 @@ pub(crate) async fn create_with_pacing(
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
-    let tag = if ty.is_empty() { None } else { Some(ty) };
     create_row_with_body(
         sy,
         &board,
         title,
         "Draft",
         &body_template(ty, ctx),
-        tag,
+        Some(ty),
         pacing,
     )
     .await
@@ -621,16 +713,18 @@ pub(crate) async fn create_with_pacing(
 /// Общий механизм создания bound-строки на готовой доске (task::create,
 /// goal::create): тело-саб-док (или перепривязка тела-сироты) + строка,
 /// привязанная к нему blockID, + начальный Status + verify вставки с
-/// ретраем ×1. `tag` — хэштег, дописываемый в тело после подтверждения;
-/// `pacing` — пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты
-/// мгновенно — см. RowInsertPacing). Возвращает (itemID, bodyDocID).
+/// ретраем ×1. `ty` — канон типа задачи: Some — ensure колонки «Тип» и
+/// запись клетки после подтверждения вставки (дефолт dev тоже пишется);
+/// None — goal-путь, колонка не минтится и клетка не пишется. `pacing` —
+/// пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты мгновенно —
+/// см. RowInsertPacing). Возвращает (itemID, bodyDocID).
 pub async fn create_row_with_body(
     sy: &SiYuan,
     board: &SyBoard,
     title: &str,
     initial_status: &str,
     template_md: &str,
-    tag: Option<&str>,
+    ty: Option<&str>,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     // идемпотентность: строка или тело с таким заголовком уже есть?
@@ -665,9 +759,21 @@ pub async fn create_row_with_body(
         let rows = read_rows(sy, board).await?;
         match check_row_insert(&rows, &item, title) {
             RowInsertCheck::Confirmed => {
-                // тип — тег в теле
-                if let Some(tag) = tag {
-                    let _ = sy.append_block_md(&body, &format!("\n#{tag}\n")).await;
+                // тип — колонка «Тип» доски: сбой записи после create не теряет
+                // задачу, тип доставляется повторным task edit --type
+                if let Some(ty) = ty {
+                    let tk = ensure_type_key(sy, &board.av_id).await.with_context(|| {
+                        format!(
+                            "задача «{title}» создана (строка {item}, тело {body}), но колонка \
+                             «{TYPE_CELL}» не создана — доставь тип: task edit {item} --type {ty}"
+                        )
+                    })?;
+                    sy.db_item_set_select(&board.av_id, &tk, &item, ty).await.with_context(|| {
+                        format!(
+                            "задача «{title}» создана (строка {item}, тело {body}), но тип не \
+                             записан — доставь: task edit {item} --type {ty}"
+                        )
+                    })?;
                 }
                 return Ok((item, body));
             }
@@ -892,7 +998,9 @@ pub(crate) enum RowInsertCheck {
 /// Исход матчинга фрагмента по готовым строкам render (без I/O).
 #[derive(Clone, Debug)]
 pub(crate) enum NeedleMatch {
-    Found(SyTask),
+    /// SyTask в боксе: enum на 240+ байт из-за роста SyTask ловит
+    /// clippy::large_enum_variant — разница Found/NotFound уходит в кучу.
+    Found(Box<SyTask>),
     /// Ни id, ни docId-префикс, ни подстрока тайтла не совпали.
     NotFound,
     /// Фрагмент матчит несколько строк: «id», «doc-id» или «подстрока».
@@ -902,8 +1010,7 @@ pub(crate) enum NeedleMatch {
     },
 }
 
-/// Матчинг фрагмента по готовым строкам: та же семантика, что у resolve()
-/// (id: равенство/префикс/суффикс → docId-префикс по саб-докам → подстрока
+/// Матчинг фрагмента по готовым строкам: семантика резолва задачи (id: равенство/префикс/суффикс → docId-префикс по саб-докам → подстрока
 /// нормализованного тайтла). `subdoc_ids` — docId саб-доков доски (одна
 /// выборка на доску, не на фрагмент).
 pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str) -> NeedleMatch {
@@ -915,7 +1022,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         })
         .collect();
     if by_id.len() == 1 {
-        return NeedleMatch::Found(by_id[0].clone());
+        return NeedleMatch::Found(Box::new(by_id[0].clone()));
     }
     if !by_id.is_empty() {
         return NeedleMatch::Ambiguous {
@@ -933,7 +1040,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         }
     }
     if by_doc_prefix.len() == 1 {
-        return NeedleMatch::Found(by_doc_prefix[0].clone());
+        return NeedleMatch::Found(Box::new(by_doc_prefix[0].clone()));
     }
     if by_doc_prefix.len() > 1 {
         return NeedleMatch::Ambiguous {
@@ -946,7 +1053,7 @@ pub(crate) fn match_needle(rows: &[SyTask], subdoc_ids: &[String], needle: &str)
         .filter(|r| normalize_title(&r.title).contains(&normalize_title(needle)))
         .collect();
     if by_title.len() == 1 {
-        return NeedleMatch::Found(by_title[0].clone());
+        return NeedleMatch::Found(Box::new(by_title[0].clone()));
     }
     if by_title.len() > 1 {
         return NeedleMatch::Ambiguous {
@@ -971,11 +1078,6 @@ pub(crate) async fn board_subdoc_ids(sy: &SiYuan, board: &SyBoard) -> Result<Vec
         .collect())
 }
 
-/// Резолв задачи по id (itemID/docID/префикс/хвост) или подстроке заголовка.
-pub async fn resolve(sy: &SiYuan, board: &SyBoard, needle: &str) -> Result<SyTask> {
-    resolve_entity(sy, board, needle, "задача").await
-}
-
 /// То же с именем сущности в сообщениях об ошибках (доска целей говорит
 /// «цель … не найдена», а не «задача …» — доска задач тут ни при чём).
 pub async fn resolve_entity(
@@ -987,7 +1089,7 @@ pub async fn resolve_entity(
     let rows = read_rows(sy, board).await?;
     let subdoc_ids = board_subdoc_ids(sy, board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
-        NeedleMatch::Found(task) => Ok(task),
+        NeedleMatch::Found(task) => Ok(*task),
         NeedleMatch::NotFound => bail!("{entity} «{needle}» не найдена"),
         NeedleMatch::Ambiguous { reason, matches } => {
             bail!("неоднозначный {reason}: {matches} совпадений")
@@ -1019,7 +1121,7 @@ pub async fn resolve_on_project(
 
     let subdoc_ids = board_subdoc_ids(sy, &board).await?;
     match match_needle(&rows, &subdoc_ids, needle) {
-        NeedleMatch::Found(task) => Ok((board, task)),
+        NeedleMatch::Found(task) => Ok((board, *task)),
         NeedleMatch::Ambiguous { reason, matches } => bail!(
             "задача «{needle}»: неоднозначно на: {} ({}: {matches}); обысканы доски: {} — уточни id",
             board.hpath,
@@ -1031,6 +1133,145 @@ pub async fn resolve_on_project(
             board.hpath
         ),
     }
+}
+
+/// Глобальный резолв по доскам всех проектов (task-семейство без --project).
+///
+/// Фаза A — точный item-id по доскам в порядке дискавери, первый матч
+/// выигрывает: itemID ядра глобально уникальны, автопуть с полным rowId
+/// детерминирован (ADR-026), ради теоретической коллизии доски не
+/// перечитываются. Фаза B — нечёткий матч собирается со всех досок:
+/// ровно один матч и ноль неоднозначностей → он; матчи на нескольких
+/// досках или неоднозначность хоть на одной — громкая ошибка с раскладкой
+/// «доска → совпадения» (тихий wrong-target исключён конструктивно).
+/// Формат ошибок mirrored на resolve_on_project + подсказка «--project».
+pub async fn resolve_global(sy: &SiYuan, needle: &str) -> Result<(SyBoard, SyTask)> {
+    let mut boards = discover_task_boards(sy).await?;
+    if boards.is_empty() {
+        bail!("доски задач не найдены: в Projects нет ни одного дока «Задачи <proj>»");
+    }
+    let mut rows_cache: Vec<Option<Vec<SyTask>>> = vec![None; boards.len()];
+
+    // Фаза A: точный id
+    let exact = needle.trim_start_matches('-');
+    for (idx, board) in boards.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        if let Some(task) = rows.iter().find(|r| r.item_id == exact) {
+            return Ok((board.clone(), task.clone()));
+        }
+    }
+
+    // Фаза B: нечёткий матч по всем доскам
+    let mut found: Vec<(usize, SyTask)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for (idx, board) in boards.iter().enumerate() {
+        let rows = cached_rows(sy, board, &mut rows_cache, idx).await?;
+        let subdoc_ids = board_subdoc_ids(sy, board).await?;
+        match match_needle(&rows, &subdoc_ids, needle) {
+            NeedleMatch::Found(task) => found.push((idx, *task)),
+            NeedleMatch::Ambiguous { reason, matches } => {
+                ambiguous.push(format!("{} ({}: {matches})", board.hpath, reason));
+            }
+            NeedleMatch::NotFound => {}
+        }
+    }
+    if found.len() == 1 && ambiguous.is_empty() {
+        let (idx, task) = found.remove(0);
+        // порядок досок дальше не используется: swap_remove достаёт элемент
+        // напрямую, без Option/expect (idx из enumerate той же boards)
+        let board = boards.swap_remove(idx);
+        return Ok((board, task));
+    }
+
+    let searched: Vec<String> = boards.iter().map(|b| b.hpath.clone()).collect();
+    let mut parts: Vec<String> = Vec::new();
+    if !found.is_empty() {
+        let boards_hit: Vec<String> = found
+            .iter()
+            .map(|(i, _)| boards[*i].hpath.clone())
+            .collect();
+        parts.push(format!("найдено на: {}", boards_hit.join(", ")));
+    }
+    if !ambiguous.is_empty() {
+        parts.push(format!("неоднозначно на: {}", ambiguous.join("; ")));
+    }
+    if parts.is_empty() {
+        bail!(
+            "задача «{needle}» не найдена; обысканы доски: {} — укажи --project, если доска известна",
+            searched.join(", ")
+        );
+    }
+    bail!(
+        "задача «{needle}»: {} (обысканы доски: {}) — уточни --project или id",
+        parts.join("; "),
+        searched.join(", ")
+    )
+}
+
+/// Доски задач всех проектов: SQL-дискавери доков «Задачи %» одним уровнем
+/// под проектами (доски задач живут только там по конвенции). Дубли доков
+/// одного проекта после пересозданий — первый по сортированному hpath.
+/// Дока нет — доски нет (benign); битая доска/инфра-сбой — громкая ошибка
+/// (таксономия find_board_titled_opt). Паттерн — выпиленный крон-дискавери
+/// (ADR-026, коммит 59d9da4).
+pub async fn discover_task_boards(sy: &SiYuan) -> Result<Vec<SyBoard>> {
+    let rows = sy
+        .sql("select id, hpath from blocks where type='d' and content like 'Задачи %' limit 200")
+        .await?;
+    let mut hpaths: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("hpath").and_then(|h| h.as_str()).map(String::from))
+        .collect();
+    hpaths.sort();
+    hpaths.dedup();
+    let mut out = Vec::new();
+    let mut seen_projects = HashSet::new();
+    for hpath in hpaths {
+        let Some((project, title)) = task_board_parts(&hpath) else {
+            continue;
+        };
+        if !seen_projects.insert(project.clone()) {
+            continue;
+        }
+        if let Some(board) = find_board_titled_opt(sy, &project, &title).await? {
+            out.push(board);
+        }
+    }
+    Ok(out)
+}
+
+/// /<proj>/Задачи <proj> → Some((proj, «Задачи <proj>»)); прочие пути — None
+/// (доски задач вглубь иерархии не вкладываются). pub(crate) для мок-ядра:
+/// дискавери-ответ строится по той же конвенции, что парсит резолв.
+pub(crate) fn task_board_parts(hpath: &str) -> Option<(String, String)> {
+    let rest = hpath.strip_prefix('/')?;
+    let (project, title) = rest.split_once('/')?;
+    let expected = format!("Задачи {project}");
+    (title == expected).then_some((project.to_string(), expected))
+}
+
+/// Проект доски из её hpath. Для досок из дискавери/резолва конвенция
+/// соблюдена; фоллбек — полный hpath (undo-журнал остаётся адресуемым).
+pub fn board_project(board: &SyBoard) -> String {
+    task_board_parts(&board.hpath)
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| board.hpath.clone())
+}
+
+/// Строки доски с кэшем между фазами: render — самая дорогая операция
+/// резолва, каждая доска читается один раз.
+async fn cached_rows(
+    sy: &SiYuan,
+    board: &SyBoard,
+    cache: &mut [Option<Vec<SyTask>>],
+    idx: usize,
+) -> Result<Vec<SyTask>> {
+    if let Some(rows) = &cache[idx] {
+        return Ok(rows.clone());
+    }
+    let rows = read_rows(sy, board).await?;
+    cache[idx] = Some(rows.clone());
+    Ok(rows)
 }
 
 /// Коммент: строка в «## Комменты» тела задачи (реплай — отступ).
@@ -1185,7 +1426,9 @@ pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
     Ok(serde_json::json!({ "url": { "content": pr } }))
 }
 
-/// Смена статуса/branch/pr (title-переименование не поддерживаем v1).
+/// Смена статуса/branch/pr/типа (title-переименование не поддерживаем v1).
+/// Тип: Some("") — снятие (пустой mSelect), Some(canon) — запись, None —
+/// не менять. Валидация типа до любых записей (паритет pr).
 pub async fn edit(
     sy: &SiYuan,
     board: &SyBoard,
@@ -1193,9 +1436,16 @@ pub async fn edit(
     status: Option<&str>,
     branch: Option<&str>,
     pr: Option<&str>,
+    ty: Option<&str>,
 ) -> Result<()> {
-    // валидация PR до любых записей: без частичных обновлений
+    // валидация PR до любых записей: без частичных обновлений;
+    // пустой ty — снятие (клетка очищается), валидация — только непустому
     let pr_value = pr.map(pr_cell_value).transpose()?;
+    let ty_canonical = match ty {
+        Some("") => Some(String::new()),
+        Some(raw) => Some(validate_task_type(raw)?),
+        None => None,
+    };
     let find = |name: &str, keys: &[(String, String)]| -> Option<String> {
         keys.iter()
             .find(|(k, _)| k == name)
@@ -1225,6 +1475,77 @@ pub async fn edit(
         )
         .await?;
     }
+    if let Some(canon) = ty_canonical {
+        // ensure колонки и здесь: легаси-строки живут на досках без «Тип»
+        let k = ensure_type_key(sy, &board.av_id).await?;
+        sy.db_item_set_select(&board.av_id, &k, &task.item_id, &canon)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Дата в колонку «Запланировано» (кроны: ран — фактический файр, мастер —
+/// next-fire). «» — очистка клетки. Валидация формата — в dispatch до
+/// мутаций; здесь ensure date-колонки + запись ValueDate. Отдельно от edit:
+/// канон задач правит 7 колонок, planned — семейство кронов.
+pub(crate) async fn set_planned(
+    sy: &SiYuan,
+    board: &SyBoard,
+    task: &SyTask,
+    planned: &str,
+) -> Result<()> {
+    let (ms, is_not_empty, formatted) = if planned.is_empty() {
+        (0, false, String::new())
+    } else {
+        let (ms, formatted) = parse_planned(planned)?;
+        (ms, true, formatted)
+    };
+    let k = ensure_planned_key(sy, &board.av_id)
+        .await
+        .with_context(|| {
+            format!(
+                "колонка «{PLANNED_CELL}» не создана — повтори: task edit {} --planned",
+                task.item_id
+            )
+        })?;
+    sy.db_item_set_date(
+        &board.av_id,
+        &k,
+        &task.item_id,
+        ms,
+        is_not_empty,
+        &formatted,
+    )
+    .await
+    .with_context(|| format!("клетка «{PLANNED_CELL}» не записана — повтор идемпотентен"))?;
+    Ok(())
+}
+
+/// Синхронизировать колонку «Расписание» со значением custom-schedule:
+/// единственная точка записи клетки — пути --schedule (create/edit), чтобы
+/// attr и отображение не расходились. Пустое расписание — очистка клетки.
+pub(crate) async fn sync_schedule_cell(
+    sy: &SiYuan,
+    board: &SyBoard,
+    item_id: &str,
+    expr: &str,
+) -> Result<()> {
+    let k = ensure_schedule_key(sy, &board.av_id).await.with_context(|| {
+        format!(
+            "колонка «{SCHEDULE_CELL}» не создана — доставь повтором: task edit {item_id} --schedule \"{expr}\""
+        )
+    })?;
+    sy.mcp_tool(
+        "database",
+        serde_json::json!({ "action": "item_update", "id": board.av_id, "keyID": k,
+                "itemID": item_id, "value": { "text": { "content": expr } } }),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "клетка «{SCHEDULE_CELL}» не записана — доставь повтором: task edit {item_id} --schedule \"{expr}\""
+        )
+    })?;
     Ok(())
 }
 
@@ -1520,14 +1841,57 @@ mod tests {
         assert_eq!(t.dev_session, "ses_read1");
     }
 
+    #[test]
+    fn parse_render_row_reads_type_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-type", "name": TYPE_CELL }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-type", "type": "mSelect",
+                       "mSelect": [{ "content": "bug" }] }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.task_type, "bug");
+    }
+
+    #[test]
+    fn parse_render_row_reads_english_type_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-type", "name": "Type" }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-type", "type": "mSelect",
+                       "mSelect": [{ "content": "spike" }] }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.task_type, "spike");
+    }
+
+    #[test]
+    fn validate_task_type_canonizes_case_and_rejects_unknown() {
+        assert_eq!(validate_task_type(" Bug ").unwrap(), "bug");
+        assert_eq!(validate_task_type("DEV").unwrap(), "dev");
+        assert_eq!(validate_task_type("Spike").unwrap(), "spike");
+        let err = validate_task_type("feature").unwrap_err().to_string();
+        assert!(err.contains("dev | spike | bug"), "суть отказа: {err}");
+        assert!(validate_task_type("").is_err(), "пустой тип — отказ");
+    }
+
     fn sy_task(item_id: &str, title: &str, body_doc: Option<&str>) -> SyTask {
         SyTask {
             item_id: item_id.to_string(),
             title: title.to_string(),
             status: String::new(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: body_doc.map(String::from),
         }
     }
@@ -1660,9 +2024,12 @@ mod tests {
             item_id: item_id.to_string(),
             title: title.to_string(),
             status: "Todo".into(),
+            task_type: String::new(),
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: None,
         }
     }

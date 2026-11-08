@@ -26,8 +26,16 @@ pub(crate) struct MockRow {
     pub(crate) item: String,
     pub(crate) title: String,
     pub(crate) status: String,
+    pub(crate) task_type: String,
+    /// Клетка «Запланировано» (formattedContent date-ячейки; "" — нет клетки).
+    pub(crate) planned: String,
+    /// Клетка «Расписание» (text; "" — нет клетки).
+    pub(crate) schedule: String,
     pub(crate) doc: Option<String>,
 }
+
+/// Прямой ребёнок-док доски сценария: (docId, полный hpath, updated).
+pub(crate) type BoardChild = (&'static str, &'static str, &'static str);
 
 impl MockRow {
     pub(crate) fn new(item: &str, title: &str) -> Self {
@@ -35,6 +43,9 @@ impl MockRow {
             item: item.to_string(),
             title: title.to_string(),
             status: String::new(),
+            task_type: String::new(),
+            planned: String::new(),
+            schedule: String::new(),
             doc: None,
         }
     }
@@ -44,15 +55,28 @@ impl MockRow {
         self
     }
 
+    pub(crate) fn with_type(mut self, task_type: &str) -> Self {
+        self.task_type = task_type.to_string();
+        self
+    }
+
+    pub(crate) fn with_planned(mut self, planned: &str) -> Self {
+        self.planned = planned.to_string();
+        self
+    }
+
+    pub(crate) fn with_schedule(mut self, schedule: &str) -> Self {
+        self.schedule = schedule.to_string();
+        self
+    }
+
     pub(crate) fn with_doc(mut self, doc: &str) -> Self {
         self.doc = Some(doc.to_string());
         self
     }
 
-
-
     /// Строка render как JSON: Title-клетка всегда, статус — по заполненности.
-    fn cells_json(&self) -> Value {
+    pub(crate) fn cells_json(&self) -> Value {
         let mut block = json!({ "content": self.title, "refSubtype": "d" });
         if let Some(doc) = &self.doc {
             block["id"] = json!(doc);
@@ -64,6 +88,24 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-status", "type": "mSelect",
                            "mSelect": [{ "content": self.status }] }
+            }));
+        }
+        if !self.task_type.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-type", "type": "mSelect",
+                           "mSelect": [{ "content": self.task_type }] }
+            }));
+        }
+        if !self.planned.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-planned", "type": "date",
+                           "date": { "formattedContent": self.planned } }
+            }));
+        }
+        if !self.schedule.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-schedule", "type": "text",
+                           "text": { "content": self.schedule } }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -106,6 +148,13 @@ pub(crate) struct MockScenario {
     /// HTTP-статус appendBlock: 200; 500 — применённый блок при lost_response
     /// либо честный сбой (в паре с append_applies).
     pub(crate) append_status: u16,
+    /// Первые N appendBlock POST отвечают 500 без применения (одноразовый
+    /// отказ записи: последующие POST проходят штатно).
+    pub(crate) append_fail_posts: usize,
+    /// Первые N deleteBlock POST отвечают 500 (одноразовый отказ удаления).
+    pub(crate) delete_fail_posts: usize,
+    /// exportMdContent отвечает 500 (сбой чтения пре-имиджа overwrite).
+    pub(crate) export_fail: bool,
     /// Состояние доков (docId → блоки): seed + применённые append-ы;
     /// export отдаёт join.
     pub(crate) doc_blocks: Vec<(&'static str, Vec<String>)>,
@@ -129,6 +178,11 @@ pub(crate) struct MockScenario {
     /// Атрибуты блоков (docId → [(имя, значение)]) для getBlockAttrs;
     /// doc без записи → 404-конверт «block not found» (честная деградация).
     pub(crate) block_attrs: Vec<(&'static str, Vec<(String, String)>)>,
+    /// Прямые дети-доки досок (проба board-orphans): hpath доски → дети
+    /// (docId, полный hpath, updated). Отказ SQL детей — `sql_children_fail`.
+    pub(crate) board_children: Vec<(&'static str, Vec<BoardChild>)>,
+    /// true — SQL-запрос детей доски отвечает HTTP 500 (честный SKIP пробы).
+    pub(crate) sql_children_fail: bool,
 }
 
 impl Default for MockScenario {
@@ -141,8 +195,11 @@ impl Default for MockScenario {
                 keys: vec![
                     ("key-title", "Primary Key"),
                     ("key-status", "Status"),
+                    ("key-type", "Тип"),
                     ("key-branch", "Branch"),
                     ("key-pr", "PR"),
+                    ("key-planned", "Запланировано"),
+                    ("key-schedule", "Расписание"),
                 ],
             }],
             hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["board-doc"])],
@@ -153,6 +210,9 @@ impl Default for MockScenario {
             item_add_replies: Vec::new(),
             append_applies: false,
             append_status: 200,
+            append_fail_posts: 0,
+            delete_fail_posts: 0,
+            export_fail: false,
             doc_blocks: Vec::new(),
             exports: Vec::new(),
             get_children_seq: vec![String::new()],
@@ -163,6 +223,8 @@ impl Default for MockScenario {
             missing_file_path: "",
             item_remove_drops_all: false,
             block_attrs: Vec::new(),
+            board_children: Vec::new(),
+            sql_children_fail: false,
         }
     }
 }
@@ -182,9 +244,13 @@ pub(crate) struct MockKernel {
     created_docs: Mutex<Vec<(String, String)>>,
     appends: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
+    append_posts: AtomicUsize,
+    delete_posts: AtomicUsize,
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
+    /// (av, keyName, keyType) всех addAttributeViewKey (минт колонок).
+    add_cols: Mutex<Vec<(String, String, String)>>,
     doc_blocks: Mutex<HashMap<String, Vec<String>>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -192,12 +258,7 @@ pub(crate) struct MockKernel {
 impl MockKernel {
     fn new(sc: MockScenario) -> Self {
         Self {
-            replies: Mutex::new(
-                sc.item_add_replies
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
+            replies: Mutex::new(sc.item_add_replies.iter().map(|s| s.to_string()).collect()),
             children: Mutex::new(sc.get_children_seq.clone()),
             doc_blocks: Mutex::new(
                 sc.doc_blocks
@@ -216,9 +277,12 @@ impl MockKernel {
             created_docs: Mutex::new(Vec::new()),
             appends: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            append_posts: AtomicUsize::new(0),
+            delete_posts: AtomicUsize::new(0),
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
+            add_cols: Mutex::new(Vec::new()),
         }
     }
 
@@ -290,6 +354,11 @@ impl MockKernel {
         self.attr_writes.lock().unwrap().clone()
     }
 
+    /// (av, keyName, keyType) всех addAttributeViewKey.
+    pub(crate) fn add_cols(&self) -> Vec<(String, String, String)> {
+        self.add_cols.lock().unwrap().clone()
+    }
+
     /// Состояние дока (применённые блоки) для ассертов comment-флоу.
     pub(crate) fn doc_blocks_of(&self, doc: &str) -> Vec<String> {
         self.doc_blocks
@@ -309,7 +378,9 @@ impl MockKernel {
             .respond_with({
                 let nb = self.sc.notebook;
                 move |_: &Request| {
-                    rest_ok(json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }))
+                    rest_ok(
+                        json!({ "notebooks": [{ "id": nb, "name": "Projects", "closed": false }] }),
+                    )
                 }
             })
             .mount(server)
@@ -323,7 +394,13 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let stmt = body.get("stmt").and_then(|s| s.as_str()).unwrap_or("");
-                    rest_ok(kernel.sql_data(stmt))
+                    let data = kernel.sql_data(stmt);
+                    if data.get("__sql_fail__").is_some() {
+                        return ResponseTemplate::new(500).set_body_string(
+                            r#"{"code":500,"msg":"metadata is not ready","data":[]}"#,
+                        );
+                    }
+                    rest_ok(data)
                 }
             })
             .mount(server)
@@ -384,6 +461,9 @@ impl MockKernel {
                 move |req: &Request| {
                     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if kernel.sc.export_fail {
+                        return ResponseTemplate::new(500);
+                    }
                     let content = {
                         let blocks = kernel.doc_blocks.lock().unwrap();
                         match blocks.get(id) {
@@ -411,6 +491,10 @@ impl MockKernel {
                 move |req: &Request| {
                     let raw = String::from_utf8_lossy(&req.body).to_string();
                     let parsed: Value = serde_json::from_str(&raw).unwrap_or_default();
+                    let post_no = kernel.append_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.append_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.appends.lock().unwrap().push(raw);
                     if kernel.sc.append_applies {
                         let doc = parsed
@@ -453,6 +537,10 @@ impl MockKernel {
                         .and_then(|i| i.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let post_no = kernel.delete_posts.fetch_add(1, Ordering::SeqCst);
+                    if post_no < kernel.sc.delete_fail_posts {
+                        return ResponseTemplate::new(500);
+                    }
                     kernel.deletes.lock().unwrap().push(id);
                     rest_ok(json!(null))
                 }
@@ -545,10 +633,8 @@ impl MockKernel {
                         .map(|(_, a)| a.clone());
                     match attrs {
                         Some(attrs) => {
-                            let map: serde_json::Map<String, Value> = attrs
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json!(v)))
-                                .collect();
+                            let map: serde_json::Map<String, Value> =
+                                attrs.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                             rest_ok(Value::Object(map))
                         }
                         None => ResponseTemplate::new(200).set_body_string(
@@ -573,9 +659,8 @@ impl MockKernel {
                         .unwrap_or("")
                         .to_string();
                     let attrs = body.get("attrs").cloned().unwrap_or_default();
-                    if let Some((name, value)) = attrs
-                        .as_object()
-                        .and_then(|m| m.into_iter().next())
+                    if let Some((name, value)) =
+                        attrs.as_object().and_then(|m| m.into_iter().next())
                     {
                         kernel.attr_writes.lock().unwrap().push((
                             id,
@@ -583,6 +668,34 @@ impl MockKernel {
                             value.as_str().unwrap_or("").to_string(),
                         ));
                     }
+                    ResponseTemplate::new(200)
+                        .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
+                }
+            })
+            .mount(server)
+            .await;
+
+        // REST: создание колонки database (минт «Тип») — наблюдатель
+        Mock::given(method("POST"))
+            .and(path("/api/av/addAttributeViewKey"))
+            .respond_with({
+                let kernel = Arc::clone(self);
+                move |req: &Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    kernel.add_cols.lock().unwrap().push((
+                        body.get("avID")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body.get("keyType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ));
                     ResponseTemplate::new(200)
                         .set_body_string(json!({ "code": 0, "msg": "", "data": null }).to_string())
                 }
@@ -642,6 +755,54 @@ impl MockKernel {
     // ——— MCP-действия над состоянием ———
 
     fn sql_data(&self, stmt: &str) -> Value {
+        // проба board-orphans: уникальная сигнатура stmt («select id,
+        // hpath, ial from blocks») — чужие SQL с hpath like не попадают
+        if stmt.contains("select id, hpath, ial from blocks") {
+            if self.sc.sql_children_fail {
+                // синтаксически валидный stmt — отказ ядра как HTTP 500
+                return json!({ "__sql_fail__": true });
+            }
+            if let Some((_, children)) = self
+                .sc
+                .board_children
+                .iter()
+                .find(|(hpath, _)| stmt.contains(&format!("hpath like '{hpath}/%'")))
+            {
+                let rows: Vec<Value> = children
+                    .iter()
+                    .map(|(id, child_hpath, updated)| {
+                        json!({
+                            "id": id,
+                            "hpath": child_hpath,
+                            "ial": format!(
+                                "{{: type=\"doc\" updated=\"{updated}\" id=\"{id}\" title=\"\"}}"
+                            ),
+                        })
+                    })
+                    .collect();
+                return json!(rows);
+            }
+            return json!([]);
+        }
+        // дискавери досок задач (глобальный резолв без --project): hpath
+        // сценария фильтруются той же конвенцией, что парсит резолв
+        if stmt.contains("content like 'Задачи %'") {
+            let mut hits: Vec<Value> = self
+                .sc
+                .hpath_ids
+                .iter()
+                .filter_map(|(hpath, ids)| {
+                    crate::siyuan_task::task_board_parts(hpath)
+                        .and_then(|_| ids.first().map(|id| json!({ "id": id, "hpath": hpath })))
+                })
+                .collect();
+            hits.sort_by(|a, b| {
+                let pa = a.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
+                let pb = b.get("hpath").and_then(|h| h.as_str()).unwrap_or("");
+                pa.cmp(pb)
+            });
+            return json!(hits);
+        }
         if let Some(root) = stmt
             .split("root_id='")
             .nth(1)
@@ -742,9 +903,7 @@ impl MockKernel {
         if q.len() > 1 {
             q.remove(0)
         } else {
-            q.last()
-                .cloned()
-                .unwrap_or_else(|| "item-mock".to_string())
+            q.last().cloned().unwrap_or_else(|| "item-mock".to_string())
         }
     }
 
@@ -769,10 +928,16 @@ impl MockKernel {
                 .unwrap_or(&self.sc.inserted_row.title)
                 .to_string();
             rows.push(MockRow {
-                doc: args.get("blockID").and_then(|b| b.as_str()).map(String::from),
+                doc: args
+                    .get("blockID")
+                    .and_then(|b| b.as_str())
+                    .map(String::from),
                 item: item.clone(),
                 title,
                 status: self.sc.inserted_row.status.clone(),
+                task_type: self.sc.inserted_row.task_type.clone(),
+                planned: self.sc.inserted_row.planned.clone(),
+                schedule: self.sc.inserted_row.schedule.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))

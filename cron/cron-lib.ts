@@ -7,6 +7,11 @@ export interface CronRow {
   title: string
   /** Расписание из custom-schedule дока-тела; пусто для обычных задач. */
   schedule: string
+  /** Клетка «Запланировано» — epoch ms (сравнение по content: formatted
+   *  ядро перекрывает своей локалью); null — пусто/не задано. */
+  plannedMs: number | null
+  /** Клетка «Расписание» (отображение custom-schedule; "" — пусто). */
+  scheduleCell: string
   /** Статус строки доски (mSelect, нижний регистр). Файр — только «вейт». */
   status: string
 }
@@ -22,6 +27,14 @@ export interface TrackedCron {
 
 export interface CronState {
   crons: Record<string, TrackedCron>
+}
+
+/** Локальное время «YYYY-MM-DD HH:MM» — метки запусков, клетки
+ *  «Запланировано» и раны читает юзер; формат стабилен для сравнения
+ *  reconcile демона (клетку пишет CLI тем же форматированием). */
+export function formatLocal(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 // ——— расписания ———
@@ -63,10 +76,13 @@ export function parseSchedule(s: string): Sched | null {
   const partRe = /^(\*|\d+(?:-\d+)?)(?:\/[1-9]\d*)?$/
   const ranges: Array<[number, number]> = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]]
   const valid = fields.every((f, i) => {
-    const [min, max] = ranges[i]!
+    const range = ranges[i]
+    if (range === undefined) return false
+    const [min, max] = range
     return f.split(",").every(p => {
       if (!partRe.test(p) || p.endsWith("/")) return false
-      const m = /^(\*|\d+)(?:-(\d+))?/.exec(p)!
+      const m = /^(\*|\d+)(?:-(\d+))?/.exec(p)
+      if (m === null || m[1] === undefined) return false
       const lo = m[1] === "*" ? min : Number(m[1])
       const hi = m[2] !== undefined ? Number(m[2]) : lo
       return lo >= min && hi <= max && lo <= hi
@@ -145,6 +161,44 @@ export function isOneShot(sched: Sched): boolean {
   return sched.kind === "at"
 }
 
+/** Следующее планируемое срабатывание после момента `after` (минутная
+ *  точность — compare с клеткой «Запланировано» доски). null — срабатываний
+ *  дальше нет (разовый в прошлом; cron-выражение, не совпадающее за год —
+ *  скан ограничен календарным годом, вечный молчун клетку не трогает).
+ *  Семантика зеркалит due(): интервал — от последнего файра (никогда не
+ *  стрелявший файрится следующим тиком, вызов передаёт now), at — момент
+ *  HH:MM [DD.MM], если он впереди. */
+export function nextFire(sched: Sched, after: Date): Date | null {
+  switch (sched.kind) {
+    case "interval": {
+      return new Date(minuteStart(after) + sched.ms)
+    }
+    case "at": {
+      // day и month приходят парой из parseSchedule (HH:MM DD.MM); без них —
+      // ежедневный at: сегодняшний момент, если он ещё впереди
+      const moment = new Date(
+        after.getFullYear(),
+        sched.month !== undefined ? sched.month - 1 : after.getMonth(),
+        sched.day ?? after.getDate(),
+        sched.hour,
+        sched.minute,
+      )
+      return moment.getTime() > after.getTime() ? moment : null
+    }
+    case "cron": {
+      const minuteMs = 60_000
+      const horizon = new Date(after.getFullYear() + 1, after.getMonth(), after.getDate()).getTime()
+      let t = minuteStart(after) + minuteMs
+      while (t < horizon) {
+        const candidate = new Date(t)
+        if (cronMatches(sched.fields, candidate)) return candidate
+        t += minuteMs
+      }
+      return null
+    }
+  }
+}
+
 /** Решение по свежему срезу доски прямо перед спавном: строка могла быть
  *  снята/закрыта/снята с Вейт, пока тик обрабатывал очередь. Гонка «rm ↔ файр»
  *  (живой кейс 05.11: файр по строке, снятой в ходе тика) сужается до окна
@@ -157,6 +211,36 @@ export function fireGate(rows: CronRow[], rowId: string): "fire" | "removed" | "
 
 export function minuteStart(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()).getTime()
+}
+
+/** Расхождение клеток мастера с расписанием и last-fire: что CLI должен
+ *  дописать (пустой объект — доска честна). «Расписание» — отображение
+ *  custom-schedule (сбой записи клетки после attr иначе молча старел бы),
+ *  «Запланировано» — next-fire после последнего файра. Сравнение даты —
+ *  по epoch ms. Чистая функция — юнит-тесты без моков; применение —
+ *  reconcileMasterCells (DRY_RUN-гвард там). */
+export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: Date): { schedule?: string; planned?: string } {
+  const patch: { schedule?: string; planned?: string } = {}
+  if (row.scheduleCell !== row.schedule) patch.schedule = row.schedule
+  // never-fired интервал: due файрит следующим тиком — плановое время now
+  // (now+interval появился бы только после файра)
+  if (prevFire === 0 && sched.kind === "interval") {
+    const plannedMs = minuteStart(now)
+    if (row.plannedMs !== plannedMs) patch.planned = formatLocal(now)
+    return patch
+  }
+  // гард вечного молчуна: полный годовой скан дорог только в cron-ветке
+  // nextFire (интервал/at — O(1), считаются всегда). never-fired cron-мастер
+  // с пустой клеткой не сканируем: due файрит на первом совпадении, после
+  // файра reconcile посчитает next от prevFire. Без гарда «0 0 30 2 *» гонял
+  // бы скан каждым тиком вечно
+  if (prevFire === 0 && row.plannedMs === null && sched.kind === "cron") return patch
+  const next = nextFire(sched, prevFire > 0 ? new Date(prevFire) : now)
+  // compare по epoch ms: formattedContent ядро перекрывает своей локалью
+  // (живая проба миграции) — строкой клетки и вычисления не совпадут никогда
+  const plannedMs = next !== null ? minuteStart(next) : null
+  if (row.plannedMs !== plannedMs) patch.planned = next !== null ? formatLocal(next) : ""
+  return patch
 }
 
 /** Валидация state-записи. */

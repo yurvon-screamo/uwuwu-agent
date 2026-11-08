@@ -9,6 +9,8 @@ export interface TaskRef {
   bodyDoc: string
   title: string
   status: string
+  /** тип задачи из колонки «Тип» (bug/dev/spike); "" — легаси-строка без типа */
+  type: string
   pr: string
   branch: string
   /** сессионные ячейки строки («Сессия dev»/«Сессия ревью»): непустые —
@@ -61,6 +63,10 @@ export interface TrackedTask {
    *  «раз за эпизод»; сброс делает демон: смена статуса — штатный путь,
    *  none-вердикт при стоявшем флаге — эпизод завершён) */
   stallSignaled?: boolean
+  /** сигнал ревью-тишины уже отправлен в этом эпизоде ревью-статуса
+   *  (анти-спам «раз за эпизод»; сброс — смена статуса или вернувшаяся
+   *  активность ревьювера; семантика зеркальна stallSignaled) */
+  reviewStallSignaled?: boolean
   /** корневой каталог окружения задачи (<root>/<row-id>); undefined —
    *  env-механика к задаче не применялась */
   envDir?: string
@@ -367,7 +373,10 @@ export function newUserComments(
     .filter((c) => isUserComment(c, botUserId))
     .sort((a, b) => (a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt - b.createdAt))
   if (lastSeen.id === "" && lastSeen.at === 0) return users
-  const idx = users.findIndex((c) => c.id === lastSeen.id)
+  // lastIndexOf, не findIndex: бит-в-бит дубль (тот же контент-хэш id)
+  // сматчится по последнему вхождению — будильник не зациклится на хвостовой
+  // копии, а снос комментов сверху не подменяет контентные id вовсе
+  const idx = users.map((c) => c.id).lastIndexOf(lastSeen.id)
   if (idx >= 0) return users.slice(idx + 1)
   return users.filter((c) => c.createdAt > lastSeen.at)
 }
@@ -457,7 +466,7 @@ export interface SpawnInit {
   /** локальный чекаут env:false-проекта; env-задачам не нужен — пути в env-строке промпта */
   localPath?: string
   /** метаданные задачи с доски */
-  task: { title: string; status: string; branch: string; pr: string }
+  task: { title: string; status: string; type: string; branch: string; pr: string }
 }
 
 const dash = (value: string): string => (value.trim() === "" ? "—" : value.trim())
@@ -504,6 +513,7 @@ export function stripExportWrapper(md: string, docTitle: string): string {
 export function spawnInitBlock(init: SpawnInit, rowId: string, project: string): string {
   const taskLine =
     `Задача: «${init.task.title}», статус ${dash(init.task.status)},` +
+    ` тип ${dash(init.task.type)},` +
     ` ветка ${dash(init.task.branch)}, PR ${dash(init.task.pr)}.`
   const bodyLine = `Тело и треды — uwuwu-cli task get ${rowId} --project ${project} (содержание работы, не ориентация).`
   const projectParts = [
@@ -528,6 +538,19 @@ export function spawnInitBlock(init: SpawnInit, rowId: string, project: string):
   ].join("\n")
 }
 
+/** Вопросный канал (одинаков в spawn/continue): команды канала сразу с id
+ *  и проектом — спавн знает оба (инцидент 05.11: вопросный коммент без
+ *  --project не приземлился, провал незаметен в длинном ходе). */
+function questionChannelLines(rowId: string, project: string): string[] {
+  return [
+    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
+    `вопросы — uwuwu-cli task comment ${rowId} --project ${project},`,
+    "результаты и выводы — task body; ждёшь ответа юзера →",
+    `uwuwu-cli task edit ${rowId} --project ${project} --status "Needs attention"`,
+    "и завершай ход. Ответ придёт комментом — тебя разбудят.",
+  ]
+}
+
 /** Стартовый промпт будильника: пайп живёт в AGENTS.md (глобально),
  *  демон знает только «какая задача» и «где работать». */
 export function spawnPrompt(
@@ -543,7 +566,8 @@ export function spawnPrompt(
       ]
     : [
         "Стадия Design: изучи задачу/репо, утряси вопросы с юзером (комменты, статус Needs attention",
-        "пока ждёшь ответа). Перед планом — скан территории: uwuwu-cli task list на смежные задачи",
+        "пока ждёшь ответа). Перед планом — скан территории:",
+        `uwuwu-cli task list --project ${project} на смежные задачи`,
         "+ gh pr list --state all (батч-сводки/hygiene съедают срезы планов тихо).",
         "Строковые указатели постановки (row-id/тайтлы чужих задач) перепроверь живым",
         "uwuwu-cli task get до включения в план — доска гниёт быстрее мастера.",
@@ -562,7 +586,7 @@ export function spawnPrompt(
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
-    "Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get — тело, тип, комменты.",
+    `Работай по AGENTS.md, раздел «Работа над задачей»: uwuwu-cli task get ${rowId} --project ${project} — тело, тип, комменты.`,
     ...stage,
     ...workLine,
     "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
@@ -570,9 +594,7 @@ export function spawnPrompt(
     "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
     "Без пустого шума в комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
     "",
-    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
-    "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
-    "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
+    ...questionChannelLines(rowId, project),
   ].join("\n")
 }
 
@@ -587,7 +609,8 @@ export function continuePrompt(
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}): сессия разработки перезапущена.`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
-    "Работай по AGENTS.md, раздел «Работа над задачей». Перечитай uwuwu-cli task get —",
+    "Работай по AGENTS.md, раздел «Работа над задачей».",
+    `Перечитай uwuwu-cli task get ${rowId} --project ${project} —`,
     "тело, комменты и свой прошлый прогресс. Стадию определи по текущему статусу и телу,",
     "продолжай с места, где остановился (если работа уже идёт — не начинай её заново).",
     ...(env !== undefined
@@ -597,9 +620,7 @@ export function continuePrompt(
         ]
       : []),
     "",
-    "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
-    "вопросы — task comment, результаты и выводы — task body; ждёшь ответа юзера →",
-    "task edit --status \"Needs attention\" и завершай ход. Ответ придёт комментом — тебя разбудят.",
+    ...questionChannelLines(rowId, project),
   ].join("\n")
 }
 
@@ -712,6 +733,8 @@ export interface ReviewContext {
   branch: string
   worktree: string
   pr: string
+  /** тип задачи из колонки «Тип»: ревьювер сверяет канон типа (Bug→TDD, Spike→без кода) */
+  type?: string
 }
 
 /** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
@@ -740,6 +763,7 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
         : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
     "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
     kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
@@ -781,6 +805,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
         ]
       : []),
     ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
+    ...(ctx.type !== undefined && ctx.type !== "" ? [`Тип задачи: ${ctx.type}`] : []),
     ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
   ].join("\n")
 }
@@ -971,6 +996,58 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   return { t: "signal", text }
 }
 
+// ——— гвард ревью-тишины: недоставленный вердикт ревьювера (инцидент 07.11,
+//      задача 20261107142321) ———
+
+export interface ReviewStallFacts {
+  /** статус строки сейчас */
+  status: string
+  /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем
+   *  решением none; dead — routeTask сам спавнит нового ревьювера) */
+  reviewerAlive: boolean | null
+  /** активность последнего сообщения ревью-сессии; null — сообщений нет
+   *  (= застой: спавн не начал ход или потерялся) */
+  lastActivityAt: number | null
+  /** сигнал уже отправлен в этом эпизоде ревью-статуса (анти-спам) */
+  signaled: boolean
+  now: number
+}
+
+export type ReviewStallVerdict =
+  | { t: "none" }
+  | { t: "signal"; text: string }
+  | { t: "silent" }
+
+/** Единственная точка решения о ревью-тишине (по образцу stallVerdict):
+ *  ревью-статус при живой ревью-сессии, молчащей дольше порога, и статусе,
+ *  не ушедшем из ревью, = ход ревьювера завершился без доставки (вердикт-
+ *  коммент/статус потерялись) или ревьювер ждёт юзера (вопрос в тредах).
+ *  routeTask в этой геометрии возвращает noop бессрочно — конвейер без
+ *  гварда висит тихо. Вердикт signal → эскалация юзеру (Needs attention,
+ *  восстановление штатными путями: перестановка ревью-статуса будит ту же
+ *  сессию доревью-промптом). Повторный сигнал в эпизоде глушится флагом
+ *  (silent); сброс — дело демона: смена статуса или вернувшаяся активность
+ *  ревьювера. */
+export function reviewStallVerdict(f: ReviewStallFacts, stallMs: number): ReviewStallVerdict {
+  if (reviewKindOf(f.status) === null) return { t: "none" }
+  if (f.reviewerAlive !== true) return { t: "none" }
+  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
+  if (!stalled) return { t: "none" }
+  if (f.signaled) return { t: "silent" }
+  const quietMin = f.lastActivityAt === null
+    ? null
+    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
+  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const text = [
+    `[factory] Задача в ревью-статусе, но сессия ревьювера молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин,`,
+    "статус из ревью не ушёл — ход завершился без доставки (вердикт-коммент/статус потерялись) или ревьювер ждёт тебя.",
+    "Проверь треды: если ревьювер задал вопрос — ответь комментом; если вердикта нет — это потеря доставки.",
+    "Затем переставь ревью-статус: сессия будет разбужена доревью-промптом, перечитает задачу с тредами",
+    "(увидит и твой ответ) и доставит недостающее.",
+  ].join(" ")
+  return { t: "signal", text }
+}
+
 // ——— гард спавн-волны: рубеж каскада при потере/порче state (инцидент 06.11) ———
 
 export const SPAWN_LOSS_MAX_DEFAULT = 2
@@ -1128,6 +1205,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
   if (t.lastStatus !== undefined && typeof t.lastStatus !== "string") return false
   if (t.missingSince !== undefined && typeof t.missingSince !== "string") return false
   if (t.stallSignaled !== undefined && typeof t.stallSignaled !== "boolean") return false
+  if (t.reviewStallSignaled !== undefined && typeof t.reviewStallSignaled !== "boolean") return false
   if (t.envDir !== undefined && !(typeof t.envDir === "string" && t.envDir.startsWith("/"))) return false
   if (
     t.mergedPrUrl !== undefined &&

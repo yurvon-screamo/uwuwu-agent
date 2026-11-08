@@ -23,6 +23,9 @@ const HERE = import.meta.dir
 const WATCH_SEC = parseWatchSec(process.env.UWUWU_TRIAGE_WATCH_SEC)
 /** refresh кэша досок (органи-дерево): часы, не минуты — проход дорогой */
 const BOARD_REFRESH_MS = 6 * 3600_000
+/** Порог тишины выходного потока: правило владельца (опыт «SiYuan-контур»,
+ *  Режим 5 дополнение) — волны черновиков ежедневные, сутки максимум. */
+const TRIAGE_SILENCE_TIMEOUT_MS = 24 * 3600_000
 
 const HELP = [
   "📥 Триаж uwuwu — входная точка задач.",
@@ -319,6 +322,7 @@ const profile: HubProfile = {
   sources: [draftWatcher],
   onFinal: triageFinalHook,
   validateState: validTriageExtras,
+  silenceTimeoutMs: TRIAGE_SILENCE_TIMEOUT_MS,
 }
 
 const hub = createHub(profile)
