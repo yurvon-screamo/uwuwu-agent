@@ -17,6 +17,12 @@
       занятый номер — предупреждение в stderr, создание продолжается; тайтл без
       номера — пробы нет; отказ пробы — предупреждение «не состоялась»
       (профилактика гонки параллельных дримеров 06.11).
+   7) payload с экспорт-обвязкой (frontmatter + ведущий title-H1) стрипается
+      до createDocWithMd (инцидент 08.11), payload пустой после стрипа —
+      отказ до ядра;
+   8) вывод несёт docId свежего дока: первичный источник — data ответа
+      createDocWithMd (проба 08.11), фолбэк — getIDsByHPath (ключ path);
+      не резолвится — warning с рецептом find, rc 0 (мутация применена).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_create.py
@@ -47,12 +53,23 @@ METADATA_ENVELOPE = {"code": -1, "msg": "document metadata is not ready"}
 
 
 class FakeKernel:
-    """Двойник kernel API: lsNotebooks + listDocsByPath + createDocWithMd (успех)."""
+    """Двойник kernel API: lsNotebooks + listDocsByPath + createDocWithMd (успех).
 
-    def __init__(self, roots: dict[str, list[str]] | None = None):
+    create_returns — data ответа createDocWithMd: живое ядро возвращает docId
+    строкой (проба 08.11); None эмулирует аномалию (фолбэк getIDsByHPath).
+    hpath_ids — массив ответа getIDsByHPath (кли-контракт: массив id-строк).
+    """
+
+    DEFAULT_ID = "20261108000000-creat00"
+
+    def __init__(self, roots: dict[str, list[str]] | None = None,
+                 create_returns: object = DEFAULT_ID,
+                 hpath_ids: list[str] | None = None):
         self.roots = roots or FIXTURE_ROOTS
         self.ids = {"Experience": EXP, "Projects": PROJ, "Daily": DAILY}
         self.calls: list[tuple[str, dict]] = []
+        self.create_returns = create_returns
+        self.hpath_ids = hpath_ids or []
 
     def post(self, path: str, body: dict, attempts: int = 6):
         self.calls.append((path, body))
@@ -64,19 +81,25 @@ class FakeKernel:
             name = next(n for n, i in self.ids.items() if i == body["notebook"])
             return {"files": [{"name": r} for r in self.roots.get(name, [])]}
         if path == "/api/filetree/createDocWithMd":
-            return None
+            return self.create_returns
+        if path == "/api/filetree/getIDsByHPath":
+            return list(self.hpath_ids)
         raise AssertionError(f"неожиданный путь: {path}")
 
     def create_calls(self) -> list[dict]:
         return [body for p, body in self.calls if p == "/api/filetree/createDocWithMd"]
 
+    def hpath_calls(self) -> list[dict]:
+        return [body for p, body in self.calls if p == "/api/filetree/getIDsByHPath"]
 
-def run_create(kernel: FakeKernel, parent: str, title: str = "Probe") -> tuple[str, str]:
+
+def run_create(kernel: FakeKernel, parent: str, title: str = "Probe",
+               md: str = "# probe\n") -> tuple[str, str]:
     """cmd_create против двойника; возвращает (stdout, stderr) — гард номера ADR
-    пишет предупреждения в stderr, stdout («создан: …») машинно-читаем."""
+    пишет предупреждения в stderr, stdout («создан: …», docId) машинно-читаем."""
     md_file = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
     try:
-        md_file.write("# probe\n")
+        md_file.write(md)
         md_file.close()
         args = SimpleNamespace(title=title, file=md_file.name, parent=parent)
         return run_cmd(wiki_ops.cmd_create, args, kernel)
@@ -326,6 +349,72 @@ class FakeTransport:
         if isinstance(envelope, Exception):
             raise envelope
         return FakeResponse(json.dumps(envelope).encode())
+
+
+class ExportWrapperAndDocId(unittest.TestCase):
+    """Payload с экспорт-обвязкой стрипается до ядра (инцидент 08.11); вывод
+    несёт docId свежего дока (первичный источник — data createDocWithMd)."""
+
+    WRAPPED = ("---\ntitle: Probe\ndate: 2026-11-08T01:00:00+08:00\n"
+               "---\n\n# Probe\n\nТело дока.\n")
+
+    def test_wrapped_payload_is_stripped_before_create(self):
+        kernel = FakeKernel()
+        out, err = run_create(kernel, "/affine", md=self.WRAPPED)
+        self.assertEqual(kernel.create_calls()[0]["markdown"], "Тело дока.\n")
+        self.assertIn("снята экспорт-обвязка", err)
+        self.assertIn("frontmatter", err)
+        self.assertIn("title-H1", err)
+        self.assertIn("создан:", out)
+        self.assertIn(f"docId: {FakeKernel.DEFAULT_ID}", out)
+
+    def test_create_response_id_used_before_fallback(self):
+        kernel = FakeKernel()
+        run_create(kernel, "/affine")
+        self.assertEqual(kernel.hpath_calls(), [],
+                         "строка в data createDocWithMd — фолбэк не зовётся")
+
+    def test_fallback_resolves_via_get_ids_by_hpath(self):
+        fallback_id = "20261108000000-fallb00"
+        kernel = FakeKernel(create_returns=None, hpath_ids=[fallback_id])
+        out, _ = run_create(kernel, "/affine")
+        call = kernel.hpath_calls()[0]
+        self.assertEqual(call["path"], "/affine/Probe")
+        self.assertIn(f"docId: {fallback_id}", out)
+
+    def test_unresolved_doc_id_warns_with_find_recipe_and_continues(self):
+        kernel = FakeKernel(create_returns=None, hpath_ids=[])
+        with patch.object(wiki_ops.time, "sleep", lambda s: None):
+            out, err = run_create(kernel, "/affine")
+        self.assertIn("создан:", out)  # мутация применена — rc 0
+        self.assertIn("ПРЕДУПРЕЖДЕНИЕ", err)
+        self.assertIn('wiki_ops find "Probe"', err)
+
+    def test_multiple_ids_on_path_are_ambiguous_warning(self):
+        kernel = FakeKernel(create_returns=None,
+                            hpath_ids=["20261108000000-dubl000",
+                                       "20261108000000-dubl001"])
+        with patch.object(wiki_ops.time, "sleep", lambda s: None):
+            out, err = run_create(kernel, "/affine")
+        self.assertIn("создан:", out)
+        self.assertIn("ПРЕДУПРЕЖДЕНИЕ", err)
+        self.assertNotIn("docId:", out)
+
+    def test_empty_after_strip_refused_before_kernel(self):
+        # «Один export без правок» — после снятия обвязки пусто: отказ до
+        # createDocWithMd (пустой док — тихий мусор).
+        kernel = FakeKernel()
+        with self.assertRaises(RuntimeError) as cm:
+            run_create(kernel, "/affine", md="---\ntitle: Probe\n---\n")
+        self.assertIn("пуст после снятия экспорт-обвязки", str(cm.exception))
+        self.assertEqual(kernel.create_calls(), [])
+
+    def test_clean_payload_strips_nothing_and_warns_nothing(self):
+        kernel = FakeKernel()
+        out, err = run_create(kernel, "/affine", md="Тело без обвязки.\n")
+        self.assertEqual(kernel.create_calls()[0]["markdown"], "Тело без обвязки.\n")
+        self.assertEqual(err, "")
+        self.assertIn(f"docId: {FakeKernel.DEFAULT_ID}", out)
 
 
 class MetadataBailDiscipline(unittest.TestCase):
