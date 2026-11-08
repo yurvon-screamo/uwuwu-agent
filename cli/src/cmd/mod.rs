@@ -33,6 +33,8 @@ mod goal_tests;
 mod search_tests;
 #[cfg(test)]
 mod write_path_tests;
+#[cfg(test)]
+mod task_status_tests;
 
 pub use sy_dispatch::read_markdown;
 pub use sy_dispatch::search_lines;
