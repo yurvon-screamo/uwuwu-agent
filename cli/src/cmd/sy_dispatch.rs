@@ -351,15 +351,18 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            // валидация PR/типа/planned до rename: без частичных обновлений
-            // (тайтл сменился, а колонки нет — недопустимый разрыв);
-            // «» — снятие типа/даты
+            // валидация PR/типа/статуса/planned до rename: без частичных
+            // обновлений (тайтл сменился, а колонки нет — недопустимый
+            // разрыв); «» — снятие типа/даты
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
             let ty_canonical = match ty.as_deref() {
                 Some("") => Some(String::new()),
                 Some(raw) => Some(syt::validate_task_type(raw)?),
                 None => None,
             };
+            // канон-форма (не эхо ввода): ядро апсертит mSelect-опцию по
+            // точному content — «ревью плана» mint'нул бы дубль «Ревью плана»
+            let status_canonical = status.as_deref().map(syt::validate_status).transpose()?;
             if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
                 syt::parse_planned(raw)?;
             }
@@ -371,7 +374,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 &sy,
                 &board,
                 &task,
-                status.as_deref(),
+                status_canonical.as_deref(),
                 branch.as_deref(),
                 pr.as_deref(),
                 ty_canonical.as_deref(),

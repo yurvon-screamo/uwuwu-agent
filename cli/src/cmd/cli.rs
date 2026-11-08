@@ -93,7 +93,14 @@ pub(crate) enum TaskSub {
     Edit {
         #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
-        #[arg(long)]
+        /// Статус: колонка «Статус» доски, канон AGENTS.md; вне канона —
+        /// отказ (левая строка минтила бы мусорную опцию на доске)
+        #[arg(
+            long,
+            value_name = "STATUS",
+            help = "Статус: Draft | Todo | Design | In Progress | Ревью плана | Ревью \
+                    результата | Тестирование | Review | Вейт | Needs attention | Done"
+        )]
         status: Option<String>,
         #[arg(long)]
         title: Option<String>,

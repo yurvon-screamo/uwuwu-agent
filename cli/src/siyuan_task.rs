@@ -585,6 +585,44 @@ pub fn agent_inventory_cell(attrs: &std::collections::HashMap<String, String>) -
     attrs.get("custom-agent").cloned().unwrap_or_default()
 }
 
+/// Канон пайп-статусов задач — дословно AGENTS.md («статусы кто ставит»).
+/// Дисплеи-формы досок: ядро апсертит mSelect-опцию по точному content,
+/// поэтому валидатор возвращает каноническую форму, а не эхо ввода.
+pub const TASK_STATUSES: [&str; 11] = [
+    "Draft",
+    "Todo",
+    "Design",
+    "In Progress",
+    "Ревью плана",
+    "Ревью результата",
+    "Тестирование",
+    "Review",
+    "Вейт",
+    "Needs attention",
+    "Done",
+];
+
+/// Канон статуса задачи: trim + регистронезависимая сверка (unicode-lowercase,
+/// кириллица включительно), возврат канонической формы; вне канона — отказ
+/// с эхом ввода и полным перечнем. Пустое — отказ: семантики снятия у
+/// статуса нет (пустая клетка — легаси-черновик юзера). Точка врезки —
+/// dispatch `TaskSub::Edit`: в общий `edit()` валидатор не заносится, он
+/// делит goal-ветку с её lowercase-каноном (`canonical_status`).
+pub fn validate_status(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_lowercase();
+    TASK_STATUSES
+        .into_iter()
+        .find(|canon| canon.to_lowercase() == normalized)
+        .map(String::from)
+        .ok_or_else(|| {
+            anyhow!(
+                "статус «{raw}» не разобран: жди {} (канон AGENTS.md; левая строка минтила бы \
+                 мусорную опцию на доске)",
+                TASK_STATUSES.join(" | ")
+            )
+        })
+}
+
 /// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
 /// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
 /// (время файра), в клетке живут с минутной точностью — формат сравнения
@@ -2167,6 +2205,30 @@ mod tests {
         attrs.insert("custom-agent".to_string(), "lead".to_string());
         attrs.insert("custom-schedule".to_string(), "6h".to_string());
         assert_eq!(agent_inventory_cell(&attrs), "lead");
+    }
+
+    /// Канон пайп-статусов задач (AGENTS.md «статусы кто ставит»): валидатор
+    /// возвращает каноническую форму, чтобы ядро не минтило дубль-опции
+    /// другого регистра (mSelect-апсерт по точному content).
+    #[test]
+    fn validate_status_canonizes_case_and_rejects_unknown() {
+        for canon in TASK_STATUSES {
+            assert_eq!(validate_status(canon).unwrap(), *canon, "канон: {canon}");
+        }
+        assert_eq!(validate_status(" ревью плана ").unwrap(), "Ревью плана");
+        assert_eq!(validate_status("in progress").unwrap(), "In Progress");
+        assert_eq!(
+            validate_status("NEEDS ATTENTION").unwrap(),
+            "Needs attention"
+        );
+        let err = validate_status("Проверка плана").unwrap_err().to_string();
+        assert!(err.contains("Проверка плана"), "эхо ввода: {err}");
+        assert!(
+            err.contains("Ревью плана"),
+            "перечень канона в отказе: {err}"
+        );
+        assert!(validate_status("").is_err(), "пустой статус — отказ");
+        assert!(validate_status("   ").is_err(), "пробельный статус — отказ");
     }
 
     /// Расширенный канон делит костяки существующих: analys ≡ spike,
