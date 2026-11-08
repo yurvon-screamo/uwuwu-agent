@@ -2513,6 +2513,32 @@ mod tests {
         (server, create_calls, append_bodies, delete_calls)
     }
 
+    /// task body --replace (force: false) через task_run: контент пишется в
+    /// temp-файл, снапшот --base опционален. Result — для unwrap_err на
+    /// тестах отказного пути.
+    async fn run_body_replace(
+        id: &str,
+        snapshot: Option<&std::path::Path>,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), content).unwrap();
+        task_run(
+            "uwuwu",
+            TaskSub::Body {
+                id: id.into(),
+                stdin: false,
+                md: Some(md.path().to_string_lossy().into_owned()),
+                replace: true,
+                replace_section: None,
+                base: snapshot.map(|p| p.to_string_lossy().into_owned()),
+                force: false,
+                attach: Vec::new(),
+            },
+        )
+        .await
+    }
+
     async fn write_body_via_cli(server: &MockServer) -> anyhow::Result<()> {
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -2681,23 +2707,9 @@ mod tests {
             mock_siyuan_with_export(vec![BOUND_DOC.to_string()], true, export).await;
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        let err = task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: None,
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = run_body_replace("таск", None, "новое тело\n")
+            .await
+            .unwrap_err();
 
         let msg = err.to_string();
         assert!(
@@ -2735,23 +2747,9 @@ mod tests {
             "Задача:   таск\nСтатус:   Design\nСтрока:   item-1\n\n----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n\n## Комменты\n\n\n- коммент\n\nАттачи:\n  /tmp/uwuwu-task-x/скрин.png\n",
         )
         .unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        run_body_replace("таск", Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap();
 
         assert_eq!(create_calls.load(Ordering::SeqCst), 0);
         {
@@ -2784,23 +2782,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: title.into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        run_body_replace(title, Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap();
         assert_eq!(create_calls.load(Ordering::SeqCst), 0);
         {
             let appends = append_bodies.lock().unwrap();
@@ -2824,23 +2808,9 @@ mod tests {
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
         let snapshot = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(snapshot.path(), "----- тело -----\n\nтело\n").unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "новое тело\n").unwrap();
-        let err = task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = run_body_replace("таск", Some(snapshot.path()), "новое тело\n")
+            .await
+            .unwrap_err();
 
         let msg = err.to_string();
         assert!(
@@ -2914,23 +2884,9 @@ mod tests {
             "----- тело -----\n\n---\ntitle: таск\n---\n\n# таск\n\nтело\n\n## Комменты\n- **AGENTS** (ts): тик\n",
         )
         .unwrap();
-        let md = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(md.path(), "переписанное тело\n").unwrap();
-        task_run(
-            "uwuwu",
-            TaskSub::Body {
-                id: "таск".into(),
-                stdin: false,
-                md: Some(md.path().to_string_lossy().into_owned()),
-                replace: true,
-                replace_section: None,
-                base: Some(snapshot.path().to_string_lossy().into_owned()),
-                force: false,
-                attach: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        run_body_replace("таск", Some(snapshot.path()), "переписанное тело\n")
+            .await
+            .unwrap();
 
         {
             let appends = append_bodies.lock().unwrap();
