@@ -803,6 +803,91 @@ async fn body_on_row_without_body_creates_doc_by_title_without_binding() {
     );
 }
 
+// ——— фрагментированная секция «Комменты»: гард на write-пути (20261108110035) ———
+
+/// Фикстура инцидента 08.11: чужая qlty-секция за «Комменты» (replace-section
+/// «не найдена — в конец»), поздний коммент аппендом в конец дока — за чужим
+/// h2. Юнит-тесты гарда (sy_dispatch::tests) зовут carry напрямую; здесь
+/// полный write-путь: dispatch → carry → отказ до записи ядра.
+fn fragmented_exports() -> Vec<(&'static str, String)> {
+    vec![(
+        BOUND_DOC,
+        "\
+старое тело
+
+## Комменты
+- **AGENTS** (2026-11-08 10:00): головной коммент
+
+## Машинный ревью (qlty)
+находки линтера
+
+- **AGENTS** (2026-11-08 11:00): PR готов к ревью (хвостовой)
+"
+        .to_string(),
+    )]
+}
+
+/// Главный сценарий: полный replace фрагментированного тела без «Комменты»
+/// в контенте — громкий отказ с перечнем хвостовых комментов, ядро не
+/// тронуто. force=true: tail-гард — инвариант переноса, --force его не
+/// обходит (в отличие от freshness-сверки).
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_on_fragmented_comments_refuses_before_write() {
+    let mut scenario = body_scenario(true);
+    scenario.exports = fragmented_exports();
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("фрагментированная «Комменты» + хвостовой коммент — отказ");
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("фрагментирована"), "суть отказа: {msg}");
+    assert!(
+        msg.contains("PR готов к ревью"),
+        "перечень несёт хвостовой коммент: {msg}"
+    );
+    assert!(
+        !msg.contains("головной коммент"),
+        "головной переносится, в потерях не числится: {msg}"
+    );
+    assert_no_write(&kernel, "гард отказывает до записи");
+}
+
+/// Влив хвостового коммента в контент: replace проходит, запись несёт
+/// и перенесённую головную секцию «Комменты», и влитой хвост.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_with_tail_inlined_passes_and_carries_head_section() {
+    let mut scenario = body_scenario(true);
+    scenario.exports = fragmented_exports();
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    let content = "\
+новое тело
+
+## qlty (влитой хвост)
+
+- **AGENTS** (2026-11-08 11:00): PR готов к ревью (хвостовой)
+";
+    body_via_cli(&server, true, None, content)
+        .await
+        .expect("влитой хвост — replace проходит");
+
+    let appends = kernel.appends();
+    assert_eq!(appends.len(), 1, "запись одним append");
+    let data = append_data_field(&appends[0]);
+    assert!(
+        data.contains("PR готов к ревью"),
+        "влитой хвост записан: {data}"
+    );
+    assert!(
+        data.contains("## Комменты\n- **AGENTS** (2026-11-08 10:00): головной коммент"),
+        "головная секция перенесена: {data}"
+    );
+}
+
 // ——— comment: секция, маркер, потерянный ответ, сбой, reply ———
 
 const COMMENT_TS: &str = "2026-11-06 12:00";
