@@ -1,9 +1,10 @@
 // lib/qlty-review-core.ts — чистые функции ядра машинного ревьюера: SARIF-
-// парсинг с контрактом полей (анти-дрейф), glob/level-фильтры, delta-
-// классификация «введено веткой vs pre-existing» (механика delta-vs-baseline
-// из Lint-спеки developer.md), рендер markdown-отчёта. Без git/qlty-сайд-
-// эффектов — тестируется напрямую (qlty-review.test.ts), оркестрация —
-// qlty-review.ts.
+// парсинг с контрактом полей (анти-дрейф), glob/level-фильтры, рендер
+// markdown-отчёта. Дельта — нативная строковая дельта qlty против upstream
+// (qlty отдаёт только находки в изменённых строках; механика — задача
+// 20261108060615-hjw3uqp), поэтому классификация «introduced vs baseline»
+// не нужна. Без git/qlty-сайд-эффектов — тестируется напрямую
+// (qlty-review.test.ts), оркестрация — qlty-review.ts.
 
 // ——— типы ———
 
@@ -147,37 +148,6 @@ export function applyFilters(
   })
 }
 
-// ——— delta-классификация ———
-
-// Ключ без line: строки сдвигаются правками выше, message стабильнее.
-// Multiset-сверка: два одинаковых F401 на разных строках — два ключа.
-const deltaKey = (f: QltyFinding): string => `${f.path}\u0000${f.ruleId}\u0000${f.message}`
-
-export function classifyDelta(
-  current: QltyFinding[],
-  baseline: QltyFinding[],
-): { introduced: QltyFinding[]; baselineMatched: QltyFinding[] } {
-  const baseCounts = new Map<string, number>()
-  for (const b of baseline) {
-    const key = deltaKey(b)
-    baseCounts.set(key, (baseCounts.get(key) ?? 0) + 1)
-  }
-
-  const introduced: QltyFinding[] = []
-  const baselineMatched: QltyFinding[] = []
-  for (const c of current) {
-    const key = deltaKey(c)
-    const left = baseCounts.get(key) ?? 0
-    if (left > 0) {
-      baseCounts.set(key, left - 1)
-      baselineMatched.push(c)
-    } else {
-      introduced.push(c)
-    }
-  }
-  return { introduced, baselineMatched }
-}
-
 // ——— рендер отчёта ———
 
 const fmtFinding = (f: QltyFinding): string =>
@@ -195,20 +165,18 @@ export function renderReport(parts: {
   directory: string
   commit?: string
   notes: string[]
-  introduced: QltyFinding[]
-  baselineMatched: QltyFinding[]
+  delta: QltyFinding[]
   smells: QltyFinding[]
 }): string {
   const head = `**Машинный ревью (qlty v${parts.qltyVersion})** — scope \`${parts.scope}\`${parts.commit ? ` (\`${parts.commit}\`)` : ""} · upstream \`${parts.upstream}\` · ${parts.directory}`
   const notes = parts.notes.length > 0 ? `\n${parts.notes.map((n) => `> ⚠ ${n}`).join("\n")}\n` : ""
   const body =
-    fmtGroup("Введено веткой (delta)", parts.introduced) +
-    fmtGroup("Baseline (pre-existing, не от этой ветки)", parts.baselineMatched) +
+    fmtGroup("Delta (qlty check --upstream: находки в изменённых строках)", parts.delta) +
     fmtGroup("Smells (qlty smells, новые против upstream)", parts.smells)
-  const total = parts.introduced.length + parts.smells.length
+  const total = parts.delta.length + parts.smells.length
   const verdict =
     total === 0
-      ? `Итог: ✅ новых машинных находок нет (baseline: ${parts.baselineMatched.length}).`
-      : `Итог: ${parts.introduced.length} введено + ${parts.baselineMatched.length} baseline + ${parts.smells.length} smells.`
+      ? "Итог: ✅ новых машинных находок нет."
+      : `Итог: ${parts.delta.length} delta + ${parts.smells.length} smells.`
   return `${head}\n${notes}\n${body}\n${verdict}`
 }

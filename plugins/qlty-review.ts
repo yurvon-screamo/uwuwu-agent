@@ -1,9 +1,10 @@
 // plugins/qlty-review.ts — тул qlty_review для OpenCode: машинный
-// алгоритмический ревью (qlty check SARIF + smells --upstream, delta-
-// классификация против merge-base). Тонкая регистрация — вся логика
+// алгоритмический ревью (qlty check/smells --upstream, нативная строковая
+// дельта против upstream). Тонкая регистрация — вся логика
 // в ../lib/qlty-review (тестируется отдельно). Ниша: пре-пуш фаза
 // девелопера и верификация ворктри ревьювером (ADR-063 — CI видит только
-// запушенную дельту). Санкция владельца: «тулу в опенкоде плагином... газ»
+// запушенную дельту; незакоммиченный хвост и untracked в тул попадают).
+// Санкция владельца: «тулу в опенкоде плагином... газ»
 // (задача 20261106182052-k2orqlz).
 
 import { Plugin } from "@opencode/plugin"
@@ -25,12 +26,12 @@ export default Plugin.define({
       editor.namespace({
         name: "qlty",
         description:
-          "Алгоритмический машинный ревью на движке qlty: линтеры-плагины + smells, delta-классификация «введено веткой vs pre-existing». Не зависит от gh.",
+          "Алгоритмический машинный ревью на движке qlty: линтеры-плагины + smells, нативная строковая дельта против upstream. Не зависит от gh.",
       })
       editor.add({
         name: "review",
         description:
-          "Машинный qlty-ревью дифа или коммита: qlty check (SARIF) + qlty smells --upstream по изменённым путям, находки разбиты на «введено веткой» и «baseline (pre-existing)». Маркетинговый формат атрибуции [plugin:rule] path:line (level) — message. Возвращает markdown-отчёт. Дефолтный уровень low отсекает note-шум.",
+          "Машинный qlty-ревью дифа или коммита: qlty check/smells --upstream — находки только в изменённых строках (pre-existing baseline-долг файла не показывается; незакоммиченный хвост и untracked в дельту входят). Маркетинговый формат атрибуции [plugin:rule] path:line (level) — message. Возвращает markdown-отчёт. Дефолтный уровень low отсекает note-шум.",
         input: {
           type: "object",
           properties: {
@@ -38,7 +39,7 @@ export default Plugin.define({
               type: "string",
               enum: ["diff", "commit"],
               description:
-                "diff — рабочая копия против upstream (merge-base…HEAD + untracked + незакоммиченный хвост); commit — файлы одного коммита (прогон по рабочей копии).",
+                "diff — рабочая копия против upstream (дельта ветки + untracked + незакоммиченный хвост); commit — дельта одного коммита против его родителя (прогон по рабочей копии).",
             },
             directory: {
               type: "string",
@@ -51,7 +52,7 @@ export default Plugin.define({
             },
             upstream: {
               type: "string",
-              description: "Базовый реф для delta-классификации. Дефолт origin/master.",
+              description: "Базовый реф для строковой дельты (merge-base с ним — база прогона). Дефолт origin/master.",
             },
             paths: {
               type: "array",
@@ -84,7 +85,7 @@ export default Plugin.define({
             }
             const r = await runReview(req)
             await context.progress({
-              status: `qlty_review: ${r.introduced} введено + ${r.baseline} baseline + ${r.smells} smells`,
+              status: `qlty_review: ${r.delta} delta + ${r.smells} smells`,
             })
             return { content: r.markdown }
           } catch (e) {
