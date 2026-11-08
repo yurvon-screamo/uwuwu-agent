@@ -78,6 +78,11 @@ export function validTriageExtras(r: Record<string, unknown>, out: HubState): vo
         tracks[rowId] = v
       }
     }
+    // материализация безусловна (даже пустым): мутатор трекера разыменовывает
+    // drafts без гварда — «поле только непустым» оставляло undefined на пустом
+    // стейте и крашило draftLoop каждый тик (инцидент 07.11, chicken-and-egg).
+    // Асимметрия с length-гейтом draftSkip ниже намеренна: draftSkip читается
+    // только через ?./??=, drafts до фикса — нет.
     out.drafts = tracks
   }
   if (r.draftSkip !== null && typeof r.draftSkip === "object" && !Array.isArray(r.draftSkip)) {
