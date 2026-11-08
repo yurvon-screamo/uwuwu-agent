@@ -7,6 +7,9 @@ export interface CronRow {
   title: string
   /** Расписание из custom-schedule дока-тела; пусто для обычных задач. */
   schedule: string
+  /** Имя базового агента вечной сессии (custom-agent дока-тела);
+   *  пусто — изолированные спавны (исторический контур). */
+  agent: string
   /** Клетка «Запланировано» — epoch ms (сравнение по content: formatted
    *  ядро перекрывает своей локалью); null — пусто/не задано. */
   plannedMs: number | null
@@ -23,6 +26,11 @@ export interface TrackedCron {
   /** Причина последнего отказа (дедуп комментов: коммент — только при смене).
    *  Сбрасывается при успешном файре. */
   lastRefusal?: string
+  /** Файр вечной сессии с неподтверждённым POST: {rowId, prompt, attemptAt}.
+   *  Ретрай обязан дедупить приземление по тексту промпта (паттерн hub
+   *  steerLandedAt) — дубль-инструкция в вечный контекст не доезжает.
+   *  Дропится при пересоздании сессии (файр начнётся заново). */
+  pendingRun?: { rowId: string; prompt: string; attemptAt: number }
 }
 
 export interface CronState {
@@ -247,11 +255,19 @@ export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: D
 export function isValidTracked(v: unknown): v is TrackedCron {
   if (v === null || typeof v !== "object") return false
   const t = v as Record<string, unknown>
+  const pending = t.pendingRun
+  const pendingOk = pending === undefined || (
+    pending !== null && typeof pending === "object" &&
+    typeof (pending as Record<string, unknown>).rowId === "string" &&
+    typeof (pending as Record<string, unknown>).prompt === "string" &&
+    typeof (pending as Record<string, unknown>).attemptAt === "number"
+  )
   return (
     (t.sessionID === "" || (typeof t.sessionID === "string" && t.sessionID.startsWith("ses_"))) &&
     typeof t.lastFiredAt === "number" &&
     (t.firedAtIso === undefined || typeof t.firedAtIso === "string") &&
-    (t.lastRefusal === undefined || typeof t.lastRefusal === "string")
+    (t.lastRefusal === undefined || typeof t.lastRefusal === "string") &&
+    pendingOk
   )
 }
 
@@ -409,5 +425,121 @@ export function firePrompt(
     `   Блокер/вопрос — тем же ходом поставь рану Needs attention: uwuwu-cli task edit ${runRowId} --project ${project} --status "Needs attention".`,
     "   Пиши от себя (коммент идёт с бот-аккаунта, автор и так виден).",
     "5. Коммент не ушёл (ран/тело сняты в полёте) — повторов и запасных мест нет: заверши ход молча.",
+  ].join("\n")
+}
+
+// ——— вечная сессия (custom-agent) ———
+
+/** Решение по статусу сессии мастера: idle → новый ход, running → стирт
+ *  (нативный delivery:"steer", паттерн hub), gone → пересоздание сессии
+ *  (контекст вечного мастера потерян — честно в логе вызывающего). */
+export function decideFire(status: "idle" | "running" | "gone"): "prompt" | "steer" | "recreate" {
+  switch (status) {
+    case "idle": return "prompt"
+    case "running": return "steer"
+    case "gone": return "recreate"
+  }
+}
+
+/** Причина отказа файра вечного мастера; null — деф на месте. */
+export function resolveAgentIssue(agent: string, defExists: boolean): string | null {
+  if (agent === "") return "custom-agent пуст"
+  if (!defExists) {
+    return `деф агента «${agent}» не найден в ~/.config/opencode/agents/<name>.md — заведи деф или сними свойство (task edit <id> --agent "")`
+  }
+  return null
+}
+
+export interface AgentModel {
+  providerID: string
+  id: string
+  variant?: string
+}
+
+/** Модель из frontmatter дефа агента: opencode не применяет модель дефа
+ *  к primary-сессиям — демон передаёт явно. Оба живых формата: инлайн
+ *  `model: provider/id#variant` (tester) и раздельные ключи `model` +
+ *  `variant` (dreamer, lead); без model — null (модель демона у вызывающего). */
+export function parseAgentDefModel(defMd: string): AgentModel | null {
+  const fm = /^---\n([\s\S]*?)\n---/.exec(defMd)?.[1]
+  if (fm === undefined) return null
+  const modelLine = /^model:\s*(\S+)\s*$/m.exec(fm)?.[1]
+  if (modelLine === undefined) return null
+  const [providerID, id] = modelLine.split("/")
+  if (providerID === undefined || id === undefined) return null
+  const [modelId, hashVariant] = id.split("#")
+  if (modelId === undefined || modelId === "") return null
+  const variant = hashVariant ?? /^variant:\s*(\S+)\s*$/m.exec(fm)?.[1]
+  return {
+    providerID,
+    id: modelId,
+    ...(variant !== undefined && variant !== "" ? { variant } : {}),
+  }
+}
+
+/** Срез сообщений сессии (форма REST opencode; user-сообщения несут текст
+ *  верхним уровнем, assistant — content-частями). */
+export interface SessionMsg {
+  id?: string
+  type?: string
+  time?: { created?: number }
+  text?: string
+  content?: { type?: string; text?: string }[]
+}
+
+const msgText = (m: SessionMsg): string => {
+  if (typeof m.text === "string" && m.text.trim() !== "") return m.text.trim()
+  return (m.content ?? [])
+    .filter((p) => p?.type === "text" && typeof p.text === "string")
+    .map((p) => p.text as string)
+    .join("\n")
+    .trim()
+}
+
+/** Приземлился ли промпт: user-сообщение новее границы с этим текстом
+ *  (точным или префиксом-80 — длинные промпты могли пережать на части) →
+ *  его time.created; иначе null. Порт hub promptLandedAt — дедуп приземления
+ *  при ретрае pendingRun («сервер приземлил, ответ потерян»). */
+export function promptLandedAt(msgs: SessionMsg[], sinceMs: number, prompt: string): number | null {
+  const needle = prompt.trim()
+  const prefix = needle.slice(0, 80)
+  let found: number | null = null
+  for (const m of msgs) {
+    if (m.type !== "user") continue
+    const at = m.time?.created ?? 0
+    if (at < sinceMs) continue
+    const body = msgText(m)
+    if (body !== needle && !body.startsWith(prefix)) continue
+    if (found === null || at < found) found = at
+  }
+  return found
+}
+
+/** Промпт файра вечной сессии: конверт самодостаточен — вечная сессия могла
+ *  переехать после реконструкции (контекст пуст). Тело непусто по инварианту
+ *  тика: гейт резолвит и валидирует его до файра (refuse). */
+export function agentFirePrompt(
+  master: { title: string; schedule: string },
+  body: string,
+  runRowId: string,
+  project: string,
+): string {
+  return [
+    `⏰ Файр крона «${master.title.replace(/[\r\n]+/g, " ")}» (расписание: ${master.schedule}).`,
+    `Ран-карточка запуска — задача ${runRowId} на доске «Задачи ${project}»: она уже создана, работать по ней не нужно.`,
+    "",
+    "=== ИНСТРУКЦИЯ (тело мастера) ===",
+    sanitizeBoundary(body),
+    "=== КОНЕЦ ИНСТРУКЦИИ ===",
+    "",
+    "ПРАВИЛА РАНА:",
+    "1. Выполни работу из инструкции автономно; работай по своему дефу.",
+    "2. Отчёт прогона — комментом в ран-карточку (тело рана — снапшот инструкции на момент файра, его не редактируй).",
+    "3. Успешный прогон — закрой ран сам:",
+    `   uwuwu-cli task edit ${runRowId} --project ${project} --status Done`,
+    "   Не уверен в исходе или ход оборвался — не закрывай: ран, оставшийся в Todo, — сигнал сбоя.",
+    "4. Блокер/вопрос человеку — коммент в ран и Needs attention:",
+    `   uwuwu-cli task comment ${runRowId} --project ${project} "<что случилось; для вопроса — явно ЧТО РЕШИТЬ>"`,
+    `   uwuwu-cli task edit ${runRowId} --project ${project} --status "Needs attention"`,
   ].join("\n")
 }

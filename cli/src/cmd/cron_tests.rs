@@ -198,6 +198,7 @@ async fn edit_schedule_writes_custom_attr() {
             branch: None,
             r#type: None,
             schedule: Some("6h".into()),
+            agent: None,
             planned: None,
         },
     )
@@ -231,6 +232,7 @@ async fn edit_schedule_empty_removes_attr_without_grammar_check() {
             branch: None,
             r#type: None,
             schedule: Some("".into()),
+            agent: None,
             planned: None,
         },
     )
@@ -265,6 +267,7 @@ async fn edit_schedule_garbage_rejected_before_write() {
             branch: None,
             r#type: None,
             schedule: Some("раз в минутку".into()),
+            agent: None,
             planned: None,
         },
     )
@@ -344,6 +347,7 @@ async fn edit_planned_writes_date_cell() {
             branch: None,
             r#type: None,
             schedule: None,
+            agent: None,
             planned: Some("2026-11-08 02:34:21".into()),
         },
     )
@@ -394,6 +398,7 @@ async fn edit_planned_empty_clears_cell() {
             branch: None,
             r#type: None,
             schedule: None,
+            agent: None,
             planned: Some("".into()),
         },
     )
@@ -426,6 +431,7 @@ async fn edit_planned_garbage_rejected_before_write() {
             branch: None,
             r#type: None,
             schedule: None,
+            agent: None,
             planned: Some("завтра утром".into()),
         },
     )
@@ -461,6 +467,7 @@ async fn edit_schedule_syncs_schedule_cell() {
             branch: None,
             r#type: None,
             schedule: Some("6h".into()),
+            agent: None,
             planned: None,
         },
     )
@@ -510,6 +517,7 @@ async fn edit_schedule_empty_clears_schedule_cell_too() {
             branch: None,
             r#type: None,
             schedule: Some("".into()),
+            agent: None,
             planned: None,
         },
     )
@@ -527,6 +535,160 @@ async fn edit_schedule_empty_clears_schedule_cell_too() {
             .and_then(|c| c.as_str()),
         Some(""),
         "пустая клетка — снятие"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// edit --agent: запись custom-agent на док-теле (без клетки — агент не
+/// состояние строки, а свойство документа).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_agent_writes_custom_attr() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: Some("code-quality-reviewer".into()),
+            planned: None,
+        },
+    )
+    .await
+    .expect("edit --agent ok");
+
+    let writes = kernel.attr_writes();
+    assert_eq!(writes.len(), 1, "ровно одна запись атрибута: {writes:?}");
+    assert_eq!(writes[0].0, PLAIN_DOC, "атрибут на теле строки");
+    assert_eq!(writes[0].1, "custom-agent");
+    assert_eq!(writes[0].2, "code-quality-reviewer");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// edit --agent "": снятие без slug-валидации — контракт «"" — снять».
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_agent_empty_removes_attr_without_slug_check() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: Some("".into()),
+            planned: None,
+        },
+    )
+    .await
+    .expect("снятие агента работает");
+
+    let writes = kernel.attr_writes();
+    assert_eq!(writes.len(), 1, "снятие = запись пустого значения");
+    assert_eq!(writes[0].1, "custom-agent");
+    assert_eq!(
+        writes[0].2, "",
+        "пустое значение — ядро удаляет ключ из IAL"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// edit --agent "мусор": slug-грамматика отвергает ДО записи.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_agent_bad_name_rejected_before_write() {
+    let (kernel, server) = MockKernel::start(list_scenario()).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: Some("Code Quality".into()),
+            planned: None,
+        },
+    )
+    .await
+    .expect_err("кривой slug — отказ");
+
+    assert!(err.to_string().contains("slug дефа"), "суть отказа: {err}");
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "записей нет: валидация до мутаций"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// get по строке с custom-agent: свойство читается и отображается штатно
+/// (формат строки — юнит-тест agent_display_line; здесь — интеграция резолва
+/// и чтения attrs при no_body).
+#[tokio::test]
+#[serial_test::serial]
+async fn get_shows_agent_attr_from_body() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-agent".to_string(), "lead".to_string())],
+    )];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261107090000-plain2".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("get: строка с агентом резолвится и показывает свойство");
+
+    assert!(kernel.attr_writes().is_empty(), "get — read-only карточка");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// cron list: мастер с custom-agent попадает в инвентарь (колонка AGENT),
+/// инвентарь остаётся read-only; обычная строка без расписания не попадает.
+#[tokio::test]
+#[serial_test::serial]
+async fn cron_list_shows_agent_column_and_stays_read_only() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![
+            ("custom-schedule".to_string(), "6h".to_string()),
+            ("custom-agent".to_string(), "lead".to_string()),
+        ],
+    )];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list: мастер с агентом найден");
+
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "list — read-only инвентарь"
     );
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }

@@ -17,6 +17,7 @@ fn create(dry_run: bool) -> TaskSub {
         stdin: false,
         attach: Vec::<PathBuf>::new(),
         schedule: None,
+        agent: None,
         dry_run,
     }
 }

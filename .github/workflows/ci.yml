@@ -57,13 +57,13 @@ jobs:
 
       - name: bun install (ts-контуры)
         run: |
-          for d in plugins factory cron dreamer lead triage; do
+          for d in plugins factory cron dreamer triage; do
             (cd "$d" && bun install --frozen-lockfile)
           done
 
       - name: typecheck (tsc --noEmit, все ts-контуры)
         run: |
-          for d in plugins factory cron dreamer lead triage; do
+          for d in plugins factory cron dreamer triage; do
             (cd "$d" && bun run typecheck)
           done
 

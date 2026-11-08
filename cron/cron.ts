@@ -19,8 +19,9 @@ import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
-  stripNonContent, type PlatformTool,
-  type CronRow, type CronState, type Sched,
+  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, agentFirePrompt,
+  type PlatformTool,
+  type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
 
 // state: песочница — UWUWU_CRON_STATE_DIR двигает state+lock, в песочнице лог
@@ -229,18 +230,20 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       bodyDoc: row.linkedDocId ?? "",
       title: (row.title ?? "").trim(),
       schedule: "",
+      agent: "",
       plannedMs: row.cells?.Запланировано?.dateMs ?? null,
       scheduleCell: row.cells?.Расписание?.value ?? "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
     }))
 }
 
-/** Расписание мастера: custom-schedule из атрибутов дока-тела; null —
- *  атрибута нет (обычная припаркованная в Вейт задача, не крон).
- *  REST getBlockAttrs, не SQL: колонка ial отстаёт от свежих записей. */
-async function scheduleOf(tool: PlatformTool, bodyDoc: string): Promise<string | null> {
+/** Свойства мастера из атрибутов дока-тела: расписание + базовый агент
+ *  (один вызов get_doc_attrs на Вейт-строку, стоимость тика не растёт).
+ *  schedule null — атрибута нет (обычная припаркованная в Вейт задача,
+ *  не крон). REST getBlockAttrs, не SQL: колонка ial отстаёт от свежих записей. */
+async function attrsOf(tool: PlatformTool, bodyDoc: string): Promise<{ schedule: string | null; agent: string }> {
   const attrs = await tool<{ [k: string]: string }>("get_doc_attrs", { docId: bodyDoc })
-  return attrs["custom-schedule"] ?? null
+  return { schedule: attrs["custom-schedule"] ?? null, agent: attrs["custom-agent"] ?? "" }
 }
 
 // ——— opencode REST ———
@@ -290,6 +293,97 @@ async function sessionAlive(sessionID: string): Promise<boolean | null> {
     const status = (e as { status?: number }).status
     if (status === 404 || status === 400) return false
     return null // неизвестно — не блокируем
+  }
+}
+
+/** Статус вечной сессии против границы последнего приземления промпта:
+ *  ход, начатый по idle-сессии, отдаёт стухшие outcome/idle до завершения
+ *  (эмпирика hub sessionStatus) — граница решает. Сбой сети — running:
+ *  стирт в живую сессию безопасен, POST в мёртвую вернётся pendingRun'ом. */
+async function sessionStatus(sessionID: string, boundaryMs: number): Promise<"idle" | "running" | "gone"> {
+  try {
+    const s = await restCall(`/session/${sessionID}`) as { outcome?: unknown; time?: { idle?: unknown } }
+    const idle = s.time?.idle
+    if (s.outcome !== undefined && typeof idle === "number" && idle >= boundaryMs) return "idle"
+    return "running"
+  } catch (e) {
+    const status = (e as { status?: number }).status
+    if (status === 404 || status === 400) return "gone"
+    return "running"
+  }
+}
+
+/** Срез сообщений сессии (свежайшие; недоставленный хвост всегда в окне). */
+async function sessionMessages(sessionID: string): Promise<SessionMsg[]> {
+  const msgs = await restCall(`/session/${sessionID}/message?limit=100&order=desc`)
+  return Array.isArray(msgs) ? msgs as SessionMsg[] : []
+}
+
+/** Признанные (admitted) входы между admission и потреблением агент-лупом:
+ *  стирт в этом окне в /message ещё не виден — дедуп приземления слеп бы
+ *  без inbox (паттерн hub sessionInbox). Сбой чтения — дедуп по /message. */
+async function sessionInbox(sessionID: string): Promise<SessionMsg[]> {
+  try {
+    const entries = await restCall(`/session/${sessionID}/inbox`)
+    if (!Array.isArray(entries)) return []
+    return (entries as unknown[])
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === "object")
+      .filter((e) => e.type === "user")
+      .map((e): SessionMsg | null => {
+        const created = (e.time as { created?: unknown } | undefined)?.created
+        const text = (e.payload as Record<string, unknown> | undefined)?.text
+        if (typeof text !== "string" || text.trim() === "" || typeof created !== "number" || !Number.isFinite(created)) return null
+        return { type: "user", time: { created }, text }
+      })
+      .filter((m): m is SessionMsg => m !== null)
+  } catch {
+    return []
+  }
+}
+
+/** POST промпта в сессию; time.created ответа — точная граница приземления
+ *  (стирт по idle-сессии отдаёт стухший outcome/idle — граница берётся из
+ *  ответа, паттерн hub steerPost). null — не приземлился. */
+async function promptPost(sessionID: string, prompt: string, steer: boolean): Promise<number | null> {
+  try {
+    const res = await restCall(`/session/${sessionID}/prompt`, {
+      method: "POST",
+      body: { text: prompt, ...(steer ? { delivery: "steer" } : {}) },
+    }) as { time?: { created?: unknown } }
+    const created = res.time?.created
+    return typeof created === "number" && Number.isFinite(created) && created > 0 ? created : Date.now()
+  } catch {
+    return null
+  }
+}
+
+/** Новая вечная сессия мастера: деф агента (нативный agent:name) + модель
+ *  из фронта дефа (opencode не применяет её к primary-сессиям сам —
+ *  передаём явно; null — модель демона). */
+async function createAgentSession(
+  agent: string, masterTitle: string, model: AgentModel | null,
+): Promise<string | null> {
+  const raw = await restCall("/session", {
+    method: "POST",
+    body: {
+      title: masterTitle.replace(/[\r\n]+/g, " ").slice(0, 60),
+      agent,
+      model: model ?? MODEL,
+      location: { directory: WORKSPACE },
+    },
+  })
+  const id = raw !== null && typeof raw === "object" ? (raw as { id?: unknown }).id : undefined
+  return typeof id === "string" && id.startsWith("ses_") ? id : null
+}
+
+/** Деф агента: существование (файр отказом при отсутствии) + модель фронта. */
+function agentDefOf(agent: string): { exists: boolean; model: AgentModel | null } {
+  const path = join(homedir(), ".config/opencode/agents", `${agent}.md`)
+  if (!existsSync(path)) return { exists: false, model: null }
+  try {
+    return { exists: true, model: parseAgentDefModel(readFileSync(path, "utf-8")) }
+  } catch {
+    return { exists: true, model: null }
   }
 }
 
@@ -404,6 +498,153 @@ async function reconcileMasterCells(project: string, row: CronRow, sched: Sched,
   await runCliEdit(project, row.rowId, args)
 }
 
+// ——— вечная сессия (custom-agent) ———
+
+/** Отказ файра вечного мастера с дедупом коммента (коммент — только при
+ *  смене причины, сброс при успешном файре); слот НЕ сжигается — починка
+ *  причины (деф заведён, расписание поправлено) подхватывается следующим
+ *  слотом. Решение фиксируется in-memory и в DRY_RUN (паритет кривого
+ *  расписания: решения не отменяются), записи (коммент/state.json) — нет. */
+async function refuseOnce(state: CronState, row: CronRow, reason: string): Promise<void> {
+  const prev = state.crons[row.rowId]
+  if (prev?.lastRefusal === reason) return
+  if (!DRY_RUN) {
+    await mcp.tool("create_comment", {
+      docId: row.bodyDoc,
+      content: `крон-мастер не запускается: ${reason}`,
+    })
+  }
+  state.crons[row.rowId] = { ...(prev ?? { sessionID: "", lastFiredAt: 0, firedAtIso: "" }), lastRefusal: reason }
+  if (!DRY_RUN) saveState(state)
+}
+
+/** Ретрай файра с неподтверждённым POST (дедуп приземления — паттерн hub
+ *  steerLandedAt: «сервер приземлил промпт, ответ потерян» — повторный POST
+ *  продублировал бы инструкцию в вечный контекст). Приземлился — файр
+ *  завершён (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
+ *  дропается, следующий файр начнётся заново. */
+async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: CronRow, masterTitle: string): Promise<void> {
+  const pending = tracked.pendingRun
+  if (pending === undefined) return
+  if (tracked.sessionID === "") {
+    log(`мастер «${masterTitle}»: pendingRun без сессии — дроп, файр начнётся заново (ран ${pending.rowId} ждёт ретрая)`)
+    state.crons[row.rowId] = { sessionID: "", lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso }
+    saveState(state)
+    return
+  }
+  const alive = await sessionAlive(tracked.sessionID)
+  if (alive === false) {
+    log(`мастер «${masterTitle}»: сессия ${tracked.sessionID} пропала — pendingRun дроп, контекст файра утерян`)
+    state.crons[row.rowId] = { sessionID: "", lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso }
+    saveState(state)
+    return
+  }
+  let msgs = await sessionMessages(tracked.sessionID).catch((e: unknown) => {
+    log(`мастер «${masterTitle}»: сообщения не достали (${String(e)}) — дедуп по inbox`)
+    return [] as SessionMsg[]
+  })
+  msgs = [...msgs, ...(await sessionInbox(tracked.sessionID))]
+  const landed = promptLandedAt(msgs, pending.attemptAt - 2000, pending.prompt)
+  if (landed !== null) {
+    log(`мастер «${masterTitle}»: промпт файра приземлился ранее (${landed}) — ретрай не нужен (ран ${pending.rowId})`)
+    state.crons[row.rowId] = { sessionID: tracked.sessionID, lastFiredAt: landed, firedAtIso: new Date(landed).toISOString() }
+    saveState(state)
+    return
+  }
+  const action = decideFire(await sessionStatus(tracked.sessionID, pending.attemptAt))
+  if (action === "recreate") {
+    log(`мастер «${masterTitle}»: сессия пропала посреди ретрая — pendingRun дроп`)
+    state.crons[row.rowId] = { sessionID: "", lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso }
+    saveState(state)
+    return
+  }
+  const landedMs = await promptPost(tracked.sessionID, pending.prompt, action === "steer")
+  if (landedMs === null) {
+    pending.attemptAt = Date.now() // новая метка попытки: дедуп приземления от неё
+    saveState(state)
+    log(`мастер «${masterTitle}»: ретрай файра не приземлился — ретрай следующим тиком (ран ${pending.rowId})`)
+    return
+  }
+  log(`мастер «${masterTitle}»: ретрай файра приземлился (${landedMs}) — ран ${pending.rowId}`)
+  state.crons[row.rowId] = { sessionID: tracked.sessionID, lastFiredAt: landedMs, firedAtIso: new Date(landedMs).toISOString() }
+  saveState(state)
+}
+
+const modelLabel = (model: AgentModel | null): string =>
+  model === null ? "демона" : `${model.providerID}/${model.id}${model.variant !== undefined ? `#${model.variant}` : ""}`
+
+/** Файр вечного мастера: ран-карточка — как у изолированного контура, промпт
+ *  уходит в ОДНУ сессию мастера (custom-agent): idle → ход, running → стирт,
+ *  gone → пересоздание (контекст потерян — честный лог). Неподтверждённый
+ *  POST — pendingRun (ретрай следующим тиком, ран не дублируется). */
+async function fireAgentMaster(state: CronState, input: {
+  project: string
+  row: CronRow
+  sched: Sched
+  body: string
+  masterTitle: string
+  now: Date
+}): Promise<void> {
+  const { project, row, sched, body, masterTitle, now } = input
+  // разовое + вечная сессия не сочетаются: снятое после файра расписание
+  // уводит строку из крон-пула — ретрай pendingRun потерял бы тики
+  if (isOneShot(sched)) {
+    const reason = "разовое расписание (HH:MM) не сочетается с вечной сессией (custom-agent) — жди интервал 5m|2h|1d или cron из 5 полей"
+    log(`мастер «${masterTitle}»: ${reason}`)
+    await refuseOnce(state, row, reason)
+    return
+  }
+  const def = agentDefOf(row.agent)
+  const issue = resolveAgentIssue(row.agent, def.exists)
+  if (issue !== null) {
+    log(`мастер «${masterTitle}»: ${issue}`)
+    await refuseOnce(state, row, issue)
+    return
+  }
+  if (DRY_RUN) {
+    const promptLen = agentFirePrompt({ title: row.title, schedule: row.schedule }, body, "0000000000000000-run", project).length
+    log(`DRY_RUN: вечный мастер «${masterTitle}» (agent «${row.agent}», модель ${modelLabel(def.model)}) — ран-карточка и файр не созданы (промпт ${promptLen} байт)`)
+    return
+  }
+  const runTitle = runCardTitle(row, now)
+  const runRowId = await createRunCard(project, runTitle, runCardBody(row.title, row.schedule, body, now), now)
+  if (runRowId === null) {
+    log(`мастер «${masterTitle}»: ран-карточка не создана — ретрай следующим тиком`)
+    return
+  }
+  const prompt = agentFirePrompt({ title: row.title, schedule: row.schedule }, body, runRowId, project)
+  const tracked = state.crons[row.rowId] ?? { sessionID: "", lastFiredAt: 0, firedAtIso: "" }
+  const action = decideFire(
+    tracked.sessionID === "" ? "gone" : await sessionStatus(tracked.sessionID, tracked.lastFiredAt),
+  )
+  let sessionID = tracked.sessionID
+  if (action === "recreate") {
+    const created = await createAgentSession(row.agent, masterTitle, def.model)
+    if (created === null) {
+      log(`мастер «${masterTitle}»: вечная сессия не поднялась — ретрай следующим тиком`)
+      return
+    }
+    sessionID = created
+    if (tracked.sessionID !== "") {
+      log(`мастер «${masterTitle}»: сессия ${tracked.sessionID} пропала — пересоздана ${created} (контекст потерян)`)
+    }
+  }
+  const landedMs = await promptPost(sessionID, prompt, action === "steer")
+  if (landedMs === null) {
+    // ран-карточка уже создана: pendingRun хранит её rowId — ретрай не плодит дубли
+    state.crons[row.rowId] = {
+      sessionID, lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso,
+      pendingRun: { rowId: runRowId, prompt, attemptAt: Date.now() },
+    }
+    saveState(state)
+    log(`мастер «${masterTitle}»: файр не приземлился — pendingRun, ретрай следующим тиком (ран ${runRowId})`)
+    return
+  }
+  state.crons[row.rowId] = { sessionID, lastFiredAt: landedMs, firedAtIso: new Date(landedMs).toISOString() }
+  saveState(state)
+  log(`мастер «${masterTitle}»: ран ${runRowId} → вечная сессия ${sessionID} (${action}, приземлился ${landedMs})`)
+}
+
 export async function tickBoard(state: CronState, board: BoardIds, boardTitle: string, now: Date): Promise<void> {
   const rows = await readRows(board)
   const project = projectOfBoard(boardTitle)
@@ -415,9 +656,10 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     if (row.bodyDoc === "") continue
     let scheduleRaw: string
     try {
-      const found = await scheduleOf(mcp.tool, row.bodyDoc)
-      if (found === null) continue
-      scheduleRaw = found
+      const attrs = await attrsOf(mcp.tool, row.bodyDoc)
+      if (attrs.schedule === null) continue
+      scheduleRaw = attrs.schedule
+      row.agent = attrs.agent
     } catch (e) {
       if (e instanceof mcp.KernelUnavailableError) throw e
       log(`мастер «${row.title || row.rowId.slice(0, 8)}»: атрибуты тела не прочитаны (${String(e)}) — пропуск, ретрай следующим тиком`)
@@ -468,11 +710,27 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     const tracked = state.crons[row.rowId]
     const lastFired = tracked?.lastFiredAt ?? 0
 
-    // предыдущая сессия ещё жива → не спамим (кроме давно повисших)
-    if (tracked !== undefined && tracked.sessionID !== "") {
+    // предыдущая изолированная сессия ещё жива → не спамим (кроме давно
+    // повисших). Вечные сессии не гейтятся: занятость решает стирт, а
+    // pendingRun-ретрай обязан идти каждым тиком независимо от due
+    if (row.agent === "" && tracked !== undefined && tracked.sessionID !== "") {
       const alive = await sessionAlive(tracked.sessionID)
       if (alive === true && now.getTime() - lastFired < SESSION_COOLDOWN_MS) continue
       if (alive === null) continue
+    }
+
+    // вечный мастер с файром в полёте: дедуп приземления/ретрай до due-гейта —
+    // неподтверждённый POST не должен ждать слота расписания. DRY_RUN — гард:
+    // resolvePendingRun делает реальные opencode-REST (sessionStatus/promptPost)
+    // в боевой сервис — инвариант «DRY_RUN ⇒ ноль реальных действий» важнее
+    // доигрывания ретрая (pendingRun остаётся в state песочницы)
+    if (row.agent !== "" && tracked?.pendingRun !== undefined) {
+      if (DRY_RUN) {
+        log(`DRY_RUN: мастер «${row.title || row.rowId.slice(0, 8)}» — pendingRun-ретрай пропущен (файр ${tracked.pendingRun.rowId} остаётся в полёте)`)
+        continue
+      }
+      await resolvePendingRun(state, tracked, row, row.title || row.rowId.slice(0, 8))
+      continue
     }
 
     if (!due(sched, lastFired, now)) continue
@@ -524,6 +782,10 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     }
     // DRY_RUN: до спавна — мастер due, гейт пройден, тело валидно; ран и
     // сессию не создаём
+    if (row.agent !== "") {
+      await fireAgentMaster(state, { project, row, sched, body: stripNonContent(resolved.markdown), masterTitle, now })
+      continue
+    }
     if (DRY_RUN) {
       const promptLen = firePrompt({ title: row.title, schedule: row.schedule }, resolved.markdown, "0000000000000000-run", project).length
       log(`DRY_RUN: мастер «${masterTitle}» — ран-карточка и сессия не созданы (промпт ${promptLen} байт)`)

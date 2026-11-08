@@ -42,6 +42,7 @@ fn edit(status: Option<&str>) -> TaskSub {
         branch: None,
         r#type: None,
         schedule: None,
+        agent: None,
         planned: None,
     }
 }
@@ -119,6 +120,7 @@ async fn edit_status_rejects_before_partial_updates() {
             branch: None,
             r#type: None,
             schedule: None,
+            agent: None,
             planned: None,
         },
     )

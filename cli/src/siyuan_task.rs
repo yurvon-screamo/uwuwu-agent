@@ -550,6 +550,41 @@ pub fn validate_task_type(raw: &str) -> Result<String> {
     }
 }
 
+/// Имя базового агента opencode для вечной сессии крона: slug из дефов
+/// `~/.config/opencode/agents/<name>.md`. Существование дефа не проверяется
+/// здесь — дефы живут на машине демона, не у CLI-клиента (демон отказывает
+/// комментом при отсутствии на файре).
+pub fn validate_agent_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        bail!(
+            "имя агента «{raw}» не разобрано: жди slug дефа из ~/.config/opencode/agents/ \
+             (строчные буквы, цифры, дефис; дефис не первый) — как имя файла .md без расширения"
+        )
+    }
+}
+
+/// Строка карточки task get: агент вечной сессии крона (custom-agent).
+pub fn agent_display_line(agent: &str) -> String {
+    format!("Агент: {agent} (вечная сессия крона)")
+}
+
+/// Колонка AGENT инвентаря cron list: пусто — изолированные спавны
+/// (исторический контур, вечная сессия не заведена).
+pub fn agent_inventory_cell(attrs: &std::collections::HashMap<String, String>) -> String {
+    attrs.get("custom-agent").cloned().unwrap_or_default()
+}
+
 /// Канон пайп-статусов задач — дословно AGENTS.md («статусы кто ставит»).
 /// Дисплеи-формы досок: ядро апсертит mSelect-опцию по точному content,
 /// поэтому валидатор возвращает каноническую форму, а не эхо ввода.
@@ -2138,6 +2173,38 @@ mod tests {
             "суть отказа: {err}"
         );
         assert!(validate_task_type("").is_err(), "пустой тип — отказ");
+    }
+
+    #[test]
+    fn validate_agent_name_accepts_slug_and_rejects_the_rest() {
+        assert_eq!(validate_agent_name("lead").unwrap(), "lead");
+        assert_eq!(
+            validate_agent_name(" code-quality-reviewer ").unwrap(),
+            "code-quality-reviewer"
+        );
+        assert_eq!(validate_agent_name("tester2").unwrap(), "tester2");
+        let err = validate_agent_name("").unwrap_err().to_string();
+        assert!(err.contains("slug дефа"), "суть отказа: {err}");
+        assert!(validate_agent_name("-lead").is_err(), "дефис не первый");
+        assert!(validate_agent_name("Lead").is_err(), "только строчные");
+        assert!(validate_agent_name("l ead").is_err(), "пробелы не slug");
+    }
+
+    #[test]
+    fn agent_display_line_and_inventory_cell_render_custom_agent() {
+        assert_eq!(
+            agent_display_line("lead"),
+            "Агент: lead (вечная сессия крона)"
+        );
+        let mut attrs = std::collections::HashMap::new();
+        assert_eq!(
+            agent_inventory_cell(&attrs),
+            "",
+            "без custom-agent — изолированные спавны (пустая колонка)"
+        );
+        attrs.insert("custom-agent".to_string(), "lead".to_string());
+        attrs.insert("custom-schedule".to_string(), "6h".to_string());
+        assert_eq!(agent_inventory_cell(&attrs), "lead");
     }
 
     /// Канон пайп-статусов задач (AGENTS.md «статусы кто ставит»): валидатор

@@ -53,6 +53,14 @@ pub(crate) enum TaskSub {
             help = "Расписание: 5m|2h|1d | HH:MM [DD.MM] | cron 5 полей"
         )]
         schedule: Option<String>,
+        /// Базовый агент opencode вечной сессии крона (custom-agent):
+        /// имя дефа из ~/.config/opencode/agents/<name>.md
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Агент вечной сессии крона: slug дефа из ~/.config/opencode/agents/"
+        )]
+        agent: Option<String>,
         // Осмотр скелета без записи: живой create ради просмотра костяка
         // кормит триаж-демон мусорными черновиками.
         #[arg(
@@ -116,6 +124,14 @@ pub(crate) enum TaskSub {
             help = "Расписание: 5m|2h|1d | HH:MM [DD.MM] | cron 5 полей; \"\" — снять"
         )]
         schedule: Option<String>,
+        /// Базовый агент вечной сессии крона: записать/сменить; пустая
+        /// строка снимает (мастер файрится изолированными спавнами)
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Агент вечной сессии крона: slug дефа из ~/.config/opencode/agents/; \"\" — снять"
+        )]
+        agent: Option<String>,
         /// Дата в колонку «Запланировано» (кроны: ран — фактический файр,
         /// мастер — next-fire); пустая строка снимает клетку
         #[arg(

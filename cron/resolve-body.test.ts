@@ -27,7 +27,7 @@ function scriptTool(respond: (call: ToolCall) => unknown): { tool: PlatformTool;
 
 const row = (over: Partial<CronRow> = {}): CronRow => ({
   rowId: "20261105210000-row0001", bodyDoc: "20261105210000-docbody", title: "крон X",
-  schedule: "5m", plannedMs: null, scheduleCell: "", status: "вейт", ...over,
+  schedule: "5m", agent: "", plannedMs: null, scheduleCell: "", status: "вейт", ...over,
 })
 
 const BOARD = "20261105210000-board1"

@@ -74,6 +74,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         stdin,
         attach,
         schedule,
+        agent,
         dry_run: true,
     } = command
     {
@@ -89,6 +90,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         if let Some(expr) = schedule.as_deref() {
             crate::schedule::validate_schedule(expr)?;
             println!("расписание: {expr} (будет записано атрибутом custom-schedule дока-тела)");
+        }
+        // --agent валидируется и в осмотре: флаг не молчит (паритет schedule)
+        if let Some(name) = agent.as_deref() {
+            if name.is_empty() {
+                anyhow::bail!("на create пустой агент бессмысленен — убери --agent; снятие: task edit <id> --agent \"\"");
+            }
+            syt::validate_agent_name(name)?;
+            println!("агент: {name} (будет записан атрибутом custom-agent дока-тела)");
         }
         println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
@@ -195,6 +204,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     if let Some(schedule) = attrs.get("custom-schedule") {
                         println!("Расписание: {schedule} (крон: файр в статусе Вейт)");
                     }
+                    if let Some(agent) = attrs.get("custom-agent") {
+                        println!("{}", syt::agent_display_line(agent));
+                    }
                 }
             }
             if !no_body {
@@ -222,6 +234,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             stdin,
             attach,
             schedule,
+            agent,
             ..
         } => {
             let attach_files = validate_attach_files(&attach)?;
@@ -243,6 +256,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     );
                 }
                 crate::schedule::validate_schedule(expr)?;
+            }
+            if let Some(name) = agent.as_deref() {
+                if name.is_empty() {
+                    anyhow::bail!(
+                        "на create пустой агент бессмысленен — убери --agent; снятие: task edit <id> --agent \"\""
+                    );
+                }
+                syt::validate_agent_name(name)?;
             }
             // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
             // должен грузить ассеты впустую (внутренний чек create остаётся
@@ -290,6 +311,18 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 })?;
                 syt::sync_schedule_cell(&sy, &board, &item, expr).await?;
             }
+            if let Some(name) = agent.as_deref() {
+                // сбой после create не теряет задачу: атрибут доставляется
+                // повторным task edit --agent (создание уже свершилось)
+                sy.set_block_attr(&body, "custom-agent", name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "задача создана (строка {item}, тело {body}), но агент \
+                             не записан — доставь: task edit {item} --agent \"{name}\""
+                        )
+                    })?;
+            }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
                 sy.append_block_md(&body, &refs).await.with_context(|| {
@@ -314,6 +347,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             branch,
             r#type: ty,
             schedule,
+            agent,
             planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
@@ -381,6 +415,25 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
                 if expr.is_empty() {
                     println!("расписание снято: {}", task.title);
+                }
+            }
+            if let Some(name) = agent.as_deref() {
+                // пустая строка = снятие атрибута (мастер файрится
+                // изолированными спавнами); валидация — только непустого
+                if !name.is_empty() {
+                    syt::validate_agent_name(name)?;
+                }
+                let body = syt::task_body_doc(&sy, &board, &task)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "строка «{}» без тела (detached) — агенту некуда записаться",
+                            task.title
+                        )
+                    })?;
+                sy.set_block_attr(&body, "custom-agent", name).await?;
+                if name.is_empty() {
+                    println!("агент снят: {}", task.title);
                 }
             }
             println!(
@@ -1214,7 +1267,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
     let board = syt::find_board(sy, project).await?;
     let rows = syt::read_rows(sy, &board).await?;
     let state = read_cron_state();
-    let mut masters: Vec<(String, String, String, String, String)> = Vec::new();
+    let mut masters: Vec<(String, String, String, String, String, String)> = Vec::new();
     for r in &rows {
         let Some(doc) = r.body_doc.as_deref() else {
             continue;
@@ -1235,6 +1288,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
         let Some(schedule) = attrs.get("custom-schedule") else {
             continue;
         };
+        let agent = syt::agent_inventory_cell(&attrs);
         let last_run = state
             .crons
             .get(&r.item_id)
@@ -1253,6 +1307,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
             r.item_id.chars().take(12).collect(),
             truncate(&r.title, 26),
             truncate(schedule, 13),
+            truncate(&agent, 12),
             last_run,
         ));
     }
@@ -1261,11 +1316,14 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<10} {:<12} {:<28} {:<14} LAST RUN",
-        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE"
+        "{:<10} {:<12} {:<28} {:<14} {:<13} LAST RUN",
+        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE", "AGENT"
     );
     for m in masters {
-        println!("{:<10} {:<12} {:<28} {:<14} {}", m.0, m.1, m.2, m.3, m.4);
+        println!(
+            "{:<10} {:<12} {:<28} {:<14} {:<13} {}",
+            m.0, m.1, m.2, m.3, m.4, m.5
+        );
     }
     Ok(())
 }
@@ -4151,10 +4209,12 @@ mod tests {
         MockServer,
         Arc<Mutex<Vec<&'static str>>>,
         Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<(String, String)>>>,
     ) {
         let server = MockServer::start().await;
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let attrs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let item_added: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let initial_title = initial_row_title.map(String::from);
 
@@ -4328,7 +4388,28 @@ mod tests {
             .mount(&server)
             .await;
 
-        (server, order, appends)
+        Mock::given(method("POST"))
+            .and(path("/api/attr/setBlockAttrs"))
+            .respond_with({
+                let attrs = attrs.clone();
+                move |req: &wiremock::Request| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&req.body).unwrap_or_default();
+                    if let Some((name, value)) = body
+                        .get("attrs")
+                        .and_then(|a| a.as_object())
+                        .and_then(|a| a.iter().next())
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    {
+                        attrs.lock().unwrap().push((name, value));
+                    }
+                    ResponseTemplate::new(200).set_body_string(r#"{"code":0}"#)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        (server, order, appends, attrs)
     }
 
     async fn create_via_cli(
@@ -4346,6 +4427,7 @@ mod tests {
                 stdin: false,
                 attach: attach.to_vec(),
                 schedule: None,
+                agent: None,
                 dry_run: false,
             },
         )
@@ -4355,7 +4437,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_uploads_before_creating_and_appends_refs() {
-        let (server, order, appends) = mock_siyuan_for_create(None).await;
+        let (server, order, appends, _attrs) = mock_siyuan_for_create(None).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин 1.png");
         std::fs::write(&img, b"png").unwrap();
@@ -4401,10 +4483,76 @@ mod tests {
         );
     }
 
+    /// create --agent: attr custom-agent записан на теле свежей строки
+    /// (свойство документа, клетки на доске нет).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_agent_writes_custom_attr() {
+        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: "аудитор проекта".into(),
+                r#type: None,
+                stdin: false,
+                attach: Vec::new(),
+                schedule: None,
+                agent: Some("code-quality-reviewer".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("create --agent ok");
+
+        let writes = attrs.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![(
+                "custom-agent".to_string(),
+                "code-quality-reviewer".to_string()
+            )],
+            "ровно одна запись атрибута на теле: {writes:?}"
+        );
+    }
+
+    /// create --agent "мусор": slug-грамматика отвергает ДО мутаций
+    /// (дока нет, attr-записей нет).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_bad_agent_rejected_before_write() {
+        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        let err = task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: "аудитор проекта".into(),
+                r#type: None,
+                stdin: false,
+                attach: Vec::new(),
+                schedule: None,
+                agent: Some("Not A Slug".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("кривой slug — отказ");
+
+        assert!(err.to_string().contains("slug дефа"), "суть отказа: {err}");
+        assert!(
+            attrs.lock().unwrap().is_empty(),
+            "записей нет: валидация до мутаций"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_bails_on_duplicate_title_before_any_upload() {
-        let (server, order, _appends) = mock_siyuan_for_create(Some("новая задача")).await;
+        let (server, order, _appends, _attrs) = mock_siyuan_for_create(Some("новая задача")).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин.png");
         std::fs::write(&img, b"png").unwrap();
