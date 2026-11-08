@@ -1,25 +1,19 @@
-// dreamer-lib.ts — чистые функции uwuwu-dreamer: кандидаты на анализ из
-// opencode.db, state-машина прогонов (new/revived/retry → done/failed/gave_up),
-// рестарт-реконсилиация, промпт дримеру. SQLite — bun:sqlite, всегда readonly.
+// dreamer-lib.ts — посессионный контур uwuwu-dreamer: кандидаты на анализ из
+// opencode.db (единица = корневая idle-сессия), state-машина прогонов
+// (new/revived/retry → done/failed/gave_up), рестарт-реконсилиация, промпт
+// дримеру. Сессии живых задач скипаются по активному набору (task-run-lib —
+// задачный контур). SQLite — bun:sqlite, всегда readonly.
 
 import type { Database } from "bun:sqlite"
-import { E2E_SESSION_PREFIX } from "../lib/e2e-tag"
+import {
+  E2E_SKIP_LIKE, fetchSessionById, hasAssistantReply, hasAssistantReplySince,
+  rowToSession, sessionTimedOut, SESSION_EXCLUSIONS_SQL, type SessionRow,
+} from "./session-row"
+import type { ActiveSessions, TrackedTaskRun } from "./task-run-lib"
 
-/** LIKE-паттерн исключения e2e-сессий — строится из константы конвенции,
- *  литерал `[e2e]` в SQL не дублируется. */
-const E2E_SKIP_LIKE = `${E2E_SESSION_PREFIX}%`
-
-// ——— типы ———
-
-export interface SessionRow {
-  id: string
-  title: string | null
-  directory: string | null
-  agent: string | null
-  parentId: string | null
-  timeCreated: number
-  timeUpdated: number
-}
+export { fetchSessionById, hasAssistantReply, hasAssistantReplySince }
+export type { SessionRow }
+export { sessionTimedOut }
 
 export type ProcStatus = "pending" | "running" | "done" | "failed" | "gave_up" | "skipped"
 
@@ -38,11 +32,16 @@ export interface TrackedSession {
 export interface DreamerState {
   /** sid → tracking; персистится как state.json (tmp + rename, с .bak) */
   sessions: Record<string, TrackedSession>
+  /** rowId → трек задачного прогона (контур task-run-lib) */
+  taskRuns: Record<string, TrackedTaskRun>
+  /** sessionID → rowId живой задачи (start-сигналы фабрики); посессионный
+   *  контур скипает эти сессии — задачи пост-обрабатываются пакетом */
+  activeSessions: ActiveSessions
   /** первый старт отработан (backlog-катофф размечен) */
   bootstrapped: boolean
 }
 
-export const emptyState = (): DreamerState => ({ sessions: {}, bootstrapped: false })
+export const emptyState = (): DreamerState => ({ sessions: {}, taskRuns: {}, activeSessions: {}, bootstrapped: false })
 
 /** Старый state без wokenAt нормализуется (0 = не было wakeup). */
 export function normalizeTracked(v: Record<string, unknown>): TrackedSession | null {
@@ -98,13 +97,21 @@ export function idleBefore(nowMs: number, idleMs: number): number {
   return nowMs - idleMs
 }
 
-export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): SessionRow[] {
+export function fetchRootSessions(
+  db: Database,
+  beforeMs: number,
+  limit = 200,
+  activeSessions: ActiveSessions = {},
+): SessionRow[] {
   // Ревью-сессии фабрики (code-quality-reviewer) в пуле опыта наравне с
   // девелоперскими — осознанная отмена границы ADR-008 владельцем
   // (uwuwu: «Дример: работа с сессиями ревьюверов», строка 20261104215725-7zngmlj).
   // Исключён только сам dreamer — его прогоны не анализируют сами себя.
   // Помеченные e2e-сессии (конвенция lib/e2e-tag.ts) — синтетика, не пост-
   // обрабатывается: риг 04.11 без маркера породил 30 прогонов на 31 смоке.
+  // Сессии живых задач (активный набор из start-сигналов фабрики) скипаются:
+  // задачи пост-обрабатываются пакетом после закрытия (task-run-lib) — единый
+  // критерий принадлежности для всех проектов, без directory-эвристик.
   const rows = db
     .query(
       `SELECT id, title, directory, agent, parent_id, time_created, time_updated
@@ -117,30 +124,9 @@ export function fetchRootSessions(db: Database, beforeMs: number, limit = 200): 
        LIMIT ?`,
     )
     .all(beforeMs, E2E_SKIP_LIKE, limit) as Array<Record<string, unknown>>
-  return rows.map(rowToSession)
-}
-
-/** Одна сессия по id (реконсилиация живых прогонов не зависит от idle-списка). */
-export function fetchSessionById(db: Database, sid: string): SessionRow | null {
-  const row = db
-    .query(
-      `SELECT id, title, directory, agent, parent_id, time_created, time_updated
-       FROM session_v2 WHERE id = ?`,
-    )
-    .get(sid) as Record<string, unknown> | null
-  return row === null ? null : rowToSession(row)
-}
-
-function rowToSession(r: Record<string, unknown>): SessionRow {
-  return {
-    id: String(r.id),
-    title: r.title === null ? null : String(r.title),
-    directory: r.directory === null ? null : String(r.directory),
-    agent: r.agent === null ? null : String(r.agent),
-    parentId: r.parent_id === null ? null : String(r.parent_id),
-    timeCreated: Number(r.time_created),
-    timeUpdated: Number(r.time_updated),
-  }
+  return rows
+    .map(rowToSession)
+    .filter((row) => activeSessions[row.id] === undefined)
 }
 
 export type CandidateReason = "new" | "revived" | "retry" | "stuck-pending"
@@ -228,16 +214,17 @@ export function markBacklog(db: Database, state: DreamerState, cutoffMs: number)
   const rows = db
     .query(
       `SELECT id, time_updated FROM session_v2
-       WHERE COALESCE(agent, '') != 'dreamer'
+       WHERE ${SESSION_EXCLUSIONS_SQL}
          AND parent_id IS NULL
-         AND time_updated < ?
-         AND COALESCE(title, '') NOT LIKE ?`,
+         AND time_updated < ?`,
     )
-    .all(cutoffMs, E2E_SKIP_LIKE) as Array<{ id: string; time_updated: number }>
+    .all(E2E_SKIP_LIKE, cutoffMs) as Array<{ id: string; time_updated: number }>
   let marked = 0
   for (const row of rows) {
     const sid = String(row.id)
-    if (state.sessions[sid] === undefined) {
+    // активные сессии задач не размечаются skipped — они не «прошлое»,
+    // их задача пост-обработается пакетом (скип делает fetchRootSessions)
+    if (state.sessions[sid] === undefined && state.activeSessions[sid] === undefined) {
       state.sessions[sid] = {
         status: "skipped",
         lastProcessedUpdate: Number(row.time_updated),
@@ -281,25 +268,6 @@ export function applyRunOutcome(
   tracked.status = tracked.attempts >= maxAttempts ? "gave_up" : "failed"
   tracked.at = Date.now()
   return tracked.status
-}
-
-/** Есть ли в сессии дримера ответ ассистента (минимальное доказательство работы). */
-export function hasAssistantReply(db: Database, dreamerSes: string): boolean {
-  const row = db
-    .query(`SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'assistant'`)
-    .get(dreamerSes) as { n: number } | null
-  return (row?.n ?? 0) > 0
-}
-
-/** Ответ ассистента ПОЗЖЕ границы (wakeup: старые ответы — прошлый прогон). */
-export function hasAssistantReplySince(db: Database, dreamerSes: string, sinceMs: number): boolean {
-  const row = db
-    .query(
-      `SELECT COUNT(*) AS n FROM session_message
-       WHERE session_id = ? AND type = 'assistant' AND time_created > ?`,
-    )
-    .get(dreamerSes, sinceMs) as { n: number } | null
-  return (row?.n ?? 0) > 0
 }
 
 // ——— промпт ———
