@@ -8,7 +8,7 @@
 `~/.local/share/uwuwu-triage/workspace/.opencode/agents/triage.md`, сессия
 создаётся с `agent: "triage"`. Агент сам решает: поболтать / ответить на
 вопрос / разобрать заявку (классификация проект+тип, дедуп через
-`uwuwu-cli search`/`task list`, сверка с целями через `uwuwu-cli goal list`) →
+`uwuwu-cli search`/`task list`) →
 `task create` (ставит Draft, затем `task edit --status Todo`) или
 коммент в существующую → сводка доставляется в ТГ. Занят → сообщение
 вбрасывается в текущий ход (нативный steer). Референс — origa marketing zoo
