@@ -84,5 +84,8 @@ jobs:
         # точкой форка, чужие изменения master не красят. Пустая дельта
         # обрабатывается нативно («No modified files», exit 0) — git-обёртка
         # со списком путей не нужна; механика — живые пробы от 08.11,
-        # опыт /tools/«qlty CI Gate Analysis».
+        # опыт /tools/«qlty CI Gate Analysis». Локальный прогон на пушнутой
+        # (tracked) ветке: qlty 0.661.0 игнорирует --upstream (база =
+        # tracking-реф) — нейтрализация env или тул qlty_review, см.
+        # agents/developer.md (Lint-спека).
         run: $HOME/.qlty/bin/qlty check --no-fix --no-progress --upstream origin/master

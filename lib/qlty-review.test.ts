@@ -203,18 +203,27 @@ describe("renderReport — формат по мотивам qltysh", () => {
 interface FakeRepo {
   /** вывод git-команд по первому аргументу */
   git: Record<string, string>
+  /** имя текущей ветки для rev-parse --abbrev-ref (дефолт work/task-x — tracked) */
+  branch?: string
   /** ответ qlty по аргументам; throw в fake —qlty не должен был вызываться */
   qlty: (args: string[]) => string
+  /** env, с которым qlty был вызван (для assert нейтрализации tracking) */
+  qltyEnv?: Record<string, string>
 }
 
 function fakeDeps(repo: FakeRepo): ReviewDeps {
+  const branch = repo.branch ?? "work/task-x"
   return {
     git: async (args: string[], _cwd: string) => {
       const key = args.join(" ")
+      if (key === "rev-parse --abbrev-ref HEAD") return branch
       if (!(key in repo.git)) throw new Error(`fake git: нет сценария для «${key}»`)
       return repo.git[key]
     },
-    qlty: async (args: string[]) => repo.qlty(args),
+    qlty: async (args: string[], _cwd: string, env?: Record<string, string>) => {
+      repo.qltyEnv = env
+      return repo.qlty(args)
+    },
   }
 }
 
@@ -242,8 +251,11 @@ const DELTA_SARIF = JSON.stringify({
 
 const SMELLS_EMPTY = JSON.stringify({ runs: [{ tool: { driver: { semanticVersion: "0.661.0" } }, results: [] }] })
 
-// qlty на пустой дельте отвечает текстом, не SARIF (живая проба 08.11)
-const NO_MODIFIED = "No modified files for checks were found on your branch.\n✔ No issues\n"
+// qlty в --sarif-режиме на пустой дельте отдаёт SARIF с пустыми results
+// (живая проба 08.11) — текст «No modified files» только без --sarif.
+const EMPTY_RESULTS_SARIF = JSON.stringify({
+  runs: [{ tool: { driver: { semanticVersion: "0.661.0" } }, results: [] }],
+})
 
 const isSmellsCall = (args: string[]) => args[0] === "smells"
 
@@ -270,6 +282,30 @@ describe("runReview — оркестрация на fake-deps", () => {
     expect(r.markdown).toContain("Delta (qlty check --upstream")
     // smells — против той же базы merge-base
     expect(upstreamArg).toBe("abcbase123")
+  })
+
+  test("tracked-ветка: tracking нейтрализуется env (пост-пуш слепота qlty)", async () => {
+    const repo: FakeRepo = {
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      branch: "work/task-xyz",
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : DELTA_SARIF),
+    }
+    await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
+    expect(repo.qltyEnv).toEqual({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "branch.work/task-xyz.merge",
+      GIT_CONFIG_VALUE_0: "",
+    })
+  })
+
+  test("detached HEAD: env-нейтрализация не подставляется", async () => {
+    const repo: FakeRepo = {
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      branch: "HEAD",
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : DELTA_SARIF),
+    }
+    await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
+    expect(repo.qltyEnv).toEqual({})
   })
 
   test("commit: база — родитель коммита (rev-parse ^), note в отчёте", async () => {
@@ -299,20 +335,16 @@ describe("runReview — оркестрация на fake-deps", () => {
     ).rejects.toThrow(/нет родителя/)
   })
 
-  test("пустая дельта — qlty отвечает «No modified files» → n/a, smells не вызывается", async () => {
+  test("пустая дельта (SARIF с пустыми results) — ✅-отчёт", async () => {
     const repo: FakeRepo = {
       git: { "merge-base origin/master HEAD": "abcbase123" },
-      qlty: (args) => {
-        if (isSmellsCall(args)) throw new Error("smells не должен вызываться на пустой дельте")
-        expect(args).toContain("--upstream")
-        return NO_MODIFIED
-      },
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : EMPTY_RESULTS_SARIF),
     }
     const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    expect(r.markdown).toContain("Изменённых путей против upstream нет")
-    expect(r.markdown).toContain("Итог: n/a.")
-    expect(r.qltyVersion).toBe("n/a")
+    expect(r.markdown).toContain("✅ новых машинных находок нет.")
+    expect(r.qltyVersion).toBe("0.661.0")
     expect(r.delta).toBe(0)
+    expect(r.smells).toBe(0)
   })
 
   test("paths-фильтр режет дельту отчёта (считаются отфильтрованные)", async () => {
