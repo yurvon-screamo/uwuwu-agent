@@ -63,6 +63,7 @@ describe("createRunCard: позитивный путь", () => {
       "uwuwu",
       "⏰ мастер · 2026-11-07 09:30:00",
       "Ран крон-задачи «мастер».\n\n## Инструкция мастера\nпроверь",
+      new Date(2026, 10, 7, 9, 30, 21),
     )
 
     expect(rowId).toBe("20261107090000-run001")
@@ -73,10 +74,10 @@ describe("createRunCard: позитивный путь", () => {
     // от машины/порядка импортов — не ассертим)
     expect(createCall?.argv.slice(1, 5)).toEqual(["task", "create", "--project", "uwuwu"])
     expect(createCall?.stdinWritten).toContain("## Инструкция мастера")
-    // edit: тот же rowId, статус Todo + снятие типа-дефолта (ран не несёт тип;
-    // stdin не пайп — тело не несёт)
+    // edit: тот же rowId, статус Todo + снятие типа-дефолта + дата файра
+    // в «Запланировано» (минутная точность — формат сравнения reconcile)
     expect(editCall?.argv.slice(1)).toEqual([
-      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo", "--type", "",
+      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo", "--type", "", "--planned", "2026-11-07 09:30",
     ])
     expect(editCall?.stdinWritten).toBe("(не пайп)")
   })
@@ -86,7 +87,7 @@ describe("createRunCard: позитивный путь", () => {
       { stdout: "", stderr: "живая строка с тайтлом «X» уже есть", code: 1 },
     ])
 
-    const rowId = await cron.createRunCard("uwuwu", "⏰ дубль", "тело")
+    const rowId = await cron.createRunCard("uwuwu", "⏰ дубль", "тело", new Date(2026, 10, 7, 9, 30))
     expect(rowId).toBeNull()
     expect(calls.length).toBe(1)
   })
@@ -96,7 +97,7 @@ describe("createRunCard: позитивный путь", () => {
       { stdout: "создана: X\n(формат изменился: строки нет)\n" },
     ])
 
-    const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело")
+    const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело", new Date(2026, 10, 7, 9, 30))
     expect(rowId).toBeNull()
     expect(calls.length).toBe(1)
   })

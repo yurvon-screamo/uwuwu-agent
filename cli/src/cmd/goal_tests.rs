@@ -863,6 +863,8 @@ fn list_table_sorts_by_status_and_marks_dead_binding() {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: None,
         },
         SyTask {
@@ -873,6 +875,8 @@ fn list_table_sorts_by_status_and_marks_dead_binding() {
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
+            planned: String::new(),
+            schedule_cell: String::new(),
             body_doc: Some("body-20261107110000-g1".into()),
         },
     ];
