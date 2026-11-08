@@ -203,27 +203,18 @@ describe("renderReport — формат по мотивам qltysh", () => {
 interface FakeRepo {
   /** вывод git-команд по первому аргументу */
   git: Record<string, string>
-  /** имя текущей ветки для rev-parse --abbrev-ref (дефолт work/task-x — tracked) */
-  branch?: string
   /** ответ qlty по аргументам; throw в fake —qlty не должен был вызываться */
   qlty: (args: string[]) => string
-  /** env, с которым qlty был вызван (для assert нейтрализации tracking) */
-  qltyEnv?: Record<string, string>
 }
 
 function fakeDeps(repo: FakeRepo): ReviewDeps {
-  const branch = repo.branch ?? "work/task-x"
   return {
     git: async (args: string[], _cwd: string) => {
       const key = args.join(" ")
-      if (key === "rev-parse --abbrev-ref HEAD") return branch
       if (!(key in repo.git)) throw new Error(`fake git: нет сценария для «${key}»`)
       return repo.git[key]
     },
-    qlty: async (args: string[], _cwd: string, env?: Record<string, string>) => {
-      repo.qltyEnv = env
-      return repo.qlty(args)
-    },
+    qlty: async (args: string[]) => repo.qlty(args),
   }
 }
 
@@ -282,30 +273,6 @@ describe("runReview — оркестрация на fake-deps", () => {
     expect(r.markdown).toContain("Delta (qlty check --upstream")
     // smells — против той же базы merge-base
     expect(upstreamArg).toBe("abcbase123")
-  })
-
-  test("tracked-ветка: tracking нейтрализуется env (пост-пуш слепота qlty)", async () => {
-    const repo: FakeRepo = {
-      git: { "merge-base origin/master HEAD": "abcbase123" },
-      branch: "work/task-xyz",
-      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : DELTA_SARIF),
-    }
-    await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    expect(repo.qltyEnv).toEqual({
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "branch.work/task-xyz.merge",
-      GIT_CONFIG_VALUE_0: "",
-    })
-  })
-
-  test("detached HEAD: env-нейтрализация не подставляется", async () => {
-    const repo: FakeRepo = {
-      git: { "merge-base origin/master HEAD": "abcbase123" },
-      branch: "HEAD",
-      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : DELTA_SARIF),
-    }
-    await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    expect(repo.qltyEnv).toEqual({})
   })
 
   test("commit: база — родитель коммита (rev-parse ^), note в отчёте", async () => {

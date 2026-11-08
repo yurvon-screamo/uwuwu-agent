@@ -5,11 +5,9 @@
 // в добавленных/изменённых строках — pre-existing baseline-долг файла не
 // показывается (инцидент PR #158). Незакоммиченный хвост и untracked в
 // дельту входят — ниша против CI-гейта (ADR-063: CI видит только
-// запушенную дельту; в Actions checkout detached, tracking-глюк не
-// активен — тут он нейтрализуется env, см. trackingNeutralizingEnv).
-// Пробы механики 08.11 — задача 20261108060615-hjw3uqp, опыт
-// /tools/«qlty CI Gate Analysis». Без зависимости от uwuwu-cli:
-// git+qlty в любом qlty-репо.
+// запушенную дельту). Пробы механики 08.11 — задача
+// 20261108060615-hjw3uqp, опыт /tools/«qlty CI Gate Analysis».
+// Без зависимости от uwuwu-cli: git+qlty в любом qlty-репо.
 
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
@@ -26,14 +24,9 @@ const exec = promisify(execFile)
 
 // qlty check exit-код ≠0 при находках (fail-level fmt) — это НЕ сбой:
 // SARIF печатается в stdout, глотаем только пустые отказы.
-async function runOut(
-  cmd: string,
-  args: string[],
-  cwd: string,
-  env: Record<string, string> = {},
-): Promise<string> {
+async function runOut(cmd: string, args: string[], cwd: string): Promise<string> {
   try {
-    const r = await exec(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...env } })
+    const r = await exec(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024 })
     return r.stdout
   } catch (e) {
     const err = e as { stdout?: string; stderr?: string; message?: string }
@@ -44,14 +37,14 @@ async function runOut(
 
 export const realDeps: ReviewDeps = {
   git: (args, cwd) => runOut("git", args, cwd),
-  qlty: (args, cwd, env) => runOut("qlty", args, cwd, env),
+  qlty: (args, cwd) => runOut("qlty", args, cwd),
 }
 
 // ——— типы ———
 
 export interface ReviewDeps {
   git: (args: string[], cwd: string) => Promise<string>
-  qlty: (args: string[], cwd: string, env?: Record<string, string>) => Promise<string>
+  qlty: (args: string[], cwd: string) => Promise<string>
 }
 
 export interface ReviewResult {
@@ -63,25 +56,6 @@ export interface ReviewResult {
 
 export type { QltyFinding, ReviewInput, ReviewScope }
 
-// qlty 0.661.0: при branch-tracking текущей ветки флаг --upstream
-// игнорируется — базой дельты становится tracking-реф, и закоммиченная
-// дельта пост-пуш ворктри невидима (поймано ревью PR #179). Пустой
-// branch.<name>.merge через GIT_CONFIG_* нейтрализует tracking для
-// git-вызовов процесса qlty — --upstream уважается (пробы 08.11). В
-// detached HEAD ветки нет — env не нужен (в т.ч. CI checkout).
-async function trackingNeutralizingEnv(
-  git: ReviewDeps["git"],
-  dir: string,
-): Promise<Record<string, string>> {
-  const branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"], dir)).trim()
-  if (branch === "" || branch === "HEAD") return {}
-  return {
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: `branch.${branch}.merge`,
-    GIT_CONFIG_VALUE_0: "",
-  }
-}
-
 // ——— оркестрация ———
 
 export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps): Promise<ReviewResult> {
@@ -90,7 +64,12 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
 
   // База дельты: merge-base для diff (ветка + хвост + untracked против точки
   // форка), родитель коммита для commit. qlty сравнивает рабочую копию с
-  // базой построчно, сам определяя изменённые пути.
+  // базой построчно, сам определяя изменённые пути. Строка «No modified
+  // files for checks were found on your branch» в tracked-чекаутах —
+  // диагностическая, скоуп --upstream-прогона не отменяет (дважды читалась
+  // как «проверять нечего» — ревью PR #179, раунд 1/2; контролируемые
+  // пробы: viолация коммитом при tracking репортится в linked worktree,
+  // full clone, new и existing файл).
   let base: string
   const notes: string[] = []
   if (input.scope === "commit") {
@@ -105,16 +84,10 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
     if (base === "") throw new Error(`merge-base ${upstream}..HEAD пуст — репо не git или upstream не существует`)
   }
 
-  const qltyEnv = await trackingNeutralizingEnv(deps.git, dir)
-
-  const deltaRaw = await deps.qlty(
-    ["check", "--sarif", "--no-fix", "--no-progress", "--upstream", base],
-    dir,
-    qltyEnv,
-  )
+  const deltaRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", "--upstream", base], dir)
   const delta = parseSarif(deltaRaw, "qlty check (delta)")
 
-  const smellsRaw = await deps.qlty(["smells", "--sarif", "--upstream", base, "--quiet"], dir, qltyEnv)
+  const smellsRaw = await deps.qlty(["smells", "--sarif", "--upstream", base, "--quiet"], dir)
   const smells = parseSarif(smellsRaw, "qlty smells").findings
 
   const level = input.level ?? "low"
