@@ -131,3 +131,92 @@ async fn board_orphans_probe_skips_on_sql_failure() {
     assert!(why.contains("SQL детей доски"), "{why}");
     std::env::remove_var("UWUWU_SIYUAN_WS");
 }
+
+/// Стаб .sy по живому набору ключей: ID, Spec, Type, Properties,
+/// Children (Content у стаба истории нет вовсе).
+fn write_history_stub(history: &std::path::Path, snapshot_dir: &str, doc_id: &str, title: &str) {
+    let stub = format!(
+        r#"{{"ID":"{doc_id}","Spec":1,"Type":"NodeDocument","Properties":{{"title":"{title}"}},"Children":[]}}"#
+    );
+    let dir = history.join(snapshot_dir).join("nb/parents");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(format!("{doc_id}.sy")), stub).expect("write");
+}
+
+/// Вердикт пробы history-deletes: (вид, текст). Паника, если пробы нет.
+fn history_deletes_verdict(outcomes: &[ProbeOutcome]) -> (&'static str, String) {
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == "history-deletes")
+        .expect("history-deletes outcome присутствует");
+    match &outcome.verdict {
+        ProbeVerdict::Clean => ("clean", String::new()),
+        ProbeVerdict::Skipped(why) => ("skipped", why.clone()),
+        ProbeVerdict::Degraded(why) => ("degraded", why.clone()),
+        ProbeVerdict::Observed(what) => ("observed", what.clone()),
+    }
+}
+
+/// Сносы из истории воркспейса попадают в OBSERVE с тайтлом; снапшоты
+/// `-update` событиями сноса не считаются; exit-семантика наблюдения —
+/// проба не портит общий прогон (полный run).
+#[tokio::test]
+#[serial_test::serial]
+async fn history_deletes_probe_lists_kernel_removes_from_workspace_history() {
+    let mut scenario = orphan_scenario();
+    scenario.board_children = vec![(
+        BOARD_HPATH,
+        vec![(CHILD_BOUND, CHILD_BOUND_HPATH, "20261108000000")],
+    )];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let ws = isolated_workspace();
+    let history = ws.path().join("history");
+    write_history_stub(
+        &history,
+        "2026-11-08-021321-delete",
+        "20261104033524-4d37yk0",
+        "SiYuan: таймер бэкапов воркспейса (rsync-restic)",
+    );
+    write_history_stub(
+        &history,
+        "2026-11-08-010616-update",
+        "20261108000000-updatedoc",
+        "не снос",
+    );
+
+    let sy = SiYuan::from_env_with_timeout(10).expect("client");
+    let outcomes = run(&sy, "uwuwu", 30).await;
+    let (kind, what) = history_deletes_verdict(&outcomes);
+    assert_eq!(kind, "observed", "verdict history-deletes: {outcomes:?}");
+    assert!(
+        what.contains("20261104033524-4d37yk0 «SiYuan: таймер бэкапов воркспейса (rsync-restic)»"),
+        "{what}"
+    );
+    assert!(
+        !what.contains("updatedoc"),
+        "update-снапшот не снос: {what}"
+    );
+    std::env::remove_var("UWUWU_SIYUAN_WS");
+}
+
+/// Нет истории воркспейса (мульти-PC) — честный SKIP пробы.
+#[tokio::test]
+#[serial_test::serial]
+async fn history_deletes_probe_skips_without_workspace_history() {
+    let mut scenario = orphan_scenario();
+    scenario.board_children = vec![(
+        BOARD_HPATH,
+        vec![(CHILD_BOUND, CHILD_BOUND_HPATH, "20261108000000")],
+    )];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let _ws = isolated_workspace(); // history/ в tempdir не создаётся
+
+    let sy = SiYuan::from_env_with_timeout(10).expect("client");
+    let outcomes = run(&sy, "uwuwu", 30).await;
+    let (kind, why) = history_deletes_verdict(&outcomes);
+    assert_eq!(kind, "skipped", "нет history/ — SKIP: {outcomes:?}");
+    assert!(why.contains("нет истории ядра"), "{why}");
+    std::env::remove_var("UWUWU_SIYUAN_WS");
+}
