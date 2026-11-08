@@ -73,8 +73,6 @@ export interface TrackedTaskRun {
  *  всех проектов — без directory-эвристик). */
 export type ActiveSessions = Record<string, string>
 
-export const emptyActiveSessions = (): ActiveSessions => ({})
-
 export function mergeActiveSession(active: ActiveSessions, sid: string, rowId: string): void {
   active[sid] = rowId
 }
@@ -121,10 +119,6 @@ export function normalizeTrackedRun(v: unknown): TrackedTaskRun | null {
     wokenAt: typeof t.wokenAt === "number" ? t.wokenAt : 0,
     at: t.at,
   }
-}
-
-export function isValidTrackedRun(v: unknown): v is TrackedTaskRun {
-  return normalizeTrackedRun(v) !== null
 }
 
 /** Активный набор из state: sid→rowId, оба — строки. */
