@@ -2,9 +2,12 @@
 // ревью-тишины фабрики (баг «вердикт и статус не применяются при успешной
 // сессии ревьювера», задача 20261107142321). Сценарий — env REVIEW_STALL_SCENARIO:
 //   stall     — трек в «Ревью результата» с живой ревью-сессией, ход завершился
-//               давно (тишина > порога), статус из ревью не ушёл: ожидание —
+//               давно (тишина > порога 6 ч), статус из ревью не ушёл: ожидание —
 //               сигнал юзеру + Needs attention, раз за эпизод (два тика подряд —
 //               второй без повторного сигнала);
+//   recent    — реплика инцидента 07.11 (задача 20261107154637): та же
+//               геометрия, тишина 31 мин при пороге 6 ч (фоновая Railway-
+//               сборка легитимно молчит) — гвард молчит, статус не трогается;
 //   healthy   — та же геометрия, активность ревьювера свежая: гвард молчит;
 //   recovered — активность вернулась при стоявшем флаге эпизода: флаг снят
 //               без сигнала (эпизод завершён);
@@ -19,15 +22,21 @@ const SCENARIO = process.env.REVIEW_STALL_SCENARIO === "healthy"
   ? "healthy"
   : process.env.REVIEW_STALL_SCENARIO === "recovered"
     ? "recovered"
-    : process.env.REVIEW_STALL_SCENARIO === "dead" ? "dead" : "stall"
+    : process.env.REVIEW_STALL_SCENARIO === "recent"
+      ? "recent"
+      : process.env.REVIEW_STALL_SCENARIO === "dead" ? "dead" : "stall"
 
 const AV_ID = "20260101000000-abcdef"
 const ROW_ID = "20261107000000-row1"
 const DOC_ID = "20261107000000-doc1"
 const REVIEW_SESSION = SCENARIO === "dead" ? "ses_dead" : "ses_rev1"
-/** давность последнего сообщения ревью-сессии: stall — за порогом (мин+1),
- *  healthy/recovered — минуту назад (ход живой или вернулся) */
-const MESSAGE_AGE_MS = SCENARIO === "stall" ? 31 * 60_000 : 60_000
+/** давность последнего сообщения ревью-сессии: stall — за порогом 6 ч
+ *  (мин+1), recent — 31 мин (реплика инцидента 07.11: легитимная тишина
+ *  фонового прогона при пороге 6 ч), healthy/recovered — минуту назад
+ *  (ход живой или вернулся) */
+const MESSAGE_AGE_MS = SCENARIO === "stall"
+  ? 361 * 60_000
+  : SCENARIO === "recent" ? 31 * 60_000 : 60_000
 const NOW = Date.now()
 
 const ROW = {

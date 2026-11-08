@@ -20,8 +20,10 @@
 //   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
 //      state + термин живой ревью-сессии
 //   5. In Progress: сессия жива, юзер и агент молчат дольше порога
-//      (UWUWU_FACTORY_STALL_MIN, деф. 30) → сигнал-коммент + Needs attention
-//      раз за эпизод (потерянный/зависший ход: активный ход рождает сообщения)
+//      (UWUWU_FACTORY_STALL_MIN, деф. 360 = 6 ч — трейд владельца 08.11:
+//      глубокие фоновые прогоны легитимно молчат часами) → сигнал-коммент
+//      + Needs attention раз за эпизод (потерянный/зависший ход: активный
+//      ход рождает сообщения)
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
