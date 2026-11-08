@@ -1,21 +1,18 @@
 // lib/qlty-review.ts — оркестрация машинного ревьюера qlty_review (тул
 // OpenCode, регистрация — plugins/qlty-review.ts; чистые функции —
-// qlty-review-core.ts). Алгоритмический слой фабричного ревью по мотивам
-// qltysh: qlty check (SARIF) + qlty smells --upstream по дифу/коммиту,
-// delta-классификация против пробы merge-base во временном worktree
-// (механика delta-vs-baseline из Lint-спеки developer.md). Ниша после
-// CI-гейта (ADR-063): пре-пуш фаза девелопера и верификация ворктри
-// ревьювером — незакоммиченный хвост и untracked CI не видит никогда.
+// qlty-review-core.ts). Механика — нативная строковая дельта qlty против
+// upstream: `qlty check/smells --upstream <base>` репортит находки только
+// в добавленных/изменённых строках — pre-existing baseline-долг файла не
+// показывается (инцидент PR #158). Незакоммиченный хвост и untracked в
+// дельту входят — ниша против CI-гейта (ADR-063: CI видит только
+// запушенную дельту). Пробы механики 08.11 — задача
+// 20261108060615-hjw3uqp, опыт /tools/«qlty CI Gate Analysis».
 // Без зависимости от uwuwu-cli: git+qlty в любом qlty-репо.
 
 import { execFile } from "node:child_process"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { promisify } from "node:util"
 import {
   applyFilters,
-  classifyDelta,
   parseSarif,
   renderReport,
   type QltyFinding,
@@ -53,8 +50,7 @@ export interface ReviewDeps {
 export interface ReviewResult {
   markdown: string
   qltyVersion: string
-  introduced: number
-  baseline: number
+  delta: number
   smells: number
 }
 
@@ -66,99 +62,53 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
   const dir = input.directory
   const upstream = input.upstream ?? "origin/master"
 
-  const base = (await deps.git(["merge-base", upstream, "HEAD"], dir)).trim()
-  if (base === "") throw new Error(`merge-base ${upstream}..HEAD пуст — репо не git или upstream не существует`)
-
-  let paths: string[]
+  // База дельты: merge-base для diff (ветка + хвост + untracked против точки
+  // форка), родитель коммита для commit. qlty сравнивает рабочую копию с
+  // базой построчно, сам определяя изменённые пути. Строка «No modified
+  // files for checks were found on your branch» в tracked-чекаутах —
+  // диагностическая, скоуп --upstream-прогона не отменяет (дважды читалась
+  // как «проверять нечего» — ревью PR #179, раунд 1/2; контролируемые
+  // пробы: viолация коммитом при tracking репортится в linked worktree,
+  // full clone, new и existing файл).
+  let base: string
   const notes: string[] = []
   if (input.scope === "commit") {
     if (!input.commit) throw new Error("scope=commit требует commit (SHA/реф)")
-    paths = (await deps.git(["diff-tree", "--no-commit-id", "--name-only", "--diff-filter=d", "-r", input.commit], dir))
-      .split("\n")
-      .filter(Boolean)
+    base = (await deps.git(["rev-parse", `${input.commit}^`], dir)).trim()
+    if (base === "") throw new Error(`у ${input.commit} нет родителя — корневой коммит не имеет дельты`)
     notes.push(
       "scope=commit: прогон по рабочей копии — корректен, если файлы на диске в состоянии коммита (свежий HEAD в чистом ворктри).",
     )
   } else {
-    const changed = (await deps.git(["diff", "--name-only", "--diff-filter=d", base], dir)).split("\n").filter(Boolean)
-    const untracked = (await deps.git(["ls-files", "--others", "--exclude-standard"], dir)).split("\n").filter(Boolean)
-    paths = [...new Set([...changed, ...untracked])]
+    base = (await deps.git(["merge-base", upstream, "HEAD"], dir)).trim()
+    if (base === "") throw new Error(`merge-base ${upstream}..HEAD пуст — репо не git или upstream не существует`)
   }
 
-  // Явный ранний выход: пустая дельта (синхронизированная ветка или
-  // pure-deletion) — прогон не требуется (паритет guard'а CI-дельты,
-  // ADR-063); безаргументный qlty check — семантика по случайности.
-  if (paths.length === 0) {
-    const scopePart = `scope \`${input.scope}\`${input.commit ? ` (\`${input.commit}\`)` : ""}`
-    return {
-      markdown: `**Машинный ревью (qlty)** — ${scopePart} · upstream \`${upstream}\` · ${dir}\n\n> ⚠ Изменённых путей нет (синхронизированная ветка или pure-deletion) — машинный ревью n/a, прогон не требуется.\n\nИтог: n/a.`,
-      qltyVersion: "n/a",
-      introduced: 0,
-      baseline: 0,
-      smells: 0,
-    }
-  }
+  const deltaRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", "--upstream", base], dir)
+  const delta = parseSarif(deltaRaw, "qlty check (delta)")
 
-  const currentRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", ...paths], dir)
-  const current = parseSarif(currentRaw, "qlty check")
-
-  // Baseline-проба: временный worktree на merge-base, те же пути.
-  // Новые файлы (нет на base) из baseline-пробы исключаются.
-  const baseFiles = new Set(
-    (await deps.git(["ls-tree", "-r", "--name-only", base], dir)).split("\n").filter(Boolean),
-  )
-  const basePaths = paths.filter((p) => baseFiles.has(p))
-
-  const tmp = mkdtempSync(join(tmpdir(), "qlty-review-baseline-"))
-  let baseline: QltyFinding[] = []
-  try {
-    await deps.git(["worktree", "add", "--detach", "--quiet", tmp, base], dir)
-    try {
-      if (basePaths.length > 0) {
-        const baselineRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", ...basePaths], tmp)
-        baseline = parseSarif(baselineRaw, "qlty check (baseline)").findings
-      }
-    } finally {
-      // лучшая попытка: не маскируем исходную ошибку прогона
-      try {
-        await deps.git(["worktree", "remove", "--force", tmp], dir)
-      } catch {
-        rmSync(tmp, { recursive: true, force: true })
-      }
-    }
-  } catch (e) {
-    rmSync(tmp, { recursive: true, force: true })
-    throw e
-  }
-
-  // Smells: нативно диффовый режим qlty
   const smellsRaw = await deps.qlty(["smells", "--sarif", "--upstream", base, "--quiet"], dir)
   const smells = parseSarif(smellsRaw, "qlty smells").findings
 
   const level = input.level ?? "low"
-  const currentFiltered = applyFilters(current.findings, { paths: input.paths, level })
-  const baselineFiltered = applyFilters(baseline, { paths: input.paths, level })
+  const deltaFiltered = applyFilters(delta.findings, { paths: input.paths, level })
   const smellsFiltered = applyFilters(smells, { paths: input.paths, level })
 
-  const { introduced, baselineMatched } = classifyDelta(currentFiltered, baselineFiltered)
-
   const markdown = renderReport({
-    qltyVersion: current.qltyVersion,
+    qltyVersion: delta.qltyVersion,
     scope: input.scope,
     upstream,
     directory: dir,
     commit: input.commit,
     notes,
-    introduced,
-    baselineMatched,
+    delta: deltaFiltered,
     smells: smellsFiltered,
   })
 
   return {
     markdown,
-    qltyVersion: current.qltyVersion,
-    introduced: introduced.length,
-    baseline: baselineMatched.length,
+    qltyVersion: delta.qltyVersion,
+    delta: deltaFiltered.length,
     smells: smellsFiltered.length,
   }
 }

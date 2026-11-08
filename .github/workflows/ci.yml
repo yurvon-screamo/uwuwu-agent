@@ -76,17 +76,15 @@ jobs:
         run: curl -sSfL https://qlty.sh | sh
 
       - name: qlty check (delta)
-        # Дельта PR по паттерну репо-конвенции (Lint-строка отчёта):
-        # --all падает на существующем baseline-долге, новое обязано быть
-        # чистым; --diff-filter=d исключает удалённые файлы (qlty падает
-        # на отсутствующих путях); пустая дельта (pure-deletion PR) —
-        # qlty-прогон не выполняется вовсе.
-        run: |
-          files=$(git diff --name-only --diff-filter=d origin/master...HEAD)
-          if [ -z "$files" ]; then
-            echo "Пустая дельта — qlty-прогон не требуется"
-            exit 0
-          fi
-          # xargs -d '\n': пути с пробелами не разлетаются (word-splitting);
-          # GNU xargs с пустым входом не запускает команду, if выше — для явного скипа
-          printf '%s\n' "$files" | xargs -r -d '\n' "$HOME/.qlty/bin/qlty" check --no-fix
+        # Настоящая строковая дельта против upstream (нативный режим qlty):
+        # находки репортятся только в добавленных/изменённых строках PR —
+        # pre-existing baseline-долг тронутого файла CI не красит (инцидент
+        # PR #158: 8 pre-existing находок lib/hub.ts на файл-скоупе).
+        # Семантика merge-base: отставшая ветка сравнивается с
+        # точкой форка, чужие изменения master не красят. Пустая дельта
+        # обрабатывается нативно («No modified files», exit 0) — git-обёртка
+        # со списком путей не нужна; механика — живые пробы от 08.11,
+        # опыт /tools/«qlty CI Gate Analysis». Готча чтения вывода:
+        # строка «No modified files» в tracked-чекаутах диагностическая,
+        # скоуп --upstream-прогона не отменяет.
+        run: $HOME/.qlty/bin/qlty check --no-fix --no-progress --upstream origin/master

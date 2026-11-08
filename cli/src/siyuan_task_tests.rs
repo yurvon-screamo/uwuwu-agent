@@ -8,6 +8,7 @@
 use crate::siyuan::SiYuan;
 use crate::siyuan_task::{read_rows, SyBoard, SyTask};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -648,4 +649,25 @@ fn test_task() -> SyTask {
         schedule_cell: String::new(),
         body_doc: Some("20261105120000-bounddo1".into()),
     }
+}
+
+#[test]
+fn task_board_ids_from_rows_filters_and_dedups() {
+    // Реестр досок для классификации сносов: конвенция hpath фильтрует
+    // мусор («Задачи …» не на своём уровне), дедуп берёт первый по
+    // сортированному hpath на проект — паритет discover_task_boards.
+    let rows = vec![
+        json!({"id": "dup-later", "hpath": "/proj/Задачи proj"}),
+        json!({"id": "dup-first", "hpath": "/proj/Задачи proj (архив)"}), // невалидный тайтл → мимо
+        json!({"id": "board-proj", "hpath": "/proj/Задачи proj"}),
+        json!({"id": "board-other", "hpath": "/other/Задачи other"}),
+        json!({"id": "junk-deep", "hpath": "/proj/подпапка/Задачи proj"}),
+        json!({"id": "junk-orphan", "hpath": "Задачи proj"}),
+    ];
+    let ids = crate::siyuan_task::task_board_ids_from_rows(&rows);
+    let expected: HashSet<String> = ["board-other", "board-proj"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(ids, expected);
 }

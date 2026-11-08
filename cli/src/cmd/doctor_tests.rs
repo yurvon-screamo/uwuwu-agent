@@ -135,10 +135,34 @@ async fn board_orphans_probe_skips_on_sql_failure() {
 /// Стаб .sy по живому набору ключей: ID, Spec, Type, Properties,
 /// Children (Content у стаба истории нет вовсе).
 fn write_history_stub(history: &std::path::Path, snapshot_dir: &str, doc_id: &str, title: &str) {
+    write_history_stub_at(history, snapshot_dir, &["nb", "parents"], doc_id, title);
+}
+
+/// Стаб сноса с доской в цепочке пути (тело задачи — саб-док дока доски).
+fn write_history_task_body_stub(
+    history: &std::path::Path,
+    snapshot_dir: &str,
+    board_doc: &str,
+    doc_id: &str,
+    title: &str,
+) {
+    write_history_stub_at(history, snapshot_dir, &["nb", board_doc], doc_id, title);
+}
+
+fn write_history_stub_at(
+    history: &std::path::Path,
+    snapshot_dir: &str,
+    chain: &[&str],
+    doc_id: &str,
+    title: &str,
+) {
     let stub = format!(
         r#"{{"ID":"{doc_id}","Spec":1,"Type":"NodeDocument","Properties":{{"title":"{title}"}},"Children":[]}}"#
     );
-    let dir = history.join(snapshot_dir).join("nb/parents");
+    let mut dir = history.join(snapshot_dir);
+    for part in chain {
+        dir = dir.join(part);
+    }
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join(format!("{doc_id}.sy")), stub).expect("write");
 }
@@ -157,9 +181,10 @@ fn history_deletes_verdict(outcomes: &[ProbeOutcome]) -> (&'static str, String) 
     }
 }
 
-/// Сносы из истории воркспейса попадают в OBSERVE с тайтлом; снапшоты
-/// `-update` событиями сноса не считаются; exit-семантика наблюдения —
-/// проба не портит общий прогон (полный run).
+/// Сносы из истории воркспейса попадают в OBSERVE: снос тела задачи (доска
+/// в цепочке пути снапшота + живой реестр досок) — задачной группой с
+/// тайтлом; снапшоты `-update` событиями сноса не считаются; exit-семантика
+/// наблюдения — проба не портит общий прогон (полный run).
 #[tokio::test]
 #[serial_test::serial]
 async fn history_deletes_probe_lists_kernel_removes_from_workspace_history() {
@@ -172,9 +197,10 @@ async fn history_deletes_probe_lists_kernel_removes_from_workspace_history() {
     set_env(&server);
     let ws = isolated_workspace();
     let history = ws.path().join("history");
-    write_history_stub(
+    write_history_task_body_stub(
         &history,
         "2026-11-08-021321-delete",
+        BOARD_DOC,
         "20261104033524-4d37yk0",
         "SiYuan: таймер бэкапов воркспейса (rsync-restic)",
     );
@@ -190,8 +216,12 @@ async fn history_deletes_probe_lists_kernel_removes_from_workspace_history() {
     let (kind, what) = history_deletes_verdict(&outcomes);
     assert_eq!(kind, "observed", "verdict history-deletes: {outcomes:?}");
     assert!(
-        what.contains("20261104033524-4d37yk0 «SiYuan: таймер бэкапов воркспейса (rsync-restic)»"),
+        what.contains("сносы тел задач за окно: 1 — 20261104033524-4d37yk0 «SiYuan: таймер бэкапов воркспейса (rsync-restic)»"),
         "{what}"
+    );
+    assert!(
+        !what.contains("прочий оборот"),
+        "все события задачи, хвост опущен: {what}"
     );
     assert!(
         !what.contains("updatedoc"),
@@ -218,5 +248,64 @@ async fn history_deletes_probe_skips_without_workspace_history() {
     let (kind, why) = history_deletes_verdict(&outcomes);
     assert_eq!(kind, "skipped", "нет history/ — SKIP: {outcomes:?}");
     assert!(why.contains("нет истории ядра"), "{why}");
+    std::env::remove_var("UWUWU_SIYUAN_WS");
+}
+
+/// Сбой SQL-дискавери реестра при живом ядре — деградация к полному
+/// перечислению всех событий без классификации, с честной причиной:
+/// канал «снос → сводка» не сужается (Unavailable-ветка run()).
+#[tokio::test]
+#[serial_test::serial]
+async fn history_deletes_degrades_to_full_listing_when_boards_registry_fails() {
+    let mut scenario = orphan_scenario();
+    scenario.board_children = vec![(
+        BOARD_HPATH,
+        vec![(CHILD_BOUND, CHILD_BOUND_HPATH, "20261108000000")],
+    )];
+    scenario.sql_boards_fail = true;
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let ws = isolated_workspace();
+    let history = ws.path().join("history");
+    write_history_task_body_stub(
+        &history,
+        "2026-11-08-021321-delete",
+        BOARD_DOC,
+        "20261104033524-4d37yk0",
+        "SiYuan: таймер бэкапов воркспейса (rsync-restic)",
+    );
+    write_history_stub(
+        &history,
+        "2026-11-08-010621-delete",
+        "20261104112902-straydoc",
+        "AGENTS.md: мёртвая ссылка",
+    );
+
+    let sy = SiYuan::from_env_with_timeout(10).expect("client");
+    let outcomes = run(&sy, "uwuwu", 30).await;
+    let (kind, what) = history_deletes_verdict(&outcomes);
+    assert_eq!(
+        kind, "observed",
+        "деградация пробы — всё ещё OBSERVE: {outcomes:?}"
+    );
+    assert!(what.contains("сносы доков за окно: 2"), "{what}");
+    // Оба события — полным перечнем с тайтлами, включая задачное тело.
+    assert!(
+        what.contains("20261104033524-4d37yk0 «SiYuan: таймер бэкапов воркспейса (rsync-restic)»"),
+        "{what}"
+    );
+    assert!(
+        what.contains("20261104112902-straydoc «AGENTS.md: мёртвая ссылка»"),
+        "{what}"
+    );
+    assert!(
+        what.contains("классификация недоступна: реестр досок"),
+        "{what}"
+    );
+    assert!(
+        !what.contains("сносы тел задач"),
+        "классификации нет: {what}"
+    );
+    assert!(!what.contains("прочий оборот"), "группировки нет: {what}");
     std::env::remove_var("UWUWU_SIYUAN_WS");
 }
