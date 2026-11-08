@@ -122,6 +122,12 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::List {
             status, r#type: ty, ..
         } => {
+            // мусорный тип фильтра — громкий отказ через тот же канон,
+            // а не тихая пустота «Задач нет.» (паритет create/edit)
+            let ty = match ty.as_deref() {
+                Some(raw) => Some(syt::validate_task_type(raw)?),
+                None => None,
+            };
             let board = syt::find_board(&sy, project).await?;
             let rows = syt::read_rows(&sy, &board).await?;
             let dead_bound = syt::dead_bound_doc_ids(&sy, &rows).await?;
