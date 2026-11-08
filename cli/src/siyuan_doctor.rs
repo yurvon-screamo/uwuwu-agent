@@ -1330,6 +1330,14 @@ mod tests {
     }
 
     #[test]
+    fn format_delete_observation_empty_window_reports_no_deletes() {
+        // Тихая доска: ни задачных, ни прочих — «нет» без счётного хвоста.
+        let boards: HashSet<String> = ["board".to_string()].into_iter().collect();
+        let text = format_delete_observation(&[], &TaskBoards::Classified(boards));
+        assert_eq!(text, "сносы тел задач за окно: нет");
+    }
+
+    #[test]
     fn is_task_board_delete_matches_any_chain_link() {
         // Любое звено цепочки (доска-предок в середине) — задачный снос;
         // цепочка без доски реестра — прочий оборот. Лист — тоже звено

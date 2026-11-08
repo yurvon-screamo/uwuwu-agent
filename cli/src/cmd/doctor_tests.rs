@@ -250,3 +250,62 @@ async fn history_deletes_probe_skips_without_workspace_history() {
     assert!(why.contains("нет истории ядра"), "{why}");
     std::env::remove_var("UWUWU_SIYUAN_WS");
 }
+
+/// Сбой SQL-дискавери реестра при живом ядре — деградация к полному
+/// перечислению всех событий без классификации, с честной причиной:
+/// канал «снос → сводка» не сужается (Unavailable-ветка run()).
+#[tokio::test]
+#[serial_test::serial]
+async fn history_deletes_degrades_to_full_listing_when_boards_registry_fails() {
+    let mut scenario = orphan_scenario();
+    scenario.board_children = vec![(
+        BOARD_HPATH,
+        vec![(CHILD_BOUND, CHILD_BOUND_HPATH, "20261108000000")],
+    )];
+    scenario.sql_boards_fail = true;
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let ws = isolated_workspace();
+    let history = ws.path().join("history");
+    write_history_task_body_stub(
+        &history,
+        "2026-11-08-021321-delete",
+        BOARD_DOC,
+        "20261104033524-4d37yk0",
+        "SiYuan: таймер бэкапов воркспейса (rsync-restic)",
+    );
+    write_history_stub(
+        &history,
+        "2026-11-08-010621-delete",
+        "20261104112902-straydoc",
+        "AGENTS.md: мёртвая ссылка",
+    );
+
+    let sy = SiYuan::from_env_with_timeout(10).expect("client");
+    let outcomes = run(&sy, "uwuwu", 30).await;
+    let (kind, what) = history_deletes_verdict(&outcomes);
+    assert_eq!(
+        kind, "observed",
+        "деградация пробы — всё ещё OBSERVE: {outcomes:?}"
+    );
+    assert!(what.contains("сносы доков за окно: 2"), "{what}");
+    // Оба события — полным перечнем с тайтлами, включая задачное тело.
+    assert!(
+        what.contains("20261104033524-4d37yk0 «SiYuan: таймер бэкапов воркспейса (rsync-restic)»"),
+        "{what}"
+    );
+    assert!(
+        what.contains("20261104112902-straydoc «AGENTS.md: мёртвая ссылка»"),
+        "{what}"
+    );
+    assert!(
+        what.contains("классификация недоступна: реестр досок"),
+        "{what}"
+    );
+    assert!(
+        !what.contains("сносы тел задач"),
+        "классификации нет: {what}"
+    );
+    assert!(!what.contains("прочий оборот"), "группировки нет: {what}");
+    std::env::remove_var("UWUWU_SIYUAN_WS");
+}
