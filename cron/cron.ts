@@ -720,8 +720,15 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
     }
 
     // вечный мастер с файром в полёте: дедуп приземления/ретрай до due-гейта —
-    // неподтверждённый POST не должен ждать слота расписания
+    // неподтверждённый POST не должен ждать слота расписания. DRY_RUN — гард:
+    // resolvePendingRun делает реальные opencode-REST (sessionStatus/promptPost)
+    // в боевой сервис — инвариант «DRY_RUN ⇒ ноль реальных действий» важнее
+    // доигрывания ретрая (pendingRun остаётся в state песочницы)
     if (row.agent !== "" && tracked?.pendingRun !== undefined) {
+      if (DRY_RUN) {
+        log(`DRY_RUN: мастер «${row.title || row.rowId.slice(0, 8)}» — pendingRun-ретрай пропущен (файр ${tracked.pendingRun.rowId} остаётся в полёте)`)
+        continue
+      }
       await resolvePendingRun(state, tracked, row, row.title || row.rowId.slice(0, 8))
       continue
     }

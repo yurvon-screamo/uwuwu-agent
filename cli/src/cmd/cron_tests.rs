@@ -638,6 +638,61 @@ async fn edit_agent_bad_name_rejected_before_write() {
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
+/// get по строке с custom-agent: свойство читается и отображается штатно
+/// (формат строки — юнит-тест agent_display_line; здесь — интеграция резолва
+/// и чтения attrs при no_body).
+#[tokio::test]
+#[serial_test::serial]
+async fn get_shows_agent_attr_from_body() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        PLAIN_DOC,
+        vec![("custom-agent".to_string(), "lead".to_string())],
+    )];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Get {
+            id: "20261107090000-plain2".into(),
+            no_body: true,
+        },
+    )
+    .await
+    .expect("get: строка с агентом резолвится и показывает свойство");
+
+    assert!(kernel.attr_writes().is_empty(), "get — read-only карточка");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// cron list: мастер с custom-agent попадает в инвентарь (колонка AGENT),
+/// инвентарь остаётся read-only; обычная строка без расписания не попадает.
+#[tokio::test]
+#[serial_test::serial]
+async fn cron_list_shows_agent_column_and_stays_read_only() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![
+            ("custom-schedule".to_string(), "6h".to_string()),
+            ("custom-agent".to_string(), "lead".to_string()),
+        ],
+    )];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    cron_run(CronSub::List { project: None })
+        .await
+        .expect("list: мастер с агентом найден");
+
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "list — read-only инвентарь"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
 /// (18) parse_render_row: date-клетка (formattedContent) читается в planned,
 /// text-клетка — в schedule_cell; обычные задачи несут пусто.
 #[test]

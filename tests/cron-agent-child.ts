@@ -142,4 +142,8 @@ let logText = ""
 try { logText = await Bun.file(LOG).text() } catch {}
 const logLines = logText.split("\n").filter((l) => l.trim() !== "")
 
-console.log(JSON.stringify({ error, state: state.crons, calls, logLines, agentOk: AGENT_OK, agentMissing: AGENT_MISSING }))
+console.log(JSON.stringify({
+  error, state: state.crons, calls, logLines,
+  agentsDir: join(homedir(), ".config/opencode/agents"),
+  agentOk: AGENT_OK, agentMissing: AGENT_MISSING,
+}))

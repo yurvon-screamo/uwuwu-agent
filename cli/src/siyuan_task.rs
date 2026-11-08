@@ -574,6 +574,17 @@ pub fn validate_agent_name(raw: &str) -> Result<String> {
     }
 }
 
+/// Строка карточки task get: агент вечной сессии крона (custom-agent).
+pub fn agent_display_line(agent: &str) -> String {
+    format!("Агент: {agent} (вечная сессия крона)")
+}
+
+/// Колонка AGENT инвентаря cron list: пусто — изолированные спавны
+/// (исторический контур, вечная сессия не заведена).
+pub fn agent_inventory_cell(attrs: &std::collections::HashMap<String, String>) -> String {
+    attrs.get("custom-agent").cloned().unwrap_or_default()
+}
+
 /// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
 /// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
 /// (время файра), в клетке живут с минутной точностью — формат сравнения
@@ -2139,6 +2150,23 @@ mod tests {
         assert!(validate_agent_name("-lead").is_err(), "дефис не первый");
         assert!(validate_agent_name("Lead").is_err(), "только строчные");
         assert!(validate_agent_name("l ead").is_err(), "пробелы не slug");
+    }
+
+    #[test]
+    fn agent_display_line_and_inventory_cell_render_custom_agent() {
+        assert_eq!(
+            agent_display_line("lead"),
+            "Агент: lead (вечная сессия крона)"
+        );
+        let mut attrs = std::collections::HashMap::new();
+        assert_eq!(
+            agent_inventory_cell(&attrs),
+            "",
+            "без custom-agent — изолированные спавны (пустая колонка)"
+        );
+        attrs.insert("custom-agent".to_string(), "lead".to_string());
+        attrs.insert("custom-schedule".to_string(), "6h".to_string());
+        assert_eq!(agent_inventory_cell(&attrs), "lead");
     }
 
     /// Расширенный канон делит костяки существующих: analys ≡ spike,

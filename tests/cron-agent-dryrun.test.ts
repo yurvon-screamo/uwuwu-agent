@@ -8,19 +8,25 @@ import { describe, expect, test } from "bun:test"
 import { join } from "node:path"
 
 const CHILD = join(import.meta.dir, "cron-agent-child.ts")
+/** HOME-песочница чайлда: os.homedir() в Bun читает HOME, заданный НА СПАВНЕ
+ *  (runtime-подмена после старта не работает — эмпирика cron.ts) — деф
+ *  тестового агента материализуется в песочнице, реальный глобальный конфиг
+ *  агентов не трогается (ревью Common: прошлый child оставлял дефы навсегда). */
+const CHILD_HOME = "/tmp/opencode/cron-agent-home"
 
 interface ChildReport {
   error?: string
   state?: Record<string, { lastRefusal?: string; pendingRun?: unknown }>
   calls: { kind: string; name: string }[]
   logLines: string[]
+  agentsDir: string
   agentOk: string
   agentMissing: string
 }
 
 async function runChild(): Promise<ChildReport> {
   const proc = Bun.spawn(["bun", CHILD], {
-    env: { ...process.env },
+    env: { ...process.env, HOME: CHILD_HOME },
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -34,6 +40,8 @@ describe("tick × DRY_RUN × вечный мастер (custom-agent)", () => {
   test("деф без missing — отказ без записей; деф на месте — решения в логе, файр не доходит до POST", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
+    // побочный эффект теста — только в HOME-песочнице (ревью Common)
+    expect(report.agentsDir.startsWith(`${CHILD_HOME}/`)).toBe(true)
     // ни одного CLI-спавна (ран-карточка), ни одной записи в доки (коммент)
     expect(report.calls.filter((c) => c.kind === "spawn")).toEqual([])
     expect(report.calls.filter((c) => c.name.includes("appendBlock"))).toEqual([])
