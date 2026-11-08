@@ -569,9 +569,12 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     const { rowId, tracked } = cand
     if (activeRuns() >= CONCURRENCY) break
     if (drain.isStopping()) break
-    if (cand.action === "wakeup") {
-      // верификация живости: либа детерминирована от state, REST — здесь
-      const alive = await sessionAlive(tracked.dreamerSes as string)
+    if (cand.action === "wakeup" && tracked.dreamerSes !== null) {
+      const dreamerSes = tracked.dreamerSes
+      // верификация живости: либа детерминирована от state, REST — здесь;
+      // гвард dreamerSes локальный — инвариант «wakeup ⇒ сессия есть» живёт
+      // в адмиссии другого модуля, кросс-модульной зависимости не строим
+      const alive = await sessionAlive(dreamerSes)
       if (alive === true) {
         // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
         // закроет как failed+attempt, восстановления без потерь)
@@ -580,7 +583,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
         tracked.at = tracked.wokenAt
         saveState(state)
         const prompt = taskRunPromptFor(rowId, tracked, collectTaskSessions(db, tracked.rootSessions), true)
-        const ok = await restCall(`/session/${tracked.dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
+        const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
         if (!ok) {
           tracked.attempts += 1
           tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
@@ -590,12 +593,12 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
           saveState(state)
           continue
         }
-        log(`задача ${rowId.slice(0, 8)}: задачный wakeup дримера ${tracked.dreamerSes}`)
+        log(`задача ${rowId.slice(0, 8)}: задачный wakeup дримера ${dreamerSes}`)
         continue
       }
       if (alive === null) continue // неизвестно — не решаем
       // 404/400: дример-сессия удалена → spawn-fallback
-      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${tracked.dreamerSes?.slice(0, 8)} мертва — пересоздание`)
+      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
       tracked.dreamerSes = null
     }
     if (DRY_RUN) {
