@@ -82,7 +82,7 @@ describe("post() wave-дисциплина", () => {
         throw new TypeError("connect ECONNREFUSED")
       }
       throw new Error(`mock: неожиданный путь ${input}`)
-    }) as typeof fetch
+    }) as unknown as typeof fetch
 
     await mcp.tool("find_doc_by_title", { title: "x" }).catch(() => undefined)
     expect(kernelHits).toBeGreaterThan(0)

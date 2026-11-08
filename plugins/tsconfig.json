@@ -18,12 +18,8 @@
     "sticky-retry/index.ts",
     "sticky-retry/contract.ts",
     "sticky-retry/tui.tsx",
-    "arkive/tui.tsx",
     "../lib/goal-lib.ts",
     "../tests/goal-mode.test.ts",
-    "../plugins-tests/sticky-retry.test.ts",
-    "../plugins-tests/sticky-retry-contract.test.ts",
-    "../plugins-tests/sticky-retry-forwarder.test.ts",
     "qlty-review.ts",
     "../lib/qlty-review.ts",
     "../lib/qlty-review.test.ts"
