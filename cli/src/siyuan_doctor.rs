@@ -634,11 +634,13 @@ async fn fs_sql_probe(sy: &SiYuan) -> ProbeOutcome {
 
 /// Событие сноса из FS-истории ядра: docId — стем .sy файла, тайтл —
 /// Properties.title стаба (стаб без Content: ключи ID, Spec, Type,
-/// Properties, Children).
+/// Properties, Children); snapshot_at — mtime каталога снапшота (окно
+/// сноса) для порядка сводки — свежие первыми.
 #[derive(Debug)]
 pub(crate) struct DeleteEvent {
     pub doc_id: String,
     pub title: Option<String>,
+    pub snapshot_at: SystemTime,
 }
 
 /// Каталог снапшота истории `<YYYY-MM-DD-HHMMSS>-<op>`; события сноса —
@@ -670,13 +672,14 @@ fn delete_title(path: &std::path::Path) -> Option<String> {
 /// ноутбук/родители/лист).
 fn collect_snapshot_events(
     dir: &std::path::Path,
+    snapshot_at: SystemTime,
     events: &mut Vec<DeleteEvent>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_snapshot_events(&path, events)?;
+            collect_snapshot_events(&path, snapshot_at, events)?;
         } else if path.extension().is_some_and(|ext| ext == "sy") {
             let doc_id = path
                 .file_stem()
@@ -686,10 +689,17 @@ fn collect_snapshot_events(
             events.push(DeleteEvent {
                 doc_id,
                 title: delete_title(&path),
+                snapshot_at,
             });
         }
     }
     Ok(())
+}
+
+/// Свежие сносы первыми: сэмпл сводки cap'ится, свежий снос тела
+/// задачи не должен срезаться хвостом старых событий.
+pub(crate) fn sort_events_newest_first(events: &mut [DeleteEvent]) {
+    events.sort_by_key(|e| std::cmp::Reverse(e.snapshot_at));
 }
 
 /// Сбор событий сноса из каталога истории воркспейса: каталоги
@@ -714,7 +724,8 @@ pub(crate) fn collect_delete_events(
         if !is_delete || !delete_in_window(entry.metadata()?.modified()?, now, window) {
             continue;
         }
-        collect_snapshot_events(&entry.path(), &mut events)?;
+        let snapshot_at = entry.metadata()?.modified()?;
+        collect_snapshot_events(&entry.path(), snapshot_at, &mut events)?;
     }
     Ok(events)
 }
@@ -752,7 +763,7 @@ fn history_deletes_probe() -> ProbeOutcome {
             )),
         );
     }
-    let events =
+    let mut events =
         match collect_delete_events(&history_dir, SystemTime::now(), HISTORY_DELETES_WINDOW) {
             Ok(events) => events,
             Err(e) => {
@@ -762,6 +773,7 @@ fn history_deletes_probe() -> ProbeOutcome {
                 )
             }
         };
+    sort_events_newest_first(&mut events);
     if events.is_empty() {
         return ProbeOutcome::new(HISTORY_DELETES, ProbeVerdict::Clean)
             .with_detail("сносов в окне нет".into());
@@ -781,8 +793,8 @@ mod tests {
     use super::{
         collect_delete_events, collect_sy_ids, delete_in_window, delete_sample, diff_id_lists,
         doc_updated_date, doctor_exit_code, fs_sql_pair_verdict, is_delete_snapshot_dir,
-        orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves, wave_verdict,
-        BoardChildDoc, ProbeOutcome, ProbeVerdict,
+        orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves,
+        sort_events_newest_first, wave_verdict, BoardChildDoc, ProbeOutcome, ProbeVerdict,
     };
     use crate::siyuan_task as syt;
     use std::collections::HashSet;
@@ -1138,14 +1150,17 @@ mod tests {
             super::DeleteEvent {
                 doc_id: "doc-1".into(),
                 title: Some("таймер бэкапов".into()),
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
             },
             super::DeleteEvent {
                 doc_id: "doc-2".into(),
                 title: None,
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
             },
             super::DeleteEvent {
                 doc_id: "doc-3".into(),
                 title: Some("третий".into()),
+                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
             },
         ];
         let text = delete_sample(&events, 2);
@@ -1153,5 +1168,25 @@ mod tests {
         assert!(text.contains("doc-2 (без тайтла)"), "{text}");
         assert!(text.contains("…+1"), "{text}");
         assert!(!text.contains("третий"), "{text}");
+    }
+
+    #[test]
+    fn sort_events_newest_first_puts_fresh_snapshot_ahead() {
+        let now = std::time::SystemTime::now();
+        let mut events = vec![
+            super::DeleteEvent {
+                doc_id: "old".into(),
+                title: None,
+                snapshot_at: now - Duration::from_secs(3600),
+            },
+            super::DeleteEvent {
+                doc_id: "fresh".into(),
+                title: None,
+                snapshot_at: now,
+            },
+        ];
+        sort_events_newest_first(&mut events);
+        assert_eq!(events[0].doc_id, "fresh");
+        assert_eq!(events[1].doc_id, "old");
     }
 }
