@@ -74,6 +74,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         stdin,
         attach,
         schedule,
+        agent,
         dry_run: true,
     } = command
     {
@@ -89,6 +90,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         if let Some(expr) = schedule.as_deref() {
             crate::schedule::validate_schedule(expr)?;
             println!("расписание: {expr} (будет записано атрибутом custom-schedule дока-тела)");
+        }
+        // --agent валидируется и в осмотре: флаг не молчит (паритет schedule)
+        if let Some(name) = agent.as_deref() {
+            if name.is_empty() {
+                anyhow::bail!("на create пустой агент бессмысленен — убери --agent; снятие: task edit <id> --agent \"\"");
+            }
+            syt::validate_agent_name(name)?;
+            println!("агент: {name} (будет записан атрибутом custom-agent дока-тела)");
         }
         println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
@@ -195,6 +204,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     if let Some(schedule) = attrs.get("custom-schedule") {
                         println!("Расписание: {schedule} (крон: файр в статусе Вейт)");
                     }
+                    if let Some(agent) = attrs.get("custom-agent") {
+                        println!("Агент: {agent} (вечная сессия крона)");
+                    }
                 }
             }
             if !no_body {
@@ -222,6 +234,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             stdin,
             attach,
             schedule,
+            agent,
             ..
         } => {
             let attach_files = validate_attach_files(&attach)?;
@@ -243,6 +256,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     );
                 }
                 crate::schedule::validate_schedule(expr)?;
+            }
+            if let Some(name) = agent.as_deref() {
+                if name.is_empty() {
+                    anyhow::bail!(
+                        "на create пустой агент бессмысленен — убери --agent; снятие: task edit <id> --agent \"\""
+                    );
+                }
+                syt::validate_agent_name(name)?;
             }
             // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
             // должен грузить ассеты впустую (внутренний чек create остаётся
@@ -290,6 +311,18 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 })?;
                 syt::sync_schedule_cell(&sy, &board, &item, expr).await?;
             }
+            if let Some(name) = agent.as_deref() {
+                // сбой после create не теряет задачу: атрибут доставляется
+                // повторным task edit --agent (создание уже свершилось)
+                sy.set_block_attr(&body, "custom-agent", name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "задача создана (строка {item}, тело {body}), но агент \
+                             не записан — доставь: task edit {item} --agent \"{name}\""
+                        )
+                    })?;
+            }
             if !uploaded.is_empty() {
                 let refs = attach_refs_md(&uploaded);
                 sy.append_block_md(&body, &refs).await.with_context(|| {
@@ -314,6 +347,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             branch,
             r#type: ty,
             schedule,
+            agent,
             planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
@@ -378,6 +412,25 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
                 if expr.is_empty() {
                     println!("расписание снято: {}", task.title);
+                }
+            }
+            if let Some(name) = agent.as_deref() {
+                // пустая строка = снятие атрибута (мастер файрится
+                // изолированными спавнами); валидация — только непустого
+                if !name.is_empty() {
+                    syt::validate_agent_name(name)?;
+                }
+                let body = syt::task_body_doc(&sy, &board, &task)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "строка «{}» без тела (detached) — агенту некуда записаться",
+                            task.title
+                        )
+                    })?;
+                sy.set_block_attr(&body, "custom-agent", name).await?;
+                if name.is_empty() {
+                    println!("агент снят: {}", task.title);
                 }
             }
             println!(
@@ -1211,7 +1264,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
     let board = syt::find_board(sy, project).await?;
     let rows = syt::read_rows(sy, &board).await?;
     let state = read_cron_state();
-    let mut masters: Vec<(String, String, String, String, String)> = Vec::new();
+    let mut masters: Vec<(String, String, String, String, String, String)> = Vec::new();
     for r in &rows {
         let Some(doc) = r.body_doc.as_deref() else {
             continue;
@@ -1232,6 +1285,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
         let Some(schedule) = attrs.get("custom-schedule") else {
             continue;
         };
+        let agent = attrs.get("custom-agent").cloned().unwrap_or_default();
         let last_run = state
             .crons
             .get(&r.item_id)
@@ -1250,6 +1304,7 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
             r.item_id.chars().take(12).collect(),
             truncate(&r.title, 26),
             truncate(schedule, 13),
+            truncate(&agent, 12),
             last_run,
         ));
     }
@@ -1258,11 +1313,14 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<10} {:<12} {:<28} {:<14} LAST RUN",
-        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE"
+        "{:<10} {:<12} {:<28} {:<14} {:<13} LAST RUN",
+        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE", "AGENT"
     );
     for m in masters {
-        println!("{:<10} {:<12} {:<28} {:<14} {}", m.0, m.1, m.2, m.3, m.4);
+        println!(
+            "{:<10} {:<12} {:<28} {:<14} {:<13} {}",
+            m.0, m.1, m.2, m.3, m.4, m.5
+        );
     }
     Ok(())
 }
@@ -4343,6 +4401,7 @@ mod tests {
                 stdin: false,
                 attach: attach.to_vec(),
                 schedule: None,
+                agent: None,
                 dry_run: false,
             },
         )

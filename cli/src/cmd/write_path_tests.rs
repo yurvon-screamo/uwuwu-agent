@@ -163,6 +163,7 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
                 stdin: false,
                 attach: Vec::<std::path::PathBuf>::new(),
                 schedule: None,
+                agent: None,
                 dry_run: false,
             },
         )
@@ -378,6 +379,7 @@ async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> a
             branch: None,
             r#type: ty.map(String::from),
             schedule: None,
+            agent: None,
             planned: None,
         },
     )

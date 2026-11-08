@@ -550,6 +550,30 @@ pub fn validate_task_type(raw: &str) -> Result<String> {
     }
 }
 
+/// Имя базового агента opencode для вечной сессии крона: slug из дефов
+/// `~/.config/opencode/agents/<name>.md`. Существование дефа не проверяется
+/// здесь — дефы живут на машине демона, не у CLI-клиента (демон отказывает
+/// комментом при отсутствии на файре).
+pub fn validate_agent_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        bail!(
+            "имя агента «{raw}» не разобрано: жди slug дефа из ~/.config/opencode/agents/ \
+             (строчные буквы, цифры, дефис; дефис не первый) — как имя файла .md без расширения"
+        )
+    }
+}
+
 /// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
 /// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
 /// (время файра), в клетке живут с минутной точностью — формат сравнения
@@ -2100,6 +2124,21 @@ mod tests {
             "суть отказа: {err}"
         );
         assert!(validate_task_type("").is_err(), "пустой тип — отказ");
+    }
+
+    #[test]
+    fn validate_agent_name_accepts_slug_and_rejects_the_rest() {
+        assert_eq!(validate_agent_name("lead").unwrap(), "lead");
+        assert_eq!(
+            validate_agent_name(" code-quality-reviewer ").unwrap(),
+            "code-quality-reviewer"
+        );
+        assert_eq!(validate_agent_name("tester2").unwrap(), "tester2");
+        let err = validate_agent_name("").unwrap_err().to_string();
+        assert!(err.contains("slug дефа"), "суть отказа: {err}");
+        assert!(validate_agent_name("-lead").is_err(), "дефис не первый");
+        assert!(validate_agent_name("Lead").is_err(), "только строчные");
+        assert!(validate_agent_name("l ead").is_err(), "пробелы не slug");
     }
 
     /// Расширенный канон делит костяки существующих: analys ≡ spike,
