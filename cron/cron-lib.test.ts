@@ -157,8 +157,8 @@ describe("firePrompt", () => {
 
 describe("fireGate: файр только по живой Вейт-строке свежего среза", () => {
   const rows = [
-    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", plannedMs: null, scheduleCell: "", status: "вейт" },
-    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", plannedMs: null, scheduleCell: "", status: "in progress" },
+    { rowId: "alive", bodyDoc: "d", title: "T", schedule: "5m", agent: "", plannedMs: null, scheduleCell: "", status: "вейт" },
+    { rowId: "moved", bodyDoc: "d", title: "T", schedule: "5m", agent: "", plannedMs: null, scheduleCell: "", status: "in progress" },
   ]
   test("строка снята — removed, файра нет", () => {
     expect(fireGate(rows, "gone")).toBe("removed")
@@ -327,7 +327,7 @@ describe("cellPatches: расхождение клеток мастера", () =
   const at = (y: number, m: number, d: number, h: number, min: number) => new Date(y, m - 1, d, h, min)
   const row = (over: Record<string, unknown> = {}) => ({
     rowId: "row-1", bodyDoc: "doc-1", title: "мастер", schedule: "6h",
-    plannedMs: null, scheduleCell: "", status: "вейт", ...over,
+    agent: "", plannedMs: null, scheduleCell: "", status: "вейт", ...over,
   })
   const sched = mustParse("6h")
 
