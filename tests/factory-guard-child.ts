@@ -14,7 +14,7 @@
 //                ре-спавн компенсирует (автокомпенсация lossMax-допуска).
 // HOME задаются родителем ДО старта процесса: os.homedir() в bun читает env
 // только на старте (инцидент 06.11: тест с runtime-HOME ходил в прод-state).
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -261,6 +261,15 @@ const calls = scriptTick()
 const { tickProject } = await import("../factory/factory")
 await tickProject(state, "t", { board: "Задачи x", repo: "r/x", local: SCENARIO === "claim-dead" ? localCheckout : "/tmp/x" })
 
+// очередь сигналов дримеру (UWUWU_DREAMER_QUEUE_DIR от родителя): имя → контент
+const queueDir = process.env.UWUWU_DREAMER_QUEUE_DIR ?? ""
+const queueSignals: Record<string, string> = {}
+try {
+  for (const name of readdirSync(queueDir)) {
+    if (name.endsWith(".json")) queueSignals[name] = readFileSync(join(queueDir, name), "utf-8")
+  }
+} catch { /* очередь не создавалась — фабрика не писала сигналы */ }
+
 const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   tasks: Record<string, unknown>
   holdSignaled?: string
@@ -274,4 +283,5 @@ console.log(JSON.stringify({
   prompts: calls.filter((c) => c === "prompt").length,
   comments: calls.filter((c) => c.startsWith("comment:")).map((x) => x.slice("comment:".length)),
   itemUpdates: calls.filter((c) => c.startsWith("item_update:")).map((x) => x.slice("item_update:".length)),
+  queueSignals,
 }))

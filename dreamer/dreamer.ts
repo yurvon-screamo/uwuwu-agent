@@ -6,16 +6,23 @@
 // — задача \UWUWU\Dreamer: старт при логоне + повтор каждую минуту, живой
 // инстанс отсекается IgnoreNew). Тик: 1 мин.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
 import {
-  applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions, fetchSessionById,
+  applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions,
   hasAssistantReply, hasAssistantReplySince, idleBefore, isInPeakWindow, markBacklog,
   normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
   type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
+import {
+  acceptDoneSignal, applyTaskRunOutcome, batchMaxUpdated, collectTaskSessions,
+  dropTaskActiveSessions, mergeActiveSession, normalizeActiveSessions,
+  normalizeTrackedRun, parseQueuedSignal, pickTaskRunCandidates, taskRunPrompt,
+  type TaskDoneSignal, type TrackedTaskRun,
+} from "./task-run-lib"
+import { fetchSessionById, sessionTimedOut } from "./session-row"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 
 // state: песочница — UWUWU_DREAMER_STATE_DIR двигает state+lock, в песочнице
@@ -35,6 +42,11 @@ const LOG_PATH = daemonLogPath({
   stateDir: STATE_DIR, sandboxed: STATE_RESOLVED.sandboxed,
   fileName: "uwuwu-dreamer.log", homeDir: homedir(),
 })
+/** Очередь сигналов фабрики (start/done): прод-дефолт — state дримера;
+ *  env-оверрайд общий с фабрикой (она пишет, дример забирает) — тесты
+ *  уводят оба в одну tmp-песочницу. */
+const QUEUE_DIR = process.env.UWUWU_DREAMER_QUEUE_DIR
+  ?? join(STATE_DIR, "queue")
 const SERVICE_REG = join(homedir(), ".local/state/opencode/service.json")
 
 const DB_PATH = process.env.UWUWU_DREAMER_DB
@@ -79,6 +91,7 @@ function loadState(): DreamerState {
   try {
     const raw: unknown = JSON.parse(readFileSync(STATE_FILE, "utf-8"))
     const sessions = (raw as { sessions?: unknown }).sessions
+    const taskRuns = (raw as { taskRuns?: unknown }).taskRuns
     const out = emptyState()
     out.bootstrapped = (raw as { bootstrapped?: unknown }).bootstrapped === true
     if (sessions !== null && typeof sessions === "object") {
@@ -88,6 +101,14 @@ function loadState(): DreamerState {
         else log(`state: запись ${k.slice(0, 8)} битая — пропущена`)
       }
     }
+    if (taskRuns !== null && typeof taskRuns === "object") {
+      for (const [k, v] of Object.entries(taskRuns as Record<string, unknown>)) {
+        const normalized = normalizeTrackedRun(v)
+        if (normalized !== null) out.taskRuns[k] = normalized
+        else log(`state: задачный трек ${k.slice(0, 8)} битый — пропущен`)
+      }
+    }
+    out.activeSessions = normalizeActiveSessions((raw as { activeSessions?: unknown }).activeSessions)
     return out
   } catch {
     return emptyState()
@@ -123,13 +144,19 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   return (j as { data?: unknown }).data ?? j
 }
 
-/** Спавн дочерней сессии дримера: parentID наследует локацию (cwd проекта)
- *  и связывает пары «сессия ↔ её анализ» в дереве сессий. */
-async function fireDreamer(sid: string, title: string, prompt: string): Promise<string | null> {
+/** Спавн дочерней сессии дримера. Посессионный прогон: parentID наследует
+ *  локацию (cwd проекта) и связывает пары «сессия ↔ её анализ» в дереве.
+ *  Задачный прогон: directory = мастер-чекаут проекта (env задачи к моменту
+ *  прогона снесён), parentID не задаётся — наследование локации родителем
+ *  побеждает явный location. */
+async function fireDreamer(
+  sid: string | null, directory: string, title: string, prompt: string,
+): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      parentID: sid,
+      ...(sid !== null ? { parentID: sid } : {}),
+      ...(directory !== "" ? { location: { directory } } : {}),
       agent: AGENT_ID,
       model: { providerID: MODEL.providerID, id: MODEL.id, variant: MODEL.variant },
       title: `💭 ${title.replace(/[\r\n]+/g, " ").slice(0, 60)}`,
@@ -176,11 +203,7 @@ async function sessionAlive(sessionID: string): Promise<boolean | null> {
 
 /** time_updated сессии дримера: живая, но молчащая дольше таймаута = зависла. */
 function dreamerTimedOut(db: Database, dreamerSes: string): boolean {
-  const row = db
-    .query(`SELECT time_updated FROM session_v2 WHERE id = ?`)
-    .get(dreamerSes) as { time_updated: number } | null
-  if (row === null) return false // сессии нет в БД — прогон закрыт реконсилиацией
-  return Date.now() - row.time_updated > RUN_TIMEOUT_MS
+  return sessionTimedOut(db, dreamerSes, RUN_TIMEOUT_MS)
 }
 
 // ——— тик ———
@@ -204,9 +227,183 @@ function startRun(
   return tracked
 }
 
+// ——— очередь сигналов фабрики ———
+
+/** Забор очереди: start — мерж в активный набор (посессионный контур скипает
+ *  эти сессии), done — постановка задачного прогона. Семантика done — «файл
+ *  живёт до потребления»: при pending/running треке файл остаётся и доедет
+ *  после освобождения слота (повторный Done при живом цикле-1 не теряется).
+ *  Start-файлы обрабатываются до done: start спавна всегда предшествует
+ *  закрытию задачи. */
+async function pollQueue(state: DreamerState): Promise<void> {
+  let names: string[]
+  try {
+    names = readdirSync(QUEUE_DIR)
+  } catch {
+    return // очередь не создана — фабрика ещё не писала
+  }
+  const files = names.filter((n) => n.endsWith(".json")).sort()
+  for (const pass of ["start", "done"] as const) {
+    for (const name of files) {
+      if (!name.startsWith(`${pass}-`)) continue
+      const tracked = state.taskRuns[name.slice(pass.length + 1, -".json".length)]
+      if (pass === "done" && tracked !== undefined
+          && (tracked.status === "pending" || tracked.status === "running")) {
+        continue // файл живёт до потребления — ретрай следующим тиком
+      }
+      let content: string
+      try {
+        content = readFileSync(join(QUEUE_DIR, name), "utf-8")
+      } catch (e) {
+        log(`очередь: ${name} не прочитан — ${e} — ретрай следующим тиком`)
+        continue
+      }
+      const parsed = parseQueuedSignal(name, content)
+      if (parsed === null) {
+        log(`очередь: ${name} битый/чужой файл — удалён`)
+        unlinkSilent(name)
+        continue
+      }
+      if (parsed.kind === "start") {
+        applyStartSignal(state, parsed.signal, name)
+      } else {
+        applyDoneSignal(state, parsed.signal, name)
+      }
+    }
+  }
+}
+
+function unlinkSilent(name: string): void {
+  if (DRY_RUN) return
+  try { unlinkSync(join(QUEUE_DIR, name)) } catch { /* уже нет — не страшно */ }
+}
+
+/** Start-сигнал: сессия задачи известна активному набору. Запоздалый сигнал
+ *  закрытого цикла (дример лежал весь цикл задачи) — скип без мержа: иначе
+ *  набор не снялся бы никогда. */
+function applyStartSignal(
+  state: DreamerState, signal: { rowId: string; sessionID: string; ts: number }, name: string,
+): void {
+  const tracked = state.taskRuns[signal.rowId]
+  const stale = tracked !== undefined
+    && (tracked.status === "done" || tracked.status === "gave_up")
+    && signal.ts < tracked.closedAt
+  if (stale) {
+    log(`очередь: ${name} — запоздалый start закрытого цикла, скип`)
+  } else {
+    mergeActiveSession(state.activeSessions, signal.sessionID, signal.rowId)
+    log(`очередь: ${name} — сессия ${signal.sessionID.slice(0, 8)} в активном наборе ${signal.rowId.slice(0, 8)}`)
+  }
+  unlinkSilent(name)
+}
+
+/** Done-сигнал: постановка задачного прогона. done/gave_up трек — новый цикл
+ *  (переоткрытие задачи); pending/running — файл остаётся (см. pollQueue). */
+function applyDoneSignal(state: DreamerState, signal: TaskDoneSignal, name: string): void {
+  if (DRY_RUN) {
+    log(`DRY_RUN: done-сигнал ${signal.rowId.slice(0, 8)} — трек не пишется, файл остаётся`)
+    return
+  }
+  const prev = state.taskRuns[signal.rowId]
+  state.taskRuns[signal.rowId] = acceptDoneSignal(prev, signal, Date.now())
+  unlinkSilent(name)
+  log(`очередь: ${name} — задачный прогон поставлен (${prev === undefined ? "новый" : "новый цикл"}, сессий-корней: ${signal.rootSessions.length})`)
+  saveState(state)
+}
+
+// ——— задачные прогоны ———
+
+/** Сборка промпта задачного прогона из трека (входы тулов — константы демона). */
+function taskRunPromptFor(
+  rowId: string, tracked: TrackedTaskRun, sessions: ReturnType<typeof collectTaskSessions>, retry: boolean,
+): string {
+  return taskRunPrompt({
+    rowId,
+    project: tracked.project,
+    title: tracked.title,
+    branch: tracked.branch,
+    pr: tracked.pr,
+    directory: tracked.directory,
+    lastProcessedUpdate: tracked.lastProcessedUpdate,
+    sessions,
+    auditPath: AUDIT_PATH,
+    wikiOpsPath: WIKI_OPS_PATH,
+    dbPath: DB_PATH,
+    retry,
+  })
+}
+
+/** Открыть задачный прогон: собрать пакет сессий, спавнить дример-сессию
+ *  в мастер-чекауте проекта (без parentID — env снесён). Границу дедупа
+ *  продвигает ТОЛЬКО финал прогона (applyTaskRunOutcome по replied): при
+ *  провале граница не должна врать «пакет анализировался». */
+async function startTaskRun(state: DreamerState, db: Database, rowId: string, tracked: TrackedTaskRun): Promise<void> {
+  const sessions = collectTaskSessions(db, tracked.rootSessions)
+  if (sessions.length === 0) {
+    // история корней указывает на несуществующие сессии (чистка БД руками
+    // владельца) — нечего анализировать, честный done без прогона
+    tracked.status = "done"
+    tracked.at = Date.now()
+    dropTaskActiveSessions(state.activeSessions, rowId)
+    saveState(state)
+    log(`задача ${rowId.slice(0, 8)}: сессий по истории корней нет в БД — прогон закрыт без анализа`)
+    return
+  }
+  tracked.status = "running"
+  tracked.at = Date.now()
+  saveState(state)
+  const dreamerSes = await fireDreamer(null, tracked.directory, tracked.title || "задача", taskRunPromptFor(rowId, tracked, sessions, false))
+  if (dreamerSes === null) {
+    tracked.attempts += 1
+    tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
+    tracked.at = Date.now()
+    log(`задача ${rowId.slice(0, 8)}: дример не поднялся (попытка ${tracked.attempts})`)
+    if (tracked.status === "gave_up") dropTaskActiveSessions(state.activeSessions, rowId)
+    saveState(state)
+    return
+  }
+  tracked.status = "running"
+  tracked.dreamerSes = dreamerSes
+  tracked.at = Date.now()
+  log(`задача ${rowId.slice(0, 8)}: задачный прогон — дример ${dreamerSes} (${sessions.length} сессий в пакете)`)
+  saveState(state)
+}
+
+/** Реконсил живых задачных прогонов: паритет посессионного, финал снимает
+ *  активный набор (done — сессии обработаны пакетом; gave_up — fallback
+ *  посессионной пост-обработки). Никаких DELETE: сессии остаются в БД. */
+async function reconcileTaskRuns(state: DreamerState, db: Database): Promise<void> {
+  const running = Object.entries(state.taskRuns).filter(([, t]) => t.status === "running")
+  for (const [rowId, tracked] of running) {
+    if (tracked.dreamerSes === null) continue
+    if (Date.now() - tracked.at < GRACE_MS) continue
+    const finished = await sessionFinished(tracked.dreamerSes)
+    if (finished === null) continue
+    const timedOut = !finished && dreamerTimedOut(db, tracked.dreamerSes)
+    if (!finished && !timedOut) continue
+    const replied = tracked.wokenAt > 0
+      ? hasAssistantReplySince(db, tracked.dreamerSes, tracked.wokenAt)
+      : hasAssistantReply(db, tracked.dreamerSes)
+    const batchMax = batchMaxUpdated(collectTaskSessions(db, tracked.rootSessions))
+    const result = applyTaskRunOutcome(tracked, batchMax, { replied, dead: finished, timedOut }, MAX_ATTEMPTS)
+    if (result === "failed" || result === "gave_up") {
+      // зависший дример может доплывать и писать в вики вне контроля state —
+      // гасим его (сессии задачи остаются в БД по решению владельца)
+      await restCall(`/session/${tracked.dreamerSes}`, { method: "DELETE" }).catch(() => {})
+      tracked.dreamerSes = null
+    }
+    if (result === "done" || result === "gave_up") {
+      dropTaskActiveSessions(state.activeSessions, rowId)
+    }
+    log(`задачный прогон ${rowId.slice(0, 8)} → ${result} (replied=${replied}${timedOut ? ", timeout" : ""})`)
+    saveState(state)
+  }
+}
+
 async function tick(state: DreamerState, db: Database): Promise<void> {
   const now = Date.now()
-  const sessions = fetchRootSessions(db, idleBefore(now, IDLE_MS))
+  await pollQueue(state)
+  const sessions = fetchRootSessions(db, idleBefore(now, IDLE_MS), 200, state.activeSessions)
 
   if (!state.bootstrapped) {
     const cutoff = now - BACKLOG_DAYS * 86_400_000
@@ -270,6 +467,11 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     saveState(state)
   }
 
+  // ——— реконсил задачных прогонов (паритет посессионного; финал снимает
+  //     активный набор — сессии задачи обработаны пакетом или отдаются
+  //     посессионному fallback'у при gave_up) ———
+  await reconcileTaskRuns(state, db)
+
   // ——— кандидаты: wakeup существующей дример-сессии или спавн новой ———
   // Пиковое окно провайдера (дефолт 15:00–19:00 локального времени): новые
   // запуски запрещены — очередь копится, разряжается после конца окна.
@@ -277,12 +479,19 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
   const peak = parsePeakWindow(process.env.UWUWU_DREAMER_PEAK)
   if (peak !== null && isInPeakWindow(new Date(), peak)) {
     const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
-    log(`пиковое окно ${peak.startHour}:00–${peak.endHour}:00: запуски приостановлены (${candidates.length} в очереди)`)
+    const taskPending = Object.values(state.taskRuns).filter((t) => t.status === "pending").length
+    log(`пиковое окно ${peak.startHour}:00–${peak.endHour}:00: запуски приостановлены (${candidates.length + taskPending} в очереди)`)
     return
   }
   const candidates = pickCandidates(sessions, state, MAX_ATTEMPTS)
+  // слот = дример-сессия, реально живущая в опенкоде (running). Pending —
+  // очередь, не слот: задачный трек стоит pending между тиками (done-сигнал
+  // ставит, спавн делает этот же тик) — счёт его в слоте с CONCURRENCY=1
+  // блокировал спавн самим собой навсегда (баг-репорт тестирования 09.11).
+  // Спавн в цикле кандидатов сразу ставит running — слот уважается.
   const activeRuns = (): number =>
-    Object.values(state.sessions).filter((t) => t.status === "running" || t.status === "pending").length
+    Object.values(state.sessions).filter((t) => t.status === "running").length +
+    Object.values(state.taskRuns).filter((t) => t.status === "running").length
   log(`очередь: ${candidates.length} кандидатов, активных прогонов: ${activeRuns()}`)
   for (const cand of candidates) {
     if (activeRuns() >= CONCURRENCY) break
@@ -340,7 +549,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
       dbPath: DB_PATH,
     })
     const tracked = startRun(state, cand.session.id, cand.session.timeUpdated, cand.resetAttempts ? 0 : (prev?.attempts ?? 0))
-    const dreamerSes = await fireDreamer(cand.session.id, cand.session.title ?? "сессия", prompt)
+    const dreamerSes = await fireDreamer(cand.session.id, "", cand.session.title ?? "сессия", prompt)
     if (dreamerSes === null) {
       // спавн не удался: это тоже попытка — иначе вечный цикл
       tracked.attempts += 1
@@ -356,6 +565,54 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример ${dreamerSes}`)
     saveState(state)
   }
+
+  // ——— задачные кандидаты: pending и failed-ретраи (паритет посессионного
+  //     pickCandidates "retry"). Слот общий с посессионными прогонами; ретрай —
+  //     wakeup живой дример-сессии (инвариант 1=1), spawn при мёртвой/отсутствующей.
+  //     Граница дедупа и активный набор живут до финала прогона —
+  //     applyTaskRunOutcome/dropTaskActiveSessions на done/gave_up. ———
+  for (const cand of pickTaskRunCandidates(state.taskRuns, MAX_ATTEMPTS)) {
+    const { rowId, tracked } = cand
+    if (activeRuns() >= CONCURRENCY) break
+    if (drain.isStopping()) break
+    if (cand.action === "wakeup" && tracked.dreamerSes !== null) {
+      const dreamerSes = tracked.dreamerSes
+      // верификация живости: либа детерминирована от state, REST — здесь;
+      // гвард dreamerSes локальный — инвариант «wakeup ⇒ сессия есть» живёт
+      // в адмиссии другого модуля, кросс-модульной зависимости не строим
+      const alive = await sessionAlive(dreamerSes)
+      if (alive === true) {
+        // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
+        // закроет как failed+attempt, восстановления без потерь)
+        tracked.status = "running"
+        tracked.wokenAt = Date.now()
+        tracked.at = tracked.wokenAt
+        saveState(state)
+        const prompt = taskRunPromptFor(rowId, tracked, collectTaskSessions(db, tracked.rootSessions), true)
+        const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
+        if (!ok) {
+          tracked.attempts += 1
+          tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
+          tracked.at = Date.now()
+          log(`задача ${rowId.slice(0, 8)}: задачный wakeup упал (попытка ${tracked.attempts})`)
+          if (tracked.status === "gave_up") dropTaskActiveSessions(state.activeSessions, rowId)
+          saveState(state)
+          continue
+        }
+        log(`задача ${rowId.slice(0, 8)}: задачный wakeup дримера ${dreamerSes}`)
+        continue
+      }
+      if (alive === null) continue // неизвестно — не решаем
+      // 404/400: дример-сессия удалена → spawn-fallback
+      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
+      tracked.dreamerSes = null
+    }
+    if (DRY_RUN) {
+      log(`DRY_RUN: задачный прогон над ${rowId.slice(0, 8)} — пропущен`)
+      continue
+    }
+    await startTaskRun(state, db, rowId, tracked)
+  }
 }
 
 async function main(): Promise<void> {
@@ -364,7 +621,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   mkdirSync(dirname(LOG_PATH), { recursive: true })
-  log(`uwuwu-dreamer: старт (tick=${TICK_SEC}s, idle=${IDLE_MS / 60_000}м, model=${MODEL.id}#${MODEL.variant}, db=${DB_PATH}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-dreamer: старт (tick=${TICK_SEC}s, idle=${IDLE_MS / 60_000}м, model=${MODEL.id}#${MODEL.variant}, db=${DB_PATH}, queue=${QUEUE_DIR}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
   emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
