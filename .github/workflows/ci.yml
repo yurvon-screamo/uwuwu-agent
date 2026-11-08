@@ -48,6 +48,30 @@ jobs:
         working-directory: cli
         run: cargo test
 
+      # TS-слой (plugins + пер-директорные агенты): tsc-гейт и bun-тесты.
+      # Пин версии = версия машин разработчиков (локи сгенерированы ею);
+      # плавающий latest = невоспроизводимые раны.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+
+      - name: bun install (ts-контуры)
+        run: |
+          for d in plugins factory cron dreamer lead triage; do
+            (cd "$d" && bun install --frozen-lockfile)
+          done
+
+      - name: typecheck (tsc --noEmit, все ts-контуры)
+        run: |
+          for d in plugins factory cron dreamer lead triage; do
+            (cd "$d" && bun run typecheck)
+          done
+
+      # bun test из корня гоняет все контуры (lib/tests + тесты агентов);
+      # интеграционные тесты само-гвардятся и скипаются без живого ядра.
+      - name: bun test
+        run: bun test
+
       - name: Install qlty
         run: curl -sSfL https://qlty.sh | sh
 
