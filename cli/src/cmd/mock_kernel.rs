@@ -183,6 +183,9 @@ pub(crate) struct MockScenario {
     pub(crate) board_children: Vec<(&'static str, Vec<BoardChild>)>,
     /// true — SQL-запрос детей доски отвечает HTTP 500 (честный SKIP пробы).
     pub(crate) sql_children_fail: bool,
+    /// true — SQL-дискавери реестра досок («Задачи %») отвечает HTTP 500
+    /// (history-deletes деградирует к полному перечислению без классификации).
+    pub(crate) sql_boards_fail: bool,
 }
 
 impl Default for MockScenario {
@@ -225,6 +228,7 @@ impl Default for MockScenario {
             block_attrs: Vec::new(),
             board_children: Vec::new(),
             sql_children_fail: false,
+            sql_boards_fail: false,
         }
     }
 }
@@ -787,6 +791,10 @@ impl MockKernel {
         // дискавери досок задач (глобальный резолв без --project): hpath
         // сценария фильтруются той же конвенцией, что парсит резолв
         if stmt.contains("content like 'Задачи %'") {
+            if self.sc.sql_boards_fail {
+                // синтаксически валидный stmt — отказ ядра как HTTP 500
+                return json!({ "__sql_fail__": true });
+            }
             let mut hits: Vec<Value> = self
                 .sc
                 .hpath_ids

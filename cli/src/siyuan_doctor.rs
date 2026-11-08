@@ -277,8 +277,17 @@ pub(crate) async fn run(sy: &SiYuan, project: &str, since_min: u64) -> Vec<Probe
     });
 
     // Чисто FS-проба: вне kernel-гейта — след сноса в истории воркспейса
-    // переживает смерть ядра.
-    outcomes.push(history_deletes_probe());
+    // переживает смерть ядра. Реестр досок для классификации — kernel-зависимая
+    // часть: недоступен → деградация к полному перечислению без разметки.
+    let task_boards = if kernel_alive {
+        match syt::task_board_root_ids(sy).await {
+            Ok(ids) => TaskBoards::Classified(ids),
+            Err(e) => TaskBoards::Unavailable(format!("реестр досок: {e}")),
+        }
+    } else {
+        TaskBoards::Unavailable("kernel недоступен".into())
+    };
+    outcomes.push(history_deletes_probe(&task_boards));
 
     outcomes
 }
@@ -641,6 +650,10 @@ pub(crate) struct DeleteEvent {
     pub doc_id: String,
     pub title: Option<String>,
     pub snapshot_at: SystemTime,
+    /// Id-цепочка пути снапшота от каталога снапшота до снесённого дока.
+    /// Живой SQL снесённый док уже не вернёт — путь единственный свидетель
+    /// принадлежности поддереву доски задач (ADR-072).
+    pub path_ids: Vec<String>,
 }
 
 /// Каталог снапшота истории `<YYYY-MM-DD-HHMMSS>-<op>`; события сноса —
@@ -669,27 +682,33 @@ fn delete_title(path: &std::path::Path) -> Option<String> {
 }
 
 /// Рекурсивный сбор событий из каталога снапшота (внутри — дерево
-/// ноутбук/родители/лист).
+/// ноутбук/родители/лист); chain — накопленная id-цепочка предков.
 fn collect_snapshot_events(
     dir: &std::path::Path,
     snapshot_at: SystemTime,
+    chain: &[String],
     events: &mut Vec<DeleteEvent>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_snapshot_events(&path, snapshot_at, events)?;
+            let mut child_chain = chain.to_vec();
+            child_chain.push(entry.file_name().to_string_lossy().into_owned());
+            collect_snapshot_events(&path, snapshot_at, &child_chain, events)?;
         } else if path.extension().is_some_and(|ext| ext == "sy") {
             let doc_id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
+            let mut path_ids = chain.to_vec();
+            path_ids.push(doc_id.clone());
             events.push(DeleteEvent {
                 doc_id,
                 title: delete_title(&path),
                 snapshot_at,
+                path_ids,
             });
         }
     }
@@ -725,9 +744,25 @@ pub(crate) fn collect_delete_events(
         if !is_delete || !delete_in_window(meta.modified()?, now, window) {
             continue;
         }
-        collect_snapshot_events(&entry.path(), meta.modified()?, &mut events)?;
+        collect_snapshot_events(&entry.path(), meta.modified()?, &[], &mut events)?;
     }
     Ok(events)
+}
+
+/// Снос поддерева доски задач: доска-предок в цепочке пути снапшота.
+/// Реестр — живые доски на момент прогона: снесённая доска в него не
+/// попадает, её собственный снос уходит в прочий оборот — событие не
+/// теряется, лишь не получает задачную метку.
+pub(crate) fn is_task_board_delete(event: &DeleteEvent, boards: &HashSet<String>) -> bool {
+    event.path_ids.iter().any(|id| boards.contains(id))
+}
+
+/// Реестр досок для классификации сносов. Classified — живой SQL-дискавери
+/// удался; Unavailable — реестра нет (ядро мертво или сбой дискавери) —
+/// деградация к полному перечислению без разметки.
+pub(crate) enum TaskBoards {
+    Classified(HashSet<String>),
+    Unavailable(String),
 }
 
 /// Формат события в OBSERVE-строке.
@@ -738,11 +773,9 @@ fn format_event(e: &DeleteEvent) -> String {
     }
 }
 
-/// OBSERVE-строка без cap: оборот сносов на живой доске 100+/сутки —
-/// сэмпл head-5 не доносит снос тела задачи до наблюдателя (ревью:
-/// потерянный док на 71-й позиции из 107). Канал «событие сноса →
-/// сводка lead» обязан работать целиком; цена — длинная строка при
-/// батч-чистках, осознанный компромисс наблюдения.
+/// Полный перечень событий через "; " — деградационная ветка форматтера:
+/// без классификации все события равнозначны, канал обязан работать целиком
+/// (без cap: оборот 100+/сутки не срезается).
 pub(crate) fn format_event_list(events: &[DeleteEvent]) -> String {
     events
         .iter()
@@ -751,11 +784,51 @@ pub(crate) fn format_event_list(events: &[DeleteEvent]) -> String {
         .join("; ")
 }
 
+/// OBSERVE-строка пробы. Classified: задачные сносы — полным перечнем
+/// (канал «снос тела задачи → сводка» работает целиком, без cap), прочий
+/// оборот — счётчиком. Unavailable: все события перечислением, как до
+/// классификации, с честной пометкой причины.
+pub(crate) fn format_delete_observation(events: &[DeleteEvent], boards: &TaskBoards) -> String {
+    match boards {
+        TaskBoards::Classified(boards) => {
+            let task_deletes: Vec<String> = events
+                .iter()
+                .filter(|e| is_task_board_delete(e, boards))
+                .map(format_event)
+                .collect();
+            let other_count = events.len() - task_deletes.len();
+            let text = if task_deletes.is_empty() {
+                if other_count > 0 {
+                    format!("сносы тел задач за окно: нет (прочий оборот: {other_count})")
+                } else {
+                    "сносы тел задач за окно: нет".to_string()
+                }
+            } else {
+                let mut text = format!(
+                    "сносы тел задач за окно: {} — {}",
+                    task_deletes.len(),
+                    task_deletes.join("; ")
+                );
+                if other_count > 0 {
+                    text.push_str(&format!("; прочий оборот: {other_count}"));
+                }
+                text
+            };
+            text
+        }
+        TaskBoards::Unavailable(reason) => format!(
+            "сносы доков за окно: {} — {} (классификация недоступна: {reason})",
+            events.len(),
+            format_event_list(events)
+        ),
+    }
+}
+
 /// Сносы доков за окно из истории воркспейса `<ws>/history`. Проба
 /// чисто FS: работает и при лежащем ядре, закрывает класс «снос мимо
 /// CLI-guard без следа» — undo-журнал cli такие сносы не пишет.
 /// Сносы — события/осадок, не деградация: OBSERVE, exit не трогает.
-fn history_deletes_probe() -> ProbeOutcome {
+fn history_deletes_probe(task_boards: &TaskBoards) -> ProbeOutcome {
     let history_dir = workspace_root().join("history");
     if !history_dir.is_dir() {
         return ProbeOutcome::new(
@@ -783,11 +856,7 @@ fn history_deletes_probe() -> ProbeOutcome {
     }
     ProbeOutcome::new(
         HISTORY_DELETES,
-        ProbeVerdict::Observed(format!(
-            "сносы доков за окно: {} — {}",
-            events.len(),
-            format_event_list(&events)
-        )),
+        ProbeVerdict::Observed(format_delete_observation(&events, task_boards)),
     )
 }
 
@@ -795,9 +864,10 @@ fn history_deletes_probe() -> ProbeOutcome {
 mod tests {
     use super::{
         collect_delete_events, collect_sy_ids, delete_in_window, diff_id_lists, doc_updated_date,
-        doctor_exit_code, format_event_list, fs_sql_pair_verdict, is_delete_snapshot_dir,
-        orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves,
+        doctor_exit_code, format_delete_observation, fs_sql_pair_verdict, is_delete_snapshot_dir,
+        is_task_board_delete, orphan_candidates, orphan_sample, report, scan_kernel_log_for_waves,
         sort_events_newest_first, wave_verdict, BoardChildDoc, ProbeOutcome, ProbeVerdict,
+        TaskBoards,
     };
     use crate::siyuan_task as syt;
     use std::collections::HashSet;
@@ -1112,6 +1182,14 @@ mod tests {
             lost.title.as_deref(),
             Some("SiYuan: таймер бэкапов воркспейса (rsync-restic)")
         );
+        // Id-цепочка пути снапшота — свидетель принадлежности поддереву
+        // доски (стаб в nb/parents/<id>.sy → "nb", "parents", docId).
+        assert_eq!(
+            lost.path_ids,
+            ["nb", "parents", "20261104033524-4d37yk0"],
+            "{:?}",
+            lost.path_ids
+        );
         let untitled = events
             .iter()
             .find(|e| e.doc_id == "20261104112902-uh1u34q")
@@ -1180,44 +1258,121 @@ mod tests {
     }
 
     #[test]
-    fn format_event_list_lists_every_event_without_cap() {
-        // Канал «событие сноса → сводка» обязан работать при реальном
-        // обороте: перечисление без cap — свежий снос тела задачи не
-        // срезается cap'ом (ревью: инцидент на 71-й позиции из 107).
+    fn format_delete_observation_unavailable_lists_every_event_without_cap() {
+        // Деградационная ветка (ядро мертво, реестра нет): канал «событие
+        // сноса → сводка» обязан работать при реальном обороте — перечисление
+        // без cap, свежий снос тела задачи не срезается (ревью: инцидент на
+        // 71-й позиции из 107).
         let events: Vec<super::DeleteEvent> = (1..=70)
-            .map(|n| super::DeleteEvent {
-                doc_id: format!("doc{n}"),
-                title: Some(format!("тайтл{n}")),
-                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
-            })
-            .chain([super::DeleteEvent {
-                doc_id: "lost".into(),
-                title: Some("таймер бэкапов".into()),
-                snapshot_at: std::time::SystemTime::UNIX_EPOCH,
-            }])
+            .map(|n| delete_event(&format!("doc{n}"), Some(&format!("тайтл{n}")), &["nb"]))
+            .chain([delete_event(
+                "lost",
+                Some("таймер бэкапов"),
+                &["nb", "board", "lost"],
+            )])
             .collect();
-        let text = format_event_list(&events);
+        let text = format_delete_observation(&events, &TaskBoards::Unavailable("offline".into()));
+        assert!(text.contains("сносы доков за окно: 71"), "{text}");
         assert!(text.contains("lost «таймер бэкапов»"), "{text}");
         assert!(text.contains("doc1 «тайтл1»"), "{text}");
         assert!(text.contains("doc70 «тайтл70»"), "{text}");
+        assert!(
+            text.contains("классификация недоступна: offline"),
+            "причина деградации названа: {text}"
+        );
         assert!(!text.contains("…+"), "без cap нет хвостовой метки: {text}");
+    }
+
+    #[test]
+    fn format_delete_observation_marks_task_body_delete_in_classified_mode() {
+        // Инцидентный сценарий в Classified-режиме: снос тела задачи (доска
+        // в цепочке пути) — отдельная видимая группа, прочий оборот — счётчик.
+        let events: Vec<super::DeleteEvent> = (1..=70)
+            .map(|n| delete_event(&format!("doc{n}"), Some(&format!("тайтл{n}")), &["nb"]))
+            .chain([delete_event(
+                "lost",
+                Some("таймер бэкапов"),
+                &["nb", "20261103233646-board", "lost"],
+            )])
+            .collect();
+        let boards: HashSet<String> = ["20261103233646-board".to_string()].into_iter().collect();
+        let text = format_delete_observation(&events, &TaskBoards::Classified(boards));
+        assert!(text.contains("сносы тел задач за окно: 1"), "{text}");
+        assert!(text.contains("lost «таймер бэкапов»"), "{text}");
+        assert!(text.contains("прочий оборот: 70"), "{text}");
+        assert!(!text.contains("doc70"), "прочий оборот — счётчиком: {text}");
+    }
+
+    #[test]
+    fn format_delete_observation_groups_all_task_deletes_and_omits_empty_other() {
+        // Все сносы задачные — «прочий оборот: 0» не шумит хвостом.
+        let events = vec![
+            delete_event("b1", Some("тело 1"), &["nb", "board", "b1"]),
+            delete_event("b2", None, &["nb", "board", "nested", "b2"]),
+        ];
+        let boards: HashSet<String> = ["board".to_string()].into_iter().collect();
+        let text = format_delete_observation(&events, &TaskBoards::Classified(boards));
+        assert_eq!(
+            text,
+            "сносы тел задач за окно: 2 — b1 «тело 1»; b2 (без тайтла)"
+        );
+    }
+
+    #[test]
+    fn format_delete_observation_reports_no_task_deletes_with_other_counter() {
+        let events = vec![
+            delete_event("x1", None, &["nb", "parents", "x1"]),
+            delete_event("x2", None, &["nb", "parents", "x2"]),
+        ];
+        let boards: HashSet<String> = ["board".to_string()].into_iter().collect();
+        let text = format_delete_observation(&events, &TaskBoards::Classified(boards));
+        assert_eq!(text, "сносы тел задач за окно: нет (прочий оборот: 2)");
+    }
+
+    #[test]
+    fn format_delete_observation_empty_window_reports_no_deletes() {
+        // Тихая доска: ни задачных, ни прочих — «нет» без счётного хвоста.
+        let boards: HashSet<String> = ["board".to_string()].into_iter().collect();
+        let text = format_delete_observation(&[], &TaskBoards::Classified(boards));
+        assert_eq!(text, "сносы тел задач за окно: нет");
+    }
+
+    #[test]
+    fn is_task_board_delete_matches_any_chain_link() {
+        // Любое звено цепочки (доска-предок в середине) — задачный снос;
+        // цепочка без доски реестра — прочий оборот. Лист — тоже звено
+        // (юнит механики any-match; снесённая доска в живом реестре
+        // отсутствует, её снос классификацией не ловится — граница плана).
+        let under_board = delete_event(
+            "body1",
+            None,
+            &["nb", "20261103233646-board", "nested", "body1"],
+        );
+        let boards: HashSet<String> = ["20261103233646-board".to_string()].into_iter().collect();
+        assert!(is_task_board_delete(&under_board, &boards));
+
+        let stray = delete_event("stray", None, &["nb", "parents", "stray"]);
+        assert!(!is_task_board_delete(&stray, &boards));
+    }
+
+    fn delete_event(doc_id: &str, title: Option<&str>, chain: &[&str]) -> super::DeleteEvent {
+        super::DeleteEvent {
+            doc_id: doc_id.to_string(),
+            title: title.map(String::from),
+            snapshot_at: std::time::SystemTime::UNIX_EPOCH,
+            path_ids: chain.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
     fn sort_events_newest_first_puts_fresh_snapshot_ahead() {
         let now = std::time::SystemTime::now();
         let mut events = vec![
-            super::DeleteEvent {
-                doc_id: "old".into(),
-                title: None,
-                snapshot_at: now - Duration::from_secs(3600),
-            },
-            super::DeleteEvent {
-                doc_id: "fresh".into(),
-                title: None,
-                snapshot_at: now,
-            },
+            delete_event("old", None, &["nb", "old"]),
+            delete_event("fresh", None, &["nb", "fresh"]),
         ];
+        events[0].snapshot_at = now - Duration::from_secs(3600);
+        events[1].snapshot_at = now;
         sort_events_newest_first(&mut events);
         assert_eq!(events[0].doc_id, "fresh");
         assert_eq!(events[1].doc_id, "old");

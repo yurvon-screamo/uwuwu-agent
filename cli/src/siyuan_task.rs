@@ -1250,6 +1250,44 @@ pub(crate) fn task_board_parts(hpath: &str) -> Option<(String, String)> {
     (title == expected).then_some((project.to_string(), expected))
 }
 
+/// docId досок «Задачи %» всех проектов — реестр для классификации сносов
+/// в doctor (ADR-072): путь снапшота истории несёт доску-предка, когда
+/// снесённое — поддерево доски. Тот же SQL/конвенция/дедуп, что
+/// discover_task_boards (первый по сортированному hpath на проект), но без
+/// render-верификации — для матчинга id доски лишний поход к доске.
+pub(crate) async fn task_board_root_ids(sy: &SiYuan) -> Result<HashSet<String>> {
+    let rows = sy
+        .sql("select id, hpath from blocks where type='d' and content like 'Задачи %' limit 200")
+        .await?;
+    Ok(task_board_ids_from_rows(&rows))
+}
+
+/// Чистая половина реестра: парсинг выборки SQL + конвенция hpath + дедуп.
+pub(crate) fn task_board_ids_from_rows(rows: &[Value]) -> HashSet<String> {
+    let mut hpaths: Vec<(String, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?.to_string();
+            let hpath = r.get("hpath")?.as_str()?.to_string();
+            Some((hpath, id))
+        })
+        .collect();
+    hpaths.sort();
+    hpaths.dedup();
+    let mut out = HashSet::new();
+    let mut seen_projects = HashSet::new();
+    for (hpath, id) in hpaths {
+        let Some((project, _)) = task_board_parts(&hpath) else {
+            continue;
+        };
+        if !seen_projects.insert(project) {
+            continue;
+        }
+        out.insert(id);
+    }
+    out
+}
+
 /// Проект доски из её hpath. Для досок из дискавери/резолва конвенция
 /// соблюдена; фоллбек — полный hpath (undo-журнал остаётся адресуемым).
 pub fn board_project(board: &SyBoard) -> String {
