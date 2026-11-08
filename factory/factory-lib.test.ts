@@ -1220,6 +1220,18 @@ describe("дефолт-порог 6 ч: реплика инцидента 07.11 
     expect(stallVerdict(devFacts(NOW - 361 * MIN), DEFAULT_MS).t).toBe("signal")
     expect(reviewStallVerdict(holderFacts(NOW - 361 * MIN), DEFAULT_MS).t).toBe("signal")
   })
+  test("env-ручка: UWUWU_FACTORY_STALL_MIN=30 возвращает старый порог — тишина 31 мин снова ловится", () => {
+    // откат порога на машине без кода (ручка совместимости, PR #182):
+    // парсер → вердикт целиком, не только таблица парсера
+    const old30Ms = stallMinutesFromEnv("30") * MIN
+    expect(stallVerdict(devFacts(NOW - 31 * MIN), old30Ms).t).toBe("signal")
+    expect(reviewStallVerdict(holderFacts(NOW - 31 * MIN), old30Ms).t).toBe("signal")
+  })
+  test("env-ручка: порог 90 мин закрывает окно фоновых сборок — 31 и 90 мин молчат, 91 ловится", () => {
+    const p90Ms = stallMinutesFromEnv("90") * MIN
+    expect(reviewStallVerdict(holderFacts(NOW - 90 * MIN), p90Ms).t).toBe("none")
+    expect(reviewStallVerdict(holderFacts(NOW - 91 * MIN), p90Ms).t).toBe("signal")
+  })
   test("ровно 6 ч — ещё none (возраст строго больше порога)", () => {
     expect(stallVerdict(devFacts(NOW - 360 * MIN), DEFAULT_MS).t).toBe("none")
     expect(reviewStallVerdict(holderFacts(NOW - 360 * MIN), DEFAULT_MS).t).toBe("none")
