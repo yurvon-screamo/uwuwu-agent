@@ -663,3 +663,30 @@ async fn list_without_project_still_refuses() {
         "до отказа доски не читаются"
     );
 }
+
+/// list --type с мусором — громкий отказ через валидатор, а не тихое «Задач
+/// нет» (декларация тела задачи 20261108150831-nfw6ywo: «фильтр list --type
+/// идёт через тот же валидатор»; опечатка юзера обязана быть громкой — тихая
+/// пустота читается как «задач с типом нет»).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_type_garbage_bails_through_validator() {
+    let (_kernel, _server) = spawn_kernel().await;
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::List {
+            status: None,
+            r#type: Some("анализ".into()),
+            project: None,
+        },
+    )
+    .await
+    .expect_err("мусорный тип фильтра — отказ");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dev | spike | bug | analys | docs | other"),
+        "отказ перечисляет полный канон: {msg}"
+    );
+}

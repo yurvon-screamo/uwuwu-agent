@@ -140,6 +140,61 @@ async fn create_retries_row_insert_once_when_render_lags() {
     assert_eq!(type_writes.len(), 1, "тип без дублей после ретрая");
 }
 
+/// Новые типы канона через полный dispatch-путь create: валидатор пропускает,
+/// клетка «Тип» получает канон, тело — костяк (analys делит spike-костяк,
+/// docs/other — dev; инварант пинят юниты body_template_maps_new_types…).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_new_types_write_canonical_cell_and_skeleton() {
+    for (ty, skeleton_marker) in [
+        ("analys", "## Контекст"),
+        ("docs", "## Постановка"),
+        ("other", "## Постановка"),
+    ] {
+        let (kernel, server) =
+            MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+        set_env(&server);
+
+        task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: NEW_TITLE.into(),
+                r#type: Some(ty.into()),
+                stdin: false,
+                attach: Vec::<std::path::PathBuf>::new(),
+                schedule: None,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create --type {ty} проходит dispatch: {e}"));
+
+        let type_writes: Vec<_> = kernel
+            .item_updates()
+            .into_iter()
+            .filter(|(_, key, _, v)| {
+                key == "key-type"
+                    && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some(ty)
+            })
+            .collect();
+        assert_eq!(
+            type_writes.len(),
+            1,
+            "клетка «Тип» = канон {ty} записан ровно один раз: {:?}",
+            kernel.item_updates()
+        );
+        let (_, md) = kernel
+            .created_docs()
+            .first()
+            .cloned()
+            .expect("тело задачи создано");
+        assert!(
+            md.contains(skeleton_marker),
+            "тело {ty} несёт костяк-маркер {skeleton_marker}: {md}"
+        );
+    }
+}
+
 /// Дедуп по факту render: в ленте появилась чужая строка с тем же тайтлом →
 /// громкий отказ, вторую строку не минтим, тег не пишется.
 #[tokio::test]
@@ -391,7 +446,8 @@ async fn edit_type_invalid_value_bails_before_any_write() {
         .expect_err("мусорный тип — отказ");
 
     assert!(
-        err.to_string().contains("dev | spike | bug"),
+        err.to_string()
+            .contains("dev | spike | bug | analys | docs | other"),
         "суть отказа: {err}"
     );
     assert!(

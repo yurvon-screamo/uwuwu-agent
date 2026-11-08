@@ -160,7 +160,8 @@ pub struct SyTask {
     pub item_id: String,
     pub title: String,
     pub status: String,
-    /// Классификация задачи из колонки «Тип» (bug/dev/spike; "" — не задан).
+    /// Классификация задачи из колонки «Тип» (bug/dev/spike/analys/docs/other;
+    /// "" — не задан).
     pub task_type: String,
     pub branch: String,
     pub pr: String,
@@ -536,13 +537,16 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
 /// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
 pub const TYPE_CELL: &str = "Тип";
 
-/// Канон типа задачи: trim + нижний регистр, ∈ {bug, dev, spike},
-/// иначе человеческий отказ.
+/// Канон типа задачи: trim + нижний регистр, ∈ {bug, dev, spike, analys,
+/// docs, other}, иначе человеческий отказ.
 pub fn validate_task_type(raw: &str) -> Result<String> {
     let canon = raw.trim().to_lowercase();
     match canon.as_str() {
-        "bug" | "dev" | "spike" => Ok(canon),
-        _ => bail!("тип «{raw}» не разобран: жди dev | spike | bug (колонка «{TYPE_CELL}» доски)"),
+        "bug" | "dev" | "spike" | "analys" | "docs" | "other" => Ok(canon),
+        _ => bail!(
+            "тип «{raw}» не разобран: жди dev | spike | bug | analys | docs | other (колонка \
+             «{TYPE_CELL}» доски)"
+        ),
     }
 }
 
@@ -645,7 +649,12 @@ pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, Str
 /// тестом task_template_syncs_with_canon_doc).
 pub fn body_template(ty: &str, ctx: &str) -> String {
     match ty {
-        "spike" => format!(
+        // analys делит костяк spike (проработка/аудит без кода — та же
+        // форма Контекст/Варианты/Вывод/Границы); docs и other падают в
+        // dev-ветку (полный пайп как dev). Инвариант пинят тестами:
+        // body_is_skeleton (task clean) итерирует ["dev","spike","bug"] и
+        // держит DraftSkeleton для новых типов только на этом шаринге.
+        "spike" | "analys" => format!(
             "## Контекст\n{ctx}\n\n## Варианты\n<что рассматривали: суть → плюсы/минусы/замеры; сравнение — таблица>\n\n## Вывод\n<рекомендация + доказательства: «путь A, потому что …»>\n\n## Границы\n<что НЕ исследовано и почему; где вывод не действует>\n"
         ),
         "bug" => format!(
@@ -2082,9 +2091,61 @@ mod tests {
         assert_eq!(validate_task_type(" Bug ").unwrap(), "bug");
         assert_eq!(validate_task_type("DEV").unwrap(), "dev");
         assert_eq!(validate_task_type("Spike").unwrap(), "spike");
+        assert_eq!(validate_task_type(" Analys ").unwrap(), "analys");
+        assert_eq!(validate_task_type("DOCS").unwrap(), "docs");
+        assert_eq!(validate_task_type("Other").unwrap(), "other");
         let err = validate_task_type("feature").unwrap_err().to_string();
-        assert!(err.contains("dev | spike | bug"), "суть отказа: {err}");
+        assert!(
+            err.contains("dev | spike | bug | analys | docs | other"),
+            "суть отказа: {err}"
+        );
         assert!(validate_task_type("").is_err(), "пустой тип — отказ");
+    }
+
+    /// Расширенный канон делит костяки существующих: analys ≡ spike,
+    /// docs/other ≡ dev — инвариант body_is_skeleton (гард task clean
+    /// итерирует только ["dev","spike","bug"]; дивергенция костяков
+    /// деградировала бы DraftSkeleton для новых типов).
+    #[test]
+    fn body_template_maps_new_types_onto_existing_skeletons() {
+        let sections = |md: &str| -> Vec<String> {
+            md.lines()
+                .filter_map(|l| l.strip_prefix("## ").map(|s| s.trim().to_string()))
+                .collect()
+        };
+        assert_eq!(
+            sections(&body_template("analys", "")),
+            sections(&body_template("spike", ""))
+        );
+        assert_eq!(
+            sections(&body_template("docs", "")),
+            sections(&body_template("dev", ""))
+        );
+        assert_eq!(
+            sections(&body_template("other", "")),
+            sections(&body_template("dev", ""))
+        );
+    }
+
+    /// Гард task clean прямо на телах новых типов: create-скелет analys
+    /// матчится через spike-итерацию, docs/other — через dev; нетронутый
+    /// скелет обязан остаться DraftSkeleton (иначе clean теряет черновики).
+    #[test]
+    fn body_is_skeleton_covers_new_type_skeletons() {
+        use crate::siyuan_guard::body_is_skeleton;
+        for ty in ["analys", "docs", "other"] {
+            assert!(
+                body_is_skeleton(&body_template(ty, ""), "заголовок"),
+                "скелет {ty} обязан матчиться гардом (шаринг костяков)"
+            );
+        }
+        // юзер-контент не матчится ни одним костяком — не DraftSkeleton;
+        // дивергенцию костяков новых типов ловят позитивные ассерты выше:
+        // сломанный шаринг уронит их громко
+        assert!(!body_is_skeleton(
+            "## Постановка\n\nсвой текст задачи\n",
+            "заголовок"
+        ));
     }
 
     fn sy_task(item_id: &str, title: &str, body_doc: Option<&str>) -> SyTask {
