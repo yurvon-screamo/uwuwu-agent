@@ -465,7 +465,7 @@ export function parseAgentDefModel(defMd: string): AgentModel | null {
   if (fm === undefined) return null
   const modelLine = /^model:\s*(\S+)\s*$/m.exec(fm)?.[1]
   if (modelLine === undefined) return null
-  const [providerID, id, inlineVariant] = modelLine.split("/")
+  const [providerID, id] = modelLine.split("/")
   if (providerID === undefined || id === undefined) return null
   const [modelId, hashVariant] = id.split("#")
   if (modelId === undefined || modelId === "") return null

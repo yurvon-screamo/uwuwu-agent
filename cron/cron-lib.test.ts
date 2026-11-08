@@ -431,7 +431,7 @@ describe("promptLandedAt: дедуп приземления промпта", () 
     expect(promptLandedAt(msgs, 150, "файр крона X")).toBe(200)
   })
   test("префикс-80 переживает пережатый на части длинный промпт", () => {
-    const long = "файр крона X " + "y".repeat(200)
+    const long = `файр крона X ${"y".repeat(200)}`
     const msgs = [user(300, long)]
     expect(promptLandedAt(msgs, 150, long)).toBe(300)
     expect(promptLandedAt(msgs, 150, long.slice(0, 120))).toBe(300)
