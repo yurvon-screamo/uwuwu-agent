@@ -6,7 +6,7 @@
 
 ```
 opencodereview/ правила ревью
-agents/        агенты: developer, dreamer, code-quality-reviewer (праймари — ревью-статусы фабрики)
+agents/        агенты: developer, dreamer, plan-reviewer (праймари «Ревью плана»), code-quality-reviewer (праймари «Ревью результата»)
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        скиллы (см. ниже)
 cli/           uwuwu-cli — задачи/кроны, поиск, вики-чтение, персона (бинарь: ~/.cargo/bin/uwuwu-cli)
@@ -54,9 +54,11 @@ Issue-driven → **task-driven**: задачи = строки канбан-до�
 Демон — **будильник + маршрутизатор ревью и тестирования + lifecycle окружений** (systemd, тик 3 мин):
 Design → окружение задачи `~/agents-env/<row-id>/{repo, scratch, logs}` (repo = git worktree
 от origin/master, ветка `work/task-<row-id>`; env-переменная `UWUWU_FACTORY_ENV_ROOT`) →
-OpenCode-сессия девелопера cwd=repo + короткий spawn; «Ревью плана»/«Ревью результата» →
-спавн/будильник ревьювера (праймари-агент `code-quality-reviewer`, 1 сессия на задачу,
-cwd = repo задачи); «Тестирование» → спавн/будильник тестировщика (праймари-агент
+OpenCode-сессия девелопера cwd=repo + короткий spawn; «Ревью плана» → спавн/будильник
+план-ревьювера (праймари-агент `plan-reviewer`, своя сессия на стадию, cwd = repo задачи);
+«Ревью результата» → спавн/будильник ревьювера результата (праймари-агент
+`code-quality-reviewer`, своя сессия на стадию, cwd = repo задачи); «Тестирование» →
+спавн/будильник тестировщика (праймари-агент
 `tester`, тоже 1 сессия на задачу); возврат статуса из ревью/тестирования → wakeup
 девелопера; перевод владельцем
 трека в In Progress — будильник/рестарт девелопера (конфликтный PR даёт конфликт-kickoff);

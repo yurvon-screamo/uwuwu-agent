@@ -190,6 +190,13 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, mergedPrUrl: "not-a-url" })).toBe(false)
     expect(isValidTracked({ ...base, mergedPrUrl: true })).toBe(false)
   })
+  test("reviewKind: вид ревью и отсутствие (legacy) валидны, чужие строки — мимо", () => {
+    expect(isValidTracked({ ...base, reviewKind: "plan" })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: "result" })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: "full" })).toBe(false)
+    expect(isValidTracked({ ...base, reviewKind: "" })).toBe(false)
+  })
 })
 
 describe("rowMissingAction — двухпроходная чистка", () => {
@@ -392,27 +399,53 @@ describe("routeTask", () => {
     expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: false })))
       .toEqual({ t: "spawn-reviewer", kind: "result" })
   })
-  test("живая сессия + вход/смена вида → доревью", () => {
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "plan" })
-    // смена вида plan → result в той же сессии
-    expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "result" })
-    // повторный раунд фиксов: вышел и вернулся в тот же вид
-    expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "result" })
-  })
-  test("живая сессия в том же статусе: комменты юзера → ревьюверу, тишина → noop", () => {
+  test("живая сессия того же вида + вход/смена вида → доревью", () => {
     expect(routeTask(facts({
-      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true,
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "rerun-reviewer", kind: "plan" })
+    // повторный раунд фиксов: вышел и вернулся в тот же вид
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true, reviewKind: "result",
+    }))).toEqual({ t: "rerun-reviewer", kind: "result" })
+  })
+  test("живая сессия другого вида → спавн нового держателя", () => {
+    // штатный переход план → результат (через In Progress — lastStatus вид не различает)
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    // ручная прямая перестановка план → результат без промежуточного статуса
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    // обратная смена: живой держатель результата, статус плана
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: true, reviewKind: "result",
+    }))).toEqual({ t: "spawn-reviewer", kind: "plan" })
+  })
+  test("живая legacy-сессия без вида → спавн нового держателя (миграция на два агента)", () => {
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: true,
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true,
+    }))).toEqual({ t: "spawn-reviewer", kind: "plan" })
+  })
+  test("живая сессия того же вида в том же статусе: комменты юзера → ревьюверу, тишина → noop", () => {
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
       freshComments: [c("x", "вопрос", 1)],
     }))).toEqual({ t: "comments-to-reviewer" })
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true })))
-      .toEqual({ t: "noop" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "noop" })
   })
-  test("liveness неизвестна → сессию считаем живой (спавнов не плодим)", () => {
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null })))
-      .toEqual({ t: "rerun-reviewer", kind: "plan" })
+  test("liveness неизвестна → глухой noop: ни спавна, ни дельты сессии неизвестного держателя", () => {
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null, reviewKind: "plan",
+    }))).toEqual({ t: "noop" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null,
+    }))).toEqual({ t: "noop" })
   })
   test("возврат из ревью: Design/In Progress → девелоперу, Review/NA → noop", () => {
     expect(routeTask(facts({ status: "In Progress", lastStatus: REVIEW_PLAN_STATUS })))
@@ -636,19 +669,23 @@ describe("mergeablePollStep: политика опроса ленивого merg
 describe("reviewSpawnPrompt", () => {
   const ctx = { branch: "feat/x", worktree: "/home/x/origa-task-x", pr: "https://github.com/x/pull/1" }
   test("plan: вид, канал чтения, переходы approve/request_changes", () => {
-    const p = reviewSpawnPrompt("r1", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r1", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
     expect(p).toContain("ревью плана")
+    // методичка адресуется по имени праймари-агента держателя
+    expect(p).toContain("праймари-агент plan-reviewer")
     expect(p).toContain("uwuwu-cli task get r1 --project uwuwu")
     expect(p).toContain("approve → In Progress")
     expect(p).toContain("request_changes → Design")
     expect(p).not.toContain("request_changes → In Progress")
-    // вердикт-строка с тремя исходами; approve-with-notes plan-у не светит
-    expect(p).toContain("approve|approve с мелкими замечаниями|request_changes")
-    expect(p).toContain("только для result")
+    // вердикт-строка план-ревью двухзначная — словарь методички plan-reviewer
+    expect(p).toContain("Статус: approve|request_changes")
+    expect(p).not.toContain("approve с мелкими замечаниями|request_changes")
     expect(p).not.toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
+    // термина выпиленной диспетчеризации в промпте быть не должно
+    expect(p).not.toContain("review_type")
   })
   test("result: ветка/ворктри/PR и переходы результата", () => {
-    const p = reviewSpawnPrompt("r2", "origa", "result", ctx)
+    const p = reviewSpawnPrompt("r2", "origa", "result", ctx, "code-quality-reviewer")
     expect(p).toContain("ревью результата")
     expect(p).toContain(ctx.worktree)
     expect(p).toContain(ctx.branch)
@@ -662,13 +699,13 @@ describe("reviewSpawnPrompt", () => {
     expect(p).not.toContain("request_changes → Design")
   })
   test("result: approve-with-notes → In Progress с пометкой дельты и прошлых раундов", () => {
-    const p = reviewSpawnPrompt("r5", "uwuwu", "result", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r5", "uwuwu", "result", { branch: "", worktree: "", pr: "" }, "code-quality-reviewer")
     expect(p).toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
     expect(p).toContain("следующее ревью с тем же ревьювером")
     expect(p).toContain("прошлые раунды ревью этой задачи")
   })
   test("result без ворктри (env:false / карантинный ревью-вход) — честная строка про diff/PR, не пустота", () => {
-    const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" }, "code-quality-reviewer")
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
     expect(p).not.toContain("Ворктри задачи: ")
@@ -676,19 +713,19 @@ describe("reviewSpawnPrompt", () => {
   test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
     const p = reviewSpawnPrompt("r8", "1xgames", "result", {
       branch: "feat/y", worktree: "", pr: "", base: "origin/main",
-    })
+    }, "code-quality-reviewer")
     expect(p).toContain("origin/main + untracked")
     expect(p).toContain("diff origin/main…feat/y")
     expect(p).not.toContain("origin/master")
   })
   test("plan без ворктри — строка про diff не появляется (плану код не нужен)", () => {
-    const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
     expect(p).not.toContain("Ворктри задачи не найден")
   })
   test("тип задачи инжектится в ревью-промпт (роутинг Bug/Spike по свойству)", () => {
-    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" })
+    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" }, "code-quality-reviewer")
     expect(p).toContain("Тип задачи: bug")
-    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" })
+    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" }, "code-quality-reviewer")
     expect(empty).not.toContain("Тип задачи")
   })
 })

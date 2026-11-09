@@ -51,10 +51,14 @@ export interface TrackedTask {
   lastCommentId: string
   createdAt: number
   attempts: number
-  /** сессия ревьювера (1 на задачу; "" — нет или умерла) */
+  /** сессия ревьювера (активный держатель текущего ревью-вида; "" — нет или умерла) */
   reviewSessionID?: string
   /** неудачные спавны ревьювера подряд (эскалация до Needs attention) */
   reviewAttempts?: number
+  /** вид ревью, который обслуживает активная ревью-сессия ("plan"/"result");
+   *  undefined — сессии нет или legacy-запись (держатель старого агента):
+   *  расхождение с видом статуса трактуется как спавн нового держателя */
+  reviewKind?: ReviewKind
   /** сессия тестировщика (1 на задачу; "" — нет или умерла) */
   testSessionID?: string
   /** неудачные спавны тестировщика подряд (эскалация до Needs attention) */
@@ -764,13 +768,17 @@ export interface ReviewContext {
   base?: string
 }
 
-/** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
-export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext): string {
+/** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе.
+ *  agentName — праймари-агент держателя (план → plan-reviewer, результат →
+ *  code-quality-reviewer): методичка адресуется по имени. */
+export function reviewSpawnPrompt(
+  rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext, agentName: string,
+): string {
   const base = baseOf(ctx)
   const lines = [
     `[factory] Задача ${rowId} (проект ${project}): ревью ${kind === "plan" ? "плана" : "результата"}.`,
     "",
-    "Ты — праймари-агент code-quality-reviewer, фабрика назначила тебя судьёй этой задачи",
+    `Ты — праймари-агент ${agentName}, фабрика назначила тебя судьёй этой задачи`,
     "(1 задача = 1 твоя сессия; повторные раунды правок придут сюда же wakeup'ом).",
     "Работай по секции «Ревью задач фабрики uwuwu» своей методики:",
     "",
@@ -778,8 +786,8 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     "   Если в тредах есть прошлые раунды ревью этой задачи (твоя сессия пересоздана) —",
     "   это продолжение: проверь устранение прошлых замечаний, не начинай с нуля.",
     kind === "plan"
-      ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
-      : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
+      ? "2. Предмет — план из тела задачи; кодовый diff не нужен (его ревью — предмет code-quality-reviewer)."
+      : "2. Предмет — все изменения ветки задачи против её базы (источник branch):",
     ...(kind === "result"
       ? [`   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,]
       : []),
@@ -792,9 +800,13 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
-    "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
-    kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    kind === "plan"
+      ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
+      : [
+          "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
+          "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+        ].join("\n"),
     "4. Статус после вердикта (uwuwu-cli task edit):",
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
@@ -944,6 +956,9 @@ export interface RouteFacts {
   lastStatus: string
   /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем решением noop) */
   reviewerAlive: boolean | null
+  /** вид ревью активной ревью-сессии (undefined — нет сессии или legacy-держатель);
+   *  расхождение с видом статуса = спавн нового держателя, не дельта */
+  reviewKind?: ReviewKind
   /** жива ли сессия тестировщика (null — liveness неизвестна: тик пропускаем решением noop) */
   testerAlive: boolean | null
   /** свежие комменты юзера */
@@ -968,9 +983,13 @@ export type RouteAction =
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
-    // null (liveness неизвестна) трактуем как «жива»: не плодим спавны на
-    // транзиентных ошибках REST — следующий тик перепроверит
-    if (f.reviewerAlive === false) return { t: "spawn-reviewer", kind }
+    // Живая сессия другого вида (или legacy без вида) — спавн нового держателя:
+    // вид помнит state, не статусная история (штатный план→результат идёт через
+    // In Progress, lastStatus виды не различает).
+    // null (liveness неизвестна, транзиентный сбой REST) — глухой noop: не плодим
+    // спавны и не шлём дельту сессии неизвестного держателя — следующий тик перепроверит.
+    if (f.reviewerAlive === null) return { t: "noop" }
+    if (f.reviewerAlive === false || f.reviewKind !== kind) return { t: "spawn-reviewer", kind }
     if (reviewKindOf(f.lastStatus) !== kind) return { t: "rerun-reviewer", kind }
     if (f.freshComments.length > 0) return { t: "comments-to-reviewer" }
     return { t: "noop" }
@@ -1340,6 +1359,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
   ) return false
   if (t.reviewAttempts !== undefined && typeof t.reviewAttempts !== "number") return false
+  if (t.reviewKind !== undefined && t.reviewKind !== "plan" && t.reviewKind !== "result") return false
   if (
     t.testSessionID !== undefined &&
     !(t.testSessionID === "" || (typeof t.testSessionID === "string" && t.testSessionID.startsWith("ses_")))

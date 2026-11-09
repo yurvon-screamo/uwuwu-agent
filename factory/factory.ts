@@ -9,8 +9,10 @@
 //      перевод владельца в In Progress у трекенной задачи — будильник/
 //      рестарт девелопера (return-to-dev), PR в конфликте с master →
 //      конфликт-kickoff (разреши, запушь, верни в «Ревью результата»)
-//   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
-//      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
+//   2. «Ревью плана» → спавн/будильник план-ревьювера (праймари
+//      plan-reviewer, своя сессия на стадию, cwd = ворктри задачи);
+//      «Ревью результата» → спавн/будильник ревьювера результата (праймари
+//      code-quality-reviewer, своя сессия на стадию, cwd = ворктри
 //      задачи); «Тестирование» → спавн/будильник тестировщика (праймари
 //      tester, тоже 1 сессия на задачу); возврат статуса из ревью/тестирования
 //      → wakeup девелопера; комменты юзера в агентских статусах — держателю
@@ -31,7 +33,7 @@ import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
-import { REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
+import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
@@ -171,10 +173,15 @@ const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
  *  Требует песочницу state — гард в main(). */
 const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
-/** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника.
- *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
- *  синхронно: модель сессии спавна главнее для фабричных сессий. */
+/** ревьювер результата («Ревью результата»): праймари-агент, качество важнее цены
+ *  будильника. «Ревью плана» ведёт PLAN_REVIEWER ниже. Модель дублирует
+ *  agents/code-quality-reviewer.md (frontmatter) — править синхронно: модель сессии
+ *  спавна главнее для фабричных сессий. */
 const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
+/** план-ревьювер стадии «Ревью плана»: парафриз, zoom-out (YAGNI/реюз/глубина
+ *  постановки), implementation readiness. Модель дублирует agents/plan-reviewer.md
+ *  (frontmatter) — править синхронно: модель сессии спавна главнее для фабричных сессий. */
+const PLAN_REVIEWER = { agent: PLAN_REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 /** тестировщик стадии «Тестирование»: праймари-агент, качество фичи важнее
  *  цены будильника; модель flash в max-вариации — единственная мультимодальная
  *  (визуальная проверка вёрстки/скринов). Модель дублирует agents/tester.md
@@ -1034,6 +1041,7 @@ function preserveAgentSessions(from: TrackedTask, to: TrackedTask): void {
   if (from.reviewSessionID !== undefined) {
     to.reviewSessionID = from.reviewSessionID
     to.reviewAttempts = from.reviewAttempts
+    to.reviewKind = from.reviewKind
   }
   if (from.testSessionID !== undefined) {
     to.testSessionID = from.testSessionID
@@ -1092,20 +1100,22 @@ async function startReview(
   // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
   const worktree = tracked.worktree
   const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
+  const reviewer = kind === "plan" ? PLAN_REVIEWER : REVIEWER
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
-    agent: REVIEWER.agent,
-    model: REVIEWER.model,
+    agent: reviewer.agent,
+    model: reviewer.model,
   })
   if (sessionID === null) throw new Error("ревью-сессия не создалась")
-  const sent = await promptSession(sessionID, reviewSpawnPrompt(task.rowId, projectName, kind, ctx))
+  const sent = await promptSession(sessionID, reviewSpawnPrompt(task.rowId, projectName, kind, ctx, reviewer.agent))
   if (!sent) {
     await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
     throw new Error("ревью-промпт не ушёл")
   }
   tracked.reviewSessionID = sessionID
   tracked.reviewAttempts = 0
+  tracked.reviewKind = kind
   // история корней: ревьювер — корневая сессия задачи, дример должен её видеть
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
@@ -1209,9 +1219,12 @@ async function dispatchReviewAction(
   const shortId = d.row.rowId.slice(0, 8)
   switch (action.t) {
     case "spawn-reviewer": {
-      // новый вход в ревью-статус = свежая попытка (сброс счётчика фейлов):
-      // юзер/дев переустановили статус после Needs attention
-      const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind
+      // новый вход в ревью-статус или спавн держателя другого вида ревью
+      // (план → результат и обратно; legacy без вида) = свежая попытка
+      // (сброс счётчика фейлов): юзер/дев переустановили статус после
+      // Needs attention или стадия сменила держателя
+      const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind ||
+        d.tracked.reviewKind !== action.kind
       const seed = entering ? 0 : d.tracked.reviewAttempts ?? 0
       try {
         await startReview(d.row, d.project, d.cfg, d.board, d.state, action.kind, d.tracked)
@@ -1574,6 +1587,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
+      reviewKind: tracked.reviewKind,
       testerAlive: testerLiveness === "alive" ? true : testerLiveness === "dead" ? false : null,
       freshComments: foreign,
     })
