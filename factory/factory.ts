@@ -1808,7 +1808,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           )
           if (!clock.stalled && clock.fromWake && activity !== null
               && Date.now() - activity > STALL_MS) {
-            log(`задача ${rowId.slice(0, 8)}: тишина от активности ${clock.quietMin} мин, но будильник сессии свежий — часы от wake, детекция ждёт ответ`)
+            log(`задача ${rowId.slice(0, 8)}: будильник сессии свежий — часы от wake, тишина ${clock.quietMin} мин, детекция ждёт ответ`)
           }
           const { stalled } = clock
           // кэш мержа действителен, пока совпадает с PR-ячейкой или ячейка
