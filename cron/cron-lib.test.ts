@@ -425,19 +425,12 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
   })
 })
 
-describe("агент крона «Lead: ночной аудит uwuwu» — деф triage (распоряжение владельца: крон на базе триаж-агента, без нового агента)", () => {
-  test("глобальный деф triage существует и его frontmatter — боевая модель файр-гейта", () => {
-    // деф триажа канонизируется в ~/.config/opencode/agents/triage.md
-    // (копия воркспейс-дефа триажа) — гейт крона (agentDefOf) читает
-    // глобальный путь: снос/поломка frontmatter = отказ файра карточки.
-    // Репо-дельты нет — деплой живых копий вне репо, пин документирует пару.
-    const home = process.env.HOME ?? ""
-    const path = join(home, ".config", "opencode", "agents", "triage.md")
-    expect(existsSync(path)).toBe(true)
-    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
-      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: undefined })
-  })
-})
+// Деф агента крона «Lead: ночной аудит uwuwu» — деф триажа (распоряжение
+// владельца: крон на базе триаж-агента, без нового агента). Живёт вне репо
+// (~/.config/opencode/agents/triage.md + крон-воркспейс-копия — резолв
+// сервера), пин на машину-зависимый файл в CI не проверяем — живой контроль
+// файр-гейта: контрольный файр 09.11 19:52 (recreate, agent=triage,
+// glm-5.3-flash) и боевой слот 04:30.
 
 describe("promptLandedAt: дедуп приземления промпта", () => {
   const user = (created: number, text: string) => ({ type: "user", time: { created }, text })
