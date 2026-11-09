@@ -167,7 +167,7 @@ function pinnedFactoryProjects(pinning: PinningDoc): string[] {
 /** Дискавери дока по заголовку (find_doc_by_title — паттерн фабрики), контент
  *  — export_doc_markdown (паттерн resolveBody крона). Throw вместо null:
  *  немой пропуск = демон без пиннинга. */
-export async function resolvePinningDoc(tool: PinningTool): Promise<PinningDoc> {
+async function resolvePinningDoc(tool: PinningTool): Promise<PinningDoc> {
   const r = await tool<{ matches?: { id?: string; inTrash?: boolean }[] }>("find_doc_by_title", {
     title: PINNING_DOC_TITLE,
     caseInsensitive: true,
