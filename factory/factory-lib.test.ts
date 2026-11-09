@@ -5,6 +5,8 @@ import {
   conflictFixPrompt,
   continuePrompt,
   kickoffModeOf,
+  baseOf,
+  DEFAULT_BASE,
   newUserComments,
   bodyEditPrompt,
   promptForStart,
@@ -265,6 +267,15 @@ describe("spawnPrompt", () => {
     expect(p).toContain("создай worktree+ветку от origin/master")
     expect(p).toContain("заполни Branch-ячейку")
   })
+  test("base из контекста: env:false-строка и env:true-строка говорят базу проекта, не дефолт", () => {
+    const p = spawnPrompt("r1", "1xgames", "1xgames/game-service", "implement", { base: "origin/main" })
+    expect(p).toContain("создай worktree+ветку от origin/main")
+    const withEnv = spawnPrompt("r2", "1xgames", "1xgames/game-service", "implement", {
+      base: "origin/main",
+      env: { repoDir: "/env/r2/repo", branch: "work/task-r2", scratchDir: "/env/r2/scratch" },
+    })
+    expect(withEnv).toContain("ветка уже от origin/main")
+  })
 })
 
 describe("continuePrompt", () => {
@@ -470,6 +481,11 @@ describe("conflictFixPrompt", () => {
     const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu")
     expect(p).not.toContain("Инит-данные")
   })
+  test("base из контекста: конфликт и починка называют базу проекта, не master", () => {
+    const p = conflictFixPrompt("r1", "https://git.l4a.ru/x/!39", "1xgames", { base: "origin/main" })
+    expect(p).toContain("конфликтует с origin/main")
+    expect(p).toContain("обнови ветку от origin/main")
+  })
 })
 
 describe("promptForStart: единственная точка выбора стартового промпта", () => {
@@ -657,6 +673,14 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("diff origin/master…feat/y")
     expect(p).not.toContain("Ворктри задачи: ")
   })
+  test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
+    const p = reviewSpawnPrompt("r8", "1xgames", "result", {
+      branch: "feat/y", worktree: "", pr: "", base: "origin/main",
+    })
+    expect(p).toContain("origin/main + untracked")
+    expect(p).toContain("diff origin/main…feat/y")
+    expect(p).not.toContain("origin/master")
+  })
   test("plan без ворктри — строка про diff не появляется (плану код не нужен)", () => {
     const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
     expect(p).not.toContain("Ворктри задачи не найден")
@@ -834,6 +858,14 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
   })
+  test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
+    const p = testingSpawnPrompt("r9", "1xgames", {
+      branch: "feat/y", worktree: "", pr: "", base: "origin/main",
+    })
+    expect(p).toContain("ветка против origin/main в ворктри задачи")
+    expect(p).toContain("diff origin/main…feat/y")
+    expect(p).not.toContain("origin/master")
+  })
   test("rerun: дельта-режим устранения баг-репорта, не пересмотр с нуля", () => {
     const p = testingRerunPrompt("r3", ctx)
     expect(p).toContain(TESTING_STATUS)
@@ -937,6 +969,29 @@ describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () =
     expect(parseProjects(undefined, fallback).uwuwu?.env).toBeUndefined()
     const bad = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", env: "no" } })
     expect(() => parseProjects(bad, fallback)).toThrow(/test.*env.*boolean/)
+  })
+
+  test("base: строка проходит и сохраняется, отсутствие — дефолт (master-based репо не меняют поведение)", () => {
+    const raw = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: "origin/main" } })
+    expect(parseProjects(raw, fallback).test?.base).toBe("origin/main")
+    expect(parseProjects(undefined, fallback).uwuwu?.base).toBeUndefined()
+  })
+
+  test("base: не-строка или пустая — отказ с именем проекта", () => {
+    const nonString = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: 42 } })
+    expect(() => parseProjects(nonString, fallback)).toThrow(/test.*base/)
+    const empty = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: "  " } })
+    expect(() => parseProjects(empty, fallback)).toThrow(/test.*base/)
+  })
+})
+
+describe("baseOf: база из конфига/контекста с дефолтом DEFAULT_BASE", () => {
+  test("нет base — дефолт origin/master (DEFAULT_PROJECTS без поля не меняют поведение)", () => {
+    expect(baseOf({})).toBe("origin/master")
+    expect(baseOf({ base: undefined })).toBe(DEFAULT_BASE)
+  })
+  test("заданная base — она и возвращается", () => {
+    expect(baseOf({ base: "origin/main" })).toBe("origin/main")
   })
 })
 
