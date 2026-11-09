@@ -22,6 +22,7 @@ import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { acquireLock, branchLabel, detectBranch } from "./single-instance"
 import { withE2ETag } from "./e2e-tag"
+import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "./compact"
 
 // ——— типы протокола ТГ ———
 
@@ -139,6 +140,9 @@ export interface HubState {
   draftSkip?: Record<string, number>
   /** последний выданный синтетический msgID не-ТГ источников (отрицательные) */
   nextDraftMsgID?: number
+  /** ms последней admission-попытки автокомпакта (пишется ДО POST —
+   *  коулдаун против повторного admission переживает рестарт) */
+  lastCompactAt?: number
 }
 
 const isDraftRef = (v: unknown): v is DraftRef => {
@@ -246,6 +250,9 @@ export function validState(
       }
       out.run = outRun
     }
+  }
+  if (Number.isFinite(r.lastCompactAt) && (r.lastCompactAt as number) >= 0) {
+    out.lastCompactAt = r.lastCompactAt as number
   }
   extra?.(r, out)
   return out
@@ -531,6 +538,9 @@ export interface SessionMsg {
   /** user-сообщения: API отдаёт текст верхним уровнем (Session.Message.User
    *  в 2.2.5, content отсутствует) */
   text?: string
+  /** assistant-сообщения: использование токенов поворота (2.2.6) — опора
+   *  автокомпакта (lib/compact) */
+  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
   content?: { type?: string; text?: string }[]
 }
 
@@ -724,6 +734,10 @@ export interface HubProfile {
   /** окно ретрая недоставленного алерта, ms; дефолт SILENCE_ALERT_RETRY_MS.
    *  Инъекция для e2e — паритет silenceTickMs */
   silenceAlertRetryMs?: number
+  /** Политика автокомпакта вечной сессии (lib/compact): idle ≥ idleMs и
+   *  контекст ≥ minContextPct% лимита модели → нативный POST /compact.
+   *  undefined — луп не стартует (safe default, откат = снять поле). */
+  compact?: CompactPolicy
 }
 
 export interface Cfg {
@@ -1681,6 +1695,48 @@ export function createHub(profile: HubProfile): Hub {
     maybeExit()
   }
 
+  // ——— автокомпакт вечной сессии ———
+
+  const COMPACT_TICK_MS = 5 * 60_000
+
+  /** Луп автокомпакта (profile.compact; undefined — не стартует): гейты,
+   *  вердикт, персист метки и POST — в compactTick (lib/compact), демон даёт
+   *  зависимости. Занятость — своя семантика: активный ход, стирт в полёте,
+   *  непустая очередь (компакт встал бы за ними — пусть очередь разгрузится
+   *  в чистом контексте). Idle — серверная time.idle: run/firing-гейты уже
+   *  отсекли фазу стухшего idle (эмпирика hub sessionStatus). */
+  const compactLoop = async (): Promise<void> => {
+    while (true) {
+      if (stopping) break
+      const policy = profile.compact
+      if (policy === undefined) break
+      try {
+        await compactTick({
+          sessionID: () => state.session,
+          busy: () => state.run !== undefined || state.firing !== undefined || state.queue.length > 0,
+          probe: async (sessionID) => {
+            const p = await compactProbe(restCall, sessionID)
+            if (!p.alive) return { idleMs: null, usagePct: null }
+            return { idleMs: p.idleAt !== null ? Date.now() - p.idleAt : null, usagePct: p.usagePct }
+          },
+          lastCompactAt: () => state.lastCompactAt ?? 0,
+          persist: (now) => {
+            state.lastCompactAt = now
+            save()
+          },
+          fire: (sessionID) => sessionCompact(restCall, sessionID),
+          policy,
+          log,
+        })
+      } catch (e) {
+        log(`compactLoop: ${e}`)
+      }
+      await sleep(COMPACT_TICK_MS)
+    }
+    loopDone.compact = true
+    maybeExit()
+  }
+
   const hub: Hub = {
     profile,
     get state() { return state },
@@ -1743,6 +1799,11 @@ export function createHub(profile: HubProfile): Hub {
       void runLoop()
       void pollLoop()
       void silenceLoop()
+      if (profile.compact !== undefined) {
+        loopDone.compact = false
+        log(`compact-watch: idle ${hoursOf(profile.compact.idleMs)} ч, контекст ≥${profile.compact.minContextPct}%`)
+        void compactLoop()
+      }
       for (const s of profile.sources) {
         void s.start(hub, {
           stopping: () => stopping,
