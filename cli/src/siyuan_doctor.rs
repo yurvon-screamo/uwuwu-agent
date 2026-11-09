@@ -538,7 +538,7 @@ async fn board_orphans_probe(sy: &SiYuan, project: &str) -> ProbeOutcome {
         .map(|r| syt::normalize_title(&r.title))
         .collect();
     let orphans = orphan_candidates(&children, &bound_ids, &row_titles);
-    let detail = format!("детей-доков {}", children.len());
+    let detail = format!("детей-доков доски {}", children.len());
     if orphans.is_empty() {
         return ProbeOutcome::new(BOARD_ORPHANS, ProbeVerdict::Clean).with_detail(detail);
     }
