@@ -67,6 +67,10 @@ import {
   stallMinutesFromEnv,
   lastActivityOf,
   stallVerdict,
+  stallClock,
+  bodyEditRoute,
+  prProbeVerdict,
+  type PrProbeResult,
   adoptBodyDoc,
   pathSafe,
   createBoardPathOnce,
@@ -799,6 +803,9 @@ async function startTask(
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
     bodyHash: (await bodyHashOf(task.bodyDoc, startExports)) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
+    // спавн-промпт = первый сигнал сессии: часы тишины сталла отсчитываются
+    // от него, пока агент не породил активность
+    lastDevPromptAt: Date.now(),
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
     // история корней: append при каждом спавне (рестарты не теряют прошлые
@@ -1066,13 +1073,29 @@ async function restartTask(
 
 // ——— ревьювер: спавн/будильник на ревью-статусах ———
 
-/** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
- *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
- *  поведение stall-сигнала, деградации нет. */
-async function prMergedByGh(url: string): Promise<boolean> {
+interface PrProbeOutcome { result: PrProbeResult; mergedUrl: string | null }
+
+/** Состояние PR по URL из PR-ячейки (gh — прямая истина о мерже). Сбой пробы
+ *  (не-GitHub проект, gh недоступен/неавторизован) — unknown: сталл-ветка
+ *  отложит кик, предел деградации в prProbeVerdict вернёт страховку. */
+async function prProbeByCell(url: string): Promise<PrProbeOutcome> {
   try {
-    return (await sh(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])) === "MERGED"
-  } catch { return false }
+    const state = await sh(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])
+    return state === "MERGED" ? { result: "merged", mergedUrl: url } : { result: "open", mergedUrl: null }
+  } catch { return { result: "unknown", mergedUrl: null } }
+}
+
+/** Состояние PR по ветке — фоллбек при пустой PR-ячейке (инцидент 09.11:
+ *  задача 0m2net0 с мерженным PR не была защищена пробой — клетка пуста на
+ *  момент чтения). Репо — явно (cwd фабрики — чужой чекаут). */
+async function prProbeByBranch(repo: string, branch: string): Promise<PrProbeOutcome> {
+  try {
+    const url = await sh([
+      "gh", "pr", "list", "-R", repo, "--head", branch, "--state", "merged",
+      "--json", "url", "--jq", ".[0].url",
+    ])
+    return url !== "" ? { result: "merged", mergedUrl: url } : { result: "open", mergedUrl: null }
+  } catch { return { result: "unknown", mergedUrl: null } }
 }
 
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
@@ -1310,6 +1333,7 @@ async function dispatchReviewAction(
           // тиком): агент перечитывает task get вместе с комментами/телом
           d.consumeComments()
           await d.refreshBodyBaseline()
+          d.tracked.lastDevPromptAt = Date.now()
           saveState(d.state)
         } else {
           log(`задача ${shortId}: возврат из ревью — промпт девелоперу не ушёл`)
@@ -1686,15 +1710,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         && (tracked.bodyUpdated ?? "") !== ""
         && updated > (tracked.bodyUpdated ?? "")
       if (lastmodChanged) {
-        const inAgentStage = slot !== "dev" && addresseeSession !== ""
-        const target = inAgentStage ? addresseeSession : tracked.sessionID
-        const targetRole = slot === "review" ? "ревьювер" : slot === "test" ? "тестировщик" : "девелопер"
-        if (target !== "") {
+        const route = bodyEditRoute({
+          status: row.status,
+          reviewSessionID: tracked.reviewSessionID ?? "",
+          testSessionID: tracked.testSessionID ?? "",
+          devSessionID: tracked.sessionID,
+        })
+        if (route.t === "wake") {
           const md = await bodyExport(tracked.bodyDoc, bodyExports)
           // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
           const hash = md === null ? null : bodyContentHash(md)
           const lastmodMs = md === null ? null : bodyLastmodMs(md)
-          const activity = await lastSessionActivity(target)
+          const activity = await lastSessionActivity(route.target)
           const ownEdit = lastmodMs !== null && typeof activity === "number" && lastmodMs <= activity
           const contentChanged = hash === null || hash !== (tracked.bodyHash ?? "")
           if (!contentChanged) {
@@ -1715,11 +1742,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
               saveState(state)
               log(`задача ${rowId.slice(0, 8)}: дубль bodyEdit-wakeup в окне дедупа — скип`)
             } else {
-              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${targetRole})`)
-              if (await promptSession(target, bodyEditPrompt(rowId))) {
+              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${route.role})`)
+              if (await promptSession(route.target, bodyEditPrompt(rowId))) {
                 tracked.bodyUpdated = updated
                 if (hash !== null) tracked.bodyHash = hash
                 tracked.lastWakeup = { key: bodyKey, at: Date.now() }
+                if (route.role === "девелопер") tracked.lastDevPromptAt = Date.now()
                 saveState(state)
                 counters.wakeups++
               }
@@ -1727,7 +1755,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           }
           continue
         }
-        // таргета нет (дев в карантине, сессии держателя тоже) — базлайн не двигаем:
+        if (route.updateBaseline) {
+          // гейт статуса (Review = мяч у владельца): правка проглочена осознанно —
+          // базлайн двигаем, иначе каждые 3 мин перевычисление и лог-шум
+          tracked.bodyUpdated = updated
+          const md = await bodyExport(tracked.bodyDoc, bodyExports)
+          const hash = md === null ? null : bodyContentHash(md)
+          if (hash !== null) tracked.bodyHash = hash
+          saveState(state)
+          log(`задача ${rowId.slice(0, 8)}: правка тела на Review (мяч у владельца) — без будки`)
+          continue
+        }
+        // таргета нет (дев в карантине) — базлайн не двигаем:
         // добудим адресата на следующем тике
       }
     }
@@ -1756,24 +1795,50 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         if (activity === "invalid") {
           log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
         } else {
-          // git только когда вердикт может стать signal: предварительный чек
-          // застоя — решение остаётся в stallVerdict, ветка в facts нужна
-          // лишь для текста сигнала
-          const stalled = activity === null || Date.now() - activity > STALL_MS
-          // кэш мержа действителен, пока совпадает с PR-ячейкой (смена PR —
-          // stacked/ремедиация через возврат из Review — штатный пайп-путь —
-          // инвалидирует без перезаписи state; новый позитив перезапишет)
-          let prMerged = (tracked.mergedPrUrl ?? "") === row.pr && row.pr !== ""
+          // Единые часы сталла (stallClock): вердикт и pre-чек ленивых проб
+          // считают тишину от одной точки — последний сигнал сессии. Свежий
+          // будильник сбрасывает часы (инцидент 09.11: reviewReturnPrompt
+          // и сталл-кик из одной геометрии «тишина от активности» — два
+          // противоречащих сигнала одним тиком)
+          const clock = stallClock(
+            { lastActivityAt: activity, lastDevPromptAt: tracked.lastDevPromptAt ?? null },
+            STALL_MS,
+            Date.now(),
+          )
+          if (!clock.stalled && clock.fromWake && activity !== null
+              && Date.now() - activity > STALL_MS) {
+            log(`задача ${rowId.slice(0, 8)}: тишина от активности ${clock.quietMin} мин, но будильник сессии свежий — часы от wake, детекция ждёт ответ`)
+          }
+          const { stalled } = clock
+          // кэш мержа действителен, пока совпадает с PR-ячейкой или ячейка
+          // пуста (позитив фоллбек-пробы по ветке); смена PR на заполненной
+          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует
+          let prMerged = (tracked.mergedPrUrl ?? "") !== ""
+            && (row.pr === "" || tracked.mergedPrUrl === row.pr)
           // gh-проба ленивая (вердикт может стать signal) и только до первого
           // MERGED: merge необратим — без кэша это была бы проба каждые 3 мин
           // на всё время ожидания Done (дни). signaled=true глушит вердикт —
-          // проба не нужна
-          if (stalled && !prMerged && row.pr !== "" && tracked.stallSignaled !== true) {
-            if (await prMergedByGh(row.pr)) {
-              tracked.mergedPrUrl = row.pr
-              prMerged = true
+          // проба не нужна. Пустая клетка при непустой ветке — фоллбек по
+          // ветке (инцидент 09.11: мерженный PR не защитил от кика)
+          if (stalled && !prMerged && tracked.stallSignaled !== true) {
+            const probe = row.pr !== ""
+              ? await prProbeByCell(row.pr)
+              : row.branch !== "" ? await prProbeByBranch(cfg.repo, row.branch) : null
+            if (probe === null) {
+              // нет ни PR-клетки, ни ветки — пробовать нечего
+              tracked.prProbeUnknownStreak = undefined
+            } else {
+              const pv = prProbeVerdict(probe.result, tracked.prProbeUnknownStreak ?? 0)
+              tracked.prProbeUnknownStreak = pv.streakAfter === 0 ? undefined : pv.streakAfter
+              if (pv.degraded) {
+                log(`задача ${rowId.slice(0, 8)}: gh не отвечает ${pv.streakAfter} тиков подряд — сталл-детект деградировал к not-merged (страховка ADR-044)`)
+              }
+              if (pv.merged && probe.mergedUrl !== null) {
+                tracked.mergedPrUrl = probe.mergedUrl
+                prMerged = true
+                log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
+              }
               saveState(state)
-              log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
@@ -1784,6 +1849,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             status: row.status,
             sessionAlive: true,
             lastActivityAt: activity,
+            lastDevPromptAt: tracked.lastDevPromptAt ?? null,
             branch: row.branch,
             branchInWorktree,
             prMerged,
@@ -1864,6 +1930,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
       tracked.lastWakeup = { key: wakeupKey, at: Date.now() }
+      tracked.lastDevPromptAt = Date.now()
       saveState(state)
       counters.wakeups++
     } else {
