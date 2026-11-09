@@ -11,12 +11,17 @@
 //                   без создания новой;
 //   legacy-migrate— строка в «Ревью результата», живая сессия без reviewKind
 //                   (state старого деплоя): переспавн нового держателя.
+//   dev-restart-preserves — строка в «In Progress» (возврат из «Ревью
+//                   результата»), девелопер мёртв: рестарт девелопера через
+//                   preserveAgentSessions сохраняет живую ревью-сессию,
+//                   её счётчик попыток и вид (инвариант 1 задача = 1 держатель
+//                   вида; рестарт дева не переспавнивает ревьювера).
 // HOME задаётся родителем ДО старта процесса: os.homedir() в bun читает env
 // только на старте (инцидент 06.11) — изоляция только через новый процесс.
-import { mkdirSync, readFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
-const SCENARIOS = ["plan-spawn", "plan-to-result", "result-rerun", "legacy-migrate"] as const
+const SCENARIOS = ["plan-spawn", "plan-to-result", "result-rerun", "legacy-migrate", "dev-restart-preserves"] as const
 const envScenario = process.env.REVIEW_DISPATCH_SCENARIO
 const SCENARIO = SCENARIOS.find((s) => s === envScenario) ?? "plan-spawn"
 
@@ -27,7 +32,9 @@ const NEW_SESSION = "ses_new"
 
 const ROW = {
   id: ROW_ID,
-  status: SCENARIO === "plan-spawn" ? "Ревью плана" : "Ревью результата",
+  status: SCENARIO === "plan-spawn"
+    ? "Ревью плана"
+    : SCENARIO === "dev-restart-preserves" ? "In Progress" : "Ревью результата",
   bodyDoc: DOC_ID,
   title: "Диспетчер ревью",
 }
@@ -185,7 +192,23 @@ const state = JSON.parse(readFileSync(stateFile, "utf-8"))
 
 const calls = scriptTick()
 const { tickProject } = await import("../factory/factory")
-const cfg = { board: "Задачи x", repo: "r/x", local: "/tmp/x" }
+// dev-restart-preserves: спавн девелопера проходит env-механику (ensureEnv по
+// cfg.local) — нужен реальный git-чекоут с локальным ref origin/master
+// (fetch best-effort упадёт на фиктивном remote — env.ts продолжает на
+// локальных рефах). Чекоут живёт в HOME-песочнице (см. factory-guard-child).
+const localCheckout = join(home, "main-checkout")
+if (SCENARIO === "dev-restart-preserves") {
+  mkdirSync(localCheckout, { recursive: true })
+  const run = (args: string[]): void => {
+    Bun.spawnSync(args, { cwd: localCheckout, stdout: "ignore", stderr: "ignore" })
+  }
+  run(["git", "init", "-b", "master", localCheckout])
+  writeFileSync(join(localCheckout, "README.md"), "dispatch-child probe\n")
+  run(["git", "-C", localCheckout, "add", "."])
+  run(["git", "-C", localCheckout, "-c", "user.email=probe@local", "-c", "user.name=probe", "commit", "-m", "init"])
+  run(["git", "-C", localCheckout, "update-ref", "refs/remotes/origin/master", "HEAD"])
+}
+const cfg = { board: "Задачи x", repo: "r/x", local: SCENARIO === "dev-restart-preserves" ? localCheckout : "/tmp/x" }
 const sliceAll = (list: string[], prefix: string): string[] =>
   list.filter((c) => c.startsWith(prefix)).map((c) => c.slice(prefix.length))
 // tick 1
@@ -196,6 +219,7 @@ const tick1 = {
   itemUpdates: sliceAll(calls, "item_update:"),
 }
 const tracked = (state.tasks as Record<string, {
+  sessionID?: string
   reviewSessionID?: string
   reviewKind?: string
   reviewAttempts?: number
@@ -204,6 +228,7 @@ const tracked = (state.tasks as Record<string, {
 const verdict = {
   scenario: SCENARIO,
   tick1,
+  devSessionID: tracked?.sessionID ?? null,
   reviewSessionID: tracked?.reviewSessionID ?? null,
   reviewKind: tracked?.reviewKind ?? null,
   reviewAttempts: tracked?.reviewAttempts ?? null,

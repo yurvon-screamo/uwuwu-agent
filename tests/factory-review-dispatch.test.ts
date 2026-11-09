@@ -21,13 +21,14 @@ interface TickCalls {
 interface DispatchVerdict {
   scenario: string
   tick1: TickCalls
+  devSessionID: string | null
   reviewSessionID: string | null
   reviewKind: string | null
   reviewAttempts: number | null
   lastStatus: string | null
 }
 
-type Scenario = "plan-spawn" | "plan-to-result" | "result-rerun" | "legacy-migrate"
+type Scenario = "plan-spawn" | "plan-to-result" | "result-rerun" | "legacy-migrate" | "dev-restart-preserves"
 
 describe("tickProject: диспетчеризация ревьюверов по виду ревью", () => {
   let home: string
@@ -47,12 +48,13 @@ describe("tickProject: диспетчеризация ревьюверов по 
   })
 
   function seatState(scenario: Scenario): void {
-    // живая ревью-сессия: у plan-to-result — план-сессия, у result-rerun —
-    // result-сессия, у legacy-migrate — сессия старого агента без вида
+    // живая ревью-сессия: у plan-to-result — план-сессия, у result-rerun и
+    // dev-restart-preserves — result-сессия, у legacy-migrate — сессия старого
+    // агента без вида
     const reviewSessionID = scenario === "plan-spawn" ? "" : "ses_rev1"
     const reviewKind = scenario === "plan-to-result"
       ? "plan"
-      : scenario === "result-rerun"
+      : scenario === "result-rerun" || scenario === "dev-restart-preserves"
       ? "result"
       : undefined
     const tasks = {
@@ -62,9 +64,11 @@ describe("tickProject: диспетчеризация ревьюверов по 
         bodyDoc: "20261108000000-doc1", title: "Диспетчер ревью", project: "t",
         lastCommentAt: 0, lastCommentId: "", createdAt: Date.now(), attempts: 0,
         reviewSessionID,
-        reviewAttempts: 0,
+        reviewAttempts: scenario === "dev-restart-preserves" ? 2 : 0,
         ...(reviewKind !== undefined ? { reviewKind } : {}),
-        lastStatus: scenario === "plan-spawn" ? "Design" : "In Progress",
+        lastStatus: scenario === "plan-spawn"
+          ? "Design"
+          : scenario === "dev-restart-preserves" ? "Ревью результата" : "In Progress",
       },
     }
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), JSON.stringify({ tasks }))
@@ -136,6 +140,18 @@ describe("tickProject: диспетчеризация ревьюверов по 
     expect(v.tick1.sessionCreates).toHaveLength(1)
     expect(v.tick1.sessionCreates[0]).toContain("code-quality-reviewer:")
     expect(v.reviewSessionID).toBe("ses_new")
+    expect(v.reviewKind).toBe("result")
+  })
+
+  test("dev-restart-preserves: рестарт мёртвого девелопера сохраняет живую ревью-сессию и её вид", async () => {
+    const v = await runTick("dev-restart-preserves")
+    // девелопер переспавнен (спавн без праймари-агента — default)
+    expect(v.tick1.sessionCreates).toHaveLength(1)
+    expect(v.devSessionID).toBe("ses_new")
+    // инвариант 1 задача = 1 держатель вида: ревью-трек пережил замену записи
+    // state — сессия, счётчик попыток и вид перенесены preserveAgentSessions
+    expect(v.reviewSessionID).toBe("ses_rev1")
+    expect(v.reviewAttempts).toBe(2)
     expect(v.reviewKind).toBe("result")
   })
 })
