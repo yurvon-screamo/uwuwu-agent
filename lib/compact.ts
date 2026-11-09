@@ -118,7 +118,10 @@ export async function modelContextLimit(
   if (cached !== undefined) return cached
   let raw: unknown
   try {
-    raw = await rest("/api/model")
+    // NB: путь БЕЗ /api-префикса — restCall демона строит `${base}/api${path}`
+    // (баг-репорт тестировщика 10.11: rest("/api/model") давал живой
+    // GET /api/api/model → 404, компакт молчал вживую навсегда)
+    raw = await rest("/model")
   } catch {
     return null // transient: не кэшируем — ретрай следующим тиком
   }
