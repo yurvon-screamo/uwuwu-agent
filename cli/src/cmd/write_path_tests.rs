@@ -661,6 +661,16 @@ async fn body_replace_delete_failure_restores_pre_image() {
     );
 }
 
+/// Env-гард тестового пейсинга отката: remove на Drop — паника теста не
+/// протекает env в последующие serial-тесты (иначе маскируется их реальное
+/// расписание).
+struct RestorePacingGuard;
+impl Drop for RestorePacingGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+    }
+}
+
 /// Рестарт ядра посреди overwrite (класс 08.11: смерти процесса ядра,
 /// NRestarts=3 за вечер): мок сносит поколение MCP-сессий после второго
 /// tools/call (render-резолв строки, затем block get живости привязки) —
@@ -675,6 +685,9 @@ async fn body_replace_rollback_survives_kernel_reset_via_backoff_retries() {
     scenario.delete_fail_posts = 4;
     scenario.mcp_restart_after_tools_calls = 2;
     let (kernel, server) = MockKernel::start(scenario).await;
+
+    std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
 
     let err = body_via_cli(&server, true, None, "новое тело\n")
         .await
@@ -714,6 +727,7 @@ async fn body_replace_rollback_exhausts_retries_dumps_pre_image() {
     let (_kernel, server) = MockKernel::start(scenario).await;
 
     std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
     let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{BOUND_DOC}.md"));
     let _ = std::fs::remove_file(&dump_path);
 
@@ -721,7 +735,6 @@ async fn body_replace_rollback_exhausts_retries_dumps_pre_image() {
         .await
         .expect_err("сбой записи — команда не молчит");
 
-    std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
     let message = format!("{err:#}");
     assert!(
         message.contains("откат не удался"),

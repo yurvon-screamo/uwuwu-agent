@@ -26,8 +26,10 @@ const METADATA_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration
 /// Паузы между попытками авто-отката overwrite: ядро, уронившее запись,
 /// лежит в рестарте (quadlet ~6с + бут ядра ~10–15с) — первые попытки
 /// уходят в отказ, смысл ретраев — пережить окно рестарта. Итог — 4 попытки
-/// и ~40–45с ожидания. Тесты — UWUWU_TEST_RESTORE_BACKOFF_MS (мс через
-/// запятую); прод-константа не читает env.
+/// и ~40–45с ожидания. UWUWU_TEST_RESTORE_BACKOFF_MS (мс через запятую)
+/// перекрывает расписание: хук тестовый, но env читается на любом пути —
+/// прод его не выставляет, чужое значение меняет прод-бэкоффы громко
+/// (предупреждение в stderr + прод-константы, никогда не частично).
 const RESTORE_BACKOFFS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(10),
@@ -35,13 +37,22 @@ const RESTORE_BACKOFFS: [Duration; 3] = [
 ];
 
 fn restore_backoffs() -> Vec<Duration> {
-    match std::env::var("UWUWU_TEST_RESTORE_BACKOFF_MS") {
-        Ok(schedule) => schedule
-            .split(',')
-            .filter_map(|part| part.trim().parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .collect(),
-        _ => RESTORE_BACKOFFS.to_vec(),
+    let Ok(schedule) = std::env::var("UWUWU_TEST_RESTORE_BACKOFF_MS") else {
+        return RESTORE_BACKOFFS.to_vec();
+    };
+    let parsed: Result<Vec<Duration>, _> = schedule
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().map(Duration::from_millis))
+        .collect();
+    match parsed {
+        Ok(backoffs) if !backoffs.is_empty() => backoffs,
+        _ => {
+            eprintln!(
+                "предупреждение: UWUWU_TEST_RESTORE_BACKOFF_MS={schedule:?} не спарсился \
+                 (нужны мс через запятую) — расписание игнорируется, прод-бэкоффы"
+            );
+            RESTORE_BACKOFFS.to_vec()
+        }
     }
 }
 const WAVE_HINT: &str = "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями";
@@ -528,7 +539,9 @@ impl SiYuan {
                 Err(rollback_err) => last_err = Some(rollback_err),
             }
         }
-        let rollback_err = last_err.expect("цикл делает хотя бы одну попытку");
+        let Some(rollback_err) = last_err else {
+            unreachable!("цикл делает хотя бы одну попытку — last_err заполнен");
+        };
         let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
         // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
         // с дефолтными правами между create и set_permissions исключено
@@ -1402,6 +1415,7 @@ mod tests {
     use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing};
     use crate::siyuan::SiYuan;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1500,6 +1514,95 @@ mod tests {
             .await;
         assert!(second.is_err(), "cooldown must fail fast the next call");
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
+    }
+
+    /// Попытка отката сбрасывает wave-cooldown: metadata-not-ready до overwrite
+    /// армит 90s fail-fast, и без сброса delete_block первой попытки (post())
+    /// падал бы «пропущено — окно волны» — откат всегда кончался бы дампом.
+    #[tokio::test]
+    async fn rollback_attempt_disarms_wave_cooldown_before_first_delete() {
+        let server = MockServer::start().await;
+        // армим окно волны: appendBlock отдаёт metadata-not-ready ровно на
+        // серию арминга (3 запроса instant-пейсинга), дальше — успех
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(metadata_error_template())
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({ "id": "x" }),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect_err("metadata-not-ready исчерпанием армит окно волны");
+        assert!(
+            sy.wave_cooldown_active(),
+            "окно волны армировано перед откатом"
+        );
+
+        // путь отката: get_children отвечает ребёнком на первый вызов и пусто
+        // дальше (первый tools/call — notifications/initialized, его не считаем)
+        let children_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&children_calls);
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-ok-barrier");
+                }
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 {
+                    "- [p] старый блок (blk-1)".to_string()
+                } else {
+                    String::new()
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2,
+                        "result": { "content": [{ "type": "text", "text": text }] }
+                    })
+                    .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+        // deleteBlock и appendBlock-успех (последний смонтированный мок
+        // перекрывает metadata-error — wiremock берёт свежайший матч)
+        Mock::given(method("POST"))
+            .and(path("/api/block/deleteBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+
+        let err = sy
+            .restore_or_fail("doc-1", "старый контент\n", anyhow::anyhow!("boom"))
+            .await
+            .expect_err("restore_or_fail всегда Err");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("восстановлен"),
+            "откат прошёл при армированном окне: {text}"
+        );
+        assert!(
+            !sy.wave_cooldown_active(),
+            "окно волны сброшено попыткой отката"
+        );
     }
 
     #[tokio::test]
