@@ -108,9 +108,13 @@ describe("tickProject: стадия «Тестирование»", () => {
     expect(v.lastStatus).toBe("Тестирование")
     // ячейка «Сессия тест» записана (k-test)
     expect(v.tick1.itemUpdates).toEqual(["k-test=ses_new"])
+    // доска с живыми сессионными колонками — флаг ADR-054 не поднимается
+    // (коммент только при расхождении: skipped пуст)
+    expect(v.tick1.comments).toHaveLength(0)
     // повторный тик: дубль-спавна нет, повторного промпта нет
     expect(v.tick2.sessionCreates).toHaveLength(0)
     expect(v.tick2.prompts).toHaveLength(0)
+    expect(v.tick2.comments).toHaveLength(0)
   })
 
   test("nocell: доска без «Сессия тест» — ячейка не пишется, флаг-коммент один на доску", async () => {
