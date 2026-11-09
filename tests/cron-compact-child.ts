@@ -41,11 +41,11 @@ const SESSION = "ses_mock_1"
 // ——— управляемый opencode-сервер ———
 
 const compactCalls: string[] = []
-let sessionModel: Record<string, unknown> | null = {
+const sessionModel: Record<string, unknown> = {
   providerID: "zai-coding-plan", id: "test-model",
 }
-let idleAt: number | null = Date.now() - 5 * 3_600_000 // idle 5ч ≥ порога
-let messages: unknown[] = [
+let idleAt: number | null = Date.now() - 5 * 3_600_000 // idle 5ч ≥ порога (финальная метка — в сценарии ниже)
+const messages: unknown[] = [
   { type: "assistant", tokens: { input: 500_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
 ]
 
@@ -67,7 +67,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ time: { created: Date.now() } })
   }
   if (/\/api\/session\/ses_[^/]+\/?$/.test(url)) {
-    return json({ outcome: "succeeded", time: { idle: idleAt }, ...(sessionModel !== null ? { model: sessionModel } : {}) })
+    return json({ outcome: "succeeded", time: { idle: idleAt }, model: sessionModel })
   }
   if (url.includes("/message")) return json(messages)
   if (url.endsWith("/api/model")) {
