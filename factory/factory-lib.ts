@@ -507,6 +507,8 @@ export interface PromptTarget {
 export interface PromptContext {
   env?: SpawnEnvContext
   init?: SpawnInit
+  /** git-ref базы env-ворктри и master-строк текста; дефолт DEFAULT_BASE */
+  base?: string
 }
 /** YAML frontmatter из начала markdown (--- … ---) — паритет CLI
  *  markdown.rs strip_frontmatter: ядро в экспорте ведёт live-атрибуты дока. */
@@ -579,6 +581,7 @@ export function spawnPrompt(
   ctx: PromptContext = {},
 ): string {
   const { env, init } = ctx
+  const base = baseOf(ctx)
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -597,9 +600,9 @@ export function spawnPrompt(
         "После approve плана:",
       ]
   const workLine = env === undefined
-    ? ["создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй."]
+    ? [`создай worktree+ветку от ${base} (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.`]
     : [
-        "работай в своём окружении задачи (фабрика создала, ветка уже от origin/master):",
+        `работай в своём окружении задачи (фабрика создала, ветка уже от ${base}):`,
         `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
         "Branch/Path-ячейки и сессии заполняет фабрика — тебе их трогать не нужно.",
       ]
@@ -654,8 +657,9 @@ export function conflictFixPrompt(
   rowId: string, pr: string, project: string, ctx: PromptContext = {},
 ): string {
   const { env, init } = ctx
+  const base = baseOf(ctx)
   return [
-    `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с master (${pr}).`,
+    `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с ${base} (${pr}).`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
     ...(env !== undefined
@@ -665,7 +669,7 @@ export function conflictFixPrompt(
           "",
         ]
       : []),
-    "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
+    `Почини конфликт: git fetch origin, обнови ветку от ${base} (rebase/merge — как принято в репо),`,
     "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
     "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
     `в «${REVIEW_RESULT_STATUS}» (uwuwu-cli task edit --status) и заверши ход.`,
@@ -756,10 +760,13 @@ export interface ReviewContext {
   pr: string
   /** тип задачи из колонки «Тип»: ревьювер сверяет канон типа (Bug→TDD, Spike→без кода) */
   type?: string
+  /** git-ref базы диффа и master-строк текста; дефолт DEFAULT_BASE */
+  base?: string
 }
 
 /** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
 export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext): string {
+  const base = baseOf(ctx)
   const lines = [
     `[factory] Задача ${rowId} (проект ${project}): ревью ${kind === "plan" ? "плана" : "результата"}.`,
     "",
@@ -774,12 +781,12 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
       ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
       : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
     ...(kind === "result"
-      ? ["   origin/master + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.",]
+      ? [`   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,]
       : []),
     ...(ctx.worktree !== ""
       ? [`   Ворктри задачи: ${ctx.worktree}`]
       : kind === "result"
-        ? [`   Ворктри задачи не найден — ревью по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+        ? [`   Ворктри задачи не найден — ревью по diff ${base}…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
            `   (git-команды из каталога сессии; ворктри не обязателен для диффа).`]
         : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
@@ -850,6 +857,7 @@ export type TestContext = ReviewContext
 
 /** Стартовый промпт тестировщика: фабрика спавнит сессию на «Тестировании». */
 export function testingSpawnPrompt(rowId: string, project: string, ctx: TestContext): string {
+  const base = baseOf(ctx)
   const lines = [
     `[factory] Задача ${rowId} (проект ${project}): стадия тестирования.`,
     "",
@@ -859,10 +867,10 @@ export function testingSpawnPrompt(rowId: string, project: string, ctx: TestCont
     "",
     `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи (постановка, план/решение,`,
     "   юзкейсы и «Проверка», отчёт инженера) и треды комментов (прошлые твои раунды, баг-репорты).",
-    "2. Изменения: ветка против origin/master в ворктри задачи; PR (gh pr view/diff) —",
+    `2. Изменения: ветка против ${base} в ворктри задачи; PR (gh pr view/diff) —`,
     ...(ctx.worktree !== ""
       ? [`   Ворктри задачи: ${ctx.worktree}`]
-      : [`   Ворктри задачи не найден — работай по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+      : [`   Ворктри задачи не найден — работай по diff ${base}…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
          `   (git-команды из каталога сессии; ворктри не обязателен).`]),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
@@ -1379,10 +1387,22 @@ export interface ProjectCfg {
   board: string
   repo: string
   local: string
+  /** git-ref базы env-ворктри и текстов промптов. Репы не на master
+   *  (GitLab и пр. — origin/main) указывают свой ref. Дефолт DEFAULT_BASE. */
+  base?: string
   /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
    *  вне механики (cfg.local не git-репо → контракт невыполним): агент сам
    *  делает ворктри/ветку и заполняет Branch-ячейку. Дефолт true. */
   env?: boolean
+}
+
+/** База env-ворктри по умолчанию: все живые проекты фабрики — master-based. */
+export const DEFAULT_BASE = "origin/master"
+
+/** База из конфига/контекста промпта с дефолтом; пустая строка — это
+ *  заданная (сломанная) база, не отсутствие. Валидность пустой — parseProjects. */
+export function baseOf(source: { base?: string }): string {
+  return source.base ?? DEFAULT_BASE
 }
 
 /** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
@@ -1411,7 +1431,14 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
     if (c.env !== undefined && typeof c.env !== "boolean") {
       throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — env должен быть boolean`)
     }
-    out[name] = { board: c.board, repo: c.repo, local: c.local, ...(c.env !== undefined ? { env: c.env } : {}) }
+    if (c.base !== undefined && (typeof c.base !== "string" || c.base.trim() === "")) {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — base должна быть непустой строкой`)
+    }
+    out[name] = {
+      board: c.board, repo: c.repo, local: c.local,
+      ...(c.base !== undefined ? { base: c.base } : {}),
+      ...(c.env !== undefined ? { env: c.env } : {}),
+    }
   }
   if (Object.keys(out).length === 0) {
     throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")

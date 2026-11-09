@@ -38,6 +38,7 @@ import {
   untrackedTasks,
   isUserComment,
   kickoffModeOf,
+  baseOf,
   promptForStart,
   prMergeableOf,
   mergeablePollStep,
@@ -730,7 +731,7 @@ async function startTask(
   let envCtx: SpawnEnvContext | undefined
   let envDir: string | undefined
   if (useEnv) {
-    const paths = await ensureEnv(envDeps(), { root: ENV_ROOT, rowId: task.rowId, local: cfg.local, base: "origin/master" })
+    const paths = await ensureEnv(envDeps(), { root: ENV_ROOT, rowId: task.rowId, local: cfg.local, base: baseOf(cfg) })
     envCtx = { repoDir: paths.repoDir, branch: paths.branch, scratchDir: paths.scratchDir }
     envDir = paths.envDir
     if (counters !== undefined) counters.envCreated++
@@ -824,7 +825,7 @@ async function gcLegacyRoots(name: string, cfg: ProjectCfg, state: FactoryState)
   const report = await gcLegacyWorktrees(envDeps(), {
     local: cfg.local,
     roots: [join(cfg.local, "wt"), join(cfg.local, ".worktrees")],
-    base: "origin/master",
+    base: baseOf(cfg),
     protectedBranches: guards.branches,
     protectedDirs: guards.dirs,
     nowMs: Date.now(),
@@ -1090,7 +1091,7 @@ async function startReview(
   // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
   // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
   const worktree = tracked.worktree
-  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
@@ -1145,7 +1146,7 @@ async function startTesting(
     return
   }
   const worktree = tracked.worktree
-  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
@@ -1301,7 +1302,7 @@ async function dispatchReviewAction(
           // живая сессия инит получила при своём спавне — будильник без
           // init (дельта-принцип); init только на свежих сессиях (startTask)
           conflicted
-            ? conflictFixPrompt(d.row.rowId, d.row.pr, d.project)
+            ? conflictFixPrompt(d.row.rowId, d.row.pr, d.project, { base: baseOf(d.cfg) })
             : reviewReturnPrompt(d.row.rowId),
         )
         if (ok) {
@@ -1746,7 +1747,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         tracked.sessionID = ""
         saveState(state)
         await notify(tracked,
-          "[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с master).")
+          `[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с ${baseOf(cfg)}).`)
       } else if (quiet === "alive" && row.status === "In Progress") {
         // сессия жива — ловим зависший ход: агент молчит дольше порога
         // (активный ход рождает сообщения на каждом шаге LLM). Неизвестная
