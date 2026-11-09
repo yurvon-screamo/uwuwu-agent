@@ -43,15 +43,10 @@ function parseListValues(raw: string): string[] {
 export function parsePinningDoc(md: string): PinningDoc {
   const doc: PinningDoc = { factories: {}, singles: {}, local: {} }
   let section: string | null = null
-  const seen = { factories: new Set<string>(), singles: new Set<string>(), local: new Set<string>() }
   for (const line of md.split("\n")) {
     const heading = line.match(/^## (.+)$/)
     if (heading !== null) {
-      const title = normalizeKey(heading[1])
-      if (title === SECTION_FACTORIES) section = SECTION_FACTORIES
-      else if (title === SECTION_SINGLES) section = SECTION_SINGLES
-      else if (title.startsWith(SECTION_LOCAL_PREFIX)) section = SECTION_LOCAL_PREFIX
-      else throw new Error(`пиннинг-док: неизвестная секция «${heading[1].trim()}» — формат: Фабрики, Одиночные демоны, Нод-локальные`)
+      section = resolveSection(heading[1])
       continue
     }
     if (section === null) continue
@@ -59,25 +54,38 @@ export function parsePinningDoc(md: string): PinningDoc {
     if (item === null) continue
     const key = normalizeKey(item[1])
     if (key === "") throw new Error(`пиннинг-док: пустой ключ в строке «${line.trim()}»`)
-    if (section === SECTION_SINGLES) {
-      const nodes = parseListValues(item[2])
-      if (nodes.length !== 1) throw new Error(`пиннинг-док: «${key}» — одна строка = одна нода, получено ${nodes.length}`)
-      if (seen.singles.has(key)) throw new Error(`пиннинг-док: дубликат «${key}» в «${SECTION_SINGLES}»`)
-      seen.singles.add(key)
-      doc.singles[key] = nodes[0]
-    } else {
-      const values = parseListValues(item[2])
-      if (values.length === 0) throw new Error(`пиннинг-док: «${key}» — пустой список значений`)
-      const seenSet = section === SECTION_FACTORIES ? seen.factories : seen.local
-      if (seenSet.has(key)) throw new Error(`пиннинг-док: дубликат «${key}» в «${section}»`)
-      seenSet.add(key)
-      ;(section === SECTION_FACTORIES ? doc.factories : doc.local)[key] = values
-    }
+    appendListItem(doc, section, key, item[2])
   }
   if (Object.keys(doc.factories).length === 0) {
     throw new Error(`пиннинг-док: секция «## Фабрики» не найдена или пуста`)
   }
   return doc
+}
+
+/** Заголовок `##` → канон секции; неизвестный — throw. */
+function resolveSection(rawTitle: string): string {
+  const title = normalizeKey(rawTitle)
+  if (title === SECTION_FACTORIES) return SECTION_FACTORIES
+  if (title === SECTION_SINGLES) return SECTION_SINGLES
+  if (title.startsWith(SECTION_LOCAL_PREFIX)) return SECTION_LOCAL_PREFIX
+  throw new Error(`пиннинг-док: неизвестная секция «${rawTitle.trim()}» — формат: Фабрики, Одиночные демоны, Нод-локальные`)
+}
+
+/** Строка списка `- ключ: значения` → запись секции (дубликаты и битые
+ *  значения — throw). */
+function appendListItem(doc: PinningDoc, section: string, key: string, rawValues: string): void {
+  if (section === SECTION_SINGLES) {
+    const nodes = parseListValues(rawValues)
+    if (nodes.length !== 1) throw new Error(`пиннинг-док: «${key}» — одна строка = одна нода, получено ${nodes.length}`)
+    if (key in doc.singles) throw new Error(`пиннинг-док: дубликат «${key}» в «${SECTION_SINGLES}»`)
+    doc.singles[key] = nodes[0]
+    return
+  }
+  const values = parseListValues(rawValues)
+  if (values.length === 0) throw new Error(`пиннинг-док: «${key}» — пустой список значений`)
+  const target = section === SECTION_FACTORIES ? doc.factories : doc.local
+  if (key in target) throw new Error(`пиннинг-док: дубликат «${key}» в «${section}»`)
+  target[key] = values
 }
 
 /** Нарушения фабрики: перепин (проект конфига пинен за другую ноду) — всегда;
