@@ -677,10 +677,12 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("approve → In Progress")
     expect(p).toContain("request_changes → Design")
     expect(p).not.toContain("request_changes → In Progress")
-    // вердикт-строка с тремя исходами; approve-with-notes plan-у не светит
-    expect(p).toContain("approve|approve с мелкими замечаниями|request_changes")
-    expect(p).toContain("только для result")
+    // вердикт-строка план-ревью двухзначная — словарь методички plan-reviewer
+    expect(p).toContain("Статус: approve|request_changes")
+    expect(p).not.toContain("approve с мелкими замечаниями|request_changes")
     expect(p).not.toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
+    // термина выпиленной диспетчеризации в промпте быть не должно
+    expect(p).not.toContain("review_type")
   })
   test("result: ветка/ворктри/PR и переходы результата", () => {
     const p = reviewSpawnPrompt("r2", "origa", "result", ctx, "code-quality-reviewer")

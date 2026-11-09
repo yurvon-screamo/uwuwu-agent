@@ -786,8 +786,8 @@ export function reviewSpawnPrompt(
     "   Если в тредах есть прошлые раунды ревью этой задачи (твоя сессия пересоздана) —",
     "   это продолжение: проверь устранение прошлых замечаний, не начинай с нуля.",
     kind === "plan"
-      ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
-      : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
+      ? "2. Предмет — план из тела задачи; кодовый diff не нужен (его ревью — предмет code-quality-reviewer)."
+      : "2. Предмет — все изменения ветки задачи против её базы (источник branch):",
     ...(kind === "result"
       ? [`   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,]
       : []),
@@ -800,9 +800,13 @@ export function reviewSpawnPrompt(
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
-    "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
-    kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    kind === "plan"
+      ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
+      : [
+          "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
+          "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+        ].join("\n"),
     "4. Статус после вердикта (uwuwu-cli task edit):",
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
