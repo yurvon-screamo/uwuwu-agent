@@ -17,6 +17,7 @@ import { tmpdir } from "node:os"
 const CHILD = join(import.meta.dir, "factory-stall-gate-child.ts")
 const ROW_ID = "20261109000000-row1"
 const PR42 = "https://github.com/r/x/pull/42"
+const PR99 = "https://github.com/r/x/pull/99"
 const DEV_SESSION = "ses_dev1"
 
 interface TickObs {
@@ -54,12 +55,15 @@ describe("tickProject: сталл-ветка и bodyEdit-гейт (ложная 
       join(home, ".local/state/opencode/service.json"),
       JSON.stringify({ url: "http://127.0.0.1:9", password: "pw" }),
     )
-    // фейковый gh: merged/open/fail — поведение pr list/pr view по режиму
+    // фейковый gh: merged/open/branch-merged/fail — поведение pr list/pr view;
+    // журнал вызовов в GH_LOG (ленивость пробы и путь по клетке/ветке)
     const fakeGh = `#!/usr/bin/env bash
 IS_LIST=false; for a in "$@"; do [[ "$a" == "list" ]] && IS_LIST=true; done
+[[ -n "\${GH_LOG:-}" ]] && echo "$*" >> "$GH_LOG"
 case "\${GH_FAKE:-fail}" in
   merged) if $IS_LIST; then echo "${PR42}"; else echo "MERGED"; fi ;;
   open) if $IS_LIST; then echo ""; else echo "OPEN"; fi ;;
+  branch-merged) if $IS_LIST; then echo "${PR99}"; else echo "OPEN"; fi ;;
   *) exit 1 ;;
 esac
 `
@@ -71,7 +75,9 @@ esac
     rmSync(home, { recursive: true, force: true })
   })
 
-  function seatState(scn: "review_swallow" | "wake_fresh" | "wake_dead" | "merged_cell" | "unknown_defer" | "branch_fallback"): void {
+  function seatState(
+    scn: "review_swallow" | "wake_fresh" | "wake_dead" | "merged_cell" | "merged_cell_url" | "unknown_defer" | "branch_fallback",
+  ): void {
     const promptAgeMin = scn === "wake_fresh" ? 1 : scn === "review_swallow" ? null : 400
     const state = {
       tasks: {
@@ -89,7 +95,7 @@ esac
   }
 
   async function runTick(
-    scenario: "review_swallow" | "wake_fresh" | "wake_dead" | "merged_cell" | "unknown_defer" | "branch_fallback",
+    scenario: "review_swallow" | "wake_fresh" | "wake_dead" | "merged_cell" | "merged_cell_url" | "unknown_defer" | "branch_fallback",
   ): Promise<TickReport> {
     seatState(scenario)
     const proc = Bun.spawn(["bun", CHILD], {
@@ -99,9 +105,9 @@ esac
         UWUWU_SIYUAN_TOKEN: "test-token",
         UWUWU_FACTORY_STATE_DIR: join(home, ".local/state/uwuwu-factory"),
         STALL_GATE_SCENARIO: scenario,
-        GH_FAKE: scenario === "merged_cell" || scenario === "branch_fallback"
+        GH_FAKE: scenario === "merged_cell" || scenario === "merged_cell_url"
           ? "merged"
-          : scenario === "wake_dead" ? "open" : "fail",
+          : scenario === "wake_dead" ? "open" : scenario === "branch_fallback" ? "branch-merged" : "fail",
         GH_LOG: ghLog,
         PATH: `${join(home, "bin")}:${process.env.PATH ?? ""}`,
       },
@@ -159,6 +165,8 @@ esac
     expect(v.state.stallSignaled).toBe(true)
     expect(v.state.lastStatus).toBe("Needs attention")
     expect(v.boardStatus).toBe("Needs attention")
+    // merged-проба по PR-клетке (gh pr view по URL из клетки, не по ветке)
+    expect(v.ghCalls?.some((c) => c.includes("pr view"))).toBe(true)
   })
 
   test("PR смержен (text-клетка, путь prProbeByCell): кэш mergedPrUrl, кика нет", async () => {
@@ -169,6 +177,18 @@ esac
     expect(v.state.stallSignaled).toBeNull()
     expect(v.boardStatus).toBe("In Progress")
     expect(v.log.join("\n")).toContain("PR смержен")
+  })
+
+  test("PR смержен (url-клетка живой доски — после фикса адаптера): кэш из клетки, кика нет", async () => {
+    const v = await runTick("merged_cell_url")
+    expect(v.perTick[0]?.statusUpdates).toHaveLength(0)
+    expect(v.perTick[0]?.comments).toHaveLength(0)
+    // кэш несёт URL ИЗ КЛЕТКИ (gh pr view) — проба по клетке на живой доске
+    expect(v.state.mergedPrUrl).toBe(PR42)
+    expect(v.ghCalls?.some((c) => c.includes("pr view"))).toBe(true)
+    expect(v.ghCalls?.some((c) => c.includes("pr list"))).toBe(false)
+    expect(v.state.stallSignaled).toBeNull()
+    expect(v.boardStatus).toBe("In Progress")
   })
 
   test("gh лежит: unknown до предела откладывает кик, на 3-м тике деградация и кик", async () => {
@@ -188,12 +208,13 @@ esac
     expect(v.boardStatus).toBe("Needs attention")
   })
 
-  test("PR-клетка url-формата (живая доска): merged-PR найден фоллбеком по ветке", async () => {
+  test("PR-клетка физически пуста (откат клетки): merged-PR найден фоллбеком по ветке", async () => {
     const v = await runTick("branch_fallback")
     expect(v.perTick[0]?.statusUpdates).toHaveLength(0)
     expect(v.perTick[0]?.comments).toHaveLength(0)
-    // кэш несёт URL, найденный gh pr list --head (не клетку)
-    expect(v.state.mergedPrUrl).toBe(PR42)
+    // кэш несёт URL, найденный gh pr list --head (не клетку — она пуста)
+    expect(v.state.mergedPrUrl).toBe(PR99)
+    expect(v.ghCalls?.some((c) => c.includes("pr list"))).toBe(true)
     expect(v.boardStatus).toBe("In Progress")
     expect(v.log.join("\n")).toContain("PR смержен")
   })

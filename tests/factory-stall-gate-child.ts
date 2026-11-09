@@ -10,12 +10,16 @@
 //   wake_dead        — будка умерла (последний промпт 400 мин назад), PR
 //                      открыт: кик — Needs attention + коммент, раз за эпизод;
 //   merged_cell      — PR смержен (клетка старого text-формата — путь
-//                      prProbeByCell): кэш mergedPrUrl = URL клетки, кика нет;
+//                      prProbeByCell на досках с text-колонкой): кэш
+//                      mergedPrUrl = URL клетки, кика нет;
+//   merged_cell_url  — PR смержен (клетка url-формата живой доски, после
+//                      фикса адаптер читает url — путь prProbeByCell):
+//                      кэш = URL клетки, кика нет;
 //   unknown_defer    — gh лежит: тики 1–2 кик отложен (полоса unknown),
 //                      тик 3 — деградация к not-merged, кик идёт;
-//   branch_fallback  — PR-клетка url-формата (как на живой доске — адаптер
-//                      её не отдаёт), merged-PR найден по ветке: кэш = URL
-//                      из gh pr list, кика нет.
+//   branch_fallback  — PR-клетка физически пуста (откат клетки ядром —
+//                      инцидент 0m2net0, вариант A), merged-PR найден по
+//                      ветке: кэш = URL из gh pr list, кика нет.
 // HOME/UWUWU_FACTORY_STATE_DIR задаются родителем ДО старта процесса
 // (os.homedir() в bun читает env только на старте — инцидент 06.11).
 // fetch скриптован (ядро/REST), gh — фейк в PATH (GH_FAKE, журнал GH_LOG).
@@ -44,8 +48,9 @@ const SCENES: Record<string, SceneCfg> = {
   wake_fresh: { status: "In Progress", msgAgeMin: 507, prCell: "https://github.com/r/x/pull/42", ticks: 2, bodyEdits: [] },
   wake_dead: { status: "In Progress", msgAgeMin: 500, prCell: "https://github.com/r/x/pull/42", ticks: 2, bodyEdits: [] },
   merged_cell: { status: "In Progress", msgAgeMin: 500, prCell: "https://github.com/r/x/pull/42", prCellText: true, ticks: 1, bodyEdits: [] },
+  merged_cell_url: { status: "In Progress", msgAgeMin: 500, prCell: "https://github.com/r/x/pull/42", ticks: 1, bodyEdits: [] },
   unknown_defer: { status: "In Progress", msgAgeMin: 500, prCell: "https://github.com/r/x/pull/42", ticks: 3, bodyEdits: [] },
-  branch_fallback: { status: "In Progress", msgAgeMin: 500, prCell: "https://github.com/r/x/pull/42", ticks: 1, bodyEdits: [] },
+  branch_fallback: { status: "In Progress", msgAgeMin: 500, prCell: "", ticks: 1, bodyEdits: [] },
 }
 const cfg = SCENES[SCENARIO]
 if (cfg === undefined) throw new Error(`child: неизвестный сценарий ${SCENARIO}`)
@@ -117,11 +122,12 @@ function scriptTick(): string[] {
         const action = String(args.action ?? "")
         if (action === "render") {
           const page = Number(args.page ?? 1)
-          // PR-клетка: prCellText — старый text-формат, адаптер читает
-          // stale text.content (путь prProbeByCell); url-формат живой доски
-          // ({"url":{"content":...}}) адаптер readDatabaseCells НЕ читает
-          // (ветки url в нём нет) — клетка доходит пустой, как на живой доске
-          const prValue = cfg.prCellText ? cfg.prCell : ""
+          // PR-клетка: prCellText — text-формат (старые доски), иначе
+          // url-формат живой доски {"url":{"content":...}}; после фикса
+          // адаптера (диспетч по активному type) url-клетка читается —
+          // prProbeByCell достижим; prCell "" — физически пустая клетка
+          // (откат клетки ядром) — путь уходит в фоллбек по ветке
+          const prValue = cfg.prCell
           result = page === 1
             ? {
                 structuredContent: {

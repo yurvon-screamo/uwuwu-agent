@@ -88,4 +88,75 @@ describe("read_database_cells: колонка типа url (баг-пин)", () 
     // баг: адаптер матчит только mSelect/text/date — url-клетка доходит ""
     expect(row?.cells?.PR?.value).toBe(PR_URL)
   })
+
+  test("stale text при активном url не читается: после смены PR проба не идёт по устаревшему URL", async () => {
+    __test.expireSession()
+    // конвертация ключа text→url оставляет в клетке старый text.content:
+    // активный type url решает — читается url.content (новый PR)
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/api/query/sql")) {
+        return new Response(JSON.stringify({
+          code: 0, msg: "",
+          data: [{ markdown: `<div data-av-id="${AV_ID}"></div>` }],
+        }), { status: 200 })
+      }
+      if (url.includes("/mcp")) {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as {
+          method?: string
+          params?: { name?: string; arguments?: Record<string, unknown> }
+        }
+        if (payload.method === "initialize") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), {
+            status: 200, headers: { "mcp-session-id": "sid" },
+          })
+        }
+        if (payload.method === "notifications/initialized") return new Response("", { status: 200 })
+        const args = payload.params?.arguments ?? {}
+        let result: unknown
+        if (payload.params?.name === "database" && String(args.action ?? "") === "render") {
+          result = {
+            structuredContent: {
+              data: {
+                view: {
+                  columns: [
+                    { id: "k-key", name: "Название" },
+                    { id: "k-pr", name: "PR" },
+                  ],
+                  rowCount: 1,
+                  rows: [{
+                    id: "20261109183658-row",
+                    cells: [
+                      {
+                        value: {
+                          keyID: "k-key", type: "block", blockID: "20261109183658-row",
+                          block: { id: "doc1", content: "Задача", refSubtype: "d" },
+                        },
+                      },
+                      {
+                        value: {
+                          keyID: "k-pr", type: "url",
+                          // stale text от записи ДО конвертации ключа/смены PR
+                          text: { content: "https://github.com/yurvon-screamo/uwuwu-agent/pull/40" },
+                          url: { url: PR_URL, content: PR_URL },
+                        },
+                      },
+                    ],
+                  }],
+                },
+              },
+            },
+          }
+        } else {
+          throw new Error(`url-cell mock: неожиданный вызов ${payload.params?.name ?? "?"} ${JSON.stringify(args)}`)
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 2, result }), { status: 200 })
+      }
+      throw new Error(`url-cell mock: неожиданный путь ${url}`)
+    }) as typeof fetch
+    const r = await tool<{
+      rows?: Array<{ cells?: Record<string, { value?: string }> }>
+    }>("read_database_cells", { databaseBlockId: BLOCK_ID })
+    expect(r.rows?.[0]?.cells?.PR?.value).toBe(PR_URL)
+  })
 })
