@@ -54,6 +54,11 @@ describe("parsePinningDoc", () => {
     expect(doc.factories).toEqual({ kisa: ["uwuwu", "origa"] })
   })
 
+  test("zero-width артефакты ядра (ZWSP в заголовке секции) не ломают парс", () => {
+    const doc = parsePinningDoc("## Фабрики\u200b\n\n- kisa: uwuwu\n")
+    expect(doc.factories).toEqual({ kisa: ["uwuwu"] })
+  })
+
   test("неизвестная секция — throw, молчаливый пропуск прячет опечатку владельца", () => {
     expect(() => parsePinningDoc("## Роутинг\n\n- kisa: uwuwu\n")).toThrow("неизвестная секция")
   })

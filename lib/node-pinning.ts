@@ -25,10 +25,11 @@ const SECTION_LOCAL_PREFIX = "нод-локальные"
 
 const LIST_LINE = /^- ([^:]+): (.+)$/
 
-/** Норм-форма ключа (нода/демон/проект): trim + lowercase — док правится
- *  владельцем в UI, регистр не контракт. */
+/** Норм-форма ключа (нода/демон/проект): trim + lowercase + срез format-
+ *  символов — док правится владельцем в UI, регистр и ZWSP-артефакты ядра
+ *  (инвентарь round-trip, класс \p{Cf} — паритет normalizeBodyMd) не контракт. */
 function normalizeKey(raw: string): string {
-  return raw.trim().toLowerCase()
+  return raw.replace(/\p{Cf}/gu, "").trim().toLowerCase()
 }
 
 function parseListValues(raw: string): string[] {
