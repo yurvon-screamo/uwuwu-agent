@@ -20,7 +20,7 @@ import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotic
 import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
-  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, agentFirePrompt,
+  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
@@ -530,8 +530,10 @@ async function refuseOnce(state: CronState, row: CronRow, reason: string): Promi
 
 /** Ретрай файра с неподтверждённым POST (дедуп приземления — паттерн hub
  *  steerLandedAt: «сервер приземлил промпт, ответ потерян» — повторный POST
- *  продублировал бы инструкцию в вечный контекст). Приземлился — файр
- *  завершён (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
+ *  продублировал бы инструкцию в вечный контекст). Дедуп по сигнатуре рана
+ *  (runLandedAt): приземлившаяся копия конверта с любым текстом (ручной
+ *  стирт-ретрай оператора) признаётся. Приземлился — файр завершён
+ *  (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
  *  дропается, следующий файр начнётся заново. */
 async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: CronRow, masterTitle: string): Promise<void> {
   const pending = tracked.pendingRun
@@ -554,7 +556,11 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
     return [] as SessionMsg[]
   })
   msgs = [...msgs, ...(await sessionInbox(tracked.sessionID))]
-  const landed = promptLandedAt(msgs, pending.attemptAt - 2000, pending.prompt)
+  // граница дедупа — прошлый файр (lastFiredAt), не attemptAt: ран-карточка
+  // создана позже него, конверт этого рана не мог приземлиться раньше, а окно
+  // шире — ручная копия между попытками доставки (лаг REST, стирт оператора
+  // до штампа pendingRun) дедупом не теряется
+  const landed = runLandedAt(msgs, tracked.lastFiredAt, pending.rowId)
   if (landed !== null) {
     log(`мастер «${masterTitle}»: промпт файра приземлился ранее (${landed}) — ретрай не нужен (ран ${pending.rowId})`)
     state.crons[row.rowId] = { sessionID: tracked.sessionID, lastFiredAt: landed, firedAtIso: new Date(landed).toISOString() }
@@ -570,7 +576,10 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
   }
   const landedMs = await promptPost(tracked.sessionID, pending.prompt, action === "steer")
   if (landedMs === null) {
-    pending.attemptAt = Date.now() // новая метка попытки: дедуп приземления от неё
+    // новая метка попытки: граница sessionStatus для decideFire следующего
+    // ретрая (outcome/idle позже метки = ход завершился, можно обычный POST).
+    // Дедуп приземления от неё НЕ идёт — его граница lastFiredAt (см. выше)
+    pending.attemptAt = Date.now()
     saveState(state)
     log(`мастер «${masterTitle}»: ретрай файра не приземлился — ретрай следующим тиком (ран ${pending.rowId})`)
     return

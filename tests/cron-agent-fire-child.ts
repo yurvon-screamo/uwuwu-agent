@@ -50,7 +50,10 @@ const promptOutcomes: ("ok" | "fail")[] = ["ok", "ok", "fail"]
 const sessionState: { outcome: unknown; idle: number } = { outcome: undefined, idle: 123 }
 // user-сообщение для дедупа приземления на T4 (заполняет оркестратор)
 let landing: { created: number; text: string } | null = null
-let createdTick = Date.now()
+// времена приземления POST — от фиксированной базы тиков, не от Date.now():
+// тики оркестратора фейковые (base+5/10/15м), реальная стена давно ушла
+// вперёд базы — due() по real-lastFiredAt перестаёт срабатывать (проба 10.11)
+let createdTick = new Date(2026, 10, 9, 10, 0, 0).getTime()
 
 const json = (data: unknown): Response => new Response(JSON.stringify(data), { status: 200 })
 
