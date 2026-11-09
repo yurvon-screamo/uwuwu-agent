@@ -2400,6 +2400,128 @@ mod tests {
         );
     }
 
+    /// Транспортный класс (5xx) — не стейл-сессия: recovery не запускается,
+    /// ровно одна попытка вызова с исходной ошибкой (ретраи/восстановление —
+    /// вне среза, смежная закрытая линия авто-ретраев).
+    #[tokio::test]
+    async fn mcp_call_does_not_recover_on_transport_error() {
+        let server = MockServer::start().await;
+        let inits = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let (ini, calls) = (Arc::clone(&inits), Arc::clone(&tool_calls));
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    ini.fetch_add(1, Ordering::SeqCst);
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-mock-t");
+                }
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500).set_body_string("boom")
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("handshake кэширует сессию");
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("5xx — транспортная ошибка без recovery");
+
+        assert!(
+            format!("{err:#}").contains("mcp response parse"),
+            "исходная транспортная ошибка без восстановления: {err:#}"
+        );
+        assert_eq!(
+            inits.load(Ordering::SeqCst),
+            1,
+            "recovery не запускался (только стартовый handshake): {}",
+            inits.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            tool_calls.load(Ordering::SeqCst),
+            1,
+            "ровно одна попытка вызова: {}",
+            tool_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Отказ re-init (ядро поднялось, но handshake не удался): громкая ошибка
+    /// с контекстом recovery, ровно один ре-инициализирующий handshake, без
+    /// циклов и без повторов исходного вызова.
+    #[tokio::test]
+    async fn mcp_call_loud_error_when_reinit_fails() {
+        let server = MockServer::start().await;
+        let inits = Arc::new(AtomicUsize::new(0));
+        let tool_404s = Arc::new(AtomicUsize::new(0));
+        let (ini, rejects) = (Arc::clone(&inits), Arc::clone(&tool_404s));
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    let n = ini.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        return ResponseTemplate::new(200)
+                            .set_body_string(
+                                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                            )
+                            .append_header("mcp-session-id", "sess-mock-r");
+                    }
+                    return ResponseTemplate::new(503).set_body_string("unavailable");
+                }
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                rejects.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(404).set_body_string("session not found")
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("handshake кэширует сессию");
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("отказ re-init — громкая ошибка с контекстом");
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("ре-инициализация не удалась"),
+            "контекст recovery в цепочке ошибки: {text}"
+        );
+        assert!(
+            text.contains("mcp response parse"),
+            "исходная причина отказа handshake сохранена: {text}"
+        );
+        assert_eq!(
+            inits.load(Ordering::SeqCst),
+            2,
+            "стартовый handshake + ровно один re-init: {}",
+            inits.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            tool_404s.load(Ordering::SeqCst),
+            1,
+            "повтора исходного вызова нет — упало на re-init: {}",
+            tool_404s.load(Ordering::SeqCst)
+        );
+    }
+
     #[tokio::test]
     async fn mcp_tool_bails_on_ok_false_in_structured_content() {
         let server = MockServer::start().await;
