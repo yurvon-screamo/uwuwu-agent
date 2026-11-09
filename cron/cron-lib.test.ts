@@ -1,4 +1,6 @@
 // cron-lib.test.ts — расписания, границы, промпты.
+import { existsSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
@@ -420,6 +422,18 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
   test("без model в фронте — null (модель демона у вызывающего)", () => {
     expect(parseAgentDefModel("---\nmode: primary\n---\n# Тело")).toBeNull()
     expect(parseAgentDefModel("# без фронта")).toBeNull()
+  })
+})
+
+describe("agents/lead.md — канон-деф ночного аудитора (миграция с hub-демона)", () => {
+  test("файл существует и его frontmatter — боевая модель/вариант файр-гейта", () => {
+    const path = join(import.meta.dir, "..", "agents", "lead.md")
+    expect(existsSync(path)).toBe(true)
+    // гейт крона (agentDefOf) парсит этот деф: снесут файл/слои копий или
+    // сломают frontmatter — карточка «Lead: ночной аудит uwuwu» отказом
+    // в файре. Пин миграции: репо-канон обязан разбираться в боевую пару.
+    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" })
   })
 })
 
