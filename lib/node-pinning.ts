@@ -130,7 +130,8 @@ export interface PinningCheck {
 export async function checkNodePinning(tool: PinningTool, opts: {
   singletonDaemon?: string
   factoryProjects?: readonly string[]
-  sandboxed: boolean
+  /** только фабрике: песочница смоук-тиков пропускает unknown-проекты (ADR-059) */
+  sandboxed?: boolean
   envNodeName?: string
   hostname: string
 }): Promise<PinningCheck> {
@@ -141,10 +142,11 @@ export async function checkNodePinning(tool: PinningTool, opts: {
   if (opts.singletonDaemon !== undefined) {
     violations = validateSingleton(pinning, opts.singletonDaemon, nodeName)
   } else if (opts.factoryProjects !== undefined) {
-    violations = validateFactory(pinning, nodeName, opts.factoryProjects, opts.sandboxed)
-    sandboxSkipped = opts.factoryProjects.filter(
-      (p) => opts.sandboxed && !normalizeList(pinnedFactoryProjects(pinning)).includes(normalizeKey(p)),
-    )
+    const sandboxed = opts.sandboxed === true
+    violations = validateFactory(pinning, nodeName, opts.factoryProjects, sandboxed)
+    sandboxSkipped = sandboxed
+      ? opts.factoryProjects.filter((p) => !normalizeList(pinnedFactoryProjects(pinning)).includes(normalizeKey(p)))
+      : []
   }
   return { nodeName, violations, sandboxSkipped }
 }
