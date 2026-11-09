@@ -538,9 +538,6 @@ export interface SessionMsg {
   /** user-сообщения: API отдаёт текст верхним уровнем (Session.Message.User
    *  в 2.2.5, content отсутствует) */
   text?: string
-  /** assistant-сообщения: использование токенов поворота (2.2.6) — опора
-   *  автокомпакта (lib/compact) */
-  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
   content?: { type?: string; text?: string }[]
 }
 
