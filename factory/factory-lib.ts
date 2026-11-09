@@ -1165,6 +1165,8 @@ export const PR_PROBE_UNKNOWN_MAX = 3
 
 export interface PrProbeVerdict {
   merged: boolean
+  /** unknown до предела: тик без сигнала — кик откладывается, полоса набирается */
+  defer: boolean
   /** длина полосы unknown после этого тика (0 — проба удалась) */
   streakAfter: number
   /** true — полоса unknown превысила предел, кик идёт с громким логом */
@@ -1172,13 +1174,15 @@ export interface PrProbeVerdict {
 }
 
 /** Решение по merged-пробе (инцидент 09.11: сбой gh съедался в false —
- *  ложный кик задачи со смерженным PR). unknown откладывает кик на тик;
- *  полоса дольше PR_PROBE_UNKNOWN_MAX деградирует к not-merged — прежний
- *  catch→false был злее (ложный кик), вечный unknown — новая слепая зона. */
+ *  ложный кик задачи со смерженным PR). unknown откладывает кик на тик
+ *  (defer — сталл-вердикт в этом тике не строится); полоса дольше
+ *  PR_PROBE_UNKNOWN_MAX деградирует к not-merged — прежний catch→false был
+ *  злее (ложный кик), вечный unknown — новая слепая зона. */
 export function prProbeVerdict(result: PrProbeResult, streakBefore: number): PrProbeVerdict {
-  if (result !== "unknown") return { merged: result === "merged", streakAfter: 0, degraded: false }
+  if (result !== "unknown") return { merged: result === "merged", defer: false, streakAfter: 0, degraded: false }
   const streakAfter = streakBefore + 1
-  return { merged: false, streakAfter, degraded: streakAfter >= PR_PROBE_UNKNOWN_MAX }
+  const degraded = streakAfter >= PR_PROBE_UNKNOWN_MAX
+  return { merged: false, defer: !degraded, streakAfter, degraded }
 }
 
 // ——— адресат будки правки тела ———

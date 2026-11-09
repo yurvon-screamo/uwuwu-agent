@@ -1277,21 +1277,24 @@ describe("bodyEditRoute: адресат будки контентной прав
 })
 
 describe("prProbeVerdict: merged-проба с пределом деградации unknown", () => {
-  test("merged/open — вердикт без деградации, streak сброшен", () => {
-    expect(prProbeVerdict("merged", 2)).toEqual({ merged: true, streakAfter: 0, degraded: false })
-    expect(prProbeVerdict("open", 2)).toEqual({ merged: false, streakAfter: 0, degraded: false })
+  test("merged/open — вердикт без дефера и деградации, streak сброшен", () => {
+    expect(prProbeVerdict("merged", 2)).toEqual({ merged: true, defer: false, streakAfter: 0, degraded: false })
+    expect(prProbeVerdict("open", 2)).toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
   })
-  test("unknown до предела — кик откладывается (merged=false, streak растёт, без деградации)", () => {
-    expect(prProbeVerdict("unknown", 0)).toEqual({ merged: false, streakAfter: 1, degraded: false })
+  test("unknown до предела — кик откладывается на тик (defer: сигнал не строится)", () => {
+    expect(prProbeVerdict("unknown", 0)).toEqual({ merged: false, defer: true, streakAfter: 1, degraded: false })
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 2))
+      .toEqual({ merged: false, defer: true, streakAfter: PR_PROBE_UNKNOWN_MAX - 1, degraded: false })
+  })
+  test("unknown на пределе и дальше — деградация к not-merged, кик идёт (страховка ADR-044 возвращена)", () => {
     expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 1))
-      .toEqual({ merged: false, streakAfter: PR_PROBE_UNKNOWN_MAX, degraded: true })
-  })
-  test("unknown свыше предела — деградация держится (страховка ADR-044 возвращена)", () => {
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX, degraded: true })
     expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX + 4))
-      .toEqual({ merged: false, streakAfter: PR_PROBE_UNKNOWN_MAX + 5, degraded: true })
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX + 5, degraded: true })
   })
   test("удачная проба после полосы unknown — streak сброшен", () => {
-    expect(prProbeVerdict("open", PR_PROBE_UNKNOWN_MAX)).toEqual({ merged: false, streakAfter: 0, degraded: false })
+    expect(prProbeVerdict("open", PR_PROBE_UNKNOWN_MAX))
+      .toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
   })
 })
 

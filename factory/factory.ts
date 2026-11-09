@@ -70,6 +70,7 @@ import {
   stallClock,
   bodyEditRoute,
   prProbeVerdict,
+  PR_PROBE_UNKNOWN_MAX,
   type PrProbeResult,
   adoptBodyDoc,
   pathSafe,
@@ -1827,6 +1828,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             if (probe === null) {
               // нет ни PR-клетки, ни ветки — пробовать нечего
               tracked.prProbeUnknownStreak = undefined
+              saveState(state)
             } else {
               const pv = prProbeVerdict(probe.result, tracked.prProbeUnknownStreak ?? 0)
               tracked.prProbeUnknownStreak = pv.streakAfter === 0 ? undefined : pv.streakAfter
@@ -1839,6 +1841,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
                 log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
               }
               saveState(state)
+              if (pv.defer) {
+                // unknown до предела: сбой gh — не повод для кика, вердикт в
+                // этом тике не строится (первый же unknown иначе кикал бы
+                // задачу со смерженным PR — вред, ради которого существует
+                // проба); полоса дольше предела деградирует выше
+                log(`задача ${rowId.slice(0, 8)}: merged-проба не удалась (gh), полоса ${pv.streakAfter}/${PR_PROBE_UNKNOWN_MAX} — кик отложен на тик`)
+                continue
+              }
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
