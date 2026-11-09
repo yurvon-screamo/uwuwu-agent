@@ -484,7 +484,7 @@ async function flagMissingSessionCells(
   if (skipped.length === 0) return
   const lost = skipped.filter((name) => SESSION_CELLS.has(name) && (cells[name] ?? "") !== "")
   if (lost.length === 0) {
-    log(`запись ${Object.keys(cells).join(", ")}: вне no-op колонки ${skipped.join(", ")} — доска ${board.dbId.slice(0, 8)}`)
+    log(`доска ${board.dbId.slice(0, 8)}: нет колонок ${skipped.join(", ")} — запись ушла в no-op; сессионных среди них нет, флаг не поднимался`)
     return
   }
   log(`доска ${board.dbId.slice(0, 8)}: сессионных колонок нет (${lost.join(", ")}) — привязка потеряна, возможны дубль-агенты`)
