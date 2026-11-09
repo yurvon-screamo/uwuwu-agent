@@ -425,15 +425,17 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
   })
 })
 
-describe("agents/lead.md — канон-деф ночного аудитора (миграция с hub-демона)", () => {
-  test("файл существует и его frontmatter — боевая модель/вариант файр-гейта", () => {
-    const path = join(import.meta.dir, "..", "agents", "lead.md")
+describe("агент крона «Lead: ночной аудит uwuwu» — деф triage (распоряжение владельца: крон на базе триаж-агента, без нового агента)", () => {
+  test("глобальный деф triage существует и его frontmatter — боевая модель файр-гейта", () => {
+    // деф триажа канонизируется в ~/.config/opencode/agents/triage.md
+    // (копия воркспейс-дефа триажа) — гейт крона (agentDefOf) читает
+    // глобальный путь: снос/поломка frontmatter = отказ файра карточки.
+    // Репо-дельты нет — деплой живых копий вне репо, пин документирует пару.
+    const home = process.env.HOME ?? ""
+    const path = join(home, ".config", "opencode", "agents", "triage.md")
     expect(existsSync(path)).toBe(true)
-    // гейт крона (agentDefOf) парсит этот деф: снесут файл/слои копий или
-    // сломают frontmatter — карточка «Lead: ночной аудит uwuwu» отказом
-    // в файре. Пин миграции: репо-канон обязан разбираться в боевую пару.
     expect(parseAgentDefModel(readFileSync(path, "utf-8")))
-      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" })
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: undefined })
   })
 })
 
