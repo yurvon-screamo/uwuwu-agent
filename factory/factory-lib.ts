@@ -1,8 +1,27 @@
 import { createHash } from "node:crypto"
+import { existsSync } from "node:fs"
+import { join } from "node:path"
 
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
 // Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
+
+import { sanitizeRowId } from "./env"
+
+/** Ворктри задачи для промпт-ctx и cwd сессии. env:true-задачам путь пишет
+ *  фабрика в state (tracked.worktree); env:false-проектам ворктри по канону
+ *  AGENTS.md создаёт сам девелопер — ~/agents-env/<rowId>/repo — и фабрика
+ *  о нём не знает: state-путь пуст навсегда, а живой каталог есть. Резолв
+ *  на лету без мутации state: каталог существует и внутри .git (ворктри)
+ *  → путь; иначе "" — честная фоллбэк-строка промпта («не найден»).
+ *  Осиротевший .git (prune срезал регистрацию, каталог остался) — принятый
+ *  компромисс против git-проб: деградация мягкая, агент увидит и уйдёт
+ *  в фоллбэк сам (инциденты 08–09.11, задача 20261109133634-6ctgzew). */
+export function resolvePromptWorktree(rowId: string, trackedWorktree: string, envRoot: string): string {
+  if (trackedWorktree !== "") return trackedWorktree
+  const repoDir = join(envRoot, sanitizeRowId(rowId), "repo")
+  return existsSync(repoDir) && existsSync(join(repoDir, ".git")) ? repoDir : ""
+}
 
 export interface TaskRef {
   rowId: string
@@ -507,6 +526,10 @@ export interface PromptTarget {
 export interface PromptContext {
   env?: SpawnEnvContext
   init?: SpawnInit
+  /** корень env-механики демона (ENV_ROOT): env:false-ветка spawn-промпта
+   *  называет агенту канон-путь ворктри — тот, что resolvePromptWorktree
+   *  потом резолвит для tester/ревьювера */
+  envRoot?: string
 }
 /** YAML frontmatter из начала markdown (--- … ---) — паритет CLI
  *  markdown.rs strip_frontmatter: ядро в экспорте ведёт live-атрибуты дока. */
@@ -578,7 +601,7 @@ export function spawnPrompt(
   rowId: string, project: string, repo: string, mode: KickoffMode = "design",
   ctx: PromptContext = {},
 ): string {
-  const { env, init } = ctx
+  const { env, init, envRoot } = ctx
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -597,7 +620,11 @@ export function spawnPrompt(
         "После approve плана:",
       ]
   const workLine = env === undefined
-    ? ["создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй."]
+    ? [
+        envRoot !== undefined
+          ? `создай worktree+ветку от origin/master — ворктри ${join(envRoot, rowId, "repo")}, скретч ${join(envRoot, rowId, "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
+          : "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
+      ]
     : [
         "работай в своём окружении задачи (фабрика создала, ветка уже от origin/master):",
         `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,

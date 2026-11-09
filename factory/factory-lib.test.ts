@@ -66,9 +66,13 @@ import {
   spawnInitBlock,
   stripExportWrapper,
   stripFrontmatter,
+  resolvePromptWorktree,
   type SpawnInit,
 } from "./factory-lib"
 import { parseCommentsMarkdown } from "../lib/platform"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const c = (id: string, text: string, at: number): TaskComment => ({ id, text, createdAt: at })
 
@@ -263,6 +267,12 @@ describe("spawnPrompt", () => {
   test("без env-контекста (env:false-проект) — прежняя строка про worktree+Branch-ячейку", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
     expect(p).toContain("создай worktree+ветку от origin/master")
+    expect(p).toContain("заполни Branch-ячейку")
+  })
+  test("env:false с envRoot — канон-путь ворктри назван (тот же, что резолвит tester/ревьювер)", () => {
+    const p = spawnPrompt("r1", "true-washing", "true-washing", "implement", { envRoot: "/home/x/agents-env" })
+    expect(p).toContain("ворктри /home/x/agents-env/r1/repo")
+    expect(p).toContain("скретч /home/x/agents-env/r1/scratch")
     expect(p).toContain("заполни Branch-ячейку")
   })
 })
@@ -847,6 +857,44 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     expect(p).toContain("стадия тестирования")
     expect(p).toContain("тест упал у меня")
     expect(p).toContain("uwuwu-cli task comment")
+  })
+})
+
+// ——— resolvePromptWorktree: ворктри для промпт-ctx (env:false резолв) ———
+
+describe("resolvePromptWorktree: env:false-задачи с агентским ворктри не лгут в промпте", () => {
+  test("tracked-ворктри не пуст — возвращается он, fs-проба не выполняется", () => {
+    // несуществующий envRoot — докажет, что до пробы дело не дошло
+    expect(resolvePromptWorktree("r1", "/env/r1/repo", "/nonexistent-root")).toBe("/env/r1/repo")
+  })
+  test("env:false с живым агентским ворктри по канон-пути — путь резолвится", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      const repoDir = join(root, "20261108081220-pwvf1fn", "repo")
+      mkdirSync(repoDir, { recursive: true })
+      writeFileSync(join(repoDir, ".git"), "gitdir: /elsewhere/main/.git/worktrees/x\n")
+      expect(resolvePromptWorktree("20261108081220-pwvf1fn", "", root)).toBe(repoDir)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  test("каталога нет — пусто: фоллбэк-строка промпта честна", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      expect(resolvePromptWorktree("20261109005428-g9wx5af", "", root)).toBe("")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  test("обломок без .git — пусто, битый путь агенту не скармливается", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      mkdirSync(join(root, "rowz", "repo"), { recursive: true })
+      expect(resolvePromptWorktree("rowz", "", root)).toBe("")
+      expect(existsSync(join(root, "rowz", "repo"))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 
