@@ -414,18 +414,24 @@ async function updateDatabaseRow(args: Record<string, unknown>): Promise<Record<
   const rowId = String(args.rowBlockId ?? "")
   const cells = (args.cells ?? {}) as Record<string, string>
   const keys = await avKeys(avId)
+  const skipped: string[] = []
   for (const [name, value] of Object.entries(cells)) {
     // колонки нет → true no-op (best-effort контракт setCellsSafe): запись в
     // чужой ключ (Status) исказила бы чужую ячейку; Status-запись на доске с
-    // колонкой «Статус» резолвится по русскому имени (паритет typed-чека ниже)
+    // колонкой «Статус» резолвится по русскому имени (паритет typed-чека ниже).
+    // Имя уходит в ответ (skipped): тихая потеря сессионной ячейки рождает
+    // дубль-агентов — фабрика флагует конфиг-расхождение доски (ADR-054)
     const keyId = keys.get(name) ?? (name === "Status" ? keys.get("Статус") : undefined)
-    if (!keyId) continue
+    if (!keyId) {
+      skipped.push(name)
+      continue
+    }
     const typed = name === "Status" || name === "Статус"
       ? { mSelect: [{ content: String(value) }] }
       : { text: { content: String(value) } }
     await mcpToolCall("database", { action: "item_update", id: avId, keyID: keyId, itemID: rowId, value: typed })
   }
-  return { updated: true }
+  return { updated: true, skipped }
 }
 
 export interface ParsedComment {
