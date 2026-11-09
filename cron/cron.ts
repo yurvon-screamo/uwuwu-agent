@@ -592,12 +592,12 @@ const compactLastCheck = new Map<string, number>()
 /** Чек автокомпакта вечной сессии: занятость — через границу lastFiredAt
  *  (стухший idle хода, паттерн sessionStatus), модель/лимит/токены —
  *  compactProbe, оркестрация «персист метки до POST» — compactTick.
- *  DRY_RUN — ноль реальных действий (инвариант демона): решения не отменяются,
- *  но GET/POST/state не звать. */
+ *  DRY_RUN/ONCE — ноль реальных действий (инвариант демона: ручной/песочный
+ *  тик не должен POST'ить): решения логом, GET/POST/state не звать. */
 async function maybeCompactEternal(state: CronState, row: CronRow, tracked: TrackedCron): Promise<void> {
   const masterTitle = row.title || row.rowId.slice(0, 8)
-  if (DRY_RUN) {
-    log(`мастер «${masterTitle}»: DRY_RUN — компакт-чек пропущен (порог idle ${Math.round(COMPACT_POLICY.idleMs / 60_000)}м, контекст ≥${COMPACT_POLICY.minContextPct}%)`)
+  if (DRY_RUN || ONCE) {
+    log(`мастер «${masterTitle}»: ${DRY_RUN ? "DRY_RUN" : "ONCE"} — компакт-чек пропущен (порог idle ${Math.round(COMPACT_POLICY.idleMs / 60_000)}м, контекст ≥${COMPACT_POLICY.minContextPct}%)`)
     return
   }
   await compactTick({

@@ -105,19 +105,22 @@ test("modelContextLimit: матч по providerID+modelID; нет модели /
   expect(await modelContextLimit(rest, "prov", "missing", cache)).toBeNull()
 })
 
-test("modelContextLimit: кэш — второй вызов не ходит в rest; сбой rest кэшируется null", async () => {
+test("modelContextLimit: кэш успешных резолвов — второй вызов не ходит в rest; transient-сбой НЕ кэшируется (ретрай следующим тиком)", async () => {
   const cache = new Map<string, number | null>()
   let fetches = 0
   const rest = async (): Promise<unknown> => {
     fetches += 1
-    return [modelRow("prov", "m1", 500_000)]
+    return [modelRow("prov", "m1", 500_000), modelRow("prov", "m2", 700_000)]
   }
   expect(await modelContextLimit(rest, "prov", "m1", cache)).toBe(500_000)
   expect(await modelContextLimit(rest, "prov", "m1", cache)).toBe(500_000)
   expect(fetches).toBe(1)
+
   const failing = async (): Promise<unknown> => { throw new Error("down") }
   expect(await modelContextLimit(failing, "prov", "m2", cache)).toBeNull()
-  expect(await modelContextLimit(failing, "prov", "m2", cache)).toBeNull() // из кэша
+  expect(await modelContextLimit(failing, "prov", "m2", cache)).toBeNull() // снова ходит в rest — ретрай
+  expect(await modelContextLimit(rest, "prov", "m2", cache)).toBe(700_000) // починилось — закэшировалось
+  expect(await modelContextLimit(failing, "prov", "m2", cache)).toBe(700_000) // успешный резолв держится
 })
 
 // ——— compactProbe: форма живого сервера, сбои — null-поля ———

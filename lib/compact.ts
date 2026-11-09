@@ -102,7 +102,11 @@ export async function sessionCompact(rest: RestCall, sessionID: string): Promise
 
 /** Лимит окна контекста модели: GET /api/model, матч providerID+modelID.
  *  Кэш инжектируется (дефолт — процессный Map): лимиты статичны в рамках
- *  запуска, тесты подставляют свой. null — модели в списке нет / limit пуст. */
+ *  запуска, тесты подставляют свой. Кэшуются ТОЛЬКО успешные резолвы —
+ *  включая «модели нет/limit пуст» (перманентный факт, API-drift); transient-
+ *  сбой транспорта не кэшируется — ретрай следующим тиком (иначе первый
+ *  замер на отказе опенкода тихо отключил бы компакт до рестарта демона).
+ *  null — модель не резолвится / сбой. */
 export async function modelContextLimit(
   rest: RestCall,
   providerID: string,
@@ -112,19 +116,20 @@ export async function modelContextLimit(
   const key = `${providerID}/${modelID}`
   const cached = cache.get(key)
   if (cached !== undefined) return cached
-  let resolved: number | null = null
+  let raw: unknown
   try {
-    const raw = await rest("/api/model")
-    const items = Array.isArray(raw) ? raw : (isRecord(raw) && Array.isArray(raw.data) ? raw.data : [])
-    for (const item of items) {
-      if (!isRecord(item) || item.providerID !== providerID || item.modelID !== modelID) continue
-      const limit = isRecord(item.limit) ? item.limit : {}
-      const ctx = limit.context
-      resolved = typeof ctx === "number" && Number.isFinite(ctx) && ctx > 0 ? ctx : null
-      break
-    }
+    raw = await rest("/api/model")
   } catch {
-    resolved = null
+    return null // transient: не кэшируем — ретрай следующим тиком
+  }
+  const items = Array.isArray(raw) ? raw : (isRecord(raw) && Array.isArray(raw.data) ? raw.data : [])
+  let resolved: number | null = null
+  for (const item of items) {
+    if (!isRecord(item) || item.providerID !== providerID || item.modelID !== modelID) continue
+    const limit = isRecord(item.limit) ? item.limit : {}
+    const ctx = limit.context
+    resolved = typeof ctx === "number" && Number.isFinite(ctx) && ctx > 0 ? ctx : null
+    break
   }
   cache.set(key, resolved)
   return resolved
