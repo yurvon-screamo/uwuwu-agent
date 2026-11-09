@@ -149,6 +149,119 @@ async fn edit_status_testing_passes_without_guard() {
     assert_eq!(kernel.item_updates().len(), 1, "запись клетки была");
 }
 
+// ---- командный уровень гарда: dispatch → gate → gh (фейковый) → запись ----
+// Живая форма gh-ответа повторяется фейковым gh в PATH (см. review_gate_tests);
+// здесь проверяется сама команда: резолв клетки/--pr, отказы до записей,
+// проход зелёного — на мок-ядре (20261109184134-d2x7lsn).
+
+use crate::review_gate_tests::{gh_env, pr_view_json, FakeGh};
+
+/// Сцена с PR-колонкой и строкой с URL-клеткой (type=url читается cli).
+fn guard_scenario(pr_cell: &str) -> MockScenario {
+    MockScenario {
+        notebook: "nb-projects",
+        boards: vec![MockBoard {
+            doc_id: BOARD_DOC,
+            av_id: BOARD_AV,
+            keys: vec![
+                ("key-title", "Первичный ключ"),
+                ("key-status", "Status"),
+                ("key-pr", "PR"),
+            ],
+        }],
+        hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec![BOARD_DOC])],
+        rows: vec![MockRow::new(ROW_ITEM, "таска")
+            .with_status("Todo")
+            .with_pr(pr_cell)
+            .with_doc(ROW_DOC)],
+        ..MockScenario::default()
+    }
+}
+
+/// Главный путь команды: зелёный PR из клетки — перевод проходит,
+/// статусная запись выполнена (живой gh заменён фейком).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_review_result_green_pr_cell_writes() {
+    gh_env(&pr_view_json("MERGEABLE", "COMPLETED", "SUCCESS"));
+    let _gh = FakeGh::install();
+    let (kernel, server) = MockKernel::start(guard_scenario(
+        "https://github.com/yurvon-screamo/uwuwu-agent/pull/194",
+    ))
+    .await;
+    set_env(&server);
+
+    task_run("uwuwu", edit(Some("Ревью результата")))
+        .await
+        .expect("зелёный PR в клетке — перевод проходит");
+
+    assert_eq!(
+        kernel.item_updates().len(),
+        1,
+        "гард пропустил — запись статуса была"
+    );
+}
+
+/// Красный PR в клетке — отказ с рецептом до любых записей (gh-ответ фейка).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_review_result_red_pr_rejected_before_write() {
+    gh_env(&pr_view_json("MERGEABLE", "COMPLETED", "FAILURE"));
+    let _gh = FakeGh::install();
+    let (kernel, server) = MockKernel::start(guard_scenario(
+        "https://github.com/yurvon-screamo/uwuwu-agent/pull/190",
+    ))
+    .await;
+    set_env(&server);
+
+    let err = task_run("uwuwu", edit(Some("Ревью результата")))
+        .await
+        .expect_err("красный PR отвергается");
+
+    let msg = format!("{err:?}");
+    assert!(msg.contains("красный"), "суть отказа: {msg}");
+    assert!(kernel.item_updates().is_empty(), "доска не тронута");
+    assert_eq!(kernel.rows()[0].status, "Todo", "клетка статуса цела");
+}
+
+/// --pr имеет приоритет над клеткой: клетка красная, --pr зелёный — проходит
+/// (гард смотрит на явно переданный URL, мутации PR-клетки нет).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_review_result_explicit_pr_overrides_cell() {
+    gh_env(&pr_view_json("MERGEABLE", "COMPLETED", "SUCCESS"));
+    let _gh = FakeGh::install();
+    let (kernel, server) = MockKernel::start(guard_scenario(
+        "https://github.com/yurvon-screamo/uwuwu-agent/pull/190",
+    ))
+    .await;
+    set_env(&server);
+
+    let green = "https://github.com/yurvon-screamo/uwuwu-agent/pull/194";
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: ROW_ITEM.into(),
+            status: Some("Ревью результата".into()),
+            title: None,
+            pr: Some(green.into()),
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: None,
+            planned: None,
+        },
+    )
+    .await
+    .expect("--pr (зелёный) приоритетнее красной клетки — перевод проходит");
+
+    assert_eq!(
+        kernel.item_updates().len(),
+        2,
+        "две записи: PR-клетка (--pr) и статус — обе легитимны"
+    );
+}
+
 /// Пин инцидента: строка «Проверка плана» (носитель 20261104060555-5wj9o6q,
 /// origa) отвергается у входа — отказ с эхом ввода и перечнем канона, записи
 /// в доску нет (левая строка минтила бы мусорную опцию).

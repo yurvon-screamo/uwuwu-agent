@@ -1,7 +1,9 @@
 //! Матрица гарда ревью (20261109184134-d2x7lsn): url-разбор, свёртка
-//! statusCheckRollup, чистый маппинг evaluate, не-GitHub ветка gate.
-//! Ветви gate с вызовами gh юнитами не покрываются — живые пробы на
-//! собственной строке задачи (см. Проверка в теле).
+//! statusCheckRollup, чистый маппинг evaluate, не-GitHub ветка gate;
+//! граница «подпроцесс gh» — интеграционные тесты с фейковым gh-бинарём
+//! в PATH (сценарии ответа/env — детерминированная замена живых gh-вызовов;
+//! живые пробы на реальном GitHub остаются приёмочным слоем). Таймаут-ветка
+//! run_gh (30с потолок) не автоматизирована — tokio::time::timeout, риск низкий.
 
 use crate::review_gate::{
     evaluate, gate, github_owner_repo, rollup_state, url_host, RollupState, STATUS_REVIEW_RESULT,
@@ -235,4 +237,211 @@ fn review_result_status_is_registered_in_canon() {
         "«{STATUS_REVIEW_RESULT}» вне канона TASK_STATUSES — гард молча перестанет \
          применяться; синхронизируй константу с реестром"
     );
+}
+
+// ---- интеграция: граница «подпроцесс gh» — фейковый gh в PATH ----
+
+use std::env::{set_var, var};
+use tempfile::TempDir;
+
+const GH_PR_URL: &str = "https://github.com/yurvon-screamo/uwuwu-agent/pull/190";
+
+/// Живой формат ответа `gh pr view --json mergeable,statusCheckRollup`
+/// строкой для GH_FAKE_VIEW_JSON.
+pub(crate) fn pr_view_json(mergeable: &str, status: &str, conclusion: &str) -> String {
+    json!({
+        "mergeable": mergeable,
+        "statusCheckRollup": [{ "name": "CI", "status": status, "conclusion": conclusion }]
+    })
+    .to_string()
+}
+
+/// Фейковый gh: bash-скрипт в tempdir + PATH-подмена (serial-тесты).
+/// `pr view` печатает GH_FAKE_VIEW_JSON (exit GH_FAKE_VIEW_EXIT, дефолт 0);
+/// `api` печатает GH_FAKE_API_STDOUT (exit 0) либо GH_FAKE_API_STDERR в
+/// stderr (exit GH_FAKE_API_EXIT, дефолт 1). Каждый тест ставит свои
+/// GH_FAKE_* ДО install().
+pub(crate) struct FakeGh {
+    _dir: TempDir,
+}
+
+impl FakeGh {
+    pub(crate) fn install() -> Self {
+        let dir = TempDir::new().expect("tempdir под фейковый gh");
+        let script = dir.path().join("gh");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+case "$1" in
+  pr)
+    printf '%s' "${GH_FAKE_VIEW_STDERR:-}" >&2
+    printf '%s' "$GH_FAKE_VIEW_JSON"
+    exit "${GH_FAKE_VIEW_EXIT:-0}"
+    ;;
+  api)
+    if [ -n "${GH_FAKE_API_STDOUT+x}" ]; then
+      printf '%s' "$GH_FAKE_API_STDOUT"
+      exit 0
+    fi
+    printf '%s' "$GH_FAKE_API_STDERR" >&2
+    exit "${GH_FAKE_API_EXIT:-1}"
+    ;;
+  *)
+    echo "fake gh: unexpected call: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        )
+        .expect("скрипт фейкового gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod фейкового gh");
+        }
+        let old_path = var("PATH").unwrap_or_default();
+        set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for FakeGh {
+    fn drop(&mut self) {
+        // PATH-гигиена: убрать путь (ещё живого, но умирающего) tempdir;
+        // GH_FAKE_* каждый serial-тест ставит сам перед install().
+        let cleaned = var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|p| Some(*p) != self._dir.path().to_str())
+            .collect::<Vec<_>>()
+            .join(":");
+        set_var("PATH", cleaned);
+    }
+}
+
+/// Полная сцена ответа `pr view` (serial-тесты шарят env — сбрасываем всё):
+/// JSON + exit 0; api-ветка в дефолт (stdout не задан, exit 1, пустой stderr).
+pub(crate) fn gh_env(view_json: &str) {
+    set_var("GH_FAKE_VIEW_JSON", view_json);
+    set_var("GH_FAKE_VIEW_EXIT", "0");
+    set_var("GH_FAKE_VIEW_STDERR", "");
+    std::env::remove_var("GH_FAKE_API_STDOUT");
+    set_var("GH_FAKE_API_EXIT", "1");
+    set_var("GH_FAKE_API_STDERR", "");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_green_via_gh_passes_without_workflows_probe() {
+    gh_env(&pr_view_json("MERGEABLE", "COMPLETED", "SUCCESS"));
+    let _gh = FakeGh::install();
+    gate(GH_PR_URL)
+        .await
+        .expect("зелёный rollup от gh — чистый проход, workflows-проба не зовётся");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_conflicting_via_gh_rejected() {
+    gh_env(&json!({ "mergeable": "CONFLICTING", "statusCheckRollup": [] }).to_string());
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL)
+        .await
+        .expect_err("конфликтный PR отвергается");
+    assert!(format!("{err:?}").contains("конфликт"), "{err:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_unknown_mergeable_via_gh_rejected() {
+    gh_env(&json!({ "mergeable": "UNKNOWN", "statusCheckRollup": [] }).to_string());
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL).await.expect_err("UNKNOWN отвергается");
+    assert!(format!("{err:?}").contains("считает"), "{err:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_pending_via_gh_rejected_with_check_name() {
+    gh_env(&pr_view_json("MERGEABLE", "IN_PROGRESS", ""));
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL).await.expect_err("pending-PR отвергается");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("ещё идёт"), "{msg}");
+    assert!(msg.contains("CI"), "имя чека в отказе: {msg}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_failed_via_gh_rejected_with_check_name() {
+    gh_env(&pr_view_json("MERGEABLE", "COMPLETED", "FAILURE"));
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL).await.expect_err("красный PR отвергается");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("красный"), "{msg}");
+    assert!(msg.contains("CI"), "имя чека в отказе: {msg}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_empty_rollup_workflows_present_rejected() {
+    gh_env(&json!({ "mergeable": "MERGEABLE", "statusCheckRollup": [] }).to_string());
+    set_var(
+        "GH_FAKE_API_STDOUT",
+        json!({ "workflows": [ { "id": "w1" } ] }).to_string(),
+    );
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL)
+        .await
+        .expect_err("пустой rollup при живых workflows отвергается");
+    assert!(format!("{err:?}").contains("не стартовал"), "{err:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_empty_rollup_actions_disabled_passes() {
+    gh_env(&json!({ "mergeable": "MERGEABLE", "statusCheckRollup": [] }).to_string());
+    set_var("GH_FAKE_API_STDERR", "gh: HTTP 403: Actions are disabled");
+    let _gh = FakeGh::install();
+    gate(GH_PR_URL)
+        .await
+        .expect("403 workflows-пробы = репо без CI — проход (предупреждение в stdout)");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_empty_rollup_api_error_rejected() {
+    gh_env(&json!({ "mergeable": "MERGEABLE", "statusCheckRollup": [] }).to_string());
+    set_var("GH_FAKE_API_STDERR", "gh: server error (502)");
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL)
+        .await
+        .expect_err("сбой workflows-пробы — громкий отказ");
+    assert!(format!("{err:?}").contains("CI-workflows"), "{err:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_gh_failure_is_loud_rejection() {
+    gh_env("");
+    set_var("GH_FAKE_VIEW_EXIT", "1");
+    set_var("GH_FAKE_VIEW_STDERR", "gh: network down");
+    set_var("GH_FAKE_API_STDERR", "gh: network down");
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL).await.expect_err("сбой gh — отказ перевода");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("gh pr не удался"), "{msg}");
+    assert!(msg.contains("network down"), "stderr gh в отказе: {msg}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gate_gh_non_json_is_loud_rejection() {
+    gh_env("not a json at all");
+    let _gh = FakeGh::install();
+    let err = gate(GH_PR_URL)
+        .await
+        .expect_err("не-JSON ответ gh — громкий отказ");
+    assert!(format!("{err:?}").contains("не-JSON"), "{err:?}");
 }

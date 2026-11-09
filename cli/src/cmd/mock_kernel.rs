@@ -31,6 +31,8 @@ pub(crate) struct MockRow {
     pub(crate) planned: String,
     /// Клетка «Расписание» (text; "" — нет клетки).
     pub(crate) schedule: String,
+    /// Клетка «PR» (url; "" — нет клетки).
+    pub(crate) pr: String,
     pub(crate) doc: Option<String>,
 }
 
@@ -46,6 +48,7 @@ impl MockRow {
             task_type: String::new(),
             planned: String::new(),
             schedule: String::new(),
+            pr: String::new(),
             doc: None,
         }
     }
@@ -67,6 +70,11 @@ impl MockRow {
 
     pub(crate) fn with_schedule(mut self, schedule: &str) -> Self {
         self.schedule = schedule.to_string();
+        self
+    }
+
+    pub(crate) fn with_pr(mut self, pr: &str) -> Self {
+        self.pr = pr.to_string();
         self
     }
 
@@ -106,6 +114,12 @@ impl MockRow {
             cells.push(json!({
                 "value": { "keyID": "key-schedule", "type": "text",
                            "text": { "content": self.schedule } }
+            }));
+        }
+        if !self.pr.is_empty() {
+            cells.push(json!({
+                "value": { "keyID": "key-pr", "type": "url",
+                           "url": { "content": self.pr } }
             }));
         }
         json!({ "id": self.item, "cells": cells })
@@ -991,6 +1005,7 @@ impl MockKernel {
                 task_type: self.sc.inserted_row.task_type.clone(),
                 planned: self.sc.inserted_row.planned.clone(),
                 schedule: self.sc.inserted_row.schedule.clone(),
+                pr: self.sc.inserted_row.pr.clone(),
             });
         }
         mcp_text(json!({ "action": "item_add", "data": { "itemID": item } }))
