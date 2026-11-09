@@ -80,9 +80,18 @@ export interface TrackedTask {
    *  BFS от полной истории накрывает осиротевшие сессии прошлых поколений */
   sessionHistory?: string[]
   /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
-   *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
-   *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
+   *  один раз). Действителен, пока совпадает с ячейкой или ячейка пуста
+   *  (позитив фоллбек-пробы по ветке): смена PR на заполненной клетке
+   *  (stacked, ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
   mergedPrUrl?: string
+  /** последний доставленный промпт в дев-сессию (ms): спавн, comment-
+   *  /bodyEdit-wakeup, return-to-dev. Часы тишины сталла считают от него —
+   *  свежий будильник сбрасывает застой (инцидент 09.11: wake + kick одним
+   *  тиком). undefined — старый state или промптов ещё не было */
+  lastDevPromptAt?: number
+  /** полоса подряд-unknown merged-пробы сталл-ветки (предел деградации —
+   *  PR_PROBE_UNKNOWN_MAX); undefined/0 — последняя проба удалась */
+  prProbeUnknownStreak?: number
   /** хэш норм-формы контента тела вне секции «Комменты» — bodyEdit-гейт:
    *  lastmod двигают UI-пересохранения и собственные записи агента, хэш —
    *  только контентные дельты (дефекты №3/№5) */
@@ -109,6 +118,8 @@ export const AGENT_MARK = "🤖"
 export const REVIEW_PLAN_STATUS = "Ревью плана"
 export const REVIEW_RESULT_STATUS = "Ревью результата"
 export const TESTING_STATUS = "Тестирование"
+/** Юзерский статус после pass тестировщика: мяч у владельца на мерж/приёмку. */
+export const USER_REVIEW_STATUS = "Review"
 
 export type ReviewKind = "plan" | "result"
 
@@ -1047,6 +1058,40 @@ export function lastActivityOf(msgs: unknown[]): number | null | "invalid" {
   return Math.max(...nums)
 }
 
+/** Единые часы тишины сталла: точка отсчёта — последний сигнал сессии
+ *  (активность последнего сообщения или доставленный промпт). Свежий
+ *  будильник сбрасывает часы: зависший после wake ход ловится тем же
+ *  порогом, но от честной точки отсчёта — «wake + kick» одним тиком
+ *  исключён (инцидент 09.11: fast-track-wake и сталл-сигнал из одной
+ *  геометрии «тишина от активности» — два противоречащих сигнала).
+ *  Потребители — stallVerdict и pre-чек ленивых проб в тике: одна
+ *  арифметика на обоих. */
+export interface StallClockFacts {
+  /** активность последнего сообщения сессии; null — сообщений нет */
+  lastActivityAt: number | null
+  /** последний доставленный промпт в сессию (ms); null — не записан */
+  lastDevPromptAt: number | null
+}
+
+export interface StallClock {
+  /** тишина от точки отсчёта дольше порога */
+  stalled: boolean
+  /** тишина в минутах от точки отсчёта; null — сигналов не было вовсе */
+  quietMin: number | null
+  /** будка свежее последней активности — детекция ждёт ответ на неё */
+  fromWake: boolean
+}
+
+export function stallClock(f: StallClockFacts, stallMs: number, now: number): StallClock {
+  const lastSignalAt = Math.max(f.lastActivityAt ?? 0, f.lastDevPromptAt ?? 0)
+  if (lastSignalAt === 0) return { stalled: true, quietMin: null, fromWake: false }
+  return {
+    stalled: now - lastSignalAt > stallMs,
+    quietMin: Math.max(1, Math.round((now - lastSignalAt) / 60_000)),
+    fromWake: (f.lastDevPromptAt ?? 0) > (f.lastActivityAt ?? 0),
+  }
+}
+
 export interface StallFacts {
   /** статус строки сейчас */
   status: string
@@ -1054,6 +1099,8 @@ export interface StallFacts {
   sessionAlive: boolean | null
   /** активность последнего сообщения; null — сообщений нет (= застой) */
   lastActivityAt: number | null
+  /** последний доставленный промпт в дев-сессию (ms); null — не записан */
+  lastDevPromptAt: number | null
   /** Branch-ячейка строки (деталь диагноза в тексте сигнала) */
   branch: string
   /** ветка нашлась в ворктри по `git worktree list` */
@@ -1082,18 +1129,19 @@ export type StallVerdict =
 export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.status !== "In Progress") return { t: "none" }
   if (f.sessionAlive !== true) return { t: "none" }
-  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
-  if (!stalled) return { t: "none" }
+  const clock = stallClock(
+    { lastActivityAt: f.lastActivityAt, lastDevPromptAt: f.lastDevPromptAt },
+    stallMs,
+    f.now,
+  )
+  if (!clock.stalled) return { t: "none" }
   // PR смержен = работа закончена, тишина сессии — штатное ожидание приёмки
   // (мяч у владельца на Done); сигнал был бы ложным (прод-кейс 06.11:
   // финализированная задача получила stall-wakeup). none — флаг анти-спама,
   // если стоял, снимет штатная none-ветка демона («эпизод завершён»).
   if (f.prMerged) return { t: "none" }
   if (f.signaled) return { t: "silent" }
-  const quietMin = f.lastActivityAt === null
-    ? null
-    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
-  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const quietText = clock.quietMin === null ? "сообщений в сессии нет" : `тишина ${clock.quietMin} мин`
   const branchDiag = f.branch === ""
     ? "Branch-ячейка пуста — агент умер до создания ветки"
     : f.branchInWorktree
@@ -1105,6 +1153,66 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
     "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
   ].join(" ")
   return { t: "signal", text }
+}
+
+// ——— merged-проба сталл-ветки: fail-open с пределом деградации ———
+
+export type PrProbeResult = "merged" | "open" | "unknown"
+
+/** Предел подряд-unknown merged-пробы: дальше — деградация к not-merged
+ *  (страховка ADR-044 возвращается, слепая зона ограничена окном тиков). */
+export const PR_PROBE_UNKNOWN_MAX = 3
+
+export interface PrProbeVerdict {
+  merged: boolean
+  /** длина полосы unknown после этого тика (0 — проба удалась) */
+  streakAfter: number
+  /** true — полоса unknown превысила предел, кик идёт с громким логом */
+  degraded: boolean
+}
+
+/** Решение по merged-пробе (инцидент 09.11: сбой gh съедался в false —
+ *  ложный кик задачи со смерженным PR). unknown откладывает кик на тик;
+ *  полоса дольше PR_PROBE_UNKNOWN_MAX деградирует к not-merged — прежний
+ *  catch→false был злее (ложный кик), вечный unknown — новая слепая зона. */
+export function prProbeVerdict(result: PrProbeResult, streakBefore: number): PrProbeVerdict {
+  if (result !== "unknown") return { merged: result === "merged", streakAfter: 0, degraded: false }
+  const streakAfter = streakBefore + 1
+  return { merged: false, streakAfter, degraded: streakAfter >= PR_PROBE_UNKNOWN_MAX }
+}
+
+// ——— адресат будки правки тела ———
+
+export type BodyEditRole = "ревьювер" | "тестировщик" | "девелопер"
+
+export type BodyEditRoute =
+  | { t: "wake"; target: string; role: BodyEditRole }
+  | { t: "swallow"; /** осознанное проглатывание (гейт статуса) — проводка обновляет базлайн */
+      updateBaseline: boolean }
+
+/** Кому адресовать будку контентной правки тела (инцидент 09.11: отчёт
+ *  тестировщика в теле на Review-строке будил дев-сессию — холостая будка
+ *  на каждом тест-раунде с отчётом). Review = мяч у владельца: правки туда
+ *  не доставляются (swallow с обновлением базлайна в проводке). Агентская
+ *  стадия — держателю сессии; без живого держателя — фоллбек на дева
+ *  (прежнее поведение проводки), без дева (карантин) — ждать адресата. */
+export function bodyEditRoute(f: {
+  status: string
+  reviewSessionID: string
+  testSessionID: string
+  devSessionID: string
+}): BodyEditRoute {
+  if (f.status === USER_REVIEW_STATUS) return { t: "swallow", updateBaseline: true }
+  const toDev: BodyEditRoute = f.devSessionID === ""
+    ? { t: "swallow", updateBaseline: false }
+    : { t: "wake", target: f.devSessionID, role: "девелопер" }
+  if (reviewKindOf(f.status) !== null) {
+    return f.reviewSessionID === "" ? toDev : { t: "wake", target: f.reviewSessionID, role: "ревьювер" }
+  }
+  if (f.status === TESTING_STATUS) {
+    return f.testSessionID === "" ? toDev : { t: "wake", target: f.testSessionID, role: "тестировщик" }
+  }
+  return toDev
 }
 
 // ——— гвард ревью-тишины: недоставленный вердикт ревьювера (инцидент 07.11,
@@ -1326,6 +1434,8 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
   ) return false
+  if (t.lastDevPromptAt !== undefined && typeof t.lastDevPromptAt !== "number") return false
+  if (t.prProbeUnknownStreak !== undefined && typeof t.prProbeUnknownStreak !== "number") return false
   if (t.bodyHash !== undefined && typeof t.bodyHash !== "string") return false
   if (
     t.lastWakeup !== undefined &&
