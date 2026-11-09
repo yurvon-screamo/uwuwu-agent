@@ -48,14 +48,17 @@ fn edit(status: Option<&str>) -> TaskSub {
 }
 
 /// Главный путь: lowercase-форма канонизируется ДО записи — в mSelect уходит
-/// канон-форма «Ревью результата», не эхо ввода «ревью результата».
+/// канон-форма «Ревью плана», не эхо ввода «ревью плана» (ядро апсертит
+/// mSelect-опцию по точному content — эхо минтило бы дубль-опцию другого
+/// регистра). «Ревью результата» как носитель канон-проверки не годится —
+/// на нём сидит гард мержабельности (review_gate, свои тесты ниже).
 #[tokio::test]
 #[serial_test::serial]
 async fn edit_status_writes_canonical_form_not_echo() {
     let (kernel, server) = MockKernel::start(edit_scenario()).await;
     set_env(&server);
 
-    task_run("uwuwu", edit(Some("ревью результата")))
+    task_run("uwuwu", edit(Some("ревью плана")))
         .await
         .expect("lowercase-форма канона проходит");
 
@@ -67,9 +70,83 @@ async fn edit_status_writes_canonical_form_not_echo() {
     assert_eq!(item, ROW_ITEM);
     assert_eq!(
         value,
-        &json!({ "mSelect": [{ "content": "Ревью результата" }] }),
+        &json!({ "mSelect": [{ "content": "Ревью плана" }] }),
         "в клетку уходит канон-форма, не эхо ввода"
     );
+}
+
+/// Гард ревью: перевод в «Ревью результата» с пустой PR-клеткой — отказ
+/// с рецептом до любых записей (gh при этом не вызывается — клетки нет).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_review_result_empty_pr_rejected_before_write() {
+    let (kernel, server) = MockKernel::start(edit_scenario()).await;
+    set_env(&server);
+
+    let err = task_run("uwuwu", edit(Some("Ревью результата")))
+        .await
+        .expect_err("перевод без PR отвергается");
+
+    let msg = err.to_string();
+    assert!(msg.contains("без PR"), "суть отказа: {msg}");
+    assert!(msg.contains("gh pr create"), "рецепт добивки: {msg}");
+    assert!(
+        kernel.item_updates().is_empty(),
+        "гард до записи: доска не тронута"
+    );
+    assert_eq!(
+        kernel.rows()[0].status,
+        "Todo",
+        "клетка статуса не изменилась"
+    );
+}
+
+/// Одновременное снятие PR (--pr "") с переводом в «Ревью результата» —
+/// отказ: вход в ревью требует живой PR-клетки, а не её очистки.
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_review_result_pr_clearing_rejected() {
+    let (kernel, server) = MockKernel::start(edit_scenario()).await;
+    set_env(&server);
+
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: ROW_ITEM.into(),
+            status: Some("Ревью результата".into()),
+            title: None,
+            pr: Some("".into()),
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: None,
+            planned: None,
+        },
+    )
+    .await
+    .expect_err("снятие PR с входом в ревью отвергается");
+
+    let msg = err.to_string();
+    assert!(msg.contains("снятием PR"), "суть отказа: {msg}");
+    assert!(
+        kernel.item_updates().is_empty(),
+        "гард до записи: доска не тронута"
+    );
+}
+
+/// Гард вешается только на целевой статус: «Тестирование» с пустой клеткой
+/// проходит как раньше (его ставит ревьювер, PR-контекст его не касается).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_status_testing_passes_without_guard() {
+    let (kernel, server) = MockKernel::start(edit_scenario()).await;
+    set_env(&server);
+
+    task_run("uwuwu", edit(Some("Тестирование")))
+        .await
+        .expect("негардированный статус проходит без PR-клетки");
+
+    assert_eq!(kernel.item_updates().len(), 1, "запись клетки была");
 }
 
 /// Пин инцидента: строка «Проверка плана» (носитель 20261104060555-5wj9o6q,

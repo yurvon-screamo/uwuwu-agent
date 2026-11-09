@@ -10,6 +10,7 @@ pub mod markdown;
 pub mod md_artifacts;
 pub mod md_heading;
 pub mod path;
+pub mod review_gate;
 pub mod schedule;
 pub mod semantic;
 pub mod siyuan;
@@ -23,6 +24,9 @@ pub mod siyuan_task;
 
 #[cfg(test)]
 mod semantic_tests;
+
+#[cfg(test)]
+mod review_gate_tests;
 
 #[cfg(test)]
 mod siyuan_task_tests;

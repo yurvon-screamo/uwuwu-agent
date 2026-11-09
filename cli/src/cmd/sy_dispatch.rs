@@ -7,6 +7,7 @@ use crate::html_embed;
 use crate::markdown;
 use crate::md_artifacts;
 use crate::md_heading;
+use crate::review_gate as rg;
 use crate::siyuan::find_marker_location as sy_find_marker_location;
 use crate::siyuan_goal as goal;
 use crate::siyuan_person as person;
@@ -363,6 +364,33 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             // канон-форма (не эхо ввода): ядро апсертит mSelect-опцию по
             // точному content — «ревью плана» mint'нул бы дубль «Ревью плана»
             let status_canonical = status.as_deref().map(syt::validate_status).transpose()?;
+            // гард ревью (20261109184134-d2x7lsn): перевод в «Ревью результата» —
+            // только при живой мержабельности PR; до любых записей (паритет
+            // «без частичных обновлений»)
+            if status_canonical.as_deref() == Some(rg::STATUS_REVIEW_RESULT) {
+                if pr.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                    bail!(
+                        "перевод в «Ревью результата» с одновременным снятием PR (--pr \"\") \
+                         — так нельзя: PR обязателен, создай (gh pr create) и повтори"
+                    );
+                }
+                let pr_url = pr
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        let cell = task.pr.trim();
+                        (!cell.is_empty()).then(|| cell.to_string())
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "перевод в «Ревью результата» без PR: клетка PR пуста — \
+                             создай PR (gh pr create), заполни --pr и повтори"
+                        )
+                    })?;
+                rg::gate(&pr_url).await?;
+            }
             if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
                 syt::parse_planned(raw)?;
             }
