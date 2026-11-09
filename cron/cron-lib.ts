@@ -31,6 +31,9 @@ export interface TrackedCron {
    *  steerLandedAt) — дубль-инструкция в вечный контекст не доезжает.
    *  Дропится при пересоздании сессии (файр начнётся заново). */
   pendingRun?: { rowId: string; prompt: string; attemptAt: number }
+  /** ms последней admission-попытки автокомпакта вечной сессии (пишется ДО
+   *  POST — коулдаун против повторного admission переживает рестарт). */
+  lastCompactAt?: number
 }
 
 export interface CronState {
@@ -267,6 +270,7 @@ export function isValidTracked(v: unknown): v is TrackedCron {
     typeof t.lastFiredAt === "number" &&
     (t.firedAtIso === undefined || typeof t.firedAtIso === "string") &&
     (t.lastRefusal === undefined || typeof t.lastRefusal === "string") &&
+    (t.lastCompactAt === undefined || (typeof t.lastCompactAt === "number" && t.lastCompactAt >= 0)) &&
     pendingOk
   )
 }
