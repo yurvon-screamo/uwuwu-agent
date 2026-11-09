@@ -336,7 +336,7 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
     );
 }
 
-/// Dry-run ветка create — read-only осмотр: при живом ядре ноль записей
+/// Dry-run ветка create — read-only осмотр: при живом мок-ядре ноль записей
 /// (строка/док/атрибуты не минтятся). Печатаемое тело собирает та же
 /// create_body_md, что и боевую запись (юнит-пин равенства в siyuan_task_tests);
 /// content-ветка dry-run не тестируется на dispatch — read_stdin читает
@@ -344,7 +344,7 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
 /// stdin).
 #[tokio::test]
 #[serial_test::serial]
-async fn create_dry_run_is_read_only_with_live_kernel() {
+async fn create_dry_run_is_read_only_with_mock_kernel() {
     let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
 
     set_env(&server);
