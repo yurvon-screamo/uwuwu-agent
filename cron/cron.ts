@@ -17,6 +17,7 @@ import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
+import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
   stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, agentFirePrompt,
@@ -60,6 +61,15 @@ const DRY_RUN = process.env.UWUWU_CRON_DRY_RUN === "1"
 /** пауза между срабатываниями одного мастера, пока жива его сессия */
 const SESSION_COOLDOWN_MS = 10 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
+
+// автокомпакт вечных сессий (lib/compact): пороги из постановки владельца
+// (задача 20261105153731-s6e27f6), env-оверрайды для проб; коулдаун — константа
+const COMPACT_POLICY: CompactPolicy = {
+  idleMs: (Number(process.env.UWUWU_CRON_COMPACT_IDLE_SEC ?? 14400) || 14400) * 1000,
+  minContextPct: Number(process.env.UWUWU_CRON_COMPACT_MIN_PCT ?? 40) || 40,
+  cooldownMs: 3_600_000,
+}
+const COMPACT_CHECK_SEC = Math.max(60, Number(process.env.UWUWU_CRON_COMPACT_CHECK_SEC ?? 600) || 600)
 
 /** Бинарь CLI для ран-карточек: прод — ~/.cargo/bin (systemd PATH не несёт
  *  его); UWUWU_CLI_BIN переопределяет (тесты/нестандартная установка). */
@@ -573,6 +583,42 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
 const modelLabel = (model: AgentModel | null): string =>
   model === null ? "демона" : `${model.providerID}/${model.id}${model.variant !== undefined ? `#${model.variant}` : ""}`
 
+// ——— автокомпакт вечной сессии мастера ———
+
+/** Троттлинг компакт-чека (in-memory: пропуск из-за рестарта догонит следующий
+ *  тик; сама admission-метка персистится в tracked.lastCompactAt). */
+const compactLastCheck = new Map<string, number>()
+
+/** Чек автокомпакта вечной сессии: занятость — через границу lastFiredAt
+ *  (стухший idle хода, паттерн sessionStatus), модель/лимит/токены —
+ *  compactProbe, оркестрация «персист метки до POST» — compactTick.
+ *  DRY_RUN/ONCE — ноль реальных действий (инвариант демона: ручной/песочный
+ *  тик не должен POST'ить): решения логом, GET/POST/state не звать. */
+async function maybeCompactEternal(state: CronState, row: CronRow, tracked: TrackedCron): Promise<void> {
+  const masterTitle = row.title || row.rowId.slice(0, 8)
+  if (DRY_RUN || ONCE) {
+    log(`мастер «${masterTitle}»: ${DRY_RUN ? "DRY_RUN" : "ONCE"} — компакт-чек пропущен (порог idle ${Math.round(COMPACT_POLICY.idleMs / 60_000)}м, контекст ≥${COMPACT_POLICY.minContextPct}%)`)
+    return
+  }
+  await compactTick({
+    sessionID: () => tracked.sessionID,
+    busy: () => false, // занятость решает граница lastFiredAt в probe
+    probe: async (sessionID) => {
+      const p = await compactProbe(restCall, sessionID)
+      const idleOk = p.idleAt !== null && p.idleAt >= tracked.lastFiredAt
+      return { idleMs: idleOk ? Date.now() - (p.idleAt as number) : null, usagePct: p.usagePct }
+    },
+    lastCompactAt: () => tracked.lastCompactAt ?? 0,
+    persist: (ms) => {
+      state.crons[row.rowId] = { ...tracked, lastCompactAt: ms }
+      saveState(state)
+    },
+    fire: (sessionID) => sessionCompact(restCall, sessionID),
+    policy: COMPACT_POLICY,
+    log: (m) => log(`мастер «${masterTitle}»: ${m}`),
+  })
+}
+
 /** Файр вечного мастера: ран-карточка — как у изолированного контура, промпт
  *  уходит в ОДНУ сессию мастера (custom-agent): idle → ход, running → стирт,
  *  gone → пересоздание (контекст потерян — честный лог). Неподтверждённый
@@ -709,6 +755,18 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
 
     const tracked = state.crons[row.rowId]
     const lastFired = tracked?.lastFiredAt ?? 0
+
+    // автокомпакт вечной сессии — ДО due-гейта: основной юзкейс — idle-окна
+    // между файрами (после гейта чек доживал бы только до моментов файра,
+    // когда сессия занята, и не выстреливал бы никогда). Файр в полёте
+    // (pendingRun) приоритетнее — вечный контур его доигрывает отдельно.
+    if (row.agent !== "" && tracked !== undefined && tracked.sessionID !== "" && tracked.pendingRun === undefined) {
+      const lastCheck = compactLastCheck.get(row.rowId) ?? 0
+      if (now.getTime() - lastCheck >= COMPACT_CHECK_SEC * 1000) {
+        compactLastCheck.set(row.rowId, now.getTime())
+        await maybeCompactEternal(state, row, tracked)
+      }
+    }
 
     // предыдущая изолированная сессия ещё жива → не спамим (кроме давно
     // повисших). Вечные сессии не гейтятся: занятость решает стирт, а

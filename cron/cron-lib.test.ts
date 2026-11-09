@@ -111,6 +111,14 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ sessionID: "gh_1", lastFiredAt: 5 })).toBe(false)
     expect(isValidTracked({ sessionID: "", lastFiredAt: "5" })).toBe(false)
   })
+
+  test("lastCompactAt опционален; валиден неотрицательный number, мусор отвергается", () => {
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: 1000 })).toBe(true)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: 0 })).toBe(true)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: -1 })).toBe(false)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: "мусор" })).toBe(false)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: null })).toBe(false)
+  })
 })
 
 describe("firePrompt", () => {
