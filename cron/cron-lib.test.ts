@@ -1,4 +1,6 @@
 // cron-lib.test.ts — расписания, границы, промпты.
+import { existsSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
@@ -420,6 +422,22 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
   test("без model в фронте — null (модель демона у вызывающего)", () => {
     expect(parseAgentDefModel("---\nmode: primary\n---\n# Тело")).toBeNull()
     expect(parseAgentDefModel("# без фронта")).toBeNull()
+  })
+})
+
+describe("пин канон-дефа dreamer — базовый агент крона «Дример дримеров» (аудит дрим-сессий)", () => {
+  test("репо-канон существует и его frontmatter — боевая модель файр-гейта", () => {
+    // Вечная сессия крона «Дример дримеров» живёт на дефе dreamer
+    // (custom-agent=dreamer, задача 20261109183943-adwyv4c): гейт agentDefOf
+    // читает глобальный деф (~/.config/opencode/agents — симлинк link.sh на
+    // мастер-чекаут), модель файра берётся из frontmatter дефа
+    // (createAgentSession → parseAgentDefModel). Пин — от репо-канона
+    // (CI-safe; пин PR #190 строил от HOME-пути и на раннере падал).
+    // Слом фронта = тихая смена модели ночного аудита.
+    const path = join(import.meta.dir, "..", "agents", "dreamer.md")
+    expect(existsSync(path)).toBe(true)
+    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" })
   })
 })
 
