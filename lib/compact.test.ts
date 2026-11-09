@@ -97,12 +97,28 @@ const modelRow = (providerID: string, modelID: string, context: number): unknown
 test("modelContextLimit: матч по providerID+modelID; нет модели / пустой limit — null", async () => {
   const cache = new Map<string, number | null>()
   const rest = async (path: string): Promise<unknown> => {
-    expect(path).toBe("/api/model")
+    expect(path).toBe("/model")
     return { data: [modelRow("prov", "m1", 1_000_000), modelRow("prov", "m2", 0)] }
   }
   expect(await modelContextLimit(rest, "prov", "m1", cache)).toBe(1_000_000)
   expect(await modelContextLimit(rest, "prov", "m2", cache)).toBeNull()
   expect(await modelContextLimit(rest, "prov", "missing", cache)).toBeNull()
+})
+
+// БАГ-ПИН (тестирование 20261105153731-s6e27f6, живой e2e против opencode 2.2.6):
+// rest демонов (lib/hub.ts, cron/cron.ts) строит URL как `${base}/api${path}` —
+// path обязан быть БЕЗ префикса /api. Передача "/api/model" уходила на
+// /api/api/model → живой сервер отвечает 404 → catch → usagePct=null → компакт
+// тихо не стрелял никогда. Моки, матчившие по endsWith("/api/model"), маскировали
+// двойной префикс. Живой контракт: GET {base}/api/model → 200, /api/api/model → 404.
+test("modelContextLimit: path без /api-префикса — rest демонов строит /api сам (двойной префикс = 404 на живом сервере)", async () => {
+  const seen: string[] = []
+  const rest = async (path: string): Promise<unknown> => {
+    seen.push(path)
+    return [modelRow("prov", "m1", 1_000_000)]
+  }
+  await modelContextLimit(rest, "prov", "m1", new Map())
+  expect(seen[0]).toBe("/model")
 })
 
 test("modelContextLimit: кэш успешных резолвов — второй вызов не ходит в rest; transient-сбой НЕ кэшируется (ретрай следующим тиком)", async () => {
@@ -142,7 +158,7 @@ function scriptRest(session: unknown, messages?: unknown): { rest: (path: string
         if (messages === undefined) throw new Error("messages недоступны")
         return { data: messages }
       }
-      if (path === "/api/model") return [modelRow("prov", "m1", 1_000_000)]
+      if (path === "/model") return [modelRow("prov", "m1", 1_000_000)] // без /api-префикса: rest демона строит /api сам (баг-пин выше)
       if (typeof session === "number") throw Object.assign(new Error("gone"), { status: session })
       return session
     },

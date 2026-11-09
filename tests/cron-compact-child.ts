@@ -70,7 +70,10 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ outcome: "succeeded", time: { idle: idleAt }, model: sessionModel })
   }
   if (url.includes("/message")) return json(messages)
-  if (url.endsWith("/api/model")) {
+  // строгий pathname-матч (тестирование s6e27f6): rest демона строит /api + path,
+  // живой контракт — GET {base}/api/model → 200; двойной префикс (/api/api/model)
+  // на живом сервере даёт 404 — мок не имеет права его принимать
+  if (new URL(url).pathname === "/api/model") {
     return json({ data: [{ providerID: "zai-coding-plan", modelID: "test-model", limit: { context: 1_000_000, output: 131_072 } }] })
   }
   if (url.includes("/inbox")) return new Response("нет inbox", { status: 404 })
