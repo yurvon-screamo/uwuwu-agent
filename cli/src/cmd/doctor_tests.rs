@@ -132,6 +132,39 @@ async fn board_orphans_probe_skips_on_sql_failure() {
     std::env::remove_var("UWUWU_SIYUAN_WS");
 }
 
+/// Detail пробы называет доску: счётчик — все прямые дети-доки доски,
+/// и формулировка «детей-доков доски N» не читается как дети кандидата
+/// (пин: инцидент аудита 08→09.11, «Без названия 49→62»).
+#[tokio::test]
+#[serial_test::serial]
+async fn board_orphans_probe_detail_names_board_children() {
+    let mut scenario = orphan_scenario();
+    scenario.board_children = vec![(
+        BOARD_HPATH,
+        vec![
+            (CHILD_BOUND, CHILD_BOUND_HPATH, "20261108000000"),
+            (CHILD_ORPHAN, CHILD_ORPHAN_HPATH, "20261108010134"),
+        ],
+    )];
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let _ws = isolated_workspace();
+
+    let sy = SiYuan::from_env_with_timeout(10).expect("client");
+    let outcomes = run(&sy, "uwuwu", 30).await;
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == "board-orphans")
+        .expect("board-orphans outcome присутствует");
+    assert_eq!(
+        outcome.detail.as_deref(),
+        Some("детей-доков доски 2"),
+        "detail должен называть доску: {:?}",
+        outcome.detail
+    );
+    std::env::remove_var("UWUWU_SIYUAN_WS");
+}
+
 /// Стаб .sy по живому набору ключей: ID, Spec, Type, Properties,
 /// Children (Content у стаба истории нет вовсе).
 fn write_history_stub(history: &std::path::Path, snapshot_dir: &str, doc_id: &str, title: &str) {
