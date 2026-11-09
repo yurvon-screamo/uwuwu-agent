@@ -336,6 +336,44 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
     );
 }
 
+/// Dry-run ветка create — read-only осмотр: при живом ядре ноль записей
+/// (строка/док/атрибуты не минтятся). Печатаемое тело собирает та же
+/// create_body_md, что и боевую запись (юнит-пин равенства в siyuan_task_tests);
+/// content-ветка dry-run не тестируется на dispatch — read_stdin читает
+/// реальный stdin процесса, обвязки мока в репо нет (рамка ревью: тест без
+/// stdin).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_dry_run_is_read_only_with_live_kernel() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "dry-run осмотр".into(),
+            r#type: None,
+            stdin: false,
+            attach: Vec::<std::path::PathBuf>::new(),
+            schedule: None,
+            agent: None,
+            dry_run: true,
+        },
+    )
+    .await
+    .expect("dry-run проходит без отказов");
+
+    assert!(kernel.created_docs().is_empty(), "dry-run не создаёт доков");
+    assert!(
+        kernel.item_add_args().is_empty(),
+        "dry-run не вставляет строк"
+    );
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "dry-run не пишет атрибутов"
+    );
+}
+
 /// Дедуп по факту render: в ленте появилась чужая строка с тем же тайтлом →
 /// громкий отказ, вторую строку не минтим, тег не пишется.
 #[tokio::test]
