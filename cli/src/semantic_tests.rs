@@ -173,6 +173,11 @@ struct EmbedMock {
     inputs: Arc<Mutex<Vec<String>>>,
     /// Задержка ответа — тесты таймаутов бюджета (п.2 ревью PR #78).
     delay: Duration,
+    /// Дискретный режим (детерминизм вместо плотных таймингов, флейк
+    /// 09.11): первый вызов — с `delay`, последующие — со `slow`.
+    /// Признак «первого» — пустой счётчик инпутов до extend (батч шлёт
+    /// все инпуты одним вызовом, len() == 1 не случится никогда).
+    slow_after_first: Option<Duration>,
 }
 
 impl Respond for EmbedMock {
@@ -183,11 +188,16 @@ impl Respond for EmbedMock {
             .iter()
             .map(|v| v.as_str().unwrap_or("").to_string())
             .collect();
+        let first_call = self.inputs.lock().unwrap().is_empty();
         self.inputs.lock().unwrap().extend(sent.iter().cloned());
+        let delay = match self.slow_after_first {
+            Some(slow) if !first_call => slow,
+            _ => self.delay,
+        };
         let embeddings: Vec<Vec<f32>> = inputs.iter().map(|_| self.vector.clone()).collect();
         ResponseTemplate::new(200)
             .set_body_json(json!({ "embeddings": embeddings }))
-            .set_delay(self.delay)
+            .set_delay(delay)
     }
 }
 
@@ -212,6 +222,25 @@ async fn embed_server_with_delay(
     vector: Vec<f32>,
     delay: Duration,
 ) -> (MockServer, Arc<Mutex<Vec<String>>>) {
+    embed_server_custom(vector, delay, None).await
+}
+
+/// Дискретный мок вместо плотных таймингов (флейк 09.11): первый вызов
+/// отвечает мгновенно, последующие — через `slow`, заведомо больший
+/// таймаута клиента. Исход теста фиксирован конструкцией мока, а не
+/// победой одного реального тайминга над другим.
+async fn embed_server_slow_after_first(
+    vector: Vec<f32>,
+    slow: Duration,
+) -> (MockServer, Arc<Mutex<Vec<String>>>) {
+    embed_server_custom(vector, Duration::ZERO, Some(slow)).await
+}
+
+async fn embed_server_custom(
+    vector: Vec<f32>,
+    delay: Duration,
+    slow_after_first: Option<Duration>,
+) -> (MockServer, Arc<Mutex<Vec<String>>>) {
     let server = MockServer::start().await;
     let inputs = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -220,6 +249,7 @@ async fn embed_server_with_delay(
             vector,
             inputs: inputs.clone(),
             delay,
+            slow_after_first,
         })
         .mount(&server)
         .await;
@@ -686,11 +716,12 @@ async fn delta_watermark_pair_persists_after_full_mountain_pass() {
     );
 }
 
-/// Бюджет умер посреди лавины — закоммиченный батч двигает пару: watermark
-/// указывает на последнюю строку закоммиченного батча, backlog считает
-/// незакрытый хвост (сегодня: пара не персистится, очередь «висит»).
+/// Смерть посреди лавины (embed-таймаут второго батча — детерминированный
+/// дискретный мок вместо плотных таймингов, флейк 09.11) — закоммиченный
+/// батч двигает пару: watermark указывает на последнюю строку
+/// закоммиченного батча, backlog считает незакрытый хвост.
 #[tokio::test]
-async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
+async fn delta_mid_mountain_embed_death_keeps_pair_progress() {
     let blocks: Vec<Value> = (0..300)
         .map(|i| {
             block(
@@ -703,51 +734,50 @@ async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
         .collect();
     let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
-    // батчи по 25ms — бюджет 100ms умирает посреди лавины: как вживую
-    // (EmbedError::Timeout), так и чистым budget_exhausted между батчами.
+    // батч 1 (32 строки) — мгновенный ответ, батчи 2+ — через 5 s при
+    // таймауте 500 ms: Err(EmbedError::Timeout) гарантирован конструкцией
+    // мока, а не гонкой «успеет ли батч в бюджет» (бывшие 25 ms vs 100 ms).
     let (embed, _inputs) =
-        embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(25)).await;
+        embed_server_slow_after_first(vec![1.0, 0.0, 0.0], Duration::from_secs(5)).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let mut store = seeded_store(dir.path());
     store.set_meta("watermark", T1).unwrap();
 
-    let report = sync::delta_sync(
+    let outcome = sync::delta_sync(
         &sy,
         &ollama(&embed.uri()),
         &mut store,
         &sync::SyncOptions {
             since: None,
-            deadline: Some(Instant::now() + Duration::from_millis(100)),
-            embed_timeout: Duration::from_secs(2),
+            deadline: None,
+            embed_timeout: Duration::from_millis(500),
             page_delay: None,
             on_batch: None,
         },
     )
     .await;
+    let Err(err) = outcome else {
+        panic!("смерть посреди лавины: ожидали Err от таймаута второго батча");
+    };
 
-    // оба исхода честны: Ok(budget_exhausted) или Err(EmbedError::Timeout)
-    if let Ok(report) = report {
-        assert!(
-            report.budget_exhausted,
-            "бюджет умер: {:?}",
-            report.budget_exhausted
-        );
-    }
-    // закоммиченные строки берём из стора: счётчик инпутов мока считает
-    // отправленные запросы, а батч может умереть по таймауту уже после
-    // отправки — без коммита
+    let is_timeout = err
+        .downcast_ref::<EmbedError>()
+        .is_some_and(|e| matches!(e, EmbedError::Timeout { .. }));
+    assert!(is_timeout, "ожидали EmbedError::Timeout: {err:#}");
+
+    // ровно первый батч закоммичен — счётчик инпутов мока здесь не нужен:
+    // смерть детерминирована, коммит только у батча 1
     let committed = store.chunk_count().unwrap() as usize;
-    assert!(
-        committed >= 32,
-        "первый батч успел закоммититься: {committed}"
+    assert_eq!(
+        committed,
+        sync::EMBED_BATCH,
+        "ровно первый батч: {committed}"
     );
-    assert!(committed < 300, "бюджет умер до конца лавины: {committed}");
     let mark = store.meta("watermark").unwrap().unwrap();
     let (updated, id) = sync::split_watermark(&mark);
     assert_eq!(updated, T1);
     assert_eq!(
-        id,
-        format!("20261105-{:04}", committed - 1),
+        id, "20261105-0031",
         "пара указывает на последнюю закоммиченную строку: {mark}"
     );
 
@@ -755,7 +785,7 @@ async fn delta_mid_mountain_budget_death_keeps_pair_progress() {
     let backlog = crate::semantic::status_backlog_for_tests(&sy, &store).await;
     assert_eq!(
         backlog,
-        (300 - committed) as u64,
+        (300 - sync::EMBED_BATCH) as u64,
         "очередь над парой: {backlog}"
     );
 }
@@ -1475,8 +1505,12 @@ async fn search_half_returns_results_when_sync_budget_dies() {
     }
     let (server, _, _) = kernel_server(blocks).await;
     let sy = SiYuan::for_tests(server.uri());
-    // батчи по 60ms — бюджет 150ms умирает посреди синка
-    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(60)).await;
+    // query (вызов 1) — мгновенный: query-first успевает из полного
+    // бюджета с огромным запасом; sync-батчи — через 2 s при остатке
+    // 150 ms: таймаут синка детерминирован конструкцией мока, а не гонкой
+    // «успеет ли query за бюджет» (бывшие 60 ms vs 150 ms, флейк 09.11).
+    let (embed, _) =
+        embed_server_slow_after_first(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), &embed.uri());
     let mut store = index_ready_store(dir.path());
