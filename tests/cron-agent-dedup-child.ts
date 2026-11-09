@@ -148,7 +148,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     stderr: new Response("").body,
     exited: Promise.resolve(0),
   }
-}) as typeof Bun.spawn
+}) as unknown as typeof Bun.spawn
 
 // ——— прогон: два мастера с pendingRun в полёте, один тик (недуевой —
 // ретрай обязан отработать до due-гейта) ———
