@@ -1445,7 +1445,7 @@ impl SiYuan {
 mod tests {
     use super::{
         body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing,
-        REST_SNIPPET_CHARS,
+        MCP_SNIPPET_CHARS, REST_SNIPPET_CHARS,
     };
     use crate::siyuan::SiYuan;
     use serde_json::json;
@@ -2247,6 +2247,115 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("kernel code=-1"), "код в ошибке: {text}");
         assert!(text.contains("auth failed"), "msg в ошибке: {text}");
+    }
+
+    /// Статусный bail — только не-2xx: 202 с пустым телом (нотификация)
+    /// проходит успех-путём как тихий пустой результат (задача
+    /// 20261109083931-ajpznm8; `is_success()` включает 202).
+    #[tokio::test]
+    async fn mcp_tool_202_notification_empty_body_passes_as_null() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 202, "").await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect("202 notification must pass, not bail");
+
+        assert!(
+            v.get("isError").is_none() && v.get("code").is_none(),
+            "202 не должен нести маркеров ошибки: {v}"
+        );
+    }
+
+    /// Граница конверт-детекта: code=0 — успех ядра, не ошибка (bail только
+    /// на code≠0; задача 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_envelope_code_zero_passes_as_data() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 200, r#"{"code":0,"msg":""}"#).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect("code=0 envelope must pass, not bail");
+    }
+
+    /// msg отсутствует в kernel-конверте — плейсхолдер «?» в ошибке (cli-канон
+    /// require_payload_ok; задача 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_envelope_without_msg_bails_with_question() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 200, r#"{"code":-32601}"#).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("code≠0 without msg must bail with ? placeholder");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("kernel code=-32601 msg=?"),
+            "плейсхолдер ? в ошибке: {text}"
+        );
+    }
+
+    /// Канонический jsonrpc-конверт с error-веткой барьерится error-веткой
+    /// («mcp {method}: {err}»), не конверт-детектом: jsonrpc присутствует —
+    /// порядок проверок после parse (паритет lib/platform.ts; задача
+    /// 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_jsonrpc_error_envelope_bails_on_error_branch() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(
+            &server,
+            200,
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"transport rpc error"}}"#,
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("jsonrpc error envelope must bail on error branch");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("transport rpc error"),
+            "error-ветка в ошибке: {text}"
+        );
+        assert!(
+            !text.contains("kernel code="),
+            "конверт-детект не должен перехватывать jsonrpc-конверт: {text}"
+        );
+    }
+
+    /// Сниппет тела в mcp-ошибке — лимит 120 + многоточие (паритет
+    /// lib/platform.ts mcpHttpError; REST-канон 200 не задет — задача
+    /// 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_404_snippet_truncated_at_mcp_limit() {
+        let server = MockServer::start().await;
+        let long_body: &'static str = Box::leak("y".repeat(300).into_boxed_str());
+        mount_mcp_tool_raw_response(&server, 404, long_body).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("long 404 body must bail with truncated snippet");
+
+        let text = err.to_string();
+        assert!(text.contains("HTTP 404"), "статус в ошибке: {text}");
+        assert!(text.contains('…'), "обрезка обозначена: {text}");
+        let ys = text.matches('y').count();
+        assert_eq!(
+            ys, MCP_SNIPPET_CHARS,
+            "сниппет mcp = 120 символов тела: {text}"
+        );
     }
 
     #[tokio::test]
