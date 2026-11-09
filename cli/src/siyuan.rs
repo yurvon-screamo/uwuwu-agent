@@ -23,6 +23,38 @@ const WAVE_COOLDOWN_SECS: u64 = 90;
 /// (штатный лаг индекса после крупных вставок пробивается вторым-третьим),
 /// затем bail с хинтом — не 4×~10с как прежде.
 const METADATA_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+/// Паузы между попытками авто-отката overwrite: ядро, уронившее запись,
+/// лежит в рестарте (quadlet ~6с + бут ядра ~10–15с) — первые попытки
+/// уходят в отказ, смысл ретраев — пережить окно рестарта. Итог — 4 попытки
+/// и ~40–45с ожидания. UWUWU_TEST_RESTORE_BACKOFF_MS (мс через запятую)
+/// перекрывает расписание: хук тестовый, но env читается на любом пути —
+/// прод его не выставляет, чужое значение меняет прод-бэкоффы громко
+/// (предупреждение в stderr + прод-константы, никогда не частично).
+const RESTORE_BACKOFFS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+fn restore_backoffs() -> Vec<Duration> {
+    let Ok(schedule) = std::env::var("UWUWU_TEST_RESTORE_BACKOFF_MS") else {
+        return RESTORE_BACKOFFS.to_vec();
+    };
+    let parsed: Result<Vec<Duration>, _> = schedule
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().map(Duration::from_millis))
+        .collect();
+    match parsed {
+        Ok(backoffs) if !backoffs.is_empty() => backoffs,
+        _ => {
+            eprintln!(
+                "предупреждение: UWUWU_TEST_RESTORE_BACKOFF_MS={schedule:?} не спарсился \
+                 (нужны мс через запятую) — расписание игнорируется, прод-бэкоффы"
+            );
+            RESTORE_BACKOFFS.to_vec()
+        }
+    }
+}
 const WAVE_HINT: &str = "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями";
 
 fn now_unix_secs() -> u64 {
@@ -389,10 +421,12 @@ impl SiYuan {
     /// Очистка детей верифицируется повторным get_children; пустой док ядра —
     /// один ZWJ-параграф (SiYuan не оставляет док без блока).
     /// Транзакционность на пре-имидже: до мутаций экспорт текущего контента;
-    /// сбой после начала очистки — авто-откат (дочистка остатков + аппенд
-    /// пре-имиджа once), двойной сбой — громкая ошибка с дампом пре-имиджа
-    /// в файл. Запись нового контента — once с контрольным чтением (sync-лаг
-    /// ядра прячет записанный блок — откат стёр бы легший контент).
+    /// сбой после начала очистки — авто-откат с бэкофф-ретраями (переживает
+    /// рестарт ядра — инциденты 08.11: смерти процесса, каждая попытка
+    /// начинается с чистой MCP-сессии), все попытки неуспешны — громкая
+    /// ошибка с дампом пре-имиджа в файл. Запись нового контента — once
+    /// с контрольным чтением (sync-лаг ядра прячет записанный блок — откат
+    /// стёр бы легший контент).
     pub async fn overwrite_doc_md(
         &self,
         doc_id: &str,
@@ -459,10 +493,20 @@ impl SiYuan {
     }
 
     /// Авто-откат overwrite: док уже очищен (частично или полностью) — вернуть
-    /// пре-имидж: дочистка остатков + аппенд пре-имиджа once. Откат тоже не
-    /// удался → дамп пре-имиджа в файл, громкая ошибка с путём и обеими
-    /// причинами. Возвращается всегда Err (исходная причина): команда упала,
-    /// контент сохранён — повтор безопасен.
+    /// пре-имидж: дочистка остатков + аппенд пре-имиджа once. Откат идёт
+    /// циклом с бэкофф-ретраями: ядро, уронившее запись, лежит в рестарте
+    /// (инциденты 08.11 — смерти процесса ядра, quadlet поднимает за ~6с),
+    /// одиночная немедленная попытка всегда уходила в тот же мёртвый
+    /// транспорт. Ретраи безопасны: попытка сходима по построению — «дочистка
+    /// до пустоты + аппенд того же пре-имиджа» перезаписывает док, частично
+    /// применённая или применённая-но-неподтверждённая попытка при повторе
+    /// не дублирует контент. Перед каждой попыткой — инвалидация MCP-сессии
+    /// (рестарт убил её на стороне ядра, стейл sid = 404 на первом же
+    /// get_children) и сброс wave-cooldown (metadata-not-ready поднимающегося
+    /// ядра не должен армить fail-fast окно против аварийного восстановления).
+    /// Все попытки неуспешны → дамп пре-имиджа в файл 0600, громкая ошибка
+    /// с путём и обеими причинами. Возвращается всегда Err (исходная
+    /// причина): команда упала, контент сохранён — повтор безопасен.
     async fn restore_or_fail(
         &self,
         doc_id: &str,
@@ -473,42 +517,58 @@ impl SiYuan {
             // восстанавливать нечего: док был пуст до операции
             return Err(cause);
         }
-        let rollback = async {
-            self.clear_doc_children(doc_id).await?;
-            self.append_block_md_once(doc_id, pre_image).await
-        };
-        if let Err(rollback_err) = rollback.await {
-            let dump_path =
-                std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
-            // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
-            // с дефолтными правами между create и set_permissions исключено
-            let dump_result = (|| -> std::io::Result<()> {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options.open(&dump_path)?;
-                use std::io::Write;
-                file.write_all(pre_image.as_bytes())?;
-                Ok(())
-            })();
-            let dump_note = match dump_result {
-                Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
-                Err(dump_err) => format!(
-                    "дамп пре-имиджа в {} не удался: {dump_err}",
-                    dump_path.display()
-                ),
+        let backoffs = restore_backoffs();
+        let total_attempts = backoffs.len() + 1;
+        let mut last_err = None;
+        for backoff in std::iter::once(Duration::ZERO).chain(backoffs) {
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
+            self.invalidate_mcp_session();
+            self.wave_cooldown_until.store(0, Ordering::Relaxed);
+            let rolled_back = async {
+                self.clear_doc_children(doc_id).await?;
+                self.append_block_md_once(doc_id, pre_image).await
             };
-            bail!(
-                "overwrite {doc_id}: {cause:#}; откат не удался ({rollback_err:#}) — {dump_note}"
-            );
+            match rolled_back.await {
+                Ok(()) => {
+                    return Err(cause.context(format!(
+                        "исходный контент дока {doc_id} восстановлен из пре-имиджа"
+                    )));
+                }
+                Err(rollback_err) => last_err = Some(rollback_err),
+            }
         }
-        Err(cause.context(format!(
-            "исходный контент дока {doc_id} восстановлен из пре-имиджа"
-        )))
+        let Some(rollback_err) = last_err else {
+            unreachable!("цикл делает хотя бы одну попытку — last_err заполнен");
+        };
+        let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
+        // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
+        // с дефолтными правами между create и set_permissions исключено
+        let dump_result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&dump_path)?;
+            use std::io::Write;
+            file.write_all(pre_image.as_bytes())?;
+            Ok(())
+        })();
+        let dump_note = match dump_result {
+            Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
+            Err(dump_err) => format!(
+                "дамп пре-имиджа в {} не удался: {dump_err}",
+                dump_path.display()
+            ),
+        };
+        bail!(
+            "overwrite {doc_id}: {cause:#}; откат не удался после {total_attempts} попыток \
+             ({rollback_err:#}) — {dump_note}"
+        );
     }
 
     /// Пустой док ядра несёт ZWJ-заглушку; после записи контента в «пустой» док
@@ -1037,6 +1097,15 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Сброс кэша MCP-сессии: рестарт ядра убивает сессии на его стороне
+    /// (реестр в памяти процесса), tools/call со стейл sid отвечает 404
+    /// «session not found». Нужен пути отката overwrite — попытка после
+    /// рестарта обязана начаться с чистой сессии, иначе все ретраи падают
+    /// одинаково на первом же get_children.
+    fn invalidate_mcp_session(&self) {
+        *self.mcp_sid.lock().unwrap() = None;
+    }
+
     /// Список database-блоков (досок) по SQL.
     pub async fn boards(&self) -> Result<Vec<Value>> {
         self.sql(
@@ -1346,6 +1415,8 @@ mod tests {
     use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing};
     use crate::siyuan::SiYuan;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1444,6 +1515,138 @@ mod tests {
             .await;
         assert!(second.is_err(), "cooldown must fail fast the next call");
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
+    }
+
+    /// Env-пейсинг отката (UWUWU_TEST_RESTORE_BACKOFF_MS): валидное расписание
+    /// парсится дословно; неспарсившийся/пустой env отбрасывается ЦЕЛИКОМ —
+    /// прод-константы, никогда не частичный график (молчаливое отбрасывание
+    /// одного элемента незаметно превратило бы график 4 попыток в 1–2 —
+    /// класс замечания ревью PR #189).
+    #[test]
+    #[serial_test::serial]
+    fn restore_backoffs_env_schedule_parses_or_discarded_whole() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+            }
+        }
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+        let _guard = EnvGuard;
+        let prod = vec![
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        ];
+
+        // env не задан — прод-константы
+        assert_eq!(super::restore_backoffs(), prod);
+
+        // валидное расписание — парсится, пробелы вокруг запятых тримятся
+        std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "5, 500");
+        assert_eq!(
+            super::restore_backoffs(),
+            vec![Duration::from_millis(5), Duration::from_millis(500)]
+        );
+
+        // мусор, частичный мусор, пустой — env отброшен целиком (прод-график)
+        for schedule in ["abc", "5,x", ""] {
+            std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", schedule);
+            assert_eq!(
+                super::restore_backoffs(),
+                prod,
+                "env {schedule:?} не должен давать частичный график"
+            );
+        }
+    }
+
+    /// Попытка отката сбрасывает wave-cooldown: metadata-not-ready до overwrite
+    /// армит 90s fail-fast, и без сброса delete_block первой попытки (post())
+    /// падал бы «пропущено — окно волны» — откат всегда кончался бы дампом.
+    #[tokio::test]
+    async fn rollback_attempt_disarms_wave_cooldown_before_first_delete() {
+        let server = MockServer::start().await;
+        // армим окно волны: appendBlock отдаёт metadata-not-ready ровно на
+        // серию арминга (3 запроса instant-пейсинга), дальше — успех
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(metadata_error_template())
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({ "id": "x" }),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect_err("metadata-not-ready исчерпанием армит окно волны");
+        assert!(
+            sy.wave_cooldown_active(),
+            "окно волны армировано перед откатом"
+        );
+
+        // путь отката: get_children отвечает ребёнком на первый вызов и пусто
+        // дальше (первый tools/call — notifications/initialized, его не считаем)
+        let children_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&children_calls);
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-ok-barrier");
+                }
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 {
+                    "- [p] старый блок (blk-1)".to_string()
+                } else {
+                    String::new()
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2,
+                        "result": { "content": [{ "type": "text", "text": text }] }
+                    })
+                    .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+        // deleteBlock и appendBlock-успех (последний смонтированный мок
+        // перекрывает metadata-error — wiremock берёт свежайший матч)
+        Mock::given(method("POST"))
+            .and(path("/api/block/deleteBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+
+        let err = sy
+            .restore_or_fail("doc-1", "старый контент\n", anyhow::anyhow!("boom"))
+            .await
+            .expect_err("restore_or_fail всегда Err");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("восстановлен"),
+            "откат прошёл при армированном окне: {text}"
+        );
+        assert!(
+            !sy.wave_cooldown_active(),
+            "окно волны сброшено попыткой отката"
+        );
     }
 
     #[tokio::test]

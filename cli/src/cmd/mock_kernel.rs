@@ -155,6 +155,11 @@ pub(crate) struct MockScenario {
     pub(crate) delete_fail_posts: usize,
     /// exportMdContent отвечает 500 (сбой чтения пре-имиджа overwrite).
     pub(crate) export_fail: bool,
+    /// После N успешных tools/call мок сносит текущее поколение MCP-сессии —
+    /// симулятор рестарта ядра (реестр сессий в памяти процесса, рестарт
+    /// инвалидирует все sid; контракт пробы 09.11: tools/call с погасшим
+    /// sid → HTTP 404 «session not found»). usize::MAX — никогда.
+    pub(crate) mcp_restart_after_tools_calls: usize,
     /// Состояние доков (docId → блоки): seed + применённые append-ы;
     /// export отдаёт join.
     pub(crate) doc_blocks: Vec<(&'static str, Vec<String>)>,
@@ -216,6 +221,7 @@ impl Default for MockScenario {
             append_fail_posts: 0,
             delete_fail_posts: 0,
             export_fail: false,
+            mcp_restart_after_tools_calls: usize::MAX,
             doc_blocks: Vec::new(),
             exports: Vec::new(),
             get_children_seq: vec![String::new()],
@@ -250,6 +256,10 @@ pub(crate) struct MockKernel {
     deletes: Mutex<Vec<String>>,
     append_posts: AtomicUsize,
     delete_posts: AtomicUsize,
+    /// Поколение живой MCP-сессии; 0 = живых сессий нет (после «рестарта»).
+    mcp_session_gen: AtomicUsize,
+    mcp_inits: AtomicUsize,
+    mcp_tools_calls_ok: AtomicUsize,
     removed_docs: Mutex<Vec<String>>,
     put_files: Mutex<Vec<String>>,
     attr_writes: Mutex<Vec<(String, String, String)>>,
@@ -283,6 +293,9 @@ impl MockKernel {
             deletes: Mutex::new(Vec::new()),
             append_posts: AtomicUsize::new(0),
             delete_posts: AtomicUsize::new(0),
+            mcp_session_gen: AtomicUsize::new(0),
+            mcp_inits: AtomicUsize::new(0),
+            mcp_tools_calls_ok: AtomicUsize::new(0),
             removed_docs: Mutex::new(Vec::new()),
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
@@ -341,6 +354,33 @@ impl MockKernel {
     /// id всех deleteBlock.
     pub(crate) fn deletes(&self) -> Vec<String> {
         self.deletes.lock().unwrap().clone()
+    }
+
+    /// initialize-вызовы MCP (ассерт ре-инициализации сессии на пути отката).
+    pub(crate) fn mcp_initializes(&self) -> usize {
+        self.mcp_inits.load(Ordering::SeqCst)
+    }
+
+    /// Сессионный контракт живого ядра (проба 09.11): реестр сессий в памяти
+    /// процесса — tools/call с чужим, отсутствующим или погасшим (после
+    /// «рестарта») sid отвечает 404. Some(response) — отказ 404; None —
+    /// сессия жива, счётчик успешных tools/call двигает рестарт-кноб.
+    fn session_reject(&self, req: &Request) -> Option<ResponseTemplate> {
+        let gen = self.mcp_session_gen.load(Ordering::SeqCst);
+        let expected = format!("sess-mock-{gen}");
+        let got = req
+            .headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if gen == 0 || got != expected {
+            return Some(ResponseTemplate::new(404).set_body_string("session not found"));
+        }
+        let ok_no = self.mcp_tools_calls_ok.fetch_add(1, Ordering::SeqCst) + 1;
+        if ok_no == self.sc.mcp_restart_after_tools_calls {
+            self.mcp_session_gen.store(0, Ordering::SeqCst);
+        }
+        None
     }
 
     /// docId всех removeDocByID (тела в трэш).
@@ -715,7 +755,9 @@ impl MockKernel {
                 move |req: &Request| {
                     let body = String::from_utf8_lossy(&req.body);
                     if body.contains("\"initialize\"") {
-                        return mcp_init();
+                        let gen = kernel.mcp_inits.fetch_add(1, Ordering::SeqCst) + 1;
+                        kernel.mcp_session_gen.store(gen, Ordering::SeqCst);
+                        return mcp_init(gen);
                     }
                     if body.contains("notifications/") {
                         return ResponseTemplate::new(200);
@@ -724,6 +766,9 @@ impl MockKernel {
                         return ResponseTemplate::new(200).set_body_string(
                             r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"unexpected"}}"#,
                         );
+                    }
+                    if let Some(reject) = kernel.session_reject(req) {
+                        return reject;
                     }
                     let parsed: Value = serde_json::from_slice(&req.body).unwrap_or_default();
                     let args = parsed
@@ -1039,12 +1084,14 @@ fn mcp_raw(text: String) -> ResponseTemplate {
     )
 }
 
-fn mcp_init() -> ResponseTemplate {
+/// initialize выдаёт sid нового поколения: живое ядро держит реестр сессий
+/// в памяти процесса, каждый initialize создаёт новую сессию.
+fn mcp_init(gen: usize) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .set_body_string(
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"3"}}}"#,
         )
-        .append_header("mcp-session-id", "sess-mock")
+        .append_header("mcp-session-id", format!("sess-mock-{gen}"))
 }
 
 /// Отсутствующий файл: контракт ядра 3.8.9 — 202 + 404-конверт.

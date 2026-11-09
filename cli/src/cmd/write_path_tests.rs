@@ -663,6 +663,97 @@ async fn body_replace_delete_failure_restores_pre_image() {
     );
 }
 
+/// Env-гард тестового пейсинга отката: remove на Drop — паника теста не
+/// протекает env в последующие serial-тесты (иначе маскируется их реальное
+/// расписание).
+struct RestorePacingGuard;
+impl Drop for RestorePacingGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+    }
+}
+
+/// Рестарт ядра посреди overwrite (класс 08.11: смерти процесса ядра,
+/// NRestarts=3 за вечер): мок сносит поколение MCP-сессий после второго
+/// tools/call (render-резолв строки, затем block get живости привязки) —
+/// get_children исходной очистки ловит 404 стейл-сессии, overwrite умирает,
+/// и откат обязан пережить это: инвалидация сессии на границе попыток →
+/// ре-инициализация → дочистка/аппенд пре-имиджа. До фикса единственная
+/// попытка отката шла с тем же мёртвым sid → дамп → ручная реставрация.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_rollback_survives_kernel_reset_via_backoff_retries() {
+    let mut scenario = body_scenario(true);
+    scenario.delete_fail_posts = 4;
+    scenario.mcp_restart_after_tools_calls = 2;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат пережил рестарт ядра: {err:#}"
+    );
+    assert!(
+        kernel.mcp_initializes() >= 2,
+        "ре-инициализация MCP-сессии на пути отката: {}",
+        kernel.mcp_initializes()
+    );
+    let appends = kernel.appends();
+    assert_eq!(
+        appends.len(),
+        1,
+        "ровно восстановительный append: {appends:?}"
+    );
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
+    );
+}
+
+/// Все попытки отката неуспешны (аппенды отката падают весь бэкофф-цикл):
+/// прежний worst-case — дамп пре-имиджа 0600 + громкая ошибка с числом
+/// попыток; команда честно падает, контент сохранён.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_rollback_exhausts_retries_dumps_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.delete_fail_posts = 4;
+    scenario.append_fail_posts = 4;
+    let (_kernel, server) = MockKernel::start(scenario).await;
+
+    std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
+    let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{BOUND_DOC}.md"));
+    let _ = std::fs::remove_file(&dump_path);
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("откат не удался"),
+        "исчерпание ретраев репортится: {message}"
+    );
+    assert!(
+        message.contains("после 4 попыток"),
+        "число попыток в ошибке: {message}"
+    );
+    let dumped = std::fs::read_to_string(&dump_path).expect("дамп пре-имиджа записан");
+    assert!(
+        dumped.contains("старый контент"),
+        "в дампе исходный контент: {dumped:?}"
+    );
+    let _ = std::fs::remove_file(&dump_path);
+}
+
 /// Сбой экспорта пре-имиджа: мутации отменены до очистки — док нетронут,
 /// сбой чтения не читается как «док был пуст» (класс PR #132).
 #[tokio::test]
