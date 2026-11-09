@@ -1,6 +1,4 @@
 // cron-lib.test.ts — расписания, границы, промпты.
-import { existsSync, readFileSync } from "node:fs"
-import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
