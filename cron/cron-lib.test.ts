@@ -1,4 +1,6 @@
 // cron-lib.test.ts — расписания, границы, промпты.
+import { existsSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
@@ -429,6 +431,21 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
 // сервера), пин на машину-зависимый файл в CI не проверяем — живой контроль
 // файр-гейта: контрольный файр 09.11 19:52 (recreate, agent=triage,
 // glm-5.3-flash) и боевой слот 04:30.
+
+describe("triage/agent.md — канон дефа крон-агента карточки Lead", () => {
+  test("frontmatter канона разбирается в боевую модель файр-гейта", () => {
+    const path = join(import.meta.dir, "..", "triage", "agent.md")
+    expect(existsSync(path)).toBe(true)
+    // канон — источник живых копий крона (деплой в обе точки: гейт agentDefOf
+    // + воркспейс-резолв): сломанный frontmatter уедет в карточку
+    // «Lead: ночной аудит uwuwu» отказом файра — пин ловит регресс на CI,
+    // до деплоя. Живые копии машина-зависимы, CI их не видит — их контроль:
+    // бит-в-бит при деплое + контрольный файр 09.11 19:52 (agent=triage,
+    // glm-5.3-flash).
+    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash" })
+  })
+})
 
 describe("promptLandedAt: дедуп приземления промпта", () => {
   const user = (created: number, text: string) => ({ type: "user", time: { created }, text })
