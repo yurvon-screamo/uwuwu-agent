@@ -566,7 +566,10 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
   }
   const landedMs = await promptPost(tracked.sessionID, pending.prompt, action === "steer")
   if (landedMs === null) {
-    pending.attemptAt = Date.now() // новая метка попытки: дедуп приземления от неё
+    // новая метка попытки: граница sessionStatus для decideFire следующего
+    // ретрая (outcome/idle позже метки = ход завершился, можно обычный POST).
+    // Дедуп приземления от неё НЕ идёт — его граница lastFiredAt (см. выше)
+    pending.attemptAt = Date.now()
     saveState(state)
     log(`мастер «${masterTitle}»: ретрай файра не приземлился — ретрай следующим тиком (ран ${pending.rowId})`)
     return
