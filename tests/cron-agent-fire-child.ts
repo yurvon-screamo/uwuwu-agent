@@ -21,6 +21,15 @@ process.env.UWUWU_CRON_STATE_DIR = join(ROOT, "state")
 process.env.UWUWU_CLI_BIN = "uwuwu-cli-fire-mock"
 mkdirSync(join(ROOT, "state"), { recursive: true })
 
+// ——— виртуальные часы: Date.now прод-кода и createdTick мока держатся в
+// симулируемом окне тиков (10:01 внутри дня тиков 10:05–10:17). Без мока
+// lastFiredAt пишется с реальных часов: когда реальное время суток уходит за
+// симулированные тики (пример — после ~10 утра локального), due-гейт
+// перестаёт срабатывать и риг падает «T3 не оставил pendingRun» — тест
+// зависел от времени суток запуска.
+const VIRTUAL_NOW = new Date(2026, 10, 9, 10, 1, 0).getTime()
+Date.now = () => VIRTUAL_NOW
+
 // деф позитивного агента в HOME-песочнице: frontmatter с инлайн #variant
 // (покрывает парсер модели) — создания машинных дефов не будет
 const AGENT = "test-agent-fire"
