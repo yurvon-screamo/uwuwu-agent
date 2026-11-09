@@ -8,14 +8,20 @@
 //               дельта-промпт в ТУ ЖЕ сессию, без создания новой;
 //   bug        — fail-вердикт тестировщика: строка в In Progress, дев-сессия
 //               жива — возврат девелоперу промптом, тест-сессия пережита.
+//   worktree   — как quarantine, но в песочном ENV_ROOT посажен живой
+//               агентский ворктри env:false (~/agents-env/<rowId>/repo c .git):
+//               резолв (20261109133634-6ctgzew) должен дать тестировщику
+//               живой путь — в cwd сессии и в промпте, без фоллбэк-строки.
 // HOME задаётся родителем ДО старта процесса: os.homedir() в bun читает env
 // только на старте (инцидент 06.11) — изоляция только через новый процесс.
-import { mkdirSync, readFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 const SCENARIO = process.env.TESTING_STAGE_SCENARIO === "rerun"
   ? "rerun"
-  : process.env.TESTING_STAGE_SCENARIO === "bug" ? "bug" : "quarantine"
+  : process.env.TESTING_STAGE_SCENARIO === "bug"
+  ? "bug"
+  : process.env.TESTING_STAGE_SCENARIO === "worktree" ? "worktree" : "quarantine"
 
 const AV_ID = "20260101000000-abcdef"
 const ROW_ID = "20261108000000-row1"
@@ -163,9 +169,10 @@ function scriptTick(): string[] {
     }
     if (url.includes("/api/session")) {
       const payload = JSON.parse(String(init?.body ?? "{}")) as {
-        agent?: string; title?: string; model?: { id?: string }
+        agent?: string; title?: string; model?: { id?: string }; location?: { directory?: string }
       }
-      calls.push(`session-create:${payload.agent ?? "default"}:${payload.title ?? ""}:${payload.model?.id ?? ""}`)
+      // directory в хвосте: cwd сессии — ключевой ассерт worktree-сценария
+      calls.push(`session-create:${payload.agent ?? "default"}:${payload.title ?? ""}:${payload.model?.id ?? ""}:${payload.location?.directory ?? "?"}`)
       return new Response(JSON.stringify({ id: NEW_SESSION }), { status: 200 })
     }
     throw new Error(`child mock: неожиданный путь ${url}`)
@@ -181,6 +188,13 @@ const stateFile = join(home, ".local/state/uwuwu-factory/state.json")
 const state = JSON.parse(readFileSync(stateFile, "utf-8"))
 
 const calls = scriptTick()
+// worktree-сценарий: живой агентский ворктри env:false в песочном ENV_ROOT
+// (ENV_ROOT = homedir()/agents-env; .git — файл, как у реального worktree)
+if (SCENARIO === "worktree") {
+  const repoDir = join(home, "agents-env", ROW_ID, "repo")
+  mkdirSync(repoDir, { recursive: true })
+  writeFileSync(join(repoDir, ".git"), "gitdir: /elsewhere/main/.git/worktrees/x\n")
+}
 const { tickProject } = await import("../factory/factory")
 const cfg = { board: "Задачи x", repo: "r/x", local: "/tmp/x" }
 const sliceAll = (list: string[], prefix: string): string[] =>
