@@ -408,7 +408,8 @@ pub(crate) enum KernelSub {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// List all projects with their description.
+    /// Имена открытых ноутбуков воркспейса (Experience/Projects/Daily) —
+    /// не перечень проектов: он через `docs ls "Projects"`.
     Projects,
     /// Read a document by slug: полный hpath (`<project>/<doc>`,
     /// `<topic>/<doc>`, слаг Daily) или одиночный заголовок (если однозначен;
