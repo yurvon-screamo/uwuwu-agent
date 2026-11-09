@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::time::Duration;
 
 /// Канон-форма статуса, на которую вешается гард (см. TASK_STATUSES).
 pub const STATUS_REVIEW_RESULT: &str = "Ревью результата";
@@ -157,16 +158,30 @@ pub fn evaluate(
     }
 }
 
-fn run_gh(args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new("gh")
-        .args(args)
-        .output()
+/// Потолок gh-вызова: полуоткрытое соединение не должно молча подвешивать
+/// перевод — гард стоит на горячем пути каждой финализации.
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// gh-вызов с потолком времени; сбой — Err (громкий отказ, не тихий вис).
+async fn run_gh(args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(args);
+    let description = format!("gh {}", args.first().unwrap_or(&""));
+    tokio::time::timeout(GH_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{description} не ответил за {}с — повтори; при повторе проверь \
+                 мержабельность руками (gh pr view)",
+                GH_TIMEOUT.as_secs()
+            )
+        })?
         .context("запуск gh не удался (есть ли gh в PATH?)")
 }
 
 /// gh-вызов с JSON-ответом; сбой — Err с stderr (one-shot, без ретраев).
 async fn gh_json(args: &[&str]) -> Result<Value> {
-    let out = run_gh(args)?;
+    let out = run_gh(args).await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
@@ -182,7 +197,7 @@ async fn gh_json(args: &[&str]) -> Result<Value> {
 /// Есть ли в репо CI-workflows. 403/404 трактуется как «Actions нет» —
 /// Ok(false); прочие сбои — Err (громкий отказ, не тихий проход).
 async fn gh_workflows_present(owner_repo: &str) -> Result<bool> {
-    let out = run_gh(&["api", &format!("repos/{owner_repo}/actions/workflows")])?;
+    let out = run_gh(&["api", &format!("repos/{owner_repo}/actions/workflows")]).await?;
     if out.status.success() {
         let v: Value =
             serde_json::from_slice(&out.stdout).context("gh api workflows вернул не-JSON")?;

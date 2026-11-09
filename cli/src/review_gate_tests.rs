@@ -4,7 +4,8 @@
 //! собственной строке задачи (см. Проверка в теле).
 
 use crate::review_gate::{
-    evaluate, gate, github_owner_repo, rollup_state, url_host, RollupState, WorkflowProbe,
+    evaluate, gate, github_owner_repo, rollup_state, url_host, RollupState, STATUS_REVIEW_RESULT,
+    WorkflowProbe,
 };
 use serde_json::{json, Value};
 
@@ -222,4 +223,16 @@ async fn gate_passes_non_github_with_warning() {
     gate("http://gitea.local/origa/pull/9")
         .await
         .expect("произвольный http-хост проходит");
+}
+
+/// Связка знания: цель гарда обязана жить в реестре канона статусов.
+/// Переименование в TASK_STATUSES без синхрона здесь — громкий отказ теста,
+/// не молчаливое отключение гарда (ревью Low №1).
+#[test]
+fn review_result_status_is_registered_in_canon() {
+    assert!(
+        crate::siyuan_task::TASK_STATUSES.contains(&STATUS_REVIEW_RESULT),
+        "«{STATUS_REVIEW_RESULT}» вне канона TASK_STATUSES — гард молча перестанет \
+         применяться; синхронизируй константу с реестром"
+    );
 }
