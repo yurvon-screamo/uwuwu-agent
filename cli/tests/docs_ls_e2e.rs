@@ -42,7 +42,10 @@ fn projects_listing_via_docs_ls_projects() {
     }
     let (code, stdout, stderr) = docs_ls("Projects");
     assert_eq!(code, Some(0), "docs ls \"Projects\" должен завершиться успехом (help projects указывает этот путь как штатный перечень проектов); stderr: {stderr}");
-    assert!(!stderr.contains("Error"), "перечень не должен приходить в тексте ошибки; stderr: {stderr}");
+    assert!(
+        !stderr.contains("Error"),
+        "перечень не должен приходить в тексте ошибки; stderr: {stderr}"
+    );
     assert!(
         !stdout.trim().is_empty(),
         "перечень проектов должен приходить в stdout, получено: {stdout:?}"
@@ -58,5 +61,8 @@ fn known_project_listing_via_docs_ls() {
     }
     let (code, stdout, stderr) = docs_ls("uwuwu");
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert!(!stdout.trim().is_empty(), "проект uwuwu не пуст — резолв сломан: {stdout:?}");
+    assert!(
+        !stdout.trim().is_empty(),
+        "проект uwuwu не пуст — резолв сломан: {stdout:?}"
+    );
 }

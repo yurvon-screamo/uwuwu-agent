@@ -349,11 +349,81 @@ async fn notebook_children_direct_resolves_by_name() {
     )
     .await;
     let sy = SiYuan::for_tests(server.uri());
-    let nbs = sy.notebooks().await.unwrap();
-    eprintln!("notebooks: {nbs:?}");
     let direct = super::docs_ls::notebook_children(&sy, "Projects", 10000)
         .await
         .unwrap();
-    eprintln!("children: {direct:?}");
-    assert_eq!(direct, Some(vec!["uwuwu/".to_string()]));
+    assert_eq!(direct, Some((vec!["uwuwu/".to_string()], false)));
+}
+
+/// Закрытый ноутбук с совпадающим именем скипается — резолв идёт только
+/// по открытым (семантика lsNotebooks-перечня projects_run).
+#[tokio::test]
+async fn notebook_children_skips_closed_notebook() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![
+            json!({ "id": "nb-closed", "name": "Projects", "closed": true }),
+            json!({ "id": "nb-open", "name": "Projects", "closed": false }),
+        ],
+        vec![json!({ "hpath": "/uwuwu/README" })],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+    let direct = super::docs_ls::notebook_children(&sy, "Projects", 10000)
+        .await
+        .unwrap();
+    assert_eq!(direct, Some((vec!["uwuwu/".to_string()], false)));
+}
+
+/// Обрезка по факту перебора: fetch_limit = limit+1 (ядро отдало limit+1
+/// строку) → truncated=true, дети — limit записей; та же дисциплина, что
+/// в subtree_stmt, не тихий срез.
+#[tokio::test]
+async fn notebook_children_beyond_limit_is_truncated() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "nb1", "name": "Daily", "closed": false })],
+        vec![
+            json!({ "hpath": "/a" }),
+            json!({ "hpath": "/b" }),
+            json!({ "hpath": "/c" }),
+        ],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "Daily", 2).await.unwrap();
+
+    assert_eq!(
+        listing.children,
+        Some(vec!["a".to_string(), "b".to_string()])
+    );
+    assert!(listing.truncated);
+}
+
+/// Живой ноутбук без детей — «пусто» (None-children), не отказ
+/// «пространство не найдено»: имя ноутбука известно.
+#[tokio::test]
+async fn empty_live_notebook_is_empty_listing() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "nb1", "name": "Daily", "closed": false })],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "Daily", 10000).await.unwrap();
+
+    assert_eq!(listing.children, None);
+    assert!(!listing.truncated);
 }

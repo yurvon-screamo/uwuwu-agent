@@ -78,10 +78,17 @@ pub(super) async fn ls_listing(
     // ведут на голый ноутбук.
     let top = prefix.split('/').next().unwrap_or(prefix);
     if top == prefix {
-        if let Some(children) = notebook_children(sy, prefix, subtree_limit).await? {
+        if let Some((children, truncated)) = notebook_children(sy, prefix, subtree_limit).await? {
+            if children.is_empty() {
+                // живой ноутбук без детей — «пусто»-ветка, не отказ с раскладкой
+                return Ok(Listing {
+                    children: None,
+                    truncated: false,
+                });
+            }
             return Ok(Listing {
                 children: Some(children),
-                truncated: false,
+                truncated,
             });
         }
     }
@@ -104,12 +111,15 @@ pub(super) async fn ls_listing(
 
 /// Дети корня ноутбука по имени: доки бокса, первый сегмент hpath — проект
 /// или топик («uwuwu» с детьми → «uwuwu/», одиночный док Daily → имя).
-/// None — открытого ноутбука с таким именем нет.
+/// Some — открытый ноутбук с таким именем найден (перечень детей корня,
+/// возможно пустой) + факт обрезки лимитом (детект перебором, fetch_limit
+/// = limit + 1, как в subtree_stmt); None — имени нет среди открытых
+/// ноутбуков (caller продолжает hpath-логикой: «пусто»/отказ с раскладкой).
 pub(super) async fn notebook_children(
     sy: &SiYuan,
     name: &str,
     subtree_limit: usize,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<(Vec<String>, bool)>> {
     for nb in sy.notebooks().await? {
         if nb.get("closed").and_then(|c| c.as_bool()).unwrap_or(false) {
             continue;
@@ -119,15 +129,14 @@ pub(super) async fn notebook_children(
         }
         let box_id = nb.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let escaped = box_id.replace('\'', "''");
+        let fetch_limit = subtree_limit + 1;
         let stmt = format!(
-            "select hpath from blocks where type='d' and box='{escaped}' limit {subtree_limit}"
+            "select hpath from blocks where type='d' and box='{escaped}' limit {fetch_limit}"
         );
         let rows = sy.sql(&stmt).await?;
+        let truncated = rows.len() > subtree_limit;
         let children = direct_children("", hpaths(&rows[..subtree_limit.min(rows.len())]));
-        if children.is_empty() {
-            return Ok(None); // «пусто»-ветка ls_listing: живой ноутбук без детей
-        }
-        return Ok(Some(children));
+        return Ok(Some((children, truncated)));
     }
     Ok(None)
 }
