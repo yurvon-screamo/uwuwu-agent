@@ -622,7 +622,7 @@ export function spawnPrompt(
   const workLine = env === undefined
     ? [
         envRoot !== undefined
-          ? `создай worktree+ветку от origin/master — ворктри ${join(envRoot, rowId, "repo")}, скретч ${join(envRoot, rowId, "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
+          ? `создай worktree+ветку от origin/master — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
           : "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
       ]
     : [

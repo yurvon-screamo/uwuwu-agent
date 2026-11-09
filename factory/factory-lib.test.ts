@@ -275,6 +275,15 @@ describe("spawnPrompt", () => {
     expect(p).toContain("скретч /home/x/agents-env/r1/scratch")
     expect(p).toContain("заполни Branch-ячейку")
   })
+  test("формула пути одна: промпт sanitize row-id так же, как резолв tester/ревьювера", () => {
+    // патологический id из тест-кейса sanitizeRowId: ведущий дефис срезается —
+    // сырой rowId в промпте отправил бы агента создавать ворктри по пути,
+    // который resolvePromptWorktree никогда не пробует (ревью PR #192, Low)
+    const id = "-5BF9NMBXZ"
+    const p = spawnPrompt(id, "true-washing", "true-washing", "implement", { envRoot: "/env" })
+    expect(p).toContain("ворктри /env/5BF9NMBXZ/repo")
+    expect(p).not.toContain("/env/-5BF9NMBXZ/repo")
+  })
 })
 
 describe("continuePrompt", () => {
