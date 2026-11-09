@@ -40,9 +40,14 @@ import {
   testingCommentsPrompt,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
+  USER_REVIEW_STATUS,
   stallMinutesFromEnv,
   lastActivityOf,
   stallVerdict,
+  stallClock,
+  bodyEditRoute,
+  prProbeVerdict,
+  PR_PROBE_UNKNOWN_MAX,
   type FactoryState,
   type RouteFacts,
   type ReviewStallFacts,
@@ -1128,6 +1133,7 @@ describe("stallVerdict: зависший ход при живой сессии",
     status: "In Progress",
     sessionAlive: true,
     lastActivityAt: NOW - 40 * MIN,
+    lastDevPromptAt: null,
     branch: "work/task-abc",
     branchInWorktree: true,
     prMerged: false,
@@ -1159,6 +1165,9 @@ describe("stallVerdict: зависший ход при живой сессии",
   })
   test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
     expect(stallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
+    expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
   })
   test("активность вернулась при стоявшем флаге — none (демон снимет флаг)", () => {
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
@@ -1193,8 +1202,153 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(cut.text).toContain(long.slice(0, 60))
     expect(cut.text).not.toContain(long)
   })
-  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
-    expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+})
+
+describe("stallClock: часы тишины сталла — от последнего сигнала сессии", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+
+  test("часы от активности: в пределах порога — не застой, за порогом — застой (прежнее поведение)", () => {
+    const fresh = stallClock({ lastActivityAt: NOW - 5 * MIN, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(fresh.stalled).toBe(false)
+    expect(fresh.quietMin).toBe(5)
+    expect(fresh.fromWake).toBe(false)
+    const stale = stallClock({ lastActivityAt: NOW - 40 * MIN, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(stale.stalled).toBe(true)
+    expect(stale.quietMin).toBe(40)
+  })
+  test("свежий будильник сбрасывает часы: активность старая, промпт свежий — не застой (инцидент 09.11)", () => {
+    const c = stallClock({ lastActivityAt: NOW - 507 * MIN, lastDevPromptAt: NOW - MIN }, 360 * MIN, NOW)
+    expect(c.stalled).toBe(false)
+    expect(c.quietMin).toBe(1)
+    expect(c.fromWake).toBe(true)
+  })
+  test("будка умерла: тишина от промпта больше порога — застой", () => {
+    const c = stallClock({ lastActivityAt: NOW - 500 * MIN, lastDevPromptAt: NOW - 400 * MIN }, 360 * MIN, NOW)
+    expect(c.stalled).toBe(true)
+    expect(c.quietMin).toBe(400)
+    expect(c.fromWake).toBe(true)
+  })
+  test("ответил после будки: часы снова от активности", () => {
+    const c = stallClock({ lastActivityAt: NOW - 2 * MIN, lastDevPromptAt: NOW - 10 * MIN }, 30 * MIN, NOW)
+    expect(c.stalled).toBe(false)
+    expect(c.quietMin).toBe(2)
+    expect(c.fromWake).toBe(false)
+  })
+  test("оба null — застой с рождения, quietMin null, fromWake false", () => {
+    const c = stallClock({ lastActivityAt: null, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(c.stalled).toBe(true)
+    expect(c.quietMin).toBeNull()
+    expect(c.fromWake).toBe(false)
+  })
+})
+
+describe("stallVerdict: часы тишины учитывают последний промпт в дев-сессию", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const facts = (over: Partial<StallFacts> = {}): StallFacts => ({
+    status: "In Progress",
+    sessionAlive: true,
+    lastActivityAt: NOW - 507 * MIN,
+    lastDevPromptAt: null,
+    branch: "work/task-abc",
+    branchInWorktree: true,
+    prMerged: false,
+    signaled: false,
+    now: NOW,
+    ...over,
+  })
+
+  test("свежий будильник при старой активности — none: wake+kick одним тиком исключён (инцидент 09.11)", () => {
+    expect(stallVerdict(facts({ lastDevPromptAt: NOW - MIN }), 360 * MIN)).toEqual({ t: "none" })
+  })
+  test("будка умерла: тишина от wake больше порога — signal, тихий текст от точки часов", () => {
+    const v = stallVerdict(facts({ lastDevPromptAt: NOW - 400 * MIN }), 360 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("тишина 400 мин")
+    expect(v.text).not.toContain("507")
+  })
+})
+
+describe("bodyEditRoute: адресат будки контентной правки тела", () => {
+  const DEV = "ses_dev"
+  const REVIEWER = "ses_rev"
+  const TESTER = "ses_tst"
+  const facts = (over: Partial<Parameters<typeof bodyEditRoute>[0]> = {}) => ({
+    status: "In Progress",
+    reviewSessionID: REVIEWER,
+    testSessionID: TESTER,
+    devSessionID: DEV,
+    ...over,
+  })
+
+  test("Review — swallow с обновлением базлайна: мяч у владельца, будить дева нечего (инцидент 09.11)", () => {
+    expect(bodyEditRoute(facts({ status: USER_REVIEW_STATUS })))
+      .toEqual({ t: "swallow", updateBaseline: true })
+  })
+  test("ревью-статус при живом ревьювере — ревьюверу", () => {
+    for (const status of [REVIEW_PLAN_STATUS, REVIEW_RESULT_STATUS]) {
+      expect(bodyEditRoute(facts({ status }))).toEqual({ t: "wake", target: REVIEWER, role: "ревьювер" })
+    }
+  })
+  test("Тестирование при живом тестировщике — тестировщику", () => {
+    expect(bodyEditRoute(facts({ status: TESTING_STATUS })))
+      .toEqual({ t: "wake", target: TESTER, role: "тестировщик" })
+  })
+  test("In Progress и Design — деву", () => {
+    for (const status of ["In Progress", "Design"]) {
+      expect(bodyEditRoute(facts({ status }))).toEqual({ t: "wake", target: DEV, role: "девелопер" })
+    }
+  })
+  test("держатель умер в агентской стадии — фоллбек на дева (прежнее поведение проводки)", () => {
+    expect(bodyEditRoute(facts({ status: REVIEW_RESULT_STATUS, reviewSessionID: "" })))
+      .toEqual({ t: "wake", target: DEV, role: "девелопер" })
+    expect(bodyEditRoute(facts({ status: TESTING_STATUS, testSessionID: "" })))
+      .toEqual({ t: "wake", target: DEV, role: "девелопер" })
+  })
+  test("дев в карантине вне агентской стадии — swallow без базлайна (ждём адресата)", () => {
+    expect(bodyEditRoute(facts({ devSessionID: "" })))
+      .toEqual({ t: "swallow", updateBaseline: false })
+  })
+})
+
+describe("prProbeVerdict: merged-проба с пределом деградации unknown", () => {
+  test("merged/open — вердикт без дефера и деградации, streak сброшен", () => {
+    expect(prProbeVerdict("merged", 2)).toEqual({ merged: true, defer: false, streakAfter: 0, degraded: false })
+    expect(prProbeVerdict("open", 2)).toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
+  })
+  test("unknown до предела — кик откладывается на тик (defer: сигнал не строится)", () => {
+    expect(prProbeVerdict("unknown", 0)).toEqual({ merged: false, defer: true, streakAfter: 1, degraded: false })
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 2))
+      .toEqual({ merged: false, defer: true, streakAfter: PR_PROBE_UNKNOWN_MAX - 1, degraded: false })
+  })
+  test("unknown на пределе и дальше — деградация к not-merged, кик идёт (страховка ADR-044 возвращена)", () => {
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 1))
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX, degraded: true })
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX + 4))
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX + 5, degraded: true })
+  })
+  test("удачная проба после полосы unknown — streak сброшен", () => {
+    expect(prProbeVerdict("open", PR_PROBE_UNKNOWN_MAX))
+      .toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
+  })
+})
+
+describe("isValidTracked: поля сталл-часов и пробы PR", () => {
+  const base = {
+    sessionID: "ses_abc", worktree: "/wt/task-x", branch: "work/task-x",
+    bodyDoc: "d1", title: "t", project: "uwuwu", lastCommentAt: 1, lastCommentId: "i", createdAt: 2, attempts: 0,
+  }
+  test("lastDevPromptAt: число и отсутствие — валидны, не-число — мимо", () => {
+    expect(isValidTracked({ ...base, lastDevPromptAt: 1234 })).toBe(true)
+    expect(isValidTracked({ ...base, lastDevPromptAt: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, lastDevPromptAt: "1234" })).toBe(false)
+  })
+  test("prProbeUnknownStreak: число и отсутствие — валидны, не-число — мимо", () => {
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: 2 })).toBe(true)
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: true })).toBe(false)
   })
 })
 
@@ -1280,6 +1434,7 @@ describe("дефолт-порог 6 ч: реплика инцидента 07.11 
     status: "In Progress",
     sessionAlive: true,
     lastActivityAt,
+    lastDevPromptAt: null,
     branch: "work/task-abc",
     branchInWorktree: true,
     prMerged: false,
