@@ -1416,6 +1416,7 @@ mod tests {
     use crate::siyuan::SiYuan;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1514,6 +1515,49 @@ mod tests {
             .await;
         assert!(second.is_err(), "cooldown must fail fast the next call");
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
+    }
+
+    /// Env-пейсинг отката (UWUWU_TEST_RESTORE_BACKOFF_MS): валидное расписание
+    /// парсится дословно; неспарсившийся/пустой env отбрасывается ЦЕЛИКОМ —
+    /// прод-константы, никогда не частичный график (молчаливое отбрасывание
+    /// одного элемента незаметно превратило бы график 4 попыток в 1–2 —
+    /// класс замечания ревью PR #189).
+    #[test]
+    #[serial_test::serial]
+    fn restore_backoffs_env_schedule_parses_or_discarded_whole() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+            }
+        }
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+        let _guard = EnvGuard;
+        let prod = vec![
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        ];
+
+        // env не задан — прод-константы
+        assert_eq!(super::restore_backoffs(), prod);
+
+        // валидное расписание — парсится, пробелы вокруг запятых тримятся
+        std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "5, 500");
+        assert_eq!(
+            super::restore_backoffs(),
+            vec![Duration::from_millis(5), Duration::from_millis(500)]
+        );
+
+        // мусор, частичный мусор, пустой — env отброшен целиком (прод-график)
+        for schedule in ["abc", "5,x", ""] {
+            std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", schedule);
+            assert_eq!(
+                super::restore_backoffs(),
+                prod,
+                "env {schedule:?} не должен давать частичный график"
+            );
+        }
     }
 
     /// Попытка отката сбрасывает wave-cooldown: metadata-not-ready до overwrite
