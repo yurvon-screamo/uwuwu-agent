@@ -393,21 +393,26 @@ export async function readTasks(
   return rows
 }
 
-async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<string[]> {
   if (DRY_RUN) {
     log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
-    return
+    return []
   }
-  await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
+  const r = await mcp.tool<{ skipped?: string[] }>("update_database_row", {
+    docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells,
+  })
+  return r.skipped ?? []
 }
 
 /** Best-effort запись служебных ячеек (Path/сессии/Branch): колонку владелец
- *  мог не завести — тихий no-op ядра или ошибка не ломают спавн. */
-async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+ *  мог не завести — тихий no-op ядра или ошибка не ломают спавн. Возврат —
+ *  имена колонок, ушедших в no-op: вызывающий решает, громко ли флаговать. */
+async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<string[]> {
   try {
-    await setCells(board, rowId, cells)
+    return await setCells(board, rowId, cells)
   } catch (e) {
     log(`ячейки ${rowId.slice(0, 8)} (${Object.keys(cells).join(", ")}): ${errText(e)} — продолжаю без записи`)
+    return []
   }
 }
 
@@ -458,6 +463,53 @@ async function commentTask(bodyDoc: string, text: string): Promise<boolean> {
     log(`comment: ${e}`)
     return false
   }
+}
+
+// ——— громкий флаг доски без сессионных колонок (ADR-054) ———
+
+const SESSION_CELLS = new Set([DEV_SESSION_CELL, REVIEW_SESSION_CELL, TEST_SESSION_CELL])
+
+/** Доски, чей флаг отсутствия сессионных колонок уже доставлен в задачу:
+ *  один коммент на доску за жизнь процесса — рестарт-спавны не спамят;
+ *  недоставка снимает дедуп, следующий спавн ретраит. */
+const sessionCellFlagged = new Set<string>()
+
+/** Конфиг-расхождение доски (ADR-054): сессионная ячейка ушла в no-op при
+ *  непустой записи — привязка сессии потеряна, фабрика не видит живой заявки
+ *  и спавнит дубль. Коммент в задачу — один раз на доску (дедуп выше);
+ *  прочий skipped (Branch/Path, пустые очистки) — механика, только лог. */
+async function flagMissingSessionCells(
+  board: BoardIds, bodyDoc: string, taskTitle: string, cells: Record<string, string>, skipped: string[],
+): Promise<void> {
+  if (skipped.length === 0) return
+  const lost = skipped.filter((name) => SESSION_CELLS.has(name) && (cells[name] ?? "") !== "")
+  if (lost.length === 0) {
+    log(`запись ${Object.keys(cells).join(", ")}: вне no-op колонки ${skipped.join(", ")} — доска ${board.dbId.slice(0, 8)}`)
+    return
+  }
+  log(`доска ${board.dbId.slice(0, 8)}: сессионных колонок нет (${lost.join(", ")}) — привязка потеряна, возможны дубль-агенты`)
+  if (bodyDoc === "" || sessionCellFlagged.has(board.dbId)) return
+  sessionCellFlagged.add(board.dbId)
+  const delivered = await commentTask(
+    bodyDoc,
+    `[factory] на доске нет колонок: ${lost.join(", ")} — привязка сессии при спавне потеряна (возможны дубль-агенты). ` +
+    `Добавь text-колонку на доску (ADR-054). Задача: ${taskTitle}`,
+  )
+  if (delivered) log(`флаг сессионных колонок доставлен в задачу ${bodyDoc.slice(0, 8)}`)
+  else {
+    sessionCellFlagged.delete(board.dbId)
+    log(`флаг сессионных колонок не доставлен (${bodyDoc.slice(0, 8)}) — ретрай следующим спавном`)
+  }
+}
+
+/** Запись сессионной ячейки спавна + громкий флаг при no-op (ADR-054):
+ *  общий хвост dev/review/test спавнов — ячейка может молча потеряться,
+ *  если колонки на доске нет. */
+async function claimSessionCell(
+  board: BoardIds, rowId: string, bodyDoc: string, taskTitle: string, cells: Record<string, string>,
+): Promise<void> {
+  const skipped = await setCellsSafe(board, rowId, cells)
+  await flagMissingSessionCells(board, bodyDoc, taskTitle, cells, skipped)
 }
 
 // ——— opencode REST (service.json) ———
@@ -807,12 +859,13 @@ async function startTask(
   }
   state.tasks[task.rowId] = entry
   saveState(state)
-  await setCellsSafe(board, task.rowId, {
+  const spawnCells = {
     ...(envCtx !== undefined
       ? { Branch: envCtx.branch, [PATH_CELL]: envCtx.repoDir }
       : {}),
     [DEV_SESSION_CELL]: sessionID,
-  })
+  }
+  await claimSessionCell(board, task.rowId, task.bodyDoc, title, spawnCells)
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
@@ -1109,7 +1162,7 @@ async function startReview(
   // история корней: ревьювер — корневая сессия задачи, дример должен её видеть
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
-  await setCellsSafe(board, task.rowId, { [REVIEW_SESSION_CELL]: sessionID })
+  await claimSessionCell(board, task.rowId, task.bodyDoc, tracked.title || task.title, { [REVIEW_SESSION_CELL]: sessionID })
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: ревью-сессия ${sessionID} (${kind})`)
 }
@@ -1163,7 +1216,7 @@ async function startTesting(
   tracked.testAttempts = 0
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
-  await setCellsSafe(board, task.rowId, { [TEST_SESSION_CELL]: sessionID })
+  await claimSessionCell(board, task.rowId, task.bodyDoc, tracked.title || task.title, { [TEST_SESSION_CELL]: sessionID })
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: тест-сессия ${sessionID}`)
 }
