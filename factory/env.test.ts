@@ -106,6 +106,39 @@ describe("ensureEnv — реальный git", () => {
   })
 })
 
+describe("ensureEnv: main-репа — base-контракт ProjectCfg.base (класс 1xgames/GitLab-notix)", () => {
+  let mainRoot = ""
+  beforeAll(async () => {
+    // main-based репа с локальным bare origin (без сети): git-факты те же,
+    // что у remote main-репо
+    const origin = join(baseRoot, "origin-main.git")
+    await sh(["git", "init", "--bare", "-b", "main", origin])
+    mainRoot = join(baseRoot, "main-work")
+    await sh(["git", "init", "-b", "main", mainRoot])
+    writeFileSync(join(mainRoot, "svc.txt"), "svc\n")
+    await sh(["git", "-C", mainRoot, "add", "."])
+    await sh(["git", "-C", mainRoot, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "svc"])
+    await sh(["git", "-C", mainRoot, "remote", "add", "origin", origin])
+    await sh(["git", "-C", mainRoot, "push", "-u", "origin", "main"])
+  })
+
+  test("base=origin/main: env-ворктри создаётся от remote-main, ветка по row-id", async () => {
+    const p = await ensureEnv(deps, { root: envRoot(), rowId: "mainrow1", local: mainRoot, base: "origin/main" })
+    expect(await sh(["git", "-C", p.repoDir, "branch", "--show-current"])).toBe("work/task-mainrow1")
+    expect(readFileSync(join(p.repoDir, "svc.txt"), "utf-8")).toContain("svc")
+    // HEAD ворктри = origin/main, не «первый попавшийся» ref
+    expect(await sh(["git", "-C", p.repoDir, "rev-parse", "HEAD"]))
+      .toBe(await sh(["git", "-C", mainRoot, "rev-parse", "origin/main"]))
+  })
+
+  test("base=origin/master на main-репе: честный отказ (репро «invalid reference» хардкода до фикса)", async () => {
+    await expect(
+      ensureEnv(deps, { root: envRoot(), rowId: "mainrow2", local: mainRoot, base: "origin/master" }),
+    ).rejects.toThrow(/invalid reference/)
+    expect(logs.some((l) => l.includes("mainrow2") && l.includes("worktree add -b не удался"))).toBe(true)
+  })
+})
+
 describe("cleanupEnv — реальный git", () => {
   test("чистое окружение: rm → prune → branch -d (порядок, ветка удалена)", async () => {
     const root = envRoot()
