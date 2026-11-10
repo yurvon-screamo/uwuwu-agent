@@ -33,6 +33,24 @@ systemctl --user start siyuan-demo.service
 `enable` не нужен и невозможен (юнит generated): wants-линк в
 `default.target` создаёт генератор при каждом daemon-reload/буте.
 
+## Часовой пояс (канон JST)
+
+Вся временная ось платформы — JST (Asia/Tokyo): хост (ноут в Японии),
+демоны (uwuwu-cron/factory/triage — process TZ хоста) и ядро контейнера
+(`Environment=TZ=Asia/Tokyo` в юните). Явный TZ обязателен: базовый образ
+b3log/siyuan несёт `TZ=Asia/Shanghai` из Dockerfile, а ядро форматирует
+date-клетки досок (`formattedContent`) и frontmatter-даты доков в своей
+зоне — без переопределения клетка «Запланировано» кронов уезжала на час
+против JST-тайтлов ран-карточек (задача 20261110042724). CLI и демоны
+работают в локальной зоне хоста (`chrono::Local`/`formatLocal`) — канон
+задаётся окружением, не кодом.
+
+Проверка зоны ядра живьём:
+
+```sh
+docker exec siyuan-demo date   # ожидаем JST (+0900)
+```
+
 ## Проверка
 
 ```sh
