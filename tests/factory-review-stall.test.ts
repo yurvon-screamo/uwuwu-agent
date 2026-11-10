@@ -55,6 +55,9 @@ describe("tickProject: гвард ревью-тишины (недоставле�
           bodyDoc: "20261107000000-doc1", title: "Зависшее ревью", project: "t",
           lastCommentAt: 0, lastCommentId: "", createdAt: Date.now(), attempts: 0,
           reviewSessionID, reviewAttempts: 0,
+          // штатный трек после разделения агентов: держатель вида записан
+          // (legacy без вида маршрутизируется в переспавн, не в гвард)
+          reviewKind: "result",
           lastStatus: "Ревью результата",
           ...(scenario === "recovered" ? { reviewStallSignaled: true } : {}),
         },

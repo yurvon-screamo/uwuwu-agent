@@ -1,10 +1,12 @@
 // cron-lib.test.ts — расписания, границы, промпты.
+import { existsSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
-  decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, agentFirePrompt,
+  decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
 } from "./cron-lib"
 
 /** Парс с громким сбоем вместо non-null assertion: расписание в тестах
@@ -108,6 +110,14 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, firedAtIso: "x" })).toBe(true)
     expect(isValidTracked({ sessionID: "gh_1", lastFiredAt: 5 })).toBe(false)
     expect(isValidTracked({ sessionID: "", lastFiredAt: "5" })).toBe(false)
+  })
+
+  test("lastCompactAt опционален; валиден неотрицательный number, мусор отвергается", () => {
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: 1000 })).toBe(true)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: 0 })).toBe(true)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: -1 })).toBe(false)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: "мусор" })).toBe(false)
+    expect(isValidTracked({ sessionID: "ses_1", lastFiredAt: 5, lastCompactAt: null })).toBe(false)
   })
 })
 
@@ -423,6 +433,44 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
   })
 })
 
+// Деф агента крона «Lead: ночной аудит uwuwu» — деф триажа (распоряжение
+// владельца: крон на базе триаж-агента, без нового агента). Живёт вне репо
+// (~/.config/opencode/agents/triage.md + крон-воркспейс-копия — резолв
+// сервера), пин на машину-зависимый файл в CI не проверяем — живой контроль
+// файр-гейта: контрольный файр 09.11 19:52 (recreate, agent=triage,
+// glm-5.3-flash) и боевой слот 04:30.
+
+describe("triage/agent.md — канон дефа крон-агента карточки Lead", () => {
+  test("frontmatter канона разбирается в боевую модель файр-гейта", () => {
+    const path = join(import.meta.dir, "..", "triage", "agent.md")
+    expect(existsSync(path)).toBe(true)
+    // канон — источник живых копий крона (деплой в обе точки: гейт agentDefOf
+    // + воркспейс-резолв): сломанный frontmatter уедет в карточку
+    // «Lead: ночной аудит uwuwu» отказом файра — пин ловит регресс на CI,
+    // до деплоя. Живые копии машина-зависимы, CI их не видит — их контроль:
+    // бит-в-бит при деплое + контрольный файр 09.11 19:52 (agent=triage,
+    // glm-5.3-flash).
+    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash" })
+  })
+})
+
+describe("пин канон-дефа dreamer — базовый агент крона «Дример дримеров» (аудит дрим-сессий)", () => {
+  test("репо-канон существует и его frontmatter — боевая модель файр-гейта", () => {
+    // Вечная сессия крона «Дример дримеров» живёт на дефе dreamer
+    // (custom-agent=dreamer, задача 20261109183943-adwyv4c): гейт agentDefOf
+    // читает глобальный деф (~/.config/opencode/agents — симлинк link.sh на
+    // мастер-чекаут), модель файра берётся из frontmatter дефа
+    // (createAgentSession → parseAgentDefModel). Пин — от репо-канона
+    // (CI-safe; пин PR #190 строил от HOME-пути и на раннере падал).
+    // Слом фронта = тихая смена модели ночного аудита.
+    const path = join(import.meta.dir, "..", "agents", "dreamer.md")
+    expect(existsSync(path)).toBe(true)
+    expect(parseAgentDefModel(readFileSync(path, "utf-8")))
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" })
+  })
+})
+
 describe("promptLandedAt: дедуп приземления промпта", () => {
   const user = (created: number, text: string) => ({ type: "user", time: { created }, text })
 
@@ -445,6 +493,52 @@ describe("promptLandedAt: дедуп приземления промпта", () 
   test("повторы — самый ранний приземлившийся", () => {
     const msgs = [user(500, "файр крона X"), user(300, "файр крона X")]
     expect(promptLandedAt(msgs, 0, "файр крона X")).toBe(300)
+  })
+})
+
+describe("runLandedAt: дедуп приземления конверта по сигнатуре рана", () => {
+  const runRowId = "20261109083020-5cwywr1"
+  const user = (created: number, text: string) => ({ type: "user", time: { created }, text })
+  const envelope = (schedule: string, extra = "") =>
+    [
+      `⏰ Файр крона «Ночной аудит» (расписание: ${schedule}).`,
+      `Ран-карточка запуска — задача ${runRowId} на доске «Задачи uwuwu»: она уже создана, работать по ней не нужно.`,
+      "",
+      "=== ИНСТРУКЦИЯ (тело мастера) ===",
+      `аудит досок${extra}`,
+      "=== КОНЕЦ ИНСТРУКЦИИ ===",
+    ].join("\n")
+
+  test("копия с разошедшимся текстом (другое расписание + frontmatter) матчится по rowId", () => {
+    const daemonCopy = envelope("30 9 * * *")
+    const manualCopy = `---\ntitle: снапшот task get\n---\n\n${envelope("30 4 * * *", " (перегенерирован оператором)")}`
+    const msgs = [user(1000, daemonCopy), user(2000, manualCopy)]
+    expect(runLandedAt(msgs, 500, runRowId)).toBe(1000)
+  })
+  test("инцидентный сценарий: ручная копия приземлилась между тиками после неудачной попытки — дедуп признаёт", () => {
+    const savedPrompt = envelope("30 9 * * *") // сохранённый pendingRun.prompt
+    const manualCopy = envelope("30 4 * * *") // стирт оператора, текст разошёлся
+    const msgs = [user(4000, manualCopy)]
+    expect(runLandedAt(msgs, 3000, runRowId)).toBe(4000)
+    // контраст: текстовый дедуп по сохранённому промпту копию не узнал бы
+    expect(promptLandedAt(msgs, 3000, savedPrompt)).toBeNull()
+  })
+  test("user-сообщение без rowId и чужой rowId не матчатся", () => {
+    const msgs = [user(1000, "обычный стирт без конверта"), user(2000, envelope("30 4 * * *").replaceAll(runRowId, "20261109185226-u3b63ti"))]
+    expect(runLandedAt(msgs, 500, runRowId)).toBeNull()
+  })
+  test("assistant-сообщение с rowId (эхо команд рана) игнорируется", () => {
+    const assistant = { type: "assistant", time: { created: 1000 }, content: [{ type: "text", text: `uwuwu-cli task edit ${runRowId} --status Done` }] }
+    const msgs = [assistant, user(2000, envelope("30 4 * * *"))]
+    expect(runLandedAt(msgs, 500, runRowId)).toBe(2000)
+  })
+  test("совпадение старее границы — null", () => {
+    const msgs = [user(1000, envelope("30 4 * * *"))]
+    expect(runLandedAt(msgs, 1500, runRowId)).toBeNull()
+  })
+  test("повторы — самый ранний приземлившийся", () => {
+    const msgs = [user(5000, envelope("30 4 * * *")), user(4000, envelope("30 9 * * *"))]
+    expect(runLandedAt(msgs, 3000, runRowId)).toBe(4000)
   })
 })
 

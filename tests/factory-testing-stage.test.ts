@@ -17,12 +17,20 @@ interface TickCalls {
   sessionCreates: string[]
   prompts: string[]
   itemUpdates: string[]
+  comments: string[]
+}
+
+interface Tick3Calls {
+  sessionCreates: string[]
+  itemUpdates: string[]
+  comments: string[]
 }
 
 interface StageVerdict {
   scenario: string
   tick1: TickCalls
   tick2: TickCalls
+  tick3: Tick3Calls
   sessionID: string | null
   testSessionID: string | null
   testAttempts: number | null
@@ -47,10 +55,11 @@ describe("tickProject: стадия «Тестирование»", () => {
     rmSync(home, { recursive: true, force: true })
   })
 
-  function seatState(scenario: string): void {
-    // quarantine/worktree — untracked строка (карантинный вход); остальным
+  function seatState(scenario: "quarantine" | "nocell" | "rerun" | "bug" | "worktree"): void {
+    // quarantine/nocell/worktree — untracked строка (карантинный вход,
+    // даунтайм демона, живой агентский ворктри без трека); остальным
     // нужен живой трек с тест-сессией
-    const tasks = scenario === "quarantine" || scenario === "worktree"
+    const tasks = scenario === "quarantine" || scenario === "nocell" || scenario === "worktree"
       ? {}
       : {
           [ROW_ID]: {
@@ -68,7 +77,7 @@ describe("tickProject: стадия «Тестирование»", () => {
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), JSON.stringify({ tasks }))
   }
 
-  async function runTick(scenario: "quarantine" | "rerun" | "bug" | "worktree"): Promise<StageVerdict> {
+  async function runTick(scenario: "quarantine" | "nocell" | "rerun" | "bug" | "worktree"): Promise<StageVerdict> {
     seatState(scenario)
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
@@ -101,9 +110,34 @@ describe("tickProject: стадия «Тестирование»", () => {
     expect(v.lastStatus).toBe("Тестирование")
     // ячейка «Сессия тест» записана (k-test)
     expect(v.tick1.itemUpdates).toEqual(["k-test=ses_new"])
+    // доска с живыми сессионными колонками — флаг ADR-054 не поднимается
+    // (коммент только при расхождении: skipped пуст)
+    expect(v.tick1.comments).toHaveLength(0)
     // повторный тик: дубль-спавна нет, повторного промпта нет
     expect(v.tick2.sessionCreates).toHaveLength(0)
     expect(v.tick2.prompts).toHaveLength(0)
+    expect(v.tick2.comments).toHaveLength(0)
+  })
+
+  test("nocell: доска без «Сессия тест» — ячейка не пишется, флаг-коммент один на доску", async () => {
+    const v = await runTick("nocell")
+    // спавн состоялся (карантинная строка), state-запись тест-сессии есть:
+    // привязка потеряна только в доске, не в треке
+    expect(v.tick1.sessionCreates).toHaveLength(1)
+    expect(v.testSessionID).toBe("ses_new")
+    // ячейка не пишется: колонки нет — запись ушла в no-op
+    expect(v.tick1.itemUpdates).toEqual([])
+    // громкий флаг: конфиг-расхождение доски доставлено владельцу (ADR-054)
+    expect(v.tick1.comments).toHaveLength(1)
+    expect(v.tick1.comments[0]).toContain("[factory]")
+    expect(v.tick1.comments[0]).toContain("Сессия тест")
+    // тихий тик: трек жив — ни спавна, ни повтора флага
+    expect(v.tick2.sessionCreates).toHaveLength(0)
+    expect(v.tick2.comments).toHaveLength(0)
+    // рестарт-спавн (трек потерян): спавн повторяется, коммент — нет (дедуп)
+    expect(v.tick3.sessionCreates).toHaveLength(1)
+    expect(v.tick3.itemUpdates).toEqual([])
+    expect(v.tick3.comments).toHaveLength(0)
   })
 
   test("rerun: живая тест-сессия + возврат из ревью → дельта-промпт в ту же сессию, без спавна", async () => {

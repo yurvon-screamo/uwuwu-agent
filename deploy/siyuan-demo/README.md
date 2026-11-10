@@ -47,6 +47,48 @@ uwuwu-cli kernel ping                                 # alive: sql ok
 юнит поднимает контейнер за RestartSec=5, NRestarts растёт
 (plain-run: RestartCount оставался 0 при любой смерти).
 
+## Ретеншен журнала journald (sudo)
+
+Логи юнита пишет системный journald; пакет cachyos-settings жёстко ставит
+`SystemMaxUse=50M` на весь `/var/log/journal` — user-стрим вытесняет логи
+siyuan-demo за часы, форензика смертей процесса ядра оставалась слепой
+(задача 20261109083919-v5mlahe; инцидент 08.11: три смерти за вечер, stdout
+утрачен). `LogNamespace=` для rootless user-квадлета невозможен
+(mount-namespace + системный `journald@.service`), файл-драйвер
+(`LogDriver=k8s-file`) дороже и лечит только этот юнит — выбран подъём
+лимита дроп-ином в `/etc` (артефакт — `journald-retention.conf` в этой
+папке): юнит не меняется, `journalctl --user -u siyuan-demo.service` и
+`podman logs` живут как были (форма без `--user` для user-квадлета читает
+системный журнал и отдаёт «No entries»), system-журнал оздоравливается тем
+же ходом.
+
+Установка (нужна рука с sudo, затем без пароля):
+
+```sh
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo cp deploy/siyuan-demo/journald-retention.conf \
+  /etc/systemd/journald.conf.d/50-uwuwu-journal-retention.conf
+sudo systemctl kill --signal=SIGHUP systemd-journald   # перечитать конфиг (Type=notify-reload)
+```
+
+Проверка:
+
+```sh
+systemd-analyze cat-config systemd/journald.conf | grep SystemMaxUse   # последняя директива: 1G
+sudo journalctl -b -u systemd-journald | grep -i "max"                 # «… is NN, max 1.0G»
+```
+
+Первая строка — без sudo: cat-config печатает итоговый merge всех
+конфигов/дроп-инов, наша директива последняя (перекрывает пакетную).
+Строка с «max 1.0G» — живое подтверждение от работающего journald
+(system-стрим без sudo не читается).
+
+Имя `50-…` перекрывает пакетный `00-journal-size.conf` (лексикографически
+позднее присваивание выигрывает); пакетный файл не трогаем — обновление
+cachyos-settings его перезаписало бы. Откат: удалить
+`/etc/systemd/journald.conf.d/50-uwuwu-journal-retention.conf` + SIGHUP —
+возврат к пакетным 50M.
+
 ## Процедура миграции с plain-run (выполнена 07.11, даун-окно ~22с)
 
 1. `systemctl --user stop siyuan-watch.timer` — вотчер не должен дёргать

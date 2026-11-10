@@ -70,10 +70,14 @@ export interface TrackedTask {
   lastCommentId: string
   createdAt: number
   attempts: number
-  /** сессия ревьювера (1 на задачу; "" — нет или умерла) */
+  /** сессия ревьювера (активный держатель текущего ревью-вида; "" — нет или умерла) */
   reviewSessionID?: string
   /** неудачные спавны ревьювера подряд (эскалация до Needs attention) */
   reviewAttempts?: number
+  /** вид ревью, который обслуживает активная ревью-сессия ("plan"/"result");
+   *  undefined — сессии нет или legacy-запись (держатель старого агента):
+   *  расхождение с видом статуса трактуется как спавн нового держателя */
+  reviewKind?: ReviewKind
   /** сессия тестировщика (1 на задачу; "" — нет или умерла) */
   testSessionID?: string
   /** неудачные спавны тестировщика подряд (эскалация до Needs attention) */
@@ -99,9 +103,18 @@ export interface TrackedTask {
    *  BFS от полной истории накрывает осиротевшие сессии прошлых поколений */
   sessionHistory?: string[]
   /** URL смерженного PR (gh-проба по PR-ячейке; merge необратим — пишется
-   *  один раз). Действителен, пока совпадает с ячейкой: смена PR (stacked,
-   *  ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
+   *  один раз). Действителен, пока совпадает с ячейкой или ячейка пуста
+   *  (позитив фоллбек-пробы по ветке): смена PR на заполненной клетке
+   *  (stacked, ремедиация) инвалидирует кэш без перезаписи — guard на чтении */
   mergedPrUrl?: string
+  /** последний доставленный промпт в дев-сессию (ms): спавн, comment-
+   *  /bodyEdit-wakeup, return-to-dev. Часы тишины сталла считают от него —
+   *  свежий будильник сбрасывает застой (инцидент 09.11: wake + kick одним
+   *  тиком). undefined — старый state или промптов ещё не было */
+  lastDevPromptAt?: number
+  /** полоса подряд-unknown merged-пробы сталл-ветки (предел деградации —
+   *  PR_PROBE_UNKNOWN_MAX); undefined/0 — последняя проба удалась */
+  prProbeUnknownStreak?: number
   /** хэш норм-формы контента тела вне секции «Комменты» — bodyEdit-гейт:
    *  lastmod двигают UI-пересохранения и собственные записи агента, хэш —
    *  только контентные дельты (дефекты №3/№5) */
@@ -128,6 +141,8 @@ export const AGENT_MARK = "🤖"
 export const REVIEW_PLAN_STATUS = "Ревью плана"
 export const REVIEW_RESULT_STATUS = "Ревью результата"
 export const TESTING_STATUS = "Тестирование"
+/** Юзерский статус после pass тестировщика: мяч у владельца на мерж/приёмку. */
+export const USER_REVIEW_STATUS = "Review"
 
 export type ReviewKind = "plan" | "result"
 
@@ -530,6 +545,8 @@ export interface PromptContext {
    *  называет агенту канон-путь ворктри — тот, что resolvePromptWorktree
    *  потом резолвит для tester/ревьювера */
   envRoot?: string
+  /** git-ref базы env-ворктри и master-строк текста; дефолт DEFAULT_BASE */
+  base?: string
 }
 /** YAML frontmatter из начала markdown (--- … ---) — паритет CLI
  *  markdown.rs strip_frontmatter: ядро в экспорте ведёт live-атрибуты дока. */
@@ -602,6 +619,7 @@ export function spawnPrompt(
   ctx: PromptContext = {},
 ): string {
   const { env, init, envRoot } = ctx
+  const base = baseOf(ctx)
   const stage = mode === "implement"
     ? [
         "Статус In Progress — владелец форсировал старт (fast-track): стадию Design",
@@ -622,11 +640,11 @@ export function spawnPrompt(
   const workLine = env === undefined
     ? [
         envRoot !== undefined
-          ? `создай worktree+ветку от origin/master — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
-          : "создай worktree+ветку от origin/master (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.",
+          ? `создай worktree+ветку от ${base} — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
+          : `создай worktree+ветку от ${base} (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.`,
       ]
     : [
-        "работай в своём окружении задачи (фабрика создала, ветка уже от origin/master):",
+        `работай в своём окружении задачи (фабрика создала, ветка уже от ${base}):`,
         `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
         "Branch/Path-ячейки и сессии заполняет фабрика — тебе их трогать не нужно.",
       ]
@@ -681,8 +699,9 @@ export function conflictFixPrompt(
   rowId: string, pr: string, project: string, ctx: PromptContext = {},
 ): string {
   const { env, init } = ctx
+  const base = baseOf(ctx)
   return [
-    `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с master (${pr}).`,
+    `[factory] Задача ${rowId} (проект ${project}): PR ветки конфликтует с ${base} (${pr}).`,
     ...(init !== undefined ? ["", spawnInitBlock(init, rowId, project)] : []),
     "",
     ...(env !== undefined
@@ -692,7 +711,7 @@ export function conflictFixPrompt(
           "",
         ]
       : []),
-    "Почини конфликт: git fetch origin, обнови ветку от master (rebase/merge — как принято в репо),",
+    `Почини конфликт: git fetch origin, обнови ветку от ${base} (rebase/merge — как принято в репо),`,
     "разреши конфликты, сохранив смысл обеих сторон, прогони self-check (build/lint/test), запушь.",
     "Убедись, что PR стал mergeable (gh pr view <pr> --json mergeable), затем верни задачу",
     `в «${REVIEW_RESULT_STATUS}» (uwuwu-cli task edit --status) и заверши ход.`,
@@ -783,14 +802,21 @@ export interface ReviewContext {
   pr: string
   /** тип задачи из колонки «Тип»: ревьювер сверяет канон типа (Bug→TDD, Spike→без кода) */
   type?: string
+  /** git-ref базы диффа и master-строк текста; дефолт DEFAULT_BASE */
+  base?: string
 }
 
-/** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе. */
-export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext): string {
+/** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе.
+ *  agentName — праймари-агент держателя (план → plan-reviewer, результат →
+ *  code-quality-reviewer): методичка адресуется по имени. */
+export function reviewSpawnPrompt(
+  rowId: string, project: string, kind: ReviewKind, ctx: ReviewContext, agentName: string,
+): string {
+  const base = baseOf(ctx)
   const lines = [
     `[factory] Задача ${rowId} (проект ${project}): ревью ${kind === "plan" ? "плана" : "результата"}.`,
     "",
-    "Ты — праймари-агент code-quality-reviewer, фабрика назначила тебя судьёй этой задачи",
+    `Ты — праймари-агент ${agentName}, фабрика назначила тебя судьёй этой задачи`,
     "(1 задача = 1 твоя сессия; повторные раунды правок придут сюда же wakeup'ом).",
     "Работай по секции «Ревью задач фабрики uwuwu» своей методики:",
     "",
@@ -798,23 +824,27 @@ export function reviewSpawnPrompt(rowId: string, project: string, kind: ReviewKi
     "   Если в тредах есть прошлые раунды ревью этой задачи (твоя сессия пересоздана) —",
     "   это продолжение: проверь устранение прошлых замечаний, не начинай с нуля.",
     kind === "plan"
-      ? "2. Вид plan → review_type=plan: план в теле задачи; кодовый diff не нужен."
-      : "2. Вид result → review_type=full, источник branch: все изменения ветки против",
+      ? "2. Предмет — план из тела задачи; кодовый diff не нужен (его ревью — предмет code-quality-reviewer)."
+      : "2. Предмет — все изменения ветки задачи против её базы (источник branch):",
     ...(kind === "result"
-      ? ["   origin/master + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.",]
+      ? [`   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,]
       : []),
     ...(ctx.worktree !== ""
       ? [`   Ворктри задачи: ${ctx.worktree}`]
       : kind === "result"
-        ? [`   Ворктри задачи не найден — ревью по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+        ? [`   Ворктри задачи не найден — ревью по diff ${base}…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
            `   (git-команды из каталога сессии; ворктри не обязателен для диффа).`]
         : []),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), стандартный формат,",
-    "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
-    kind === "plan" ? "   (второй вариант — только для result)." : "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    kind === "plan"
+      ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
+      : [
+          "   вердикт-строка «Статус: approve|approve с мелкими замечаниями|request_changes» обязательна",
+          "   (approve с мелкими замечаниями — все находки Low, методика в твоём промпте).",
+        ].join("\n"),
     "4. Статус после вердикта (uwuwu-cli task edit):",
     kind === "plan"
       ? "   approve → In Progress · request_changes → Design"
@@ -877,6 +907,7 @@ export type TestContext = ReviewContext
 
 /** Стартовый промпт тестировщика: фабрика спавнит сессию на «Тестировании». */
 export function testingSpawnPrompt(rowId: string, project: string, ctx: TestContext): string {
+  const base = baseOf(ctx)
   const lines = [
     `[factory] Задача ${rowId} (проект ${project}): стадия тестирования.`,
     "",
@@ -886,10 +917,10 @@ export function testingSpawnPrompt(rowId: string, project: string, ctx: TestCont
     "",
     `1. uwuwu-cli task get ${rowId} --project ${project} — тело задачи (постановка, план/решение,`,
     "   юзкейсы и «Проверка», отчёт инженера) и треды комментов (прошлые твои раунды, баг-репорты).",
-    "2. Изменения: ветка против origin/master в ворктри задачи; PR (gh pr view/diff) —",
+    `2. Изменения: ветка против ${base} в ворктри задачи; PR (gh pr view/diff) —`,
     ...(ctx.worktree !== ""
       ? [`   Ворктри задачи: ${ctx.worktree}`]
-      : [`   Ворктри задачи не найден — работай по diff origin/master…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
+      : [`   Ворктри задачи не найден — работай по diff ${base}…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
          `   (git-команды из каталога сессии; ворктри не обязателен).`]),
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
@@ -963,6 +994,9 @@ export interface RouteFacts {
   lastStatus: string
   /** жива ли сессия ревьювера (null — liveness неизвестна: тик пропускаем решением noop) */
   reviewerAlive: boolean | null
+  /** вид ревью активной ревью-сессии (undefined — нет сессии или legacy-держатель);
+   *  расхождение с видом статуса = спавн нового держателя, не дельта */
+  reviewKind?: ReviewKind
   /** жива ли сессия тестировщика (null — liveness неизвестна: тик пропускаем решением noop) */
   testerAlive: boolean | null
   /** свежие комменты юзера */
@@ -987,9 +1021,13 @@ export type RouteAction =
 export function routeTask(f: RouteFacts): RouteAction {
   const kind = reviewKindOf(f.status)
   if (kind !== null) {
-    // null (liveness неизвестна) трактуем как «жива»: не плодим спавны на
-    // транзиентных ошибках REST — следующий тик перепроверит
-    if (f.reviewerAlive === false) return { t: "spawn-reviewer", kind }
+    // Живая сессия другого вида (или legacy без вида) — спавн нового держателя:
+    // вид помнит state, не статусная история (штатный план→результат идёт через
+    // In Progress, lastStatus виды не различает).
+    // null (liveness неизвестна, транзиентный сбой REST) — глухой noop: не плодим
+    // спавны и не шлём дельту сессии неизвестного держателя — следующий тик перепроверит.
+    if (f.reviewerAlive === null) return { t: "noop" }
+    if (f.reviewerAlive === false || f.reviewKind !== kind) return { t: "spawn-reviewer", kind }
     if (reviewKindOf(f.lastStatus) !== kind) return { t: "rerun-reviewer", kind }
     if (f.freshComments.length > 0) return { t: "comments-to-reviewer" }
     return { t: "noop" }
@@ -1066,6 +1104,40 @@ export function lastActivityOf(msgs: unknown[]): number | null | "invalid" {
   return Math.max(...nums)
 }
 
+/** Единые часы тишины сталла: точка отсчёта — последний сигнал сессии
+ *  (активность последнего сообщения или доставленный промпт). Свежий
+ *  будильник сбрасывает часы: зависший после wake ход ловится тем же
+ *  порогом, но от честной точки отсчёта — «wake + kick» одним тиком
+ *  исключён (инцидент 09.11: fast-track-wake и сталл-сигнал из одной
+ *  геометрии «тишина от активности» — два противоречащих сигнала).
+ *  Потребители — stallVerdict и pre-чек ленивых проб в тике: одна
+ *  арифметика на обоих. */
+export interface StallClockFacts {
+  /** активность последнего сообщения сессии; null — сообщений нет */
+  lastActivityAt: number | null
+  /** последний доставленный промпт в сессию (ms); null — не записан */
+  lastDevPromptAt: number | null
+}
+
+export interface StallClock {
+  /** тишина от точки отсчёта дольше порога */
+  stalled: boolean
+  /** тишина в минутах от точки отсчёта; null — сигналов не было вовсе */
+  quietMin: number | null
+  /** будка свежее последней активности — детекция ждёт ответ на неё */
+  fromWake: boolean
+}
+
+export function stallClock(f: StallClockFacts, stallMs: number, now: number): StallClock {
+  const lastSignalAt = Math.max(f.lastActivityAt ?? 0, f.lastDevPromptAt ?? 0)
+  if (lastSignalAt === 0) return { stalled: true, quietMin: null, fromWake: false }
+  return {
+    stalled: now - lastSignalAt > stallMs,
+    quietMin: Math.max(1, Math.round((now - lastSignalAt) / 60_000)),
+    fromWake: (f.lastDevPromptAt ?? 0) > (f.lastActivityAt ?? 0),
+  }
+}
+
 export interface StallFacts {
   /** статус строки сейчас */
   status: string
@@ -1073,6 +1145,8 @@ export interface StallFacts {
   sessionAlive: boolean | null
   /** активность последнего сообщения; null — сообщений нет (= застой) */
   lastActivityAt: number | null
+  /** последний доставленный промпт в дев-сессию (ms); null — не записан */
+  lastDevPromptAt: number | null
   /** Branch-ячейка строки (деталь диагноза в тексте сигнала) */
   branch: string
   /** ветка нашлась в ворктри по `git worktree list` */
@@ -1101,18 +1175,19 @@ export type StallVerdict =
 export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.status !== "In Progress") return { t: "none" }
   if (f.sessionAlive !== true) return { t: "none" }
-  const stalled = f.lastActivityAt === null || f.now - f.lastActivityAt > stallMs
-  if (!stalled) return { t: "none" }
+  const clock = stallClock(
+    { lastActivityAt: f.lastActivityAt, lastDevPromptAt: f.lastDevPromptAt },
+    stallMs,
+    f.now,
+  )
+  if (!clock.stalled) return { t: "none" }
   // PR смержен = работа закончена, тишина сессии — штатное ожидание приёмки
   // (мяч у владельца на Done); сигнал был бы ложным (прод-кейс 06.11:
   // финализированная задача получила stall-wakeup). none — флаг анти-спама,
   // если стоял, снимет штатная none-ветка демона («эпизод завершён»).
   if (f.prMerged) return { t: "none" }
   if (f.signaled) return { t: "silent" }
-  const quietMin = f.lastActivityAt === null
-    ? null
-    : Math.max(1, Math.round((f.now - f.lastActivityAt) / 60_000))
-  const quietText = quietMin === null ? "сообщений в сессии нет" : `тишина ${quietMin} мин`
+  const quietText = clock.quietMin === null ? "сообщений в сессии нет" : `тишина ${clock.quietMin} мин`
   const branchDiag = f.branch === ""
     ? "Branch-ячейка пуста — агент умер до создания ветки"
     : f.branchInWorktree
@@ -1124,6 +1199,70 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
     "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
   ].join(" ")
   return { t: "signal", text }
+}
+
+// ——— merged-проба сталл-ветки: fail-open с пределом деградации ———
+
+export type PrProbeResult = "merged" | "open" | "unknown"
+
+/** Предел подряд-unknown merged-пробы: дальше — деградация к not-merged
+ *  (страховка ADR-044 возвращается, слепая зона ограничена окном тиков). */
+export const PR_PROBE_UNKNOWN_MAX = 3
+
+export interface PrProbeVerdict {
+  merged: boolean
+  /** unknown до предела: тик без сигнала — кик откладывается, полоса набирается */
+  defer: boolean
+  /** длина полосы unknown после этого тика (0 — проба удалась) */
+  streakAfter: number
+  /** true — полоса unknown превысила предел, кик идёт с громким логом */
+  degraded: boolean
+}
+
+/** Решение по merged-пробе (инцидент 09.11: сбой gh съедался в false —
+ *  ложный кик задачи со смерженным PR). unknown откладывает кик на тик
+ *  (defer — сталл-вердикт в этом тике не строится); полоса дольше
+ *  PR_PROBE_UNKNOWN_MAX деградирует к not-merged — прежний catch→false был
+ *  злее (ложный кик), вечный unknown — новая слепая зона. */
+export function prProbeVerdict(result: PrProbeResult, streakBefore: number): PrProbeVerdict {
+  if (result !== "unknown") return { merged: result === "merged", defer: false, streakAfter: 0, degraded: false }
+  const streakAfter = streakBefore + 1
+  const degraded = streakAfter >= PR_PROBE_UNKNOWN_MAX
+  return { merged: false, defer: !degraded, streakAfter, degraded }
+}
+
+// ——— адресат будки правки тела ———
+
+export type BodyEditRole = "ревьювер" | "тестировщик" | "девелопер"
+
+export type BodyEditRoute =
+  | { t: "wake"; target: string; role: BodyEditRole }
+  | { t: "swallow"; /** осознанное проглатывание (гейт статуса) — проводка обновляет базлайн */
+      updateBaseline: boolean }
+
+/** Кому адресовать будку контентной правки тела (инцидент 09.11: отчёт
+ *  тестировщика в теле на Review-строке будил дев-сессию — холостая будка
+ *  на каждом тест-раунде с отчётом). Review = мяч у владельца: правки туда
+ *  не доставляются (swallow с обновлением базлайна в проводке). Агентская
+ *  стадия — держателю сессии; без живого держателя — фоллбек на дева
+ *  (прежнее поведение проводки), без дева (карантин) — ждать адресата. */
+export function bodyEditRoute(f: {
+  status: string
+  reviewSessionID: string
+  testSessionID: string
+  devSessionID: string
+}): BodyEditRoute {
+  if (f.status === USER_REVIEW_STATUS) return { t: "swallow", updateBaseline: true }
+  const toDev: BodyEditRoute = f.devSessionID === ""
+    ? { t: "swallow", updateBaseline: false }
+    : { t: "wake", target: f.devSessionID, role: "девелопер" }
+  if (reviewKindOf(f.status) !== null) {
+    return f.reviewSessionID === "" ? toDev : { t: "wake", target: f.reviewSessionID, role: "ревьювер" }
+  }
+  if (f.status === TESTING_STATUS) {
+    return f.testSessionID === "" ? toDev : { t: "wake", target: f.testSessionID, role: "тестировщик" }
+  }
+  return toDev
 }
 
 // ——— гвард ревью-тишины: недоставленный вердикт ревьювера (инцидент 07.11,
@@ -1345,6 +1484,8 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     t.mergedPrUrl !== undefined &&
     !(typeof t.mergedPrUrl === "string" && t.mergedPrUrl.startsWith("http"))
   ) return false
+  if (t.lastDevPromptAt !== undefined && typeof t.lastDevPromptAt !== "number") return false
+  if (t.prProbeUnknownStreak !== undefined && typeof t.prProbeUnknownStreak !== "number") return false
   if (t.bodyHash !== undefined && typeof t.bodyHash !== "string") return false
   if (
     t.lastWakeup !== undefined &&
@@ -1359,6 +1500,7 @@ export function isValidTracked(v: unknown): v is TrackedTask {
     !(t.reviewSessionID === "" || (typeof t.reviewSessionID === "string" && t.reviewSessionID.startsWith("ses_")))
   ) return false
   if (t.reviewAttempts !== undefined && typeof t.reviewAttempts !== "number") return false
+  if (t.reviewKind !== undefined && t.reviewKind !== "plan" && t.reviewKind !== "result") return false
   if (
     t.testSessionID !== undefined &&
     !(t.testSessionID === "" || (typeof t.testSessionID === "string" && t.testSessionID.startsWith("ses_")))
@@ -1406,10 +1548,22 @@ export interface ProjectCfg {
   board: string
   repo: string
   local: string
+  /** git-ref базы env-ворктри и текстов промптов. Репы не на master
+   *  (GitLab и пр. — origin/main) указывают свой ref. Дефолт DEFAULT_BASE. */
+  base?: string
   /** env-механика задачи (worktree+скретч в ~/agents-env). false — проект
    *  вне механики (cfg.local не git-репо → контракт невыполним): агент сам
    *  делает ворктри/ветку и заполняет Branch-ячейку. Дефолт true. */
   env?: boolean
+}
+
+/** База env-ворктри по умолчанию: все живые проекты фабрики — master-based. */
+export const DEFAULT_BASE = "origin/master"
+
+/** База из конфига/контекста промпта с дефолтом; пустая строка — это
+ *  заданная (сломанная) база, не отсутствие. Валидность пустой — parseProjects. */
+export function baseOf(source: { base?: string }): string {
+  return source.base ?? DEFAULT_BASE
 }
 
 /** UWUWU_FACTORY_PROJECTS_JSON: полный Record<имя, ProjectCfg> — тестовая
@@ -1438,7 +1592,14 @@ export function parseProjects(raw: string | undefined, fallback: Record<string, 
     if (c.env !== undefined && typeof c.env !== "boolean") {
       throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — env должен быть boolean`)
     }
-    out[name] = { board: c.board, repo: c.repo, local: c.local, ...(c.env !== undefined ? { env: c.env } : {}) }
+    if (c.base !== undefined && (typeof c.base !== "string" || c.base.trim() === "")) {
+      throw new Error(`UWUWU_FACTORY_PROJECTS_JSON: проект «${name}» — base должна быть непустой строкой`)
+    }
+    out[name] = {
+      board: c.board, repo: c.repo, local: c.local,
+      ...(c.base !== undefined ? { base: c.base } : {}),
+      ...(c.env !== undefined ? { env: c.env } : {}),
+    }
   }
   if (Object.keys(out).length === 0) {
     throw new Error("UWUWU_FACTORY_PROJECTS_JSON: конфиг пуст — демон без проектов молча ничего не делает; убери env или задай проекты")

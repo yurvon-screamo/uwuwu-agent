@@ -377,11 +377,29 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
        *  нельзя, живая проба миграции: записали «2026-11-08 02:34», ядро
        *  отдало «8 ноября 2026 г. 01:34»). */
       let dateMs: number | null = null
-      if (v.mSelect) value = v.mSelect.map((o) => o.content).join(",")
-      else if (v.text) value = v.text.content ?? ""
-      else if (v.date) {
-        dateMs = typeof v.date.content === "number" && v.date.content > 0 ? v.date.content : null
-        value = v.date.formattedContent ?? ""
+      // активный type ячейки решает, какое поле читать (паритет Rust
+      // cell_value, siyuan_task.rs): после конвертации ключа text→url в
+      // значении остаётся stale text.content — без диспетча url-клетка
+      // доходила пустой (prProbeByCell недостижим на живой доске) или со
+      // старым URL из stale text (проба по устаревшему PR),
+      // задача 20261109183658
+      if (v.type === "text") {
+        value = v.text?.content ?? ""
+      } else if (v.type === "url" || v.type === "email" || v.type === "phone") {
+        value = v[v.type]?.content ?? ""
+      } else if (v.type === "select" || v.type === "mSelect") {
+        value = (v.mSelect ?? []).map((o) => o.content).join(",")
+      } else if (v.type === "date") {
+        dateMs = typeof v.date?.content === "number" && v.date.content > 0 ? v.date.content : null
+        value = v.date?.formattedContent ?? ""
+      } else if (v.type === undefined) {
+        // фоллбек для значений без type: прежний порядок матчей адаптера
+        if (v.mSelect) value = v.mSelect.map((o) => o.content).join(",")
+        else if (v.text) value = v.text.content ?? ""
+        else if (v.date) {
+          dateMs = typeof v.date.content === "number" && v.date.content > 0 ? v.date.content : null
+          value = v.date.formattedContent ?? ""
+        }
       }
       if (col !== "") cells[col] = { value, dateMs }
     }
@@ -396,18 +414,24 @@ async function updateDatabaseRow(args: Record<string, unknown>): Promise<Record<
   const rowId = String(args.rowBlockId ?? "")
   const cells = (args.cells ?? {}) as Record<string, string>
   const keys = await avKeys(avId)
+  const skipped: string[] = []
   for (const [name, value] of Object.entries(cells)) {
     // колонки нет → true no-op (best-effort контракт setCellsSafe): запись в
     // чужой ключ (Status) исказила бы чужую ячейку; Status-запись на доске с
-    // колонкой «Статус» резолвится по русскому имени (паритет typed-чека ниже)
+    // колонкой «Статус» резолвится по русскому имени (паритет typed-чека ниже).
+    // Имя уходит в ответ (skipped): тихая потеря сессионной ячейки рождает
+    // дубль-агентов — фабрика флагует конфиг-расхождение доски (ADR-054)
     const keyId = keys.get(name) ?? (name === "Status" ? keys.get("Статус") : undefined)
-    if (!keyId) continue
+    if (!keyId) {
+      skipped.push(name)
+      continue
+    }
     const typed = name === "Status" || name === "Статус"
       ? { mSelect: [{ content: String(value) }] }
       : { text: { content: String(value) } }
     await mcpToolCall("database", { action: "item_update", id: avId, keyID: keyId, itemID: rowId, value: typed })
   }
-  return { updated: true }
+  return { updated: true, skipped }
 }
 
 export interface ParsedComment {

@@ -21,6 +21,15 @@ process.env.UWUWU_CRON_STATE_DIR = join(ROOT, "state")
 process.env.UWUWU_CLI_BIN = "uwuwu-cli-fire-mock"
 mkdirSync(join(ROOT, "state"), { recursive: true })
 
+// ——— виртуальные часы: Date.now прод-кода и createdTick мока держатся в
+// симулируемом окне тиков (10:01 внутри дня тиков 10:05–10:17). Без мока
+// lastFiredAt пишется с реальных часов: когда реальное время суток уходит за
+// симулированные тики (пример — после ~10 утра локального), due-гейт
+// перестаёт срабатывать и риг падает «T3 не оставил pendingRun» — тест
+// зависел от времени суток запуска.
+const VIRTUAL_NOW = new Date(2026, 10, 9, 10, 1, 0).getTime()
+Date.now = () => VIRTUAL_NOW
+
 // деф позитивного агента в HOME-песочнице: frontmatter с инлайн #variant
 // (покрывает парсер модели) — создания машинных дефов не будет
 const AGENT = "test-agent-fire"
@@ -50,7 +59,10 @@ const promptOutcomes: ("ok" | "fail")[] = ["ok", "ok", "fail"]
 const sessionState: { outcome: unknown; idle: number } = { outcome: undefined, idle: 123 }
 // user-сообщение для дедупа приземления на T4 (заполняет оркестратор)
 let landing: { created: number; text: string } | null = null
-let createdTick = Date.now()
+// времена приземления POST — от фиксированной базы тиков, не от Date.now():
+// тики оркестратора фейковые (base+5/10/15м), реальная стена давно ушла
+// вперёд базы — due() по real-lastFiredAt перестаёт срабатывать (проба 10.11)
+let createdTick = new Date(2026, 10, 9, 10, 0, 0).getTime()
 
 const json = (data: unknown): Response => new Response(JSON.stringify(data), { status: 200 })
 

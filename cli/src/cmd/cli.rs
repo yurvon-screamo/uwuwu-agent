@@ -65,7 +65,7 @@ pub(crate) enum TaskSub {
         // кормит триаж-демон мусорными черновиками.
         #[arg(
             long = "dry-run",
-            help = "Печать скелета тела в stdout, ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)"
+            help = "Печать итогового тела в stdout (контент как есть при --stdin, иначе скелет по типу), ноль записей в воркспейс (без frontmatter и тега — их добавляют ядро/create)"
         )]
         dry_run: bool,
     },
@@ -408,7 +408,8 @@ pub(crate) enum KernelSub {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// List all projects with their description.
+    /// Имена открытых ноутбуков воркспейса (Experience/Projects/Daily) —
+    /// не перечень проектов: он через `docs ls "Projects"`.
     Projects,
     /// Read a document by slug: полный hpath (`<project>/<doc>`,
     /// `<topic>/<doc>`, слаг Daily) или одиночный заголовок (если однозначен;

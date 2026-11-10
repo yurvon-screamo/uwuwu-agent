@@ -5,6 +5,8 @@ import {
   conflictFixPrompt,
   continuePrompt,
   kickoffModeOf,
+  baseOf,
+  DEFAULT_BASE,
   newUserComments,
   bodyEditPrompt,
   promptForStart,
@@ -38,9 +40,14 @@ import {
   testingCommentsPrompt,
   REVIEW_PLAN_STATUS,
   REVIEW_RESULT_STATUS,
+  USER_REVIEW_STATUS,
   stallMinutesFromEnv,
   lastActivityOf,
   stallVerdict,
+  stallClock,
+  bodyEditRoute,
+  prProbeVerdict,
+  PR_PROBE_UNKNOWN_MAX,
   type FactoryState,
   type RouteFacts,
   type ReviewStallFacts,
@@ -192,6 +199,13 @@ describe("isValidTracked", () => {
     expect(isValidTracked({ ...base, mergedPrUrl: "not-a-url" })).toBe(false)
     expect(isValidTracked({ ...base, mergedPrUrl: true })).toBe(false)
   })
+  test("reviewKind: вид ревью и отсутствие (legacy) валидны, чужие строки — мимо", () => {
+    expect(isValidTracked({ ...base, reviewKind: "plan" })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: "result" })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, reviewKind: "full" })).toBe(false)
+    expect(isValidTracked({ ...base, reviewKind: "" })).toBe(false)
+  })
 })
 
 describe("rowMissingAction — двухпроходная чистка", () => {
@@ -283,6 +297,15 @@ describe("spawnPrompt", () => {
     const p = spawnPrompt(id, "true-washing", "true-washing", "implement", { envRoot: "/env" })
     expect(p).toContain("ворктри /env/5BF9NMBXZ/repo")
     expect(p).not.toContain("/env/-5BF9NMBXZ/repo")
+  })
+  test("base из контекста: env:false-строка и env:true-строка говорят базу проекта, не дефолт", () => {
+    const p = spawnPrompt("r1", "1xgames", "1xgames/game-service", "implement", { base: "origin/main" })
+    expect(p).toContain("создай worktree+ветку от origin/main")
+    const withEnv = spawnPrompt("r2", "1xgames", "1xgames/game-service", "implement", {
+      base: "origin/main",
+      env: { repoDir: "/env/r2/repo", branch: "work/task-r2", scratchDir: "/env/r2/scratch" },
+    })
+    expect(withEnv).toContain("ветка уже от origin/main")
   })
 })
 
@@ -400,27 +423,53 @@ describe("routeTask", () => {
     expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: false })))
       .toEqual({ t: "spawn-reviewer", kind: "result" })
   })
-  test("живая сессия + вход/смена вида → доревью", () => {
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "plan" })
-    // смена вида plan → result в той же сессии
-    expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "result" })
-    // повторный раунд фиксов: вышел и вернулся в тот же вид
-    expect(routeTask(facts({ status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true })))
-      .toEqual({ t: "rerun-reviewer", kind: "result" })
-  })
-  test("живая сессия в том же статусе: комменты юзера → ревьюверу, тишина → noop", () => {
+  test("живая сессия того же вида + вход/смена вида → доревью", () => {
     expect(routeTask(facts({
-      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true,
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "rerun-reviewer", kind: "plan" })
+    // повторный раунд фиксов: вышел и вернулся в тот же вид
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true, reviewKind: "result",
+    }))).toEqual({ t: "rerun-reviewer", kind: "result" })
+  })
+  test("живая сессия другого вида → спавн нового держателя", () => {
+    // штатный переход план → результат (через In Progress — lastStatus вид не различает)
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: "In Progress", reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    // ручная прямая перестановка план → результат без промежуточного статуса
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    // обратная смена: живой держатель результата, статус плана
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: true, reviewKind: "result",
+    }))).toEqual({ t: "spawn-reviewer", kind: "plan" })
+  })
+  test("живая legacy-сессия без вида → спавн нового держателя (миграция на два агента)", () => {
+    expect(routeTask(facts({
+      status: REVIEW_RESULT_STATUS, lastStatus: REVIEW_RESULT_STATUS, reviewerAlive: true,
+    }))).toEqual({ t: "spawn-reviewer", kind: "result" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: true,
+    }))).toEqual({ t: "spawn-reviewer", kind: "plan" })
+  })
+  test("живая сессия того же вида в том же статусе: комменты юзера → ревьюверу, тишина → noop", () => {
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
       freshComments: [c("x", "вопрос", 1)],
     }))).toEqual({ t: "comments-to-reviewer" })
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true })))
-      .toEqual({ t: "noop" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: REVIEW_PLAN_STATUS, reviewerAlive: true, reviewKind: "plan",
+    }))).toEqual({ t: "noop" })
   })
-  test("liveness неизвестна → сессию считаем живой (спавнов не плодим)", () => {
-    expect(routeTask(facts({ status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null })))
-      .toEqual({ t: "rerun-reviewer", kind: "plan" })
+  test("liveness неизвестна → глухой noop: ни спавна, ни дельты сессии неизвестного держателя", () => {
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null, reviewKind: "plan",
+    }))).toEqual({ t: "noop" })
+    expect(routeTask(facts({
+      status: REVIEW_PLAN_STATUS, lastStatus: "Design", reviewerAlive: null,
+    }))).toEqual({ t: "noop" })
   })
   test("возврат из ревью: Design/In Progress → девелоперу, Review/NA → noop", () => {
     expect(routeTask(facts({ status: "In Progress", lastStatus: REVIEW_PLAN_STATUS })))
@@ -488,6 +537,11 @@ describe("conflictFixPrompt", () => {
   test("живая сессия (будильник мимо startTask) — без инит-блока: дельта-принцип", () => {
     const p = conflictFixPrompt("r1", "https://github.com/x/pull/9", "uwuwu")
     expect(p).not.toContain("Инит-данные")
+  })
+  test("base из контекста: конфликт и починка называют базу проекта, не master", () => {
+    const p = conflictFixPrompt("r1", "https://git.l4a.ru/x/!39", "1xgames", { base: "origin/main" })
+    expect(p).toContain("конфликтует с origin/main")
+    expect(p).toContain("обнови ветку от origin/main")
   })
 })
 
@@ -639,19 +693,23 @@ describe("mergeablePollStep: политика опроса ленивого merg
 describe("reviewSpawnPrompt", () => {
   const ctx = { branch: "feat/x", worktree: "/home/x/origa-task-x", pr: "https://github.com/x/pull/1" }
   test("plan: вид, канал чтения, переходы approve/request_changes", () => {
-    const p = reviewSpawnPrompt("r1", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r1", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
     expect(p).toContain("ревью плана")
+    // методичка адресуется по имени праймари-агента держателя
+    expect(p).toContain("праймари-агент plan-reviewer")
     expect(p).toContain("uwuwu-cli task get r1 --project uwuwu")
     expect(p).toContain("approve → In Progress")
     expect(p).toContain("request_changes → Design")
     expect(p).not.toContain("request_changes → In Progress")
-    // вердикт-строка с тремя исходами; approve-with-notes plan-у не светит
-    expect(p).toContain("approve|approve с мелкими замечаниями|request_changes")
-    expect(p).toContain("только для result")
+    // вердикт-строка план-ревью двухзначная — словарь методички plan-reviewer
+    expect(p).toContain("Статус: approve|request_changes")
+    expect(p).not.toContain("approve с мелкими замечаниями|request_changes")
     expect(p).not.toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
+    // термина выпиленной диспетчеризации в промпте быть не должно
+    expect(p).not.toContain("review_type")
   })
   test("result: ветка/ворктри/PR и переходы результата", () => {
-    const p = reviewSpawnPrompt("r2", "origa", "result", ctx)
+    const p = reviewSpawnPrompt("r2", "origa", "result", ctx, "code-quality-reviewer")
     expect(p).toContain("ревью результата")
     expect(p).toContain(ctx.worktree)
     expect(p).toContain(ctx.branch)
@@ -665,25 +723,33 @@ describe("reviewSpawnPrompt", () => {
     expect(p).not.toContain("request_changes → Design")
   })
   test("result: approve-with-notes → In Progress с пометкой дельты и прошлых раундов", () => {
-    const p = reviewSpawnPrompt("r5", "uwuwu", "result", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r5", "uwuwu", "result", { branch: "", worktree: "", pr: "" }, "code-quality-reviewer")
     expect(p).toContain("approve с мелкими замечаниями (все находки Low) → In Progress")
     expect(p).toContain("следующее ревью с тем же ревьювером")
     expect(p).toContain("прошлые раунды ревью этой задачи")
   })
   test("result без ворктри (env:false / карантинный ревью-вход) — честная строка про diff/PR, не пустота", () => {
-    const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r3", "uwuwu", "result", { branch: "feat/y", worktree: "", pr: "" }, "code-quality-reviewer")
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
     expect(p).not.toContain("Ворктри задачи: ")
   })
+  test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
+    const p = reviewSpawnPrompt("r8", "1xgames", "result", {
+      branch: "feat/y", worktree: "", pr: "", base: "origin/main",
+    }, "code-quality-reviewer")
+    expect(p).toContain("origin/main + untracked")
+    expect(p).toContain("diff origin/main…feat/y")
+    expect(p).not.toContain("origin/master")
+  })
   test("plan без ворктри — строка про diff не появляется (плану код не нужен)", () => {
-    const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" })
+    const p = reviewSpawnPrompt("r4", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
     expect(p).not.toContain("Ворктри задачи не найден")
   })
   test("тип задачи инжектится в ревью-промпт (роутинг Bug/Spike по свойству)", () => {
-    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" })
+    const p = reviewSpawnPrompt("r6", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "bug" }, "code-quality-reviewer")
     expect(p).toContain("Тип задачи: bug")
-    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" })
+    const empty = reviewSpawnPrompt("r7", "uwuwu", "result", { branch: "", worktree: "", pr: "", type: "" }, "code-quality-reviewer")
     expect(empty).not.toContain("Тип задачи")
   })
 })
@@ -853,6 +919,14 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
   })
+  test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
+    const p = testingSpawnPrompt("r9", "1xgames", {
+      branch: "feat/y", worktree: "", pr: "", base: "origin/main",
+    })
+    expect(p).toContain("ветка против origin/main в ворктри задачи")
+    expect(p).toContain("diff origin/main…feat/y")
+    expect(p).not.toContain("origin/master")
+  })
   test("rerun: дельта-режим устранения баг-репорта, не пересмотр с нуля", () => {
     const p = testingRerunPrompt("r3", ctx)
     expect(p).toContain(TESTING_STATUS)
@@ -995,6 +1069,29 @@ describe("parseProjects: env-оверрайд UWUWU_FACTORY_PROJECTS_JSON", () =
     const bad = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", env: "no" } })
     expect(() => parseProjects(bad, fallback)).toThrow(/test.*env.*boolean/)
   })
+
+  test("base: строка проходит и сохраняется, отсутствие — дефолт (master-based репо не меняют поведение)", () => {
+    const raw = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: "origin/main" } })
+    expect(parseProjects(raw, fallback).test?.base).toBe("origin/main")
+    expect(parseProjects(undefined, fallback).uwuwu?.base).toBeUndefined()
+  })
+
+  test("base: не-строка или пустая — отказ с именем проекта", () => {
+    const nonString = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: 42 } })
+    expect(() => parseProjects(nonString, fallback)).toThrow(/test.*base/)
+    const empty = JSON.stringify({ test: { board: "b", repo: "r", local: "/l", base: "  " } })
+    expect(() => parseProjects(empty, fallback)).toThrow(/test.*base/)
+  })
+})
+
+describe("baseOf: база из конфига/контекста с дефолтом DEFAULT_BASE", () => {
+  test("нет base — дефолт origin/master (DEFAULT_PROJECTS без поля не меняют поведение)", () => {
+    expect(baseOf({})).toBe("origin/master")
+    expect(baseOf({ base: undefined })).toBe(DEFAULT_BASE)
+  })
+  test("заданная base — она и возвращается", () => {
+    expect(baseOf({ base: "origin/main" })).toBe("origin/main")
+  })
 })
 
 // ——— сводка прохода ———
@@ -1093,6 +1190,7 @@ describe("stallVerdict: зависший ход при живой сессии",
     status: "In Progress",
     sessionAlive: true,
     lastActivityAt: NOW - 40 * MIN,
+    lastDevPromptAt: null,
     branch: "work/task-abc",
     branchInWorktree: true,
     prMerged: false,
@@ -1124,6 +1222,9 @@ describe("stallVerdict: зависший ход при живой сессии",
   })
   test("повторный тик после сигнала — silent (анти-спам раз за эпизод)", () => {
     expect(stallVerdict(facts({ signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
+    expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
   })
   test("активность вернулась при стоявшем флаге — none (демон снимет флаг)", () => {
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
@@ -1158,8 +1259,153 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(cut.text).toContain(long.slice(0, 60))
     expect(cut.text).not.toContain(long)
   })
-  test("ровно на пороге — ещё none (возраст строго больше порога)", () => {
-    expect(stallVerdict(facts({ lastActivityAt: NOW - 30 * MIN }), 30 * MIN)).toEqual({ t: "none" })
+})
+
+describe("stallClock: часы тишины сталла — от последнего сигнала сессии", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+
+  test("часы от активности: в пределах порога — не застой, за порогом — застой (прежнее поведение)", () => {
+    const fresh = stallClock({ lastActivityAt: NOW - 5 * MIN, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(fresh.stalled).toBe(false)
+    expect(fresh.quietMin).toBe(5)
+    expect(fresh.fromWake).toBe(false)
+    const stale = stallClock({ lastActivityAt: NOW - 40 * MIN, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(stale.stalled).toBe(true)
+    expect(stale.quietMin).toBe(40)
+  })
+  test("свежий будильник сбрасывает часы: активность старая, промпт свежий — не застой (инцидент 09.11)", () => {
+    const c = stallClock({ lastActivityAt: NOW - 507 * MIN, lastDevPromptAt: NOW - MIN }, 360 * MIN, NOW)
+    expect(c.stalled).toBe(false)
+    expect(c.quietMin).toBe(1)
+    expect(c.fromWake).toBe(true)
+  })
+  test("будка умерла: тишина от промпта больше порога — застой", () => {
+    const c = stallClock({ lastActivityAt: NOW - 500 * MIN, lastDevPromptAt: NOW - 400 * MIN }, 360 * MIN, NOW)
+    expect(c.stalled).toBe(true)
+    expect(c.quietMin).toBe(400)
+    expect(c.fromWake).toBe(true)
+  })
+  test("ответил после будки: часы снова от активности", () => {
+    const c = stallClock({ lastActivityAt: NOW - 2 * MIN, lastDevPromptAt: NOW - 10 * MIN }, 30 * MIN, NOW)
+    expect(c.stalled).toBe(false)
+    expect(c.quietMin).toBe(2)
+    expect(c.fromWake).toBe(false)
+  })
+  test("оба null — застой с рождения, quietMin null, fromWake false", () => {
+    const c = stallClock({ lastActivityAt: null, lastDevPromptAt: null }, 30 * MIN, NOW)
+    expect(c.stalled).toBe(true)
+    expect(c.quietMin).toBeNull()
+    expect(c.fromWake).toBe(false)
+  })
+})
+
+describe("stallVerdict: часы тишины учитывают последний промпт в дев-сессию", () => {
+  const NOW = 1_000_000_000_000
+  const MIN = 60_000
+  const facts = (over: Partial<StallFacts> = {}): StallFacts => ({
+    status: "In Progress",
+    sessionAlive: true,
+    lastActivityAt: NOW - 507 * MIN,
+    lastDevPromptAt: null,
+    branch: "work/task-abc",
+    branchInWorktree: true,
+    prMerged: false,
+    signaled: false,
+    now: NOW,
+    ...over,
+  })
+
+  test("свежий будильник при старой активности — none: wake+kick одним тиком исключён (инцидент 09.11)", () => {
+    expect(stallVerdict(facts({ lastDevPromptAt: NOW - MIN }), 360 * MIN)).toEqual({ t: "none" })
+  })
+  test("будка умерла: тишина от wake больше порога — signal, тихий текст от точки часов", () => {
+    const v = stallVerdict(facts({ lastDevPromptAt: NOW - 400 * MIN }), 360 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("тишина 400 мин")
+    expect(v.text).not.toContain("507")
+  })
+})
+
+describe("bodyEditRoute: адресат будки контентной правки тела", () => {
+  const DEV = "ses_dev"
+  const REVIEWER = "ses_rev"
+  const TESTER = "ses_tst"
+  const facts = (over: Partial<Parameters<typeof bodyEditRoute>[0]> = {}) => ({
+    status: "In Progress",
+    reviewSessionID: REVIEWER,
+    testSessionID: TESTER,
+    devSessionID: DEV,
+    ...over,
+  })
+
+  test("Review — swallow с обновлением базлайна: мяч у владельца, будить дева нечего (инцидент 09.11)", () => {
+    expect(bodyEditRoute(facts({ status: USER_REVIEW_STATUS })))
+      .toEqual({ t: "swallow", updateBaseline: true })
+  })
+  test("ревью-статус при живом ревьювере — ревьюверу", () => {
+    for (const status of [REVIEW_PLAN_STATUS, REVIEW_RESULT_STATUS]) {
+      expect(bodyEditRoute(facts({ status }))).toEqual({ t: "wake", target: REVIEWER, role: "ревьювер" })
+    }
+  })
+  test("Тестирование при живом тестировщике — тестировщику", () => {
+    expect(bodyEditRoute(facts({ status: TESTING_STATUS })))
+      .toEqual({ t: "wake", target: TESTER, role: "тестировщик" })
+  })
+  test("In Progress и Design — деву", () => {
+    for (const status of ["In Progress", "Design"]) {
+      expect(bodyEditRoute(facts({ status }))).toEqual({ t: "wake", target: DEV, role: "девелопер" })
+    }
+  })
+  test("держатель умер в агентской стадии — фоллбек на дева (прежнее поведение проводки)", () => {
+    expect(bodyEditRoute(facts({ status: REVIEW_RESULT_STATUS, reviewSessionID: "" })))
+      .toEqual({ t: "wake", target: DEV, role: "девелопер" })
+    expect(bodyEditRoute(facts({ status: TESTING_STATUS, testSessionID: "" })))
+      .toEqual({ t: "wake", target: DEV, role: "девелопер" })
+  })
+  test("дев в карантине вне агентской стадии — swallow без базлайна (ждём адресата)", () => {
+    expect(bodyEditRoute(facts({ devSessionID: "" })))
+      .toEqual({ t: "swallow", updateBaseline: false })
+  })
+})
+
+describe("prProbeVerdict: merged-проба с пределом деградации unknown", () => {
+  test("merged/open — вердикт без дефера и деградации, streak сброшен", () => {
+    expect(prProbeVerdict("merged", 2)).toEqual({ merged: true, defer: false, streakAfter: 0, degraded: false })
+    expect(prProbeVerdict("open", 2)).toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
+  })
+  test("unknown до предела — кик откладывается на тик (defer: сигнал не строится)", () => {
+    expect(prProbeVerdict("unknown", 0)).toEqual({ merged: false, defer: true, streakAfter: 1, degraded: false })
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 2))
+      .toEqual({ merged: false, defer: true, streakAfter: PR_PROBE_UNKNOWN_MAX - 1, degraded: false })
+  })
+  test("unknown на пределе и дальше — деградация к not-merged, кик идёт (страховка ADR-044 возвращена)", () => {
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX - 1))
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX, degraded: true })
+    expect(prProbeVerdict("unknown", PR_PROBE_UNKNOWN_MAX + 4))
+      .toEqual({ merged: false, defer: false, streakAfter: PR_PROBE_UNKNOWN_MAX + 5, degraded: true })
+  })
+  test("удачная проба после полосы unknown — streak сброшен", () => {
+    expect(prProbeVerdict("open", PR_PROBE_UNKNOWN_MAX))
+      .toEqual({ merged: false, defer: false, streakAfter: 0, degraded: false })
+  })
+})
+
+describe("isValidTracked: поля сталл-часов и пробы PR", () => {
+  const base = {
+    sessionID: "ses_abc", worktree: "/wt/task-x", branch: "work/task-x",
+    bodyDoc: "d1", title: "t", project: "uwuwu", lastCommentAt: 1, lastCommentId: "i", createdAt: 2, attempts: 0,
+  }
+  test("lastDevPromptAt: число и отсутствие — валидны, не-число — мимо", () => {
+    expect(isValidTracked({ ...base, lastDevPromptAt: 1234 })).toBe(true)
+    expect(isValidTracked({ ...base, lastDevPromptAt: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, lastDevPromptAt: "1234" })).toBe(false)
+  })
+  test("prProbeUnknownStreak: число и отсутствие — валидны, не-число — мимо", () => {
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: 2 })).toBe(true)
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: undefined })).toBe(true)
+    expect(isValidTracked({ ...base, prProbeUnknownStreak: true })).toBe(false)
   })
 })
 
@@ -1245,6 +1491,7 @@ describe("дефолт-порог 6 ч: реплика инцидента 07.11 
     status: "In Progress",
     sessionAlive: true,
     lastActivityAt,
+    lastDevPromptAt: null,
     branch: "work/task-abc",
     branchInWorktree: true,
     prMerged: false,
