@@ -28,7 +28,7 @@ export interface TaskRef {
   bodyDoc: string
   title: string
   status: string
-  /** тип задачи из колонки «Тип» (bug/dev/spike/analys/docs/other); "" — легаси-строка без типа */
+  /** тип задачи из колонки «Тип» (bug/spike/analys/docs/other/feature/refactoring/legacy/idea/qa/infrastructure); "" — легаси-строка без типа */
   type: string
   pr: string
   branch: string

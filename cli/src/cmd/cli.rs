@@ -73,7 +73,10 @@ pub(crate) enum TaskSub {
     List {
         #[arg(long, help = "Фильтр по статусу (todo|design|in progress|…)")]
         status: Option<String>,
-        #[arg(long, help = "Фильтр по типу (bug|dev|spike|analys|docs|other)")]
+        #[arg(
+            long,
+            help = "Фильтр по типу (bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure)"
+        )]
         r#type: Option<String>,
         #[arg(long, help = "Проект (переопределяет --project задачи)")]
         project: Option<String>,

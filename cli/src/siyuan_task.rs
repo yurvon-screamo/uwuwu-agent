@@ -537,15 +537,19 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
 /// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
 pub const TYPE_CELL: &str = "Тип";
 
-/// Канон типа задачи: trim + нижний регистр, ∈ {bug, dev, spike, analys,
-/// docs, other}, иначе человеческий отказ.
+/// Канон типа задачи: trim + нижний регистр, ∈ {bug, spike, analys, docs,
+/// other, refactoring, legacy, feature, idea, qa, infrastructure}, иначе
+/// человеческий отказ. dev выпилен (задача 20261110180332, «непонятная
+/// категория») — dev-строки досок мигрированы на новый канон.
 pub fn validate_task_type(raw: &str) -> Result<String> {
     let canon = raw.trim().to_lowercase();
     match canon.as_str() {
-        "bug" | "dev" | "spike" | "analys" | "docs" | "other" => Ok(canon),
+        "bug" | "spike" | "analys" | "docs" | "other" | "feature" | "refactoring" | "legacy"
+        | "idea" | "qa" | "infrastructure" => Ok(canon),
         _ => bail!(
-            "тип «{raw}» не разобран: жди dev | spike | bug | analys | docs | other (колонка \
-             «{TYPE_CELL}» доски)"
+            "тип «{raw}» не разобран: жди feature | refactoring | legacy | idea | qa | \
+             infrastructure | bug | spike | analys | docs | other (колонка \
+             «{TYPE_CELL}» доски; dev выпилен — мигрируй строку на новый канон)"
         ),
     }
 }
@@ -724,8 +728,8 @@ pub fn body_template(ty: &str, ctx: &str) -> String {
     match ty {
         // analys делит костяк spike (проработка/аудит без кода — та же
         // форма Контекст/Варианты/Вывод/Границы); docs и other падают в
-        // dev-ветку (полный пайп как dev). Инвариант пинят тестами:
-        // body_is_skeleton (task clean) итерирует ["dev","spike","bug"] и
+        // фичевую ветку (полный пайп как feature). Инвариант пинят тестами:
+        // body_is_skeleton (task clean) итерирует ["other","spike","bug"] и
         // держит DraftSkeleton для новых типов только на этом шаринге.
         "spike" | "analys" => format!(
             "## Контекст\n{ctx}\n\n## Варианты\n<что рассматривали: суть → плюсы/минусы/замеры; сравнение — таблица>\n\n## Вывод\n<рекомендация + доказательства: «путь A, потому что …»>\n\n## Границы\n<что НЕ исследовано и почему; где вывод не действует>\n"
@@ -2176,14 +2180,29 @@ mod tests {
     #[test]
     fn validate_task_type_canonizes_case_and_rejects_unknown() {
         assert_eq!(validate_task_type(" Bug ").unwrap(), "bug");
-        assert_eq!(validate_task_type("DEV").unwrap(), "dev");
         assert_eq!(validate_task_type("Spike").unwrap(), "spike");
         assert_eq!(validate_task_type(" Analys ").unwrap(), "analys");
         assert_eq!(validate_task_type("DOCS").unwrap(), "docs");
         assert_eq!(validate_task_type("Other").unwrap(), "other");
-        let err = validate_task_type("feature").unwrap_err().to_string();
+        // новый канон (20261110180332): расширение + выпил dev
+        assert_eq!(validate_task_type("Feature").unwrap(), "feature");
+        assert_eq!(validate_task_type(" REFACTORING ").unwrap(), "refactoring");
+        assert_eq!(validate_task_type("Legacy").unwrap(), "legacy");
+        assert_eq!(validate_task_type("Idea").unwrap(), "idea");
+        assert_eq!(validate_task_type("QA").unwrap(), "qa");
+        assert_eq!(
+            validate_task_type("Infrastructure").unwrap(),
+            "infrastructure"
+        );
+        for gone in ["dev", "DEV", " Dev "] {
+            assert!(validate_task_type(gone).is_err(), "dev выпилен: {gone}");
+        }
+        let err = validate_task_type("hotfix").unwrap_err().to_string();
         assert!(
-            err.contains("dev | spike | bug | analys | docs | other"),
+            err.contains(
+                "feature | refactoring | legacy | idea | qa | infrastructure | \
+                 bug | spike | analys | docs | other"
+            ),
             "суть отказа: {err}"
         );
         assert!(validate_task_type("").is_err(), "пустой тип — отказ");
@@ -2246,9 +2265,9 @@ mod tests {
     }
 
     /// Расширенный канон делит костяки существующих: analys ≡ spike,
-    /// docs/other ≡ dev — инвариант body_is_skeleton (гард task clean
-    /// итерирует только ["dev","spike","bug"]; дивергенция костяков
-    /// деградировала бы DraftSkeleton для новых типов).
+    /// docs/other и все новые типы ≡ feature — инвариант body_is_skeleton
+    /// (гард task clean итерирует только ["other","spike","bug"];
+    /// дивергенция костяков деградировала бы DraftSkeleton для новых типов).
     #[test]
     fn body_template_maps_new_types_onto_existing_skeletons() {
         let sections = |md: &str| -> Vec<String> {
@@ -2260,14 +2279,22 @@ mod tests {
             sections(&body_template("analys", "")),
             sections(&body_template("spike", ""))
         );
-        assert_eq!(
-            sections(&body_template("docs", "")),
-            sections(&body_template("dev", ""))
-        );
-        assert_eq!(
-            sections(&body_template("other", "")),
-            sections(&body_template("dev", ""))
-        );
+        for ty in [
+            "docs",
+            "other",
+            "feature",
+            "refactoring",
+            "legacy",
+            "idea",
+            "qa",
+            "infrastructure",
+        ] {
+            assert_eq!(
+                sections(&body_template(ty, "")),
+                sections(&body_template("other", "")),
+                "тип {ty} делит фичевый костяк"
+            );
+        }
     }
 
     /// Контракт create (20261109101129): непустой контент — тело как есть
@@ -2276,23 +2303,23 @@ mod tests {
     #[test]
     fn create_body_md_content_replaces_skeleton_and_strips_title_h1() {
         let content = "## Постановка\n\nсвоё тело\n";
-        assert_eq!(create_body_md("таск", "dev", content), content);
+        assert_eq!(create_body_md("таск", "feature", content), content);
 
         let with_title = "# таск\n\n## Постановка\n\nтело\n";
         assert_eq!(
-            create_body_md("таск", "dev", with_title),
+            create_body_md("таск", "feature", with_title),
             "\n## Постановка\n\nтело\n",
             "титульный H1 стрипается паритетом с task body"
         );
 
         assert_eq!(
-            create_body_md("таск", "dev", "   \n\n  "),
-            body_template("dev", ""),
+            create_body_md("таск", "feature", "   \n\n  "),
+            body_template("feature", ""),
             "whitespace-only = пустой: скелет"
         );
         assert_eq!(
-            create_body_md("таск", "dev", ""),
-            body_template("dev", ""),
+            create_body_md("таск", "feature", ""),
+            body_template("feature", ""),
             "пустой контент — скелет (регресс)"
         );
         assert!(
@@ -2570,7 +2597,7 @@ mod tests {
         let doc = std::fs::read_to_string(doc_path)
             .unwrap_or_else(|e| panic!("канон-док недоступен ({doc_path}): {e}"));
         for (template_name, ty) in [
-            ("dev-задача", "dev"),
+            ("feature-задача", "feature"),
             ("spike-задача (исследование)", "spike"),
             ("bug-задача (TDD)", "bug"),
         ] {
