@@ -43,7 +43,8 @@ function scriptTick(): string[] {
     // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
     // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
     const path = new URL(url).pathname
-    if (/^\/api\/session\/.+/.test(path)) {
+    const sessMatch = /^\/api\/session\/(ses_[^/]+)(\/(message|prompt))?$/.exec(path)
+    if (sessMatch !== null) {
       calls.push("rest-session")
       return new Response(JSON.stringify({ id: SESSION_ID }), { status: 200 })
     }
@@ -118,7 +119,8 @@ const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
 
 // Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
 // битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
-// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
 const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
   .then(() => false, () => true)
 

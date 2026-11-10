@@ -44,7 +44,7 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/api/session/active") {
       return Response.json({ [dreamerSes]: { type: "running" } })
     }
-    if (/^\/api\/session\/[^/]+$/.test(path)) {
+    if ((req.method === "GET" || req.method === "DELETE") && /^\/api\/session\/[^/]+$/.test(path)) {
       return req.method === "DELETE" ? Response.json({}) : Response.json({ id: dreamerSes })
     }
     return new Response(JSON.stringify({ error: `mock: неожиданный REST ${req.method} ${path}` }), { status: 404 })
@@ -109,7 +109,8 @@ const code = await proc.exited
 
 // Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
 // битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
-// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
 const strictPathPin = await fetch(`http://127.0.0.1:${server.port}/api/api/session`, { method: "POST", body: "{}" })
   .then((res) => !res.ok, () => true)
 server.stop(true)
