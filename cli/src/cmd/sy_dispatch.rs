@@ -241,8 +241,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let attach_files = validate_attach_files(&attach)?;
             let ctx = if stdin { read_stdin()? } else { String::new() };
             // тип валидируется до любых записей: пустой на create
-            // бессмысленен (паритет расписания), канон — дефолт dev тоже
-            // пишется в колонку
+            // бессмысленен (паритет расписания), канон — дефолт feature
+            // тоже пишется в колонку
             let ty_canonical = match ty.as_deref() {
                 Some("") => anyhow::bail!(
                     "на create пустой тип бессмысленен — убери --type; снятие: task edit <id> --type \"\""
