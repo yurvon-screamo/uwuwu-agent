@@ -895,6 +895,39 @@ async fn body_replace_rollback_survives_kernel_reset_via_backoff_retries() {
     );
 }
 
+/// Рестарт ядра гасит MCP-сессию посреди составной команды (задача
+/// 20261109095605-qxcouod): recovery в единой точке mcp-вызовов сам
+/// восстанавливает сессию — гашение после первого tools/call (render-резолв
+/// строки), get_children очистки ловит 404 стейл-сессии → re-init + повтор —
+/// и overwrite доезжает штатно, откат не нужен. До общего recovery команда
+/// падала на стейл-сессии без попытки восстановления. Reject 404 не
+/// исполняет мутацию (session_reject мока отвечает до диспетчеризации) —
+/// append нового тела ровно один: once-семантика повтора.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_survives_kernel_reset_via_mcp_session_recovery() {
+    let mut scenario = body_scenario(true);
+    scenario.mcp_restart_after_tools_calls = 1;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect("recovery сессии вытягивает команду после рестарта ядра");
+
+    assert!(
+        kernel.mcp_initializes() >= 2,
+        "recovery: повторная инициализация сессии: {}",
+        kernel.mcp_initializes()
+    );
+    let appends = kernel.appends();
+    assert_eq!(appends.len(), 1, "ровно append нового тела: {appends:?}");
+    let body = append_data_field(&appends[0]);
+    assert!(
+        body.contains("новое тело"),
+        "записано новое тело, откат не понадобился: {body:?}"
+    );
+}
+
 /// Все попытки отката неуспешны (аппенды отката падают весь бэкофф-цикл):
 /// прежний worst-case — дамп пре-имиджа 0600 + громкая ошибка с числом
 /// попыток; команда честно падает, контент сохранён.
