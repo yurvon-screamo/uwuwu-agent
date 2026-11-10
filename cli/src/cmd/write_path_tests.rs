@@ -196,6 +196,184 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
     }
 }
 
+// ——— create с контентом: семантика «передал контент — тело твоё» (20261109101129) ———
+
+/// create с непустым контентом (--stdin): контент — тело целиком как есть,
+/// скелет не вкатывается (плейсхолдеров «## План»/«## Проверка» нет).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let content = "## Постановка\n\nсвоя формулировка от агента\n";
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        content,
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert_eq!(
+        md, content,
+        "контент записан как есть — скелет не оборачивает"
+    );
+    assert!(
+        !md.contains("<срезы/шаги") && !md.contains("<исполняемое"),
+        "плейсхолдеров скелета в теле нет: {md}"
+    );
+}
+
+/// create без контента — регресс: типовой скелет как раньше.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_without_content_writes_type_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        "",
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create без контента ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("## Постановка") && md.contains("<срезы/шаги") && md.contains("<исполняемое"),
+        "пустой контент — типовой скелет dev: {md}"
+    );
+}
+
+/// Титульный H1 в контенте стрипается (паритет task body: createDocWithMd
+/// оставил бы его heading-блоком — дубль к заголовку дока); чужой H1 и
+/// прочий контент — как есть.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_title_h1_in_content_strips_only_title_h1() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let content = format!("# {NEW_TITLE}\n\n## Постановка\n\nтело\n\n# Чужой Раздел\n\nостаётся\n");
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        &content,
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        !md.contains(&format!("# {NEW_TITLE}\n")),
+        "титульный H1 стрипается: {md}"
+    );
+    assert!(md.contains("# Чужой Раздел"), "чужой H1 остаётся: {md}");
+    assert!(
+        md.contains("## Постановка\n\nтело"),
+        "контент после стрипа как есть: {md}"
+    );
+    assert!(
+        !md.contains("<срезы/шаги"),
+        "скелет при непустом контенте не вкатывается: {md}"
+    );
+}
+
+/// Whitespace-only контент — «пустой»: типовой скелет, как без --stdin.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_whitespace_only_content_writes_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        "   \n\n  ",
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с whitespace-контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("<срезы/шаги"),
+        "whitespace-only = пустой: скелет: {md}"
+    );
+}
+
+/// Dry-run ветка create — read-only осмотр: при живом мок-ядре ноль записей
+/// (строка/док/атрибуты не минтятся). Печатаемое тело собирает та же
+/// create_body_md, что и боевую запись (юнит-пин равенства в siyuan_task_tests);
+/// content-ветка dry-run не тестируется на dispatch — read_stdin читает
+/// реальный stdin процесса, обвязки мока в репо нет (рамка ревью: тест без
+/// stdin).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_dry_run_is_read_only_with_mock_kernel() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "dry-run осмотр".into(),
+            r#type: None,
+            stdin: false,
+            attach: Vec::<std::path::PathBuf>::new(),
+            schedule: None,
+            agent: None,
+            dry_run: true,
+        },
+    )
+    .await
+    .expect("dry-run проходит без отказов");
+
+    assert!(kernel.created_docs().is_empty(), "dry-run не создаёт доков");
+    assert!(
+        kernel.item_add_args().is_empty(),
+        "dry-run не вставляет строк"
+    );
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "dry-run не пишет атрибутов"
+    );
+}
+
 /// Дедуп по факту render: в ленте появилась чужая строка с тем же тайтлом →
 /// громкий отказ, вторую строку не минтим, тег не пишется.
 #[tokio::test]

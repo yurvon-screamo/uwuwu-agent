@@ -430,3 +430,31 @@ fn is_iso_date(s: &str) -> bool {
         && s.as_bytes()[7] == b'-'
         && s.chars().filter(|c| *c != '-').all(|c| c.is_ascii_digit())
 }
+
+/// projects печатает имена ноутбуков воркспейса — help не должен обещать
+/// перечень проектов и должен указывать штатный путь перечня (задача
+/// 20261109132340-nje6zb4).
+#[test]
+fn projects_help_describes_notebooks_not_projects() {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let projects = cmd
+        .find_subcommand("projects")
+        .expect("projects subcommand exists");
+    let about = projects
+        .get_about()
+        .expect("projects about задан")
+        .to_string();
+    let low = about.to_lowercase();
+    assert!(
+        !low.contains("list all projects"),
+        "help не должен обещать перечень проектов: {about}"
+    );
+    assert!(
+        low.contains("ноутбук"),
+        "help должен описывать фактическую семантику (ноутбуки воркспейса): {about}"
+    );
+    assert!(
+        low.contains("docs ls"),
+        "help должен указывать штатный путь перечня проектов (docs ls \"Projects\"): {about}"
+    );
+}

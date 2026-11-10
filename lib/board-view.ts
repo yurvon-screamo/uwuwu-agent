@@ -22,6 +22,10 @@ export interface RenderRow {
       isDetached?: boolean
       mSelect?: { content?: string }[]
       text?: { content?: string }
+      /** ключ типа url (PR-колонка, паритет Rust /url/content) и родня */
+      url?: { content?: string }
+      email?: { content?: string }
+      phone?: { content?: string }
       /** date-клетка: content — epoch ms (истина), formattedContent —
        *  дисплей ядра (локаль ядра, перекрывает записанную строку). */
       date?: { content?: number; formattedContent?: string }

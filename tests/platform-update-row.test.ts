@@ -66,18 +66,35 @@ const row = "20261108000000-row1"
 const uniqAv = (n: number): string => `20261108000000-av${n}`
 
 describe("update_database_row: запись только в существующие колонки", () => {
-  test("колонки нет — true no-op: ноль item_update, Status не искажается", async () => {
+  test("колонки нет — true no-op: ноль item_update, Status не искажается, skipped перечисляет имена", async () => {
     // Arrange: доска без колонки «Сессия тест» (деплой-окно фичи)
     const calls = mockKernel([{ id: "k-status", name: "Status" }])
 
     // Act: фабричная Done-чистка — пустая тест-ячейка + пустые соседние
-    await tool("update_database_row", {
+    const r = await tool("update_database_row", {
       docId: "doc1", databaseBlockId: uniqAv(1), rowBlockId: row,
       cells: { "Сессия dev": "", "Сессия ревью": "", "Сессия тест": "", Branch: "work/x" },
     })
 
-    // Assert: ни одной записи — фоллбэк на Status не сработал
+    // Assert: ни одной записи — фоллбэк на Status не сработал;
+    // skipped — имена колонок, ушедших в no-op (флаг фабрики, ADR-054)
     expect(calls).toEqual(["sql"])
+    expect(r.skipped).toEqual(["Сессия dev", "Сессия ревью", "Сессия тест", "Branch"])
+  })
+
+  test("частичная доска — записывается только существующая колонка, skipped только недостающие", async () => {
+    const calls = mockKernel([
+      { id: "k-status", name: "Status" },
+      { id: "k-dev", name: "Сессия dev" },
+    ])
+
+    const r = await tool("update_database_row", {
+      docId: "doc1", databaseBlockId: uniqAv(4), rowBlockId: row,
+      cells: { "Сессия dev": "ses_x", "Сессия ревью": "ses_r" },
+    })
+
+    expect(calls).toEqual(["sql", "item_update:k-dev=ses_x"])
+    expect(r.skipped).toEqual(["Сессия ревью"])
   })
 
   test("колонка есть — запись текстом в свой ключ", async () => {

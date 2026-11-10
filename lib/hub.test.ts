@@ -211,6 +211,13 @@ test("validState: мусор → дефолты; полный раундтрип
   expect(validState({ run: { sessionID: "ses_x", startedAt: 0, req: { text: "t", chatID: 1, msgID: 1, receivedAt: 0 } } }).run?.startedAt).toBe(0)
 })
 
+test("validState: lastCompactAt валиден и персистится; битое значение стрипится", () => {
+  expect(validState({ offset: 0, queue: [], lastCompactAt: 1234 })).toEqual({ offset: 0, queue: [], lastCompactAt: 1234 })
+  for (const junk of [-1, "мусор", null]) {
+    expect(validState({ offset: 0, queue: [], lastCompactAt: junk })).toEqual({ offset: 0, queue: [] })
+  }
+})
+
 test("validState: run.delivered персистится; битые id стрипятся почастино — ход жив", () => {
   const good = {
     offset: 0, chatID: 1, queue: [],
