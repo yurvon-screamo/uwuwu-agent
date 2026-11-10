@@ -134,8 +134,11 @@ export interface PinningCheck {
   sandboxSkipped: string[]
 }
 
-/** Старт-сверка демона: резолв дока + валидация скоупа. Вызывающий демон сам
- *  решает судьбу (прод-паттерн: violations непусты → stderr + exit 1). */
+/** Старт-сверка демона: резолв дока + валидация скоупа. Ровно одно из
+ *  полей скоупа — другая комбинация = ошибка программирования вызова
+ *  (тихий no-op неразличим снаружи и противоположен fail-loud духу
+ *  фичи). Вызывающий демон сам решает судьбу (прод-паттерн:
+ *  failPinnedStart при непустых violations). */
 export async function checkNodePinning(tool: PinningTool, opts: {
   singletonDaemon?: string
   factoryProjects?: readonly string[]
@@ -144,45 +147,60 @@ export async function checkNodePinning(tool: PinningTool, opts: {
   envNodeName?: string
   hostname: string
 }): Promise<PinningCheck> {
+  const scopes = [opts.singletonDaemon !== undefined, opts.factoryProjects !== undefined].filter(Boolean).length
+  if (scopes !== 1) {
+    throw new Error(`checkNodePinning: ровно одно из singletonDaemon/factoryProjects обязательно, получено ${scopes} — вызов молча ничего бы не проверил`)
+  }
   const pinning = await resolvePinningDoc(tool)
   const nodeName = nodeNameFromEnv(opts.envNodeName, opts.hostname)
   let violations: string[] = []
   let sandboxSkipped: string[] = []
   if (opts.singletonDaemon !== undefined) {
     violations = validateSingleton(pinning, opts.singletonDaemon, nodeName)
-  } else if (opts.factoryProjects !== undefined) {
+  } else {
     const sandboxed = opts.sandboxed === true
-    violations = validateFactory(pinning, nodeName, opts.factoryProjects, sandboxed)
+    violations = validateFactory(pinning, nodeName, opts.factoryProjects as readonly string[], sandboxed)
     sandboxSkipped = sandboxed
-      ? opts.factoryProjects.filter((p) => !normalizeList(pinnedFactoryProjects(pinning)).includes(normalizeKey(p)))
+      ? (opts.factoryProjects as readonly string[]).filter((p) => !normalizeList(pinnedFactoryProjects(pinning)).includes(normalizeKey(p)))
       : []
   }
   return { nodeName, violations, sandboxSkipped }
+}
+
+/** Прод-паттерн демонов: непустые violations — отказ старта (stderr) и
+ *  exit 1; пустые — no-op (демон продолжает свои строки подтверждения). */
+export function failPinnedStart(check: PinningCheck, print: (line: string) => void = console.error): void {
+  if (check.violations.length === 0) return
+  print(`пиннинг: отказ старта (нода ${check.nodeName}):\n- ${check.violations.join("\n- ")}`)
+  process.exit(1)
 }
 
 function pinnedFactoryProjects(pinning: PinningDoc): string[] {
   return Object.values(pinning.factories).flat()
 }
 
-/** Дискавери дока по заголовку (find_doc_by_title — паттерн фабрики), контент
- *  — export_doc_markdown (паттерн resolveBody крона). Throw вместо null:
- *  немой пропуск = демон без пиннинга. */
+/** Дискавери дока по организ-дереву: папка проекта uwuwu (паттерн
+ *  findTaskBoards фабрики), среди её детей — док с точным заголовком
+ *  «Node-pinning»; контент — export_doc_markdown (паттерн resolveBody
+ *  крона). Scope папкой — тёзка вне проекта uwuwu не источник истины.
+ *  Throw вместо null: немой пропуск = демон без пиннинга. */
 async function resolvePinningDoc(tool: PinningTool): Promise<PinningDoc> {
-  const r = await tool<{ matches?: { id?: string; inTrash?: boolean }[] }>("find_doc_by_title", {
-    title: PINNING_DOC_TITLE,
-    caseInsensitive: true,
-    limit: 5,
-  })
-  const matches = (r.matches ?? []).filter((m) => typeof m.id === "string" && m.inTrash !== true)
-  if (matches.length === 0) throw new Error(`пиннинг-док не найден: нет дока «${PINNING_DOC_TITLE}» в проекте «${PINNING_PROJECT}» (uwuwu-cli read "${PINNING_PROJECT}/${PINNING_DOC_TITLE}")`)
-  const docIds = matches.map((m) => m.id as string)
+  const r = await tool<{ nodes?: { id?: string; type?: string; data?: string; parentId?: string }[] }>("list_organize_nodes", {})
+  const nodes = r.nodes ?? []
+  const folder = nodes.find((n) => n.type === "folder" && normalizeKey(n.data ?? "") === PINNING_PROJECT)
+  if (folder === undefined || typeof folder.id !== "string") {
+    throw new Error(`пиннинг-док не найден: нет папки проекта «${PINNING_PROJECT}» в организ-дереве`)
+  }
+  const docIds = nodes
+    .filter((n) => n.type === "doc" && n.parentId === folder.id && typeof n.data === "string")
+    .map((n) => n.data as string)
   const titles = await Promise.all(docIds.map(async (docId) => {
     const d = await tool<{ title?: string }>("get_doc", { docId })
     return { docId, title: d.title ?? "" }
   }))
   const exact = titles.filter((t) => t.title === PINNING_DOC_TITLE)
-  if (exact.length === 0) throw new Error(`пиннинг-док не найден: матчи «${PINNING_DOC_TITLE}» не дали точного заголовка (${titles.map((t) => `«${t.title}»`).join(", ")})`)
-  if (exact.length > 1) throw new Error(`пиннинг-док неоднозначен: ${exact.length} доков с заголовком «${PINNING_DOC_TITLE}» — снеси дубли`)
+  if (exact.length === 0) throw new Error(`пиннинг-док не найден: в папке «${PINNING_PROJECT}» нет дока «${PINNING_DOC_TITLE}» (uwuwu-cli read "${PINNING_PROJECT}/${PINNING_DOC_TITLE}")`)
+  if (exact.length > 1) throw new Error(`пиннинг-док неоднозначен: ${exact.length} доков с заголовком «${PINNING_DOC_TITLE}» в «${PINNING_PROJECT}» — снеси дубли`)
   const exported = await tool<{ exists?: boolean; markdown?: string }>("export_doc_markdown", { docId: exact[0].docId })
   if (exported.exists !== true) throw new Error(`пиннинг-док «${PINNING_DOC_TITLE}» не экспортируется (exists:false)`)
   return parsePinningDoc(exported.markdown ?? "")

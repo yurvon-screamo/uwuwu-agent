@@ -100,7 +100,7 @@ import {
   type TaskRef,
   type TrackedTask,
 } from "./factory-lib"
-import { checkNodePinning } from "../lib/node-pinning"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
@@ -1919,10 +1919,7 @@ async function main(): Promise<void> {
     envNodeName: process.env.UWUWU_NODE_NAME,
     hostname: hostname(),
   })
-  if (pinning.violations.length > 0) {
-    console.error(`пиннинг: отказ старта (нода ${pinning.nodeName}):\n- ${pinning.violations.join("\n- ")}`)
-    process.exit(1)
-  }
+  failPinnedStart(pinning)
   log(`пиннинг: нода ${pinning.nodeName} подтверждена${pinning.sandboxSkipped.length > 0 ? ` (песочница пропустила незапиненные: ${pinning.sandboxSkipped.join(", ")})` : ""}`)
   log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся

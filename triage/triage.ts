@@ -8,7 +8,7 @@
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { hostname } from "node:os"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
-import { checkNodePinning } from "../lib/node-pinning"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import {
   createHub, type Hub, type HubFinalHook, type HubProfile, type HubSource, type DraftRef, type DraftVerdict,
   type Request,
@@ -326,10 +326,7 @@ const profile: HubProfile = {
       envNodeName: process.env.UWUWU_NODE_NAME,
       hostname: hostname(),
     })
-    if (pinning.violations.length > 0) {
-      console.error(`пиннинг: отказ старта (нода ${pinning.nodeName}):\n- ${pinning.violations.join("\n- ")}`)
-      process.exit(1)
-    }
+    failPinnedStart(pinning)
     hub.log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   },
   onFinal: triageFinalHook,

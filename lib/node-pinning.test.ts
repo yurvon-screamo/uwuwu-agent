@@ -4,6 +4,8 @@
 // unknown-проекта — прод отказ, песочница пропуск).
 import { describe, expect, test } from "bun:test"
 import {
+  checkNodePinning,
+  failPinnedStart,
   nodeNameFromEnv,
   parsePinningDoc,
   validateFactory,
@@ -156,5 +158,112 @@ describe("nodeNameFromEnv", () => {
     expect(nodeNameFromEnv(undefined, "kisa")).toBe("kisa")
     expect(nodeNameFromEnv("", "Kisa.Local")).toBe("kisa.local")
     expect(nodeNameFromEnv("   ", "kisa")).toBe("kisa")
+  })
+})
+
+// ——— checkNodePinning: контракт входа и сквозной резолв (mock-транспорт) ———
+
+/** Mock-транспорт: организ-дерево с доком «Node-pinning» в uwuwu и тёзкой в
+ *  другой папке (не источник истины). Не-«Node-pinning» вызовы — throw
+ *  (тест упадёт громко, не молча вернув пустоту). */
+function mockPinningTool(docTitle = "Node-pinning", exists = true): Parameters<typeof checkNodePinning>[0] {
+  const nodes = [
+    { id: "folder-uwuwu", type: "folder", data: "uwuwu", parentId: "" },
+    { id: "folder-other", type: "folder", data: "other-proj", parentId: "" },
+    { id: "doc-pinning", type: "doc", data: "docid-pinning", parentId: "folder-uwuwu" },
+    { id: "doc-twin", type: "doc", data: "docid-twin", parentId: "folder-other" },
+  ]
+  return async (name, args) => {
+    if (name === "list_organize_nodes") return { nodes }
+    if (name === "get_doc") {
+      const docId = (args as { docId?: string }).docId
+      if (docId === "docid-pinning") return { title: docTitle }
+      if (docId === "docid-twin") return { title: docTitle }
+      return { title: "другой док" }
+    }
+    if (name === "export_doc_markdown") {
+      if ((args as { docId?: string }).docId === "docid-pinning" && exists) return { exists: true, markdown: ADR076_MD }
+      return { exists: false }
+    }
+    throw new Error(`mock: неожиданный вызов ${name}`)
+  }
+}
+
+describe("checkNodePinning", () => {
+  test("ни одного поля скоупа — throw: вызов молча ничего бы не проверил", async () => {
+    expect(checkNodePinning(mockPinningTool(), { hostname: "kisa" })).rejects.toThrow("ровно одно из singletonDaemon/factoryProjects")
+  })
+
+  test("оба поля скоупа — throw: иначе factoryProjects молча игнорируется", async () => {
+    expect(checkNodePinning(mockPinningTool(), {
+      singletonDaemon: "triage",
+      factoryProjects: ["uwuwu"],
+      hostname: "kisa",
+    })).rejects.toThrow("получено 2")
+  })
+
+  test("сквозняк: док резолвится из папки uwuwu, тёзка в другой папке игнорируется", async () => {
+    const check = await checkNodePinning(mockPinningTool(), {
+      factoryProjects: ["uwuwu", "origa", "foilcap", "true-washing"],
+      sandboxed: false,
+      hostname: "kisa",
+    })
+    expect(check.nodeName).toBe("kisa")
+    expect(check.violations).toEqual([])
+  })
+
+  test("тёзка заголовка в папке uwuwu пуста (exists:false) — отказ, тёзка вне папки не спасает", async () => {
+    expect(checkNodePinning(mockPinningTool("Node-pinning", false), {
+      singletonDaemon: "triage",
+      hostname: "kisa",
+    })).rejects.toThrow("не экспортируется")
+  })
+
+  test("папка проекта uwuwu отсутствует в дереве — отказ", async () => {
+    const emptyTree = async (_name: string, args: Record<string, unknown>) => {
+      if (_name === "list_organize_nodes") return { nodes: [] }
+      throw new Error(`mock: неожиданный вызов ${_name} ${JSON.stringify(args)}`)
+    }
+    expect(checkNodePinning(emptyTree, { singletonDaemon: "triage", hostname: "kisa" })).rejects.toThrow("нет папки проекта")
+  })
+})
+
+describe("failPinnedStart", () => {
+  test("непустые violations — отказ в print и exit 1", () => {
+    const lines: string[] = []
+    const exits: number[] = []
+    const originalExit = process.exit
+    process.exit = ((code?: number) => {
+      exits.push(code ?? 0)
+      return undefined as never
+    }) as typeof process.exit
+    try {
+      failPinnedStart({ nodeName: "redmi", violations: ["проект «uwuwu» пинен за kisa"], sandboxSkipped: [] }, (line) => lines.push(line))
+    } finally {
+      process.exit = originalExit
+    }
+    expect(exits).toEqual([1])
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain("отказ старта (нода redmi)")
+    expect(lines[0]).toContain("пинен за kisa")
+  })
+
+  test("пустые violations — no-op (демон продолжает свои строки подтверждения)", () => {
+    let printed = false
+    let exited = false
+    const originalExit = process.exit
+    process.exit = (() => {
+      exited = true
+      return undefined as never
+    }) as typeof process.exit
+    try {
+      failPinnedStart({ nodeName: "kisa", violations: [], sandboxSkipped: [] }, () => {
+        printed = true
+      })
+    } finally {
+      process.exit = originalExit
+    }
+    expect(printed).toBe(false)
+    expect(exited).toBe(false)
   })
 })

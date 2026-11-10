@@ -16,7 +16,7 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
-import { checkNodePinning } from "../lib/node-pinning"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
@@ -858,10 +858,7 @@ async function main(): Promise<void> {
     envNodeName: process.env.UWUWU_NODE_NAME,
     hostname: hostname(),
   })
-  if (pinning.violations.length > 0) {
-    console.error(`пиннинг: отказ старта (нода ${pinning.nodeName}):\n- ${pinning.violations.join("\n- ")}`)
-    process.exit(1)
-  }
+  failPinnedStart(pinning)
   log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   log(`uwuwu-cron: старт (задачные доски «Задачи <proj>», гейт Вейт, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
