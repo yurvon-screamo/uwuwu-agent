@@ -812,6 +812,12 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain(TESTING_STATUS)
     expect(p).toContain("код-ревью обязателен перед возвратом тестировщику")
   })
+  test("return: docs-only ветка — «запушь» вакуумных инструкций снят (ревью PR #213, Low)", () => {
+    const p = reviewReturnPrompt("r6")
+    expect(p).toContain("docs-only задача (правки только в uwuwu-доках)")
+    expect(p).toContain("не применяется")
+    expect(p).toContain("снова ревью-статус")
+  })
 })
 
 describe("isValidTracked: ревью- и тест-поля", () => {
