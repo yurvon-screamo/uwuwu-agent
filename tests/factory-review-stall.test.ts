@@ -24,6 +24,7 @@ interface StallVerdict {
   scenario: string
   tick1: TickCalls
   tick2: TickCalls
+  strictPathPin?: boolean
   reviewStallSignaled: boolean | null
   lastStatus: string
   reviewSessionID: string
@@ -96,6 +97,8 @@ describe("tickProject: гвард ревью-тишины (недоставле�
 
   test("stall: ход завершился без доставки → сигнал юзеру + Needs attention, раз за эпизод", async () => {
     const v = await runTick("stall")
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(v.strictPathPin).toBe(true)
     // тик 1: недоставка детектирована — статус и сигнал
     expect(v.tick1.itemUpdates).toContain("k-status=Needs attention")
     expect(v.tick1.comments).toHaveLength(1)

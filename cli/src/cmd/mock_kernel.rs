@@ -97,9 +97,24 @@ impl MockRow {
             }));
         }
         if !self.planned.is_empty() {
+            // живое ядро: date.content — epoch ms (истина), formattedContent —
+            // дисплей ядра в его локали (board-view.ts). Мок пересчитывает ms
+            // из строки в локальной зоне — паритет ядра/CLI.
+            let dt =
+                chrono::NaiveDateTime::parse_from_str(self.planned.trim(), "%Y-%m-%d %H:%M:%S")
+                    .or_else(|_| {
+                        chrono::NaiveDateTime::parse_from_str(self.planned.trim(), "%Y-%m-%d %H:%M")
+                    });
+            let ms = {
+                use chrono::TimeZone;
+                dt.ok()
+                    .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
+                    .map(|l| l.timestamp_millis())
+                    .unwrap_or(0)
+            };
             cells.push(json!({
                 "value": { "keyID": "key-planned", "type": "date",
-                           "date": { "formattedContent": self.planned } }
+                           "date": { "content": ms, "formattedContent": self.planned } }
             }));
         }
         if !self.schedule.is_empty() {

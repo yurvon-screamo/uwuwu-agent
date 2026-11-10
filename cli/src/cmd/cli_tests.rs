@@ -458,3 +458,30 @@ fn projects_help_describes_notebooks_not_projects() {
         "help должен указывать штатный путь перечня проектов (docs ls \"Projects\"): {about}"
     );
 }
+
+/// docs ls help описывает ноутбучную ветку резолва — путь, на который
+/// ведёт help projects и AGENTS.md; неполный help = интерфейсный контракт
+/// не назван (задача 20261110080223-au2sr76, ADR-081).
+#[test]
+fn docs_ls_help_describes_notebook_fallback() {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let ls = cmd
+        .find_subcommand("docs")
+        .expect("docs subcommand exists")
+        .find_subcommand("ls")
+        .expect("docs ls subcommand exists");
+    let about = ls
+        .get_long_about()
+        .or_else(|| ls.get_about())
+        .expect("docs ls about задан")
+        .to_string();
+    let low = about.to_lowercase();
+    assert!(
+        low.contains("ноутбук"),
+        "help docs ls должен описывать ноутбучную ветку резолва (ADR-081): {about}"
+    );
+    assert!(
+        low.contains("не резолвится"),
+        "help docs ls должен явно закрывать составной префикс «Projects/<проект>» — не обещать: {about}"
+    );
+}

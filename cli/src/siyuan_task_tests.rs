@@ -646,6 +646,7 @@ fn test_task() -> SyTask {
         pr: String::new(),
         dev_session: String::new(),
         planned: String::new(),
+        planned_ms: 0,
         schedule_cell: String::new(),
         body_doc: Some("20261105120000-bounddo1".into()),
     }

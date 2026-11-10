@@ -56,27 +56,28 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
 
   // — opencode REST (боевой контур) —
-  const compactMatch = /\/api\/session\/(ses_[^/]+)\/compact$/.exec(url)
+  // Строгий pathname-матч (класс PR #207): rest демона строит `${base}/api${path}`,
+  // двойной префикс (/api/api/…) на живом сервере даёт 404 — мок не имеет права
+  // его принимать: суффикс/подстрока/безъякорный regex по URL маскируют разрыв.
+  const path = new URL(url).pathname
+  const compactMatch = /^\/api\/session\/(ses_[^/]+)\/compact$/.exec(path)
   if (compactMatch !== null) {
     compactCalls.push(compactMatch[1])
     return json({ id: "msg_compact", sessionID: compactMatch[1], type: "compaction", time: { created: Date.now() } })
   }
-  const promptMatch = /\/api\/session\/(ses_[^/]+)\/prompt$/.exec(url)
+  const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
   if (promptMatch !== null) {
     // pendingRun-ретрай (сценарий T3): промпт доигрывается, compact не трогаем
     return json({ time: { created: Date.now() } })
   }
-  if (/\/api\/session\/ses_[^/]+\/?$/.test(url)) {
+  if (/^\/api\/session\/ses_[^/]+\/?$/.test(path)) {
     return json({ outcome: "succeeded", time: { idle: idleAt }, model: sessionModel })
   }
-  if (url.includes("/message")) return json(messages)
-  // строгий pathname-матч (тестирование s6e27f6): rest демона строит /api + path,
-  // живой контракт — GET {base}/api/model → 200; двойной префикс (/api/api/model)
-  // на живом сервере даёт 404 — мок не имеет права его принимать
-  if (new URL(url).pathname === "/api/model") {
+  if (/^\/api\/session\/ses_[^/]+\/message$/.test(path)) return json(messages)
+  if (path === "/api/model") {
     return json({ data: [{ providerID: "zai-coding-plan", modelID: "test-model", limit: { context: 1_000_000, output: 131_072 } }] })
   }
-  if (url.includes("/inbox")) return new Response("нет inbox", { status: 404 })
+  if (/^\/api\/session\/ses_[^/]+\/inbox$/.test(path)) return new Response("нет inbox", { status: 404 })
 
   // — SiYuan REST/MCP (доска мастера) —
   if (url.includes("/api/attr/getBlockAttrs")) {
@@ -172,12 +173,19 @@ try {
 
 ;(Bun as unknown as { spawn: unknown }).spawn = Bun.spawn
 
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/model")
+  .then(() => false, () => true)
+
 let logLines: string[] = []
 try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
 } catch {}
 
 console.log(JSON.stringify({
-  error, stages, compactCalls, spawnCalls, logLines,
+  error, stages, compactCalls, spawnCalls, logLines, strictPathPin,
   compactEnv: { idleSec: process.env.UWUWU_CRON_COMPACT_IDLE_SEC },
 }))

@@ -44,6 +44,7 @@ import {
   promptForStart,
   prMergeableOf,
   mergeablePollStep,
+  resolvePromptWorktree,
   type MergeablePollStep,
   wakeupPrompt,
   bodyEditPrompt,
@@ -828,7 +829,9 @@ async function startTask(
   const sent = await promptSession(sessionID, promptForStart(
     start,
     { rowId: task.rowId, project: projectName, repo: cfg.repo, pr: task.pr },
-    { env: envCtx, init },
+    // envRoot — даже при envCtx=undefined (env:false): промпт называет агенту
+    // канон-путь ворктри, который потом резолвит resolvePromptWorktree
+    { env: envCtx, init, envRoot: ENV_ROOT },
   ))
   if (!sent) throw new Error("spawn-промпт не ушёл")
 
@@ -1173,10 +1176,11 @@ async function startReview(
     log(`DRY_RUN: спавн ревьювера (${kind}) над ${task.rowId.slice(0, 8)} — пропущен`)
     return
   }
-  // ворктри задачи из state (repoDir env-задачи, пишет фабрика на спавне);
-  // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
-  // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
-  const worktree = tracked.worktree
+  // ворктри задачи: state-путь фабрики (env:true) или живой агентский
+  // ворктри env:false по канон-пути (девелопер создал сам); оба пусты
+  // (карантинный ревью-вход без дев-спавна) → честная строка промпта
+  // «ревью по diff/PR» из каталога сессии cfg.local
+  const worktree = resolvePromptWorktree(task.rowId, tracked.worktree, ENV_ROOT)
   const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
   const reviewer = kind === "plan" ? PLAN_REVIEWER : REVIEWER
   const sessionID = await createSession({
@@ -1233,7 +1237,9 @@ async function startTesting(
     log(`DRY_RUN: спавн тестировщика над ${task.rowId.slice(0, 8)} — пропущен`)
     return
   }
-  const worktree = tracked.worktree
+  // ворктри для ctx/cwd: state-путь фабрики или живой агентский env:false
+  // (см. resolvePromptWorktree) — промпт не лжёт «не найден» при живом ворктри
+  const worktree = resolvePromptWorktree(task.rowId, tracked.worktree, ENV_ROOT)
   const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
@@ -1317,7 +1323,12 @@ async function dispatchReviewAction(
     case "rerun-reviewer": {
       const ok = await promptSession(
         d.tracked.reviewSessionID ?? "",
-        reviewRerunPrompt(d.row.rowId, action.kind, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr, type: d.row.type }),
+        reviewRerunPrompt(d.row.rowId, action.kind, {
+          branch: d.row.branch,
+          worktree: resolvePromptWorktree(d.row.rowId, d.tracked.worktree, ENV_ROOT),
+          pr: d.row.pr,
+          type: d.row.type,
+        }),
       )
       if (ok) {
         d.consumeComments()
@@ -1356,7 +1367,12 @@ async function dispatchReviewAction(
     case "rerun-tester": {
       const ok = await promptSession(
         d.tracked.testSessionID ?? "",
-        testingRerunPrompt(d.row.rowId, { branch: d.row.branch, worktree: d.tracked.worktree, pr: d.row.pr, type: d.row.type }),
+        testingRerunPrompt(d.row.rowId, {
+          branch: d.row.branch,
+          worktree: resolvePromptWorktree(d.row.rowId, d.tracked.worktree, ENV_ROOT),
+          pr: d.row.pr,
+          type: d.row.type,
+        }),
       )
       if (ok) {
         d.consumeComments()
