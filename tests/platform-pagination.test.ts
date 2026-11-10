@@ -18,6 +18,31 @@ function pageOf(rows: string[], rowCount?: number): BoardViewPage {
   return { view: { rowCount, rows: rows.map((id) => ({ id })) } }
 }
 
+describe("read_database_cells: полнота доски (живое ядро)", () => {
+  const hasEnv = (process.env.UWUWU_SIYUAN_TOKEN ?? process.env.UWUWU_SIYUAN_WS ?? "") !== ""
+
+  test.skipIf(!hasEnv)("адаптер видит ≥ rowCount строк доски «Задачи uwuwu»", async () => {
+    // Arrange: доска по тайтлу; счётчик ядра — независимой пробой page 1
+    const found = await tool<{ matches?: { id: string; inTrash?: boolean }[] }>(
+      "find_doc_by_title", { title: BOARD_TITLE, caseInsensitive: true, limit: 5 })
+    const docId = found.matches?.find((m) => m.inTrash !== true)?.id
+    expect(docId).toBeTruthy()
+    const doc = await tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
+    const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id ?? ""
+    expect(dbId).not.toBe("")
+    const probe = await __test.renderBoardPage(dbId, 1)
+    const rowCount = probe.view?.rowCount ?? 0
+    expect(rowCount).toBeGreaterThan(0)
+
+    // Act
+    const r = await tool<{ rows?: unknown[] }>("read_database_cells", { databaseBlockId: dbId })
+
+    // Assert: полный состав (до фикса: 50 из 145 — красный факт одной пробой)
+    expect((r.rows ?? []).length).toBeGreaterThanOrEqual(rowCount)
+  })
+})
+
+
 describe("collectBoardView: пагинация", () => {
   test("мультистраница — собирает страницы до счётчика ядра", async () => {
     // Arrange
@@ -188,29 +213,5 @@ describe("read_database_cells: связка строка→тело (linkedDocId
 
     // Assert
     expect(r.rows?.[0]?.linkedDocId).toBe("20261105000000-legacydoc")
-  })
-})
-
-describe("read_database_cells: полнота доски (живое ядро)", () => {
-  const hasEnv = (process.env.UWUWU_SIYUAN_TOKEN ?? process.env.UWUWU_SIYUAN_WS ?? "") !== ""
-
-  test.skipIf(!hasEnv)("адаптер видит ≥ rowCount строк доски «Задачи uwuwu»", async () => {
-    // Arrange: доска по тайтлу; счётчик ядра — независимой пробой page 1
-    const found = await tool<{ matches?: { id: string; inTrash?: boolean }[] }>(
-      "find_doc_by_title", { title: BOARD_TITLE, caseInsensitive: true, limit: 5 })
-    const docId = found.matches?.find((m) => m.inTrash !== true)?.id
-    expect(docId).toBeTruthy()
-    const doc = await tool<{ blocks?: { id: string; flavour: string }[] }>("read_doc", { docId })
-    const dbId = doc.blocks?.find((b) => b.flavour === "platform:database")?.id ?? ""
-    expect(dbId).not.toBe("")
-    const probe = await __test.renderBoardPage(dbId, 1)
-    const rowCount = probe.view?.rowCount ?? 0
-    expect(rowCount).toBeGreaterThan(0)
-
-    // Act
-    const r = await tool<{ rows?: unknown[] }>("read_database_cells", { databaseBlockId: dbId })
-
-    // Assert: полный состав (до фикса: 50 из 145 — красный факт одной пробой)
-    expect((r.rows ?? []).length).toBeGreaterThanOrEqual(rowCount)
   })
 })
