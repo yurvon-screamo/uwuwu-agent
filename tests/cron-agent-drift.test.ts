@@ -24,7 +24,9 @@ interface ChildReport {
   creations: { title: string; agent: unknown; model: unknown }[]
   promptCalls: { sessionID: string; text: string; delivery: unknown }[]
   deletes: string[]
+  comments: { docId: string; content: string }[]
   logLines: string[]
+  masterDocId: string
   agents: string[]
   runCardIds: string[]
 }
@@ -122,7 +124,47 @@ describe.skipIf(!hasServiceReg)("tick × дрейф агента вечной с
     expect(report.runCardIds).toEqual([
       "20261109000000-run1", "20261109000000-run2", "20261109000000-run3",
       "20261109000000-run4", "20261109000000-run5", "20261109000000-run6",
+      "20261109000000-run7", // T8: ран создан до failed POST, ретраи не дублируют
     ])
     expect(report.logLines.some((l) => l.includes(`агент сменён (${AGENT_C} → ${AGENT_B})`))).toBe(true)
+
+    // — ветка гейта дефа при дрейфе в resolvePendingRun (допокрытие tester,
+    // заявленное поведение: «дефа нет → refuseOnce, без создания мёртвой сессии») —
+
+    // T8: новый failed POST → pendingRun run7, creations/deletes не растут
+    const [t8, t9, t10] = report.stages.slice(7) as [typeof t1, typeof t1, typeof t1]
+    expect(master(t8).pendingRun).toBeDefined()
+    expect((master(t8).pendingRun as { rowId: string }).rowId).toBe("20261109000000-run7")
+    expect(t8.creations).toBe(4)
+    expect(t8.deletes).toBe(3)
+
+    // штатный дрейф-сценарий (T1–T7) ни разу не комментил отказ
+    expect(report.comments.length).toBe(1)
+
+    // T9: ретрай при дрейфе B→агент-без-дефа → refuseOnce, recreate НЕТ:
+    // мёртвой сессии не создано, слот не сжигается (pendingRun жив),
+    // коммент в мастер с причиной, дедуп-метка в state
+    expect(t9.creations).toBe(4) // recreate не случился
+    expect(t9.deletes).toBe(3)
+    expect(master(t9).pendingRun).toBeDefined() // слот не сожжён — ретрай возможен
+    expect((master(t9).pendingRun as { rowId: string }).rowId).toBe("20261109000000-run7")
+    expect(master(t9).lastRefusal).toContain("test-drift-missing")
+    expect(master(t9).lastRefusal).toContain("не найден")
+    expect(report.comments.length).toBe(1)
+    expect(report.comments[0].docId).toBe(report.masterDocId)
+    expect(report.comments[0].content).toContain("крон-мастер не запускается:")
+    expect(report.comments[0].content).toContain("test-drift-missing")
+    expect(t9.prompts).toBe(8) // 7 до T8 + упавший POST T8: конверт в мёртвую цель НЕ улетел
+    expect(t10.prompts).toBe(9) // T10: ретрай приземлил run7
+
+    // T10: агент с дефом вернули → ретрай приземлил run7 в ту же сессию
+    // (дрейфа нет), pendingRun снят, дедуп refusal сброшен (повторный отказ
+    // комментится заново)
+    expect(t10.creations).toBe(4) // recreate по-прежнему нет — агент совпадает
+    expect(report.promptCalls[7].sessionID).toBe("ses_mock_4")
+    expect(report.promptCalls[7].text).toContain("20261109000000-run7")
+    expect(master(t10).pendingRun).toBeUndefined()
+    expect(master(t10).lastRefusal).toBeUndefined()
+    expect(master(t10).lastFiredAt).toBeGreaterThan(master(t8).lastFiredAt as number)
   })
 })

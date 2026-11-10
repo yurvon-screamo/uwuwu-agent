@@ -10,7 +10,13 @@
 //   T5 смена после idle → recreate: ses_mock_3 (агент C), DELETE ses_mock_2;
 //   T6 failed POST → pendingRun (ран не теряется);
 //   T7 ретрай при новом дрейфе (B) → recreate ses_mock_4 (агент B), исходный
-//      конверт в новую сессию, ран НЕ дублируется.
+//      конверт в новую сессию, ран НЕ дублируется;
+//   T8 failed POST → новый pendingRun (ран run7);
+//   T9 ретрай при дрейфе на агент БЕЗ дефа → refuseOnce (коммент в мастер),
+//      recreate НЕ случается (мёртвой сессии нет), pendingRun жив (слот не
+//      сжигается), повторных комментов при том же отказе нет;
+//   T10 возврат агента с дефом → ретрай приземляет ран run7, pendingRun
+//      снят, lastRefusal сброшен (дедуп refuseOnce открыт).
 // Mock: SiYuan REST + opencode REST (глобальный fetch) + CLI-спавн
 // (Bun.spawn); registry сессий несёт agent/outcome/idle — форма GET /session
 // живого сервера (живая проба 10.11). HOME-песочница задаётся спавнером.
@@ -62,6 +68,7 @@ const creations: { title: string; agent: unknown; model: unknown }[] = []
 interface PromptCall { sessionID: string; text: string; delivery: unknown }
 const promptCalls: PromptCall[] = []
 const deletes: string[] = []
+const comments: { docId: string; content: string }[] = []
 let failNextPost = false
 // времена приземления POST — от времён тиков оркестратора, не от Date.now()
 let currentTickMs = 0
@@ -115,7 +122,9 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ code: 0, msg: "", data: { content: "---\ntitle: drift-мастер\n---\n\n# drift-мастер\n\nПроверь audit-контур." } })
   }
   if (url.includes("/api/block/appendBlock")) {
-    throw new Error("mock: сценарий дрейфа не должен комментить отказ (дефы на месте)")
+    // refuseOnce (T9: дрейф на агент без дефа) — трекаем коммент-отказ
+    comments.push({ docId: String(body.parentID ?? ""), content: String(body.data ?? "") })
+    return json({ code: 0, msg: "", data: [] })
   }
   if (url.includes("/api/query/sql")) {
     if (String(body.stmt ?? "").includes("select markdown from blocks")) {
@@ -231,6 +240,16 @@ try {
   agentAttr = AGENT_B // ещё одна смена — в окне ретрая
   await tick(31) // T7: ретрай до due-слота: дрейф → recreate, исходный конверт в новую сессию
   snap("T7")
+  failNextPost = true
+  await tick(35) // T8: файр в ses_mock_4 → POST падает → pendingRun (ран run7)
+  snap("T8")
+  failNextPost = false
+  agentAttr = "test-drift-missing" // деф не создавался — resolveAgentIssue обязан отказать
+  await tick(36) // T9: ретрай при дрейфе B→missing: гейт дефа → refuseOnce, recreate НЕТ
+  snap("T9")
+  agentAttr = AGENT_B // владелец вернул агент с дефом
+  await tick(37) // T10: ретрай без дрейфа → ран run7 приземляется, дедуп refusal сброшен
+  snap("T10")
 } catch (e) {
   error = String(e)
 }
@@ -243,8 +262,8 @@ try {
 } catch {}
 
 console.log(JSON.stringify({
-  error, stages, creations, promptCalls, deletes, spawnCalls, logLines,
-  agentsDir, agents: [AGENT_A, AGENT_B, AGENT_C],
+  error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments,
+  agentsDir, masterDocId: BODY, agents: [AGENT_A, AGENT_B, AGENT_C],
   runCardIds: spawnCalls
     .filter((c) => c.argv[2] === "create")
     .map((c) => /строка: (\S+)/.exec(c.stdoutText)?.[1] ?? ""),
