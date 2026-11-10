@@ -39,11 +39,15 @@ function scriptTick(): string[] {
       calls.push(`exportMd:${payload.id}`)
       return new Response(JSON.stringify({ code: 0, msg: "", data: { content: "" } }), { status: 200 })
     }
-    if (url.includes("/api/session/")) {
+    // opencode REST — строгий pathname-матч (класс PR #207): rest демона строит
+    // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
+    // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
+    const path = new URL(url).pathname
+    if (/^\/api\/session\/.+/.test(path)) {
       calls.push("rest-session")
       return new Response(JSON.stringify({ id: SESSION_ID }), { status: 200 })
     }
-    if (url.includes("/api/session")) {
+    if (path === "/api/session") {
       calls.push("rest-prompt")
       return new Response(JSON.stringify({}), { status: 200 })
     }
@@ -111,9 +115,17 @@ await tickProject(state, "t", { board: "Задачи x", repo: "r/x", local: "/t
 const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   tasks: Record<string, { bodyDoc: string; bodyUpdated?: string }>
 }
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
   bodyDoc: after.tasks[ROW_ID]?.bodyDoc ?? null,
   bodyUpdated: after.tasks[ROW_ID]?.bodyUpdated ?? null,
   exportIds: calls.filter((c) => c.startsWith("exportMd:")).map((c) => c.slice("exportMd:".length)),
   prompts: calls.filter((c) => c === "rest-prompt").length,
+  strictPathPin,
 }))

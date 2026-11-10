@@ -71,13 +71,17 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
 
   // — opencode REST (боевой контур) —
-  if (url.endsWith("/api/session") && init?.method === "POST") {
+  // Строгий pathname-матч (класс PR #207): rest демона строит `${base}/api${path}`,
+  // двойной префикс (/api/api/…) на живом сервере даёт 404 — мок не имеет права
+  // его принимать: суффикс/подстрока/безъякорный regex по URL маскируют разрыв.
+  const path = new URL(url).pathname
+  if (path === "/api/session" && init?.method === "POST") {
     creations.push({
       title: String(body.title ?? ""), agent: body.agent, model: body.model,
     })
     return json({ id: `ses_mock_${creations.length}` })
   }
-  const promptMatch = /\/api\/session\/(ses_[^/]+)\/prompt$/.exec(url)
+  const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
   if (promptMatch !== null) {
     const mode = promptOutcomes[promptCalls.length] ?? "ok"
     promptCalls.push({ sessionID: promptMatch[1], text: String(body.text ?? ""), delivery: body.delivery })
@@ -85,11 +89,11 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     createdTick += 1
     return json({ time: { created: createdTick } })
   }
-  if (/\/api\/session\/ses_[^/]+\/?$/.test(url)) return json({ outcome: sessionState.outcome, time: { idle: sessionState.idle } })
-  if (url.includes("/message")) {
+  if (/^\/api\/session\/ses_[^/]+\/?$/.test(path)) return json({ outcome: sessionState.outcome, time: { idle: sessionState.idle } })
+  if (/^\/api\/session\/ses_[^/]+\/message$/.test(path)) {
     return json(landing === null ? [] : [{ type: "user", time: { created: landing.created }, text: landing.text }])
   }
-  if (url.includes("/inbox")) return new Response("нет inbox", { status: 404 })
+  if (/^\/api\/session\/ses_[^/]+\/inbox$/.test(path)) return new Response("нет inbox", { status: 404 })
 
   // — SiYuan REST/MCP (доска мастера) —
   if (url.includes("/api/attr/getBlockAttrs")) {
@@ -206,13 +210,19 @@ try {
 
 ;(Bun as unknown as { spawn: unknown }).spawn = Bun.spawn
 
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 let logLines: string[] = []
 try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
 } catch {}
 
 console.log(JSON.stringify({
-  error, stages, creations, promptCalls, spawnCalls, logLines,
+  error, stages, creations, promptCalls, spawnCalls, logLines, strictPathPin,
   agentsDir: join(homedir(), ".config/opencode/agents"), agent: AGENT,
   runCardIds: spawnCalls
     .filter((c) => c.argv[2] === "create")

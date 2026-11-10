@@ -74,19 +74,23 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
 
   // — opencode REST (боевой контур) —
-  if (url.endsWith("/api/session") && init?.method === "POST") {
+  // Строгий pathname-матч (класс PR #207): rest демона строит `${base}/api${path}`,
+  // двойной префикс (/api/api/…) на живом сервере даёт 404 — мок не имеет права
+  // его принимать: суффикс/подстрока/безъякорный regex по URL маскируют разрыв.
+  const path = new URL(url).pathname
+  if (path === "/api/session" && init?.method === "POST") {
     creations.push(body)
     return json({ id: `ses_new_${creations.length}` })
   }
-  const promptMatch = /\/api\/session\/(ses_[^/]+)\/prompt$/.exec(url)
+  const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
   if (promptMatch !== null) {
     promptCalls.push({ sessionID: promptMatch[1], text: String(body.text ?? ""), delivery: body.delivery })
     return json({ time: { created: Date.now() } })
   }
-  if (/\/api\/session\/ses_[^/]+\/?$/.test(url)) return json({ outcome: undefined, time: { idle: 123 } })
-  const inboxMatch = /\/api\/session\/(ses_[^/]+)\/inbox$/.exec(url)
+  if (/^\/api\/session\/ses_[^/]+\/?$/.test(path)) return json({ outcome: undefined, time: { idle: 123 } })
+  const inboxMatch = /^\/api\/session\/(ses_[^/]+)\/inbox$/.exec(path)
   if (inboxMatch !== null) return json(inboxBoxes[inboxMatch[1]] ?? [])
-  const msgMatch = /\/api\/session\/(ses_[^/]+)\/message/.exec(url)
+  const msgMatch = /^\/api\/session\/(ses_[^/]+)\/message$/.exec(path)
   if (msgMatch !== null) return json(msgBoxes[msgMatch[1]] ?? [])
 
   // — SiYuan REST/MCP (доска с двумя мастерами) —
@@ -165,6 +169,12 @@ try {
 }
 ;(Bun as unknown as { spawn: unknown }).spawn = Bun.spawn
 
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 let logLines: string[] = []
 try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
@@ -175,6 +185,7 @@ console.log(JSON.stringify({
   error,
   promptCalls,
   creations,
+  strictPathPin,
   createCalls: spawnCalls.filter((a) => a[2] === "create"),
   masterA: { pendingRun: masterOf("20261109000000-masterA").pendingRun ?? null, lastFiredAt: masterOf("20261109000000-masterA").lastFiredAt },
   masterB: { pendingRun: masterOf("20261109000000-masterB").pendingRun ?? null, lastFiredAt: masterOf("20261109000000-masterB").lastFiredAt },

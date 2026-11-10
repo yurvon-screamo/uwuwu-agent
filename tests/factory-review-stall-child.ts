@@ -162,28 +162,33 @@ function scriptTick(): string[] {
       calls.push(`mcp:${tool}`)
       return new Response(JSON.stringify({ jsonrpc: 2.0, id: 1, result }), { status: 200 })
     }
-    if (url.includes("/prompt")) {
+    // opencode REST — строгий pathname-матч (класс PR #207): rest демона строит
+    // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
+    // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
+    const path = new URL(url).pathname
+    if (/^\/api\/session\/(ses_[^/]+)\/prompt$/.test(path)) {
       calls.push("prompt")
       return new Response(JSON.stringify({}), { status: 200 })
     }
-    if (url.includes("/api/session/")) {
+    const sessMatch = /^\/api\/session\/(ses_[^/]+)(\/message)?$/.exec(path)
+    if (sessMatch !== null) {
       if (method === "DELETE") {
         calls.push("session-delete")
         return new Response(JSON.stringify({}), { status: 200 })
       }
       // активность ревью-сессии: /message — массив [{ time: { created, … } }]
-      if (url.includes("/message")) {
+      if (sessMatch[2] === "/message") {
         calls.push("session-message")
         return new Response(JSON.stringify([{ time: { created: NOW - MESSAGE_AGE_MS, streamed: NOW - MESSAGE_AGE_MS } }]), { status: 200 })
       }
       calls.push("session-get")
-      const sid = url.split("/api/session/")[1]?.split(/[/?]/)[0] ?? ""
+      const sid = sessMatch[1] ?? ""
       if (sid === "ses_dead") {
         return new Response(JSON.stringify({ code: -1, msg: "session gone" }), { status: 404 })
       }
       return new Response(JSON.stringify({ id: sid || "ses_x" }), { status: 200 })
     }
-    if (url.includes("/api/session")) {
+    if (path === "/api/session") {
       calls.push("session-create")
       return new Response(JSON.stringify({ id: "ses_new" }), { status: 200 })
     }
@@ -225,9 +230,17 @@ const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   tasks: Record<string, { reviewStallSignaled?: boolean; lastStatus?: string; reviewSessionID?: string }>
 }
 const track = after.tasks[ROW_ID] ?? {}
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// откат матчинга на суффикс/подстроку делает пин ложным → мастер-тест красный
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
   scenario: SCENARIO,
   tick1, tick2,
+  strictPathPin,
   reviewStallSignaled: track.reviewStallSignaled ?? null,
   lastStatus: track.lastStatus ?? "",
   reviewSessionID: track.reviewSessionID ?? "",

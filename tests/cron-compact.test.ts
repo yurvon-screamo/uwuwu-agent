@@ -17,6 +17,7 @@ const SERVICE_REG = join(process.env.HOME ?? "", ".local/state/opencode/service.
 
 interface ChildReport {
   error?: string
+  strictPathPin?: boolean
   stages: { label: string; state: Record<string, Record<string, unknown>>; compacts: number }[]
   compactCalls: string[]
   spawnCalls: string[][]
@@ -49,6 +50,7 @@ describe.skipIf(!hasServiceReg)("tick × автокомпакт вечного �
   test("недуевый мастер: idle+раздутая → один POST; коулдаун глушит; pendingRun приоритетнее", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
+    expect(report.strictPathPin).toBe(true) // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
     expect(report.compactEnv.idleSec).toBe("240")
 
     const master = (s: (typeof report.stages)[number]) => s.state[ROW] as Record<string, unknown>
