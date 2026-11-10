@@ -101,13 +101,21 @@ jobs:
         working-directory: cli
         run: |
           set -o pipefail
-          # Валидация инпута dispatch: runs=0 / не-число дают пустой seq
-          # → ноль прогонов → тихий false-green. Зелёный статус обязан
-          # означать «N прогонов прошли».
-          case "$STRESS_RUNS" in ''|*[!0-9]*|0)
+          # Валидация инпута dispatch: не-число / 0 / «00» (ведущие нули
+          # проходят case — ловится только литерал 0 — и seq 1 00 даёт
+          # ноль итераций при молчащем -ne гарде, ревью раунд 2 Low) —
+          # всё это громкий фейл, не тихий false-green: зелёный статус
+          # обязан означать «N прогонов прошли». $((10#…)) нормализует
+          # ведущие нули (00→0, 012→12).
+          case "$STRESS_RUNS" in ''|*[!0-9]*)
             echo "::error::STRESS_RUNS должно быть числом >= 1, получено: '$STRESS_RUNS'"
             exit 1 ;;
           esac
+          STRESS_RUNS=$((10#$STRESS_RUNS))
+          if [ "$STRESS_RUNS" -lt 1 ]; then
+            echo "::error::STRESS_RUNS должно быть >= 1, получено: '$STRESS_RUNS'"
+            exit 1
+          fi
           # Логи живут в корне репо (../stress-logs относительно cli/):
           # report-шаг читает их из корня — пути в одной системе координат.
           mkdir -p ../stress-logs
