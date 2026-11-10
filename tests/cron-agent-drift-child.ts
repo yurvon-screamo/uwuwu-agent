@@ -79,21 +79,25 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input)
   const method = init?.method ?? "GET"
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+  // строгий pathname-матч opencode-REST (страж child-rigs): двойной префикс
+  // (/api/api/…) на живом сервере даёт 404 — мок не имеет права его принимать
+  const path = new URL(url).pathname
+  const strictPathPin = true
 
   // — opencode REST (боевой контур) —
-  if (url.endsWith("/api/session") && method === "POST") {
+  if (path === "/api/session" && method === "POST") {
     const id = `ses_mock_${creations.length + 1}`
     creations.push({ title: String(body.title ?? ""), agent: body.agent, model: body.model })
     sessions.set(id, { agent: String(body.agent ?? ""), outcome: undefined, idle: 0 })
     return json({ id })
   }
-  if (/\/api\/session\/ses_[^/]+$/.test(url) && method === "DELETE") {
-    const id = /\/api\/session\/(ses_[^/]+)$/.exec(url)?.[1] ?? ""
-    deletes.push(id)
-    sessions.delete(id)
+  const deleteMatch = /^\/api\/session\/(ses_[^/]+)$/.exec(path)
+  if (deleteMatch !== null && method === "DELETE") {
+    deletes.push(deleteMatch[1])
+    sessions.delete(deleteMatch[1])
     return json({})
   }
-  const promptMatch = /\/api\/session\/(ses_[^/]+)\/prompt$/.exec(url)
+  const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
   if (promptMatch !== null) {
     promptCalls.push({ sessionID: promptMatch[1], text: String(body.text ?? ""), delivery: body.delivery })
     if (failNextPost) return new Response("boom: POST не приземлился", { status: 500 })
@@ -105,14 +109,14 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     }
     return json({ time: { created } })
   }
-  const getMatch = /\/api\/session\/(ses_[^/]+)\/?$/.exec(url)
-  if (getMatch !== null) {
+  const getMatch = /^\/api\/session\/(ses_[^/]+)\/?$/.exec(path)
+  if (getMatch !== null && method === "GET") {
     const s = sessions.get(getMatch[1])
     if (s === undefined) return new Response("нет сессии", { status: 404 })
     return json({ outcome: s.outcome, time: { idle: s.idle }, agent: s.agent })
   }
-  if (url.includes("/message")) return json([])
-  if (url.includes("/inbox")) return new Response("нет inbox", { status: 404 })
+  if (/^\/api\/session\/ses_[^/]+\/message$/.test(path)) return json([])
+  if (/^\/api\/session\/ses_[^/]+\/inbox$/.test(path)) return new Response("нет inbox", { status: 404 })
 
   // — SiYuan REST/MCP (доска мастера) —
   if (url.includes("/api/attr/getBlockAttrs")) {
