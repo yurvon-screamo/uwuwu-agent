@@ -28,6 +28,8 @@ tempfile = "3"
 serial_test = "4"
 wiremock = "0.6"
 serde_json = "1"
+# async-e2e (boards_session_cols_e2e): runtime + #[tokio::test] для клиента SiYuan
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [profile.release]
 opt-level = 3
