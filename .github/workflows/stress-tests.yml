@@ -87,7 +87,9 @@ jobs:
         working-directory: cli
         run: |
           set -o pipefail
-          mkdir -p stress-logs
+          # Логи живут в корне репо (../stress-logs относительно cli/):
+          # report-шаг читает их из корня — пути в одной системе координат.
+          mkdir -p ../stress-logs
           overall=0
           for i in $(seq 1 "$STRESS_RUNS"); do
             echo "::group::Прогон $i/$STRESS_RUNS"
