@@ -16,7 +16,7 @@
 //! 8. task edit --schedule "6h": грамматика валидирована, атрибут записан
 //! 9. task edit --schedule "": снятие без валидации грамматики
 //! 19. state демона — camelCase (sessionID/lastFiredAt, формат cron.ts) читается
-//! 20. run_card_parts: «⏰ <мастер> · <ts>» → (мастер, ts)
+//! 20. run_card_owner: «⏰ <мастер> · <дата>» → мастер
 //! 21. last_run_from_board: максимум «Запланировано» по ранам мастера
 //! 22. last run мастера — из ран-карточек доски; колонка «Запланировано» видна
 //! 23. фоллэк: ранов на доске нет — last run из state демона (с сессией)
@@ -330,40 +330,50 @@ fn parse_state_reads_camelcase_tracked_fields() {
     assert!(empty.crons.is_empty(), "битый state — пусто, не паника");
 }
 
-/// (20) run_card_parts: тайтл ран-карточки «⏰ <мастер> · <ts>» (runCardTitle
-/// демона) разворачивается в (мастер, ts); чужие тайтлы — None.
+/// (20) run_card_owner: тайтл ран-карточки «⏰ <мастер> · <дата>» (runCardTitle
+/// демона) матчится в мастера; чужие тайтлы — None.
 #[test]
-fn run_card_parts_extracts_master_and_timestamp() {
-    use crate::cmd::sy_dispatch::run_card_parts;
-    let (owner, ts) = run_card_parts("⏰ stable-ватчер SiYuan · 2026-11-10 07:36:21").unwrap();
-    assert_eq!(owner, "stable-ватчер SiYuan");
-    assert_eq!(ts, "2026-11-10 07:36:21");
-    let (owner, ts) = run_card_parts("⏰ Lead: ночной аудит uwuwu · 2026-11-10 03:30").unwrap();
-    assert_eq!(owner, "Lead: ночной аудит uwuwu");
-    assert_eq!(ts, "2026-11-10 03:30");
-    assert!(run_card_parts("обычная задача").is_none(), "не ран");
+fn run_card_owner_extracts_master_from_run_title() {
+    use crate::cmd::sy_dispatch::run_card_owner;
+    assert_eq!(
+        run_card_owner("⏰ stable-ватчер SiYuan · 2026-11-10 07:36:21"),
+        Some("stable-ватчер SiYuan")
+    );
+    assert_eq!(
+        run_card_owner("⏰ Lead: ночной аудит uwuwu · 2026-11-10 03:30"),
+        Some("Lead: ночной аудит uwuwu")
+    );
+    assert!(run_card_owner("обычная задача").is_none(), "не ран");
     assert!(
-        run_card_parts("⏰ пометка без разделителя").is_none(),
+        run_card_owner("⏰ пометка без разделителя").is_none(),
         "нет хвоста"
     );
 }
 
-/// (21) last_run_from_board: максимум «Запланировано» по ран-карточкам
-/// мастера; чужие раны и раны с битой клеткой не учитываются.
+/// (21) last_run_from_board: максимум «Запланировано» (planned_ms —
+/// date.content клетки, epoch ms) по ран-карточкам мастера — свойство
+/// строки (канон 20261108020718); чужие раны и строки без клетки (ms = 0)
+/// не учитываются.
 #[test]
 fn last_run_from_board_takes_latest_run_card_of_master() {
     use crate::cmd::sy_dispatch::last_run_from_board;
-    let rows = vec![
-        run_row("⏰ мастер · 2026-11-08 02:34:21", "2026-11-08 02:34"),
-        run_row("⏰ мастер · 2026-11-09 10:00:00", "2026-11-09 10:00"),
-        run_row("⏰ другой мастер · 2026-11-10 23:00:00", "2026-11-10 23:00"),
-        run_row("⏰ мастер · битая клетка", ""),
-    ];
-    let ms = last_run_from_board("мастер", &rows).expect("файр мастера найден");
     let expected = crate::siyuan_task::parse_planned("2026-11-09 10:00")
         .unwrap()
         .0;
-    assert_eq!(ms, expected, "свежий ран мастера, чужие не учитаны");
+    let mut rows = vec![
+        run_row("⏰ мастер · 2026-11-08 02:34:21", "2026-11-08 02:34"),
+        run_row("⏰ мастер · 2026-11-09 10:00:00", "2026-11-09 10:00"),
+        run_row("⏰ другой мастер · 2026-11-10 23:00:00", "2026-11-10 23:00"),
+        run_row("⏰ мастер · пустая клетка", ""),
+    ];
+    rows[0].planned_ms = expected - 86_400_000;
+    rows[1].planned_ms = expected;
+    rows[2].planned_ms = expected + 86_400_000; // чужой ран, свежее всех
+    let ms = last_run_from_board("мастер", &rows).expect("файр мастера найден");
+    assert_eq!(
+        ms, expected,
+        "свежий ран мастера, чужой ран и строка без клетки не учитаны"
+    );
     assert!(
         last_run_from_board("мастер без ранов", &rows).is_none(),
         "ранов нет — None (фоллэк: state)"
@@ -381,6 +391,7 @@ fn run_row(title: &str, planned: &str) -> crate::siyuan_task::SyTask {
         pr: String::new(),
         dev_session: String::new(),
         planned: planned.to_string(),
+        planned_ms: 0,
         schedule_cell: String::new(),
         body_doc: None,
     }
@@ -487,6 +498,54 @@ async fn list_falls_back_to_state_last_run_when_no_run_cards() {
         "LAST RUN из state-фоллэка: {line}"
     );
     assert!(line.contains("ses_abc123"), "хвост сессии из state: {line}");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (24) Приоритет доски при обоих источниках: раны мастера на доске + непустой
+/// state (даже новее ранов — файл пер-машинный, мог отстать) → LAST RUN из
+/// ран-карточек, state не подмешивается (нет хвоста сессии).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_board_run_cards_win_over_state_when_both_present() {
+    use chrono::TimeZone;
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
+    scenario.rows.push(
+        MockRow::new(
+            "20261110013900-run1",
+            "⏰ stable-ватчер SiYuan · 2026-11-08 02:34:21",
+        )
+        .with_status("Done")
+        .with_planned("2026-11-08 02:34"),
+    );
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    // state «свежее» ранов: если бы источник путался, LAST RUN взял бы его
+    let fired = chrono::Local
+        .with_ymd_and_hms(2026, 11, 10, 23, 59, 0)
+        .single()
+        .expect("валидная локальная дата")
+        .timestamp_millis() as u64;
+    let _state = state_dir_with(&format!(
+        r#"{{ "crons": {{ "20261107090000-master1": {{ "sessionID": "ses_abc123def", "lastFiredAt": {fired} }} }} }}"#
+    ));
+
+    let sy = crate::siyuan::SiYuan::from_env().expect("мок-ядро");
+    let lines = crate::cmd::sy_dispatch::cron_list(&sy, "uwuwu")
+        .await
+        .expect("инвентарь собран");
+    let line = master_line(&lines, "stable-ватчер SiYuan");
+    assert!(
+        line.contains("2026-11-08 02:34"),
+        "LAST RUN из ранов доски, state новее: {line}"
+    );
+    assert!(
+        !line.contains("ses_"),
+        "state-хвост сессии не подмешан при живых ранах: {line}"
+    );
     std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
 
@@ -916,4 +975,49 @@ fn render_row_parses_planned_and_schedule_cells() {
     assert_eq!(parsed[0].schedule_cell, "6h");
     assert_eq!(parsed[1].planned, "");
     assert_eq!(parsed[1].schedule_cell, "");
+}
+
+/// (25) edit --planned: колонки «Запланировано» на доске нет (сценарий без
+/// key-planned) — ensure минтит date-колонку (ветка add_attr_view_key).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_planned_mints_date_column_when_missing() {
+    let mut scenario = list_scenario();
+    scenario.boards[0].keys = vec![("key-title", "Первичный ключ"), ("key-status", "Status")];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: None,
+            planned: Some("2026-11-08 02:34".into()),
+        },
+    )
+    .await
+    .expect("edit --planned ok");
+
+    assert_eq!(
+        kernel.add_cols(),
+        vec![(
+            BOARD_AV.to_string(),
+            "Запланировано".to_string(),
+            "date".to_string()
+        )],
+        "минт отсутствующей колонки «Запланировано» типом date"
+    );
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!(
+        !writes[0].1.is_empty(),
+        "клетка пишется в ключ свежеминченной колонки"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }

@@ -1273,23 +1273,27 @@ pub(crate) fn format_local(unix_ms: u64) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
-/// Ран-карточка мастера: тайтл формата «⏰ <мастер> · <дата>» (runCardTitle
-/// демона) → (мастер, ts-хвост). Грамматику ts проверяет parse_planned при
-/// потреблении — здесь только структурный матч. pub(crate) для тестов.
-pub(crate) fn run_card_parts(title: &str) -> Option<(&str, &str)> {
+/// Ран-карточка мастера: тайтл «⏰ <мастер> · <дата>» (формат runCardTitle
+/// демона) → Some(мастер) — структурный матч для сопоставления рана с
+/// мастером. Хвост-дата не валидируется здесь: время файра берётся из
+/// planned-клетки рана (свойство строки — канон 20261108020718).
+pub(crate) fn run_card_owner(title: &str) -> Option<&str> {
     let rest = title.strip_prefix("⏰ ")?;
-    rest.rsplit_once(" · ")
+    let (owner, _tail) = rest.rsplit_once(" · ")?;
+    Some(owner)
 }
 
-/// Фактический last run мастера с доски: максимум «Запланировано» по его
-/// ран-карточкам (ран несёт фактический файр — createRunCard). Битые клетки
-/// ранов скипаются. None — ранов мастера на доске нет (фоллэк — state).
+/// Фактический last run мастера с доски: максимум «Запланировано» (planned_ms
+/// — date.content клетки, epoch ms) по его ран-карточкам — ран несёт
+/// фактический файр (createRunCard). Строки без клетки (planned_ms = 0)
+/// скипаются. None — ранов мастера на доске нет (фоллэк — state).
 pub(crate) fn last_run_from_board(master_title: &str, rows: &[SyTask]) -> Option<i64> {
     rows.iter()
-        .filter_map(|r| run_card_parts(&r.title))
-        .filter(|(owner, _)| owner.trim() == master_title.trim())
-        .filter_map(|(_, ts)| syt::parse_planned(ts).ok())
-        .map(|(ms, _)| ms)
+        .filter(|r| {
+            run_card_owner(&r.title).is_some_and(|owner| owner.trim() == master_title.trim())
+        })
+        .map(|r| r.planned_ms)
+        .filter(|ms| *ms > 0)
         .max()
 }
 
@@ -1366,14 +1370,37 @@ pub(crate) async fn cron_list(sy: &SiYuan, project: &str) -> Result<Vec<String>>
             "Крон-задач нет (расписание — task create/edit --schedule, статус Вейт).".to_string(),
         ]);
     }
+    // ширина колонки по факту: клетки в formattedContent ядра бывают шире
+    // заголовка (UI-локаль «11 ноября 2026 г. 01:30») — рвать таблицу на
+    // фиксированных {:<17} не надо
+    let planned_w = masters
+        .iter()
+        .map(|m| m.planned.chars().count())
+        .chain(["ЗАПЛАНИРОВАНО".chars().count()])
+        .max()
+        .unwrap_or_default()
+        + 1;
     let mut out = vec![format!(
-        "{:<10} {:<12} {:<28} {:<14} {:<13} {:<17} LAST RUN",
-        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE", "AGENT", "ЗАПЛАНИРОВАНО"
+        "{:<10} {:<12} {:<28} {:<14} {:<13} {:<plw$} LAST RUN",
+        "СТАТУС",
+        "СТРОКА",
+        "ЗАГОЛОВОК",
+        "SCHEDULE",
+        "AGENT",
+        "ЗАПЛАНИРОВАНО",
+        plw = planned_w,
     )];
     for m in masters {
         out.push(format!(
-            "{:<10} {:<12} {:<28} {:<14} {:<13} {:<17} {}",
-            m.status, m.row, m.title, m.schedule, m.agent, m.planned, m.last_run
+            "{:<10} {:<12} {:<28} {:<14} {:<13} {:<plw$} {}",
+            m.status,
+            m.row,
+            m.title,
+            m.schedule,
+            m.agent,
+            m.planned,
+            m.last_run,
+            plw = planned_w,
         ));
     }
     Ok(out)
@@ -4061,6 +4088,7 @@ mod tests {
             pr: String::new(),
             dev_session: String::new(),
             planned: String::new(),
+            planned_ms: 0,
             schedule_cell: String::new(),
             body_doc: Some(BOUND_DOC.into()),
         }
