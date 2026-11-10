@@ -1,19 +1,25 @@
 //! cron list на общем stateful wiremock-ядре (cmd::mock_kernel, дедуп
 //! мок-билдеров 20261107052603; кроны унифицированы с задачами —
 //! 20261106182051): инвентарь мастеров крон-задач — строки задачной доски
-//! с custom-schedule в доке-теле; last run/сессия из state демона
-//! (UWUWU_CRON_STATE_DIR песочница).
+//! с custom-schedule в доке-теле; last run — доска (факт файра в клетках
+//! ран-карточек мастера), state демона — фоллэк (UWUWU_CRON_STATE_DIR
+//! песочница).
 //!
 //! Сценарии:
 //! 1. Вейт-строка с расписанием в атрибутах → строка таблицы с last run из state
 //! 2. строки без атрибута расписания → в инвентарь не попадают
-//! 3. пустой state (нет файла) → last run пуст, инвентарь работает
+//! 3. пустой state (нет файла) → инвентарь работает
 //! 4. атрибут расписания отсутствует у всех → «Крон-задач нет»
 //! 5. сбои чтения атрибутов — громкая ошибка (инвентарь честный)
 //! 6. доска проекта не найдена — отказ с именем доски
-//! 7. формат last run: локальное «YYYY-MM-DD HH:MM» из unix-ms state
+//! 7. формат last run: локальное «YYYY-MM-DD HH:MM» из unix-ms
 //! 8. task edit --schedule "6h": грамматика валидирована, атрибут записан
 //! 9. task edit --schedule "": снятие без валидации грамматики
+//! 19. state демона — camelCase (sessionID/lastFiredAt, формат cron.ts) читается
+//! 20. run_card_owner: «⏰ <мастер> · <дата>» → мастер
+//! 21. last_run_from_board: максимум «Запланировано» по ранам мастера
+//! 22. last run мастера — из ран-карточек доски; колонка «Запланировано» видна
+//! 23. фоллэк: ранов на доске нет — last run из state демона (с сессией)
 
 use crate::cmd::cli::{CronSub, TaskSub};
 use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockRow, MockScenario};
@@ -33,7 +39,11 @@ fn list_scenario() -> MockScenario {
         boards: vec![MockBoard {
             doc_id: BOARD_DOC,
             av_id: BOARD_AV,
-            keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+            keys: vec![
+                ("key-title", "Первичный ключ"),
+                ("key-status", "Status"),
+                ("key-planned", "Запланировано"),
+            ],
         }],
         hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec![BOARD_DOC])],
         rows: vec![
@@ -294,6 +304,251 @@ fn state_dir_with(content: &str) -> tempfile::TempDir {
     dir
 }
 
+/// Таблица cron list: строка мастера по тайтлу (готовые строки — cron_list).
+fn master_line(lines: &[String], title: &str) -> String {
+    lines
+        .iter()
+        .find(|l| l.contains(title) && !l.contains("ЗАГОЛОВОК"))
+        .unwrap_or_else(|| panic!("строка мастера «{title}» в таблице: {lines:?}"))
+        .clone()
+}
+
+// ——— last run из клеток доски, state — фоллэк (20261110044120-ngfixkj) ———
+
+/// (19) state демона — camelCase-ключи (sessionID/lastFiredAt, формат cron.ts):
+/// поля читаются; битый JSON — пусто без паники. Прежний snake_case-парсинг
+/// молча давал нули — LAST RUN пуст всегда (баг 20261110044120).
+#[test]
+fn parse_state_reads_camelcase_tracked_fields() {
+    let st = crate::cmd::sy_dispatch::parse_state(
+        r#"{ "crons": { "row-1": { "sessionID": "ses_abc123def", "lastFiredAt": 1762498200000, "firedAtIso": "2026-11-07T09:30:00+09:00" } } }"#,
+    );
+    let t = st.crons.get("row-1").expect("запись мастера прочитана");
+    assert_eq!(t.last_fired_at, 1762498200000, "lastFiredAt прочитан");
+    assert_eq!(t.session_id, "ses_abc123def", "sessionID прочитан");
+    let empty = crate::cmd::sy_dispatch::parse_state("мусор, не json");
+    assert!(empty.crons.is_empty(), "битый state — пусто, не паника");
+}
+
+/// (20) run_card_owner: тайтл ран-карточки «⏰ <мастер> · <дата>» (runCardTitle
+/// демона) матчится в мастера; чужие тайтлы — None.
+#[test]
+fn run_card_owner_extracts_master_from_run_title() {
+    use crate::cmd::sy_dispatch::run_card_owner;
+    assert_eq!(
+        run_card_owner("⏰ stable-ватчер SiYuan · 2026-11-10 07:36:21"),
+        Some("stable-ватчер SiYuan")
+    );
+    assert_eq!(
+        run_card_owner("⏰ Lead: ночной аудит uwuwu · 2026-11-10 03:30"),
+        Some("Lead: ночной аудит uwuwu")
+    );
+    assert!(run_card_owner("обычная задача").is_none(), "не ран");
+    assert!(
+        run_card_owner("⏰ пометка без разделителя").is_none(),
+        "нет хвоста"
+    );
+}
+
+/// (21) last_run_from_board: максимум «Запланировано» (planned_ms —
+/// date.content клетки, epoch ms) по ран-карточкам мастера — свойство
+/// строки (канон 20261108020718); чужие раны и строки без клетки (ms = 0)
+/// не учитываются.
+#[test]
+fn last_run_from_board_takes_latest_run_card_of_master() {
+    use crate::cmd::sy_dispatch::last_run_from_board;
+    let expected = crate::siyuan_task::parse_planned("2026-11-09 10:00")
+        .unwrap()
+        .0;
+    let mut rows = vec![
+        run_row("⏰ мастер · 2026-11-08 02:34:21", "2026-11-08 02:34"),
+        run_row("⏰ мастер · 2026-11-09 10:00:00", "2026-11-09 10:00"),
+        run_row("⏰ другой мастер · 2026-11-10 23:00:00", "2026-11-10 23:00"),
+        run_row("⏰ мастер · пустая клетка", ""),
+    ];
+    rows[0].planned_ms = expected - 86_400_000;
+    rows[1].planned_ms = expected;
+    rows[2].planned_ms = expected + 86_400_000; // чужой ран, свежее всех
+    let ms = last_run_from_board("мастер", &rows).expect("файр мастера найден");
+    assert_eq!(
+        ms, expected,
+        "свежий ран мастера, чужой ран и строка без клетки не учитаны"
+    );
+    assert!(
+        last_run_from_board("мастер без ранов", &rows).is_none(),
+        "ранов нет — None (фоллэк: state)"
+    );
+}
+
+/// Ран-карточка для юнит-тестов: тайтл + planned-клетка.
+fn run_row(title: &str, planned: &str) -> crate::siyuan_task::SyTask {
+    crate::siyuan_task::SyTask {
+        item_id: title.chars().take(8).collect(),
+        title: title.to_string(),
+        status: "Done".to_string(),
+        task_type: String::new(),
+        branch: String::new(),
+        pr: String::new(),
+        dev_session: String::new(),
+        planned: planned.to_string(),
+        planned_ms: 0,
+        schedule_cell: String::new(),
+        body_doc: None,
+    }
+}
+
+/// (22) LAST RUN мастера — из ран-карточек доски (единый источник, state
+/// пуст): свежий ран мастера, чужие раны игнорируются; колонка
+/// «Запланировано» (next-fire мастера) отображается в таблице.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_last_run_comes_from_run_cards_and_shows_planned_column() {
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
+    // мастер с next-fire клеткой; раны без привязки тела (мок-доска)
+    scenario.rows[0] = MockRow::new("20261107090000-master1", "stable-ватчер SiYuan")
+        .with_status("Вейт")
+        .with_doc(MASTER_DOC)
+        .with_planned("2026-11-11 05:00");
+    scenario.rows.push(
+        MockRow::new(
+            "20261110013900-run1",
+            "⏰ stable-ватчер SiYuan · 2026-11-08 02:34:21",
+        )
+        .with_status("Done")
+        .with_planned("2026-11-08 02:34"),
+    );
+    scenario.rows.push(
+        MockRow::new(
+            "20261110033000-run2",
+            "⏰ stable-ватчер SiYuan · 2026-11-09 10:00:00",
+        )
+        .with_status("Done")
+        .with_planned("2026-11-09 10:00"),
+    );
+    scenario.rows.push(
+        MockRow::new(
+            "20261110050000-run3",
+            "⏰ другой мастер · 2026-11-10 23:00:00",
+        )
+        .with_status("Done")
+        .with_planned("2026-11-10 23:00"),
+    );
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let _state = state_dir_with("{}");
+
+    let sy = crate::siyuan::SiYuan::from_env().expect("мок-ядро");
+    let lines = crate::cmd::sy_dispatch::cron_list(&sy, "uwuwu")
+        .await
+        .expect("инвентарь собран");
+    let line = master_line(&lines, "stable-ватчер SiYuan");
+    assert!(
+        line.contains("2026-11-09 10:00"),
+        "LAST RUN — свежий ран мастера: {line}"
+    );
+    assert!(
+        !line.contains("2026-11-10 23:00"),
+        "чужой ран не в LAST RUN: {line}"
+    );
+    assert!(
+        line.contains("2026-11-11 05:00"),
+        "колонка «Запланировано» (next-fire): {line}"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (23) Фоллэк: ранов мастера на доске нет (почищены) — LAST RUN из state
+/// демона (camelCase), с хвостом сессии; контракт «state пер-машинный»
+/// сохранён.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_falls_back_to_state_last_run_when_no_run_cards() {
+    use chrono::TimeZone;
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
+    scenario.rows[0] = MockRow::new("20261107090000-master1", "stable-ватчер SiYuan")
+        .with_status("Вейт")
+        .with_doc(MASTER_DOC)
+        .with_planned("2026-11-11 05:00");
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    let fired = chrono::Local
+        .with_ymd_and_hms(2026, 11, 7, 9, 30, 0)
+        .single()
+        .expect("валидная локальная дата")
+        .timestamp_millis() as u64;
+    let _state = state_dir_with(&format!(
+        r#"{{ "crons": {{ "20261107090000-master1": {{ "sessionID": "ses_abc123def", "lastFiredAt": {fired} }} }} }}"#
+    ));
+
+    let sy = crate::siyuan::SiYuan::from_env().expect("мок-ядро");
+    let lines = crate::cmd::sy_dispatch::cron_list(&sy, "uwuwu")
+        .await
+        .expect("инвентарь собран");
+    let line = master_line(&lines, "stable-ватчер SiYuan");
+    assert!(
+        line.contains("2026-11-07 09:30"),
+        "LAST RUN из state-фоллэка: {line}"
+    );
+    assert!(line.contains("ses_abc123"), "хвост сессии из state: {line}");
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
+/// (24) Приоритет доски при обоих источниках: раны мастера на доске + непустой
+/// state (даже новее ранов — файл пер-машинный, мог отстать) → LAST RUN из
+/// ран-карточек, state не подмешивается (нет хвоста сессии).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_board_run_cards_win_over_state_when_both_present() {
+    use chrono::TimeZone;
+    let mut scenario = list_scenario();
+    scenario.block_attrs = vec![(
+        MASTER_DOC,
+        vec![("custom-schedule".to_string(), "6h".to_string())],
+    )];
+    scenario.rows.push(
+        MockRow::new(
+            "20261110013900-run1",
+            "⏰ stable-ватчер SiYuan · 2026-11-08 02:34:21",
+        )
+        .with_status("Done")
+        .with_planned("2026-11-08 02:34"),
+    );
+    let (_kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+    // state «свежее» ранов: если бы источник путался, LAST RUN взял бы его
+    let fired = chrono::Local
+        .with_ymd_and_hms(2026, 11, 10, 23, 59, 0)
+        .single()
+        .expect("валидная локальная дата")
+        .timestamp_millis() as u64;
+    let _state = state_dir_with(&format!(
+        r#"{{ "crons": {{ "20261107090000-master1": {{ "sessionID": "ses_abc123def", "lastFiredAt": {fired} }} }} }}"#
+    ));
+
+    let sy = crate::siyuan::SiYuan::from_env().expect("мок-ядро");
+    let lines = crate::cmd::sy_dispatch::cron_list(&sy, "uwuwu")
+        .await
+        .expect("инвентарь собран");
+    let line = master_line(&lines, "stable-ватчер SiYuan");
+    assert!(
+        line.contains("2026-11-08 02:34"),
+        "LAST RUN из ранов доски, state новее: {line}"
+    );
+    assert!(
+        !line.contains("ses_"),
+        "state-хвост сессии не подмешан при живых ранах: {line}"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
+}
+
 // ——— planned: колонка «Запланировано» (date-клетка) ———
 
 /// (11) parse_planned: оба формата, formatted — минутная точность.
@@ -354,21 +609,18 @@ async fn edit_planned_writes_date_cell() {
     .await
     .expect("edit --planned ok");
 
-    // доска сценария без колонки: ensure заминтил date-колонку
-    assert_eq!(
-        kernel.add_cols(),
-        vec![(
-            BOARD_AV.to_string(),
-            "Запланировано".to_string(),
-            "date".to_string()
-        )],
-        "минт колонки «Запланировано» типом date"
+    // колонка «Запланировано» есть в сценарии (реальная доска после PR #163) —
+    // ensure её не минтит, клетка пишется в существующий ключ
+    assert!(
+        kernel.add_cols().is_empty(),
+        "существующая колонка не минтится: {:?}",
+        kernel.add_cols()
     );
     let writes = kernel.item_updates();
     assert_eq!(writes.len(), 1, "ровно одна запись клетки: {writes:?}");
     let (av, key, item, value) = &writes[0];
     assert_eq!(av, BOARD_AV);
-    assert!(!key.is_empty(), "ключ заминченной колонки");
+    assert_eq!(key, "key-planned", "ключ существующей колонки");
     assert_eq!(item, "20261107090000-plain2");
     let date = value.get("date").expect("date-шейп значения");
     assert!(date.get("content").and_then(|c| c.as_i64()).unwrap() > 0);
@@ -723,4 +975,49 @@ fn render_row_parses_planned_and_schedule_cells() {
     assert_eq!(parsed[0].schedule_cell, "6h");
     assert_eq!(parsed[1].planned, "");
     assert_eq!(parsed[1].schedule_cell, "");
+}
+
+/// (25) edit --planned: колонки «Запланировано» на доске нет (сценарий без
+/// key-planned) — ensure минтит date-колонку (ветка add_attr_view_key).
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_planned_mints_date_column_when_missing() {
+    let mut scenario = list_scenario();
+    scenario.boards[0].keys = vec![("key-title", "Первичный ключ"), ("key-status", "Status")];
+    let (kernel, server) = MockKernel::start(scenario).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "20261107090000-plain2".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            schedule: None,
+            agent: None,
+            planned: Some("2026-11-08 02:34".into()),
+        },
+    )
+    .await
+    .expect("edit --planned ok");
+
+    assert_eq!(
+        kernel.add_cols(),
+        vec![(
+            BOARD_AV.to_string(),
+            "Запланировано".to_string(),
+            "date".to_string()
+        )],
+        "минт отсутствующей колонки «Запланировано» типом date"
+    );
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!(
+        !writes[0].1.is_empty(),
+        "клетка пишется в ключ свежеминченной колонки"
+    );
+    std::env::remove_var("UWUWU_CRON_STATE_DIR");
 }
