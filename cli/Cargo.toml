@@ -13,7 +13,9 @@ name = "uwuwu_cli"
 path = "src/lib.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+# ANSI-цвета выключены глобально (default-features выключены ради фичи color): cli используется только агентами
+# (задача 20261110104429-ml41jc8) — help/ошибки монохромны и в TTY, и в пайпе.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", features = ["json", "cookies", "multipart"] }
