@@ -445,6 +445,22 @@ export function decideFire(status: "idle" | "running" | "gone"): "prompt" | "ste
   }
 }
 
+/** Дрейф агента живой вечной сессии против custom-agent мастера (эпизод
+ *  09.11: агент вшит при createAgentSession, смена карточки сессию не
+ *  обновляет — первый файр POST-ится 200, ход умирает «Agent not found»,
+ *  ретрая нет). idle → recreate (gone-путь с честным логом), running →
+ *  defer (живой ход не рвём — пересоздание на следующем файре, умерший
+ *  ход читается как idle и ловится там же). agent null (сбой чтения/не
+ *  отдал сервер) или совпадение — null: ложных recreate нет. */
+export function agentDriftAction(
+  status: "idle" | "running",
+  sessionAgent: string | null,
+  masterAgent: string,
+): "recreate" | "defer" | null {
+  if (sessionAgent === null || sessionAgent === masterAgent) return null
+  return status === "idle" ? "recreate" : "defer"
+}
+
 /** Причина отказа файра вечного мастера; null — деф на месте. */
 export function resolveAgentIssue(agent: string, defExists: boolean): string | null {
   if (agent === "") return "custom-agent пуст"

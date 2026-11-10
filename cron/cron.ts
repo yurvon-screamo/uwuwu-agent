@@ -21,7 +21,7 @@ import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotic
 import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
-  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
+  stripNonContent, decideFire, agentDriftAction, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
@@ -310,17 +310,22 @@ async function sessionAlive(sessionID: string): Promise<boolean | null> {
 /** Статус вечной сессии против границы последнего приземления промпта:
  *  ход, начатый по idle-сессии, отдаёт стухшие outcome/idle до завершения
  *  (эмпирика hub sessionStatus) — граница решает. Сбой сети — running:
- *  стирт в живую сессию безопасен, POST в мёртвую вернётся pendingRun'ом. */
-async function sessionStatus(sessionID: string, boundaryMs: number): Promise<"idle" | "running" | "gone"> {
+ *  стирт в живую сессию безопасен, POST в мёртвую вернётся pendingRun'ом.
+ *  agent — вшитый при createAgentSession агент сессии (Agent.ID, живая
+ *  проба 10.11): сверка с custom-agent мастера ловит смену карточки
+ *  (эпизод 09.11); null — сервер не отдал поле/сбой — дрейф не засчитывать. */
+async function sessionStatus(
+  sessionID: string, boundaryMs: number,
+): Promise<{ status: "idle" | "running" | "gone"; agent: string | null }> {
   try {
-    const s = await restCall(`/session/${sessionID}`) as { outcome?: unknown; time?: { idle?: unknown } }
+    const s = await restCall(`/session/${sessionID}`) as { outcome?: unknown; time?: { idle?: unknown }; agent?: unknown }
     const idle = s.time?.idle
-    if (s.outcome !== undefined && typeof idle === "number" && idle >= boundaryMs) return "idle"
-    return "running"
+    const status = s.outcome !== undefined && typeof idle === "number" && idle >= boundaryMs ? "idle" : "running"
+    return { status, agent: typeof s.agent === "string" ? s.agent : null }
   } catch (e) {
     const status = (e as { status?: number }).status
-    if (status === 404 || status === 400) return "gone"
-    return "running"
+    if (status === 404 || status === 400) return { status: "gone", agent: null }
+    return { status: "running", agent: null } // неизвестно — не блокируем
   }
 }
 
@@ -396,6 +401,29 @@ function agentDefOf(agent: string): { exists: boolean; model: AgentModel | null 
   } catch {
     return { exists: true, model: null }
   }
+}
+
+/** Пересоздание вечной сессии мастера под текущий custom-agent: новая
+ *  сессия + DELETE старой (note ≠ null — сессия была жива: сироту в
+ *  opencode не оставляем; note null — gone-путь, старая уже мертва).
+ *  null — не поднялась (state вызывающий не трогает — ретрай следующим
+ *  тиком). */
+async function recreateAgentSession(
+  oldSessionID: string, agent: string, masterTitle: string, model: AgentModel | null, note: string | null,
+): Promise<string | null> {
+  const created = await createAgentSession(agent, masterTitle, model)
+  if (created === null) {
+    log(`мастер «${masterTitle}»: вечная сессия не поднялась — ретрай следующим тиком`)
+    return null
+  }
+  if (oldSessionID === "") return created // первосоздание — старой нет
+  if (note === null) {
+    log(`мастер «${masterTitle}»: сессия ${oldSessionID} пропала — пересоздана ${created} (контекст потерян)`)
+  } else {
+    await restCall(`/session/${oldSessionID}`, { method: "DELETE" }).catch(() => {})
+    log(`мастер «${masterTitle}»: ${note} — сессия ${oldSessionID} пересоздана как ${created} (контекст сброшен)`)
+  }
+  return created
 }
 
 // ——— тик ———
@@ -535,7 +563,8 @@ async function refuseOnce(state: CronState, row: CronRow, reason: string): Promi
  *  (runLandedAt): приземлившаяся копия конверта с любым текстом (ручной
  *  стирт-ретрай оператора) признаётся. Приземлился — файр завершён
  *  (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
- *  дропается, следующий файр начнётся заново. */
+ *  дропается, следующий файр начнётся заново; дрейф агента — recreate под
+ *  нового агента с доставкой ИСХОДНОГО конверта (ран не дублируется). */
 async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: CronRow, masterTitle: string): Promise<void> {
   const pending = tracked.pendingRun
   if (pending === undefined) return
@@ -545,12 +574,37 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
     saveState(state)
     return
   }
-  const alive = await sessionAlive(tracked.sessionID)
-  if (alive === false) {
+  const probe = await sessionStatus(tracked.sessionID, pending.attemptAt)
+  if (probe.status === "gone") {
     log(`мастер «${masterTitle}»: сессия ${tracked.sessionID} пропала — pendingRun дроп, контекст файра утерян`)
     state.crons[row.rowId] = { sessionID: "", lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso }
     saveState(state)
     return
+  }
+  const drift = agentDriftAction(probe.status, probe.agent, row.agent)
+  let action = decideFire(probe.status)
+  if (drift === "recreate") {
+    // агент карточки сменён при файре в полёте (эпизод 09.11): POST в старую
+    // сессию умирает тихо «Agent not found». Пересоздание под нового агента:
+    // свежий контекст пуст — дедуп приземления ниже безопасен, исходный
+    // конверт доставляется в новую сессию, ран не дублируется
+    const def = agentDefOf(row.agent)
+    const issue = resolveAgentIssue(row.agent, def.exists)
+    if (issue !== null) {
+      log(`мастер «${masterTitle}»: ${issue}`)
+      await refuseOnce(state, row, issue)
+      return
+    }
+    const created = await recreateAgentSession(
+      tracked.sessionID, row.agent, masterTitle, def.model,
+      `агент сменён (${probe.agent} → ${row.agent})`,
+    )
+    if (created === null) return // state не тронут — ретрай пересоздания следующим тиком
+    tracked.sessionID = created // tracked — живая ссылка state.crons[row.rowId]
+    saveState(state)
+    action = "prompt" // свежая сессия пуста — обычный POST, не стирт
+  } else if (drift === "defer") {
+    log(`мастер «${masterTitle}»: агент сменён (${probe.agent} → ${row.agent}) на живом ходе — ход не рвём, пересоздание на следующем файре`)
   }
   let msgs = await sessionMessages(tracked.sessionID).catch((e: unknown) => {
     log(`мастер «${masterTitle}»: сообщения не достали (${String(e)}) — дедуп по inbox`)
@@ -565,13 +619,6 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
   if (landed !== null) {
     log(`мастер «${masterTitle}»: промпт файра приземлился ранее (${landed}) — ретрай не нужен (ран ${pending.rowId})`)
     state.crons[row.rowId] = { sessionID: tracked.sessionID, lastFiredAt: landed, firedAtIso: new Date(landed).toISOString() }
-    saveState(state)
-    return
-  }
-  const action = decideFire(await sessionStatus(tracked.sessionID, pending.attemptAt))
-  if (action === "recreate") {
-    log(`мастер «${masterTitle}»: сессия пропала посреди ретрая — pendingRun дроп`)
-    state.crons[row.rowId] = { sessionID: "", lastFiredAt: tracked.lastFiredAt, firedAtIso: tracked.firedAtIso }
     saveState(state)
     return
   }
@@ -631,8 +678,11 @@ async function maybeCompactEternal(state: CronState, row: CronRow, tracked: Trac
 
 /** Файр вечного мастера: ран-карточка — как у изолированного контура, промпт
  *  уходит в ОДНУ сессию мастера (custom-agent): idle → ход, running → стирт,
- *  gone → пересоздание (контекст потерян — честный лог). Неподтверждённый
- *  POST — pendingRun (ретрай следующим тиком, ран не дублируется). */
+ *  gone → пересоздание (контекст потерян — честный лог). Дрейф агента
+ *  (смена custom-agent карточки при живой сессии, эпизод 09.11): idle →
+ *  recreate под нового агента, running → ход не рвём (пересоздание на
+ *  следующем файре). Неподтверждённый POST — pendingRun (ретрай следующим
+ *  тиком, ран не дублируется). */
 async function fireAgentMaster(state: CronState, input: {
   project: string
   row: CronRow
@@ -670,20 +720,23 @@ async function fireAgentMaster(state: CronState, input: {
   }
   const prompt = agentFirePrompt({ title: row.title, schedule: row.schedule }, body, runRowId, project)
   const tracked = state.crons[row.rowId] ?? { sessionID: "", lastFiredAt: 0, firedAtIso: "" }
-  const action = decideFire(
-    tracked.sessionID === "" ? "gone" : await sessionStatus(tracked.sessionID, tracked.lastFiredAt),
-  )
+  const probe = tracked.sessionID === ""
+    ? { status: "gone" as const, agent: null }
+    : await sessionStatus(tracked.sessionID, tracked.lastFiredAt)
+  const { status, agent: liveAgent } = probe
+  const drift = status === "gone" ? null : agentDriftAction(status, liveAgent, row.agent)
+  if (drift === "defer") {
+    log(`мастер «${masterTitle}»: агент сменён (${liveAgent} → ${row.agent}) на живом ходе — ход не рвём, пересоздание на следующем файре`)
+  }
+  const action = drift === "recreate" ? "recreate" : decideFire(status)
   let sessionID = tracked.sessionID
   if (action === "recreate") {
-    const created = await createAgentSession(row.agent, masterTitle, def.model)
-    if (created === null) {
-      log(`мастер «${masterTitle}»: вечная сессия не поднялась — ретрай следующим тиком`)
-      return
-    }
+    const created = await recreateAgentSession(
+      tracked.sessionID, row.agent, masterTitle, def.model,
+      drift === "recreate" ? `агент сменён (${liveAgent} → ${row.agent})` : null,
+    )
+    if (created === null) return
     sessionID = created
-    if (tracked.sessionID !== "") {
-      log(`мастер «${masterTitle}»: сессия ${tracked.sessionID} пропала — пересоздана ${created} (контекст потерян)`)
-    }
   }
   const landedMs = await promptPost(sessionID, prompt, action === "steer")
   if (landedMs === null) {
