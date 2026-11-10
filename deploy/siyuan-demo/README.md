@@ -57,8 +57,10 @@ siyuan-demo за часы, форензика смертей процесса я
 (mount-namespace + системный `journald@.service`), файл-драйвер
 (`LogDriver=k8s-file`) дороже и лечит только этот юнит — выбран подъём
 лимита дроп-ином в `/etc` (артефакт — `journald-retention.conf` в этой
-папке): юнит не меняется, `journalctl -u siyuan-demo` и `podman logs` живут
-как были, system-журнал оздоравливается тем же ходом.
+папке): юнит не меняется, `journalctl --user -u siyuan-demo.service` и
+`podman logs` живут как были (форма без `--user` для user-квадлета читает
+системный журнал и отдаёт «No entries»), system-журнал оздоравливается тем
+же ходом.
 
 Установка (нужна рука с sudo, затем без пароля):
 
