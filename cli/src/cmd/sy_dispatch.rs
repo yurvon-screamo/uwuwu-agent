@@ -70,7 +70,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
     if let TaskSub::Create {
-        title: _,
+        title,
         r#type: ty,
         stdin,
         attach,
@@ -102,7 +102,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
-        println!("{}", syt::body_template(&ty, &ctx));
+        println!("{}", syt::create_body_md(&title, &ty, &ctx));
         return Ok(());
     }
     // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,

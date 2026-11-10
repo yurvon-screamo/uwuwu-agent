@@ -31,6 +31,9 @@ export interface TrackedCron {
    *  steerLandedAt) — дубль-инструкция в вечный контекст не доезжает.
    *  Дропится при пересоздании сессии (файр начнётся заново). */
   pendingRun?: { rowId: string; prompt: string; attemptAt: number }
+  /** ms последней admission-попытки автокомпакта вечной сессии (пишется ДО
+   *  POST — коулдаун против повторного admission переживает рестарт). */
+  lastCompactAt?: number
 }
 
 export interface CronState {
@@ -267,6 +270,7 @@ export function isValidTracked(v: unknown): v is TrackedCron {
     typeof t.lastFiredAt === "number" &&
     (t.firedAtIso === undefined || typeof t.firedAtIso === "string") &&
     (t.lastRefusal === undefined || typeof t.lastRefusal === "string") &&
+    (t.lastCompactAt === undefined || (typeof t.lastCompactAt === "number" && t.lastCompactAt >= 0)) &&
     pendingOk
   )
 }
@@ -510,6 +514,25 @@ export function promptLandedAt(msgs: SessionMsg[], sinceMs: number, prompt: stri
     if (at < sinceMs) continue
     const body = msgText(m)
     if (body !== needle && !body.startsWith(prefix)) continue
+    if (found === null || at < found) found = at
+  }
+  return found
+}
+
+/** Приземлился ли конверт рана: user-сообщение новее границы с вхождением
+ *  runRowId → его time.created; иначе null. Сигнатура вместо полного текста
+ *  (promptLandedAt): rowId вшит в конверт шаблоном agentFirePrompt и стабилен
+ *  между попытками доставки — ручная копия с разошедшимся текстом (другое
+ *  расписание, frontmatter) тем же дедупом признаётся, дубль-инструкция в
+ *  вечный контекст не доезжает (ADR-075). rowId уникален (timestamp+random),
+ *  случайное вхождение в чужой текст нечужно. */
+export function runLandedAt(msgs: SessionMsg[], sinceMs: number, runRowId: string): number | null {
+  let found: number | null = null
+  for (const m of msgs) {
+    if (m.type !== "user") continue
+    const at = m.time?.created ?? 0
+    if (at < sinceMs) continue
+    if (!msgText(m).includes(runRowId)) continue
     if (found === null || at < found) found = at
   }
   return found

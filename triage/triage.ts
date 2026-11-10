@@ -319,6 +319,9 @@ const profile: HubProfile = {
   onFinal: triageFinalHook,
   validateState: validTriageExtras,
   silenceTimeoutMs: TRIAGE_SILENCE_TIMEOUT_MS,
+  // автокомпакт вечной сессии — пороги из постановки владельца (задача
+  // 20261105153731-s6e27f6): 4ч неактивности при контексте ≥40%
+  compact: { idleMs: 4 * 3_600_000, minContextPct: 40, cooldownMs: 3_600_000 },
 }
 
 const hub = createHub(profile)

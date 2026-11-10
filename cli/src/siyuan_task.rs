@@ -758,6 +758,20 @@ pub fn legacy_body_template(title: &str, ty: &str) -> String {
     }
 }
 
+/// Итоговое тело create: непустой контент — тело целиком как есть
+/// (семантика «передал контент — тело твоё», 20261109101129); титульный H1
+/// стрипается паритетом с task body — createDocWithMd оставил бы его
+/// heading-блоком, дубль к заголовку дока (20261106071828). Пустой (по trim)
+/// контент — типовой скелет по типу. Dry-run печатает ту же сборку:
+/// сухой прогон = ровно то, что будет записано.
+pub fn create_body_md(title: &str, ty: &str, ctx: &str) -> String {
+    if ctx.trim().is_empty() {
+        body_template(ty, "")
+    } else {
+        crate::markdown::strip_title_h1(ctx, title)
+    }
+}
+
 /// Создание задачи: строка Draft + тело-саб-док (идемпотентно по заголовку).
 pub async fn create(
     sy: &SiYuan,
@@ -785,7 +799,7 @@ pub(crate) async fn create_with_pacing(
         &board,
         title,
         "Draft",
-        &body_template(ty, ctx),
+        &create_body_md(title, ty, ctx),
         Some(ty),
         pacing,
     )
@@ -2253,6 +2267,37 @@ mod tests {
         assert_eq!(
             sections(&body_template("other", "")),
             sections(&body_template("dev", ""))
+        );
+    }
+
+    /// Контракт create (20261109101129): непустой контент — тело как есть
+    /// (титульный H1 стрипается, чужой остаётся), whitespace-only и пустой —
+    /// типовой скелет. Точка истины и для dry-run (сухой прогон = запись).
+    #[test]
+    fn create_body_md_content_replaces_skeleton_and_strips_title_h1() {
+        let content = "## Постановка\n\nсвоё тело\n";
+        assert_eq!(create_body_md("таск", "dev", content), content);
+
+        let with_title = "# таск\n\n## Постановка\n\nтело\n";
+        assert_eq!(
+            create_body_md("таск", "dev", with_title),
+            "\n## Постановка\n\nтело\n",
+            "титульный H1 стрипается паритетом с task body"
+        );
+
+        assert_eq!(
+            create_body_md("таск", "dev", "   \n\n  "),
+            body_template("dev", ""),
+            "whitespace-only = пустой: скелет"
+        );
+        assert_eq!(
+            create_body_md("таск", "dev", ""),
+            body_template("dev", ""),
+            "пустой контент — скелет (регресс)"
+        );
+        assert!(
+            create_body_md("таск", "spike", "").contains("## Контекст"),
+            "скелет по типу (spike-костяк)"
         );
     }
 
