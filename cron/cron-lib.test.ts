@@ -7,6 +7,7 @@ import {
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
   decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
+  agentDriftAction,
 } from "./cron-lib"
 
 /** Парс с громким сбоем вместо non-null assertion: расписание в тестах
@@ -397,6 +398,23 @@ describe("decideFire: решение по статусу вечной сесси
     expect(decideFire("idle")).toBe("prompt")
     expect(decideFire("running")).toBe("steer")
     expect(decideFire("gone")).toBe("recreate")
+  })
+})
+
+describe("agentDriftAction: расхождение агента сессии и custom-agent мастера", () => {
+  test("idle + смена агента → recreate (эпизод 09.11: тихий Agent not found без ретрая)", () => {
+    expect(agentDriftAction("idle", "lead", "triage")).toBe("recreate")
+  })
+  test("running + смена агента → defer (живой ход не рвём)", () => {
+    expect(agentDriftAction("running", "lead", "triage")).toBe("defer")
+  })
+  test("агент совпадает → бездействие (регресс: штатные файры без recreate)", () => {
+    expect(agentDriftAction("idle", "triage", "triage")).toBeNull()
+    expect(agentDriftAction("running", "triage", "triage")).toBeNull()
+  })
+  test("агент сессии неизвестен (сбой чтения) → бездействие (ложных recreate нет)", () => {
+    expect(agentDriftAction("idle", null, "triage")).toBeNull()
+    expect(agentDriftAction("running", null, "triage")).toBeNull()
   })
 })
 
