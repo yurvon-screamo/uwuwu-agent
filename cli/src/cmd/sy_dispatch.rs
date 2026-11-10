@@ -15,6 +15,7 @@ use crate::siyuan::{FileFetch, SiYuan};
 use crate::siyuan_guard as guard;
 use crate::siyuan_guard::{Journal, JournalRow, Probe, Verdict};
 use crate::siyuan_task as syt;
+use crate::siyuan_task::SyTask;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -1193,24 +1194,36 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
 pub(crate) async fn cron_run(command: CronSub) -> Result<()> {
     let sy = SiYuan::from_env()?;
     let CronSub::List { project } = command;
-    cron_list(&sy, project.as_deref().unwrap_or("uwuwu")).await
+    for line in cron_list(&sy, project.as_deref().unwrap_or("uwuwu")).await? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// State демона uwuwu-cron: пер-машинский файл (~/.local/state/uwuwu-cron,
 /// песочница двигает UWUWU_CRON_STATE_DIR). Отсутствует/бит — пусто: инвентарь
-/// живёт на доске, state только дополняет last run/сессией.
+/// живёт на доске, state — только фоллэк last run (ранов на доске нет).
 #[derive(serde::Deserialize, Default)]
-struct CronStateFile {
+pub(crate) struct CronStateFile {
     #[serde(default)]
-    crons: std::collections::HashMap<String, TrackedCronEntry>,
+    pub(crate) crons: std::collections::HashMap<String, TrackedCronEntry>,
 }
 
-#[derive(serde::Deserialize)]
-struct TrackedCronEntry {
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    last_fired_at: u64,
+/// Запись трекинга демона (формат cron.ts, camelCase: sessionID/lastFiredAt).
+/// rename обязателен: дефолтный snake_case молча давал нули — LAST RUN
+/// пуст при живых файрах (баг 20261110044120).
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct TrackedCronEntry {
+    #[serde(default, rename = "sessionID")]
+    pub(crate) session_id: String,
+    #[serde(default, rename = "lastFiredAt")]
+    pub(crate) last_fired_at: u64,
+}
+
+/// Разбор state.json; битый/чужой JSON — пусто (read-only инвентарь не должен
+/// падать на state демона). pub(crate) для тестов cron list.
+pub(crate) fn parse_state(raw: &str) -> CronStateFile {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn read_cron_state() -> CronStateFile {
@@ -1246,8 +1259,7 @@ fn read_cron_state() -> CronStateFile {
 }
 
 fn read_state_file(path: std::path::PathBuf) -> Result<CronStateFile> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    Ok(parse_state(&std::fs::read_to_string(path)?))
 }
 
 /// Локальное время «YYYY-MM-DD HH:MM» из unix-ms — формат ячейки Last Run
@@ -1261,13 +1273,47 @@ pub(crate) fn format_local(unix_ms: u64) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
+/// Ран-карточка мастера: тайтл формата «⏰ <мастер> · <дата>» (runCardTitle
+/// демона) → (мастер, ts-хвост). Грамматику ts проверяет parse_planned при
+/// потреблении — здесь только структурный матч. pub(crate) для тестов.
+pub(crate) fn run_card_parts(title: &str) -> Option<(&str, &str)> {
+    let rest = title.strip_prefix("⏰ ")?;
+    rest.rsplit_once(" · ")
+}
+
+/// Фактический last run мастера с доски: максимум «Запланировано» по его
+/// ран-карточкам (ран несёт фактический файр — createRunCard). Битые клетки
+/// ранов скипаются. None — ранов мастера на доске нет (фоллэк — state).
+pub(crate) fn last_run_from_board(master_title: &str, rows: &[SyTask]) -> Option<i64> {
+    rows.iter()
+        .filter_map(|r| run_card_parts(&r.title))
+        .filter(|(owner, _)| owner.trim() == master_title.trim())
+        .filter_map(|(_, ts)| syt::parse_planned(ts).ok())
+        .map(|(ms, _)| ms)
+        .max()
+}
+
+/// Строка инвентаря мастеров (поля таблицы cron list).
+struct CronMasterRow {
+    status: String,
+    row: String,
+    title: String,
+    schedule: String,
+    agent: String,
+    planned: String,
+    last_run: String,
+}
+
 /// Инвентарь мастеров крон-задач доски проекта: строки с custom-schedule
-/// в доке-теле. Скедул — атрибут, last run/сессия — state демона.
-async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
+/// в доке-теле. Скедул — атрибут; last run — доска (факт файра в клетках
+/// ран-карточек мастера), state демона — фоллэк; «Запланировано» — клетка
+/// мастера (next-fire). Возвращает готовые строки таблицы — pub(crate)
+/// для тестов (содержимое таблицы проверяется, не только отсутствие отказа).
+pub(crate) async fn cron_list(sy: &SiYuan, project: &str) -> Result<Vec<String>> {
     let board = syt::find_board(sy, project).await?;
     let rows = syt::read_rows(sy, &board).await?;
     let state = read_cron_state();
-    let mut masters: Vec<(String, String, String, String, String, String)> = Vec::new();
+    let mut masters: Vec<CronMasterRow> = Vec::new();
     for r in &rows {
         let Some(doc) = r.body_doc.as_deref() else {
             continue;
@@ -1289,43 +1335,48 @@ async fn cron_list(sy: &SiYuan, project: &str) -> Result<()> {
             continue;
         };
         let agent = syt::agent_inventory_cell(&attrs);
-        let last_run = state
-            .crons
-            .get(&r.item_id)
-            .filter(|t| t.last_fired_at > 0)
-            .map(|t| {
-                let session = if t.session_id.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", &t.session_id[..t.session_id.len().min(10)])
-                };
-                format!("{}{}", format_local(t.last_fired_at), session)
-            })
-            .unwrap_or_default();
-        masters.push((
-            r.status.clone(),
-            r.item_id.chars().take(12).collect(),
-            truncate(&r.title, 26),
-            truncate(schedule, 13),
-            truncate(&agent, 12),
+        let last_run = match last_run_from_board(&r.title, &rows) {
+            Some(ms) => format_local(ms as u64),
+            None => state
+                .crons
+                .get(&r.item_id)
+                .filter(|t| t.last_fired_at > 0)
+                .map(|t| {
+                    let session = if t.session_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", &t.session_id[..t.session_id.len().min(10)])
+                    };
+                    format!("{}{}", format_local(t.last_fired_at), session)
+                })
+                .unwrap_or_default(),
+        };
+        masters.push(CronMasterRow {
+            status: r.status.clone(),
+            row: r.item_id.chars().take(12).collect(),
+            title: truncate(&r.title, 26),
+            schedule: truncate(schedule, 13),
+            agent: truncate(&agent, 12),
+            planned: r.planned.clone(),
             last_run,
-        ));
+        });
     }
     if masters.is_empty() {
-        println!("Крон-задач нет (расписание — task create/edit --schedule, статус Вейт).");
-        return Ok(());
+        return Ok(vec![
+            "Крон-задач нет (расписание — task create/edit --schedule, статус Вейт).".to_string(),
+        ]);
     }
-    println!(
-        "{:<10} {:<12} {:<28} {:<14} {:<13} LAST RUN",
-        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE", "AGENT"
-    );
+    let mut out = vec![format!(
+        "{:<10} {:<12} {:<28} {:<14} {:<13} {:<17} LAST RUN",
+        "СТАТУС", "СТРОКА", "ЗАГОЛОВОК", "SCHEDULE", "AGENT", "ЗАПЛАНИРОВАНО"
+    )];
     for m in masters {
-        println!(
-            "{:<10} {:<12} {:<28} {:<14} {:<13} {}",
-            m.0, m.1, m.2, m.3, m.4, m.5
-        );
+        out.push(format!(
+            "{:<10} {:<12} {:<28} {:<14} {:<13} {:<17} {}",
+            m.status, m.row, m.title, m.schedule, m.agent, m.planned, m.last_run
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Одна text-клетка (keyID от board_keys).
