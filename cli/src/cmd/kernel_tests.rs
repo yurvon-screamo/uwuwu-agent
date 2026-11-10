@@ -94,6 +94,7 @@ fn board_with_carrier(legacy: bool) -> MockScenario {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn resolve_av_by_doc_id_reads_native_data_av_id() {
     let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
     set_env(&server);
@@ -104,6 +105,7 @@ async fn resolve_av_by_doc_id_reads_native_data_av_id() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn resolve_av_by_doc_id_reads_legacy_av_id_carrier() {
     let (_kernel, server) = MockKernel::start(board_with_carrier(true)).await;
     set_env(&server);
@@ -114,6 +116,7 @@ async fn resolve_av_by_doc_id_reads_legacy_av_id_carrier() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn resolve_av_by_bare_av_id_finds_carrier_block() {
     let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
     set_env(&server);
@@ -124,6 +127,7 @@ async fn resolve_av_by_bare_av_id_finds_carrier_block() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn resolve_av_rejects_id_without_database_relation() {
     let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
     set_env(&server);
