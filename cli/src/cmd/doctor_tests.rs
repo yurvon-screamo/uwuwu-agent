@@ -24,6 +24,7 @@ fn orphan_scenario() -> MockScenario {
             doc_id: BOARD_DOC,
             av_id: BOARD_AV,
             keys: vec![("key-title", "Primary Key"), ("key-status", "Status")],
+            legacy: false,
         }],
         hpath_ids: vec![(BOARD_HPATH, vec![BOARD_DOC])],
         rows: vec![MockRow::new("20261108000000-row1", "привязанная задача")

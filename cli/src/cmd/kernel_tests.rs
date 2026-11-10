@@ -64,27 +64,74 @@ fn export_parses_doc_id() {
 }
 
 #[test]
-fn render_parses_ids_and_page() {
-    let KernelSub::Render {
-        av_id,
-        block_id,
-        page,
-    } = expect_kernel(
-        parse_kernel(&[
-            "render",
-            "20261104102403-kernel1",
-            "20261104102403-block02",
-            "--page",
-            "2",
-        ])
-        .unwrap(),
-    )
+fn render_parses_id_and_page() {
+    let KernelSub::Render { id, page } =
+        expect_kernel(parse_kernel(&["render", "20261104102403-kernel1", "--page", "2"]).unwrap())
     else {
         panic!("expected render subcommand");
     };
-    assert_eq!(av_id, "20261104102403-kernel1");
-    assert_eq!(block_id, "20261104102403-block02");
+    assert_eq!(id, "20261104102403-kernel1");
     assert_eq!(page, 2);
+}
+
+// ——— render-проба: one-shot резолв av по id (flow на мок-ядре) ———
+
+use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockScenario};
+use crate::siyuan::SiYuan;
+use crate::siyuan_task::resolve_av;
+
+/// Доска сценария: нативный av-блок (data-av-id=) или legacy i-носитель (avID=).
+fn board_with_carrier(legacy: bool) -> MockScenario {
+    MockScenario {
+        boards: vec![MockBoard {
+            doc_id: "board-doc",
+            av_id: "av-1",
+            keys: vec![],
+            legacy,
+        }],
+        ..MockScenario::default()
+    }
+}
+
+#[tokio::test]
+async fn resolve_av_by_doc_id_reads_native_data_av_id() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "board-doc").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+async fn resolve_av_by_doc_id_reads_legacy_av_id_carrier() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(true)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "board-doc").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+async fn resolve_av_by_bare_av_id_finds_carrier_block() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "av-1").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+async fn resolve_av_rejects_id_without_database_relation() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let err = resolve_av(&sy, "20261104102403-stranger")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("не резолвится"), "{err}");
 }
 
 #[test]

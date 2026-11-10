@@ -119,6 +119,9 @@ pub(crate) struct MockBoard {
     pub(crate) doc_id: &'static str,
     pub(crate) av_id: &'static str,
     pub(crate) keys: Vec<(&'static str, &'static str)>,
+    /// true — database-блок сценария как legacy i-носитель (`avID=`),
+    /// false — нативный av-блок (`data-av-id=`).
+    pub(crate) legacy: bool,
 }
 
 /// Сценарий мок-ядра: статические данные поверх stateful-билдера. Дефолт —
@@ -209,6 +212,7 @@ impl Default for MockScenario {
                     ("key-planned", "Запланировано"),
                     ("key-schedule", "Расписание"),
                 ],
+                legacy: false,
             }],
             hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["board-doc"])],
             rows: Vec::new(),
@@ -803,6 +807,19 @@ impl MockKernel {
 
     // ——— MCP-действия над состоянием ———
 
+    /// Markdown database-блока доски: нативный av-блок (data-av-id=) или
+    /// legacy i-носитель (avID=) — как их отдаёт SQL ядра.
+    fn carrier_markdown(board: &MockBoard) -> String {
+        if board.legacy {
+            format!("<i avID=\"{}\"></i>", board.av_id)
+        } else {
+            format!(
+                "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
+                board.av_id
+            )
+        }
+    }
+
     fn sql_data(&self, stmt: &str) -> Value {
         // проба board-orphans: уникальная сигнатура stmt («select id,
         // hpath, ial from blocks») — чужие SQL с hpath like не попадают
@@ -865,10 +882,7 @@ impl MockKernel {
             return match self.sc.boards.iter().find(|b| b.doc_id == root) {
                 Some(b) => json!([{
                     "id": format!("block-{}", b.doc_id),
-                    "markdown": format!(
-                        "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
-                        b.av_id
-                    )
+                    "markdown": Self::carrier_markdown(b),
                 }]),
                 None => json!([]),
             };
@@ -878,10 +892,7 @@ impl MockKernel {
             let b = &self.sc.boards[0];
             return json!([{
                 "id": format!("block-{}", b.doc_id),
-                "markdown": format!(
-                    "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
-                    b.av_id
-                )
+                "markdown": Self::carrier_markdown(b),
             }]);
         }
         // пробы существования доков по id (`id='...'`)
