@@ -3,7 +3,10 @@
 //! wiremock-тесты в siyuan.rs.
 
 use super::cli::{Cli, Commands, KernelSub};
+use super::mock_kernel::{set_env, MockBoard, MockKernel, MockScenario};
 use super::sy_dispatch::ls_lines;
+use crate::siyuan::SiYuan;
+use crate::siyuan_task::resolve_av;
 use clap::Parser as _;
 use serde_json::json;
 
@@ -75,10 +78,6 @@ fn render_parses_id_and_page() {
 }
 
 // ——— render-проба: one-shot резолв av по id (flow на мок-ядре) ———
-
-use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockScenario};
-use crate::siyuan::SiYuan;
-use crate::siyuan_task::resolve_av;
 
 /// Доска сценария: нативный av-блок (data-av-id=) или legacy i-носитель (avID=).
 fn board_with_carrier(legacy: bool) -> MockScenario {
