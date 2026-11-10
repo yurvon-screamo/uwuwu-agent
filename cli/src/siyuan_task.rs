@@ -160,8 +160,9 @@ pub struct SyTask {
     pub item_id: String,
     pub title: String,
     pub status: String,
-    /// Классификация задачи из колонки «Тип» (bug/dev/spike/analys/docs/other;
-    /// "" — не задан).
+    /// Классификация задачи из колонки «Тип» (канон: bug | spike | analys |
+    /// docs | other | feature | refactoring | legacy | idea | qa |
+    /// infrastructure; "" — не задан).
     pub task_type: String,
     pub branch: String,
     pub pr: String,
@@ -536,6 +537,12 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
 /// Имя колонки типа на досках задач: парс клеток принимает «Тип»/"Type"
 /// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
 pub const TYPE_CELL: &str = "Тип";
+
+/// Дефолт типа при `task create` без `--type` (sy_dispatch, dispatch и
+/// dry-run): feature — батч-дефолт миграции 20261110180332 и базовый тип
+/// фичевого пайпа. Прежний дефолт dev выпилен из канона — захардкоженный
+/// литерал реинкарнировал выпиленный тип мимо валидатора (ревью PR #221).
+pub const DEFAULT_TASK_TYPE: &str = "feature";
 
 /// Канон типа задачи: trim + нижний регистр, ∈ {bug, spike, analys, docs,
 /// other, refactoring, legacy, feature, idea, qa, infrastructure}, иначе

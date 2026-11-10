@@ -607,11 +607,11 @@ describe("spawnInitBlock: инит-данные первого промпта", 
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
     projectDocs: ["uwuwu/README", "uwuwu/Домены"],
-    task: { title: "Фича", status: "Design", type: "dev", branch: "work/task-r1", pr: "" },
+    task: { title: "Фича", status: "Design", type: "feature", branch: "work/task-r1", pr: "" },
   }
   test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain("Задача: «Фича», статус Design, тип dev, ветка work/task-r1, PR —.")
+    expect(b).toContain("Задача: «Фича», статус Design, тип feature, ветка work/task-r1, PR —.")
     expect(b).toContain('uwuwu-cli task get r1 --project uwuwu')
   })
   test("легаси-строка без типа — тире в слоте типа", () => {

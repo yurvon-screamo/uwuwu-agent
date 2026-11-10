@@ -196,6 +196,65 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
     }
 }
 
+/// create БЕЗ --type (дефолт-ветка dispatch) пишет в клетку «Тип»
+/// DEFAULT_TASK_TYPE (feature), не выпиленный dev: дыра ревью PR #221 —
+/// захардкоженный "dev" был мимо валидатора и реинкарнировал выпиленный
+/// тип на доске штатным путём (agents/developer.md: create без --type).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_without_type_defaults_to_feature_cell_and_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: NEW_TITLE.into(),
+            r#type: None,
+            stdin: false,
+            attach: Vec::<std::path::PathBuf>::new(),
+            schedule: None,
+            agent: None,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("create без --type проходит dispatch");
+
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, v)| {
+            key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
+        })
+        .collect();
+    assert_eq!(
+        type_writes.len(),
+        1,
+        "клетка «Тип» = дефолт feature записан ровно один раз: {:?}",
+        kernel.item_updates()
+    );
+    assert!(
+        !kernel
+            .item_updates()
+            .iter()
+            .any(|(_, key, _, v)| key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")),
+        "выпиленный dev не должен вминтиться дефолтом: {:?}",
+        kernel.item_updates()
+    );
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("## Постановка") && md.contains("<срезы/шаги"),
+        "тело дефолта — фичевый костяк: {md}"
+    );
+}
+
 // ——— create с контентом: семантика «передал контент — тело твоё» (20261109101129) ———
 
 /// create с непустым контентом (--stdin): контент — тело целиком как есть,

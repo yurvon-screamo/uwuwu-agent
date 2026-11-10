@@ -81,10 +81,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         if !attach.is_empty() {
             anyhow::bail!("create --dry-run не аттачит: скелет печатается без записей в воркспейс — убери --attach");
         }
-        // --type валидируется и в осмотре: флаг не молчит (ревью Low)
+        // --type валидируется и в осмотре: флаг не молчит (ревью Low);
+        // дефолт — DEFAULT_TASK_TYPE (feature), не выпиленный dev
         let ty = match ty.as_deref() {
             Some(raw) => syt::validate_task_type(raw)?,
-            None => "dev".to_string(),
+            None => syt::DEFAULT_TASK_TYPE.to_string(),
         };
         // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)
         if let Some(expr) = schedule.as_deref() {
@@ -247,7 +248,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     "на create пустой тип бессмысленен — убери --type; снятие: task edit <id> --type \"\""
                 ),
                 Some(raw) => syt::validate_task_type(raw)?,
-                None => "dev".to_string(),
+                None => syt::DEFAULT_TASK_TYPE.to_string(),
             };
             if let Some(expr) = schedule.as_deref() {
                 if expr.is_empty() {
