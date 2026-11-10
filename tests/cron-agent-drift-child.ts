@@ -115,10 +115,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     if (s === undefined) return new Response("нет сессии", { status: 404 })
     return json({ outcome: s.outcome, time: { idle: s.idle }, agent: s.agent })
   }
-  const msgMatch = /^\/api\/session\/(ses_[^/]+)\/message$/.exec(path)
-  if (msgMatch !== null) return json([])
-  const inboxMatch = /^\/api\/session\/(ses_[^/]+)\/inbox$/.exec(path)
-  if (inboxMatch !== null) return new Response("нет inbox", { status: 404 })
+  if (/^\/api\/session\/ses_[^/]+\/message$/.test(path)) return json([])
+  if (/^\/api\/session\/ses_[^/]+\/inbox$/.test(path)) return new Response("нет inbox", { status: 404 })
 
   // — SiYuan REST/MCP (доска мастера) —
   if (url.includes("/api/attr/getBlockAttrs")) {
@@ -264,8 +262,8 @@ try {
 
 // Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
 // битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
-// отклонение пина ловит полный откат класса, точечные ветки добивают ассерты
-// вердиктов мастер-тестов
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
 const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
   .then(() => false, () => true)
 
