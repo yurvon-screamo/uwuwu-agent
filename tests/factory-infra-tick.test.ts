@@ -42,7 +42,7 @@ describe("tickProject: самоисцеление пустого bodyDoc тре�
   })
 
   /** Ребёнок с HOME от старта процесса: state/лог/REST — только песочница. */
-  async function runTick(): Promise<{ bodyDoc: string | null; bodyUpdated: string | null; exportIds: string[]; prompts: number }> {
+  async function runTick(): Promise<{ bodyDoc: string | null; bodyUpdated: string | null; exportIds: string[]; prompts: number; strictPathPin?: boolean }> {
     const proc = Bun.spawn(["bun", CHILD], {
       // UWUWU_FACTORY_STATE_DIR — явная песочница: дефолт-изоляция ветки
       // (задача 20261106082216) не должна уводить сидированный state
@@ -72,6 +72,8 @@ describe("tickProject: самоисцеление пустого bodyDoc тре�
     expect(verdict.exportIds).toEqual([BODY_DOC])
     // Assert: будильников нет (свежих комментов не было)
     expect(verdict.prompts).toBe(0)
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(verdict.strictPathPin).toBe(true)
   })
 
   test("тик-2: adopt не повторяется (идемпотентность)", async () => {

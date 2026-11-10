@@ -148,25 +148,29 @@ function scriptTick(): string[] {
       calls.push(`mcp:${tool}`)
       return new Response(JSON.stringify({ jsonrpc: 2.0, id: 1, result }), { status: 200 })
     }
-    if (url.includes("/prompt")) {
+    // opencode REST — строгий pathname-матч (класс PR #207): rest демона строит
+    // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
+    // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
+    const path = new URL(url).pathname
+    if (/^\/api\/session\/(ses_[^/]+)\/prompt$/.test(path)) {
       const payload = JSON.parse(String(init?.body ?? "{}")) as { text?: string }
       calls.push(`prompt:${(payload.text ?? "").slice(0, 800)}`)
       return new Response(JSON.stringify({}), { status: 200 })
     }
-    if (url.includes("/api/session/")) {
+    const sessMatch = /^\/api\/session\/(ses_[^/]+)(\/message)?$/.exec(path)
+    if (sessMatch !== null) {
       if (method === "DELETE") {
         calls.push("session-delete")
         return new Response(JSON.stringify({}), { status: 200 })
       }
-      if (url.includes("/message")) {
+      if (sessMatch[2] === "/message") {
         calls.push("session-message")
         return new Response(JSON.stringify([{ time: { created: Date.now() - 60_000, streamed: Date.now() - 60_000 } }]), { status: 200 })
       }
       calls.push("session-get")
-      const sid = url.split("/api/session/")[1]?.split(/[/?]/)[0] ?? ""
-      return new Response(JSON.stringify({ id: sid || "ses_x" }), { status: 200 })
+      return new Response(JSON.stringify({ id: sessMatch[1] || "ses_x" }), { status: 200 })
     }
-    if (url.includes("/api/session")) {
+    if (path === "/api/session") {
       const payload = JSON.parse(String(init?.body ?? "{}")) as {
         agent?: string; title?: string; model?: { id?: string }; location?: { directory?: string }
       }
@@ -242,11 +246,20 @@ const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   }>
 }
 const track = after.tasks[ROW_ID] ?? {}
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
   scenario: SCENARIO,
   tick1,
   tick2,
   tick3,
+  strictPathPin,
   sessionID: track.sessionID ?? null,
   testSessionID: track.testSessionID ?? null,
   testAttempts: track.testAttempts ?? null,

@@ -31,6 +31,7 @@ interface StageVerdict {
   tick1: TickCalls
   tick2: TickCalls
   tick3: Tick3Calls
+  strictPathPin?: boolean
   sessionID: string | null
   testSessionID: string | null
   testAttempts: number | null
@@ -96,6 +97,8 @@ describe("tickProject: стадия «Тестирование»", () => {
 
   test("quarantine: untracked «Тестирование» → карантинная запись + спавн тестировщика, дев-волна молчит", async () => {
     const v = await runTick("quarantine")
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(v.strictPathPin).toBe(true)
     // спавн ровно один, агент tester, тайтл стадии «тестирование»
     expect(v.tick1.sessionCreates).toHaveLength(1)
     expect(v.tick1.sessionCreates[0]).toContain("tester:")

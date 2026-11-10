@@ -202,11 +202,16 @@ function scriptTick(): string[] {
       calls.push(`mcp:${tool}`)
       return new Response(JSON.stringify({ jsonrpc: 2.0, id: 1, result }), { status: 200 })
     }
-    if (url.includes("/prompt")) {
+    // opencode REST — строгий pathname-матч (класс PR #207): rest демона строит
+    // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
+    // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
+    const path = new URL(url).pathname
+    if (/^\/api\/session\/(ses_[^/]+)\/prompt$/.test(path)) {
       calls.push("prompt")
       return new Response(JSON.stringify({}), { status: 200 })
     }
-    if (url.includes("/api/session/")) {
+    const sessMatch = /^\/api\/session\/(ses_[^/]+)$/.exec(path)
+    if (sessMatch !== null) {
       if (method === "DELETE") {
         calls.push("session-delete")
         return new Response(JSON.stringify({}), { status: 200 })
@@ -215,7 +220,7 @@ function scriptTick(): string[] {
       // Мёртвые id по сценарию: hold — сироты ses_old* (404 → state-loss
       // сигнатура); claim-skip — заявка жива (внешняя работа); claim-dead —
       // заявка ses_ext1 мертва, а свежая фабричная сессия после спавна жива.
-      const sid = url.split("/api/session/")[1]?.split(/[/?]/)[0] ?? ""
+      const sid = sessMatch[1] ?? ""
       const deadIds = SCENARIO === "claim-dead"
         ? ["ses_ext1"]
         : SCENARIO === "claim-skip" ? [] : ["ses_old1", "ses_old2", "ses_old3"]
@@ -224,7 +229,7 @@ function scriptTick(): string[] {
       }
       return new Response(JSON.stringify({ id: sid || "ses_x" }), { status: 200 })
     }
-    if (url.includes("/api/session")) {
+    if (path === "/api/session") {
       calls.push("session-create")
       return new Response(JSON.stringify({ id: "ses_new" }), { status: 200 })
     }
@@ -274,10 +279,19 @@ const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
   tasks: Record<string, unknown>
   holdSignaled?: string
 }
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// откат протыкаемой ветки (create) на суффикс/подстроку делает пин ложным →
+// мастер-тест красный
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
   scenario: SCENARIO,
   taskCount: Object.keys(after.tasks).length,
   holdSignaled: after.holdSignaled ?? null,
+  strictPathPin,
   sessionCreates: calls.filter((c) => c === "session-create").length,
   sessionDeletes: calls.filter((c) => c === "session-delete").length,
   prompts: calls.filter((c) => c === "prompt").length,
