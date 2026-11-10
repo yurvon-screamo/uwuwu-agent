@@ -1,0 +1,107 @@
+# Периодический стресс-прогон cli-тестов — системный ловец тайминг-флейков
+# (задача 20261110051831-qnkx3id, из ревью PR #195).
+#
+# Зачем: семья тайминг-флейков cli (search_lines #145, mcp_transport,
+# semantic_tests #195, безымянный fail 10.11) выстреливает только под
+# нагрузкой полного прогона и ловится сейчас ревью-прогонами PR — каждый
+# инцидент стоит хода ручной атрибуции. Эта джоба гоняет полный cargo test
+# ×N в том же контуре, где стреляют флейки (CPU-нагрузка sha256-воркерами
+# по числу ядер — проверенный паттерн тестировщика задачи 20261109094809),
+# по ночному расписанию на мастер-контуре, и фиксирует имя теста + фрагмент
+# паники при падении (урок 10.11: безымянный fail = потерянное наблюдение).
+#
+# Нотификация — нативный email GitHub при падении scheduled workflow;
+# автозаведение задач сознательно не строится (минимальность): сигнал =
+# красная джоба + summary с именами/паниками.
+#
+# Триггеры только schedule + workflow_dispatch: PR-гейт CI не затронут,
+# чекраны branch protection живут в ci.yml.
+name: Stress tests
+
+on:
+  schedule:
+    # 18:45 UTC = 03:45 JST (ночь владельца); не круглые минуты —
+    # у GitHub пик нагрузки планировщика в начале часа.
+    - cron: '45 18 * * *'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'Прогонов cargo test'
+        required: false
+        default: '5'
+      stress:
+        description: 'CPU-нагрузка (sha256-воркеры по числу ядер)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Stress (cargo test ×N)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      STRESS_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '5' }}
+      STRESS_CPU: ${{ github.event_name == 'workflow_dispatch' && inputs.stress || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Пины по SHA как в ci.yml: плавающие теги = supply-chain поверхность.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: cli
+
+      # Стресс-воркеры: по одному sha256-хэширующему процессу на ядро, все
+      # ядра под 100% — тот же контур, где roundtrip моков превышает бюджеты
+      # тайминг-чувствительных тестов. Внимание: trap на EXIT шага здесь не
+      # годится — он убил бы воркеров в конце этого же шага, до тестов;
+      # воркеры живут между шагами, уборку делает шаг «Kill CPU load»
+      # (if: always() — и на красном пути тоже), а контейнер раннера —
+      # страховка в любом исходе джобы.
+      - name: CPU load (sha256 workers)
+        if: env.STRESS_CPU == 'true'
+        run: |
+          echo "cores: $(nproc)"
+          for i in $(seq 1 "$(nproc)"); do
+            sha256sum /dev/zero >/dev/null 2>&1 &
+            echo $! >> stress-workers.pids
+          done
+
+      # ×N прогонов подряд; выход НЕ раньше конца цикла — собираем полную
+      # картину (сколько упало, какие тесты), а не первый фейл.
+      - name: cargo test ×N
+        working-directory: cli
+        run: |
+          set -o pipefail
+          mkdir -p stress-logs
+          overall=0
+          for i in $(seq 1 "$STRESS_RUNS"); do
+            echo "::group::Прогон $i/$STRESS_RUNS"
+            cargo test 2>&1 | tee "../stress-logs/run-$i.log"
+            rc=$?
+            echo "::endgroup::"
+            echo "$rc" > "../stress-logs/run-$i.rc"
+            if [ "$rc" -ne 0 ]; then
+              overall=1
+              echo "прогон $i: FAIL (rc=$rc)"
+            else
+              echo "прогон $i: ok"
+            fi
+          done
+          exit "$overall"
+
+      # Воркеры держатся только на время тестов — убить до шага отчёта.
+      - name: Kill CPU load
+        if: always() && env.STRESS_CPU == 'true'
+        run: xargs -r kill < stress-workers.pids 2>/dev/null || true
+
+      # Сигнал: имена упавших тестов + фрагменты паник в summary и
+      # аннотации. Красная джоба без этого шага = «безымянный fail».
+      - name: Failure report
+        if: failure()
+        run: |
+          scripts/ci/stress-report.sh stress-logs | tee "$GITHUB_STEP_SUMMARY"
