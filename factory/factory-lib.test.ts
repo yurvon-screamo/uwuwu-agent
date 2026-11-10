@@ -288,6 +288,14 @@ describe("spawnPrompt", () => {
     })
     expect(withEnv).toContain("ветка уже от origin/main")
   })
+  test("docs-only финал назван: без PR/CI, PR-ячейка = вики-артефакт (кейс 20261104094441-wvv9psh)", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
+    expect(p).toContain("docs-only — без PR/CI")
+    expect(p).toContain("URL главного")
+    expect(p).toContain("закрытие без мержа")
+    // PR-путь остаётся каноном кодовых задач
+    expect(p).toContain("gh pr create")
+  })
 })
 
 describe("continuePrompt", () => {
@@ -715,6 +723,16 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("diff origin/master…feat/y")
     expect(p).not.toContain("Ворктри задачи: ")
   })
+  test("result: docs-only hint — диффа/PR может не быть, предмет доки по ссылкам тела", () => {
+    // канон docs-only финала (задача 20261109234534): ревьювер не импровизирует
+    // по отсутствующему PR, а ревьюит вики-артефакты из тела
+    const p = reviewSpawnPrompt("r10", "uwuwu", "result", { branch: "", worktree: "", pr: "" }, "code-quality-reviewer")
+    expect(p).toContain("docs-only задача — диффа/PR может не быть")
+    expect(p).toContain("доки uwuwu по ссылкам тела")
+    // план-ревью без кода — hint не нужен
+    const plan = reviewSpawnPrompt("r10", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
+    expect(plan).not.toContain("docs-only задача")
+  })
   test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
     const p = reviewSpawnPrompt("r8", "1xgames", "result", {
       branch: "feat/y", worktree: "", pr: "", base: "origin/main",
@@ -899,6 +917,11 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     const p = testingSpawnPrompt("r2", "uwuwu", { branch: "feat/y", worktree: "", pr: "" })
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
+  })
+  test("spawn: docs-only hint — объект проверки доки по ссылкам тела", () => {
+    const p = testingSpawnPrompt("r5", "uwuwu", { branch: "", worktree: "", pr: "" })
+    expect(p).toContain("docs-only задача — объект проверки: доки uwuwu по ссылкам тела")
+    expect(p).toContain("дифф/PR/CI n/a")
   })
   test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
     const p = testingSpawnPrompt("r9", "1xgames", {
