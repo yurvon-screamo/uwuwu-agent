@@ -82,7 +82,6 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   // строгий pathname-матч opencode-REST (страж child-rigs): двойной префикс
   // (/api/api/…) на живом сервере даёт 404 — мок не имеет права его принимать
   const path = new URL(url).pathname
-  const strictPathPin = true
 
   // — opencode REST (боевой контур) —
   if (path === "/api/session" && method === "POST") {
@@ -265,8 +264,15 @@ try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
 } catch {}
 
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса, точечные откатывы веток добивают ассерты
+// вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
-  error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments,
+  error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments, strictPathPin,
   agentsDir, masterDocId: BODY, agents: [AGENT_A, AGENT_B, AGENT_C],
   runCardIds: spawnCalls
     .filter((c) => c.argv[2] === "create")
