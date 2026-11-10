@@ -1993,6 +1993,44 @@ mod tests {
     }
 
     #[test]
+    fn carrier_from_rows_takes_first_hit_across_formats() {
+        let rows = vec![
+            // первая строка без маркера — пропускается
+            json!({"id": "block-plain", "markdown": "<p>текст</p>"}),
+            // первый хит: legacy i-носитель
+            json!({"id": "block-legacy", "markdown": "<i avID=\"av-legacy\"></i>"}),
+            // второй нативный — не берётся (первый хит выигрывает)
+            json!({"id": "block-native", "markdown": "<div data-av-id=\"av-native\"></div>"}),
+        ];
+        assert_eq!(
+            carrier_from_rows(&rows),
+            Some(("av-legacy".to_string(), "block-legacy".to_string()))
+        );
+    }
+
+    #[test]
+    fn carrier_from_rows_skips_marker_row_without_block_id() {
+        let rows = vec![
+            json!({"markdown": "<div data-av-id=\"av-1\"></div>"}),
+            json!({"id": "block-good", "markdown": "<div data-av-id=\"av-2\"></div>"}),
+        ];
+        assert_eq!(
+            carrier_from_rows(&rows),
+            Some(("av-2".to_string(), "block-good".to_string()))
+        );
+    }
+
+    #[test]
+    fn carrier_from_rows_returns_none_without_carrier() {
+        assert_eq!(carrier_from_rows(&[]), None);
+        let rows = vec![
+            json!({"id": "block-plain", "markdown": "<p>текст</p>"}),
+            json!({"id": "block-empty", "markdown": ""}),
+        ];
+        assert_eq!(carrier_from_rows(&rows), None);
+    }
+
+    #[test]
     fn pick_search_hit_takes_exact_name_and_hpath() {
         let results = vec![json!({
             "avID": "av-1", "avName": "Задачи 1xgames", "blockID": "b-1",
