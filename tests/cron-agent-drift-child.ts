@@ -81,19 +81,23 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
 
   // — opencode REST (боевой контур) —
-  if (url.endsWith("/api/session") && method === "POST") {
+  // Строгий pathname-матч (класс PR #207): rest демона строит `${base}/api${path}`,
+  // двойной префикс (/api/api/…) на живом сервере даёт 404 — мок не имеет права
+  // его принимать: суффикс/подстрока/безъякорный regex по URL маскируют разрыв.
+  const path = new URL(url).pathname
+  if (path === "/api/session" && method === "POST") {
     const id = `ses_mock_${creations.length + 1}`
     creations.push({ title: String(body.title ?? ""), agent: body.agent, model: body.model })
     sessions.set(id, { agent: String(body.agent ?? ""), outcome: undefined, idle: 0 })
     return json({ id })
   }
-  if (/\/api\/session\/ses_[^/]+$/.test(url) && method === "DELETE") {
-    const id = /\/api\/session\/(ses_[^/]+)$/.exec(url)?.[1] ?? ""
+  if (/^\/api\/session\/ses_[^/]+$/.test(path) && method === "DELETE") {
+    const id = /^\/api\/session\/(ses_[^/]+)$/.exec(path)?.[1] ?? ""
     deletes.push(id)
     sessions.delete(id)
     return json({})
   }
-  const promptMatch = /\/api\/session\/(ses_[^/]+)\/prompt$/.exec(url)
+  const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
   if (promptMatch !== null) {
     promptCalls.push({ sessionID: promptMatch[1], text: String(body.text ?? ""), delivery: body.delivery })
     if (failNextPost) return new Response("boom: POST не приземлился", { status: 500 })
@@ -105,14 +109,16 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     }
     return json({ time: { created } })
   }
-  const getMatch = /\/api\/session\/(ses_[^/]+)\/?$/.exec(url)
+  const getMatch = /^\/api\/session\/(ses_[^/]+)\/?$/.exec(path)
   if (getMatch !== null) {
     const s = sessions.get(getMatch[1])
     if (s === undefined) return new Response("нет сессии", { status: 404 })
     return json({ outcome: s.outcome, time: { idle: s.idle }, agent: s.agent })
   }
-  if (url.includes("/message")) return json([])
-  if (url.includes("/inbox")) return new Response("нет inbox", { status: 404 })
+  const msgMatch = /^\/api\/session\/(ses_[^/]+)\/message$/.exec(path)
+  if (msgMatch !== null) return json([])
+  const inboxMatch = /^\/api\/session\/(ses_[^/]+)\/inbox$/.exec(path)
+  if (inboxMatch !== null) return new Response("нет inbox", { status: 404 })
 
   // — SiYuan REST/MCP (доска мастера) —
   if (url.includes("/api/attr/getBlockAttrs")) {
@@ -256,13 +262,20 @@ try {
 
 ;(Bun as unknown as { spawn: unknown }).spawn = Bun.spawn
 
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// отклонение пина ловит полный откат класса, точечные ветки добивают ассерты
+// вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 let logLines: string[] = []
 try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
 } catch {}
 
 console.log(JSON.stringify({
-  error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments,
+  error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments, strictPathPin,
   agentsDir, masterDocId: BODY, agents: [AGENT_A, AGENT_B, AGENT_C],
   runCardIds: spawnCalls
     .filter((c) => c.argv[2] === "create")

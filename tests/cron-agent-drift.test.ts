@@ -29,6 +29,7 @@ interface ChildReport {
   masterDocId: string
   agents: string[]
   runCardIds: string[]
+  strictPathPin?: boolean
 }
 
 async function runChild(): Promise<ChildReport> {
@@ -56,6 +57,7 @@ describe.skipIf(!hasServiceReg)("tick × дрейф агента вечной с
   test("idle-дрейф → recreate+DELETE+лог; живой ход → defer; без смены → без recreate; ретрай при дрейфе → recreate без дубль-рана", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
+    expect(report.strictPathPin).toBe(true) // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
 
     const [t1, t2, t3, t4, t5, t6, t7] = report.stages
     const master = (s: typeof t1) => s.state[ROW] as Record<string, unknown>
