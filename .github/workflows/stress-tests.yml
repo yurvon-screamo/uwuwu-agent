@@ -16,6 +16,12 @@
 #
 # Триггеры только schedule + workflow_dispatch: PR-гейт CI не затронут,
 # чекраны branch protection живут в ci.yml.
+#
+# pull_request с path-фильтром — самопроверка джобы: scheduled workflow
+# нельзя триггернуть dispatch'ем до мерджа (GitHub требует workflow на
+# default branch), PR-ран на изменении этих файлов — единственный способ
+# доказать зелёный путь end-to-end. Path-фильтр держит рутину чистой:
+# на обычных PR джоба не гоняется.
 name: Stress tests
 
 on:
@@ -33,6 +39,10 @@ on:
         description: 'CPU-нагрузка (sha256-воркеры по числу ядер)'
         type: boolean
         default: true
+  pull_request:
+    paths:
+      - '.github/workflows/stress-tests.yml'
+      - 'scripts/ci/**'
 
 permissions:
   contents: read
