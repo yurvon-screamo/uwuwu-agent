@@ -1,5 +1,5 @@
 // cron-lib.test.ts — расписания, границы, промпты.
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, lstatSync, readFileSync, readlinkSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
@@ -7,6 +7,7 @@ import {
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
   decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
+  agentDriftAction,
 } from "./cron-lib"
 
 /** Парс с громким сбоем вместо non-null assertion: расписание в тестах
@@ -400,6 +401,23 @@ describe("decideFire: решение по статусу вечной сесси
   })
 })
 
+describe("agentDriftAction: расхождение агента сессии и custom-agent мастера", () => {
+  test("idle + смена агента → recreate (эпизод 09.11: тихий Agent not found без ретрая)", () => {
+    expect(agentDriftAction("idle", "lead", "triage")).toBe("recreate")
+  })
+  test("running + смена агента → defer (живой ход не рвём)", () => {
+    expect(agentDriftAction("running", "lead", "triage")).toBe("defer")
+  })
+  test("агент совпадает → бездействие (регресс: штатные файры без recreate)", () => {
+    expect(agentDriftAction("idle", "triage", "triage")).toBeNull()
+    expect(agentDriftAction("running", "triage", "triage")).toBeNull()
+  })
+  test("агент сессии неизвестен (сбой чтения) → бездействие (ложных recreate нет)", () => {
+    expect(agentDriftAction("idle", null, "triage")).toBeNull()
+    expect(agentDriftAction("running", null, "triage")).toBeNull()
+  })
+})
+
 describe("resolveAgentIssue", () => {
   test("деф на месте — файр разрешён", () => {
     expect(resolveAgentIssue("lead", true)).toBeNull()
@@ -434,24 +452,42 @@ describe("parseAgentDefModel: модель из frontmatter дефа", () => {
 })
 
 // Деф агента крона «Lead: ночной аудит uwuwu» — деф триажа (распоряжение
-// владельца: крон на базе триаж-агента, без нового агента). Живёт вне репо
-// (~/.config/opencode/agents/triage.md + крон-воркспейс-копия — резолв
-// сервера), пин на машину-зависимый файл в CI не проверяем — живой контроль
-// файр-гейта: контрольный файр 09.11 19:52 (recreate, agent=triage,
-// glm-5.3-flash) и боевой слот 04:30.
+// владельца: крон на базе триаж-агента, без нового агента). Живые точки —
+// симлинки на канон репо: глобальная (~/.config/opencode/agents — каталог-
+// симлинк link.sh на мастер-чекаут) и крон-воркспейс (прямые симлинки на
+// канон, задача 20261110052629-ow3cggv); ручных копий нет — контент-рассинк
+// невозможен (симлинк — тот же файл); потеря симлинка возможна только
+// деструктивной операцией над каталогом (крон при пересоздании воркспейса
+// симлинки не восстанавливает — лечение: повтор `ln -sfn` / `git checkout`).
+// Пин на машину-зависимый файл в CI не проверяем — живой контроль
+// файр-гейта: контрольный файр
+// 09.11 19:52 (recreate, agent=triage, glm-5.3-flash) и боевой слот 04:30.
 
 describe("triage/agent.md — канон дефа крон-агента карточки Lead", () => {
   test("frontmatter канона разбирается в боевую модель файр-гейта", () => {
     const path = join(import.meta.dir, "..", "triage", "agent.md")
     expect(existsSync(path)).toBe(true)
-    // канон — источник живых копий крона (деплой в обе точки: гейт agentDefOf
-    // + воркспейс-резолв): сломанный frontmatter уедет в карточку
-    // «Lead: ночной аудит uwuwu» отказом файра — пин ловит регресс на CI,
-    // до деплоя. Живые копии машина-зависимы, CI их не видит — их контроль:
-    // бит-в-бит при деплое + контрольный файр 09.11 19:52 (agent=triage,
-    // glm-5.3-flash).
+    // канон — единственный источник обеих живых точек (гейт agentDefOf
+    // + воркспейс-резолв, обе — симлинки): сломанный frontmatter уедет в
+    // карточку «Lead: ночной аудит uwuwu» отказом файра — пин ловит регресс
+    // на CI, до деплоя. Контроль живого резолва: проба симлинка из
+    // крон-воркспейса 10.11 (agent=triage, glm-5.3-flash) + контрольный
+    // файр 09.11 19:52.
     expect(parseAgentDefModel(readFileSync(path, "utf-8")))
       .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash" })
+  })
+
+  test("git-симлинк agents/triage.md (глобальная точка) — target на канон, резолв в тот же контент", () => {
+    // Каталог ~/.config/opencode/agents — симлинк link.sh на репо-каталог
+    // agents/: глобальную точку гейта формирует git-симлинк agents/triage.md
+    // (PR #211). Опечатка в target или перенос triage/ ломают её громко
+    // (agentDefOf → exists=false → отказ файра), но только в живом слоте —
+    // этот пин двигает сигнал на CI.
+    const link = join(import.meta.dir, "..", "agents", "triage.md")
+    expect(lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(link)).toBe("../triage/agent.md")
+    const canon = join(import.meta.dir, "..", "triage", "agent.md")
+    expect(readFileSync(link, "utf-8")).toBe(readFileSync(canon, "utf-8"))
   })
 })
 

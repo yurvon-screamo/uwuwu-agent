@@ -63,6 +63,7 @@ pub(crate) fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .try_init();
 }

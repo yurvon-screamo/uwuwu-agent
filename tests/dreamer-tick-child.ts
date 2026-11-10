@@ -22,8 +22,10 @@ mkdirSync(queueDir, { recursive: true })
 mkdirSync(join(home, ".local/share/opencode"), { recursive: true })
 
 // ——— фейк opencode REST: ловим спавн/промпт, отдаём живую дример-сессию ———
-// restCall демона ходит на `/api${path}` — вердикт и ассерты нормализуют путь
-// (path без /api-префикса, как в контракте REST демона).
+// restCall демона ходит на `${base}/api${path}` — мок сматчит ТОЛЬКО точный
+// pathname живого контракта (/api/…); двойной префикс (/api/api/…) на живом
+// сервере даёт 404 — мок не имеет права его принимать (класс PR #207).
+// Незнакомый путь = 404: restCall демона бросает громко, не тихий skip.
 const calls: Array<{ method: string; path: string; body: unknown }> = []
 const server = Bun.serve({
   hostname: "127.0.0.1",
@@ -31,18 +33,21 @@ const server = Bun.serve({
   fetch: async (req) => {
     const url = new URL(req.url)
     const body = req.method === "POST" ? await req.json().catch(() => null) : null
-    const path = url.pathname.startsWith("/api") ? url.pathname.slice("/api".length) : url.pathname
+    const path = url.pathname
     calls.push({ method: req.method, path, body })
-    if (req.method === "POST" && path === "/session") {
+    if (req.method === "POST" && path === "/api/session") {
       return Response.json({ id: dreamerSes })
     }
-    if (req.method === "GET" && path === "/session/active") {
+    if (req.method === "POST" && /^\/api\/session\/[^/]+\/prompt$/.test(path)) {
+      return Response.json({})
+    }
+    if (req.method === "GET" && path === "/api/session/active") {
       return Response.json({ [dreamerSes]: { type: "running" } })
     }
-    if (req.method === "GET" && path.startsWith("/session/")) {
-      return Response.json({ id: dreamerSes })
+    if ((req.method === "GET" || req.method === "DELETE") && /^\/api\/session\/[^/]+$/.test(path)) {
+      return req.method === "DELETE" ? Response.json({}) : Response.json({ id: dreamerSes })
     }
-    return Response.json({})
+    return new Response(JSON.stringify({ error: `mock: неожиданный REST ${req.method} ${path}` }), { status: 404 })
   },
 })
 writeFileSync(join(home, ".local/state/opencode/service.json"), JSON.stringify({
@@ -101,6 +106,13 @@ const [daemonOut, daemonErr] = await Promise.all([
   new Response(proc.stdout).text(), new Response(proc.stderr).text(),
 ])
 const code = await proc.exited
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
+const strictPathPin = await fetch(`http://127.0.0.1:${server.port}/api/api/session`, { method: "POST", body: "{}" })
+  .then((res) => !res.ok, () => true)
 server.stop(true)
 
 // ——— вердикт: state + очередь + перехваченные REST-вызовы ———
@@ -122,7 +134,8 @@ console.log(JSON.stringify({
   taskRun: state.taskRuns?.[rowId] ?? null,
   activeSessions: state.activeSessions ?? null,
   queue,
-  sessionCreates: calls.filter((c) => c.method === "POST" && c.path === "/session"),
-  prompts: calls.filter((c) => c.method === "POST" && c.path.endsWith("/prompt")),
-  sessionDeletes: calls.filter((c) => c.method === "DELETE" && c.path.startsWith("/session/")),
+  sessionCreates: calls.filter((c) => c.method === "POST" && c.path === "/api/session"),
+  prompts: calls.filter((c) => c.method === "POST" && c.path === `/api/session/${dreamerSes}/prompt`),
+  sessionDeletes: calls.filter((c) => c.method === "DELETE" && /^\/api\/session\/[^/]+$/.test(c.path)),
+  strictPathPin,
 }))

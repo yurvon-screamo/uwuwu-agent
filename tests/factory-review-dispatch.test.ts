@@ -21,6 +21,7 @@ interface TickCalls {
 interface DispatchVerdict {
   scenario: string
   tick1: TickCalls
+  strictPathPin?: boolean
   devSessionID: string | null
   reviewSessionID: string | null
   reviewKind: string | null
@@ -93,6 +94,8 @@ describe("tickProject: диспетчеризация ревьюверов по 
 
   test("plan-spawn: «Ревью плана» без сессии → спавн plan-reviewer, state помнит вид", async () => {
     const v = await runTick("plan-spawn")
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(v.strictPathPin).toBe(true)
     expect(v.tick1.sessionCreates).toHaveLength(1)
     expect(v.tick1.sessionCreates[0]).toContain("plan-reviewer:")
     // методичка адресована по имени агента

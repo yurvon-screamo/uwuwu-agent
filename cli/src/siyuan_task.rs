@@ -171,6 +171,9 @@ pub struct SyTask {
     /// Дата из колонки «Запланировано» (formattedContent date-клетки;
     /// "" — пусто). Кроны: ран — фактический файр, мастер — next-fire.
     pub planned: String,
+    /// Машиночитаемое значение той же клетки — date.content, epoch ms
+    /// (истина ядра; formattedContent — дисплей в локали ядра). 0 — пусто.
+    pub planned_ms: i64,
     /// Значение колонки «Расписание» (отображение custom-schedule мастера).
     pub schedule_cell: String,
     pub body_doc: Option<String>,
@@ -325,6 +328,7 @@ pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         pr: String::new(),
         dev_session: String::new(),
         planned: String::new(),
+        planned_ms: 0,
         schedule_cell: String::new(),
         body_doc: None,
     };
@@ -363,7 +367,15 @@ pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
-            PLANNED_CELL => t.planned = value,
+            PLANNED_CELL => {
+                t.planned = value;
+                // content date-клетки — epoch ms (истина; formattedContent
+                // — дисплей ядра в его локали)
+                t.planned_ms = cell
+                    .pointer("/value/date/content")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+            }
             SCHEDULE_CELL => t.schedule_cell = value,
             _ => {}
         }
@@ -2366,6 +2378,7 @@ mod tests {
             pr: String::new(),
             dev_session: String::new(),
             planned: String::new(),
+            planned_ms: 0,
             schedule_cell: String::new(),
             body_doc: body_doc.map(String::from),
         }
@@ -2504,6 +2517,7 @@ mod tests {
             pr: String::new(),
             dev_session: String::new(),
             planned: String::new(),
+            planned_ms: 0,
             schedule_cell: String::new(),
             body_doc: None,
         }

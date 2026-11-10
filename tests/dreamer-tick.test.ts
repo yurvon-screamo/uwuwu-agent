@@ -25,6 +25,7 @@ interface TickVerdict {
   sessionCreates: Array<{ body: { agent?: string; parentID?: string; location?: { directory?: string } } }>
   prompts: Array<{ body: { text?: string } }>
   sessionDeletes: unknown[]
+  strictPathPin?: boolean
 }
 
 describe("тик дримера: задачный контур (Done → пакетный прогон)", () => {
@@ -53,6 +54,8 @@ describe("тик дримера: задачный контур (Done → пак�
   test("done-сигнал → задачный прогон спавнит дримера: трек running, пакет с BFS-детьми, no DELETE", async () => {
     const verdict = await runTick("task-spawn")
     expect(verdict.exitCode).toBe(0)
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс (не-ок ответ)
+    expect(verdict.strictPathPin).toBe(true)
 
     // очередь потреблена: start (мерж активного набора) и done (постановка)
     expect(verdict.queue).toEqual([])

@@ -1,0 +1,157 @@
+# Периодический стресс-прогон cli-тестов — системный ловец тайминг-флейков
+# (задача 20261110051831-qnkx3id, из ревью PR #195).
+#
+# Красный путь доказан живым раном (Actions run 42821058074, 11.11): канарка-
+# тест ×5 прогонов → rc=101 в каждом → Failure report собрал имена тестов,
+# паники и ##[error] аннотации.
+#
+# Зачем: семья тайминг-флейков cli (search_lines #145, mcp_transport,
+# semantic_tests #195, безымянный fail 10.11) выстреливает только под
+# нагрузкой полного прогона и ловится сейчас ревью-прогонами PR — каждый
+# инцидент стоит хода ручной атрибуции. Эта джоба гоняет полный cargo test
+# ×N в том же контуре, где стреляют флейки (CPU-нагрузка sha256-воркерами
+# по числу ядер — проверенный паттерн тестировщика задачи 20261109094809),
+# по ночному расписанию на мастер-контуре, и фиксирует имя теста + фрагмент
+# паники при падении (урок 10.11: безымянный fail = потерянное наблюдение).
+#
+# Нотификация — нативный email GitHub при падении scheduled workflow;
+# автозаведение задач сознательно не строится (минимальность): сигнал =
+# красная джоба + summary с именами/паниками.
+#
+# Триггеры только schedule + workflow_dispatch: PR-гейт CI не затронут,
+# чекраны branch protection живут в ci.yml.
+#
+# pull_request с path-фильтром — самопроверка джобы: scheduled workflow
+# нельзя триггернуть dispatch'ем до мерджа (GitHub требует workflow на
+# default branch), PR-ран на изменении этих файлов — единственный способ
+# доказать зелёный путь end-to-end. Path-фильтр держит рутину чистой:
+# на обычных PR джоба не гоняется.
+name: Stress tests
+
+on:
+  schedule:
+    # 18:45 UTC = 03:45 JST (ночь владельца); не круглые минуты —
+    # у GitHub пик нагрузки планировщика в начале часа.
+    - cron: '45 18 * * *'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'Прогонов cargo test'
+        required: false
+        default: '5'
+      stress:
+        description: 'CPU-нагрузка (sha256-воркеры по числу ядер)'
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - '.github/workflows/stress-tests.yml'
+      - 'scripts/ci/**'
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Stress (cargo test ×N)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      STRESS_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '5' }}
+      # AND-OR-паттерн GitHub врёт для stress=false (true && false || 'true'
+      # → 'true'), поэтому вложенная форма: dispatch → честная 'true'/'false',
+      # остальные события → 'true'.
+      STRESS_CPU: ${{ github.event_name == 'workflow_dispatch' && (inputs.stress && 'true' || 'false') || 'true' }}
+    steps:
+      # Пины по SHA как в ci.yml: плавающие теги = supply-chain поверхность.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: cli
+
+      # Стресс-воркеры: по одному sha256-хэширующему процессу на ядро, все
+      # ядра под 100% — тот же контур, где roundtrip моков превышает бюджеты
+      # тайминг-чувствительных тестов. Внимание: trap на EXIT шага здесь не
+      # годится — он убил бы воркеров в конце этого же шага, до тестов;
+      # воркеры живут между шагами, уборку делает шаг «Kill CPU load»
+      # (if: always() — и на красном пути тоже), а контейнер раннера —
+      # страховка в любом исходе джобы.
+      - name: CPU load (sha256 workers)
+        if: env.STRESS_CPU == 'true'
+        run: |
+          echo "cores: $(nproc)"
+          for i in $(seq 1 "$(nproc)"); do
+            sha256sum /dev/zero >/dev/null 2>&1 &
+            echo $! >> stress-workers.pids
+          done
+
+      # ×N прогонов подряд; выход НЕ раньше конца цикла — собираем полную
+      # картину (сколько упало, какие тесты), а не первый фейл.
+      #
+      # Готча bash -e (ревью PR #209, High): дефолтный shell шага —
+      # bash -e, с pipefail падающий pipeline убивает шаг немедленно и
+      # строки после него (rc=$?, запись .rc) не выполняются никогда —
+      # отчёт не видит упавших. Лов статуса через `|| rc=$?` выводит
+      # pipeline из-под set -e: цикл переживает любой исход и .rc пишется
+      # для каждого прогона.
+      - name: cargo test ×N
+        working-directory: cli
+        run: |
+          set -o pipefail
+          # Валидация инпута dispatch: не-число / 0 / «00» (ведущие нули
+          # проходят case — ловится только литерал 0 — и seq 1 00 даёт
+          # ноль итераций при молчащем -ne гарде, ревью раунд 2 Low) —
+          # всё это громкий фейл, не тихий false-green: зелёный статус
+          # обязан означать «N прогонов прошли». $((10#…)) нормализует
+          # ведущие нули (00→0, 012→12).
+          case "$STRESS_RUNS" in ''|*[!0-9]*)
+            echo "::error::STRESS_RUNS должно быть числом >= 1, получено: '$STRESS_RUNS'"
+            exit 1 ;;
+          esac
+          STRESS_RUNS=$((10#$STRESS_RUNS))
+          if [ "$STRESS_RUNS" -lt 1 ]; then
+            echo "::error::STRESS_RUNS должно быть >= 1, получено: '$STRESS_RUNS'"
+            exit 1
+          fi
+          # Логи живут в корне репо (../stress-logs относительно cli/):
+          # report-шаг читает их из корня — пути в одной системе координат.
+          mkdir -p ../stress-logs
+          overall=0
+          for i in $(seq 1 "$STRESS_RUNS"); do
+            echo "::group::Прогон $i/$STRESS_RUNS"
+            rc=0
+            cargo test 2>&1 | tee "../stress-logs/run-$i.log" || rc=$?
+            echo "::endgroup::"
+            echo "$rc" > "../stress-logs/run-$i.rc"
+            if [ "$rc" -ne 0 ]; then
+              overall=1
+              echo "прогон $i: FAIL (rc=$rc)"
+            else
+              echo "прогон $i: ok"
+            fi
+          done
+          # Страховка полноты: зелёный без всех .rc-файлов — внутренняя
+          # поломка цикла, не успех (ловит будущие правки шага).
+          done_runs="$(find ../stress-logs -name 'run-*.rc' | wc -l)"
+          if [ "$done_runs" -ne "$STRESS_RUNS" ]; then
+            echo "::error::выполнено прогонов: $done_runs из $STRESS_RUNS"
+            exit 1
+          fi
+          exit "$overall"
+
+      # Воркеры держатся только на время тестов — убить до шага отчёта.
+      - name: Kill CPU load
+        if: always() && env.STRESS_CPU == 'true'
+        run: xargs -r kill < stress-workers.pids 2>/dev/null || true
+
+      # Сигнал: имена упавших тестов + фрагменты паник в summary и
+      # аннотации. Красная джоба без этого шага = «безымянный fail».
+      # Потоки: markdown → stdout (tee в summary), ::error аннотации →
+      # stderr (парсятся из лога напрямую; в summary им делать нечего).
+      - name: Failure report
+        if: failure()
+        run: |
+          scripts/ci/stress-report.sh stress-logs | tee "$GITHUB_STEP_SUMMARY"

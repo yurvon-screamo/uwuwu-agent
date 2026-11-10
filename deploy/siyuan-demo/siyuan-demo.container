@@ -11,7 +11,7 @@ StartLimitIntervalSec=0
 
 [Container]
 ContainerName=siyuan-demo
-Image=docker.io/b3log/siyuan:v3.8.10-alpha.5
+Image=docker.io/b3log/siyuan:v3.8.10
 Network=pasta
 PublishPort=0.0.0.0:6806:6806
 Volume=/home/yurvon/siyuan-demo-ws:/siyuan/workspace
