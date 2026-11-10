@@ -13,9 +13,10 @@
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
@@ -917,6 +918,15 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
+  // пиннинг за нодами (ADR-076): крон — singleton-класс, второй экземпляр
+  // файрил бы кроны дважды; строка «cron: нода» в доке — контракт
+  const pinning = await checkNodePinning(mcp.tool, {
+    singletonDaemon: "cron",
+    envNodeName: process.env.UWUWU_NODE_NAME,
+    hostname: hostname(),
+  })
+  failPinnedStart(pinning)
+  log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   log(`uwuwu-cron: старт (задачные доски «Задачи <proj>», гейт Вейт, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
   emitNotice(STATE_RESOLVED.notice, log)

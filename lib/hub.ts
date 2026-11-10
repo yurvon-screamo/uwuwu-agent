@@ -721,6 +721,10 @@ export interface HubProfile {
   /** extra-валидатор state.json входа (черновик-трекер триажа):
    *  битые поля стрипятся внутри хука, база не роняется */
   validateState?: (raw: Record<string, unknown>, out: HubState) => void
+  /** старт-сверка демона между syncAgentDef и лупами/источниками (пиннинг
+   *  за нодой, ADR-076): throw = отказ старта — демон умирает до любой
+   *  поллинг-работы; деф к этому моменту уже материализован */
+  beforeLoops?: (hub: Hub) => Promise<void>
   /** порог тишины выходного потока, ms: доставок и завершённых ходов нет
    *  дольше порога при живом процессе → алерт владельцу (silenceLoop).
    *  Атрибут профиля: триаж — сутки (волны черновиков ежедневные) */
@@ -1763,6 +1767,7 @@ export function createHub(profile: HubProfile): Hub {
       mkdirSync(dirname(LOG_PATH), { recursive: true })
       gcMedia()
       syncAgentDef()
+      if (profile.beforeLoops !== undefined) await profile.beforeLoops(hub)
       // громкий warning инцидент-класса 06.11: чекаут не master без явного
       // RUN_ROOT env — E2E/тестовый прогон трогает прод-state. Пути не
       // переезжают (HOME-механика изолирует state+лог+workspace+media разом

@@ -6,7 +6,9 @@
 // triage/README. Запуск: systemd --user (uwuwu-triage.service).
 
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
+import { hostname } from "node:os"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import {
   createHub, type Hub, type HubFinalHook, type HubProfile, type HubSource, type DraftRef, type DraftVerdict,
   type Request,
@@ -316,6 +318,17 @@ const profile: HubProfile = {
     },
   },
   sources: [draftWatcher],
+  beforeLoops: async (hub) => {
+    // пиннинг за нодами (ADR-076): триаж — singleton-класс, второй экземпляр
+    // валидировал бы черновики дважды; строка «triage: нода» в доке — контракт
+    const pinning = await checkNodePinning(mcpTool, {
+      singletonDaemon: "triage",
+      envNodeName: process.env.UWUWU_NODE_NAME,
+      hostname: hostname(),
+    })
+    failPinnedStart(pinning)
+    hub.log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
+  },
   onFinal: triageFinalHook,
   validateState: validTriageExtras,
   silenceTimeoutMs: TRIAGE_SILENCE_TIMEOUT_MS,
