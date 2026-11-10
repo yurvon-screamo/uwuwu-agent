@@ -104,6 +104,7 @@ pub(crate) enum TaskSub {
         status: Option<String>,
         #[arg(long)]
         title: Option<String>,
+        /// URL главного PR задачи (https); docs-only — URL главного вики-артефакта
         #[arg(long)]
         pr: Option<String>,
         #[arg(long)]
