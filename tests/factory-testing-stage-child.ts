@@ -4,6 +4,9 @@
 //               переходе): карантинная запись state + спавн тестировщика
 //               (агент tester, cwd ворктри, ячейка «Сессия тест»), дев-волна
 //               НЕ спавнится; повторный тик не плодит дубль-спавн;
+//   nocell     — доска без колонки «Сессия тест»: спавн не пишет ячейку,
+//               громкий флаг [factory] доставлен раз на доску (дедуп
+//               держит рестарт-спавн tick3);
 //   rerun      — трек с живой тест-сессией, lastStatus «Ревью результата»:
 //               дельта-промпт в ТУ ЖЕ сессию, без создания новой;
 //   bug        — fail-вердикт тестировщика: строка в In Progress, дев-сессия
@@ -13,9 +16,10 @@
 import { mkdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 
-const SCENARIO = process.env.TESTING_STAGE_SCENARIO === "rerun"
-  ? "rerun"
-  : process.env.TESTING_STAGE_SCENARIO === "bug" ? "bug" : "quarantine"
+const RAW_SCENARIO = process.env.TESTING_STAGE_SCENARIO ?? ""
+const SCENARIO = RAW_SCENARIO === "rerun" || RAW_SCENARIO === "bug" || RAW_SCENARIO === "nocell"
+  ? RAW_SCENARIO
+  : "quarantine"
 
 const AV_ID = "20260101000000-abcdef"
 const ROW_ID = "20261108000000-row1"
@@ -29,13 +33,24 @@ const ROW = {
   title: "Тестовая стадия",
 }
 
+// Схема доски (render columns + keys): на nocell «Сессия тест» отсутствует —
+// чтение cells и запись ячеек видят одинаковую раскладку
+const BOARD_KEYS = [
+  { id: "k-status", name: "Status" },
+  { id: "k-dev", name: "Сессия dev" },
+  { id: "k-rev", name: "Сессия ревью" },
+  { id: "k-test", name: "Сессия тест" },
+]
+const viewKeys = SCENARIO === "nocell" ? BOARD_KEYS.filter((k) => k.id !== "k-test") : BOARD_KEYS
+
 function scriptTick(): string[] {
   const calls: string[] = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? "GET"
     if (url.includes("/api/block/appendBlock")) {
-      calls.push("comment")
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { data?: string }
+      calls.push(`comment:${payload.data ?? ""}`)
       return new Response(JSON.stringify({ code: 0, msg: "", data: [] }), { status: 200 })
     }
     if (url.includes("/api/export/exportMdContent")) {
@@ -94,12 +109,7 @@ function scriptTick(): string[] {
                 structuredContent: {
                   data: {
                     view: {
-                      columns: [
-                        { id: "k-status", name: "Status" },
-                        { id: "k-dev", name: "Сессия dev" },
-                        { id: "k-rev", name: "Сессия ревью" },
-                        { id: "k-test", name: "Сессия тест" },
-                      ],
+                      columns: viewKeys,
                       rowCount: 1,
                       rows: [{
                         id: ROW.id,
@@ -119,16 +129,7 @@ function scriptTick(): string[] {
               }
             : { structuredContent: { data: { view: { rows: [] } } } }
         } else if (action === "keys") {
-          result = {
-            structuredContent: {
-              data: { keys: [
-                { id: "k-status", name: "Status" },
-                { id: "k-dev", name: "Сессия dev" },
-                { id: "k-rev", name: "Сессия ревью" },
-                { id: "k-test", name: "Сессия тест" },
-              ] },
-            },
-          }
+          result = { structuredContent: { data: { keys: viewKeys } } }
         } else if (action === "item_update") {
           const value = (args.value ?? {}) as { text?: { content?: string }; mSelect?: { content?: string }[] }
           const content = value.text?.content ?? value.mSelect?.map((o) => o.content ?? "").join(",") ?? "?"
@@ -192,6 +193,7 @@ const tick1 = {
   sessionCreates: sliceAll(calls, "session-create:"),
   prompts: sliceAll(calls, "prompt:"),
   itemUpdates: sliceAll(calls, "item_update:"),
+  comments: sliceAll(calls, "comment:"),
 }
 // tick 2 (дубль-спавн / повторная доставка)
 await tickProject(state, "t", cfg)
@@ -200,6 +202,22 @@ const tick2 = {
   sessionCreates: sliceAll(tail, "session-create:"),
   prompts: sliceAll(tail, "prompt:"),
   itemUpdates: sliceAll(tail, "item_update:"),
+  comments: sliceAll(tail, "comment:"),
+}
+// tick 3 — рестарт-спавн (только nocell): трек тест-сессии потерян
+// (даунтайм демона), строка снова untracked — спавн повторяется, а
+// флаг-коммент НЕ доставляется второй раз (дедуп на доску)
+let tick3 = { sessionCreates: [] as string[], itemUpdates: [] as string[], comments: [] as string[] }
+if (SCENARIO === "nocell") {
+  delete state.tasks[ROW_ID]
+  const cut3 = calls.length
+  await tickProject(state, "t", cfg)
+  const tail3 = calls.slice(cut3)
+  tick3 = {
+    sessionCreates: sliceAll(tail3, "session-create:"),
+    itemUpdates: sliceAll(tail3, "item_update:"),
+    comments: sliceAll(tail3, "comment:"),
+  }
 }
 
 const after = JSON.parse(readFileSync(stateFile, "utf-8")) as {
@@ -216,6 +234,7 @@ console.log(JSON.stringify({
   scenario: SCENARIO,
   tick1,
   tick2,
+  tick3,
   sessionID: track.sessionID ?? null,
   testSessionID: track.testSessionID ?? null,
   testAttempts: track.testAttempts ?? null,

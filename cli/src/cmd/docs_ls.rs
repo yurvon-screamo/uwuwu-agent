@@ -70,9 +70,31 @@ pub(super) async fn ls_listing(
         });
     }
 
+    // Ноутбучная ветка: префикс целиком — имя открытого ноутбука → дети его
+    // корня (проекты/топики живут с hpath от корня ноутбука без имени
+    // ноутбука, «Projects» как hpath-пространство не существует). Fallback
+    // после пустого hpath-матча: прежняя семантика адресации первична.
+    // Составной префикс («Projects/<проект>») не резолвится — указатели
+    // ведут на голый ноутбук.
+    let top = prefix.split('/').next().unwrap_or(prefix);
+    if top == prefix {
+        if let Some((children, truncated)) = notebook_children(sy, prefix, subtree_limit).await? {
+            if children.is_empty() {
+                // живой ноутбук без детей — «пусто»-ветка, не отказ с раскладкой
+                return Ok(Listing {
+                    children: None,
+                    truncated: false,
+                });
+            }
+            return Ok(Listing {
+                children: Some(children),
+                truncated,
+            });
+        }
+    }
+
     // Ноль строк: известное пространство → «пусто»; неизвестное →
     // громкий отказ с раскладкой доступных.
-    let top = prefix.split('/').next().unwrap_or(prefix);
     let tops = top_segments(sy).await?;
     if tops.iter().any(|known| known == top) {
         Ok(Listing {
@@ -85,6 +107,38 @@ pub(super) async fn ls_listing(
             tops.join(", ")
         ))
     }
+}
+
+/// Дети корня ноутбука по имени: доки бокса, первый сегмент hpath — проект
+/// или топик («uwuwu» с детьми → «uwuwu/», одиночный док Daily → имя).
+/// Some — открытый ноутбук с таким именем найден (перечень детей корня,
+/// возможно пустой) + факт обрезки лимитом (детект перебором, fetch_limit
+/// = limit + 1, как в subtree_stmt); None — имени нет среди открытых
+/// ноутбуков (caller продолжает hpath-логикой: «пусто»/отказ с раскладкой).
+pub(super) async fn notebook_children(
+    sy: &SiYuan,
+    name: &str,
+    subtree_limit: usize,
+) -> Result<Option<(Vec<String>, bool)>> {
+    for nb in sy.notebooks().await? {
+        if nb.get("closed").and_then(|c| c.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if nb.get("name").and_then(|n| n.as_str()) != Some(name) {
+            continue;
+        }
+        let box_id = nb.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let escaped = box_id.replace('\'', "''");
+        let fetch_limit = subtree_limit + 1;
+        let stmt = format!(
+            "select hpath from blocks where type='d' and box='{escaped}' limit {fetch_limit}"
+        );
+        let rows = sy.sql(&stmt).await?;
+        let truncated = rows.len() > subtree_limit;
+        let children = direct_children("", hpaths(&rows[..subtree_limit.min(rows.len())]));
+        return Ok(Some((children, truncated)));
+    }
+    Ok(None)
 }
 
 /// SQL выборки поддерева: substr-префикс вместо LIKE (вайлкарды %/_ в
@@ -111,7 +165,13 @@ pub(super) fn direct_children<'a, I>(prefix: &str, hpaths: I) -> Vec<String>
 where
     I: Iterator<Item = &'a str>,
 {
-    let full_prefix = format!("/{}/", prefix);
+    // Пустой префикс = корень ноутбука (дети — первые сегменты hpath);
+    // «dir/»-постфикс и дедуп папка-док/папка общие с hpath-веткой.
+    let full_prefix = if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}/", prefix)
+    };
     let mut entries: Vec<String> = Vec::new();
     for hpath in hpaths {
         let Some(rest) = hpath.strip_prefix(&full_prefix) else {

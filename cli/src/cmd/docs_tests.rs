@@ -237,3 +237,193 @@ async fn empty_prefix_bails_with_available_spaces() {
     assert!(text.contains("пустой префикс"), "{text}");
     assert!(text.contains("доступные пространства: uwuwu"), "{text}");
 }
+
+/// Роутер ноутбучной ветки: lsNotebooks + box-sql (дети корня ноутбука)
+/// + общий sql-роутер прежних веток.
+async fn mount_notebook_router(
+    server: &MockServer,
+    notebooks: Vec<Value>,
+    box_rows: Vec<Value>,
+    subtree: Vec<Value>,
+    tops: Vec<Value>,
+) {
+    Mock::given(method("POST"))
+        .and(path("/api/notebook/lsNotebooks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "code": 0, "msg": "", "data": { "notebooks": notebooks } })),
+        )
+        .mount(server)
+        .await;
+    let sql = sql_router(subtree, tops);
+    Mock::given(method("POST"))
+        .and(path("/api/query/sql"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let stmt = body
+                .get("stmt")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default();
+            if stmt.contains("box=") {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "code": 0, "msg": "", "data": box_rows }))
+            } else {
+                sql(req)
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+/// Префикс-имя открытого ноутбука → дети его корня: проекты в ноутбуке
+/// Projects не живут в hpath с именем ноутбука, перечень даёт box-выборка
+/// (fix 20261109132340: путь из help projects и методичек).
+#[tokio::test]
+async fn notebook_prefix_lists_root_children() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "20261103224312", "name": "Projects", "closed": false })],
+        vec![
+            json!({ "hpath": "/uwuwu" }),
+            json!({ "hpath": "/uwuwu/README (uwuwu)" }),
+            json!({ "hpath": "/cli/ADR/ADR-014: SiYuan" }),
+            json!({ "hpath": "/daily-note" }),
+        ],
+        vec![], // hpath-пространство «Projects» не существует
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "Projects", 10000).await.unwrap();
+
+    assert_eq!(
+        listing.children,
+        Some(vec![
+            "cli/".to_string(),
+            "daily-note".to_string(),
+            "uwuwu/".to_string()
+        ])
+    );
+    assert!(!listing.truncated);
+}
+
+/// Однотокенный неизвестный префикс после пустого notebook-фоллбека —
+/// прежний громкий отказ с раскладкой доступных пространств.
+#[tokio::test]
+async fn single_token_unknown_bails_after_notebook_fallback() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "nb1", "name": "Projects", "closed": false })],
+        vec![],
+        vec![],
+        vec![json!({ "top": "uwuwu" })],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let err = ls_listing(&sy, "опечатка", 10000)
+        .await
+        .expect_err("unknown space must bail");
+
+    let text = err.to_string();
+    assert!(text.contains("«опечатка» не найдено"), "{text}");
+    assert!(text.contains("доступные: uwuwu"), "{text}");
+}
+
+/// notebook_children напрямую: тот же box-контракт без ls_listing-обвязки.
+#[tokio::test]
+async fn notebook_children_direct_resolves_by_name() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "20261103224312", "name": "Projects", "closed": false })],
+        vec![
+            json!({ "hpath": "/uwuwu" }),
+            json!({ "hpath": "/uwuwu/README" }),
+        ],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+    let direct = super::docs_ls::notebook_children(&sy, "Projects", 10000)
+        .await
+        .unwrap();
+    assert_eq!(direct, Some((vec!["uwuwu/".to_string()], false)));
+}
+
+/// Закрытый ноутбук с совпадающим именем скипается — резолв идёт только
+/// по открытым (семантика lsNotebooks-перечня projects_run).
+#[tokio::test]
+async fn notebook_children_skips_closed_notebook() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![
+            json!({ "id": "nb-closed", "name": "Projects", "closed": true }),
+            json!({ "id": "nb-open", "name": "Projects", "closed": false }),
+        ],
+        vec![json!({ "hpath": "/uwuwu/README" })],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+    let direct = super::docs_ls::notebook_children(&sy, "Projects", 10000)
+        .await
+        .unwrap();
+    assert_eq!(direct, Some((vec!["uwuwu/".to_string()], false)));
+}
+
+/// Обрезка по факту перебора: fetch_limit = limit+1 (ядро отдало limit+1
+/// строку) → truncated=true, дети — limit записей; та же дисциплина, что
+/// в subtree_stmt, не тихий срез.
+#[tokio::test]
+async fn notebook_children_beyond_limit_is_truncated() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "nb1", "name": "Daily", "closed": false })],
+        vec![
+            json!({ "hpath": "/a" }),
+            json!({ "hpath": "/b" }),
+            json!({ "hpath": "/c" }),
+        ],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "Daily", 2).await.unwrap();
+
+    assert_eq!(
+        listing.children,
+        Some(vec!["a".to_string(), "b".to_string()])
+    );
+    assert!(listing.truncated);
+}
+
+/// Живой ноутбук без детей — «пусто» (None-children), не отказ
+/// «пространство не найдено»: имя ноутбука известно.
+#[tokio::test]
+async fn empty_live_notebook_is_empty_listing() {
+    let server = MockServer::start().await;
+    mount_notebook_router(
+        &server,
+        vec![json!({ "id": "nb1", "name": "Daily", "closed": false })],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .await;
+    let sy = SiYuan::for_tests(server.uri());
+
+    let listing = ls_listing(&sy, "Daily", 10000).await.unwrap();
+
+    assert_eq!(listing.children, None);
+    assert!(!listing.truncated);
+}

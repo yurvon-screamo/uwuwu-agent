@@ -196,6 +196,184 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
     }
 }
 
+// ——— create с контентом: семантика «передал контент — тело твоё» (20261109101129) ———
+
+/// create с непустым контентом (--stdin): контент — тело целиком как есть,
+/// скелет не вкатывается (плейсхолдеров «## План»/«## Проверка» нет).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let content = "## Постановка\n\nсвоя формулировка от агента\n";
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        content,
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert_eq!(
+        md, content,
+        "контент записан как есть — скелет не оборачивает"
+    );
+    assert!(
+        !md.contains("<срезы/шаги") && !md.contains("<исполняемое"),
+        "плейсхолдеров скелета в теле нет: {md}"
+    );
+}
+
+/// create без контента — регресс: типовой скелет как раньше.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_without_content_writes_type_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        "",
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create без контента ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("## Постановка") && md.contains("<срезы/шаги") && md.contains("<исполняемое"),
+        "пустой контент — типовой скелет dev: {md}"
+    );
+}
+
+/// Титульный H1 в контенте стрипается (паритет task body: createDocWithMd
+/// оставил бы его heading-блоком — дубль к заголовку дока); чужой H1 и
+/// прочий контент — как есть.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_title_h1_in_content_strips_only_title_h1() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let content = format!("# {NEW_TITLE}\n\n## Постановка\n\nтело\n\n# Чужой Раздел\n\nостаётся\n");
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        &content,
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        !md.contains(&format!("# {NEW_TITLE}\n")),
+        "титульный H1 стрипается: {md}"
+    );
+    assert!(md.contains("# Чужой Раздел"), "чужой H1 остаётся: {md}");
+    assert!(
+        md.contains("## Постановка\n\nтело"),
+        "контент после стрипа как есть: {md}"
+    );
+    assert!(
+        !md.contains("<срезы/шаги"),
+        "скелет при непустом контенте не вкатывается: {md}"
+    );
+}
+
+/// Whitespace-only контент — «пустой»: типовой скелет, как без --stdin.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_with_whitespace_only_content_writes_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    create_with_pacing(
+        &sy,
+        "uwuwu",
+        NEW_TITLE,
+        "dev",
+        "   \n\n  ",
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с whitespace-контентом ok");
+
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("<срезы/шаги"),
+        "whitespace-only = пустой: скелет: {md}"
+    );
+}
+
+/// Dry-run ветка create — read-only осмотр: при живом мок-ядре ноль записей
+/// (строка/док/атрибуты не минтятся). Печатаемое тело собирает та же
+/// create_body_md, что и боевую запись (юнит-пин равенства в siyuan_task_tests);
+/// content-ветка dry-run не тестируется на dispatch — read_stdin читает
+/// реальный stdin процесса, обвязки мока в репо нет (рамка ревью: тест без
+/// stdin).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_dry_run_is_read_only_with_mock_kernel() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    set_env(&server);
+    task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "dry-run осмотр".into(),
+            r#type: None,
+            stdin: false,
+            attach: Vec::<std::path::PathBuf>::new(),
+            schedule: None,
+            agent: None,
+            dry_run: true,
+        },
+    )
+    .await
+    .expect("dry-run проходит без отказов");
+
+    assert!(kernel.created_docs().is_empty(), "dry-run не создаёт доков");
+    assert!(
+        kernel.item_add_args().is_empty(),
+        "dry-run не вставляет строк"
+    );
+    assert!(
+        kernel.attr_writes().is_empty(),
+        "dry-run не пишет атрибутов"
+    );
+}
+
 /// Дедуп по факту render: в ленте появилась чужая строка с тем же тайтлом →
 /// громкий отказ, вторую строку не минтим, тег не пишется.
 #[tokio::test]
@@ -661,6 +839,130 @@ async fn body_replace_delete_failure_restores_pre_image() {
         restored.contains("старый контент"),
         "исходный контент возвращён в док: {restored:?}"
     );
+}
+
+/// Env-гард тестового пейсинга отката: remove на Drop — паника теста не
+/// протекает env в последующие serial-тесты (иначе маскируется их реальное
+/// расписание).
+struct RestorePacingGuard;
+impl Drop for RestorePacingGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+    }
+}
+
+/// Рестарт ядра посреди overwrite (класс 08.11: смерти процесса ядра,
+/// NRestarts=3 за вечер): мок сносит поколение MCP-сессий после второго
+/// tools/call (render-резолв строки, затем block get живости привязки) —
+/// get_children исходной очистки ловит 404 стейл-сессии, overwrite умирает,
+/// и откат обязан пережить это: инвалидация сессии на границе попыток →
+/// ре-инициализация → дочистка/аппенд пре-имиджа. До фикса единственная
+/// попытка отката шла с тем же мёртвым sid → дамп → ручная реставрация.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_rollback_survives_kernel_reset_via_backoff_retries() {
+    let mut scenario = body_scenario(true);
+    scenario.delete_fail_posts = 4;
+    scenario.mcp_restart_after_tools_calls = 2;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    assert!(
+        format!("{err:#}").contains("восстановлен"),
+        "откат пережил рестарт ядра: {err:#}"
+    );
+    assert!(
+        kernel.mcp_initializes() >= 2,
+        "ре-инициализация MCP-сессии на пути отката: {}",
+        kernel.mcp_initializes()
+    );
+    let appends = kernel.appends();
+    assert_eq!(
+        appends.len(),
+        1,
+        "ровно восстановительный append: {appends:?}"
+    );
+    let restored = append_data_field(&appends[0]);
+    assert!(
+        restored.contains("старый контент"),
+        "исходный контент возвращён в док: {restored:?}"
+    );
+}
+
+/// Рестарт ядра гасит MCP-сессию посреди составной команды (задача
+/// 20261109095605-qxcouod): recovery в единой точке mcp-вызовов сам
+/// восстанавливает сессию — гашение после первого tools/call (render-резолв
+/// строки), get_children очистки ловит 404 стейл-сессии → re-init + повтор —
+/// и overwrite доезжает штатно, откат не нужен. До общего recovery команда
+/// падала на стейл-сессии без попытки восстановления. Reject 404 не
+/// исполняет мутацию (session_reject мока отвечает до диспетчеризации) —
+/// append нового тела ровно один: once-семантика повтора.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_survives_kernel_reset_via_mcp_session_recovery() {
+    let mut scenario = body_scenario(true);
+    scenario.mcp_restart_after_tools_calls = 1;
+    let (kernel, server) = MockKernel::start(scenario).await;
+
+    body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect("recovery сессии вытягивает команду после рестарта ядра");
+
+    assert!(
+        kernel.mcp_initializes() >= 2,
+        "recovery: повторная инициализация сессии: {}",
+        kernel.mcp_initializes()
+    );
+    let appends = kernel.appends();
+    assert_eq!(appends.len(), 1, "ровно append нового тела: {appends:?}");
+    let body = append_data_field(&appends[0]);
+    assert!(
+        body.contains("новое тело"),
+        "записано новое тело, откат не понадобился: {body:?}"
+    );
+}
+
+/// Все попытки отката неуспешны (аппенды отката падают весь бэкофф-цикл):
+/// прежний worst-case — дамп пре-имиджа 0600 + громкая ошибка с числом
+/// попыток; команда честно падает, контент сохранён.
+#[tokio::test]
+#[serial_test::serial]
+async fn body_replace_rollback_exhausts_retries_dumps_pre_image() {
+    let mut scenario = body_scenario(true);
+    scenario.delete_fail_posts = 4;
+    scenario.append_fail_posts = 4;
+    let (_kernel, server) = MockKernel::start(scenario).await;
+
+    std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "1,1,1");
+    let _pacing = RestorePacingGuard;
+    let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{BOUND_DOC}.md"));
+    let _ = std::fs::remove_file(&dump_path);
+
+    let err = body_via_cli(&server, true, None, "новое тело\n")
+        .await
+        .expect_err("сбой записи — команда не молчит");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("откат не удался"),
+        "исчерпание ретраев репортится: {message}"
+    );
+    assert!(
+        message.contains("после 4 попыток"),
+        "число попыток в ошибке: {message}"
+    );
+    let dumped = std::fs::read_to_string(&dump_path).expect("дамп пре-имиджа записан");
+    assert!(
+        dumped.contains("старый контент"),
+        "в дампе исходный контент: {dumped:?}"
+    );
+    let _ = std::fs::remove_file(&dump_path);
 }
 
 /// Сбой экспорта пре-имиджа: мутации отменены до очистки — док нетронут,

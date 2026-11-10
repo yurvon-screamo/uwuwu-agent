@@ -9,8 +9,10 @@
 //      перевод владельца в In Progress у трекенной задачи — будильник/
 //      рестарт девелопера (return-to-dev), PR в конфликте с master →
 //      конфликт-kickoff (разреши, запушь, верни в «Ревью результата»)
-//   2. «Ревью плана»/«Ревью результата» → спавн/будильник ревьювера
-//      (праймари code-quality-reviewer, 1 сессия на задачу, cwd = ворктри
+//   2. «Ревью плана» → спавн/будильник план-ревьювера (праймари
+//      plan-reviewer, своя сессия на стадию, cwd = ворктри задачи);
+//      «Ревью результата» → спавн/будильник ревьювера результата (праймари
+//      code-quality-reviewer, своя сессия на стадию, cwd = ворктри
 //      задачи); «Тестирование» → спавн/будильник тестировщика (праймари
 //      tester, тоже 1 сессия на задачу); возврат статуса из ревью/тестирования
 //      → wakeup девелопера; комменты юзера в агентских статусах — держателю
@@ -27,17 +29,18 @@
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
-import { REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
+import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
   newUserComments,
   untrackedTasks,
   isUserComment,
   kickoffModeOf,
+  baseOf,
   promptForStart,
   prMergeableOf,
   mergeablePollStep,
@@ -66,6 +69,11 @@ import {
   stallMinutesFromEnv,
   lastActivityOf,
   stallVerdict,
+  stallClock,
+  bodyEditRoute,
+  prProbeVerdict,
+  PR_PROBE_UNKNOWN_MAX,
+  type PrProbeResult,
   adoptBodyDoc,
   pathSafe,
   createBoardPathOnce,
@@ -99,6 +107,7 @@ import {
   type TaskRef,
   type TrackedTask,
 } from "./factory-lib"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
@@ -170,10 +179,15 @@ const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
  *  Требует песочницу state — гард в main(). */
 const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
-/** ревьювер ревью-статусов: праймари-агент, качество важнее цены будильника.
- *  Модель дублирует agents/code-quality-reviewer.md (frontmatter) — править
- *  синхронно: модель сессии спавна главнее для фабричных сессий. */
+/** ревьювер результата («Ревью результата»): праймари-агент, качество важнее цены
+ *  будильника. «Ревью плана» ведёт PLAN_REVIEWER ниже. Модель дублирует
+ *  agents/code-quality-reviewer.md (frontmatter) — править синхронно: модель сессии
+ *  спавна главнее для фабричных сессий. */
 const REVIEWER = { agent: REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
+/** план-ревьювер стадии «Ревью плана»: парафриз, zoom-out (YAGNI/реюз/глубина
+ *  постановки), implementation readiness. Модель дублирует agents/plan-reviewer.md
+ *  (frontmatter) — править синхронно: модель сессии спавна главнее для фабричных сессий. */
+const PLAN_REVIEWER = { agent: PLAN_REVIEWER_AGENT_ID, model: { providerID: "zai-coding-plan", id: "glm-5.3" } } as const
 /** тестировщик стадии «Тестирование»: праймари-агент, качество фичи важнее
  *  цены будильника; модель flash в max-вариации — единственная мультимодальная
  *  (визуальная проверка вёрстки/скринов). Модель дублирует agents/tester.md
@@ -392,21 +406,26 @@ export async function readTasks(
   return rows
 }
 
-async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+async function setCells(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<string[]> {
   if (DRY_RUN) {
     log(`DRY_RUN: setCells ${rowId.slice(0, 8)} ${JSON.stringify(cells)} — пропущен`)
-    return
+    return []
   }
-  await mcp.tool("update_database_row", { docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells })
+  const r = await mcp.tool<{ skipped?: string[] }>("update_database_row", {
+    docId: board.docId, databaseBlockId: board.dbId, rowBlockId: rowId, cells,
+  })
+  return r.skipped ?? []
 }
 
 /** Best-effort запись служебных ячеек (Path/сессии/Branch): колонку владелец
- *  мог не завести — тихий no-op ядра или ошибка не ломают спавн. */
-async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<void> {
+ *  мог не завести — тихий no-op ядра или ошибка не ломают спавн. Возврат —
+ *  имена колонок, ушедших в no-op: вызывающий решает, громко ли флаговать. */
+async function setCellsSafe(board: BoardIds, rowId: string, cells: Record<string, string>): Promise<string[]> {
   try {
-    await setCells(board, rowId, cells)
+    return await setCells(board, rowId, cells)
   } catch (e) {
     log(`ячейки ${rowId.slice(0, 8)} (${Object.keys(cells).join(", ")}): ${errText(e)} — продолжаю без записи`)
+    return []
   }
 }
 
@@ -457,6 +476,53 @@ async function commentTask(bodyDoc: string, text: string): Promise<boolean> {
     log(`comment: ${e}`)
     return false
   }
+}
+
+// ——— громкий флаг доски без сессионных колонок (ADR-054) ———
+
+const SESSION_CELLS = new Set([DEV_SESSION_CELL, REVIEW_SESSION_CELL, TEST_SESSION_CELL])
+
+/** Доски, чей флаг отсутствия сессионных колонок уже доставлен в задачу:
+ *  один коммент на доску за жизнь процесса — рестарт-спавны не спамят;
+ *  недоставка снимает дедуп, следующий спавн ретраит. */
+const sessionCellFlagged = new Set<string>()
+
+/** Конфиг-расхождение доски (ADR-054): сессионная ячейка ушла в no-op при
+ *  непустой записи — привязка сессии потеряна, фабрика не видит живой заявки
+ *  и спавнит дубль. Коммент в задачу — один раз на доску (дедуп выше);
+ *  прочий skipped (Branch/Path, пустые очистки) — механика, только лог. */
+async function flagMissingSessionCells(
+  board: BoardIds, bodyDoc: string, taskTitle: string, cells: Record<string, string>, skipped: string[],
+): Promise<void> {
+  if (skipped.length === 0) return
+  const lost = skipped.filter((name) => SESSION_CELLS.has(name) && (cells[name] ?? "") !== "")
+  if (lost.length === 0) {
+    log(`доска ${board.dbId.slice(0, 8)}: нет колонок ${skipped.join(", ")} — запись ушла в no-op; сессионных среди них нет, флаг не поднимался`)
+    return
+  }
+  log(`доска ${board.dbId.slice(0, 8)}: сессионных колонок нет (${lost.join(", ")}) — привязка потеряна, возможны дубль-агенты`)
+  if (bodyDoc === "" || sessionCellFlagged.has(board.dbId)) return
+  sessionCellFlagged.add(board.dbId)
+  const delivered = await commentTask(
+    bodyDoc,
+    `[factory] на доске нет колонок: ${lost.join(", ")} — привязка сессии при спавне потеряна (возможны дубль-агенты). ` +
+    `Добавь text-колонку на доску (ADR-054). Задача: ${taskTitle}`,
+  )
+  if (delivered) log(`флаг сессионных колонок доставлен в задачу ${bodyDoc.slice(0, 8)}`)
+  else {
+    sessionCellFlagged.delete(board.dbId)
+    log(`флаг сессионных колонок не доставлен (${bodyDoc.slice(0, 8)}) — ретрай следующим спавном`)
+  }
+}
+
+/** Запись сессионной ячейки спавна + громкий флаг при no-op (ADR-054):
+ *  общий хвост dev/review/test спавнов — ячейка может молча потеряться,
+ *  если колонки на доске нет. */
+async function claimSessionCell(
+  board: BoardIds, rowId: string, bodyDoc: string, taskTitle: string, cells: Record<string, string>,
+): Promise<void> {
+  const skipped = await setCellsSafe(board, rowId, cells)
+  await flagMissingSessionCells(board, bodyDoc, taskTitle, cells, skipped)
 }
 
 // ——— opencode REST (service.json) ———
@@ -730,7 +796,7 @@ async function startTask(
   let envCtx: SpawnEnvContext | undefined
   let envDir: string | undefined
   if (useEnv) {
-    const paths = await ensureEnv(envDeps(), { root: ENV_ROOT, rowId: task.rowId, local: cfg.local, base: "origin/master" })
+    const paths = await ensureEnv(envDeps(), { root: ENV_ROOT, rowId: task.rowId, local: cfg.local, base: baseOf(cfg) })
     envCtx = { repoDir: paths.repoDir, branch: paths.branch, scratchDir: paths.scratchDir }
     envDir = paths.envDir
     if (counters !== undefined) counters.envCreated++
@@ -798,6 +864,9 @@ async function startTask(
     bodyUpdated: await bodyUpdatedAt(task.bodyDoc) ?? undefined,
     bodyHash: (await bodyHashOf(task.bodyDoc, startExports)) ?? undefined,
     agentActive: true, // spawn отправлен — агент работает
+    // спавн-промпт = первый сигнал сессии: часы тишины сталла отсчитываются
+    // от него, пока агент не породил активность
+    lastDevPromptAt: Date.now(),
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
     ...(envDir !== undefined ? { envDir } : {}),
     // история корней: append при каждом спавне (рестарты не теряют прошлые
@@ -806,12 +875,13 @@ async function startTask(
   }
   state.tasks[task.rowId] = entry
   saveState(state)
-  await setCellsSafe(board, task.rowId, {
+  const spawnCells = {
     ...(envCtx !== undefined
       ? { Branch: envCtx.branch, [PATH_CELL]: envCtx.repoDir }
       : {}),
     [DEV_SESSION_CELL]: sessionID,
-  })
+  }
+  await claimSessionCell(board, task.rowId, task.bodyDoc, title, spawnCells)
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: сессия ${sessionID}, старт ${start}${envCtx !== undefined ? `, env=${envDir}` : " (env:false — агент сам делает ворктри)"} (попыток до этого: ${attemptsSeed})`)
 }
@@ -824,7 +894,7 @@ async function gcLegacyRoots(name: string, cfg: ProjectCfg, state: FactoryState)
   const report = await gcLegacyWorktrees(envDeps(), {
     local: cfg.local,
     roots: [join(cfg.local, "wt"), join(cfg.local, ".worktrees")],
-    base: "origin/master",
+    base: baseOf(cfg),
     protectedBranches: guards.branches,
     protectedDirs: guards.dirs,
     nowMs: Date.now(),
@@ -1033,6 +1103,7 @@ function preserveAgentSessions(from: TrackedTask, to: TrackedTask): void {
   if (from.reviewSessionID !== undefined) {
     to.reviewSessionID = from.reviewSessionID
     to.reviewAttempts = from.reviewAttempts
+    to.reviewKind = from.reviewKind
   }
   if (from.testSessionID !== undefined) {
     to.testSessionID = from.testSessionID
@@ -1065,13 +1136,29 @@ async function restartTask(
 
 // ——— ревьювер: спавн/будильник на ревью-статусах ———
 
-/** Смержен ли PR по URL из PR-ячейки (gh — прямая истина о мерже). Фил
- *  (не-GitHub проект, gh недоступен/неавторизован) → false = прежнее
- *  поведение stall-сигнала, деградации нет. */
-async function prMergedByGh(url: string): Promise<boolean> {
+interface PrProbeOutcome { result: PrProbeResult; mergedUrl: string | null }
+
+/** Состояние PR по URL из PR-ячейки (gh — прямая истина о мерже). Сбой пробы
+ *  (не-GitHub проект, gh недоступен/неавторизован) — unknown: сталл-ветка
+ *  отложит кик, предел деградации в prProbeVerdict вернёт страховку. */
+async function prProbeByCell(url: string): Promise<PrProbeOutcome> {
   try {
-    return (await sh(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])) === "MERGED"
-  } catch { return false }
+    const state = await sh(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])
+    return state === "MERGED" ? { result: "merged", mergedUrl: url } : { result: "open", mergedUrl: null }
+  } catch { return { result: "unknown", mergedUrl: null } }
+}
+
+/** Состояние PR по ветке — фоллбек при пустой PR-ячейке (инцидент 09.11:
+ *  задача 0m2net0 с мерженным PR не была защищена пробой — клетка пуста на
+ *  момент чтения). Репо — явно (cwd фабрики — чужой чекаут). */
+async function prProbeByBranch(repo: string, branch: string): Promise<PrProbeOutcome> {
+  try {
+    const url = await sh([
+      "gh", "pr", "list", "-R", repo, "--head", branch, "--state", "merged",
+      "--json", "url", "--jq", ".[0].url",
+    ])
+    return url !== "" ? { result: "merged", mergedUrl: url } : { result: "open", mergedUrl: null }
+  } catch { return { result: "unknown", mergedUrl: null } }
 }
 
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
@@ -1090,25 +1177,27 @@ async function startReview(
   // пусто (env:false или карантинный ревью-вход без дев-спавна) → честная
   // строка промпта «ревью по diff/PR» из каталога сессии cfg.local
   const worktree = tracked.worktree
-  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
+  const reviewer = kind === "plan" ? PLAN_REVIEWER : REVIEWER
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
-    agent: REVIEWER.agent,
-    model: REVIEWER.model,
+    agent: reviewer.agent,
+    model: reviewer.model,
   })
   if (sessionID === null) throw new Error("ревью-сессия не создалась")
-  const sent = await promptSession(sessionID, reviewSpawnPrompt(task.rowId, projectName, kind, ctx))
+  const sent = await promptSession(sessionID, reviewSpawnPrompt(task.rowId, projectName, kind, ctx, reviewer.agent))
   if (!sent) {
     await restCall(`/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
     throw new Error("ревью-промпт не ушёл")
   }
   tracked.reviewSessionID = sessionID
   tracked.reviewAttempts = 0
+  tracked.reviewKind = kind
   // история корней: ревьювер — корневая сессия задачи, дример должен её видеть
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
-  await setCellsSafe(board, task.rowId, { [REVIEW_SESSION_CELL]: sessionID })
+  await claimSessionCell(board, task.rowId, task.bodyDoc, tracked.title || task.title, { [REVIEW_SESSION_CELL]: sessionID })
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: ревью-сессия ${sessionID} (${kind})`)
 }
@@ -1145,7 +1234,7 @@ async function startTesting(
     return
   }
   const worktree = tracked.worktree
-  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type }
+  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
@@ -1162,7 +1251,7 @@ async function startTesting(
   tracked.testAttempts = 0
   tracked.sessionHistory = [...(tracked.sessionHistory ?? []), sessionID]
   saveState(state)
-  await setCellsSafe(board, task.rowId, { [TEST_SESSION_CELL]: sessionID })
+  await claimSessionCell(board, task.rowId, task.bodyDoc, tracked.title || task.title, { [TEST_SESSION_CELL]: sessionID })
   writeTaskStartSignal(task.rowId, sessionID)
   log(`задача ${task.rowId.slice(0, 8)}: тест-сессия ${sessionID}`)
 }
@@ -1208,9 +1297,12 @@ async function dispatchReviewAction(
   const shortId = d.row.rowId.slice(0, 8)
   switch (action.t) {
     case "spawn-reviewer": {
-      // новый вход в ревью-статус = свежая попытка (сброс счётчика фейлов):
-      // юзер/дев переустановили статус после Needs attention
-      const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind
+      // новый вход в ревью-статус или спавн держателя другого вида ревью
+      // (план → результат и обратно; legacy без вида) = свежая попытка
+      // (сброс счётчика фейлов): юзер/дев переустановили статус после
+      // Needs attention или стадия сменила держателя
+      const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind ||
+        d.tracked.reviewKind !== action.kind
       const seed = entering ? 0 : d.tracked.reviewAttempts ?? 0
       try {
         await startReview(d.row, d.project, d.cfg, d.board, d.state, action.kind, d.tracked)
@@ -1301,7 +1393,7 @@ async function dispatchReviewAction(
           // живая сессия инит получила при своём спавне — будильник без
           // init (дельта-принцип); init только на свежих сессиях (startTask)
           conflicted
-            ? conflictFixPrompt(d.row.rowId, d.row.pr, d.project)
+            ? conflictFixPrompt(d.row.rowId, d.row.pr, d.project, { base: baseOf(d.cfg) })
             : reviewReturnPrompt(d.row.rowId),
         )
         if (ok) {
@@ -1309,6 +1401,7 @@ async function dispatchReviewAction(
           // тиком): агент перечитывает task get вместе с комментами/телом
           d.consumeComments()
           await d.refreshBodyBaseline()
+          d.tracked.lastDevPromptAt = Date.now()
           saveState(d.state)
         } else {
           log(`задача ${shortId}: возврат из ревью — промпт девелоперу не ушёл`)
@@ -1573,6 +1666,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
+      reviewKind: tracked.reviewKind,
       testerAlive: testerLiveness === "alive" ? true : testerLiveness === "dead" ? false : null,
       freshComments: foreign,
     })
@@ -1685,15 +1779,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         && (tracked.bodyUpdated ?? "") !== ""
         && updated > (tracked.bodyUpdated ?? "")
       if (lastmodChanged) {
-        const inAgentStage = slot !== "dev" && addresseeSession !== ""
-        const target = inAgentStage ? addresseeSession : tracked.sessionID
-        const targetRole = slot === "review" ? "ревьювер" : slot === "test" ? "тестировщик" : "девелопер"
-        if (target !== "") {
+        const route = bodyEditRoute({
+          status: row.status,
+          reviewSessionID: tracked.reviewSessionID ?? "",
+          testSessionID: tracked.testSessionID ?? "",
+          devSessionID: tracked.sessionID,
+        })
+        if (route.t === "wake") {
           const md = await bodyExport(tracked.bodyDoc, bodyExports)
           // сбой экспорта → деградация к будке (тихий скип потерял бы правку)
           const hash = md === null ? null : bodyContentHash(md)
           const lastmodMs = md === null ? null : bodyLastmodMs(md)
-          const activity = await lastSessionActivity(target)
+          const activity = await lastSessionActivity(route.target)
           const ownEdit = lastmodMs !== null && typeof activity === "number" && lastmodMs <= activity
           const contentChanged = hash === null || hash !== (tracked.bodyHash ?? "")
           if (!contentChanged) {
@@ -1714,11 +1811,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
               saveState(state)
               log(`задача ${rowId.slice(0, 8)}: дубль bodyEdit-wakeup в окне дедупа — скип`)
             } else {
-              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${targetRole})`)
-              if (await promptSession(target, bodyEditPrompt(rowId))) {
+              log(`задача ${rowId.slice(0, 8)}: контентная правка тела → wakeup (${route.role})`)
+              if (await promptSession(route.target, bodyEditPrompt(rowId))) {
                 tracked.bodyUpdated = updated
                 if (hash !== null) tracked.bodyHash = hash
                 tracked.lastWakeup = { key: bodyKey, at: Date.now() }
+                if (route.role === "девелопер") tracked.lastDevPromptAt = Date.now()
                 saveState(state)
                 counters.wakeups++
               }
@@ -1726,7 +1824,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           }
           continue
         }
-        // таргета нет (дев в карантине, сессии держателя тоже) — базлайн не двигаем:
+        if (route.updateBaseline) {
+          // гейт статуса (Review = мяч у владельца): правка проглочена осознанно —
+          // базлайн двигаем, иначе каждые 3 мин перевычисление и лог-шум
+          tracked.bodyUpdated = updated
+          const md = await bodyExport(tracked.bodyDoc, bodyExports)
+          const hash = md === null ? null : bodyContentHash(md)
+          if (hash !== null) tracked.bodyHash = hash
+          saveState(state)
+          log(`задача ${rowId.slice(0, 8)}: правка тела на Review (мяч у владельца) — без будки`)
+          continue
+        }
+        // таргета нет (дев в карантине) — базлайн не двигаем:
         // добудим адресата на следующем тике
       }
     }
@@ -1746,7 +1855,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         tracked.sessionID = ""
         saveState(state)
         await notify(tracked,
-          "[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с master).")
+          `[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с ${baseOf(cfg)}).`)
       } else if (quiet === "alive" && row.status === "In Progress") {
         // сессия жива — ловим зависший ход: агент молчит дольше порога
         // (активный ход рождает сообщения на каждом шаге LLM). Неизвестная
@@ -1755,24 +1864,59 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         if (activity === "invalid") {
           log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
         } else {
-          // git только когда вердикт может стать signal: предварительный чек
-          // застоя — решение остаётся в stallVerdict, ветка в facts нужна
-          // лишь для текста сигнала
-          const stalled = activity === null || Date.now() - activity > STALL_MS
-          // кэш мержа действителен, пока совпадает с PR-ячейкой (смена PR —
-          // stacked/ремедиация через возврат из Review — штатный пайп-путь —
-          // инвалидирует без перезаписи state; новый позитив перезапишет)
-          let prMerged = (tracked.mergedPrUrl ?? "") === row.pr && row.pr !== ""
+          // Единые часы сталла (stallClock): вердикт и pre-чек ленивых проб
+          // считают тишину от одной точки — последний сигнал сессии. Свежий
+          // будильник сбрасывает часы (инцидент 09.11: reviewReturnPrompt
+          // и сталл-кик из одной геометрии «тишина от активности» — два
+          // противоречащих сигнала одним тиком)
+          const clock = stallClock(
+            { lastActivityAt: activity, lastDevPromptAt: tracked.lastDevPromptAt ?? null },
+            STALL_MS,
+            Date.now(),
+          )
+          if (!clock.stalled && clock.fromWake && activity !== null
+              && Date.now() - activity > STALL_MS) {
+            log(`задача ${rowId.slice(0, 8)}: будильник сессии свежий — часы от wake, тишина ${clock.quietMin} мин, детекция ждёт ответ`)
+          }
+          const { stalled } = clock
+          // кэш мержа действителен, пока совпадает с PR-ячейкой или ячейка
+          // пуста (позитив фоллбек-пробы по ветке); смена PR на заполненной
+          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует
+          let prMerged = (tracked.mergedPrUrl ?? "") !== ""
+            && (row.pr === "" || tracked.mergedPrUrl === row.pr)
           // gh-проба ленивая (вердикт может стать signal) и только до первого
           // MERGED: merge необратим — без кэша это была бы проба каждые 3 мин
           // на всё время ожидания Done (дни). signaled=true глушит вердикт —
-          // проба не нужна
-          if (stalled && !prMerged && row.pr !== "" && tracked.stallSignaled !== true) {
-            if (await prMergedByGh(row.pr)) {
-              tracked.mergedPrUrl = row.pr
-              prMerged = true
+          // проба не нужна. Пустая клетка при непустой ветке — фоллбек по
+          // ветке (инцидент 09.11: мерженный PR не защитил от кика)
+          if (stalled && !prMerged && tracked.stallSignaled !== true) {
+            const probe = row.pr !== ""
+              ? await prProbeByCell(row.pr)
+              : row.branch !== "" ? await prProbeByBranch(cfg.repo, row.branch) : null
+            if (probe === null) {
+              // нет ни PR-клетки, ни ветки — пробовать нечего
+              tracked.prProbeUnknownStreak = undefined
               saveState(state)
-              log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
+            } else {
+              const pv = prProbeVerdict(probe.result, tracked.prProbeUnknownStreak ?? 0)
+              tracked.prProbeUnknownStreak = pv.streakAfter === 0 ? undefined : pv.streakAfter
+              if (pv.degraded) {
+                log(`задача ${rowId.slice(0, 8)}: gh не отвечает ${pv.streakAfter} тиков подряд — сталл-детект деградировал к not-merged (страховка ADR-044)`)
+              }
+              if (pv.merged && probe.mergedUrl !== null) {
+                tracked.mergedPrUrl = probe.mergedUrl
+                prMerged = true
+                log(`задача ${rowId.slice(0, 8)}: PR смержен — тишина сессии = ожидание приёмки (Done владельца), stall-сигнал не нужен`)
+              }
+              saveState(state)
+              if (pv.defer) {
+                // unknown до предела: сбой gh — не повод для кика, вердикт в
+                // этом тике не строится (первый же unknown иначе кикал бы
+                // задачу со смерженным PR — вред, ради которого существует
+                // проба); полоса дольше предела деградирует выше
+                log(`задача ${rowId.slice(0, 8)}: merged-проба не удалась (gh), полоса ${pv.streakAfter}/${PR_PROBE_UNKNOWN_MAX} — кик отложен на тик`)
+                continue
+              }
             }
           }
           // при валидном кэше вердикт всё равно none — факты для текста
@@ -1783,6 +1927,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
             status: row.status,
             sessionAlive: true,
             lastActivityAt: activity,
+            lastDevPromptAt: tracked.lastDevPromptAt ?? null,
             branch: row.branch,
             branchInWorktree,
             prMerged,
@@ -1863,6 +2008,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.lastCommentId = lastComment.id
       tracked.agentActive = true
       tracked.lastWakeup = { key: wakeupKey, at: Date.now() }
+      tracked.lastDevPromptAt = Date.now()
       saveState(state)
       counters.wakeups++
     } else {
@@ -1908,6 +2054,17 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   rotateLog()
   await mcp.connect()
+  // пиннинг за нодами (ADR-076): док-истина топологии; перепин или незапиненный
+  // конфиг в проде — громкий отказ старта; песочница смоук-тиков (ADR-059)
+  // unknown-проекты пропускает (их в доке нет и не должно быть)
+  const pinning = await checkNodePinning(mcp.tool, {
+    factoryProjects: Object.keys(projects),
+    sandboxed: STATE_RESOLVED.sandboxed,
+    envNodeName: process.env.UWUWU_NODE_NAME,
+    hostname: hostname(),
+  })
+  failPinnedStart(pinning)
+  log(`пиннинг: нода ${pinning.nodeName} подтверждена${pinning.sandboxSkipped.length > 0 ? ` (песочница пропустила незапиненные: ${pinning.sandboxSkipped.join(", ")})` : ""}`)
   log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
   // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов

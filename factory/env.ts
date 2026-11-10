@@ -50,7 +50,7 @@ export interface EnsureEnvArgs {
   rowId: string
   /** главный чекаут репо (там живёт .git и refs) */
   local: string
-  /** база ворктри; прод — origin/master, тесты — локальная ветка */
+  /** база ворктри; прод — baseOf(cfg) проекта, тесты — локальная ветка */
   base: string
 }
 

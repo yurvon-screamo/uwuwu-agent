@@ -23,6 +23,38 @@ const WAVE_COOLDOWN_SECS: u64 = 90;
 /// (штатный лаг индекса после крупных вставок пробивается вторым-третьим),
 /// затем bail с хинтом — не 4×~10с как прежде.
 const METADATA_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+/// Паузы между попытками авто-отката overwrite: ядро, уронившее запись,
+/// лежит в рестарте (quadlet ~6с + бут ядра ~10–15с) — первые попытки
+/// уходят в отказ, смысл ретраев — пережить окно рестарта. Итог — 4 попытки
+/// и ~40–45с ожидания. UWUWU_TEST_RESTORE_BACKOFF_MS (мс через запятую)
+/// перекрывает расписание: хук тестовый, но env читается на любом пути —
+/// прод его не выставляет, чужое значение меняет прод-бэкоффы громко
+/// (предупреждение в stderr + прод-константы, никогда не частично).
+const RESTORE_BACKOFFS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+fn restore_backoffs() -> Vec<Duration> {
+    let Ok(schedule) = std::env::var("UWUWU_TEST_RESTORE_BACKOFF_MS") else {
+        return RESTORE_BACKOFFS.to_vec();
+    };
+    let parsed: Result<Vec<Duration>, _> = schedule
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().map(Duration::from_millis))
+        .collect();
+    match parsed {
+        Ok(backoffs) if !backoffs.is_empty() => backoffs,
+        _ => {
+            eprintln!(
+                "предупреждение: UWUWU_TEST_RESTORE_BACKOFF_MS={schedule:?} не спарсился \
+                 (нужны мс через запятую) — расписание игнорируется, прод-бэкоффы"
+            );
+            RESTORE_BACKOFFS.to_vec()
+        }
+    }
+}
 const WAVE_HINT: &str = "ядро в волне деградации индекса: пауза 2–5 минут, затем `uwuwu-cli doctor`; при повторении — docker restart siyuan-demo. Сразу не ретраить — волна кормится ретраями";
 
 fn now_unix_secs() -> u64 {
@@ -75,6 +107,33 @@ pub enum FileFetch {
 pub struct UploadedAsset {
     pub original_name: String,
     pub asset_path: String,
+}
+
+/// Исход одиночной mcp-попытки (mcp_call_once): тип-носитель причины —
+/// строки не переживают границы функций. StaleSession — HTTP 404 при
+/// активном sid в запросе: ядро не знает сессию (реестр в памяти процесса
+/// погас рестартом), вызов не дошёл до исполнения; транспорт — всё прочее.
+enum McpAttemptErr {
+    StaleSession,
+    Transport(anyhow::Error),
+}
+
+impl From<anyhow::Error> for McpAttemptErr {
+    fn from(err: anyhow::Error) -> Self {
+        McpAttemptErr::Transport(err)
+    }
+}
+
+impl McpAttemptErr {
+    /// Перевод исхода попытки в anyhow-ошибку (handshake-пути, где recovery
+    /// неприменим); StaleSession здесь невозможен по построению (запрос без
+    /// активного sid) — текст ошибки фиксирует инвариант.
+    fn into_transport(self) -> anyhow::Error {
+        match self {
+            McpAttemptErr::Transport(err) => err,
+            McpAttemptErr::StaleSession => anyhow!("mcp: сессия отклонена (404) без активного sid"),
+        }
+    }
 }
 
 pub struct SiYuan {
@@ -257,11 +316,14 @@ impl SiYuan {
         let envelope: Value = serde_json::from_str(&raw).with_context(|| {
             format!(
                 "kernel {path}: HTTP {status}, тело не JSON: {}",
-                body_snippet(&raw)
+                body_snippet(&raw, REST_SNIPPET_CHARS)
             )
         })?;
         if !status.is_success() {
-            bail!("kernel {path}: HTTP {status}, {}", body_snippet(&raw));
+            bail!(
+                "kernel {path}: HTTP {status}, {}",
+                body_snippet(&raw, REST_SNIPPET_CHARS)
+            );
         }
         let code = envelope.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
@@ -389,10 +451,12 @@ impl SiYuan {
     /// Очистка детей верифицируется повторным get_children; пустой док ядра —
     /// один ZWJ-параграф (SiYuan не оставляет док без блока).
     /// Транзакционность на пре-имидже: до мутаций экспорт текущего контента;
-    /// сбой после начала очистки — авто-откат (дочистка остатков + аппенд
-    /// пре-имиджа once), двойной сбой — громкая ошибка с дампом пре-имиджа
-    /// в файл. Запись нового контента — once с контрольным чтением (sync-лаг
-    /// ядра прячет записанный блок — откат стёр бы легший контент).
+    /// сбой после начала очистки — авто-откат с бэкофф-ретраями (переживает
+    /// рестарт ядра — инциденты 08.11: смерти процесса, каждая попытка
+    /// начинается с чистой MCP-сессии), все попытки неуспешны — громкая
+    /// ошибка с дампом пре-имиджа в файл. Запись нового контента — once
+    /// с контрольным чтением (sync-лаг ядра прячет записанный блок — откат
+    /// стёр бы легший контент).
     pub async fn overwrite_doc_md(
         &self,
         doc_id: &str,
@@ -459,10 +523,20 @@ impl SiYuan {
     }
 
     /// Авто-откат overwrite: док уже очищен (частично или полностью) — вернуть
-    /// пре-имидж: дочистка остатков + аппенд пре-имиджа once. Откат тоже не
-    /// удался → дамп пре-имиджа в файл, громкая ошибка с путём и обеими
-    /// причинами. Возвращается всегда Err (исходная причина): команда упала,
-    /// контент сохранён — повтор безопасен.
+    /// пре-имидж: дочистка остатков + аппенд пре-имиджа once. Откат идёт
+    /// циклом с бэкофф-ретраями: ядро, уронившее запись, лежит в рестарте
+    /// (инциденты 08.11 — смерти процесса ядра, quadlet поднимает за ~6с),
+    /// одиночная немедленная попытка всегда уходила в тот же мёртвый
+    /// транспорт. Ретраи безопасны: попытка сходима по построению — «дочистка
+    /// до пустоты + аппенд того же пре-имиджа» перезаписывает док, частично
+    /// применённая или применённая-но-неподтверждённая попытка при повторе
+    /// не дублирует контент. Перед каждой попыткой — инвалидация MCP-сессии
+    /// (рестарт убил её на стороне ядра, стейл sid = 404 на первом же
+    /// get_children) и сброс wave-cooldown (metadata-not-ready поднимающегося
+    /// ядра не должен армить fail-fast окно против аварийного восстановления).
+    /// Все попытки неуспешны → дамп пре-имиджа в файл 0600, громкая ошибка
+    /// с путём и обеими причинами. Возвращается всегда Err (исходная
+    /// причина): команда упала, контент сохранён — повтор безопасен.
     async fn restore_or_fail(
         &self,
         doc_id: &str,
@@ -473,42 +547,58 @@ impl SiYuan {
             // восстанавливать нечего: док был пуст до операции
             return Err(cause);
         }
-        let rollback = async {
-            self.clear_doc_children(doc_id).await?;
-            self.append_block_md_once(doc_id, pre_image).await
-        };
-        if let Err(rollback_err) = rollback.await {
-            let dump_path =
-                std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
-            // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
-            // с дефолтными правами между create и set_permissions исключено
-            let dump_result = (|| -> std::io::Result<()> {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options.open(&dump_path)?;
-                use std::io::Write;
-                file.write_all(pre_image.as_bytes())?;
-                Ok(())
-            })();
-            let dump_note = match dump_result {
-                Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
-                Err(dump_err) => format!(
-                    "дамп пре-имиджа в {} не удался: {dump_err}",
-                    dump_path.display()
-                ),
+        let backoffs = restore_backoffs();
+        let total_attempts = backoffs.len() + 1;
+        let mut last_err = None;
+        for backoff in std::iter::once(Duration::ZERO).chain(backoffs) {
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
+            self.invalidate_mcp_session();
+            self.wave_cooldown_until.store(0, Ordering::Relaxed);
+            let rolled_back = async {
+                self.clear_doc_children(doc_id).await?;
+                self.append_block_md_once(doc_id, pre_image).await
             };
-            bail!(
-                "overwrite {doc_id}: {cause:#}; откат не удался ({rollback_err:#}) — {dump_note}"
-            );
+            match rolled_back.await {
+                Ok(()) => {
+                    return Err(cause.context(format!(
+                        "исходный контент дока {doc_id} восстановлен из пре-имиджа"
+                    )));
+                }
+                Err(rollback_err) => last_err = Some(rollback_err),
+            }
         }
-        Err(cause.context(format!(
-            "исходный контент дока {doc_id} восстановлен из пре-имиджа"
-        )))
+        let Some(rollback_err) = last_err else {
+            unreachable!("цикл делает хотя бы одну попытку — last_err заполнен");
+        };
+        let dump_path = std::env::temp_dir().join(format!("uwuwu-overwrite-preimage-{doc_id}.md"));
+        // 0600 с creation: пре-имидж может быть приватным (PERSON) — окно
+        // с дефолтными правами между create и set_permissions исключено
+        let dump_result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&dump_path)?;
+            use std::io::Write;
+            file.write_all(pre_image.as_bytes())?;
+            Ok(())
+        })();
+        let dump_note = match dump_result {
+            Ok(()) => format!("исходный контент сохранён в {}", dump_path.display()),
+            Err(dump_err) => format!(
+                "дамп пре-имиджа в {} не удался: {dump_err}",
+                dump_path.display()
+            ),
+        };
+        bail!(
+            "overwrite {doc_id}: {cause:#}; откат не удался после {total_attempts} попыток \
+             ({rollback_err:#}) — {dump_note}"
+        );
     }
 
     /// Пустой док ядра несёт ZWJ-заглушку; после записи контента в «пустой» док
@@ -881,7 +971,36 @@ impl SiYuan {
 
     // ---------- MCP: database (доски) ----------
 
+    /// Единая точка mcp-вызовов cli с recovery сессии. Рестарт ядра гасит
+    /// реестр сессий (в памяти процесса): вызов с кэшированным sid получает
+    /// HTTP 404 «session not found» — протокольный reject на входе
+    /// streamable-http эндпоинта, вызов не дошёл до исполнения, поэтому один
+    /// re-init + повтор безопасен и для мутаций (once-семантика по
+    /// построению). Глубина 1 структурно: повтор идёт через mcp_call_once,
+    /// recovery-путь не входит в recovery (опыт platform/SiYuan MCP-клиент,
+    /// PR #60/#63). Транспортный класс (ядро лежит: connection refused,
+    /// 502 шлюза) — не 404, без ретраев: смежная закрытая линия.
     async fn mcp_call(&self, method: &str, params: Value) -> Result<Value> {
+        match self.mcp_call_once(method, params.clone()).await {
+            Ok(v) => Ok(v),
+            Err(McpAttemptErr::Transport(err)) => Err(err),
+            Err(McpAttemptErr::StaleSession) => {
+                self.invalidate_mcp_session();
+                self.ensure_mcp_session().await.context(
+                    "mcp recovery: сессия отклонена ядром (404), ре-инициализация не удалась",
+                )?;
+                match self.mcp_call_once(method, params).await {
+                    Ok(v) => Ok(v),
+                    Err(McpAttemptErr::StaleSession) => {
+                        bail!("mcp {method}: сессия отклонена (404) и после ре-инициализации")
+                    }
+                    Err(McpAttemptErr::Transport(err)) => Err(err),
+                }
+            }
+        }
+    }
+
+    async fn mcp_call_once(&self, method: &str, params: Value) -> Result<Value, McpAttemptErr> {
         let is_notification = method.starts_with("notifications/");
         let body = if is_notification {
             json!({ "jsonrpc": "2.0", "method": method, "params": params })
@@ -893,12 +1012,16 @@ impl SiYuan {
             ("Content-Type", "application/json".into()),
             ("Accept", "application/json, text/event-stream".into()),
         ];
-        {
+        let session_cached = {
             let guard = self.mcp_sid.lock().unwrap();
-            if let Some(sid) = guard.as_ref() {
-                headers.push(("Mcp-Session-Id", sid.clone()));
+            match guard.as_ref() {
+                Some(sid) => {
+                    headers.push(("Mcp-Session-Id", sid.clone()));
+                    true
+                }
+                None => false,
             }
-        }
+        };
         let resp = self
             .client
             .post(format!("{}/mcp", self.base))
@@ -919,10 +1042,34 @@ impl SiYuan {
             .send()
             .await
             .context("mcp request")?;
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            *self.mcp_sid.lock().unwrap() = Some(sid.to_str()?.to_string());
+        // Барьеры до доверия ответу (паритет lib/platform.ts, PR #60; задачи
+        // 20261109083931-ajpznm8 и 20261109095605-qxcouod): стейл-сессия
+        // детектится по структурным признакам — 404 + факт активного sid в
+        // запросе, не по тексту тела (формулировка ядра меняется между
+        // версиями); детект до статусного bail — plain-text 404 не валит
+        // JSON-парсер и не маскируется «mcp response parse», recovery
+        // (re-init + один повтор) восстанавливает команду. Прочий не-2xx —
+        // статусный bail со сниппетом тела (401-конверт не парсится в тихий
+        // Null); конверт-детект после parse — kernel-конверт code≠0 без
+        // jsonrpc поверх HTTP 200 не проходит как данные (ADR-030 «худший
+        // режим отказа — тихий ноль»).
+        let status = resp.status();
+        let sid_hdr = resp.headers().get("mcp-session-id").cloned();
+        let text = resp.text().await.context("mcp response body")?;
+        if status == reqwest::StatusCode::NOT_FOUND && session_cached {
+            return Err(McpAttemptErr::StaleSession);
         }
-        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "mcp {method}: HTTP {status}: {}",
+                body_snippet(&text, MCP_SNIPPET_CHARS)
+            )
+            .into());
+        }
+        if let Some(sid) = sid_hdr {
+            *self.mcp_sid.lock().unwrap() =
+                Some(sid.to_str().context("mcp session id header")?.to_string());
+        }
         // streamable-http: последняя строка data:; пустое тело = нотификация (202)
         let payload = text
             .lines()
@@ -933,15 +1080,26 @@ impl SiYuan {
             return Ok(Value::Null);
         }
         let v: Value = serde_json::from_str(payload).context("mcp response parse")?;
+        if v.get("jsonrpc").is_none() {
+            if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
+                if code != 0 {
+                    let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("?");
+                    return Err(anyhow!("mcp {method}: kernel code={code} msg={msg}").into());
+                }
+            }
+        }
         if let Some(err) = v.get("error") {
-            bail!("mcp {method}: {err}");
+            return Err(anyhow!("mcp {method}: {err}").into());
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Handshake сессии. Идёт через mcp_call_once напрямую — recovery-путь
+    /// сам не проходит через recovery (урок PR #63): initialize без sid не
+    /// бывает stale, и это структурно исключает рекурсию восстановления.
     pub async fn mcp_initialize(&self) -> Result<Value> {
         let r = self
-            .mcp_call(
+            .mcp_call_once(
                 "initialize",
                 json!({
                     "protocolVersion": "2025-03-26",
@@ -949,8 +1107,11 @@ impl SiYuan {
                     "clientInfo": { "name": "uwuwu-cli", "version": env!("CARGO_PKG_VERSION") }
                 }),
             )
-            .await?;
-        let _ = self.mcp_call("notifications/initialized", json!({})).await;
+            .await
+            .map_err(McpAttemptErr::into_transport)?;
+        let _ = self
+            .mcp_call_once("notifications/initialized", json!({}))
+            .await;
         Ok(r)
     }
 
@@ -1035,6 +1196,15 @@ impl SiYuan {
             self.mcp_initialize().await?;
         }
         Ok(())
+    }
+
+    /// Сброс кэша MCP-сессии: рестарт ядра убивает сессии на его стороне
+    /// (реестр в памяти процесса), tools/call со стейл sid отвечает 404
+    /// «session not found». Нужен пути отката overwrite — попытка после
+    /// рестарта обязана начаться с чистой сессии, иначе все ретраи падают
+    /// одинаково на первом же get_children.
+    fn invalidate_mcp_session(&self) {
+        *self.mcp_sid.lock().unwrap() = None;
     }
 
     /// Список database-блоков (досок) по SQL.
@@ -1177,14 +1347,20 @@ impl SiYuan {
 }
 
 /// Голова тела ответа для сообщений об ошибках: диагностика без простыни.
-fn body_snippet(raw: &str) -> String {
-    const SNIPPET_CHARS: usize = 200;
-    let mut head: String = raw.chars().take(SNIPPET_CHARS).collect();
-    if raw.chars().count() > SNIPPET_CHARS {
+/// Лимит параметром: REST-пути ядра — 200, mcp — 120 (паритет
+/// lib/platform.ts mcpHttpError, задача 20261109083931-ajpznm8).
+fn body_snippet(raw: &str, limit: usize) -> String {
+    let mut head: String = raw.chars().take(limit).collect();
+    if raw.chars().count() > limit {
         head.push('…');
     }
     head
 }
+
+/// Лимит сниппета тела для REST-конвертов ядра (post_probe и пр.).
+const REST_SNIPPET_CHARS: usize = 200;
+/// Лимит сниппета тела для mcp-ошибок — паритет lib/platform.ts mcpHttpError.
+const MCP_SNIPPET_CHARS: usize = 120;
 
 /// Верхнеуровневые дети дока из .sy в порядке документа — минимум для
 /// адресации диаграмм по маркеру.
@@ -1343,9 +1519,14 @@ impl SiYuan {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing};
+    use super::{
+        body_snippet, doc_content_is_empty, parse_block_ids, FileFetch, RetryPacing,
+        MCP_SNIPPET_CHARS, REST_SNIPPET_CHARS,
+    };
     use crate::siyuan::SiYuan;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1446,6 +1627,138 @@ mod tests {
         assert!(second.unwrap_err().to_string().contains("окно fail-fast"));
     }
 
+    /// Env-пейсинг отката (UWUWU_TEST_RESTORE_BACKOFF_MS): валидное расписание
+    /// парсится дословно; неспарсившийся/пустой env отбрасывается ЦЕЛИКОМ —
+    /// прод-константы, никогда не частичный график (молчаливое отбрасывание
+    /// одного элемента незаметно превратило бы график 4 попыток в 1–2 —
+    /// класс замечания ревью PR #189).
+    #[test]
+    #[serial_test::serial]
+    fn restore_backoffs_env_schedule_parses_or_discarded_whole() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+            }
+        }
+        std::env::remove_var("UWUWU_TEST_RESTORE_BACKOFF_MS");
+        let _guard = EnvGuard;
+        let prod = vec![
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        ];
+
+        // env не задан — прод-константы
+        assert_eq!(super::restore_backoffs(), prod);
+
+        // валидное расписание — парсится, пробелы вокруг запятых тримятся
+        std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", "5, 500");
+        assert_eq!(
+            super::restore_backoffs(),
+            vec![Duration::from_millis(5), Duration::from_millis(500)]
+        );
+
+        // мусор, частичный мусор, пустой — env отброшен целиком (прод-график)
+        for schedule in ["abc", "5,x", ""] {
+            std::env::set_var("UWUWU_TEST_RESTORE_BACKOFF_MS", schedule);
+            assert_eq!(
+                super::restore_backoffs(),
+                prod,
+                "env {schedule:?} не должен давать частичный график"
+            );
+        }
+    }
+
+    /// Попытка отката сбрасывает wave-cooldown: metadata-not-ready до overwrite
+    /// армит 90s fail-fast, и без сброса delete_block первой попытки (post())
+    /// падал бы «пропущено — окно волны» — откат всегда кончался бы дампом.
+    #[tokio::test]
+    async fn rollback_attempt_disarms_wave_cooldown_before_first_delete() {
+        let server = MockServer::start().await;
+        // армим окно волны: appendBlock отдаёт metadata-not-ready ровно на
+        // серию арминга (3 запроса instant-пейсинга), дальше — успех
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(metadata_error_template())
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+        sy.post_with_pacing(
+            "/api/block/appendBlock",
+            json!({ "id": "x" }),
+            RetryPacing::instant(),
+        )
+        .await
+        .expect_err("metadata-not-ready исчерпанием армит окно волны");
+        assert!(
+            sy.wave_cooldown_active(),
+            "окно волны армировано перед откатом"
+        );
+
+        // путь отката: get_children отвечает ребёнком на первый вызов и пусто
+        // дальше (первый tools/call — notifications/initialized, его не считаем)
+        let children_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&children_calls);
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                if body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-ok-barrier");
+                }
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 {
+                    "- [p] старый блок (blk-1)".to_string()
+                } else {
+                    String::new()
+                };
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2,
+                        "result": { "content": [{ "type": "text", "text": text }] }
+                    })
+                    .to_string(),
+                )
+            })
+            .mount(&server)
+            .await;
+        // deleteBlock и appendBlock-успех (последний смонтированный мок
+        // перекрывает metadata-error — wiremock берёт свежайший матч)
+        Mock::given(method("POST"))
+            .and(path("/api/block/deleteBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/block/appendBlock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":null})))
+            .mount(&server)
+            .await;
+
+        let err = sy
+            .restore_or_fail("doc-1", "старый контент\n", anyhow::anyhow!("boom"))
+            .await
+            .expect_err("restore_or_fail всегда Err");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("восстановлен"),
+            "откат прошёл при армированном окне: {text}"
+        );
+        assert!(
+            !sy.wave_cooldown_active(),
+            "окно волны сброшено попыткой отката"
+        );
+    }
+
     #[tokio::test]
     async fn non_metadata_errors_do_not_arm_wave_cooldown() {
         let server = MockServer::start().await;
@@ -1481,10 +1794,10 @@ mod tests {
     #[test]
     fn body_snippet_truncates_long_bodies() {
         let long = "x".repeat(500);
-        let snippet = body_snippet(&long);
+        let snippet = body_snippet(&long, REST_SNIPPET_CHARS);
         assert_eq!(snippet.chars().count(), 201);
         assert!(snippet.ends_with('…'));
-        assert_eq!(body_snippet("short"), "short");
+        assert_eq!(body_snippet("short", REST_SNIPPET_CHARS), "short");
     }
 
     #[tokio::test]
@@ -1927,6 +2240,523 @@ mod tests {
             })
             .mount(server)
             .await;
+    }
+
+    /// Состояние сессионного мока ядра — контракт живого ядра (проба 09.11,
+    /// протокол streamable-http): реестр сессий в памяти «процесса», рестарт
+    /// = гашение поколения; tools/call с чужим/погасшим sid отвечает 404
+    /// plain-text, и reject — не исполнение (счётчики раздельные).
+    struct SessionKernel {
+        inits: AtomicUsize,
+        tool_oks: AtomicUsize,
+        tool_404s: AtomicUsize,
+        session_gen: AtomicUsize,
+        /// Гасить сессию после N успешных tools/call (симулятор рестарта).
+        restart_after_tools_calls: usize,
+        /// «Зомби-ядро»: tools/call отклоняются даже со свежей сессией —
+        /// recovery не вылечивает (второй 404 подряд).
+        zombie: bool,
+    }
+
+    impl SessionKernel {
+        fn new(restart_after_tools_calls: usize, zombie: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inits: AtomicUsize::new(0),
+                tool_oks: AtomicUsize::new(0),
+                tool_404s: AtomicUsize::new(0),
+                session_gen: AtomicUsize::new(0),
+                restart_after_tools_calls,
+                zombie,
+            })
+        }
+
+        fn inits(&self) -> usize {
+            self.inits.load(Ordering::SeqCst)
+        }
+
+        fn tool_oks(&self) -> usize {
+            self.tool_oks.load(Ordering::SeqCst)
+        }
+
+        fn tool_404s(&self) -> usize {
+            self.tool_404s.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Сессионное ядро: initialize выдаёт новое поколение sid, tools/call
+    /// живёт по сессионному контракту выше.
+    async fn mount_session_kernel(server: &MockServer, kernel: Arc<SessionKernel>) {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    let gen = kernel.inits.fetch_add(1, Ordering::SeqCst) + 1;
+                    kernel.session_gen.store(gen, Ordering::SeqCst);
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", format!("sess-mock-{gen}"));
+                }
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                let gen = kernel.session_gen.load(Ordering::SeqCst);
+                let got = req
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if kernel.zombie || gen == 0 || got != format!("sess-mock-{gen}") {
+                    kernel.tool_404s.fetch_add(1, Ordering::SeqCst);
+                    return ResponseTemplate::new(404).set_body_string("session not found");
+                }
+                let oks = kernel.tool_oks.fetch_add(1, Ordering::SeqCst) + 1;
+                if oks == kernel.restart_after_tools_calls {
+                    kernel.session_gen.store(0, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2,
+                        "result": { "content": [{ "type": "text", "text": "ok" }] }
+                    })
+                    .to_string(),
+                )
+            })
+            .mount(server)
+            .await;
+    }
+
+    /// Мок MCP-сервера без кэша сессии (initialize не выдаёт sid): tools/call —
+    /// сырой HTTP-ответ (статус+тело), репликация нестандартных отказов ядра
+    /// не-сессионного класса — 404 plain-text без активной сессии (задача
+    /// 20261109083931-ajpznm8), 401-конверт, kernel-конверт поверх 200.
+    /// Сессионный класс 404+sid (recovery) покрывает SessionKernel выше.
+    async fn mount_mcp_tool_raw_response(server: &MockServer, status: u16, body: &'static str) {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let req_body = String::from_utf8_lossy(&req.body);
+                if req_body.contains("\"initialize\"") {
+                    return ResponseTemplate::new(200).set_body_string(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                    );
+                }
+                if req_body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                ResponseTemplate::new(status).set_body_string(body)
+            })
+            .mount(server)
+            .await;
+    }
+
+    /// Рестарт ядра гасит сессию посреди последовательности вызовов: 404 по
+    /// стейл sid → ровно один re-init → повтор исходного вызова доезжает.
+    /// Reject (404) не считается исполнением — once-семантика повтора.
+    #[tokio::test]
+    async fn mcp_call_recovers_stale_session_with_single_reinit() {
+        let server = MockServer::start().await;
+        let kernel = SessionKernel::new(1, false);
+        mount_session_kernel(&server, Arc::clone(&kernel)).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("первый handshake кэширует sess-mock-1");
+        sy.mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect("первый вызов с живой сессией");
+
+        sy.mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect("recovery вытягивает стейл-сессию");
+
+        assert_eq!(
+            kernel.inits(),
+            2,
+            "ровно один recovery re-init: {}",
+            kernel.inits()
+        );
+        assert_eq!(
+            kernel.tool_oks(),
+            2,
+            "исполнения: первый вызов + повтор, reject не считается: {}",
+            kernel.tool_oks()
+        );
+        assert_eq!(
+            kernel.tool_404s(),
+            1,
+            "один 404 до recovery: {}",
+            kernel.tool_404s()
+        );
+    }
+
+    /// Ядро отклоняет tools/call даже со свежей сессией: recovery глубины 1 —
+    /// ровно один re-init, затем громкая ошибка, без цикла.
+    #[tokio::test]
+    async fn mcp_call_gives_up_after_single_recovery_when_kernel_rejects_again() {
+        let server = MockServer::start().await;
+        let kernel = SessionKernel::new(usize::MAX, true);
+        mount_session_kernel(&server, Arc::clone(&kernel)).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("handshake кэширует сессию");
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("зомби-ядро отклоняет и после re-init — громкая ошибка");
+
+        let text = format!("{err:#}");
+        assert!(text.contains("404"), "ошибка называет класс отказа: {text}");
+        assert_eq!(
+            kernel.inits(),
+            2,
+            "глубина 1 — без цикла re-init: {}",
+            kernel.inits()
+        );
+        assert_eq!(
+            kernel.tool_404s(),
+            2,
+            "два отклонения: исходный вызов + повтор: {}",
+            kernel.tool_404s()
+        );
+    }
+
+    /// 404 без активного sid в запросе — не стейл-сессия: recovery не
+    /// запускается, ровно одна HTTP-попытка (иначе initialize-путь циклил бы).
+    #[tokio::test]
+    async fn mcp_call_without_cached_session_does_not_retry_on_404() {
+        let server = MockServer::start().await;
+        let http_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&http_calls);
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |_: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(404).set_body_string("session not found")
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("404 без sid — ошибка без recovery-цикла");
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("HTTP 404") && text.contains("session not found"),
+            "не-сессионный 404 — статусный bail со статусом и телом: {text}"
+        );
+        assert!(
+            !text.contains("mcp response parse"),
+            "parse-маскировка устранена (ajpznm8): {text}"
+        );
+        assert_eq!(
+            http_calls.load(Ordering::SeqCst),
+            1,
+            "ровно одна HTTP-попытка: {}",
+            http_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Транспортный класс (5xx) — не стейл-сессия: recovery не запускается,
+    /// ровно одна попытка вызова с исходной ошибкой (ретраи/восстановление —
+    /// вне среза, смежная закрытая линия авто-ретраев).
+    #[tokio::test]
+    async fn mcp_call_does_not_recover_on_transport_error() {
+        let server = MockServer::start().await;
+        let inits = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let (ini, calls) = (Arc::clone(&inits), Arc::clone(&tool_calls));
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    ini.fetch_add(1, Ordering::SeqCst);
+                    return ResponseTemplate::new(200)
+                        .set_body_string(
+                            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                        )
+                        .append_header("mcp-session-id", "sess-mock-t");
+                }
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500).set_body_string("boom")
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("handshake кэширует сессию");
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("5xx — транспортная ошибка без recovery");
+
+        assert!(
+            format!("{err:#}").contains("HTTP 500") && format!("{err:#}").contains("boom"),
+            "статусный bail несёт статус и тело, recovery не запускался: {err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("mcp response parse"),
+            "parse-маскировка устранена (ajpznm8): {err:#}"
+        );
+        assert_eq!(
+            inits.load(Ordering::SeqCst),
+            1,
+            "recovery не запускался (только стартовый handshake): {}",
+            inits.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            tool_calls.load(Ordering::SeqCst),
+            1,
+            "ровно одна попытка вызова: {}",
+            tool_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Отказ re-init (ядро поднялось, но handshake не удался): громкая ошибка
+    /// с контекстом recovery, ровно один ре-инициализирующий handshake, без
+    /// циклов и без повторов исходного вызова.
+    #[tokio::test]
+    async fn mcp_call_loud_error_when_reinit_fails() {
+        let server = MockServer::start().await;
+        let inits = Arc::new(AtomicUsize::new(0));
+        let tool_404s = Arc::new(AtomicUsize::new(0));
+        let (ini, rejects) = (Arc::clone(&inits), Arc::clone(&tool_404s));
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                if body.contains("\"initialize\"") {
+                    let n = ini.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        return ResponseTemplate::new(200)
+                            .set_body_string(
+                                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":1}}}"#,
+                            )
+                            .append_header("mcp-session-id", "sess-mock-r");
+                    }
+                    return ResponseTemplate::new(503).set_body_string("unavailable");
+                }
+                if body.contains("notifications/") {
+                    return ResponseTemplate::new(200);
+                }
+                rejects.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(404).set_body_string("session not found")
+            })
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_initialize()
+            .await
+            .expect("handshake кэширует сессию");
+        let err = sy
+            .mcp_call("tools/call", json!({ "name": "database", "arguments": {} }))
+            .await
+            .expect_err("отказ re-init — громкая ошибка с контекстом");
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("ре-инициализация не удалась"),
+            "контекст recovery в цепочке ошибки: {text}"
+        );
+        assert!(
+            text.contains("HTTP 503") && text.contains("unavailable"),
+            "исходная причина отказа handshake сохранена со статусом (ajpznm8): {text}"
+        );
+        assert_eq!(
+            inits.load(Ordering::SeqCst),
+            2,
+            "стартовый handshake + ровно один re-init: {}",
+            inits.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            tool_404s.load(Ordering::SeqCst),
+            1,
+            "повтора исходного вызова нет — упало на re-init: {}",
+            tool_404s.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Режим 1 (parse-маскировка): tools/call без активной сессии получает
+    /// 404 plain-text «session not found» — ошибка несёт статус и тело,
+    /// не валится в «mcp response parse» (задача 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_404_plain_text_bails_with_status_and_body() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 404, "session not found").await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("stale-session 404 must bail, not parse-fail");
+
+        let text = err.to_string();
+        assert!(text.contains("HTTP 404"), "статус в ошибке: {text}");
+        assert!(text.contains("session not found"), "тело в ошибке: {text}");
+        assert!(
+            !text.contains("mcp response parse"),
+            "parse-маскировка устранена: {text}"
+        );
+    }
+
+    /// Режим 2 (тихий Null на не-2xx): 401 с kernel-конвертом `{}` — не-JSON
+    /// конверт при JSON-парсимом теле; ошибка со статусом, не тихий Ok(Null).
+    #[tokio::test]
+    async fn mcp_tool_401_json_envelope_bails_with_status() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 401, "{}").await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("401 must bail, not parse into silent Null");
+
+        let text = err.to_string();
+        assert!(text.contains("HTTP 401"), "статус в ошибке: {text}");
+    }
+
+    /// Режим 3 (тихий Null на HTTP 200 с конвертом ошибки, ADR-030):
+    /// kernel-конверт code≠0 без jsonrpc поверх успешного HTTP — ошибка
+    /// с кодом и msg, не тихий Ok(Null), который downstream читает как данные.
+    #[tokio::test]
+    async fn mcp_tool_200_kernel_envelope_code_nonzero_bails() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 200, r#"{"code":-1,"msg":"auth failed"}"#).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("kernel envelope with code≠0 must bail, not pass as Null");
+
+        let text = err.to_string();
+        assert!(text.contains("kernel code=-1"), "код в ошибке: {text}");
+        assert!(text.contains("auth failed"), "msg в ошибке: {text}");
+    }
+
+    /// Статусный bail — только не-2xx: 202 с пустым телом (нотификация)
+    /// проходит успех-путём как тихий пустой результат (задача
+    /// 20261109083931-ajpznm8; `is_success()` включает 202).
+    #[tokio::test]
+    async fn mcp_tool_202_notification_empty_body_passes_as_null() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 202, "").await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let v = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect("202 notification must pass, not bail");
+
+        assert!(
+            v.get("isError").is_none() && v.get("code").is_none(),
+            "202 не должен нести маркеров ошибки: {v}"
+        );
+    }
+
+    /// Граница конверт-детекта: code=0 — успех ядра, не ошибка (bail только
+    /// на code≠0; задача 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_envelope_code_zero_passes_as_data() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 200, r#"{"code":0,"msg":""}"#).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        sy.mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect("code=0 envelope must pass, not bail");
+    }
+
+    /// msg отсутствует в kernel-конверте — плейсхолдер «?» в ошибке (cli-канон
+    /// require_payload_ok; задача 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_envelope_without_msg_bails_with_question() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(&server, 200, r#"{"code":-32601}"#).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("code≠0 without msg must bail with ? placeholder");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("kernel code=-32601 msg=?"),
+            "плейсхолдер ? в ошибке: {text}"
+        );
+    }
+
+    /// Канонический jsonrpc-конверт с error-веткой барьерится error-веткой
+    /// («mcp {method}: {err}»), не конверт-детектом: jsonrpc присутствует —
+    /// порядок проверок после parse (паритет lib/platform.ts; задача
+    /// 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_200_jsonrpc_error_envelope_bails_on_error_branch() {
+        let server = MockServer::start().await;
+        mount_mcp_tool_raw_response(
+            &server,
+            200,
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"transport rpc error"}}"#,
+        )
+        .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("jsonrpc error envelope must bail on error branch");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("transport rpc error"),
+            "error-ветка в ошибке: {text}"
+        );
+        assert!(
+            !text.contains("kernel code="),
+            "конверт-детект не должен перехватывать jsonrpc-конверт: {text}"
+        );
+    }
+
+    /// Сниппет тела в mcp-ошибке — лимит 120 + многоточие (паритет
+    /// lib/platform.ts mcpHttpError; REST-канон 200 не задет — задача
+    /// 20261109083931-ajpznm8).
+    #[tokio::test]
+    async fn mcp_tool_404_snippet_truncated_at_mcp_limit() {
+        let server = MockServer::start().await;
+        let long_body: &'static str = Box::leak("y".repeat(300).into_boxed_str());
+        mount_mcp_tool_raw_response(&server, 404, long_body).await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .mcp_tool("database", json!({ "action": "get_children" }))
+            .await
+            .expect_err("long 404 body must bail with truncated snippet");
+
+        let text = err.to_string();
+        assert!(text.contains("HTTP 404"), "статус в ошибке: {text}");
+        assert!(text.contains('…'), "обрезка обозначена: {text}");
+        let ys = text.matches('y').count();
+        assert_eq!(
+            ys, MCP_SNIPPET_CHARS,
+            "сниппет mcp = 120 символов тела: {text}"
+        );
     }
 
     #[tokio::test]

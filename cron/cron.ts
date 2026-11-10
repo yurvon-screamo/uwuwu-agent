@@ -13,13 +13,15 @@
 // Запуск: systemd --user (uwuwu-cron.service). Тик: 1 минута.
 
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
+import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
+import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
-  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, agentFirePrompt,
+  stripNonContent, decideFire, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
@@ -60,6 +62,15 @@ const DRY_RUN = process.env.UWUWU_CRON_DRY_RUN === "1"
 /** пауза между срабатываниями одного мастера, пока жива его сессия */
 const SESSION_COOLDOWN_MS = 10 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
+
+// автокомпакт вечных сессий (lib/compact): пороги из постановки владельца
+// (задача 20261105153731-s6e27f6), env-оверрайды для проб; коулдаун — константа
+const COMPACT_POLICY: CompactPolicy = {
+  idleMs: (Number(process.env.UWUWU_CRON_COMPACT_IDLE_SEC ?? 14400) || 14400) * 1000,
+  minContextPct: Number(process.env.UWUWU_CRON_COMPACT_MIN_PCT ?? 40) || 40,
+  cooldownMs: 3_600_000,
+}
+const COMPACT_CHECK_SEC = Math.max(60, Number(process.env.UWUWU_CRON_COMPACT_CHECK_SEC ?? 600) || 600)
 
 /** Бинарь CLI для ран-карточек: прод — ~/.cargo/bin (systemd PATH не несёт
  *  его); UWUWU_CLI_BIN переопределяет (тесты/нестандартная установка). */
@@ -520,8 +531,10 @@ async function refuseOnce(state: CronState, row: CronRow, reason: string): Promi
 
 /** Ретрай файра с неподтверждённым POST (дедуп приземления — паттерн hub
  *  steerLandedAt: «сервер приземлил промпт, ответ потерян» — повторный POST
- *  продублировал бы инструкцию в вечный контекст). Приземлился — файр
- *  завершён (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
+ *  продублировал бы инструкцию в вечный контекст). Дедуп по сигнатуре рана
+ *  (runLandedAt): приземлившаяся копия конверта с любым текстом (ручной
+ *  стирт-ретрай оператора) признаётся. Приземлился — файр завершён
+ *  (lastFiredAt по времени приземления); мёртвая сессия — pendingRun
  *  дропается, следующий файр начнётся заново. */
 async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: CronRow, masterTitle: string): Promise<void> {
   const pending = tracked.pendingRun
@@ -544,7 +557,11 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
     return [] as SessionMsg[]
   })
   msgs = [...msgs, ...(await sessionInbox(tracked.sessionID))]
-  const landed = promptLandedAt(msgs, pending.attemptAt - 2000, pending.prompt)
+  // граница дедупа — прошлый файр (lastFiredAt), не attemptAt: ран-карточка
+  // создана позже него, конверт этого рана не мог приземлиться раньше, а окно
+  // шире — ручная копия между попытками доставки (лаг REST, стирт оператора
+  // до штампа pendingRun) дедупом не теряется
+  const landed = runLandedAt(msgs, tracked.lastFiredAt, pending.rowId)
   if (landed !== null) {
     log(`мастер «${masterTitle}»: промпт файра приземлился ранее (${landed}) — ретрай не нужен (ран ${pending.rowId})`)
     state.crons[row.rowId] = { sessionID: tracked.sessionID, lastFiredAt: landed, firedAtIso: new Date(landed).toISOString() }
@@ -560,7 +577,10 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
   }
   const landedMs = await promptPost(tracked.sessionID, pending.prompt, action === "steer")
   if (landedMs === null) {
-    pending.attemptAt = Date.now() // новая метка попытки: дедуп приземления от неё
+    // новая метка попытки: граница sessionStatus для decideFire следующего
+    // ретрая (outcome/idle позже метки = ход завершился, можно обычный POST).
+    // Дедуп приземления от неё НЕ идёт — его граница lastFiredAt (см. выше)
+    pending.attemptAt = Date.now()
     saveState(state)
     log(`мастер «${masterTitle}»: ретрай файра не приземлился — ретрай следующим тиком (ран ${pending.rowId})`)
     return
@@ -572,6 +592,42 @@ async function resolvePendingRun(state: CronState, tracked: TrackedCron, row: Cr
 
 const modelLabel = (model: AgentModel | null): string =>
   model === null ? "демона" : `${model.providerID}/${model.id}${model.variant !== undefined ? `#${model.variant}` : ""}`
+
+// ——— автокомпакт вечной сессии мастера ———
+
+/** Троттлинг компакт-чека (in-memory: пропуск из-за рестарта догонит следующий
+ *  тик; сама admission-метка персистится в tracked.lastCompactAt). */
+const compactLastCheck = new Map<string, number>()
+
+/** Чек автокомпакта вечной сессии: занятость — через границу lastFiredAt
+ *  (стухший idle хода, паттерн sessionStatus), модель/лимит/токены —
+ *  compactProbe, оркестрация «персист метки до POST» — compactTick.
+ *  DRY_RUN/ONCE — ноль реальных действий (инвариант демона: ручной/песочный
+ *  тик не должен POST'ить): решения логом, GET/POST/state не звать. */
+async function maybeCompactEternal(state: CronState, row: CronRow, tracked: TrackedCron): Promise<void> {
+  const masterTitle = row.title || row.rowId.slice(0, 8)
+  if (DRY_RUN || ONCE) {
+    log(`мастер «${masterTitle}»: ${DRY_RUN ? "DRY_RUN" : "ONCE"} — компакт-чек пропущен (порог idle ${Math.round(COMPACT_POLICY.idleMs / 60_000)}м, контекст ≥${COMPACT_POLICY.minContextPct}%)`)
+    return
+  }
+  await compactTick({
+    sessionID: () => tracked.sessionID,
+    busy: () => false, // занятость решает граница lastFiredAt в probe
+    probe: async (sessionID) => {
+      const p = await compactProbe(restCall, sessionID)
+      const idleOk = p.idleAt !== null && p.idleAt >= tracked.lastFiredAt
+      return { idleMs: idleOk ? Date.now() - (p.idleAt as number) : null, usagePct: p.usagePct }
+    },
+    lastCompactAt: () => tracked.lastCompactAt ?? 0,
+    persist: (ms) => {
+      state.crons[row.rowId] = { ...tracked, lastCompactAt: ms }
+      saveState(state)
+    },
+    fire: (sessionID) => sessionCompact(restCall, sessionID),
+    policy: COMPACT_POLICY,
+    log: (m) => log(`мастер «${masterTitle}»: ${m}`),
+  })
+}
 
 /** Файр вечного мастера: ран-карточка — как у изолированного контура, промпт
  *  уходит в ОДНУ сессию мастера (custom-agent): idle → ход, running → стирт,
@@ -709,6 +765,18 @@ export async function tickBoard(state: CronState, board: BoardIds, boardTitle: s
 
     const tracked = state.crons[row.rowId]
     const lastFired = tracked?.lastFiredAt ?? 0
+
+    // автокомпакт вечной сессии — ДО due-гейта: основной юзкейс — idle-окна
+    // между файрами (после гейта чек доживал бы только до моментов файра,
+    // когда сессия занята, и не выстреливал бы никогда). Файр в полёте
+    // (pendingRun) приоритетнее — вечный контур его доигрывает отдельно.
+    if (row.agent !== "" && tracked !== undefined && tracked.sessionID !== "" && tracked.pendingRun === undefined) {
+      const lastCheck = compactLastCheck.get(row.rowId) ?? 0
+      if (now.getTime() - lastCheck >= COMPACT_CHECK_SEC * 1000) {
+        compactLastCheck.set(row.rowId, now.getTime())
+        await maybeCompactEternal(state, row, tracked)
+      }
+    }
 
     // предыдущая изолированная сессия ещё жива → не спамим (кроме давно
     // повисших). Вечные сессии не гейтятся: занятость решает стирт, а
@@ -850,6 +918,15 @@ async function main(): Promise<void> {
   mkdirSync(dirname(LOG_PATH), { recursive: true })
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
+  // пиннинг за нодами (ADR-076): крон — singleton-класс, второй экземпляр
+  // файрил бы кроны дважды; строка «cron: нода» в доке — контракт
+  const pinning = await checkNodePinning(mcp.tool, {
+    singletonDaemon: "cron",
+    envNodeName: process.env.UWUWU_NODE_NAME,
+    hostname: hostname(),
+  })
+  failPinnedStart(pinning)
+  log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   log(`uwuwu-cron: старт (задачные доски «Задачи <proj>», гейт Вейт, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
   emitNotice(STATE_RESOLVED.notice, log)
