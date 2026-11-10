@@ -3,12 +3,18 @@
 # фрагменты паник из логов упавших прогонов → markdown для
 # $GITHUB_STEP_SUMMARY + ::error аннотации.
 #
+# Потоки (ревью PR #209, Low): markdown → stdout (шаг пайпит его в
+# $GITHUB_STEP_SUMMARY), ::error аннотации → stderr (GitHub парсит их
+# из лога напрямую; литеральный «::error::» в summary — мусор).
+#
 # Урок 10.11 (безымянный флейк полного прогона): имя теста фиксируется
 # в момент падения автоматически — «безымянных fail» больше нет.
 #
 # Использование: stress-report.sh <logs-dir>
 #   logs-dir содержит run-<N>.log (полный вывод cargo test) и
-#   run-<N>.rc (exit-код прогона, пишет workflow).
+#   run-<N>.rc (exit-код прогона, пишет workflow). Отсутствие rc-файла
+#   трактуется консервативно как упавший прогон: шаг цикла мог умереть
+#   до записи (таймаут, инфра-сбой) — красная джоба обязана дать сигнал.
 set -euo pipefail
 
 logs_dir="${1:?usage: stress-report.sh <logs-dir>}"
@@ -17,12 +23,21 @@ logs_dir="${1:?usage: stress-report.sh <logs-dir>}"
 found=0
 annotation_count=0
 
-for log in "$logs_dir"/run-*.log; do
-  [ -e "$log" ] || continue
+# find + sort -V: числовой порядок прогонов (лексический glob ставит
+# run-10 перед run-2 при >9 прогонов).
+mapfile -t logs < <(find "$logs_dir" -name 'run-*.log' -print | sort -V)
+
+for log in "${logs[@]}"; do
   rc_file="${log%.log}.rc"
-  [ -e "$rc_file" ] || continue
-  rc="$(cat "$rc_file")"
-  [ "$rc" -ne 0 ] || continue
+  if [ -e "$rc_file" ]; then
+    rc="$(cat "$rc_file")"
+  else
+    # rc-файла нет: прогон не завершился штатно (шаг убит до записи).
+    rc="?"
+  fi
+  case "$rc" in
+    0) continue ;;
+  esac
   found=1
   run_id="$(basename "$log" .log)"
 
@@ -61,9 +76,9 @@ for log in "$logs_dir"/run-*.log; do
   # живёт в summary.
   if [ "$annotation_count" -lt 10 ]; then
     if [ -n "$failed_tests" ]; then
-      echo "::error::$run_id: упали: $(echo "$failed_tests" | head -5 | tr '\n' ' ')"
+      echo "::error::$run_id: упали: $(echo "$failed_tests" | head -5 | tr '\n' ' ' | sed 's/ *$//')" >&2
     else
-      echo "::error::$run_id: сбой без упавших тестов (компиляция/инфраструктура)"
+      echo "::error::$run_id: сбой без упавших тестов (компиляция/инфраструктура)" >&2
     fi
     annotation_count=$((annotation_count + 1))
   fi

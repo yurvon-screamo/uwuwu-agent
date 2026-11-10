@@ -54,11 +54,14 @@ jobs:
     timeout-minutes: 45
     env:
       STRESS_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '5' }}
-      STRESS_CPU: ${{ github.event_name == 'workflow_dispatch' && inputs.stress || 'true' }}
+      # AND-OR-паттерн GitHub врёт для stress=false (true && false || 'true'
+      # → 'true'), поэтому вложенная форма: dispatch → честная 'true'/'false',
+      # остальные события → 'true'.
+      STRESS_CPU: ${{ github.event_name == 'workflow_dispatch' && (inputs.stress && 'true' || 'false') || 'true' }}
     steps:
-      - uses: actions/checkout@v7
-
       # Пины по SHA как в ci.yml: плавающие теги = supply-chain поверхность.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
@@ -83,18 +86,32 @@ jobs:
 
       # ×N прогонов подряд; выход НЕ раньше конца цикла — собираем полную
       # картину (сколько упало, какие тесты), а не первый фейл.
+      #
+      # Готча bash -e (ревью PR #209, High): дефолтный shell шага —
+      # bash -e, с pipefail падающий pipeline убивает шаг немедленно и
+      # строки после него (rc=$?, запись .rc) не выполняются никогда —
+      # отчёт не видит упавших. Лов статуса через `|| rc=$?` выводит
+      # pipeline из-под set -e: цикл переживает любой исход и .rc пишется
+      # для каждого прогона.
       - name: cargo test ×N
         working-directory: cli
         run: |
           set -o pipefail
+          # Валидация инпута dispatch: runs=0 / не-число дают пустой seq
+          # → ноль прогонов → тихий false-green. Зелёный статус обязан
+          # означать «N прогонов прошли».
+          case "$STRESS_RUNS" in ''|*[!0-9]*|0)
+            echo "::error::STRESS_RUNS должно быть числом >= 1, получено: '$STRESS_RUNS'"
+            exit 1 ;;
+          esac
           # Логи живут в корне репо (../stress-logs относительно cli/):
           # report-шаг читает их из корня — пути в одной системе координат.
           mkdir -p ../stress-logs
           overall=0
           for i in $(seq 1 "$STRESS_RUNS"); do
             echo "::group::Прогон $i/$STRESS_RUNS"
-            cargo test 2>&1 | tee "../stress-logs/run-$i.log"
-            rc=$?
+            rc=0
+            cargo test 2>&1 | tee "../stress-logs/run-$i.log" || rc=$?
             echo "::endgroup::"
             echo "$rc" > "../stress-logs/run-$i.rc"
             if [ "$rc" -ne 0 ]; then
@@ -104,6 +121,13 @@ jobs:
               echo "прогон $i: ok"
             fi
           done
+          # Страховка полноты: зелёный без всех .rc-файлов — внутренняя
+          # поломка цикла, не успех (ловит будущие правки шага).
+          done_runs="$(find ../stress-logs -name 'run-*.rc' | wc -l)"
+          if [ "$done_runs" -ne "$STRESS_RUNS" ]; then
+            echo "::error::выполнено прогонов: $done_runs из $STRESS_RUNS"
+            exit 1
+          fi
           exit "$overall"
 
       # Воркеры держатся только на время тестов — убить до шага отчёта.
@@ -113,6 +137,8 @@ jobs:
 
       # Сигнал: имена упавших тестов + фрагменты паник в summary и
       # аннотации. Красная джоба без этого шага = «безымянный fail».
+      # Потоки: markdown → stdout (tee в summary), ::error аннотации →
+      # stderr (парсятся из лога напрямую; в summary им делать нечего).
       - name: Failure report
         if: failure()
         run: |
