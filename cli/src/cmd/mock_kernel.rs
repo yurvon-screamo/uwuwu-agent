@@ -194,6 +194,10 @@ pub(crate) struct MockScenario {
     /// true — SQL-дискавери реестра досок («Задачи %») отвечает HTTP 500
     /// (history-deletes деградирует к полному перечислению без классификации).
     pub(crate) sql_boards_fail: bool,
+    /// Блоки маркерного поиска av (шаг 2 resolve_av, SQL по вхождению
+    /// маркера со значением): (blockId, markdown). Пусто — SQL отвечает
+    /// носителем единственной доски сценария (прежний generic-ответ).
+    pub(crate) marker_blocks: Vec<(&'static str, &'static str)>,
 }
 
 impl Default for MockScenario {
@@ -239,6 +243,7 @@ impl Default for MockScenario {
             board_children: Vec::new(),
             sql_children_fail: false,
             sql_boards_fail: false,
+            marker_blocks: Vec::new(),
         }
     }
 }
@@ -886,6 +891,27 @@ impl MockKernel {
                 }]),
                 None => json!([]),
             };
+        }
+        // маркерный поиск av по значению (шаг 2 resolve_av): сигнатура —
+        // like с кавычкой-значением; find_board-форма (`avID=%`) не матчится
+        if stmt.contains("markdown like '%data-av-id=\"")
+            || stmt.contains("markdown like '%avID=\"")
+        {
+            if self.sc.marker_blocks.is_empty() {
+                // сценарий не задаёт блоки — прежний generic-ответ
+                let b = &self.sc.boards[0];
+                return json!([{
+                    "id": format!("block-{}", b.doc_id),
+                    "markdown": Self::carrier_markdown(b),
+                }]);
+            }
+            let rows: Vec<Value> = self
+                .sc
+                .marker_blocks
+                .iter()
+                .map(|(id, md)| json!({ "id": id, "markdown": md }))
+                .collect();
+            return json!(rows);
         }
         if stmt.contains("type='av'") {
             // запрос av-носителя без root: единственная доска сценария

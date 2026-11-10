@@ -137,6 +137,45 @@ async fn resolve_av_rejects_id_without_database_relation() {
     assert!(err.to_string().contains("не резолвится"), "{err}");
 }
 
+// ——— верификация маркерного шага (extract == id) ———
+
+/// Пин верификации: блок маркерного SQL, где первый по позиции маркер
+/// (`avID=`) указывает на чужой av — такая строка не принимается (без
+/// верификации resolve_av вернул бы чужую пару и render отрендерил
+/// не ту доску молча).
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_bare_av_id_rejects_marker_row_with_foreign_extract() {
+    let mut sc = board_with_carrier(false);
+    sc.marker_blocks = vec![(
+        "block-mixed",
+        "<i avID=\"foreign-av\"></i><div data-av-id=\"av-1\"></div>",
+    )];
+    let (_kernel, server) = MockKernel::start(sc).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let err = resolve_av(&sy, "av-1").await.unwrap_err();
+    assert!(err.to_string().contains("не резолвится"), "{err}");
+}
+
+/// Позитивная ветка маркерного шага: extract по первому маркеру совпал
+/// с запрошенным avID — пара (avID, blockID носителя) принимается.
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_bare_av_id_takes_matching_marker_row() {
+    let mut sc = board_with_carrier(false);
+    sc.marker_blocks = vec![(
+        "block-quoted",
+        "<p>цитата data-av-id=\"av-1\" из документации</p>",
+    )];
+    let (_kernel, server) = MockKernel::start(sc).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "av-1").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-quoted");
+}
+
 #[test]
 fn timeout_flag_parses_before_and_after_subcommand() {
     for argv in [
