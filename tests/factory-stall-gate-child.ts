@@ -185,16 +185,21 @@ function scriptTick(): string[] {
       calls.push(`mcp:${tool}`)
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 })
     }
-    if (url.includes("/prompt")) {
+    // opencode REST — строгий pathname-матч (класс PR #207): rest демона строит
+    // `${base}/api${path}`, двойной префикс (/api/api/…) на живом сервере даёт
+    // 404 — мок не имеет права его принимать; незнакомый путь = громкий отказ
+    const path = new URL(url).pathname
+    if (/^\/api\/session\/(ses_[^/]+)\/prompt$/.test(path)) {
       calls.push("prompt")
       return new Response(JSON.stringify({}), { status: 200 })
     }
-    if (url.includes("/api/session/")) {
+    const sessMatch = /^\/api\/session\/(ses_[^/]+)(\/message)?$/.exec(path)
+    if (sessMatch !== null) {
       if (method === "DELETE") {
         calls.push("session-delete")
         return new Response(JSON.stringify({}), { status: 200 })
       }
-      if (url.includes("/message")) {
+      if (sessMatch[2] === "/message") {
         calls.push("session-message")
         const age = cfg.msgAgeMin * 60_000
         return new Response(JSON.stringify([{ time: { created: NOW - age, streamed: NOW - age } }]), { status: 200 })
@@ -202,7 +207,7 @@ function scriptTick(): string[] {
       calls.push("session-get")
       return new Response(JSON.stringify({ id: DEV }), { status: 200 })
     }
-    if (url.includes("/api/session")) {
+    if (path === "/api/session") {
       calls.push("session-create")
       return new Response(JSON.stringify({ id: "ses_new" }), { status: 200 })
     }
@@ -248,10 +253,19 @@ const ghLog = process.env.GH_LOG
 const ghCalls = ghLog !== undefined && existsSync(ghLog)
   ? readFileSync(ghLog, "utf-8").split("\n").filter((l) => l.trim() !== "")
   : null
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
+// прочих веток добивают ассерты вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
+
 console.log(JSON.stringify({
   scenario: SCENARIO,
   perTick,
   ghCalls,
+  strictPathPin,
   state: {
     mergedPrUrl: t.mergedPrUrl ?? null,
     prProbeUnknownStreak: t.prProbeUnknownStreak ?? null,

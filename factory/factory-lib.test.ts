@@ -73,9 +73,13 @@ import {
   spawnInitBlock,
   stripExportWrapper,
   stripFrontmatter,
+  resolvePromptWorktree,
   type SpawnInit,
 } from "./factory-lib"
 import { parseCommentsMarkdown } from "../lib/platform"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const c = (id: string, text: string, at: number): TaskComment => ({ id, text, createdAt: at })
 
@@ -279,6 +283,21 @@ describe("spawnPrompt", () => {
     expect(p).toContain("создай worktree+ветку от origin/master")
     expect(p).toContain("заполни Branch-ячейку")
   })
+  test("env:false с envRoot — канон-путь ворктри назван (тот же, что резолвит tester/ревьювер)", () => {
+    const p = spawnPrompt("r1", "true-washing", "true-washing", "implement", { envRoot: "/home/x/agents-env" })
+    expect(p).toContain("ворктри /home/x/agents-env/r1/repo")
+    expect(p).toContain("скретч /home/x/agents-env/r1/scratch")
+    expect(p).toContain("заполни Branch-ячейку")
+  })
+  test("формула пути одна: промпт sanitize row-id так же, как резолв tester/ревьювера", () => {
+    // патологический id из тест-кейса sanitizeRowId: ведущий дефис срезается —
+    // сырой rowId в промпте отправил бы агента создавать ворктри по пути,
+    // который resolvePromptWorktree никогда не пробует (ревью PR #192, Low)
+    const id = "-5BF9NMBXZ"
+    const p = spawnPrompt(id, "true-washing", "true-washing", "implement", { envRoot: "/env" })
+    expect(p).toContain("ворктри /env/5BF9NMBXZ/repo")
+    expect(p).not.toContain("/env/-5BF9NMBXZ/repo")
+  })
   test("base из контекста: env:false-строка и env:true-строка говорят базу проекта, не дефолт", () => {
     const p = spawnPrompt("r1", "1xgames", "1xgames/game-service", "implement", { base: "origin/main" })
     expect(p).toContain("создай worktree+ветку от origin/main")
@@ -287,6 +306,14 @@ describe("spawnPrompt", () => {
       env: { repoDir: "/env/r2/repo", branch: "work/task-r2", scratchDir: "/env/r2/scratch" },
     })
     expect(withEnv).toContain("ветка уже от origin/main")
+  })
+  test("docs-only финал назван: без PR/CI, PR-ячейка = вики-артефакт (кейс 20261104094441-wvv9psh)", () => {
+    const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement")
+    expect(p).toContain("docs-only — без PR/CI")
+    expect(p).toContain("URL главного")
+    expect(p).toContain("закрытие без мержа")
+    // PR-путь остаётся каноном кодовых задач
+    expect(p).toContain("gh pr create")
   })
 })
 
@@ -715,6 +742,16 @@ describe("reviewSpawnPrompt", () => {
     expect(p).toContain("diff origin/master…feat/y")
     expect(p).not.toContain("Ворктри задачи: ")
   })
+  test("result: docs-only hint — диффа/PR может не быть, предмет доки по ссылкам тела", () => {
+    // канон docs-only финала (задача 20261109234534): ревьювер не импровизирует
+    // по отсутствующему PR, а ревьюит вики-артефакты из тела
+    const p = reviewSpawnPrompt("r10", "uwuwu", "result", { branch: "", worktree: "", pr: "" }, "code-quality-reviewer")
+    expect(p).toContain("docs-only задача — диффа/PR может не быть")
+    expect(p).toContain("доки uwuwu по ссылкам тела")
+    // план-ревью без кода — hint не нужен
+    const plan = reviewSpawnPrompt("r10", "uwuwu", "plan", { branch: "", worktree: "", pr: "" }, "plan-reviewer")
+    expect(plan).not.toContain("docs-only задача")
+  })
   test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
     const p = reviewSpawnPrompt("r8", "1xgames", "result", {
       branch: "feat/y", worktree: "", pr: "", base: "origin/main",
@@ -793,6 +830,12 @@ describe("reviewRerunPrompt / reviewCommentsPrompt / reviewReturnPrompt", () => 
     expect(p).toContain("баг-репорт тестировщика")
     expect(p).toContain(TESTING_STATUS)
     expect(p).toContain("код-ревью обязателен перед возвратом тестировщику")
+  })
+  test("return: docs-only ветка — «запушь» вакуумных инструкций снят (ревью PR #213, Low)", () => {
+    const p = reviewReturnPrompt("r6")
+    expect(p).toContain("docs-only задача (правки только в uwuwu-доках)")
+    expect(p).toContain("не применяется")
+    expect(p).toContain("снова ревью-статус")
   })
 })
 
@@ -900,6 +943,11 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     expect(p).toContain("Ворктри задачи не найден")
     expect(p).toContain("diff origin/master…feat/y")
   })
+  test("spawn: docs-only hint — объект проверки доки по ссылкам тела", () => {
+    const p = testingSpawnPrompt("r5", "uwuwu", { branch: "", worktree: "", pr: "" })
+    expect(p).toContain("docs-only задача — объект проверки: доки uwuwu по ссылкам тела")
+    expect(p).toContain("дифф/PR/CI n/a")
+  })
   test("base из контекста: дифф-строки говорят базу проекта, не дефолт", () => {
     const p = testingSpawnPrompt("r9", "1xgames", {
       branch: "feat/y", worktree: "", pr: "", base: "origin/main",
@@ -921,6 +969,44 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
     expect(p).toContain("стадия тестирования")
     expect(p).toContain("тест упал у меня")
     expect(p).toContain("uwuwu-cli task comment")
+  })
+})
+
+// ——— resolvePromptWorktree: ворктри для промпт-ctx (env:false резолв) ———
+
+describe("resolvePromptWorktree: env:false-задачи с агентским ворктри не лгут в промпте", () => {
+  test("tracked-ворктри не пуст — возвращается он, fs-проба не выполняется", () => {
+    // несуществующий envRoot — докажет, что до пробы дело не дошло
+    expect(resolvePromptWorktree("r1", "/env/r1/repo", "/nonexistent-root")).toBe("/env/r1/repo")
+  })
+  test("env:false с живым агентским ворктри по канон-пути — путь резолвится", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      const repoDir = join(root, "20261108081220-pwvf1fn", "repo")
+      mkdirSync(repoDir, { recursive: true })
+      writeFileSync(join(repoDir, ".git"), "gitdir: /elsewhere/main/.git/worktrees/x\n")
+      expect(resolvePromptWorktree("20261108081220-pwvf1fn", "", root)).toBe(repoDir)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  test("каталога нет — пусто: фоллбэк-строка промпта честна", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      expect(resolvePromptWorktree("20261109005428-g9wx5af", "", root)).toBe("")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  test("обломок без .git — пусто, битый путь агенту не скармливается", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-probe-"))
+    try {
+      mkdirSync(join(root, "rowz", "repo"), { recursive: true })
+      expect(resolvePromptWorktree("rowz", "", root)).toBe("")
+      expect(existsSync(join(root, "rowz", "repo"))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

@@ -1283,6 +1283,7 @@ fn comment_task() -> SyTask {
         pr: String::new(),
         dev_session: String::new(),
         planned: String::new(),
+        planned_ms: 0,
         schedule_cell: String::new(),
         body_doc: Some(BOUND_DOC.into()),
     }

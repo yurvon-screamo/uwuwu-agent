@@ -19,6 +19,7 @@ const SERVICE_REG = join(process.env.HOME ?? "", ".local/state/opencode/service.
 
 interface ChildReport {
   error?: string
+  strictPathPin?: boolean
   stages: { label: string; state: Record<string, Record<string, unknown>>; prompts: number; creations: number; spawns: number; runCards: number }[]
   creations: { title: string; agent: unknown; model: unknown }[]
   promptCalls: { sessionID: string; text: string; delivery: unknown }[]
@@ -58,6 +59,7 @@ describe.skipIf(!hasServiceReg)("tick × боевой файр вечного м
   test("gone→prompt создаёт сессию и ран; running→steer; failed POST→pendingRun; ретрай без due закрывает приземлением", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
+    expect(report.strictPathPin).toBe(true) // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
     expect(report.agentsDir.startsWith(`${CHILD_HOME}/`)).toBe(true)
 
     const [t1, t2, t3, t4] = report.stages

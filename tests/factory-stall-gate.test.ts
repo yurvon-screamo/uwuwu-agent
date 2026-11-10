@@ -30,6 +30,7 @@ interface TickReport {
   scenario: string
   perTick: TickObs[]
   ghCalls: string[] | null
+  strictPathPin?: boolean
   state: {
     mergedPrUrl: string | null
     prProbeUnknownStreak: number | null
@@ -123,6 +124,8 @@ esac
 
   test("review: контентная правка тела (отчёт тестировщика) — будки дева нет, базлайн обновлён", async () => {
     const v = await runTick("review_swallow")
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(v.strictPathPin).toBe(true)
     // три тика (правки на тиках 1 и 3, тик 2 — без правки): ни одной будки
     for (const t of v.perTick) expect(t.prompts).toBe(0)
     expect(v.perTick[0]?.comments).toHaveLength(0)

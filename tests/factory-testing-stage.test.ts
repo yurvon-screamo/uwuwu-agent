@@ -31,6 +31,7 @@ interface StageVerdict {
   tick1: TickCalls
   tick2: TickCalls
   tick3: Tick3Calls
+  strictPathPin?: boolean
   sessionID: string | null
   testSessionID: string | null
   testAttempts: number | null
@@ -55,9 +56,11 @@ describe("tickProject: стадия «Тестирование»", () => {
     rmSync(home, { recursive: true, force: true })
   })
 
-  function seatState(scenario: "quarantine" | "nocell" | "rerun" | "bug"): void {
-    // quarantine и nocell: строка untracked (даунтайм демона на переходе)
-    const tasks = scenario === "quarantine" || scenario === "nocell"
+  function seatState(scenario: "quarantine" | "nocell" | "rerun" | "bug" | "worktree"): void {
+    // quarantine/nocell/worktree — untracked строка (карантинный вход,
+    // даунтайм демона, живой агентский ворктри без трека); остальным
+    // нужен живой трек с тест-сессией
+    const tasks = scenario === "quarantine" || scenario === "nocell" || scenario === "worktree"
       ? {}
       : {
           [ROW_ID]: {
@@ -75,7 +78,7 @@ describe("tickProject: стадия «Тестирование»", () => {
     writeFileSync(join(home, ".local/state/uwuwu-factory/state.json"), JSON.stringify({ tasks }))
   }
 
-  async function runTick(scenario: "quarantine" | "nocell" | "rerun" | "bug"): Promise<StageVerdict> {
+  async function runTick(scenario: "quarantine" | "nocell" | "rerun" | "bug" | "worktree"): Promise<StageVerdict> {
     seatState(scenario)
     const proc = Bun.spawn(["bun", CHILD], {
       env: {
@@ -94,6 +97,8 @@ describe("tickProject: стадия «Тестирование»", () => {
 
   test("quarantine: untracked «Тестирование» → карантинная запись + спавн тестировщика, дев-волна молчит", async () => {
     const v = await runTick("quarantine")
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(v.strictPathPin).toBe(true)
     // спавн ровно один, агент tester, тайтл стадии «тестирование»
     expect(v.tick1.sessionCreates).toHaveLength(1)
     expect(v.tick1.sessionCreates[0]).toContain("tester:")
@@ -164,5 +169,25 @@ describe("tickProject: стадия «Тестирование»", () => {
     expect(v.lastStatus).toBe("In Progress")
     expect(v.tick2.prompts).toHaveLength(0)
     expect(v.tick2.sessionCreates).toHaveLength(0)
+  })
+
+  test("worktree: env:false с живым агентским ворктри — cwd и промпт ведут в живой путь, не фоллбэк", async () => {
+    // e2e фикса 20261109133634-6ctgzew: инциденты 08–09.11 — промпт тестировщика
+    // заявлял «ворктри не найден» при живом ~/agents-env/<rowId>/repo.
+    const v = await runTick("worktree")
+    const liveDir = join(home, "agents-env", ROW_ID, "repo")
+    // спавн один (tester), cwd сессии — живой агентский ворктри, не cfg.local
+    expect(v.tick1.sessionCreates).toHaveLength(1)
+    expect(v.tick1.sessionCreates[0]).toContain("tester:")
+    expect(v.tick1.sessionCreates[0]).toContain(liveDir)
+    // промпт называет живой ворктри и НЕ советует diff-only фоллбэк
+    expect(v.tick1.prompts).toHaveLength(1)
+    expect(v.tick1.prompts[0]).toContain(`Ворктри задачи: ${liveDir}`)
+    expect(v.tick1.prompts[0]).not.toContain("Ворктри задачи не найден")
+    // карантинная механика не изменилась: тест-сессия записана, дубля нет
+    expect(v.testSessionID).toBe("ses_new")
+    expect(v.lastStatus).toBe("Тестирование")
+    expect(v.tick2.sessionCreates).toHaveLength(0)
+    expect(v.tick2.prompts).toHaveLength(0)
   })
 })

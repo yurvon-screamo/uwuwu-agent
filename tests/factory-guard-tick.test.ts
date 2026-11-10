@@ -17,6 +17,7 @@ interface GuardVerdict {
   scenario: string
   taskCount: number
   holdSignaled: string | null
+  strictPathPin?: boolean
   sessionCreates: number
   sessionDeletes: number
   prompts: number
@@ -79,6 +80,8 @@ describe("tickProject: гард каскада при потере state", () =>
   test("инцидент-сценарий: пустой state, на доске сироты-спавны — HOLD, ноль спавнов, алерт и бэкап", async () => {
     // Act
     const verdict = await runTick("hold", JSON.stringify({ tasks: {} }))
+    // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
+    expect(verdict.strictPathPin).toBe(true)
 
     // Assert: спавнов нет вовсе (сессии не создаются, промпты не уходят)
     expect(verdict.sessionCreates).toBe(0)

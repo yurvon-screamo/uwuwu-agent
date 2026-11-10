@@ -19,6 +19,7 @@ const SERVICE_REG = join(process.env.HOME ?? "", ".local/state/opencode/service.
 
 interface ChildReport {
   error?: string
+  strictPathPin?: boolean
   promptCalls: { sessionID: string; text: string; delivery: unknown }[]
   creations: Record<string, unknown>[]
   createCalls: string[][]
@@ -53,6 +54,7 @@ describe.skipIf(!hasServiceReg)("tick × инцидентный дедуп pendi
   test("ручная копия конверта с разошедшимся текстом признаётся — ретрай без дубль-POST и дубль-рана", async () => {
     const report = await runChild()
     expect(report.error ?? "").toBe("")
+    expect(report.strictPathPin).toBe(true) // регресс-пин класса PR #207: мок отвергает двойной /api-префикс
 
     // главный контракт: ни одного POST/создания сессии/дубль-ран-карточки —
     // дубль-инструкция в вечный контекст не доезжает (ADR-075)

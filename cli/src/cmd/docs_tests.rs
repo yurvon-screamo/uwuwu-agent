@@ -171,6 +171,10 @@ async fn unknown_space_bails_with_available_spaces() {
     let text = err.to_string();
     assert!(text.contains("«опечатка» не найдено"), "{text}");
     assert!(text.contains("доступные: platform, uwuwu"), "{text}");
+    assert!(
+        text.contains("имя открытого ноутбука — тоже адрес"),
+        "отказ «не найдено» обязан подсказывать ноутбучную адресацию (ADR-081): {text}"
+    );
 }
 
 #[tokio::test]
@@ -236,6 +240,10 @@ async fn empty_prefix_bails_with_available_spaces() {
     let text = err.to_string();
     assert!(text.contains("пустой префикс"), "{text}");
     assert!(text.contains("доступные пространства: uwuwu"), "{text}");
+    assert!(
+        text.contains("или имя открытого ноутбука"),
+        "отказ пустого префикса обязан подсказывать ноутбучную адресацию (ADR-081): {text}"
+    );
 }
 
 /// Роутер ноутбучной ветки: lsNotebooks + box-sql (дети корня ноутбука)
@@ -331,6 +339,10 @@ async fn single_token_unknown_bails_after_notebook_fallback() {
     let text = err.to_string();
     assert!(text.contains("«опечатка» не найдено"), "{text}");
     assert!(text.contains("доступные: uwuwu"), "{text}");
+    assert!(
+        text.contains("имя открытого ноутбука — тоже адрес"),
+        "отказ «не найдено» обязан подсказывать ноутбучную адресацию (ADR-081): {text}"
+    );
 }
 
 /// notebook_children напрямую: тот же box-контракт без ls_listing-обвязки.

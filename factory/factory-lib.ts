@@ -1,8 +1,27 @@
 import { createHash } from "node:crypto"
+import { existsSync } from "node:fs"
+import { join } from "node:path"
 
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
 // Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
+
+import { sanitizeRowId } from "./env"
+
+/** Ворктри задачи для промпт-ctx и cwd сессии. env:true-задачам путь пишет
+ *  фабрика в state (tracked.worktree); env:false-проектам ворктри по канону
+ *  AGENTS.md создаёт сам девелопер — ~/agents-env/<rowId>/repo — и фабрика
+ *  о нём не знает: state-путь пуст навсегда, а живой каталог есть. Резолв
+ *  на лету без мутации state: каталог существует и внутри .git (ворктри)
+ *  → путь; иначе "" — честная фоллбэк-строка промпта («не найден»).
+ *  Осиротевший .git (prune срезал регистрацию, каталог остался) — принятый
+ *  компромисс против git-проб: деградация мягкая, агент увидит и уйдёт
+ *  в фоллбэк сам (инциденты 08–09.11, задача 20261109133634-6ctgzew). */
+export function resolvePromptWorktree(rowId: string, trackedWorktree: string, envRoot: string): string {
+  if (trackedWorktree !== "") return trackedWorktree
+  const repoDir = join(envRoot, sanitizeRowId(rowId), "repo")
+  return existsSync(repoDir) && existsSync(join(repoDir, ".git")) ? repoDir : ""
+}
 
 export interface TaskRef {
   rowId: string
@@ -522,6 +541,10 @@ export interface PromptTarget {
 export interface PromptContext {
   env?: SpawnEnvContext
   init?: SpawnInit
+  /** корень env-механики демона (ENV_ROOT): env:false-ветка spawn-промпта
+   *  называет агенту канон-путь ворктри — тот, что resolvePromptWorktree
+   *  потом резолвит для tester/ревьювера */
+  envRoot?: string
   /** git-ref базы env-ворктри и master-строк текста; дефолт DEFAULT_BASE */
   base?: string
 }
@@ -595,7 +618,7 @@ export function spawnPrompt(
   rowId: string, project: string, repo: string, mode: KickoffMode = "design",
   ctx: PromptContext = {},
 ): string {
-  const { env, init } = ctx
+  const { env, init, envRoot } = ctx
   const base = baseOf(ctx)
   const stage = mode === "implement"
     ? [
@@ -615,7 +638,11 @@ export function spawnPrompt(
         "После approve плана:",
       ]
   const workLine = env === undefined
-    ? [`создай worktree+ветку от ${base} (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.`]
+    ? [
+        envRoot !== undefined
+          ? `создай worktree+ветку от ${base} — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
+          : `создай worktree+ветку от ${base} (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.`,
+      ]
     : [
         `работай в своём окружении задачи (фабрика создала, ветка уже от ${base}):`,
         `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
@@ -629,7 +656,8 @@ export function spawnPrompt(
     ...stage,
     ...workLine,
     "Код + self-check + PR (gh pr create, URL в PR-ячейку) + отчёт в тело → статус",
-    "«Ревью результата» → конец хода. Вернулся wakeup'ом с вердиктом: request_changes →",
+    "«Ревью результата» → конец хода (docs-only — без PR/CI: в PR-ячейку URL главного",
+    "вики-артефакта, закрытие без мержа). Вернулся wakeup'ом с вердиктом: request_changes →",
     "устрани замечания и снова ревью-статус. Ревьювера сам не вызываешь.",
     "Без пустого шума в комментах («взялся», «отчёт») — коммент только вопрос юзеру или PR-ссылка.",
     "",
@@ -800,7 +828,10 @@ export function reviewSpawnPrompt(
       ? "2. Предмет — план из тела задачи; кодовый diff не нужен (его ревью — предмет code-quality-reviewer)."
       : "2. Предмет — все изменения ветки задачи против её базы (источник branch):",
     ...(kind === "result"
-      ? [`   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,]
+      ? [
+          `   ${base} + untracked; PR (gh pr diff/view, CI) — дополнительные артефакты.`,
+          "   docs-only задача — диффа/PR может не быть: предмет — доки uwuwu по ссылкам тела.",
+        ]
       : []),
     ...(ctx.worktree !== ""
       ? [`   Ворктри задачи: ${ctx.worktree}`]
@@ -895,6 +926,7 @@ export function testingSpawnPrompt(rowId: string, project: string, ctx: TestCont
       ? [`   Ворктри задачи: ${ctx.worktree}`]
       : [`   Ворктри задачи не найден — работай по diff ${base}…${ctx.branch || "<ветка из Branch-ячейки>"} / PR`,
          `   (git-команды из каталога сессии; ворктри не обязателен).`]),
+    "   docs-only задача — объект проверки: доки uwuwu по ссылкам тела (дифф/PR/CI n/a).",
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
@@ -955,6 +987,8 @@ export function reviewReturnPrompt(rowId: string): string {
     "  запушь и поставь «Ревью результата» — код-ревью обязателен перед возвратом тестировщику;",
     "- владелец вернул в Design → перепланируй и снова «Ревью плана»;",
     "- владелец перевёл в In Progress (fast-track) → продолжай/почини по текущей фазе, Design не нужен.",
+    "- docs-only задача (правки только в uwuwu-доках) — «запушь» в ветках выше не применяется:",
+    "  правь вики, self-check (актуальность/точность доков) и снова ревью-статус.",
   ].join("\n")
 }
 
