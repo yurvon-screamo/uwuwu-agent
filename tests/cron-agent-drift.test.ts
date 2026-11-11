@@ -30,7 +30,6 @@ interface ChildReport {
   masterDocId: string
   agents: string[]
   runCardIds: string[]
-  strictPathPin?: boolean
 }
 
 async function runChild(): Promise<ChildReport> {
