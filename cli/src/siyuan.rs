@@ -174,6 +174,10 @@ fn fish_vars_path() -> PathBuf {
 /// Рас-экранировка значения из fish_variables: fish пишет спецсимволы как
 /// `\xHH` (`:`, `.`, `-` в URL/путях), а также `\n`, `\t`, `\r`; `\\`
 /// буквализирует бэкслеш. Неизвестная последовательность сохраняется дословно.
+/// Граница применимости: байты ≥ 0x80 реконструируются как latin-1
+/// (`byte as char`), не как UTF-8-последовательности — fish экранирует
+/// не-ASCII байтами `\xHH`; ступень рассчитана на ASCII-носители
+/// (токены, пути/URL со спецсимволами ASCII), не на произвольный текст.
 fn fish_unescape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -221,7 +225,7 @@ fn fish_unescape(raw: &str) -> String {
 /// значение — хвост после первого `:` имени. Побеждает последняя запись
 /// (fish хранит одну запись на переменную; дубль — последнее записанное).
 /// Файл отсутствует/не читается или переменной в нём нет — None.
-pub(crate) fn token_from_fish_vars(path: &std::path::Path) -> Option<String> {
+fn token_from_fish_vars(path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     content
         .lines()
@@ -241,7 +245,7 @@ pub(crate) fn token_from_fish_vars(path: &std::path::Path) -> Option<String> {
 /// api/token из conf.json воркспейса (последний фоллбек). Класс прав ядра:
 /// stable 3.8.10 пересохраняет conf.json `0600` от uid контейнера — хост-юзер
 /// не читает; ошибка различает «нет файла» и «не читается» и называет мост.
-pub(crate) fn token_from_conf(ws_root: &std::path::Path) -> Result<String> {
+fn token_from_conf(ws_root: &std::path::Path) -> Result<String> {
     let path = ws_root.join("conf/conf.json");
     let raw = std::fs::read_to_string(&path).map_err(|err| {
         let why = if err.kind() == std::io::ErrorKind::NotFound {
@@ -249,7 +253,7 @@ pub(crate) fn token_from_conf(ws_root: &std::path::Path) -> Result<String> {
         } else {
             format!(
                 "не читается ({err}) — ядро пишет conf.json 0600 от uid контейнера; \
-                 мост: podman exec siyuan-demo chmod 644 /siyuan/workspace/conf/conf.json"
+                 мост: docker exec siyuan-demo chmod 644 /siyuan/workspace/conf/conf.json"
             )
         };
         anyhow!("{}: {why}", path.display())
@@ -3076,11 +3080,11 @@ mod tests {
         let fish = write_fish_file(
             dir.path(),
             "SETUVAR --export UWUWU_AFFINE_EMAIL:agent@uwuwu.net\n\
-             SETUVAR --export UWUWU_SIYUAN_TOKEN:6u9sbtgle13g2hru\n",
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:deadbeefcafe1234\n",
         );
         // conf.json в ws нет: живой класс 0600 — conf-фоллбек недоступен
         let got = resolve_token(None, &fish, dir.path()).expect("fish vars выручают");
-        assert_eq!(got, "6u9sbtgle13g2hru");
+        assert_eq!(got, "deadbeefcafe1234");
     }
 
     #[test]
@@ -3116,11 +3120,11 @@ mod tests {
             "# comment\n\
              SETUVAR fish_color_normal:normal\n\
              SETUVAR --export UWUWU_AFFINE_PASSWORD:xx\n\
-             SETUVAR --export UWUWU_SIYUAN_TOKEN:6u9sbtgle13g2hru\n",
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:deadbeefcafe1234\n",
         );
         assert_eq!(
             token_from_fish_vars(&fish).as_deref(),
-            Some("6u9sbtgle13g2hru")
+            Some("deadbeefcafe1234")
         );
     }
 
