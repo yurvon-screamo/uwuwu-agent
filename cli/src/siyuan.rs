@@ -315,22 +315,44 @@ fn api_token_from_conf_json(raw: &str, origin: &str) -> Result<String> {
 /// Последнее звено рефреш-цепочки: токен изнутри контейнера. conf.json хосту
 /// недоступен надёжно (ядро пересохраняет 0600 через temp+rename), docker exec
 /// читает источник истины напрямую: контейнер жив ⟺ kernel жив. Имя контейнера
-/// — дефолт контура.
+/// — дефолт контура. Жёсткий таймаут: зависший/медленный docker-демон (штатная
+/// ситуация процедуры ротации — контейнер перезапускается) не вешает CLI
+/// синхронным вызовом без предела — ровно класс тихого зависания, против
+/// которого задача.
 fn docker_exec_token() -> Result<String> {
     const CONTAINER: &str = "siyuan-demo";
     const CONF_IN_CONTAINER: &str = "/siyuan/workspace/conf/conf.json";
-    let out = std::process::Command::new("docker")
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut child = std::process::Command::new("docker")
         .args(["exec", CONTAINER, "cat", CONF_IN_CONTAINER])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|err| anyhow!("docker недоступен ({err})"))?;
-    if !out.status.success() {
-        bail!(
-            "docker exec {CONTAINER} упал: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                bail!(
+                    "docker exec {CONTAINER} не ответил за {TIMEOUT:?} — демон завис или медленный"
+                );
+            }
+            Err(err) => bail!("docker exec {CONTAINER}: {err}"),
+        }
+    }
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stdout)
+            .map_err(|err| anyhow!("docker exec {CONTAINER}: stdout не читается ({err})"))?;
     }
     api_token_from_conf_json(
-        std::str::from_utf8(&out.stdout)?,
+        &stdout,
         &format!("docker exec {CONTAINER} {CONF_IN_CONTAINER}"),
     )
 }
@@ -347,7 +369,7 @@ fn refresh_walk_past_equal(
     stale: &str,
     fish_path: &std::path::Path,
     ws_root: &std::path::Path,
-    docker: Option<&dyn Fn() -> Result<String>>,
+    docker: &dyn Fn() -> Result<String>,
 ) -> Result<String> {
     let mut attempts: Vec<String> = Vec::new();
     match token_from_fish_vars(fish_path) {
@@ -360,13 +382,10 @@ fn refresh_walk_past_equal(
         Ok(_) => attempts.push("conf.json: токен равен провалившемуся".into()),
         Err(err) => attempts.push(err.to_string()),
     }
-    match docker {
-        Some(f) => match f() {
-            Ok(t) if t != stale => return Ok(t),
-            Ok(_) => attempts.push("docker exec: токен равен провалившемуся".into()),
-            Err(err) => attempts.push(format!("docker exec: {err:#}")),
-        },
-        None => attempts.push("docker exec: недоступен".into()),
+    match docker() {
+        Ok(t) if t != stale => return Ok(t),
+        Ok(_) => attempts.push("docker exec: токен равен провалившемуся".into()),
+        Err(err) => attempts.push(format!("docker exec: {err:#}")),
     }
     bail!(
         "отличного от провалившегося токена не нашёл ни один источник: {}; \
@@ -383,9 +402,36 @@ fn default_refresher() -> TokenRefresher {
             stale,
             &fish_vars_path(),
             &workspace_root(),
-            Some(&docker_exec_token),
+            &docker_exec_token,
         )
     })
+}
+
+/// Классификация исхода одиночного POST (send_post): политика ретраев
+/// живёт в post_with_pacing, разбор ответа — здесь.
+enum PostFailure {
+    /// Транспортный отказ (pasta/kernel-down) — обычный ретрай.
+    Transport(String),
+    /// Rate-limit kernel'а (HTTP 429 опорный, конверт-msg фоллбэк) — fail-fast.
+    RateLimited(String),
+    /// metadata-not-ready lag — ретрай с бэкоффом, исчерпание армит волну.
+    MetadataNotReady(String),
+    /// 401/Auth failed — рефреш-класс (walk-past-equal, один на вызов).
+    AuthFailed,
+    /// Прочий code≠0 — обычный ретрай.
+    Kernel(String),
+}
+
+impl PostFailure {
+    fn as_last(&self) -> String {
+        match self {
+            PostFailure::Transport(msg)
+            | PostFailure::RateLimited(msg)
+            | PostFailure::MetadataNotReady(msg)
+            | PostFailure::Kernel(msg) => msg.clone(),
+            PostFailure::AuthFailed => String::new(),
+        }
+    }
 }
 
 impl SiYuan {
@@ -419,6 +465,9 @@ impl SiYuan {
 
     /// Тестовый конструктор: поля client/mcp_sid приватны для siyuan,
     /// сиблинг-модуль siyuan_task_tests соберёт только через него.
+    /// Рефрешер — герметичная заглушка (громкий отказ): тест, поймавший 401,
+    /// не читает реальные носители хоста и не зовёт реальный docker;
+    /// 401-сценарии — через for_tests_with_refresher.
     #[cfg(test)]
     pub(crate) fn for_tests(base: String) -> Self {
         Self {
@@ -434,7 +483,11 @@ impl SiYuan {
                 metadata_backoffs: vec![Duration::from_millis(5), Duration::from_millis(5)],
                 other_step_ms: 1,
             }),
-            refresher: default_refresher(),
+            refresher: std::sync::Arc::new(|_: &str| {
+                anyhow::bail!(
+                    "рефрешер не настроен: для 401-сценариев юзай for_tests_with_refresher"
+                )
+            }),
         }
     }
 
@@ -478,6 +531,58 @@ impl SiYuan {
     /// рефреш-токен walk-past-equal и немедленный повтор (самолечение
     /// ротации без рестартов); 429 — fail-fast без ретраев (каждая
     /// 401-попытка с источника продлевает rate-limit-бан kernel'а).
+    /// Одиночный POST с текущим токеном: успех → data конверта; исход
+    /// классифицируется в PostFailure — без ретрай-политики.
+    async fn send_post(&self, path: &str, body: &Value, token: &str) -> Result<Value, PostFailure> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, path))
+            .header("Authorization", format!("Token {token}"))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| PostFailure::Transport(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(PostFailure::RateLimited(
+                "HTTP 429 — kernel rate-limit: серия неудачных токенов забанила                  источник, бан бьёт и валидные токены (10+ мин). Не долбить:                  каждая 401-попытка продлевает бан."
+                    .into(),
+            ));
+        }
+        let raw = resp.text().await.unwrap_or_default();
+        let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if v.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(v.get("data").cloned().unwrap_or(Value::Null));
+        }
+        let last = format!(
+            "code={} msg={}",
+            v.get("code").and_then(|c| c.as_i64()).unwrap_or(-999),
+            v.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
+        );
+        // Вспомогательный 429-фоллбэк: конверт с rate-limit msg
+        // (опорный сигнал — HTTP-статус выше).
+        if last.contains("Слишком много неудачных попыток") {
+            return Err(PostFailure::RateLimited(format!(
+                "rate-limit конвертом — {last}. Не долбить: каждая 401-попытка продлевает бан."
+            )));
+        }
+        if last.contains("metadata is not ready") {
+            return Err(PostFailure::MetadataNotReady(last));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || last.contains("Auth failed") {
+            return Err(PostFailure::AuthFailed);
+        }
+        Err(PostFailure::Kernel(last))
+    }
+
+    /// Ретрай-политика: 4 попытки; metadata-lag — бэкофф по пейсингу,
+    /// исчерпание армит окно волны; прочие ошибки — обычный ретрай,
+    /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
+    /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
+    /// Auth-семантика (задача 20261111233714): 401 — один раз за вызов
+    /// рефреш-токен walk-past-equal и немедленный повтор (самолечение
+    /// ротации без рестартов); 429 — fail-fast без ретраев (каждая
+    /// 401-попытка с источника продлевает rate-limit-бан kernel'а).
     async fn post_with_pacing(
         &self,
         path: &str,
@@ -492,82 +597,48 @@ impl SiYuan {
         let mut auth_refreshed = false;
         for attempt in 0..4u32 {
             let token = self.current_token();
-            let resp = self
-                .client
-                .post(format!("{}{}", self.base, path))
-                .header("Authorization", format!("Token {token}"))
-                .json(&body)
-                .send()
-                .await;
-            match resp {
-                Ok(r) => {
-                    let status = r.status();
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        bail!(
-                            "POST {path}: HTTP 429 — kernel rate-limit: серия неудачных \
-                             токенов забанила источник, бан бьёт и валидные токены \
-                             (10+ мин). Не долбить: каждая 401-попытка продлевает бан."
-                        );
-                    }
-                    let raw = r.text().await.unwrap_or_default();
-                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-                    if v.get("code").and_then(|c| c.as_i64()) == Some(0) {
-                        return Ok(v.get("data").cloned().unwrap_or(Value::Null));
-                    }
-                    last = format!(
-                        "code={} msg={}",
-                        v.get("code").and_then(|c| c.as_i64()).unwrap_or(-999),
-                        v.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
-                    );
-                    // Вспомогательный 429-фоллбэк: конверт с rate-limit msg
-                    // (опорный сигнал — HTTP-статус выше).
-                    if last.contains("Слишком много неудачных попыток")
-                    {
-                        bail!(
-                            "POST {path}: rate-limit конвертом — {last}. Не долбить: \
-                             каждая 401-попытка продлевает бан."
-                        );
-                    }
-                    if last.contains("metadata is not ready") {
-                        match pacing.metadata_backoffs.get(metadata_attempts) {
-                            Some(backoff) => {
-                                metadata_attempts += 1;
-                                tokio::time::sleep(*backoff).await;
-                                continue;
-                            }
-                            None => {
-                                self.arm_wave_cooldown();
-                                bail!("POST {path}: {last} — {WAVE_HINT}");
-                            }
+            match self.send_post(path, &body, &token).await {
+                Ok(value) => return Ok(value),
+                Err(PostFailure::RateLimited(reason)) => bail!("POST {path}: {reason}"),
+                Err(PostFailure::MetadataNotReady(msg)) => {
+                    last = msg;
+                    match pacing.metadata_backoffs.get(metadata_attempts) {
+                        Some(backoff) => {
+                            metadata_attempts += 1;
+                            tokio::time::sleep(*backoff).await;
+                            continue;
                         }
-                    }
-                    let auth_failed =
-                        status == reqwest::StatusCode::UNAUTHORIZED || last.contains("Auth failed");
-                    if auth_failed {
-                        if auth_refreshed {
-                            bail!(
-                                "POST {path}: 401 повторился после рефреша — все \
-                                 источники дают невалидный токен; {last}"
-                            );
-                        }
-                        auth_refreshed = true;
-                        match (self.refresher)(&token) {
-                            Ok(fresh) => {
-                                *self.token.lock().unwrap() = fresh;
-                                continue; // немедленный повтор, без ретрай-сна
-                            }
-                            Err(err) => bail!(
-                                "POST {path}: 401, рефреш не спас: {err:#}; исходный отказ: {last}"
-                            ),
+                        None => {
+                            self.arm_wave_cooldown();
+                            bail!("POST {path}: {last} — {WAVE_HINT}");
                         }
                     }
                 }
-                Err(e) => last = e.to_string(),
+                Err(PostFailure::AuthFailed) => {
+                    if auth_refreshed {
+                        bail!(
+                            "POST {path}: 401 повторился после рефреша — все \
+                             источники дают невалидный токен; {last}"
+                        );
+                    }
+                    auth_refreshed = true;
+                    let fresh = (self.refresher)(&token).map_err(|err| {
+                        anyhow!("POST {path}: 401, рефреш не спас: {err:#}; исходный отказ: {last}")
+                    })?;
+                    *self.token.lock().unwrap() = fresh;
+                    continue; // немедленный повтор, без ретрай-сна
+                }
+                Err(failure) => last = failure.as_last(),
             }
             tokio::time::sleep(std::time::Duration::from_millis(
                 pacing.other_step_ms * (attempt as u64 + 1),
             ))
             .await;
+        }
+        if auth_refreshed {
+            // Рефреш случился на исчерпанной попытке: токен структуры уже
+            // свежий — следующий вызов пройдёт; не маскировать это старым 401.
+            bail!("POST {path}: {last} — токен уже рефрешнут, повтори вызов со свежим");
         }
         bail!("POST {path}: {last}")
     }
@@ -3406,7 +3477,7 @@ mod tests {
             "stale-token",
             &fish,
             dir.path(),
-            Some(&docker_serving("fresh-token")),
+            &docker_serving("fresh-token"),
         )
         .expect("протухший кэш не останавливает цепочку");
         assert_eq!(got, "fresh-token");
@@ -3424,7 +3495,7 @@ mod tests {
             "stale-token",
             &fish,
             dir.path(),
-            Some(&docker_serving("fresh-token")),
+            &docker_serving("fresh-token"),
         )
         .expect("первый отличный источник — находка");
         assert_eq!(got, "rotated-token");
@@ -3438,7 +3509,7 @@ mod tests {
             "stale-token",
             &dir.path().join("fish_variables"),
             dir.path(),
-            Some(&docker_serving("fresh-token")),
+            &docker_serving("fresh-token"),
         )
         .expect("docker exec — последнее звено");
         assert_eq!(got, "fresh-token");
@@ -3452,9 +3523,8 @@ mod tests {
             "SETUVAR --export UWUWU_SIYUAN_TOKEN:stale-token\n",
         );
         let docker_also_stale = docker_serving("stale-token");
-        let err =
-            refresh_walk_past_equal("stale-token", &fish, dir.path(), Some(&docker_also_stale))
-                .expect_err("все источники равны провалившемуся — громкий отказ");
+        let err = refresh_walk_past_equal("stale-token", &fish, dir.path(), &docker_also_stale)
+            .expect_err("все источники равны провалившемуся — громкий отказ");
         let msg = format!("{err:#}");
         assert!(msg.contains("fish vars"), "fish упомянут: {msg}");
         assert!(msg.contains("conf.json"), "conf упомянут: {msg}");
@@ -3473,7 +3543,7 @@ mod tests {
             "stale-token",
             &dir.path().join("fish_variables"),
             dir.path(),
-            Some(&docker_dead),
+            &docker_dead,
         )
         .expect_err("docker-отказ виден в перечне");
         assert!(format!("{err:#}").contains("docker недоступен"), "{err}");
