@@ -3140,6 +3140,20 @@ mod tests {
         assert_eq!(token_from_fish_vars(&fish).as_deref(), Some("new"));
     }
 
+    /// Строгая граница имени: маркер `UWUWU_SIYUAN_TOKEN:` внутри значения
+    /// чужой переменной или внутри чужого имени (префикс) — не матч.
+    /// Регресс фильтра «имя после пробела» сматчил бы чужой секрет.
+    #[test]
+    fn fish_vars_strict_name_boundary_skips_marker_inside_foreign_value() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export OTHERVAR:prefix-UWUWU_SIYUAN_TOKEN:leak-tail\n\
+             SETUVAR MY_UWUWU_SIYUAN_TOKEN:leak-prefix-name\n",
+        );
+        assert_eq!(token_from_fish_vars(&fish), None);
+    }
+
     #[test]
     fn fish_vars_missing_file_is_none() {
         let dir = tempfile::tempdir().expect("tmp");
