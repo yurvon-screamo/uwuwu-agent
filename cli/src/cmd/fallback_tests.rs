@@ -532,6 +532,7 @@ async fn global_comment_without_project_lands_on_owning_board() {
             id: "origa-only".into(),
             reply: None,
             stdin: false,
+            md: None,
             text: vec!["вопрос владельцу: ЧТО РЕШИТЬ?".into()],
         },
     )

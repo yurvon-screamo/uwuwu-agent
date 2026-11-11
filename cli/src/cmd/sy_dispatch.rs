@@ -252,9 +252,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
     // проглоченный trailing_var_arg'ом (`task comment <id> "текст" --project X`
     // → project=None), маскируется под «флаг не передан» (крон-сессия 04.11).
-    // stdin здесь НЕ читается — его читает ровно одна ветка ниже.
-    if let TaskSub::Comment { stdin, text, .. } = &command {
-        pre_guard_positional_comment(*stdin, text)?;
+    // stdin здесь НЕ читается — его читает ровно одна ветка ниже; --md тоже
+    // не читается — явный канал, гвардится в Comment-ветке.
+    if let TaskSub::Comment {
+        stdin, md, text, ..
+    } = &command
+    {
+        pre_guard_positional_comment(*stdin, md.as_deref(), text)?;
     }
     // Board-bound подкоманды привязаны к доске/журналу — глобальной семантики
     // нет. Id-семейство (get/edit/claim/comment/thread/close/body/rm) без
@@ -627,9 +631,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             id,
             reply,
             stdin,
+            md,
             text,
         } => {
-            let msg = guarded_comment_text(stdin, &text)?;
+            let msg = guarded_comment_text(stdin, md.as_deref(), &text)?;
             // write-side превенция тег-матча ядра (см. body): предупреждение
             // в stderr, запись не блокируется
             if let Some(warning) = md_artifacts::tag_trap_warning(&msg) {
@@ -2504,46 +2509,63 @@ fn looks_like_flag(token: &str) -> bool {
 /// Текст коммента + гвард до сети: подозрительный позиционный текст — отказ
 /// с подсказкой вместо тихой отправки юзеру. Сама валидация —
 /// validate_comment_text (тестируется на строках, stdin не нужен).
-fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
-    let msg = collect_text(stdin, text)?;
-    validate_comment_text(stdin, &msg)?;
+/// --md и позиционный текст одновременно — конфликт каналов, громкий отказ
+/// до чтения файла и сети.
+fn guarded_comment_text(stdin: bool, md: Option<&str>, text: &[String]) -> Result<String> {
+    if md.is_some() && !text.is_empty() {
+        bail!(
+            "--md и позиционный текст одновременно — передай текст одним каналом \
+             (--md <файл>, --stdin или позиционным аргументом)"
+        );
+    }
+    let msg = if let Some(path) = md {
+        std::fs::read_to_string(path).with_context(|| format!("--md {path}: файл не читается"))?
+    } else {
+        collect_text(stdin, text)?
+    };
+    validate_comment_text(stdin || md.is_some(), &msg)?;
     Ok(msg)
 }
 
 /// Пред-гвард позиционного текста коммента: выполняется в task_run ДО bail по
 /// пустому --project, чтобы проглоченный trailing_var_arg'ом флаг
 /// (`task comment <id> "текст" --project X`) не маскировался под «--project не
-/// передан». stdin — no-op: его содержимое недоступно до чтения, читает его
-/// ровно одна ветка (двойное чтение дало бы EOF → ложный «пустой текст»).
-/// Позиционная валидация чистая и идемпотентна — повтор в Comment-ветке безвреден.
-fn pre_guard_positional_comment(stdin: bool, text: &[String]) -> Result<()> {
-    if stdin {
+/// передан». Явные каналы (stdin, --md) — no-op: их контент здесь не читается,
+/// валидирует ровно одна ветка ниже (двойное чтение stdin дало бы EOF →
+/// ложный «пустой текст»). Позиционная валидация чистая и идемпотентна —
+/// повтор в Comment-ветке безвреден.
+fn pre_guard_positional_comment(stdin: bool, md: Option<&str>, text: &[String]) -> Result<()> {
+    if stdin || md.is_some() {
         return Ok(());
     }
     validate_comment_text(false, &text.join(" "))
 }
 
-/// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
-/// токенов отклоняются имена подкоманд и флагоподобные токены. stdin не
-/// гвардится на подкоманды и флаги: явное намерение, глотание туда невозможно.
-fn validate_comment_text(stdin: bool, msg: &str) -> Result<()> {
+/// Гвард текста коммента: пустой — отказ во всех каналах; из позиционных
+/// токенов отклоняются имена подкоманд и флагоподобные токены. Явный канал
+/// (explicit — stdin или --md) не гвардится на подкоманды и флаги: явное
+/// намерение, глотание туда невозможно.
+fn validate_comment_text(explicit: bool, msg: &str) -> Result<()> {
     if msg.trim().is_empty() {
-        bail!("пустой текст коммента — передай --stdin или текст позиционным аргументом");
+        bail!(
+            "пустой текст коммента — передай --stdin, --md <файл> или текст позиционным аргументом"
+        );
     }
-    if stdin {
+    if explicit {
         return Ok(());
     }
     let tokens: Vec<&str> = msg.split_whitespace().collect();
     if let Some(first) = tokens.first().filter(|t| TASK_SUB_NAMES.contains(t)) {
         bail!(
             "«{first}» — имя подкоманды task/cron, а не текст коммента \
-             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\" или --stdin)"
+             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\", \
+             --stdin или --md <файл>)"
         );
     }
     if let Some(flag) = tokens.iter().find(|t| looks_like_flag(t)) {
         bail!(
             "токен «{flag}» похож на флаг: после текста коммента флаги глотаются как текст \
-             (trailing_var_arg) — пиши флаги до <id> или используй --stdin"
+             (trailing_var_arg) — пиши флаги до <id>, используй --stdin или --md <файл>"
         );
     }
     Ok(())
@@ -2645,6 +2667,8 @@ mod tests {
     use super::draft_created_header;
     use super::format_goal_card;
     use super::format_task_header;
+    use super::guarded_comment_text;
+    use super::pre_guard_positional_comment;
     use super::replace_md_section;
     use super::require_fresh_snapshot;
     use super::save_body_assets;
@@ -3889,6 +3913,73 @@ mod tests {
             .expect("stdin: подкоманды не гвардятся");
     }
 
+    // ——— канал --md: явный контент без токен-гвардов, отказы чтения с именем пути ———
+
+    #[test]
+    fn comment_md_flag_like_content_passes_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.md");
+        std::fs::write(
+            &file,
+            "# Отчёт\n\nкоманда `bash -n x.sh` и флаг --frozen-lockfile в прозе\n",
+        )
+        .unwrap();
+        let msg = guarded_comment_text(false, Some(file.to_str().unwrap()), &[])
+            .expect("флагоподобные строки в файле — явный канал, гвард не режет");
+        assert!(msg.contains("--frozen-lockfile"), "контент целиком: {msg}");
+    }
+
+    #[test]
+    fn comment_md_empty_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.md");
+        std::fs::write(&file, "   \n").unwrap();
+        let err = guarded_comment_text(false, Some(file.to_str().unwrap()), &[])
+            .expect_err("пустой файл — пустой коммент, отказ во всех каналах");
+        assert!(err.to_string().contains("пустой"), "суть отказа: {err}");
+    }
+
+    #[test]
+    fn comment_md_missing_file_error_names_the_path() {
+        let err = guarded_comment_text(false, Some("/no/such/report.md"), &[])
+            .expect_err("нет файла — отказ");
+        assert!(
+            err.to_string().contains("/no/such/report.md"),
+            "имя пути в отказе: {err}"
+        );
+    }
+
+    #[test]
+    fn comment_md_directory_error_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = guarded_comment_text(false, Some(dir.path().to_str().unwrap()), &[])
+            .expect_err("директория — не файл, отказ");
+        assert!(
+            err.to_string().contains(dir.path().to_str().unwrap()),
+            "имя пути в отказе: {err}"
+        );
+    }
+
+    #[test]
+    fn comment_md_with_positional_text_is_loud_conflict() {
+        let err = guarded_comment_text(false, Some("/no/such/f.md"), &["текст".to_string()])
+            .expect_err("--md и позиционный текст одновременно — конфликт каналов");
+        assert!(
+            err.to_string().contains("одним каналом"),
+            "суть отказа: {err}"
+        );
+    }
+
+    /// Пин фикса High ревью плана: пред-гвард при --md — no-op даже с пустым
+    /// позиционным (empty-bail пред-гварда не должен убить main-сценарий
+    /// `task comment <id> --md файл.md` до Comment-ветки).
+    #[test]
+    fn comment_pre_guard_is_noop_when_md_channel_set() {
+        pre_guard_positional_comment(false, Some("f.md"), &[])
+            .expect("--md — явный канал, пред-гвард no-op");
+        pre_guard_positional_comment(true, None, &[]).expect("stdin — как раньше");
+    }
+
     // ——— порядок диспетчера: гвард текста раньше bail по --project ———
 
     /// `task comment <id> …` при пустом --project: оба пути падают до
@@ -3898,6 +3989,7 @@ mod tests {
             id: "20261104072048-4n1rwdt".into(),
             reply: None,
             stdin,
+            md: None,
             text: text.iter().map(|s| s.to_string()).collect(),
         }
     }
