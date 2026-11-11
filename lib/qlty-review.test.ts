@@ -114,6 +114,20 @@ describe("parseSarif — startLine толерантен (инцидент origa 
   test("startLine не в контракте обязательных полей", () => {
     expect(SARIF_CONTRACT_FIELDS.some((x) => x.includes("startLine"))).toBe(false)
   })
+
+  test("applyFilters не падает на null-строке (level и paths) — whole-file находки проходят фильтры как все", () => {
+    const wholeFile = f({ line: null, path: "go.mod", level: "error", ruleId: "osv-scanner:GO-2026-1234", message: "vuln" })
+    // дефолт low: error проходит
+    expect(applyFilters([wholeFile, f({ line: 3 })], {})).toHaveLength(2)
+    // level=medium/high: error (и null-строка) не отсекается
+    expect(applyFilters([wholeFile], { level: "medium" })).toHaveLength(1)
+    expect(applyFilters([wholeFile], { level: "high" })).toHaveLength(1)
+    // paths-глоб применяется к пути без строки
+    expect(applyFilters([wholeFile], { paths: ["go.mod"] })).toHaveLength(1)
+    expect(applyFilters([wholeFile], { paths: ["src/*"] })).toHaveLength(0)
+    // paths+level вместе
+    expect(applyFilters([wholeFile], { paths: ["go.mod"], level: "medium" })).toHaveLength(1)
+  })
 })
 
 describe("parseSarif — контракт SARIF", () => {
@@ -433,4 +447,54 @@ describe("runReview — оркестрация на fake-deps", () => {
       runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo)),
     ).rejects.toThrow(/merge-base.*пуст/)
   })
+})
+
+// ——— живой e2e: git+qlty подпроцессы, realDeps (гвард UWUWU_E2E=1) ———
+// Главный пользовательский сценарий тула end-to-end: tmp-git-репо с
+// untracked-нарушителем → живой `qlty check --upstream` → SARIF → parse →
+// отчёт. Не инцидент-класс (живые плагины отдают region) — толерантность к
+// безстрочным находкам закреплена юнитами выше и прогоном на живом
+// osv-scanner SARIF (без region.startLine) из пробы origa 20261108203611.
+// Гвард по культуре репо: без UWUWU_E2E=1 сразу зелёный (CI qlty ставит,
+// но плагин-инсталл в свежем tmp-репо делает ран хрупким/медленным).
+
+const qltyE2E = process.env.UWUWU_E2E === "1"
+
+describe("runReview e2e — живой qlty (UWUWU_E2E=1)", () => {
+  test.skipIf(!qltyE2E)(
+    "diff: untracked ruff-нарушитель → отчёт с находкой, не ошибка",
+    async () => {
+      const { execFileSync } = await import("node:child_process")
+      const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs")
+      const { tmpdir } = await import("node:os")
+      const { join } = await import("node:path")
+
+      const root = mkdtempSync(join(tmpdir(), "qlty-review-e2e-"))
+      const git = (args: string[], cwd = root) => execFileSync("git", args, { cwd, stdio: "pipe" }).toString()
+      try {
+        mkdirSync(join(root, ".qlty"), { recursive: true })
+        writeFileSync(join(root, ".qlty", "qlty.toml"), 'config_version = "0"\n\n[[source]]\nname = "default"\ndefault = true\n\n[[plugin]]\nname = "ruff"\ndrivers = ["lint"]\n')
+        writeFileSync(join(root, "README.md"), "# e2e\n")
+        git(["init", "-b", "master"])
+        git(["config", "user.email", "e2e@test"])
+        git(["config", "user.name", "e2e"])
+        git(["add", ".qlty/qlty.toml", "README.md"])
+        git(["commit", "-m", "init"])
+        git(["branch", "origin/master"])
+        // untracked-нарушитель: входит в дельту (доки тула), qlty гоняет его
+        writeFileSync(join(root, "bad.py"), "import os\nprint('x')\n")
+
+        const r = await runReview({ scope: "diff", directory: root })
+
+        expect(r.delta).toBeGreaterThanOrEqual(1)
+        expect(r.markdown).toContain("bad.py")
+        expect(r.markdown).toContain("ruff:")
+        expect(r.markdown).toContain("Итог:")
+        expect(r.markdown).not.toContain("контракт SARIF нарушен")
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+    120_000,
+  )
 })
