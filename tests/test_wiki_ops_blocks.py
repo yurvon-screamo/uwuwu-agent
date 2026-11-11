@@ -647,6 +647,20 @@ class ItemUpdateChildGuard(unittest.TestCase):
         run_block(kernel, "update", block_id=ITEM_ID, payload="- новый текст")
         self.assertEqual(len(kernel.mutations), 1)
 
+    def test_item_with_single_non_paragraph_child_is_refused(self):
+        # Единственный чайлд не-p (вложенный list без p-носителя) — не штатная
+        # структура: гвард требует ровно один p, а не «≤1 чайлда» — регрессия
+        # условия в len(children) <= 1 пропустила бы этот кейс (tester-пин).
+        kernel = self._item_kernel(children=[
+            _block("20261112024100-cr10001", btype="l", parent_id=ITEM_ID,
+                   markdown="- Вложенный пункт"),
+        ])
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", block_id=ITEM_ID, payload="- пункт после правки")
+        self.assertIn("чайлд", str(cm.exception))
+        self.assertEqual(kernel.mutations, [], "отказ до мутации")
+        self.assertEqual(kernel.puts, [], "отказ до undo-журнала")
+
 
 class InsertedItemDuplicateChildPostcheck(unittest.TestCase):
     """Пост-чек вставки айтемов: p-детей у нового айтема ≥ 2 — qxob57e-класс
