@@ -5781,4 +5781,55 @@ mod tests {
             .expect_err("чужой itemID не резолвится");
         assert!(err.to_string().contains("не видна в render"), "{err}");
     }
+
+    /// Мёртвая привязка на get — один резолв тела: проба живости привязки
+    /// (MCP block get) зовётся ровно один раз на вызов (ревью раунд 3 Low:
+    /// шапка и экспорт резолвили по отдельности — warning деградации
+    /// печатался дважды). Тело при этом экспортируется fallback-доком
+    /// по заголовку — degraded-состояние не прячется.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_dead_binding_resolves_body_once() {
+        let scenario = MockScenario {
+            notebook: "nb-projects",
+            boards: vec![MockBoard {
+                doc_id: "db-doc",
+                av_id: "av-db",
+                keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+                legacy: false,
+            }],
+            hpath_ids: vec![
+                ("/uwuwu/Задачи uwuwu", vec!["db-doc"]),
+                (
+                    "/uwuwu/Задачи uwuwu/мёртвая привязка",
+                    vec!["20261112000000-fallbk"],
+                ),
+            ],
+            rows: vec![MockRow::new("20261112000001-deadw", "мёртвая привязка")
+                .with_status("Draft")
+                .with_doc("20261111000000-deadd1")],
+            // привязка мертва (block get отвечает «not found»)
+            block_get_alive: false,
+            exports: vec![("20261112000000-fallbk", "тело по заголовку".into())],
+            ..MockScenario::default()
+        };
+        let (kernel, server) = MockKernel::start(scenario).await;
+        set_env(&server);
+        task_run(
+            "uwuwu",
+            TaskSub::Get {
+                id: "20261112000001-deadw".into(),
+                no_body: false,
+            },
+        )
+        .await
+        .expect("мёртвая привязка — fallback по заголовку, не отказ");
+        // один резолв: проба живости привязки ровно одна на get
+        // (два вызова = возврат двойного резолва раунда 3)
+        assert_eq!(
+            kernel.block_get_calls("20261111000000-deadd1"),
+            1,
+            "проба живости мёртвой привязки зовётся один раз на get"
+        );
+    }
 }

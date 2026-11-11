@@ -291,6 +291,9 @@ pub(crate) struct MockKernel {
     add_cols: Mutex<Vec<(String, String, String)>>,
     doc_blocks: Mutex<HashMap<String, Vec<String>>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
+    /// docId всех MCP block get (проба живости привязки: журнал для
+    /// ассертов «резолв тела ровно один»).
+    block_gets: Mutex<Vec<String>>,
 }
 
 impl MockKernel {
@@ -324,6 +327,7 @@ impl MockKernel {
             put_files: Mutex::new(Vec::new()),
             attr_writes: Mutex::new(Vec::new()),
             add_cols: Mutex::new(Vec::new()),
+            block_gets: Mutex::new(Vec::new()),
         }
     }
 
@@ -383,6 +387,17 @@ impl MockKernel {
     /// initialize-вызовы MCP (ассерт ре-инициализации сессии на пути отката).
     pub(crate) fn mcp_initializes(&self) -> usize {
         self.mcp_inits.load(Ordering::SeqCst)
+    }
+
+    /// Сколько раз дёргался MCP block get по этому docId (пин «резолв
+    /// тела ровно один»: проба живости привязки в get — один вызов).
+    pub(crate) fn block_get_calls(&self, doc_id: &str) -> usize {
+        self.block_gets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| d.as_str() == doc_id)
+            .count()
     }
 
     /// Сессионный контракт живого ядра (проба 09.11): реестр сессий в памяти
@@ -815,7 +830,10 @@ impl MockKernel {
                         "item_add" => kernel.handle_item_add(&args),
                         "item_update" => kernel.handle_item_update(&args, &id),
                         "item_remove" => kernel.handle_item_remove(&args),
-                        "get" => kernel.handle_block_get(&id),
+                        "get" => {
+                            kernel.block_gets.lock().unwrap().push(id.clone());
+                            kernel.handle_block_get(&id)
+                        }
                         "get_children" => kernel.handle_get_children(),
                         _ => mcp_text(json!({ "action": "unknown", "data": null })),
                     }
