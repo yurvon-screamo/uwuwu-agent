@@ -2,8 +2,11 @@
 //! поверх смигрированного uwuwu-воркспейса.
 //!
 //! Конфигурация: UWUWU_SIYUAN_URL (деф. http://127.0.0.1:6806) и
-//! UWUWU_SIYUAN_TOKEN; при пустом токене читается api.token из
-//! $UWUWU_SIYUAN_WS/conf/conf.json (деф. ~/siyuan-demo-ws).
+//! UWUWU_SIYUAN_TOKEN; при пустом токене — фоллбек-цепочка:
+//! fish universal vars (~/.config/fish/fish_variables) → api.token из
+//! $UWUWU_SIYUAN_WS/conf/conf.json (деф. ~/siyuan-demo-ws) — ядро
+//! пересохраняет conf.json правами своего uid (0600), конфиг-фоллбек
+//! не единственный носитель (задача 20261111013319).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -159,6 +162,138 @@ pub(crate) fn workspace_root() -> PathBuf {
         })
 }
 
+/// Файл universal-переменных fish — штатный носитель env-канона хоста
+/// (AGENTS.md: «всё в fish universal vars + environment.d»). Читается
+/// напрямую, минуя env процесса: сессии и демоны, спавненные без экспорта
+/// (кроны, wakeup-рестарты, factory-агенты), токен в env не несут —
+/// задача 20261111013319.
+fn fish_vars_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/fish/fish_variables")
+}
+
+/// Рас-экранировка значения из fish_variables: fish пишет спецсимволы как
+/// `\xHH` (`:`, `.`, `-` в URL/путях), а также `\n`, `\t`, `\r`; `\\`
+/// буквализирует бэкслеш. Неизвестная последовательность сохраняется дословно.
+fn fish_unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('x') => {
+                chars.next();
+                let hex: String = chars.by_ref().take(2).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(byte) => out.push(byte as char),
+                    Err(_) => {
+                        out.push('\\');
+                        out.push('x');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('r') => {
+                chars.next();
+                out.push('\r');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Токен из fish universal vars: строки `SETUVAR [флаги] имя:значение`,
+/// значение — хвост после первого `:` имени. Побеждает последняя запись
+/// (fish хранит одну запись на переменную; дубль — последнее записанное).
+/// Файл отсутствует/не читается или переменной в нём нет — None.
+pub(crate) fn token_from_fish_vars(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .filter(|l| l.starts_with("SETUVAR"))
+        .filter_map(|l| {
+            let marker = "UWUWU_SIYUAN_TOKEN:";
+            let idx = l.find(marker)?;
+            if idx == 0 || !l[..idx].ends_with(' ') {
+                return None; // имя не целое слово (значение чужой переменной)
+            }
+            Some(fish_unescape(&l[idx + marker.len()..]))
+        })
+        .rev()
+        .find(|v| !v.is_empty())
+}
+
+/// api/token из conf.json воркспейса (последний фоллбек). Класс прав ядра:
+/// stable 3.8.10 пересохраняет conf.json `0600` от uid контейнера — хост-юзер
+/// не читает; ошибка различает «нет файла» и «не читается» и называет мост.
+pub(crate) fn token_from_conf(ws_root: &std::path::Path) -> Result<String> {
+    let path = ws_root.join("conf/conf.json");
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
+        let why = if err.kind() == std::io::ErrorKind::NotFound {
+            "файла нет".to_string()
+        } else {
+            format!(
+                "не читается ({err}) — ядро пишет conf.json 0600 от uid контейнера; \
+                 мост: podman exec siyuan-demo chmod 644 /siyuan/workspace/conf/conf.json"
+            )
+        };
+        anyhow!("{}: {why}", path.display())
+    })?;
+    let conf: Value =
+        serde_json::from_str(&raw).with_context(|| format!("{}: не JSON", path.display()))?;
+    conf.pointer("/api/token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{}: api/token не найден", path.display()))
+}
+
+/// Цепочка источников токена CLI (стойкость к пересохранениям ядра):
+/// env UWUWU_SIYUAN_TOKEN → fish universal vars → conf.json воркспейса.
+/// Явный env приоритетен (override); полный отказ — одна ошибка с перечнем
+/// мест и подсказкой, не голый 401.
+fn resolve_token(
+    env: Option<String>,
+    fish_path: &std::path::Path,
+    ws_root: &std::path::Path,
+) -> Result<String> {
+    if let Some(t) = env.filter(|t| !t.is_empty()) {
+        return Ok(t);
+    }
+    let mut attempts: Vec<String> = Vec::new();
+    match token_from_fish_vars(fish_path) {
+        Some(t) => return Ok(t),
+        None => attempts.push(format!(
+            "fish vars {} — файла нет или UWUWU_SIYUAN_TOKEN не задан",
+            fish_path.display()
+        )),
+    }
+    match token_from_conf(ws_root) {
+        Ok(t) => return Ok(t),
+        Err(err) => attempts.push(err.to_string()),
+    }
+    bail!(
+        "UWUWU_SIYUAN_TOKEN не найден: env пуст; {}. \
+         Носитель токена: fish `set -U UWUWU_SIYUAN_TOKEN <токен>` \
+         или environment.d uwuwu-siyuan.conf.",
+        attempts.join("; ")
+    );
+}
+
 impl SiYuan {
     pub fn from_env() -> Result<Self> {
         Self::from_env_with_timeout(120)
@@ -170,24 +305,11 @@ impl SiYuan {
     pub fn from_env_with_timeout(timeout_secs: u64) -> Result<Self> {
         let base =
             std::env::var("UWUWU_SIYUAN_URL").unwrap_or_else(|_| "http://127.0.0.1:6806".into());
-        let token = match std::env::var("UWUWU_SIYUAN_TOKEN") {
-            Ok(t) if !t.is_empty() => t,
-            _ => {
-                let ws = workspace_root();
-                let conf: Value = serde_json::from_str(
-                    &std::fs::read_to_string(ws.join("conf/conf.json")).with_context(|| {
-                        format!(
-                            "нет conf/conf.json в {} (задай UWUWU_SIYUAN_TOKEN)",
-                            ws.display()
-                        )
-                    })?,
-                )?;
-                conf.pointer("/api/token")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("api/token не найден в conf.json"))?
-                    .to_string()
-            }
-        };
+        let token = resolve_token(
+            std::env::var("UWUWU_SIYUAN_TOKEN").ok(),
+            &fish_vars_path(),
+            &workspace_root(),
+        )?;
         Ok(Self {
             base,
             token,
@@ -2900,5 +3022,194 @@ mod tests {
             md, "текст `code` хвост\n\n```rust\nkeep \u{200b}\u{200d} inside\n```\n",
             "zero-width снят вне фенсов, фенс дословен"
         );
+    }
+
+    // ---------- резолвер токена: env → fish vars → conf.json ----------
+    // (задача 20261111013319: stable 3.8.10 пересохраняет conf.json 0600 от
+    // uid контейнера — конфиг-фоллбек умирал, сессии без env токена падали)
+
+    use super::{fish_unescape, resolve_token, token_from_conf, token_from_fish_vars};
+
+    fn write_fish_file(dir: &std::path::Path, content: &str) -> std::path::PathBuf {
+        let path = dir.join("fish_variables");
+        std::fs::write(&path, content).expect("fish_variables written");
+        path
+    }
+
+    fn write_conf_token(ws: &std::path::Path, token: &str) {
+        std::fs::create_dir_all(ws.join("conf")).expect("conf dir");
+        std::fs::write(
+            ws.join("conf/conf.json"),
+            json!({ "api": { "token": token } }).to_string(),
+        )
+        .expect("conf.json written");
+    }
+
+    #[test]
+    fn resolve_token_prefers_env_over_fish_and_conf() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:fish-token\n",
+        );
+        // conf.json в ws нет: env-ветка не должна до него дойти
+        let got =
+            resolve_token(Some("env-token".into()), &fish, dir.path()).expect("env override wins");
+        assert_eq!(got, "env-token");
+    }
+
+    #[test]
+    fn resolve_token_ignores_empty_env_value() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:fish-token\n",
+        );
+        let got = resolve_token(Some(String::new()), &fish, dir.path())
+            .expect("пустой env не стопорит цепочку");
+        assert_eq!(got, "fish-token");
+    }
+
+    #[test]
+    fn resolve_token_falls_back_to_fish_vars_when_env_missing() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_AFFINE_EMAIL:agent@uwuwu.net\n\
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:6u9sbtgle13g2hru\n",
+        );
+        // conf.json в ws нет: живой класс 0600 — conf-фоллбек недоступен
+        let got = resolve_token(None, &fish, dir.path()).expect("fish vars выручают");
+        assert_eq!(got, "6u9sbtgle13g2hru");
+    }
+
+    #[test]
+    fn resolve_token_falls_back_to_conf_when_fish_misses() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(dir.path(), "SETUVAR fish_color_normal:normal\n");
+        write_conf_token(dir.path(), "conf-token");
+        let got = resolve_token(None, &fish, dir.path()).expect("conf.json фоллбек жив");
+        assert_eq!(got, "conf-token");
+    }
+
+    #[test]
+    fn resolve_token_full_miss_reports_every_source() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(dir.path(), "SETUVAR fish_color_normal:normal\n");
+        let err =
+            resolve_token(None, &fish, dir.path()).expect_err("полный отказ — громкая ошибка");
+        let text = err.to_string();
+        assert!(
+            text.contains("UWUWU_SIYUAN_TOKEN не найден"),
+            "названа переменная: {text}"
+        );
+        assert!(text.contains("fish_variables"), "назван fish-путь: {text}");
+        assert!(text.contains("conf/conf.json"), "назван conf-путь: {text}");
+        assert!(text.contains("set -U"), "есть подсказка носителя: {text}");
+    }
+
+    #[test]
+    fn fish_vars_parses_export_flagged_entry_and_skips_foreign_lines() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "# comment\n\
+             SETUVAR fish_color_normal:normal\n\
+             SETUVAR --export UWUWU_AFFINE_PASSWORD:xx\n\
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:6u9sbtgle13g2hru\n",
+        );
+        assert_eq!(
+            token_from_fish_vars(&fish).as_deref(),
+            Some("6u9sbtgle13g2hru")
+        );
+    }
+
+    #[test]
+    fn fish_vars_last_entry_wins_and_empty_skipped() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:old\n\
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:new\n\
+             SETUVAR --export UWUWU_SIYUAN_TOKEN:\n",
+        );
+        assert_eq!(token_from_fish_vars(&fish).as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn fish_vars_missing_file_is_none() {
+        let dir = tempfile::tempdir().expect("tmp");
+        assert_eq!(token_from_fish_vars(&dir.path().join("absent")), None);
+    }
+
+    #[test]
+    fn fish_unescape_decodes_hex_escapes_in_paths_and_urls() {
+        assert_eq!(
+            fish_unescape("http\\x3a//127\\x2e0\\x2e0\\x2e1\\x3a6806"),
+            "http://127.0.0.1:6806"
+        );
+        assert_eq!(
+            fish_unescape("/home/yurvon/siyuan\\x2ddemo\\x2dws"),
+            "/home/yurvon/siyuan-demo-ws"
+        );
+    }
+
+    #[test]
+    fn fish_unescape_literal_and_unknown_sequences() {
+        assert_eq!(fish_unescape("a\\\\b"), "a\\b");
+        assert_eq!(fish_unescape("line\\nnext"), "line\nnext");
+        // \xZZ не hex — сохраняется дословно
+        assert_eq!(fish_unescape("\\xZZ"), "\\xZZ");
+        // хвост без двух hex-цифр — дословно
+        assert_eq!(fish_unescape("a\\x"), "a\\x");
+    }
+
+    #[test]
+    fn token_from_conf_reads_api_token() {
+        let dir = tempfile::tempdir().expect("tmp");
+        write_conf_token(dir.path(), "conf-token");
+        assert_eq!(
+            token_from_conf(dir.path()).expect("api/token прочитан"),
+            "conf-token"
+        );
+    }
+
+    #[test]
+    fn token_from_conf_missing_file_named_as_absent() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let err = token_from_conf(dir.path()).expect_err("нет файла — громко");
+        let text = err.to_string();
+        assert!(text.contains("файла нет"), "причина названа: {text}");
+        assert!(text.contains("conf/conf.json"), "путь назван: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_from_conf_unreadable_file_names_the_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tmp");
+        write_conf_token(dir.path(), "conf-token");
+        let path = dir.path().join("conf/conf.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let err = token_from_conf(dir.path()).expect_err("не читается — громко");
+        let text = err.to_string();
+        assert!(text.contains("не читается"), "класс прав назван: {text}");
+        assert!(
+            text.contains("chmod 644"),
+            "мост назван (класс 0600 от uid контейнера): {text}"
+        );
+    }
+
+    #[test]
+    fn token_from_conf_non_string_token_is_an_error() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("conf")).expect("conf dir");
+        std::fs::write(
+            dir.path().join("conf/conf.json"),
+            json!({ "api": { "token": 42 } }).to_string(),
+        )
+        .expect("conf.json written");
+        let err = token_from_conf(dir.path()).expect_err("не-строка — громко");
+        assert!(err.to_string().contains("api/token не найден"), "{err}");
     }
 }
