@@ -2406,14 +2406,18 @@ fn looks_like_inline_text(value: &str) -> bool {
         || value.len() > PATH_MAX_BYTES
 }
 
-/// Отказ «путь-флаг получил не-путь»: имя флага, начало offending-значения
+/// Отказ «путь-флаг получил не-путь»: имя флага, префикс offending-значения
 /// и подсказка — агент мгновенно самопоправляется вместо дебага сырой
 /// OS-ошибки open() («File name too long»).
 fn not_a_path_error(flag: &str, value: &str, hint: &str) -> anyhow::Error {
+    // префикс, не весь аргумент: значения, пойманные детектором по длине,
+    // иначе уносят в диагностику килобайты текста и топят подсказку
+    const PREFIX_CHARS: usize = 100;
     let first_line = value.lines().next().unwrap_or_default();
+    let shown: String = first_line.chars().take(PREFIX_CHARS).collect();
     anyhow::anyhow!(
         "{flag} ждёт путь к файлу, а передан, похоже, сам текст \
-         («{first_line}…»); {hint}"
+         («{shown}…»); {hint}"
     )
 }
 
@@ -4171,6 +4175,11 @@ mod tests {
         assert!(
             !shown.contains("os error"),
             "File name too long не годится: {shown}"
+        );
+        assert!(
+            shown.chars().count() < 300,
+            "диагностика не тащит весь аргумент: len={}",
+            shown.chars().count()
         );
     }
 
