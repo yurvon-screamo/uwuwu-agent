@@ -1486,7 +1486,7 @@ pub async fn comment(
     author: &str,
     text: &str,
     reply_to: Option<&str>,
-) -> Result<()> {
+) -> Result<CommentInserted> {
     let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
     let draft = CommentDraft {
         author,
@@ -1598,6 +1598,17 @@ fn is_comment_clock(time: &str) -> bool {
         })
 }
 
+/// Факт вставки коммента (контракт ответов мутаций): ответ несёт блок
+/// как записался + был ли он вставлен (дедуп-ретрай бит-в-бит дубля
+/// вставки не делает — ответ отличает «записан» от «уже был»).
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommentInserted {
+    /// Строка-маркер как записалась (автор/таймстемп/текст; реплай — с отступом).
+    pub marker: String,
+    /// false — бит-в-бит дубль уже был в теле, вставки не было.
+    pub fresh: bool,
+}
+
 /// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
 /// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
 /// поэтому ts вычисляется один раз на вызов.
@@ -1607,7 +1618,7 @@ pub(crate) async fn comment_with_ts(
     task: &SyTask,
     draft: &CommentDraft<'_>,
     ts: &str,
-) -> Result<()> {
+) -> Result<CommentInserted> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
@@ -1618,25 +1629,41 @@ pub(crate) async fn comment_with_ts(
     } else {
         format!("\n{marker}")
     };
-    append_once_confirmed(sy, &body, &line, &marker).await
+    let fresh = append_once_confirmed(sy, &body, &line, &marker).await?;
+    Ok(CommentInserted {
+        marker: if draft.reply_to.is_some() {
+            format!("  {marker}")
+        } else {
+            marker
+        },
+        fresh,
+    })
 }
 
 /// Идемпотентный аппенд строки: один POST без слепых ретраев; до и после
 /// сбоя — контрольное чтение дока, маркер уже там → успех без повтора
 /// (слепой ретрай неидемпотентной записи при потерянном ответе плодит
 /// бит-в-бит дубли — факт ses_e729d7329ffe). Маркер матчится как подстрока:
-/// отступ реплай-строки матчу не мешает.
-async fn append_once_confirmed(sy: &SiYuan, doc_id: &str, line: &str, marker: &str) -> Result<()> {
+/// отступ реплай-строки матчу не мешает. Возврат (контракт ответов):
+/// true — вставка этим вызовом (включая потерянный ответ с приземлившимся
+/// блоком), false — маркер уже был в доке до вызова (дедуп-хит).
+async fn append_once_confirmed(
+    sy: &SiYuan,
+    doc_id: &str,
+    line: &str,
+    marker: &str,
+) -> Result<bool> {
     if doc_md_contains(sy, doc_id, marker).await? {
-        return Ok(());
+        return Ok(false);
     }
     if let Err(err) = sy.append_block_md_once(doc_id, line).await {
         if doc_md_contains(sy, doc_id, marker).await? {
-            return Ok(());
+            // маркера до вызова не было — приземлился потерянным ответом
+            return Ok(true);
         }
         return Err(err);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn doc_md_contains(sy: &SiYuan, doc_id: &str, marker: &str) -> Result<bool> {

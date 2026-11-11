@@ -431,6 +431,7 @@ pub(crate) enum Commands {
     /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
     /// факт (владелец/дример), replace — полная перезапись на месте.
+    /// Мутации возвращают финальный документ целиком или явную ошибку.
     Person {
         #[command(subcommand)]
         command: PersonSub,
@@ -483,7 +484,9 @@ pub(crate) enum Commands {
         command: CronSub,
     },
     /// Канбан-задачи («Задачи <Proj>» SiYuan database): create/list/get/
-    /// edit/comment/close; комменты — секция тел задач.
+    /// edit/comment/close; комменты — секция тел задач. Мутации create/edit/
+    /// claim/comment/close/body возвращают финальное состояние сущности
+    /// (read-after-write) или явную ошибку (rm/clean/undo несут undo-журнал/вердикты).
     Task {
         #[command(subcommand)]
         command: TaskSub,
@@ -493,6 +496,7 @@ pub(crate) enum Commands {
     },
     /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
     /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
+    /// Мутации возвращают финальное состояние сущности или явную ошибку.
     Goal {
         #[command(subcommand)]
         command: GoalSub,

@@ -144,7 +144,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const a = argv as string[]
   spawnCalls.push(a)
   const out = a[2] === "create"
-    ? `создана: дубль-ран!\n  строка: 20261109000000-DUP-RUN\n  тело: 20261109000000-dupdoc`
+    ? `Задача:   дубль-ран!\nСтатус:   Draft\nСтрока:   20261109000000-DUP-RUN\nДоска:    /uwuwu/Задачи uwuwu\n\n----- тело -----\ndoc 20261109000000-dupdoc`
     : `обновлено: ${a[3]}`
   return {
     stdin: { write: () => {}, end: () => {} },

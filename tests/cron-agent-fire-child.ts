@@ -170,7 +170,7 @@ const mockProc = (stdoutText: string, opts: { stdin?: string } | undefined, call
     runCounter += 1
     const rowId = `20261109000000-run${runCounter}`
     const title = a[a.indexOf("--title") + 1] ?? "?"
-    return mockProc(`создана: ${title}\n  строка: ${rowId}\n  тело: 20261109000000-rundoc${runCounter}`, opts, call)
+    return mockProc(`Задача:   ${title}\nСтатус:   Draft\nСтрока:   ${rowId}\nДоска:    /uwuwu/Задачи uwuwu\n\n----- тело -----\ndoc 20261109000000-rundoc${runCounter}`, opts, call)
   }
   if (a[1] === "task" && a[2] === "edit") return mockProc(`обновлено: ${a[3]}`, opts, call)
   throw new Error(`mock: неожиданный спавн ${a.join(" ")}`)
@@ -227,6 +227,6 @@ console.log(JSON.stringify({
   agentsDir: join(homedir(), ".config/opencode/agents"), agent: AGENT,
   runCardIds: spawnCalls
     .filter((c) => c.argv[2] === "create")
-    .map((c) => /строка: (\S+)/.exec(c.stdoutText)?.[1] ?? ""),
+    .map((c) => /Строка:\s+(\S+)/.exec(c.stdoutText)?.[1] ?? ""),
   landingPrompt: landing?.text ?? "",
 }))
