@@ -690,6 +690,22 @@ pub fn validate_status(raw: &str) -> Result<String> {
         })
 }
 
+/// Начальный статус create: флаг строго для машинных созданий (крон-раны
+/// минтятся сразу Todo — draftLoop триажа раны не видит, жалоба 12.11).
+/// Единственное допустимое значение Todo (регистр канонизируется); Draft —
+/// дефолт без флага, прочие статусы — только через task edit (канон:
+/// Todo/Design ставят триаж и владелец). Возврат — канонная форма.
+pub fn validate_create_status(raw: Option<&str>) -> Result<&'static str> {
+    match raw {
+        None => Ok("Draft"),
+        Some(v) if v.trim().eq_ignore_ascii_case("todo") => Ok("Todo"),
+        Some(raw) => Err(anyhow!(
+            "на create --status допустим только Todo (машинные создания; Draft — дефолт без \
+             флага, прочие статусы — task edit <id> --status): получил «{raw}»"
+        )),
+    }
+}
+
 /// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
 /// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
 /// (время файра), в клетке живут с минутной точностью — формат сравнения
@@ -839,15 +855,26 @@ pub fn create_body_md(title: &str, ty: &str, ctx: &str) -> String {
     }
 }
 
-/// Создание задачи: строка Draft + тело-саб-док (идемпотентно по заголовку).
+/// Создание задачи: строка в начальном статусе (Draft / машинное Todo) +
+/// тело-саб-док (идемпотентно по заголовку).
 pub async fn create(
     sy: &SiYuan,
     project: &str,
     title: &str,
     ty: &str,
     ctx: &str,
+    initial_status: &str,
 ) -> Result<(String, String)> {
-    create_with_pacing(sy, project, title, ty, ctx, &RowInsertPacing::production()).await
+    create_with_pacing(
+        sy,
+        project,
+        title,
+        ty,
+        ctx,
+        initial_status,
+        &RowInsertPacing::production(),
+    )
+    .await
 }
 
 /// create с инъекцией пейсинга verify-ретрая: прод ждёт лаг render перед
@@ -858,6 +885,7 @@ pub(crate) async fn create_with_pacing(
     title: &str,
     ty: &str,
     ctx: &str,
+    initial_status: &str,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
@@ -865,7 +893,7 @@ pub(crate) async fn create_with_pacing(
         sy,
         &board,
         title,
-        "Draft",
+        initial_status,
         &create_body_md(title, ty, ctx),
         Some(ty),
         pacing,

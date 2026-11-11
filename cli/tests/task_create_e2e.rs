@@ -67,7 +67,7 @@ async fn create_with_content_writes_content_as_body_on_live_kernel() -> Result<(
     let content = format!(
         "# {TITLE}\n\n## Постановка\n\nсвоё тело e2e — скелет не нужен\n\n# Чужой Раздел\n\nостаётся\n"
     );
-    let (_item_id, body_doc) = syt::create(&sy, PROJECT, TITLE, "dev", &content).await?;
+    let (_item_id, body_doc) = syt::create(&sy, PROJECT, TITLE, "dev", &content, "Draft").await?;
 
     let md = sy.export_md_by_id(&body_doc).await?;
     assert!(

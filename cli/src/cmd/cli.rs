@@ -37,6 +37,15 @@ pub(crate) enum TaskSub {
             help = "Тип: feature | bug | spike | analys | docs | other | refactoring | legacy | idea | qa | infrastructure (колонка «Тип» доски + шаблон тела); без флага — feature"
         )]
         r#type: Option<String>,
+        /// Начальный статус строки: флаг строго для машинных созданий
+        /// (крон-раны минтятся сразу Todo — draftLoop триажа раны не
+        /// видит); Draft — дефолт без флага
+        #[arg(
+            long,
+            value_name = "STATUS",
+            help = "Начальный статус: только Todo (машинные создания — крон-раны); без флага — Draft"
+        )]
+        status: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
         #[arg(

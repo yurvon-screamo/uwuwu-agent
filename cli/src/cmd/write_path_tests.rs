@@ -64,6 +64,7 @@ async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
         NEW_TITLE,
         "feature",
         "",
+        "Draft",
         &RowInsertPacing::instant(),
     )
     .await
@@ -164,6 +165,7 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
                 attach: Vec::<std::path::PathBuf>::new(),
                 schedule: None,
                 agent: None,
+                status: None,
                 dry_run: false,
             },
         )
@@ -215,6 +217,7 @@ async fn create_without_type_defaults_to_feature_cell_and_skeleton() {
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
             agent: None,
+            status: None,
             dry_run: false,
         },
     )
@@ -273,6 +276,7 @@ async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() 
         NEW_TITLE,
         "feature",
         content,
+        "Draft",
         &RowInsertPacing::instant(),
     )
     .await
@@ -307,6 +311,7 @@ async fn create_without_content_writes_type_skeleton() {
         NEW_TITLE,
         "feature",
         "",
+        "Draft",
         &RowInsertPacing::instant(),
     )
     .await
@@ -340,6 +345,7 @@ async fn create_with_title_h1_in_content_strips_only_title_h1() {
         NEW_TITLE,
         "feature",
         &content,
+        "Draft",
         &RowInsertPacing::instant(),
     )
     .await
@@ -379,6 +385,7 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
         NEW_TITLE,
         "feature",
         "   \n\n  ",
+        "Draft",
         &RowInsertPacing::instant(),
     )
     .await
@@ -416,6 +423,7 @@ async fn create_dry_run_is_read_only_with_mock_kernel() {
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
             agent: None,
+            status: None,
             dry_run: true,
         },
     )
