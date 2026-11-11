@@ -1,7 +1,9 @@
 // qlty-review.test.ts — юнит-тесты ядра машинного ревьюера (bun test, без
 // реального git/qlty: SARIF-фикстуры из живого прогона qlty 0.661.0,
 // git/qlty подменяются ReviewDeps). Контракт SARIF — константа
-// SARIF_CONTRACT_FIELDS; нехватка поля = громкая ошибка, не пустой отчёт.
+// SARIF_CONTRACT_FIELDS; нехватка поля = громкая ошибка, не пустой отчёт
+// (исключение — region.startLine: по SARIF-спеке опционален, толерантный
+// рендер «строка неизвестна», инцидент origa 20261108203611).
 import { describe, expect, test } from "bun:test"
 import {
   applyFilters,
@@ -51,6 +53,69 @@ const f = (over: Partial<QltyFinding>): QltyFinding => ({
   ...over,
 })
 
+describe("parseSarif — startLine толерантен (инцидент origa 20261108203611)", () => {
+  // Регресс инцидента: qlty-плагин отдал находку без region.startLine —
+  // рендер отдаёт отчёт с «строка неизвестна», вызов не падает.
+  test("нет region.startLine → line: null, не throw", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" } } }] }],
+        },
+      ],
+    })
+    const { findings } = parseSarif(sarif, "test")
+    expect(findings).toHaveLength(1)
+    expect(findings[0].line).toBeNull()
+    expect(findings[0].path).toBe("a.py")
+  })
+
+  test("region отсутствует целиком → line: null (whole-file находка по SARIF-спеке)", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "osv-scanner:GO-2026-1234", level: "error", message: { text: "vuln" }, locations: [{ physicalLocation: { artifactLocation: { uri: "go.mod" } } }] }],
+        },
+      ],
+    })
+    const { findings } = parseSarif(sarif, "test")
+    expect(findings[0].line).toBeNull()
+  })
+
+  test("startLine не число (дрейф типа) → line: null, не throw", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" }, region: { startLine: "5" } } }] }],
+        },
+      ],
+    })
+    expect(parseSarif(sarif, "test").findings[0].line).toBeNull()
+  })
+
+  test("рендер null-строки — «строка неизвестна», findings с line — как раньше", () => {
+    const md = renderReport({
+      qltyVersion: "0.661.0",
+      scope: "diff",
+      upstream: "origin/master",
+      directory: "/repo",
+      notes: [],
+      delta: [f({ line: null, path: "go.mod", ruleId: "osv-scanner:GO-2026-1234", level: "error", message: "vuln" }), f({ line: 3 })],
+      smells: [],
+    })
+    expect(md).toContain("- [osv-scanner:GO-2026-1234] go.mod (строка неизвестна) (error) — vuln")
+    expect(md).toContain("- [ruff:F401] src/a.py:3 (warning) — `os` imported but unused")
+    expect(md).toContain("Итог: 2 delta + 0 smells.")
+  })
+
+  test("startLine не в контракте обязательных полей", () => {
+    expect(SARIF_CONTRACT_FIELDS.some((x) => x.includes("startLine"))).toBe(false)
+  })
+})
+
 describe("parseSarif — контракт SARIF", () => {
   test("валидный SARIF → находки + версия qlty", () => {
     const { findings, qltyVersion } = parseSarif(SARIF_OK, "test")
@@ -76,23 +141,23 @@ describe("parseSarif — контракт SARIF", () => {
   test.each([
     ["нет semanticVersion", { runs: [{ tool: { driver: {} }, results: [] }] }],
     [
-      "нет startLine у result",
-      {
-        runs: [
-          {
-            tool: { driver: { semanticVersion: "0.661.0" } },
-            results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" } } }] }],
-          },
-        ],
-      },
-    ],
-    [
       "нет ruleId у result",
       {
         runs: [
           {
             tool: { driver: { semanticVersion: "0.661.0" } },
             results: [{ level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" }, region: { startLine: 1 } } }] }],
+          },
+        ],
+      },
+    ],
+    [
+      "нет uri у result",
+      {
+        runs: [
+          {
+            tool: { driver: { semanticVersion: "0.661.0" } },
+            results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { region: { startLine: 1 } } }] }],
           },
         ],
       },
@@ -324,6 +389,39 @@ describe("runReview — оркестрация на fake-deps", () => {
     const filtered = await runReview({ scope: "diff", directory: "/repo", paths: ["docs/*"] }, fakeDeps(repo))
     expect(filtered.delta).toBe(0)
     expect(filtered.markdown).toContain("✅ новых машинных находок нет.")
+  })
+
+  test("смешанная дельта (есть line и без startLine) — отчёт, не ошибка (инцидент 10.11)", async () => {
+    const mixedSarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [
+            {
+              ruleId: "ruff:F401",
+              level: "warning",
+              message: { text: "`os` imported but unused" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "src/changed.py" }, region: { startLine: 1 } } }],
+            },
+            {
+              ruleId: "osv-scanner:GO-2026-1234",
+              level: "error",
+              message: { text: "vuln in dependency" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "go.mod" } } }],
+            },
+          ],
+        },
+      ],
+    })
+    const repo: FakeRepo = {
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : mixedSarif),
+    }
+    const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
+    expect(r.delta).toBe(2)
+    expect(r.markdown).toContain("[ruff:F401] src/changed.py:1")
+    expect(r.markdown).toContain("[osv-scanner:GO-2026-1234] go.mod (строка неизвестна)")
+    expect(r.markdown).not.toContain("контракт SARIF нарушен")
   })
 
   test("пустой merge-base — громкая ошибка", async () => {

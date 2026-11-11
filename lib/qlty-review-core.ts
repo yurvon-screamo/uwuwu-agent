@@ -14,7 +14,10 @@ export interface QltyFinding {
   /** SARIF-уровень: note | warning | error (грубее qlty- severity) */
   level: string
   path: string
-  line: number
+  /** null = строка неизвестна: SARIF допускает локацию без region/startLine
+   * (whole-file находка) — рендерится «строка неизвестна», вызов не падает
+   * (инцидент 10.11, origa 20261108203611). */
+  line: number | null
   message: string
 }
 
@@ -37,13 +40,15 @@ export interface ReviewInput {
 
 // ——— SARIF-контракт (анти-дрейф): нехватка любого поля = громкая ошибка ———
 
+// region.startLine намеренно вне контракта: SARIF-спека допускает локацию
+// без региона/строки (whole-file находка), qlty-плагины такое отдают —
+// контрактом делать обязательным неверно, рендер толерантен (line: null).
 export const SARIF_CONTRACT_FIELDS = [
   "runs[0].tool.driver.semanticVersion",
   "runs[0].results[].ruleId",
   "runs[0].results[].level",
   "runs[0].results[].message.text",
   "runs[0].results[].locations[0].physicalLocation.artifactLocation.uri",
-  "runs[0].results[].locations[0].physicalLocation.region.startLine",
 ] as const
 
 const contractFail = (label: string, what: string): Error =>
@@ -95,8 +100,8 @@ export function parseSarif(raw: string, label: string): { findings: QltyFinding[
     if (typeof level !== "string" || level === "") throw contractFail(label, `results[${i}].level`)
     if (typeof message !== "string") throw contractFail(label, `results[${i}].message.text`)
     if (typeof path !== "string" || path === "") throw contractFail(label, `results[${i}].locations[0].physicalLocation.artifactLocation.uri`)
-    if (typeof line !== "number" || !Number.isFinite(line)) throw contractFail(label, `results[${i}].locations[0].physicalLocation.region.startLine`)
-    findings.push({ ruleId, level, path, line, message })
+    // startLine опционален (см. SARIF_CONTRACT_FIELDS): нет/не число — строка неизвестна
+    findings.push({ ruleId, level, path, line: typeof line === "number" && Number.isFinite(line) ? line : null, message })
   }
   return { findings, qltyVersion: version }
 }
@@ -151,7 +156,9 @@ export function applyFilters(
 // ——— рендер отчёта ———
 
 const fmtFinding = (f: QltyFinding): string =>
-  `- [${f.ruleId}] ${f.path}:${f.line} (${f.level}) — ${f.message}`
+  f.line === null
+    ? `- [${f.ruleId}] ${f.path} (строка неизвестна) (${f.level}) — ${f.message}`
+    : `- [${f.ruleId}] ${f.path}:${f.line} (${f.level}) — ${f.message}`
 
 const fmtGroup = (title: string, findings: QltyFinding[]): string => {
   if (findings.length === 0) return ""
