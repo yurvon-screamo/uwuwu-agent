@@ -8,11 +8,18 @@
 //! не доказывают, что аргумент командной строки вообще долетает до гварда
 //! (clap-диспатч может отрезать раньше: positional-ловушка `person replace`).
 //! Здесь — живой бинарь. Гвард стоит до сети (sy_dispatch.rs:688–716,
-//! resolve_task :717), поэтому отказные кейсы не требуют ядра и токена.
+//! resolve_task :717), поэтому отказные кейсы не требуют живого ядра.
+//!
+//! Машина-нюанс: cli резолвит UWUWU_SIYUAN_TOKEN рано, до dispatch — на
+//! машине без fish vars/conf.json (CI-runner) отказ «токен не найден»
+//! стреляет раньше гварда. Отказные кейсы сами ставят dummy-токен и
+//! недостижимый URL: резолв проходит, гвард отказывает до сети — если
+//! регрессия утащит вход за гвард, connect-ошибка честно уронит тест.
 //!
 //! Гейтнутый тест (`UWUWU_E2E=1`) добивает обратную сторону: валидный путь
 //! проходит гвард до адресации задачи («не найдена», не подсказка) —
-//! read-only resolve на живом ядре, без мутаций доски.
+//! read-only resolve на живом ядре (env вызывающего: токен/URL не
+//! подменяются), без мутаций доски.
 //!
 //! Запуск: cargo test (отказные — всегда); UWUWU_E2E=1 cargo test — плюс
 //! валидные пути.
@@ -23,7 +30,24 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_uwuwu-cli")
 }
 
+/// Отказной прогон: env без живого ядра (dummy-токен, URL в никуда) — см.
+/// док-коммент модуля.
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
+    let out = Command::new(bin())
+        .args(args)
+        .env("UWUWU_SIYUAN_TOKEN", "dummy-path-guard-test")
+        .env("UWUWU_SIYUAN_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("spawn uwuwu-cli");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Гейтнутый прогон: env вызывающего как есть (живое ядро).
+fn run_live(args: &[&str]) -> (Option<i32>, String, String) {
     let out = Command::new(bin())
         .args(args)
         .output()
@@ -273,7 +297,7 @@ fn valid_paths_reach_task_resolution_on_live_kernel() {
     ];
 
     for (what, args) in &cases {
-        let (code, _, stderr) = run(args);
+        let (code, _, stderr) = run_live(args);
         assert_eq!(code, Some(1), "{what}: stderr={stderr}");
         assert!(
             stderr.contains("не найдена"),
