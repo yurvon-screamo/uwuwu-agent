@@ -31,7 +31,7 @@ export default Plugin.define({
       editor.add({
         name: "review",
         description:
-          "Машинный qlty-ревью дифа или коммита: qlty check/smells --upstream — находки только в изменённых строках (pre-existing baseline-долг файла не показывается; незакоммиченный хвост и untracked в дельту входят). Маркетинговый формат атрибуции [plugin:rule] path:line (level) — message. Возвращает markdown-отчёт. Дефолтный уровень low отсекает note-шум.",
+          "Машинный qlty-ревью дифа или коммита: qlty check/smells --upstream — находки только в изменённых строках (pre-existing baseline-долг файла не показывается; незакоммиченный хвост и untracked в дельту входят). Маркетинговый формат атрибуции [plugin:rule] path:line (level) — message; whole-file находка без region.startLine — path (строка неизвестна) (level). Возвращает markdown-отчёт. Дефолтный уровень low отсекает note-шум.",
         input: {
           type: "object",
           properties: {
