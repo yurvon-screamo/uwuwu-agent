@@ -718,13 +718,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             // незакрытый фенс, пустая строка в html) не грузит ассеты
             let fences = html_embed::parse_input(&content)?;
             // снапшот читается до обращения к ядру: локальная ошибка — fail fast
-            let snapshot = match base.as_deref() {
-                Some(path) => Some(
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("снапшот --base не читается: {path}"))?,
-                ),
-                None => None,
-            };
+            let snapshot = read_base_snapshot(base.as_deref())?;
             let (board, task) = resolve_task(&sy, project, &id).await?;
             let body_path = board.body_hpath(&task.title);
             // upload до записи тела: сбой не оставляет тело без референсов
@@ -2384,9 +2378,69 @@ fn collect_threads(md: &str) -> String {
     out
 }
 
+/// Снапшот --base: локальное чтение до сети (fail fast). Не-путь — понятный
+/// отказ; нечитаемый путь — контекст вызова поверх честной OS-причины.
+fn read_base_snapshot(base: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = base else {
+        return Ok(None);
+    };
+    if looks_like_inline_text(path) {
+        return Err(not_a_path_error(
+            "--base",
+            path,
+            "сохрани снапшот в файл и передай путь",
+        ));
+    }
+    Ok(Some(std::fs::read_to_string(path).with_context(|| {
+        format!("снапшот --base не читается: {path}")
+    })?))
+}
+
+/// Не-путь в путь-флаге: перевод строки (вставленный многострочник) либо
+/// длина за ядерными лимитами Linux — компонент имени длиннее NAME_MAX или
+/// путь длиннее PATH_MAX физически не существует как файл (ENAMETOOLONG),
+/// значит это вставленный текст. Ноль ложных срабатываний: легитимный путь
+/// бывает длиннее порога только суммарно, покомпонентно — никогда.
+fn looks_like_inline_text(value: &str) -> bool {
+    const NAME_MAX_BYTES: usize = 255;
+    const PATH_MAX_BYTES: usize = 4096;
+    value.contains('\n')
+        || value
+            .split('/')
+            .any(|component| component.len() > NAME_MAX_BYTES)
+        || value.len() > PATH_MAX_BYTES
+}
+
+/// Отказ «путь-флаг получил не-путь»: имя флага, префикс offending-значения
+/// и подсказка — агент мгновенно самопоправляется вместо дебага сырой
+/// OS-ошибки open() («File name too long»).
+fn not_a_path_error(flag: &str, value: &str, hint: &str) -> anyhow::Error {
+    // префикс, не весь аргумент: значения, пойманные детектором по длине,
+    // иначе уносят в диагностику килобайты текста и топят подсказку
+    const PREFIX_CHARS: usize = 100;
+    let first_line = value.lines().next().unwrap_or_default();
+    let shown: String = first_line.chars().take(PREFIX_CHARS).collect();
+    anyhow::anyhow!(
+        "{flag} ждёт путь к файлу, а передан, похоже, сам текст \
+         («{shown}…»); {hint}"
+    )
+}
+
 fn read_body_input(md_file: Option<&str>, stdin: bool, attach_present: bool) -> Result<String> {
     if let Some(f) = md_file {
-        return Ok(std::fs::read_to_string(f)?);
+        if looks_like_inline_text(f) {
+            return Err(not_a_path_error(
+                "--md",
+                f,
+                "сам текст подавай через --stdin",
+            ));
+        }
+        // честная причина не маскируется: подсказка сверху, OS-ошибка в caused by
+        return std::fs::read_to_string(f).map_err(|err| {
+            anyhow::Error::new(err).context(
+                "--md ждёт путь к файлу; если хотел передать текст — подавай его через --stdin",
+            )
+        });
     }
     if stdin {
         return read_stdin();
@@ -2399,8 +2453,17 @@ fn read_body_input(md_file: Option<&str>, stdin: bool, attach_present: bool) -> 
 }
 
 /// Файлы аттачей: существуют и это файлы — до любых сетевых вызовов.
+/// Не-путь (вставленный текст вместо пути) — понятный отказ с именем флага.
 fn validate_attach_files(files: &[std::path::PathBuf]) -> Result<&[std::path::PathBuf]> {
     for file in files {
+        let shown = file.to_string_lossy();
+        if looks_like_inline_text(&shown) {
+            return Err(not_a_path_error(
+                "--attach",
+                &shown,
+                "укажи путь к существующему файлу",
+            ));
+        }
         let meta = std::fs::metadata(file)
             .with_context(|| format!("файл {}: недоступен", file.display()))?;
         anyhow::ensure!(meta.is_file(), "{} — не файл (директория?)", file.display());
@@ -4169,6 +4232,107 @@ mod tests {
             validate_attach_files(&[dir.path().to_path_buf()]).expect_err("директория — отказ");
         assert!(err.to_string().contains("не файл"), "суть: {err}");
         assert_eq!(validate_attach_files(&[ok]).unwrap().len(), 1);
+    }
+
+    use super::{read_base_snapshot, read_body_input};
+
+    #[test]
+    fn read_body_input_multiline_md_arg_bails_with_stdin_hint_not_os_error() {
+        let err = read_body_input(Some("строка один\nстрока два"), false, false)
+            .expect_err("многострочный аргумент --md — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--md ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            shown.contains("--stdin"),
+            "подсказка самоисправления: {shown}"
+        );
+        assert!(shown.contains("строка один"), "начало значения: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_body_input_over_name_max_md_arg_bails_with_stdin_hint_not_name_too_long() {
+        let long = "слово ".repeat(120); // одним компонентом длиннее NAME_MAX — ENAMETOOLONG
+        let err = read_body_input(Some(long.as_str()), false, false)
+            .expect_err("имя длиннее NAME_MAX — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--md ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            shown.contains("--stdin"),
+            "подсказка самоисправления: {shown}"
+        );
+        assert!(
+            !shown.contains("os error"),
+            "File name too long не годится: {shown}"
+        );
+        assert!(
+            shown.chars().count() < 300,
+            "диагностика не тащит весь аргумент: len={}",
+            shown.chars().count()
+        );
+    }
+
+    #[test]
+    fn read_body_input_missing_md_path_keeps_honest_enoent_with_stdin_hint() {
+        let err = read_body_input(Some("/nonexistent/нет-такого-файла.md"), false, false)
+            .expect_err("нечитаемый путь — отказ");
+        let full = format!("{err:#}"); // headline + caused by
+        assert!(
+            full.contains("No such file or directory"),
+            "честная причина не маскируется: {full}"
+        );
+        assert!(
+            err.to_string().contains("--stdin"),
+            "непрерывающая подсказка сверху: {full}"
+        );
+    }
+
+    #[test]
+    fn read_body_input_valid_md_path_reads_content() {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "контент тела\n").unwrap();
+        let content = read_body_input(Some(md.path().to_str().unwrap()), false, false).unwrap();
+        assert_eq!(content, "контент тела\n");
+    }
+
+    #[test]
+    fn validate_attach_files_inline_text_bails_with_attach_hint_not_os_error() {
+        let err = validate_attach_files(&["первая строка\nвторая".into()])
+            .expect_err("многострочный аргумент --attach — это текст, не путь");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("--attach ждёт путь к файлу"),
+            "суть: {shown}"
+        );
+        assert!(shown.contains("первая строка"), "начало значения: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_base_snapshot_multiline_arg_bails_with_base_hint_not_os_error() {
+        let err = read_base_snapshot(Some("снапшот задачи\nвторая строка"))
+            .expect_err("многострочный аргумент --base — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--base ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_base_snapshot_valid_path_reads_content_and_absent_is_none() {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "снапшот-контент").unwrap();
+        let snapshot = read_base_snapshot(Some(md.path().to_str().unwrap())).unwrap();
+        assert_eq!(snapshot.as_deref(), Some("снапшот-контент"));
+        assert!(read_base_snapshot(None).unwrap().is_none());
     }
 
     #[tokio::test]
