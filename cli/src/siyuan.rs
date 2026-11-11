@@ -141,7 +141,9 @@ impl McpAttemptErr {
 
 pub struct SiYuan {
     pub base: String,
-    pub token: String,
+    /// Токен под мьютексом: 401-триггерный рефреш мутует его из цикла запроса
+    /// (задача 20261111233714: ротация api.token — самолечение без рестартов).
+    token: std::sync::Mutex<String>,
     client: reqwest::Client,
     // MCP-сессия (ленивая)
     mcp_sid: std::sync::Mutex<Option<String>>,
@@ -150,7 +152,14 @@ pub struct SiYuan {
     /// Инъекция мгновенного пейсинга ретраев для тестов (RowInsertPacing-прецедент
     /// PR #125): None в проде — production-константы в post().
     test_pacing: Option<RetryPacing>,
+    /// Источник рефреш-токена: walk-past-equal цепочка fish → conf.json →
+    /// docker exec. Дефолт — реальная цепочка; тесты подменяют замыканием.
+    refresher: TokenRefresher,
 }
+
+/// Провайдер перечитанного токена: вход — провалившийся токен (stale),
+/// выход — отличный от него или громкий отказ с перечнем источников.
+pub(crate) type TokenRefresher = std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 
 /// Корень воркспейса (FS-пробы doctor'а, конфиг-фоллбек токена):
 /// UWUWU_SIYUAN_WS, иначе ~/siyuan-demo-ws.
@@ -258,12 +267,7 @@ fn token_from_conf(ws_root: &std::path::Path) -> Result<String> {
         };
         anyhow!("{}: {why}", path.display())
     })?;
-    let conf: Value =
-        serde_json::from_str(&raw).with_context(|| format!("{}: не JSON", path.display()))?;
-    conf.pointer("/api/token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("{}: api/token не найден", path.display()))
+    api_token_from_conf_json(&raw, &path.display().to_string())
 }
 
 /// Цепочка источников токена CLI (стойкость к пересохранениям ядра):
@@ -298,6 +302,92 @@ fn resolve_token(
     );
 }
 
+/// api/token из сырого conf.json (строка). Общая для conf.json на диске и
+/// docker exec-канала.
+fn api_token_from_conf_json(raw: &str, origin: &str) -> Result<String> {
+    let conf: Value = serde_json::from_str(raw).with_context(|| format!("{origin}: не JSON"))?;
+    conf.pointer("/api/token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{origin}: api/token не найден"))
+}
+
+/// Последнее звено рефреш-цепочки: токен изнутри контейнера. conf.json хосту
+/// недоступен надёжно (ядро пересохраняет 0600 через temp+rename), docker exec
+/// читает источник истины напрямую: контейнер жив ⟺ kernel жив. Имя контейнера
+/// — дефолт контура.
+fn docker_exec_token() -> Result<String> {
+    const CONTAINER: &str = "siyuan-demo";
+    const CONF_IN_CONTAINER: &str = "/siyuan/workspace/conf/conf.json";
+    let out = std::process::Command::new("docker")
+        .args(["exec", CONTAINER, "cat", CONF_IN_CONTAINER])
+        .output()
+        .map_err(|err| anyhow!("docker недоступен ({err})"))?;
+    if !out.status.success() {
+        bail!(
+            "docker exec {CONTAINER} упал: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    api_token_from_conf_json(
+        std::str::from_utf8(&out.stdout)?,
+        &format!("docker exec {CONTAINER} {CONF_IN_CONTAINER}"),
+    )
+}
+
+/// Рефреш-цепочка 401-самолечения, семантика walk-past-equal (пиннинг плана
+/// 20261111233714, High ревью): источники опрашиваются по порядку fish vars →
+/// conf.json → docker exec; значения, равные провалившемуся токену, пропускаются
+/// (протухший кэш не считается находкой — иначе в окне ротации fish-кэш
+/// останавливал цепочку до единственного живого источника); первый отличный —
+/// находка; все отказали или везде равный — громкий отказ с перечнем источников.
+/// Стартовый resolve_token остаётся first-hit: 401 доказывает подозрение кэшей
+/// только на рефреш-пути.
+fn refresh_walk_past_equal(
+    stale: &str,
+    fish_path: &std::path::Path,
+    ws_root: &std::path::Path,
+    docker: Option<&dyn Fn() -> Result<String>>,
+) -> Result<String> {
+    let mut attempts: Vec<String> = Vec::new();
+    match token_from_fish_vars(fish_path) {
+        Some(t) if t != stale => return Ok(t),
+        Some(_) => attempts.push("fish vars: токен равен провалившемуся (кэш протух)".into()),
+        None => attempts.push(format!("fish vars {} — значения нет", fish_path.display())),
+    }
+    match token_from_conf(ws_root) {
+        Ok(t) if t != stale => return Ok(t),
+        Ok(_) => attempts.push("conf.json: токен равен провалившемуся".into()),
+        Err(err) => attempts.push(err.to_string()),
+    }
+    match docker {
+        Some(f) => match f() {
+            Ok(t) if t != stale => return Ok(t),
+            Ok(_) => attempts.push("docker exec: токен равен провалившемуся".into()),
+            Err(err) => attempts.push(format!("docker exec: {err:#}")),
+        },
+        None => attempts.push("docker exec: недоступен".into()),
+    }
+    bail!(
+        "отличного от провалившегося токена не нашёл ни один источник: {}; \
+         ротируй токен или синхронизируй носители \
+         (fish `set -U UWUWU_SIYUAN_TOKEN <свежий>` / environment.d uwuwu-siyuan.conf)",
+        attempts.join("; ")
+    )
+}
+
+/// Дефолтный рефрешер: чистая цепочка над живыми путями хоста.
+fn default_refresher() -> TokenRefresher {
+    std::sync::Arc::new(|stale: &str| {
+        refresh_walk_past_equal(
+            stale,
+            &fish_vars_path(),
+            &workspace_root(),
+            Some(&docker_exec_token),
+        )
+    })
+}
+
 impl SiYuan {
     pub fn from_env() -> Result<Self> {
         Self::from_env_with_timeout(120)
@@ -316,13 +406,14 @@ impl SiYuan {
         )?;
         Ok(Self {
             base,
-            token,
+            token: std::sync::Mutex::new(token),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()?,
             mcp_sid: std::sync::Mutex::new(None),
             wave_cooldown_until: AtomicU64::new(0),
             test_pacing: None,
+            refresher: default_refresher(),
         })
     }
 
@@ -332,7 +423,7 @@ impl SiYuan {
     pub(crate) fn for_tests(base: String) -> Self {
         Self {
             base,
-            token: "test-token".into(),
+            token: std::sync::Mutex::new("test-token".into()),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -343,7 +434,25 @@ impl SiYuan {
                 metadata_backoffs: vec![Duration::from_millis(5), Duration::from_millis(5)],
                 other_step_ms: 1,
             }),
+            refresher: default_refresher(),
         }
+    }
+
+    /// Тестовая инъекция рефрешера: замыкание получает провалившийся токен
+    /// и возвращает отличный (или громкий отказ).
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_refresher(
+        base: String,
+        refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync>,
+    ) -> Self {
+        let mut sy = Self::for_tests(base);
+        sy.refresher = refresher;
+        sy
+    }
+
+    /// Снапшот токена под локом — для header'ов запросов и рефреша.
+    fn current_token(&self) -> String {
+        self.token.lock().unwrap().clone()
     }
 
     fn arm_wave_cooldown(&self) {
@@ -368,6 +477,10 @@ impl SiYuan {
     /// Прочие ошибки (транспорт, code≠0) ретраются как прежде, 4 попытки,
     /// и окно волны НЕ армят: транспортный отказ — класс режимов 1–3
     /// (pasta/kernel-down), гасится ops-процедурами, не клиентом.
+    /// Auth-семантика (задача 20261111233714): 401 — один раз за вызов
+    /// рефреш-токен walk-past-equal и немедленный повтор (самолечение
+    /// ротации без рестартов); 429 — fail-fast без ретраев (каждая
+    /// 401-попытка с источника продлевает rate-limit-бан kernel'а).
     async fn post_with_pacing(
         &self,
         path: &str,
@@ -379,17 +492,28 @@ impl SiYuan {
         }
         let mut last = String::new();
         let mut metadata_attempts = 0usize;
+        let mut auth_refreshed = false;
         for attempt in 0..4u32 {
+            let token = self.current_token();
             let resp = self
                 .client
                 .post(format!("{}{}", self.base, path))
-                .header("Authorization", format!("Token {}", self.token))
+                .header("Authorization", format!("Token {token}"))
                 .json(&body)
                 .send()
                 .await;
             match resp {
                 Ok(r) => {
-                    let v: Value = r.json().await.unwrap_or(Value::Null);
+                    let status = r.status();
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        bail!(
+                            "POST {path}: HTTP 429 — kernel rate-limit: серия неудачных \
+                             токенов забанила источник, бан бьёт и валидные токены \
+                             (10+ мин). Не долбить: каждая 401-попытка продлевает бан."
+                        );
+                    }
+                    let raw = r.text().await.unwrap_or_default();
+                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                     if v.get("code").and_then(|c| c.as_i64()) == Some(0) {
                         return Ok(v.get("data").cloned().unwrap_or(Value::Null));
                     }
@@ -398,6 +522,15 @@ impl SiYuan {
                         v.get("code").and_then(|c| c.as_i64()).unwrap_or(-999),
                         v.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
                     );
+                    // Вспомогательный 429-фоллбэк: конверт с rate-limit msg
+                    // (опорный сигнал — HTTP-статус выше).
+                    if last.contains("Слишком много неудачных попыток")
+                    {
+                        bail!(
+                            "POST {path}: rate-limit конвертом — {last}. Не долбить: \
+                             каждая 401-попытка продлевает бан."
+                        );
+                    }
                     if last.contains("metadata is not ready") {
                         match pacing.metadata_backoffs.get(metadata_attempts) {
                             Some(backoff) => {
@@ -409,6 +542,26 @@ impl SiYuan {
                                 self.arm_wave_cooldown();
                                 bail!("POST {path}: {last} — {WAVE_HINT}");
                             }
+                        }
+                    }
+                    let auth_failed =
+                        status == reqwest::StatusCode::UNAUTHORIZED || last.contains("Auth failed");
+                    if auth_failed {
+                        if auth_refreshed {
+                            bail!(
+                                "POST {path}: 401 повторился после рефреша — все \
+                                 источники дают невалидный токен; {last}"
+                            );
+                        }
+                        auth_refreshed = true;
+                        match (self.refresher)(&token) {
+                            Ok(fresh) => {
+                                *self.token.lock().unwrap() = fresh;
+                                continue; // немедленный повтор, без ретрай-сна
+                            }
+                            Err(err) => bail!(
+                                "POST {path}: 401, рефреш не спас: {err:#}; исходный отказ: {last}"
+                            ),
                         }
                     }
                 }
@@ -432,7 +585,7 @@ impl SiYuan {
         let resp = self
             .client
             .post(format!("{}{}", self.base, path))
-            .header("Authorization", format!("Token {}", self.token))
+            .header("Authorization", format!("Token {}", self.current_token()))
             .json(&body)
             .send()
             .await
@@ -890,7 +1043,7 @@ impl SiYuan {
         let resp = self
             .client
             .post(format!("{}/api/file/getFile", self.base))
-            .header("Authorization", format!("Token {}", self.token))
+            .header("Authorization", format!("Token {}", self.current_token()))
             .json(&json!({ "path": path }))
             .send()
             .await;
@@ -930,7 +1083,7 @@ impl SiYuan {
         let resp = self
             .client
             .post(format!("{}/api/file/putFile", self.base))
-            .header("Authorization", format!("Token {}", self.token))
+            .header("Authorization", format!("Token {}", self.current_token()))
             .multipart(form)
             .send()
             .await
@@ -965,7 +1118,7 @@ impl SiYuan {
         let resp = self
             .client
             .post(format!("{}/api/asset/upload", self.base))
-            .header("Authorization", format!("Token {}", self.token))
+            .header("Authorization", format!("Token {}", self.current_token()))
             .multipart(form)
             .send()
             .await
@@ -1054,7 +1207,7 @@ impl SiYuan {
         let resp = self
             .client
             .post(format!("{}/api/file/readDir", self.base))
-            .header("Authorization", format!("Token {}", self.token))
+            .header("Authorization", format!("Token {}", self.current_token()))
             .json(&json!({ "path": path }))
             .send()
             .await
@@ -1134,7 +1287,7 @@ impl SiYuan {
             json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
         };
         let mut headers = vec![
-            ("Authorization", format!("Token {}", self.token)),
+            ("Authorization", format!("Token {}", self.current_token())),
             ("Content-Type", "application/json".into()),
             ("Accept", "application/json, text/event-stream".into()),
         ];
@@ -3229,5 +3382,283 @@ mod tests {
         .expect("conf.json written");
         let err = token_from_conf(dir.path()).expect_err("не-строка — громко");
         assert!(err.to_string().contains("api/token не найден"), "{err}");
+    }
+
+    // ---------- рефреш-цепочка 401: walk-past-equal + docker exec ----------
+    // (задача 20261111233714: ротация api.token — самолечение без рестартов;
+    // семантика пиннингнута планом по High ревью: равные провалившемуся
+    // значения пропускаются, первый отличный — находка)
+
+    use super::{api_token_from_conf_json, refresh_walk_past_equal};
+    use anyhow::Result;
+
+    fn docker_serving(token: &'static str) -> impl Fn() -> Result<String> {
+        move || Ok(token.to_string())
+    }
+
+    #[test]
+    fn refresh_skips_stale_equal_fish_and_takes_docker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // Ключевой кейс главного сценария: ротация сделана, fish-кэш ещё
+        // протухший (равен провалившемуся) — цепочка доходит до docker.
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:stale-token\n",
+        );
+        let got = refresh_walk_past_equal(
+            "stale-token",
+            &fish,
+            dir.path(),
+            Some(&docker_serving("fresh-token")),
+        )
+        .expect("протухший кэш не останавливает цепочку");
+        assert_eq!(got, "fresh-token");
+    }
+
+    #[test]
+    fn refresh_takes_first_distinct_source_fish_over_docker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // fish обновлён владельцем по ранбуку → берётся он, docker не зовётся.
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:rotated-token\n",
+        );
+        let got = refresh_walk_past_equal(
+            "stale-token",
+            &fish,
+            dir.path(),
+            Some(&docker_serving("fresh-token")),
+        )
+        .expect("первый отличный источник — находка");
+        assert_eq!(got, "rotated-token");
+    }
+
+    #[test]
+    fn refresh_falls_through_missing_fish_and_missing_conf_to_docker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // fish-файла нет, conf.json нет — docker exec остаётся живым каналом.
+        let got = refresh_walk_past_equal(
+            "stale-token",
+            &dir.path().join("fish_variables"),
+            dir.path(),
+            Some(&docker_serving("fresh-token")),
+        )
+        .expect("docker exec — последнее звено");
+        assert_eq!(got, "fresh-token");
+    }
+
+    #[test]
+    fn refresh_full_miss_reports_every_source_and_names_the_fix() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fish = write_fish_file(
+            dir.path(),
+            "SETUVAR --export UWUWU_SIYUAN_TOKEN:stale-token\n",
+        );
+        let docker_also_stale = docker_serving("stale-token");
+        let err =
+            refresh_walk_past_equal("stale-token", &fish, dir.path(), Some(&docker_also_stale))
+                .expect_err("все источники равны провалившемуся — громкий отказ");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("fish vars"), "fish упомянут: {msg}");
+        assert!(msg.contains("conf.json"), "conf упомянут: {msg}");
+        assert!(msg.contains("docker exec"), "docker упомянут: {msg}");
+        assert!(msg.contains("равен провалившемуся"), "причина видна: {msg}");
+        assert!(msg.contains("set -U"), "подсказка носителя: {msg}");
+    }
+
+    #[test]
+    fn refresh_reports_docker_failure_when_it_is_the_only_channel() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let docker_dead = || -> Result<String> {
+            anyhow::bail!("docker недоступен (нет сокета)")
+        };
+        let err = refresh_walk_past_equal(
+            "stale-token",
+            &dir.path().join("fish_variables"),
+            dir.path(),
+            Some(&docker_dead),
+        )
+        .expect_err("docker-отказ виден в перечне");
+        assert!(format!("{err:#}").contains("docker недоступен"), "{err}");
+    }
+
+    #[test]
+    fn api_token_from_conf_json_extracts_api_token() {
+        let raw = json!({ "api": { "token": "abc123" } }).to_string();
+        let got = api_token_from_conf_json(&raw, "probe").expect("токен извлечён");
+        assert_eq!(got, "abc123");
+    }
+
+    #[test]
+    fn api_token_from_conf_json_names_origin_on_missing_field() {
+        let raw = json!({ "foo": 1 }).to_string();
+        let err = api_token_from_conf_json(&raw, "docker exec probe").expect_err("нет api/token");
+        assert!(err.to_string().contains("docker exec probe"), "{err}");
+    }
+
+    // docker_exec_token: прод-функция с внешним docker — без сети не зовётся;
+    // её контракт (парсинг вывода) покрыт api_token_from_conf_json-тестами.
+
+    #[tokio::test]
+    async fn post_refreshes_token_once_on_401_and_repeats_with_fresh_header() {
+        let server = MockServer::start().await;
+        // Первый запрос — провалившийся токен; повтор — свежий: два мока
+        // матчат по Authorization-заголовку, ровно по одному запросу каждый.
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Token test-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed [header: Authorization]"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Token fresh-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"code":0,"msg":"","data":"3.8.10"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
+            Arc::new(|stale: &str| {
+                assert_eq!(stale, "test-token", "рефреш получает провалившийся токен");
+                Ok("fresh-token".into())
+            });
+        let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
+
+        let v = sy.post("/api/system/version", json!({})).await;
+        assert!(v.is_ok(), "повтор со свежим токеном должен пройти: {v:?}");
+        assert_eq!(v.unwrap(), json!("3.8.10"));
+        // Токен структуры обновлён: следующие запросы идут со свежим.
+        assert_eq!(sy.current_token(), "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn post_bails_without_retries_when_refresh_returns_same_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed [header: Authorization]"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
+            Arc::new(|_| anyhow::bail!("отличного токена не нашёл"));
+        let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
+
+        let err = sy
+            .post("/api/system/version", json!({}))
+            .await
+            .expect_err("рефреш не спас — громко, без долбления");
+        assert!(
+            err.to_string().contains("рефреш не спас"),
+            "причина рефреша видна: {err}"
+        );
+        server.verify().await; // expect(1): ровно один запрос
+    }
+
+    #[tokio::test]
+    async fn post_fails_fast_on_second_401_after_successful_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Token test-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed [header: Authorization]"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Token fresh-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"code":-1,"msg":"Auth failed [header: Authorization]"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
+            Arc::new(|_| Ok("fresh-token".into()));
+        let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
+
+        let err = sy
+            .post("/api/system/version", json!({}))
+            .await
+            .expect_err("401 после рефреша — без второго рефреша");
+        assert!(
+            err.to_string().contains("повторился после рефреша"),
+            "{err}"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn post_fails_fast_on_http_429_without_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(
+                r#"{"code":-1,"msg":"Слишком много неудачных попыток аутентификации, повторите попытку позже"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post("/api/system/version", json!({}))
+            .await
+            .expect_err("429 — fail-fast, не долбить");
+        let msg = err.to_string();
+        assert!(msg.contains("429"), "статус виден: {msg}");
+        assert!(msg.contains("Не долбить"), "подсказка: {msg}");
+        server.verify().await; // ровно один запрос
+    }
+
+    #[tokio::test]
+    async fn post_fails_fast_on_rate_limit_envelope_even_with_200_status() {
+        let server = MockServer::start().await;
+        // Вспомогательный фоллбэк: rate-limit конвертом при 200-статусе.
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"code":-1,"msg":"Слишком много неудачных попыток аутентификации, повторите попытку позже"}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sy = SiYuan::for_tests(server.uri());
+
+        let err = sy
+            .post("/api/system/version", json!({}))
+            .await
+            .expect_err("rate-limit конвертом — тоже fail-fast");
+        assert!(err.to_string().contains("rate-limit конвертом"), "{err}");
+        server.verify().await;
     }
 }
