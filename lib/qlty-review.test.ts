@@ -1,7 +1,9 @@
 // qlty-review.test.ts — юнит-тесты ядра машинного ревьюера (bun test, без
 // реального git/qlty: SARIF-фикстуры из живого прогона qlty 0.661.0,
 // git/qlty подменяются ReviewDeps). Контракт SARIF — константа
-// SARIF_CONTRACT_FIELDS; нехватка поля = громкая ошибка, не пустой отчёт.
+// SARIF_CONTRACT_FIELDS; нехватка поля = громкая ошибка, не пустой отчёт
+// (исключение — region.startLine: по SARIF-спеке опционален, толерантный
+// рендер «строка неизвестна», инцидент origa 20261108203611).
 import { describe, expect, test } from "bun:test"
 import {
   applyFilters,
@@ -51,6 +53,83 @@ const f = (over: Partial<QltyFinding>): QltyFinding => ({
   ...over,
 })
 
+describe("parseSarif — startLine толерантен (инцидент origa 20261108203611)", () => {
+  // Регресс инцидента: qlty-плагин отдал находку без region.startLine —
+  // рендер отдаёт отчёт с «строка неизвестна», вызов не падает.
+  test("нет region.startLine → line: null, не throw", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" } } }] }],
+        },
+      ],
+    })
+    const { findings } = parseSarif(sarif, "test")
+    expect(findings).toHaveLength(1)
+    expect(findings[0].line).toBeNull()
+    expect(findings[0].path).toBe("a.py")
+  })
+
+  test("region отсутствует целиком → line: null (whole-file находка по SARIF-спеке)", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "osv-scanner:GO-2026-1234", level: "error", message: { text: "vuln" }, locations: [{ physicalLocation: { artifactLocation: { uri: "go.mod" } } }] }],
+        },
+      ],
+    })
+    const { findings } = parseSarif(sarif, "test")
+    expect(findings[0].line).toBeNull()
+  })
+
+  test("startLine не число (дрейф типа) → line: null, не throw", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" }, region: { startLine: "5" } } }] }],
+        },
+      ],
+    })
+    expect(parseSarif(sarif, "test").findings[0].line).toBeNull()
+  })
+
+  test("рендер null-строки — «строка неизвестна», findings с line — как раньше", () => {
+    const md = renderReport({
+      qltyVersion: "0.661.0",
+      scope: "diff",
+      upstream: "origin/master",
+      directory: "/repo",
+      notes: [],
+      delta: [f({ line: null, path: "go.mod", ruleId: "osv-scanner:GO-2026-1234", level: "error", message: "vuln" }), f({ line: 3 })],
+      smells: [],
+    })
+    expect(md).toContain("- [osv-scanner:GO-2026-1234] go.mod (строка неизвестна) (error) — vuln")
+    expect(md).toContain("- [ruff:F401] src/a.py:3 (warning) — `os` imported but unused")
+    expect(md).toContain("Итог: 2 delta + 0 smells.")
+  })
+
+  test("startLine не в контракте обязательных полей", () => {
+    expect(SARIF_CONTRACT_FIELDS.some((x) => x.includes("startLine"))).toBe(false)
+  })
+
+  test("applyFilters не падает на null-строке (level и paths) — whole-file находки проходят фильтры как все", () => {
+    const wholeFile = f({ line: null, path: "go.mod", level: "error", ruleId: "osv-scanner:GO-2026-1234", message: "vuln" })
+    // дефолт low: error проходит
+    expect(applyFilters([wholeFile, f({ line: 3 })], {})).toHaveLength(2)
+    // level=medium/high: error (и null-строка) не отсекается
+    expect(applyFilters([wholeFile], { level: "medium" })).toHaveLength(1)
+    expect(applyFilters([wholeFile], { level: "high" })).toHaveLength(1)
+    // paths-глоб применяется к пути без строки
+    expect(applyFilters([wholeFile], { paths: ["go.mod"] })).toHaveLength(1)
+    expect(applyFilters([wholeFile], { paths: ["src/*"] })).toHaveLength(0)
+    // paths+level вместе
+    expect(applyFilters([wholeFile], { paths: ["go.mod"], level: "medium" })).toHaveLength(1)
+  })
+})
+
 describe("parseSarif — контракт SARIF", () => {
   test("валидный SARIF → находки + версия qlty", () => {
     const { findings, qltyVersion } = parseSarif(SARIF_OK, "test")
@@ -76,23 +155,23 @@ describe("parseSarif — контракт SARIF", () => {
   test.each([
     ["нет semanticVersion", { runs: [{ tool: { driver: {} }, results: [] }] }],
     [
-      "нет startLine у result",
-      {
-        runs: [
-          {
-            tool: { driver: { semanticVersion: "0.661.0" } },
-            results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" } } }] }],
-          },
-        ],
-      },
-    ],
-    [
       "нет ruleId у result",
       {
         runs: [
           {
             tool: { driver: { semanticVersion: "0.661.0" } },
             results: [{ level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { artifactLocation: { uri: "a.py" }, region: { startLine: 1 } } }] }],
+          },
+        ],
+      },
+    ],
+    [
+      "нет uri у result",
+      {
+        runs: [
+          {
+            tool: { driver: { semanticVersion: "0.661.0" } },
+            results: [{ ruleId: "x:1", level: "warning", message: { text: "m" }, locations: [{ physicalLocation: { region: { startLine: 1 } } }] }],
           },
         ],
       },
@@ -326,6 +405,39 @@ describe("runReview — оркестрация на fake-deps", () => {
     expect(filtered.markdown).toContain("✅ новых машинных находок нет.")
   })
 
+  test("смешанная дельта (есть line и без startLine) — отчёт, не ошибка (инцидент 10.11)", async () => {
+    const mixedSarif = JSON.stringify({
+      runs: [
+        {
+          tool: { driver: { semanticVersion: "0.661.0" } },
+          results: [
+            {
+              ruleId: "ruff:F401",
+              level: "warning",
+              message: { text: "`os` imported but unused" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "src/changed.py" }, region: { startLine: 1 } } }],
+            },
+            {
+              ruleId: "osv-scanner:GO-2026-1234",
+              level: "error",
+              message: { text: "vuln in dependency" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "go.mod" } } }],
+            },
+          ],
+        },
+      ],
+    })
+    const repo: FakeRepo = {
+      git: { "merge-base origin/master HEAD": "abcbase123" },
+      qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : mixedSarif),
+    }
+    const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
+    expect(r.delta).toBe(2)
+    expect(r.markdown).toContain("[ruff:F401] src/changed.py:1")
+    expect(r.markdown).toContain("[osv-scanner:GO-2026-1234] go.mod (строка неизвестна)")
+    expect(r.markdown).not.toContain("контракт SARIF нарушен")
+  })
+
   test("пустой merge-base — громкая ошибка", async () => {
     const repo: FakeRepo = {
       git: { "merge-base origin/master HEAD": "" },
@@ -335,4 +447,54 @@ describe("runReview — оркестрация на fake-deps", () => {
       runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo)),
     ).rejects.toThrow(/merge-base.*пуст/)
   })
+})
+
+// ——— живой e2e: git+qlty подпроцессы, realDeps (гвард UWUWU_E2E=1) ———
+// Главный пользовательский сценарий тула end-to-end: tmp-git-репо с
+// untracked-нарушителем → живой `qlty check --upstream` → SARIF → parse →
+// отчёт. Не инцидент-класс (живые плагины отдают region) — толерантность к
+// безстрочным находкам закреплена юнитами выше и прогоном на живом
+// osv-scanner SARIF (без region.startLine) из пробы origa 20261108203611.
+// Гвард по культуре репо: без UWUWU_E2E=1 сразу зелёный (CI qlty ставит,
+// но плагин-инсталл в свежем tmp-репо делает ран хрупким/медленным).
+
+const qltyE2E = process.env.UWUWU_E2E === "1"
+
+describe("runReview e2e — живой qlty (UWUWU_E2E=1)", () => {
+  test.skipIf(!qltyE2E)(
+    "diff: untracked ruff-нарушитель → отчёт с находкой, не ошибка",
+    async () => {
+      const { execFileSync } = await import("node:child_process")
+      const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs")
+      const { tmpdir } = await import("node:os")
+      const { join } = await import("node:path")
+
+      const root = mkdtempSync(join(tmpdir(), "qlty-review-e2e-"))
+      const git = (args: string[], cwd = root) => execFileSync("git", args, { cwd, stdio: "pipe" }).toString()
+      try {
+        mkdirSync(join(root, ".qlty"), { recursive: true })
+        writeFileSync(join(root, ".qlty", "qlty.toml"), 'config_version = "0"\n\n[[source]]\nname = "default"\ndefault = true\n\n[[plugin]]\nname = "ruff"\ndrivers = ["lint"]\n')
+        writeFileSync(join(root, "README.md"), "# e2e\n")
+        git(["init", "-b", "master"])
+        git(["config", "user.email", "e2e@test"])
+        git(["config", "user.name", "e2e"])
+        git(["add", ".qlty/qlty.toml", "README.md"])
+        git(["commit", "-m", "init"])
+        git(["branch", "origin/master"])
+        // untracked-нарушитель: входит в дельту (доки тула), qlty гоняет его
+        writeFileSync(join(root, "bad.py"), "import os\nprint('x')\n")
+
+        const r = await runReview({ scope: "diff", directory: root })
+
+        expect(r.delta).toBeGreaterThanOrEqual(1)
+        expect(r.markdown).toContain("bad.py")
+        expect(r.markdown).toContain("ruff:")
+        expect(r.markdown).toContain("Итог:")
+        expect(r.markdown).not.toContain("контракт SARIF нарушен")
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+    120_000,
+  )
 })
