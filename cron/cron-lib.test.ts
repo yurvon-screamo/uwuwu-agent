@@ -464,10 +464,13 @@ describe("пин канон-дефа dreamer — базовый агент кр�
     // (createAgentSession → parseAgentDefModel). Пин — от репо-канона
     // (CI-safe; пин PR #190 строил от HOME-пути и на раннере падал).
     // Слом фронта = тихая смена модели ночного аудита.
+    // Перевод glm-5.3#max → glm-5.3-flash#high — решение владельца 11.11
+    // (задача 20261110180337-xnt3j92: «Переводи дримера на флеш high»);
+    // крон «Дример дримеров» едет вместе с дефом — осознанно.
     const path = join(import.meta.dir, "..", "agents", "dreamer.md")
     expect(existsSync(path)).toBe(true)
     expect(parseAgentDefModel(readFileSync(path, "utf-8")))
-      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" })
+      .toEqual({ providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: "high" })
   })
 })
 
