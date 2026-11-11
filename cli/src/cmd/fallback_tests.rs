@@ -686,7 +686,10 @@ async fn list_type_garbage_bails_through_validator() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("dev | spike | bug | analys | docs | other"),
+        msg.contains(
+            "feature | refactoring | legacy | idea | qa | infrastructure | \
+             bug | spike | analys | docs | other"
+        ),
         "отказ перечисляет полный канон: {msg}"
     );
 }

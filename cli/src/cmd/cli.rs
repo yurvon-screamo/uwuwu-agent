@@ -34,7 +34,7 @@ pub(crate) enum TaskSub {
         #[arg(
             long,
             value_name = "TYPE",
-            help = "Тип: dev | spike | bug | analys | docs | other (колонка «Тип» доски + шаблон тела); без флага — dev"
+            help = "Тип: feature | bug | spike | analys | docs | other | refactoring | legacy | idea | qa | infrastructure (колонка «Тип» доски + шаблон тела); без флага — feature"
         )]
         r#type: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
@@ -73,7 +73,10 @@ pub(crate) enum TaskSub {
     List {
         #[arg(long, help = "Фильтр по статусу (todo|design|in progress|…)")]
         status: Option<String>,
-        #[arg(long, help = "Фильтр по типу (bug|dev|spike|analys|docs|other)")]
+        #[arg(
+            long,
+            help = "Фильтр по типу (bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure)"
+        )]
         r#type: Option<String>,
         #[arg(long, help = "Проект (переопределяет --project задачи)")]
         project: Option<String>,
@@ -114,7 +117,7 @@ pub(crate) enum TaskSub {
         #[arg(
             long,
             value_name = "TYPE",
-            help = "Тип: dev | spike | bug | analys | docs | other; \"\" — снять"
+            help = "Тип: feature | bug | spike | analys | docs | other | refactoring | legacy | idea | qa | infrastructure; \"\" — снять"
         )]
         r#type: Option<String>,
         /// Расписание крона: записать/сменить; пустая строка снимает

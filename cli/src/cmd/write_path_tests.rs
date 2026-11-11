@@ -62,7 +62,7 @@ async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "dev",
+        "feature",
         "",
         &RowInsertPacing::instant(),
     )
@@ -98,7 +98,7 @@ async fn create_rebinds_lost_row_to_orphan_body_without_new_doc() {
         .into_iter()
         .filter(|(_, key, _, v)| {
             key == "key-type"
-                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
         })
         .collect();
     assert_eq!(
@@ -134,7 +134,7 @@ async fn create_retries_row_insert_once_when_render_lags() {
         .into_iter()
         .filter(|(_, key, _, v)| {
             key == "key-type"
-                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
         })
         .collect();
     assert_eq!(type_writes.len(), 1, "тип без дублей после ретрая");
@@ -142,7 +142,7 @@ async fn create_retries_row_insert_once_when_render_lags() {
 
 /// Новые типы канона через полный dispatch-путь create: валидатор пропускает,
 /// клетка «Тип» получает канон, тело — костяк (analys делит spike-костяк,
-/// docs/other — dev; инварант пинят юниты body_template_maps_new_types…).
+/// docs/other — feature; инварант пинят юниты body_template_maps_new_types…).
 #[tokio::test]
 #[serial_test::serial]
 async fn create_new_types_write_canonical_cell_and_skeleton() {
@@ -196,6 +196,65 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
     }
 }
 
+/// create БЕЗ --type (дефолт-ветка dispatch) пишет в клетку «Тип»
+/// DEFAULT_TASK_TYPE (feature), не выпиленный dev: дыра ревью PR #221 —
+/// захардкоженный "dev" был мимо валидатора и реинкарнировал выпиленный
+/// тип на доске штатным путём (agents/developer.md: create без --type).
+#[tokio::test]
+#[serial_test::serial]
+async fn create_without_type_defaults_to_feature_cell_and_skeleton() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+    set_env(&server);
+
+    task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: NEW_TITLE.into(),
+            r#type: None,
+            stdin: false,
+            attach: Vec::<std::path::PathBuf>::new(),
+            schedule: None,
+            agent: None,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("create без --type проходит dispatch");
+
+    let type_writes: Vec<_> = kernel
+        .item_updates()
+        .into_iter()
+        .filter(|(_, key, _, v)| {
+            key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
+        })
+        .collect();
+    assert_eq!(
+        type_writes.len(),
+        1,
+        "клетка «Тип» = дефолт feature записан ровно один раз: {:?}",
+        kernel.item_updates()
+    );
+    assert!(
+        !kernel
+            .item_updates()
+            .iter()
+            .any(|(_, key, _, v)| key == "key-type"
+                && v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")),
+        "выпиленный dev не должен вминтиться дефолтом: {:?}",
+        kernel.item_updates()
+    );
+    let (_, md) = kernel
+        .created_docs()
+        .first()
+        .cloned()
+        .expect("тело задачи создано");
+    assert!(
+        md.contains("## Постановка") && md.contains("<срезы/шаги"),
+        "тело дефолта — фичевый костяк: {md}"
+    );
+}
+
 // ——— create с контентом: семантика «передал контент — тело твоё» (20261109101129) ———
 
 /// create с непустым контентом (--stdin): контент — тело целиком как есть,
@@ -212,7 +271,7 @@ async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() 
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "dev",
+        "feature",
         content,
         &RowInsertPacing::instant(),
     )
@@ -246,7 +305,7 @@ async fn create_without_content_writes_type_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "dev",
+        "feature",
         "",
         &RowInsertPacing::instant(),
     )
@@ -260,7 +319,7 @@ async fn create_without_content_writes_type_skeleton() {
         .expect("тело задачи создано");
     assert!(
         md.contains("## Постановка") && md.contains("<срезы/шаги") && md.contains("<исполняемое"),
-        "пустой контент — типовой скелет dev: {md}"
+        "пустой контент — типовой скелет feature: {md}"
     );
 }
 
@@ -279,7 +338,7 @@ async fn create_with_title_h1_in_content_strips_only_title_h1() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "dev",
+        "feature",
         &content,
         &RowInsertPacing::instant(),
     )
@@ -318,7 +377,7 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "dev",
+        "feature",
         "   \n\n  ",
         &RowInsertPacing::instant(),
     )
@@ -452,7 +511,7 @@ async fn create_mints_type_column_when_board_lacks_it() {
         .item_updates()
         .into_iter()
         .filter(|(_, _, _, v)| {
-            v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+            v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
         })
         .collect();
     assert_eq!(
@@ -501,7 +560,7 @@ async fn create_with_none_type_does_not_mint_type_column() {
         .into_iter()
         .filter(|(_, key, _, v)| {
             key == "key-type"
-                || v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("dev")
+                || v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("feature")
         })
         .collect();
     assert!(type_writes.is_empty(), "клетка типа не пишется");
@@ -533,7 +592,7 @@ fn edit_type_scenario() -> MockScenario {
         rows: vec![
             MockRow::new("item-t1", "таск с типом")
                 .with_status("Todo")
-                .with_type("dev")
+                .with_type("feature")
                 .with_doc(BOUND_DOC),
             MockRow::new("item-t2", "таск без типа")
                 .with_status("Todo")
@@ -621,13 +680,15 @@ async fn edit_type_empty_clears_type_cell() {
 async fn edit_type_invalid_value_bails_before_any_write() {
     let (kernel, server) = MockKernel::start(edit_type_scenario()).await;
 
-    let err = edit_type_via_cli(&server, "item-t2", Some("feature"))
+    let err = edit_type_via_cli(&server, "item-t2", Some("hotfix"))
         .await
         .expect_err("мусорный тип — отказ");
 
     assert!(
-        err.to_string()
-            .contains("dev | spike | bug | analys | docs | other"),
+        err.to_string().contains(
+            "feature | refactoring | legacy | idea | qa | infrastructure | \
+                 bug | spike | analys | docs | other"
+        ),
         "суть отказа: {err}"
     );
     assert!(
