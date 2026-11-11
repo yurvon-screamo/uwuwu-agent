@@ -112,10 +112,19 @@ class FakeKernel:
         # Дети, материализуемые вместе с вставкой (parent_id — первый insert_id):
         # пост-чек дубль-p у вставленных айтемов (qxob57e-класс, проба 11.11).
         self.insert_children = [dict(c) for c in insert_children]
+        # Симуляция транспортного сбоя SQL после первой мутации: деградация
+        # пост-чека (Common ревью раунда 1) не должна ронять успешную вставку.
+        self.sql_fails_after_mutation = False
 
     def post(self, path: str, body: dict, attempts: int = 6):
         if path == "/api/query/sql":
-            return self._sql(body["stmt"])
+            stmt = body["stmt"]
+            if (self.sql_fails_after_mutation and self.mutations
+                    and "parent_id" in stmt):
+                # Точечно: сбой детской пробы пост-чека (qxob57e-контур) —
+                # _verify_materialized остаётся живым, деградирует пост-чек.
+                raise RuntimeError("POST /api/query/sql: симулированный транспортный сбой")
+            return self._sql(stmt)
         if path in ("/api/block/updateBlock", "/api/block/insertBlock", "/api/block/deleteBlock"):
             self.mutations.append((path, dict(body), attempts))
             if path == "/api/block/insertBlock":
@@ -693,6 +702,30 @@ class InsertedItemDuplicateChildPostcheck(unittest.TestCase):
         )
         output = run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
         self.assertNotIn("⚠", output)
+
+    def test_sql_failure_in_postcheck_degrades_to_warning_not_error(self):
+        # Common ревью раунда 1: транспортный сбой SQL в пост-чеке ронял
+        # успешную вставку (rc≠0 после применённой мутации) — агент-потребитель
+        # мог повторить вставку (дубль). Канон _verify_materialized: сбой пробы
+        # — деградация в предупреждение, вставка считается состоявшейся.
+        kernel = FakeKernel(
+            blocks=[_block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- якорь"),
+                    _block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- якорь")],
+            docs=[_doc()],
+            insert_ids=[NEW_ID],
+            insert_types={NEW_ID: "NodeListItem"},
+            insert_children=[
+                {"id": "20261112023800-ch10001", "type": "p", "markdown": "Текст пункта"},
+                {"id": "20261112023800-ch20001", "type": "p", "markdown": "ДУБЛЬ старым текстом"},
+            ],
+            sy_tree={"Children": [{"ID": NEW_ID, "Type": "NodeListItem"}]},
+        )
+        kernel.sql_fails_after_mutation = True
+        output = run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
+        self.assertEqual(len(kernel.mutations), 1, "вставка применена")
+        self.assertIn("вставлено", output, "успех операции не скрыт")
+        self.assertIn("не выполнен", output, "пост-чек деградировал в предупреждение")
+        self.assertIn("parent_id", output, "рецепт ручной сверки структуры")
 
 
 class MutationIsSingleAttempt(unittest.TestCase):
