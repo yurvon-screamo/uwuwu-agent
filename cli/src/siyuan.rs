@@ -441,10 +441,7 @@ impl SiYuan {
     /// Тестовая инъекция рефрешера: замыкание получает провалившийся токен
     /// и возвращает отличный (или громкий отказ).
     #[cfg(test)]
-    pub(crate) fn for_tests_with_refresher(
-        base: String,
-        refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn for_tests_with_refresher(base: String, refresher: TokenRefresher) -> Self {
         let mut sy = Self::for_tests(base);
         sy.refresher = refresher;
         sy
@@ -3389,7 +3386,7 @@ mod tests {
     // семантика пиннингнута планом по High ревью: равные провалившемуся
     // значения пропускаются, первый отличный — находка)
 
-    use super::{api_token_from_conf_json, refresh_walk_past_equal};
+    use super::{api_token_from_conf_json, refresh_walk_past_equal, TokenRefresher};
     use anyhow::Result;
 
     fn docker_serving(token: &'static str) -> impl Fn() -> Result<String> {
@@ -3530,11 +3527,10 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
-            Arc::new(|stale: &str| {
-                assert_eq!(stale, "test-token", "рефреш получает провалившийся токен");
-                Ok("fresh-token".into())
-            });
+        let refresher: TokenRefresher = Arc::new(|stale: &str| {
+            assert_eq!(stale, "test-token", "рефреш получает провалившийся токен");
+            Ok("fresh-token".into())
+        });
         let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
 
         let v = sy.post("/api/system/version", json!({})).await;
@@ -3556,8 +3552,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
-            Arc::new(|_| anyhow::bail!("отличного токена не нашёл"));
+        let refresher: TokenRefresher = Arc::new(|_| anyhow::bail!("отличного токена не нашёл"));
         let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
 
         let err = sy
@@ -3600,8 +3595,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let refresher: std::sync::Arc<dyn Fn(&str) -> Result<String> + Send + Sync> =
-            Arc::new(|_| Ok("fresh-token".into()));
+        let refresher: TokenRefresher = Arc::new(|_| Ok("fresh-token".into()));
         let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
 
         let err = sy
