@@ -160,9 +160,10 @@ pub(crate) enum TaskSub {
         )]
         session: Option<String>,
     },
-    /// Коммент в док задачи (диалог юзер ↔ агент). Текст — единственный
-    /// позиционный аргумент (или --stdin); читать комменты: task get / task thread.
-    /// Токены-подкоманды и флаги в тексте отклоняются гвардом до отправки.
+    /// Коммент в док задачи (диалог юзер ↔ агент). Текст — позиционный
+    /// аргумент, --stdin или --md <файл>; читать комменты: task get / task
+    /// thread. Токены-подкоманды и флаги в позиционном тексте отклоняются
+    /// гвардом до отправки.
     Comment {
         #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
@@ -172,8 +173,14 @@ pub(crate) enum TaskSub {
             help = "Ответить в тред: префикс id верхнеуровневого коммента (id — в task thread)"
         )]
         reply: Option<String>,
-        #[arg(long, help = "Текст из stdin")]
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Файл с markdown (иначе текст позиционно или --stdin)"
+        )]
+        md: Option<String>,
         #[arg(trailing_var_arg = true, help = "Текст коммента")]
         text: Vec<String>,
     },

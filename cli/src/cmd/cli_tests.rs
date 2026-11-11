@@ -1,5 +1,5 @@
-//! Parse-тесты грамматики `task body`: явный --stdin, конфликт с --md,
-//! дефолт без флагов. Чистый clap-парсинг — без сети и env.
+//! Parse-тесты грамматики `task body` и `task comment`: явный --stdin,
+//! конфликт с --md, дефолт без флагов. Чистый clap-парсинг — без сети и env.
 
 use super::cli::{Cli, Commands, SemanticSub, TaskSub};
 use clap::Parser as _;
@@ -484,4 +484,68 @@ fn docs_ls_help_describes_notebook_fallback() {
         low.contains("не резолвится"),
         "help docs ls должен явно закрывать составной префикс «Projects/<проект>» — не обещать: {about}"
     );
+}
+
+// ——— task comment: три канала текста (позиционный | --stdin | --md) ———
+
+fn expect_comment(command: Commands) -> (bool, Option<String>, Vec<String>) {
+    let Commands::Task {
+        command: TaskSub::Comment {
+            stdin, md, text, ..
+        },
+        ..
+    } = command
+    else {
+        panic!("expected task comment subcommand");
+    };
+    (stdin, md, text)
+}
+
+#[test]
+fn comment_md_flag_parses_without_positional_text() {
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "comment",
+        "abc123",
+        "--md",
+        "report.md",
+    ])
+    .unwrap();
+    let (stdin, md, text) = expect_comment(command);
+    assert!(!stdin);
+    assert_eq!(md.as_deref(), Some("report.md"));
+    assert!(
+        text.is_empty(),
+        "--md без позиционного текста — main-сценарий"
+    );
+}
+
+#[test]
+fn comment_positional_text_and_stdin_parse_as_before() {
+    let command =
+        parse_command(&["task", "--project", "uwuwu", "comment", "abc123", "текст"]).unwrap();
+    let (stdin, md, text) = expect_comment(command);
+    assert!(!stdin);
+    assert!(md.is_none());
+    assert_eq!(text, vec!["текст"]);
+}
+
+#[test]
+fn comment_stdin_conflicts_with_md() {
+    let parsed = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "comment",
+        "abc123",
+        "--stdin",
+        "--md",
+        "f.md",
+    ]);
+    let Err(err) = parsed else {
+        panic!("expected parse error for comment --stdin together with --md");
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
 }
