@@ -166,6 +166,26 @@ fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
     );
 }
 
+/// Шапка из факта create (ADR-067-окно: render лагает/сорвался): item/title/
+/// тип/статус Draft известны без перечитывания — stdout сохраняет «Строка: <id>»
+/// для потребителей stdout (крон-ран-карточки), warning требует контрольный get.
+fn draft_created_header(board: &syt::SyBoard, item: &str, title: &str, ty: &str) -> String {
+    let draft = SyTask {
+        item_id: item.to_string(),
+        title: title.to_string(),
+        status: "Draft".into(),
+        task_type: ty.to_string(),
+        branch: String::new(),
+        pr: String::new(),
+        dev_session: String::new(),
+        planned: String::new(),
+        planned_ms: 0,
+        schedule_cell: String::new(),
+        body_doc: None,
+    };
+    format_task_header(board, &draft, None, None)
+}
+
 /// Финальный экспорт тела после мутации (контракт «фулл-тело»): маркер-блок
 /// и artifact-report. Create/body печатают канон-маркер «----- тело -----»
 /// (ровно как get: write-гард task_get_wrapper_signature и срезка --base
@@ -309,7 +329,12 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             let header = task_header_md(&sy, &board, &task).await?;
             print!("{header}");
             if !no_body {
-                let md = match task.body_doc {
+                // резолв тела громкий и с fallback по заголовку (task_body_doc):
+                // detached/мёртвая привязка не прячет тело — старый контракт get
+                // (пустой блок «----- тело -----» у живого дока = ложный сигнал
+                // «тела нет» → replace уничтожил бы существующий док)
+                let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
+                let md = match body_doc {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
                 };
@@ -434,7 +459,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             // контракт ответов: ответ = созданная задача целиком, перечитанная
             // с ядра (шапка перечитанной строки + финальный экспорт тела).
             // Перечитывание/экспорт сорвались → ADR-067: rc 0 + warning +
-            // рецепт, ретраить create нельзя (строка уже существует)
+            // рецепт, ретраить create нельзя (строка уже существует). В окне
+            // срыва stdout всё равно несёт «Строка: <id>» — шапка собирается
+            // из факта create (item/title/тип/Draft известны без render;
+            // лаг render — документированная реальность ядра), иначе
+            // потребители stdout (крон-ран-карточки) теряли бы id.
             match syt::find_board(&sy, project).await {
                 Ok(board) => match reload_task(&sy, &board, &item).await {
                     Ok(fresh) => match task_header_md(&sy, &board, &fresh).await {
@@ -444,7 +473,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         }
                         Err(err) => warn_unreadable_state(&item, &err),
                     },
-                    Err(err) => warn_unreadable_state(&item, &err),
+                    Err(err) => {
+                        print!(
+                            "{}",
+                            draft_created_header(&board, &item, &title, &ty_canonical)
+                        );
+                        warn_unreadable_state(&item, &err);
+                    }
                 },
                 Err(err) => warn_unreadable_state(&item, &err),
             }
@@ -2607,6 +2642,7 @@ mod tests {
     use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
+    use super::draft_created_header;
     use super::format_goal_card;
     use super::format_task_header;
     use super::replace_md_section;
@@ -5679,6 +5715,25 @@ mod tests {
         ] {
             assert!(card.contains(line), "нет строки «{line}» в:\n{card}");
         }
+    }
+
+    /// Шапка из факта create (ADR-067-окно): stdout сохраняет «Строка: <id>»
+    /// для потребителей (крон-ран-карточки) даже при срыве перечитывания.
+    #[test]
+    fn draft_created_header_carries_row_id() {
+        let board = header_board();
+        let header = draft_created_header(&board, "20261111230000-lagrow", "лаг-ран", "feature");
+        for line in [
+            "Задача:   лаг-ран",
+            "Статус:   Draft",
+            "Тип:      feature",
+            "Строка:   20261111230000-lagrow",
+            "Доска:    /uwuwu/Задачи uwuwu",
+        ] {
+            assert!(header.contains(line), "нет строки «{line}» в:\n{header}");
+        }
+        // шапка из факта create — тела в ней нет (экспорт не перечитан)
+        assert!(!header.contains("----- тело"));
     }
 
     /// Композиция read-after-write: reload_task перечитывает render доски и
