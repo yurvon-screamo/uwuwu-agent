@@ -484,8 +484,9 @@ pub(crate) enum Commands {
         command: CronSub,
     },
     /// Канбан-задачи («Задачи <Proj>» SiYuan database): create/list/get/
-    /// edit/comment/close; комменты — секция тел задач. Мутации возвращают
-    /// финальное состояние сущности (read-after-write) или явную ошибку.
+    /// edit/comment/close; комменты — секция тел задач. Мутации create/edit/
+    /// claim/comment/close/body возвращают финальное состояние сущности
+    /// (read-after-write) или явную ошибку (rm/clean/undo несут undo-журнал/вердикты).
     Task {
         #[command(subcommand)]
         command: TaskSub,

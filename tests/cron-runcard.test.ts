@@ -1,5 +1,5 @@
 // tests/cron-runcard.test.ts — позитивный путь createRunCard (ревью Low):
-// парсинг rowId из stdout `task create` («строка: <id>») и вторичный спавн
+// парсинг rowId из stdout `task create` (контракт ответов: строка «Строка: <id>» шапки) и вторичный спавн
 // `task edit <id> --status Todo`. Дрейф формата вывода CLI иначе ломал бы
 // создание ранов молча (только строка в логе). Bun.spawn патчится на скрипт:
 // createRunCard экспортирована из демона (паттерн tickBoard).
@@ -64,10 +64,10 @@ describe("runCardBody: шапка ран-карточки", () => {
 })
 
 describe("createRunCard: позитивный путь", () => {
-  test("парсит rowId из stdout create и переводит ран в Todo", async () => {
+  test("парсит rowId из stdout create (контракт ответов: шапка карточки) и переводит ран в Todo", async () => {
     const { calls } = scriptSpawn([
-      { stdout: "создана: ⏰ мастер · 2026-11-07 09:30:00\n  строка: 20261107090000-run001\n  тело:   20261107090000-body01\n" },
-      { stdout: "обновлено: ⏰ мастер · 2026-11-07 09:30:00\n" },
+      { stdout: "Задача:   ⏰ мастер · 2026-11-07 09:30:00\nСтатус:   Draft\nТип:      feature\nСтрока:   20261107090000-run001\nДоска:    /uwuwu/Задачи uwuwu\n\n----- тело (итог) -----\n# ран\n" },
+      { stdout: "Задача:   ⏰ мастер · 2026-11-07 09:30:00\nСтатус:   Todo\nСтрока:   20261107090000-run001\nДоска:    /uwuwu/Задачи uwuwu\n" },
     ])
 
     const rowId = await cron.createRunCard(
@@ -103,9 +103,9 @@ describe("createRunCard: позитивный путь", () => {
     expect(calls.length).toBe(1)
   })
 
-  test("stdout без строки «строка: …» → null (дрейф формата не минтит раны)", async () => {
+  test("stdout без строки «Строка: …» → null (дрейф формата не минтит раны)", async () => {
     const { calls } = scriptSpawn([
-      { stdout: "создана: X\n(формат изменился: строки нет)\n" },
+      { stdout: "Задача:   X\nСтатус:   Draft\n(формат изменился: строки нет)\n" },
     ])
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело", new Date(2026, 10, 7, 9, 30))

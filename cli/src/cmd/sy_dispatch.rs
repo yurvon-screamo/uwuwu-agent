@@ -110,9 +110,10 @@ pub(crate) fn format_task_header(
 }
 
 /// Шапка с живыми атрибутами тела (расписание/агент): общий хвост task get
-/// и мутаций. Тело резолвится как в get (task_body_doc: привязка строки +
-/// fallback по заголовку); ошибка чтения атрибутов не валит шапку — колонки
-/// важнее.
+/// и мутаций. Резолв тела громкий (task_body_doc: привязка + fallback по
+/// заголовку; отказ при телах-дублях — «вычисти сироты в UI»): get печатает
+/// диагноз по `?`, мутации зовут в ADR-067-обёртке (Err → warning, rc 0).
+/// Чтение attrs тихое (паритет get: колонки важнее расписания).
 pub(crate) async fn task_header_md(
     sy: &SiYuan,
     board: &syt::SyBoard,
@@ -120,7 +121,7 @@ pub(crate) async fn task_header_md(
 ) -> Result<String> {
     let mut schedule = None;
     let mut agent = None;
-    if let Ok(Some(doc)) = syt::task_body_doc(sy, board, task).await {
+    if let Some(doc) = syt::task_body_doc(sy, board, task).await? {
         if let Ok(attrs) = sy.get_block_attrs(&doc).await {
             schedule = attrs.get("custom-schedule").cloned();
             agent = attrs.get("custom-agent").cloned();
@@ -166,8 +167,11 @@ fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
 }
 
 /// Финальный экспорт тела после мутации (контракт «фулл-тело»): маркер-блок
-/// и artifact-report. Экспорт сорвался → маркер без тела + warning (rc 0,
-/// ADR-067: запись уже свершилась).
+/// и artifact-report. Create/body печатают канон-маркер «----- тело -----»
+/// (ровно как get: write-гард task_get_wrapper_signature и срезка --base
+/// покрывают рециркуляцию ответа тем же матчем); goal/person — «(итог)»-
+/// маркеры (расширение гарда). Экспорт сорвался → маркер без тела + warning
+/// (rc 0, ADR-067: запись уже свершилась).
 async fn print_final_body(sy: &SiYuan, doc_id: &str, label: &str) {
     match sy.export_md_by_id(doc_id).await {
         Ok(md) => {
@@ -435,8 +439,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 Ok(board) => match reload_task(&sy, &board, &item).await {
                     Ok(fresh) => match task_header_md(&sy, &board, &fresh).await {
                         Ok(header) => {
-                            print!("{}", header.trim_end());
-                            print_final_body(&sy, &body, "тело (итог)").await;
+                            print!("{header}");
+                            print_final_body(&sy, &body, "тело").await;
                         }
                         Err(err) => warn_unreadable_state(&item, &err),
                     },
@@ -519,7 +523,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                             task.title
                         )
                     })?;
-                sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                sy.set_block_attr(&body, "custom-schedule", expr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но атрибут custom-schedule не записан — \
+                         доставь: task edit {} --schedule \"{expr}\"",
+                            task.item_id
+                        )
+                    })?;
                 // колонка «Расписание» — отображение attr: пишется синхронно
                 // в единственной точке записи расписания (снятие чистит клетку)
                 syt::sync_schedule_cell(&sy, &board, &task.item_id, expr)
@@ -547,7 +559,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                             task.title
                         )
                     })?;
-                sy.set_block_attr(&body, "custom-agent", name).await?;
+                sy.set_block_attr(&body, "custom-agent", name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но атрибут custom-agent не записан — \
+                         доставь: task edit {} --agent \"{name}\"",
+                            task.item_id
+                        )
+                    })?;
             }
             // контракт ответов: ответ = финальное состояние строки (шапка,
             // перечитанная с ядра, без тела — edit тело не меняет); сбой
@@ -726,7 +746,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             // контракт ответов: финальный экспорт тела как записалось
             // (round-trip-артефакты ядра видны сразу, без контрольного get)
-            print_final_body(&sy, &doc, "тело (итог)").await;
+            print_final_body(&sy, &doc, "тело").await;
             Ok(())
         }
     }
@@ -780,14 +800,11 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             // контракт ответов: созданная цель целиком (карточка перечитанной
             // строки + финальный экспорт тела); сбой перечитывания → ADR-067
             match goal::find_goal_board(&sy, project).await {
-                Ok(board) => match syt::read_rows(&sy, &board).await {
-                    Ok(rows) => match rows.into_iter().find(|r| r.item_id == item) {
-                        Some(fresh) => {
-                            println!("{}", format_goal_card(&board, &fresh));
-                            print_final_body(&sy, &body, "цель (итог)").await;
-                        }
-                        None => warn_unreadable_state(&item, &anyhow!("строка не видна в render")),
-                    },
+                Ok(board) => match reload_task(&sy, &board, &item).await {
+                    Ok(fresh) => {
+                        println!("{}", format_goal_card(&board, &fresh));
+                        print_final_body(&sy, &body, "цель (итог)").await;
+                    }
                     Err(err) => warn_unreadable_state(&item, &err),
                 },
                 Err(err) => warn_unreadable_state(&item, &err),

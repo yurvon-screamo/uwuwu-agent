@@ -481,7 +481,8 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
     log(`task create упал (code ${code}): ${err.trim().slice(0, 200)}`)
     return null
   }
-  const rowId = /строка: (\S+)/.exec(out)?.[1]
+  // контракта ответов (PR #226): create печатает шапку карточки — rowId в строке «Строка:   <id>»
+  const rowId = /Строка:\s+(\S+)/.exec(out)?.[1]
   if (rowId === undefined) {
     log(`task create без строки в выводе: ${out.trim().slice(0, 200)}`)
     return null

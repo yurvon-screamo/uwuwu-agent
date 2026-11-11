@@ -88,6 +88,8 @@ pub(crate) fn artifact_report(md: &str) -> Vec<String> {
 /// Канон-строка маркера, замыкающего шапку карточки в выводе `task get`
 /// (sy_dispatch::strip_task_get_output срезает по ней снапшот --base).
 /// Единая константа для срезки и write-side детекции — сигнатуры не разъедутся.
+/// Тот же маркер печатает финальный блок мутаций create/body (контракт
+/// ответов, PR #226) — рециркуляция их вывода ловится тем же матчем.
 pub(crate) const TASK_GET_BODY_MARKER: &str = "----- тело -----";
 
 /// Write-side гард вставки обёртки вывода `task get` в контент записи task
@@ -96,7 +98,9 @@ pub(crate) const TASK_GET_BODY_MARKER: &str = "----- тело -----";
 /// текста ошибки или None:
 /// - строка ровно «----- тело -----» вне code-fence — полный вывод get или
 ///   контент, пересобранный из испорченного тела (рециркуляция вложенного
-///   мусора ловится тем же матчем);
+///   мусора ловится тем же матчем); «----- … (итог) -----» — финальный блок
+///   мутаций контракта ответов (create/body/goal/person, PR #226) — тот же
+///   класс рециркуляции;
 /// - вход (после ведущих пустых строк) начинается с YAML-frontmatter-шапки
 ///   «--- / title: …» — хвост вывода get: шапку карточки срезали, frontmatter
 ///   остался.
@@ -127,6 +131,11 @@ pub(crate) fn task_get_wrapper_signature(content: &str) -> Option<&'static str> 
             return Some("маркер «----- тело -----» — шапка вывода task get");
         }
         let trimmed = line.trim_end();
+        if trimmed.starts_with("----- ") && trimmed.ends_with(" (итог) -----") {
+            return Some(
+                "маркер «----- … (итог) -----» — финальный блок мутации (контракт ответов)",
+            );
+        }
         if at_start {
             if trimmed.is_empty() {
                 continue;
@@ -672,6 +681,25 @@ mod tests {
     #[test]
     fn full_task_get_output_hits_marker_signature() {
         assert!(task_get_wrapper_signature(&full_task_get_output()).is_some());
+    }
+
+    #[test]
+    fn final_mutation_markers_hit_signature() {
+        // контракт ответов (PR #226): финальные блоки мутаций — тот же класс
+        // рециркуляции; create/body несут канон-маркер (уже ловится), goal/person —
+        // «(итог)»-маркеры (расширение гарда)
+        assert!(task_get_wrapper_signature("пrefix\n\n----- тело (итог) -----\nмусор\n").is_some());
+        assert!(task_get_wrapper_signature("----- цель (итог) -----\nмусор\n").is_some());
+        assert!(task_get_wrapper_signature("----- персона (итог) -----\nмусор\n").is_some());
+        // не-маркер: «(итог)» без обёртки «----- … -----», цитата в тексте — мимо
+        assert_eq!(
+            task_get_wrapper_signature("итог в тексте «----- цель (итог) -----» внутри строки\n"),
+            None
+        );
+        assert_eq!(
+            task_get_wrapper_signature("тело (итог) без маркера\n"),
+            None
+        );
     }
 
     #[test]
