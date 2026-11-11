@@ -429,7 +429,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) = syt::create(&sy, project, &title, &ty_canonical, &ctx, initial_status).await?;
+            let (item, body) =
+                syt::create(&sy, project, &title, &ty_canonical, &ctx, initial_status).await?;
             if let Some(expr) = schedule.as_deref() {
                 // сбой после create не теряет задачу: атрибут доставляется
                 // повторным task edit --schedule (создание уже свершилось)
@@ -493,7 +494,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     Err(err) => {
                         print!(
                             "{}",
-                            draft_created_header(&board, &item, &title, &ty_canonical, initial_status)
+                            draft_created_header(
+                                &board,
+                                &item,
+                                &title,
+                                &ty_canonical,
+                                initial_status
+                            )
                         );
                         warn_unreadable_state(&item, &err);
                     }
@@ -4954,7 +4961,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_bails_on_duplicate_title_before_any_upload() {
-        let (server, order, _appends, _attrs, _status) = mock_siyuan_for_create(Some("новая задача")).await;
+        let (server, order, _appends, _attrs, _status) =
+            mock_siyuan_for_create(Some("новая задача")).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин.png");
         std::fs::write(&img, b"png").unwrap();
@@ -5838,7 +5846,13 @@ mod tests {
     #[test]
     fn draft_created_header_carries_row_id() {
         let board = header_board();
-        let header = draft_created_header(&board, "20261111230000-lagrow", "лаг-ран", "feature", "Todo");
+        let header = draft_created_header(
+            &board,
+            "20261111230000-lagrow",
+            "лаг-ран",
+            "feature",
+            "Todo",
+        );
         for line in [
             "Задача:   лаг-ран",
             "Статус:   Todo",
