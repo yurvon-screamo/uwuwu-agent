@@ -1,6 +1,6 @@
 // uwuwu-dreamer — демон агентной пост-обработки сессий.
 // Поллит opencode.db (readonly): уснувшая корневая сессия → дочерняя сессия
-// опенкода с агентом dreamer (glm-5.3#max), который автономно обновляет вики
+// опенкода с агентом dreamer (glm-5.3-flash#high), который автономно обновляет вики
 // (гигиена доков, опыт, инфра-задачи). Замена механизма заявок и qwen-фактизации.
 // Запуск: systemd --user (линукс) или Task Scheduler (вин: dreamer/win-autostart.ps1
 // — задача \UWUWU\Dreamer: старт при логоне + повтор каждую минуту, живой
@@ -74,7 +74,7 @@ const MAX_ATTEMPTS = 3
 const CONCURRENCY = Number(process.env.UWUWU_DREAMER_CONCURRENCY ?? 1)
 
 const AGENT_ID = "dreamer"
-const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3", variant: "max" } as const
+const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash", variant: "high" } as const
 
 const log = (m: string): void => {
   try { appendFileSync(LOG_PATH, `${new Date().toISOString()} ${m}\n`) } catch {}

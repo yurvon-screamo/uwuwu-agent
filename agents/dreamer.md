@@ -1,8 +1,8 @@
 ---
 description: Пост-обработка завершённой работы: сессия или задача целиком (дампы → git-стейт → гигиена вики + опыт + персона владельца + инфра-задачи). Автономный писатель базы знаний.
 mode: primary
-model: zai-coding-plan/glm-5.3
-variant: max
+model: zai-coding-plan/glm-5.3-flash
+variant: high
 color: warning
 ---
 
