@@ -66,6 +66,118 @@ async fn resolve_task(
     }
 }
 
+// ——— контракт ответов мутаций: read-after-write ———
+
+/// Шапка карточки задачи (контракт ответов и task get — один формат).
+/// Синхронный форматтер: значения колонок берутся из перечитанной строки,
+/// расписание/агент — из атрибутов тела (None — не читать).
+pub(crate) fn format_task_header(
+    board: &syt::SyBoard,
+    task: &SyTask,
+    schedule: Option<&str>,
+    agent: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Задача:   {}\n", task.title));
+    out.push_str(&format!("Статус:   {}\n", task.status));
+    if !task.task_type.is_empty() {
+        out.push_str(&format!("Тип:      {}\n", task.task_type));
+    }
+    out.push_str(&format!("Строка:   {}\n", task.item_id));
+    // где приземлился резолв — особенно при глобальном (без --project)
+    out.push_str(&format!("Доска:    {}\n", board.hpath));
+    if !task.branch.is_empty() {
+        out.push_str(&format!("Ветка:    {}\n", task.branch));
+    }
+    if !task.pr.is_empty() {
+        out.push_str(&format!("PR:       {}\n", task.pr));
+    }
+    if !task.dev_session.is_empty() {
+        out.push_str(&format!("Сессия dev: {}\n", task.dev_session));
+    }
+    if !task.planned.is_empty() {
+        out.push_str(&format!("Запланировано: {}\n", task.planned));
+    }
+    if let Some(schedule) = schedule {
+        out.push_str(&format!("Расписание: {schedule} (крон: файр в статусе Вейт)\n"));
+    }
+    if let Some(agent) = agent {
+        out.push_str(&format!("{}\n", syt::agent_display_line(agent)));
+    }
+    out
+}
+
+/// Шапка с живыми атрибутами тела (расписание/агент): общий хвост task get
+/// и мутаций. Тело резолвится как в get (task_body_doc: привязка строки +
+/// fallback по заголовку); ошибка чтения атрибутов не валит шапку — колонки
+/// важнее.
+pub(crate) async fn task_header_md(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    task: &SyTask,
+) -> Result<String> {
+    let mut schedule = None;
+    let mut agent = None;
+    if let Ok(Some(doc)) = syt::task_body_doc(sy, board, task).await {
+        if let Ok(attrs) = sy.get_block_attrs(&doc).await {
+            schedule = attrs.get("custom-schedule").cloned();
+            agent = attrs.get("custom-agent").cloned();
+        }
+    }
+    Ok(format_task_header(board, task, schedule.as_deref(), agent.as_deref()))
+}
+
+/// Перечитывание строки после мутации (read-after-write): render доски
+/// заново, поиск по itemID. NotFound — отказ (вызывающий решает: ADR-067
+/// мутация применена → warning, не падение).
+async fn reload_task(sy: &SiYuan, board: &syt::SyBoard, item_id: &str) -> Result<SyTask> {
+    let rows = syt::read_rows(sy, board).await?;
+    rows.into_iter()
+        .find(|r| r.item_id == item_id)
+        .ok_or_else(|| anyhow!("строка {item_id} не видна в render доски «{}»", board.hpath))
+}
+
+/// Финальный ответ мутации: шапка перечитанной строки. Ветка ADR-067
+/// («мутация применена — после неё не падаем»): перечитывание сорвалось
+/// (транспорт/лаг render) → rc 0 + warning + рецепт контрольного get,
+/// чтобы агент не ретраил уже применённую мутацию.
+async fn print_final_state(sy: &SiYuan, board: &syt::SyBoard, task: &SyTask) {
+    match reload_task(sy, board, &task.item_id).await {
+        Ok(fresh) => match task_header_md(sy, board, &fresh).await {
+            Ok(header) => println!("{header}"),
+            Err(err) => warn_unreadable_state(&task.item_id, &err),
+        },
+        Err(err) => warn_unreadable_state(&task.item_id, &err),
+    }
+}
+
+fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
+    eprintln!(
+        "⚠ мутация применена, но финальное состояние не прочитано ({err:#}) — \
+         сверяй контрольным: task get {item_id}"
+    );
+}
+
+/// Финальный экспорт тела после мутации (контракт «фулл-тело»): маркер-блок
+/// + artifact-report. Экспорт сорвался → маркер без тела + warning (rc 0,
+/// ADR-067: запись уже свершилась).
+async fn print_final_body(sy: &SiYuan, doc_id: &str, label: &str) {
+    match sy.export_md_by_id(doc_id).await {
+        Ok(md) => {
+            for warning in md_artifacts::artifact_report(&md) {
+                eprintln!("⚠ round-trip-артефакт: {warning}");
+            }
+            println!("\n----- {label} -----\n{md}");
+        }
+        Err(err) => {
+            eprintln!(
+                "⚠ запись применена, но финальный экспорт не получен ({err:#}) — \
+                 сверяй контрольным чтением дока {doc_id}"
+            );
+        }
+    }
+}
+
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
@@ -183,36 +295,10 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Get { id, no_body } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            println!("Задача:   {}", task.title);
-            println!("Статус:   {}", task.status);
-            if !task.task_type.is_empty() {
-                println!("Тип:      {}", task.task_type);
-            }
-            println!("Строка:   {}", task.item_id);
-            // где приземлился резолв — особенно при глобальном (без --project)
-            println!("Доска:    {}", board.hpath);
-            if !task.branch.is_empty() {
-                println!("Ветка:    {}", task.branch);
-            }
-            if !task.pr.is_empty() {
-                println!("PR:       {}", task.pr);
-            }
-            if !task.planned.is_empty() {
-                println!("Запланировано: {}", task.planned);
-            }
-            let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
-            if let Some(doc) = body_doc.as_deref() {
-                if let Ok(attrs) = sy.get_block_attrs(doc).await {
-                    if let Some(schedule) = attrs.get("custom-schedule") {
-                        println!("Расписание: {schedule} (крон: файр в статусе Вейт)");
-                    }
-                    if let Some(agent) = attrs.get("custom-agent") {
-                        println!("{}", syt::agent_display_line(agent));
-                    }
-                }
-            }
+            let header = task_header_md(&sy, &board, &task).await?;
+            print!("{header}");
             if !no_body {
-                let md = match body_doc {
+                let md = match task.body_doc {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
                 };
@@ -334,7 +420,23 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     )
                 })?;
             }
-            println!("создана: {title}\n  строка: {item}\n  тело:   {body}");
+            // контракт ответов: ответ = созданная задача целиком, перечитанная
+            // с ядра (шапка перечитанной строки + финальный экспорт тела).
+            // Перечитывание/экспорт сорвались → ADR-067: rc 0 + warning +
+            // рецепт, ретраить create нельзя (строка уже существует)
+            match syt::find_board(&sy, project).await {
+                Ok(board) => match reload_task(&sy, &board, &item).await {
+                    Ok(fresh) => match task_header_md(&sy, &board, &fresh).await {
+                        Ok(header) => {
+                            print!("{}", header.trim_end());
+                            print_final_body(&sy, &body, "тело (итог)").await;
+                        }
+                        Err(err) => warn_unreadable_state(&item, &err),
+                    },
+                    Err(err) => warn_unreadable_state(&item, &err),
+                },
+                Err(err) => warn_unreadable_state(&item, &err),
+            }
             if !uploaded.is_empty() {
                 let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
                 println!("  ассеты: {}", paths.join(", "));
@@ -368,10 +470,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
                 syt::parse_planned(raw)?;
             }
-            let final_title = match title.as_deref() {
-                Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
-                None => None,
-            };
+            if let Some(raw) = title.as_deref() {
+                syt::edit_title(&sy, &board, &task, raw).await?;
+            }
             syt::edit(
                 &sy,
                 &board,
@@ -382,19 +483,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ty_canonical.as_deref(),
             )
             .await?;
+            // серединные сбои после базового edit: колонки уже записаны —
+            // ошибка называет применённое и рецепт доставки (не частичные
+            // println-подтверждения: финальное состояние печатается в конце)
             if let Some(raw) = planned.as_deref() {
-                syt::set_planned(&sy, &board, &task, raw).await?;
-            }
-            if ty_canonical.as_deref() == Some("") {
-                println!("тип снят: {}", task.title);
-            }
-            match planned.as_deref() {
-                Some("") => println!("запланировано снято: {}", task.title),
-                Some(raw) => {
-                    let (_, formatted) = syt::parse_planned(raw)?;
-                    println!("запланировано: {formatted}");
-                }
-                None => {}
+                syt::set_planned(&sy, &board, &task, raw).await.with_context(|| {
+                    format!(
+                        "колонки строки записаны, но «Запланировано» не записано — \
+                         доставь: task edit {} --planned \"{raw}\"",
+                        task.item_id
+                    )
+                })?;
             }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
@@ -414,10 +513,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 sy.set_block_attr(&body, "custom-schedule", expr).await?;
                 // колонка «Расписание» — отображение attr: пишется синхронно
                 // в единственной точке записи расписания (снятие чистит клетку)
-                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
-                if expr.is_empty() {
-                    println!("расписание снято: {}", task.title);
-                }
+                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "атрибут записан, но клетка «{}» не записана — доставь: \
+                             task edit {} --schedule \"{expr}\"",
+                            syt::SCHEDULE_CELL,
+                            task.item_id
+                        )
+                    })?;
             }
             if let Some(name) = agent.as_deref() {
                 // пустая строка = снятие атрибута (мастер файрится
@@ -434,14 +539,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                         )
                     })?;
                 sy.set_block_attr(&body, "custom-agent", name).await?;
-                if name.is_empty() {
-                    println!("агент снят: {}", task.title);
-                }
             }
-            println!(
-                "обновлено: {}",
-                final_title.as_deref().unwrap_or(&task.title)
-            );
+            // контракт ответов: ответ = финальное состояние строки (шапка,
+            // перечитанная с ядра, без тела — edit тело не меняет); сбой
+            // перечитывания → ADR-067 warning, ретрай edit безопасен
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Claim { id, session } => {
@@ -453,7 +555,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             };
             let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::claim(&sy, &board, &task, &session).await?;
-            println!("заявлено: {} ← {}", task.title, session);
+            // контракт ответов: шапка перечитанной строки («Сессия dev» видна)
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Comment {
@@ -469,12 +572,17 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 eprintln!("{warning}");
             }
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
-            println!(
-                "коммент отправлен на {}: {}",
-                board.hpath,
-                truncate(&msg, 60)
-            );
+            let inserted = syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
+            // контракт ответов: вставленный блок как записался; дедуп-хит
+            // (бит-в-бит дубль уже был) — отдельная честная строка
+            if inserted.fresh {
+                println!("коммент записан на {}:\n{}", board.hpath, inserted.marker);
+            } else {
+                println!(
+                    "коммент уже был (бит-в-бит дубль, вставки не было) на {}:\n{}",
+                    board.hpath, inserted.marker
+                );
+            }
             Ok(())
         }
         TaskSub::Thread { id } => {
@@ -489,7 +597,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Close { id, note } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::close(&sy, &board, &task, note.as_deref()).await?;
-            println!("закрыта: {}", task.title);
+            // контракт ответов: шапка перечитанной строки (статус Done виден)
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
@@ -605,6 +714,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
                 println!("ассеты: {}", paths.join(", "));
             }
+            // контракт ответов: финальный экспорт тела как записалось
+            // (round-trip-артефакты ядра видны сразу, без контрольного get)
+            print_final_body(&sy, &doc, "тело (итог)").await;
             Ok(())
         }
     }
@@ -655,7 +767,21 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
                 &ctx,
             )
             .await?;
-            println!("создана цель: {title}\n  строка: {item}\n  тело:   {body}");
+            // контракт ответов: созданная цель целиком (карточка перечитанной
+            // строки + финальный экспорт тела); сбой перечитывания → ADR-067
+            match goal::find_goal_board(&sy, project).await {
+                Ok(board) => match syt::read_rows(&sy, &board).await {
+                    Ok(rows) => match rows.into_iter().find(|r| r.item_id == item) {
+                        Some(fresh) => {
+                            println!("{}", format_goal_card(&board, &fresh));
+                            print_final_body(&sy, &body, "цель (итог)").await;
+                        }
+                        None => warn_unreadable_state(&item, &anyhow!("строка не видна в render")),
+                    },
+                    Err(err) => warn_unreadable_state(&item, &err),
+                },
+                Err(err) => warn_unreadable_state(&item, &err),
+            }
             Ok(())
         }
         GoalSub::Edit { id, status, title } => {
@@ -672,11 +798,24 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             if let Some(raw) = title.as_deref() {
                 syt::edit_title(&sy, &board, &goal, raw).await?;
             }
-            println!("обновлена цель: {}", goal.title);
+            // контракт ответов: финальное состояние строки цели (шапка цели)
+            match reload_task(&sy, &board, &goal.item_id).await {
+                Ok(fresh) => println!("{}", format_goal_card(&board, &fresh)),
+                Err(err) => warn_unreadable_state(&goal.item_id, &err),
+            }
             Ok(())
         }
         GoalSub::Rm { id } => goal_rm(&sy, project, &id).await,
     }
+}
+
+/// Карточка цели (контракт ответов goal add/edit): статус → строка →
+/// заголовок → доска. Формат парный шапке task-карточки.
+pub(crate) fn format_goal_card(board: &syt::SyBoard, goal: &SyTask) -> String {
+    format!(
+        "Цель:     {}\nСтатус:   {}\nСтрока:   {}\nДоска:    {}",
+        goal.title, goal.status, goal.item_id, board.hpath
+    )
 }
 
 /// Таблица реестра целей: статус → строка → заголовок; `(!)` — мёртвая
@@ -1169,6 +1308,9 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
             }
             let doc_id = person::append(&sy, &target, &md).await?;
             println!("дописано: {}:{} ({doc_id})", target.notebook, target.hpath);
+            // контракт ответов: финальный документ целиком (санкция владельца
+            // «ДА, Газ»: док компактный — финал в ответе, get не нужен)
+            print_final_body(&sy, &doc_id, "персона (итог)").await;
             Ok(())
         }
         PersonSub::Replace { stdin, md } => {
@@ -1185,6 +1327,7 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
                 "персона перезаписана: {}:{} ({doc_id})",
                 target.notebook, target.hpath
             );
+            print_final_body(&sy, &doc_id, "персона (итог)").await;
             Ok(())
         }
     }
@@ -2437,6 +2580,8 @@ mod tests {
     use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
+    use super::format_goal_card;
+    use super::format_task_header;
     use super::replace_md_section;
     use super::require_fresh_snapshot;
     use super::save_body_assets;
@@ -2446,7 +2591,9 @@ mod tests {
     use super::validate_comment_text;
     use super::SectionEdit;
     use crate::cmd::cli::TaskSub;
+    use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockRow, MockScenario};
     use crate::siyuan::SiYuan;
+    use crate::siyuan_task::SyBoard;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -5396,5 +5543,148 @@ mod tests {
         );
         assert!(append_payloads(&append_bodies).is_empty());
         assert_eq!(delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ——— контракт ответов мутаций: формат ответа — юнит-ассерты ———
+
+    fn header_board() -> SyBoard {
+        SyBoard {
+            doc_id: "board-doc".into(),
+            av_id: "av-1".into(),
+            block_id: "block-1".into(),
+            hpath: "/uwuwu/Задачи uwuwu".into(),
+            notebook: "nb".into(),
+        }
+    }
+
+    fn header_task() -> crate::siyuan_task::SyTask {
+        crate::siyuan_task::SyTask {
+            item_id: "20261111111111-rowhdr".into(),
+            title: "таска".into(),
+            status: "In Progress".into(),
+            task_type: "feature".into(),
+            branch: "work/task-x".into(),
+            pr: "https://git.example/pr/1".into(),
+            dev_session: "ses-live".into(),
+            planned: "2026-11-12 09:00".into(),
+            planned_ms: 0,
+            schedule_cell: "1d".into(),
+            body_doc: Some("20261111111111-bodyh1".into()),
+        }
+    }
+
+    /// Фулл-шапка: все строки карточки, включая «Сессия dev» (контракт claim).
+    #[test]
+    fn task_header_full_shape() {
+        let header = format_task_header(
+            &header_board(),
+            &header_task(),
+            Some("1d"),
+            Some("triage"),
+        );
+        for line in [
+            "Задача:   таска",
+            "Статус:   In Progress",
+            "Тип:      feature",
+            "Строка:   20261111111111-rowhdr",
+            "Доска:    /uwuwu/Задачи uwuwu",
+            "Ветка:    work/task-x",
+            "PR:       https://git.example/pr/1",
+            "Сессия dev: ses-live",
+            "Запланировано: 2026-11-12 09:00",
+            "Расписание: 1d (крон: файр в статусе Вейт)",
+        ] {
+            assert!(header.contains(line), "нет строки «{line}» в:\n{header}");
+        }
+        assert!(header.contains("Агент: triage (вечная сессия крона)"), "{header}");
+        // шапка — не фулл-ответ create/body: тела в ней нет
+        assert!(!header.contains("----- тело"));
+    }
+
+    /// Минимальная шапка: пустые колонки строк не порождают (паритет get).
+    #[test]
+    fn task_header_omits_empty_cells() {
+        let task = crate::siyuan_task::SyTask {
+            item_id: "20261111111111-rowmin".into(),
+            title: "минимум".into(),
+            status: "Todo".into(),
+            task_type: String::new(),
+            branch: String::new(),
+            pr: String::new(),
+            dev_session: String::new(),
+            planned: String::new(),
+            planned_ms: 0,
+            schedule_cell: String::new(),
+            body_doc: None,
+        };
+        let header = format_task_header(&header_board(), &task, None, None);
+        assert!(header.contains("Статус:   Todo"), "{header}");
+        assert!(!header.contains("Тип:"), "{header}");
+        assert!(!header.contains("Ветка:"), "{header}");
+        assert!(!header.contains("PR:"), "{header}");
+        assert!(!header.contains("Сессия dev"), "{header}");
+        assert!(!header.contains("Запланировано"), "{header}");
+        assert!(!header.contains("Расписание"), "{header}");
+        assert!(!header.contains("Агент:"), "{header}");
+    }
+
+    /// Карточка цели (контракт goal add/edit): статус/строка/тайтл/доска.
+    #[test]
+    fn goal_card_shape() {
+        let board = SyBoard {
+            doc_id: "goal-board".into(),
+            av_id: "av-goal".into(),
+            block_id: "goal-block".into(),
+            hpath: "/uwuwu/Цели uwuwu".into(),
+            notebook: "nb".into(),
+        };
+        let goal = crate::siyuan_task::SyTask {
+            item_id: "20261111111111-goal1".into(),
+            title: "цель-раз".into(),
+            status: "in progress".into(),
+            ..header_task()
+        };
+        let card = format_goal_card(&board, &goal);
+        for line in [
+            "Цель:     цель-раз",
+            "Статус:   in progress",
+            "Строка:   20261111111111-goal1",
+            "Доска:    /uwuwu/Цели uwuwu",
+        ] {
+            assert!(card.contains(line), "нет строки «{line}» в:\n{card}");
+        }
+    }
+
+    /// Композиция read-after-write: reload_task перечитывает render доски и
+    /// находит строку по itemID (риг — состояние ядра после мутации).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_task_reads_rows_by_item_id() {
+        let scenario = MockScenario {
+            notebook: "nb-projects".into(),
+            boards: vec![MockBoard {
+                doc_id: "rw-doc".into(),
+                av_id: "av-rw".into(),
+                keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+                legacy: false,
+            }],
+            hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["rw-doc"])],
+            rows: vec![MockRow::new("20261111111111-rerwl", "таска").with_status("Todo")],
+            ..MockScenario::default()
+        };
+        let (_kernel, server) = MockKernel::start(scenario).await;
+        set_env(&server);
+        let sy = SiYuan::from_env().unwrap();
+        let board = crate::siyuan_task::find_board(&sy, "uwuwu").await.unwrap();
+        let fresh = super::reload_task(&sy, &board, "20261111111111-rerwl")
+            .await
+            .expect("строка после мутации видна в render");
+        assert_eq!(fresh.status, "Todo");
+        assert_eq!(fresh.title, "таска");
+        // NotFound — специфичный отказ, не паника (вызывающий решает: ADR-067)
+        let err = super::reload_task(&sy, &board, "no-such-item")
+            .await
+            .expect_err("чужой itemID не резолвится");
+        assert!(err.to_string().contains("не видна в render"), "{err}");
     }
 }

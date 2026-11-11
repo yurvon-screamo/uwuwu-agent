@@ -1364,7 +1364,7 @@ async fn run_comment(
     lost: bool,
     text: &str,
     reply_to: Option<&str>,
-) -> anyhow::Result<CommentOutcome> {
+) -> anyhow::Result<(crate::siyuan_task::CommentInserted, CommentOutcome)> {
     let (kernel, server) = MockKernel::start(comment_scenario(base_blocks, apply, lost)).await;
     set_env(&server);
     let sy = SiYuan::from_env()?;
@@ -1373,20 +1373,24 @@ async fn run_comment(
         text,
         reply_to,
     };
-    comment_with_ts(&sy, &comment_board(), &comment_task(), &draft, COMMENT_TS).await?;
+    let inserted =
+        comment_with_ts(&sy, &comment_board(), &comment_task(), &draft, COMMENT_TS).await?;
     let md = kernel.doc_blocks_of(BOUND_DOC).join("\n");
     let append_attempts = kernel.appends().len();
-    Ok(CommentOutcome {
-        md,
-        append_attempts,
-    })
+    Ok((
+        inserted,
+        CommentOutcome {
+            md,
+            append_attempts,
+        },
+    ))
 }
 
 /// Секция «Комменты» уже есть: заголовок не дублируется, дописана строка.
 #[tokio::test]
 #[serial_test::serial]
 async fn comment_with_existing_section_appends_only_the_line() {
-    let outcome = run_comment(
+    let (inserted, outcome) = run_comment(
         &[
             "## Контекст\nзаметки",
             "## Комменты",
@@ -1414,6 +1418,13 @@ async fn comment_with_existing_section_appends_only_the_line() {
         "заголовок единственный"
     );
     assert!(outcome.md.contains("старый"), "прежние комменты на месте");
+    // контракт ответов: свежая вставка — fresh + маркер как записался
+    assert!(inserted.fresh, "первая вставка — fresh");
+    assert_eq!(
+        inserted.marker,
+        "- **AGENTS** (2026-11-06 12:00): готово",
+        "маркер без отступа (не reply)"
+    );
 }
 
 /// Маркер уже в доке (повтор команды / применённый, но потерянный ответ) —
@@ -1422,7 +1433,7 @@ async fn comment_with_existing_section_appends_only_the_line() {
 #[serial_test::serial]
 async fn comment_with_marker_already_in_doc_appends_nothing() {
     let line = "- **AGENTS** (2026-11-06 12:00): готово";
-    let outcome = run_comment(&["## Комменты", line], true, false, "готово", None)
+    let (inserted, outcome) = run_comment(&["## Комменты", line], true, false, "готово", None)
         .await
         .expect("дубль распознан как успех");
 
@@ -1433,6 +1444,10 @@ async fn comment_with_marker_already_in_doc_appends_nothing() {
         "без задвоения: {}",
         outcome.md
     );
+    // контракт ответов: дедуп-хит отличим от вставки — fresh=false,
+    // ответ печатает «уже был», а не «коммент записан»
+    assert!(!inserted.fresh, "дедуп-хит — не вставка");
+    assert_eq!(inserted.marker, line, "маркер как записался");
 }
 
 /// Потерянный ответ: appendBlock ответил 500, но блок применился —
@@ -1440,7 +1455,7 @@ async fn comment_with_marker_already_in_doc_appends_nothing() {
 #[tokio::test]
 #[serial_test::serial]
 async fn comment_survives_lost_append_response_when_marker_landed() {
-    let outcome = run_comment(&["## Контекст"], false, true, "готово", None)
+    let (inserted, outcome) = run_comment(&["## Контекст"], false, true, "готово", None)
         .await
         .expect("потерянный ответ не валит коммент");
 
@@ -1460,6 +1475,9 @@ async fn comment_survives_lost_append_response_when_marker_landed() {
         "строка: {}",
         outcome.md
     );
+    // применённая потерянная вставка — fresh=true: маркер в доке, ответ
+    // «коммент записан» не врёт
+    assert!(inserted.fresh, "маркер приземлился — вставка состоялась");
 }
 
 /// Append не применился и ответил ошибкой — честный сбой, коммента в доке нет.
@@ -1480,7 +1498,7 @@ async fn comment_fails_loudly_when_append_never_lands() {
 #[tokio::test]
 #[serial_test::serial]
 async fn comment_reply_line_is_indented_under_parent() {
-    let outcome = run_comment(
+    let (inserted, outcome) = run_comment(
         &["## Комменты", "- **owner** (11.11 09:00): вопрос"],
         true,
         false,
@@ -1497,4 +1515,11 @@ async fn comment_reply_line_is_indented_under_parent() {
         "реплай с отступом: {:?}",
         outcome.md
     );
+    // контракт ответов: reply-маркер в ответе несёт отступ (как записался)
+    assert_eq!(
+        inserted.marker,
+        "  - **AGENTS** (2026-11-06 12:00): ответ",
+        "reply-маркер с отступом"
+    );
+    assert!(inserted.fresh);
 }
