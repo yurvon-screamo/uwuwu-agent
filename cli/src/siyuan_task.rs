@@ -1647,7 +1647,12 @@ pub(crate) async fn comment_with_ts(
 /// отступ реплай-строки матчу не мешает. Возврат (контракт ответов):
 /// true — вставка этим вызовом (включая потерянный ответ с приземлившимся
 /// блоком), false — маркер уже был в доке до вызова (дедуп-хит).
-async fn append_once_confirmed(sy: &SiYuan, doc_id: &str, line: &str, marker: &str) -> Result<bool> {
+async fn append_once_confirmed(
+    sy: &SiYuan,
+    doc_id: &str,
+    line: &str,
+    marker: &str,
+) -> Result<bool> {
     if doc_md_contains(sy, doc_id, marker).await? {
         return Ok(false);
     }

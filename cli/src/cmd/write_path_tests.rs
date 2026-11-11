@@ -1421,8 +1421,7 @@ async fn comment_with_existing_section_appends_only_the_line() {
     // контракт ответов: свежая вставка — fresh + маркер как записался
     assert!(inserted.fresh, "первая вставка — fresh");
     assert_eq!(
-        inserted.marker,
-        "- **AGENTS** (2026-11-06 12:00): готово",
+        inserted.marker, "- **AGENTS** (2026-11-06 12:00): готово",
         "маркер без отступа (не reply)"
     );
 }
@@ -1517,8 +1516,7 @@ async fn comment_reply_line_is_indented_under_parent() {
     );
     // контракт ответов: reply-маркер в ответе несёт отступ (как записался)
     assert_eq!(
-        inserted.marker,
-        "  - **AGENTS** (2026-11-06 12:00): ответ",
+        inserted.marker, "  - **AGENTS** (2026-11-06 12:00): ответ",
         "reply-маркер с отступом"
     );
     assert!(inserted.fresh);

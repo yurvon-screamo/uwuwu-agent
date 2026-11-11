@@ -99,7 +99,9 @@ pub(crate) fn format_task_header(
         out.push_str(&format!("Запланировано: {}\n", task.planned));
     }
     if let Some(schedule) = schedule {
-        out.push_str(&format!("Расписание: {schedule} (крон: файр в статусе Вейт)\n"));
+        out.push_str(&format!(
+            "Расписание: {schedule} (крон: файр в статусе Вейт)\n"
+        ));
     }
     if let Some(agent) = agent {
         out.push_str(&format!("{}\n", syt::agent_display_line(agent)));
@@ -124,7 +126,12 @@ pub(crate) async fn task_header_md(
             agent = attrs.get("custom-agent").cloned();
         }
     }
-    Ok(format_task_header(board, task, schedule.as_deref(), agent.as_deref()))
+    Ok(format_task_header(
+        board,
+        task,
+        schedule.as_deref(),
+        agent.as_deref(),
+    ))
 }
 
 /// Перечитывание строки после мутации (read-after-write): render доски
@@ -159,7 +166,7 @@ fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
 }
 
 /// Финальный экспорт тела после мутации (контракт «фулл-тело»): маркер-блок
-/// + artifact-report. Экспорт сорвался → маркер без тела + warning (rc 0,
+/// и artifact-report. Экспорт сорвался → маркер без тела + warning (rc 0,
 /// ADR-067: запись уже свершилась).
 async fn print_final_body(sy: &SiYuan, doc_id: &str, label: &str) {
     match sy.export_md_by_id(doc_id).await {
@@ -487,13 +494,15 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             // ошибка называет применённое и рецепт доставки (не частичные
             // println-подтверждения: финальное состояние печатается в конце)
             if let Some(raw) = planned.as_deref() {
-                syt::set_planned(&sy, &board, &task, raw).await.with_context(|| {
-                    format!(
-                        "колонки строки записаны, но «Запланировано» не записано — \
+                syt::set_planned(&sy, &board, &task, raw)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но «Запланировано» не записано — \
                          доставь: task edit {} --planned \"{raw}\"",
-                        task.item_id
-                    )
-                })?;
+                            task.item_id
+                        )
+                    })?;
             }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
@@ -572,7 +581,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 eprintln!("{warning}");
             }
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            let inserted = syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
+            let inserted =
+                syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
             // контракт ответов: вставленный блок как записался; дедуп-хит
             // (бит-в-бит дубль уже был) — отдельная честная строка
             if inserted.fresh {
@@ -5576,12 +5586,8 @@ mod tests {
     /// Фулл-шапка: все строки карточки, включая «Сессия dev» (контракт claim).
     #[test]
     fn task_header_full_shape() {
-        let header = format_task_header(
-            &header_board(),
-            &header_task(),
-            Some("1d"),
-            Some("triage"),
-        );
+        let header =
+            format_task_header(&header_board(), &header_task(), Some("1d"), Some("triage"));
         for line in [
             "Задача:   таска",
             "Статус:   In Progress",
@@ -5596,7 +5602,10 @@ mod tests {
         ] {
             assert!(header.contains(line), "нет строки «{line}» в:\n{header}");
         }
-        assert!(header.contains("Агент: triage (вечная сессия крона)"), "{header}");
+        assert!(
+            header.contains("Агент: triage (вечная сессия крона)"),
+            "{header}"
+        );
         // шапка — не фулл-ответ create/body: тела в ней нет
         assert!(!header.contains("----- тело"));
     }
@@ -5661,10 +5670,10 @@ mod tests {
     #[serial_test::serial]
     async fn reload_task_reads_rows_by_item_id() {
         let scenario = MockScenario {
-            notebook: "nb-projects".into(),
+            notebook: "nb-projects",
             boards: vec![MockBoard {
-                doc_id: "rw-doc".into(),
-                av_id: "av-rw".into(),
+                doc_id: "rw-doc",
+                av_id: "av-rw",
                 keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
                 legacy: false,
             }],
