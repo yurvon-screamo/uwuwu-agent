@@ -13,6 +13,8 @@
 //! 6. сбой SQL ядра — громкая ошибка, не «не найдена»
 //! 7. get точного id без --project — глобальный резолв (фаза A)
 //! 8. comment без --project на подстроку чужой доски — приземлился (инцидент 05.11)
+//!    8-bis: канал --md через полный task_run — контент файла в ядре, токен-гвард не режет
+//!    8-ter: пин High: --md без позиционного текста и без --project — пред-гвард no-op, глобальный резолв жив
 //! 9. подстрока на двух досках — громкая ошибка с раскладкой обеих
 //! 10. неоднозначность на одной доске без --project — громкая ошибка
 //! 11. полный промах без --project — раскладка обысканных досок
@@ -549,6 +551,85 @@ async fn global_comment_without_project_lands_on_owning_board() {
     assert!(
         appends.iter().any(|a| a.contains("вопрос владельцу")),
         "текст коммента в append: {appends:?}"
+    );
+}
+
+/// (8-bis) Канал `--md` через полный task_run: контент файла приземляется в
+/// тело задачи, флагоподобные строки не режутся токен-гвардом (явный канал).
+/// Юнит-тесты guarded_comment_text — белый ящик; этот тест пинит прокидку
+/// `md` в Comment-ветке диспетчера: если её потеряют, юниты останутся
+/// зелёными, а коммент пойдёт «пустым» — здесь падение.
+#[tokio::test]
+#[serial_test::serial]
+async fn comment_md_channel_lands_file_content_via_kernel() {
+    let (kernel, _server) = spawn_kernel().await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.md");
+    std::fs::write(
+        &file,
+        "## Отчёт\n\nCI-шаг `gh pr checks --watch`, bun-флаг `--frozen-lockfile` в прозе\n",
+    )
+    .unwrap();
+
+    task_run(
+        "uwuwu",
+        TaskSub::Comment {
+            id: "20261105100000-ttask1".into(),
+            reply: None,
+            stdin: false,
+            md: Some(file.to_string_lossy().into_owned()),
+            text: vec![],
+        },
+    )
+    .await
+    .expect("коммент через --md приземлился");
+
+    let appends = kernel.appends_snapshot();
+    assert_eq!(appends.len(), 2, "секция + коммент: {appends:?}");
+    assert!(
+        appends.iter().all(|a| a.contains("20261105000001-tbodyx1")),
+        "оба appendBlock — в тело задачи: {appends:?}"
+    );
+    assert!(
+        appends.iter().any(|a| a.contains("--frozen-lockfile")),
+        "флагоподобная строка из файла дошла до ядра без токен-гварда: {appends:?}"
+    );
+}
+
+/// (8-ter) Пин High ревью плана на полном пути: `--md` без позиционного
+/// текста и без --project — пред-гвард no-op, глобальный резолв жив.
+/// Возврат pre_guard_positional_comment к empty-bail по пустому позиционному
+/// убил бы main-сценарий `task comment <id> --md файл.md` до Comment-ветки —
+/// здесь падение.
+#[tokio::test]
+#[serial_test::serial]
+async fn comment_md_channel_survives_empty_project_pre_guard() {
+    let (kernel, _server) = spawn_kernel().await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("note.md");
+    std::fs::write(&file, "вопрос владельцу: ЧТО РЕШИТЬ?\n").unwrap();
+
+    task_run(
+        "",
+        TaskSub::Comment {
+            id: "20261105110000-otask1".into(),
+            reply: None,
+            stdin: false,
+            md: Some(file.to_string_lossy().into_owned()),
+            text: vec![],
+        },
+    )
+    .await
+    .expect("--md без позиционного текста проходит пред-гвард и резолвится глобально");
+
+    let appends = kernel.appends_snapshot();
+    assert!(
+        appends.iter().all(|a| a.contains("20261105000003-obodyx3")),
+        "оба appendBlock — в тело origa-задачи: {appends:?}"
+    );
+    assert!(
+        appends.iter().any(|a| a.contains("ЧТО РЕШИТЬ?")),
+        "контент файла в append: {appends:?}"
     );
 }
 
