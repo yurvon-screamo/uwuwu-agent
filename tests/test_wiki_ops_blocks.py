@@ -32,7 +32,14 @@
      громкий отказ («напечатанные id» — не доказательство материала,
      проба 07.11); пустой new_ids в ответе ядра — громкий отказ;
      NodeList-обёртка markdown-парсера — транзиентна (ядро мержит item'ы
-     в существующий list и отбрасывает её, проба 07.11) — не фантом.
+     в существующий list и отбрасывает её, проба 07.11) — не фантом;
+ 12) айтем (type='i') — контекст всего поддерева (живая проба 12.11,
+     задача 20261111063638): update переписывает поддерево айтема payload'ом —
+     штатный p-носитель обновляется каскадом, лишние чайлды (вложенный list,
+     дубль-p qxob57e-класса) сносятся тихо, code=0; гвард: безопасны ноль
+     чайлдов или ровно один p, иначе отказ до мутации и до undo-журнала;
+     пост-чек insert-after: p-детей у вставленного айтема ≥ 2 — предупреждение
+     (мутация уже применена, лишний p сносится block-delete).
 
 Прогон: python3 -m unittest discover -s tests -t .  (из корня репо)
 или напрямую: python3 tests/test_wiki_ops_blocks.py
@@ -90,7 +97,8 @@ class FakeKernel:
     id в doOperations; materialize_ids — какие из них реально ложатся в blocks)."""
 
     def __init__(self, blocks=(), docs=(), put_fails=False,
-                 insert_ids=(NEW_ID,), insert_types=None, materialize_ids=None, sy_tree=None):
+                 insert_ids=(NEW_ID,), insert_types=None, materialize_ids=None, sy_tree=None,
+                 insert_children=()):
         self.blocks = {b["id"]: dict(b) for b in blocks}
         self.docs = {d["id"]: dict(d) for d in docs}
         self.sql_stmts = []
@@ -101,6 +109,9 @@ class FakeKernel:
         self.insert_types = dict(insert_types) if insert_types else {}
         self.materialize_ids = list(materialize_ids) if materialize_ids is not None else list(insert_ids)
         self.sy_tree = sy_tree
+        # Дети, материализуемые вместе с вставкой (parent_id — первый insert_id):
+        # пост-чек дубль-p у вставленных айтемов (qxob57e-класс, проба 11.11).
+        self.insert_children = [dict(c) for c in insert_children]
 
     def post(self, path: str, body: dict, attempts: int = 6):
         if path == "/api/query/sql":
@@ -117,6 +128,12 @@ class FakeKernel:
                 for i in self.materialize_ids:
                     self.blocks[i] = {"id": i, "type": "p", "root_id": DOC_ID,
                                       "parent_id": DOC_ID, "markdown": ""}
+                if self.materialize_ids and self.insert_children:
+                    for c in self.insert_children:
+                        child = dict(c)
+                        child.setdefault("parent_id", self.materialize_ids[0])
+                        child.setdefault("root_id", DOC_ID)
+                        self.blocks[child["id"]] = child
                 return [{"timestamp": 0, "doOperations": [{"action": "insert", "data": data}]}]
             return {"doOperations": []}
         raise AssertionError(f"неожиданный путь: {path}")
@@ -142,6 +159,17 @@ class FakeKernel:
             if m is None:
                 raise AssertionError(f"непонятный stmt: {stmt}")
             return [{"c": sum(1 for r in all_rows if r.get("parent_id") == m.group(1))}]
+        if "where parent_id='" in stmt:
+            # Дети по parent_id (гвард айтемов update, пост-чек вставки):
+            # select id, type, substr(markdown,…) md — строки блоков-детей,
+            # алиас md эмулирует substr-проекцию живого ядра.
+            m = re.search(r"parent_id='([^']+)'", stmt)
+            rows = sorted((dict(r) for r in all_rows if r.get("parent_id") == m.group(1)),
+                          key=lambda r: r["id"])
+            if "substr(markdown" in stmt:
+                for r in rows:
+                    r["md"] = r.get("markdown", "")[:80]
+            return rows
         if "type='d'" in stmt:
             m = re.search(r"id='([^']+)'", stmt)
             if m is None:
@@ -543,6 +571,128 @@ class InsertAfterMaterializationPostcheck(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             run_block(kernel, "insert-after", payload="- первый\n- второй")
         self.assertIn(NEW_ID_B, str(cm.exception))
+
+
+class ItemUpdateChildGuard(unittest.TestCase):
+    """block-update айтема (type='i') переписывает его поддерево ровно payload'ом
+    (живая проба 12.11, задача 20261111063638): штатный p-носитель обновляется
+    каскадом, но лишние чайлды сносятся тихо, code=0 — вложенный list исчезает
+    целиком, дубль-p (qxob57e-класс) теряет носителя или дублируется. Отказ —
+    до мутации и до undo-журнала; безопасно: ноль чайлдов или ровно один p."""
+
+    def _item_kernel(self, children) -> FakeKernel:
+        blocks = [_block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- пункт"),
+                  _block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- пункт"),
+                  *children]
+        return FakeKernel(blocks=blocks, docs=[_doc()])
+
+    def test_item_with_nested_list_child_is_refused_before_mutation_and_journal(self):
+        # Главный кейс пробы 12.11: update айтема с вложенным списком молча
+        # снёс поддерево (чайлды исчезли из SQL и экспорта) при «обновлён».
+        kernel = self._item_kernel(children=[
+            _block("20261112023600-cr10001", btype="p", parent_id=ITEM_ID,
+                   markdown="Родитель с вложенным"),
+            _block("20261112023600-cr20001", btype="l", parent_id=ITEM_ID,
+                   markdown="- Вложенный пункт 1\n- Вложенный пункт 2"),
+        ])
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", block_id=ITEM_ID, payload="- пункт после правки")
+        message = str(cm.exception)
+        self.assertIn("чайлд", message)
+        self.assertIn("20261112023600-cr20001", message, "перечисление сносимого: id")
+        self.assertIn("l", message, "перечисление сносимого: тип")
+        self.assertIn("block-delete", message, "рецепт для дублей/лишних чайлдов")
+        self.assertEqual(kernel.mutations, [])
+        self.assertEqual(kernel.puts, [], "отказ до undo-журнала")
+
+    def test_item_with_duplicate_paragraph_is_refused(self):
+        # qxob57e-модель (проба 11.11): айтем с p-носителем и p-дублем —
+        # update переписывает поддерево, тексты чайлдов теряются/смешиваются.
+        kernel = self._item_kernel(children=[
+            _block("20261112023700-cr10001", btype="p", parent_id=ITEM_ID,
+                   markdown="Текст айтема"),
+            _block("20261112023700-cr20001", btype="p", parent_id=ITEM_ID,
+                   markdown="ДУБЛЬ-ПАРАГРАФ старым текстом"),
+        ])
+        with self.assertRaises(RuntimeError) as cm:
+            run_block(kernel, "update", block_id=ITEM_ID, payload="- новый текст")
+        self.assertIn("2", str(cm.exception))
+        self.assertEqual(kernel.mutations, [])
+
+    def test_item_with_single_carrier_paragraph_is_updated(self):
+        # Негатив: штатная структура [i → p-носитель] — обновление проходит
+        # (проба 12.11: ядро каскадно обновляет носитель, правка исполнена).
+        kernel = self._item_kernel(children=[
+            _block("20261112023200-cr10001", btype="p", parent_id=ITEM_ID,
+                   markdown="Текст пункта"),
+        ])
+        output = run_block(kernel, "update", block_id=ITEM_ID, payload="- новый текст")
+        self.assertIn("обновлён", output)
+        self.assertEqual(kernel.mutations,
+                         [("/api/block/updateBlock",
+                           {"dataType": "markdown", "data": "- новый текст", "id": ITEM_ID}, 1)])
+
+    def test_item_without_children_is_updated(self):
+        # Ноль чайлдов (вне инварианта ядра, но безопасно: нечего сносить).
+        kernel = self._item_kernel(children=[])
+        run_block(kernel, "update", block_id=ITEM_ID, payload="- новый текст")
+        self.assertEqual(len(kernel.mutations), 1)
+
+
+class InsertedItemDuplicateChildPostcheck(unittest.TestCase):
+    """Пост-чек вставки айтемов: p-детей у нового айтема ≥ 2 — qxob57e-класс
+    «дубль-p» (проба 11.11: insertBlock с айтем-пейлоадом оставлял чайлда со
+    старым текстом). Мутация уже применена — громкое предупреждение с рецептом,
+    не отказ. Один p — штатный носитель текста пункта (проба 12.11); l-дети —
+    вложенный контент payload'а, легитимны."""
+
+    def test_inserted_item_with_extra_paragraph_warns(self):
+        kernel = FakeKernel(
+            blocks=[_block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- якорь"),
+                    _block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- якорь")],
+            docs=[_doc()],
+            insert_ids=[NEW_ID],
+            insert_types={NEW_ID: "NodeListItem"},
+            insert_children=[
+                {"id": "20261112023800-ch10001", "type": "p", "markdown": "Текст пункта"},
+                {"id": "20261112023800-ch20001", "type": "p", "markdown": "ДУБЛЬ старым текстом"},
+            ],
+        )
+        output = run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
+        self.assertIn("⚠", output)
+        self.assertIn(NEW_ID, output)
+        self.assertIn("20261112023800-ch20001", output, "перечисление подозрительных детей")
+        self.assertIn("block-delete", output, "рецепт сноса дубля")
+
+    def test_inserted_item_with_single_carrier_paragraph_is_silent(self):
+        # Негатив: штатная пара [i → p] — предупреждения нет.
+        kernel = FakeKernel(
+            blocks=[_block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- якорь"),
+                    _block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- якорь")],
+            docs=[_doc()],
+            insert_ids=[NEW_ID],
+            insert_types={NEW_ID: "NodeListItem"},
+            insert_children=[
+                {"id": "20261112023800-ch10001", "type": "p", "markdown": "Текст пункта"},
+            ],
+        )
+        output = run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
+        self.assertNotIn("⚠", output)
+
+    def test_inserted_item_children_not_yet_in_index_stay_silent(self):
+        # Лаг индекса: детей нет в blocks (индекс не доехал) — SQL-проба
+        # честно пуста, пост-чек n/a, не ложная тревога.
+        kernel = FakeKernel(
+            blocks=[_block(ITEM_ID, btype="i", parent_id=LIST_ID, markdown="- якорь"),
+                    _block(LIST_ID, btype="l", parent_id=DOC_ID, markdown="- якорь")],
+            docs=[_doc()],
+            insert_ids=[NEW_ID],
+            insert_types={NEW_ID: "NodeListItem"},
+            materialize_ids=[NEW_ID],
+            sy_tree={"Children": [{"ID": NEW_ID, "Type": "NodeListItem"}]},
+        )
+        output = run_block(kernel, "insert-after", block_id=ITEM_ID, payload="- один пункт")
+        self.assertNotIn("⚠", output)
 
 
 class MutationIsSingleAttempt(unittest.TestCase):
