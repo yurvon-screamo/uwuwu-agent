@@ -79,22 +79,21 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input)
   const method = init?.method ?? "GET"
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+  // строгий pathname-матч opencode-REST (страж child-rigs): двойной префикс
+  // (/api/api/…) на живом сервере даёт 404 — мок не имеет права его принимать
+  const path = new URL(url).pathname
 
   // — opencode REST (боевой контур) —
-  // Строгий pathname-матч (класс PR #207): rest демона строит `${base}/api${path}`,
-  // двойной префикс (/api/api/…) на живом сервере даёт 404 — мок не имеет права
-  // его принимать: суффикс/подстрока/безъякорный regex по URL маскируют разрыв.
-  const path = new URL(url).pathname
   if (path === "/api/session" && method === "POST") {
     const id = `ses_mock_${creations.length + 1}`
     creations.push({ title: String(body.title ?? ""), agent: body.agent, model: body.model })
     sessions.set(id, { agent: String(body.agent ?? ""), outcome: undefined, idle: 0 })
     return json({ id })
   }
-  if (/^\/api\/session\/ses_[^/]+$/.test(path) && method === "DELETE") {
-    const id = /^\/api\/session\/(ses_[^/]+)$/.exec(path)?.[1] ?? ""
-    deletes.push(id)
-    sessions.delete(id)
+  const deleteMatch = /^\/api\/session\/(ses_[^/]+)$/.exec(path)
+  if (deleteMatch !== null && method === "DELETE") {
+    deletes.push(deleteMatch[1])
+    sessions.delete(deleteMatch[1])
     return json({})
   }
   const promptMatch = /^\/api\/session\/(ses_[^/]+)\/prompt$/.exec(path)
@@ -110,7 +109,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ time: { created } })
   }
   const getMatch = /^\/api\/session\/(ses_[^/]+)\/?$/.exec(path)
-  if (getMatch !== null) {
+  if (getMatch !== null && method === "GET") {
     const s = sessions.get(getMatch[1])
     if (s === undefined) return new Response("нет сессии", { status: 404 })
     return json({ outcome: s.outcome, time: { idle: s.idle }, agent: s.agent })
@@ -260,17 +259,17 @@ try {
 
 ;(Bun as unknown as { spawn: unknown }).spawn = Bun.spawn
 
-// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
-// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
-// пин ловит полный откат класса и откат протыкаемой ветки; точечный откат
-// прочих веток добивают ассерты вердиктов мастер-тестов
-const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
-  .then(() => false, () => true)
-
 let logLines: string[] = []
 try {
   logLines = (await Bun.file(LOG).text()).split("\n").filter((l) => l.trim() !== "")
 } catch {}
+
+// Регресс-пин класса PR #207 (строгий pathname-матч): двойной /api-префикс —
+// битый прод-путь (живой сервер даёт 404), мок не имеет права его принимать;
+// пин ловит полный откат класса, точечные откатывы веток добивают ассерты
+// вердиктов мастер-тестов
+const strictPathPin = await fetch("http://mock.invalid/api/api/session", { method: "POST", body: "{}" })
+  .then(() => false, () => true)
 
 console.log(JSON.stringify({
   error, stages, creations, promptCalls, deletes, spawnCalls, logLines, comments, strictPathPin,

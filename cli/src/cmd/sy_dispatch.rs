@@ -1751,13 +1751,9 @@ async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
             }
             print!("{content}");
         }
-        KernelSub::Render {
-            av_id,
-            block_id,
-            page,
-        } => {
-            crate::siyuan_id::ensure_node_id(&av_id, "av_id")?;
-            crate::siyuan_id::ensure_node_id(&block_id, "block_id")?;
+        KernelSub::Render { id, page } => {
+            crate::siyuan_id::ensure_node_id(&id, "id")?;
+            let (av_id, block_id) = crate::siyuan_task::resolve_av(&sy, &id).await?;
             let render = sy.db_render(&av_id, &block_id, page).await?;
             println!("{}", serde_json::to_string_pretty(&render)?);
         }

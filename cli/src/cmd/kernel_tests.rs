@@ -3,7 +3,10 @@
 //! wiremock-тесты в siyuan.rs.
 
 use super::cli::{Cli, Commands, KernelSub};
+use super::mock_kernel::{set_env, MockBoard, MockKernel, MockScenario};
 use super::sy_dispatch::ls_lines;
+use crate::siyuan::SiYuan;
+use crate::siyuan_task::resolve_av;
 use clap::Parser as _;
 use serde_json::json;
 
@@ -64,27 +67,113 @@ fn export_parses_doc_id() {
 }
 
 #[test]
-fn render_parses_ids_and_page() {
-    let KernelSub::Render {
-        av_id,
-        block_id,
-        page,
-    } = expect_kernel(
-        parse_kernel(&[
-            "render",
-            "20261104102403-kernel1",
-            "20261104102403-block02",
-            "--page",
-            "2",
-        ])
-        .unwrap(),
-    )
+fn render_parses_id_and_page() {
+    let KernelSub::Render { id, page } =
+        expect_kernel(parse_kernel(&["render", "20261104102403-kernel1", "--page", "2"]).unwrap())
     else {
         panic!("expected render subcommand");
     };
-    assert_eq!(av_id, "20261104102403-kernel1");
-    assert_eq!(block_id, "20261104102403-block02");
+    assert_eq!(id, "20261104102403-kernel1");
     assert_eq!(page, 2);
+}
+
+// ——— render-проба: one-shot резолв av по id (flow на мок-ядре) ———
+
+/// Доска сценария: нативный av-блок (data-av-id=) или legacy i-носитель (avID=).
+fn board_with_carrier(legacy: bool) -> MockScenario {
+    MockScenario {
+        boards: vec![MockBoard {
+            doc_id: "board-doc",
+            av_id: "av-1",
+            keys: vec![],
+            legacy,
+        }],
+        ..MockScenario::default()
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_by_doc_id_reads_native_data_av_id() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "board-doc").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_by_doc_id_reads_legacy_av_id_carrier() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(true)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "board-doc").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_by_bare_av_id_finds_carrier_block() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "av-1").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-board-doc");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_rejects_id_without_database_relation() {
+    let (_kernel, server) = MockKernel::start(board_with_carrier(false)).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let err = resolve_av(&sy, "20261104102403-stranger")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("не резолвится"), "{err}");
+}
+
+// ——— верификация маркерного шага (extract == id) ———
+
+/// Пин верификации: блок маркерного SQL, где первый по позиции маркер
+/// (`avID=`) указывает на чужой av — такая строка не принимается (без
+/// верификации resolve_av вернул бы чужую пару и render отрендерил
+/// не ту доску молча).
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_bare_av_id_rejects_marker_row_with_foreign_extract() {
+    let mut sc = board_with_carrier(false);
+    sc.marker_blocks = vec![(
+        "block-mixed",
+        "<i avID=\"foreign-av\"></i><div data-av-id=\"av-1\"></div>",
+    )];
+    let (_kernel, server) = MockKernel::start(sc).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let err = resolve_av(&sy, "av-1").await.unwrap_err();
+    assert!(err.to_string().contains("не резолвится"), "{err}");
+}
+
+/// Позитивная ветка маркерного шага: extract по первому маркеру совпал
+/// с запрошенным avID — пара (avID, blockID носителя) принимается.
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_av_bare_av_id_takes_matching_marker_row() {
+    let mut sc = board_with_carrier(false);
+    sc.marker_blocks = vec![(
+        "block-quoted",
+        "<p>цитата data-av-id=\"av-1\" из документации</p>",
+    )];
+    let (_kernel, server) = MockKernel::start(sc).await;
+    set_env(&server);
+    let sy = SiYuan::from_env().unwrap();
+    let (av, block) = resolve_av(&sy, "av-1").await.unwrap();
+    assert_eq!(av, "av-1");
+    assert_eq!(block, "block-quoted");
 }
 
 #[test]

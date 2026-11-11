@@ -134,6 +134,9 @@ pub(crate) struct MockBoard {
     pub(crate) doc_id: &'static str,
     pub(crate) av_id: &'static str,
     pub(crate) keys: Vec<(&'static str, &'static str)>,
+    /// true — database-блок сценария как legacy i-носитель (`avID=`),
+    /// false — нативный av-блок (`data-av-id=`).
+    pub(crate) legacy: bool,
 }
 
 /// Сценарий мок-ядра: статические данные поверх stateful-билдера. Дефолт —
@@ -206,6 +209,10 @@ pub(crate) struct MockScenario {
     /// true — SQL-дискавери реестра досок («Задачи %») отвечает HTTP 500
     /// (history-deletes деградирует к полному перечислению без классификации).
     pub(crate) sql_boards_fail: bool,
+    /// Блоки маркерного поиска av (шаг 2 resolve_av, SQL по вхождению
+    /// маркера со значением): (blockId, markdown). Пусто — SQL отвечает
+    /// носителем единственной доски сценария (прежний generic-ответ).
+    pub(crate) marker_blocks: Vec<(&'static str, &'static str)>,
 }
 
 impl Default for MockScenario {
@@ -224,6 +231,7 @@ impl Default for MockScenario {
                     ("key-planned", "Запланировано"),
                     ("key-schedule", "Расписание"),
                 ],
+                legacy: false,
             }],
             hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["board-doc"])],
             rows: Vec::new(),
@@ -250,6 +258,7 @@ impl Default for MockScenario {
             board_children: Vec::new(),
             sql_children_fail: false,
             sql_boards_fail: false,
+            marker_blocks: Vec::new(),
         }
     }
 }
@@ -818,6 +827,19 @@ impl MockKernel {
 
     // ——— MCP-действия над состоянием ———
 
+    /// Markdown database-блока доски: нативный av-блок (data-av-id=) или
+    /// legacy i-носитель (avID=) — как их отдаёт SQL ядра.
+    fn carrier_markdown(board: &MockBoard) -> String {
+        if board.legacy {
+            format!("<i avID=\"{}\"></i>", board.av_id)
+        } else {
+            format!(
+                "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
+                board.av_id
+            )
+        }
+    }
+
     fn sql_data(&self, stmt: &str) -> Value {
         // проба board-orphans: уникальная сигнатура stmt («select id,
         // hpath, ial from blocks») — чужие SQL с hpath like не попадают
@@ -880,23 +902,38 @@ impl MockKernel {
             return match self.sc.boards.iter().find(|b| b.doc_id == root) {
                 Some(b) => json!([{
                     "id": format!("block-{}", b.doc_id),
-                    "markdown": format!(
-                        "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
-                        b.av_id
-                    )
+                    "markdown": Self::carrier_markdown(b),
                 }]),
                 None => json!([]),
             };
+        }
+        // маркерный поиск av по значению (шаг 2 resolve_av): сигнатура —
+        // like с кавычкой-значением; find_board-форма (`avID=%`) не матчится
+        if stmt.contains("markdown like '%data-av-id=\"")
+            || stmt.contains("markdown like '%avID=\"")
+        {
+            if self.sc.marker_blocks.is_empty() {
+                // сценарий не задаёт блоки — прежний generic-ответ
+                let b = &self.sc.boards[0];
+                return json!([{
+                    "id": format!("block-{}", b.doc_id),
+                    "markdown": Self::carrier_markdown(b),
+                }]);
+            }
+            let rows: Vec<Value> = self
+                .sc
+                .marker_blocks
+                .iter()
+                .map(|(id, md)| json!({ "id": id, "markdown": md }))
+                .collect();
+            return json!(rows);
         }
         if stmt.contains("type='av'") {
             // запрос av-носителя без root: единственная доска сценария
             let b = &self.sc.boards[0];
             return json!([{
                 "id": format!("block-{}", b.doc_id),
-                "markdown": format!(
-                    "<div data-type=\"NodeAttributeView\" data-av-id=\"{}\"></div>",
-                    b.av_id
-                )
+                "markdown": Self::carrier_markdown(b),
             }]);
         }
         // пробы существования доков по id (`id='...'`)

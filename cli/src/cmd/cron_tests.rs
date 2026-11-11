@@ -44,6 +44,7 @@ fn list_scenario() -> MockScenario {
                 ("key-status", "Status"),
                 ("key-planned", "Запланировано"),
             ],
+            legacy: false,
         }],
         hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec![BOARD_DOC])],
         rows: vec![

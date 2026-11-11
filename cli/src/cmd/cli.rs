@@ -396,12 +396,12 @@ pub(crate) enum KernelSub {
         doc_id: String,
     },
     /// render-проба доски (MCP database render): rowCount/page/itemCount
-    /// as-is — деградация досок и пагинация строк
+    /// as-is — деградация досок и пагинация строк. Вход one-shot: док-доска
+    /// или сам av — avID и block-носитель резолвятся сами (оба формата
+    /// маркера: data-av-id и legacy avID).
     Render {
-        #[arg(help = "av-id доски")]
-        av_id: String,
-        #[arg(help = "blockID дока-носителя доски")]
-        block_id: String,
+        #[arg(help = "id дока доски | av доски")]
+        id: String,
         #[arg(long, default_value = "1", help = "Номер страницы")]
         page: u64,
     },

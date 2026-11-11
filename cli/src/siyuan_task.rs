@@ -93,41 +93,9 @@ pub async fn find_board_titled_opt(
              and (type='av' or (type='i' and markdown like '%avID=%')) limit 5"
         ))
         .await?;
-    let mut av_id = String::new();
-    let mut block_id = String::new();
-    for r in &rows {
-        let md = r.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
-        if let Some(av) = extract_av_id(md) {
-            av_id = av;
-            block_id = r
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string();
-            break;
-        }
-    }
-    if av_id.is_empty() {
-        // fallback: MCP db_search по имени; первый хит не доверяем —
-        // несвежий индекс отдаёт фаззи-хиты чужих досок
-        let v = sy.db_search(title).await?;
-        let results = v
-            .pointer("/data/results")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let expect_hpath = format!("Projects{hpath}");
-        match pick_search_hit(&results, &expect_hpath, title, &doc_id) {
-            Some((av, block)) => {
-                av_id = av;
-                block_id = block;
-            }
-            None => bail!(
-                "database доски «{title}» не найден: поиск вернул {} хит(ов), валидного нет (ожидался hPath «{expect_hpath}»)",
-                results.len()
-            ),
-        }
-    }
+    let Some((av_id, block_id)) = carrier_from_rows(&rows) else {
+        return search_board_fallback(sy, title, doc_id, &hpath, nb).await;
+    };
     Ok(Some(SyBoard {
         doc_id,
         av_id,
@@ -135,6 +103,82 @@ pub async fn find_board_titled_opt(
         hpath,
         notebook: nb,
     }))
+}
+
+/// Fallback резолва доски: MCP db_search по имени; первый хит не доверяем —
+/// несвежий индекс отдаёт фаззи-хиты чужих досок.
+async fn search_board_fallback(
+    sy: &SiYuan,
+    title: &str,
+    doc_id: String,
+    hpath: &str,
+    notebook: String,
+) -> Result<Option<SyBoard>> {
+    let v = sy.db_search(title).await?;
+    let results = v
+        .pointer("/data/results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let expect_hpath = format!("Projects{hpath}");
+    match pick_search_hit(&results, &expect_hpath, title, &doc_id) {
+        Some((av, block)) => Ok(Some(SyBoard {
+            doc_id,
+            av_id: av,
+            block_id: block,
+            hpath: hpath.to_string(),
+            notebook,
+        })),
+        None => bail!(
+            "database доски «{title}» не найден: поиск вернул {} хит(ов), валидного нет (ожидался hPath «{expect_hpath}»)",
+            results.len()
+        ),
+    }
+}
+
+/// Первый носитель database-блока из SQL-строк: (avID, blockID) — паритет
+/// extract_av_id (оба формата маркера: data-av-id и legacy avID).
+/// None — носителя в выборке нет.
+fn carrier_from_rows(rows: &[serde_json::Value]) -> Option<(String, String)> {
+    rows.iter().find_map(|r| {
+        let md = r.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
+        let av_id = extract_av_id(md)?;
+        let block_id = r.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        (!block_id.is_empty()).then(|| (av_id, block_id.to_string()))
+    })
+}
+
+/// One-shot резолв (avID, blockID носителя) для render-пробы по id:
+/// док-доска (root_id-поиск носителя, паритет find_board) либо сам avID
+/// (блок-носитель ищется по вхождению маркера с верификацией extract).
+pub(crate) async fn resolve_av(sy: &SiYuan, id: &str) -> Result<(String, String)> {
+    let carrier_rows = sy
+        .sql(&format!(
+            "select id, markdown from blocks where root_id='{id}' \
+             and (type='av' or (type='i' and markdown like '%avID=%')) limit 5"
+        ))
+        .await?;
+    if let Some(found) = carrier_from_rows(&carrier_rows) {
+        return Ok(found);
+    }
+    let marker_rows = sy
+        .sql(&format!(
+            "select id, markdown from blocks where \
+             (markdown like '%data-av-id=\"{id}\"%' or markdown like '%avID=\"{id}\"%') \
+             and (type='av' or type='i') limit 5"
+        ))
+        .await?;
+    for row in &marker_rows {
+        let md = row.get("markdown").and_then(|m| m.as_str()).unwrap_or("");
+        let block_id = row.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if extract_av_id(md).as_deref() == Some(id) && !block_id.is_empty() {
+            return Ok((id.to_string(), block_id.to_string()));
+        }
+    }
+    bail!(
+        "id «{id}» не резолвится в attribute view: ни док с database-блоком, ни живой avID — \
+         проверь id (kernel export <id> показывает markdown дока)"
+    )
 }
 
 fn extract_av_id(md: &str) -> Option<String> {
@@ -1958,6 +2002,44 @@ mod tests {
     fn extract_av_id_returns_none_without_av_marker() {
         let md = r#"<div data-type="NodeDocument"></div>"#;
         assert_eq!(extract_av_id(md), None);
+    }
+
+    #[test]
+    fn carrier_from_rows_takes_first_hit_across_formats() {
+        let rows = vec![
+            // первая строка без маркера — пропускается
+            json!({"id": "block-plain", "markdown": "<p>текст</p>"}),
+            // первый хит: legacy i-носитель
+            json!({"id": "block-legacy", "markdown": "<i avID=\"av-legacy\"></i>"}),
+            // второй нативный — не берётся (первый хит выигрывает)
+            json!({"id": "block-native", "markdown": "<div data-av-id=\"av-native\"></div>"}),
+        ];
+        assert_eq!(
+            carrier_from_rows(&rows),
+            Some(("av-legacy".to_string(), "block-legacy".to_string()))
+        );
+    }
+
+    #[test]
+    fn carrier_from_rows_skips_marker_row_without_block_id() {
+        let rows = vec![
+            json!({"markdown": "<div data-av-id=\"av-1\"></div>"}),
+            json!({"id": "block-good", "markdown": "<div data-av-id=\"av-2\"></div>"}),
+        ];
+        assert_eq!(
+            carrier_from_rows(&rows),
+            Some(("av-2".to_string(), "block-good".to_string()))
+        );
+    }
+
+    #[test]
+    fn carrier_from_rows_returns_none_without_carrier() {
+        assert_eq!(carrier_from_rows(&[]), None);
+        let rows = vec![
+            json!({"id": "block-plain", "markdown": "<p>текст</p>"}),
+            json!({"id": "block-empty", "markdown": ""}),
+        ];
+        assert_eq!(carrier_from_rows(&rows), None);
     }
 
     #[test]
