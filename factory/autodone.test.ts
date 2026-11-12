@@ -121,6 +121,17 @@ describe("githubProbeVerdict", () => {
       .toBe("checks-pending")
   })
 
+  test("живой payload прогона (mergeStateStatus UNSTABLE при чеке в полёте) → checks-pending", () => {
+    // живой gh pr view скретч-PR #238 на 14:51 UTC 12.11.2026 (прогон тестировщика):
+    // mss UNSTABLE — метка «checks in flight», не вердикт; ждём до терминального
+    expect(githubProbeVerdict({
+      state: "OPEN",
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "UNSTABLE",
+      statusCheckRollup: [{ status: "IN_PROGRESS", conclusion: null }],
+    })).toBe("checks-pending")
+  })
+
   test("зелёный rollup → clean; UNSTABLE (не-обязательные упавшие) → clean", () => {
     // живая форма CheckRun (gh pr view): status COMPLETED + conclusion SUCCESS
     const ok = [{ status: "COMPLETED", conclusion: "SUCCESS" }]
