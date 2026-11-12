@@ -6,10 +6,17 @@
 // в фабрике: merged-проба по PR-клетке (prProbeByCell) на живой доске
 // недостижим — row.pr всегда "" и путь всегда уходит в фоллбек по ветке.
 // Ред-пин на текущем проде: тест красный, пока адаптер не читает url.
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { tool, __test } from "../lib/platform"
 
 const AV_ID = "20260101000000-abcdef"
+// Мок подменяет globalThis.fetch — протечка в соседние файлы полного
+// прогона (bun test: один процесс, глобальный объект общий) валила живой
+// тест platform-pagination: afterEach возвращает оригинальный fetch.
+const originalFetch = globalThis.fetch
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
 const BLOCK_ID = "20261101000000-avblk1"
 const PR_URL = "https://github.com/yurvon-screamo/uwuwu-agent/pull/198"
 

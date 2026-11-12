@@ -20,17 +20,20 @@ impl SiYuanStore {
             Some(md) => md.clone(),
             None => sy_task::create_body_md(&input.title, &input.task_type.0, ""),
         };
-        let ty = input
-            .task_type
-            .is_set()
-            .then_some(input.task_type.0.as_str());
+        let props = sy_task::CreateProps {
+            ty: input
+                .task_type
+                .is_set()
+                .then_some(input.task_type.0.as_str()),
+            ..Default::default()
+        };
         let (row_id, _doc_id) = sy_task::create_row_with_body(
             &self.sy,
             &board,
             &input.title,
             &status,
             &body_md,
-            ty,
+            &props,
             &self.pacing,
         )
         .await
@@ -64,16 +67,15 @@ impl SiYuanStore {
     ) -> StoreResult<Task> {
         let board = self.board(board).await?;
         let row = self.row_of(&board, task).await?;
-        sy_task::edit(
-            &self.sy,
-            &board,
-            &row,
-            patch.status.as_deref(),
-            patch.branch.as_deref(),
-            patch.pr.as_deref(),
-            patch.task_type.as_ref().map(|t| t.0.as_str()),
-        )
-        .await?;
+        let updates = sy_task::CellUpdates {
+            status: patch.status.as_deref(),
+            branch: patch.branch.as_deref(),
+            pr: patch.pr.as_deref(),
+            ty: patch.task_type.as_ref().map(|t| t.0.as_str()),
+            priority: None,
+            autodone: None,
+        };
+        sy_task::edit(&self.sy, &board, &row, &updates).await?;
         if let Some(title) = &patch.title {
             sy_task::edit_title(&self.sy, &board, &row, title).await?;
         }
