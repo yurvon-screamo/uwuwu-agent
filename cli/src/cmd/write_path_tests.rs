@@ -14,10 +14,10 @@ use crate::cmd::mock_kernel::{set_env, MockKernel, MockRow, MockScenario};
 use crate::cmd::sy_dispatch::task_run;
 use crate::siyuan::SiYuan;
 use crate::siyuan_task::{
-    comment_with_ts, create_row_with_body, create_with_pacing, CommentDraft, RowInsertPacing,
-    SyBoard, SyTask,
+    comment_with_ts, create_row_with_body, create_with_pacing, CommentDraft, CreateProps,
+    RowInsertPacing, SyBoard, SyTask,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use wiremock::MockServer;
 
 const BOARD_HPATH: &str = "/uwuwu/Задачи uwuwu";
@@ -62,9 +62,13 @@ async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -161,6 +165,8 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
             TaskSub::Create {
                 title: NEW_TITLE.into(),
                 r#type: Some(ty.into()),
+                priority: None,
+                autodone: false,
                 stdin: false,
                 attach: Vec::<std::path::PathBuf>::new(),
                 schedule: None,
@@ -213,6 +219,8 @@ async fn create_without_type_defaults_to_feature_cell_and_skeleton() {
         TaskSub::Create {
             title: NEW_TITLE.into(),
             r#type: None,
+            priority: None,
+            autodone: false,
             stdin: false,
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
@@ -274,9 +282,13 @@ async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() 
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         content,
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -309,9 +321,13 @@ async fn create_without_content_writes_type_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -343,9 +359,13 @@ async fn create_with_title_h1_in_content_strips_only_title_h1() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         &content,
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -383,9 +403,13 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "   \n\n  ",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -419,6 +443,8 @@ async fn create_dry_run_is_read_only_with_mock_kernel() {
         TaskSub::Create {
             title: "dry-run осмотр".into(),
             r#type: None,
+            priority: None,
+            autodone: false,
             stdin: false,
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
@@ -552,7 +578,7 @@ async fn create_with_none_type_does_not_mint_type_column() {
         NEW_TITLE,
         "todo",
         "## Суть\nконтекст\n",
-        None,
+        &CreateProps::default(),
         &RowInsertPacing::instant(),
     )
     .await
@@ -623,6 +649,8 @@ async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> a
             pr: None,
             branch: None,
             r#type: ty.map(String::from),
+            priority: None,
+            autodone: None,
             schedule: None,
             agent: None,
             planned: None,
@@ -1348,6 +1376,8 @@ fn comment_task() -> SyTask {
         title: TASK_TITLE.into(),
         status: "Draft".into(),
         task_type: String::new(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
@@ -1528,4 +1558,173 @@ async fn comment_reply_line_is_indented_under_parent() {
         "reply-маркер с отступом"
     );
     assert!(inserted.fresh);
+}
+
+// ——— edit/create приоритета и autodone: write-путь новых колонок (ревью
+// Common-3: мутационный путь не был покрыт ни одним тестом) ———
+
+/// Сценарий edit-флоу для новых колонок: доска БЕЗ «Приоритет»/«Autodone» —
+/// ensure минтит их, запись идёт в свежесминченный keyID.
+fn edit_props_scenario() -> MockScenario {
+    let mut sc = MockScenario {
+        rows: vec![MockRow::new("item-p1", "таск с приоритетом")
+            .with_status("Review")
+            .with_doc(BOUND_DOC)],
+        ..MockScenario::default()
+    };
+    sc.block_attrs = vec![(BOUND_DOC, vec![])];
+    sc
+}
+
+async fn edit_props_via_cli(
+    server: &MockServer,
+    priority: Option<&str>,
+    autodone: Option<String>,
+) -> anyhow::Result<()> {
+    set_env(server);
+    task_run(
+        "uwuwu",
+        TaskSub::Edit {
+            id: "item-p1".into(),
+            status: None,
+            title: None,
+            pr: None,
+            branch: None,
+            r#type: None,
+            priority: priority.map(String::from),
+            autodone,
+            schedule: None,
+            agent: None,
+            planned: None,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_priority_mints_column_and_writes_canonical_select_cell() {
+    let (kernel, server) = MockKernel::start(edit_props_scenario()).await;
+
+    edit_props_via_cli(&server, Some(" HIGH "), None)
+        .await
+        .expect("edit --priority проходит");
+
+    // ensure: колонки «Приоритет» не было в фикстуре — минт select
+    let mints = kernel.add_cols();
+    assert!(
+        mints
+            .iter()
+            .any(|(_, name, ty)| name == "Приоритет" && ty == "select"),
+        "колонка «Приоритет» минтится: {mints:?}"
+    );
+    // запись: канон-форма, не эхо ввода (ensure минтнул ключ — item_update
+    // уходит в его keyID, поэтому фильтр не по литералу ключа)
+    let prio_writes = kernel.item_updates();
+    assert_eq!(
+        prio_writes.len(),
+        1,
+        "ровно одна запись приоритета: {:?}",
+        prio_writes
+    );
+    let (_, key, item, value) = &prio_writes[0];
+    assert_eq!(item, "item-p1");
+    assert_ne!(
+        key, "key-status",
+        "запись в свежесминченный ключ, не Status"
+    );
+    assert_eq!(
+        value,
+        &json!({ "mSelect": [{ "content": "high" }] }),
+        "в клетку уходит канон-форма, не эхо « HIGH »"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn edit_autodone_mints_column_and_writes_checkbox_cell() {
+    let (kernel, server) = MockKernel::start(edit_props_scenario()).await;
+
+    edit_props_via_cli(&server, None, Some("on".into()))
+        .await
+        .expect("edit --autodone on проходит");
+
+    let mints = kernel.add_cols();
+    assert!(
+        mints
+            .iter()
+            .any(|(_, name, ty)| name == "Autodone" && ty == "checkbox"),
+        "колонка «Autodone» минтится checkbox-типом: {mints:?}"
+    );
+    let writes = kernel.item_updates();
+    assert_eq!(writes.len(), 1, "ровно одна запись клетки: {writes:?}");
+    let (_, _, item, value) = &writes[0];
+    assert_eq!(item, "item-p1");
+    assert_eq!(
+        value,
+        &json!({ "checkbox": { "checked": true } }),
+        "checkbox-шейп ядра: checked true"
+    );
+
+    // off — тот же путь с checked:false
+    let (kernel2, server2) = MockKernel::start(edit_props_scenario()).await;
+    edit_props_via_cli(&server2, None, Some("off".into()))
+        .await
+        .expect("edit --autodone off проходит");
+    let writes2 = kernel2.item_updates();
+    assert_eq!(writes2.len(), 1, "ровно одна запись клетки: {writes2:?}");
+    assert_eq!(
+        writes2[0].3,
+        json!({ "checkbox": { "checked": false } }),
+        "off снимает галочку"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_writes_priority_and_autodone_cells() {
+    let (kernel, server) = MockKernel::start(create_scenario(&["item-row"], 1, false, false)).await;
+
+    create_with_pacing(
+        &sy_from_env(&server),
+        "uwuwu",
+        NEW_TITLE,
+        "",
+        "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: Some("high"),
+            autodone: true,
+        },
+        &RowInsertPacing::instant(),
+    )
+    .await
+    .expect("create с приоритетом и autodone");
+
+    let prio = kernel.item_updates().into_iter().find(|(_, _key, _, v)| {
+        v.pointer("/mSelect/0/content").and_then(|c| c.as_str()) == Some("high")
+    });
+    assert!(
+        prio.is_some(),
+        "клетка «Приоритет» записана: {:?}",
+        kernel.item_updates()
+    );
+    let checkbox = kernel
+        .item_updates()
+        .into_iter()
+        .find(|(_, _, _, v)| v.get("checkbox").is_some());
+    assert!(
+        checkbox.is_some(),
+        "клетка «Autodone» записана: {:?}",
+        kernel.item_updates()
+    );
+    assert_eq!(
+        checkbox.unwrap().3,
+        json!({ "checkbox": { "checked": true } })
+    );
+}
+
+fn sy_from_env(server: &MockServer) -> SiYuan {
+    set_env(server);
+    SiYuan::from_env().unwrap()
 }

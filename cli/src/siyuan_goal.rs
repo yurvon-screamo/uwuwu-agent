@@ -77,7 +77,7 @@ pub async fn create(
         title,
         &canonical_status(status)?,
         &goal_body_template(ctx),
-        None,
+        &syt::CreateProps::default(),
         // прод-пейсинг verify-ретрая; инъекция мгновенного — при переводе
         // goal-тестов с их Kernel-мока на общий MockKernel
         &syt::RowInsertPacing::production(),
