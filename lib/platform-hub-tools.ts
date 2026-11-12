@@ -3,6 +3,7 @@
 //! Status/Запланировано — Project v2 + frontmatter, Branch/PR/Сессия dev/
 //! Расписание — frontmatter.
 
+import type { GhIssue } from "./platform-hub"
 import {
   ghJson,
   hubRepo,
@@ -76,7 +77,7 @@ export async function hubTool<T = Record<string, unknown>>(
           cells: {
             "Название": cell(String(issue.title)),
             "Status": cell(fields.status ?? "Todo"),
-            "Тип": cell((issue as any).type?.name ? String((issue as any).type.name).toLowerCase() : (fields["type"] ?? "")),
+            "Тип": cell(githubTypeName(issue, fields.type)),
             "Branch": cell(fields.branch ?? ""),
             "PR": cell(fields.pr ?? ""),
             "Сессия dev": cell(fields["dev-session"] ?? ""),
@@ -104,7 +105,7 @@ export async function hubTool<T = Record<string, unknown>>(
         else if (name === "Сессия dev") fm["dev-session"] = value
         else if (name === "Запланировано") fm.planned = value
         else if (name === "Расписание") fm.schedule = value
-        else if (name === "Тип") fm["type"] = value
+        else if (name === "Тип") fm.type = value
         else if (name === "Autodone") fm.autodone = value === "✓" ? "true" : "false"
         else if (name === "Приоритет") fm.priority = value
       }
@@ -189,15 +190,20 @@ function allIssues(): Array<Record<string, unknown>> {
     "api", "-X", "GET", `repos/${hubRepo()}/issues`,
     "-F", "state=all", "-F", "per_page=100",
   ])
-  const arr = Array.isArray(data) ? data : []
-  return arr.filter((i: any) => !i.pull_request) as Array<Record<string, unknown>>
+  const arr = (Array.isArray(data) ? data : []) as GhIssue[]
+  return arr.filter((i) => !i.pull_request) as unknown as Array<Record<string, unknown>>
+}
+
+function githubTypeName(issue: unknown, fallback: string | undefined): string {
+  const name = (issue as GhIssue).type?.name
+  return name ? name.toLowerCase() : (fallback ?? "")
 }
 
 function projects(): string[] {
   const data = ghJson<unknown[]>([ "api", `repos/${hubRepo()}/labels`, "-F", "per_page=100" ])
-  const arr = Array.isArray(data) ? data : []
+  const arr = (Array.isArray(data) ? data : []) as Array<{ name?: string }>
   return arr
-    .map((l: any) => String(l.name))
+    .map((l) => String(l.name))
     .filter((n) => n.startsWith("proj:"))
     .map((n) => n.slice("proj:".length))
 }
@@ -223,7 +229,7 @@ function projectOf(number: string): string {
   const issue = issueByNumber(number)
   const labels = issue?.labels
   if (Array.isArray(labels)) {
-    for (const l of labels as any[]) {
+    for (const l of labels as Array<{ name?: string }>) {
       const name = typeof l === "object" && l !== null ? String(l.name) : String(l)
       if (name.startsWith("proj:")) return name.slice("proj:".length)
     }
