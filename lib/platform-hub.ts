@@ -14,7 +14,9 @@ export function hubConfigured(): boolean {
 }
 
 function gh(args: string[], stdinBody?: string): string {
-  const r = spawnSync("gh", args, {
+  const full = stdinBody !== undefined ? [...args, "--input", "-"] : args
+  // gh api без --input - игнорирует stdin (см. Rust gh_raw — тот же готч)
+  const r = spawnSync("gh", full, {
     input: stdinBody,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -37,11 +39,11 @@ export function hubRepo(): string {
 /// Issues репо по label (state=all — доска несёт и Done-строки, паритет
 /// SiYuan-доски) + frontmatter-разбор body.
 export function issuesForProject(project: string): Array<Record<string, unknown>> {
+  // query-string: gh -f/-F форма на GET давала искажённую выборку
+  // (живой e2e 13.11)
+  const label = encodeURIComponent(`proj:${project}`)
   const data = ghJson<unknown[]>([
-    "api", "-X", "GET",
-    `repos/${hubRepo()}/issues`,
-    "-F", "state=all", "-F", "per_page=100",
-    "-f", `labels=proj:${project}`,
+    "api", `repos/${hubRepo()}/issues?labels=${label}&state=all&per_page=100`,
   ])
   const arr = Array.isArray(data) ? data : []
   return arr.filter((i: any) => !i.pull_request) as Array<Record<string, unknown>>
