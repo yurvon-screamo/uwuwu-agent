@@ -189,6 +189,8 @@ def _load_session_message(con: sqlite3.Connection, sid: str) -> list[dict]:
             ]
         else:  # compaction, synthetic, ... — сохранить как есть
             parts = [p for p in (d.get("content") or []) if isinstance(p, dict)]
+            if role == "synthetic" and d.get("text"):
+                parts = [{"type": "text", "text": d["text"]}] + parts
         out.append({"time": created, "role": role, "meta": d, "parts": parts})
     return out
 
@@ -245,7 +247,7 @@ def _assistant_preview(parts: list[dict]) -> str:
 
 
 def _message_preview(role: str, parts: list[dict]) -> str:
-    if role == "user":
+    if role == "user" or role == "synthetic":
         return _first_text(parts)[:200]
     if role == "assistant":
         return _assistant_preview(parts)
