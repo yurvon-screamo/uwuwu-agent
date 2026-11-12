@@ -125,10 +125,24 @@ pub(crate) async fn task_header_md(
     board: &syt::SyBoard,
     task: &SyTask,
 ) -> Result<String> {
+    // один резолв на вызов: warning мёртвой привязки печатается ровно один раз
+    let body_doc = syt::task_body_doc(sy, board, task).await?;
+    task_header_md_with_doc(sy, board, task, body_doc.as_deref()).await
+}
+
+/// Формат шапки по уже резолвленному телу (Single-резолв контракт: get
+/// резолвит один раз и передаёт док в шапку и экспорт — двойной warning
+/// мёртвой привязки недопустим, ревью раунд 3).
+async fn task_header_md_with_doc(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    task: &SyTask,
+    body_doc: Option<&str>,
+) -> Result<String> {
     let mut schedule = None;
     let mut agent = None;
-    if let Some(doc) = syt::task_body_doc(sy, board, task).await? {
-        if let Ok(attrs) = sy.get_block_attrs(&doc).await {
+    if let Some(doc) = body_doc {
+        if let Ok(attrs) = sy.get_block_attrs(doc).await {
             schedule = attrs.get("custom-schedule").cloned();
             agent = attrs.get("custom-agent").cloned();
         }
@@ -370,14 +384,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Get { id, no_body } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            let header = task_header_md(&sy, &board, &task).await?;
+            // один резолв тела (task_body_doc громкий: fallback по заголовку,
+            // отказ при телах-дублях) — шапка и экспорт берут один и тот же док,
+            // warning мёртвой привязки печатается ровно один раз
+            let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
+            let header = task_header_md_with_doc(&sy, &board, &task, body_doc.as_deref()).await?;
             print!("{header}");
             if !no_body {
-                // резолв тела громкий и с fallback по заголовку (task_body_doc):
-                // detached/мёртвая привязка не прячет тело — старый контракт get
-                // (пустой блок «----- тело -----» у живого дока = ложный сигнал
-                // «тела нет» → replace уничтожил бы существующий док)
-                let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
                 let md = match body_doc {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
@@ -6238,5 +6251,56 @@ mod tests {
             .await
             .expect_err("чужой itemID не резолвится");
         assert!(err.to_string().contains("не видна в render"), "{err}");
+    }
+
+    /// Мёртвая привязка на get — один резолв тела: проба живости привязки
+    /// (MCP block get) зовётся ровно один раз на вызов (ревью раунд 3 Low:
+    /// шапка и экспорт резолвили по отдельности — warning деградации
+    /// печатался дважды). Тело при этом экспортируется fallback-доком
+    /// по заголовку — degraded-состояние не прячется.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_dead_binding_resolves_body_once() {
+        let scenario = MockScenario {
+            notebook: "nb-projects",
+            boards: vec![MockBoard {
+                doc_id: "db-doc",
+                av_id: "av-db",
+                keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+                legacy: false,
+            }],
+            hpath_ids: vec![
+                ("/uwuwu/Задачи uwuwu", vec!["db-doc"]),
+                (
+                    "/uwuwu/Задачи uwuwu/мёртвая привязка",
+                    vec!["20261112000000-fallbk"],
+                ),
+            ],
+            rows: vec![MockRow::new("20261112000001-deadw", "мёртвая привязка")
+                .with_status("Draft")
+                .with_doc("20261111000000-deadd1")],
+            // привязка мертва (block get отвечает «not found»)
+            block_get_alive: false,
+            exports: vec![("20261112000000-fallbk", "тело по заголовку".into())],
+            ..MockScenario::default()
+        };
+        let (kernel, server) = MockKernel::start(scenario).await;
+        set_env(&server);
+        task_run(
+            "uwuwu",
+            TaskSub::Get {
+                id: "20261112000001-deadw".into(),
+                no_body: false,
+            },
+        )
+        .await
+        .expect("мёртвая привязка — fallback по заголовку, не отказ");
+        // один резолв: проба живости привязки ровно одна на get
+        // (два вызова = возврат двойного резолва раунда 3)
+        assert_eq!(
+            kernel.block_get_calls("20261111000000-deadd1"),
+            1,
+            "проба живости мёртвой привязки зовётся один раз на get"
+        );
     }
 }
