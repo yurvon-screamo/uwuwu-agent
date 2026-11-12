@@ -354,8 +354,11 @@ async function tick(tool: PlatformTool): Promise<void> {
   await executeActions(actions, scan.observations)
   // кэш «последнего известного состава» — мерж, не замещение: записи
   // замороженных/недочитанных слагов переживают недостоверный тик (ревью Common-2)
-  state = { cache: mergeCache(state.cache, [...scan.observations.values()], frozen) }
-  save()
+  const nextCache = mergeCache(state.cache, [...scan.observations.values()], frozen)
+  if (JSON.stringify(state.cache) !== JSON.stringify(nextCache)) {
+    state = { cache: nextCache }
+    save()
+  }
 }
 
 const main = async (): Promise<void> => {

@@ -181,9 +181,10 @@ describe("decideActions", () => {
     expect(decideActions(cache, [obs("x", "20261113100100", S)], live([]), frozen)).toEqual([])
   })
 
-  test("интеграционный матч супервизора: живой ребёнок снесённого дока гасится (liveKnown ⊇ кэш)", () => {
-    // контейнер пропал: observations пусты, liveKnown знает живого из кэша —
-    // decideActions с liveKnown (а не только сканом) порождает stop
+  test("интеграционный матч супервизора: чистый снос дока гасит живого ребёнка (liveKnown ⊇ кэш)", () => {
+    // чистый снос: observations пусты, frozen пуст (containerMissing — другой
+    // сценарий, покрыт frozen-тестами выше: там непустой frozen stop гасит);
+    // liveKnown знает живого из кэша — decideActions порождает stop
     const cache = { x: cacheEntry(obs("x", "20261113100000", S)) }
     expect(decideActions(cache, [], live(["x"]), new Set())).toEqual([{ kind: "stop", slug: "x" }])
   })
@@ -192,7 +193,7 @@ describe("decideActions", () => {
 // ——— mergeCache (кэш мержится, не замещается) ———
 
 describe("mergeCache", () => {
-    const entry = (slug: string, updatedAt: string): RegistryCacheEntry => {
+  const entry = (slug: string, updatedAt: string): RegistryCacheEntry => {
     const o = obs(slug, updatedAt, specMd())
     return { docId: o.spec.docId, updatedAt, runtimeHash: runtimeHashOf(o.spec.token, o.spec.owner, o.spec.model, o.spec.workspace, o.spec.enabled) }
   }
