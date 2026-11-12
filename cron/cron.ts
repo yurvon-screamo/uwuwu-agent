@@ -461,13 +461,16 @@ export function runCardBody(masterTitle: string, schedule: string, instruction: 
   ].join("\n")
 }
 
-/** Ран-карточка запуска: task create (Draft) → edit Todo + planned. CLI
- *  зовётся процессом — боевой create с дедупом тайтла и verify вставки;
- *  дублировать write-путь в TS не делаем. Дата файра — колонка
- *  «Запланировано» (минутная точность, формат сравнения reconcile).
- *  rowId или null (создание не удалось — ретрай следующим тиком). */
+/** Ран-карточка запуска: task create --status Todo → edit (тип+planned).
+ *  Начальный статус Todo прямо в create — Draft-фазы рана нет, draftLoop
+ *  триажа (строгий матч Status === "Draft") раны не видит (жалоба 12.11:
+ *  Draft-раны доставлялись владельцу в ТГ). CLI зовётся процессом — боевой
+ *  create с дедупом тайтла и verify вставки; дублировать write-путь в TS
+ *  не делаем. Дата файра — колонка «Запланировано» (минутная точность,
+ *  формат сравнения reconcile). rowId или null (создание не удалось —
+ *  ретрай следующим тиком). */
 export async function createRunCard(project: string, runTitle: string, bodyMd: string, firedAt: Date): Promise<string | null> {
-  const create = Bun.spawn([CLI_BIN, "task", "create", "--project", project, "--title", runTitle, "--stdin"], {
+  const create = Bun.spawn([CLI_BIN, "task", "create", "--project", project, "--title", runTitle, "--status", "Todo", "--stdin"], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   })
   create.stdin.write(bodyMd)
@@ -487,9 +490,10 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
     log(`task create без строки в выводе: ${out.trim().slice(0, 200)}`)
     return null
   }
-  // ран — запись запуска, тип не несёт: клетка «Тип» от create-дефолта (dev)
-  // снимается в том же edit — без неё канбан-фильтры по типу не шумят ранами
-  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--status", "Todo", "--type", "", "--planned", formatLocal(firedAt)], {
+  // ран — запись запуска, тип не несёт: клетка «Тип» от create-дефолта
+  // (feature) снимается тем же edit — без неё канбан-фильтры по типу
+  // не шумят ранами
+  const edit = Bun.spawn([CLI_BIN, "task", "edit", rowId, "--project", project, "--type", "", "--planned", formatLocal(firedAt)], {
     stdout: "pipe", stderr: "pipe",
   })
   const [, editErr, editCode] = await Promise.all([
@@ -498,11 +502,11 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
     edit.exited,
   ])
   if (editCode !== 0) {
-    // не фатально: Draft-ран в окне дебаунса не поймается вотчером, а если
-    // поймается — триаж переведёт сам («уже не Draft → пропусти» не сработает,
-    // вердикт Todo); ран не теряется в обоих исходах. Пустая клетка даты
-    // видна на доске и правится руками — отдельного ретрая не строим.
-    log(`task edit Todo/planned не прошёл (code ${editCode}): ${editErr.trim().slice(0, 200)} — ран останется Draft до триажа`)
+    // не фатально: ран уже Todo (создан таким), draftLoop его не видит —
+    // доставки владельцу нет; потери: клетка «Тип» (feature) и дата файра
+    // в «Запланировано». Пустая клетка даты видна на доске и правится
+    // руками — отдельного ретрая не строим.
+    log(`task edit type/planned не прошёл (code ${editCode}): ${editErr.trim().slice(0, 200)} — ран Todo, клетка тип/planned не записана`)
   }
   return rowId
 }

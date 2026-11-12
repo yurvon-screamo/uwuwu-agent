@@ -167,13 +167,20 @@ fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
 }
 
 /// Шапка из факта create (ADR-067-окно: render лагает/сорвался): item/title/
-/// тип/статус Draft известны без перечитывания — stdout сохраняет «Строка: <id>»
-/// для потребителей stdout (крон-ран-карточки), warning требует контрольный get.
-fn draft_created_header(board: &syt::SyBoard, item: &str, title: &str, ty: &str) -> String {
+/// тип/начальный статус известны без перечитывания — stdout сохраняет
+/// «Строка: <id>» для потребителей stdout (крон-ран-карточки), warning
+/// требует контрольный get.
+fn created_header(
+    board: &syt::SyBoard,
+    item: &str,
+    title: &str,
+    ty: &str,
+    initial_status: &str,
+) -> String {
     let draft = SyTask {
         item_id: item.to_string(),
         title: title.to_string(),
-        status: "Draft".into(),
+        status: initial_status.to_string(),
         task_type: ty.to_string(),
         branch: String::new(),
         pr: String::new(),
@@ -219,6 +226,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         attach,
         schedule,
         agent,
+        status,
         dry_run: true,
     } = command
     {
@@ -243,6 +251,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             }
             syt::validate_agent_name(name)?;
             println!("агент: {name} (будет записан атрибутом custom-agent дока-тела)");
+        }
+        // --status валидируется и в осмотре: флаг не молчит (паритет --type)
+        let status_canonical = syt::validate_create_status(status.as_deref())?;
+        if status_canonical != "Draft" {
+            println!("статус: {status_canonical} (начальный статус строки)");
         }
         println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
@@ -363,6 +376,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             attach,
             schedule,
             agent,
+            status,
             ..
         } => {
             let attach_files = validate_attach_files(&attach)?;
@@ -377,6 +391,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 Some(raw) => syt::validate_task_type(raw)?,
                 None => syt::DEFAULT_TASK_TYPE.to_string(),
             };
+            // начальный статус до любых записей: флаг строго для машинного
+            // Todo (крон-раны), всё прочее — отказ
+            let initial_status = syt::validate_create_status(status.as_deref())?;
             if let Some(expr) = schedule.as_deref() {
                 if expr.is_empty() {
                     anyhow::bail!(
@@ -416,7 +433,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) = syt::create(&sy, project, &title, &ty_canonical, &ctx).await?;
+            let (item, body) =
+                syt::create(&sy, project, &title, &ty_canonical, &ctx, initial_status).await?;
             if let Some(expr) = schedule.as_deref() {
                 // сбой после create не теряет задачу: атрибут доставляется
                 // повторным task edit --schedule (создание уже свершилось)
@@ -480,7 +498,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     Err(err) => {
                         print!(
                             "{}",
-                            draft_created_header(&board, &item, &title, &ty_canonical)
+                            created_header(&board, &item, &title, &ty_canonical, initial_status)
                         );
                         warn_unreadable_state(&item, &err);
                     }
@@ -2727,7 +2745,7 @@ mod tests {
     use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
-    use super::draft_created_header;
+    use super::created_header;
     use super::format_goal_card;
     use super::format_task_header;
     use super::guarded_comment_text;
@@ -4752,11 +4770,13 @@ mod tests {
         Arc<Mutex<Vec<&'static str>>>,
         Arc<Mutex<Vec<String>>>,
         Arc<Mutex<Vec<(String, String)>>>,
+        Arc<Mutex<Vec<String>>>,
     ) {
         let server = MockServer::start().await;
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let attrs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let status_writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let item_added: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let initial_title = initial_row_title.map(String::from);
 
@@ -4865,6 +4885,7 @@ mod tests {
         let order_for_mcp = order.clone();
         let item_added_for_mcp = item_added.clone();
         let initial_for_mcp = initial_title.clone();
+        let status_writes_for_mcp = status_writes.clone();
         Mock::given(method("POST"))
             .and(path("/mcp"))
             .respond_with(move |req: &wiremock::Request| {
@@ -4884,6 +4905,12 @@ mod tests {
                         *item_added_for_mcp.lock().unwrap() = true;
                         order_for_mcp.lock().unwrap().push("item_add");
                         json!({ "action": "item_add", "data": { "itemID": ROW_ID } }).to_string()
+                    } else if body.contains("\"item_update\"") {
+                        status_writes_for_mcp
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&req.body).to_string());
+                        json!({ "action": "item_update", "data": null }).to_string()
                     } else if body.contains("\"keys\"") {
                         json!({ "action": "keys",
                                 "data": { "keys": [
@@ -4951,7 +4978,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        (server, order, appends, attrs)
+        (server, order, appends, attrs, status_writes)
     }
 
     async fn create_via_cli(
@@ -4970,6 +4997,7 @@ mod tests {
                 attach: attach.to_vec(),
                 schedule: None,
                 agent: None,
+                status: None,
                 dry_run: false,
             },
         )
@@ -4979,7 +5007,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_uploads_before_creating_and_appends_refs() {
-        let (server, order, appends, _attrs) = mock_siyuan_for_create(None).await;
+        let (server, order, appends, _attrs, _status) = mock_siyuan_for_create(None).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин 1.png");
         std::fs::write(&img, b"png").unwrap();
@@ -5030,7 +5058,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_agent_writes_custom_attr() {
-        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+        let (server, _order, _appends, attrs, _status) = mock_siyuan_for_create(None).await;
 
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -5043,6 +5071,7 @@ mod tests {
                 attach: Vec::new(),
                 schedule: None,
                 agent: Some("code-quality-reviewer".into()),
+                status: None,
                 dry_run: false,
             },
         )
@@ -5065,7 +5094,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_bad_agent_rejected_before_write() {
-        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+        let (server, _order, _appends, attrs, _status) = mock_siyuan_for_create(None).await;
 
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -5078,6 +5107,7 @@ mod tests {
                 attach: Vec::new(),
                 schedule: None,
                 agent: Some("Not A Slug".into()),
+                status: None,
                 dry_run: false,
             },
         )
@@ -5091,10 +5121,103 @@ mod tests {
         );
     }
 
+    /// create --status Todo (крон-ран-карточки): начальный статус строки
+    /// Todo записан в клетку доски, дефолт Draft не участвует.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_status_todo_writes_todo_to_cell() {
+        let (server, _order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: "⏰ ран · 2026-11-12 03:00".into(),
+                r#type: None,
+                stdin: false,
+                attach: Vec::new(),
+                schedule: None,
+                agent: None,
+                status: Some("Todo".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("create --status Todo ok");
+
+        let bodies = status_writes.lock().unwrap();
+        let todos: Vec<_> = bodies
+            .iter()
+            .filter(|body| {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/params/arguments/value/mSelect/0/content")
+                            .or_else(|| v.pointer("/value/mSelect/0/content"))
+                            .and_then(|c| c.as_str())
+                            .map(String::from)
+                    })
+                    .as_deref()
+                    == Some("Todo")
+            })
+            .collect();
+        assert_eq!(
+            todos.len(),
+            1,
+            "ровно одна запись начального статуса Todo: {:#?}",
+            bodies
+        );
+    }
+
+    /// create --status вне Todo (включая Draft и пустое) — отказ ДО мутаций:
+    /// флаг строго для машинного Todo (Draft — дефолт без флага, прочие
+    /// статусы — task edit).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_status_other_than_todo_rejected_before_write() {
+        let (server, order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        for raw in ["Draft", "In Progress", ""] {
+            let err = task_run(
+                "uwuwu",
+                TaskSub::Create {
+                    title: "статус вне контракта".into(),
+                    r#type: None,
+                    stdin: false,
+                    attach: Vec::new(),
+                    schedule: None,
+                    agent: None,
+                    status: Some(raw.into()),
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect_err(&format!("--status «{raw}» — отказ"));
+
+            assert!(
+                err.to_string().contains("допустим только Todo"),
+                "суть отказа для «{raw}»: {err}"
+            );
+        }
+        assert!(
+            status_writes.lock().unwrap().is_empty(),
+            "записей нет: валидация до мутаций"
+        );
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "ни upload, ни createDoc, ни item_add — отказ строго до записей: {:?}",
+            order.lock().unwrap()
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_bails_on_duplicate_title_before_any_upload() {
-        let (server, order, _appends, _attrs) = mock_siyuan_for_create(Some("новая задача")).await;
+        let (server, order, _appends, _attrs, _status) =
+            mock_siyuan_for_create(Some("новая задача")).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин.png");
         std::fs::write(&img, b"png").unwrap();
@@ -5976,12 +6099,18 @@ mod tests {
     /// Шапка из факта create (ADR-067-окно): stdout сохраняет «Строка: <id>»
     /// для потребителей (крон-ран-карточки) даже при срыве перечитывания.
     #[test]
-    fn draft_created_header_carries_row_id() {
+    fn created_header_carries_row_id() {
         let board = header_board();
-        let header = draft_created_header(&board, "20261111230000-lagrow", "лаг-ран", "feature");
+        let header = created_header(
+            &board,
+            "20261111230000-lagrow",
+            "лаг-ран",
+            "feature",
+            "Todo",
+        );
         for line in [
             "Задача:   лаг-ран",
-            "Статус:   Draft",
+            "Статус:   Todo",
             "Тип:      feature",
             "Строка:   20261111230000-lagrow",
             "Доска:    /uwuwu/Задачи uwuwu",

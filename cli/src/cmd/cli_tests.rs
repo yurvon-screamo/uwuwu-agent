@@ -155,6 +155,40 @@ fn type_flag_parses_on_create_edit_and_list() {
 }
 
 #[test]
+fn status_flag_parses_on_create() {
+    let command = parse_command(&[
+        "task",
+        "--project",
+        "uwuwu",
+        "create",
+        "--title",
+        "т",
+        "--status",
+        "Todo",
+    ])
+    .unwrap();
+    let Commands::Task {
+        command: TaskSub::Create { status, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task create");
+    };
+    assert_eq!(status.as_deref(), Some("Todo"));
+
+    // без флага — Draft-дефолт (машинный путь не активирован)
+    let command = parse_command(&["task", "--project", "uwuwu", "create", "--title", "т"]).unwrap();
+    let Commands::Task {
+        command: TaskSub::Create { status, .. },
+        ..
+    } = command
+    else {
+        panic!("expected task create");
+    };
+    assert_eq!(status, None);
+}
+
+#[test]
 fn clean_ids_value_parses_with_hyphen_leading_fragments() {
     let Commands::Task {
         command: TaskSub::Clean { ids, .. },
