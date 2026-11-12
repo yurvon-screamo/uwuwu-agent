@@ -23,7 +23,7 @@ import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  decideActions, defTargetDirectory, liveSessionDirectory, parseBotDoc, parseModel, runtimeHashOf,
+  decideActions, defTargetDirectory, hashDjb2, liveSessionDirectory, parseBotDoc, parseModel, runtimeHashOf,
   type BotObservation, type BotSpec, type RegistryCacheEntry,
 } from "./bots-lib"
 
@@ -93,10 +93,8 @@ interface OrganizeNode {
 
 /** Контейнер реестра: док «Боты» — ребёнок папки проекта uwuwu (доки-контейнеры
  *  SiYuan, паритет триажа с досками «Задачи …»; organize-папкой не является).
- *  null — контейнера ещё нет (реестр пуст). */
-async function botsContainerId(tool: PlatformTool): Promise<string | null> {
-  const r = await tool<{ nodes?: OrganizeNode[] }>("list_organize_nodes", {})
-  const nodes = r.nodes ?? []
+ *  Один list_organize_nodes на тик — ноды подаются снаружи. */
+async function botsContainerId(tool: PlatformTool, nodes: OrganizeNode[]): Promise<string | null> {
   const projects = nodes.find((n) => n.type === "folder" && n.data === "Projects" && n.parentId === null)
   if (projects === undefined) return null
   const uwuwu = nodes.find((n) => n.type === "folder" && n.data === "uwuwu" && n.parentId === projects.id)
@@ -111,18 +109,28 @@ async function botsContainerId(tool: PlatformTool): Promise<string | null> {
 
 const normalizeAgentName = (slug: string): string => {
   const base = slug.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "")
-  if (base !== "") return base
-  let h = 5381
-  for (let i = 0; i < slug.length; i++) h = ((h << 5) + h + slug.charCodeAt(i)) | 0
-  return `bot-${(h >>> 0).toString(36)}`
+  return base !== "" ? base : `bot-${hashDjb2(slug)}`
 }
 
-async function scanRegistry(tool: PlatformTool): Promise<Map<string, BotObservation>> {
-  const containerId = await botsContainerId(tool)
-  if (containerId === null) return new Map()
+/** Результат скана: наблюдения по докам + признаки недостоверности скана
+ *  (контракт заморозки — см. tick). */
+interface ScanResult {
+  observations: Map<string, BotObservation>
+  /** контейнер «Боты» не найден при живом ядре: переименование/перенос
+   *  владельцем или лаг организ-индекса — НЕ доказательство сноса ботов */
+  containerMissing: boolean
+  /** docId, чтение/парсинг которых упало (док из кэша → слаг замораживается) */
+  failedDocIds: Set<string>
+}
+
+async function scanRegistry(tool: PlatformTool): Promise<ScanResult> {
   const r = await tool<{ nodes?: OrganizeNode[] }>("list_organize_nodes", {})
-  const docs = (r.nodes ?? []).filter((n) => n.type === "doc" && n.parentId === containerId && typeof n.id === "string")
-  const out = new Map<string, BotObservation>()
+  const nodes = r.nodes ?? []
+  const containerId = await botsContainerId(tool, nodes)
+  if (containerId === null) return { observations: new Map(), containerMissing: true, failedDocIds: new Set() }
+  const docs = nodes.filter((n) => n.type === "doc" && n.parentId === containerId && typeof n.id === "string")
+  const observations = new Map<string, BotObservation>()
+  const failedDocIds = new Set<string>()
   for (const doc of docs) {
     try {
       const info = await tool<{ title?: string; updatedAt?: string }>("get_doc", { docId: doc.id })
@@ -141,23 +149,26 @@ async function scanRegistry(tool: PlatformTool): Promise<Map<string, BotObservat
         ...(parsed.workspace !== undefined && parsed.workspace !== "" ? { workspace: parsed.workspace } : {}),
       }
       // коллизия слагов (два дока «Бот: x») — громко: слаг — ключ жизненного цикла
-      if (out.has(spec.slug)) throw new Error(`дубликат слага «${spec.slug}» в реестре`)
-      out.set(spec.slug, { spec, updatedAt: info.updatedAt ?? "" })
+      if (observations.has(spec.slug)) throw new Error(`дубликат слага «${spec.slug}» в реестре`)
+      observations.set(spec.slug, { spec, updatedAt: info.updatedAt ?? "" })
     } catch (e) {
       log(`реестр: док ${doc.id}: ${e} — скип`)
+      failedDocIds.add(doc.id as string)
     }
   }
-  return out
+  return { observations, containerMissing: false, failedDocIds }
 }
 
 // ——— per-бот каталог: материал ребёнка ———
 
 const botDirOf = (slug: string): string => join(BOTS_DIR, slug)
 
-function writeAtomic(path: string, content: string): void {
+/** Атомарная запись; mode — для секретов (hub.json: 0600 — токен не читаем
+ *  others на multi-user хосте). */
+function writeAtomic(path: string, content: string, mode?: number): void {
   mkdirSync(dirname(path), { recursive: true })
   const tmp = `${path}.tmp`
-  writeFileSync(tmp, content)
+  writeFileSync(tmp, content, mode !== undefined ? { mode } : undefined)
   renameSync(tmp, path)
 }
 
@@ -166,7 +177,6 @@ interface ChildMeta {
   agentName: string
   sessionTitle: string
   workspace?: string
-  model?: { providerID: string; id: string; variant?: string }
 }
 
 function materializeBotDir(obs: BotObservation): string {
@@ -174,25 +184,25 @@ function materializeBotDir(obs: BotObservation): string {
   writeAtomic(join(dir, "hub.json"), JSON.stringify({
     token: obs.spec.token,
     owner: obs.spec.owner,
-    ...(obs.spec.model !== undefined ? { model: obs.spec.model } : {}),
-  }, null, 2))
+    model: obs.spec.model,
+  }, null, 2), 0o600)
   writeAtomic(join(dir, "agent.md"), obs.spec.def)
   const meta: ChildMeta = {
     slug: obs.spec.slug,
     agentName: normalizeAgentName(obs.spec.slug),
     sessionTitle: `Бот: ${obs.spec.slug}`,
     ...(obs.spec.workspace !== undefined ? { workspace: obs.spec.workspace } : {}),
-    ...(obs.spec.model !== undefined ? { model: obs.spec.model } : {}),
   }
   writeAtomic(join(dir, "bot-meta.json"), JSON.stringify(meta, null, 2))
   return dir
 }
 
-/** Seed-контракт: деф резолвится сервером из directory сессии — при
- *  переехавшей вечной сессии материализуем agent.md в её directory (расхождение
- *  с workspace спеки — warning). Возвращает directory, куда ребёнок положит
- *  деф сам (syncAgentDef — workspace), или null, если сессии нет. */
-async function seedDefIntoSessionDirectory(obs: BotObservation): Promise<string | null> {
+/** Синх дефа в directory живой сессии: деф резолвится сервером из location
+ *  сессии — при переехавшей вечной сессии материализуем agent.md и там
+ *  (расхождение с workspace спеки — warning). Вызывается на spawn/restart
+ *  И на def-update — иначе горячая правка молча перестаёт доезжать
+ *  seeded-сессии (ревью Common-2). null — сессии нет. */
+async function syncDefIntoSessionDirectory(obs: BotObservation): Promise<string | null> {
   const statePath = join(RUN_ROOT, ".local/state", `uwuwu-bots-${obs.spec.slug}`, "state.json")
   let session: string | undefined
   try {
@@ -207,7 +217,7 @@ async function seedDefIntoSessionDirectory(obs: BotObservation): Promise<string 
   if (directory === "") return null
   const dst = join(directory, ".opencode/agents", `${normalizeAgentName(obs.spec.slug)}.md`)
   writeAtomic(dst, obs.spec.def)
-  log(`бот ${obs.spec.slug}: деф seeded-сессии материализован в ${dst}`)
+  log(`бот ${obs.spec.slug}: деф сессии материализован в ${dst}`)
   return directory
 }
 
@@ -260,32 +270,47 @@ const save = (): void => {
 
 // ——— исполнение действий тика ———
 
+async function spawnBot(action: { slug: string }, scanned: Map<string, BotObservation>): Promise<void> {
+  const obs = scanned.get(action.slug)
+  if (obs === undefined) return
+  materializeBotDir(obs)
+  await syncDefIntoSessionDirectory(obs)
+  spawnChild(action.slug)
+}
+
+async function restartBot(action: { slug: string; reason: string }, scanned: Map<string, BotObservation>): Promise<void> {
+  log(`бот ${action.slug}: ${action.reason} — рестарт ребёнка`)
+  const pid = childPid(action.slug)
+  if (pid !== null) await stopChild(action.slug, pid)
+  const obs = scanned.get(action.slug)
+  if (obs === undefined) return
+  materializeBotDir(obs)
+  await syncDefIntoSessionDirectory(obs)
+  spawnChild(action.slug)
+}
+
+async function stopBot(action: { slug: string }): Promise<void> {
+  log(`бот ${action.slug}: док снесён или enabled: off — гашу ребёнка (вечная сессия в opencode.db остаётся)`)
+  const pid = childPid(action.slug)
+  if (pid !== null) await stopChild(action.slug, pid)
+}
+
+async function updateDef(action: { slug: string }, scanned: Map<string, BotObservation>): Promise<void> {
+  const obs = scanned.get(action.slug)
+  if (obs === undefined) return
+  writeAtomic(join(botDirOf(action.slug), "agent.md"), obs.spec.def)
+  // seeded-сессия резолвит деф из своего directory (≠ workspace): без этого
+  // синха горячая правка молча перестаёт доезжать (ревью Common-2)
+  await syncDefIntoSessionDirectory(obs)
+  log(`бот ${action.slug}: методичка обновлена — ребёнок подхватит на следующем ходе`)
+}
+
 async function executeActions(actions: ReturnType<typeof decideActions>, scanned: Map<string, BotObservation>): Promise<void> {
   for (const action of actions) {
-    const obs = scanned.get(action.slug)
-    if (action.kind !== "stop" && obs === undefined) continue
-    const pid = childPid(action.slug)
-    if (action.kind === "spawn") {
-      if (obs === undefined) continue
-      materializeBotDir(obs)
-      await seedDefIntoSessionDirectory(obs)
-      spawnChild(action.slug)
-    } else if (action.kind === "restart") {
-      log(`бот ${action.slug}: ${action.reason} — рестарт ребёнка`)
-      if (pid !== null) await stopChild(action.slug, pid)
-      if (obs !== undefined) materializeBotDir(obs)
-      if (obs !== undefined) await seedDefIntoSessionDirectory(obs)
-      spawnChild(action.slug)
-    } else if (action.kind === "stop") {
-      log(`бот ${action.slug}: док снесён или enabled: off — гашу ребёнка (вечная сессия в opencode.db остаётся)`)
-      if (pid !== null) await stopChild(action.slug, pid)
-    } else if (action.kind === "def-update") {
-      if (obs !== undefined) {
-        const dir = botDirOf(action.slug)
-        writeAtomic(join(dir, "agent.md"), obs.spec.def)
-        log(`бот ${action.slug}: методичка обновлена в per-бот каталоге — ребёнок подхватит на следующем ходе`)
-      }
-    }
+    if (action.kind === "spawn") await spawnBot(action, scanned)
+    else if (action.kind === "restart") await restartBot(action, scanned)
+    else if (action.kind === "stop") await stopBot(action)
+    else await updateDef(action, scanned)
   }
 }
 
@@ -294,23 +319,42 @@ async function executeActions(actions: ReturnType<typeof decideActions>, scanned
 const drain = makeDrain()
 
 async function tick(tool: PlatformTool): Promise<void> {
-  let scanned: Map<string, BotObservation>
+  let scan: ScanResult
   try {
-    scanned = await scanRegistry(tool)
+    scan = await scanRegistry(tool)
   } catch (e) {
     // заморозка состава: ядро лежит — детей не поднимать и не гасить по
     // stale-данным; диф продолжится при ожила ядра
     log(`тик: скан реестра не удался (${e}) — заморозка состава до следующего тика`)
     return
   }
+  const cacheSlugs = Object.keys(state.cache)
+  const liveKnown = new Set([...cacheSlugs, ...scan.observations.keys()].filter((s) => childPid(s) !== null))
+  // контракт заморозки (ревью Common-1): недостоверный скан при живом ядре —
+  // НЕ доказательство «док снесён»; заморозить затронутых, не гасить живых
+  const frozen = new Set<string>()
+  if (scan.containerMissing) {
+    if (cacheSlugs.length > 0 || liveKnown.size > 0) {
+      log(`тик: контейнер «Боты» не найден при живом ядре и известных ботах (${cacheSlugs.join(", ") || "—"}) — заморозка состава (лаг индекса/перенос владельцем?)`)
+      for (const slug of new Set([...cacheSlugs, ...liveKnown])) frozen.add(slug)
+    }
+  } else {
+    for (const docId of scan.failedDocIds) {
+      const slug = cacheSlugs.find((s) => state.cache[s].docId === docId)
+      if (slug !== undefined) {
+        frozen.add(slug)
+        log(`тик: бот ${slug}: док ${docId} не читается — заморозка на последнем известном составе`)
+      }
+    }
+  }
   const live = new Set<string>()
-  for (const slug of scanned.keys()) {
+  for (const slug of scan.observations.keys()) {
     if (childPid(slug) !== null) live.add(slug)
   }
-  const actions = decideActions(state.cache, [...scanned.values()], live)
-  await executeActions(actions, scanned)
+  const actions = decideActions(state.cache, [...scan.observations.values()], live, frozen)
+  await executeActions(actions, scan.observations)
   const nextCache: Record<string, RegistryCacheEntry> = {}
-  for (const [slug, obs] of scanned) {
+  for (const [slug, obs] of scan.observations) {
     nextCache[slug] = {
       docId: obs.spec.docId,
       updatedAt: obs.updatedAt,

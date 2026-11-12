@@ -157,14 +157,18 @@ export type BotAction =
   | { kind: "stop"; slug: string }
   | { kind: "def-update"; slug: string }
 
-/** Хэш рантайм-существенного состава спеки (djb2): сравнение между тиками;
- *  криптографии нет и не нужно. */
-export function runtimeHashOf(token: string, owner: string, model: { providerID: string; id: string; variant?: string } | undefined, workspace: string | undefined, enabled: boolean): string {
-  const modelStr = model === undefined ? "" : `${model.providerID}/${model.id}#${model.variant ?? ""}`
-  const raw = `${token}|${owner}|${modelStr}|${workspace ?? ""}|${enabled ? "1" : "0"}`
+/** djb2-хэш строки: дешёвая сверка состава между тиками; криптографии нет
+ *  и не нужно. Общий хелпер (runtimeHashOf, normalizeAgentName). */
+export function hashDjb2(raw: string): string {
   let h = 5381
   for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) | 0
   return (h >>> 0).toString(36)
+}
+
+/** Хэш рантайм-существенного состава спеки. */
+export function runtimeHashOf(token: string, owner: string, model: { providerID: string; id: string; variant?: string } | undefined, workspace: string | undefined, enabled: boolean): string {
+  const modelStr = model === undefined ? "" : `${model.providerID}/${model.id}#${model.variant ?? ""}`
+  return hashDjb2(`${token}|${owner}|${modelStr}|${workspace ?? ""}|${enabled ? "1" : "0"}`)
 }
 
 /** Диф тика: свежий скан реестра против кэша + живые дети. Живость ребёнка —
@@ -172,16 +176,23 @@ export function runtimeHashOf(token: string, owner: string, model: { providerID:
  *  поднимает, максимум раз в тик); снесённый док / enabled: off у живого —
  *  stop; смена рантайм-существенного — restart; смена тела (updatedAt) без
  *  рантайма — def-update (ребёнок перечитает agent.md на следующем ходе —
- *  горячая правка методички). */
+ *  горячая правка методички).
+ *
+ *  frozen — слагы, состав которых НЕ трогать (контракт заморозки):
+ *  структурное отсутствие контейнера реестра / ошибка чтения дока при живом
+ *  ядре — не доказательство «док снесён» (лаг индекса, перенос владельцем,
+ *  опечатка в спеке); замороженный slug не получает ни spawn, ни stop. */
 export function decideActions(
   cache: Record<string, RegistryCacheEntry>,
   scanned: BotObservation[],
   liveChildren: Set<string>,
+  frozen: Set<string> = new Set(),
 ): BotAction[] {
   const actions: BotAction[] = []
   const scannedSlugs = new Set<string>()
   for (const obs of scanned) {
     scannedSlugs.add(obs.spec.slug)
+    if (frozen.has(obs.spec.slug)) continue
     const prev = cache[obs.spec.slug]
     const hash = runtimeHashOf(obs.spec.token, obs.spec.owner, obs.spec.model, obs.spec.workspace, obs.spec.enabled)
     const alive = liveChildren.has(obs.spec.slug)
@@ -200,7 +211,7 @@ export function decideActions(
     if (prev.updatedAt !== obs.updatedAt) actions.push({ kind: "def-update", slug: obs.spec.slug })
   }
   for (const slug of liveChildren) {
-    if (!scannedSlugs.has(slug)) actions.push({ kind: "stop", slug })
+    if (!scannedSlugs.has(slug) && !frozen.has(slug)) actions.push({ kind: "stop", slug })
   }
   return actions
 }

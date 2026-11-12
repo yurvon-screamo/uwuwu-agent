@@ -170,6 +170,16 @@ describe("decideActions", () => {
     const off = obs("x", "20261113100300", specMd({ bot: "bot:\n  token: t\n  owner: o\n  model: zai-coding-plan/glm-5.3-flash\n  enabled: false", def: "# Другая методичка" }))
     expect(decideActions({ x: cacheEntry(prev) }, [off], live(["x"]))).toEqual([{ kind: "stop", slug: "x" }])
   })
+
+  test("frozen-слаг не трогается: ни spawn, ни stop — контракт заморозки", () => {
+    const prev = obs("x", "20261113100000", S)
+    const cache = { x: cacheEntry(prev), y: cacheEntry(obs("y", "20261113100000", S)) }
+    const frozen = new Set(["x"])
+    // живой x без скана (контейнер пропал) — без stop; живой y без скана — stop
+    expect(decideActions(cache, [], live(["x", "y"]), frozen)).toEqual([{ kind: "stop", slug: "y" }])
+    // x не жив и в frozen — без spawn (мёртвый ребёнок замороженного бота ждёт оживления скана)
+    expect(decideActions(cache, [obs("x", "20261113100100", S)], live([]), frozen)).toEqual([])
+  })
 })
 
 // ——— seed-контракт directory ———
