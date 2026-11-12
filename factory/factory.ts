@@ -197,17 +197,15 @@ const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
 const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
 /** CUP (задача 20261112160316): кап одновременно активных (LLM-тратящих)
  *  задач глобально по всем проектам — GLM-подписка одна. Мусор env → 7. */
-const CUP = Number(process.env.UWUWU_FACTORY_CUP ?? 7) > 0
-  ? Number(process.env.UWUWU_FACTORY_CUP)
-  : 7
+const CUP_RAW = Number(process.env.UWUWU_FACTORY_CUP ?? 7)
+const CUP = CUP_RAW > 0 ? CUP_RAW : 7
 /** Пик-окно GLM Coding Plan (см. peakWindowFromEnv): дефолт 06:00–10:00 UTC
  *  = 15:00–19:00 JST, "off" отключает заморозку. */
 const PEAK: PeakWindow = peakWindowFromEnv(process.env.UWUWU_FACTORY_PEAK)
 /** Таймаут ожидания зелёного CI автодона (pending-проба) — дальше Needs
  *  attention (не bounce: висящий CI не вина задачи). */
-const AUTODONE_TIMEOUT_MS = Number(process.env.UWUWU_FACTORY_AUTODONE_TIMEOUT_MIN ?? 60) > 0
-  ? Number(process.env.UWUWU_FACTORY_AUTODONE_TIMEOUT_MIN) * 60_000
-  : 60 * 60_000
+const AUTODONE_TIMEOUT_RAW = Number(process.env.UWUWU_FACTORY_AUTODONE_TIMEOUT_MIN ?? 60)
+const AUTODONE_TIMEOUT_MS = AUTODONE_TIMEOUT_RAW > 0 ? AUTODONE_TIMEOUT_RAW * 60_000 : 60 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 /** ревьювер результата («Ревью результата»): праймари-агент, качество важнее цены
  *  будильника. «Ревью плана» ведёт PLAN_REVIEWER ниже. Модель дублирует
