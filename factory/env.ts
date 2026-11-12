@@ -1,9 +1,10 @@
-// env.ts — окружение задачи: <root>/<rowId>/{repo,scratch,logs}.
-// Жизненный цикл ведёт фабрика: ensureEnv на спавне (идемпотентен —
-// переживает потерю state.json), cleanupEnv на Done, sweepEnvs на старте
-// демона. git-операции через инъекцию run(): прод — фабричный sh() с
-// таймаутом, тесты — реальный Bun.spawn на temp-репо.
-import { existsSync, mkdirSync, readdirSync, rmSync, renameSync, statSync } from "node:fs"
+// env.ts — окружение задачи: <root>/<rowId>/{repo,scratch,logs} + лиз
+// Xvfb-дисплея <root>/<rowId>/display. Жизненный цикл ведёт фабрика:
+// ensureEnv на спавне (идемпотентен — переживает потерю state.json),
+// cleanupEnv на Done, sweepEnvs на старте демона. git-операции через
+// инъекцию run(): прод — фабричный sh() с таймаутом, тесты — реальный
+// Bun.spawn на temp-репо.
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 export interface EnvDeps {
@@ -18,6 +19,14 @@ export interface EnvPaths {
   scratchDir: string
   logsDir: string
   branch: string
+  /** лиз-файл Xvfb-дисплея задачи (см. resolveDisplay) */
+  displayFile: string
+}
+
+/** ensureEnv-результат: пути + номер дисплея (null — файла нет и
+ *  аллокация не удалась: диапазон насыщен; задача живёт без дисплея). */
+export interface ResolvedEnv extends EnvPaths {
+  display: number | null
 }
 
 /** row-id → безопасный фрагмент имени каталога/ветки. Полный id (не префикс):
@@ -37,7 +46,91 @@ export function envPaths(root: string, rowId: string): EnvPaths {
     scratchDir: join(envDir, "scratch"),
     logsDir: join(envDir, "logs"),
     branch: `work/task-${safe}`,
+    displayFile: displayFilePath(envDir),
   }
+}
+
+// ——— Xvfb-дисплей задачи ———
+
+/** Фабричный диапазон дисплеев: обход человеческих :0–:10 и легаси-привычки :99.
+ *  Активных задач единицы (CUP=7), насыщение практически недостижимо. */
+const DISPLAY_RANGE = { start: 100, end: 399 } as const
+
+/** Прод-путь X-сокетов (живой X-сервер держит X<n>); параметр аллокатора —
+ *  тесты гоняют temp-FS, не настоящий /tmp. */
+const X11_SOCKETS_DIR = "/tmp/.X11-unix"
+
+/** Лиз-файл дисплея живёт в корне env — снос env на Done освобождает лиз сам. */
+export function displayFilePath(envDir: string): string {
+  return join(envDir, "display")
+}
+
+/** Голый номер без двоеточия, одна строка — контракт парсера (и промпт-билдера,
+ *  и любой ручной cat). Мусор/отсутствие — null (вызывающий решает сам). */
+export function readDisplayNumber(file: string): number | null {
+  try {
+    const raw = readFileSync(file, "utf-8").trim()
+    return /^\d+$/.test(raw) ? Number(raw) : null
+  } catch {
+    return null
+  }
+}
+
+interface DisplayAllocArgs {
+  envRoot: string
+  selfRowId: string
+  x11Dir: string
+  range: { readonly start: number; readonly end: number }
+}
+
+/** Наименьший свободный номер диапазона; занято = display-файлы соседних env
+ *  ∪ X-сокеты (человеческие/чужие дисплеи не трогаем). Насыщение → null. */
+export function allocateDisplayNumber(args: DisplayAllocArgs): number | null {
+  const occupied = new Set<number>()
+  try {
+    for (const entry of readdirSync(args.envRoot)) {
+      if (entry === args.selfRowId || entry === ATTIC_DIR) continue
+      const n = readDisplayNumber(join(args.envRoot, entry, "display"))
+      if (n !== null) occupied.add(n)
+    }
+  } catch {
+    // root нет/нечитаем — занятость только по сокетам
+  }
+  try {
+    for (const entry of readdirSync(args.x11Dir)) {
+      const m = /^X(\d+)$/.exec(entry)
+      if (m) occupied.add(Number(m[1]))
+    }
+  } catch {
+    // x11Dir нет — вне env-файлов не занято
+  }
+  for (let n = args.range.start; n <= args.range.end; n++) {
+    if (!occupied.has(n)) return n
+  }
+  return null
+}
+
+/** Дисплей задачи: файл есть → reuse номера как есть (лиз задачи стабильный,
+ *  тестировщик наследует номер дев-сессии; занятость валидирует сам X-сервер
+ *  при старте — «Server is already active» видит агент и чистит осиротевший
+ *  процесс, это семья orphan-процессов). Файла нет → аллокация. Синхронный
+ *  участок read→write и вызов ДО первого await ensureEnv: конкурентные
+ *  ensureEnv спавн-волны (runBatch по 4 полосам) сериализуются однопоточным
+ *  event loop — TOCTOU невозможен. */
+function resolveDisplay(deps: EnvDeps, root: string, rowId: string): number | null {
+  const safe = sanitizeRowId(rowId)
+  const file = displayFilePath(join(root, safe))
+  const existing = readDisplayNumber(file)
+  if (existing !== null) return existing
+  if (existsSync(file)) deps.log(`env ${safe}: display-файл с мусором — пере-аллокация`)
+  const allocated = allocateDisplayNumber({ envRoot: root, selfRowId: safe, x11Dir: X11_SOCKETS_DIR, range: DISPLAY_RANGE })
+  if (allocated === null) {
+    deps.log(`env ${safe}: диапазон дисплеев :${DISPLAY_RANGE.start}–:${DISPLAY_RANGE.end} насыщен — задача живёт без Xvfb-дисплея`)
+    return null
+  }
+  mkdirSync(join(root, safe), { recursive: true })
+  writeFileSync(file, String(allocated))
+  return allocated
 }
 
 const ATTIC_DIR = ".attic"
@@ -56,12 +149,14 @@ export interface EnsureEnvArgs {
 
 /** Идемпотентное создание окружения: живой зарегистрированный ворктри →
  *  reuse; ветка уже есть (ретрай после частичного фейла) → attach к ней;
- *  fetch base — best-effort (упал → локальные рефы, спавн не роняем). */
-export async function ensureEnv(deps: EnvDeps, args: EnsureEnvArgs): Promise<EnvPaths> {
+ *  fetch base — best-effort (упал → локальные рефы, спавн не роняем).
+ *  Дисплей резолвится синхронно до первого await (см. resolveDisplay). */
+export async function ensureEnv(deps: EnvDeps, args: EnsureEnvArgs): Promise<ResolvedEnv> {
   const paths = envPaths(args.root, args.rowId)
+  const display = resolveDisplay(deps, args.root, args.rowId)
   if (existsSync(paths.repoDir)) {
     const registered = await worktreeListContains(deps, args.local, paths.repoDir)
-    if (registered) return paths
+    if (registered) return { ...paths, display }
     // каталог без регистрации в .git — обломок прерванного прогона (линка
     // .git нет либо регистрация срезана prune): содержимое недостижимо —
     // пересоздаём с громким логом
@@ -83,7 +178,7 @@ export async function ensureEnv(deps: EnvDeps, args: EnsureEnvArgs): Promise<Env
   mkdirSync(paths.envDir, { recursive: true })
   mkdirSync(paths.scratchDir, { recursive: true })
   mkdirSync(paths.logsDir, { recursive: true })
-  return paths
+  return { ...paths, display }
 }
 
 export type CleanupOutcome = "removed" | "atticked" | "failed"
