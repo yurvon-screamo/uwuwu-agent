@@ -288,22 +288,29 @@ describe("spawnPrompt", () => {
   test("без env-контекста (env:false-проект) — прежняя строка про worktree+Branch-ячейку", () => {
     const p = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent")
     expect(p).toContain("создай worktree+ветку от origin/master")
+    expect(p).toContain("ветка work/task-r1")
     expect(p).toContain("заполни Branch-ячейку")
+    expect(p).not.toContain("по сути")
   })
   test("env:false с envRoot — канон-путь ворктри назван (тот же, что резолвит tester/ревьювер)", () => {
     const p = spawnPrompt("r1", "true-washing", "true-washing", "implement", { envRoot: "/home/x/agents-env" })
     expect(p).toContain("ворктри /home/x/agents-env/r1/repo")
     expect(p).toContain("скретч /home/x/agents-env/r1/scratch")
+    expect(p).toContain("ветка work/task-r1")
     expect(p).toContain("заполни Branch-ячейку")
+    expect(p).not.toContain("по сути")
   })
   test("формула пути одна: промпт sanitize row-id так же, как резолв tester/ревьювера", () => {
     // патологический id из тест-кейса sanitizeRowId: ведущий дефис срезается —
     // сырой rowId в промпте отправил бы агента создавать ворктри по пути,
-    // который resolvePromptWorktree никогда не пробует (ревью PR #192, Low)
+    // который resolvePromptWorktree никогда не пробует (ревью PR #192, Low);
+    // ветка — та же формула: env.ts строит work/task-<safe>, промпт называет её же
     const id = "-5BF9NMBXZ"
     const p = spawnPrompt(id, "true-washing", "true-washing", "implement", { envRoot: "/env" })
     expect(p).toContain("ворктри /env/5BF9NMBXZ/repo")
     expect(p).not.toContain("/env/-5BF9NMBXZ/repo")
+    expect(p).toContain("ветка work/task-5BF9NMBXZ")
+    expect(p).not.toContain("work/task--5BF9NMBXZ")
   })
   test("base из контекста: env:false-строка и env:true-строка говорят базу проекта, не дефолт", () => {
     const p = spawnPrompt("r1", "1xgames", "1xgames/game-service", "implement", { base: "origin/main" })
