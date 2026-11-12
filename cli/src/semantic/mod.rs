@@ -20,18 +20,21 @@ use std::time::{Duration, Instant};
 
 use store::Store;
 
-/// Wall-clock бюджет семантической половины одного поиска (reconcile-проба +
-/// дельта + эмбедд запроса + KNN). Холодный старт модели ~5.5 s вмещается;
-/// превышение — деградация со статусом.
+/// Wall-clock бюджет семантической половины одного поиска (дельта +
+/// эмбедд запроса + KNN; reconcile на поиске не ходит — см. delta_in_leftover).
+/// Холодный старт модели ~5.5 s вмещается; превышение — деградация со статусом.
 pub(crate) const SEARCH_BUDGET: Duration = Duration::from_secs(10);
 /// Таймаут батча на поисковом пути; `semantic rebuild` строит клиент шире.
 pub(crate) const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REBUILD_EMBED_TIMEOUT: Duration = Duration::from_secs(120);
-/// Бюджет ручной дотяжки `semantic sync`: очередь в тысячи строк ≈ минуты
-/// тёплых батчей (1879 строк ≈ 60 батчей ≈ 2–5 мин) с запасом; команда
-/// явная — долгий wall-clock приемлем. Хвост над watermark догоняется
-/// повтором команды.
+/// Дефолт бюджета ручной дотяжки `semantic sync`: очередь в тысячи строк ≈
+/// минуты тёплых батчей (1879 строк ≈ 60 батчей ≈ 2–5 мин) с запасом;
+/// команда явная — долгий wall-clock приемлем. Хвост над watermark догоняется
+/// повтором команды. Override для разового бэкфилла — UWUWU_SYNC_BUDGET_SECS.
 pub(crate) const SYNC_BUDGET: Duration = Duration::from_secs(600);
+/// Порог «давний reconcile» в `semantic status`: самопочинка индекса живёт
+/// в явном `semantic sync`, возраст прогона виден здесь.
+const RECONCILE_STALE_SECS: i64 = 24 * 3600;
 pub(crate) const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:11434";
 pub(crate) const DEFAULT_EMBED_MODEL: &str = "qwen3-embedding:0.6b";
 const REBUILD_HINT: &str = "uwuwu-cli semantic rebuild";
@@ -136,9 +139,10 @@ pub(crate) async fn search_half_at(
         Err(status) => return section(&header, status),
     };
 
-    // Синк — в остатке бюджета: смерть бюджета или отказ синка не подменяют
-    // результаты, а становятся примечанием последней строкой секции.
-    let sync_note = sync_in_leftover(sy, &ollama, &mut store, deadline).await;
+    // Дельта — в остатке бюджета: смерть бюджета или отказ дельты не
+    // подменяют результаты, а становятся примечанием последней строкой
+    // секции. Reconcile на поиске не ходит (delta_in_leftover).
+    let sync_note = delta_in_leftover(sy, &ollama, &mut store, deadline).await;
 
     let hits = match store.knn(&query_vec, req.limit, req.threshold) {
         Ok(hits) => hits,
@@ -197,11 +201,15 @@ async fn query_embedding(
     }
 }
 
-/// Синк в остатке бюджета поиска: дельта первой (горячий путь), reconcile
-/// следом (суточный guard внутри). None — дотянуться успели; Some —
-/// примечание последней строкой секции: результаты уже посчитаны, отказ
-/// синхронизации их не подменяет (query-first, задача 20261106182055).
-async fn sync_in_leftover(
+/// Дельта в остатке бюджета поиска: единственная синхронизация поискового
+/// пути. Reconcile (полный id-скан корпуса + repair-эмбедды) в 10-секундный
+/// остаток структурно не помещается — попытки на поиске давали хронный
+/// «reconcile не прошёл» и ~550 SQL-запросов скана на каждый поиск
+/// (задача 20261112203959); он живёт в `semantic sync` (SYNC_BUDGET,
+/// REBUILD_EMBED_TIMEOUT). None — дотянуться успели; Some — примечание
+/// последней строкой секции: результаты уже посчитаны, отказ синхронизации
+/// их не подменяет (query-first, задача 20261106182055).
+async fn delta_in_leftover(
     sy: &SiYuan,
     ollama: &OllamaClient,
     store: &mut Store,
@@ -233,9 +241,6 @@ async fn sync_in_leftover(
     };
     if report.budget_exhausted {
         return Some(budget_note.to_string());
-    }
-    if let Err(e) = sync::reconcile(sy, ollama, store, Some(deadline)).await {
-        return Some(format!("reconcile не прошёл: {e:#}"));
     }
     None
 }
@@ -334,7 +339,15 @@ async fn rebuild_index(
         on_batch,
     };
     let report = sync::delta_sync(sy, &ollama, store, &opts).await?;
-    store.set_meta("built_at", &chrono::Utc::now().timestamp().to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    store.set_meta("built_at", &now.to_string())?;
+    if !resume {
+        // Полный rebuild = завершённая сверка с корпусом (проход от нуля
+        // встроил всю полосу): штампуем last_reconcile_at, чтобы status не
+        // показывал ложное «reconcile давний» сразу после пересборки.
+        // --resume идёт от watermark — сверкой не является, не штампуем.
+        store.set_meta("last_reconcile_at", &now.to_string())?;
+    }
     Ok(RebuildReport {
         embedded: report.embedded,
         skipped_short: report.skipped_short,
@@ -343,10 +356,10 @@ async fn rebuild_index(
 }
 
 /// Ручная дотяжка индекса вне бюджета поиска (`semantic sync`): дельта,
-/// затем reconcile — с advisory-локом (параллельный rebuild или синк
-/// громко отказывает: сотни секунд записей без лока могли бы портить
-/// чужой свежий rebuild — watermark перескочил бы незакрытые строки).
-/// Строки отчёта — в stdout вызывающего.
+/// затем reconcile (полный id-скан + repair) — с advisory-локом
+/// (параллельный rebuild или синк громко отказывает: сотни секунд записей
+/// без лока могли бы портить чужой свежий rebuild — watermark перескочил бы
+/// незакрытые строки). Строки отчёта — в stdout вызывающего.
 pub async fn sync_once(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
     if !cfg.db_path.exists() {
         anyhow::bail!("индекс пуст — {REBUILD_HINT}");
@@ -366,7 +379,7 @@ async fn sync_once_locked(
     store: &mut Store,
 ) -> Result<Vec<String>> {
     let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
-    let deadline = Instant::now() + SYNC_BUDGET;
+    let deadline = Instant::now() + sync_budget();
     let delta = sync::delta_sync(
         sy,
         &ollama,
@@ -382,26 +395,48 @@ async fn sync_once_locked(
         },
     )
     .await?;
-    let reconcile = sync::reconcile(sy, &ollama, store, Some(deadline)).await?;
+    let reconcile = sync::reconcile(
+        sy,
+        &ollama,
+        store,
+        sync::RepairBudget {
+            deadline: Some(deadline),
+            embed_timeout: REBUILD_EMBED_TIMEOUT,
+        },
+    )
+    .await?;
     let backlog = backlog_size(sy, store).await?;
 
     let mut lines = vec![format!(
         "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
         delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
     )];
-    if reconcile.skipped {
-        lines.push("reconcile: скипнут (суточный интервал не истёк)".to_string());
-    } else {
-        lines.push(format!(
+    lines.push(if reconcile.completed {
+        format!(
             "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
             reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-        ));
-    }
+        )
+    } else {
+        format!(
+            "reconcile не дошёл (бюджет): восстановлено {}, вычищено {}, путей освежено {} — дыры ретраятся следующим sync",
+            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+        )
+    });
     if delta.budget_exhausted {
         lines.push("бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string());
     }
     lines.push(format!("очередь дельты: {backlog} строк"));
     Ok(lines)
+}
+
+/// Бюджет `semantic sync`: дефолт SYNC_BUDGET, override — UWUWU_SYNC_BUDGET_SECS
+/// (разовый бэкфилл дрейфа на десятки минут; мусор/ноль в env — дефолт).
+fn sync_budget() -> Duration {
+    std::env::var("UWUWU_SYNC_BUDGET_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(SYNC_BUDGET, Duration::from_secs)
 }
 
 /// Строки `uwuwu-cli semantic status`: состояние индекса и очереди дельты.
@@ -422,18 +457,39 @@ pub async fn status(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
     let reconciled = human_ts(store.meta("last_reconcile_at")?);
     let backlog = backlog_size(sy, &store).await?;
     let oversize = oversize_count(sy).await?;
-    Ok(vec![
+    let mut lines = vec![
         format!("чанков: {count}"),
         format!("модель: {model} ({dim}-dim)"),
         format!("watermark: {watermark}"),
         format!("built: {built_at}, reconcile: {reconciled}"),
+    ];
+    if let Some(hint) = reconcile_stale_hint(store.meta("last_reconcile_at")?) {
+        lines.push(hint);
+    }
+    lines.extend([
         format!("очередь дельты: {backlog} строк"),
         format!(
             "блоков >{} симв. в корпусе: {oversize} (не индексируются)",
             sync::MAX_CONTENT_CHARS
         ),
         format!("путь: {}", cfg.db_path.display()),
-    ])
+    ]);
+    Ok(lines)
+}
+
+/// Подсказка о давнем reconcile: самопочинка индекса живёт в явном
+/// `semantic sync`, возраст последнего завершённого прогона виден здесь.
+/// Отсутствие меты (reconcile ещё не был) — тоже давний.
+fn reconcile_stale_hint(raw: Option<String>) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    let fresh = raw
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|last| now - last <= RECONCILE_STALE_SECS);
+    if fresh {
+        None
+    } else {
+        Some("reconcile давний — прогони uwuwu-cli semantic sync".to_string())
+    }
 }
 
 fn human_ts(raw: Option<String>) -> String {
