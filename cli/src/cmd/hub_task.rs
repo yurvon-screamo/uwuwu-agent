@@ -6,8 +6,25 @@
 
 use crate::cmd::cli::TaskSub;
 use crate::store::task_store::{CreateTask, EditTask};
-use crate::store::{task_store_from_env, TaskBoard, TaskType};
+use crate::store::{task_store, TaskBoard, TaskType};
 use anyhow::{bail, Result};
+
+/// Гвард «путь-флаг получил не-путь» (ADR-094, процессный контракт).
+/// Значение похоже на путь (есть '/') — но файла нет: честная OS-причина
+/// (ENOENT caused by) под подсказкой флага. Не-путь (inline-текст) —
+/// отказ с усечённым началом значения и stdin-подсказкой. До записей и сети.
+fn path_flag(flag: &str, value: &str, stdin_hint: &str) -> Result<()> {
+    let looks_like_path = value.contains('/') || value.starts_with('.');
+    if !looks_like_path {
+        let head: String = value.chars().take(40).collect();
+        bail!("{flag} ждёт путь к файлу (получен не-путь: «{head}»); для текста из stdin — {stdin_hint}")
+    }
+    std::fs::read_to_string(value).map(|_| ()).map_err(|e| {
+        anyhow::anyhow!("{flag}: {e}").context(format!(
+            "{flag} ждёт путь к файлу; для текста из stdin — {stdin_hint}"
+        ))
+    })
+}
 
 fn make_board(project: &str) -> TaskBoard {
     TaskBoard {
@@ -23,7 +40,7 @@ fn not_migrated(cmd: &str) -> Result<()> {
 }
 
 pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
-    let store = task_store_from_env()?;
+    let store = task_store(std::env::var("UWUWU_HUB_REPO").unwrap_or_default());
     let board = make_board(project);
     match command {
         TaskSub::List {
@@ -92,12 +109,11 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             dry_run,
             ..
         } => {
+            for path in &attach {
+                path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
+            }
             if dry_run {
-                let body = crate::siyuan_task::create_body_md(
-                    &title,
-                    ty.as_deref().unwrap_or("feature"),
-                    "",
-                );
+                let body = create_body_md(&title, ty.as_deref().unwrap_or("feature"), "");
                 println!("{body}");
                 return Ok(());
             }
@@ -241,6 +257,15 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             attach,
             replace_section,
         } => {
+            if let Some(path) = &md {
+                path_flag("--md", path, "--stdin")?;
+            }
+            if let Some(base_path) = &base {
+                path_flag("--base", base_path, "--force")?;
+            }
+            for path in &attach {
+                path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
+            }
             let task = store
                 .resolve(&board, &id)
                 .await
@@ -284,4 +309,10 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             not_migrated("rm/clean/undo/cron-семья")
         }
     }
+}
+
+/// Шаблон тела задачи по типу (бывш. siyuan_task::create_body_md —
+/// утилита домен-нейтральна, мигрировала с store-вырезкой).
+pub fn create_body_md(title: &str, ty: &str, _ctx: &str) -> String {
+    format!("# {title}\n\n\n<!-- task-type: {ty} -->\n")
 }

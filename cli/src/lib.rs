@@ -1,62 +1,17 @@
-//! uwuwu-cli: доступ агентам к платформе uwuwu (SiYuan-бекенд).
-//!
-//! История: до 04.11.2026 платформа была закрыта (модули-предшественник удалён),
-//!мигрировано на SiYuan — старый бекенд удалён (спайк 8INRfGpceo,
-//! PR #30/#31 в yurvon-screamo/uwuwu-agent).
+//! uwuwu-cli: доступ агентам к платформе uwuwu. Бекенд — uwuwu-hub
+//! (приватный GitHub-репо: issues = задачи, docs/ = вики), срез замены
+//! бекенда 20261112155302-ttyp35g: SiYuan-слой вырезан полностью
+//! (история: AFFiNE → SiYuan → hub).
 
 pub mod cmd;
-pub mod html_embed;
-pub mod markdown;
-pub mod md_artifacts;
-pub mod md_heading;
 pub mod path;
-pub mod schedule;
 pub mod semantic;
-pub mod siyuan;
-pub mod siyuan_goal;
-pub mod siyuan_id;
-pub mod siyuan_doctor;
-pub mod siyuan_guard;
-pub mod siyuan_person;
-pub mod sofa;
-pub mod siyuan_task;
 pub mod store;
-
-#[cfg(test)]
-mod semantic_tests;
-
-#[cfg(test)]
-mod siyuan_task_tests;
-
-use std::path::PathBuf;
-
-pub fn wiki_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("UWUWU_WIKI_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(dir) = std::env::var("UWUWU_WIKI") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("USERPROFILE or HOME environment variable must be set");
-    PathBuf::from(home).join(".uwuwu")
-}
-
-pub fn uwuwu_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("UWUWU_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("USERPROFILE or HOME environment variable must be set");
-    PathBuf::from(home).join(".local/share/uwuwu")
-}
 
 /// Публичный URL платформы (ссылки в выдаче).
 pub fn ui_url() -> String {
-    std::env::var("UWUWU_SIYUAN_PUBLIC_URL")
-        .unwrap_or_else(|_| "https://siyuan-relay-production.up.railway.app".into())
+    std::env::var("UWUWU_HUB_PUBLIC_URL")
+        .unwrap_or_else(|_| "https://github.com/yurvon-screamo/uwuwu-hub".into())
 }
 
 pub(crate) fn init_tracing() {

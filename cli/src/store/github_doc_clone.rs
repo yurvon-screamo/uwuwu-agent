@@ -1,6 +1,7 @@
 //! Клон-менеджмент GitHub DocStore: ленивый clone/fetch, ff-only write
 //! (commit+push, retry после rebase — контракт записи вики).
 
+use super::doc_store::DocStore;
 use super::git_util::{git_raw, git_sync_with_author};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
@@ -110,4 +111,41 @@ pub(super) fn dirs_data_home() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
         })
         .join("uwuwu-cli")
+}
+
+impl super::github_doc_store::GitHubDocStore {
+    /// Дописать в конец дока (person append): read-modify-write ff-push.
+    pub(crate) async fn append_doc(&self, slug: &str, addition: &str) -> Result<()> {
+        let current = self
+            .read(&super::doc_store::DocRef {
+                slug: slug.to_string(),
+            })
+            .await
+            .unwrap_or_default();
+        let mut next = current;
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(addition);
+        next.push('\n');
+        self.write_doc(slug_if_doc(slug), next).await
+    }
+
+    /// Перезаписать док целиком (person replace).
+    pub(crate) async fn replace_doc(&self, slug: &str, body: &str) -> Result<()> {
+        self.write_doc(slug_if_doc(slug), body.to_string()).await
+    }
+
+    async fn write_doc(&self, slug: String, content: String) -> Result<()> {
+        let file = self.clone_path().join("docs").join(format!("{slug}.md"));
+        self.write_files(
+            &[(file, content.into_bytes())],
+            &format!("wiki: {slug} (person)"),
+        )
+        .await
+    }
+}
+
+fn slug_if_doc(slug: &str) -> String {
+    slug.to_string()
 }

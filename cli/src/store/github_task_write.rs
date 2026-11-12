@@ -29,7 +29,10 @@ impl GitHubStore {
         let status = input.status.clone().unwrap_or_else(|| "Draft".into());
         let body_md = match &input.body_md {
             Some(md) => md.clone(),
-            None => crate::siyuan_task::create_body_md(&input.title, &input.task_type.0, ""),
+            None => format!(
+                "# {}\n\n\n<!-- task-type: {} -->\n",
+                input.title, input.task_type.0
+            ),
         };
         let body = Frontmatter::parse(&body_md).with_field("status", &status);
         let mut payload = Map::new();

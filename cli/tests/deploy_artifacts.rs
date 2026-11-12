@@ -1,4 +1,6 @@
-//! Пин канон-артефакта ретеншена журнала (deploy/siyuan-demo).
+//! Пин канон-артефакта ретеншена журнала (deploy/journald-retention.conf):
+//! journald user-лимит общий для контуров ноутбука — SiYuan-контекст ушёл
+//! с заменой бекенда, артефакт оставлен как действующий на хосте.
 //!
 //! Задача 20261109083919-v5mlahe: лимит journald поднят с пакетных 50M до 1G
 //! дроп-ином в /etc; канон-артефакт в репо — контракт «хост-состояние
@@ -52,7 +54,7 @@ fn retention_artifact_path() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli/ always has a parent (repo root)")
-        .join("deploy/siyuan-demo/journald-retention.conf")
+        .join("deploy/journald-retention.conf")
         .leak()
 }
 
@@ -116,111 +118,5 @@ fn commented_directives_and_other_sections_are_not_active() {
     assert_eq!(
         directives,
         vec![("SystemMaxUse".to_string(), "1G".to_string())]
-    );
-}
-
-// --- Пин канона JST ядра SiYuan (задача 20261110042724-aivnb3b) ---
-//
-// Ядро форматирует date-клетки досок и frontmatter-даты в своей зоне; базовый
-// образ b3log/siyuan несёт TZ=Asia/Shanghai из Dockerfile — без явного
-// переопределения клетка «Запланировано» кронов уезжала на час против
-// JST-тайтлов ран-карточек. Канон задаётся окружением юнита (Environment=TZ),
-// не кодом — артефакт в репо контракт «хост-состояние воспроизводимо с репо».
-
-const SIYUAN_TZ_CANON: &str = "Asia/Tokyo";
-
-/// Активные (не закомментированные) значения `Environment=` секции
-/// `[Container]` quadlet-юнита. Quadlet допускает несколько Environment-строк.
-fn container_env_values(unit: &str) -> Vec<String> {
-    let mut in_container = false;
-    let mut values = Vec::new();
-    for line in unit.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            in_container = line == "[Container]";
-            continue;
-        }
-        if in_container {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "Environment" {
-                    values.push(value.trim().to_string());
-                }
-            }
-        }
-    }
-    values
-}
-
-fn siyuan_container_unit_path() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli/ always has a parent (repo root)")
-        .join("deploy/siyuan-demo/siyuan-demo.container")
-        .leak()
-}
-
-#[test]
-fn siyuan_demo_container_carries_active_tz_tokyo() {
-    // Arrange
-    let path = siyuan_container_unit_path();
-    let unit = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("quadlet-юнит siyuan-demo должен существовать: {path:?}: {e}"));
-
-    // Act
-    let env_values = container_env_values(&unit);
-    let tz = env_values.iter().find_map(|v| {
-        v.split_whitespace()
-            .find_map(|pair| pair.strip_prefix("TZ=").map(str::to_string))
-    });
-
-    // Assert
-    assert!(
-        !env_values.is_empty() || unit.contains("Environment"),
-        "в секции [Container] не осталось активных Environment-директив"
-    );
-    assert_eq!(
-        tz.as_deref(),
-        Some(SIYUAN_TZ_CANON),
-        "активной директивы Environment=…TZ={SIYUAN_TZ_CANON} нет в quadlet siyuan-demo — ядро унаследует Asia/Shanghai из образа и клетки «Запланировано» снова уедут на час против JST-тайтлов"
-    );
-}
-
-#[test]
-fn siyuan_demo_readme_documents_tz_canon() {
-    // Arrange
-    let readme_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli/ always has a parent (repo root)")
-        .join("deploy/siyuan-demo/README.md");
-    let readme = std::fs::read_to_string(&readme_path).unwrap_or_else(|e| {
-        panic!("deploy/siyuan-demo/README.md должен существовать: {readme_path:?}: {e}")
-    });
-
-    // Act + Assert
-    // README — путь воспроизводимости установки: секция канона обязана нести
-    // и причину (образ несёт Shanghai), и живую проверку зоны ядра.
-    assert!(
-        readme.contains("Часовой пояс"),
-        "в deploy/siyuan-demo/README.md пропала секция про часовой пояс — канон JST не воспроизводим с репо"
-    );
-    assert!(
-        readme.contains(SIYUAN_TZ_CANON),
-        "deploy/siyuan-demo/README.md не называет канонную зону ({SIYUAN_TZ_CANON})"
-    );
-    assert!(
-        readme.contains("docker exec siyuan-demo date"),
-        "в deploy/siyuan-demo/README.md пропала живая проверка зоны ядра (docker exec siyuan-demo date)"
-    );
-}
-
-#[test]
-fn container_env_parser_skips_comments_and_other_sections() {
-    let unit = "# Environment=TZ=Asia/Tokyo\n[Unit]\nEnvironment=LEAK=yes\n[Container]\nImage=x\n# Environment=TZ=Europe/Moscow\nEnvironment=TZ=Asia/Tokyo\nEnvironment=FOO=bar\n";
-    assert_eq!(
-        container_env_values(unit),
-        vec!["TZ=Asia/Tokyo".to_string(), "FOO=bar".to_string()]
     );
 }

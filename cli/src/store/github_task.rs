@@ -117,6 +117,11 @@ impl GitHubStore {
     }
 }
 
+/// Публичный доступ к frontmatter-полям тела (cron list и пр.).
+pub(crate) fn parse_frontmatter_public(body: &str) -> std::collections::HashMap<String, String> {
+    Frontmatter::parse(body).fields_public()
+}
+
 /// «Запланировано» → epoch ms ("" → 0). Frontmatter несёт ISO-дату.
 fn planned_ms(planned: Option<&str>) -> i64 {
     let Some(s) = planned else { return 0 };
@@ -160,6 +165,10 @@ impl Frontmatter {
             raw_fields,
             rest_md,
         }
+    }
+
+    pub(crate) fn fields_public(&self) -> std::collections::HashMap<String, String> {
+        self.raw_fields.iter().cloned().collect()
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<String> {

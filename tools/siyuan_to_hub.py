@@ -64,6 +64,27 @@ def gh_json(args, stdin=None):
     return json.loads(gh(args, stdin) or "{}")
 
 
+GH_RETRY_DELAYS = [2, 5, 15, 30]
+
+
+def gh_json_retry(args, stdin=None):
+    """POST-мутации: secondary rate limit и transient GraphQL сбои —
+    ретраи с бэкоффом (2/5/15/30s)."""
+    for i, delay in enumerate([0] + GH_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return gh_json(args, stdin)
+        except RuntimeError as e:
+            text = str(e)
+            transient = ("secondary rate limit" in text.lower()
+                         or "something went wrong" in text.lower()
+                         or "temporarily blocked" in text.lower())
+            if i == len(GH_RETRY_DELAYS) or not transient:
+                raise
+            print(f"  ! gh transient (попытка {i+1}): {text[:120]} — retry через {delay}s")
+
+
 def sql(stmt):
     return siyuan_api("/api/query/sql", {"stmt": stmt}) or []
 
@@ -215,8 +236,8 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     ty = task_type if task_type in TASK_TYPES else None
     if ty:
         payload["type"] = {"bug": "bug", "feature": "feature"}.get(ty, ty)
-    number = gh_json(["api", "-X", "POST", f"repos/{repo}/issues"],
-                     json.dumps(payload))["number"]
+    number = gh_json_retry(["api", "-X", "POST", f"repos/{repo}/issues"],
+                           json.dumps(payload))["number"]
     # frontmatter-ячейки поверх тела (Branch/PR/Сессия dev/Запланировано/
     # Расписание + status-дубль для CLI-чтения)
     fm = {"status": status}
@@ -231,6 +252,7 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
            json.dumps({"body": body}))
     if status and status != "Draft":
         set_project_status(project, number, status)
+        time.sleep(1.5)
     if status == "Done":
         gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{number}"],
            json.dumps({"state": "closed", "state_reason": "completed"}))
