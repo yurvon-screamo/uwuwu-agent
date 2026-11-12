@@ -5,12 +5,17 @@
 //! проекция доменных строк доски (SyTask) и issue uwuwu-hub в одну форму.
 
 pub mod doc_store;
+pub mod github_doc_blob;
+pub mod github_doc_clone;
+pub mod github_doc_search;
+pub mod github_doc_store;
 pub mod github_gh;
 pub mod github_project;
 pub mod github_project_resolve;
 pub mod github_task;
 pub mod github_task_read;
 pub mod github_task_write;
+pub mod git_util;
 pub mod siyuan_task_store;
 pub mod siyuan_task_store_write;
 pub mod task_store;

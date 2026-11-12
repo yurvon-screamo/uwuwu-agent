@@ -162,3 +162,30 @@ mod frontmatter_tests {
         assert!(out.ends_with("просто тело"));
     }
 }
+
+/// Полнотекст-парсер GitHub DocStore: строки «path:line:text» → хиты.
+#[test]
+fn fulltext_parser_extracts_slug_and_snippet() {
+    let stdout = "docs/uwuwu/README.md:12:SiYuan бекенд нестабилен\ndocs/x.md:3:ещё\n";
+    let hits = crate::store::github_doc_search::parse_line_pairs(stdout);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].title, "README");
+    assert!(hits[0].snippet.contains("нестабилен"));
+}
+
+/// Заголовочный поиск: AND-токены по путям, case-insensitive.
+#[test]
+fn by_title_matches_and_tokens_case_insensitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs/Задачи uwuwu");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("Замена бекенда.md"), "x").unwrap();
+    std::fs::write(docs.join("Другое.md"), "x").unwrap();
+    let hits = crate::store::github_doc_search::by_title_sync(
+        tmp.path().to_str().unwrap(),
+        "замена бекенда",
+        10,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "Задачи uwuwu/Замена бекенда");
+}
