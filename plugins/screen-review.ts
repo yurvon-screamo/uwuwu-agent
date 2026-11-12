@@ -91,7 +91,9 @@ export default Plugin.define({
               questions: i.questions,
               threshold: i.threshold,
             }
-            const r = await runScreenReview(req)
+            const r = await runScreenReview(req, {
+              onProgress: (status) => context.progress({ status }),
+            })
             await context.progress({ status: "screen_review: отчёт готов" })
             return { content: r }
           } catch (e) {

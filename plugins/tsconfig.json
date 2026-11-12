@@ -26,6 +26,7 @@
     "screen-review.ts",
     "../lib/screen-review.ts",
     "../lib/screen-review-core.ts",
+    "../lib/screen-review-render.ts",
     "../lib/screen-review.test.ts"
   ]
 }

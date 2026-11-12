@@ -5,7 +5,7 @@
 // один вызов на скрин, вердикты атрибутированы к скрину), сборка отчёта.
 // Регистрация — plugins/screen-review.ts. Сеть и ФС подменяются deps —
 // юнит-тесты без живой модели.
-import { basename } from "node:path"
+import { basename, isAbsolute } from "node:path"
 import {
   buildRequest,
   DEFAULT_CHECKLIST,
@@ -13,13 +13,12 @@ import {
   DEFAULT_THRESHOLD,
   parseAnswers,
   problemProbability,
-  renderReport,
-  renderVerdictSection,
   resolveQuestions,
   type Checklist,
   type ScreenVerdict,
   type SystemOneRequest,
 } from "./screen-review-core"
+import { renderReport, renderVerdictSection } from "./screen-review-render"
 
 export const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 export const DEFAULT_MODEL = "d1-omni"
@@ -49,6 +48,8 @@ export interface ScreenReviewDeps {
   postJson?: (url: string, body: SystemOneRequest) => Promise<{ status: number; body: string }>
   /** подмена чтения файла в тестах (дефолт — fs/promises readFile → base64) */
   readImageBase64?: (path: string) => Promise<string>
+  /** прогресс для агента (плагин кладёт context.progress) — после каждого скрина */
+  onProgress?: (status: string) => Promise<void>
   config?: ScreenReviewConfig
 }
 
@@ -71,20 +72,31 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
   if (!Array.isArray(input.images) || input.images.length < 1) {
     throw new Error("screen_review: images — непустой массив путей к скринам (абсолютные пути на машине сервера)")
   }
+  const notAbsolute = input.images.filter((p) => !isAbsolute(p))
+  if (notAbsolute.length > 0) {
+    throw new Error(
+      `screen_review: пути к скринам должны быть абсолютными (cwd тулa — сервер opencode, не сессия агента): ${notAbsolute.join(", ")}`,
+    )
+  }
   const questions = resolveQuestions(input)
   const checklistName = input.questions ? "<inline>" : (input.checklist ?? DEFAULT_CHECKLIST)
   const config = deps.config ?? resolveConfig()
-  const postJson = deps.postJson ?? defaultPostJson
-  const readImageBase64 = deps.readImageBase64 ?? defaultReadImageBase64
   const state = input.state ?? DEFAULT_STATE
   const threshold = input.threshold ?? DEFAULT_THRESHOLD
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error(`screen_review: threshold — число 0..1 (вероятность), получено ${threshold}`)
+  }
 
   const sections: string[] = []
   const verdicts: ScreenVerdict[] = []
-  for (const imagePath of input.images) {
-    const verdict = await reviewImage({ imagePath, state, questions, config, threshold }, { postJson, readImageBase64 })
+  for (const [index, imagePath] of input.images.entries()) {
+    const verdict = await reviewImage(
+      { imagePath, state, questions, config, threshold },
+      { postJson: deps.postJson, readImageBase64: deps.readImageBase64 },
+    )
     verdicts.push(verdict)
     sections.push(renderVerdictSection(verdict, state, threshold))
+    await deps.onProgress?.(`screen_review: ${index + 1}/${input.images.length} — ${verdict.imageName} готов`)
   }
   const flagged = verdicts.filter((v) => sectionHasFlags(v, threshold))
   const summary = renderSummary(flagged.map((v) => v.imageName))
@@ -127,13 +139,30 @@ async function reviewImage(
   }
   const url = `${config.ollamaUrl.replace(/\/$/, "")}/v1/systemone`
   const request = buildRequest(config.model, state, imageBase64, questions)
-  const { status, body } = await (deps.postJson ?? defaultPostJson)(url, request)
-  if (status !== 200) {
-    throw new Error(`screen_review: ollama ${status} на ${imagePath} — ${truncate(body)}`)
+  let response: { status: number; body: string }
+  try {
+    response = await (deps.postJson ?? defaultPostJson)(url, request)
+  } catch (e) {
+    // connection refused / DNS / таймаут AbortSignal — HTTP-статуса нет,
+    // причина в e.cause: без обёртки агент видит голое «fetch failed»
+    // (паттерн lib/qlty-review.ts — отказы внешних вызовов с контекстом)
+    const msg = e instanceof Error ? e.message : String(e)
+    const cause = (e as { cause?: unknown }).cause
+    const causeMsg = cause === undefined || cause === null ? "" : ` (причина: ${describeCause(cause)})`
+    throw new Error(`screen_review: оляма недоступна — ${imagePath} → ${url}: ${msg}${causeMsg}`)
+  }
+  if (response.status !== 200) {
+    throw new Error(`screen_review: ollama ${response.status} на ${imagePath} — ${truncate(response.body)}`)
   }
   const label = `screen_review (${basename(imagePath)})`
-  const { answers, inputTokens } = parseAnswers(body, label)
+  const { answers, inputTokens } = parseAnswers(response.body, label, Object.keys(questions))
   return { imagePath, imageName: basename(imagePath), answers, inputTokens }
+}
+
+function describeCause(cause: unknown): string {
+  if (cause instanceof Error) return cause.message
+  if (typeof cause === "string") return cause
+  return JSON.stringify(cause)
 }
 
 const truncate = (s: string, max = 300): string => (s.length <= max ? s : `${s.slice(0, max)}…`)

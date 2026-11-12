@@ -11,19 +11,21 @@ import {
   DEFAULT_THRESHOLD,
   parseAnswers,
   problemProbability,
-  renderReport,
-  renderVerdictSection,
   resolveQuestions,
-  scoreVerdictLabel,
 } from "./screen-review-core"
+import { renderReport, renderVerdictSection, scoreVerdictLabel } from "./screen-review-render"
 import { runScreenReview, type ScreenReviewDeps } from "./screen-review"
 
 // Живой ответ systemone от d1-omni (проба 13.11.2026 на эталоне /download,
-// структурно сокращён: 4 вопроса, один каждого типа + второй noul).
+// структурно сокращён: 7 ответов — полный чек-лист ui-slop, три типа).
 const SYSTEMONE_OK = JSON.stringify({
   model: "d1-omni",
   answers: {
     double_frame: { type: "noul", noul: 0.8537415956049682 },
+    card_in_card: { type: "noul", noul: 0.34 },
+    alignment: { type: "noul", noul: 0.09 },
+    overlap: { type: "noul", noul: 0.11 },
+    contrast: { type: "noul", noul: 0.49 },
     main_defect: {
       type: "choice",
       choice: "double_frame",
@@ -76,6 +78,28 @@ describe("parseAnswers — контракт ответа systemone (анти-д�
     expect(err).not.toBeNull()
     expect(err?.message).toContain(what)
     for (const field of ANSWER_CONTRACT_FIELDS) expect(err?.message).toContain(field.split("[")[0])
+  })
+
+  test("неполный ответ (подмножество вопросов) → контрактная ошибка с id недостающих", () => {
+    const partial = JSON.stringify({
+      answers: { double_frame: { type: "noul", noul: 0.5 } },
+      usage: { input_tokens: 1 },
+    })
+    const err = (() => {
+      try {
+        parseAnswers(partial, "test", ["double_frame", "main_defect", "severity"])
+        return null
+      } catch (e) {
+        return e as Error
+      }
+    })()
+    expect(err?.message).toContain("ответила не на все вопросы")
+    expect(err?.message).toContain("main_defect, severity")
+  })
+
+  test("полный ответ при сверке с вопросами проходит", () => {
+    const { answers } = parseAnswers(SYSTEMONE_OK, "test", Object.keys(resolveQuestions({})))
+    expect(Object.keys(answers)).toHaveLength(7)
   })
 })
 
@@ -254,7 +278,15 @@ describe("runScreenReview — пер-скрин семантика и валид
     const deps = okDeps(["/a.png"])
     deps.postJson = async (_url, body) => {
       seenRequests.push(body)
-      return { status: 200, body: SYSTEMONE_OK }
+      const ids = Object.keys(body.questions)
+      return {
+        status: 200,
+        body: JSON.stringify({
+          model: body.model,
+          answers: Object.fromEntries(ids.map((id) => [id, { type: "noul", noul: 0.1 }])),
+          usage: { input_tokens: 100 },
+        }),
+      }
     }
     const md = await runScreenReview(
       { images: ["/a.png"], questions: { only: { type: "noul", instructions: "тест" } } },
@@ -263,6 +295,7 @@ describe("runScreenReview — пер-скрин семантика и валид
     expect(md).toContain("чек-лист <inline>")
     const req = seenRequests[0] as { questions: Record<string, unknown> }
     expect(Object.keys(req.questions)).toEqual(["only"])
+    expect(md).toContain("| only | noul |")
   })
 
   test("кастомный порог передаётся в рендер", async () => {
@@ -270,5 +303,48 @@ describe("runScreenReview — пер-скрин семантика и валид
     expect(md).toContain("порог 0.9")
     // noul 0.85 < 0.9 — флага нет, сводка без скринов
     expect(md).toContain("Скринов с флагами нет.")
+  })
+
+  test.each([
+    ["отрицательный", -0.1],
+    ["больше 1", 1.5],
+    ["не число", Number.NaN],
+  ])("threshold %s → громкая ошибка диапазона", async (_name, threshold) => {
+    await expect(runScreenReview({ images: ["/a.png"], threshold }, okDeps(["/a.png"]))).rejects.toThrow(
+      "threshold — число 0..1",
+    )
+  })
+
+  test("относительный путь → громкая ошибка с путём (готч cwd тула — сервер)", async () => {
+    await expect(runScreenReview({ images: ["shots/a.png"] }, okDeps([]))).rejects.toThrow(
+      "пути к скринам должны быть абсолютными",
+    )
+  })
+
+  test("сетевое исключение → обёртка со скрином, URL и причиной", async () => {
+    const deps = okDeps(["/a.png"])
+    const cause = new Error("connect ECONNREFUSED 127.0.0.1:11434")
+    const fetchFailed = new Error("fetch failed", { cause })
+    deps.postJson = async () => {
+      throw fetchFailed
+    }
+    const err = (await runScreenReview({ images: ["/a.png"] }, deps).catch((e: unknown) => e as Error)) as Error
+    expect(err.message).toContain("оляма недоступна")
+    expect(err.message).toContain("/a.png")
+    expect(err.message).toContain("http://mock:11434/v1/systemone")
+    expect(err.message).toContain("ECONNREFUSED")
+  })
+
+  test("onProgress вызывается после каждого скрина с атрибуцией", async () => {
+    const statuses: string[] = []
+    const deps = okDeps(["/a.png", "/b.png"])
+    deps.onProgress = async (status) => {
+      statuses.push(status)
+    }
+    await runScreenReview({ images: ["/a.png", "/b.png"] }, deps)
+    expect(statuses).toEqual([
+      "screen_review: 1/2 — a.png готов",
+      "screen_review: 2/2 — b.png готов",
+    ])
   })
 })
