@@ -38,6 +38,12 @@ export interface TaskRef {
   devSession?: string
   reviewSession?: string
   testSession?: string
+  /** колонка «Приоритет» (high/medium/low); "" — не указан (сортируется
+   *  ниже low; дефолта нет — решение владельца) */
+  priority?: string
+  /** колонка «Autodone»: true — автомерж PR при входе в Review (галочка
+   *  владельца; триаж не ставит) */
+  autodone?: boolean
 }
 
 export interface TaskComment {
@@ -122,6 +128,16 @@ export interface TrackedTask {
   /** последний доставленный будильник: идентичный ключ в коротком окне не
    *  ставится в сессию повторно (дефект №5.2, дубль-доставка) */
   lastWakeup?: WakeupStamp
+  /** автодон: "pending" — проба/мерж в ходу, "merged"/"bounced"/"escalated"
+   *  — терминальные исходы эпизода; undefined — задача не в Review или
+   *  без галочки. Новый вход в Review перезаписывает в pending */
+  autodoneState?: "pending" | "merged" | "bounced" | "escalated"
+  /** ms-время входа в Review с autodone (часы таймаута pending-проб) */
+  autodoneSince?: number
+  /** приоритет строки (обновляется каждый тик из скана) — глобальный счёт
+   *  активных CUP в пик учитывает только high (замороженные не-high слоты
+   *  не держат); undefined — старый state до фичи, трактуется как не-high */
+  priority?: string
 }
 
 export interface FactoryState {
@@ -1634,6 +1650,9 @@ export interface PassCounters {
   envAtticked: number
   /** задачи под наблюдением на конец прохода (этот проект) */
   watched: number
+  /** автодон за тик: смержено/закрыто без ПР и возвращено в In Progress */
+  autodoneMerged?: number
+  autodoneBounced?: number
   /** спавны, задержанные гардом каскада за тик (HOLD); undefined — гарда не было */
   held?: number
   /** причина HOLD для сводки; meaningful только при held */
@@ -1650,6 +1669,95 @@ export function formatPassSummary(project: string, c: PassCounters): string {
   const heldPart = c.held !== undefined && c.held > 0
     ? `, задержано гардом=${c.held}${c.heldReason !== undefined ? ` (${c.heldReason})` : ""}`
     : ""
+  const autodonePart = (c.autodoneMerged ?? 0) + (c.autodoneBounced ?? 0) > 0
+    ? `, автодон: мерж=${c.autodoneMerged ?? 0}/bounce=${c.autodoneBounced ?? 0}`
+    : ""
   return `проход ${project}: спавн dev=${c.devSpawned} ревью=${c.reviewSpawned} тест=${c.testerSpawned}` +
-    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}${heldPart}, наблюдение=${c.watched}${failures}`
+    `, будильники=${c.wakeups}, чистки=${c.cleanups}${envPart}${heldPart}${autodonePart}, наблюдение=${c.watched}${failures}`
+}
+
+// ——— очередь CUP и часы пик (задача 20261112160316) ———
+
+/** Ранг приоритета для сортировки очереди: high → medium → low → пустые
+ *  внизу (пустая клетка валидна, «не указан» — решение владельца). */
+export function priorityRank(priority: string): number {
+  switch (priority.trim().toLowerCase()) {
+    case "high":
+      return 0
+    case "medium":
+      return 1
+    case "low":
+      return 2
+    default:
+      return 3
+  }
+}
+
+/** Статусы, в которых задача тратит LLM (сессия жива или нужна). Review
+ *  (ручное ревью владельца), Needs attention, Done не тратят — дословно
+ *  постановка («мануал ревью или нид атеншн не считаем»). */
+export const LLM_ACTIVE_STATUSES: ReadonlySet<string> = new Set([
+  "Design",
+  "In Progress",
+  REVIEW_PLAN_STATUS,
+  REVIEW_RESULT_STATUS,
+  TESTING_STATUS,
+])
+
+/** В пик-окно в счёте активных учитываются только high-задачи: замороженные
+ *  не-high не держат слоты (иначе high из очереди не заспавнился бы вопреки
+ *  цели пика «high продолжают работают»). Вне окна считаются все. */
+export function activeTaskCountEx(
+  entries: { status: string; priority: string }[],
+  opts: { peak: boolean },
+): number {
+  return entries.filter((e) => {
+    if (!LLM_ACTIVE_STATUSES.has(e.status)) return false
+    if (opts.peak && priorityRank(e.priority) !== 0) return false
+    return true
+  }).length
+}
+
+/** Выборка очереди: untracked Design/In Progress строки, порядок
+ *  приоритет (high → medium → low → пустые внизу) потом rowId asc
+ *  (= FIFO по времени создания — rowId минтится timestamp-ом). */
+export function queueOrder(tasks: TaskRef[]): TaskRef[] {
+  return [...tasks].sort((a, b) => {
+    const d = priorityRank(a.priority ?? "") - priorityRank(b.priority ?? "")
+    return d !== 0 ? d : a.rowId.localeCompare(b.rowId)
+  })
+}
+
+/** Бюджет спавнов этого тика: сколько задач из очереди можно взять. */
+export function cupBudget(active: number, cup: number): number {
+  return Math.max(0, cup - active)
+}
+
+/** Пик-окно GLM Coding Plan: будни Mon–Fri 06:00–10:00 UTC
+ *  (= 14:00–18:00 UTC+8 Singapore = 15:00–19:00 JST; доки Z.ai).
+ *  Границы end-exclusive. env UWUWU_FACTORY_PEAK: "HH:MM-HH:MM" в UTC —
+ *  своё окно, "off" — выключить, пусто/мусор — дефолт. */
+export interface PeakWindow { startMin: number; endMin: number; enabled: boolean }
+
+export function peakWindowFromEnv(raw: string | undefined): PeakWindow {
+  const DEFAULT: PeakWindow = { startMin: 6 * 60, endMin: 10 * 60, enabled: true }
+  const v = (raw ?? "").trim()
+  if (v === "") return DEFAULT
+  if (v.toLowerCase() === "off") return { startMin: 0, endMin: 0, enabled: false }
+  const m = v.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/)
+  if (!m) return DEFAULT
+  const startMin = Number(m[1]) * 60 + Number(m[2])
+  const endMin = Number(m[3]) * 60 + Number(m[4])
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) return DEFAULT
+  return { startMin, endMin, enabled: true }
+}
+
+/** Сейчас пик? Будни (Mon–Fri) в UTC-минутах внутри окна. Выходные — всегда
+ *  вне пика (доки Z.ai: «weekends included» в off-peak). */
+export function isPeakHours(now: Date, window: PeakWindow): boolean {
+  if (!window.enabled) return false
+  const day = now.getUTCDay()
+  if (day === 0 || day === 6) return false
+  const min = now.getUTCHours() * 60 + now.getUTCMinutes()
+  return min >= window.startMin && min < window.endMin
 }

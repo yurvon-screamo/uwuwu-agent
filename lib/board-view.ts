@@ -29,6 +29,8 @@ export interface RenderRow {
       /** date-клетка: content — epoch ms (истина), formattedContent —
        *  дисплей ядра (локаль ядра, перекрывает записанную строку). */
       date?: { content?: number; formattedContent?: string }
+      /** checkbox-клетка (колонка «Autodone», автодон) */
+      checkbox?: { checked?: boolean }
     }
   }[]
 }
