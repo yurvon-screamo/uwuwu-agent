@@ -14,7 +14,11 @@ synthetic. Красное состояние на master воспроизвод�
 """
 import json
 import sqlite3
+import subprocess  # nosec B404 — e2e дамп-слоя: запуск собственного CLI в тесте
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools import opencode_audit as audit
 
@@ -83,6 +87,87 @@ class SyntheticPreviewTest(unittest.TestCase):
         self.assertEqual(audit._message_preview("synthetic", []), "")
         self.assertEqual(audit._message_preview("idle", [{"type": "text", "text": "x"}]), "")
         self.assertEqual(audit._message_preview("user", [{"type": "text", "text": "u"}]), "u")
+
+
+class SyntheticPreviewE2eTest(unittest.TestCase):
+    """E2E дамп-слоя: subprocess с файловой БД, полный main-путь до JSON stdout.
+
+    Верхний автоматизируемый уровень (без LLM): фикс-схема v2 (session_v2 +
+    session_message) на диске, CLI как его вызовет дример (`session <id> --db
+    <путь>`), synthetic-preview обязан доехать до сериализованного timeline.
+    """
+
+    SESSION_V2_DDL = """CREATE TABLE session_v2 (
+        id text PRIMARY KEY, slug text, title text, agent text,
+        directory text, parent_id text,
+        summary_additions integer DEFAULT 0, summary_deletions integer DEFAULT 0,
+        summary_files integer DEFAULT 0,
+        time_created integer, time_updated integer)"""
+
+    def _db_path(self) -> str:
+        con = sqlite3.connect(self.db_file)
+        con.execute(self.SESSION_V2_DDL)
+        con.execute(
+            """CREATE TABLE session_message (
+                id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+                seq integer NOT NULL, time_created integer NOT NULL,
+                time_updated integer NOT NULL, data text NOT NULL)"""
+        )
+        con.execute(
+            """CREATE TABLE event (
+                aggregate_id text, type text, seq integer,
+                data text, time_created integer)"""
+        )
+        con.execute(
+            "INSERT INTO session_v2 (id, slug, title, agent, directory, parent_id,"
+            " time_created, time_updated) VALUES (?, 's', 't', 'build', '/d', NULL,"
+            " 1000, 1005)",
+            (SESSION_ID,),
+        )
+        con.execute(
+            "INSERT INTO session_message VALUES ('m1', ?, 'user', 1, 1001, 1001, ?)",
+            (SESSION_ID, json.dumps({"time": {"created": 1001}, "text": "промпт"})),
+        )
+        con.execute(
+            "INSERT INTO session_message VALUES ('m2', ?, 'synthetic', 2, 1002, 1002, ?)",
+            (
+                SESSION_ID,
+                json.dumps({
+                    "time": {"created": 1002},
+                    "text": "The server restarted while you were working. "
+                            "Continue from where you left off.",
+                }),
+            ),
+        )
+        con.execute(
+            "INSERT INTO session_message VALUES ('m3', ?, 'assistant', 3, 1003, 1003, ?)",
+            (SESSION_ID, json.dumps({
+                "time": {"created": 1003},
+                "content": [{"type": "text", "text": "продолжаю работу"}],
+            })),
+        )
+        con.commit()
+        con.close()
+        return self.db_file
+
+    def test_cli_session_dump_carries_synthetic_preview_in_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.db_file = str(Path(tmp) / "opencode.db")
+            db = self._db_path()
+            proc = subprocess.run(  # nosec B603 — argv константный, db-путь из tempfile теста
+                [sys.executable, "tools/opencode_audit.py", "session", SESSION_ID,
+                 "--db", db, "--compact"],
+                capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        dump = json.loads(proc.stdout)
+        timeline = dump["timeline"]
+        syn = [t for t in timeline if t["role"] == "synthetic"]
+        self.assertEqual(len(syn), 1)
+        self.assertIn("server restarted", syn[0]["preview"])
+        # соседние роли не пострадали: user несёт свой текст, assistant — свой
+        self.assertEqual(timeline[0]["preview"], "промпт")
+        self.assertEqual(timeline[2]["preview"], "продолжаю работу")
 
 
 if __name__ == "__main__":
