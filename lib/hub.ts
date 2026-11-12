@@ -1763,7 +1763,7 @@ export function createHub(profile: HubProfile): Hub {
     deliverWithRetries,
     run: async (): Promise<void> => {
       if (cfg.token === undefined || cfg.token === "" || cfg.owner === undefined || cfg.owner === "") {
-        console.error(`hub.json не прочитан или нет token/owner: ${CFG} — заполни по ${profile.here}/README.md`)
+        console.error(`${profile.daemonName}: hub.json не прочитан или нет token/owner (${CFG}) — заполни по контракту входа (${profile.here})`)
         process.exit(1)
       }
       if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {
