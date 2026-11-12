@@ -661,8 +661,8 @@ export function spawnPrompt(
   const workLine = env === undefined
     ? [
         envRoot !== undefined
-          ? `создай worktree+ветку от ${base} — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); имя ветки по сути задачи, не id; заполни Branch-ячейку и реализуй.`
-          : `создай worktree+ветку от ${base} (имя по сути задачи, не id), заполни Branch-ячейку и реализуй.`,
+          ? `создай worktree+ветку от ${base} — ворктри ${join(envRoot, sanitizeRowId(rowId), "repo")}, скретч ${join(envRoot, sanitizeRowId(rowId), "scratch")} (не /tmp); ветка work/task-${sanitizeRowId(rowId)}; заполни Branch-ячейку и реализуй.`
+          : `создай worktree+ветку от ${base} — ветка work/task-${sanitizeRowId(rowId)}; заполни Branch-ячейку и реализуй.`,
       ]
     : [
         `работай в своём окружении задачи (фабрика создала, ветка уже от ${base}):`,
