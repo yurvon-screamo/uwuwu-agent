@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 impl super::github_doc_store::GitHubDocStore {
-    pub(super) async fn ensure_clone(&self) -> Result<()> {
+    pub(crate) async fn ensure_clone(&self) -> Result<()> {
         if !self.clone_root.join(".git").exists() {
             std::fs::create_dir_all(&self.clone_root)?;
             let url = format!("https://github.com/{}.git", self.repo);

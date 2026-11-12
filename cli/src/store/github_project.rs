@@ -18,6 +18,8 @@ pub(super) async fn set_status_and_planned(
     status: Option<&str>,
     planned: Option<&str>,
 ) -> Result<()> {
+    // Project v2 — канбан владельца (вид); отсутствие не валило запись:
+    // frontmatter тела уже несёт Status/Запланировано для CLI/демонов.
     let Some((project_number, project_id)) = project_for_label(store, issue_number).await? else {
         return Ok(());
     };

@@ -45,9 +45,16 @@ pub async fn gh_graphql(query: &str, variables: &Value) -> Result<Value> {
 }
 
 /// Сырой stdout gh (для non-JSON путей: --jq уходит, парсим на месте).
+/// stdin_body → args дополняются `--input -`: gh api БЕЗ --input игнорирует
+/// stdin, тело мутации молча терялось (422 links/0/schema — краш-баг среза C,
+/// пойман на живом импорте мигратора до прод-переключения).
 async fn gh_raw(args: &[&str], stdin_body: Option<&str>) -> Result<String> {
+    let mut full: Vec<&str> = args.to_vec();
+    if stdin_body.is_some() {
+        full.extend(["--input", "-"]);
+    }
     let mut cmd = Command::new("gh");
-    cmd.args(args)
+    cmd.args(&full)
         .stdin(if stdin_body.is_some() {
             Stdio::piped()
         } else {

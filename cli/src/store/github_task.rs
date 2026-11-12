@@ -3,15 +3,31 @@
 //! label `proj:<имя>` = доска проекта; Status/Запланировано — поля Project
 //! v2; Branch/PR/Сессия dev/Расписание — frontmatter в body.
 //!
-//! Идемпотентный дубль-резолв — строго list-issues по label+тайтл
-//! (консистентный REST); search API — только для инициализации списков
-//! (eventual consistency индекса, вердикт ревью дельта-раунд 2).
+//! Идемпотентный дубль-резолв — list-issues по label+тайтл с паузой ≥2s
+//! (ретрай после таймаута): ЖИВАЯ ПРОБА 13.11 — list GitHub имеет лаг ~2–4s
+//! после POST (и с label-фильтром, и без) — search API тем более (eventual
+//! consistency, вердикт ревью дельта-раунд 2). Немедленный ретрай после
+//! таймаута видит пусто — пауза и повторный list обязательны.
 //! Write-side операции — github_task_write.rs (единообразие с SiYuanStore).
 
 use super::task_store::StoreResult;
 use super::{Task, TaskBoard, TaskType};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
+
+/// Minimal percent-encoding для query-значений (colon/space/слэш).
+pub(crate) fn urlencoded(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 pub struct GitHubStore {
     /// yurvon-screamo/uwuwu-hub (или sandbox для e2e).
@@ -30,10 +46,16 @@ impl GitHubStore {
     /// Конвертация issue-API ответа (body с frontmatter) в нейтральный Task.
     pub(super) fn convert(&self, issue: &Value) -> Task {
         let front = Frontmatter::parse(issue["body"].as_str().unwrap_or(""));
+        // state — проекция статуса: closed = Done (контракт миграции),
+        // иначе frontmatter/поле проекта
+        let status = match issue["state"].as_str() {
+            Some("closed") => "Done".to_string(),
+            _ => front.get("status").unwrap_or_else(|| "Todo".into()),
+        };
         Task {
             id: issue["number"].to_string(),
             title: issue["title"].as_str().unwrap_or("").to_string(),
-            status: front.get("status").unwrap_or_else(|| "Todo".into()),
+            status,
             task_type: TaskType(
                 issue
                     .pointer("/type/name")

@@ -34,29 +34,32 @@ pub(super) async fn project_for_label(
         return Ok(None);
     };
     let number = match project {
-        "uwuwu" => 5,
+        "uwuwu" => Some(5),
         _ => project_number_by_title(store, project).await?,
+    };
+    let Some(number) = number else {
+        return Ok(None);
     };
     let id = project_id_by_number(store, number).await?;
     Ok(Some((number, id)))
 }
 
-async fn project_number_by_title(store: &GitHubStore, project: &str) -> Result<i64> {
+async fn project_number_by_title(_store: &GitHubStore, project: &str) -> Result<Option<i64>> {
     let data = gh_graphql(
-        "query($login: String!) { viewer { projectsV2(first: 30) { nodes {
+        "query { viewer { projectsV2(first: 30) { nodes {
             number title } } } }",
-        &json!({ "login": viewer_login(store).await? }),
+        &json!({}),
     )
     .await?;
     let needle = format!("Задачи {project}");
-    data.pointer("/viewer/projectsV2/nodes")
+    Ok(data
+        .pointer("/viewer/projectsV2/nodes")
         .and_then(|n| n.as_array())
         .and_then(|a| {
             a.iter()
                 .find(|p| p["title"].as_str() == Some(needle.as_str()))
                 .and_then(|p| p["number"].as_i64())
-        })
-        .context("Project v2 «{needle}» не найден — срез A не доезжал?")
+        }))
 }
 
 async fn project_id_by_number(_store: &GitHubStore, number: i64) -> Result<String> {
