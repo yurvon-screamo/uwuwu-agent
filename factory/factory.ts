@@ -1356,6 +1356,10 @@ async function runAutodoneTick(
   if (tracked.autodoneState !== "pending") {
     tracked.autodoneState = "pending"
     tracked.autodoneSince = Date.now()
+    // новый эпизод — свежий бюджет проб: unknown-страйк прошлого эпизода
+    // (эскалация на сбойном хосте) не должна эскалировать с первой пробы
+    // (ревью раунд 2, Low)
+    tracked.prProbeUnknownStreak = undefined
     saveState(state)
     log(`задача ${rowId.slice(0, 8)}: autodone — вход в Review, проба PR`)
   }
