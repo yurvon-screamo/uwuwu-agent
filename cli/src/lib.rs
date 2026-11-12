@@ -20,6 +20,7 @@ pub mod siyuan_guard;
 pub mod siyuan_person;
 pub mod sofa;
 pub mod siyuan_task;
+pub mod store;
 
 #[cfg(test)]
 mod semantic_tests;
