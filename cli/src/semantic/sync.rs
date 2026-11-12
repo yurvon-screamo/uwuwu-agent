@@ -215,19 +215,19 @@ fn since_with_overlap(watermark: &str) -> Result<String> {
 }
 
 /// Результат классификации страницы дельты (чистый, без IO).
-struct PageOutcome {
+pub(crate) struct PageOutcome {
     /// Строки полосы [MIN, MAX] — кандидаты на эмбедд.
-    pending: Vec<KernelRow>,
+    pub(crate) pending: Vec<KernelRow>,
     /// Усохшие/переросшие строки — prune-кандидаты (DELETE отсутствующих
     /// no-op по PK; вернуть блок может правка).
-    prune_ids: Vec<String>,
+    pub(crate) prune_ids: Vec<String>,
     /// Дрейф метаданных (hpath/box/root) при неизменных (updated, content) —
     /// освежается без переэмбедда.
-    drift: Vec<ChunkMeta>,
-    cursor_updated: String,
-    cursor_id: String,
-    skipped_short: usize,
-    skipped_long: usize,
+    pub(crate) drift: Vec<ChunkMeta>,
+    pub(crate) cursor_updated: String,
+    pub(crate) cursor_id: String,
+    pub(crate) skipped_short: usize,
+    pub(crate) skipped_long: usize,
 }
 
 /// Классификация страницы дельты: курсор двигается по всем найденным
@@ -236,7 +236,7 @@ struct PageOutcome {
 /// проиндексированная с теми же (updated, content), — чистый skip:
 /// overlap-перескан не переэмбеддит идемпотентное (анти-карусель
 /// 20261106182055), а расхождение только в путях — дрейф без эмбедда.
-fn process_page(
+pub(crate) fn process_page(
     rows: &[Value],
     by_id: &std::collections::HashMap<String, KernelRow>,
     indexed: &std::collections::HashMap<String, IndexedRow>,
@@ -426,7 +426,7 @@ pub async fn delta_sync(
 /// Таймаут, урезанный бюджетом (меньше потолка пути), — это исчерпание
 /// бюджета посреди эмбедда, а не отказ сервера: грациозная остановка
 /// вместо Err. Таймаут при полном потолке — настоящий шторм ollama, Err.
-async fn embed_batches(
+pub(crate) async fn embed_batches(
     ollama: &OllamaClient,
     store: &mut Store,
     batches: &[&[KernelRow]],

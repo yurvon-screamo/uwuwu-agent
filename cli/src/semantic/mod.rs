@@ -8,7 +8,19 @@
 //! конструктивно. Обслуживание индекса — `uwuwu-cli semantic rebuild|status`
 //! (bootstrap пустого индекса — только явной командой, не внутри поиска).
 
+pub mod hub_source;
+pub mod hub_sync;
 pub mod ollama;
+use crate::store::github_doc_store::GitHubDocStore;
+
+/// Hub-режим semantic-индекса: UWUWU_HUB_REPO задан → скан uwuwu-hub
+/// (docs md из git-клона + issues через gh API) вместо kernel-дельты.
+fn hub_doc_store() -> Option<GitHubDocStore> {
+    match std::env::var("UWUWU_HUB_REPO") {
+        Ok(repo) if !repo.is_empty() => Some(GitHubDocStore::from_env(repo)),
+        _ => None,
+    }
+}
 pub mod store;
 pub mod sync;
 
@@ -217,20 +229,39 @@ async fn delta_in_leftover(
 ) -> Option<String> {
     let budget_note =
         "дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками";
-    let report = match sync::delta_sync(
-        sy,
-        ollama,
-        store,
-        &sync::SyncOptions {
-            since: None,
-            deadline: Some(deadline),
-            embed_timeout: SEARCH_EMBED_TIMEOUT,
-            page_delay: None,
-            on_batch: None,
-        },
-    )
-    .await
-    {
+    let report = match hub_doc_store() {
+        Some(doc) => {
+            hub_sync::hub_sync(
+                &doc,
+                ollama,
+                store,
+                &sync::SyncOptions {
+                    since: None,
+                    deadline: Some(deadline),
+                    embed_timeout: SEARCH_EMBED_TIMEOUT,
+                    page_delay: None,
+                    on_batch: None,
+                },
+            )
+            .await
+        }
+        None => {
+            sync::delta_sync(
+                sy,
+                ollama,
+                store,
+                &sync::SyncOptions {
+                    since: None,
+                    deadline: Some(deadline),
+                    embed_timeout: SEARCH_EMBED_TIMEOUT,
+                    page_delay: None,
+                    on_batch: None,
+                },
+            )
+            .await
+        }
+    };
+    let report = match report {
         Ok(report) => report,
         Err(e) => {
             return match e.downcast_ref::<ollama::EmbedError>() {
@@ -335,10 +366,17 @@ async fn rebuild_index(
         since: if resume { None } else { Some("0".to_string()) },
         deadline: None,
         embed_timeout: REBUILD_EMBED_TIMEOUT,
-        page_delay: Some(Duration::from_millis(200)),
+        page_delay: match hub_doc_store() {
+            // hub-скан ходит в свой git-клон и gh API — ядро не душит
+            Some(_) => None,
+            None => Some(Duration::from_millis(200)),
+        },
         on_batch,
     };
-    let report = sync::delta_sync(sy, &ollama, store, &opts).await?;
+    let report = match hub_doc_store() {
+        Some(doc) => hub_sync::hub_sync(&doc, &ollama, store, &opts).await?,
+        None => sync::delta_sync(sy, &ollama, store, &opts).await?,
+    };
     let now = chrono::Utc::now().timestamp();
     store.set_meta("built_at", &now.to_string())?;
     if !resume {
@@ -380,52 +418,80 @@ async fn sync_once_locked(
 ) -> Result<Vec<String>> {
     let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
     let deadline = Instant::now() + sync_budget();
-    let delta = sync::delta_sync(
-        sy,
-        &ollama,
-        store,
-        &sync::SyncOptions {
-            since: None,
-            deadline: Some(deadline),
-            embed_timeout: REBUILD_EMBED_TIMEOUT,
-            // пауза между страницами: дотяжка ходит по ядру страницами —
-            // не душим прод-ядро сканами (как rebuild)
-            page_delay: Some(Duration::from_millis(200)),
-            on_batch: None,
-        },
-    )
-    .await?;
-    let reconcile = sync::reconcile(
-        sy,
-        &ollama,
-        store,
-        sync::RepairBudget {
-            deadline: Some(deadline),
-            embed_timeout: REBUILD_EMBED_TIMEOUT,
-        },
-    )
-    .await?;
-    let backlog = backlog_size(sy, store).await?;
-
-    let mut lines = vec![format!(
-        "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
-        delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
-    )];
-    lines.push(if reconcile.completed {
-        format!(
-            "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
-            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-        )
-    } else {
-        format!(
-            "reconcile не дошёл (бюджет): восстановлено {}, вычищено {}, путей освежено {} — дыры ретраятся следующим sync",
-            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-        )
-    });
-    if delta.budget_exhausted {
-        lines.push("бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string());
-    }
-    lines.push(format!("очередь дельты: {backlog} строк"));
+    let lines = match hub_doc_store() {
+        Some(doc) => {
+            let report = hub_sync::hub_sync(
+                &doc,
+                &ollama,
+                store,
+                &sync::SyncOptions {
+                    since: None,
+                    deadline: Some(deadline),
+                    embed_timeout: REBUILD_EMBED_TIMEOUT,
+                    page_delay: None,
+                    on_batch: None,
+                },
+            )
+            .await?;
+            vec![
+                format!(
+                    "hub-скан: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
+                    report.embedded, report.skipped_short, report.pruned, report.paths_refreshed,
+                ),
+                "backlog: — (hub: полный скан дедупится содержимым, watermark нет)".to_string(),
+            ]
+        }
+        None => {
+            let delta = sync::delta_sync(
+                sy,
+                &ollama,
+                store,
+                &sync::SyncOptions {
+                    since: None,
+                    deadline: Some(deadline),
+                    embed_timeout: REBUILD_EMBED_TIMEOUT,
+                    // пауза между страницами: дотяжка ходит по ядру страницами —
+                    // не душим прод-ядро сканами (как rebuild)
+                    page_delay: Some(Duration::from_millis(200)),
+                    on_batch: None,
+                },
+            )
+            .await?;
+            let reconcile = sync::reconcile(
+                sy,
+                &ollama,
+                store,
+                sync::RepairBudget {
+                    deadline: Some(deadline),
+                    embed_timeout: REBUILD_EMBED_TIMEOUT,
+                },
+            )
+            .await?;
+            let backlog = backlog_size(sy, store).await?;
+            let mut lines = vec![format!(
+                "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
+                delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
+            )];
+            lines.push(if reconcile.completed {
+                format!(
+                    "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
+                    reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+                )
+            } else {
+                format!(
+                    "reconcile не дошёл (бюджет): восстановлено {}, вычищено {}, путей освежено {} — дыры ретраятся следующим sync",
+                    reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+                )
+            });
+            if delta.budget_exhausted {
+                lines.push(
+                    "бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string(),
+                );
+            }
+            lines.push(format!("очередь дельты: {backlog} строк"));
+            lines
+        }
+    };
     Ok(lines)
 }
 
