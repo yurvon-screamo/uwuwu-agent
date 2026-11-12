@@ -57,4 +57,28 @@ describe("пин дефа dreamer — методичка инцидент-раз
     expect(def()).toContain("исход: разовый | повтор задачи")
     expect(def()).toContain("Метки:")
   })
+
+  test("конвейерные маркеры закреплены (шторм 20261112074307-zq2iv3o)", () => {
+    // Блок «Конвейерные маркеры»: димер обязан видеть рестарты serve,
+    // убитые ходы и аутеджи в дампах — без пина блок сносится правкой дефа
+    // тихо (демон не читает шаг 8), и молчание дримеров возвращается.
+    expect(def()).toContain("Конвейерные маркеры (таймауты/прерывания ходов)")
+    expect(def()).toContain("The server restarted while you were working")
+    expect(def()).toContain("The previous response was interrupted")
+    expect(def()).toContain("[sticky-retry] provider outage")
+  })
+
+  test("SQL-проба конвейерных маркеров: рестарты + idle_outcome по пакету сессий", () => {
+    // Полный подсчёт мимо лимита timeline дампа; исход сессии — носитель
+    // «тихой смерти» (failed/interrupted/succeeded-без-финала).
+    expect(def()).toContain("like '%server restarted%'")
+    expect(def()).toContain("idle_outcome")
+  })
+
+  test("шторм = задача на паттерн даже при успешном Done (таймауты не блокируют закрытие)", () => {
+    // Ключевое правило разрыва наблюдаемости: без него шторма тонут
+    // в успешно закрытых задачах — исход смоука 20261112074307-zq2iv3o.
+    expect(def()).toContain("задача на паттерн даже если задача формально закрылась")
+    expect(def()).toContain("таймауты не блокируют Done")
+  })
 })
