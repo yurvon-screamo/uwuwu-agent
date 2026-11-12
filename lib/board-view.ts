@@ -29,13 +29,41 @@ export interface RenderRow {
       /** date-клетка: content — epoch ms (истина), formattedContent —
        *  дисплей ядра (локаль ядра, перекрывает записанную строку). */
       date?: { content?: number; formattedContent?: string }
+      /** checkbox-клетка (колонка «Autodone», автодон) */
+      checkbox?: { checked?: boolean }
     }
   }[]
 }
 
-/** Payload одной страницы render (структурная часть ответа ядра). */
+/** Payload одной страницы render. Две формы ядра: table — `view.rows` +
+ *  `rowCount`; kanban — `view.groups[].cards` + `cardCount` (форма значений
+ *  ячеек та же; паритет CLI parse_board_page, siyuan_task.rs). */
 export interface BoardViewPage {
-  view?: { columns?: ViewColumn[]; rows?: RenderRow[]; rowCount?: number }
+  view?: {
+    columns?: ViewColumn[]
+    /** kanban-вид: колонки в `fields` (паритет CLI parse_board_page) */
+    fields?: ViewColumn[]
+    rows?: RenderRow[]
+    rowCount?: number
+    groups?: { cards?: RenderRow[] }[]
+    cardCount?: number
+  }
+}
+
+/** Строки страницы в форме, независимой от вида: table rows, иначе kanban
+ *  cards (карточка несёт значения в `values` — нормализуем в `cells`,
+ *  форма value-ячеек та же). Счётчик — rowCount ?? cardCount. */
+export function boardPageItems(
+  view: BoardViewPage["view"],
+): { items: RenderRow[]; count: number } {
+  const rows = view?.rows ?? []
+  if (rows.length > 0) return { items: rows, count: view?.rowCount ?? 0 }
+  const cards = (view?.groups ?? []).flatMap((g) => g.cards ?? [])
+  const items = cards.map((card) => {
+    const withValues = card as RenderRow & { values?: RenderRow["cells"] }
+    return { ...withValues, cells: withValues.cells ?? withValues.values }
+  })
+  return { items, count: view?.cardCount ?? 0 }
 }
 
 export type FetchBoardPage = (page: number) => Promise<BoardViewPage>
@@ -61,10 +89,11 @@ export async function collectBoardView(fetchPage: FetchBoardPage): Promise<Board
   for (let page = 1; page <= MAX_RENDER_PAGES; page++) {
     const data = await fetchPage(page)
     if (page === 1) {
-      view.columns = data.view?.columns ?? []
-      rowCount = data.view?.rowCount ?? 0
+      // kanban-вид несёт колонки в `fields`, table — в `columns` (паритет CLI)
+      view.columns = data.view?.columns ?? data.view?.fields ?? []
+      rowCount = data.view?.rowCount ?? data.view?.cardCount ?? 0
     }
-    const items = data.view?.rows ?? []
+    const { items } = boardPageItems(data.view)
     if (items.length === 0) return view
     for (const row of items) {
       const id = row.id ?? ""

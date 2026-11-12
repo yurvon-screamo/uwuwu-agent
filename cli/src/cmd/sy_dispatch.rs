@@ -83,6 +83,12 @@ pub(crate) fn format_task_header(
     if !task.task_type.is_empty() {
         out.push_str(&format!("Тип:      {}\n", task.task_type));
     }
+    if !task.priority.is_empty() {
+        out.push_str(&format!("Приоритет: {}\n", task.priority));
+    }
+    if task.autodone {
+        out.push_str("Autodone: on (автомерж PR при входе в Review)\n");
+    }
     out.push_str(&format!("Строка:   {}\n", task.item_id));
     // где приземлился резолв — особенно при глобальном (без --project)
     out.push_str(&format!("Доска:    {}\n", board.hpath));
@@ -182,6 +188,8 @@ fn created_header(
         title: title.to_string(),
         status: initial_status.to_string(),
         task_type: ty.to_string(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
@@ -222,6 +230,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     if let TaskSub::Create {
         title,
         r#type: ty,
+        priority,
+        autodone,
         stdin,
         attach,
         schedule,
@@ -239,6 +249,21 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             Some(raw) => syt::validate_task_type(raw)?,
             None => syt::DEFAULT_TASK_TYPE.to_string(),
         };
+        // --priority валидируется и в осмотре: флаг не молчит (паритет --type)
+        if let Some(raw) = priority.as_deref() {
+            syt::validate_priority(raw)?;
+            println!(
+                "приоритет: {raw} (будет записан в колонку «{}» доски)",
+                syt::PRIORITY_CELL
+            );
+        }
+        // --autodone не молчит (паритет --priority, ревью Low)
+        if autodone {
+            println!(
+                "autodone: on (будет записан в колонку «{}» доски)",
+                syt::AUTODONE_CELL
+            );
+        }
         // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)
         if let Some(expr) = schedule.as_deref() {
             crate::schedule::validate_schedule(expr)?;
@@ -320,8 +345,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 println!("Задач нет.");
             }
             println!(
-                "{:<13} {:<6} {:<12} {:<34} PR",
-                "СТАТУС", "ТИП", "СТРОКА", "ЗАГОЛОВОК"
+                "{:<13} {:<6} {:<7} {:<3} {:<12} {:<34} PR",
+                "СТАТУС", "ТИП", "ПРИОР", "AD", "СТРОКА", "ЗАГОЛОВОК"
             );
             filtered.sort_by(|a, b| a.status.cmp(&b.status));
             for r in &filtered {
@@ -330,9 +355,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     _ => "",
                 };
                 println!(
-                    "{:<13} {:<6} {:<12} {:<34} {}{}",
+                    "{:<13} {:<6} {:<7} {:<3} {:<12} {:<34} {}{}",
                     r.status,
                     r.task_type,
+                    r.priority,
+                    if r.autodone { "on" } else { "" },
                     &r.item_id[..r.item_id.len().min(12)],
                     truncate(&r.title, 32),
                     r.pr,
@@ -372,6 +399,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Create {
             title,
             r#type: ty,
+            priority,
+            autodone,
             stdin,
             attach,
             schedule,
@@ -390,6 +419,16 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ),
                 Some(raw) => syt::validate_task_type(raw)?,
                 None => syt::DEFAULT_TASK_TYPE.to_string(),
+            };
+            // приоритет: канон до любых записей (дефолта нет — решение
+            // владельца «нужно явно все указывать обязательно»); пустой на
+            // create бессмысленен (паритет типа)
+            let priority_canonical = match priority.as_deref() {
+                Some("") => anyhow::bail!(
+                    "на create пустой приоритет бессмысленен — убери --priority; снятие: task edit <id> --priority \"\""
+                ),
+                Some(raw) => Some(syt::validate_priority(raw)?),
+                None => None,
             };
             // начальный статус до любых записей: флаг строго для машинного
             // Todo (крон-раны), всё прочее — отказ
@@ -433,8 +472,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) =
-                syt::create(&sy, project, &title, &ty_canonical, &ctx, initial_status).await?;
+            let (item, body) = syt::create(
+                &sy,
+                project,
+                &title,
+                &ctx,
+                initial_status,
+                &syt::CreateProps {
+                    ty: Some(&ty_canonical),
+                    priority: priority_canonical.as_deref(),
+                    autodone,
+                },
+            )
+            .await?;
             if let Some(expr) = schedule.as_deref() {
                 // сбой после create не теряет задачу: атрибут доставляется
                 // повторным task edit --schedule (создание уже свершилось)
@@ -518,19 +568,35 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             pr,
             branch,
             r#type: ty,
+            priority,
+            autodone,
             schedule,
             agent,
             planned,
         } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            // валидация PR/типа/статуса/planned до rename: без частичных
-            // обновлений (тайтл сменился, а колонки нет — недопустимый
-            // разрыв); «» — снятие типа/даты
+            // валидация PR/типа/приоритета/статуса/planned до rename: без
+            // частичных обновлений (тайтл сменился, а колонки нет —
+            // недопустимый разрыв); «» — снятие типа/приоритета/даты
             pr.as_deref().map(syt::pr_cell_value).transpose()?;
             let ty_canonical = match ty.as_deref() {
                 Some("") => Some(String::new()),
                 Some(raw) => Some(syt::validate_task_type(raw)?),
                 None => None,
+            };
+            let priority_canonical = match priority.as_deref() {
+                Some("") => Some(String::new()),
+                Some(raw) => Some(syt::validate_priority(raw)?),
+                None => None,
+            };
+            // on/off: без значения — on (default_missing_value), мусор — отказ
+            let autodone_value = match autodone.as_deref() {
+                None => None,
+                Some("on") | Some("true") | Some("1") => Some(true),
+                Some("off") | Some("false") | Some("0") => Some(false),
+                Some(raw) => {
+                    anyhow::bail!("autodone «{raw}» не разобран: жди on | off (без значения — on)")
+                }
             };
             // канон-форма (не эхо ввода): ядро апсертит mSelect-опцию по
             // точному content — «ревью плана» mint'нул бы дубль «Ревью плана»
@@ -545,10 +611,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 &sy,
                 &board,
                 &task,
-                status_canonical.as_deref(),
-                branch.as_deref(),
-                pr.as_deref(),
-                ty_canonical.as_deref(),
+                &syt::CellUpdates {
+                    status: status_canonical.as_deref(),
+                    branch: branch.as_deref(),
+                    pr: pr.as_deref(),
+                    ty: ty_canonical.as_deref(),
+                    priority: priority_canonical.as_deref(),
+                    autodone: autodone_value,
+                },
             )
             .await?;
             // серединные сбои после базового edit: колонки уже записаны —
@@ -872,7 +942,7 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             // канонизация статуса до любых записей: без частичных обновлений
             let canonical = status.as_deref().map(goal::canonical_status).transpose()?;
             if let Some(st) = canonical.as_deref() {
-                syt::edit(&sy, &board, &goal, Some(st), None, None, None).await?;
+                syt::edit(&sy, &board, &goal, &syt::CellUpdates::status_only(st)).await?;
             }
             if let Some(raw) = title.as_deref() {
                 syt::edit_title(&sy, &board, &goal, raw).await?;
@@ -4565,6 +4635,8 @@ mod tests {
             title: "таск".into(),
             status: String::new(),
             task_type: String::new(),
+            priority: String::new(),
+            autodone: false,
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
@@ -4998,6 +5070,8 @@ mod tests {
                 schedule: None,
                 agent: None,
                 status: None,
+                priority: None,
+                autodone: false,
                 dry_run: false,
             },
         )
@@ -5072,6 +5146,8 @@ mod tests {
                 schedule: None,
                 agent: Some("code-quality-reviewer".into()),
                 status: None,
+                priority: None,
+                autodone: false,
                 dry_run: false,
             },
         )
@@ -5108,6 +5184,8 @@ mod tests {
                 schedule: None,
                 agent: Some("Not A Slug".into()),
                 status: None,
+                priority: None,
+                autodone: false,
                 dry_run: false,
             },
         )
@@ -5135,6 +5213,8 @@ mod tests {
             TaskSub::Create {
                 title: "⏰ ран · 2026-11-12 03:00".into(),
                 r#type: None,
+                priority: None,
+                autodone: false,
                 stdin: false,
                 attach: Vec::new(),
                 schedule: None,
@@ -5186,6 +5266,8 @@ mod tests {
                 TaskSub::Create {
                     title: "статус вне контракта".into(),
                     r#type: None,
+                    priority: None,
+                    autodone: false,
                     stdin: false,
                     attach: Vec::new(),
                     schedule: None,
@@ -6005,6 +6087,8 @@ mod tests {
             title: "таска".into(),
             status: "In Progress".into(),
             task_type: "feature".into(),
+            priority: String::new(),
+            autodone: false,
             branch: "work/task-x".into(),
             pr: "https://git.example/pr/1".into(),
             dev_session: "ses-live".into(),
@@ -6050,6 +6134,8 @@ mod tests {
             title: "минимум".into(),
             status: "Todo".into(),
             task_type: String::new(),
+            priority: String::new(),
+            autodone: false,
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),

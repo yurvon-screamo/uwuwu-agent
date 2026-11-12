@@ -14,6 +14,8 @@ fn create(dry_run: bool) -> TaskSub {
     TaskSub::Create {
         title: "проба-скелета".into(),
         r#type: Some("bug".into()),
+        priority: None,
+        autodone: false,
         stdin: false,
         attach: Vec::<PathBuf>::new(),
         schedule: None,

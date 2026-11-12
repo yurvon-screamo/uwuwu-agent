@@ -210,6 +210,12 @@ pub struct SyTask {
     pub task_type: String,
     pub branch: String,
     pub pr: String,
+    /// Значение колонки «Приоритет» (select high/medium/low; "" — не задан,
+    /// дефолта нет — решение владельца).
+    pub priority: String,
+    /// Значение колонки «Autodone» (checkbox): true — автомерж при входе в
+    /// Review (ставит только владелец).
+    pub autodone: bool,
     /// Значение колонки «Сессия dev» (пишут фабрика при спавне и `task claim`).
     pub dev_session: String,
     /// Дата из колонки «Запланировано» (formattedContent date-клетки;
@@ -368,6 +374,8 @@ pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         title: String::new(),
         status: String::new(),
         task_type: String::new(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
@@ -408,6 +416,8 @@ pub(crate) fn parse_render_row(it: &Value, keys: &[Value]) -> Option<SyTask> {
         match name.as_str() {
             "Status" | "Статус" => t.status = value,
             TYPE_CELL | "Type" => t.task_type = value,
+            PRIORITY_CELL => t.priority = value,
+            AUTODONE_CELL => t.autodone = value == "true",
             "Branch" => t.branch = value,
             DEV_SESSION_CELL => t.dev_session = value,
             "PR" | "Pr" => t.pr = value,
@@ -447,6 +457,18 @@ fn cell_value(cell: &Value) -> String {
         Some("email") => single("/email/content"),
         Some("phone") => single("/phone/content"),
         Some("date") => single("/date/formattedContent"),
+        Some("checkbox") => {
+            return if c
+                .pointer("/checkbox/checked")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string();
+        }
         Some("select") | Some("mSelect") => {
             return c
                 .get("mSelect")
@@ -594,6 +616,17 @@ pub(crate) async fn status_key(sy: &SiYuan, av: &str) -> Result<String> {
 /// (паритет Status/"Статус"), создание — русское имя (доски проекта русские).
 pub const TYPE_CELL: &str = "Тип";
 
+/// Имя колонки приоритета (select high/medium/low): триаж ставит явно при
+/// заведении — дефолта нет, «нужно явно все указывать обязательно»
+/// (решение владельца, задача 20261112160316). Пустая клетка — валидное
+/// «не указан»: в очереди фабрики сортируется ниже low.
+pub const PRIORITY_CELL: &str = "Приоритет";
+
+/// Имя колонки autodone (checkbox): задача мержится автоматически при
+/// входе в Review. Носитель галочки — только владелец (UI/task edit),
+/// триаж не ставит никогда.
+pub const AUTODONE_CELL: &str = "Autodone";
+
 /// Дефолт типа при `task create` без `--type` (sy_dispatch, dispatch и
 /// dry-run): feature — батч-дефолт миграции 20261110180332 и базовый тип
 /// фичевого пайпа. Прежний дефолт dev выпилен из канона — захардкоженный
@@ -613,6 +646,20 @@ pub fn validate_task_type(raw: &str) -> Result<String> {
             "тип «{raw}» не разобран: жди feature | refactoring | legacy | idea | qa | \
              infrastructure | bug | spike | analys | docs | other (колонка \
              «{TYPE_CELL}» доски; dev выпилен — мигрируй строку на новый канон)"
+        ),
+    }
+}
+
+/// Канон приоритета: trim + нижний регистр ∈ {high, medium, low} —
+/// канонические литералы в стиле Status/Тип (ядро апсертит select-опцию
+/// по точному content, валидатор возвращает каноническую форму).
+pub fn validate_priority(raw: &str) -> Result<String> {
+    let canon = raw.trim().to_lowercase();
+    match canon.as_str() {
+        "high" | "medium" | "low" => Ok(canon),
+        _ => bail!(
+            "приоритет «{raw}» не разобран: жди high | medium | low (колонка \
+             «{PRIORITY_CELL}» доски; дефолта нет — приоритет ставится явно)"
         ),
     }
 }
@@ -771,6 +818,25 @@ pub(crate) async fn ensure_schedule_key(sy: &SiYuan, av: &str) -> Result<String>
     sy.add_attr_view_key(av, SCHEDULE_CELL, "text").await
 }
 
+/// keyID колонки «Приоритет»: существующая или свежесозданная select-колонка
+/// (ensure-паттерн «Тип»).
+pub(crate) async fn ensure_priority_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == PRIORITY_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, PRIORITY_CELL, "select").await
+}
+
+/// keyID колонки «Autodone»: существующая или свежесозданная checkbox-колонка.
+pub(crate) async fn ensure_autodone_key(sy: &SiYuan, av: &str) -> Result<String> {
+    let keys = board_keys(sy, av).await?;
+    if let Some((_, id)) = keys.iter().find(|(name, _)| name == AUTODONE_CELL) {
+        return Ok(id.clone());
+    }
+    sy.add_attr_view_key(av, AUTODONE_CELL, "checkbox").await
+}
+
 /// Колонки database: (имя → id) в порядке объявления на доске.
 pub(crate) async fn board_keys(sy: &SiYuan, av: &str) -> Result<Vec<(String, String)>> {
     let v = sy
@@ -861,17 +927,17 @@ pub async fn create(
     sy: &SiYuan,
     project: &str,
     title: &str,
-    ty: &str,
     ctx: &str,
     initial_status: &str,
+    props: &CreateProps<'_>,
 ) -> Result<(String, String)> {
     create_with_pacing(
         sy,
         project,
         title,
-        ty,
         ctx,
         initial_status,
+        props,
         &RowInsertPacing::production(),
     )
     .await
@@ -883,30 +949,108 @@ pub(crate) async fn create_with_pacing(
     sy: &SiYuan,
     project: &str,
     title: &str,
-    ty: &str,
     ctx: &str,
     initial_status: &str,
+    props: &CreateProps<'_>,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
+    // тип в шаблоне и клетке — один: dispatch всегда канонизирует к дефолту
+    let ty = props.ty.unwrap_or(DEFAULT_TASK_TYPE);
     create_row_with_body(
         sy,
         &board,
         title,
         initial_status,
         &create_body_md(title, ty, ctx),
-        Some(ty),
+        props,
         pacing,
     )
     .await
 }
 
+/// Свойства задачной строки при create: тип/приоритет/autodone (goal-путь —
+/// Default: колонки задач на доске целей не минтятся).
+#[derive(Default)]
+pub struct CreateProps<'a> {
+    /// Канон типа (Some пишется всегда, включая дефолт feature).
+    pub ty: Option<&'a str>,
+    /// Канон приоритета (None — клетка не пишется, дефолта нет).
+    pub priority: Option<&'a str>,
+    /// Autodone-галочка (владелец решает; триаж не ставит).
+    pub autodone: bool,
+}
+
+/// Клетки свойств созданной строки (тип/приоритет/autodone): ensure колонки
+/// и запись клетки; сбой — громкий отказ с рецептом доставки (паритет
+/// прежнего inline-типа). Default-props (goal-путь) — no-op.
+async fn write_create_props(
+    sy: &SiYuan,
+    board: &SyBoard,
+    item: &str,
+    title: &str,
+    props: &CreateProps<'_>,
+) -> Result<()> {
+    if let Some(ty) = props.ty {
+        let tk = ensure_type_key(sy, &board.av_id).await.with_context(|| {
+            format!(
+                "задача «{title}» создана (строка {item}), но колонка \
+                 «{TYPE_CELL}» не создана — доставь тип: task edit {item} --type {ty}"
+            )
+        })?;
+        sy.db_item_set_select(&board.av_id, &tk, item, ty)
+            .await
+            .with_context(|| {
+                format!(
+                    "задача «{title}» создана (строка {item}), но тип не записан — \
+                 доставь: task edit {item} --type {ty}"
+                )
+            })?;
+    }
+    if let Some(priority) = props.priority {
+        let pk = ensure_priority_key(sy, &board.av_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "строка {item} создана, но колонка «{PRIORITY_CELL}» не создана — \
+                 доставь приоритет: task edit {item} --priority {priority}"
+                )
+            })?;
+        sy.db_item_set_select(&board.av_id, &pk, item, priority)
+            .await
+            .with_context(|| {
+                format!(
+                    "строка {item} создана, но приоритет не записан — доставь: \
+                     task edit {item} --priority {priority}"
+                )
+            })?;
+    }
+    if props.autodone {
+        let ak = ensure_autodone_key(sy, &board.av_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "строка {item} создана, но колонка «{AUTODONE_CELL}» не создана — \
+                 доставь: task edit {item} --autodone"
+                )
+            })?;
+        sy.db_item_set_checkbox(&board.av_id, &ak, item, true)
+            .await
+            .with_context(|| {
+                format!(
+                    "строка {item} создана, но autodone не записан — доставь: \
+                     task edit {item} --autodone"
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// Общий механизм создания bound-строки на готовой доске (task::create,
 /// goal::create): тело-саб-док (или перепривязка тела-сироты) + строка,
 /// привязанная к нему blockID, + начальный Status + verify вставки с
-/// ретраем ×1. `ty` — канон типа задачи: Some — ensure колонки «Тип» и
-/// запись клетки после подтверждения вставки (дефолт feature тоже пишется);
-/// None — goal-путь, колонка не минтится и клетка не пишется. `pacing` —
+/// ретраем ×1. `props` — клетка «Тип»/«Приоритет»/«Autodone» после
+/// подтверждения вставки (goal — Default: колонки не минтятся). `pacing` —
 /// пауза перед повторной вставкой (инъекция: прод 1.5 s, тесты мгновенно —
 /// см. RowInsertPacing). Возвращает (itemID, bodyDocID).
 pub async fn create_row_with_body(
@@ -915,7 +1059,7 @@ pub async fn create_row_with_body(
     title: &str,
     initial_status: &str,
     template_md: &str,
-    ty: Option<&str>,
+    props: &CreateProps<'_>,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     // идемпотентность: строка или тело с таким заголовком уже есть?
@@ -950,22 +1094,10 @@ pub async fn create_row_with_body(
         let rows = read_rows(sy, board).await?;
         match check_row_insert(&rows, &item, title) {
             RowInsertCheck::Confirmed => {
-                // тип — колонка «Тип» доски: сбой записи после create не теряет
-                // задачу, тип доставляется повторным task edit --type
-                if let Some(ty) = ty {
-                    let tk = ensure_type_key(sy, &board.av_id).await.with_context(|| {
-                        format!(
-                            "задача «{title}» создана (строка {item}, тело {body}), но колонка \
-                             «{TYPE_CELL}» не создана — доставь тип: task edit {item} --type {ty}"
-                        )
-                    })?;
-                    sy.db_item_set_select(&board.av_id, &tk, &item, ty).await.with_context(|| {
-                        format!(
-                            "задача «{title}» создана (строка {item}, тело {body}), но тип не \
-                             записан — доставь: task edit {item} --type {ty}"
-                        )
-                    })?;
-                }
+                // клетки свойств — после подтверждения вставки: сбой записи
+                // после create не теряет задачу, свойство доставляется
+                // повторным task edit
+                write_create_props(sy, board, &item, title, props).await?;
                 return Ok((item, body));
             }
             RowInsertCheck::DuplicateTitle => bail!(
@@ -1777,24 +1909,51 @@ pub(crate) fn pr_cell_value(pr: &str) -> Result<Value> {
     Ok(serde_json::json!({ "url": { "content": pr } }))
 }
 
-/// Смена статуса/branch/pr/типа (title-переименование не поддерживаем v1).
-/// Тип: Some("") — снятие (пустой mSelect), Some(canon) — запись, None —
-/// не менять. Валидация типа до любых записей (паритет pr).
+/// Клетки-свойства одной мутации task edit. Валидация значений — до любых
+/// записей (паритет pr); None — поле не трогаем. Пустая строка в Option —
+/// снятие (очистка клетки).
+pub struct CellUpdates<'a> {
+    pub status: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub pr: Option<&'a str>,
+    pub ty: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    /// Some(true/false) — вкл/выкл autodone, None — не менять.
+    pub autodone: Option<bool>,
+}
+
+impl<'a> CellUpdates<'a> {
+    pub fn status_only(status: &'a str) -> Self {
+        Self {
+            status: Some(status),
+            branch: None,
+            pr: None,
+            ty: None,
+            priority: None,
+            autodone: None,
+        }
+    }
+}
+
+/// Смена статуса/branch/pr/типа/приоритета/autodone (title-переименование
+/// не поддерживаем v1). Пустая строка — снятие (клетка очищается); None —
+/// не менять. Валидация всех значений до любых записей: без частичных
+/// обновлений.
 pub async fn edit(
     sy: &SiYuan,
     board: &SyBoard,
     task: &SyTask,
-    status: Option<&str>,
-    branch: Option<&str>,
-    pr: Option<&str>,
-    ty: Option<&str>,
+    updates: &CellUpdates<'_>,
 ) -> Result<()> {
-    // валидация PR до любых записей: без частичных обновлений;
-    // пустой ty — снятие (клетка очищается), валидация — только непустому
-    let pr_value = pr.map(pr_cell_value).transpose()?;
-    let ty_canonical = match ty {
+    let pr_value = updates.pr.map(pr_cell_value).transpose()?;
+    let ty_canonical = match updates.ty {
         Some("") => Some(String::new()),
         Some(raw) => Some(validate_task_type(raw)?),
+        None => None,
+    };
+    let priority_canonical = match updates.priority {
+        Some("") => Some(String::new()),
+        Some(raw) => Some(validate_priority(raw)?),
         None => None,
     };
     let find = |name: &str, keys: &[(String, String)]| -> Option<String> {
@@ -1803,12 +1962,12 @@ pub async fn edit(
             .map(|(_, id)| id.clone())
     };
     let keys = board_keys(sy, &board.av_id).await?;
-    if let Some(st) = status {
+    if let Some(st) = updates.status {
         let k = find("Status", &keys).context("ключ Status не найден")?;
         sy.db_item_set_status(&board.av_id, &k, &task.item_id, st)
             .await?;
     }
-    if let Some(v) = branch {
+    if let Some(v) = updates.branch {
         let k = find("Branch", &keys).context("ключ Branch не найден")?;
         sy.mcp_tool(
             "database",
@@ -1830,6 +1989,16 @@ pub async fn edit(
         // ensure колонки и здесь: легаси-строки живут на досках без «Тип»
         let k = ensure_type_key(sy, &board.av_id).await?;
         sy.db_item_set_select(&board.av_id, &k, &task.item_id, &canon)
+            .await?;
+    }
+    if let Some(canon) = priority_canonical {
+        let k = ensure_priority_key(sy, &board.av_id).await?;
+        sy.db_item_set_select(&board.av_id, &k, &task.item_id, &canon)
+            .await?;
+    }
+    if let Some(checked) = updates.autodone {
+        let k = ensure_autodone_key(sy, &board.av_id).await?;
+        sy.db_item_set_checkbox(&board.av_id, &k, &task.item_id, checked)
             .await?;
     }
     Ok(())
@@ -2334,6 +2503,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_render_row_reads_priority_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-prio", "name": PRIORITY_CELL }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-prio", "type": "mSelect",
+                       "mSelect": [{ "content": "high" }] }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert_eq!(t.priority, "high");
+    }
+
+    #[test]
+    fn parse_render_row_reads_checkbox_autodone_cell() {
+        let keys = vec![
+            json!({ "id": "key-1", "name": "Primary Key" }),
+            json!({ "id": "key-auto", "name": AUTODONE_CELL }),
+        ];
+        let mut row = render_row("таск", "row-1", None);
+        row["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-auto", "type": "checkbox",
+                       "checkbox": { "checked": true } }
+        }));
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert!(t.autodone);
+        let mut row_off = render_row("таск-2", "row-2", None);
+        row_off["cells"].as_array_mut().unwrap().push(json!({
+            "value": { "keyID": "key-auto", "type": "checkbox",
+                       "checkbox": { "checked": false } }
+        }));
+        let t2 = parse_render_row(&row_off, &keys).unwrap();
+        assert!(!t2.autodone);
+    }
+
+    #[test]
+    fn parse_render_row_keeps_autodone_false_without_cell() {
+        let keys = vec![json!({ "id": "key-1", "name": "Primary Key" })];
+        let row = render_row("таск", "row-1", None);
+        let t = parse_render_row(&row, &keys).unwrap();
+        assert!(!t.autodone);
+        assert_eq!(t.priority, "");
+    }
+
+    #[test]
+    fn validate_priority_canonizes_case_and_rejects_unknown() {
+        assert_eq!(validate_priority(" High ").unwrap(), "high");
+        assert_eq!(validate_priority("MEDIUM").unwrap(), "medium");
+        assert_eq!(validate_priority("Low").unwrap(), "low");
+        let err = validate_priority("средний").expect_err("не-канон — отказ");
+        assert!(
+            err.to_string().contains("high | medium | low"),
+            "суть: {err}"
+        );
+    }
+
+    #[test]
     fn validate_task_type_canonizes_case_and_rejects_unknown() {
         assert_eq!(validate_task_type(" Bug ").unwrap(), "bug");
         assert_eq!(validate_task_type("Spike").unwrap(), "spike");
@@ -2511,6 +2738,8 @@ mod tests {
             title: title.to_string(),
             status: String::new(),
             task_type: String::new(),
+            priority: String::new(),
+            autodone: false,
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),
@@ -2650,6 +2879,8 @@ mod tests {
             title: title.to_string(),
             status: "Todo".into(),
             task_type: String::new(),
+            priority: String::new(),
+            autodone: false,
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),

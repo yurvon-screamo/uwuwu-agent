@@ -319,6 +319,47 @@ async function mcpToolCall(name: string, args: Record<string, unknown>): Promise
 
 const keyCache = new Map<string, Map<string, string>>()
 
+/** Гарантированные колонки database-доски (автодон: «Приоритет» select,
+ *  «Autodone» checkbox — задача 20261112160316): отсутствующая минтится
+ *  через kernel /api/av/addAttributeViewKey (REST-проба той же задачи),
+ *  присутствующая — no-op. keyCache инвалидируется: свежесминченный ключ
+ *  обязан быть виден следующим update_database_row. */
+async function ensureDatabaseColumns(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const blockId = String(args.databaseBlockId ?? "")
+  const avId = await avIdOfBlock(blockId)
+  const wanted = (args.columns ?? []) as { name?: string; type?: string }[]
+  const existing = await avKeys(avId)
+  const created: string[] = []
+  for (const col of wanted) {
+    const name = String(col.name ?? "")
+    const type = String(col.type ?? "text")
+    if (!name || existing.has(name)) continue
+    await post("/api/av/addAttributeViewKey", {
+      avID: avId,
+      keyID: newNodeId(),
+      keyName: name,
+      keyType: type,
+      keyIcon: "",
+      previousKeyID: "",
+    })
+    created.push(name)
+  }
+  if (created.length > 0) keyCache.delete(avId)
+  return { created, avId }
+}
+
+/** Id узла в формате ядра: 14-значный timestamp + 7 случайных [a-z0-9]
+ *  (паритет CLI siyuan_id::new_node_id). */
+function newNodeId(): string {
+  const d = new Date()
+  const p = (n: number, w = 2) => String(n).padStart(w, "0")
+  const ts = `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`
+  const abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+  let tail = ""
+  for (let i = 0; i < 7; i++) tail += abc[Math.floor(Math.random() * abc.length)]
+  return `${ts}-${tail}`
+}
+
 async function avKeys(avId: string): Promise<Map<string, string>> {
   const hit = keyCache.get(avId)
   if (hit) return hit
@@ -389,6 +430,11 @@ async function readDatabaseCells(args: Record<string, unknown>): Promise<Record<
         value = v[v.type]?.content ?? ""
       } else if (v.type === "select" || v.type === "mSelect") {
         value = (v.mSelect ?? []).map((o) => o.content).join(",")
+      } else if (v.type === "checkbox") {
+        // kernel av.ValueCheckbox {checked}; строковый контракт клеток прочих
+        // типов соблюдается: "true"/"false" (проба живым ядром, задача
+        // 20261112160316)
+        value = v.checkbox?.checked === true ? "true" : "false"
       } else if (v.type === "date") {
         dateMs = typeof v.date?.content === "number" && v.date.content > 0 ? v.date.content : null
         value = v.date?.formattedContent ?? ""
@@ -577,6 +623,8 @@ export async function tool<T = Record<string, unknown>>(name: string, args: Reco
       return readDatabaseCells(args) as T
     case "update_database_row":
       return updateDatabaseRow(args) as T
+    case "ensure_database_columns":
+      return ensureDatabaseColumns(args) as T
     case "doc_exists": {
       // Живость дока через MCP block get (не SQL): индекс blocks отстаёт от
       // свежих доков, filetree/block — FS-истина. Ядро отвечает isError

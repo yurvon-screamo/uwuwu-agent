@@ -46,6 +46,19 @@ pub(crate) enum TaskSub {
             help = "Начальный статус: только Todo (машинные создания — крон-раны); без флага — Draft"
         )]
         status: Option<String>,
+        #[arg(
+            long,
+            value_name = "PRIORITY",
+            help = "Приоритет: high | medium | low (колонка «Приоритет» доски; дефолта нет — приоритет ставится явно, триаж обязан указывать)"
+        )]
+        priority: Option<String>,
+        /// Autodone-галочка: автомерж PR при входе задачи в Review (ставит
+        /// только владелец, триаж не ставит)
+        #[arg(
+            long,
+            help = "Autodone: автомерж PR при входе в Review (галочка владельца)"
+        )]
+        autodone: bool,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
         #[arg(
@@ -129,6 +142,24 @@ pub(crate) enum TaskSub {
             help = "Тип: feature | bug | spike | analys | docs | other | refactoring | legacy | idea | qa | infrastructure; \"\" — снять"
         )]
         r#type: Option<String>,
+        /// Приоритет: колонка «Приоритет» доски; пустая строка снимает
+        /// (дефолта нет — приоритет ставится явно)
+        #[arg(
+            long,
+            value_name = "PRIORITY",
+            help = "Приоритет: high | medium | low; \"\" — снять"
+        )]
+        priority: Option<String>,
+        /// Autodone: автомерж PR при входе задачи в Review; значение
+        /// опционально — без значения on, off снимает галочку
+        #[arg(
+            long,
+            value_name = "ON_OFF",
+            num_args = 0..=1,
+            default_missing_value = "on",
+            help = "Autodone: on | off (без значения — on); автомерж PR при входе в Review"
+        )]
+        autodone: Option<String>,
         /// Расписание крона: записать/сменить; пустая строка снимает
         /// (пауза = закрыть задачу, расписания без задачи не бывает)
         #[arg(

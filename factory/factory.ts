@@ -79,6 +79,8 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
+  USER_REVIEW_STATUS,
+  AGENT_MARK,
   stripExportWrapper,
   alertTargetOf,
   spawnGuardVerdict,
@@ -107,7 +109,21 @@ import {
   type TaskComment,
   type TaskRef,
   type TrackedTask,
+  activeTaskCountEx,
+  cupBudget,
+  queueOrder,
+  peakWindowFromEnv,
+  isPeakHours,
+  type PeakWindow,
 } from "./factory-lib"
+import {
+  prCarrierOf,
+  githubProbeVerdict,
+  giteaProbeVerdict,
+  autodoneAction,
+  type PrCarrier,
+  type PrProbeState,
+} from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
@@ -179,6 +195,17 @@ const ONCE = process.env.UWUWU_FACTORY_ONCE === "1"
  *  (спавны, промпты, ячейки, комменты, термин сессий) заменяются логом.
  *  Требует песочницу state — гард в main(). */
 const DRY_RUN = process.env.UWUWU_FACTORY_DRY_RUN === "1"
+/** CUP (задача 20261112160316): кап одновременно активных (LLM-тратящих)
+ *  задач глобально по всем проектам — GLM-подписка одна. Мусор env → 7. */
+const CUP_RAW = Number(process.env.UWUWU_FACTORY_CUP ?? 7)
+const CUP = CUP_RAW > 0 ? CUP_RAW : 7
+/** Пик-окно GLM Coding Plan (см. peakWindowFromEnv): дефолт 06:00–10:00 UTC
+ *  = 15:00–19:00 JST, "off" отключает заморозку. */
+const PEAK: PeakWindow = peakWindowFromEnv(process.env.UWUWU_FACTORY_PEAK)
+/** Таймаут ожидания зелёного CI автодона (pending-проба) — дальше Needs
+ *  attention (не bounce: висящий CI не вина задачи). */
+const AUTODONE_TIMEOUT_RAW = Number(process.env.UWUWU_FACTORY_AUTODONE_TIMEOUT_MIN ?? 60)
+const AUTODONE_TIMEOUT_MS = AUTODONE_TIMEOUT_RAW > 0 ? AUTODONE_TIMEOUT_RAW * 60_000 : 60 * 60_000
 const MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
 /** ревьювер результата («Ревью результата»): праймари-агент, качество важнее цены
  *  будильника. «Ревью плана» ведёт PLAN_REVIEWER ниже. Модель дублирует
@@ -293,6 +320,35 @@ async function sh(cmd: string[], opts: { cwd?: string } = {}): Promise<string> {
 
 interface BoardIds { docId: string; dbId: string }
 
+/** Контракт колонок автодона на досках задач (задача 20261112160316):
+ *  «Приоритет» select + «Autodone» checkbox — постановка сама требует
+ *  колонки, это явное поручение на доску-мутацию. Идемпотентно, на старте
+ *  демона по всем проектным доскам; сбой одного проекта не глушит старт. */
+const AUTODONE_COLUMNS = [
+  { name: "Приоритет", type: "select" },
+  { name: "Autodone", type: "checkbox" },
+]
+
+async function ensureBoardColumns(projects: Record<string, ProjectCfg>): Promise<void> {
+  if (DRY_RUN) {
+    log("DRY_RUN: ensure колонок автодона пропущен (мутация доски)")
+    return
+  }
+  for (const [name, cfg] of Object.entries(projects)) {
+    try {
+      const board = await findBoard(cfg.board)
+      const r = await mcp.tool<{ created?: string[] }>("ensure_database_columns", {
+        docId: board.docId, databaseBlockId: board.dbId, columns: AUTODONE_COLUMNS,
+      })
+      if ((r.created ?? []).length > 0) {
+        log(`колонки автодона на «${cfg.board}» минчены: ${(r.created ?? []).join(", ")}`)
+      }
+    } catch (e) {
+      log(`колонки автодона [${name}]: ${errText(e)} — задачи проекта без колонок читаются пустыми, retry на следующем старте`)
+    }
+  }
+}
+
 async function findBoard(title: string): Promise<BoardIds> {
   const r = await mcp.tool<{ matches?: { id: string; inTrash?: boolean }[] }>("find_doc_by_title", { title, caseInsensitive: true, limit: 5 })
   let docId = r.matches?.find(m => m.inTrash !== true)?.id
@@ -394,6 +450,8 @@ export async function readTasks(
       title,
       status: row.cells?.Status?.value ?? "",
       type: (row.cells?.Тип?.value ?? "").trim(),
+      priority: (row.cells?.Приоритет?.value ?? "").trim(),
+      autodone: (row.cells?.Autodone?.value ?? "") === "true",
       pr: row.cells?.PR?.value ?? "",
       branch: row.cells?.Branch?.value ?? "",
       devSession: (row.cells?.[DEV_SESSION_CELL]?.value ?? "").trim(),
@@ -871,6 +929,7 @@ async function startTask(
     // от него, пока агент не породил активность
     lastDevPromptAt: Date.now(),
     lastStatus: task.status, // спавн из этого статуса (Design/In Progress) — не рестартить им же
+    priority: task.priority,
     ...(envDir !== undefined ? { envDir } : {}),
     // история корней: append при каждом спавне (рестарты не теряют прошлые
     // поколения сессий — BFS задачного прогона накрывает осиротевших)
@@ -1162,6 +1221,235 @@ async function prProbeByBranch(repo: string, branch: string): Promise<PrProbeOut
     ])
     return url !== "" ? { result: "merged", mergedUrl: url } : { result: "open", mergedUrl: null }
   } catch { return { result: "unknown", mergedUrl: null } }
+}
+
+// ——— автодон: галочка владельца → проба/мерж PR на входе в Review ———
+// (задача 20261112160316; решение одного тика — autodoneAction в autodone.ts)
+
+/** Токен tea-логина по имени-хосту (конфиг ~/.config/tea/config.yml).
+ *  null — логина/токена нет: проба уйдёт в unknown → streak → эскалация,
+ *  не тихая деградация. */
+function teaTokenFor(host: string): string | null {
+  try {
+    const raw = readFileSync(join(homedir(), ".config", "tea", "config.yml"), "utf8")
+    const blocks = raw.split(/^\s*-\s+name:\s*/m).slice(1)
+    for (const block of blocks) {
+      const name = block.split("\n")[0]?.trim() ?? ""
+      if (name !== host) continue
+      const m = block.match(/^\s+token:\s*(\S+)/m)
+      return m?.[1] ?? null
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Gitea API GET (токен из конфига tea). Сбой/не-2xx → null: проба честно
+ *  уходит в unknown (стрик до эскалации), не маскируется. Таймаут — тот же
+ *  SPAWN_TIMEOUT_MS (ревью Low: зависший хост не должен висеть на дефолте). */
+async function giteaApi(host: string, path: string): Promise<unknown | null> {
+  const token = teaTokenFor(host)
+  if (token === null) return null
+  try {
+    const r = await fetch(`https://${host}/api/v1${path}`, {
+      headers: { Authorization: `token ${token}` },
+      signal: AbortSignal.timeout(SPAWN_TIMEOUT_MS),
+    })
+    if (!r.ok) return null
+    return await r.json()
+  } catch {
+    return null
+  }
+}
+
+/** Проба PR по носителю. GitHub — gh pr view; Gitea — HTTP API (pulls/{index}
+ *  + combined status head-SHA; пустой статус = CI не настроен, не блокер).
+ *  Фоллбек по ветке — поиск открытого PR; не нашли → носитель «без ПР». */
+async function autodoneProbe(
+  carrier: PrCarrier, cfg: ProjectCfg,
+): Promise<{ state: PrProbeState; pr: PrCarrier }> {
+  switch (carrier.kind) {
+    case "github": {
+      try {
+        const raw = await sh([
+          "gh", "pr", "view", carrier.url,
+          "--json", "state,mergeable,mergeStateStatus,statusCheckRollup",
+        ])
+        return { state: githubProbeVerdict(JSON.parse(raw)), pr: carrier }
+      } catch {
+        return { state: "unknown", pr: carrier }
+      }
+    }
+    case "gitea": {
+      const data = await giteaApi(carrier.host, `/repos/${carrier.slug}/pulls/${carrier.index}`)
+      if (data === null || typeof data !== "object") return { state: "unknown", pr: carrier }
+      const d = data as { head?: { sha?: string }; state?: string; merged?: boolean; mergeable?: boolean }
+      let ci = ""
+      if (typeof d.head?.sha === "string" && d.head.sha !== "") {
+        const st = await giteaApi(carrier.host, `/repos/${carrier.slug}/commits/${d.head.sha}/status`)
+        ci = String((st as { state?: string } | null)?.state ?? "")
+      }
+      return { state: giteaProbeVerdict(d, ci), pr: carrier }
+    }
+    case "github-branch": {
+      try {
+        const url = await sh([
+          "gh", "pr", "list", "-R", cfg.repo, "--head", carrier.branch,
+          "--state", "open", "--json", "url", "--jq", ".[0].url",
+        ])
+        if (url === "") return { state: "clean", pr: { kind: "none" } }
+        return await autodoneProbe({ kind: "github", url }, cfg)
+      } catch {
+        return { state: "unknown", pr: carrier }
+      }
+    }
+    case "gitea-branch": {
+      const list = await giteaApi(carrier.host, `/repos/${carrier.slug}/pulls?state=open`)
+      if (list === null || !Array.isArray(list)) return { state: "unknown", pr: carrier }
+      const hit = list.find((p) => (p as { head?: { ref?: string } })?.head?.ref === carrier.branch)
+      if (hit === undefined) return { state: "clean", pr: { kind: "none" } }
+      const h = hit as { html_url?: string; number?: number }
+      return await autodoneProbe({
+        kind: "gitea", url: h.html_url ?? "", host: carrier.host,
+        index: String(h.number ?? ""), slug: carrier.slug,
+      }, cfg)
+    }
+    case "none":
+      return { state: "clean", pr: carrier }
+    case "invalid":
+      // недостижимо из runAutodoneTick (invalid перехватывается раньше с
+      // эскалацией), но тип требует полноты: honest unknown, не падение
+      return { state: "unknown", pr: carrier }
+  }
+}
+
+/** Мерж PR носителя: gh --merge / tea --style merge (merge-commit — как
+ *  мержит владелец). false — сбой вызова: streak до эскалации. */
+async function mergePr(pr: PrCarrier): Promise<boolean> {
+  try {
+    if (pr.kind === "github") {
+      await sh(["gh", "pr", "merge", pr.url, "--merge"])
+      return true
+    }
+    if (pr.kind === "gitea") {
+      await sh(["tea", "pr", "merge", pr.index, "--repo", pr.slug, "--login", pr.host, "--style", "merge"])
+      return true
+    }
+    return false
+  } catch (e) {
+    log(`autodone merge (${pr.kind}): ${errText(e)}`)
+    return false
+  }
+}
+
+/** Один тик автодона по задаче в Review с галочкой: проба → вердикт →
+ *  исход. Все статусы-пишутся через setCells (DRY_RUN гейтится внутри),
+ *  merge-вызовы гейтятся явно (новый класс внешних мутаций — замечание
+ *  ревью High). Bounce НЕ трогает lastStatus: следующий тик вернёт мяч
+ *  девелоперу штатным return-to-dev. */
+async function runAutodoneTick(
+  task: TaskRef, tracked: TrackedTask, ctx: { cfg: ProjectCfg; board: BoardIds; state: FactoryState; counters: PassCounters },
+): Promise<void> {
+  const { cfg, board, state, counters } = ctx
+  const rowId = task.rowId
+  if (tracked.autodoneState !== "pending") {
+    tracked.autodoneState = "pending"
+    tracked.autodoneSince = Date.now()
+    // новый эпизод — свежий бюджет проб: unknown-страйк прошлого эпизода
+    // (эскалация на сбойном хосте) не должна эскалировать с первой пробы
+    // (ревью раунд 2, Low)
+    tracked.prProbeUnknownStreak = undefined
+    saveState(state)
+    log(`задача ${rowId.slice(0, 8)}: autodone — вход в Review, проба PR`)
+  }
+  const finishDone = async (comment: string): Promise<void> => {
+    await setCells(board, rowId, { Status: "Done" })
+    tracked.autodoneState = "merged"
+    if (task.pr !== "") tracked.mergedPrUrl = task.pr
+    tracked.lastStatus = "Done"
+    saveState(state)
+    counters.autodoneMerged = (counters.autodoneMerged ?? 0) + 1
+    await commentTask(tracked.bodyDoc, `${AGENT_MARK} autodone: ${comment}`)
+  }
+  const carrier0 = prCarrierOf(task.pr, task.branch, cfg.repo)
+  if (carrier0.kind === "none") {
+    log(`задача ${rowId.slice(0, 8)}: autodone — PR-ячейки нет (wiki-URL/пусто) → Done`)
+    await finishDone("задача без PR закрывается — Done")
+    return
+  }
+  if (carrier0.kind === "invalid") {
+    // мусор в PR-ячейке (PR-паттерн без схемы и пр.): громко человеку, не
+    // Done и не крэш тика (ревью Common-1)
+    log(`задача ${rowId.slice(0, 8)}: autodone — PR-ячейка не парсится как URL → Needs attention`)
+    await setCells(board, rowId, { Status: "Needs attention" })
+    tracked.autodoneState = "escalated"
+    tracked.lastStatus = "Needs attention"
+    saveState(state)
+    await notify(tracked, `[factory] autodone: PR-ячейка не парсится как URL («${carrier0.url}»). Поправь ячейку и переставь Review — автодон перезапустится.`)
+    return
+  }
+  const { state: probe, pr } = await autodoneProbe(carrier0, cfg)
+  if (pr.kind === "none") {
+    log(`задача ${rowId.slice(0, 8)}: autodone — PR по ветке не найден → Done`)
+    await finishDone("PR по ветке не найден — задача без PR закрывается: Done")
+    return
+  }
+  const pendingMs = Date.now() - (tracked.autodoneSince ?? Date.now())
+  const act = autodoneAction(probe, {
+    pendingMs,
+    timeoutMs: AUTODONE_TIMEOUT_MS,
+    unknownStreak: tracked.prProbeUnknownStreak ?? 0,
+    unknownMax: PR_PROBE_UNKNOWN_MAX,
+  })
+  switch (act.t) {
+    case "wait": {
+      log(`задача ${rowId.slice(0, 8)}: autodone — ${probe}, жду следующий тик (${Math.round(pendingMs / 60_000)} мин в Review)`)
+      return
+    }
+    case "merge": {
+      if (DRY_RUN) {
+        log(`DRY_RUN: autodone merge (${pr.kind}) по ${rowId.slice(0, 8)} — пропущен`)
+        return
+      }
+      const ok = await mergePr(pr)
+      if (!ok) {
+        tracked.prProbeUnknownStreak = (tracked.prProbeUnknownStreak ?? 0) + 1
+        saveState(state)
+        log(`задача ${rowId.slice(0, 8)}: autodone — merge не удался (попытка ${tracked.prProbeUnknownStreak}/${PR_PROBE_UNKNOWN_MAX})`)
+        return
+      }
+      tracked.prProbeUnknownStreak = undefined
+      log(`задача ${rowId.slice(0, 8)}: autodone — PR смержен → Done`)
+      await finishDone(`PR смержен (${pr.kind}) — Done`)
+      return
+    }
+    case "done": {
+      log(`задача ${rowId.slice(0, 8)}: autodone — ${act.reason} → Done`)
+      await finishDone(`${act.reason} — Done`)
+      return
+    }
+    case "bounce": {
+      log(`задача ${rowId.slice(0, 8)}: autodone — bounce: ${act.reason} → In Progress`)
+      await setCells(board, rowId, { Status: "In Progress" })
+      tracked.autodoneState = "bounced"
+      tracked.prProbeUnknownStreak = undefined
+      saveState(state)
+      counters.autodoneBounced = (counters.autodoneBounced ?? 0) + 1
+      // lastStatus не трогаем — следующий тик вернёт мяч девелоперу
+      await commentTask(tracked.bodyDoc, `${AGENT_MARK} autodone: ${act.reason} — задача возвращена в In Progress`)
+      return
+    }
+    case "escalate": {
+      log(`задача ${rowId.slice(0, 8)}: autodone — эскалация: ${act.reason}`)
+      await setCells(board, rowId, { Status: "Needs attention" })
+      tracked.autodoneState = "escalated"
+      tracked.lastStatus = "Needs attention"
+      saveState(state)
+      await notify(tracked, `[factory] autodone: ${act.reason}. Разберись (CI/конфликт/проба) — после разбора проведи задачу через пайп заново или переставь Review: автодон перезапустится на новом входе.`)
+      return
+    }
+  }
 }
 
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
@@ -1467,6 +1755,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     devSpawned: 0, reviewSpawned: 0, testerSpawned: 0, wakeups: 0, cleanups: 0,
     envCreated: 0, envRemoved: 0, envAtticked: 0,
     watched: 0, failures: [],
+    autodoneMerged: 0, autodoneBounced: 0,
   }
 
   // 1. новые задачи: Design → девелопер (утряска), In Progress без state →
@@ -1522,9 +1811,37 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
   // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
   // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
-  const devWave = guard.t === "allow"
+  // Очередь CUP (задача 20261112160316): кап активных (LLM-тратящих) задач
+  // глобально по всем проектам; берём первые budget в порядке приоритет →
+  // FIFO (rowId = timestamp создания). В пик считаются только high —
+  // замороженные не-high слотов не держат. Возвраты трекнутых задач девелоперу
+  // и карантинные спавны ревью/теста не гейтятся (продолжение пайпа, не новая
+  // работа) — но учитываются в счёте наравне.
+  const peakNow = isPeakHours(new Date(), PEAK)
+  const devCandidates = guard.t === "allow"
     ? untracked.filter((t) => reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId))
     : []
+  // пик-заморозка не-high: спавн откладывается до конца окна (выполняющиеся
+  // ходы сессий доигрывают — процессы не трогаем)
+  const candidatesNow = peakNow
+    ? devCandidates.filter((t) => (t.priority ?? "").trim().toLowerCase() === "high")
+    : devCandidates
+  const activeEntries = Object.values(state.tasks).map((t) => ({
+    status: t.lastStatus ?? "",
+    priority: t.priority ?? "",
+  }))
+  const active = activeTaskCountEx(activeEntries, { peak: peakNow })
+  const budget = cupBudget(active, CUP)
+  const devWave = queueOrder(candidatesNow).slice(0, budget)
+  const queued = candidatesNow.length - devWave.length
+  if (queued > 0) {
+    const head = queueOrder(candidatesNow)[budget]?.title
+    log(`очередь CUP: активных=${active}/${CUP}${peakNow ? " (пик: счёт только high)" : ""}, ждут=${queued}, голова — «${head ?? "?"}»`)
+  }
+  if (peakNow && devCandidates.length > candidatesNow.length) {
+    const frozen = devCandidates.length - candidatesNow.length
+    log(`часы пик: спавн не-high отложен (${frozen} задач(и), приоритеты medium/low/пусто — до конца окна)`)
+  }
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
@@ -1563,6 +1880,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       lastCommentAt: last?.createdAt ?? 0, lastCommentId: last?.id ?? "",
       createdAt: Date.now(), attempts: 0, reviewAttempts: 0, testAttempts: 0,
       lastStatus: task.status,
+      priority: task.priority,
       bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
       bodyHash: (await bodyHashOf(task.bodyDoc, quarantineExports)) ?? undefined,
     }
@@ -1581,6 +1899,31 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       counters.failures.push(`${task.rowId.slice(0, 8)}: ${errText(e)}`)
     }
     started.add(task.rowId)
+  }
+
+  // автодон-строки в Review без state (даунтайм демона на входе в Review):
+  // entry + проба этим же тиком основного цикла (НЕ started — строка должна
+  // дойти до автодон-хука). Спавна нет — guard каскада не задействован.
+  for (const task of rows) {
+    if (task.status !== USER_REVIEW_STATUS || !task.autodone) continue
+    if (state.tasks[task.rowId] !== undefined || started.has(task.rowId)) continue
+    const adExports = new Map<string, string | null>()
+    const last = latestComment(
+      (await taskComments(task.bodyDoc, adExports)).filter((c) => isUserComment(c, BOT_USER_ID)),
+    )
+    const entry: TrackedTask = {
+      sessionID: "", worktree: "", branch: "",
+      bodyDoc: task.bodyDoc, title: task.title, project: projectName,
+      lastCommentAt: last?.createdAt ?? 0, lastCommentId: last?.id ?? "",
+      createdAt: Date.now(), attempts: 0, reviewAttempts: 0, testAttempts: 0,
+      lastStatus: task.status,
+      priority: task.priority,
+      bodyUpdated: (await bodyUpdatedAt(task.bodyDoc)) ?? undefined,
+      bodyHash: (await bodyHashOf(task.bodyDoc, adExports)) ?? undefined,
+    }
+    state.tasks[task.rowId] = entry
+    saveState(state)
+    log(`задача ${task.rowId.slice(0, 8)}: autodone в Review без state — карантинная запись + проба`)
   }
 
   // 2. активные этой доски (state общий на все проекты)
@@ -1619,6 +1962,17 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.bodyDoc = adopted
       healed = true
       log(`задача ${rowId.slice(0, 8)}: пустой bodyDoc трека — принята привязка строки ${adopted.slice(0, 8)}`)
+    }
+    // приоритет строки — свежий из скана (счёт CUP в пик смотрит сюда)
+    if ((tracked.priority ?? "") !== (row.priority ?? "")) {
+      tracked.priority = row.priority
+      healed = true
+    }
+    // галочка снята → сброс seen: переустановка позже = свежая активация
+    // автодона (ревью Common-2)
+    if (!(row.autodone ?? false) && tracked.autodoneSeen === true) {
+      tracked.autodoneSeen = false
+      healed = true
     }
     if (tracked.bodyDoc !== "" && (tracked.bodyUpdated ?? "") === "") {
       const seeded = await bodyUpdatedAt(tracked.bodyDoc)
@@ -1678,7 +2032,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     const testerLiveness = tracked.testSessionID === undefined || tracked.testSessionID === ""
       ? "dead"
       : await sessionLiveness(tracked.testSessionID)
-    const action = routeTask({
+    let action = routeTask({
       status: row.status,
       lastStatus: tracked.lastStatus ?? "",
       reviewerAlive: reviewerLiveness === "alive" ? true : reviewerLiveness === "dead" ? false : null,
@@ -1686,6 +2040,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       testerAlive: testerLiveness === "alive" ? true : testerLiveness === "dead" ? false : null,
       freshComments: foreign,
     })
+    // пик-заморозка не-high: спавны/будильники ревью-контура откладываются
+    // до конца окна (решение в лог — «почему ветка не взята», статусные
+    // записи и сталл-эскалации ниже идут как обычно — токен не тратят)
+    const rowPriority = (row.priority ?? "").trim().toLowerCase()
+    if (peakNow && rowPriority !== "high" && action.t !== "noop") {
+      log(`часы пик: действие «${action.t}» по не-high задаче ${rowId.slice(0, 8)} отложено до конца окна`)
+      action = { t: "noop" }
+    }
     let commentsConsumed = false
     const consumeComments = (): void => {
       const lastComment = fresh[fresh.length - 1]
@@ -1710,6 +2072,23 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
     if (skipRest === "skip-rest") continue
+
+    // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
+    // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
+    // пайпа — следующий тик возвращает мяч девелоперу штатным return-to-dev.
+    // Эпизод: pending бежит; терминальный исход (merged/escalated) того же
+    // эпизода (lastStatus всё ещё Review) не перезапускается — но НОВЫЙ вход
+    // в Review (lastStatusedge) или переустановка галочки (off→on, ревью
+    // Common-2) перезапускают эпизод: эскалация не убивает автодон навсегда.
+    const autodoneFreshActivation = (row.autodone ?? false) && tracked.autodoneSeen !== true
+    const autodoneNewEntry = tracked.lastStatus !== USER_REVIEW_STATUS
+    if (row.status === USER_REVIEW_STATUS && (row.autodone ?? false) &&
+        (tracked.autodoneState === undefined || tracked.autodoneState === "pending" ||
+         autodoneNewEntry || autodoneFreshActivation)) {
+      tracked.autodoneSeen = true
+      await runAutodoneTick(row, tracked, { cfg, board, state, counters })
+      continue
+    }
 
     // запоминаем наблюдённый статус — граница перехода для след. тика
     if (tracked.lastStatus !== row.status) {
@@ -2081,7 +2460,8 @@ async function main(): Promise<void> {
   })
   failPinnedStart(pinning)
   log(`пиннинг: нода ${pinning.nodeName} подтверждена${pinning.sandboxSkipped.length > 0 ? ` (песочница пропустила незапиненные: ${pinning.sandboxSkipped.join(", ")})` : ""}`)
-  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}, CUP=${CUP}, пик=${PEAK.enabled ? `${PEAK.startMin}-${PEAK.endMin} UTC` : "off"}, autodone-timeout=${Math.round(AUTODONE_TIMEOUT_MS / 60_000)}m${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
+  await ensureBoardColumns(projects)
   // громкое замечание резолюции state: авто-изоляция ветки или неудавшийся
   // git-детект — в лог и stderr (journald), чтобы не было тихих сюрпризов
   emitNotice(STATE_RESOLVED.notice, log)

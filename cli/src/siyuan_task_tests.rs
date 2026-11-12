@@ -642,6 +642,8 @@ fn test_task() -> SyTask {
         title: "таск".into(),
         status: "Draft".into(),
         task_type: String::new(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),
