@@ -330,9 +330,9 @@ fn docker_exec_token() -> Result<String> {
         .spawn()
         .map_err(|err| anyhow!("docker недоступен ({err})"))?;
     let deadline = std::time::Instant::now() + TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -344,6 +344,18 @@ fn docker_exec_token() -> Result<String> {
             }
             Err(err) => bail!("docker exec {CONTAINER}: {err}"),
         }
+    };
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        bail!(
+            "docker exec {CONTAINER} упал ({}): {}",
+            status,
+            stderr.trim()
+        );
     }
     let mut stdout = String::new();
     if let Some(mut pipe) = child.stdout.take() {
@@ -545,7 +557,7 @@ impl SiYuan {
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(PostFailure::RateLimited(
-                "HTTP 429 — kernel rate-limit: серия неудачных токенов забанила                  источник, бан бьёт и валидные токены (10+ мин). Не долбить:                  каждая 401-попытка продлевает бан."
+                "HTTP 429 — kernel rate-limit: серия неудачных токенов забанила источник, бан бьёт и валидные токены (10+ мин). Не долбить: каждая 401-попытка продлевает бан."
                     .into(),
             ));
         }
@@ -3724,5 +3736,44 @@ mod tests {
             .expect_err("rate-limit конвертом — тоже fail-fast");
         assert!(err.to_string().contains("rate-limit конвертом"), "{err}");
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn post_bails_with_refreshed_token_notice_when_refresh_hits_exhausted_cycle() {
+        let server = MockServer::start().await;
+        // Сценарий Low-ревью: попытки 0–2 съедены прочими отказами (code≠0),
+        // 401 приходит на последней (4-й) попытке — рефреш мутует токен, но
+        // цикл исчерпан: bail обязан назвать обновление токена, не маскировать
+        // его старым 401.
+        let seen = AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(path("/api/system/version"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                if n < 3 {
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"code":-9,"msg":"internal kernel hiccup"}"#)
+                } else {
+                    ResponseTemplate::new(401).set_body_string(
+                        r#"{"code":-1,"msg":"Auth failed [header: Authorization]"}"#,
+                    )
+                }
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+        let refresher: TokenRefresher = Arc::new(|_| Ok("fresh-token".into()));
+        let sy = SiYuan::for_tests_with_refresher(server.uri(), refresher);
+
+        let err = sy
+            .post("/api/system/version", json!({}))
+            .await
+            .expect_err("цикл исчерпан — громко, но с фактом обновления токена");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("токен уже рефрешнут"),
+            "факт рефреша не замаскирован старым 401: {msg}"
+        );
+        server.verify().await; // ровно 4 запроса: 3×code≠0 + 401
     }
 }
