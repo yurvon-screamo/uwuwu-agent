@@ -111,6 +111,14 @@ describe("Xvfb-дисплей: лиз-файл и аллокация (задач
   // изолированный env-root на кейс: envRoot() общий на describe, соседние env
   // других тестов уже держат лизы — номера дисплеев были бы не предсказуемы
   const displayRoot = (): string => mkdtempSync(join(tmpdir(), "uwuwu-display-"))
+  /** пустой temp-x11Dir для ensureEnv-кейсов: без инъекции ensureEnv сканирует
+   *  прод-константу /tmp/.X11-unix — живой Xvfb машины (штатный режим фичи)
+   *  сдвигал бы пины номеров, тесты флеймили (баг-репорт тестировщика, PR #244) */
+  const emptyX11 = (root: string): string => {
+    const dir = join(root, "x11")
+    mkdirSync(dir, { recursive: true })
+    return dir
+  }
   const mkX11 = (root: string, sockets: number[]): string => {
     const dir = join(root, "x11")
     mkdirSync(dir, { recursive: true })
@@ -185,7 +193,7 @@ describe("Xvfb-дисплей: лиз-файл и аллокация (задач
   test("ensureEnv пишет лиз-файл с голым номером, reuse держит номер", async () => {
     const root = displayRoot()
     try {
-      const first = await ensureEnv(deps, { root, rowId: "disprow1", local: baseRoot, base: "master" })
+      const first = await ensureEnv(deps, { root, rowId: "disprow1", local: baseRoot, base: "master", x11Dir: emptyX11(root) })
       expect(first.display).toBe(100)
       expect(readDisplayNumber(displayFilePath(first.envDir))).toBe(100)
       expect(readFileSync(displayFilePath(first.envDir), "utf-8")).toBe("100")
@@ -198,8 +206,8 @@ describe("Xvfb-дисплей: лиз-файл и аллокация (задач
   test("сосед с :100 — новый env берёт :101 (занятость соседей)", async () => {
     const root = displayRoot()
     try {
-      await ensureEnv(deps, { root, rowId: "disprow2", local: baseRoot, base: "master" })
-      const p = await ensureEnv(deps, { root, rowId: "disprow3", local: baseRoot, base: "master" })
+      await ensureEnv(deps, { root, rowId: "disprow2", local: baseRoot, base: "master", x11Dir: emptyX11(root) })
+      const p = await ensureEnv(deps, { root, rowId: "disprow3", local: baseRoot, base: "master", x11Dir: emptyX11(root) })
       expect(p.display).toBe(101)
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -222,9 +230,19 @@ describe("Xvfb-дисплей: лиз-файл и аллокация (задач
     try {
       mkdirSync(join(root, "disprow4"), { recursive: true })
       writeFileSync(displayFilePath(join(root, "disprow4")), ":42")
-      const p = await ensureEnv(deps, { root, rowId: "disprow4", local: baseRoot, base: "master" })
+      const p = await ensureEnv(deps, { root, rowId: "disprow4", local: baseRoot, base: "master", x11Dir: emptyX11(root) })
       expect(p.display).not.toBeNull()
       expect(logs.some((l) => l.includes("disprow4") && l.includes("пере-аллокация"))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  test("ensureEnv учитывает x11Dir-инъекцию: живой X-сокет temp-каталога сдвигает номер", async () => {
+    const root = displayRoot()
+    try {
+      const x11 = mkX11(root, [100])
+      const p = await ensureEnv(deps, { root, rowId: "injrow1", local: baseRoot, base: "master", x11Dir: x11 })
+      expect(p.display).toBe(101)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -236,8 +254,8 @@ describe("Xvfb-дисплей: лиз-файл и аллокация (задач
       // сериализует участок read→write; если аллокация уедет после await,
       // оба вызова прочитают одинаковых соседей и возьмут один номер
       const [a, b] = await Promise.all([
-        ensureEnv(deps, { root, rowId: "wave1", local: baseRoot, base: "master" }),
-        ensureEnv(deps, { root, rowId: "wave2", local: baseRoot, base: "master" }),
+        ensureEnv(deps, { root, rowId: "wave1", local: baseRoot, base: "master", x11Dir: emptyX11(root) }),
+        ensureEnv(deps, { root, rowId: "wave2", local: baseRoot, base: "master", x11Dir: emptyX11(root) }),
       ])
       expect(a.display).not.toBeNull()
       expect(b.display).not.toBeNull()

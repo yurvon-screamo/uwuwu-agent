@@ -117,13 +117,13 @@ export function allocateDisplayNumber(args: DisplayAllocArgs): number | null {
  *  участок read→write и вызов ДО первого await ensureEnv: конкурентные
  *  ensureEnv спавн-волны (runBatch по 4 полосам) сериализуются однопоточным
  *  event loop — TOCTOU невозможен. */
-function resolveDisplay(deps: EnvDeps, root: string, rowId: string): number | null {
+function resolveDisplay(deps: EnvDeps, root: string, rowId: string, x11Dir: string): number | null {
   const safe = sanitizeRowId(rowId)
   const file = displayFilePath(join(root, safe))
   const existing = readDisplayNumber(file)
   if (existing !== null) return existing
   if (existsSync(file)) deps.log(`env ${safe}: display-файл с мусором — пере-аллокация`)
-  const allocated = allocateDisplayNumber({ envRoot: root, selfRowId: safe, x11Dir: X11_SOCKETS_DIR, range: DISPLAY_RANGE })
+  const allocated = allocateDisplayNumber({ envRoot: root, selfRowId: safe, x11Dir, range: DISPLAY_RANGE })
   if (allocated === null) {
     deps.log(`env ${safe}: диапазон дисплеев :${DISPLAY_RANGE.start}–:${DISPLAY_RANGE.end} насыщен — задача живёт без Xvfb-дисплея`)
     return null
@@ -145,6 +145,10 @@ export interface EnsureEnvArgs {
   local: string
   /** база ворктри; прод — baseOf(cfg) проекта, тесты — локальная ветка */
   base: string
+  /** каталог X-сокетов для учёта занятости дисплеев; дефолт — прод-константа.
+   *  Инъекция для тестов: живой Xvfb машины (штатный режим фичи) не должен
+   *  делать env-тесты недетерминированными (баг-репорт тестировщика, PR #244). */
+  x11Dir?: string
 }
 
 /** Идемпотентное создание окружения: живой зарегистрированный ворктри →
@@ -153,7 +157,7 @@ export interface EnsureEnvArgs {
  *  Дисплей резолвится синхронно до первого await (см. resolveDisplay). */
 export async function ensureEnv(deps: EnvDeps, args: EnsureEnvArgs): Promise<ResolvedEnv> {
   const paths = envPaths(args.root, args.rowId)
-  const display = resolveDisplay(deps, args.root, args.rowId)
+  const display = resolveDisplay(deps, args.root, args.rowId, args.x11Dir ?? X11_SOCKETS_DIR)
   if (existsSync(paths.repoDir)) {
     const registered = await worktreeListContains(deps, args.local, paths.repoDir)
     if (registered) return { ...paths, display }
