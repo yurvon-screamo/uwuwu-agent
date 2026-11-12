@@ -120,3 +120,45 @@ fn task() -> Task {
         schedule_cell: String::new(),
     }
 }
+
+/// Frontmatter GitHubStore: parse из тела issue, мульти-правка без потери
+/// rest-md и порядка полей (контракт миграции: Branch/PR/Сессия dev —
+/// frontmatter, тело не трогается).
+mod frontmatter_tests {
+    use crate::store::github_task::Frontmatter;
+
+    #[test]
+    fn parse_without_frontmatter_rests_whole_body() {
+        let f = Frontmatter::parse("тело без блока");
+        assert!(f.get("branch").is_none());
+        assert_eq!(f.rest_md, "тело без блока");
+    }
+
+    #[test]
+    fn parse_extracts_fields_and_rest() {
+        let f = Frontmatter::parse("---\nbranch: work/x\nstatus: Todo\n---\n\n# тело\n");
+        assert_eq!(f.get("branch").as_deref(), Some("work/x"));
+        assert_eq!(f.get("status").as_deref(), Some("Todo"));
+        assert!(f.rest_md.contains("# тело"));
+    }
+
+    #[test]
+    fn with_fields_replaces_keeps_order_and_rest() {
+        let f = Frontmatter::parse("---\nbranch: old\npr: https://x/1\n---\nтекст");
+        let out = f.with_fields(&[("branch", "new"), ("dev-session", "ses_1")]);
+        assert!(out.contains("branch: new"));
+        assert!(out.contains("pr: https://x/1"));
+        assert!(out.contains("dev-session: ses_1"));
+        assert!(out.starts_with("---\n"));
+        assert!(out.ends_with("текст"));
+        assert!(!out.contains("branch: old"));
+    }
+
+    #[test]
+    fn with_field_creates_block_on_plain_body() {
+        let f = Frontmatter::parse("просто тело");
+        let out = f.with_field("schedule", "6h");
+        assert!(out.starts_with("---\nschedule: 6h\n---\n"));
+        assert!(out.ends_with("просто тело"));
+    }
+}

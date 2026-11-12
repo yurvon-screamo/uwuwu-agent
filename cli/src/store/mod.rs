@@ -1,10 +1,16 @@
 //! Backend-слой uwuwu-cli: контракты хранилища (TaskStore, DocStore) и
-//! нейтральные типы. Реализации: `siyuan` (существующий контур) и `github`
-//! (uwuwu-hub, срез C задачи 20261112155302-ttyp35g). Выбор — по env
-//! `UWUWU_HUB_REPO` (задан → GitHub); контрактовые типы — проекция доменных
-//! строк доски (SyTask) и issue uwuwu-hub в одну форму.
+//! нейтральные типы. Реализации: `siyuan_task_store` (существующий контур)
+//! и `github_task` (uwuwu-hub, срез C задачи 20261112155302-ttyp35g).
+//! Выбор — по env `UWUWU_HUB_REPO` (задан → GitHub); контрактовые типы —
+//! проекция доменных строк доски (SyTask) и issue uwuwu-hub в одну форму.
 
 pub mod doc_store;
+pub mod github_gh;
+pub mod github_project;
+pub mod github_project_resolve;
+pub mod github_task;
+pub mod github_task_read;
+pub mod github_task_write;
 pub mod siyuan_task_store;
 pub mod siyuan_task_store_write;
 pub mod task_store;
@@ -14,6 +20,20 @@ mod store_tests;
 
 pub use doc_store::{DocEntry, DocStore};
 pub use task_store::{CommentInsert, CreateTask, EditTask, TaskStore, ThreadEntry};
+
+/// Фабрика реализации по env: `UWUWU_HUB_REPO` задан → GitHubStore
+/// (uwuwu-hub), иначе — SiYuanStore (текущий контур). Миграция (срез E)
+/// переключает прод одним env-полем; трейт-объект — один бекенд на процесс.
+pub fn task_store_from_env() -> anyhow::Result<std::sync::Arc<dyn TaskStore>> {
+    match std::env::var("UWUWU_HUB_REPO") {
+        Ok(repo) if !repo.is_empty() => {
+            Ok(std::sync::Arc::new(github_task::GitHubStore::new(repo)))
+        }
+        _ => Ok(std::sync::Arc::new(siyuan_task_store::SiYuanStore::new(
+            crate::siyuan::SiYuan::from_env()?,
+        ))),
+    }
+}
 
 use std::fmt;
 
