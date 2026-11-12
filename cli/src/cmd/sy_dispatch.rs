@@ -239,6 +239,11 @@ async fn print_final_body(sy: &SiYuan, doc_id: &str, label: &str) {
 }
 
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
+    // Hub-режим (UWUWU_HUB_REPO): task-семья через TaskStore (GitHubStore)
+    // — SiYuan-путь ниже мёртв (срез D, задача 20261112155302-ttyp35g).
+    if crate::store::github_task::hub_repo_non_empty() {
+        return crate::cmd::hub_task::run(project, command).await;
+    }
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
     if let TaskSub::Create {

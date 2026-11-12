@@ -35,7 +35,7 @@ impl GitHubDocStore {
         &self.clone_root
     }
 
-    pub(super) fn clone_root_str(&self) -> &str {
+    pub(crate) fn clone_root_str(&self) -> &str {
         self.clone_root.to_str().unwrap_or(".")
     }
 

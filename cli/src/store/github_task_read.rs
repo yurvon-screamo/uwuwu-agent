@@ -10,19 +10,17 @@ use serde_json::Value;
 #[async_trait::async_trait]
 impl TaskStore for GitHubStore {
     async fn list(&self, board: &TaskBoard) -> StoreResult<Vec<Task>> {
-        let label = self.label_of(board);
+        // Явный query-string (URL-encoded colon): gh -f/-F форма на GET
+        // давала искажённую выборку (живой e2e 13.11 — свежий issue не
+        // попадал в -f labels, ручной query-string видел).
+        let label = crate::store::github_task::urlencoded(&self.label_of(board));
         let data = gh_json(
             &[
                 "api",
-                "-X",
-                "GET",
-                &format!("repos/{}/issues", self.repo),
-                "-f",
-                &format!("labels={label}"),
-                "-F",
-                "state=open",
-                "-F",
-                "per_page=100",
+                &format!(
+                    "repos/{}/issues?labels={label}&state=open&per_page=100",
+                    self.repo
+                ),
             ],
             None,
         )

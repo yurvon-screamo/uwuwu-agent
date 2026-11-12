@@ -2,6 +2,7 @@
 
 mod cli;
 mod docs_ls;
+pub(crate) mod hub_task;
 mod read_resolve;
 mod sy_dispatch;
 

@@ -29,6 +29,11 @@ pub(crate) fn urlencoded(value: &str) -> String {
     out
 }
 
+/// Гейт hub-режима для cmd-путей: UWUWU_HUB_REPO непуст.
+pub fn hub_repo_non_empty() -> bool {
+    (std::env::var("UWUWU_HUB_REPO").unwrap_or_default()).trim() != ""
+}
+
 pub struct GitHubStore {
     /// yurvon-screamo/uwuwu-hub (или sandbox для e2e).
     pub repo: String,

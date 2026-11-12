@@ -74,14 +74,6 @@ async fn project_id_by_number(_store: &GitHubStore, number: i64) -> Result<Strin
         .context("Project v2 id пуст")
 }
 
-async fn viewer_login(_store: &GitHubStore) -> Result<String> {
-    let data = gh_graphql("query { viewer { login } }", &json!({})).await?;
-    data.pointer("/viewer/login")
-        .and_then(|l| l.as_str())
-        .map(String::from)
-        .context("viewer.login пуст")
-}
-
 async fn issue_ctx(store: &GitHubStore, issue_number: &str) -> serde_json::Value {
     let (owner, repo) = store
         .repo
