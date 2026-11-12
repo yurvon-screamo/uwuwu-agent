@@ -170,7 +170,7 @@ fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
 /// тип/начальный статус известны без перечитывания — stdout сохраняет
 /// «Строка: <id>» для потребителей stdout (крон-ран-карточки), warning
 /// требует контрольный get.
-fn draft_created_header(
+fn created_header(
     board: &syt::SyBoard,
     item: &str,
     title: &str,
@@ -494,13 +494,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     Err(err) => {
                         print!(
                             "{}",
-                            draft_created_header(
-                                &board,
-                                &item,
-                                &title,
-                                &ty_canonical,
-                                initial_status
-                            )
+                            created_header(&board, &item, &title, &ty_canonical, initial_status)
                         );
                         warn_unreadable_state(&item, &err);
                     }
@@ -2666,7 +2660,7 @@ mod tests {
     use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
-    use super::draft_created_header;
+    use super::created_header;
     use super::format_goal_card;
     use super::format_task_header;
     use super::replace_md_section;
@@ -4926,7 +4920,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_status_other_than_todo_rejected_before_write() {
-        let (server, _order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
+        let (server, order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
 
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -4955,6 +4949,11 @@ mod tests {
         assert!(
             status_writes.lock().unwrap().is_empty(),
             "записей нет: валидация до мутаций"
+        );
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "ни upload, ни createDoc, ни item_add — отказ строго до записей: {:?}",
+            order.lock().unwrap()
         );
     }
 
@@ -5844,9 +5843,9 @@ mod tests {
     /// Шапка из факта create (ADR-067-окно): stdout сохраняет «Строка: <id>»
     /// для потребителей (крон-ран-карточки) даже при срыве перечитывания.
     #[test]
-    fn draft_created_header_carries_row_id() {
+    fn created_header_carries_row_id() {
         let board = header_board();
-        let header = draft_created_header(
+        let header = created_header(
             &board,
             "20261111230000-lagrow",
             "лаг-ран",
