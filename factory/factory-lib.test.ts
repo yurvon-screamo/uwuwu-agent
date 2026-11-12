@@ -75,6 +75,13 @@ import {
   stripFrontmatter,
   resolvePromptWorktree,
   type SpawnInit,
+  priorityRank,
+  queueOrder,
+  cupBudget,
+  activeTaskCountEx,
+  peakWindowFromEnv,
+  isPeakHours,
+  LLM_ACTIVE_STATUSES,
 } from "./factory-lib"
 import { parseCommentsMarkdown } from "../lib/platform"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
@@ -2348,5 +2355,116 @@ describe("newUserComments — свежесть после сноса комме�
     const fresh = newUserComments(remaining, lastSeen, "BOT")
     expect(fresh.length).toBe(1)
     expect(fresh[0].text).toContain("новый после последнего захода")
+  })
+})
+
+// ——— очередь CUP и часы пик (задача 20261112160316) ———
+
+
+describe("priorityRank/queueOrder", () => {
+  const row = (rowId: string, priority: string) => ({
+    rowId, bodyDoc: "", title: rowId, status: "Design", type: "feature", pr: "", branch: "", priority,
+  })
+
+  test("ранг: high < medium < low < пустой", () => {
+    expect(priorityRank("high")).toBe(0)
+    expect(priorityRank("HIGH")).toBe(0)
+    expect(priorityRank("medium")).toBe(1)
+    expect(priorityRank("low")).toBe(2)
+    expect(priorityRank("")).toBe(3)
+    expect(priorityRank("мусор")).toBe(3)
+  })
+
+  test("очередь: приоритет сначала, FIFO (rowId asc) внутри приоритета", () => {
+    const tasks = [
+      row("20261112090000-low", "low"),
+      row("20261112120000-high2", "high"),
+      row("20261112080000-med", "medium"),
+      row("20261112110000-high1", "high"),
+      row("20261112130000-empty", ""),
+    ]
+    expect(queueOrder(tasks).map((t) => t.rowId)).toEqual([
+      "20261112110000-high1",
+      "20261112120000-high2",
+      "20261112080000-med",
+      "20261112090000-low",
+      "20261112130000-empty",
+    ])
+  })
+})
+
+describe("cupBudget/activeTaskCountEx", () => {
+  test("бюджет = max(0, cup - active)", () => {
+    expect(cupBudget(3, 7)).toBe(4)
+    expect(cupBudget(7, 7)).toBe(0)
+    expect(cupBudget(9, 7)).toBe(0)
+  })
+
+  test("вне пика: все LLM-статусы считаются, Review/Needs attention/Done — нет", () => {
+    const entries = [
+      { status: "Design", priority: "low" },
+      { status: "In Progress", priority: "medium" },
+      { status: "Ревью плана", priority: "high" },
+      { status: "Ревью результата", priority: "medium" },
+      { status: "Тестирование", priority: "low" },
+      { status: "Review", priority: "high" },
+      { status: "Needs attention", priority: "high" },
+      { status: "Done", priority: "high" },
+    ]
+    expect(activeTaskCountEx(entries, { peak: false })).toBe(5)
+  })
+
+  test("контракт LLM_ACTIVE_STATUSES стабилен (канон статусов AGENTS.md)", () => {
+    expect([...LLM_ACTIVE_STATUSES].sort()).toEqual([
+      "Design", "In Progress", "Ревью плана", "Ревью результата", "Тестирование",
+    ].sort())
+  })
+
+  test("в пик: считаются только high — замороженные не-high слотов не держат", () => {
+    const entries = [
+      { status: "In Progress", priority: "high" },
+      { status: "Design", priority: "medium" },
+      { status: "Тестирование", priority: "" },
+      { status: "Review", priority: "high" },
+    ]
+    expect(activeTaskCountEx(entries, { peak: false })).toBe(3)
+    expect(activeTaskCountEx(entries, { peak: true })).toBe(1)
+  })
+})
+
+describe("peakWindowFromEnv/isPeakHours", () => {
+  test("дефолт: будни 06:00–10:00 UTC (14:00–18:00 UTC+8)", () => {
+    const w = peakWindowFromEnv(undefined)
+    expect(w).toEqual({ startMin: 360, endMin: 600, enabled: true })
+  })
+
+  test("off выключает; мусор → дефолт", () => {
+    expect(peakWindowFromEnv("off").enabled).toBe(false)
+    expect(peakWindowFromEnv("")).toEqual({ startMin: 360, endMin: 600, enabled: true })
+    expect(peakWindowFromEnv("14:00")).toEqual({ startMin: 360, endMin: 600, enabled: true })
+    expect(peakWindowFromEnv("abc-def")).toEqual({ startMin: 360, endMin: 600, enabled: true })
+  })
+
+  test("своё окно парсится", () => {
+    expect(peakWindowFromEnv("01:30-02:45")).toEqual({ startMin: 90, endMin: 165, enabled: true })
+  })
+
+  const window = peakWindowFromEnv(undefined)
+
+  test("границы окна end-exclusive; выходные — всегда вне пика", () => {
+    // Tue 2026-11-10 05:59 UTC — до окна
+    expect(isPeakHours(new Date("2026-11-10T05:59:00Z"), window)).toBe(false)
+    // 06:00 — внутри
+    expect(isPeakHours(new Date("2026-11-10T06:00:00Z"), window)).toBe(true)
+    // 09:59 — внутри
+    expect(isPeakHours(new Date("2026-11-10T09:59:00Z"), window)).toBe(true)
+    // 10:00 — конец окна (end-exclusive)
+    expect(isPeakHours(new Date("2026-11-10T10:00:00Z"), window)).toBe(false)
+    // суббота 14:00 UTC — вне пика (weekends included в off-peak)
+    expect(isPeakHours(new Date("2026-11-14T07:00:00Z"), window)).toBe(false)
+  })
+
+  test("выключенное окно — никогда не пик", () => {
+    expect(isPeakHours(new Date("2026-11-10T07:00:00Z"), peakWindowFromEnv("off"))).toBe(false)
   })
 })
