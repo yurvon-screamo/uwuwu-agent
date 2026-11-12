@@ -1345,9 +1345,9 @@ async function mergePr(pr: PrCarrier): Promise<boolean> {
  *  ревью High). Bounce НЕ трогает lastStatus: следующий тик вернёт мяч
  *  девелоперу штатным return-to-dev. */
 async function runAutodoneTick(
-  task: TaskRef, tracked: TrackedTask, cfg: ProjectCfg, board: BoardIds,
-  state: FactoryState, counters: PassCounters,
+  task: TaskRef, tracked: TrackedTask, ctx: { cfg: ProjectCfg; board: BoardIds; state: FactoryState; counters: PassCounters },
 ): Promise<void> {
+  const { cfg, board, state, counters } = ctx
   const rowId = task.rowId
   if (tracked.autodoneState !== "pending") {
     tracked.autodoneState = "pending"
@@ -2053,7 +2053,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // пайпа — следующий тик возвращает мяч девелоперу штатным return-to-dev.
     if (row.status === USER_REVIEW_STATUS && row.autodone &&
         tracked.autodoneState !== "merged" && tracked.autodoneState !== "escalated") {
-      await runAutodoneTick(row, tracked, cfg, board, state, counters)
+      await runAutodoneTick(row, tracked, { cfg, board, state, counters })
       continue
     }
 
