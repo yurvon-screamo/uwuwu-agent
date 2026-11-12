@@ -8,13 +8,7 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
-import { createHub, type HubModel, type HubProfile } from "../lib/hub"
-
-interface Cfg {
-  token: string
-  owner: string
-  model?: HubModel
-}
+import { createHub, type Cfg, type HubProfile } from "../lib/hub"
 
 interface BotMeta {
   slug: string

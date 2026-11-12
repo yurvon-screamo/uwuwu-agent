@@ -23,7 +23,7 @@ import { mcpConfigured, tool as mcpTool } from "../lib/platform"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
 import { acquireLock, makeDrain } from "../lib/single-instance"
 import {
-  decideActions, defTargetDirectory, hashDjb2, liveSessionDirectory, parseBotDoc, parseModel, runtimeHashOf,
+  decideActions, defTargetDirectory, hashDjb2, liveSessionDirectory, mergeCache, parseBotDoc, parseModel,
   type BotObservation, type BotSpec, type RegistryCacheEntry,
 } from "./bots-lib"
 
@@ -270,23 +270,19 @@ const save = (): void => {
 
 // ——— исполнение действий тика ———
 
-async function spawnBot(action: { slug: string }, scanned: Map<string, BotObservation>): Promise<void> {
-  const obs = scanned.get(action.slug)
-  if (obs === undefined) return
+async function spawnBot(obs: BotObservation): Promise<void> {
   materializeBotDir(obs)
   await syncDefIntoSessionDirectory(obs)
-  spawnChild(action.slug)
+  spawnChild(obs.spec.slug)
 }
 
-async function restartBot(action: { slug: string; reason: string }, scanned: Map<string, BotObservation>): Promise<void> {
-  log(`бот ${action.slug}: ${action.reason} — рестарт ребёнка`)
-  const pid = childPid(action.slug)
-  if (pid !== null) await stopChild(action.slug, pid)
-  const obs = scanned.get(action.slug)
-  if (obs === undefined) return
+async function restartBot(obs: BotObservation, reason: string): Promise<void> {
+  log(`бот ${obs.spec.slug}: ${reason} — рестарт ребёнка`)
+  const pid = childPid(obs.spec.slug)
+  if (pid !== null) await stopChild(obs.spec.slug, pid)
   materializeBotDir(obs)
   await syncDefIntoSessionDirectory(obs)
-  spawnChild(action.slug)
+  spawnChild(obs.spec.slug)
 }
 
 async function stopBot(action: { slug: string }): Promise<void> {
@@ -295,22 +291,27 @@ async function stopBot(action: { slug: string }): Promise<void> {
   if (pid !== null) await stopChild(action.slug, pid)
 }
 
-async function updateDef(action: { slug: string }, scanned: Map<string, BotObservation>): Promise<void> {
-  const obs = scanned.get(action.slug)
-  if (obs === undefined) return
-  writeAtomic(join(botDirOf(action.slug), "agent.md"), obs.spec.def)
+async function updateDef(obs: BotObservation): Promise<void> {
+  writeAtomic(join(botDirOf(obs.spec.slug), "agent.md"), obs.spec.def)
   // seeded-сессия резолвит деф из своего directory (≠ workspace): без этого
   // синха горячая правка молча перестаёт доезжать (ревью Common-2)
   await syncDefIntoSessionDirectory(obs)
-  log(`бот ${action.slug}: методичка обновлена — ребёнок подхватит на следующем ходе`)
+  log(`бот ${obs.spec.slug}: методичка обновлена — ребёнок подхватит на следующем ходе`)
 }
 
 async function executeActions(actions: ReturnType<typeof decideActions>, scanned: Map<string, BotObservation>): Promise<void> {
   for (const action of actions) {
-    if (action.kind === "spawn") await spawnBot(action, scanned)
-    else if (action.kind === "restart") await restartBot(action, scanned)
-    else if (action.kind === "stop") await stopBot(action)
-    else await updateDef(action, scanned)
+    // stop не требует наблюдения (снос дока / enabled: off по кэшу+lock);
+    // остальные actions порождаются только из scanned — obs обязана быть
+    if (action.kind === "stop") {
+      await stopBot(action)
+      continue
+    }
+    const obs = scanned.get(action.slug)
+    if (obs === undefined) continue
+    if (action.kind === "spawn") await spawnBot(obs)
+    else if (action.kind === "restart") await restartBot(obs, action.reason)
+    else await updateDef(obs)
   }
 }
 
@@ -329,6 +330,8 @@ async function tick(tool: PlatformTool): Promise<void> {
     return
   }
   const cacheSlugs = Object.keys(state.cache)
+  // живость по всем известным слагам (кэш + скан), не только успешного скана:
+  // иначе живой ребёнок снесённого дока невидим дифу и не гасится (ревью High)
   const liveKnown = new Set([...cacheSlugs, ...scan.observations.keys()].filter((s) => childPid(s) !== null))
   // контракт заморозки (ревью Common-1): недостоверный скан при живом ядре —
   // НЕ доказательство «док снесён»; заморозить затронутых, не гасить живых
@@ -347,26 +350,12 @@ async function tick(tool: PlatformTool): Promise<void> {
       }
     }
   }
-  const live = new Set<string>()
-  for (const slug of scan.observations.keys()) {
-    if (childPid(slug) !== null) live.add(slug)
-  }
-  const actions = decideActions(state.cache, [...scan.observations.values()], live, frozen)
+  const actions = decideActions(state.cache, [...scan.observations.values()], liveKnown, frozen)
   await executeActions(actions, scan.observations)
-  const nextCache: Record<string, RegistryCacheEntry> = {}
-  for (const [slug, obs] of scan.observations) {
-    nextCache[slug] = {
-      docId: obs.spec.docId,
-      updatedAt: obs.updatedAt,
-      runtimeHash: runtimeHashOf(obs.spec.token, obs.spec.owner, obs.spec.model, obs.spec.workspace, obs.spec.enabled),
-    }
-  }
-  const before = JSON.stringify(state.cache)
-  const after = JSON.stringify(nextCache)
-  if (before !== after) {
-    state = { cache: nextCache }
-    save()
-  }
+  // кэш «последнего известного состава» — мерж, не замещение: записи
+  // замороженных/недочитанных слагов переживают недостоверный тик (ревью Common-2)
+  state = { cache: mergeCache(state.cache, [...scan.observations.values()], frozen) }
+  save()
 }
 
 const main = async (): Promise<void> => {

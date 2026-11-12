@@ -3,7 +3,7 @@
 
 import { describe, test, expect } from "bun:test"
 import {
-  decideActions, defTargetDirectory, liveSessionDirectory, parseBotDoc, parseModel, runtimeHashOf,
+  decideActions, defTargetDirectory, liveSessionDirectory, mergeCache, parseBotDoc, parseModel, runtimeHashOf,
   type BotObservation, type RegistryCacheEntry,
 } from "./bots-lib"
 
@@ -179,6 +179,37 @@ describe("decideActions", () => {
     expect(decideActions(cache, [], live(["x", "y"]), frozen)).toEqual([{ kind: "stop", slug: "y" }])
     // x не жив и в frozen — без spawn (мёртвый ребёнок замороженного бота ждёт оживления скана)
     expect(decideActions(cache, [obs("x", "20261113100100", S)], live([]), frozen)).toEqual([])
+  })
+
+  test("интеграционный матч супервизора: живой ребёнок снесённого дока гасится (liveKnown ⊇ кэш)", () => {
+    // контейнер пропал: observations пусты, liveKnown знает живого из кэша —
+    // decideActions с liveKnown (а не только сканом) порождает stop
+    const cache = { x: cacheEntry(obs("x", "20261113100000", S)) }
+    expect(decideActions(cache, [], live(["x"]), new Set())).toEqual([{ kind: "stop", slug: "x" }])
+  })
+})
+
+// ——— mergeCache (кэш мержится, не замещается) ———
+
+describe("mergeCache", () => {
+    const entry = (slug: string, updatedAt: string): RegistryCacheEntry => {
+    const o = obs(slug, updatedAt, specMd())
+    return { docId: o.spec.docId, updatedAt, runtimeHash: runtimeHashOf(o.spec.token, o.spec.owner, o.spec.model, o.spec.workspace, o.spec.enabled) }
+  }
+
+  test("свежие наблюдения замещают, preserved-отсутствующие переживают, снесённые умирают", () => {
+    const prev = { x: entry("x", "20261113100000"), y: entry("y", "20261113100000"), z: entry("z", "20261113100000") }
+    // x обновился, z снесён достоверно (вне preserve), y не сканировался (frozen)
+    const merged = mergeCache(prev, [obs("x", "20261113100500", specMd())], new Set(["y"]))
+    expect(merged.x.updatedAt).toBe("20261113100500")
+    expect(merged.y.updatedAt).toBe("20261113100000") // заморозка не потеряна
+    expect(merged.z).toBeUndefined() // легитимный снос — запись умирает
+  })
+
+  test("containerMissing (пустой скан) с полным preserve — кэш без изменений", () => {
+    const prev = { x: entry("x", "20261113100000"), y: entry("y", "20261113100100") }
+    const merged = mergeCache(prev, [], new Set(["x", "y"]))
+    expect(merged).toEqual(prev)
   })
 })
 

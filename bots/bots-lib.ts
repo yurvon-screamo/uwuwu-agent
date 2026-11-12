@@ -171,12 +171,38 @@ export function runtimeHashOf(token: string, owner: string, model: { providerID:
   return hashDjb2(`${token}|${owner}|${modelStr}|${workspace ?? ""}|${enabled ? "1" : "0"}`)
 }
 
+/** Кэш «последнего известного состава»: мерж свежих наблюдений поверх
+ *  предыдущего — записи затронутых заморозкой (containerMissing/per-doc
+ *  ошибка) слагов НЕ выпадают (иначе «заморозка на последнем известном
+ *  составе» испаряется первым тиком, ревью Common-2). Легитимный снос —
+ *  слаг отсутствует в наблюдениях и не preservation → запись умирает. */
+export function mergeCache(
+  prev: Record<string, RegistryCacheEntry>,
+  observations: BotObservation[],
+  preserve: Set<string>,
+): Record<string, RegistryCacheEntry> {
+  const out: Record<string, RegistryCacheEntry> = {}
+  for (const obs of observations) {
+    out[obs.spec.slug] = {
+      docId: obs.spec.docId,
+      updatedAt: obs.updatedAt,
+      runtimeHash: runtimeHashOf(obs.spec.token, obs.spec.owner, obs.spec.model, obs.spec.workspace, obs.spec.enabled),
+    }
+  }
+  for (const [slug, entry] of Object.entries(prev)) {
+    if (!(slug in out) && preserve.has(slug)) out[slug] = entry
+  }
+  return out
+}
+
 /** Диф тика: свежий скан реестра против кэша + живые дети. Живость ребёнка —
- *  per-бот lock (pid): мёртвый при живой enabled-спеке — spawn (супервизор
- *  поднимает, максимум раз в тик); снесённый док / enabled: off у живого —
- *  stop; смена рантайм-существенного — restart; смена тела (updatedAt) без
- *  рантайма — def-update (ребёнок перечитает agent.md на следующем ходе —
- *  горячая правка методички).
+ *  per-бот lock (pid); liveChildren подаётся по ВСЕМ известным слагам (кэш +
+ *  скан, супервизорный liveKnown): живой ребёнок вне скана = док снесён/исчез
+ *  из скана достоверно → stop (замороженные — исключение, см. ниже). Живость
+ *  ребёнка — per-бот lock (pid): мёртвый при живой enabled-спеке — spawn
+ *  (супервизор поднимает, максимум раз в тик); смена рантайм-существенного —
+ *  restart; смена тела (updatedAt) без рантайма — def-update (ребёнок
+ *  перечитает agent.md на следующем ходе — горячая правка методички).
  *
  *  frozen — слагы, состав которых НЕ трогать (контракт заморозки):
  *  структурное отсутствие контейнера реестра / ошибка чтения дока при живом
