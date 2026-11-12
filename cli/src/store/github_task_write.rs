@@ -34,19 +34,42 @@ impl GitHubStore {
                 input.title, input.task_type.0
             ),
         };
-        let body = Frontmatter::parse(&body_md).with_field("status", &status);
+        let mut fm_cells: Vec<(&str, String)> = vec![("status", status.clone())];
+        if let Some(pr) = &input.priority {
+            fm_cells.push(("priority", pr.clone()));
+        }
+        if let Some(ad) = input.autodone {
+            fm_cells.push(("autodone", if ad { "true" } else { "false" }.to_string()));
+        }
+        let fm_pairs: Vec<(&str, &str)> = fm_cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let body = Frontmatter::parse(&body_md).with_fields(&fm_pairs);
         let mut payload = Map::new();
         payload.insert("title".into(), json!(input.title));
         payload.insert("body".into(), json!(body));
         payload.insert("labels".into(), json!([self.label_of(board)]));
         if input.task_type.is_set() {
-            payload.insert("type".into(), json!(display_type(&input.task_type.0)));
+            payload.insert("type".into(), json!(input.task_type.0));
         }
-        let created = gh_json(
+        let created = match gh_json(
             &["api", "-X", "POST", &format!("repos/{}/issues", self.repo)],
             Some(&Value::Object(payload).to_string()),
         )
-        .await?;
+        .await
+        {
+            Ok(created) => created,
+            Err(post_err) => {
+                // POST упал (сеть/таймаут) — возможно, issue создан: пауза
+                // ≥ лага платформы, ретрай-резолв по точному тайтлу через
+                // list (консистентный REST); не найден — исходная ошибка
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                let existing = self.list(board).await?;
+                let canon = input.title.to_lowercase();
+                if let Some(t) = existing.iter().find(|t| t.title.to_lowercase() == canon) {
+                    return Ok(t.clone());
+                }
+                return Err(StoreError::Other(post_err));
+            }
+        };
         let number = created["number"].to_string();
         github_project::set_status_and_planned(self, &number, Some(&status), None).await?;
         Ok(self.issue_fresh(&number).await?)
@@ -67,7 +90,7 @@ impl GitHubStore {
             payload.insert(
                 "type".into(),
                 match ty.is_set() {
-                    true => json!(display_type(&ty.0)),
+                    true => json!(ty.0),
                     false => Value::Null,
                 },
             );
@@ -88,6 +111,7 @@ impl GitHubStore {
             ("branch", &patch.branch),
             ("pr", &patch.pr),
             ("dev-session", &patch.dev_session),
+            ("priority", &patch.priority),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.as_ref().map(|s| (k, s)))
@@ -97,6 +121,12 @@ impl GitHubStore {
             let cells: Vec<(&str, &str)> =
                 front_cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let body = Frontmatter::parse(&body_md).with_fields(&cells);
+            self.set_issue_body(&number, &body).await?;
+        }
+        if let Some(ad) = patch.autodone {
+            let body_md = self.issue_body(&number).await?;
+            let body = Frontmatter::parse(&body_md)
+                .with_field("autodone", if ad { "true" } else { "false" });
             self.set_issue_body(&number, &body).await?;
         }
         if let Some(status) = &patch.status {
@@ -184,11 +214,4 @@ impl GitHubStore {
         let body = Frontmatter::parse(&body_md).with_field(key, value);
         self.set_issue_body(&task.id, &body).await
     }
-}
-
-/// Канон-тип (lowercase в CLI) → display-тип GitHub (дефолтные Bug/Feature
-/// с заглавной; кастомные — lowercase как созданы). Резолв case-insensitive:
-/// GitHub PATCH type матчит имя независимо от регистра (проба срез A).
-fn display_type(ty: &str) -> String {
-    ty.to_string()
 }

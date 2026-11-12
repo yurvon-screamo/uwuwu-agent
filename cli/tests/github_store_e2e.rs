@@ -32,6 +32,8 @@ fn create_input(title: &str) -> CreateTask {
         status: None,
         body_md: None,
         attachments: vec![],
+        priority: None,
+        autodone: None,
     }
 }
 
@@ -54,6 +56,8 @@ async fn github_store_full_lifecycle_live() {
                 status: Some("Todo".into()),
                 body_md: Some("живой e2e: полный цикл\n\nсекция проверки".into()),
                 attachments: vec![],
+                priority: None,
+                autodone: None,
             },
         )
         .await

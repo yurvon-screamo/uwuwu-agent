@@ -74,6 +74,8 @@ impl GitHubStore {
             planned: front.get("planned").unwrap_or_default(),
             planned_ms: planned_ms(front.get("planned").as_deref()),
             schedule_cell: front.get("schedule").unwrap_or_default(),
+            priority: front.get("priority").unwrap_or_default(),
+            autodone: matches!(front.get("autodone").as_deref(), Some("true") | Some("✓")),
         }
     }
 

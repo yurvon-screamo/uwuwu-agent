@@ -1,33 +1,40 @@
 //! Project v2 мутации GitHubStore: Status (single-select) и «Запланировано»
-//! (date) на item задачи. Item резолвится по issue id через GraphQL.
+//! (date) на item задачи, add-item при создании. Резолверы —
+//! github_project_resolve.rs.
 //!
-//! Механики проверены live-пробой срез A: project item id —
-//! viewer.projectV2(number).items.nodes по issue number; поля —
-//! updateProjectV2ItemFieldValue (singleSelectOptionId / date).
+//! Порядок записи статуса: item отсутствует → add-item → set-field. Frontmatter
+//! тела уже несёт статус (github_task_write) — канбан-запись синхронизирует
+//! Projects v2 (вид владельца).
 
+use super::github_project_resolve::{
+    add_issue_to_project, item_id_of, planned_field_id, project_for_label, status_field_ids,
+};
 use super::github_task::GitHubStore;
 use super::github_gh::gh_graphql;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-/// Статус (+ опционально дата «Запланировано») в Project v2.
-/// None-статус — только дата. Дата: ISO-строка YYYY-MM-DD ("" — очистка).
+/// Статус (+ опционально дата «Запланировано») в Project v2. None-статус —
+/// только дата. Дата: ISO-строка YYYY-MM-DD ("" — очистка).
+/// Project v2 отсутствует (нет канбана) — no-op: frontmatter тела несёт
+/// статус для CLI/демонов.
 pub(super) async fn set_status_and_planned(
     store: &GitHubStore,
     issue_number: &str,
     status: Option<&str>,
     planned: Option<&str>,
 ) -> Result<()> {
-    // Project v2 — канбан владельца (вид); отсутствие не валило запись:
-    // frontmatter тела уже несёт Status/Запланировано для CLI/демонов.
-    let Some((project_number, project_id)) = project_for_label(store, issue_number).await? else {
+    let Some((_, project_id)) = project_for_label(store, issue_number).await? else {
         return Ok(());
     };
-    let item_id = item_id_of(store, project_number, issue_number)
-        .await?
-        .context("issue не в проекте — добавление item отдельным шагом (followup)")?;
+    // Item отсутствует → добавить (create-путь: issue создан POST'ом и в
+    // проекте ещё не состоит; повторный add-item идемпотентен).
+    add_issue_to_project(store, &project_id, issue_number).await?;
+    let Some((item_id, _)) = item_id_of(store, issue_number).await? else {
+        return Err(bail_missing_item(issue_number));
+    };
     if let Some(status) = status {
-        let (field_id, option_id) = status_field_ids(store, &project_id, status).await?;
+        let (field_id, option_id) = status_field_ids(&project_id, status).await?;
         gh_graphql(
             "mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
                 updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i,
@@ -35,11 +42,12 @@ pub(super) async fn set_status_and_planned(
             }",
             &json!({ "p": project_id, "i": item_id, "f": field_id, "o": option_id }),
         )
-        .await?;
+        .await
+        .with_context(|| format!("Projects v2: статус «{status}» не записан"))?;
     }
     if let Some(planned) = planned {
         let date = normalize_date(planned)?;
-        let field_id = planned_field_id(store, &project_id).await?;
+        let field_id = planned_field_id(&project_id).await?;
         let value = match date.is_empty() {
             true => json!(null),
             false => json!(date),
@@ -51,12 +59,18 @@ pub(super) async fn set_status_and_planned(
             }",
             &json!({ "p": project_id, "i": item_id, "f": field_id, "d": value }),
         )
-        .await?;
+        .await
+        .with_context(|| format!("Projects v2: «Запланировано» {date} не записано"))?;
     }
     Ok(())
 }
 
-use super::github_project_resolve::{item_id_of, planned_field_id, project_for_label, status_field_ids};
+fn bail_missing_item(issue_number: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "issue #{issue_number} не найден в Project v2 после add-item — \
+         проверь канбан владельца вручную"
+    )
+}
 
 /// «Запланировано» принимает дисплей-форму ядра (YYYY-MM-DD; хвосты до
 /// пробела срезаются). Пустое — очистка клетки.

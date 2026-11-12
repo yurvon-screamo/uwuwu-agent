@@ -20,6 +20,7 @@ function gh(args: string[], stdinBody?: string): string {
     input: stdinBody,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+    timeout: 120_000,
   })
   if (r.status !== 0) {
     throw new Error(`gh ${args.slice(0, 3).join(" ")} упал: ${r.stderr.slice(0, 300)}`)
@@ -122,7 +123,8 @@ export function setProjectStatus(project: string, number: string, status: string
   const proj = d.data.viewer.projectV2 as ProjectV2Node
   const item = proj.items.nodes.find((n) => n.content?.number === Number(number))
   const opt = proj.statusField.options.find((o) => o.name === status)
-  if (!item || !opt) return
+  if (!item) throw new Error(`Projects v2: issue #${number} не в проекте после add-item`)
+  if (!opt) throw new Error(`Projects v2: опция Status «${status}» не найдена (канон срез A)`)
   const q2 = `mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId } }`
   gh([ "api", "graphql", "--input", "-" ], JSON.stringify({
     query: q2,

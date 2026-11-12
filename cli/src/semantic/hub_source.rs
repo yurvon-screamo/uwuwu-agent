@@ -107,18 +107,11 @@ async fn issues_rows(repo: &str) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
     let mut page = 1;
     loop {
+        // query-string явно: gh -f/-F форма на GET искажала выборку
         let data = gh_json(
             &[
                 "api",
-                "-X",
-                "GET",
-                &format!("repos/{repo}/issues"),
-                "-F",
-                "state=all",
-                "-F",
-                "per_page=100",
-                "-F",
-                &format!("page={page}"),
+                &format!("repos/{repo}/issues?state=all&per_page=100&page={page}"),
             ],
             None,
         )
@@ -162,7 +155,9 @@ async fn issues_rows(repo: &str) -> Result<Vec<Value>> {
 
 /// Детерминенный хеш контента (SipHash с нулевым ключом — стабилен между
 /// процессами): меняется только при изменении контента → skip-unchanged
-/// дельты не переэмбеддит неизменные файлы.
+/// дельты не переэмбеддит неизменные файлы. Риск (принят, Low): DefaultHasher
+/// не гарантирован между версиями rustc — после обновления тулчейна возможен
+/// полный переэмбеддинг индекса (без потери данных).
 fn content_hash(content: &str) -> String {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);

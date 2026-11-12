@@ -1,13 +1,15 @@
-//! Project v2 резолверы GitHubStore: issue → проект по proj-label,
-//! item id, поля Status/«Запланировано». Живой вызов — github_project.rs.
+//! Project v2 резолверы и мутации GitHubStore: issue → проект по proj-label,
+//! item-резолв (через issue.projectItems — без пагинации project'а),
+//! add-item, поля Status/«Запланировано». Живое покрытие — e2e-риг
+//! github_store_e2e (create на доске с канбаном).
 
 use super::github_gh::gh_graphql;
 use super::github_task::GitHubStore;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-/// Канбаны «Задачи <proj>» пер-проектные: label issue → номер проекта.
-/// Скоуп: один issue — один proj-label, проект однозначен.
+/// Канбаны «Задачи <proj>» пер-проектные: label issue → (номер, id) проекта.
+/// None — у issue нет proj-label (status-поле не применимо).
 pub(super) async fn project_for_label(
     store: &GitHubStore,
     issue_number: &str,
@@ -33,18 +35,16 @@ pub(super) async fn project_for_label(
     let Some(project) = labels.iter().find_map(|l| l.strip_prefix("proj:")) else {
         return Ok(None);
     };
-    let number = match project {
-        "uwuwu" => Some(5),
-        _ => project_number_by_title(store, project).await?,
-    };
-    let Some(number) = number else {
+    let Some(number) = project_number_by_title(project).await? else {
         return Ok(None);
     };
-    let id = project_id_by_number(store, number).await?;
+    let id = project_id_by_number(number).await?;
     Ok(Some((number, id)))
 }
 
-async fn project_number_by_title(_store: &GitHubStore, project: &str) -> Result<Option<i64>> {
+/// Пагинация не нужна: viewer.projectsV2 — собственные проекты (десятки,
+/// first: 30 с запасом); список короткий и полный.
+async fn project_number_by_title(project: &str) -> Result<Option<i64>> {
     let data = gh_graphql(
         "query { viewer { projectsV2(first: 30) { nodes {
             number title } } } }",
@@ -62,7 +62,7 @@ async fn project_number_by_title(_store: &GitHubStore, project: &str) -> Result<
         }))
 }
 
-async fn project_id_by_number(_store: &GitHubStore, number: i64) -> Result<String> {
+async fn project_id_by_number(number: i64) -> Result<String> {
     let data = gh_graphql(
         "query($n: Int!) { viewer { projectV2(number: $n) { id } } }",
         &json!({ "n": number }),
@@ -86,35 +86,118 @@ async fn issue_ctx(store: &GitHubStore, issue_number: &str) -> serde_json::Value
     })
 }
 
+/// Node-id issue (для addProjectV2ItemById contentId).
+pub(super) async fn issue_node_id(store: &GitHubStore, issue_number: &str) -> Result<String> {
+    let data = gh_graphql(
+        "query($repo: String!, $owner: String!, $n: Int!) {
+            repository(name: $repo, owner: $owner) {
+                issue(number: $n) { id }
+            }
+        }",
+        &(issue_ctx(store, issue_number).await),
+    )
+    .await?;
+    data.pointer("/repository/issue/id")
+        .and_then(|i| i.as_str())
+        .map(String::from)
+        .context("issue node id пуст")
+}
+
+/// Item id через issue.projectItems (пагинация project items не нужна:
+/// issue входит в 1–2 проекта, first: 10 покрывает).
 pub(super) async fn item_id_of(
-    _store: &GitHubStore,
-    project_number: i64,
+    store: &GitHubStore,
     issue_number: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     let n = issue_number.parse::<i64>()?;
     let data = gh_graphql(
-        "query($n: Int!) { viewer { projectV2(number: $n) {
-            items(first: 100) { nodes { id content {
-                ... on Issue { number } } } } } } }",
-        &json!({ "n": project_number }),
+        "query($repo: String!, $owner: String!, $n: Int!) {
+            repository(name: $repo, owner: $owner) {
+                issue(number: $n) {
+                    projectItems(first: 10) {
+                        nodes {
+                            id
+                            project { id ... on ProjectV2 { number } }
+                        }
+                    }
+                }
+            }
+        }",
+        &(issue_ctx(store, issue_number).await),
     )
     .await?;
     Ok(data
-        .pointer("/viewer/projectV2/items/nodes")
+        .pointer("/repository/issue/projectItems/nodes")
         .and_then(|nodes| nodes.as_array())
         .and_then(|a| {
             a.iter()
-                .find(|item| item.pointer("/content/number").and_then(|x| x.as_i64()) == Some(n))
-        })
-        .and_then(|item| item["id"].as_str())
-        .map(String::from))
+                .find(|item| item.pointer("/project/number").and_then(|x| x.as_i64()) == Some(n))
+                .and_then(|item| {
+                    let id = item["id"].as_str()?.to_string();
+                    let project_id = item
+                        .pointer("/project/id")
+                        .and_then(|x| x.as_str())?
+                        .to_string();
+                    Some((id, project_id))
+                })
+        }))
 }
 
-pub(super) async fn status_field_ids(
-    _store: &GitHubStore,
+/// Добавить issue в Project v2 (addProjectV2ItemById, contentId = issue
+/// node id). Идемпотентен: уже в проекте — no-op.
+pub(super) async fn add_issue_to_project(
+    store: &GitHubStore,
     project_id: &str,
-    status: &str,
-) -> Result<(String, String)> {
+    issue_number: &str,
+) -> Result<()> {
+    if item_in_project(store, project_id, issue_number).await? {
+        return Ok(());
+    }
+    let content_id = issue_node_id(store, issue_number).await?;
+    gh_graphql(
+        "mutation($p: ID!, $c: ID!) {
+            addProjectV2ItemById(input: {projectId: $p, contentId: $c}) {
+                item { id }
+            }
+        }",
+        &json!({ "p": project_id, "c": content_id }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Item issue в проекте: issue.projectItems — прямая связь, пагинация
+/// project-стороны не нужна.
+pub(super) async fn item_in_project(
+    store: &GitHubStore,
+    project_id: &str,
+    issue_number: &str,
+) -> Result<bool> {
+    let data = gh_graphql(
+        "query($repo: String!, $owner: String!, $n: Int!) {
+            repository(name: $repo, owner: $owner) {
+                issue(number: $n) {
+                    projectItems(first: 10) {
+                        nodes { project { id } }
+                    }
+                }
+            }
+        }",
+        &(issue_ctx(store, issue_number).await),
+    )
+    .await?;
+    Ok(data
+        .pointer("/repository/issue/projectItems/nodes")
+        .and_then(|nodes| nodes.as_array())
+        .map(|a| {
+            a.iter().any(|item| {
+                item.pointer("/project/id").and_then(|x| x.as_str()) == Some(project_id)
+            })
+        })
+        .unwrap_or(false))
+}
+
+pub(super) async fn status_field_ids(project_id: &str, status: &str) -> Result<(String, String)> {
     let data = gh_graphql(
         "query($id: ID!) { node(id: $id) { ... on ProjectV2 {
             field(name: \"Status\") { ... on ProjectV2SingleSelectField {
@@ -141,7 +224,7 @@ pub(super) async fn status_field_ids(
     Ok((field_id, option_id))
 }
 
-pub(super) async fn planned_field_id(_store: &GitHubStore, project_id: &str) -> Result<String> {
+pub(super) async fn planned_field_id(project_id: &str) -> Result<String> {
     let data = gh_graphql(
         "query($id: ID!) { node(id: $id) { ... on ProjectV2 {
             field(name: \"Запланировано\") { ... on ProjectV2Field { id } } } } }",

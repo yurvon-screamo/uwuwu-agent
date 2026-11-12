@@ -61,7 +61,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 let needle = ty.to_lowercase();
                 tasks.retain(|t| t.task_type.0.to_lowercase() == needle);
             }
-            tasks.sort_by(|a, b| a.id.cmp(&b.id));
+            tasks.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(0));
             for t in &tasks {
                 let ty = if t.task_type.is_set() {
                     format!(" {:4}", t.task_type.0)
@@ -107,6 +107,8 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             stdin,
             attach,
             dry_run,
+            priority,
+            autodone,
             ..
         } => {
             for path in &attach {
@@ -131,6 +133,8 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                             status,
                             body_md,
                             attachments: vec![],
+                            priority,
+                            autodone: Some(autodone),
                         },
                     )
                     .await?;

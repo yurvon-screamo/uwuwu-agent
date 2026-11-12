@@ -2,7 +2,7 @@
 //! write-side (github_task_write.rs). Структура/конвертация — github_task.rs.
 
 use super::github_task::GitHubStore;
-use super::task_store::{CreateTask, EditTask, StoreResult, TaskStore};
+use super::task_store::{CreateTask, EditTask, StoreResult, TaskStore, ThreadEntry};
 use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
@@ -65,6 +65,60 @@ impl TaskStore for GitHubStore {
 
     async fn body_get(&self, _board: &TaskBoard, task: &Task) -> StoreResult<String> {
         self.issue_body(&task.id).await
+    }
+
+    /// Полная перезапись тела (frontmatter сохраняется вызывающим? — нет:
+    /// вызывающий передаёт новое тело ЦЕЛИКОМ; base-сверка защищает от
+    /// параллельной правки).
+    async fn body_replace(
+        &self,
+        _board: &TaskBoard,
+        task: &Task,
+        new_md: &str,
+        base: &str,
+    ) -> StoreResult<Task> {
+        let current = self.issue_body(&task.id).await?;
+        if current != base {
+            anyhow::bail!(
+                "тело изменилось с момента снапшота (--base) — перечитай task get и повтори"
+            );
+        }
+        self.set_issue_body(&task.id, new_md).await?;
+        Ok(self.issue_fresh(&task.id).await?)
+    }
+
+    /// Тред = issue comments (плоский список; reply-семантика — цитатный
+    /// маркер, вложенности нет).
+    async fn thread(&self, _board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>> {
+        let number = &task.id;
+        let data = gh_json(
+            &[
+                "api",
+                "-X",
+                "GET",
+                &format!("repos/{}/issues/{number}/comments", self.repo),
+                "-F",
+                "per_page=100",
+            ],
+            None,
+        )
+        .await?;
+        let mut out = Vec::new();
+        if let Some(items) = data.as_array() {
+            for c in items {
+                out.push(ThreadEntry {
+                    id: c["id"].to_string(),
+                    reply_to: None,
+                    author: c
+                        .pointer("/user/login")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    text: c["body"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn body_attrs(

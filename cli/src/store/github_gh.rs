@@ -72,10 +72,14 @@ async fn gh_raw(args: &[&str], stdin_body: Option<&str>) -> Result<String> {
             drop(stdin);
         }
     }
-    let out = child
-        .wait_with_output()
-        .await
-        .context("gh прервался без ответа")?;
+    // Таймаут: зависший gh не вешает демона (Common ревью кода)
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .context("gh превысил таймаут 120s")?
+    .context("gh прервался без ответа")?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

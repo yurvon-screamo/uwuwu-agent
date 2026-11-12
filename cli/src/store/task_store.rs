@@ -16,6 +16,10 @@ pub struct CreateTask {
     pub body_md: Option<String>,
     /// Аттачи: (путь, альт-текст) — медиа в md-референсы тела.
     pub attachments: Vec<(std::path::PathBuf, String)>,
+    /// Приоритет (канон CUP); None — не задан.
+    pub priority: Option<String>,
+    /// Autodone-галочка (владелец решает; триаж не ставит).
+    pub autodone: Option<bool>,
 }
 
 /// Edit: все поля опциональны — пишутся только заданные.
@@ -29,6 +33,10 @@ pub struct EditTask {
     pub dev_session: Option<String>,
     /// (дисплей, epoch ms) — паритет клетки «Запланировано».
     pub planned: Option<(String, i64)>,
+    /// Приоритет (канон CUP): high/medium/low; "" — снять (дефолта нет).
+    pub priority: Option<String>,
+    /// Some(true/false) — вкл/выкл autodone, None — не менять.
+    pub autodone: Option<bool>,
 }
 
 /// Comment insert: семантика append — реализация не дедупит (паритет
@@ -54,24 +62,16 @@ pub trait TaskStore: Send + Sync {
     /// Финальное состояние тела задачи (md).
     async fn body_get(&self, board: &TaskBoard, task: &Task) -> StoreResult<String>;
 
-    /// Полная перезапись тела. `base` — снапшот свежести (task body_md из
-    /// get): реализация отказывает при расхождении с текущим телом —
+    /// Полная перезапись тела. `base` — снапшот свежести (тело из get):
+    /// реализация отказывает при расхождении с текущим телом —
     /// параллельная правка не затирается.
-    ///
-    /// Default: этап коммутации (логика cmd-слоя переезжает в store после
-    /// нарезки sy_dispatch) — громкий отказ, тихих заглушек нет.
     async fn body_replace(
         &self,
         board: &TaskBoard,
         task: &Task,
-        _new_md: &str,
-        _base: &str,
-    ) -> StoreResult<Task> {
-        let _ = (board, task);
-        Err(anyhow::anyhow!(
-            "store: body_replace не реализован — этап коммутации"
-        ))
-    }
+        new_md: &str,
+        base: &str,
+    ) -> StoreResult<Task>;
 
     async fn create(&self, board: &TaskBoard, input: &CreateTask) -> Result<Task, StoreError>;
 
@@ -90,14 +90,8 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<CommentInsert, StoreError>;
 
     /// Вид задачи как диалога: комменты с якорями (reply-вложенность —
-    /// элементы с `reply_to`). Default: этап коммутации (парсер маркеров
-    /// переезжает из cmd-слоя) — громкий отказ.
-    async fn thread(&self, board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>> {
-        let _ = (board, task);
-        Err(anyhow::anyhow!(
-            "store: thread не реализован — этап коммутации"
-        ))
-    }
+    /// элементы с `reply_to`).
+    async fn thread(&self, board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>>;
 
     /// Ячейка «Сессия dev»: claim агента / запись фабрики.
     async fn claim(&self, board: &TaskBoard, task: &Task, session: &str) -> StoreResult<Task>;

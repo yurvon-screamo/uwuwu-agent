@@ -74,21 +74,22 @@ impl TaskStore for BareStore {
     ) -> Result<(), anyhow::Error> {
         unreachable!("тест касается только default-методов")
     }
-}
-
-#[tokio::test]
-async fn default_body_replace_is_loud() {
-    let err = BareStore
-        .body_replace(&board(), &task(), "новое тело", "база")
-        .await
-        .unwrap_err();
-    assert!(format!("{err}").contains("body_replace"));
-}
-
-#[tokio::test]
-async fn default_thread_is_loud() {
-    let err = BareStore.thread(&board(), &task()).await.unwrap_err();
-    assert!(format!("{err}").contains("thread"));
+    async fn body_replace(
+        &self,
+        _board: &TaskBoard,
+        _task: &Task,
+        _new_md: &str,
+        _base: &str,
+    ) -> Result<Task, anyhow::Error> {
+        unreachable!("тест касается только default-методов")
+    }
+    async fn thread(
+        &self,
+        _board: &TaskBoard,
+        _task: &Task,
+    ) -> Result<Vec<crate::store::ThreadEntry>, anyhow::Error> {
+        unreachable!("тест касается только default-методов")
+    }
 }
 
 #[tokio::test]
@@ -118,6 +119,8 @@ fn task() -> Task {
         planned: String::new(),
         planned_ms: 0,
         schedule_cell: String::new(),
+        priority: String::new(),
+        autodone: false,
     }
 }
 

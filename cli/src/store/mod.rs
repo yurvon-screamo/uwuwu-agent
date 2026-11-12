@@ -63,8 +63,12 @@ pub struct Task {
     pub planned: String,
     /// Машиночитаемая дата той же клетки, epoch ms (0 — пусто).
     pub planned_ms: i64,
-    /// Отображение расписания крона (custom-schedule мастера).
+    /// Отображение расписания крона (schedule мастера).
     pub schedule_cell: String,
+    /// Приоритет (канон CUP-очереди: high/medium/low, "" — не задан).
+    pub priority: String,
+    /// Autodone: галочка автомержа PR при входе в Review.
+    pub autodone: bool,
 }
 
 /// Ошибка store-операции: классы, по которым CLI/демоны ветвят поведение
