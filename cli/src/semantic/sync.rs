@@ -697,26 +697,24 @@ pub(crate) async fn repair_missing(
             outcome.completed = false;
             return Ok(outcome);
         }
-        if !repair_id_batch(sy, ollama, store, id_batch, &budget, &mut outcome).await? {
+        let rows = fetch_by_ids(sy, id_batch).await?;
+        let (target, prune_ids) = split_repair_targets(rows);
+        if !prune_ids.is_empty() {
+            outcome.pruned += store.prune(&prune_ids)?;
+        }
+        if !repair_embed_windows(ollama, store, &target, &budget, &mut outcome).await? {
+            outcome.completed = false;
             return Ok(outcome);
         }
     }
     Ok(outcome)
 }
 
-/// Ремонт одного id-батча: fetch, prune вне полосы, эмбедд окон.
-/// false — бюджет исчерпан посреди батча (частичный прогон).
-async fn repair_id_batch(
-    sy: &SiYuan,
-    ollama: &OllamaClient,
-    store: &mut Store,
-    id_batch: &[String],
-    budget: &RepairBudget,
-    outcome: &mut RepairOutcome,
-) -> Result<bool> {
-    let rows = fetch_by_ids(sy, id_batch).await?;
-    let mut prune_ids: Vec<String> = Vec::new();
-    let target: Vec<KernelRow> = rows
+/// Классификация repair-строк: полоса [MIN, MAX] — на эмбедд, вне полосы —
+/// id'ы на prune (усохшие/переросшие чанки индексу не нужны).
+fn split_repair_targets(rows: Vec<KernelRow>) -> (Vec<KernelRow>, Vec<String>) {
+    let mut prune_ids = Vec::new();
+    let target = rows
         .into_iter()
         .filter(|row| match length_class(&row.content) {
             LengthClass::Embeddable => true,
@@ -726,15 +724,23 @@ async fn repair_id_batch(
             }
         })
         .collect();
-    if !prune_ids.is_empty() {
-        outcome.pruned += store.prune(&prune_ids)?;
-    }
-    for batch in embed_batch_windows(&target) {
+    (target, prune_ids)
+}
+
+/// Эмбедд ремонтных окон одного id-батча; false — бюджет исчерпан посреди
+/// эмбедда (частичный прогон, см. embed_batches).
+async fn repair_embed_windows(
+    ollama: &OllamaClient,
+    store: &mut Store,
+    target: &[KernelRow],
+    budget: &RepairBudget,
+    outcome: &mut RepairOutcome,
+) -> Result<bool> {
+    for batch in embed_batch_windows(target) {
         let timeout = embed_call_timeout(budget.deadline, budget.embed_timeout);
         if timeout.is_zero() {
             // Остаток бюджета меньше таймаута вызова — честная
             // остановка (см. embed_batches).
-            outcome.completed = false;
             return Ok(false);
         }
         let mut delta_report = SyncReport::default();
@@ -742,7 +748,6 @@ async fn repair_id_batch(
             if timeout < budget.embed_timeout && is_embed_timeout(&e) {
                 // Бюджет кончился посреди эмбедда — частичный прогон
                 // без завершения (см. embed_batches).
-                outcome.completed = false;
                 return Ok(false);
             }
             return Err(e);
