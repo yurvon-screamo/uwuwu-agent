@@ -842,8 +842,10 @@ async fn repair_does_not_rewind_watermark_pair() {
         &ollama(&embed.uri()),
         &mut store,
         &["old-row".into()],
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("repair");
@@ -931,8 +933,10 @@ async fn reconcile_backfills_prunes_and_refreshes_paths() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");
@@ -977,8 +981,10 @@ async fn reconcile_runs_even_when_last_reconcile_is_fresh() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");
@@ -1015,8 +1021,10 @@ async fn reconcile_repairs_with_slow_embed_when_timeout_allows() {
         &ollama(&embed.uri()),
         &mut store,
         &["slow-hole".to_string()],
-        None,
-        Duration::from_millis(500),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_millis(500),
+        },
     )
     .await;
     assert!(
@@ -1035,8 +1043,10 @@ async fn reconcile_repairs_with_slow_embed_when_timeout_allows() {
         &ollama(&embed.uri()),
         &mut store,
         &["slow-hole".to_string()],
-        None,
-        Duration::from_secs(5),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(5),
+        },
     )
     .await
     .expect("repair patient");
@@ -1129,8 +1139,10 @@ async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        Some(Instant::now() - Duration::from_millis(1)),
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");
@@ -1173,8 +1185,10 @@ async fn reconcile_interrupted_repair_does_not_count_run() {
         &ollama(&embed.uri()),
         &mut store,
         &["b1".to_string()],
-        Some(Instant::now() - Duration::from_millis(1)),
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("repair_missing");
@@ -1226,8 +1240,10 @@ async fn reconcile_prunes_block_shrunk_below_min_chars() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");
@@ -1325,8 +1341,10 @@ async fn reconcile_skips_oversize_backfill() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");
@@ -1368,8 +1386,10 @@ async fn reconcile_prunes_block_grown_beyond_max_chars() {
         &sy,
         &ollama(&embed.uri()),
         &mut store,
-        None,
-        Duration::from_secs(2),
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
     )
     .await
     .expect("reconcile");

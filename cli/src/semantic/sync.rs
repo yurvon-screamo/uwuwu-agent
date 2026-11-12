@@ -507,18 +507,17 @@ pub struct ReconcileReport {
 /// kernel SQL), дрейф путей без переэмбеддинга. last_reconcile_at
 /// ставится только по завершённому прогону — оборванный бюджет
 /// повторится при следующем sync. Вызывается только из `semantic sync`:
-/// repair-эмбедды ходят с REBUILD-классом таймаута (embed_timeout).
+/// repair-эмбедды ходят с REBUILD-классом таймаута (budget.embed_timeout).
 pub async fn reconcile(
     sy: &SiYuan,
     ollama: &OllamaClient,
     store: &mut Store,
-    deadline: Option<Instant>,
-    embed_timeout: Duration,
+    budget: RepairBudget,
 ) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
     let now = chrono::Utc::now().timestamp();
 
-    let kernel = scan_kernel_pages(sy, deadline).await?;
+    let kernel = scan_kernel_pages(sy, budget.deadline).await?;
     if !kernel.completed {
         // Прерванный бюджетом скан — рутинное событие sync-пути
         // (бюджет 600 s, живой бэклог). Частичный kernel против индекса
@@ -536,8 +535,7 @@ pub async fn reconcile(
         report.paths_refreshed = store.refresh_paths(&diff.path_drift)?;
     }
 
-    let repaired =
-        repair_missing(sy, ollama, store, &diff.repair_ids, deadline, embed_timeout).await?;
+    let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, budget).await?;
     if !repaired.completed {
         // Частичный backfill не фиксирует прогон — дыры ретраятся
         // следующим поиском, а не через сутки (Common ревью PR #96).
@@ -653,6 +651,13 @@ pub(crate) struct RepairOutcome {
     pub(crate) completed: bool,
 }
 
+/// Бюджет repair-прохода: wall-clock дедлайн + потолок таймаута одного
+/// embed-вызова (sync — REBUILD_EMBED_TIMEOUT).
+pub struct RepairBudget {
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) embed_timeout: Duration,
+}
+
 /// Backfill/переэмбедд недостающих строк: классификация по длине —
 /// усохшие/переросшие блоки вычищаются из индекса (а при backfill просто
 /// не индексируются), полосу [MIN, MAX] ремонтирует переэмбедд.
@@ -663,8 +668,7 @@ pub(crate) async fn repair_missing(
     ollama: &OllamaClient,
     store: &mut Store,
     repair_ids: &[String],
-    deadline: Option<Instant>,
-    embed_timeout: Duration,
+    budget: RepairBudget,
 ) -> Result<RepairOutcome> {
     let mut outcome = RepairOutcome {
         repaired: 0,
@@ -672,7 +676,7 @@ pub(crate) async fn repair_missing(
         completed: true,
     };
     for id_batch in repair_ids.chunks(PAGE) {
-        if !budget_left(deadline) {
+        if !budget_left(budget.deadline) {
             outcome.completed = false;
             return Ok(outcome);
         }
@@ -692,7 +696,7 @@ pub(crate) async fn repair_missing(
             outcome.pruned += store.prune(&prune_ids)?;
         }
         for batch in embed_batch_windows(&target) {
-            if !budget_left(deadline) {
+            if !budget_left(budget.deadline) {
                 outcome.completed = false;
                 return Ok(outcome);
             }
@@ -701,7 +705,7 @@ pub(crate) async fn repair_missing(
                 ollama,
                 store,
                 batch,
-                embed_call_timeout(deadline, embed_timeout),
+                embed_call_timeout(budget.deadline, budget.embed_timeout),
                 &mut delta_report,
             )
             .await?;

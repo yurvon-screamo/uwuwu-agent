@@ -387,8 +387,16 @@ async fn sync_once_locked(
         },
     )
     .await?;
-    let reconcile =
-        sync::reconcile(sy, &ollama, store, Some(deadline), REBUILD_EMBED_TIMEOUT).await?;
+    let reconcile = sync::reconcile(
+        sy,
+        &ollama,
+        store,
+        sync::RepairBudget {
+            deadline: Some(deadline),
+            embed_timeout: REBUILD_EMBED_TIMEOUT,
+        },
+    )
+    .await?;
     let backlog = backlog_size(sy, store).await?;
 
     let mut lines = vec![format!(
