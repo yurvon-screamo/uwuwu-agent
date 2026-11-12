@@ -105,6 +105,7 @@ import {
   type StartKind,
   type SessionLiveness,
   type SpawnEnvContext,
+  type DisplayLease,
   type SpawnGuardHold,
   type TaskComment,
   type TaskRef,
@@ -125,7 +126,7 @@ import {
   type PrProbeState,
 } from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
-import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, type EnvDeps } from "./env"
+import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
@@ -856,7 +857,12 @@ async function startTask(
   let envDir: string | undefined
   if (useEnv) {
     const paths = await ensureEnv(envDeps(), { root: ENV_ROOT, rowId: task.rowId, local: cfg.local, base: baseOf(cfg) })
-    envCtx = { repoDir: paths.repoDir, branch: paths.branch, scratchDir: paths.scratchDir }
+    envCtx = {
+      repoDir: paths.repoDir,
+      branch: paths.branch,
+      scratchDir: paths.scratchDir,
+      ...(paths.display !== null ? { display: { num: paths.display, file: paths.displayFile } } : {}),
+    }
     envDir = paths.envDir
     if (counters !== undefined) counters.envCreated++
   }
@@ -1515,6 +1521,16 @@ async function failReview(
   }
 }
 
+/** Лиз Xvfb-дисплея задачи из tracked.envDir (лиз-файл ведёт ensureEnv):
+ *  файл есть и парсится → lease; иначе undefined — строка DISPLAY в
+ *  промпт не попадает (насыщение, старый env до фичи). */
+function displayLeaseOf(tracked: TrackedTask): DisplayLease | undefined {
+  if (tracked.envDir === undefined) return undefined
+  const file = displayFilePath(tracked.envDir)
+  const num = readDisplayNumber(file)
+  return num !== null ? { num, file } : undefined
+}
+
 /** Спавн тестировщика: 1 сессия на задачу (cwd = ворктри задачи — там код,
  *  который он гоняет и допокрывает тестами). Выбрасывает при фейле. */
 async function startTesting(
@@ -1528,7 +1544,11 @@ async function startTesting(
   // ворктри для ctx/cwd: state-путь фабрики или живой агентский env:false
   // (см. resolvePromptWorktree) — промпт не лжёт «не найден» при живом ворктри
   const worktree = resolvePromptWorktree(task.rowId, tracked.worktree, ENV_ROOT)
-  const ctx = { branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg) }
+  const display = displayLeaseOf(tracked)
+  const ctx = {
+    branch: task.branch, worktree, pr: task.pr, type: task.type, base: baseOf(cfg),
+    ...(display !== undefined ? { display } : {}),
+  }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
     title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
@@ -1653,6 +1673,7 @@ async function dispatchReviewAction(
       return undefined
     }
     case "rerun-tester": {
+      const display = displayLeaseOf(d.tracked)
       const ok = await promptSession(
         d.tracked.testSessionID ?? "",
         testingRerunPrompt(d.row.rowId, {
@@ -1660,6 +1681,7 @@ async function dispatchReviewAction(
           worktree: resolvePromptWorktree(d.row.rowId, d.tracked.worktree, ENV_ROOT),
           pr: d.row.pr,
           type: d.row.type,
+          ...(display !== undefined ? { display } : {}),
         }),
       )
       if (ok) {
