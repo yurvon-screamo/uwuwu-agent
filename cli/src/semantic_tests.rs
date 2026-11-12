@@ -1247,7 +1247,7 @@ async fn reconcile_prunes_block_shrunk_below_min_chars() {
 #[tokio::test]
 async fn delta_prunes_block_shrunk_below_min_chars() {
     // Тот же усохший блок в overlap-окне дельты: старый чанк уходит
-    // из индекса сразу, не дожидаясь суточного reconcile.
+    // из индекса сразу, в том же прогоне.
     let blocks = vec![block(
         "b1",
         T0,
