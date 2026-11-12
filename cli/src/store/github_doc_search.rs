@@ -130,20 +130,6 @@ fn title_of(slug: &str) -> String {
     slug.rsplit('/').next().unwrap_or(slug).to_string()
 }
 
-/// Тестовый доступ к синхронным операциям (pub-слой DocStore — async).
-pub(super) mod test_support {
-    use super::by_title;
-    pub(super) use super::parse_line_pairs;
-
-    pub(super) fn by_title_sync(
-        clone_dir: &str,
-        query: &str,
-        top_n: usize,
-    ) -> Vec<super::TitleHit> {
-        by_title(clone_dir, query, top_n).expect("test fs ops")
-    }
-}
-
 /// Синхронный доступ для тестов (DocStore-слой — async).
 #[cfg(test)]
 pub(crate) fn by_title_sync(clone_dir: &str, query: &str, top_n: usize) -> Vec<TitleHit> {
