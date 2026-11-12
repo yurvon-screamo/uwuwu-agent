@@ -1006,7 +1006,7 @@ describe("DISPLAY-шов: лиз Xvfb-дисплея в промптах с env-
   const pin = (p: string): void => {
     expect(p).toContain("Xvfb-дисплей задачи: :100")
     expect(p).toContain(lease.file)
-    expect(p).toContain('pkill -f "Xvfb :100"')
+    expect(p).toContain('pkill -f "[X]vfb :100"')
     expect(p).toContain("чужие дисплеи не трогай")
   }
   test("spawnPrompt env-ветка: строка есть, env:false — строки нет", () => {
