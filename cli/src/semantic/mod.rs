@@ -339,7 +339,15 @@ async fn rebuild_index(
         on_batch,
     };
     let report = sync::delta_sync(sy, &ollama, store, &opts).await?;
-    store.set_meta("built_at", &chrono::Utc::now().timestamp().to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    store.set_meta("built_at", &now.to_string())?;
+    if !resume {
+        // Полный rebuild = завершённая сверка с корпусом (проход от нуля
+        // встроил всю полосу): штампуем last_reconcile_at, чтобы status не
+        // показывал ложное «reconcile давний» сразу после пересборки.
+        // --resume идёт от watermark — сверкой не является, не штампуем.
+        store.set_meta("last_reconcile_at", &now.to_string())?;
+    }
     Ok(RebuildReport {
         embedded: report.embedded,
         skipped_short: report.skipped_short,
@@ -403,10 +411,17 @@ async fn sync_once_locked(
         "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
         delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
     )];
-    lines.push(format!(
-        "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
-        reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-    ));
+    lines.push(if reconcile.completed {
+        format!(
+            "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
+            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+        )
+    } else {
+        format!(
+            "reconcile не дошёл (бюджет): восстановлено {}, вычищено {}, путей освежено {} — дыры ретраятся следующим sync",
+            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
+        )
+    });
     if delta.budget_exhausted {
         lines.push("бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string());
     }

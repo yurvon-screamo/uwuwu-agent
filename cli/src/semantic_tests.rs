@@ -1166,7 +1166,7 @@ fn embed_batch_windows_cuts_by_count_and_chars() {
 #[tokio::test]
 async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
     // High ревью PR #96: прерванный бюджетом скан — рутинное событие
-    // поискового пути (бюджет 10s, живой бэклог). Частичный kernel против
+    // sync-пути (бюджет 600s, живой бэклог). Частичный kernel против
     // индекса даёт ложные vanished (весь несосканированный хвост) —
     // прерванный прогон обязан быть no-op: без prune, без last_reconcile_at.
     let blocks = vec![block(
@@ -1200,6 +1200,7 @@ async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
     .await
     .expect("reconcile");
 
+    assert!(!report.completed, "частичный скан помечен не дошедшим");
     assert_eq!(report.pruned, 0, "частичный скан не prune'ит индекс");
     assert_eq!(report.repaired, 0, "частичный скан не ремонтирует");
     assert_eq!(
@@ -1218,8 +1219,8 @@ async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
 #[tokio::test]
 async fn reconcile_interrupted_repair_does_not_count_run() {
     // Common ревью PR #96: частичный backfill (бюджет умер посреди repair)
-    // не должен проставлять last_reconcile_at — дыры ретраятся следующим
-    // поиском, а не через сутки.
+    // не должен проставлять last_reconcile_at — дыры ретраятся при
+    // следующем sync, а не через сутки.
     let (server, _) = kernel_server_blocks_only(vec![block(
         "b1",
         T0,

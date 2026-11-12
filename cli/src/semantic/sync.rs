@@ -511,6 +511,9 @@ pub struct ReconcileReport {
     pub repaired: usize,
     pub pruned: usize,
     pub paths_refreshed: usize,
+    /// Прогон дошёл до конца (скан + repair завершены); false = бюджет
+    /// исчерпан посреди — дыры ретраятся при следующем sync.
+    pub completed: bool,
 }
 
 /// Полный id-diff ядра и индекса: самоисцеление пропусков (backfill),
@@ -535,6 +538,7 @@ pub async fn reconcile(
         // дал бы ложные vanished — весь несосканированный хвост был бы
         // вычищен (High ревью PR #96). Прерванный прогон — no-op: без
         // prune, без last_reconcile_at; повторится при следующем sync.
+        report.completed = false;
         return Ok(report);
     }
     let diff = diff_index(&kernel.metas, &store.chunk_metas()?);
@@ -549,14 +553,16 @@ pub async fn reconcile(
     let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, budget).await?;
     if !repaired.completed {
         // Частичный backfill не фиксирует прогон — дыры ретраятся
-        // следующим поиском, а не через сутки (Common ревью PR #96).
+        // при следующем sync, а не через сутки (Common ревью PR #96).
+        report.completed = false;
         return Ok(report);
     }
     report.pruned += repaired.pruned;
     report.repaired += repaired.repaired;
+    report.completed = true;
 
     // last_reconcile_at только по завершённому прогону — оборванный
-    // бюджетом повторится на следующем поиске.
+    // бюджетом повторится при следующем sync.
     store.set_meta("last_reconcile_at", &now.to_string())?;
     Ok(report)
 }
@@ -691,44 +697,59 @@ pub(crate) async fn repair_missing(
             outcome.completed = false;
             return Ok(outcome);
         }
-        let rows = fetch_by_ids(sy, id_batch).await?;
-        let mut prune_ids: Vec<String> = Vec::new();
-        let target: Vec<KernelRow> = rows
-            .into_iter()
-            .filter(|row| match length_class(&row.content) {
-                LengthClass::Embeddable => true,
-                LengthClass::TooShort | LengthClass::TooLong => {
-                    prune_ids.push(row.meta.block_id.clone());
-                    false
-                }
-            })
-            .collect();
-        if !prune_ids.is_empty() {
-            outcome.pruned += store.prune(&prune_ids)?;
-        }
-        for batch in embed_batch_windows(&target) {
-            let timeout = embed_call_timeout(budget.deadline, budget.embed_timeout);
-            if timeout.is_zero() {
-                // Остаток бюджета меньше таймаута вызова — честная
-                // остановка (см. embed_batches).
-                outcome.completed = false;
-                return Ok(outcome);
-            }
-            let mut delta_report = SyncReport::default();
-            if let Err(e) = embed_and_upsert(ollama, store, batch, timeout, &mut delta_report).await
-            {
-                if timeout < budget.embed_timeout && is_embed_timeout(&e) {
-                    // Бюджет кончился посреди эмбедда — частичный прогон
-                    // без завершения (см. embed_batches).
-                    outcome.completed = false;
-                    return Ok(outcome);
-                }
-                return Err(e);
-            }
-            outcome.repaired += delta_report.embedded;
+        if !repair_id_batch(sy, ollama, store, id_batch, &budget, &mut outcome).await? {
+            return Ok(outcome);
         }
     }
     Ok(outcome)
+}
+
+/// Ремонт одного id-батча: fetch, prune вне полосы, эмбедд окон.
+/// false — бюджет исчерпан посреди батча (частичный прогон).
+async fn repair_id_batch(
+    sy: &SiYuan,
+    ollama: &OllamaClient,
+    store: &mut Store,
+    id_batch: &[String],
+    budget: &RepairBudget,
+    outcome: &mut RepairOutcome,
+) -> Result<bool> {
+    let rows = fetch_by_ids(sy, id_batch).await?;
+    let mut prune_ids: Vec<String> = Vec::new();
+    let target: Vec<KernelRow> = rows
+        .into_iter()
+        .filter(|row| match length_class(&row.content) {
+            LengthClass::Embeddable => true,
+            LengthClass::TooShort | LengthClass::TooLong => {
+                prune_ids.push(row.meta.block_id.clone());
+                false
+            }
+        })
+        .collect();
+    if !prune_ids.is_empty() {
+        outcome.pruned += store.prune(&prune_ids)?;
+    }
+    for batch in embed_batch_windows(&target) {
+        let timeout = embed_call_timeout(budget.deadline, budget.embed_timeout);
+        if timeout.is_zero() {
+            // Остаток бюджета меньше таймаута вызова — честная
+            // остановка (см. embed_batches).
+            outcome.completed = false;
+            return Ok(false);
+        }
+        let mut delta_report = SyncReport::default();
+        if let Err(e) = embed_and_upsert(ollama, store, batch, timeout, &mut delta_report).await {
+            if timeout < budget.embed_timeout && is_embed_timeout(&e) {
+                // Бюджет кончился посреди эмбедда — частичный прогон
+                // без завершения (см. embed_batches).
+                outcome.completed = false;
+                return Ok(false);
+            }
+            return Err(e);
+        }
+        outcome.repaired += delta_report.embedded;
+    }
+    Ok(true)
 }
 
 /// Точечный fetch полных строк по id (backfill-ремонт): явный LIMIT.
