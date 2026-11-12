@@ -284,8 +284,13 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     if !force && base.is_none() {
                         bail!("task body --replace требует --base (снапшот свежести) или --force");
                     }
-                    let current = store.body_get(&board, &task).await?;
-                    store.body_replace(&board, &task, &md, &current).await?;
+                    // base — содержимое снапшота (файл): защита от
+                    // параллельной правки = сверка base vs текущее тело
+                    let base_md = match &base {
+                        Some(path) => std::fs::read_to_string(path)?,
+                        None => String::new(),
+                    };
+                    store.body_replace(&board, &task, &md, &base_md).await?;
                     println!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
