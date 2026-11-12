@@ -423,6 +423,9 @@ pub async fn delta_sync(
 
 /// Эмбедд батчей с бюджет-гейтом на каждый батч; false — бюджет исчерпан
 /// (хвост остаётся над watermark и дотягивается следующими запусками).
+/// Таймаут, урезанный бюджетом (меньше потолка пути), — это исчерпание
+/// бюджета посреди эмбедда, а не отказ сервера: грациозная остановка
+/// вместо Err. Таймаут при полном потолке — настоящий шторм ollama, Err.
 async fn embed_batches(
     ollama: &OllamaClient,
     store: &mut Store,
@@ -431,23 +434,31 @@ async fn embed_batches(
     report: &mut SyncReport,
 ) -> Result<bool> {
     for batch in batches {
-        if !budget_left(opts.deadline) {
+        let timeout = embed_call_timeout(opts.deadline, opts.embed_timeout);
+        if timeout.is_zero() {
             report.budget_exhausted = true;
             return Ok(false);
         }
-        embed_and_upsert(
-            ollama,
-            store,
-            batch,
-            embed_call_timeout(opts.deadline, opts.embed_timeout),
-            report,
-        )
-        .await?;
+        if let Err(e) = embed_and_upsert(ollama, store, batch, timeout, report).await {
+            if timeout < opts.embed_timeout && is_embed_timeout(&e) {
+                report.budget_exhausted = true;
+                return Ok(false);
+            }
+            return Err(e);
+        }
         if let Some(on_batch) = &opts.on_batch {
             on_batch(report.embedded);
         }
     }
     Ok(true)
+}
+
+/// Таймаут-класс ошибки: embed-вызов не уложился (сервер жив, но медлен).
+fn is_embed_timeout(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<super::ollama::EmbedError>(),
+        Some(super::ollama::EmbedError::Timeout { .. })
+    )
 }
 
 /// Эмбедд батча + атомарная запись (чанки и watermark одной транзакцией).
@@ -696,19 +707,24 @@ pub(crate) async fn repair_missing(
             outcome.pruned += store.prune(&prune_ids)?;
         }
         for batch in embed_batch_windows(&target) {
-            if !budget_left(budget.deadline) {
+            let timeout = embed_call_timeout(budget.deadline, budget.embed_timeout);
+            if timeout.is_zero() {
+                // Остаток бюджета меньше таймаута вызова — честная
+                // остановка (см. embed_batches).
                 outcome.completed = false;
                 return Ok(outcome);
             }
             let mut delta_report = SyncReport::default();
-            embed_and_upsert(
-                ollama,
-                store,
-                batch,
-                embed_call_timeout(budget.deadline, budget.embed_timeout),
-                &mut delta_report,
-            )
-            .await?;
+            if let Err(e) = embed_and_upsert(ollama, store, batch, timeout, &mut delta_report).await
+            {
+                if timeout < budget.embed_timeout && is_embed_timeout(&e) {
+                    // Бюджет кончился посреди эмбедда — частичный прогон
+                    // без завершения (см. embed_batches).
+                    outcome.completed = false;
+                    return Ok(outcome);
+                }
+                return Err(e);
+            }
             outcome.repaired += delta_report.embedded;
         }
     }

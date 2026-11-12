@@ -790,6 +790,59 @@ async fn delta_mid_mountain_embed_death_keeps_pair_progress() {
     );
 }
 
+#[tokio::test]
+async fn delta_budget_limited_embed_timeout_stops_gracefully() {
+    // Таймаут, урезанный бюджетом (меньше потолка пути), — исчерпание
+    // бюджета, а не отказ сервера: дельта останавливается gracefully
+    // (budget_exhausted, закоммиченный префикс живёт), sync печатает
+    // отчёт вместо Err. Отличие от mountain-теста: там deadline = None,
+    // таймаут равен потолку — настоящий Err.
+    let blocks: Vec<Value> = (0..64)
+        .map(|i| {
+            block(
+                &format!("20261105-{i:04}"),
+                T1,
+                &format!("чанк очереди номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // батч 1 (32 строки) — мгновенный ответ, батч 2 — через 2 s при
+    // дедлайне 500 ms и потолке 2 s: таймаут батча 2 (≈480 ms) меньше
+    // потолка — бюджет-урезанный, грациозная остановка детерминирована
+    // конструкцией мока, а не гонкой таймингов.
+    let (embed, _inputs) =
+        embed_server_slow_after_first(vec![1.0, 0.0, 0.0], Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("watermark", T1).unwrap();
+
+    let report = sync::delta_sync(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &sync::SyncOptions {
+            since: None,
+            deadline: Some(Instant::now() + Duration::from_millis(500)),
+            embed_timeout: Duration::from_secs(2),
+            page_delay: None,
+            on_batch: None,
+        },
+    )
+    .await
+    .expect("бюджет-урезанный таймаут — грациозная остановка");
+
+    assert!(report.budget_exhausted, "бюджет исчерпан посреди очереди");
+    assert_eq!(report.embedded, sync::EMBED_BATCH, "успел только батч 1");
+    let committed = store.chunk_count().unwrap() as usize;
+    assert_eq!(committed, sync::EMBED_BATCH, "батч 1 закоммичен");
+    let mark = store.meta("watermark").unwrap().unwrap();
+    let (_, id) = sync::split_watermark(&mark);
+    assert_eq!(id, "20261105-0031", "watermark на батче 1: {mark}");
+}
+
 /// Пара монотонна и по id внутри секунды: откат id-компоненты не двигает
 /// курсор назад (resume с overlap-окном переезает секунды повторно).
 #[test]
