@@ -291,7 +291,14 @@ def export_notebooks(docs_dir):
         if not nb_id:
             print(f"! ноутбук «{nb_name}» не найден")
             continue
-        all_docs = sql(f"select id, hpath, content from blocks where box='{nb_id}' and type='d'")
+        # SiYuan SQL без LIMIT отдаёт дефолт-порцию (64) — пагинируем
+        all_docs, offset = [], 0
+        while True:
+            page = sql(f"select id, hpath from blocks where box='{nb_id}' and type='d' limit 200 offset {offset}")
+            all_docs.extend(page)
+            if len(page) < 200:
+                break
+            offset += 200
         print(f"«{nb_name}»: {len(all_docs)} доков")
         for i, r in enumerate(all_docs):
             hpath = r["hpath"].strip("/")
