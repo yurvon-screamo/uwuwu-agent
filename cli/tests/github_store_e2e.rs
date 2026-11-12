@@ -39,6 +39,7 @@ fn create_input(title: &str) -> CreateTask {
 /// → list видит → resolve по тайтлу → edit (branch+type) → comment →
 /// claim (dev-session) → close (Done закрыл issue).
 #[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
 async fn github_store_full_lifecycle_live() {
     let store = sandbox();
     let stamp = chrono::Utc::now().timestamp_millis();
@@ -119,6 +120,7 @@ async fn github_store_full_lifecycle_live() {
 /// Идемпотентность create: дубль-тайтл — громкий отказ (list-first с
 /// паузой ≥ лага платформы — ретрай после таймаута видит созданное).
 #[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
 async fn github_store_create_duplicate_is_loud() {
     let store = sandbox();
     let stamp = chrono::Utc::now().timestamp_millis();
