@@ -12,7 +12,10 @@
 //!   молча отдаёт первые 64 строки);
 //! - reconcile: backfill пропущенных с эмбеддингом + prune исчезнувших
 //!   (трэш исключён из kernel SQL — проба 05.11) + дрейф путей без
-//!   переэмбеддинга.
+//!   переэмбеддинга. Вынесен из поискового пути (задача 20261112203959:
+//!   repair-эмбедды длинных батчей структурно не помещаются в 10-секундный
+//!   остаток поиска, хронный «reconcile не прошёл» + ~550 SQL-запросов
+//!   скана на каждый поиск) — reconcile живёт в `semantic sync`.
 
 use crate::siyuan::SiYuan;
 use anyhow::Result;
@@ -21,14 +24,19 @@ use std::time::{Duration, Instant};
 
 use super::ollama::OllamaClient;
 use super::store::{ChunkMeta, ChunkRecord, IndexedRow, Store};
-use super::SEARCH_EMBED_TIMEOUT;
 
 /// Целевые типы блоков-чанков (контентные; l/d/av/tb — не чанки).
 pub(crate) const TARGET_TYPES_SQL: &str = "('p','i','h','c','t')";
 /// Страница kernel-выборки (явный LIMIT каждого stmt).
 pub(crate) const PAGE: usize = 256;
-/// Батч эмбеддинга.
+/// Батч эмбеддинга: потолок строк.
 pub(crate) const EMBED_BATCH: usize = 32;
+/// Потолок суммарных символов одного embed-батча: эмбедд ~5k симв./сек
+/// (живой замер 12.11: 32×4400 ≈ 28 с), батч обязан умещаться в таймаут
+/// пути с запасом — жирные чанки режутся в отдельные окна. Полоса чанков
+/// ограничена MAX_CONTENT_CHARS (8000), поэтому одиночный чанк всегда
+/// укладывается в бюджет окна.
+pub(crate) const EMBED_BATCH_CHARS: usize = 24_000;
 /// Минимальная длина чанка (символы): заголовки-ярлыки не индексируем.
 pub(crate) const MIN_CONTENT_CHARS: usize = 40;
 /// Верхняя граница чанка (символы): html_embed-стены и крупные код-блоки
@@ -37,8 +45,6 @@ pub(crate) const MIN_CONTENT_CHARS: usize = 40;
 pub(crate) const MAX_CONTENT_CHARS: usize = 8000;
 /// Overlap окна дельты: правки в ту же секунду, что watermark.
 pub(crate) const OVERLAP_SECS: i64 = 60;
-/// Reconcile не чаще раза в сутки.
-pub(crate) const RECONCILE_INTERVAL_SECS: i64 = 24 * 3600;
 
 pub struct SyncOptions {
     /// None → от watermark из meta минус overlap; Some(s) → стартовая граница
@@ -70,7 +76,7 @@ pub struct SyncReport {
     pub budget_exhausted: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct KernelRow {
     pub meta: ChunkMeta,
     pub content: String,
@@ -78,6 +84,31 @@ pub struct KernelRow {
 
 pub(crate) fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Окна эмбеддинга: слайсы набора строк по EMBED_BATCH строк И по
+/// EMBED_BATCH_CHARS суммарных символов — набор длинных чанков не собирается
+/// в батч, чей embed дольше таймаута пути; watermark двигается каждым
+/// записанным окном, дельта проходит сквозь страницы длинных доков.
+pub(crate) fn embed_batch_windows(rows: &[KernelRow]) -> Vec<&[KernelRow]> {
+    let mut windows = Vec::new();
+    let mut start = 0usize;
+    let mut window_chars = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let chars = row.content.chars().count();
+        let full_by_count = i - start >= EMBED_BATCH;
+        let full_by_chars = window_chars > 0 && window_chars + chars > EMBED_BATCH_CHARS;
+        if full_by_count || full_by_chars {
+            windows.push(&rows[start..i]);
+            start = i;
+            window_chars = 0;
+        }
+        window_chars += chars;
+    }
+    if start < rows.len() {
+        windows.push(&rows[start..]);
+    }
+    windows
 }
 
 /// Страница дельты: keyset по (updated, id), старейшие первыми. Лёгкие
@@ -368,7 +399,7 @@ pub async fn delta_sync(
         if !embed_batches(
             ollama,
             store,
-            outcome.pending.chunks(EMBED_BATCH),
+            &embed_batch_windows(&outcome.pending),
             opts,
             &mut report,
         )
@@ -395,7 +426,7 @@ pub async fn delta_sync(
 async fn embed_batches(
     ollama: &OllamaClient,
     store: &mut Store,
-    batches: std::slice::Chunks<'_, KernelRow>,
+    batches: &[&[KernelRow]],
     opts: &SyncOptions,
     report: &mut SyncReport,
 ) -> Result<bool> {
@@ -469,40 +500,31 @@ pub struct ReconcileReport {
     pub repaired: usize,
     pub pruned: usize,
     pub paths_refreshed: usize,
-    /// Суточный интервал ещё не истёк — шаг пропущен.
-    pub skipped: bool,
 }
 
 /// Полный id-diff ядра и индекса: самоисцеление пропусков (backfill),
 /// prune исчезнувших (в т.ч. трэш — блоки удалённых доков выпадают из
 /// kernel SQL), дрейф путей без переэмбеддинга. last_reconcile_at
 /// ставится только по завершённому прогону — оборванный бюджет
-/// повторится на следующем поиске.
+/// повторится при следующем sync. Вызывается только из `semantic sync`:
+/// repair-эмбедды ходят с REBUILD-классом таймаута (embed_timeout).
 pub async fn reconcile(
     sy: &SiYuan,
     ollama: &OllamaClient,
     store: &mut Store,
     deadline: Option<Instant>,
+    embed_timeout: Duration,
 ) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
     let now = chrono::Utc::now().timestamp();
-    if let Some(last) = store
-        .meta("last_reconcile_at")?
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        if now - last < RECONCILE_INTERVAL_SECS {
-            report.skipped = true;
-            return Ok(report);
-        }
-    }
 
     let kernel = scan_kernel_pages(sy, deadline).await?;
     if !kernel.completed {
-        // Прерванный бюджетом скан — рутинное событие поискового пути
-        // (бюджет 10s, живой бэклог). Частичный kernel против индекса дал бы
-        // ложные vanished — весь несосканированный хвост был бы вычищен
-        // (High ревью PR #96). Прерванный прогон — no-op: без prune,
-        // без last_reconcile_at; повторится следующим поиском.
+        // Прерванный бюджетом скан — рутинное событие sync-пути
+        // (бюджет 600 s, живой бэклог). Частичный kernel против индекса
+        // дал бы ложные vanished — весь несосканированный хвост был бы
+        // вычищен (High ревью PR #96). Прерванный прогон — no-op: без
+        // prune, без last_reconcile_at; повторится при следующем sync.
         return Ok(report);
     }
     let diff = diff_index(&kernel.metas, &store.chunk_metas()?);
@@ -514,7 +536,8 @@ pub async fn reconcile(
         report.paths_refreshed = store.refresh_paths(&diff.path_drift)?;
     }
 
-    let repaired = repair_missing(sy, ollama, store, &diff.repair_ids, deadline).await?;
+    let repaired =
+        repair_missing(sy, ollama, store, &diff.repair_ids, deadline, embed_timeout).await?;
     if !repaired.completed {
         // Частичный backfill не фиксирует прогон — дыры ретраятся
         // следующим поиском, а не через сутки (Common ревью PR #96).
@@ -621,6 +644,7 @@ fn diff_index(kernel: &[ChunkMeta], index: &[ChunkMeta]) -> IndexDiff {
 }
 
 /// Счётчики repair-прохода + признак завершённости.
+#[derive(Debug)]
 pub(crate) struct RepairOutcome {
     pub(crate) repaired: usize,
     pub(crate) pruned: usize,
@@ -632,6 +656,7 @@ pub(crate) struct RepairOutcome {
 /// Backfill/переэмбедд недостающих строк: классификация по длине —
 /// усохшие/переросшие блоки вычищаются из индекса (а при backfill просто
 /// не индексируются), полосу [MIN, MAX] ремонтирует переэмбедд.
+/// Таймаут эмбедда прокидывается вызывающим (sync — REBUILD-класс).
 /// Тестовый вход закрепляет контракт частичного прогона.
 pub(crate) async fn repair_missing(
     sy: &SiYuan,
@@ -639,6 +664,7 @@ pub(crate) async fn repair_missing(
     store: &mut Store,
     repair_ids: &[String],
     deadline: Option<Instant>,
+    embed_timeout: Duration,
 ) -> Result<RepairOutcome> {
     let mut outcome = RepairOutcome {
         repaired: 0,
@@ -665,7 +691,7 @@ pub(crate) async fn repair_missing(
         if !prune_ids.is_empty() {
             outcome.pruned += store.prune(&prune_ids)?;
         }
-        for batch in target.chunks(EMBED_BATCH) {
+        for batch in embed_batch_windows(&target) {
             if !budget_left(deadline) {
                 outcome.completed = false;
                 return Ok(outcome);
@@ -675,7 +701,7 @@ pub(crate) async fn repair_missing(
                 ollama,
                 store,
                 batch,
-                embed_call_timeout(deadline, SEARCH_EMBED_TIMEOUT),
+                embed_call_timeout(deadline, embed_timeout),
                 &mut delta_report,
             )
             .await?;

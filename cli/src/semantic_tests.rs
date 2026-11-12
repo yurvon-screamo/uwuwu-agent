@@ -843,6 +843,7 @@ async fn repair_does_not_rewind_watermark_pair() {
         &mut store,
         &["old-row".into()],
         None,
+        Duration::from_secs(2),
     )
     .await
     .expect("repair");
@@ -926,9 +927,15 @@ async fn reconcile_backfills_prunes_and_refreshes_paths() {
         );
     }
 
-    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
-        .await
-        .expect("reconcile");
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile");
 
     assert_eq!(report.pruned, 1, "b4 исчез из ядра");
     assert_eq!(report.paths_refreshed, 1, "b2 переехал без эмбеддинга");
@@ -952,7 +959,10 @@ async fn reconcile_backfills_prunes_and_refreshes_paths() {
 }
 
 #[tokio::test]
-async fn reconcile_skips_within_daily_interval() {
+async fn reconcile_runs_even_when_last_reconcile_is_fresh() {
+    // Явный sync обязан проходить reconcile всегда: суточного guard'а нет
+    // (он тормозил поисковый путь до выноса reconcile из него). Пустой
+    // diff — дёшев, отчёт пустой, но last_reconcile_at ставится.
     let (server, _) = kernel_server_blocks_only(vec![]).await;
     let sy = SiYuan::for_tests(server.uri());
     let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
@@ -963,12 +973,131 @@ async fn reconcile_skips_within_daily_interval() {
         .set_meta("last_reconcile_at", &fresh.to_string())
         .unwrap();
 
-    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
-        .await
-        .expect("reconcile");
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile");
 
-    assert!(report.skipped);
+    assert_eq!(report.repaired, 0, "пустое ядро — ремонтов нет");
     assert!(inputs.lock().unwrap().is_empty());
+    assert!(store.meta("last_reconcile_at").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn reconcile_repairs_with_slow_embed_when_timeout_allows() {
+    // Таймаут repair-эмбедда — параметр вызывающего: sync ходит с
+    // REBUILD-классом (120 s), медленный батч ремонтируется; с коротким
+    // таймаутом тот же батч — частичный прогон без завершения.
+    let blocks = vec![block(
+        "slow-hole",
+        T0,
+        "ремонтный чанк с длинным содержанием для медленного эмбедда",
+        "/hole",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // Каждый ответ через 1.5 s: при таймауте 500 ms — отказ, при 5 s — успех
+    // (дискретный мок, исход фиксирован конструкцией, не гонкой таймингов).
+    let (embed, _) =
+        embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_millis(1500)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    store.set_meta("model", "test-model").unwrap();
+    store.set_meta("dim", "3").unwrap();
+
+    let rushed = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["slow-hole".to_string()],
+        None,
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        rushed.is_err(),
+        "короткий таймаут — эмбедд не уложился: {:?}",
+        rushed
+    );
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        0,
+        "частичный прогон не записал"
+    );
+
+    let patient = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["slow-hole".to_string()],
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("repair patient");
+    assert!(patient.completed, "щедрый таймаут — прогон завершён");
+    assert_eq!(patient.repaired, 1);
+    assert_eq!(store.chunk_count().unwrap(), 1, "чанк отремонтирован");
+}
+
+// ——— резка embed-батчей по символьному бюджету ———
+
+fn kernel_row(id: &str, content: &str) -> sync::KernelRow {
+    sync::KernelRow {
+        meta: ChunkMeta {
+            block_id: id.to_string(),
+            root_id: String::new(),
+            box_id: String::new(),
+            hpath: String::new(),
+            updated: T0.into(),
+        },
+        content: content.to_string(),
+    }
+}
+
+#[test]
+fn embed_batch_windows_cuts_by_count_and_chars() {
+    // Потолок строк: 40 коротких → 32 + 8.
+    let short: Vec<_> = (0..40)
+        .map(|i| {
+            kernel_row(
+                &format!("s{i}"),
+                &format!("короткий чанк номер {i} для резки батчей"),
+            )
+        })
+        .collect();
+    let windows = sync::embed_batch_windows(&short);
+    assert_eq!(windows.len(), 2, "32 + 8 по потолку строк: {windows:?}");
+    assert_eq!(windows[0].len(), 32);
+    assert_eq!(windows[1].len(), 8);
+
+    // Потолок символов: 4 чанка по 8000 → 3 (ровно 24k) + 1.
+    let fat: Vec<_> = (0..4)
+        .map(|i| kernel_row(&format!("f{i}"), &"ж".repeat(sync::MAX_CONTENT_CHARS)))
+        .collect();
+    let windows = sync::embed_batch_windows(&fat);
+    assert_eq!(windows.len(), 2, "24k символов закрывают окно: {windows:?}");
+    assert_eq!(windows[0].len(), 3);
+    assert_eq!(windows[1].len(), 1);
+
+    // Два чанка по 12500 не собираются вместе (сумма > 24k).
+    let mixed: Vec<_> = (0..2)
+        .map(|i| kernel_row(&format!("m{i}"), &"м".repeat(12_500)))
+        .collect();
+    let windows = sync::embed_batch_windows(&mixed);
+    assert_eq!(windows.len(), 2, "жирные чанки — по отдельному окну");
+    assert_eq!(windows[0].len(), 1);
+    assert_eq!(windows[1].len(), 1);
+
+    // Одиночный чанк всегда в своём окне; пустой набор — без окон.
+    let single = [kernel_row("single", &"о".repeat(sync::MAX_CONTENT_CHARS))];
+    assert_eq!(sync::embed_batch_windows(&single).len(), 1);
+    assert!(sync::embed_batch_windows(&[]).is_empty());
 }
 
 #[tokio::test]
@@ -1001,6 +1130,7 @@ async fn reconcile_interrupted_scan_is_noop_not_mass_prune() {
         &ollama(&embed.uri()),
         &mut store,
         Some(Instant::now() - Duration::from_millis(1)),
+        Duration::from_secs(2),
     )
     .await
     .expect("reconcile");
@@ -1044,6 +1174,7 @@ async fn reconcile_interrupted_repair_does_not_count_run() {
         &mut store,
         &["b1".to_string()],
         Some(Instant::now() - Duration::from_millis(1)),
+        Duration::from_secs(2),
     )
     .await
     .expect("repair_missing");
@@ -1091,9 +1222,15 @@ async fn reconcile_prunes_block_shrunk_below_min_chars() {
     }
     store.set_meta("last_reconcile_at", "1000").unwrap();
 
-    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
-        .await
-        .expect("reconcile");
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile");
 
     assert_eq!(
         store.chunk_count().unwrap(),
@@ -1184,9 +1321,15 @@ async fn reconcile_skips_oversize_backfill() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let mut store = seeded_store(dir.path());
 
-    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
-        .await
-        .expect("reconcile");
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile");
 
     assert_eq!(report.repaired, 0, "оверсайз не попадает в backfill");
     assert_eq!(store.chunk_count().unwrap(), 0);
@@ -1221,9 +1364,15 @@ async fn reconcile_prunes_block_grown_beyond_max_chars() {
     }
     store.set_meta("last_reconcile_at", "1000").unwrap();
 
-    let report = sync::reconcile(&sy, &ollama(&embed.uri()), &mut store, None)
-        .await
-        .expect("reconcile");
+    let report = sync::reconcile(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile");
 
     assert_eq!(
         store.chunk_count().unwrap(),
@@ -1232,6 +1381,34 @@ async fn reconcile_prunes_block_grown_beyond_max_chars() {
     );
     assert_eq!(report.pruned, 1);
     assert!(inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn status_hints_when_reconcile_is_stale() {
+    // Подсказка «reconcile давний» — честный сигнал, что самопочинку
+    // индекса давно никто не гонял (semantic sync); свежий прогон её гасит.
+    let (server, _) = kernel_server_blocks_only(vec![]).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), "http://127.0.0.1:1");
+    // index_ready_store ставит свежий last_reconcile_at — подсказки нет.
+    let store = index_ready_store(dir.path());
+    drop(store);
+    let lines = crate::semantic::status(&sy, &cfg).await.expect("status");
+    assert!(
+        !lines.iter().any(|l| l.contains("reconcile давний")),
+        "свежий reconcile без подсказки: {lines:?}"
+    );
+
+    // Просроченный прогон — подсказка появляется.
+    let store = Store::open(&cfg.db_path).expect("переоткрыть индекс");
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+    drop(store);
+    let lines = crate::semantic::status(&sy, &cfg).await.expect("status");
+    assert!(
+        lines.iter().any(|l| l.contains("reconcile давний")),
+        "давний reconcile подсвечен: {lines:?}"
+    );
 }
 
 #[tokio::test]
@@ -1275,6 +1452,76 @@ async fn status_reports_oversize_blocks_by_target_types() {
         "фильтр целевых типов в метрике: {metric_stmt}"
     );
     assert!(metric_stmt.contains("limit"), "явный LIMIT: {metric_stmt}");
+}
+
+#[tokio::test]
+async fn search_half_does_not_reconcile_even_when_index_has_holes() {
+    // Поисковый путь синхронизируется только дельтой: reconcile (полный
+    // id-скан корпуса + repair-эмбедды) в остаток бюджета поиска не
+    // помещается структурно — он живёт в `semantic sync`. Дыра ниже
+    // watermark (строка в ядре, не в индексе) для поиска невидима и НЕ
+    // запускает reconcile-скан/repair на поиске.
+    let blocks = vec![
+        block(
+            "indexed-ok",
+            T0,
+            "проиндексированный чанк с длинным содержанием для поиска",
+            "/ok",
+        ),
+        block(
+            "hole-below-watermark",
+            // сутки ниже watermark: вне 60-секундного overlap-окна дельты,
+            // видна только reconcile'у
+            "20261104000000",
+            "дырявый чанк ниже watermark с длинным содержанием",
+            "/hole",
+        ),
+    ];
+    let (server, _, stmts) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    // В индексе только indexed-ok; дырявый чанк есть в ядре, но не в
+    // индексе (watermark T1 — выше обеих строк, дельте он невидим).
+    let hit = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "indexed-ok".into(),
+            root_id: "indexed-ok-root".into(),
+            box_id: "b".into(),
+            hpath: "/ok".into(),
+            updated: T0.into(),
+        },
+        content: "проиндексированный чанк с длинным содержанием для поиска".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    let tx = store.begin().unwrap();
+    Store::upsert_batch(&tx, &[hit], None).unwrap();
+    tx.commit().unwrap();
+    // прошлый reconcile просрочен: на старом коде это будит reconcile на
+    // поиске (скан + repair) — красный тест именно на это
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+    inputs.lock().unwrap().clear();
+    drop(store);
+
+    let lines =
+        crate::semantic::search_half(&sy, &cfg, "проиндексированный запрос", 10, 0.35).await;
+
+    assert!(
+        !lines.iter().any(|l| l.contains("reconcile")),
+        "поиск не должен ни звать reconcile, ни сообщать о нём: {lines:?}"
+    );
+    let captured = stmts.lock().unwrap();
+    assert!(
+        !captured
+            .iter()
+            .any(|s| s.contains("id >") && !s.contains("updated >")),
+        "reconcile-скан (id-keyset без updated-пары) не ходит на поиске: {captured:?}"
+    );
+    // эмбедд зазван один раз — для запроса; repair дыры на поиске не ходит
+    let embedded = inputs.lock().unwrap();
+    assert_eq!(embedded.len(), 1, "только query-embed: {embedded:?}");
 }
 
 // ——— search_half: матрица деградации и happy path ———

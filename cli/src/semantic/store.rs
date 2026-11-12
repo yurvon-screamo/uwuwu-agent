@@ -45,7 +45,7 @@ pub struct Store {
 }
 
 /// Строка индекса без вектора — reconcile-diff и метаданные.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChunkMeta {
     pub block_id: String,
     pub root_id: String,
