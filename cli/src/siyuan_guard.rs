@@ -555,6 +555,8 @@ mod tests {
             title: title.into(),
             status: status.into(),
             task_type: String::new(),
+            priority: String::new(),
+            autodone: false,
             branch: String::new(),
             pr: String::new(),
             dev_session: String::new(),

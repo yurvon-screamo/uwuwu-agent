@@ -14,8 +14,8 @@ use crate::cmd::mock_kernel::{set_env, MockKernel, MockRow, MockScenario};
 use crate::cmd::sy_dispatch::task_run;
 use crate::siyuan::SiYuan;
 use crate::siyuan_task::{
-    comment_with_ts, create_row_with_body, create_with_pacing, CommentDraft, RowInsertPacing,
-    SyBoard, SyTask,
+    comment_with_ts, create_row_with_body, create_with_pacing, CommentDraft, CreateProps,
+    RowInsertPacing, SyBoard, SyTask,
 };
 use serde_json::Value;
 use wiremock::MockServer;
@@ -62,9 +62,13 @@ async fn create_via_flow(server: &MockServer) -> anyhow::Result<()> {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -161,6 +165,8 @@ async fn create_new_types_write_canonical_cell_and_skeleton() {
             TaskSub::Create {
                 title: NEW_TITLE.into(),
                 r#type: Some(ty.into()),
+                priority: None,
+                autodone: false,
                 stdin: false,
                 attach: Vec::<std::path::PathBuf>::new(),
                 schedule: None,
@@ -213,6 +219,8 @@ async fn create_without_type_defaults_to_feature_cell_and_skeleton() {
         TaskSub::Create {
             title: NEW_TITLE.into(),
             r#type: None,
+            priority: None,
+            autodone: false,
             stdin: false,
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
@@ -274,9 +282,13 @@ async fn create_with_nonempty_content_writes_content_as_body_without_skeleton() 
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         content,
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -309,9 +321,13 @@ async fn create_without_content_writes_type_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -343,9 +359,13 @@ async fn create_with_title_h1_in_content_strips_only_title_h1() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         &content,
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -383,9 +403,13 @@ async fn create_with_whitespace_only_content_writes_skeleton() {
         &sy,
         "uwuwu",
         NEW_TITLE,
-        "feature",
         "   \n\n  ",
         "Draft",
+        &CreateProps {
+            ty: Some("feature"),
+            priority: None,
+            autodone: false,
+        },
         &RowInsertPacing::instant(),
     )
     .await
@@ -419,6 +443,8 @@ async fn create_dry_run_is_read_only_with_mock_kernel() {
         TaskSub::Create {
             title: "dry-run осмотр".into(),
             r#type: None,
+            priority: None,
+            autodone: false,
             stdin: false,
             attach: Vec::<std::path::PathBuf>::new(),
             schedule: None,
@@ -552,7 +578,7 @@ async fn create_with_none_type_does_not_mint_type_column() {
         NEW_TITLE,
         "todo",
         "## Суть\nконтекст\n",
-        None,
+        &CreateProps::default(),
         &RowInsertPacing::instant(),
     )
     .await
@@ -623,6 +649,8 @@ async fn edit_type_via_cli(server: &MockServer, id: &str, ty: Option<&str>) -> a
             pr: None,
             branch: None,
             r#type: ty.map(String::from),
+            priority: None,
+            autodone: None,
             schedule: None,
             agent: None,
             planned: None,
@@ -1348,6 +1376,8 @@ fn comment_task() -> SyTask {
         title: TASK_TITLE.into(),
         status: "Draft".into(),
         task_type: String::new(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: String::new(),

@@ -125,6 +125,8 @@ fn probe_task(dev_session: &str) -> SyTask {
         title: "таск".into(),
         status: "In Progress".into(),
         task_type: String::new(),
+        priority: String::new(),
+        autodone: false,
         branch: String::new(),
         pr: String::new(),
         dev_session: dev_session.into(),

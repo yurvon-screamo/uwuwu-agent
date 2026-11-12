@@ -76,9 +76,13 @@ async fn create_with_content_writes_content_as_body_on_live_kernel() -> Result<(
         &sy,
         PROJECT,
         TITLE,
-        syt::DEFAULT_TASK_TYPE,
         &content,
         "Draft",
+        &syt::CreateProps {
+            ty: Some(syt::DEFAULT_TASK_TYPE),
+            priority: None,
+            autodone: false,
+        },
     )
     .await?;
 
@@ -117,8 +121,19 @@ async fn create_with_status_todo_mints_row_in_todo_on_live_kernel() -> Result<()
     cleanup(&sy).await?;
 
     const TODO_TITLE: &str = "zz-e2e create-status: ран минтится Todo";
-    let (item_id, _body_doc) =
-        syt::create(&sy, PROJECT, TODO_TITLE, syt::DEFAULT_TASK_TYPE, "", "Todo").await?;
+    let (item_id, _body_doc) = syt::create(
+        &sy,
+        PROJECT,
+        TODO_TITLE,
+        "",
+        "Todo",
+        &syt::CreateProps {
+            ty: Some(syt::DEFAULT_TASK_TYPE),
+            priority: None,
+            autodone: false,
+        },
+    )
+    .await?;
 
     let board = syt::find_board(&sy, PROJECT).await?;
     let rows = syt::read_rows(&sy, &board).await?;

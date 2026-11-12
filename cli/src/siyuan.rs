@@ -1680,6 +1680,26 @@ impl SiYuan {
         Ok(())
     }
 
+    /// Значение checkbox-ячейки: шейп kernel av.ValueCheckbox {checked}.
+    /// Проба живым ядром 12.11 (задача 20261112160316): колонка
+    /// addAttributeViewKey с keyType checkbox mint'ится REST-ом, запись
+    /// клетки — тем же database item_update, что и прочие типы.
+    pub async fn db_item_set_checkbox(
+        &self,
+        av_id: &str,
+        key_id: &str,
+        item_id: &str,
+        checked: bool,
+    ) -> Result<()> {
+        self.mcp_tool(
+            "database",
+            json!({ "action": "item_update", "id": av_id, "keyID": key_id,
+                    "itemID": item_id, "value": { "checkbox": { "checked": checked } } }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Значение date-ячейки: content — epoch ms, formattedContent — строка
     /// отображения (шейп kernel av.ValueDate). isNotEmpty=false — очистка
     /// клетки (kernel считает date пустой по флагу, не по content).
