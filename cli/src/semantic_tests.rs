@@ -2382,3 +2382,269 @@ async fn backlog_size_counts_only_rows_above_watermark() {
 
     assert_eq!(backlog, 1, "над watermark только вторая строка");
 }
+
+// ——— repair-классификация длин и транзакционность частичного прогона ———
+
+#[tokio::test]
+async fn repair_missing_prunes_out_of_band_rows() {
+    // Классификация длин repair-строк: полоса [MIN, MAX] — на переэмбедд,
+    // усохшие (≤ MIN) и переросшие (> MAX) — вычищаются из индекса, а не
+    // эмбеддятся (поведение split_repair_targets через repair_missing).
+    let blocks = vec![
+        block("short", T0, &"к".repeat(30), "/d"),
+        block(
+            "good",
+            T0,
+            "обычный ремонтный чанк с содержанием нужной длины",
+            "/d",
+        ),
+        block("long", T0, &"д".repeat(sync::MAX_CONTENT_CHARS + 1), "/d"),
+    ];
+    // усохший и переросший сидят в индексе со старым вектором — prune
+    // обязан их вычистить, полосный — переэмбеддить
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    for (id, content) in [
+        ("short", "короткий ярлык чанка"),
+        ("good", "обычный ремонтный чанк с содержанием нужной длины"),
+        ("long", "переросший чанк индекса"),
+    ] {
+        let record = ChunkRecord {
+            meta: ChunkMeta {
+                block_id: id.into(),
+                root_id: format!("{id}-root"),
+                box_id: "box".into(),
+                hpath: "/d".into(),
+                updated: T0.into(),
+            },
+            content: content.into(),
+            vec: normalize(vec![1.0, 0.0, 0.0]),
+        };
+        let tx = store.begin().expect("tx");
+        Store::upsert_batch(&tx, std::slice::from_ref(&record), Some(T0)).expect("upsert");
+        tx.commit().expect("commit");
+    }
+
+    let (server, _) = kernel_server_blocks_only(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, inputs) = embed_server(vec![1.0, 0.0, 0.0]).await;
+
+    let outcome = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &["short".to_string(), "good".to_string(), "long".to_string()],
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("repair");
+
+    assert_eq!(outcome.pruned, 2, "усохший и переросший вычищены");
+    assert_eq!(outcome.repaired, 1, "полосный чанк переэмбеджен");
+    assert!(outcome.completed, "дошёл до конца списка id");
+    assert_eq!(
+        store.chunk_count().unwrap(),
+        1,
+        "в индексе остался только полосный чанк"
+    );
+    let embedded = inputs.lock().unwrap();
+    assert_eq!(embedded.len(), 1, "эмбедд зазван только для полосного");
+    assert!(
+        embedded[0].contains("обычный ремонтный"),
+        "переэмбедд — контент полосного чанка: {embedded:?}"
+    );
+}
+
+#[tokio::test]
+async fn repair_missing_partial_run_keeps_committed_prefix() {
+    // Смерть посреди repair-окон (дискретный мок: окно 1 мгновенно, окно 2
+    // через 5 s при таймауте 2 s → Err) — закоммиченный префикс живёт в
+    // индексе: работа пер-окна транзакционна и не откатывается ошибкой
+    // следующего окна (живое наблюдение тестирования: бэкфилл при обрыве
+    // бюджета пишет чанки, отчёт их не показывает).
+    let blocks: Vec<Value> = (0..40)
+        .map(|i| {
+            block(
+                &format!("r{i:03}"),
+                T0,
+                &format!("ремонтный чанк номер {i} с содержанием длиннее сорока символов"),
+                "/d",
+            )
+        })
+        .collect();
+    let (server, _) = kernel_server_blocks_only(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _inputs) =
+        embed_server_slow_after_first(vec![1.0, 0.0, 0.0], Duration::from_secs(5)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut store = seeded_store(dir.path());
+    let repair_ids: Vec<String> = (0..40).map(|i| format!("r{i:03}")).collect();
+
+    let outcome = sync::repair_missing(
+        &sy,
+        &ollama(&embed.uri()),
+        &mut store,
+        &repair_ids,
+        sync::RepairBudget {
+            deadline: None,
+            embed_timeout: Duration::from_secs(2),
+        },
+    )
+    .await;
+
+    let Err(err) = outcome else {
+        panic!("смерть на втором окне: ожидали Err от таймаута");
+    };
+    assert!(
+        err.downcast_ref::<EmbedError>()
+            .is_some_and(|e| matches!(e, EmbedError::Timeout { .. })),
+        "ожидали EmbedError::Timeout: {err:#}"
+    );
+    assert_eq!(
+        store.chunk_count().unwrap() as usize,
+        sync::EMBED_BATCH,
+        "первое окно (32 строки) закоммичено и пережило смерть второго"
+    );
+}
+
+// ——— sync_once: контракт строки отчёта «не дошёл» и штамп завершённого ———
+
+#[tokio::test]
+#[serial_test::serial]
+async fn sync_once_reports_unfinished_reconcile_when_budget_dies() {
+    // Бюджет, урезанный env'ом до копеек, умирает посреди sync-прогона
+    // (до конца скана или на repair-эмбедде — исход устойчив к обеим
+    // веткам). Отчёт обязан быть честным «не дошёл» с указанием ретрая,
+    // а не ложно-успешное «восстановлено 0» (пин ревью-дельты: живой
+    // бэкфилл при обрыве бюджета выглядит пустым прогоном).
+    // Дыра ЗА пределами 60-секундного overlap дельты (сутки раньше
+    // watermark): иначе дельта сама эмбеддит блок, и repair не получает
+    // дыры — «восстановлено 0» уже не про reconcile.
+    let blocks = vec![block(
+        "hole-below-watermark",
+        "20261104000000",
+        "дырный блок ниже watermark с содержанием достаточной длины",
+        "/hole",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    // каждый embed-вызов через 5 s: бюджет 1 s не доживает до ответа
+    // никогда; дельта пуста (водяной знак T1 старше ядра не имеет)
+    let (embed, _) = embed_server_with_delay(vec![1.0, 0.0, 0.0], Duration::from_secs(5)).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    // непустой индекс для index_ready: сид-чанк на watermark (дельте не виден)
+    let seed = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "seed".into(),
+            root_id: "seed-root".into(),
+            box_id: "box".into(),
+            hpath: "/hole".into(),
+            updated: T1.into(),
+        },
+        content: "сид-чанк индекса с содержанием достаточной длины".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    {
+        let tx = store.begin().expect("tx");
+        Store::upsert_batch(&tx, std::slice::from_ref(&seed), Some(T1)).expect("upsert");
+        tx.commit().expect("commit");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    std::env::set_var("UWUWU_SYNC_BUDGET_SECS", "1");
+    let lines = crate::semantic::sync_once(&sy, &cfg).await.expect("sync");
+    std::env::remove_var("UWUWU_SYNC_BUDGET_SECS");
+
+    let unfin = lines
+        .iter()
+        .find(|l| l.starts_with("reconcile не дошёл"))
+        .expect("честная строка «не дошёл» в отчёте");
+    assert!(
+        unfin.contains("дыры ретраятся следующим sync"),
+        "ретрай-подсказка на месте: {unfin}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("reconcile:")),
+        "ложно-успешного «reconcile: восстановлено» нет: {lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("очередь дельты"))
+            .count(),
+        1,
+        "очередь дельты отчитана: {lines:?}"
+    );
+    let store = Store::open(&cfg.db_path).expect("reopen");
+    assert_eq!(
+        store.meta("last_reconcile_at").unwrap().as_deref(),
+        Some("1000"),
+        "оборванный прогон не штампует last_reconcile_at"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn sync_once_reports_finished_reconcile_and_stamps_it() {
+    // Завершённый прогон: строка «reconcile: восстановлено N» с реальным
+    // счётчиком ремонтов и штамп last_reconcile_at (только завершённым
+    // прогоном — см. interrupted-тесты reconcile).
+    // Дыра ЗА пределами 60-секундного overlap дельты (сутки раньше
+    // watermark) — её берёт только reconcile.
+    let blocks = vec![block(
+        "hole-below-watermark",
+        "20261104000000",
+        "дырный блок ниже watermark с содержанием достаточной длины",
+        "/hole",
+    )];
+    let (server, _, _) = kernel_server(blocks).await;
+    let sy = SiYuan::for_tests(server.uri());
+    let (embed, _) = embed_server(vec![1.0, 0.0, 0.0]).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg = config(dir.path(), &embed.uri());
+    let mut store = index_ready_store(dir.path());
+    // непустой индекс для index_ready: сид-чанк на watermark (дельте не виден)
+    let seed = ChunkRecord {
+        meta: ChunkMeta {
+            block_id: "seed".into(),
+            root_id: "seed-root".into(),
+            box_id: "box".into(),
+            hpath: "/hole".into(),
+            updated: T1.into(),
+        },
+        content: "сид-чанк индекса с содержанием достаточной длины".into(),
+        vec: normalize(vec![1.0, 0.0, 0.0]),
+    };
+    {
+        let tx = store.begin().expect("tx");
+        Store::upsert_batch(&tx, std::slice::from_ref(&seed), Some(T1)).expect("upsert");
+        tx.commit().expect("commit");
+    }
+    store.set_meta("last_reconcile_at", "1000").unwrap();
+
+    let lines = crate::semantic::sync_once(&sy, &cfg).await.expect("sync");
+
+    let fin = lines
+        .iter()
+        .find(|l| l.starts_with("reconcile:"))
+        .expect("строка завершённого reconcile в отчёте");
+    assert!(
+        fin.contains("восстановлено 1"),
+        "счётчик ремонтов честный: {fin}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("reconcile не дошёл")),
+        "прогон дошёл — строки «не дошёл» нет: {lines:?}"
+    );
+    let store = Store::open(&cfg.db_path).expect("reopen");
+    let stamped = store
+        .meta("last_reconcile_at")
+        .unwrap()
+        .expect("last_reconcile_at записан");
+    assert_ne!(stamped, "1000", "штамп свежего прогона, не старый мета");
+}
