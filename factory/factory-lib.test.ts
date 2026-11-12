@@ -83,6 +83,7 @@ import {
   isPeakHours,
   LLM_ACTIVE_STATUSES,
 } from "./factory-lib"
+import { envPaths } from "./env"
 import { parseCommentsMarkdown } from "../lib/platform"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -311,6 +312,18 @@ describe("spawnPrompt", () => {
     expect(p).not.toContain("/env/-5BF9NMBXZ/repo")
     expect(p).toContain("ветка work/task-5BF9NMBXZ")
     expect(p).not.toContain("work/task--5BF9NMBXZ")
+  })
+  test("формула ветки и путей одна с envPaths: промпт называет то, что env:true-механика строит (защита от дрейфа формул)", () => {
+    // связка с живым генератором (env.ts envPaths), не литералом: смена формулы
+    // в envPaths или в промпте поодиночке валит тест — дрейф (#192, этот баг)
+    // больше не может накопиться молча
+    for (const id of ["r1", "20261104212512-ms8lqhg", "-5BF9NMBXZ", "---"]) {
+      const env = envPaths("/env", id)
+      const p = spawnPrompt(id, "true-washing", "true-washing", "implement", { envRoot: "/env" })
+      expect(p).toContain(`ворктри ${env.repoDir},`)
+      expect(p).toContain(`скретч ${env.scratchDir} (не /tmp)`)
+      expect(p).toContain(`ветка ${env.branch};`)
+    }
   })
   test("base из контекста: env:false-строка и env:true-строка говорят базу проекта, не дефолт", () => {
     const p = spawnPrompt("r1", "1xgames", "1xgames/game-service", "implement", { base: "origin/main" })
