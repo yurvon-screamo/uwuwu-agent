@@ -252,7 +252,7 @@ export function renderVerdictSection(verdict: ScreenVerdict, state: string, thre
   }
   lines.push("")
   if (flags.length > 0) {
-    lines.push("**Сигналы** (P > " + threshold + "):")
+    lines.push(`**Сигналы** (P > ${threshold}):`)
     for (const { id, p } of flags.sort((a, b) => b.p - a.p)) {
       lines.push(`- ${id} — P ${round(p)}`)
     }

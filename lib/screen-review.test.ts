@@ -122,7 +122,7 @@ describe("buildRequest — questions уходят map'ом (не массиво�
     expect(req.state).toBe("state")
     expect(req.images).toEqual(["B64"])
     expect(Array.isArray(req.questions)).toBe(false)
-    expect(req.questions["double_frame"]?.type).toBe("noul")
+    expect(req.questions.double_frame?.type).toBe("noul")
   })
 
   test("ui-slop: choice-критерии содержат none, score-уровни от меньшего к большему", () => {
