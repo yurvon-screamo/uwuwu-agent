@@ -231,7 +231,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         title,
         r#type: ty,
         priority,
-        autodone: _,
+        autodone,
         stdin,
         attach,
         schedule,
@@ -255,6 +255,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             println!(
                 "приоритет: {raw} (будет записан в колонку «{}» доски)",
                 syt::PRIORITY_CELL
+            );
+        }
+        // --autodone не молчит (паритет --priority, ревью Low)
+        if autodone {
+            println!(
+                "autodone: on (будет записан в колонку «{}» доски)",
+                syt::AUTODONE_CELL
             );
         }
         // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)

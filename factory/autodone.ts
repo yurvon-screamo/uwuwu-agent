@@ -6,12 +6,15 @@
  *  ячейке с непустой веткой — фоллбек по ветке (семейство ADR-086), носитель
  *  выбирается по shape репо (первый сегмент с точкой = Gitea-хост, иначе
  *  GitHub). Прочие URL (wiki-артефакт docs-only канона) и пустая ячейка без
- *  ветки — «без ПР». */
+ *  ветки — «без ПР». Строка, похожая на PR-ссылку, но не парсящаяся как
+ *  URL (мусор руками через UI, схема потеряна) — «invalid»: вызывающий
+ *  эскалирует (громко, человеку), не закрывает задачу и не валит тик. */
 export type PrCarrier =
   | { kind: "github"; url: string }
   | { kind: "gitea"; url: string; host: string; index: string; slug: string }
   | { kind: "github-branch"; branch: string }
   | { kind: "gitea-branch"; branch: string; host: string; slug: string }
+  | { kind: "invalid"; url: string }
   | { kind: "none" }
 
 const GITHUB_PR = /\/pull\/(\d+)/
@@ -25,17 +28,26 @@ export function giteaRepoOf(repo: string): { host: string; slug: string } | null
   return host.includes(".") ? { host, slug: `${owner}/${name}` } : null
 }
 
+/** Тотальный парсер: не бросает никогда (брошенный new URL ронял весь тик
+ *  проекта на одной мусорной клетке — ревью Common-1). */
 export function prCarrierOf(prCell: string, branch: string, repo: string): PrCarrier {
   const url = prCell.trim()
   if (url !== "") {
-    const gh = url.match(GITHUB_PR)
-    if (gh) return { kind: "github", url }
     const gt = url.match(GITEA_PR)
-    if (gt) {
-      const parsed = new URL(url)
-      const host = parsed.host
-      const slug = parsed.pathname.split("/pulls/")[0]?.replace(/^\//, "") ?? ""
-      return { kind: "gitea", url, host, index: gt[1] ?? "", slug }
+    const gh = url.match(GITHUB_PR)
+    if (gt !== null || gh !== null) {
+      if (!/^https?:\/\//i.test(url)) return { kind: "invalid", url }
+      try {
+        const parsed = new URL(url)
+        if (gt !== null) {
+          const slug = parsed.pathname.split("/pulls/")[0]?.replace(/^\//, "") ?? ""
+          if (slug === "") return { kind: "invalid", url }
+          return { kind: "gitea", url, host: parsed.host, index: gt[1] ?? "", slug }
+        }
+        return { kind: "github", url }
+      } catch {
+        return { kind: "invalid", url }
+      }
     }
     return { kind: "none" }
   }

@@ -2443,6 +2443,9 @@ describe("peakWindowFromEnv/isPeakHours", () => {
     expect(peakWindowFromEnv("")).toEqual({ startMin: 360, endMin: 600, enabled: true })
     expect(peakWindowFromEnv("14:00")).toEqual({ startMin: 360, endMin: 600, enabled: true })
     expect(peakWindowFromEnv("abc-def")).toEqual({ startMin: 360, endMin: 600, enabled: true })
+    // диапазон часов валиден regex-ом, но окна не существует — дефолт (ревью Low)
+    expect(peakWindowFromEnv("25:00-27:00")).toEqual({ startMin: 360, endMin: 600, enabled: true })
+    expect(peakWindowFromEnv("10:00-10:61")).toEqual({ startMin: 360, endMin: 600, enabled: true })
   })
 
   test("своё окно парсится", () => {

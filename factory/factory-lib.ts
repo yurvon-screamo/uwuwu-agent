@@ -129,11 +129,16 @@ export interface TrackedTask {
    *  ставится в сессию повторно (дефект №5.2, дубль-доставка) */
   lastWakeup?: WakeupStamp
   /** автодон: "pending" — проба/мерж в ходу, "merged"/"bounced"/"escalated"
-   *  — терминальные исходы эпизода; undefined — задача не в Review или
-   *  без галочки. Новый вход в Review перезаписывает в pending */
+   *  — исходы эпизода. НОВЫЙ вход в Review (lastStatusedge) или
+   *  переустановка галочки перезаписывают в pending — эскалация не убивает
+   *  автодон навсегда: задача, прошедшая пайп заново после разбора,
+   *  мержится автоматически (ревью Common-2) */
   autodoneState?: "pending" | "merged" | "bounced" | "escalated"
   /** ms-время входа в Review с autodone (часы таймаута pending-проб) */
   autodoneSince?: number
+  /** последнее виденное значение галочки: false→true переход = свежая
+   *  активация (переустановка в Review перезапускает эпизод) */
+  autodoneSeen?: boolean
   /** приоритет строки (обновляется каждый тик из скана) — глобальный счёт
    *  активных CUP в пик учитывает только high (замороженные не-high слоты
    *  не держат); undefined — старый state до фичи, трактуется как не-high */
@@ -1748,7 +1753,13 @@ export function peakWindowFromEnv(raw: string | undefined): PeakWindow {
   if (!m) return DEFAULT
   const startMin = Number(m[1]) * 60 + Number(m[2])
   const endMin = Number(m[3]) * 60 + Number(m[4])
-  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) return DEFAULT
+  // диапазон часов/минут: «25:00-27:00» парсится regex-ом, но окна не
+  // существует — тихо выключенный пик хуже дефолта (ревью Low)
+  const valid = [Number(m[1]), Number(m[3])].every((h) => h <= 23) &&
+    [Number(m[2]), Number(m[4])].every((mm) => mm <= 59)
+  if (!valid || !Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) {
+    return DEFAULT
+  }
   return { startMin, endMin, enabled: true }
 }
 

@@ -54,6 +54,20 @@ describe("prCarrierOf", () => {
   test("пустая ячейка без ветки — «без ПР»", () => {
     expect(prCarrierOf("", "", "yurvon-screamo/uwuwu-agent")).toEqual({ kind: "none" })
   })
+
+  test("PR-паттерн без схемы — invalid (не бросает, ревью Common-1)", () => {
+    expect(prCarrierOf("git.l4a.ru/ek/ai-generator/pulls/84", "", ""))
+      .toEqual({ kind: "invalid", url: "git.l4a.ru/ek/ai-generator/pulls/84" })
+    expect(prCarrierOf("github.com/o/r/pull/9", "", ""))
+      .toEqual({ kind: "invalid", url: "github.com/o/r/pull/9" })
+  })
+
+  test("PR-паттерн со схемой, но пустым slug — invalid", () => {
+    expect(prCarrierOf("https://git.l4a.ru/pulls/84", "", "")).toEqual({
+      kind: "invalid",
+      url: "https://git.l4a.ru/pulls/84",
+    })
+  })
 })
 
 describe("giteaRepoOf", () => {

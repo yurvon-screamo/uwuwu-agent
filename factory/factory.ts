@@ -1246,13 +1246,15 @@ function teaTokenFor(host: string): string | null {
 }
 
 /** Gitea API GET (токен из конфига tea). Сбой/не-2xx → null: проба честно
- *  уходит в unknown (стрик до эскалации), не маскируется. */
+ *  уходит в unknown (стрик до эскалации), не маскируется. Таймаут — тот же
+ *  SPAWN_TIMEOUT_MS (ревью Low: зависший хост не должен висеть на дефолте). */
 async function giteaApi(host: string, path: string): Promise<unknown | null> {
   const token = teaTokenFor(host)
   if (token === null) return null
   try {
     const r = await fetch(`https://${host}/api/v1${path}`, {
       headers: { Authorization: `token ${token}` },
+      signal: AbortSignal.timeout(SPAWN_TIMEOUT_MS),
     })
     if (!r.ok) return null
     return await r.json()
@@ -1315,6 +1317,10 @@ async function autodoneProbe(
     }
     case "none":
       return { state: "clean", pr: carrier }
+    case "invalid":
+      // недостижимо из runAutodoneTick (invalid перехватывается раньше с
+      // эскалацией), но тип требует полноты: honest unknown, не падение
+      return { state: "unknown", pr: carrier }
   }
 }
 
@@ -1366,6 +1372,17 @@ async function runAutodoneTick(
   if (carrier0.kind === "none") {
     log(`задача ${rowId.slice(0, 8)}: autodone — PR-ячейки нет (wiki-URL/пусто) → Done`)
     await finishDone("задача без PR закрывается — Done")
+    return
+  }
+  if (carrier0.kind === "invalid") {
+    // мусор в PR-ячейке (PR-паттерн без схемы и пр.): громко человеку, не
+    // Done и не крэш тика (ревью Common-1)
+    log(`задача ${rowId.slice(0, 8)}: autodone — PR-ячейка не парсится как URL → Needs attention`)
+    await setCells(board, rowId, { Status: "Needs attention" })
+    tracked.autodoneState = "escalated"
+    tracked.lastStatus = "Needs attention"
+    saveState(state)
+    await notify(tracked, `[factory] autodone: PR-ячейка не парсится как URL («${carrier0.url}»). Поправь ячейку и переставь Review — автодон перезапустится.`)
     return
   }
   const { state: probe, pr } = await autodoneProbe(carrier0, cfg)
@@ -1425,7 +1442,7 @@ async function runAutodoneTick(
       tracked.autodoneState = "escalated"
       tracked.lastStatus = "Needs attention"
       saveState(state)
-      await notify(tracked, `[factory] autodone: ${act.reason}. Разберись вручную: переставь статус или сними галочку.`)
+      await notify(tracked, `[factory] autodone: ${act.reason}. Разберись (CI/конфликт/проба) — после разбора проведи задачу через пайп заново или переставь Review: автодон перезапустится на новом входе.`)
       return
     }
   }
@@ -1947,6 +1964,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.priority = row.priority
       healed = true
     }
+    // галочка снята → сброс seen: переустановка позже = свежая активация
+    // автодона (ревью Common-2)
+    if (!(row.autodone ?? false) && tracked.autodoneSeen === true) {
+      tracked.autodoneSeen = false
+      healed = true
+    }
     if (tracked.bodyDoc !== "" && (tracked.bodyUpdated ?? "") === "") {
       const seeded = await bodyUpdatedAt(tracked.bodyDoc)
       if (seeded !== null) {
@@ -2049,8 +2072,16 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
     // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
     // пайпа — следующий тик возвращает мяч девелоперу штатным return-to-dev.
-    if (row.status === USER_REVIEW_STATUS && row.autodone &&
-        tracked.autodoneState !== "merged" && tracked.autodoneState !== "escalated") {
+    // Эпизод: pending бежит; терминальный исход (merged/escalated) того же
+    // эпизода (lastStatus всё ещё Review) не перезапускается — но НОВЫЙ вход
+    // в Review (lastStatusedge) или переустановка галочки (off→on, ревью
+    // Common-2) перезапускают эпизод: эскалация не убивает автодон навсегда.
+    const autodoneFreshActivation = (row.autodone ?? false) && tracked.autodoneSeen !== true
+    const autodoneNewEntry = tracked.lastStatus !== USER_REVIEW_STATUS
+    if (row.status === USER_REVIEW_STATUS && (row.autodone ?? false) &&
+        (tracked.autodoneState === undefined || tracked.autodoneState === "pending" ||
+         autodoneNewEntry || autodoneFreshActivation)) {
+      tracked.autodoneSeen = true
       await runAutodoneTick(row, tracked, { cfg, board, state, counters })
       continue
     }
