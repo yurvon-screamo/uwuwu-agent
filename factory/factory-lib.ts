@@ -522,6 +522,16 @@ export function kickoffModeOf(status: string): KickoffMode {
   return status === "In Progress" ? "implement" : "design"
 }
 
+/** Лиз Xvfb-дисплея задачи (файл `<env>/display` ведёт ensureEnv, см. env.ts):
+ *  номер + путь лиз-файла — носитель истины, переживает компакты сессии.
+ *  undefined — файла нет (насыщение диапазона, старый env или env:false). */
+export interface DisplayLease {
+  /** номер дисплея (голое число из лиз-файла) */
+  num: number
+  /** путь лиз-файла */
+  file: string
+}
+
 /** Контекст окружения задачи для промптов: пути приходят из ensureEnv.
  *  undefined — проект вне env-механики (env:false), агент действует по
  *  прежним строкам (сам создаёт ворктри/ветку и заполняет Branch-ячейку). */
@@ -529,6 +539,8 @@ export interface SpawnEnvContext {
   repoDir: string
   branch: string
   scratchDir: string
+  /** лиз Xvfb-дисплея задачи */
+  display?: DisplayLease
 }
 
 /** Инит-данные первого промпта сессии: юзер (персона), проект (живые доки,
@@ -623,6 +635,16 @@ export function spawnInitBlock(init: SpawnInit, rowId: string, project: string):
 /** Вопросный канал (одинаков в spawn/continue): команды канала сразу с id
  *  и проектом — спавн знает оба (инцидент 05.11: вопросный коммент без
  *  --project не приземлился, провал незаметен в длинном ходе). */
+/** Строка DISPLAY-шва: номер + лиз-файл + правило чистки — обе половины
+ *  инцидента 12.11 (общий :99, голый pkill Xvfb гасит чужие). Одна
+ *  формулировка на все промпты с env-контекстом. */
+function displayLine(d: DisplayLease): string {
+  return `Xvfb-дисплей задачи: :${d.num} (лиз-файл ${d.file}, внутри голый номер). Для X-прогонов используй только его; гаси только свой процесс (pkill -f "Xvfb :${d.num}") — чужие дисплеи не трогай.`
+}
+
+/** Вопросный канал (одинаков в spawn/continue): команды канала сразу с id
+ *  и проектом — спавн знает оба (инцидент 05.11: вопросный коммент без
+ *  --project не приземлился, провал незаметен в длинном ходе). */
 function questionChannelLines(rowId: string, project: string): string[] {
   return [
     "ВАЖНО: юзер НЕ читает эту сессию — вся коммуникация только в uwuwu:",
@@ -668,6 +690,7 @@ export function spawnPrompt(
         `работай в своём окружении задачи (фабрика создала, ветка уже от ${base}):`,
         `repo=${env.repoDir}, ветка=${env.branch}, скретч=${env.scratchDir} (не /tmp).`,
         "Branch/Path-ячейки и сессии заполняет фабрика — тебе их трогать не нужно.",
+        ...(env.display !== undefined ? [displayLine(env.display)] : []),
       ]
   return [
     `[factory] Задача ${rowId} (проект ${project}, репо ${repo}).`,
@@ -705,6 +728,7 @@ export function continuePrompt(
       ? [
           `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
           `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+          ...(env.display !== undefined ? [displayLine(env.display)] : []),
         ]
       : []),
     "",
@@ -730,6 +754,7 @@ export function conflictFixPrompt(
       ? [
           `Окружение задачи уже существует — своё не создавай: repo=${env.repoDir}, ветка=${env.branch},`,
           `скретч=${env.scratchDir} (не /tmp). Незакоммиченное — там же, в repo.`,
+          ...(env.display !== undefined ? [displayLine(env.display)] : []),
           "",
         ]
       : []),
@@ -826,6 +851,8 @@ export interface ReviewContext {
   type?: string
   /** git-ref базы диффа и master-строк текста; дефолт DEFAULT_BASE */
   base?: string
+  /** лиз Xvfb-дисплея задачи; доходит только тестировщику (см. displayLine) */
+  display?: DisplayLease
 }
 
 /** Стартовый промпт ревьювера: фабрика спавнит сессию на ревью-статусе.
@@ -951,6 +978,7 @@ export function testingSpawnPrompt(rowId: string, project: string, ctx: TestCont
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
+    ...(ctx.display !== undefined ? [`   ${displayLine(ctx.display)}`] : []),
     "3. Отчёт — комментом в задачу (uwuwu-cli task comment): главный сценарий (что запускали/",
     "   тыкали — команды, клики, скрины) и что сверх него; покрытие по слоям (главный путь:",
     "   юнит/граница/e2e, баг-пины); прочие проверки. Вердикт-строка",
@@ -973,6 +1001,7 @@ export function testingRerunPrompt(rowId: string, ctx: TestContext): string {
     "проверь устранение своего баг-репорта (прошлый отчёт в тредах), всё заново",
     "не пересматривай. Отчёт комментом, статус по вердикту",
     "(pass → Review · fail → In Progress). Новое покрытие — по методичке.",
+    ...(ctx.display !== undefined ? [displayLine(ctx.display)] : []),
     ...(ctx.pr !== "" ? [`PR: ${ctx.pr}`] : []),
     ...(ctx.worktree !== "" ? [`Ворктри: ${ctx.worktree}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`Тип задачи: ${ctx.type}`] : []),
