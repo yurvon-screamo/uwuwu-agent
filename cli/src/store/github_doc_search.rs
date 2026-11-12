@@ -82,17 +82,42 @@ pub(crate) fn by_title(clone_dir: &str, query: &str, top_n: usize) -> Result<Vec
     if !docs.exists() {
         return Ok(Vec::new());
     }
-    let tokens: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    if tokens.is_empty() {
+    let needle = query.to_lowercase();
+    if needle.trim().is_empty() {
         return Ok(Vec::new());
     }
     let mut exact = Vec::new();
     let mut tokenized = Vec::new();
-    let mut stack = vec![docs.clone()];
+    for slug in walk_md_slugs(&docs) {
+        let lower = slug.to_lowercase();
+        if lower.contains(&needle) {
+            exact.push(hit(&slug));
+        } else if matches_tokens(&lower, &needle) {
+            tokenized.push(hit(&slug));
+        }
+    }
+    exact.extend(tokenized);
+    exact.truncate(top_n);
+    Ok(exact)
+}
+
+/// AND-токены запроса по пути (whitespace-разбиение, подстрочно).
+fn matches_tokens(lower_path: &str, needle: &str) -> bool {
+    needle.split_whitespace().all(|t| lower_path.contains(t))
+}
+
+fn hit(slug: &str) -> TitleHit {
+    let title = title_of(slug);
+    TitleHit {
+        slug: slug.to_string(),
+        title,
+    }
+}
+
+/// Все md-слаги под docs/ (итеративный обход, сортировка для детермизма).
+fn walk_md_slugs(docs: &Path) -> Vec<String> {
+    let mut slugs = Vec::new();
+    let mut stack = vec![docs.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -107,23 +132,14 @@ pub(crate) fn by_title(clone_dir: &str, query: &str, top_n: usize) -> Result<Vec
                 continue;
             }
             let rel = path
-                .strip_prefix(&docs)
+                .strip_prefix(docs)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let slug = rel.trim_end_matches(".md").to_string();
-            let lower = rel.to_lowercase();
-            if lower.contains(&query.to_lowercase()) {
-                let title = title_of(&slug);
-                exact.push(TitleHit { slug, title });
-            } else if tokens.iter().all(|t| lower.contains(t)) {
-                let title = title_of(&slug);
-                tokenized.push(TitleHit { slug, title });
-            }
+            slugs.push(rel.trim_end_matches(".md").to_string());
         }
     }
-    exact.extend(tokenized);
-    exact.truncate(top_n);
-    Ok(exact)
+    slugs.sort();
+    slugs
 }
 
 fn title_of(slug: &str) -> String {
