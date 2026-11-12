@@ -5,9 +5,16 @@
 // из док-спеки реестра; ребёнок собирает HubProfile и уходит в hub.run().
 
 import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
 import { join } from "node:path"
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
-import { createHub, type HubProfile } from "../lib/hub"
+import { createHub, type HubModel, type HubProfile } from "../lib/hub"
+
+interface Cfg {
+  token: string
+  owner: string
+  model?: HubModel
+}
 
 interface BotMeta {
   slug: string
@@ -39,8 +46,17 @@ const main = (): void => {
     console.error("usage: bun bot-child.ts <slug>")
     process.exit(1)
   }
-  const dir = join(process.env.UWUWU_BOTS_HOME ?? "", ".local/share/uwuwu-bots", slug)
+  // паритет супервизора (bots.ts RUN_ROOT): env не задан → homedir — иначе
+  // относительный путь не найдёт per-бот каталог, материализованный в домашнем
+  const dir = join(process.env.UWUWU_BOTS_HOME ?? homedir(), ".local/share/uwuwu-bots", slug)
   const meta = readMeta(dir)
+  // модель — bot.model спеки в hub.json, контракт обязательный: регрессия
+  // материализации не должна молча гнать бота на дефолтной модели
+  const cfg = JSON.parse(readFileSync(join(dir, "hub.json"), "utf-8")) as Cfg
+  if (cfg.model === undefined) {
+    console.error(`bot ${slug}: в ${join(dir, "hub.json")} нет model — материал супервизора некорректен, откажитесь от старта`)
+    process.exit(1)
+  }
   const profile: HubProfile = {
     daemonName: `uwuwu-bots-${slug}`,
     here: dir,
@@ -52,9 +68,7 @@ const main = (): void => {
     e2eEnv: "UWUWU_BOTS_E2E",
     batchEnv: "UWUWU_BOTS_BATCH_MS",
     pollEnv: "UWUWU_BOTS_POLL_SEC",
-    // модель сессии — bot.model спеки в hub.json (cfg.model wins); profile.model —
-    // дефолт раннера (формат с variant — паритет dreamer/hub)
-    model: { providerID: "zai-coding-plan", id: "glm-5.3-flash" },
+    model: cfg.model,
     tgFormatter: {
       htmlParts: (text) => {
         try { return splitMessage(toTelegramHTML(text).text, { format: "html" }) } catch { return null }
