@@ -85,24 +85,37 @@ describe("githubProbeVerdict", () => {
     expect(githubProbeVerdict({ state: "OPEN", mergeStateStatus: "DIRTY", statusCheckRollup: [] }))
       .toBe("conflict")
   })
-
-  test("упавший required-чек → checks-failed", () => {
-    const rollup = [{ state: "COMPLETED", conclusion: "SUCCESS" }, { state: "COMPLETED", conclusion: "FAILURE" }]
+  test("упавший required-чек → checks-failed (обе формы чеков)", () => {
+    const rollup = [
+      { status: "COMPLETED", conclusion: "SUCCESS" },
+      { status: "COMPLETED", conclusion: "FAILURE" },
+    ]
     expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: rollup }))
+      .toBe("checks-failed")
+    // StatusContext-форма: state FAILURE
+    expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [{ state: "FAILURE" }] }))
       .toBe("checks-failed")
   })
 
-  test("checks в полёте → checks-pending", () => {
-    const rollup = [{ state: "PENDING", conclusion: undefined }]
-    expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: rollup }))
+  test("checks в полёте → checks-pending (обе формы чеков)", () => {
+    expect(githubProbeVerdict({
+      state: "OPEN",
+      mergeable: "MERGEABLE",
+      statusCheckRollup: [{ status: "IN_PROGRESS", conclusion: null }],
+    })).toBe("checks-pending")
+    expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [{ state: "PENDING" }] }))
       .toBe("checks-pending")
   })
 
-  test("зелёный rollup → clean; UNSTABLE (не-обязательные упали) → clean", () => {
-    const ok = [{ state: "COMPLETED", conclusion: "SUCCESS" }]
+  test("зелёный rollup → clean; UNSTABLE (не-обязательные упавшие) → clean", () => {
+    // живая форма CheckRun (gh pr view): status COMPLETED + conclusion SUCCESS
+    const ok = [{ status: "COMPLETED", conclusion: "SUCCESS" }]
     expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: ok }))
       .toBe("clean")
     expect(githubProbeVerdict({ state: "OPEN", mergeStateStatus: "UNSTABLE", statusCheckRollup: ok }))
+      .toBe("clean")
+    // StatusContext-форма
+    expect(githubProbeVerdict({ state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [{ state: "SUCCESS" }] }))
       .toBe("clean")
   })
 })

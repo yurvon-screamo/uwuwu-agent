@@ -58,25 +58,32 @@ export type PrProbeState =
   | "unknown"
 
 /** Вердикт gh pr view (state/mergeable/mergeStateStatus/statusCheckRollup).
- *  required-проверки в полёте дают BLOCKED с PENDING-rollup, упавшие —
- *  FAILURE; UNSTABLE = mergeable при не-обязательных упавших (мерж допустим). */
+ *  Rollup несёт два вида чеков: CheckRun (status QUEUED/IN_PROGRESS/
+ *  COMPLETED + conclusion SUCCESS/FAILURE/…) и StatusContext (state
+ *  EXPECTED/PENDING/SUCCESS/FAILURE/ERROR). Успех = терминальный зелёный
+ *  или skip; fail = красная терминальная; всё остальное — в полёте.
+ *  UNSTABLE = mergeable при не-обязательных упавших (мерж допустим). */
 export function githubProbeVerdict(view: {
   state?: string
   mergeable?: string | boolean
   mergeStateStatus?: string
-  statusCheckRollup?: { state?: string; conclusion?: string }[]
+  statusCheckRollup?: { state?: string | null; status?: string; conclusion?: string | null }[]
 }): PrProbeState {
   if (view.state === "MERGED") return "merged"
   if (view.state !== "OPEN") return "unknown"
   if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") return "conflict"
   const rollup = view.statusCheckRollup ?? []
-  const checks = rollup.filter((c) => (c.state ?? "") !== "NEUTRAL")
-  const failed = checks.some(
-    (c) => c.conclusion === "FAILURE" || c.conclusion === "CANCELLED" || c.state === "FAILURE",
-  )
-  if (failed) return "checks-failed"
-  const pending = checks.some((c) => (c.state ?? "") !== "COMPLETED")
-  if (pending) return "checks-pending"
+  const outcomes = rollup.map((c) => ({
+    done: (c.state ?? c.status ?? "") === "COMPLETED",
+    failed:
+      ["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(c.conclusion ?? "") ||
+      ["FAILURE", "ERROR"].includes(c.state ?? ""),
+    green:
+      ["SUCCESS", "SKIPPED", "NEUTRAL"].includes(c.conclusion ?? "") ||
+      ["SUCCESS", "NEUTRAL"].includes(c.state ?? ""),
+  }))
+  if (outcomes.some((o) => o.failed)) return "checks-failed"
+  if (outcomes.some((o) => !o.done && !o.green)) return "checks-pending"
   return "clean"
 }
 
