@@ -348,3 +348,56 @@ describe("runScreenReview — пер-скрин семантика и валид
     ])
   })
 })
+
+// ——— живой e2e: живая оляма d1-omni, realDeps (гвард UWUWU_E2E=1) ———
+// Главный пользовательский сценарий тула end-to-end: сгенерированный PNG →
+// чтение с диска → живой POST /v1/systemone → parseAnswers (контракт) →
+// markdown-отчёт. Не зависит от внешних файлов-эталонов (проба 13.11:
+// контракт держится на 1x1 PNG — модель отвечает полным форматом на все
+// вопросы; калибровка вероятностей — не предмет e2e, её не проверяем).
+// Гвард по культуре репо (прецедент qlty-review.test.ts): без UWUWU_E2E=1
+// сразу зелёный — живой модели в CI нет; на ноде без d1-omni при включённом
+// гварде тест падает честной ошибкой «оляма недоступна» — это контракт тула.
+
+const omniE2E = process.env.UWUWU_E2E === "1"
+
+describe("runScreenReview e2e — живая оляма d1-omni (UWUWU_E2E=1)", () => {
+  test.skipIf(!omniE2E)(
+    "скрин через живой /v1/systemone → отчёт с полным чек-листом и атрибуцией",
+    async () => {
+      const { rmSync } = await import("node:fs")
+      const { mkdtemp, writeFile } = await import("node:fs/promises")
+      const { tmpdir } = await import("node:os")
+      const { join } = await import("node:path")
+
+      const dir = await mkdtemp(join(tmpdir(), "screen-review-e2e-"))
+      const imagePath = join(dir, "e2e-probe.png")
+      try {
+        // валидный 1x1 белый PNG
+        const png1x1 = Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+          "base64",
+        )
+        await writeFile(imagePath, png1x1)
+
+        const report = await runScreenReview({ images: [imagePath] })
+
+        // шапка с моделью и дефолтным чек-листом, хвост с ролью скринера
+        expect(report).toContain("## screen_review (d1-omni, чек-лист ui-slop, порог 0.6)")
+        expect(report).toContain("Роль тула — скринер/прицел, не финальный судья")
+        // атрибуция к скрину: секция с именем файла
+        expect(report).toContain(`### Скрин: e2e-probe.png`)
+        // контракт живьём: все 7 вопросов чек-листа в таблице, input_tokens
+        for (const id of ["double_frame", "card_in_card", "alignment", "overlap", "contrast", "main_defect", "severity"]) {
+          expect(report).toContain(`| ${id} |`)
+        }
+        expect(report).toMatch(/input_tokens: \d+/)
+        // дрейф формата олямы не маскируется
+        expect(report).not.toContain("контракт ответа systemone нарушен")
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+    200_000,
+  )
+})
