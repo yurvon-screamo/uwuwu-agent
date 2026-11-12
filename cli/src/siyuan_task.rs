@@ -2770,4 +2770,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn validate_create_status_defaults_to_draft_without_flag() {
+        assert_eq!(validate_create_status(None).unwrap(), "Draft");
+    }
+
+    #[test]
+    fn validate_create_status_canonicalizes_todo_regardless_of_case_or_padding() {
+        for raw in ["Todo", "todo", " todo ", "tOdO"] {
+            assert_eq!(
+                validate_create_status(Some(raw)).unwrap(),
+                "Todo",
+                "канонизация «{raw}»"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_create_status_rejects_everything_but_todo() {
+        // Draft — дефолт без флага; прочие статусы — task edit (канон:
+        // Todo/Design ставят триаж и владелец). Пустое и whitespace — тоже
+        // не Todo: молчаливой канонизации в дефолт нет.
+        for raw in ["Draft", "In Progress", "Review", "", "  ", "To-Do"] {
+            let err =
+                validate_create_status(Some(raw)).expect_err(&format!("--status «{raw}» — отказ"));
+            assert!(
+                err.to_string().contains("допустим только Todo"),
+                "рецепт в отказе для «{raw}»: {err}"
+            );
+        }
+    }
 }
