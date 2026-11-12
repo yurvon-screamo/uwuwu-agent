@@ -41,6 +41,12 @@ pub(super) async fn dry_run(command: &TaskSub) -> Result<bool> {
     if !attach.is_empty() {
         anyhow::bail!("create --dry-run не аттачит: скелет печатается без записей в воркспейс — убери --attach");
     }
+    // --type валидируется и в осмотре: флаг не молчит (ревью Low);
+    // дефолт — DEFAULT_TASK_TYPE (feature), не выпиленный dev
+    let ty = match ty.as_deref() {
+        Some(raw) => syt::validate_task_type(raw)?,
+        None => syt::DEFAULT_TASK_TYPE.to_string(),
+    };
     // --priority валидируется и в осмотре: флаг не молчит (паритет --type)
     if let Some(raw) = priority.as_deref() {
         syt::validate_priority(raw)?;
@@ -56,12 +62,6 @@ pub(super) async fn dry_run(command: &TaskSub) -> Result<bool> {
             syt::AUTODONE_CELL
         );
     }
-    // --type валидируется и в осмотре: флаг не молчит (ревью Low);
-    // дефолт — DEFAULT_TASK_TYPE (feature), не выпиленный dev
-    let ty = match ty.as_deref() {
-        Some(raw) => syt::validate_task_type(raw)?,
-        None => syt::DEFAULT_TASK_TYPE.to_string(),
-    };
     // --schedule валидируется и в осмотре: флаг не молчит (ревью Low)
     if let Some(expr) = schedule.as_deref() {
         crate::schedule::validate_schedule(expr)?;

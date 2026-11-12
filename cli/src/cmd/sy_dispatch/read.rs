@@ -50,8 +50,6 @@ pub(crate) async fn projects_run() -> Result<()> {
     Ok(())
 }
 
-// ——— kernel: живые пробы ядра (one-shot, без ретраев) ———
-
 /// Имена записей readDir: директории с хвостовым «/».
 pub(crate) fn ls_lines(entries: &[Value]) -> Vec<String> {
     entries

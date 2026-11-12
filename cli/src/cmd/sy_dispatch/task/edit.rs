@@ -159,11 +159,11 @@ pub(super) async fn run_claim(sy: &SiYuan, project: &str, command: TaskSub) -> R
         unreachable!("task_run роутит Claim в edit::run_claim");
     };
     let session = match session {
-                Some(sid) => sid,
-                None => std::env::var("OPENCODE_SESSION_ID").map_err(|_| anyhow!(
-                    "sessionID не задан: нет --session и нет OPENCODE_SESSION_ID в env — заявись из сессии агента или передай id явно"
-                ))?,
-            };
+        Some(sid) => sid,
+        None => std::env::var("OPENCODE_SESSION_ID").map_err(|_| anyhow!(
+            "sessionID не задан: нет --session и нет OPENCODE_SESSION_ID в env — заявись из сессии агента или передай id явно"
+        ))?,
+    };
     let (board, task) = resolve_task(sy, project, &id).await?;
     syt::claim(sy, &board, &task, &session).await?;
     // контракт ответов: шапка перечитанной строки («Сессия dev» видна)

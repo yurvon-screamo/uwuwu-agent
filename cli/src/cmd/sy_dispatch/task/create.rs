@@ -31,22 +31,15 @@ pub(super) async fn run(sy: &SiYuan, project: &str, command: TaskSub) -> Result<
     };
     let attach_files = validate_attach_files(&attach)?;
     let ctx = if stdin { read_stdin()? } else { String::new() };
-    let (ty_canonical, initial_status) = validate_create_flags(
+    // канон-формы до любых записей: порядок валидаций дословно из монолита
+    // (ty → priority → status → schedule → agent)
+    let (ty_canonical, priority_canonical, initial_status) = validate_create_flags(
         ty.as_deref(),
+        priority.as_deref(),
         status.as_deref(),
         schedule.as_deref(),
         agent.as_deref(),
     )?;
-    // приоритет: канон до любых записей (дефолта нет — решение
-    // владельца «нужно явно все указывать обязательно»); пустой на
-    // create бессмысленен (паритет типа)
-    let priority_canonical = match priority.as_deref() {
-        Some("") => anyhow::bail!(
-            "на create пустой приоритет бессмысленен — убери --priority; снятие: task edit <id> --priority \"\""
-        ),
-        Some(raw) => Some(syt::validate_priority(raw)?),
-        None => None,
-    };
     // пред-чек дедупа тайтла ДО uploads: ретрай с живой строкой не
     // должен грузить ассеты впустую (внутренний чек create остаётся
     // авторитетным — гонка между чеками ловится им же)
@@ -148,10 +141,11 @@ async fn precheck_duplicate_title(
 /// агент (пустые бессмысленны, грамматики валидируются). Возвращает канон.
 fn validate_create_flags(
     ty: Option<&str>,
+    priority: Option<&str>,
     status: Option<&str>,
     schedule: Option<&str>,
     agent: Option<&str>,
-) -> Result<(String, &'static str)> {
+) -> Result<(String, Option<String>, &'static str)> {
     // тип валидируется до любых записей: пустой на create
     // бессмысленен (паритет расписания), канон — дефолт feature
     // тоже пишется в колонку
@@ -161,6 +155,16 @@ fn validate_create_flags(
         ),
         Some(raw) => syt::validate_task_type(raw)?,
         None => syt::DEFAULT_TASK_TYPE.to_string(),
+    };
+    // приоритет: канон до любых записей (дефолта нет — решение
+    // владельца «нужно явно все указывать обязательно»); пустой на
+    // create бессмысленен (паритет типа)
+    let priority_canonical = match priority {
+        Some("") => anyhow::bail!(
+            "на create пустой приоритет бессмысленен — убери --priority; снятие: task edit <id> --priority \"\""
+        ),
+        Some(raw) => Some(syt::validate_priority(raw)?),
+        None => None,
     };
     // начальный статус до любых записей: флаг строго для машинного
     // Todo (крон-раны), всё прочее — отказ
@@ -181,5 +185,5 @@ fn validate_create_flags(
         }
         syt::validate_agent_name(name)?;
     }
-    Ok((ty_canonical, initial_status))
+    Ok((ty_canonical, priority_canonical, initial_status))
 }

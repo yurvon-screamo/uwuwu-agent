@@ -174,5 +174,3 @@ async fn restore_journal_cells(
         ),
     }
 }
-
-// ——— person: персона владельца (SiYuan-док) ———

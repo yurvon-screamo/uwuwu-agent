@@ -48,5 +48,3 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
         }
     }
 }
-
-// ——— cron: инвентарь крон-задач (мастера с расписанием на доске задач) ———

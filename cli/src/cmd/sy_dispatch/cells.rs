@@ -37,5 +37,3 @@ pub(super) async fn set_text_cells(
     }
     Ok(())
 }
-
-// ——— docs/search/blob/projects ———

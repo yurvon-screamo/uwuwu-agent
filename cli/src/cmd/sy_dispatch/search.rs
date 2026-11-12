@@ -5,8 +5,6 @@ use crate::siyuan::SiYuan;
 use anyhow::Result;
 use serde_json::Value;
 
-// ——— docs/search/blob/projects ——— (search; read.rs — соседний модуль)
-
 /// Голова stdout search — контракт фабричных агентов (парсят вывод);
 /// единственная точка формата, правка = красный golden-тест.
 pub(super) fn search_head(query: &str) -> String {

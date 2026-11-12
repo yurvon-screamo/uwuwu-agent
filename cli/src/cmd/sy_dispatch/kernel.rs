@@ -6,8 +6,6 @@ use crate::siyuan::{FileFetch, SiYuan};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-// ——— kernel: живые пробы ядра (one-shot, без ретраев) ———
-
 pub(super) async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<()> {
     let sy = SiYuan::from_env_with_timeout(timeout_secs)?;
     match command {
@@ -75,5 +73,3 @@ pub(super) async fn kernel_run(command: KernelSub, timeout_secs: u64) -> Result<
     }
     Ok(())
 }
-
-// ——— утилиты ———

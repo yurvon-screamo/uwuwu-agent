@@ -12,8 +12,6 @@ use crate::siyuan_task as syt;
 use crate::siyuan_task::SyTask;
 use serde_json::json;
 
-// ——— goal: реестр долгосрочных целей («Цели <proj>») ———
-
 /// Диспетчер цели-семьи: доску «Цели <proj>» заводит владелец руками в UI —
 /// CLI без неё громко отказывается с инструкцией (find_goal_board).
 pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<()> {
@@ -185,5 +183,3 @@ async fn goal_rm(sy: &SiYuan, project: &str, id: &str) -> anyhow::Result<()> {
     println!("удалена цель: {} (undo-журнал: {journal_path})", goal.title);
     Ok(())
 }
-
-// ——— guard: rm-вердикт, батч-снос, undo ———
