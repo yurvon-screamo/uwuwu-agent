@@ -201,3 +201,60 @@ async fn get_dead_binding_resolves_body_once() {
         "проба живости мёртвой привязки зовётся один раз на get"
     );
 }
+
+// ——— пины порядка валидаций dry_run (монолит: attach → type → priority →
+// autodone → schedule → agent → status). Рефакторинг sy_dispatch (задача
+// 20261112141437) однажды переставил type после priority — отказ шёл по
+// priority, а при --type bogus --autodone stdout уходил до отказа. Пины
+// ловят возврат перестановки по тексту отказа. dry_run не ходит в сеть —
+// моки не нужны. ———
+
+#[tokio::test]
+async fn dry_run_invalid_type_beats_priority() {
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "probe".into(),
+            r#type: Some("bogus".into()),
+            priority: Some("bogus".into()),
+            autodone: false,
+            stdin: false,
+            attach: Vec::new(),
+            schedule: None,
+            agent: None,
+            status: None,
+            dry_run: true,
+        },
+    )
+    .await
+    .expect_err("два невалидных флага — отказ по первому валидатору (type)");
+    assert!(
+        err.to_string().contains("тип «bogus» не разобран"),
+        "отказ должен быть по --type (монолит-порядок: type до priority), факт: {err}"
+    );
+}
+
+#[tokio::test]
+async fn dry_run_invalid_priority_beats_status() {
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "probe".into(),
+            r#type: None,
+            priority: Some("bogus".into()),
+            autodone: false,
+            stdin: false,
+            attach: Vec::new(),
+            schedule: None,
+            agent: None,
+            status: Some("bogus".into()),
+            dry_run: true,
+        },
+    )
+    .await
+    .expect_err("невалидные priority+status — отказ по priority");
+    assert!(
+        err.to_string().contains("приоритет «bogus» не разобран"),
+        "отказ должен быть по --priority (монолит-порядок: priority до status), факт: {err}"
+    );
+}

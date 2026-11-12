@@ -614,3 +614,66 @@ async fn validation_errors_fire_before_network_and_uploads() {
 }
 
 // ——— контракт ответов мутаций: формат ответа — юнит-ассерты ———
+
+// ——— пины порядка валидаций create (монолит: ty → priority → status →
+// schedule → agent внутри validate_create_flags). Рефакторинг sy_dispatch
+// (задача 20261112141437) выносил priority из валидатора в хвост — при
+// нескольких невалидных флагах отказ шёл по status вместо priority.
+// Валидации падают до любых записей в воркспейс — dead-URL гарантирует,
+// что дошедшая до сети регрессия уронит тест соединением, а не мимо пина. ———
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_invalid_type_beats_priority() {
+    std::env::set_var("UWUWU_SIYUAN_URL", "http://127.0.0.1:1");
+    std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "probe".into(),
+            r#type: Some("bogus".into()),
+            priority: Some("bogus".into()),
+            autodone: false,
+            stdin: false,
+            attach: Vec::new(),
+            schedule: None,
+            agent: None,
+            status: None,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect_err("два невалидных флага — отказ по первому валидатору (type)");
+    assert!(
+        err.to_string().contains("тип «bogus» не разобран"),
+        "отказ должен быть по --type (монолит-порядок validate_create_flags: ty до priority), факт: {err}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_invalid_priority_beats_status() {
+    std::env::set_var("UWUWU_SIYUAN_URL", "http://127.0.0.1:1");
+    std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+    let err = task_run(
+        "uwuwu",
+        TaskSub::Create {
+            title: "probe".into(),
+            r#type: None,
+            priority: Some("bogus".into()),
+            autodone: false,
+            stdin: false,
+            attach: Vec::new(),
+            schedule: None,
+            agent: None,
+            status: Some("bogus".into()),
+            dry_run: false,
+        },
+    )
+    .await
+    .expect_err("невалидные priority+status — отказ по priority");
+    assert!(
+        err.to_string().contains("приоритет «bogus» не разобран"),
+        "отказ должен быть по --priority (монолит-порядок validate_create_flags: priority до status), факт: {err}"
+    );
+}
