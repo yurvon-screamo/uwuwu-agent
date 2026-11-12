@@ -48,9 +48,15 @@ def siyuan_api(path, payload):
 
 
 def gh(args, stdin=None):
-    r = subprocess.run(["gh"] + args, input=stdin, capture_output=True, text=True)
+    full = list(args)
+    if stdin is not None:
+        # gh api без --input - игнорирует stdin: тело мутации молча терялось
+        full += ["--input", "-"]
+    r = subprocess.run(["gh"] + full, input=stdin, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args[:3])}: {r.stderr[:300]}")
+        with open("/home/yurvon/agents-env/20261112155302-ttyp35g/scratch/failed-payload.json", "w") as f:
+            f.write(stdin or "")
+        raise RuntimeError(f"gh {' '.join(args[:3])}: {r.stderr[:300]} (полный payload → scratch/failed-payload.json)")
     return r.stdout
 
 
@@ -274,47 +280,41 @@ def set_project_status(project, number, status):
 # ——— вики ———
 
 def export_notebooks(docs_dir):
-    """Ноутбуки Experience/Projects/Daily → docs/<NB>/… (экспорт ядра md)."""
-    count = 0
+    """Ноутбуки Experience/Projects/Daily → docs/<NB>/<hpath>.md: плоская
+    выгрузка по полному SQL-списку блоков (type='d'), поштучный
+    exportMdContent. Полный корпус — никаких walk-усечений."""
+    nbs = siyuan_api("/api/notebook/lsNotebooks", {}) or []
+    by_name = {n["name"]: n["id"] for n in (nbs.get("notebooks") or [])}
+    count, failed = 0, 0
     for nb_name, out_dir in NOTEBOOKS.items():
-        nbs = siyuan_api("/api/notebook/lsNotebooks", {}) or []
-        nb = next((n for n in (nbs.get("notebooks") or []) if n["name"] == nb_name), None)
-        if not nb:
+        nb_id = by_name.get(nb_name)
+        if not nb_id:
             print(f"! ноутбук «{nb_name}» не найден")
             continue
-        nb_id = nb["id"]
-        tree = siyuan_api("/api/filetree/listDocsByPath",
-                          {"notebook": nb_id, "path": "/", "sort": 0})
-        stack = [(nb_id, "/", out_dir)]
-        while stack:
-            nb_id, path, out = stack.pop()
-            for doc in (tree.get("files") or []):
-                pass  # listDocsByPath отдаёт только верх; полная выгрузка ниже
-            break
-        # полная выгрузка: обход id-дерева SQL'ом
-        all_docs = sql(f"select id, hpath, content, box from blocks where box='{nb_id}' and type='d'")
-        by_parent = {}
-        for r in all_docs:
-            parent = "/".join(r["hpath"].split("/")[:-1]) or "/"
-            by_parent.setdefault(parent, []).append(r)
-        def walk(parent, out_path):
-            nonlocal count
-            os.makedirs(out_path, exist_ok=True)
-            for r in by_parent.get(parent, []):
-                hpath = r["hpath"]
-                sub = hpath.strip("/").split("/")
-                target = os.path.join(out_path, *sub[:-1]) if len(sub) > 1 else out_path
-                os.makedirs(target, exist_ok=True)
-                dest = os.path.join(target, sub[-1] + ".md")
-                try:
-                    d = siyuan_api("/api/export/exportMdContent", {"id": r["id"]})
-                    with open(dest, "w") as f:
-                        f.write(d.get("content") or "")
-                    count += 1
-                except Exception as e:
-                    print(f"  ! экспорт «{hpath}»: {e}")
-                walk(hpath, target)
-        walk("/", os.path.join(docs_dir, out_dir))
+        all_docs = sql(f"select id, hpath, content from blocks where box='{nb_id}' and type='d'")
+        print(f"«{nb_name}»: {len(all_docs)} доков")
+        for i, r in enumerate(all_docs):
+            hpath = r["hpath"].strip("/")
+            if not hpath:
+                # корневой док ноутбука: <NB>.md
+                dest = os.path.join(docs_dir, out_dir, f"{nb_name}.md")
+            else:
+                segs = [s2.replace("/", "∕") for s2 in hpath.split("/")]
+                dest = os.path.join(docs_dir, out_dir, *segs) + ".md"
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            try:
+                d = siyuan_api("/api/export/exportMdContent", {"id": r["id"]})
+                with open(dest, "w") as f:
+                    f.write(d.get("content") or "")
+                count += 1
+            except Exception as e:
+                failed += 1
+                if failed <= 5:
+                    print(f"  ! «{hpath}»: {e}")
+            if (i + 1) % 100 == 0:
+                print(f"  «{nb_name}»: {i + 1}/{len(all_docs)}")
+    if failed:
+        print(f"! не выгружено: {failed}")
     return count
 
 
@@ -342,9 +342,18 @@ def main():
             print(f"проект «{b['project']}»:")
             rows = render_board(b["doc_id"])
             for row in rows:
-                title = (cell_value(row, "Primary Key")[0]
-                         or cell_value(row, "Название")[0]
-                         or (row.get("content") or "")).strip()
+                # Primary Key канон разъехался по доскам (Primary Key /
+                # Название / Первичный ключ) — берём первую block-клетку
+                title = ""
+                for cell in row.get("cells") or []:
+                    v = cell.get("value") or {}
+                    if v.get("type") == "block":
+                        title = (v.get("block") or {}).get("content") or ""
+                        break
+                if not title:
+                    title = (cell_value(row, "Первичный ключ")[0]
+                             or cell_value(row, "Primary Key")[0]
+                             or cell_value(row, "Название")[0]).strip()
                 if not title:
                     continue
                 status = STATUS_MAP.get(cell_value(row, "Status")[0], cell_value(row, "Status")[0])
