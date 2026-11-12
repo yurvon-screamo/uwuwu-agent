@@ -71,8 +71,16 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 Решение маршрутизации — чистая функция `routeTask` (factory-lib, покрыта тестами).
 Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
+Автодон/очередь/пик (задача 20261112160316): галочка «Autodone» (ставит только владелец) —
+фабрика сама мержит PR на входе в Review (GitHub gh / Gitea tea+API, merge-commit) и ставит
+Done; красный CI/конфликт — обратно в In Progress; без PR — Done сразу. Очередь CUP
+(`UWUWU_FACTORY_CUP`, деф. 7 глобально) — новые Design/In Progress берутся по приоритету
+(high → medium → low, колонка «Приоритет», триаж ставит явно). Пик-окно GLM
+(`UWUWU_FACTORY_PEAK`, деф. будни 06:00–10:00 UTC = 15:00–19:00 JST, off-выключатель) —
+спавны/будильники не-high откладываются до конца окна.
 `factory/` — Bun/TS: конфиг board/repo/local/env, env-lifecycle (factory/env.ts,
-идемпотентный ensureEnv + cleanupEnv + старт-свип сирот), session-recovery MCP, state+reconcile.
+идемпотентный ensureEnv + cleanupEnv + старт-свип сирот), session-recovery MCP, state+reconcile,
+autodone (factory/autodone.ts — носитель PR, вердикты проб, DRY_RUN-гейт merge-вызовов).
 Имена ревью-статусов и стадии тестирования — контракт с колонками досок: константы
 `REVIEW_PLAN_STATUS`/`REVIEW_RESULT_STATUS`/`TESTING_STATUS` (factory-lib).
 Ячейки Path/«Сессия dev»/«Сессия ревью»/«Сессия тест» — фабрика пишет best-effort (колонки заводит владелец); агент заявляет свою сессию на строку командой `task claim` (колонка «Сессия dev» на доске обязательна — без неё claim громко отказывает). Спавн фабрики на доске без сессионной колонки тоже громкий: коммент в задачу с расхождением (ADR-054), раз на доску — тихая потеря привязки рождает дубль-агентов.
