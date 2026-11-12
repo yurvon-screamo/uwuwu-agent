@@ -1,11 +1,29 @@
-# CI на PR: fmt + clippy + test + qlty (delta).
+# CI: fmt + clippy + test + qlty (delta) — на PR и на мастер-пуше.
 # Без concurrency: cancel-in-progress ест свои раны (опыт origa, док cicd).
-# Триггер только pull_request: CI-чек для branch protection прицепляется
-# именно к PR-ранам — dispatch/push чека на PR не дают.
+# Required-чек branch protection «CI» прицепляется именно к PR-ранам —
+# push-ран мастер-коммита гейтом PR не становится, он валидирует сам мердж.
+#
+# Зачем push на master (кейс #221): батч-мерджи вносят артефакты, невидимые
+# на PR-ветках — каждый PR-ран гоняет merge-коммит со своей копией master,
+# и зелёные по отдельности диффы двух PR конфликтуют только на
+# мастер-коммите (дубль strictPathPin, TS2300 — всплыл красным CI чужого
+# PR #224, hotfix cee4c0c). Push-ран мастер-коммита ловит это в момент
+# мерджа. Развилка «merge queue» (предотвращение до мастера) отвергнута:
+# сериализация мерджей и пересборка autodone-механики против редкого
+# эпизода — детекция достаточна (линия stress-tests.yml: сигнал =
+# красная джоба + нативный email GitHub, автозаведение задач не строим).
+#
+# Красный push-ран — не всегда батч-артефакт: семейство тайминг-флейков
+# cargo test (search_lines #145, mcp_transport, semantic_tests #195) изредка
+# красит и мастер-раны. Отличие: флейк исчезает на перезапуске
+# (gh run rerun), батч-артефакт воспроизводится.
 name: CI
 
 on:
   pull_request:
+  push:
+    branches:
+      - master
 
 permissions:
   contents: read
