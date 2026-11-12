@@ -1,8 +1,10 @@
-// tests/cron-runcard.test.ts — позитивный путь createRunCard (ревью Low):
-// парсинг rowId из stdout `task create` («строка: <id>») и вторичный спавн
-// `task edit <id> --status Todo`. Дрейф формата вывода CLI иначе ломал бы
-// создание ранов молча (только строка в логе). Bun.spawn патчится на скрипт:
-// createRunCard экспортирована из демона (паттерн tickBoard).
+// tests/cron-runcard.test.ts — позитивный путь createRunCard:
+// парсинг rowId из stdout `task create` (контракт ответов: строка «Строка: <id>» шапки),
+// начальный статус Todo в argv create (Draft-фазы рана нет — draftLoop триажа
+// раны не видит) и вторичный спавн `task edit <id> --type "" --planned`.
+// Дрейф формата вывода CLI иначе ломал бы создание ранов молча (только строка
+// в логе). Bun.spawn патчится на скрипт: createRunCard экспортирована из
+// демона (паттерн tickBoard).
 import { afterEach, describe, expect, test } from "bun:test"
 
 // CLI_BIN печётся на импорте демона: фиксируем до import — ассерты не зависят
@@ -64,10 +66,10 @@ describe("runCardBody: шапка ран-карточки", () => {
 })
 
 describe("createRunCard: позитивный путь", () => {
-  test("парсит rowId из stdout create и переводит ран в Todo", async () => {
+  test("парсит rowId из stdout create, минтит ран сразу Todo (--status) и доставляет тип+planned edit'ом", async () => {
     const { calls } = scriptSpawn([
-      { stdout: "создана: ⏰ мастер · 2026-11-07 09:30:00\n  строка: 20261107090000-run001\n  тело:   20261107090000-body01\n" },
-      { stdout: "обновлено: ⏰ мастер · 2026-11-07 09:30:00\n" },
+      { stdout: "Задача:   ⏰ мастер · 2026-11-07 09:30:00\nСтатус:   Todo\nТип:      feature\nСтрока:   20261107090000-run001\nДоска:    /uwuwu/Задачи uwuwu\n\n----- тело -----\n# ран\n" },
+      { stdout: "Задача:   ⏰ мастер · 2026-11-07 09:30:00\nСтатус:   Todo\nСтрока:   20261107090000-run001\nДоска:    /uwuwu/Задачи uwuwu\n" },
     ])
 
     const rowId = await cron.createRunCard(
@@ -81,14 +83,17 @@ describe("createRunCard: позитивный путь", () => {
     // bun-types: .toBe(value) — 1-аргенная сигнатура, сообщение = название теста
     expect(calls.length).toBe(2)
     const [createCall, editCall] = calls
-    // create: заголовок и тело через stdin (argv[0] — бинарь, путь зависит
-    // от машины/порядка импортов — не ассертим)
+    // create: начальный статус Todo в argv (ран без Draft-фазы — draftLoop
+    // триажа раны не видит); заголовок и тело через stdin (argv[0] — бинарь,
+    // путь зависит от машины/порядка импортов — не ассертим)
     expect(createCall?.argv.slice(1, 5)).toEqual(["task", "create", "--project", "uwuwu"])
+    expect(createCall?.argv.slice(-3)).toEqual(["--status", "Todo", "--stdin"])
     expect(createCall?.stdinWritten).toContain("## Инструкция мастера")
-    // edit: тот же rowId, статус Todo + снятие типа-дефолта + дата файра
-    // в «Запланировано» (минутная точность — формат сравнения reconcile)
+    // edit: тот же rowId, снятие типа-дефолта + дата файра
+    // в «Запланировано» (минутная точность — формат сравнения reconcile);
+    // статуса в edit больше нет — Todo уже записан create'ом
     expect(editCall?.argv.slice(1)).toEqual([
-      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--status", "Todo", "--type", "", "--planned", "2026-11-07 09:30",
+      "task", "edit", "20261107090000-run001", "--project", "uwuwu", "--type", "", "--planned", "2026-11-07 09:30",
     ])
     expect(editCall?.stdinWritten).toBe("(не пайп)")
   })
@@ -103,9 +108,9 @@ describe("createRunCard: позитивный путь", () => {
     expect(calls.length).toBe(1)
   })
 
-  test("stdout без строки «строка: …» → null (дрейф формата не минтит раны)", async () => {
+  test("stdout без строки «Строка: …» → null (дрейф формата не минтит раны)", async () => {
     const { calls } = scriptSpawn([
-      { stdout: "создана: X\n(формат изменился: строки нет)\n" },
+      { stdout: "Задача:   X\nСтатус:   Draft\n(формат изменился: строки нет)\n" },
     ])
 
     const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело", new Date(2026, 10, 7, 9, 30))

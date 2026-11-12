@@ -37,6 +37,15 @@ pub(crate) enum TaskSub {
             help = "Тип: feature | bug | spike | analys | docs | other | refactoring | legacy | idea | qa | infrastructure (колонка «Тип» доски + шаблон тела); без флага — feature"
         )]
         r#type: Option<String>,
+        /// Начальный статус строки: флаг строго для машинных созданий
+        /// (крон-раны минтятся сразу Todo — draftLoop триажа раны не
+        /// видит); Draft — дефолт без флага
+        #[arg(
+            long,
+            value_name = "STATUS",
+            help = "Начальный статус: только Todo (машинные создания — крон-раны); без флага — Draft"
+        )]
+        status: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
         #[arg(
@@ -160,9 +169,10 @@ pub(crate) enum TaskSub {
         )]
         session: Option<String>,
     },
-    /// Коммент в док задачи (диалог юзер ↔ агент). Текст — единственный
-    /// позиционный аргумент (или --stdin); читать комменты: task get / task thread.
-    /// Токены-подкоманды и флаги в тексте отклоняются гвардом до отправки.
+    /// Коммент в док задачи (диалог юзер ↔ агент). Текст — позиционный
+    /// аргумент, --stdin или --md <файл>; читать комменты: task get / task
+    /// thread. Токены-подкоманды и флаги в позиционном тексте отклоняются
+    /// гвардом до отправки.
     Comment {
         #[arg(allow_hyphen_values = true, help = "row-id / doc-id / префикс")]
         id: String,
@@ -172,8 +182,14 @@ pub(crate) enum TaskSub {
             help = "Ответить в тред: префикс id верхнеуровневого коммента (id — в task thread)"
         )]
         reply: Option<String>,
-        #[arg(long, help = "Текст из stdin")]
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Файл с markdown (иначе текст позиционно или --stdin)"
+        )]
+        md: Option<String>,
         #[arg(trailing_var_arg = true, help = "Текст коммента")]
         text: Vec<String>,
     },
@@ -431,6 +447,7 @@ pub(crate) enum Commands {
     /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
     /// факт (владелец/дример), replace — полная перезапись на месте.
+    /// Мутации возвращают финальный документ целиком или явную ошибку.
     Person {
         #[command(subcommand)]
         command: PersonSub,
@@ -483,7 +500,9 @@ pub(crate) enum Commands {
         command: CronSub,
     },
     /// Канбан-задачи («Задачи <Proj>» SiYuan database): create/list/get/
-    /// edit/comment/close; комменты — секция тел задач.
+    /// edit/comment/close; комменты — секция тел задач. Мутации create/edit/
+    /// claim/comment/close/body возвращают финальное состояние сущности
+    /// (read-after-write) или явную ошибку (rm/clean/undo несут undo-журнал/вердикты).
     Task {
         #[command(subcommand)]
         command: TaskSub,
@@ -493,6 +512,7 @@ pub(crate) enum Commands {
     },
     /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
     /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
+    /// Мутации возвращают финальное состояние сущности или явную ошибку.
     Goal {
         #[command(subcommand)]
         command: GoalSub,

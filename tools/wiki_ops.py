@@ -44,7 +44,12 @@ warning с рецептом find, rc 0 (мутация применена — п
                                          таблицы (шапка + separator + все строки):
                                          update переписывает таблицу ЦЕЛИКОМ,
                                          row-payload схлопывает её тихо, code=0
-                                         (пробы 06.11/07.11)
+                                         (пробы 06.11/07.11); айтем (type='i') —
+                                         update переписывает поддерево айтема:
+                                         лишние чайлды (вложенный list, дубль-p)
+                                         сносятся тихо — гвард требует ноль чайлдов
+                                         или ровно один p-носитель (проба 12.11),
+                                         правка текста пункта — update самого p
   block-insert-after <blockID> --md <файл>   вставка после блока; multi-block
                                          легален вне списков, якорь-item
                                          (type='i') — payload строго один item
@@ -1194,6 +1199,64 @@ def _assert_single_list_item(payload: str, row: dict) -> None:
         f"(id {row['parent_id']}, type='l') или в конец дока (doc-level append)")
 
 
+ITEM_CHILDREN_LIMIT = 20  # явный LIMIT (правило проекта); гварду важен факт «сверх одного p», не полный список
+
+ITEM_CARRIER_TYPE = "p"  # штатный носитель текста пункта: l → i → p (проба 12.11)
+
+
+def _item_children_stmt(item_id: str) -> str:
+    return (f"select id, type, substr(markdown, 1, 80) md from blocks "
+            f"where parent_id='{item_id}' order by id limit {ITEM_CHILDREN_LIMIT}")  # nosec B608 — item_id валидирован DOC_ID_RE
+
+
+def _assert_item_update_safe(row: dict) -> None:
+    """block-update айтема переписывает его поддерево ровно payload'ом (живая
+    проба 12.11, задача 20261111063638): штатный p-носитель обновляется
+    каскадом, но лишние чайлды сносятся тихо, code=0 — вложенный list исчезает
+    целиком, дубль-p (qxob57e-класс) теряет носителя или дублируется. Отказ
+    вместо тихой потери (канон ADR-039), до undo-журнала. Безопасные структуры:
+    ноль чайлдов, ровно один p. Одна SQL-проба без докатки: верификация вставки
+    уже докатывает индекс до update (POSTCHECK_ATTEMPTS), у целевого айтема row
+    из _resolved_block — сам айтем проиндексирован."""
+    children = _sql_rows(_item_children_stmt(row["id"]), attempts=1)
+    if len(children) == 0 or (len(children) == 1 and children[0]["type"] == ITEM_CARRIER_TYPE):
+        return
+    listed = "; ".join(f"{c['id']} ({c['type']}) «{(c.get('md') or '').strip()}»" for c in children)
+    raise RuntimeError(
+        f"айтем {row['id']} несёт {len(children)} чайлд(ов) — update перепишет поддерево "
+        f"payload'ом и тихо снесёт их (проба 12.11: вложенный list и дубль-p исчезают, code=0): "
+        f"{listed}. Правка текста пункта — block-update p-носителя (лист); вложенный контент — "
+        "перенеси block-insert-after до правки айтема; дублирующий p — снеси block-delete, "
+        "затем повтори block-update айтема")
+
+
+def _warn_duplicate_item_children(item_ids: list[str]) -> None:
+    """Пост-чек вставленных айтемов: p-детей ≥ 2 — qxob57e-класс «дубль-p»
+    (проба 11.11: insertBlock с айтем-пейлоадом оставлял чайлда со старым
+    текстом, последующая правка айтема выглядела «заявлена, не исполнена»).
+    Мутация уже применена и верифицирована (_verify_materialized) — ронять
+    успешную вставку диагностикой нельзя: сбой SQL-пробы деградирует в
+    предупреждение «не выполнен» с рецептом ручной сверки (канон
+    _verify_materialized/.sy-фолбэк и _undo_patch). Одна SQL-проба без докатки:
+    материализация подтверждена строкой выше (индекс сошёлся), дети создаются
+    с айтемом одной транзакцией ядра. Один p — штатный носитель текста пункта
+    (проба 12.11); l-дети — вложенный контент payload'а, легитимны."""
+    for item_id in item_ids:
+        try:
+            children = _sql_rows(_item_children_stmt(item_id), attempts=1)
+        except Exception:
+            print(f"  ⚠ пост-чек дубль-p для айтема {item_id} не выполнен (SQL не ответил) — "
+                  "сверь структуру айтема вручную: SQL-дети по parent_id")
+            continue
+        carriers = [c for c in children if c["type"] == ITEM_CARRIER_TYPE]
+        if len(carriers) < 2:
+            continue
+        listed = "; ".join(f"{c['id']} «{(c.get('md') or '').strip()}»" for c in carriers)
+        print(f"  ⚠ айтем {item_id} несёт {len(carriers)} p-детей — дубль-класс qxob57e "
+              f"(правка айтема будет выглядеть неисполненной): {listed}; "
+              "лишний сносится block-delete (лист)")
+
+
 UNDO_DIR = "data/assets/undo/wiki_ops"
 
 
@@ -1287,18 +1350,34 @@ def _undo_patch(journal: dict | None, fields: dict) -> None:
         print(f"WARNING: undo-журнал не дополнен ({exc})")
 
 
-def _new_block_ids(resp) -> list[str]:
-    """Новые block id из doOperations[].data (data-node-id) — для цепочки операций.
-    Форма ответа ядра зависит от эндпоинта: updateBlock — dict, insertBlock —
-    список транзакций (проба 06.11)."""
+# data-node-id из тегов ответа ядра: id формата <14 цифр>-<7 символов> —
+# один паттерн для всех парсеров новых блоков (_new_block_ids/_checked_block_ids/
+# _inserted_item_ids читают одни и те же теги doOperations).
+NODE_ID_TAG_RE = r'data-node-id="(\d{14}-[a-z0-9]{7})"'
+
+
+def _response_div_tags(resp) -> list[str]:
+    """<div>-теги узлов вставки из doOperations — форма ответа ядра зависит от
+    эндпоинта (updateBlock — dict, insertBlock — список транзакций, проба
+    06.11); единое место этой нормы для всех парсеров новых блоков."""
     ops: list[dict] = []
     if isinstance(resp, list):
         ops = [op for tx in resp for op in tx.get("doOperations", [])]
     elif isinstance(resp, dict):
         ops = resp.get("doOperations", [])
-    block_ids: list[str] = []
+    tags: list[str] = []
     for op in ops:
-        block_ids += re.findall(r'data-node-id="(\d{14}-[a-z0-9]{7})"', op.get("data") or "")
+        tags += re.findall(r"<div[^>]*>", op.get("data") or "")
+    return tags
+
+
+def _new_block_ids(resp) -> list[str]:
+    """Новые block id из doOperations[].data (data-node-id) — для цепочки операций."""
+    block_ids: list[str] = []
+    for tag in _response_div_tags(resp):
+        node_id = re.search(NODE_ID_TAG_RE, tag)
+        if node_id:
+            block_ids.append(node_id.group(1))
     return block_ids
 
 
@@ -1310,20 +1389,26 @@ def _checked_block_ids(resp) -> list[str]:
     верхний вставленный item), так что её отсутствие — мерж, не потеря.
     Тип узла читается из того же тега (data-type рядом с data-node-id);
     все прочие узлы (item'ы, параграфы, код-блоки) проверяются пост-чеком."""
-    ops: list[dict] = []
-    if isinstance(resp, list):
-        ops = [op for tx in resp for op in tx.get("doOperations", [])]
-    elif isinstance(resp, dict):
-        ops = resp.get("doOperations", [])
     ids: list[str] = []
-    for op in ops:
-        for tag in re.findall(r"<div[^>]*>", op.get("data") or ""):
-            node_id = re.search(r'data-node-id="(\d{14}-[a-z0-9]{7})"', tag)
-            if not node_id:
-                continue
-            node_type = re.search(r'data-type="(Node\w+)"', tag)
-            if node_type and node_type.group(1) == "NodeList":
-                continue
+    for tag in _response_div_tags(resp):
+        node_id = re.search(NODE_ID_TAG_RE, tag)
+        if not node_id:
+            continue
+        node_type = re.search(r'data-type="(Node\w+)"', tag)
+        if node_type and node_type.group(1) == "NodeList":
+            continue
+        ids.append(node_id.group(1))
+    return ids
+
+
+def _inserted_item_ids(resp) -> list[str]:
+    """id вставленных NodeListItem — адресаты пост-чека дубль-p
+    (qxob57e-класс, проба 11.11): параграфы и контейнеры не айтемы."""
+    ids: list[str] = []
+    for tag in _response_div_tags(resp):
+        node_id = re.search(NODE_ID_TAG_RE, tag)
+        node_type = re.search(r'data-type="(Node\w+)"', tag)
+        if node_id and node_type and node_type.group(1) == "NodeListItem":
             ids.append(node_id.group(1))
     return ids
 
@@ -1348,6 +1433,8 @@ def cmd_block_update(a):
         raise RuntimeError(f"payload содержит {chunks} блока(ов) — updateBlock молча применит только первый, хвост пропадёт (проба 06.11); для нескольких блоков — block-insert-after; многострочный контент одного блока — параграф с переносами или код-блок")
     if row["type"] == "t" and not _payload_has_table_separator(payload):
         raise RuntimeError(f"блок {row['id']} — таблица (type='t'): updateBlock переписывает таблицу ЦЕЛИКОМ — payload без separator-строки шапки схлопнет её до одной строки, code=0 (пробы 06.11/07.11); правка ячейки/строки — в UI или doc-level replace дока; переписать таблицу осознанно — payload = новая таблица целиком (шапка + separator + все строки)")
+    if row["type"] == "i":
+        _assert_item_update_safe(row)
     journal = _undo_write("update", row["id"], {
         "root_id": row["root_id"], "hpath": _root_hpath(row["root_id"]),
         "before_md": row["markdown"], "after_md": payload,
@@ -1385,6 +1472,7 @@ def cmd_block_insert_after(a):
     for block_id in new_ids:
         print(f"  новый блок: {block_id}")
     print(f"  {verdict}")
+    _warn_duplicate_item_children(_inserted_item_ids(resp))
 
 
 # --- block-insert-html: живой HTML-блок через dataType="dom" ---

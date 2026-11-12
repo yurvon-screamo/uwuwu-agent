@@ -66,6 +66,156 @@ async fn resolve_task(
     }
 }
 
+// ——— контракт ответов мутаций: read-after-write ———
+
+/// Шапка карточки задачи (контракт ответов и task get — один формат).
+/// Синхронный форматтер: значения колонок берутся из перечитанной строки,
+/// расписание/агент — из атрибутов тела (None — не читать).
+pub(crate) fn format_task_header(
+    board: &syt::SyBoard,
+    task: &SyTask,
+    schedule: Option<&str>,
+    agent: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Задача:   {}\n", task.title));
+    out.push_str(&format!("Статус:   {}\n", task.status));
+    if !task.task_type.is_empty() {
+        out.push_str(&format!("Тип:      {}\n", task.task_type));
+    }
+    out.push_str(&format!("Строка:   {}\n", task.item_id));
+    // где приземлился резолв — особенно при глобальном (без --project)
+    out.push_str(&format!("Доска:    {}\n", board.hpath));
+    if !task.branch.is_empty() {
+        out.push_str(&format!("Ветка:    {}\n", task.branch));
+    }
+    if !task.pr.is_empty() {
+        out.push_str(&format!("PR:       {}\n", task.pr));
+    }
+    if !task.dev_session.is_empty() {
+        out.push_str(&format!("Сессия dev: {}\n", task.dev_session));
+    }
+    if !task.planned.is_empty() {
+        out.push_str(&format!("Запланировано: {}\n", task.planned));
+    }
+    if let Some(schedule) = schedule {
+        out.push_str(&format!(
+            "Расписание: {schedule} (крон: файр в статусе Вейт)\n"
+        ));
+    }
+    if let Some(agent) = agent {
+        out.push_str(&format!("{}\n", syt::agent_display_line(agent)));
+    }
+    out
+}
+
+/// Шапка с живыми атрибутами тела (расписание/агент): общий хвост task get
+/// и мутаций. Резолв тела громкий (task_body_doc: привязка + fallback по
+/// заголовку; отказ при телах-дублях — «вычисти сироты в UI»): get печатает
+/// диагноз по `?`, мутации зовут в ADR-067-обёртке (Err → warning, rc 0).
+/// Чтение attrs тихое (паритет get: колонки важнее расписания).
+pub(crate) async fn task_header_md(
+    sy: &SiYuan,
+    board: &syt::SyBoard,
+    task: &SyTask,
+) -> Result<String> {
+    let mut schedule = None;
+    let mut agent = None;
+    if let Some(doc) = syt::task_body_doc(sy, board, task).await? {
+        if let Ok(attrs) = sy.get_block_attrs(&doc).await {
+            schedule = attrs.get("custom-schedule").cloned();
+            agent = attrs.get("custom-agent").cloned();
+        }
+    }
+    Ok(format_task_header(
+        board,
+        task,
+        schedule.as_deref(),
+        agent.as_deref(),
+    ))
+}
+
+/// Перечитывание строки после мутации (read-after-write): render доски
+/// заново, поиск по itemID. NotFound — отказ (вызывающий решает: ADR-067
+/// мутация применена → warning, не падение).
+async fn reload_task(sy: &SiYuan, board: &syt::SyBoard, item_id: &str) -> Result<SyTask> {
+    let rows = syt::read_rows(sy, board).await?;
+    rows.into_iter()
+        .find(|r| r.item_id == item_id)
+        .ok_or_else(|| anyhow!("строка {item_id} не видна в render доски «{}»", board.hpath))
+}
+
+/// Финальный ответ мутации: шапка перечитанной строки. Ветка ADR-067
+/// («мутация применена — после неё не падаем»): перечитывание сорвалось
+/// (транспорт/лаг render) → rc 0 + warning + рецепт контрольного get,
+/// чтобы агент не ретраил уже применённую мутацию.
+async fn print_final_state(sy: &SiYuan, board: &syt::SyBoard, task: &SyTask) {
+    match reload_task(sy, board, &task.item_id).await {
+        Ok(fresh) => match task_header_md(sy, board, &fresh).await {
+            Ok(header) => println!("{header}"),
+            Err(err) => warn_unreadable_state(&task.item_id, &err),
+        },
+        Err(err) => warn_unreadable_state(&task.item_id, &err),
+    }
+}
+
+fn warn_unreadable_state(item_id: &str, err: &anyhow::Error) {
+    eprintln!(
+        "⚠ мутация применена, но финальное состояние не прочитано ({err:#}) — \
+         сверяй контрольным: task get {item_id}"
+    );
+}
+
+/// Шапка из факта create (ADR-067-окно: render лагает/сорвался): item/title/
+/// тип/начальный статус известны без перечитывания — stdout сохраняет
+/// «Строка: <id>» для потребителей stdout (крон-ран-карточки), warning
+/// требует контрольный get.
+fn created_header(
+    board: &syt::SyBoard,
+    item: &str,
+    title: &str,
+    ty: &str,
+    initial_status: &str,
+) -> String {
+    let draft = SyTask {
+        item_id: item.to_string(),
+        title: title.to_string(),
+        status: initial_status.to_string(),
+        task_type: ty.to_string(),
+        branch: String::new(),
+        pr: String::new(),
+        dev_session: String::new(),
+        planned: String::new(),
+        planned_ms: 0,
+        schedule_cell: String::new(),
+        body_doc: None,
+    };
+    format_task_header(board, &draft, None, None)
+}
+
+/// Финальный экспорт тела после мутации (контракт «фулл-тело»): маркер-блок
+/// и artifact-report. Create/body печатают канон-маркер «----- тело -----»
+/// (ровно как get: write-гард task_get_wrapper_signature и срезка --base
+/// покрывают рециркуляцию ответа тем же матчем); goal/person — «(итог)»-
+/// маркеры (расширение гарда). Экспорт сорвался → маркер без тела + warning
+/// (rc 0, ADR-067: запись уже свершилась).
+async fn print_final_body(sy: &SiYuan, doc_id: &str, label: &str) {
+    match sy.export_md_by_id(doc_id).await {
+        Ok(md) => {
+            for warning in md_artifacts::artifact_report(&md) {
+                eprintln!("⚠ round-trip-артефакт: {warning}");
+            }
+            println!("\n----- {label} -----\n{md}");
+        }
+        Err(err) => {
+            eprintln!(
+                "⚠ запись применена, но финальный экспорт не получен ({err:#}) — \
+                 сверяй контрольным чтением дока {doc_id}"
+            );
+        }
+    }
+}
+
 pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // dry-run ветка раньше project-проверки и from_env: скелет тела от проекта
     // не зависит, осмотр — read-only и работает без доступа к ядру (ноль запросов)
@@ -76,6 +226,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         attach,
         schedule,
         agent,
+        status,
         dry_run: true,
     } = command
     {
@@ -101,6 +252,11 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             syt::validate_agent_name(name)?;
             println!("агент: {name} (будет записан атрибутом custom-agent дока-тела)");
         }
+        // --status валидируется и в осмотре: флаг не молчит (паритет --type)
+        let status_canonical = syt::validate_create_status(status.as_deref())?;
+        if status_canonical != "Draft" {
+            println!("статус: {status_canonical} (начальный статус строки)");
+        }
         println!("тип: {ty} (колонка «{}» доски)", syt::TYPE_CELL);
         let ctx = if stdin { read_stdin()? } else { String::new() };
         println!("{}", syt::create_body_md(&title, &ty, &ctx));
@@ -109,9 +265,13 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
     // Гвард позиционного текста коммента ДО bail по --project: иначе флаг,
     // проглоченный trailing_var_arg'ом (`task comment <id> "текст" --project X`
     // → project=None), маскируется под «флаг не передан» (крон-сессия 04.11).
-    // stdin здесь НЕ читается — его читает ровно одна ветка ниже.
-    if let TaskSub::Comment { stdin, text, .. } = &command {
-        pre_guard_positional_comment(*stdin, text)?;
+    // stdin здесь НЕ читается — его читает ровно одна ветка ниже; --md тоже
+    // не читается — явный канал, гвардится в Comment-ветке.
+    if let TaskSub::Comment {
+        stdin, md, text, ..
+    } = &command
+    {
+        pre_guard_positional_comment(*stdin, md.as_deref(), text)?;
     }
     // Board-bound подкоманды привязаны к доске/журналу — глобальной семантики
     // нет. Id-семейство (get/edit/claim/comment/thread/close/body/rm) без
@@ -183,35 +343,14 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         }
         TaskSub::Get { id, no_body } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            println!("Задача:   {}", task.title);
-            println!("Статус:   {}", task.status);
-            if !task.task_type.is_empty() {
-                println!("Тип:      {}", task.task_type);
-            }
-            println!("Строка:   {}", task.item_id);
-            // где приземлился резолв — особенно при глобальном (без --project)
-            println!("Доска:    {}", board.hpath);
-            if !task.branch.is_empty() {
-                println!("Ветка:    {}", task.branch);
-            }
-            if !task.pr.is_empty() {
-                println!("PR:       {}", task.pr);
-            }
-            if !task.planned.is_empty() {
-                println!("Запланировано: {}", task.planned);
-            }
-            let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
-            if let Some(doc) = body_doc.as_deref() {
-                if let Ok(attrs) = sy.get_block_attrs(doc).await {
-                    if let Some(schedule) = attrs.get("custom-schedule") {
-                        println!("Расписание: {schedule} (крон: файр в статусе Вейт)");
-                    }
-                    if let Some(agent) = attrs.get("custom-agent") {
-                        println!("{}", syt::agent_display_line(agent));
-                    }
-                }
-            }
+            let header = task_header_md(&sy, &board, &task).await?;
+            print!("{header}");
             if !no_body {
+                // резолв тела громкий и с fallback по заголовку (task_body_doc):
+                // detached/мёртвая привязка не прячет тело — старый контракт get
+                // (пустой блок «----- тело -----» у живого дока = ложный сигнал
+                // «тела нет» → replace уничтожил бы существующий док)
+                let body_doc = syt::task_body_doc(&sy, &board, &task).await?;
                 let md = match body_doc {
                     Some(doc) => sy.export_md_by_id(&doc).await.unwrap_or_default(),
                     None => String::new(),
@@ -237,6 +376,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             attach,
             schedule,
             agent,
+            status,
             ..
         } => {
             let attach_files = validate_attach_files(&attach)?;
@@ -251,6 +391,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 Some(raw) => syt::validate_task_type(raw)?,
                 None => syt::DEFAULT_TASK_TYPE.to_string(),
             };
+            // начальный статус до любых записей: флаг строго для машинного
+            // Todo (крон-раны), всё прочее — отказ
+            let initial_status = syt::validate_create_status(status.as_deref())?;
             if let Some(expr) = schedule.as_deref() {
                 if expr.is_empty() {
                     anyhow::bail!(
@@ -290,7 +433,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             for file in attach_files {
                 uploaded.push(sy.upload_asset(file).await?);
             }
-            let (item, body) = syt::create(&sy, project, &title, &ty_canonical, &ctx).await?;
+            let (item, body) =
+                syt::create(&sy, project, &title, &ty_canonical, &ctx, initial_status).await?;
             if let Some(expr) = schedule.as_deref() {
                 // сбой после create не теряет задачу: атрибут доставляется
                 // повторным task edit --schedule (создание уже свершилось)
@@ -334,7 +478,33 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                     )
                 })?;
             }
-            println!("создана: {title}\n  строка: {item}\n  тело:   {body}");
+            // контракт ответов: ответ = созданная задача целиком, перечитанная
+            // с ядра (шапка перечитанной строки + финальный экспорт тела).
+            // Перечитывание/экспорт сорвались → ADR-067: rc 0 + warning +
+            // рецепт, ретраить create нельзя (строка уже существует). В окне
+            // срыва stdout всё равно несёт «Строка: <id>» — шапка собирается
+            // из факта create (item/title/тип/Draft известны без render;
+            // лаг render — документированная реальность ядра), иначе
+            // потребители stdout (крон-ран-карточки) теряли бы id.
+            match syt::find_board(&sy, project).await {
+                Ok(board) => match reload_task(&sy, &board, &item).await {
+                    Ok(fresh) => match task_header_md(&sy, &board, &fresh).await {
+                        Ok(header) => {
+                            print!("{header}");
+                            print_final_body(&sy, &body, "тело").await;
+                        }
+                        Err(err) => warn_unreadable_state(&item, &err),
+                    },
+                    Err(err) => {
+                        print!(
+                            "{}",
+                            created_header(&board, &item, &title, &ty_canonical, initial_status)
+                        );
+                        warn_unreadable_state(&item, &err);
+                    }
+                },
+                Err(err) => warn_unreadable_state(&item, &err),
+            }
             if !uploaded.is_empty() {
                 let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
                 println!("  ассеты: {}", paths.join(", "));
@@ -368,10 +538,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             if let Some(raw) = planned.as_deref().filter(|s| !s.is_empty()) {
                 syt::parse_planned(raw)?;
             }
-            let final_title = match title.as_deref() {
-                Some(raw) => Some(syt::edit_title(&sy, &board, &task, raw).await?),
-                None => None,
-            };
+            if let Some(raw) = title.as_deref() {
+                syt::edit_title(&sy, &board, &task, raw).await?;
+            }
             syt::edit(
                 &sy,
                 &board,
@@ -382,19 +551,19 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 ty_canonical.as_deref(),
             )
             .await?;
+            // серединные сбои после базового edit: колонки уже записаны —
+            // ошибка называет применённое и рецепт доставки (не частичные
+            // println-подтверждения: финальное состояние печатается в конце)
             if let Some(raw) = planned.as_deref() {
-                syt::set_planned(&sy, &board, &task, raw).await?;
-            }
-            if ty_canonical.as_deref() == Some("") {
-                println!("тип снят: {}", task.title);
-            }
-            match planned.as_deref() {
-                Some("") => println!("запланировано снято: {}", task.title),
-                Some(raw) => {
-                    let (_, formatted) = syt::parse_planned(raw)?;
-                    println!("запланировано: {formatted}");
-                }
-                None => {}
+                syt::set_planned(&sy, &board, &task, raw)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но «Запланировано» не записано — \
+                         доставь: task edit {} --planned \"{raw}\"",
+                            task.item_id
+                        )
+                    })?;
             }
             if let Some(expr) = schedule.as_deref() {
                 // пустая строка = снятие атрибута (ядро удаляет ключ из IAL);
@@ -411,13 +580,27 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                             task.title
                         )
                     })?;
-                sy.set_block_attr(&body, "custom-schedule", expr).await?;
+                sy.set_block_attr(&body, "custom-schedule", expr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но атрибут custom-schedule не записан — \
+                         доставь: task edit {} --schedule \"{expr}\"",
+                            task.item_id
+                        )
+                    })?;
                 // колонка «Расписание» — отображение attr: пишется синхронно
                 // в единственной точке записи расписания (снятие чистит клетку)
-                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr).await?;
-                if expr.is_empty() {
-                    println!("расписание снято: {}", task.title);
-                }
+                syt::sync_schedule_cell(&sy, &board, &task.item_id, expr)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "атрибут записан, но клетка «{}» не записана — доставь: \
+                             task edit {} --schedule \"{expr}\"",
+                            syt::SCHEDULE_CELL,
+                            task.item_id
+                        )
+                    })?;
             }
             if let Some(name) = agent.as_deref() {
                 // пустая строка = снятие атрибута (мастер файрится
@@ -433,15 +616,20 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                             task.title
                         )
                     })?;
-                sy.set_block_attr(&body, "custom-agent", name).await?;
-                if name.is_empty() {
-                    println!("агент снят: {}", task.title);
-                }
+                sy.set_block_attr(&body, "custom-agent", name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "колонки строки записаны, но атрибут custom-agent не записан — \
+                         доставь: task edit {} --agent \"{name}\"",
+                            task.item_id
+                        )
+                    })?;
             }
-            println!(
-                "обновлено: {}",
-                final_title.as_deref().unwrap_or(&task.title)
-            );
+            // контракт ответов: ответ = финальное состояние строки (шапка,
+            // перечитанная с ядра, без тела — edit тело не меняет); сбой
+            // перечитывания → ADR-067 warning, ретрай edit безопасен
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Claim { id, session } => {
@@ -453,28 +641,36 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             };
             let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::claim(&sy, &board, &task, &session).await?;
-            println!("заявлено: {} ← {}", task.title, session);
+            // контракт ответов: шапка перечитанной строки («Сессия dev» видна)
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Comment {
             id,
             reply,
             stdin,
+            md,
             text,
         } => {
-            let msg = guarded_comment_text(stdin, &text)?;
+            let msg = guarded_comment_text(stdin, md.as_deref(), &text)?;
             // write-side превенция тег-матча ядра (см. body): предупреждение
             // в stderr, запись не блокируется
             if let Some(warning) = md_artifacts::tag_trap_warning(&msg) {
                 eprintln!("{warning}");
             }
             let (board, task) = resolve_task(&sy, project, &id).await?;
-            syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
-            println!(
-                "коммент отправлен на {}: {}",
-                board.hpath,
-                truncate(&msg, 60)
-            );
+            let inserted =
+                syt::comment(&sy, &board, &task, "AGENTS", &msg, reply.as_deref()).await?;
+            // контракт ответов: вставленный блок как записался; дедуп-хит
+            // (бит-в-бит дубль уже был) — отдельная честная строка
+            if inserted.fresh {
+                println!("коммент записан на {}:\n{}", board.hpath, inserted.marker);
+            } else {
+                println!(
+                    "коммент уже был (бит-в-бит дубль, вставки не было) на {}:\n{}",
+                    board.hpath, inserted.marker
+                );
+            }
             Ok(())
         }
         TaskSub::Thread { id } => {
@@ -489,7 +685,8 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
         TaskSub::Close { id, note } => {
             let (board, task) = resolve_task(&sy, project, &id).await?;
             syt::close(&sy, &board, &task, note.as_deref()).await?;
-            println!("закрыта: {}", task.title);
+            // контракт ответов: шапка перечитанной строки (статус Done виден)
+            print_final_state(&sy, &board, &task).await;
             Ok(())
         }
         TaskSub::Rm { id } => task_rm(&sy, project, &id).await,
@@ -539,13 +736,7 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
             // незакрытый фенс, пустая строка в html) не грузит ассеты
             let fences = html_embed::parse_input(&content)?;
             // снапшот читается до обращения к ядру: локальная ошибка — fail fast
-            let snapshot = match base.as_deref() {
-                Some(path) => Some(
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("снапшот --base не читается: {path}"))?,
-                ),
-                None => None,
-            };
+            let snapshot = read_base_snapshot(base.as_deref())?;
             let (board, task) = resolve_task(&sy, project, &id).await?;
             let body_path = board.body_hpath(&task.title);
             // upload до записи тела: сбой не оставляет тело без референсов
@@ -605,6 +796,9 @@ pub(crate) async fn task_run(project: &str, command: TaskSub) -> Result<()> {
                 let paths: Vec<&str> = uploaded.iter().map(|a| a.asset_path.as_str()).collect();
                 println!("ассеты: {}", paths.join(", "));
             }
+            // контракт ответов: финальный экспорт тела как записалось
+            // (round-trip-артефакты ядра видны сразу, без контрольного get)
+            print_final_body(&sy, &doc, "тело").await;
             Ok(())
         }
     }
@@ -655,7 +849,18 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
                 &ctx,
             )
             .await?;
-            println!("создана цель: {title}\n  строка: {item}\n  тело:   {body}");
+            // контракт ответов: созданная цель целиком (карточка перечитанной
+            // строки + финальный экспорт тела); сбой перечитывания → ADR-067
+            match goal::find_goal_board(&sy, project).await {
+                Ok(board) => match reload_task(&sy, &board, &item).await {
+                    Ok(fresh) => {
+                        println!("{}", format_goal_card(&board, &fresh));
+                        print_final_body(&sy, &body, "цель (итог)").await;
+                    }
+                    Err(err) => warn_unreadable_state(&item, &err),
+                },
+                Err(err) => warn_unreadable_state(&item, &err),
+            }
             Ok(())
         }
         GoalSub::Edit { id, status, title } => {
@@ -672,11 +877,24 @@ pub(crate) async fn goal_run(project: &str, command: GoalSub) -> anyhow::Result<
             if let Some(raw) = title.as_deref() {
                 syt::edit_title(&sy, &board, &goal, raw).await?;
             }
-            println!("обновлена цель: {}", goal.title);
+            // контракт ответов: финальное состояние строки цели (шапка цели)
+            match reload_task(&sy, &board, &goal.item_id).await {
+                Ok(fresh) => println!("{}", format_goal_card(&board, &fresh)),
+                Err(err) => warn_unreadable_state(&goal.item_id, &err),
+            }
             Ok(())
         }
         GoalSub::Rm { id } => goal_rm(&sy, project, &id).await,
     }
+}
+
+/// Карточка цели (контракт ответов goal add/edit): статус → строка →
+/// заголовок → доска. Формат парный шапке task-карточки.
+pub(crate) fn format_goal_card(board: &syt::SyBoard, goal: &SyTask) -> String {
+    format!(
+        "Цель:     {}\nСтатус:   {}\nСтрока:   {}\nДоска:    {}",
+        goal.title, goal.status, goal.item_id, board.hpath
+    )
 }
 
 /// Таблица реестра целей: статус → строка → заголовок; `(!)` — мёртвая
@@ -1169,6 +1387,9 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
             }
             let doc_id = person::append(&sy, &target, &md).await?;
             println!("дописано: {}:{} ({doc_id})", target.notebook, target.hpath);
+            // контракт ответов: финальный документ целиком (санкция владельца
+            // «ДА, Газ»: док компактный — финал в ответе, get не нужен)
+            print_final_body(&sy, &doc_id, "персона (итог)").await;
             Ok(())
         }
         PersonSub::Replace { stdin, md } => {
@@ -1185,6 +1406,7 @@ pub(crate) async fn person_run(command: PersonSub) -> Result<()> {
                 "персона перезаписана: {}:{} ({doc_id})",
                 target.notebook, target.hpath
             );
+            print_final_body(&sy, &doc_id, "персона (итог)").await;
             Ok(())
         }
     }
@@ -2174,9 +2396,69 @@ fn collect_threads(md: &str) -> String {
     out
 }
 
+/// Снапшот --base: локальное чтение до сети (fail fast). Не-путь — понятный
+/// отказ; нечитаемый путь — контекст вызова поверх честной OS-причины.
+fn read_base_snapshot(base: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = base else {
+        return Ok(None);
+    };
+    if looks_like_inline_text(path) {
+        return Err(not_a_path_error(
+            "--base",
+            path,
+            "сохрани снапшот в файл и передай путь",
+        ));
+    }
+    Ok(Some(std::fs::read_to_string(path).with_context(|| {
+        format!("снапшот --base не читается: {path}")
+    })?))
+}
+
+/// Не-путь в путь-флаге: перевод строки (вставленный многострочник) либо
+/// длина за ядерными лимитами Linux — компонент имени длиннее NAME_MAX или
+/// путь длиннее PATH_MAX физически не существует как файл (ENAMETOOLONG),
+/// значит это вставленный текст. Ноль ложных срабатываний: легитимный путь
+/// бывает длиннее порога только суммарно, покомпонентно — никогда.
+fn looks_like_inline_text(value: &str) -> bool {
+    const NAME_MAX_BYTES: usize = 255;
+    const PATH_MAX_BYTES: usize = 4096;
+    value.contains('\n')
+        || value
+            .split('/')
+            .any(|component| component.len() > NAME_MAX_BYTES)
+        || value.len() > PATH_MAX_BYTES
+}
+
+/// Отказ «путь-флаг получил не-путь»: имя флага, префикс offending-значения
+/// и подсказка — агент мгновенно самопоправляется вместо дебага сырой
+/// OS-ошибки open() («File name too long»).
+fn not_a_path_error(flag: &str, value: &str, hint: &str) -> anyhow::Error {
+    // префикс, не весь аргумент: значения, пойманные детектором по длине,
+    // иначе уносят в диагностику килобайты текста и топят подсказку
+    const PREFIX_CHARS: usize = 100;
+    let first_line = value.lines().next().unwrap_or_default();
+    let shown: String = first_line.chars().take(PREFIX_CHARS).collect();
+    anyhow::anyhow!(
+        "{flag} ждёт путь к файлу, а передан, похоже, сам текст \
+         («{shown}…»); {hint}"
+    )
+}
+
 fn read_body_input(md_file: Option<&str>, stdin: bool, attach_present: bool) -> Result<String> {
     if let Some(f) = md_file {
-        return Ok(std::fs::read_to_string(f)?);
+        if looks_like_inline_text(f) {
+            return Err(not_a_path_error(
+                "--md",
+                f,
+                "сам текст подавай через --stdin",
+            ));
+        }
+        // честная причина не маскируется: подсказка сверху, OS-ошибка в caused by
+        return std::fs::read_to_string(f).map_err(|err| {
+            anyhow::Error::new(err).context(
+                "--md ждёт путь к файлу; если хотел передать текст — подавай его через --stdin",
+            )
+        });
     }
     if stdin {
         return read_stdin();
@@ -2189,8 +2471,17 @@ fn read_body_input(md_file: Option<&str>, stdin: bool, attach_present: bool) -> 
 }
 
 /// Файлы аттачей: существуют и это файлы — до любых сетевых вызовов.
+/// Не-путь (вставленный текст вместо пути) — понятный отказ с именем флага.
 fn validate_attach_files(files: &[std::path::PathBuf]) -> Result<&[std::path::PathBuf]> {
     for file in files {
+        let shown = file.to_string_lossy();
+        if looks_like_inline_text(&shown) {
+            return Err(not_a_path_error(
+                "--attach",
+                &shown,
+                "укажи путь к существующему файлу",
+            ));
+        }
         let meta = std::fs::metadata(file)
             .with_context(|| format!("файл {}: недоступен", file.display()))?;
         anyhow::ensure!(meta.is_file(), "{} — не файл (директория?)", file.display());
@@ -2299,46 +2590,63 @@ fn looks_like_flag(token: &str) -> bool {
 /// Текст коммента + гвард до сети: подозрительный позиционный текст — отказ
 /// с подсказкой вместо тихой отправки юзеру. Сама валидация —
 /// validate_comment_text (тестируется на строках, stdin не нужен).
-fn guarded_comment_text(stdin: bool, text: &[String]) -> Result<String> {
-    let msg = collect_text(stdin, text)?;
-    validate_comment_text(stdin, &msg)?;
+/// --md и позиционный текст одновременно — конфликт каналов, громкий отказ
+/// до чтения файла и сети.
+fn guarded_comment_text(stdin: bool, md: Option<&str>, text: &[String]) -> Result<String> {
+    if md.is_some() && !text.is_empty() {
+        bail!(
+            "--md и позиционный текст одновременно — передай текст одним каналом \
+             (--md <файл>, --stdin или позиционным аргументом)"
+        );
+    }
+    let msg = if let Some(path) = md {
+        std::fs::read_to_string(path).with_context(|| format!("--md {path}: файл не читается"))?
+    } else {
+        collect_text(stdin, text)?
+    };
+    validate_comment_text(stdin || md.is_some(), &msg)?;
     Ok(msg)
 }
 
 /// Пред-гвард позиционного текста коммента: выполняется в task_run ДО bail по
 /// пустому --project, чтобы проглоченный trailing_var_arg'ом флаг
 /// (`task comment <id> "текст" --project X`) не маскировался под «--project не
-/// передан». stdin — no-op: его содержимое недоступно до чтения, читает его
-/// ровно одна ветка (двойное чтение дало бы EOF → ложный «пустой текст»).
-/// Позиционная валидация чистая и идемпотентна — повтор в Comment-ветке безвреден.
-fn pre_guard_positional_comment(stdin: bool, text: &[String]) -> Result<()> {
-    if stdin {
+/// передан». Явные каналы (stdin, --md) — no-op: их контент здесь не читается,
+/// валидирует ровно одна ветка ниже (двойное чтение stdin дало бы EOF →
+/// ложный «пустой текст»). Позиционная валидация чистая и идемпотентна —
+/// повтор в Comment-ветке безвреден.
+fn pre_guard_positional_comment(stdin: bool, md: Option<&str>, text: &[String]) -> Result<()> {
+    if stdin || md.is_some() {
         return Ok(());
     }
     validate_comment_text(false, &text.join(" "))
 }
 
-/// Гвард текста коммента: пустой — отказ в обоих источниках; из позиционных
-/// токенов отклоняются имена подкоманд и флагоподобные токены. stdin не
-/// гвардится на подкоманды и флаги: явное намерение, глотание туда невозможно.
-fn validate_comment_text(stdin: bool, msg: &str) -> Result<()> {
+/// Гвард текста коммента: пустой — отказ во всех каналах; из позиционных
+/// токенов отклоняются имена подкоманд и флагоподобные токены. Явный канал
+/// (explicit — stdin или --md) не гвардится на подкоманды и флаги: явное
+/// намерение, глотание туда невозможно.
+fn validate_comment_text(explicit: bool, msg: &str) -> Result<()> {
     if msg.trim().is_empty() {
-        bail!("пустой текст коммента — передай --stdin или текст позиционным аргументом");
+        bail!(
+            "пустой текст коммента — передай --stdin, --md <файл> или текст позиционным аргументом"
+        );
     }
-    if stdin {
+    if explicit {
         return Ok(());
     }
     let tokens: Vec<&str> = msg.split_whitespace().collect();
     if let Some(first) = tokens.first().filter(|t| TASK_SUB_NAMES.contains(t)) {
         bail!(
             "«{first}» — имя подкоманды task/cron, а не текст коммента \
-             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\" или --stdin)"
+             (читать комменты: task get/thread <id>; писать: task comment <id> \"текст\", \
+             --stdin или --md <файл>)"
         );
     }
     if let Some(flag) = tokens.iter().find(|t| looks_like_flag(t)) {
         bail!(
             "токен «{flag}» похож на флаг: после текста коммента флаги глотаются как текст \
-             (trailing_var_arg) — пиши флаги до <id> или используй --stdin"
+             (trailing_var_arg) — пиши флаги до <id>, используй --stdin или --md <файл>"
         );
     }
     Ok(())
@@ -2437,6 +2745,11 @@ mod tests {
     use super::carry_over_comments_section;
     use super::collect_asset_refs;
     use super::collect_threads;
+    use super::created_header;
+    use super::format_goal_card;
+    use super::format_task_header;
+    use super::guarded_comment_text;
+    use super::pre_guard_positional_comment;
     use super::replace_md_section;
     use super::require_fresh_snapshot;
     use super::save_body_assets;
@@ -2446,7 +2759,9 @@ mod tests {
     use super::validate_comment_text;
     use super::SectionEdit;
     use crate::cmd::cli::TaskSub;
+    use crate::cmd::mock_kernel::{set_env, MockBoard, MockKernel, MockRow, MockScenario};
     use crate::siyuan::SiYuan;
+    use crate::siyuan_task::SyBoard;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -3679,6 +3994,73 @@ mod tests {
             .expect("stdin: подкоманды не гвардятся");
     }
 
+    // ——— канал --md: явный контент без токен-гвардов, отказы чтения с именем пути ———
+
+    #[test]
+    fn comment_md_flag_like_content_passes_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.md");
+        std::fs::write(
+            &file,
+            "# Отчёт\n\nкоманда `bash -n x.sh` и флаг --frozen-lockfile в прозе\n",
+        )
+        .unwrap();
+        let msg = guarded_comment_text(false, Some(file.to_str().unwrap()), &[])
+            .expect("флагоподобные строки в файле — явный канал, гвард не режет");
+        assert!(msg.contains("--frozen-lockfile"), "контент целиком: {msg}");
+    }
+
+    #[test]
+    fn comment_md_empty_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.md");
+        std::fs::write(&file, "   \n").unwrap();
+        let err = guarded_comment_text(false, Some(file.to_str().unwrap()), &[])
+            .expect_err("пустой файл — пустой коммент, отказ во всех каналах");
+        assert!(err.to_string().contains("пустой"), "суть отказа: {err}");
+    }
+
+    #[test]
+    fn comment_md_missing_file_error_names_the_path() {
+        let err = guarded_comment_text(false, Some("/no/such/report.md"), &[])
+            .expect_err("нет файла — отказ");
+        assert!(
+            err.to_string().contains("/no/such/report.md"),
+            "имя пути в отказе: {err}"
+        );
+    }
+
+    #[test]
+    fn comment_md_directory_error_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = guarded_comment_text(false, Some(dir.path().to_str().unwrap()), &[])
+            .expect_err("директория — не файл, отказ");
+        assert!(
+            err.to_string().contains(dir.path().to_str().unwrap()),
+            "имя пути в отказе: {err}"
+        );
+    }
+
+    #[test]
+    fn comment_md_with_positional_text_is_loud_conflict() {
+        let err = guarded_comment_text(false, Some("/no/such/f.md"), &["текст".to_string()])
+            .expect_err("--md и позиционный текст одновременно — конфликт каналов");
+        assert!(
+            err.to_string().contains("одним каналом"),
+            "суть отказа: {err}"
+        );
+    }
+
+    /// Пин фикса High ревью плана: пред-гвард при --md — no-op даже с пустым
+    /// позиционным (empty-bail пред-гварда не должен убить main-сценарий
+    /// `task comment <id> --md файл.md` до Comment-ветки).
+    #[test]
+    fn comment_pre_guard_is_noop_when_md_channel_set() {
+        pre_guard_positional_comment(false, Some("f.md"), &[])
+            .expect("--md — явный канал, пред-гвард no-op");
+        pre_guard_positional_comment(true, None, &[]).expect("stdin — как раньше");
+    }
+
     // ——— порядок диспетчера: гвард текста раньше bail по --project ———
 
     /// `task comment <id> …` при пустом --project: оба пути падают до
@@ -3688,6 +4070,7 @@ mod tests {
             id: "20261104072048-4n1rwdt".into(),
             reply: None,
             stdin,
+            md: None,
             text: text.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -3867,6 +4250,107 @@ mod tests {
             validate_attach_files(&[dir.path().to_path_buf()]).expect_err("директория — отказ");
         assert!(err.to_string().contains("не файл"), "суть: {err}");
         assert_eq!(validate_attach_files(&[ok]).unwrap().len(), 1);
+    }
+
+    use super::{read_base_snapshot, read_body_input};
+
+    #[test]
+    fn read_body_input_multiline_md_arg_bails_with_stdin_hint_not_os_error() {
+        let err = read_body_input(Some("строка один\nстрока два"), false, false)
+            .expect_err("многострочный аргумент --md — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--md ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            shown.contains("--stdin"),
+            "подсказка самоисправления: {shown}"
+        );
+        assert!(shown.contains("строка один"), "начало значения: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_body_input_over_name_max_md_arg_bails_with_stdin_hint_not_name_too_long() {
+        let long = "слово ".repeat(120); // одним компонентом длиннее NAME_MAX — ENAMETOOLONG
+        let err = read_body_input(Some(long.as_str()), false, false)
+            .expect_err("имя длиннее NAME_MAX — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--md ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            shown.contains("--stdin"),
+            "подсказка самоисправления: {shown}"
+        );
+        assert!(
+            !shown.contains("os error"),
+            "File name too long не годится: {shown}"
+        );
+        assert!(
+            shown.chars().count() < 300,
+            "диагностика не тащит весь аргумент: len={}",
+            shown.chars().count()
+        );
+    }
+
+    #[test]
+    fn read_body_input_missing_md_path_keeps_honest_enoent_with_stdin_hint() {
+        let err = read_body_input(Some("/nonexistent/нет-такого-файла.md"), false, false)
+            .expect_err("нечитаемый путь — отказ");
+        let full = format!("{err:#}"); // headline + caused by
+        assert!(
+            full.contains("No such file or directory"),
+            "честная причина не маскируется: {full}"
+        );
+        assert!(
+            err.to_string().contains("--stdin"),
+            "непрерывающая подсказка сверху: {full}"
+        );
+    }
+
+    #[test]
+    fn read_body_input_valid_md_path_reads_content() {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "контент тела\n").unwrap();
+        let content = read_body_input(Some(md.path().to_str().unwrap()), false, false).unwrap();
+        assert_eq!(content, "контент тела\n");
+    }
+
+    #[test]
+    fn validate_attach_files_inline_text_bails_with_attach_hint_not_os_error() {
+        let err = validate_attach_files(&["первая строка\nвторая".into()])
+            .expect_err("многострочный аргумент --attach — это текст, не путь");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("--attach ждёт путь к файлу"),
+            "суть: {shown}"
+        );
+        assert!(shown.contains("первая строка"), "начало значения: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_base_snapshot_multiline_arg_bails_with_base_hint_not_os_error() {
+        let err = read_base_snapshot(Some("снапшот задачи\nвторая строка"))
+            .expect_err("многострочный аргумент --base — это текст, не путь");
+        let shown = err.to_string();
+        assert!(shown.contains("--base ждёт путь к файлу"), "суть: {shown}");
+        assert!(
+            !shown.contains("os error"),
+            "сырая OS-ошибка не годится: {shown}"
+        );
+    }
+
+    #[test]
+    fn read_base_snapshot_valid_path_reads_content_and_absent_is_none() {
+        let md = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(md.path(), "снапшот-контент").unwrap();
+        let snapshot = read_base_snapshot(Some(md.path().to_str().unwrap())).unwrap();
+        assert_eq!(snapshot.as_deref(), Some("снапшот-контент"));
+        assert!(read_base_snapshot(None).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4286,11 +4770,13 @@ mod tests {
         Arc<Mutex<Vec<&'static str>>>,
         Arc<Mutex<Vec<String>>>,
         Arc<Mutex<Vec<(String, String)>>>,
+        Arc<Mutex<Vec<String>>>,
     ) {
         let server = MockServer::start().await;
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let appends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let attrs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let status_writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let item_added: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let initial_title = initial_row_title.map(String::from);
 
@@ -4399,6 +4885,7 @@ mod tests {
         let order_for_mcp = order.clone();
         let item_added_for_mcp = item_added.clone();
         let initial_for_mcp = initial_title.clone();
+        let status_writes_for_mcp = status_writes.clone();
         Mock::given(method("POST"))
             .and(path("/mcp"))
             .respond_with(move |req: &wiremock::Request| {
@@ -4418,6 +4905,12 @@ mod tests {
                         *item_added_for_mcp.lock().unwrap() = true;
                         order_for_mcp.lock().unwrap().push("item_add");
                         json!({ "action": "item_add", "data": { "itemID": ROW_ID } }).to_string()
+                    } else if body.contains("\"item_update\"") {
+                        status_writes_for_mcp
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&req.body).to_string());
+                        json!({ "action": "item_update", "data": null }).to_string()
                     } else if body.contains("\"keys\"") {
                         json!({ "action": "keys",
                                 "data": { "keys": [
@@ -4485,7 +4978,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        (server, order, appends, attrs)
+        (server, order, appends, attrs, status_writes)
     }
 
     async fn create_via_cli(
@@ -4504,6 +4997,7 @@ mod tests {
                 attach: attach.to_vec(),
                 schedule: None,
                 agent: None,
+                status: None,
                 dry_run: false,
             },
         )
@@ -4513,7 +5007,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_uploads_before_creating_and_appends_refs() {
-        let (server, order, appends, _attrs) = mock_siyuan_for_create(None).await;
+        let (server, order, appends, _attrs, _status) = mock_siyuan_for_create(None).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин 1.png");
         std::fs::write(&img, b"png").unwrap();
@@ -4564,7 +5058,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_agent_writes_custom_attr() {
-        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+        let (server, _order, _appends, attrs, _status) = mock_siyuan_for_create(None).await;
 
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -4577,6 +5071,7 @@ mod tests {
                 attach: Vec::new(),
                 schedule: None,
                 agent: Some("code-quality-reviewer".into()),
+                status: None,
                 dry_run: false,
             },
         )
@@ -4599,7 +5094,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_bad_agent_rejected_before_write() {
-        let (server, _order, _appends, attrs) = mock_siyuan_for_create(None).await;
+        let (server, _order, _appends, attrs, _status) = mock_siyuan_for_create(None).await;
 
         std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
         std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
@@ -4612,6 +5107,7 @@ mod tests {
                 attach: Vec::new(),
                 schedule: None,
                 agent: Some("Not A Slug".into()),
+                status: None,
                 dry_run: false,
             },
         )
@@ -4625,10 +5121,103 @@ mod tests {
         );
     }
 
+    /// create --status Todo (крон-ран-карточки): начальный статус строки
+    /// Todo записан в клетку доски, дефолт Draft не участвует.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_status_todo_writes_todo_to_cell() {
+        let (server, _order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        task_run(
+            "uwuwu",
+            TaskSub::Create {
+                title: "⏰ ран · 2026-11-12 03:00".into(),
+                r#type: None,
+                stdin: false,
+                attach: Vec::new(),
+                schedule: None,
+                agent: None,
+                status: Some("Todo".into()),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("create --status Todo ok");
+
+        let bodies = status_writes.lock().unwrap();
+        let todos: Vec<_> = bodies
+            .iter()
+            .filter(|body| {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/params/arguments/value/mSelect/0/content")
+                            .or_else(|| v.pointer("/value/mSelect/0/content"))
+                            .and_then(|c| c.as_str())
+                            .map(String::from)
+                    })
+                    .as_deref()
+                    == Some("Todo")
+            })
+            .collect();
+        assert_eq!(
+            todos.len(),
+            1,
+            "ровно одна запись начального статуса Todo: {:#?}",
+            bodies
+        );
+    }
+
+    /// create --status вне Todo (включая Draft и пустое) — отказ ДО мутаций:
+    /// флаг строго для машинного Todo (Draft — дефолт без флага, прочие
+    /// статусы — task edit).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_with_status_other_than_todo_rejected_before_write() {
+        let (server, order, _appends, _attrs, status_writes) = mock_siyuan_for_create(None).await;
+
+        std::env::set_var("UWUWU_SIYUAN_URL", server.uri());
+        std::env::set_var("UWUWU_SIYUAN_TOKEN", "test-token");
+        for raw in ["Draft", "In Progress", ""] {
+            let err = task_run(
+                "uwuwu",
+                TaskSub::Create {
+                    title: "статус вне контракта".into(),
+                    r#type: None,
+                    stdin: false,
+                    attach: Vec::new(),
+                    schedule: None,
+                    agent: None,
+                    status: Some(raw.into()),
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect_err(&format!("--status «{raw}» — отказ"));
+
+            assert!(
+                err.to_string().contains("допустим только Todo"),
+                "суть отказа для «{raw}»: {err}"
+            );
+        }
+        assert!(
+            status_writes.lock().unwrap().is_empty(),
+            "записей нет: валидация до мутаций"
+        );
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "ни upload, ни createDoc, ни item_add — отказ строго до записей: {:?}",
+            order.lock().unwrap()
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn create_with_attach_bails_on_duplicate_title_before_any_upload() {
-        let (server, order, _appends, _attrs) = mock_siyuan_for_create(Some("новая задача")).await;
+        let (server, order, _appends, _attrs, _status) =
+            mock_siyuan_for_create(Some("новая задача")).await;
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("скрин.png");
         std::fs::write(&img, b"png").unwrap();
@@ -5396,5 +5985,172 @@ mod tests {
         );
         assert!(append_payloads(&append_bodies).is_empty());
         assert_eq!(delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ——— контракт ответов мутаций: формат ответа — юнит-ассерты ———
+
+    fn header_board() -> SyBoard {
+        SyBoard {
+            doc_id: "board-doc".into(),
+            av_id: "av-1".into(),
+            block_id: "block-1".into(),
+            hpath: "/uwuwu/Задачи uwuwu".into(),
+            notebook: "nb".into(),
+        }
+    }
+
+    fn header_task() -> crate::siyuan_task::SyTask {
+        crate::siyuan_task::SyTask {
+            item_id: "20261111111111-rowhdr".into(),
+            title: "таска".into(),
+            status: "In Progress".into(),
+            task_type: "feature".into(),
+            branch: "work/task-x".into(),
+            pr: "https://git.example/pr/1".into(),
+            dev_session: "ses-live".into(),
+            planned: "2026-11-12 09:00".into(),
+            planned_ms: 0,
+            schedule_cell: "1d".into(),
+            body_doc: Some("20261111111111-bodyh1".into()),
+        }
+    }
+
+    /// Фулл-шапка: все строки карточки, включая «Сессия dev» (контракт claim).
+    #[test]
+    fn task_header_full_shape() {
+        let header =
+            format_task_header(&header_board(), &header_task(), Some("1d"), Some("triage"));
+        for line in [
+            "Задача:   таска",
+            "Статус:   In Progress",
+            "Тип:      feature",
+            "Строка:   20261111111111-rowhdr",
+            "Доска:    /uwuwu/Задачи uwuwu",
+            "Ветка:    work/task-x",
+            "PR:       https://git.example/pr/1",
+            "Сессия dev: ses-live",
+            "Запланировано: 2026-11-12 09:00",
+            "Расписание: 1d (крон: файр в статусе Вейт)",
+        ] {
+            assert!(header.contains(line), "нет строки «{line}» в:\n{header}");
+        }
+        assert!(
+            header.contains("Агент: triage (вечная сессия крона)"),
+            "{header}"
+        );
+        // шапка — не фулл-ответ create/body: тела в ней нет
+        assert!(!header.contains("----- тело"));
+    }
+
+    /// Минимальная шапка: пустые колонки строк не порождают (паритет get).
+    #[test]
+    fn task_header_omits_empty_cells() {
+        let task = crate::siyuan_task::SyTask {
+            item_id: "20261111111111-rowmin".into(),
+            title: "минимум".into(),
+            status: "Todo".into(),
+            task_type: String::new(),
+            branch: String::new(),
+            pr: String::new(),
+            dev_session: String::new(),
+            planned: String::new(),
+            planned_ms: 0,
+            schedule_cell: String::new(),
+            body_doc: None,
+        };
+        let header = format_task_header(&header_board(), &task, None, None);
+        assert!(header.contains("Статус:   Todo"), "{header}");
+        assert!(!header.contains("Тип:"), "{header}");
+        assert!(!header.contains("Ветка:"), "{header}");
+        assert!(!header.contains("PR:"), "{header}");
+        assert!(!header.contains("Сессия dev"), "{header}");
+        assert!(!header.contains("Запланировано"), "{header}");
+        assert!(!header.contains("Расписание"), "{header}");
+        assert!(!header.contains("Агент:"), "{header}");
+    }
+
+    /// Карточка цели (контракт goal add/edit): статус/строка/тайтл/доска.
+    #[test]
+    fn goal_card_shape() {
+        let board = SyBoard {
+            doc_id: "goal-board".into(),
+            av_id: "av-goal".into(),
+            block_id: "goal-block".into(),
+            hpath: "/uwuwu/Цели uwuwu".into(),
+            notebook: "nb".into(),
+        };
+        let goal = crate::siyuan_task::SyTask {
+            item_id: "20261111111111-goal1".into(),
+            title: "цель-раз".into(),
+            status: "in progress".into(),
+            ..header_task()
+        };
+        let card = format_goal_card(&board, &goal);
+        for line in [
+            "Цель:     цель-раз",
+            "Статус:   in progress",
+            "Строка:   20261111111111-goal1",
+            "Доска:    /uwuwu/Цели uwuwu",
+        ] {
+            assert!(card.contains(line), "нет строки «{line}» в:\n{card}");
+        }
+    }
+
+    /// Шапка из факта create (ADR-067-окно): stdout сохраняет «Строка: <id>»
+    /// для потребителей (крон-ран-карточки) даже при срыве перечитывания.
+    #[test]
+    fn created_header_carries_row_id() {
+        let board = header_board();
+        let header = created_header(
+            &board,
+            "20261111230000-lagrow",
+            "лаг-ран",
+            "feature",
+            "Todo",
+        );
+        for line in [
+            "Задача:   лаг-ран",
+            "Статус:   Todo",
+            "Тип:      feature",
+            "Строка:   20261111230000-lagrow",
+            "Доска:    /uwuwu/Задачи uwuwu",
+        ] {
+            assert!(header.contains(line), "нет строки «{line}» в:\n{header}");
+        }
+        // шапка из факта create — тела в ней нет (экспорт не перечитан)
+        assert!(!header.contains("----- тело"));
+    }
+
+    /// Композиция read-after-write: reload_task перечитывает render доски и
+    /// находит строку по itemID (риг — состояние ядра после мутации).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_task_reads_rows_by_item_id() {
+        let scenario = MockScenario {
+            notebook: "nb-projects",
+            boards: vec![MockBoard {
+                doc_id: "rw-doc",
+                av_id: "av-rw",
+                keys: vec![("key-title", "Первичный ключ"), ("key-status", "Status")],
+                legacy: false,
+            }],
+            hpath_ids: vec![("/uwuwu/Задачи uwuwu", vec!["rw-doc"])],
+            rows: vec![MockRow::new("20261111111111-rerwl", "таска").with_status("Todo")],
+            ..MockScenario::default()
+        };
+        let (_kernel, server) = MockKernel::start(scenario).await;
+        set_env(&server);
+        let sy = SiYuan::from_env().unwrap();
+        let board = crate::siyuan_task::find_board(&sy, "uwuwu").await.unwrap();
+        let fresh = super::reload_task(&sy, &board, "20261111111111-rerwl")
+            .await
+            .expect("строка после мутации видна в render");
+        assert_eq!(fresh.status, "Todo");
+        assert_eq!(fresh.title, "таска");
+        // NotFound — специфичный отказ, не паника (вызывающий решает: ADR-067)
+        let err = super::reload_task(&sy, &board, "no-such-item")
+            .await
+            .expect_err("чужой itemID не резолвится");
+        assert!(err.to_string().contains("не видна в render"), "{err}");
     }
 }

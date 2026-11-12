@@ -690,6 +690,22 @@ pub fn validate_status(raw: &str) -> Result<String> {
         })
 }
 
+/// Начальный статус create: флаг строго для машинных созданий (крон-раны
+/// минтятся сразу Todo — draftLoop триажа раны не видит, жалоба 12.11).
+/// Единственное допустимое значение Todo (регистр канонизируется); Draft —
+/// дефолт без флага, прочие статусы — только через task edit (канон:
+/// Todo/Design ставят триаж и владелец). Возврат — канонная форма.
+pub fn validate_create_status(raw: Option<&str>) -> Result<&'static str> {
+    match raw {
+        None => Ok("Draft"),
+        Some(v) if v.trim().eq_ignore_ascii_case("todo") => Ok("Todo"),
+        Some(raw) => Err(anyhow!(
+            "на create --status допустим только Todo (машинные создания; Draft — дефолт без \
+             флага, прочие статусы — task edit <id> --status): получил «{raw}»"
+        )),
+    }
+}
+
 /// Разобрать «YYYY-MM-DD HH:MM[:SS]» (локальное время) в (epoch ms, строка
 /// отображения «YYYY-MM-DD HH:MM»). Секунды принимаются от демона
 /// (время файра), в клетке живут с минутной точностью — формат сравнения
@@ -839,15 +855,26 @@ pub fn create_body_md(title: &str, ty: &str, ctx: &str) -> String {
     }
 }
 
-/// Создание задачи: строка Draft + тело-саб-док (идемпотентно по заголовку).
+/// Создание задачи: строка в начальном статусе (Draft / машинное Todo) +
+/// тело-саб-док (идемпотентно по заголовку).
 pub async fn create(
     sy: &SiYuan,
     project: &str,
     title: &str,
     ty: &str,
     ctx: &str,
+    initial_status: &str,
 ) -> Result<(String, String)> {
-    create_with_pacing(sy, project, title, ty, ctx, &RowInsertPacing::production()).await
+    create_with_pacing(
+        sy,
+        project,
+        title,
+        ty,
+        ctx,
+        initial_status,
+        &RowInsertPacing::production(),
+    )
+    .await
 }
 
 /// create с инъекцией пейсинга verify-ретрая: прод ждёт лаг render перед
@@ -858,6 +885,7 @@ pub(crate) async fn create_with_pacing(
     title: &str,
     ty: &str,
     ctx: &str,
+    initial_status: &str,
     pacing: &RowInsertPacing,
 ) -> Result<(String, String)> {
     let board = find_board(sy, project).await?;
@@ -865,7 +893,7 @@ pub(crate) async fn create_with_pacing(
         sy,
         &board,
         title,
-        "Draft",
+        initial_status,
         &create_body_md(title, ty, ctx),
         Some(ty),
         pacing,
@@ -1486,7 +1514,7 @@ pub async fn comment(
     author: &str,
     text: &str,
     reply_to: Option<&str>,
-) -> Result<()> {
+) -> Result<CommentInserted> {
     let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
     let draft = CommentDraft {
         author,
@@ -1598,6 +1626,17 @@ fn is_comment_clock(time: &str) -> bool {
         })
 }
 
+/// Факт вставки коммента (контракт ответов мутаций): ответ несёт блок
+/// как записался + был ли он вставлен (дедуп-ретрай бит-в-бит дубля
+/// вставки не делает — ответ отличает «записан» от «уже был»).
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommentInserted {
+    /// Строка-маркер как записалась (автор/таймстемп/текст; реплай — с отступом).
+    pub marker: String,
+    /// false — бит-в-бит дубль уже был в теле, вставки не было.
+    pub fresh: bool,
+}
+
 /// comment с инъекцией метки времени: тесты зовут с фиксированной, прод —
 /// через comment() с текущей. Дубли узнаются бит-в-бит (author+ts+text),
 /// поэтому ts вычисляется один раз на вызов.
@@ -1607,7 +1646,7 @@ pub(crate) async fn comment_with_ts(
     task: &SyTask,
     draft: &CommentDraft<'_>,
     ts: &str,
-) -> Result<()> {
+) -> Result<CommentInserted> {
     let body = task_body_doc(sy, board, task)
         .await?
         .ok_or_else(|| anyhow!("тело задачи «{}» не найдено", task.title))?;
@@ -1618,25 +1657,41 @@ pub(crate) async fn comment_with_ts(
     } else {
         format!("\n{marker}")
     };
-    append_once_confirmed(sy, &body, &line, &marker).await
+    let fresh = append_once_confirmed(sy, &body, &line, &marker).await?;
+    Ok(CommentInserted {
+        marker: if draft.reply_to.is_some() {
+            format!("  {marker}")
+        } else {
+            marker
+        },
+        fresh,
+    })
 }
 
 /// Идемпотентный аппенд строки: один POST без слепых ретраев; до и после
 /// сбоя — контрольное чтение дока, маркер уже там → успех без повтора
 /// (слепой ретрай неидемпотентной записи при потерянном ответе плодит
 /// бит-в-бит дубли — факт ses_e729d7329ffe). Маркер матчится как подстрока:
-/// отступ реплай-строки матчу не мешает.
-async fn append_once_confirmed(sy: &SiYuan, doc_id: &str, line: &str, marker: &str) -> Result<()> {
+/// отступ реплай-строки матчу не мешает. Возврат (контракт ответов):
+/// true — вставка этим вызовом (включая потерянный ответ с приземлившимся
+/// блоком), false — маркер уже был в доке до вызова (дедуп-хит).
+async fn append_once_confirmed(
+    sy: &SiYuan,
+    doc_id: &str,
+    line: &str,
+    marker: &str,
+) -> Result<bool> {
     if doc_md_contains(sy, doc_id, marker).await? {
-        return Ok(());
+        return Ok(false);
     }
     if let Err(err) = sy.append_block_md_once(doc_id, line).await {
         if doc_md_contains(sy, doc_id, marker).await? {
-            return Ok(());
+            // маркера до вызова не было — приземлился потерянным ответом
+            return Ok(true);
         }
         return Err(err);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn doc_md_contains(sy: &SiYuan, doc_id: &str, marker: &str) -> Result<bool> {
@@ -2712,6 +2767,37 @@ mod tests {
             assert_eq!(
                 doc_h2, code_h2,
                 "рассинхрон канон-дока и body_template для {ty}: док и код — один источник"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_create_status_defaults_to_draft_without_flag() {
+        assert_eq!(validate_create_status(None).unwrap(), "Draft");
+    }
+
+    #[test]
+    fn validate_create_status_canonicalizes_todo_regardless_of_case_or_padding() {
+        for raw in ["Todo", "todo", " todo ", "tOdO"] {
+            assert_eq!(
+                validate_create_status(Some(raw)).unwrap(),
+                "Todo",
+                "канонизация «{raw}»"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_create_status_rejects_everything_but_todo() {
+        // Draft — дефолт без флага; прочие статусы — task edit (канон:
+        // Todo/Design ставят триаж и владелец). Пустое и whitespace — тоже
+        // не Todo: молчаливой канонизации в дефолт нет.
+        for raw in ["Draft", "In Progress", "Review", "", "  ", "To-Do"] {
+            let err =
+                validate_create_status(Some(raw)).expect_err(&format!("--status «{raw}» — отказ"));
+            assert!(
+                err.to_string().contains("допустим только Todo"),
+                "рецепт в отказе для «{raw}»: {err}"
             );
         }
     }
