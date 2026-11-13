@@ -22,7 +22,7 @@ pub(crate) fn reject_frontmatter(content: &str) -> Result<()> {
 }
 
 /// Первая строка входа `# <тайтл>` срезается (паритет title-H1 стрипа
-/// wiki_ops create): дубль шапки-заголовка — артефакт экспорта.
+/// прежнего write-path): дубль шапки-заголовка — артефакт экспорта.
 pub(crate) fn strip_title_h1<'a>(content: &'a str, title: &str) -> &'a str {
     let trimmed = content.trim_start_matches('\n');
     let first = trimmed.lines().next().unwrap_or("");
