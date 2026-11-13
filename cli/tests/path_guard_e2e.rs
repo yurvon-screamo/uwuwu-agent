@@ -37,6 +37,7 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
         .args(args)
         .env("UWUWU_SIYUAN_TOKEN", "dummy-path-guard-test")
         .env("UWUWU_SIYUAN_URL", "http://127.0.0.1:1")
+        .env("UWUWU_HUB_REPO", "owner/hub-guard-test")
         .output()
         .expect("spawn uwuwu-cli");
     (
