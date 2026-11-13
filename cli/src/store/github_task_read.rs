@@ -91,13 +91,17 @@ impl TaskStore for GitHubStore {
         _board: &TaskBoard,
         task: &Task,
         new_md: &str,
-        base: &str,
+        base: Option<&str>,
     ) -> StoreResult<Task> {
         let current = self.issue_body(&task.id).await?;
-        if current != base {
-            anyhow::bail!(
-                "тело изменилось с момента снапшота (--base) — перечитай task get и повтори"
-            );
+        if let Some(base) = base {
+            // хвостовые \n не различаем: печать `task body` добавляет
+            // финальный \n (println) — снапшот на байт длиннее сырого body
+            if current.trim_end_matches('\n') != base.trim_end_matches('\n') {
+                anyhow::bail!(
+                    "тело изменилось с момента снапшота (--base) — перечитай task get и повтори"
+                );
+            }
         }
         self.set_issue_body(&task.id, new_md).await?;
         Ok(self.issue_fresh(&task.id).await?)
@@ -107,21 +111,28 @@ impl TaskStore for GitHubStore {
     /// маркер, вложенности нет).
     async fn thread(&self, _board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>> {
         let number = &task.id;
-        let data = gh_json(
-            &[
-                "api",
-                "-X",
-                "GET",
-                &format!("repos/{}/issues/{number}/comments", self.repo),
-                "-F",
-                "per_page=100",
-            ],
-            None,
-        )
-        .await?;
         let mut out = Vec::new();
-        if let Some(items) = data.as_array() {
-            for c in items {
+        // page-петля: одиночный per_page=100 тихо обрезает длинные цепочки
+        let mut page = 1u32;
+        loop {
+            // query-string явно: gh -F на GET искажал выборку (тот же
+            // готч, что в list — комментарий выше)
+            let data = gh_json(
+                &[
+                    "api",
+                    &format!(
+                        "repos/{}/issues/{number}/comments?per_page=100&page={page}",
+                        self.repo
+                    ),
+                ],
+                None,
+            )
+            .await?;
+            let items = data.as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                break;
+            }
+            for c in &items {
                 out.push(ThreadEntry {
                     id: c["id"].to_string(),
                     reply_to: None,
@@ -133,6 +144,10 @@ impl TaskStore for GitHubStore {
                     text: c["body"].as_str().unwrap_or("").to_string(),
                 });
             }
+            if items.len() < 100 {
+                break;
+            }
+            page += 1;
         }
         Ok(out)
     }

@@ -32,6 +32,19 @@ fn make_board(project: &str) -> TaskBoard {
     }
 }
 
+/// Снапшот --base: штатны обе формы — печать `task body` (сырое тело)
+/// и полный `task get` (обёртка карточки «Задача:/Статус:/Строка:»).
+/// Для сверки срезаем обёртку: сравнение идёт с сырым issue body
+/// (хвостовые \n нормализует store).
+fn base_for_compare(raw: &str) -> String {
+    if raw.starts_with("Задача:") {
+        if let Some(pos) = raw.find("\n---\n") {
+            return raw[pos + 1..].trim_end_matches('\n').to_string();
+        }
+    }
+    raw.trim_end_matches('\n').to_string()
+}
+
 fn not_migrated(cmd: &str) -> Result<()> {
     bail!(
         "hub-режим: task {cmd} переносится следующим срезом коммутации \
@@ -287,13 +300,16 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     if !force && base.is_none() {
                         bail!("task body --replace требует --base (снапшот свежести) или --force");
                     }
-                    // base — содержимое снапшота (файл): защита от
-                    // параллельной правки = сверка base vs текущее тело
-                    let base_md = match &base {
-                        Some(path) => std::fs::read_to_string(path)?,
-                        None => String::new(),
+                    // Some — снапшот свежести: срез обёртки (task get) и
+                    // хвостовых \n — сравнение в измерении сырого body;
+                    // None — --force без снапшота: осознанная перезапись
+                    let base_snapshot = match &base {
+                        Some(path) => Some(base_for_compare(&std::fs::read_to_string(path)?)),
+                        None => None,
                     };
-                    store.body_replace(&board, &task, &md, &base_md).await?;
+                    store
+                        .body_replace(&board, &task, &md, base_snapshot.as_deref())
+                        .await?;
                     println!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
@@ -305,7 +321,9 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     }
                     next.push_str(&md);
                     next.push('\n');
-                    store.body_replace(&board, &task, &next, &current).await?;
+                    store
+                        .body_replace(&board, &task, &next, Some(current.as_str()))
+                        .await?;
                     println!("дописано в тело: issue #{}", task.id);
                 }
                 _ => {
@@ -327,4 +345,27 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
 /// утилита домен-нейтральна, мигрировала с store-вырезкой).
 pub fn create_body_md(title: &str, ty: &str, _ctx: &str) -> String {
     format!("# {title}\n\n\n<!-- task-type: {ty} -->\n")
+}
+
+#[cfg(test)]
+mod base_snapshot_tests {
+    use super::base_for_compare;
+
+    #[test]
+    fn task_body_print_form_stays_as_is() {
+        let raw = "---\nstatus: In Progress\n---\n\n## Раздел\n";
+        assert_eq!(
+            base_for_compare(raw),
+            "---\nstatus: In Progress\n---\n\n## Раздел"
+        );
+    }
+
+    #[test]
+    fn task_get_wrapper_stripped() {
+        let raw = "Задача:   Замена бекенда на стабильный\nСтатус:   In Progress\nСтрока:   issue #317\n\n---\nstatus: In Progress\n---\n\nТело\n";
+        assert_eq!(
+            base_for_compare(raw),
+            "---\nstatus: In Progress\n---\n\nТело"
+        );
+    }
 }

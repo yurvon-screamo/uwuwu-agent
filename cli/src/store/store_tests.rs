@@ -79,7 +79,7 @@ impl TaskStore for BareStore {
         _board: &TaskBoard,
         _task: &Task,
         _new_md: &str,
-        _base: &str,
+        _base: Option<&str>,
     ) -> Result<Task, anyhow::Error> {
         unreachable!("тест касается только default-методов")
     }

@@ -62,15 +62,16 @@ pub trait TaskStore: Send + Sync {
     /// Финальное состояние тела задачи (md).
     async fn body_get(&self, board: &TaskBoard, task: &Task) -> StoreResult<String>;
 
-    /// Полная перезапись тела. `base` — снапшот свежести (тело из get):
-    /// реализация отказывает при расхождении с текущим телом —
-    /// параллельная правка не затирается.
+    /// Полная перезапись тела. `Some(base)` — снапшот свежести (тело из
+    /// get): реализация отказывает при расхождении с текущим телом —
+    /// параллельная правка не затирается. `None` — осознанная перезапись
+    /// без снапшота (--force): сверка не производится.
     async fn body_replace(
         &self,
         board: &TaskBoard,
         task: &Task,
         new_md: &str,
-        base: &str,
+        base: Option<&str>,
     ) -> StoreResult<Task>;
 
     async fn create(&self, board: &TaskBoard, input: &CreateTask) -> Result<Task, StoreError>;
