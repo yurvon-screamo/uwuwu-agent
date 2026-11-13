@@ -80,6 +80,9 @@ pub(crate) async fn docs_append(
         }
         joined
     };
+    if addition.trim().is_empty() {
+        bail!("вход пуст — тихий no-op замаскирует сломанный пайп вызывающего");
+    }
     let doc = match store.exists(slug).await? {
         true => store.append_doc(slug, &addition).await?,
         false if force => store.create_doc(slug, &addition).await?.doc,
@@ -148,4 +151,58 @@ pub(crate) async fn search(query: &str, limit: usize, threshold: f32) -> Result<
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod docs_cmd_tests {
+    use crate::store::doc_store::{DocRef, DocStore};
+    use crate::store::github_doc_rig::{hub_env, PLAIN_DOC};
+    use serial_test::serial;
+
+    /// append --force создаёт док при отсутствии (ветка cmd-слоя, ревью
+    /// Common-2: force-ветка не покрыта).
+    #[tokio::test]
+    #[serial]
+    async fn append_force_creates_missing_doc() -> Result<(), anyhow::Error> {
+        let tmp = tempfile::TempDir::new()?;
+        hub_env(&tmp).await?;
+        let missing = "Experience/theme/по-force";
+        super::docs_append(missing, false, &["дельта через force".to_string()], true).await?;
+        let md = super::doc_store()
+            .read(&DocRef {
+                slug: missing.into(),
+            })
+            .await?;
+        assert!(md.contains("title: по-force"));
+        assert!(md.contains("дельта через force"));
+        Ok(())
+    }
+
+    /// append без --force на отсутствующем доке — громкий отказ (строгость
+    /// exists-чека не подменяется force-веткой).
+    #[tokio::test]
+    #[serial]
+    async fn append_without_force_on_missing_doc_rejects() -> Result<(), anyhow::Error> {
+        let tmp = tempfile::TempDir::new()?;
+        hub_env(&tmp).await?;
+        let missing = "Experience/theme/нет-дока";
+        let err = super::docs_append(missing, false, &["дельта".to_string()], false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("docs create"));
+        Ok(())
+    }
+
+    /// Пустой ввод append — громкий отказ, не тихий no-op (ревью Low-1).
+    #[tokio::test]
+    #[serial]
+    async fn append_empty_stdin_rejects() -> Result<(), anyhow::Error> {
+        let tmp = tempfile::TempDir::new()?;
+        hub_env(&tmp).await?;
+        let err = super::docs_append(PLAIN_DOC, true, &[], false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("вход пуст"));
+        Ok(())
+    }
 }

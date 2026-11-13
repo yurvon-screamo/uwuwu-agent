@@ -5,7 +5,7 @@
 //! клона); расхождение — громкий отказ. Задача 46.
 //! Текстовые гварды входа — github_doc_guards.rs.
 
-use super::doc_store::{DocRef, DocStore, DocWrite};
+use super::doc_store::DocWrite;
 use super::github_doc_guards::{create_bytes, create_warnings, reject_frontmatter, sha256_hex};
 use super::github_doc_store::GitHubDocStore;
 use anyhow::{bail, Result};
@@ -36,10 +36,14 @@ impl GitHubDocStore {
         reject_frontmatter(content)?;
         let warnings = create_warnings(self, slug);
         let bytes = create_bytes(&title, content);
-        self.write_doc_bytes(slug, &[(file, bytes)], &[], "create")
+        self.write_doc_bytes(slug, &[(file, bytes.clone())], &[], "create")
             .await?;
-        let doc = self.read(&DocRef { slug: slug.into() }).await?;
-        Ok(DocWrite { doc, warnings })
+        // финальный контент известен из входа — без повторного read
+        // (лишний fetch на клоне)
+        Ok(DocWrite {
+            doc: String::from_utf8_lossy(&bytes).to_string(),
+            warnings,
+        })
     }
 
     /// Дописать в конец существующего дока (дока нет → отказ).
@@ -135,9 +139,10 @@ impl GitHubDocStore {
         Ok(out)
     }
 
-    /// Существует ли док по строгому пути (без basename-фоллбека).
+    /// Существует ли док по строгому пути, по текущему клону (без
+    /// basename-фоллбека; fetch мутация делает сама — кратные
+    /// ensure_clone на команду не заводим).
     pub(crate) async fn exists(&self, slug: &str) -> Result<bool> {
-        self.ensure_clone().await?;
         Ok(self.doc_file(slug)?.exists())
     }
 }

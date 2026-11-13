@@ -201,7 +201,13 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 (false, Some(path)) => std::fs::read_to_string(path)?,
                 _ => String::new(),
             };
-            store.replace_doc(slug, &body, None).await?;
+            // create-or-replace: дока нет — create со шапкой (контракт
+            // прежней replace_doc «создать без скелета», контент как есть)
+            if store.exists(slug).await? {
+                store.replace_doc(slug, &body, None).await?;
+            } else {
+                store.create_doc(slug, &body).await?;
+            }
             println!("персона перезаписана");
             Ok(())
         }

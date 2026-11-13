@@ -4,8 +4,11 @@
 
 use crate::store::doc_store::{DocRef, DocStore};
 use crate::store::github_doc_guards::sha256_hex;
-use crate::store::github_doc_rig::{hub, rig, ADR_DOC, NEW_DOC, PLAIN_DOC};
+use crate::store::github_doc_rig::{
+    foreign_append_tail, hub, rig, setup_hub, ADR_DOC, NEW_DOC, PLAIN_DOC,
+};
 use anyhow::Result;
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn create_writes_header_and_strips_title_h1() -> Result<()> {
@@ -139,6 +142,33 @@ async fn delete_removes_doc_and_rejects_folder() -> Result<()> {
     assert!(err.to_string().contains("не найден"));
     let err = store.delete_doc("Projects/proj").await.unwrap_err();
     assert!(err.to_string().contains("папка"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_survives_foreign_push_between_reads() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let work = setup_hub(tmp.path(), "ff").await?;
+    let store = hub(&work);
+    // read агента: снапшот без чужой дельты
+    let _fresh = store
+        .read(&DocRef {
+            slug: PLAIN_DOC.into(),
+        })
+        .await?;
+    // чужой push в хвост того же файла — между read и store-вызовом
+    foreign_append_tail(
+        tmp.path(),
+        "ff",
+        "Experience/theme/plain-doc.md",
+        "чужая дельта в хвост\n",
+    )
+    .await?;
+    // append затягивает чужую дельту (ensure_clone до read) и выживает:
+    // обе дельты в файле
+    let after = store.append_doc(PLAIN_DOC, "наша дельта").await?;
+    assert!(after.contains("чужая дельта в хвост"));
+    assert!(after.ends_with("наша дельта\n"));
     Ok(())
 }
 

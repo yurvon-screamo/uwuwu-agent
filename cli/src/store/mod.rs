@@ -23,7 +23,7 @@ mod store_tests;
 #[cfg(test)]
 mod github_doc_clone_tests;
 #[cfg(test)]
-mod github_doc_rig;
+pub(crate) mod github_doc_rig;
 #[cfg(test)]
 mod github_doc_write_tests;
 
