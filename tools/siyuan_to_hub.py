@@ -472,8 +472,11 @@ def ensure_native_fields(ctx, project):
             continue
         inp = {"projectId": ctx["id"], "name": name, "dataType": dtype}
         if options:
+            # create строже update: color и description опций обязательны
+            # (не null — проба 13.11)
             inp["singleSelectOptions"] = [
-                {"name": o, "color": FIELD_COLORS.get(o, "GRAY")}
+                {"name": o, "color": FIELD_COLORS.get(o, "GRAY"),
+                 "description": f"канон: {o}"}
                 for o in options]
         m = ("mutation($inp: CreateProjectV2FieldInput!) { createProjectV2Field("
              "input: $inp) { projectV2Field { "
@@ -534,17 +537,35 @@ def project_items_map(ctx):
     return out
 
 
-def set_item_field(ctx, item_id, field_id, value, label):
-    m = ("mutation($p: ID!, $i: ID!, $f: ID!, $v: JSON!) { "
-         "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, "
-         "fieldId: $f, value: $v}) { clientMutationId } }")
+# GitHub GraphQL не имеет скаляра JSON — каждая форма value своей
+# мутацией: select → singleSelectOptionId (String), date → Date!-скаляр,
+# text → text (String)
+FIELD_MUTS = {
+    "select": ("mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { "
+               "updateProjectV2ItemFieldValue(input: {projectId: $p, "
+               "itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}})"
+               " { clientMutationId } }", "o"),
+    "date": ("mutation($p: ID!, $i: ID!, $f: ID!, $d: Date!) { "
+             "updateProjectV2ItemFieldValue(input: {projectId: $p, "
+             "itemId: $i, fieldId: $f, value: {date: $d}}) "
+             "{ clientMutationId } }", "d"),
+    "text": ("mutation($p: ID!, $i: ID!, $f: ID!, $t: String!) { "
+             "updateProjectV2ItemFieldValue(input: {projectId: $p, "
+             "itemId: $i, fieldId: $f, value: {text: $t}}) "
+             "{ clientMutationId } }", "t"),
+}
+
+
+def set_item_field(ctx, item_id, field_id, value, label, kind="select"):
+    m, var = FIELD_MUTS[kind]
     for delay in (0, 2, 4, 8):
         if delay:
             time.sleep(delay)  # свежий item виден update'у с лагом (13.11)
         try:
             gh_json(["api", "graphql", "--input", "-"], json.dumps({
                 "query": m, "variables": {
-                    "p": ctx["id"], "i": item_id, "f": field_id, "v": value}}))
+                    "p": ctx["id"], "i": item_id, "f": field_id,
+                    var: value}}))
             return True
         except RuntimeError as e:
             t = str(e)
@@ -586,11 +607,11 @@ def sync_project_fields(repo, project, number, node_id, fm):
     item_id, curf = cur["item_id"], cur["fields"]
     fields = ctx["fields"]
 
-    def want(name, value, label):
+    def want(name, value, label, kind="select"):
         if fields.get(name) and value is not None \
                 and curf.get(name) != str(value):
             if set_item_field(ctx, item_id, fields[name]["id"], value,
-                              f"#{number} {label}"):
+                              f"#{number} {label}", kind):
                 curf[name] = str(value)
 
     st = fm.get("status") or ""
@@ -602,7 +623,7 @@ def sync_project_fields(repo, project, number, node_id, fm):
         print(f"  ! #{number}: опция Status «{st}» не найдена")
     iso = date_iso(fm.get("planned"))
     if iso:
-        want("Запланировано", iso, f"Запланировано={iso}")
+        want("Запланировано", iso, f"Запланировано={iso}", kind="date")
     pr_val = (fm.get("priority") or "").strip().lower()
     pf = (fields.get("Приоритет") or {}).get("options") or {}
     if pr_val in pf:
@@ -616,7 +637,7 @@ def sync_project_fields(repo, project, number, node_id, fm):
                        ("Расписание", "schedule")):
         val = str(fm.get(key) or "").strip()
         if val:
-            want(fname, val, f"{fname}={val[:40]}")
+            want(fname, val, f"{fname}={val[:40]}", kind="text")
 
 
 # ——— вики ———
