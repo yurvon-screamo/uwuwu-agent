@@ -4,9 +4,11 @@
 
 pub mod doc_store;
 pub mod github_doc_blob;
+pub mod github_doc_guards;
 pub mod github_doc_clone;
 pub mod github_doc_search;
 pub mod github_doc_store;
+pub mod github_doc_write;
 pub mod github_gh;
 pub mod github_project;
 pub mod github_project_resolve;
@@ -20,6 +22,10 @@ pub mod task_store;
 mod store_tests;
 #[cfg(test)]
 mod github_doc_clone_tests;
+#[cfg(test)]
+mod github_doc_rig;
+#[cfg(test)]
+mod github_doc_write_tests;
 
 pub use doc_store::{DocEntry, DocStore};
 pub use task_store::{CommentInsert, CreateTask, EditTask, TaskStore, ThreadEntry};

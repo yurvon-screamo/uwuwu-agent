@@ -4,7 +4,8 @@
 //! 20261112155302-ttyp35g) — commit + push fast-forward only.
 //!
 //! Клон-менеджмент (ensure_clone/write_files) — github_doc_clone.rs;
-//! поиск — github_doc_search.rs; blob — github_doc_blob.rs.
+//! write-семейство docs — github_doc_write.rs; поиск —
+//! github_doc_search.rs; blob — github_doc_blob.rs.
 
 use super::doc_store::{BlobGet, BlobRef, DocEntry, DocRef, DocStore, FulltextHit, TitleHit};
 use super::github_doc_blob::download_attachment;
@@ -62,10 +63,12 @@ impl GitHubDocStore {
         out
     }
 
-    /// Файл дока в worktree: slug → docs/<slug>.md (без ..-ходов).
-    fn doc_file(&self, slug: &str) -> Result<PathBuf> {
+    /// Файл дока в worktree: slug → docs/<slug>.md. Строгая резолюция:
+    /// без «..», пустого слага и пустых внутренних сегментов («a//b» —
+    /// отказ, а не тихий маппинг в «a/b»).
+    pub(super) fn doc_file(&self, slug: &str) -> Result<PathBuf> {
         let safe = slug.trim_matches('/');
-        if safe.is_empty() || safe.split('/').any(|seg| seg == "..") {
+        if safe.is_empty() || safe.split('/').any(|seg| seg.is_empty() || seg == "..") {
             bail!("слаг «{slug}» небезопасен");
         }
         Ok(self.clone_root.join("docs").join(format!("{safe}.md")))
@@ -203,7 +206,8 @@ impl DocStore for GitHubDocStore {
             .with_context(|| format!("локальный файл {} не читается", local_path.display()))?;
         let key = format!("assets/{}", sanitize_asset_name(dest_name));
         let path = self.asset_file(&key)?;
-        self.write_files(&[(path, bytes)], &format!("asset: {dest_name}"))
+        self.ensure_clone().await?;
+        self.write_files(&[(path, bytes)], &[], &format!("asset: {dest_name}"))
             .await?;
         Ok(BlobRef { key })
     }

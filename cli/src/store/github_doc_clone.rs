@@ -1,7 +1,6 @@
 //! Клон-менеджмент GitHub DocStore: ленивый clone/fetch, ff-only write
 //! (commit+push, retry после rebase — контракт записи вики).
 
-use super::doc_store::DocStore;
 use super::git_util::{git_raw, git_sync_with_author};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
@@ -64,21 +63,42 @@ impl super::github_doc_store::GitHubDocStore {
         Ok(())
     }
 
-    /// Запись файлов в клон + commit + push ff-only. Конфликт push (нон-фф)
-    /// — fetch/rebase/retry единожды; повторный конфликт — громкий отказ.
+    /// Запись файлов в клон + commit + push ff-only. add — точечный по
+    /// целевым путям (чужой незакоммиченный мусор клона уехать не может —
+    /// класс инцидента b46b8fd; ensure_clone с dirty-гардом зовёт caller
+    /// ДО записи). Конфликт push (нон-фф) — fetch/rebase/retry единожды;
+    /// повторный конфликт — громкий отказ.
     pub(crate) async fn write_files(
         &self,
         files: &[(PathBuf, Vec<u8>)],
+        deleted: &[PathBuf],
         message: &str,
     ) -> Result<()> {
-        self.ensure_clone().await?;
         for (path, bytes) in files {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, bytes)?;
         }
-        git(&["-C", self.clone_root_str(), "add", "-A"]).await?;
+        for path in deleted {
+            std::fs::remove_file(path)?;
+        }
+        let mut add: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .chain(deleted.iter().map(|p| p.to_string_lossy().to_string()))
+            .collect();
+        add.sort();
+        add.dedup();
+        let mut add_args: Vec<String> = vec![
+            "-C".into(),
+            self.clone_root_str().into(),
+            "add".into(),
+            "--".into(),
+        ];
+        add_args.extend(add);
+        let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+        git_raw(&add_refs).await?;
         git_c_user(&["-C", self.clone_root_str(), "commit", "-m", message])?;
         match git_status_ok(&["-C", self.clone_root_str(), "push", "origin", "main"]).await {
             Ok(()) => Ok(()),
@@ -124,41 +144,4 @@ pub(super) fn dirs_data_home() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
         })
         .join("uwuwu-cli")
-}
-
-impl super::github_doc_store::GitHubDocStore {
-    /// Дописать в конец дока (person append): read-modify-write ff-push.
-    pub(crate) async fn append_doc(&self, slug: &str, addition: &str) -> Result<()> {
-        let current = self
-            .read(&super::doc_store::DocRef {
-                slug: slug.to_string(),
-            })
-            .await
-            .unwrap_or_default();
-        let mut next = current;
-        if !next.ends_with('\n') {
-            next.push('\n');
-        }
-        next.push_str(addition);
-        next.push('\n');
-        self.write_doc(slug_if_doc(slug), next).await
-    }
-
-    /// Перезаписать док целиком (person replace).
-    pub(crate) async fn replace_doc(&self, slug: &str, body: &str) -> Result<()> {
-        self.write_doc(slug_if_doc(slug), body.to_string()).await
-    }
-
-    async fn write_doc(&self, slug: String, content: String) -> Result<()> {
-        let file = self.clone_path().join("docs").join(format!("{slug}.md"));
-        self.write_files(
-            &[(file, content.into_bytes())],
-            &format!("wiki: {slug} (person)"),
-        )
-        .await
-    }
-}
-
-fn slug_if_doc(slug: &str) -> String {
-    slug.to_string()
 }

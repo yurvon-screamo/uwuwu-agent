@@ -50,6 +50,14 @@ pub struct TitleHit {
     pub title: String,
 }
 
+/// Результат create: финальный док (read-after-write) + warn-строки
+/// (занятый ADR-номер, первая док новой папки) — warn не отказ.
+#[derive(Clone, Debug)]
+pub struct DocWrite {
+    pub doc: String,
+    pub warnings: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait DocStore: Send + Sync {
     /// Markdown-экспорт дока по слагу (read).
@@ -73,4 +81,8 @@ pub trait DocStore: Send + Sync {
 
     /// assets/<имя> в репо — GitHub).
     async fn blob_put(&self, local_path: &std::path::Path, dest_name: &str) -> Result<BlobRef>;
+
+    // Write-семейство docs (create/append/replace/delete/tree/exists) —
+    // inherent у GitHubDocStore (github_doc_write.rs): git-write-path —
+    // специфика GitHub-бекаренда, в трейт не поднимается (задача 46).
 }
