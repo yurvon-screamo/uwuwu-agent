@@ -282,11 +282,23 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 (false, Some(path)) => Some(std::fs::read_to_string(path)?),
                 _ => None,
             };
-            // вход — контент тела: frontmatter-шапка и обёртка task get в
-            // тело не вставляются (frontmatter ведёт store, шапка — печать
-            // get; help-контракт «frontmatter-шапка — отказ») — отказ ДО мутации
+            // вход — контент тела: обёртка task get и fm-карточка в тело не
+            // вставляются (frontmatter ведёт store, шапка — печать get;
+            // help-контракт «frontmatter-шапка — отказ») — отказ ДО мутации.
+            // Append-ветка мягче: "---" первой строкой может быть легитимной
+            // линейкой контента, отказ только на полный fm-блок.
             if let Some(md) = &new_body {
-                if md.starts_with("---\n") || md.starts_with("Задача:") {
+                // полный fm-блок: "---\n" первой строкой + закрывающая "---"
+                // ниже (саму первую строку не считаем — "---\n<текст>" без
+                // закрывающей это легитимная линейка контента)
+                let full_fm_block = md.starts_with("---\n")
+                    && md
+                        .split('\n')
+                        .skip(1)
+                        .take(29)
+                        .any(|l| l.trim_end() == "---");
+                let wrap = md.starts_with("Задача:");
+                if wrap || (replace && md.starts_with("---\n")) || (!replace && full_fm_block) {
                     bail!("вход task body — контент тела: frontmatter-шапка и обёртка task get в тело не вставляются")
                 }
             }
