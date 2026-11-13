@@ -272,6 +272,13 @@ def cell_value(row, key):
             return ((v.get("block") or {}).get("content") or "", "0")
         if t == "checkbox":
             return ("✓" if v.get("checkbox") else "", "0")
+        # text/url/number хранят значение во вложенных объектах
+        # (v["text"]["content"], v["url"]["content"]) — верхнеуровневый
+        # content у них пуст (из-за этого терялись Branch/PR/Сессии)
+        for nested in ("text", "url", "number", "block"):
+            inner = v.get(nested)
+            if isinstance(inner, dict) and inner.get("content") is not None:
+                return (str(inner["content"]), "0")
         return (v.get("content") or "", "0")
     return ("", "0")
 
