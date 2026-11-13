@@ -3,6 +3,7 @@
 //! Status/Запланировано — Project v2 + frontmatter, Branch/PR/Сессия dev/
 //! Расписание — frontmatter.
 
+import { hubCloneRoot } from "./platform-hub"
 import type { GhIssue } from "./platform-hub"
 import {
   ghJson,
