@@ -275,7 +275,6 @@ describe("taskRunPrompt", () => {
     lastProcessedUpdate: 0,
     sessions: collectTaskSessions(db, ["ses_dev1"]),
     auditPath: "/audit.py",
-    wikiOpsPath: "/wiki_ops.py",
     dbPath: "/opencode.db",
   }
 
