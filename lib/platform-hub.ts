@@ -34,9 +34,12 @@ export function ghJson<T>(args: string[], stdinBody?: string): T {
 }
 
 export function hubCloneRoot(): string {
-  return process.env.UWUWU_HUB_CLONE_ROOT
+  // база + каталог репо (паритет cli from_env: клон живёт в
+  // hub-clone/<owner>__<repo>, голая база не содержит docs/)
+  const base = process.env.UWUWU_HUB_CLONE_ROOT
     ? process.env.UWUWU_HUB_CLONE_ROOT
     : `${process.env.HOME ?? "."}/.local/share/uwuwu-cli/hub-clone`
+  return `${base}/${hubRepo().replace("/", "__")}`
 }
 
 export function hubRepo(): string {
