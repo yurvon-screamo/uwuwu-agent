@@ -201,7 +201,7 @@ export function isUserComment(c: TaskComment, botUserId?: string): boolean {
 
 // ——— self-эхо wakeup-контура: маркеры, время, сесс-скопед срез (20261106032707) ———
 
-/** Автор агентских комментов CLI (sy_dispatch): обёртка «- **AGENTS** (ts): …».
+/** Автор агентских комментов CLI: обёртка «- **AGENTS** (ts): …».
  *  Автор-скопед фильтр по этой строке — ловушка (вердики ревьювера и триаж
  *  приходят тем же маркером): здесь только признак «мог быть от сессии». */
 export const AGENT_COMMENT_USER = "AGENTS"
