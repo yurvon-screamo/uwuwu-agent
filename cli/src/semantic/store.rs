@@ -4,11 +4,10 @@
 //! писатели сериализуются; upsert по block_id идемпотентен, гонка сходится
 //! к тому же состоянию (задача 20261104072044, риск «конкуренция сессий»).
 
+use super::sync::sql_literal;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
-
-use super::sync::sql_literal;
 
 const REBUILD_LOCK_KEY: &str = "rebuild_lock";
 
@@ -96,14 +95,6 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Текущий режим журнала (тест-проверка WAL-прагмы при открытии).
-    #[cfg(test)]
-    pub(crate) fn journal_mode(&self) -> Result<String> {
-        Ok(self
-            .conn
-            .query_row("pragma journal_mode", [], |r| r.get(0))?)
-    }
-
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -184,21 +175,6 @@ impl Store {
             .prepare("select value from locks where key = ?1 limit 1")?;
         let mut rows = stmt.query([REBUILD_LOCK_KEY])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn place_lock(&self, payload: &str) -> Result<()> {
-        self.conn.execute(
-            "insert into locks(key, value) values (?1, ?2)
-             on conflict(key) do update set value = excluded.value",
-            rusqlite::params![REBUILD_LOCK_KEY, payload],
-        )?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lock_payload(&self) -> Result<Option<String>> {
-        self.rebuild_lock_value()
     }
 
     /// write-транзакция на батч: короткие IMMEDIATE-серии не держат

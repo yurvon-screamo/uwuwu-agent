@@ -8,17 +8,27 @@
 //! конструктивно. Обслуживание индекса — `uwuwu-cli semantic rebuild|status`
 //! (bootstrap пустого индекса — только явной командой, не внутри поиска).
 
+pub mod hub_source;
+pub mod hub_sync;
 pub mod ollama;
 pub mod store;
 pub mod sync;
 
-use crate::siyuan::SiYuan;
+use crate::store::github_doc_store::GitHubDocStore;
 use anyhow::Result;
 use ollama::OllamaClient;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
 use store::Store;
+
+/// Hub-режим semantic-индекса: UWUWU_HUB_REPO задан → скан uwuwu-hub
+/// (docs md из git-клона + issues через gh API) вместо kernel-дельты.
+fn hub_doc_store() -> Option<GitHubDocStore> {
+    match std::env::var("UWUWU_HUB_REPO") {
+        Ok(repo) if !repo.is_empty() => Some(GitHubDocStore::from_env(repo)),
+        _ => None,
+    }
+}
 
 /// Wall-clock бюджет семантической половины одного поиска (дельта +
 /// эмбедд запроса + KNN; reconcile на поиске не ходит — см. delta_in_leftover).
@@ -89,14 +99,12 @@ pub struct SearchHalfRequest<'a> {
 /// Строки семантической секции ответа search: заголовок + выдача либо
 /// объяснение деградации (статус всегда видим в stdout). Печать — вызывающий.
 pub async fn search_half(
-    sy: &SiYuan,
     cfg: &SemanticConfig,
     query: &str,
     limit: usize,
     threshold: f32,
 ) -> Vec<String> {
     search_half_at(
-        sy,
         cfg,
         &SearchHalfRequest {
             query,
@@ -110,7 +118,6 @@ pub async fn search_half(
 
 /// Тестовый вход с явным дедлайном: остальной контракт тот же.
 pub(crate) async fn search_half_at(
-    sy: &SiYuan,
     cfg: &SemanticConfig,
     req: &SearchHalfRequest<'_>,
     deadline: Instant,
@@ -142,7 +149,7 @@ pub(crate) async fn search_half_at(
     // Дельта — в остатке бюджета: смерть бюджета или отказ дельты не
     // подменяют результаты, а становятся примечанием последней строкой
     // секции. Reconcile на поиске не ходит (delta_in_leftover).
-    let sync_note = delta_in_leftover(sy, &ollama, &mut store, deadline).await;
+    let sync_note = delta_in_leftover(&ollama, &mut store, deadline).await;
 
     let hits = match store.knn(&query_vec, req.limit, req.threshold) {
         Ok(hits) => hits,
@@ -210,22 +217,20 @@ async fn query_embedding(
 /// последней строкой секции: результаты уже посчитаны, отказ синхронизации
 /// их не подменяет (query-first, задача 20261106182055).
 async fn delta_in_leftover(
-    sy: &SiYuan,
     ollama: &OllamaClient,
     store: &mut Store,
     deadline: Instant,
 ) -> Option<String> {
     let budget_note =
         "дельта не дотянулась в остатке бюджета — очередь дотянется следующими поисками";
-    let report = match sync::delta_sync(
-        sy,
+    let doc = hub_doc_store()?;
+    let report = match hub_sync::hub_sync(
+        &doc,
         ollama,
         store,
         &sync::SyncOptions {
-            since: None,
             deadline: Some(deadline),
             embed_timeout: SEARCH_EMBED_TIMEOUT,
-            page_delay: None,
             on_batch: None,
         },
     )
@@ -288,21 +293,19 @@ pub struct RebuildReport {
 /// Advisory-лок держится весь прогон (acquire до ветки resume/clear,
 /// release на любом исходе) — параллельный rebuild громко отказывает.
 pub async fn rebuild(
-    sy: &SiYuan,
     cfg: &SemanticConfig,
     on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
     resume: bool,
 ) -> Result<RebuildReport> {
     let mut store = Store::open(&cfg.db_path)?;
     store.acquire_rebuild_lock()?;
-    let result = rebuild_index(sy, cfg, &mut store, on_batch, resume).await;
+    let result = rebuild_index(cfg, &mut store, on_batch, resume).await;
     // Крэш-лок (убитый процесс) снимается steal'ом следующего запуска.
     let _ = store.release_rebuild_lock();
     result
 }
 
 async fn rebuild_index(
-    sy: &SiYuan,
     cfg: &SemanticConfig,
     store: &mut Store,
     on_batch: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
@@ -332,13 +335,15 @@ async fn rebuild_index(
 
     let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
     let opts = sync::SyncOptions {
-        since: if resume { None } else { Some("0".to_string()) },
         deadline: None,
         embed_timeout: REBUILD_EMBED_TIMEOUT,
-        page_delay: Some(Duration::from_millis(200)),
+        // hub-скан ходит в свой git-клон и gh API — ядро не душит
         on_batch,
     };
-    let report = sync::delta_sync(sy, &ollama, store, &opts).await?;
+    let doc = hub_doc_store().ok_or_else(|| {
+        anyhow::anyhow!("semantic: UWUWU_HUB_REPO не задан — hub-источник обязателен")
+    })?;
+    let report = hub_sync::hub_sync(&doc, &ollama, store, &opts).await?;
     let now = chrono::Utc::now().timestamp();
     store.set_meta("built_at", &now.to_string())?;
     if !resume {
@@ -360,72 +365,42 @@ async fn rebuild_index(
 /// (параллельный rebuild или синк громко отказывает: сотни секунд записей
 /// без лока могли бы портить чужой свежий rebuild — watermark перескочил бы
 /// незакрытые строки). Строки отчёта — в stdout вызывающего.
-pub async fn sync_once(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
+pub async fn sync_once(cfg: &SemanticConfig) -> Result<Vec<String>> {
     if !cfg.db_path.exists() {
         anyhow::bail!("индекс пуст — {REBUILD_HINT}");
     }
     let mut store = Store::open(&cfg.db_path)?;
     index_ready(&store, cfg).map_err(anyhow::Error::msg)?;
     store.acquire_rebuild_lock()?;
-    let result = sync_once_locked(sy, cfg, &mut store).await;
+    let result = sync_once_locked(cfg, &mut store).await;
     // Крэш-лок снимается steal'ом следующего запуска (как у rebuild).
     let _ = store.release_rebuild_lock();
     result
 }
 
-async fn sync_once_locked(
-    sy: &SiYuan,
-    cfg: &SemanticConfig,
-    store: &mut Store,
-) -> Result<Vec<String>> {
+async fn sync_once_locked(cfg: &SemanticConfig, store: &mut Store) -> Result<Vec<String>> {
     let ollama = OllamaClient::new(&cfg.embed_url, &cfg.embed_model, REBUILD_EMBED_TIMEOUT)?;
     let deadline = Instant::now() + sync_budget();
-    let delta = sync::delta_sync(
-        sy,
+    let doc =
+        hub_doc_store().ok_or_else(|| anyhow::anyhow!("semantic: UWUWU_HUB_REPO не задан"))?;
+    let report = hub_sync::hub_sync(
+        &doc,
         &ollama,
         store,
         &sync::SyncOptions {
-            since: None,
             deadline: Some(deadline),
             embed_timeout: REBUILD_EMBED_TIMEOUT,
-            // пауза между страницами: дотяжка ходит по ядру страницами —
-            // не душим прод-ядро сканами (как rebuild)
-            page_delay: Some(Duration::from_millis(200)),
             on_batch: None,
         },
     )
     .await?;
-    let reconcile = sync::reconcile(
-        sy,
-        &ollama,
-        store,
-        sync::RepairBudget {
-            deadline: Some(deadline),
-            embed_timeout: REBUILD_EMBED_TIMEOUT,
-        },
-    )
-    .await?;
-    let backlog = backlog_size(sy, store).await?;
-
-    let mut lines = vec![format!(
-        "дельта: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
-        delta.embedded, delta.skipped_short, delta.pruned, delta.paths_refreshed,
-    )];
-    lines.push(if reconcile.completed {
+    let lines = vec![
         format!(
-            "reconcile: восстановлено {}, вычищено {}, путей освежено {}",
-            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-        )
-    } else {
-        format!(
-            "reconcile не дошёл (бюджет): восстановлено {}, вычищено {}, путей освежено {} — дыры ретраятся следующим sync",
-            reconcile.repaired, reconcile.pruned, reconcile.paths_refreshed,
-        )
-    });
-    if delta.budget_exhausted {
-        lines.push("бюджет дотяжки исчерпан — хвост над watermark, повтори команду".to_string());
-    }
-    lines.push(format!("очередь дельты: {backlog} строк"));
+            "hub-скан: {} чанков (коротких пропущено {}, вычищено {}, путей освежено {})",
+            report.embedded, report.skipped_short, report.pruned, report.paths_refreshed,
+        ),
+        "backlog: — (hub: полный скан дедупится содержимым, watermark нет)".to_string(),
+    ];
     Ok(lines)
 }
 
@@ -440,7 +415,7 @@ fn sync_budget() -> Duration {
 }
 
 /// Строки `uwuwu-cli semantic status`: состояние индекса и очереди дельты.
-pub async fn status(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
+pub async fn status(cfg: &SemanticConfig) -> Result<Vec<String>> {
     if !cfg.db_path.exists() {
         return Ok(vec![
             "индекс: отсутствует (пуст)".to_string(),
@@ -455,25 +430,16 @@ pub async fn status(sy: &SiYuan, cfg: &SemanticConfig) -> Result<Vec<String>> {
     let watermark = store.meta("watermark")?.unwrap_or_else(|| "—".into());
     let built_at = human_ts(store.meta("built_at")?);
     let reconciled = human_ts(store.meta("last_reconcile_at")?);
-    let backlog = backlog_size(sy, &store).await?;
-    let oversize = oversize_count(sy).await?;
     let mut lines = vec![
         format!("чанков: {count}"),
         format!("модель: {model} ({dim}-dim)"),
         format!("watermark: {watermark}"),
-        format!("built: {built_at}, reconcile: {reconciled}"),
+        format!("built: {built_at}, reconcile: {reconciled} (hub: полный скан)"),
     ];
     if let Some(hint) = reconcile_stale_hint(store.meta("last_reconcile_at")?) {
         lines.push(hint);
     }
-    lines.extend([
-        format!("очередь дельты: {backlog} строк"),
-        format!(
-            "блоков >{} симв. в корпусе: {oversize} (не индексируются)",
-            sync::MAX_CONTENT_CHARS
-        ),
-        format!("путь: {}", cfg.db_path.display()),
-    ]);
+    lines.extend([format!("путь: {}", cfg.db_path.display())]);
     Ok(lines)
 }
 
@@ -497,52 +463,4 @@ fn human_ts(raw: Option<String>) -> String {
         .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "—".into())
-}
-
-/// Тестовый вход в backlog_size (иначе приватен для semantic_tests).
-#[cfg(test)]
-pub(crate) async fn status_backlog_for_tests(sy: &SiYuan, store: &Store) -> u64 {
-    backlog_size(sy, store).await.expect("backlog")
-}
-
-/// Живая state-метрика корпуса: блоки за верхней границей длины, по целевым
-/// типам — тот же фильтр, что у индексации. Пересчёт на каждый status —
-/// overlap-перескан дельты накопительный счётчик не завышает по построению.
-async fn oversize_count(sy: &SiYuan) -> Result<u64> {
-    let stmt = format!(
-        "select count(*) as c from blocks \
-         where type in {types} and length(content) > {max} limit 1",
-        types = sync::TARGET_TYPES_SQL,
-        max = sync::MAX_CONTENT_CHARS,
-    );
-    let rows = sy.sql(&stmt).await?;
-    Ok(rows
-        .first()
-        .and_then(|r| r.get("c"))
-        .and_then(|c| c.as_i64())
-        .unwrap_or(0) as u64)
-}
-
-/// Размер очереди: строки ядра над watermark-парой (без content; явный
-/// LIMIT). Пара курсора: `updated > wu or (updated = wu и id > wi)` —
-/// хвост лавины одной секунды виден, закоммиченный префикс секунды — нет.
-async fn backlog_size(sy: &SiYuan, store: &Store) -> Result<u64> {
-    let Some(mark) = store.meta("watermark")? else {
-        return Ok(0);
-    };
-    let (mark_updated, mark_id) = sync::split_watermark(&mark);
-    let stmt = format!(
-        "select count(*) as c from blocks \
-         where type in {types} \
-         and (updated > {u} or (updated = {u} and id > {i})) limit 1",
-        types = sync::TARGET_TYPES_SQL,
-        u = sync::sql_literal(&mark_updated),
-        i = sync::sql_literal(&mark_id),
-    );
-    let rows = sy.sql(&stmt).await?;
-    Ok(rows
-        .first()
-        .and_then(|r| r.get("c"))
-        .and_then(|c| c.as_i64())
-        .unwrap_or(0) as u64)
 }

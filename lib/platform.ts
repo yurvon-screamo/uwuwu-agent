@@ -12,6 +12,8 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { collectBoardView, type BoardViewPage } from "./board-view"
+import { hubConfigured } from "./platform-hub"
+import { hubTool } from "./platform-hub-tools"
 
 const SIYUAN_URL = process.env.UWUWU_SIYUAN_URL || "http://127.0.0.1:6806"
 
@@ -33,7 +35,8 @@ function siyuanToken(): string {
 
 const TOKEN = siyuanToken()
 
-export const mcpConfigured = (): boolean => TOKEN !== ""
+export const mcpConfigured = (): boolean =>
+  (process.env.UWUWU_HUB_REPO ?? "") !== "" || TOKEN !== ""
 
 /** Ядро не ответило на транспорте (refused/DNS/таймаут/обрыв тела ответа) —
  *  отличать от «ядро ответило ошибкой»: демоны решают по классу. Прод-кейс
@@ -592,6 +595,10 @@ function commentToSnapshot(text: string): Record<string, unknown> {
 }
 
 export async function tool<T = Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> {
+  // Hub-режим (UWUWU_HUB_REPO): tool-имена уходят в gh-реализации
+  // platform-hub (срез D, задача 20261112155302-ttyp35g) — SiYuan MCP
+  // не используется.
+  if (hubConfigured()) return hubTool<T>(name, args)
   switch (name) {
     case "find_doc_by_title": {
       const title = String(args.title ?? "")

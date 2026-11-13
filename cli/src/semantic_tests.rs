@@ -1580,7 +1580,8 @@ async fn search_half_does_not_reconcile_even_when_index_has_holes() {
     drop(store);
 
     let lines =
-        crate::semantic::search_half(&sy, &cfg, "проиндексированный запрос", 10, 0.35).await;
+        crate::semantic::search_half(
+        &mock_cfg(), &cfg, "проиндексированный запрос", 10, 0.35).await;
 
     assert!(
         !lines.iter().any(|l| l.contains("reconcile")),
@@ -1627,7 +1628,8 @@ async fn search_half_reports_missing_index_with_rebuild_hint() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = config(dir.path(), "http://127.0.0.1:1");
 
-    let lines = crate::semantic::search_half(&sy, &cfg, "запрос", 10, 0.35).await;
+    let lines = crate::semantic::search_half(
+        &mock_cfg(), &cfg, "запрос", 10, 0.35).await;
 
     assert!(lines[0].starts_with("Семантический (test-model, cos ≥ 0.35):"));
     assert!(lines[1].contains("индекс пуст"));
@@ -1657,7 +1659,7 @@ async fn search_half_reports_model_mismatch() {
     tx.commit().unwrap();
 
     let lines = crate::semantic::search_half(
-        &sy,
+        &mock_cfg(),
         &config(dir.path(), "http://127.0.0.1:1"),
         "q",
         10,
@@ -1852,7 +1854,7 @@ async fn search_half_returns_results_when_sync_budget_dies() {
     drop(store);
 
     let section = crate::semantic::search_half_at(
-        &sy,
+        &mock_cfg(),
         &cfg,
         &crate::semantic::SearchHalfRequest {
             query: "важный запрос",
@@ -1888,7 +1890,7 @@ async fn search_half_bounds_query_embed_timeout_by_remaining_budget() {
 
     let started = Instant::now();
     let section = crate::semantic::search_half_at(
-        &sy,
+        &mock_cfg(),
         &cfg,
         &crate::semantic::SearchHalfRequest {
             query: "запрос",
@@ -2123,7 +2125,7 @@ async fn search_half_degrades_loudly_when_ollama_down() {
 
     // Порт 1 — connection refused, полнотекст бы ответил (ядро-мок жив).
     let lines = crate::semantic::search_half(
-        &sy,
+        &mock_cfg(),
         &config(dir.path(), "http://127.0.0.1:1"),
         "q",
         10,
@@ -2171,9 +2173,14 @@ async fn search_half_ranks_aligned_chunk_and_reports_empty_above_threshold() {
 
     // Запрос эмбеддится в [0, 2, 0] → косинус 1.0 с aligned, 0 с orthogonal.
     let (embed, _) = embed_server(vec![0.0, 2.0, 0.0]).await;
-    let lines =
-        crate::semantic::search_half(&sy, &config(dir.path(), &embed.uri()), "туннель", 10, 0.35)
-            .await;
+    let lines = crate::semantic::search_half(
+        &mock_cfg(),
+        &config(dir.path(), &embed.uri()),
+        "туннель",
+        10,
+        0.35,
+    )
+    .await;
 
     assert!(
         lines[1].starts_with("1. /rathole/туннель  (1.00)"),
@@ -2188,7 +2195,7 @@ async fn search_half_ranks_aligned_chunk_and_reports_empty_above_threshold() {
 
     let (other_embed, _) = embed_server(vec![0.0, 0.0, 2.0]).await;
     let empty = crate::semantic::search_half(
-        &sy,
+        &mock_cfg(),
         &config(dir.path(), &other_embed.uri()),
         "мимо",
         10,

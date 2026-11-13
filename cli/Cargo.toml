@@ -16,6 +16,7 @@ path = "src/lib.rs"
 # ANSI-цвета выключены глобально (default-features выключены ради фичи color): cli используется только агентами
 # (задача 20261110104429-ml41jc8) — help/ошибки монохромны и в TTY, и в пайпе.
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", features = ["json", "cookies", "multipart"] }
@@ -24,6 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+e2e-github = []
 
 [dev-dependencies]
 tempfile = "3"
