@@ -208,16 +208,3 @@ pub(super) async fn status_field_ids(project_id: &str, status: &str) -> Result<(
         .to_string();
     Ok((field_id, option_id))
 }
-
-pub(super) async fn planned_field_id(project_id: &str) -> Result<String> {
-    let data = gh_graphql(
-        "query($id: ID!) { node(id: $id) { ... on ProjectV2 {
-            field(name: \"Запланировано\") { ... on ProjectV2Field { id } } } } }",
-        &json!({ "id": project_id }),
-    )
-    .await?;
-    data.pointer("/node/field/id")
-        .and_then(|i| i.as_str())
-        .map(String::from)
-        .context("поле «Запланировано» не найдено (срез A)")
-}

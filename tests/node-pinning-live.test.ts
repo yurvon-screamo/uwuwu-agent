@@ -1,5 +1,5 @@
 // node-pinning-live.test.ts — живая граница «вики-док ↔ контракт»: реальный
-// экспорт ядра (uwuwu-cli read по kernel SiYuan) парсится parsePinningDoc.
+// вики-док (uwuwu-cli read по вики hub) парсится parsePinningDoc.
 // Гвардится env-ом ядра (skipIf, паттерн platform-pagination) — в CI ядро
 // недоступно и тест скипается. Ассерты — структурные инварианты контура
 // (singleton-строки обязательны, фабрики непустые), не точная топология:
@@ -7,17 +7,17 @@
 import { describe, expect, test } from "bun:test"
 import { parsePinningDoc } from "../lib/node-pinning"
 
-const hasWiki = (process.env.UWUWU_SIYUAN_TOKEN ?? process.env.UWUWU_SIYUAN_WS ?? "") !== ""
+const hasWiki = (process.env.UWUWU_HUB_REPO ?? "") !== ""
 
 async function readPinningDoc(): Promise<string> {
-  const proc = Bun.spawn(["uwuwu-cli", "read", "uwuwu/Node-pinning"], {
+  const proc = Bun.spawn(["uwuwu-cli", "read", "Projects/uwuwu/Node-pinning"], {
     stdout: "pipe",
     stderr: "pipe",
   })
   const out = await new Response(proc.stdout).text()
   const err = await new Response(proc.stderr).text()
   const code = await proc.exited
-  if (code !== 0) throw new Error(`uwuwu-cli read uwuwu/Node-pinning: code=${code} ${err.slice(0, 200)}`)
+  if (code !== 0) throw new Error(`uwuwu-cli read Projects/uwuwu/Node-pinning: code=${code} ${err.slice(0, 200)}`)
   return out
 }
 

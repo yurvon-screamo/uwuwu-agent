@@ -1,6 +1,6 @@
 //! Диспетчер CLI. Бекенд — uwuwu-hub (GitHub issues + Projects v2 +
-//! docs md), срез F задачи 20261112155302-ttyp35g. SiYuan-слой вырезан
-//! целиком (sy_dispatch, siyuan-*; DocsSub остался в виде Ls).
+//! docs md), срез F задачи 20261112155302-ttyp35g. легаси-слой вырезан
+//! целиком.
 
 pub(crate) mod cli;
 pub(crate) mod hub_docs;

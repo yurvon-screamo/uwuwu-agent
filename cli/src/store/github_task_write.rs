@@ -1,5 +1,5 @@
 //! GitHubStore write-side: create/edit/comment/claim/close/attrs.
-//! Хелперы-методы (единообразие с SiYuanStore: один trait-impl с
+//! Хелперы-методы (единый trait-impl с
 //! делегацией — E0119). Мутации Project v2 полей — github_project.rs.
 
 use super::github_project;
@@ -146,7 +146,7 @@ impl GitHubStore {
         reply_to: Option<&str>,
     ) -> Result<CommentInsert, StoreError> {
         // issue comments — плоский список (тредов нет): reply = цитатный
-        // маркер + текст, честный паритет SiYuan «вложенный пункт»
+        // маркер + текст, честный паритет вложенных пунктов
         let body = match reply_to {
             Some(anchor) => format!("> ответ на {anchor}\n\n{text}"),
             None => text.to_string(),

@@ -1,7 +1,6 @@
 //! uwuwu-cli: доступ агентам к платформе uwuwu. Бекенд — uwuwu-hub
 //! (приватный GitHub-репо: issues = задачи, docs/ = вики), срез замены
-//! бекенда 20261112155302-ttyp35g: SiYuan-слой вырезан полностью
-//! (история: AFFiNE → SiYuan → hub).
+//! бекенда 20261112155302-ttyp35g (история носителей: AFFiNE → hub).
 
 pub mod cmd;
 pub mod path;

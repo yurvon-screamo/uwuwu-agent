@@ -2281,7 +2281,7 @@ describe("isValidTracked: поля bodyHash/lastWakeup", () => {
   })
 })
 
-describe("parseCommentsMarkdown — секция «Комменты» (SiYuan-эмуляция list_comments)", () => {
+describe("parseCommentsMarkdown — секция «Комменты» (эмуляция list_comments)", () => {
   const MD = [
     "## Постановка", "", "- пункт тела", "",
     "## Комменты", "",

@@ -1,7 +1,6 @@
-//! CLI-маршрутизация hub-режима (срез F вырезки SiYuan, задача
+//! CLI-маршрутизация hub-режима (задача
 //! 20261112155302-ttyp35g): task/search/read/docs/semantic/projects/person/
-//! cron — через uwuwu-hub (TaskStore/DocStore + gh); SiYuan-специфичные
-//! команды (goal/shot/blob/kernel/doctor) вырезаны вместе с SiYuan-слоем.
+//! cron — через uwuwu-hub (TaskStore/DocStore + gh).
 
 use crate::cmd::cli::{Commands, SemanticSub};
 use anyhow::{bail, Result};
@@ -44,7 +43,7 @@ fn not_on_hub(command: Commands) -> Result<()> {
         Commands::Doctor { .. } => "doctor",
         _ => "команда",
     };
-    bail!("hub-режим: команда «{name}» — SiYuan-специфика выпилена (срез F). Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
+    bail!("hub-режим: команда «{name}» не поддерживается. Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
 }
 
 /// Проекты = labels `proj:*` репо hub (источник истины — инвентарь срез A).
@@ -57,7 +56,7 @@ async fn projects_hub() -> Result<()> {
 }
 
 fn gh_labels() -> Vec<String> {
-    let repo = std::env::var("UWUWU_HUB_REPO").unwrap_or_default();
+    let repo = hub_repo_default();
     let r = std::process::Command::new("gh")
         .args([
             "api",
@@ -79,7 +78,7 @@ fn gh_labels() -> Vec<String> {
 /// Вейт (мастера). Семантика унифицированных кронов (ADR-075) сохраняется.
 async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
     let crate::cmd::cli::CronSub::List { project } = command;
-    let repo = std::env::var("UWUWU_HUB_REPO").unwrap_or_default();
+    let repo = hub_repo_default();
     let labels_filter = match &project {
         Some(p) => format!("proj:{p}"),
         None => String::new(),
@@ -124,6 +123,16 @@ async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
 /// Персона = приватный md-док вики (Experience:/personal/PERSON): hub —
 /// docs/Experience/person/PERSON.md через git-клон (show) и ff-push
 /// (append/replace — контракт записи вики).
+/// Hub-репо по умолчанию: установка закреплена за yurvon-screamo/uwuwu-hub.
+/// Пустой env не роняет CLI зависаниями на пустом repo — отдаём дефолт.
+pub fn hub_repo_default() -> String {
+    // пустая строка в env == не задана: дефолт установки
+    std::env::var("UWUWU_HUB_REPO")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "yurvon-screamo/uwuwu-hub".into())
+}
+
 async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
     use crate::store::doc_store::DocStore;
     let path_guard = |value: &str| {
@@ -133,9 +142,7 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
         Ok(())
     };
     let slug = "Experience/person/PERSON";
-    let store = crate::store::github_doc_store::GitHubDocStore::from_env(
-        std::env::var("UWUWU_HUB_REPO").unwrap_or_default(),
-    );
+    let store = crate::store::github_doc_store::GitHubDocStore::from_env(hub_repo_default());
     match command {
         crate::cmd::cli::PersonSub::Show => {
             let md = store

@@ -1,12 +1,12 @@
 //! DocStore — контракт вики-домена над бекендом: md-доки по слагам,
 //! перечень детей папки, blob-операции, источники search.
 //!
-//! SiYuan: экспорт ядра (read) + kernel file (blob). GitHub: md-файлы
+//! GitHub: md-файлы
 //! docs/ репо uwuwu-hub через локальный git-клон (ленивый fetch).
 
 use anyhow::Result;
 
-/// Слаг → путь/страница (SiYuan: hpath-матч по заголовкам; GitHub: путь
+/// Слаг → путь/страница (GitHub: путь
 /// в docs/). Реализация нормализует регистр и слэши.
 #[derive(Clone, Debug)]
 pub struct DocRef {
@@ -20,14 +20,13 @@ pub struct DocEntry {
     pub is_folder: bool,
 }
 
-/// Blob: ключ = путь/референс носителя (SiYuan: assets/<name>; GitHub:
+/// Blob: ключ = путь/референс носителя (GitHub:
 /// assets/ репо или user-attachments URL).
 #[derive(Clone, Debug)]
 pub struct BlobRef {
     pub key: String,
 }
 
-/// Готч SiYuangetFile: молчаливые 200+0 байт для отсутствующего файла —
 /// реализация различает пустой ответ и честный 404, документировано в
 /// AGENTS.md (blob).
 #[derive(Debug)]
@@ -59,7 +58,7 @@ pub trait DocStore: Send + Sync {
     /// Дети папки: "Projects" → папки проектов; "Projects/<proj>" → доки.
     async fn ls(&self, path: &str) -> Result<Vec<DocEntry>>;
 
-    /// Полнотекст (SQL/серверный индекс — SiYuan; code search / grep —
+    /// Полнотекст (code search / grep —
     /// GitHub). Отказ маршрута — Err с честным текстом, не пустой вектор.
     async fn search_fulltext(&self, query: &str, top_n: usize) -> Result<Vec<FulltextHit>>;
 
@@ -72,7 +71,6 @@ pub trait DocStore: Send + Sync {
 
     async fn blob_get(&self, key: &BlobRef) -> Result<BlobGet>;
 
-    /// Загрузить файл → вернувшийся ключ (rename по path_safe на SiYuan;
     /// assets/<имя> в репо — GitHub).
     async fn blob_put(&self, local_path: &std::path::Path, dest_name: &str) -> Result<BlobRef>;
 }

@@ -1,6 +1,6 @@
 //! Backend-слой uwuwu-cli: контракты хранилища (TaskStore, DocStore) и
 //! нейтральные типы. Реализация — `github_task` (uwuwu-hub; срезы B/C
-//! задачи 20261112155302-ttyp35g); SiYuan-реализация вырезана (срез F).
+//! задачи 20261112155302-ttyp35g).
 
 pub mod doc_store;
 pub mod github_doc_blob;
@@ -30,14 +30,14 @@ pub fn task_store(repo: String) -> std::sync::Arc<dyn TaskStore> {
 
 use std::fmt;
 
-/// Доска задач проекта: нейтральный указатель (SiYuan — база/av; GitHub — label).
+/// Доска задач проекта: нейтральный указатель (GitHub — label).
 #[derive(Clone, Debug)]
 pub struct TaskBoard {
     pub project: String,
 }
 
 /// Таск-домен: тип из канона доски ("" — не задан). Валидация значений —
-/// store-реализация (SiYuan validate_task_type / GitHub issue types).
+/// store-реализация (GitHub issue types).
 #[derive(Clone, Debug)]
 pub struct TaskType(pub String);
 

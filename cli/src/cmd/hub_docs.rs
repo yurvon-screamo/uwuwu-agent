@@ -7,7 +7,7 @@ use crate::store::github_doc_store::GitHubDocStore;
 use anyhow::Result;
 
 fn doc_store() -> GitHubDocStore {
-    GitHubDocStore::from_env(std::env::var("UWUWU_HUB_REPO").unwrap_or_default())
+    GitHubDocStore::from_env(crate::cmd::run::hub_repo_default())
 }
 
 pub(crate) async fn read(slug: &str) -> Result<String> {

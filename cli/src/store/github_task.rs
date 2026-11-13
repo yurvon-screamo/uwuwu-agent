@@ -8,7 +8,7 @@
 //! после POST (и с label-фильтром, и без) — search API тем более (eventual
 //! consistency, вердикт ревью дельта-раунд 2). Немедленный ретрай после
 //! таймаута видит пусто — пауза и повторный list обязательны.
-//! Write-side операции — github_task_write.rs (единообразие с SiYuanStore).
+//! Write-side операции — github_task_write.rs (единый trait-impl).
 
 use super::task_store::StoreResult;
 use super::{Task, TaskBoard, TaskType};

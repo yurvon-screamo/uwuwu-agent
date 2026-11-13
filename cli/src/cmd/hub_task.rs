@@ -1,5 +1,5 @@
 //! Hub-ветка task-семьи (UWUWU_HUB_REPO задан): команды через TaskStore
-//! (GitHubStore). Перехват в начале task_run — SiYuan-путь мёртв в
+//! (GitHubStore). Перехват в начале task_run — легаси-путь мёртв в
 //! hub-режиме. Не-перенесённые подкоманды (rm/clean/undo/goal-семья) —
 //! громкий отказ с причиной: коммутация отдельным срезом (задача
 //! 20261112155302-ttyp35g, план срез F/B-2).
@@ -35,12 +35,12 @@ fn make_board(project: &str) -> TaskBoard {
 fn not_migrated(cmd: &str) -> Result<()> {
     bail!(
         "hub-режим: task {cmd} переносится следующим срезом коммутации \
-         (SiYuan-путь вырезан); пока — SiYuan-инстанс или ручной gh"
+         (легаси-путь вырезан); пока — ручной gh"
     )
 }
 
 pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
-    let store = task_store(std::env::var("UWUWU_HUB_REPO").unwrap_or_default());
+    let store = task_store(crate::cmd::run::hub_repo_default());
     let board = make_board(project);
     match command {
         TaskSub::List {
@@ -323,7 +323,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
     }
 }
 
-/// Шаблон тела задачи по типу (бывш. siyuan_task::create_body_md —
+/// Шаблон тела задачи по типу (тело-шаблон create —
 /// утилита домен-нейтральна, мигрировала с store-вырезкой).
 pub fn create_body_md(title: &str, ty: &str, _ctx: &str) -> String {
     format!("# {title}\n\n\n<!-- task-type: {ty} -->\n")
