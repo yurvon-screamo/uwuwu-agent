@@ -144,17 +144,19 @@ pub(super) async fn item_id_of(
 }
 
 /// Добавить issue в Project v2 (addProjectV2ItemById, contentId = issue
-/// node id). Идемпотентен: уже в проекте — no-op.
+/// node id). Идемпотентен: уже в проекте — no-op. Возвращает item id из
+/// ответа мутации (надёжнее повторного резолва: свежий item попадает в
+/// issue.projectItems с лагом — проба 13.11).
 pub(super) async fn add_issue_to_project(
     store: &GitHubStore,
     project_id: &str,
     issue_number: &str,
-) -> Result<()> {
-    if item_in_project(store, project_id, issue_number).await? {
-        return Ok(());
+) -> Result<String> {
+    if let Some((item_id, _)) = item_id_of(store, issue_number).await? {
+        return Ok(item_id);
     }
     let content_id = issue_node_id(store, issue_number).await?;
-    gh_graphql(
+    let data = gh_graphql(
         "mutation($p: ID!, $c: ID!) {
             addProjectV2ItemById(input: {projectId: $p, contentId: $c}) {
                 item { id }
@@ -163,40 +165,23 @@ pub(super) async fn add_issue_to_project(
         &json!({ "p": project_id, "c": content_id }),
     )
     .await?;
-    Ok(())
+    if let Some(item_id) = data
+        .pointer("/addProjectV2ItemById/item/id")
+        .and_then(|i| i.as_str())
+        .map(String::from)
+    {
+        return Ok(item_id);
+    }
+    // Ответ мутации без item id — резолв с паузой (лаг платформы)
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    if let Some((item_id, _)) = item_id_of(store, issue_number).await? {
+        return Ok(item_id);
+    }
+    anyhow::bail!("issue #{issue_number} не найден в Project v2 после add-item")
 }
 
 /// Item issue в проекте: issue.projectItems — прямая связь, пагинация
 /// project-стороны не нужна.
-pub(super) async fn item_in_project(
-    store: &GitHubStore,
-    project_id: &str,
-    issue_number: &str,
-) -> Result<bool> {
-    let data = gh_graphql(
-        "query($repo: String!, $owner: String!, $n: Int!) {
-            repository(name: $repo, owner: $owner) {
-                issue(number: $n) {
-                    projectItems(first: 10) {
-                        nodes { project { id } }
-                    }
-                }
-            }
-        }",
-        &(issue_ctx(store, issue_number).await),
-    )
-    .await?;
-    Ok(data
-        .pointer("/repository/issue/projectItems/nodes")
-        .and_then(|nodes| nodes.as_array())
-        .map(|a| {
-            a.iter().any(|item| {
-                item.pointer("/project/id").and_then(|x| x.as_str()) == Some(project_id)
-            })
-        })
-        .unwrap_or(false))
-}
-
 pub(super) async fn status_field_ids(project_id: &str, status: &str) -> Result<(String, String)> {
     let data = gh_graphql(
         "query($id: ID!) { node(id: $id) { ... on ProjectV2 {

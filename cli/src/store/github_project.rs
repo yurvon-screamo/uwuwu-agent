@@ -7,7 +7,7 @@
 //! Projects v2 (вид владельца).
 
 use super::github_project_resolve::{
-    add_issue_to_project, item_id_of, planned_field_id, project_for_label, status_field_ids,
+    add_issue_to_project, planned_field_id, project_for_label, status_field_ids,
 };
 use super::github_task::GitHubStore;
 use super::github_gh::gh_graphql;
@@ -28,22 +28,48 @@ pub(super) async fn set_status_and_planned(
         return Ok(());
     };
     // Item отсутствует → добавить (create-путь: issue создан POST'ом и в
-    // проекте ещё не состоит; повторный add-item идемпотентен).
-    add_issue_to_project(store, &project_id, issue_number).await?;
-    let Some((item_id, _)) = item_id_of(store, issue_number).await? else {
-        return Err(bail_missing_item(issue_number));
-    };
+    // проекте ещё не состоит; повторный add-item идемпотентен). Item id —
+    // из ответа мутации (свежий item в issue.projectItems может появиться
+    // с лагом).
+    let item_id = add_issue_to_project(store, &project_id, issue_number).await?;
     if let Some(status) = status {
         let (field_id, option_id) = status_field_ids(&project_id, status).await?;
-        gh_graphql(
-            "mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
-                updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i,
-                    fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId }
-            }",
-            &json!({ "p": project_id, "i": item_id, "f": field_id, "o": option_id }),
-        )
-        .await
-        .with_context(|| format!("Projects v2: статус «{status}» не записан"))?;
+        let mut last_err: Option<anyhow::Error> = None;
+        for delay in [0u64, 2, 4, 8] {
+            if delay > 0 {
+                // Свежедобавленный item виден для update с лагом (проба
+                // 13.11: add-ok, update NOT_FOUND до ~4s) — ретраи с бэкоффом
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            match gh_graphql(
+                "mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+                    updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i,
+                        fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId }
+                }",
+                &json!({ "p": project_id, "i": item_id, "f": field_id, "o": option_id }),
+            )
+            .await
+            {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if text.contains("Could not resolve to a node") {
+                        last_err = Some(anyhow::anyhow!(text));
+                        continue;
+                    }
+                    return Err(e)
+                        .with_context(|| format!("Projects v2: статус «{status}» не записан"));
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err).with_context(|| {
+                format!("Projects v2: статус «{status}» не записан (лаг платформы)")
+            });
+        }
     }
     if let Some(planned) = planned {
         let date = normalize_date(planned)?;
@@ -63,13 +89,6 @@ pub(super) async fn set_status_and_planned(
         .with_context(|| format!("Projects v2: «Запланировано» {date} не записано"))?;
     }
     Ok(())
-}
-
-fn bail_missing_item(issue_number: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "issue #{issue_number} не найден в Project v2 после add-item — \
-         проверь канбан владельца вручную"
-    )
 }
 
 /// «Запланировано» принимает дисплей-форму ядра (YYYY-MM-DD; хвосты до

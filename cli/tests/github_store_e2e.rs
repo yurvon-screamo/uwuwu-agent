@@ -47,21 +47,40 @@ async fn github_store_full_lifecycle_live() {
     let stamp = chrono::Utc::now().timestamp_millis();
     let title = format!("[e2e] полный цикл GitHubStore {stamp}");
 
-    let created = store
-        .create(
-            &board(),
-            &CreateTask {
-                title: title.clone(),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: Some("живой e2e: полный цикл\n\nсекция проверки".into()),
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create");
+    // create с ретраем на транзиентных ошибках Projects v2 (лаг платформы)
+    let mut created = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+        match store
+            .create(
+                &board(),
+                &CreateTask {
+                    title: title.clone(),
+                    task_type: TaskType("bug".into()),
+                    status: Some("Todo".into()),
+                    body_md: Some("живой e2e: полный цикл\n\nсекция проверки".into()),
+                    attachments: vec![],
+                    priority: None,
+                    autodone: None,
+                },
+            )
+            .await
+        {
+            Ok(task) => {
+                created = Some(task);
+                break;
+            }
+            Err(e) => {
+                let text = format!("{e:#}");
+                if !text.contains("Projects v2") {
+                    panic!("create: {text}");
+                }
+            }
+        }
+    }
+    let created = created.expect("create: попытки исчерпаны");
     assert_eq!(created.status, "Todo");
 
     tokio::time::sleep(LIST_LAG).await;
