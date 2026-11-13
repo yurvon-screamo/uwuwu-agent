@@ -40,7 +40,7 @@ fn not_migrated(cmd: &str) -> Result<()> {
 }
 
 pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
-    let store = task_store(std::env::var("UWUWU_HUB_REPO").unwrap_or_default());
+    let store = task_store(crate::cmd::run::hub_repo_default());
     let board = make_board(project);
     match command {
         TaskSub::List {

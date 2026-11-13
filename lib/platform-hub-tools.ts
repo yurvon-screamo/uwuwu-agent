@@ -236,20 +236,16 @@ export async function hubTool<T = Record<string, unknown>>(
           }
         } catch {}
       }
-      // Проектные папки в wiki-ветке Projects: data == имя проекта — там
-      // resolvePinningDoc находит док «Node-pinning»
+      // Вики-доки проектов — прямые дети pf:<proj>: resolvePinningDoc
+      // ищет док «Node-pinning» среди children папки проекта
       for (const project of projects()) {
-        const folderId = `wikiproject:${project}`
-        nodes.push({ id: folderId, type: "folder", data: project, parentId: "wiki:Projects" })
         const dirPath = `${clone}/docs/Projects/${project}`
         try {
           for (const entry of require("node:fs").readdirSync(dirPath, { withFileTypes: true })) {
             if (!entry.isFile() || !entry.name.endsWith(".md")) continue
             const base = entry.name.replace(/\.md$/, "")
             const docId = `doc:Projects/${project}/${base}`
-            // parentId == folderId проекта — resolvePinningDoc фильтрует доки
-            // по папке пиннинг-проекта
-            nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
+            nodes.push({ id: docId, type: "doc", data: docId, parentId: `pf:${project}` })
           }
         } catch {}
       }

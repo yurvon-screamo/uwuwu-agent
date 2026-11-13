@@ -24,10 +24,6 @@ impl GitHubDocStore {
 
     /// Клон по дефолту: ~/.local/share/uwuwu-cli/hub-clone/<repo-без-слэша>.
     pub fn from_env(repo: String) -> Self {
-        assert!(
-            !repo.is_empty(),
-            "UWUWU_HUB_REPO пуст — doc-хранилище без repo не резолвит клон              (пустой dir_name уводит clone_root в родителя)"
-        );
         let root = std::env::var("UWUWU_HUB_CLONE_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs_data_home().join("hub-clone"));
