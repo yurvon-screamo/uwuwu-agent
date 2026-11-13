@@ -196,10 +196,16 @@ fn body_append_preserves_frontmatter_card() {
     );
     assert_eq!(code, Some(0), "append успешен: {stderr}");
     let written = patch_body(&guards).expect("PATCH записан");
-    assert!(written.starts_with("---\n"), "fm-карточка в начале: {written}");
+    assert!(
+        written.starts_with("---\n"),
+        "fm-карточка в начале: {written}"
+    );
     assert!(written.contains("status: Todo"), "fm-поле живо: {written}");
     assert!(written.contains("# Тело"), "контент жив: {written}");
-    assert!(written.ends_with("доб-строка\n"), "addition в конце: {written}");
+    assert!(
+        written.ends_with("доб-строка\n"),
+        "addition в конце: {written}"
+    );
     assert_eq!(
         written.matches("\n---\n").count(),
         1,
