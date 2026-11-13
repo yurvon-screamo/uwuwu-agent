@@ -192,3 +192,63 @@ fn by_title_matches_and_tokens_case_insensitive() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].slug, "Задачи uwuwu/Замена бекенда");
 }
+
+/// Дефолт priority при create (задача 1052): fm-конструирование
+/// новой задачи — чистая функция write-path.
+mod create_frontmatter_tests {
+    use crate::store::github_task_write::create_frontmatter;
+
+    #[test]
+    fn create_without_priority_flag_defaults_to_medium() {
+        let out = create_frontmatter("# заголовок\n\nтело", "Todo", None, None);
+        assert!(
+            out.starts_with("---\nstatus: Todo\npriority: medium\n"),
+            "стабильный порядок + дефолт medium, got: {out}"
+        );
+        assert!(out.ends_with("# заголовок\n\nтело"));
+    }
+
+    #[test]
+    fn explicit_priority_flag_wins_over_default() {
+        let out = create_frontmatter("тело", "Draft", Some("high"), None);
+        assert!(
+            out.starts_with("---\nstatus: Draft\npriority: high\n"),
+            "got: {out}"
+        );
+        assert!(!out.contains("medium"));
+    }
+
+    #[test]
+    fn authored_priority_in_body_frontmatter_survives() {
+        let body = "---\npriority: low\n---\nтело с авторским fm";
+        let out = create_frontmatter(body, "Todo", None, None);
+        assert!(out.contains("priority: low"), "got: {out}");
+        assert!(
+            !out.contains("medium"),
+            "дефолт не подставляется поверх авторского"
+        );
+        assert!(out.contains("status: Todo"));
+    }
+
+    #[test]
+    fn explicit_flag_overrides_authored_frontmatter_field() {
+        let body = "---\npriority: low\n---\nrest";
+        let out = create_frontmatter(body, "Todo", Some("high"), None);
+        assert!(out.contains("priority: high"), "got: {out}");
+        assert!(!out.contains("priority: low"));
+    }
+
+    #[test]
+    fn autodone_cell_keeps_bool_parity_and_order() {
+        let out = create_frontmatter("тело", "Draft", Some("low"), Some(true));
+        assert!(
+            out.starts_with("---\nstatus: Draft\npriority: low\nautodone: true\n"),
+            "got: {out}"
+        );
+        let off = create_frontmatter("тело", "Draft", None, Some(false));
+        assert!(
+            off.starts_with("---\nstatus: Draft\npriority: medium\nautodone: false\n"),
+            "got: {off}"
+        );
+    }
+}

@@ -159,3 +159,115 @@ async fn github_store_create_duplicate_is_loud() {
         .expect_err("дубль должен отказать");
     assert!(format!("{err}").contains("дубль"));
 }
+
+/// fm-поля тела задачи: ручная вычитка frontmatter-блока (тестовый
+/// crate не видит pub(crate)-парсер стора, regex запрещён).
+fn fm_field(body: &str, key: &str) -> Option<String> {
+    let after_open = body.strip_prefix("---\n")?;
+    let end = after_open.find("\n---\n")?;
+    for line in after_open[..end].lines() {
+        if let Some((k, v)) = line.split_once(": ") {
+            if k.trim() == key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Контракт priority при create (дефолт medium — решение владельца
+/// 13.11): create без флага рождает fm `priority: medium`; явный флаг
+/// перекрывает; авторский `priority` во fm тела (--stdin) перекрыт не
+/// бывает. Уборка проб — close (канон рига).
+#[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
+async fn github_store_create_priority_contract_live() {
+    let store = sandbox();
+    let board = board();
+    let stamp = chrono::Utc::now().timestamp_millis();
+
+    // Act: три создания — дефолт, явный high, авторский priority в fm тела
+    let defaulted = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] priority дефолт {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: None,
+                attachments: vec![],
+                priority: None,
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create без флага");
+    let explicit = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] priority high {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: None,
+                attachments: vec![],
+                priority: Some("high".into()),
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create с high");
+    let authored = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] priority в fm тела {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: Some("---\npriority: low\n---\nтело с авторским fm".into()),
+                attachments: vec![],
+                priority: None,
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create с авторским fm");
+
+    // Assert: fm каждого из трёх
+    let default_body = store
+        .body_get(&board, &defaulted)
+        .await
+        .expect("body_get дефолт");
+    let explicit_body = store
+        .body_get(&board, &explicit)
+        .await
+        .expect("body_get high");
+    let authored_body = store
+        .body_get(&board, &authored)
+        .await
+        .expect("body_get авторский");
+    assert_eq!(
+        fm_field(&default_body, "priority").as_deref(),
+        Some("medium"),
+        "create без флага: fm обязан нести priority: medium"
+    );
+    assert_eq!(
+        fm_field(&explicit_body, "priority").as_deref(),
+        Some("high"),
+        "явный --priority перекрывает дефолт"
+    );
+    assert_eq!(
+        fm_field(&authored_body, "priority").as_deref(),
+        Some("low"),
+        "авторский priority во fm тела перекрыт дефолтом не бывает"
+    );
+
+    // Уборка: пробы не копятся (close — канон рига)
+    for task in [&defaulted, &explicit, &authored] {
+        let closed = store
+            .close(&board, task, Some("e2e priority-контракт"))
+            .await
+            .expect("close пробы");
+        assert_eq!(closed.status, "Done");
+    }
+}
