@@ -207,14 +207,16 @@ function githubTypeName(issue: unknown, fallback: string | undefined): string {
 }
 
 function projects(): string[] {
-  const data = ghJson<unknown[]>([ "api", `repos/${hubRepo()}/labels`, "-F", "per_page=100" ])
-  const arr = (Array.isArray(data) ? data : []) as Array<{ name?: string }>
+  const repo = hubRepo()
+  const data = ghJson<unknown[]>([
+    "api", "-X", "GET", `repos/${repo}/labels?per_page=100`,
+  ])
+  const arr = Array.isArray(data) ? data : []
   return arr
-    .map((l) => String(l.name))
+    .map((l) => String((l as { name?: string }).name))
     .filter((n) => n.startsWith("proj:"))
     .map((n) => n.slice("proj:".length))
 }
-
 function mdClonePath(slug: string): string {
   const root = process.env.UWUWU_HUB_CLONE_ROOT
     ? process.env.UWUWU_HUB_CLONE_ROOT
