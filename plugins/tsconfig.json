@@ -22,6 +22,11 @@
     "../tests/goal-mode.test.ts",
     "qlty-review.ts",
     "../lib/qlty-review.ts",
-    "../lib/qlty-review.test.ts"
+    "../lib/qlty-review.test.ts",
+    "screen-review.ts",
+    "../lib/screen-review.ts",
+    "../lib/screen-review-core.ts",
+    "../lib/screen-review-render.ts",
+    "../lib/screen-review.test.ts"
   ]
 }
