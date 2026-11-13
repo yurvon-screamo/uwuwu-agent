@@ -247,6 +247,8 @@ export async function hubTool<T = Record<string, unknown>>(
             if (!entry.isFile() || !entry.name.endsWith(".md")) continue
             const base = entry.name.replace(/\.md$/, "")
             const docId = `doc:Projects/${project}/${base}`
+            // parentId == folderId проекта — resolvePinningDoc фильтрует доки
+            // по папке пиннинг-проекта
             nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
           }
         } catch {}
