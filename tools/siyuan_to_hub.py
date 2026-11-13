@@ -317,8 +317,10 @@ def strip_comments_section(md):
 
 
 def asset_names(md):
-    """Имена файлов, на которые ссылается тело (assets/<file>)."""
-    return sorted(set(re.findall(r"assets/([A-Za-z0-9._\-]+)", str(md or ""))))
+    """Имена файлов-ассетов в теле: только с расширением (assets/foo.png),
+    текстовые «assets/inline» не ассеты."""
+    return sorted({n for n in re.findall(r"assets/([A-Za-z0-9._\-]+)", str(md or ""))
+                   if "." in n})
 
 
 def rewrite_asset_links(md, repo):
@@ -809,12 +811,9 @@ def sync_project_fields(repo, project, number, node_id, fm):
     ad = "on" if fm.get("autodone") == "true" else "off"
     if ad in adf:
         want("Autodone", ad, adf[ad], f"Autodone={ad}")
-    for fname, key in (("Branch", "branch"), ("PR", "pr"),
-                       ("Сессия dev", "dev-session"),
-                       ("Расписание", "schedule")):
-        val = str(fm.get(key) or "").strip()
-        if val:
-            want(fname, val, val, f"{fname}={val[:40]}", kind="text")
+    # Branch/PR/Сессии/Расписание/Приоритет/Autodone/Запланировано —
+    # глобальные issue fields (sync_issue_fields выше); проектные колонки
+    # с теми же именами бэкаются issue fields и project-мутацией не пишутся
 
 
 # ——— вики ———
