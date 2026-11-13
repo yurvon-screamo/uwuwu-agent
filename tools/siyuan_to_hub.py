@@ -136,7 +136,7 @@ def render_board(doc_id):
     while True:
         req = urllib.request.Request(SIYUAN_URL + "/api/riff/render",
             data=json.dumps({"id": doc_id, "page": page}).encode(),
-            headers={"Authorization": f"Token {SIY_TOKEN}", "Content-Type": "application/json"})
+            headers={"Authorization": f"Token {SIYUAN_TOKEN}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as r:
             d = json.load(r)
         data = d.get("data") or {}
