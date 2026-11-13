@@ -52,12 +52,25 @@ def gh(args, stdin=None):
     if stdin is not None:
         # gh api без --input - игнорирует stdin: тело мутации молча терялось
         full += ["--input", "-"]
-    r = subprocess.run(["gh"] + full, input=stdin, capture_output=True, text=True)
-    if r.returncode != 0:
-        with open("/home/yurvon/agents-env/20261112155302-ttyp35g/scratch/failed-payload.json", "w") as f:
-            f.write(stdin or "")
-        raise RuntimeError(f"gh {' '.join(args[:3])}: {r.stderr[:300]} (полный payload → scratch/failed-payload.json)")
-    return r.stdout
+    delays = [0, 10, 30, 60, 120]
+    r = None
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        r = subprocess.run(["gh"] + full, input=stdin, capture_output=True, text=True)
+        err = r.stderr[:300]
+        transient = ("secondary rate limit" in err.lower()
+                     or "temporarily blocked" in err.lower()
+                     or "something went wrong" in err.lower()
+                     or "abuse detection" in err.lower())
+        if r.returncode == 0:
+            return r.stdout
+        if not transient or attempt == len(delays) - 1:
+            with open("/home/yurvon/agents-env/20261112155302-ttyp35g/scratch/failed-payload.json", "w") as f:
+                f.write(stdin or "")
+            raise RuntimeError(f"gh {' '.join(full[:3])}: {err}")
+        print(f"  ! transient (попытка {attempt+1}): {err[:120]} — retry {delay}s")
+    raise RuntimeError("gh: исчерпаны ретраи")
 
 
 def gh_json(args, stdin=None):
