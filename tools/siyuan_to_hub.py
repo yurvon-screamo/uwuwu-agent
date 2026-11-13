@@ -366,8 +366,7 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
             # «мигрировали» только в fm тела)
             want_closed = status == "Done"
             is_closed = issue.get("state") == "closed"
-            sync_project_fields(repo, project, num, issue.get("node_id", ""),
-                                status, planned, want_closed)
+            sync_project_fields(repo, project, num, issue.get("node_id", ""), fm)
             if want_closed != is_closed:
                 gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{num}"],
                    json.dumps({"state": "closed" if want_closed else "open",
@@ -386,8 +385,7 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     created = gh_json_retry(["api", "-X", "POST", f"repos/{repo}/issues"],
                             json.dumps(payload))
     number, node_id = created["number"], created.get("node_id", "")
-    sync_project_fields(repo, project, number, node_id, status, planned,
-                        status == "Done")
+    sync_project_fields(repo, project, number, node_id, fm)
     if status == "Done":
         gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{number}"],
            json.dumps({"state": "closed", "state_reason": "completed"}))
@@ -413,8 +411,28 @@ def date_iso(raw):
     return ""
 
 
+# Нативные поля канбана Project v2 (канон срез A + кастомные под колонки
+# SiYuan-доски): статус канбана — поле, не тело. fm в теле остаётся только
+# зеркалом для CLI-чтения (контракт GitHubStore).
+NATIVE_FIELDS = [
+    ("Status", "SINGLE_SELECT",
+     ["Draft", "Todo", "Design", "Ревью плана", "In Progress",
+      "Ревью результата", "Review", "Done", "Needs attention", "Вейт"]),
+    ("Запланировано", "DATE", None),
+    ("Приоритет", "SINGLE_SELECT", ["high", "medium", "low"]),
+    ("Autodone", "SINGLE_SELECT", ["on", "off"]),
+    ("Branch", "TEXT", None),
+    ("PR", "TEXT", None),
+    ("Сессия dev", "TEXT", None),
+    ("Расписание", "TEXT", None),
+]
+
+FIELD_COLORS = {"high": "RED", "medium": "YELLOW", "low": "GRAY",
+                "on": "GREEN", "off": "GRAY"}
+
+
 def project_ctx(project):
-    """id проекта + Status-field + опции + Запланировано (кэш на прогон)."""
+    """id проекта + все поля (имя → {id, options}) — кэш на прогон."""
     if project in PROJECT_CACHE:
         return PROJECT_CACHE[project]
     d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
@@ -428,105 +446,177 @@ def project_ctx(project):
         PROJECT_CACHE[project] = None
         return None
     q = ('query($id: ID!) { node(id: $id) { ... on ProjectV2 { '
-         'statusField: field(name: "Status") { ... on ProjectV2SingleSelectField '
-         '{ id options { id name } } } '
-         'planned: field(name: "Запланировано") { ... on ProjectV2Field { id } } '
-         '} } }')
+         'fields(first: 40) { nodes { '
+         '... on ProjectV2Field { id name } '
+         '... on ProjectV2SingleSelectField { id name options { id name } } '
+         '} } } } }')
     d2 = gh_json(["api", "graphql", "--input", "-"], json.dumps(
         {"query": q, "variables": {"id": pid}}))
-    node = d2["data"]["node"] or {}
-    ctx = {"id": pid, "status_field": node.get("statusField"),
-           "planned_field": node.get("planned")}
+    fields = {}
+    for f in ((d2["data"]["node"] or {}).get("fields") or {}).get("nodes") or []:
+        fields[f["name"]] = {"id": f["id"],
+                             "options": {o["name"]: o["id"]
+                                         for o in f.get("options") or []}}
+    ctx = {"id": pid, "fields": fields}
     PROJECT_CACHE[project] = ctx
     return ctx
 
 
-def issue_item_id(repo, number):
-    """projectItems issue (паритет item_id_of CLI): без пагинации
-    project-стороны — issue входит в 1–2 проекта."""
-    owner, name = repo.split("/", 1)
-    q = ('query($owner: String!, $name: String!, $n: Int!) { '
-         'repository(owner: $owner, name: $name) { issue(number: $n) { '
-         'projectItems(first: 10) { nodes { id project { id } } } } } }')
-    d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
-        "query": q,
-        "variables": {"owner": owner, "name": name, "n": int(number)}}))
-    repo_data = ((d.get("data") or {}).get("repository") or {})
-    return ((((repo_data.get("issue") or {}).get("projectItems") or {})
-             .get("nodes")) or [])
+def ensure_native_fields(ctx, project):
+    """Поля канона, которых нет в проекте, — создаём (Status/Запланировано
+    уже залиты срезом A; Приоритет/Autodone/Branch/PR/Сессия dev/Расписание
+    добираются первым прогоном мигратора)."""
+    fields = ctx["fields"]
+    for name, dtype, options in NATIVE_FIELDS:
+        if name in fields:
+            continue
+        inp = {"projectId": ctx["id"], "name": name, "dataType": dtype}
+        if options:
+            inp["singleSelectOptions"] = [
+                {"name": o, "color": FIELD_COLORS.get(o, "GRAY")}
+                for o in options]
+        m = ("mutation($inp: CreateProjectV2FieldInput!) { createProjectV2Field("
+             "input: $inp) { projectV2Field { "
+             "... on ProjectV2Field { id name } "
+             "... on ProjectV2SingleSelectField { id name options { id name } } "
+             "} } }")
+        try:
+            d = gh_json(["api", "graphql", "--input", "-"], json.dumps(
+                {"query": m, "variables": {"inp": inp}}))
+            f = d["data"]["createProjectV2Field"]["projectV2Field"]
+            fields[name] = {"id": f["id"], "options": {
+                o["name"]: o["id"] for o in f.get("options") or []}}
+            print(f"  поле «{name}» создано в «Задачи {project}»")
+        except RuntimeError as e:
+            print(f"  ! поле «{name}» ({project}): {str(e)[:120]}")
 
 
-def sync_project_fields(repo, project, number, node_id, status, planned, closed):
-    """Status + Запланировано в Project v2 + state issue (Done↔closed).
-    Item id — из issue.projectItems либо ответа addProjectV2ItemById
-    (свежий item виден с лагом — ретраи 0/2/4/8/15s, проба 13.11)."""
+def project_items_map(ctx):
+    """Все items проекта: number → {item_id, fields{name → value}}.
+    Пагинация first:100/after (uwuwu-доска > 700 items). Кэш в ctx —
+    дифф-запись: пишем только расхождения, повторные прогоны дёшевы."""
+    if "items" in ctx:
+        return ctx["items"]
+    out, after = {}, None
+    while True:
+        q = ('query($id: ID!, $after: String) { node(id: $id) { '
+             '... on ProjectV2 { items(first: 100, after: $after) { '
+             'pageInfo { hasNextPage endCursor } nodes { id '
+             'content { ... on Issue { number } } '
+             'fieldValues(first: 20) { nodes { '
+             '... on ProjectV2ItemFieldSingleSelectValue { name '
+             'field { ... on ProjectV2Field { name } } } '
+             '... on ProjectV2ItemFieldDateValue { date '
+             'field { ... on ProjectV2Field { name } } } '
+             '... on ProjectV2ItemFieldTextValue { text '
+             'field { ... on ProjectV2Field { name } } } '
+             '} } } } } } }')
+        d = gh_json(["api", "graphql", "--input", "-"], json.dumps(
+            {"query": q, "variables": {"id": ctx["id"], "after": after}}))
+        conn = ((d["data"]["node"] or {}).get("items")) or {}
+        for it in conn.get("nodes") or []:
+            num = ((it.get("content") or {}).get("number"))
+            if num is None:
+                continue
+            fv = {}
+            for f in it.get("fieldValues", {}).get("nodes") or []:
+                fname = ((f.get("field") or {}).get("name"))
+                val = f.get("name") or f.get("date") or f.get("text")
+                if fname and val is not None:
+                    fv[fname] = str(val)
+            out[num] = {"item_id": it["id"], "fields": fv}
+        info = conn.get("pageInfo") or {}
+        if info.get("hasNextPage"):
+            after = info.get("endCursor")
+        else:
+            break
+    ctx["items"] = out
+    return out
+
+
+def set_item_field(ctx, item_id, field_id, value, label):
+    m = ("mutation($p: ID!, $i: ID!, $f: ID!, $v: JSON!) { "
+         "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, "
+         "fieldId: $f, value: $v}) { clientMutationId } }")
+    for delay in (0, 2, 4, 8):
+        if delay:
+            time.sleep(delay)  # свежий item виден update'у с лагом (13.11)
+        try:
+            gh_json(["api", "graphql", "--input", "-"], json.dumps({
+                "query": m, "variables": {
+                    "p": ctx["id"], "i": item_id, "f": field_id, "v": value}}))
+            return True
+        except RuntimeError as e:
+            t = str(e)
+            if ("Could not resolve to a node" in t
+                    or "was provided invalid value" in t):
+                continue
+            print(f"  ! {label}: {t[:140]}")
+            return False
+    print(f"  ! {label}: item не принял запись после ретраев (лаг платформы)")
+    return False
+
+
+def sync_project_fields(repo, project, number, node_id, fm):
+    """Все нативные поля канбана из fm: Status/Приоритет/Autodone (select),
+    Запланировано (date), Branch/PR/Сессия dev/Расписание (text).
+    Item — из карты проекта; нет → addProjectV2ItemById (идемпотентно)."""
     ctx = project_ctx(project)
     if not ctx:
         return
-    item_id = None
-    for delay in (0, 2, 4, 8, 15):
-        if delay:
-            time.sleep(delay)
-        for n in issue_item_id(repo, number):
-            if (n.get("project") or {}).get("id") == ctx["id"]:
-                item_id = n["id"]
-                break
-        if item_id:
-            break
+    ensure_native_fields(ctx, project)
+    items = project_items_map(ctx)
+    cur = items.get(int(number))
+    if cur is None:
         m = ("mutation($p: ID!, $c: ID!) { addProjectV2ItemById(input: "
              "{projectId: $p, contentId: $c}) { item { id } } }")
+        got = None
         try:
             d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
                 "query": m, "variables": {"p": ctx["id"], "c": node_id}}))
-            item_id = ((((d.get("data") or {}).get("addProjectV2ItemById")
-                         or {}).get("item") or {}).get("id"))
-            if item_id:
-                break
+            got = ((((d.get("data") or {}).get("addProjectV2ItemById")
+                     or {}).get("item") or {}).get("id"))
         except RuntimeError as e:
             print(f"  ! add-item #{number}: {str(e)[:120]}")
-    if not item_id:
-        print(f"  ! #{number}: item в Project v2 не резолвится после ретраев")
-        return
-    sf = ctx.get("status_field")
-    if sf and status:
-        opt = next((o["id"] for o in sf.get("options") or []
-                    if o["name"] == status), None)
-        if opt:
-            m = ("mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { "
-                 "updateProjectV2ItemFieldValue(input: {projectId: $p, "
-                 "itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}})"
-                 " { clientMutationId } }")
-            for delay in (0, 2, 4, 8):
-                if delay:
-                    time.sleep(delay)
-                try:
-                    gh(["api", "graphql", "--input", "-"], json.dumps({
-                        "query": m,
-                        "variables": {"p": ctx["id"], "i": item_id,
-                                      "f": sf["id"], "o": opt}}))
-                    break
-                except RuntimeError as e:
-                    t = str(e)
-                    if ("Could not resolve to a node" in t
-                            or "was provided invalid value" in t):
-                        continue  # лаг платформы — ретрай
-                    print(f"  ! status «{status}» #{number}: {t[:120]}")
-                    break
-        else:
-            print(f"  ! #{number}: опция Status «{status}» не найдена")
-    pf = ctx.get("planned_field")
-    iso = date_iso(planned)
-    if pf and iso:
-        m = ("mutation($p: ID!, $i: ID!, $f: ID!, $d: JSON) { "
-             "updateProjectV2ItemFieldValue(input: {projectId: $p, "
-             "itemId: $i, fieldId: $f, value: {date: $d}}) "
-             "{ clientMutationId } }")
-        try:
-            gh(["api", "graphql", "--input", "-"], json.dumps({
-                "query": m, "variables": {"p": ctx["id"], "i": item_id,
-                                          "f": pf["id"], "d": iso}}))
-        except RuntimeError as e:
-            print(f"  ! запланировано #{number}: {str(e)[:120]}")
+        if not got:
+            print(f"  ! #{number}: item в Project v2 не создан")
+            return
+        cur = {"item_id": got, "fields": {}}
+        items[int(number)] = cur
+    item_id, curf = cur["item_id"], cur["fields"]
+    fields = ctx["fields"]
+
+    def want(name, value, label):
+        if fields.get(name) and value is not None \
+                and curf.get(name) != str(value):
+            if set_item_field(ctx, item_id, fields[name]["id"], value,
+                              f"#{number} {label}"):
+                curf[name] = str(value)
+
+    st = fm.get("status") or ""
+    sf = fields.get("Status") or {}
+    opt = (sf.get("options") or {}).get(st)
+    if st and opt:
+        want("Status", st, f"Status={st}")
+    elif st and not opt:
+        print(f"  ! #{number}: опция Status «{st}» не найдена")
+    iso = date_iso(fm.get("planned"))
+    if iso:
+        want("Запланировано", iso, f"Запланировано={iso}")
+    pr_val = (fm.get("priority") or "").strip().lower()
+    pf = (fields.get("Приоритет") or {}).get("options") or {}
+    if pr_val in pf:
+        want("Приоритет", pr_val, f"Приоритет={pr_val}")
+    adf = (fields.get("Autodone") or {}).get("options") or {}
+    ad = "on" if fm.get("autodone") == "true" else "off"
+    if ad in adf:
+        want("Autodone", ad, f"Autodone={ad}")
+    for fname, key in (("Branch", "branch"), ("PR", "pr"),
+                       ("Сессия dev", "dev-session"),
+                       ("Расписание", "schedule")):
+        val = str(fm.get(key) or "").strip()
+        if val:
+            want(fname, val, f"{fname}={val[:40]}")
 
 
 # ——— вики ———
