@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -289,6 +290,71 @@ def row_body_md(doc_id, token_cache):
     return md
 
 
+def strip_comments_section(md):
+    """«## Комменты» уезжает в issue comments — из тела секция вычищается
+    (иначе двойное представление: тело + комментарии)."""
+    lines = md.splitlines()
+    out, in_c, fenced = [], False, False
+    for line in lines:
+        if line.strip().startswith("```") or line.strip().startswith("~~~"):
+            fenced = not fenced
+        if not fenced and line.strip() == "## Комменты":
+            in_c = True
+            continue
+        if in_c and not fenced and line.startswith("## "):
+            in_c = False
+        if in_c:
+            continue
+        out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def asset_names(md):
+    """Имена файлов, на которые ссылается тело (assets/<file>)."""
+    return sorted(set(re.findall(r"assets/([A-Za-z0-9._\-]+)", str(md or ""))))
+
+
+def rewrite_asset_links(md, repo):
+    """GitHub issue md не резолвит repo-relative пути → абсолютный raw URL."""
+    return re.sub(r"\]\(assets/([A-Za-z0-9._\-]+)\)",
+                  f"](https://github.com/{repo}/raw/main/assets/\\1)",
+                  str(md or ""))
+
+
+COLLECTED_ASSETS = set()
+
+
+def push_assets(repo, clone_root, names):
+    """Файлы тел из воркспейса SiYuan → assets/ репо hub (git push,
+    не API: без rate limits)."""
+    ws = os.environ.get("UWUWU_SIYUAN_WS", "")
+    src = os.path.join(ws, "data", "assets") if ws else ""
+    rd = os.path.join(clone_root, repo.replace("/", "__"))
+    dest = os.path.join(rd, "assets")
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for name in sorted(names):
+        src_f = os.path.join(src, name) if src else ""
+        if not src_f or not os.path.isfile(src_f):
+            print(f"  ! ассет не найден в SiYuan: {name}")
+            continue
+        dst_f = os.path.join(dest, name)
+        if not os.path.exists(dst_f):
+            shutil.copy2(src_f, dst_f)
+            copied += 1
+    if not copied:
+        return
+    subprocess.run(["git", "-C", rd, "add", "assets"],
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", rd, "-c", "user.name=AGENTS",
+                    "-c", "user.email=agents@uwuwu.net", "commit",
+                    "-m", "assets: файлы тел задач из SiYuan"],
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", rd, "push", "origin", "main"],
+                   capture_output=True, text=True)
+    print(f"assets: {copied} файлов залито в репо")
+
+
 def comments_of(md):
     """Секция «## Комменты» тела: маркерные строки → плоский список."""
     lines = md.splitlines()
@@ -344,12 +410,21 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     if schedule: fm["schedule"] = schedule
     if priority: fm["priority"] = priority
     if autodone: fm["autodone"] = autodone
+    body_md = strip_comments_section(body_md)
     body_full = "---\n" + "".join(f"{k}: {v}\n" for k, v in fm.items()) \
         + "---\n" + body_md
-    existing = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
-                        "-f", f"labels=proj:{project}", "-F", "state=all",
-                        "-F", "per_page=100"])
-    for issue in existing if isinstance(existing, list) else []:
+    existing, page = [], 1
+    while True:
+        chunk = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
+                         "-f", f"labels=proj:{project}", "-F", "state=all",
+                         "-F", "per_page=100", "-F", f"page={page}"])
+        if not isinstance(chunk, list) or not chunk:
+            break
+        existing.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    for issue in existing:
         if str(issue.get("title", "")).lower() == safe_title.lower():
             num = issue["number"]
             # тело из SiYuan — источник истины миграции: дополняем, если
@@ -363,6 +438,19 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
             else:
                 print(f"  дубль: «{title}» → #{num} (skip)")
                 tag = "exists"
+            # комментарии: ранние прогоны писали их только на create —
+            # добираем отсутствующие (сверка по телу комментария)
+            if comments:
+                have = gh_json(["api", "-X", "GET",
+                                f"repos/{repo}/issues/{num}/comments",
+                                "-F", "per_page=100"])
+                have = {str(c.get("body") or "")
+                        for c in have if isinstance(have, list)}
+                for c in comments:
+                    if c not in have:
+                        gh(["api", "-X", "POST",
+                            f"repos/{repo}/issues/{num}/comments"],
+                           json.dumps({"body": c}))
             # канбан + state: Status/Запланировано в Project v2 и
             # Done↔closed синхронизируются и для существующих (ранние
             # прогоны создавали issues без записи канбана — статусы
@@ -897,6 +985,8 @@ def main():
                     if bd2:
                         body_doc_id = bd2[0].get("id", "")
                 body = row_body_md(body_doc_id, cache)
+                COLLECTED_ASSETS.update(asset_names(body))
+                body = rewrite_asset_links(body, args.repo)
                 comments = comments_of(body)
                 number = import_issue(args.repo, b["project"], title, body, status,
                                       ty, branch, pr, session, review_session,
@@ -909,6 +999,9 @@ def main():
         with open("migration-manifest.json", "w") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=1)
         print(f"манифест: {len(manifest)} строк → migration-manifest.json")
+
+        if COLLECTED_ASSETS and not args.dry_run:
+            push_assets(args.repo, args.clone_root, COLLECTED_ASSETS)
 
     if not args.skip_wiki:
         docs_dir = os.path.join(args.clone_root,
