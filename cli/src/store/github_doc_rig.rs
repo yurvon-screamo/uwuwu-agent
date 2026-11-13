@@ -85,11 +85,24 @@ pub(crate) async fn foreign_append_tail(
 
 /// Env-контуры для cmd-тестов (doc_store() идёт через from_env):
 /// UWUWU_HUB_CLONE_ROOT/HUB_REPO в tmp, клон с seed по конвенции
-/// <repo-slashes→__>. Тест с env — #[serial] (гонка env-переменных).
-pub(crate) async fn hub_env(tmp: &TempDir) -> Result<std::path::PathBuf> {
+/// <repo-slashes→__>. Env снимается Drop'ом гарда — не-serial тесты,
+/// идущие после, не увидят env на удалённом TempDir. Тест с env —
+/// #[serial] (гонка env-переменных).
+pub(crate) struct HubEnvGuard {
+    pub(crate) work: std::path::PathBuf,
+}
+
+impl Drop for HubEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("UWUWU_HUB_CLONE_ROOT");
+        std::env::remove_var("UWUWU_HUB_REPO");
+    }
+}
+
+pub(crate) async fn hub_env(tmp: &TempDir) -> Result<HubEnvGuard> {
     std::env::set_var("UWUWU_HUB_CLONE_ROOT", tmp.path());
     std::env::set_var("UWUWU_HUB_REPO", "local/test");
     let work = tmp.path().join("local__test");
     setup_at(&tmp.path().join("local__test-origin"), &work).await?;
-    Ok(work)
+    Ok(HubEnvGuard { work })
 }

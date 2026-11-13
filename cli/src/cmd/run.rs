@@ -201,8 +201,8 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 (false, Some(path)) => std::fs::read_to_string(path)?,
                 _ => String::new(),
             };
-            // create-or-replace: дока нет — create со шапкой (контракт
-            // прежней replace_doc «создать без скелета», контент как есть)
+            // create-or-replace: дока нет — create со шапкой (frontmatter+
+            // H1 из тайтла слага, frontmatter-гард входа)
             if store.exists(slug).await? {
                 store.replace_doc(slug, &body, None).await?;
             } else {
