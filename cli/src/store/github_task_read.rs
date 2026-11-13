@@ -107,20 +107,27 @@ impl TaskStore for GitHubStore {
     /// маркер, вложенности нет).
     async fn thread(&self, _board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>> {
         let number = &task.id;
-        let data = gh_json(
-            &[
-                "api",
-                "-X",
-                "GET",
-                &format!("repos/{}/issues/{number}/comments", self.repo),
-                "-F",
-                "per_page=100",
-            ],
-            None,
-        )
-        .await?;
         let mut out = Vec::new();
-        if let Some(items) = data.as_array() {
+        let mut page = 1usize;
+        loop {
+            let data = gh_json(
+                &[
+                    "api",
+                    "-X",
+                    "GET",
+                    &format!("repos/{}/issues/{number}/comments", self.repo),
+                    "-F",
+                    "per_page=100",
+                    "-F",
+                    &format!("page={page}"),
+                ],
+                None,
+            )
+            .await?;
+            let Some(items) = data.as_array() else {
+                break;
+            };
+            let fetched = items.len();
             for c in items {
                 out.push(ThreadEntry {
                     id: c["id"].to_string(),
@@ -133,6 +140,10 @@ impl TaskStore for GitHubStore {
                     text: c["body"].as_str().unwrap_or("").to_string(),
                 });
             }
+            if fetched < 100 {
+                break;
+            }
+            page += 1;
         }
         Ok(out)
     }
