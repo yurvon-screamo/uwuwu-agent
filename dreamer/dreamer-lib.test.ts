@@ -251,7 +251,7 @@ describe("hasAssistantReplySince / wakeupPrompt", () => {
     expect(hasAssistantReplySince(db, "ses_d_none", 0)).toBe(false)
   })
   test("wakeupPrompt содержит границу и инструкцию дельты", () => {
-    const p = wakeupPrompt({ sessionId: "ses_abc", sessionTitle: "т", auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" })
+    const p = wakeupPrompt({ sessionId: "ses_abc", sessionTitle: "т", auditPath: "/a.py", hubClonePath: "/h/hub-clone", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" })
     expect(p).toContain("2026-11-01T12:00:00.000Z")
     expect(p).toContain("дельту")
     expect(p).toContain("не дублируй")

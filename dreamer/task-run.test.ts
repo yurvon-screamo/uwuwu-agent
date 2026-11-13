@@ -275,7 +275,7 @@ describe("taskRunPrompt", () => {
     lastProcessedUpdate: 0,
     sessions: collectTaskSessions(db, ["ses_dev1"]),
     auditPath: "/audit.py",
-    wikiOpsPath: "/wiki_ops.py",
+    hubClonePath: "/h/hub-clone",
     dbPath: "/opencode.db",
   }
 
@@ -287,6 +287,7 @@ describe("taskRunPrompt", () => {
     expect(prompt).not.toContain("--compact session ses_dreamer_child")
     expect(prompt).toContain("gh pr view https://github.com/x/y/pull/1")
     expect(prompt).toContain("/home/x/uwuwu-agent")
+    expect(prompt).toContain("/h/hub-clone")
     expect(prompt).not.toContain("Повторный прогон")
   })
 

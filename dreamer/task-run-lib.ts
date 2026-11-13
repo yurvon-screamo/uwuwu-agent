@@ -321,7 +321,7 @@ export interface TaskPromptInput {
   lastProcessedUpdate: number
   sessions: SessionRow[]
   auditPath: string
-  wikiOpsPath: string
+  hubClonePath: string
   dbPath: string
   /** повторная попытка (прошлый прогон прервался) — та же сессия дримера */
   retry?: boolean
@@ -355,7 +355,8 @@ export function taskRunPrompt(input: TaskPromptInput): string {
     `- git-контекст: каталог ${input.directory} (master после мерджа; ветка ${input.branch || "—"}),`,
     `  невлитая работа — gh pr view ${input.pr || "<PR отсутствует>"}`,
     `- чтение вики: uwuwu-cli read "<slug>"; поиск: uwuwu-cli search`,
-    `- запись в вики (абсолютный путь — cwd у тебя чужой проект): "${input.wikiOpsPath}"`,
+    `- запись в вики — клон hub (cwd у тебя чужой проект): "${input.hubClonePath}";`,
+    `  правки файлов docs/**.md + git add/commit/push (ff-only); методика записи — agents/dreamer.md`,
   ]
   const dedup = input.lastProcessedUpdate > 0
     ? [
