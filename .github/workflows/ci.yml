@@ -61,7 +61,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
-        # e2e-тесты требуют живое ядро SiYuan и гвардятся UWUWU_E2E=1:
+        # e2e-тесты ходят в живой hub (uwuwu-hub) и гвардятся UWUWU_E2E_GITHUB=1:
         # без переменной они сразу зелёные (см. cli/tests/*_e2e.rs).
         working-directory: cli
         run: cargo test
