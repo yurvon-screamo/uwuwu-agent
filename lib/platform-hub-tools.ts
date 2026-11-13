@@ -58,13 +58,16 @@ export async function hubTool<T = Record<string, unknown>>(
         const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
         let title = parsed.payload.split("/").pop() ?? ""
         let content = ""
+        let exists = false
         try {
           const raw = require("node:fs").readFileSync(mdPath, "utf8")
           content = raw
+          exists = true
           const fmTitle = raw.match(/^title:\s*(.+)$/m)
           if (fmTitle) title = fmTitle[1].trim()
         } catch {}
-        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+        // контракт resolvePinningDoc: exists + markdown (не content)
+        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
       }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
@@ -146,13 +149,16 @@ export async function hubTool<T = Record<string, unknown>>(
         const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
         let title = parsed.payload.split("/").pop() ?? ""
         let content = ""
+        let exists = false
         try {
           const raw = require("node:fs").readFileSync(mdPath, "utf8")
           content = raw
+          exists = true
           const fmTitle = raw.match(/^title:\s*(.+)$/m)
           if (fmTitle) title = fmTitle[1].trim()
         } catch {}
-        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+        // контракт resolvePinningDoc: exists + markdown (не content)
+        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
       }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
@@ -191,13 +197,16 @@ export async function hubTool<T = Record<string, unknown>>(
         const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
         let title = parsed.payload.split("/").pop() ?? ""
         let content = ""
+        let exists = false
         try {
           const raw = require("node:fs").readFileSync(mdPath, "utf8")
           content = raw
+          exists = true
           const fmTitle = raw.match(/^title:\s*(.+)$/m)
           if (fmTitle) title = fmTitle[1].trim()
         } catch {}
-        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+        // контракт resolvePinningDoc: exists + markdown (не content)
+        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
       }
       if (parsed?.kind === "issue") {
         const body = String(issueByNumber(parsed.payload)?.body ?? "")
