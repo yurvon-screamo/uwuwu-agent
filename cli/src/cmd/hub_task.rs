@@ -295,6 +295,14 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 (false, Some(path)) => Some(std::fs::read_to_string(path)?),
                 _ => None,
             };
+            // вход — контент тела: frontmatter-шапка и обёртка task get
+            // в тело не вставляются (frontmatter ведёт store, шапка —
+            // печать get; help-контракт «frontmatter-шапка — отказ»)
+            if let Some(md) = &new_body {
+                if md.starts_with("---\n") || md.starts_with("Задача:") {
+                    bail!("вход task body — контент тела: frontmatter-шапка и обёртка task get в тело не вставляются")
+                }
+            }
             match (replace, new_body) {
                 (true, Some(md)) => {
                     if !force && base.is_none() {

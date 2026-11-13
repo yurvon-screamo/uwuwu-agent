@@ -7,6 +7,8 @@ use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
 
+use super::github_task::Frontmatter;
+
 #[async_trait::async_trait]
 impl TaskStore for GitHubStore {
     async fn list(&self, board: &TaskBoard) -> StoreResult<Vec<Task>> {
@@ -103,7 +105,18 @@ impl TaskStore for GitHubStore {
                 );
             }
         }
-        self.set_issue_body(&task.id, new_md).await?;
+        // new_md — контент тела; frontmatter (status/branch/pr/приоритет —
+        // карточка задачи) переносится из текущего body: запись тела
+        // карточку не затирает. Разделитель — паритет с with_fields
+        // (пустая строка между блоком и контентом, если его нет во входе)
+        let front = Frontmatter::parse(&current);
+        let separator = if new_md.starts_with('\n') || front.is_empty() {
+            ""
+        } else {
+            "\n"
+        };
+        let merged = format!("{}{}{}", front.block(), separator, new_md);
+        self.set_issue_body(&task.id, &merged).await?;
         Ok(self.issue_fresh(&task.id).await?)
     }
 

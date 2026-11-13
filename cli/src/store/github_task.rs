@@ -180,6 +180,22 @@ impl Frontmatter {
             .map(|(_, v)| v.clone())
     }
 
+    /// Карточка пуста (frontmatter-блока в body не было).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.raw_fields.is_empty()
+    }
+
+    /// Frontmatter-блок без rest_md — перенос карточки (status/branch/pr/
+    /// приоритет) в новое тело при body --replace.
+    pub(crate) fn block(&self) -> String {
+        let mut out = String::from("---\n");
+        for (k, v) in &self.raw_fields {
+            out.push_str(&format!("{k}: {v}\n"));
+        }
+        out.push_str("---\n");
+        out
+    }
+
     /// Body с заменой/вставкой ключа frontmatter (блок пересобирается,
     /// порядок полей сохраняется; тело после блока не трогается).
     pub(crate) fn with_field(&self, key: &str, value: &str) -> String {
