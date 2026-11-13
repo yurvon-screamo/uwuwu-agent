@@ -129,16 +129,16 @@ def board_rows(av_id):
 
 
 def render_board(doc_id):
-    """Полная выборка database render через uwuwu-cli kernel render
-    (--page пагинация, pageSize 50; колонки → keyID-мап для cell_value)."""
+    """Полная выборка database render через прямой REST ядра SiYuan
+    (CLI kernel-команды вырезаны срезом F): /api/riff/render + пагинация;
+    колонки → keyID-мап для cell_value."""
     rows, columns, page = [], {}, 1
     while True:
-        out = subprocess.run(["uwuwu-cli", "kernel", "render", doc_id,
-                              "--page", str(page)],
-                             capture_output=True, text=True)
-        if out.returncode != 0:
-            raise RuntimeError(f"kernel render {doc_id} p{page}: {out.stderr[:300]}")
-        d = json.loads(out.stdout)
+        req = urllib.request.Request(SIYUAN_URL + "/api/riff/render",
+            data=json.dumps({"id": doc_id, "page": page}).encode(),
+            headers={"Authorization": f"Token {SIY_TOKEN}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            d = json.load(r)
         data = d.get("data") or {}
         view = data.get("view") or {}
         for col in view.get("columns") or []:
