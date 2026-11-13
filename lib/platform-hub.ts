@@ -128,23 +128,36 @@ export function issuePatch(number: string, payload: Record<string, unknown>): vo
 export function setProjectStatus(project: string, number: string, status: string): void {
   const projNumber = projectBoardNumber(project)
   if (projNumber === null) return
-  const q1 = `query($n: Int!) { viewer { projectV2(number: $n) { id items(first: 100) { nodes { id content { ... on Issue { number } } } } statusField: field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`
-  const d = JSON.parse(gh([ "api", "graphql", "--input", "-" ],
-    JSON.stringify({ query: q1, variables: { n: projNumber } })))
-  interface ProjectV2Node {
-    id: string
-    items: { nodes: Array<{ id: string; content?: { number?: number } }> }
-    statusField: { id: string; options: Array<{ id: string; name: string }> }
+  // Item-резолв через issue.projectItems: items(first:100) по всей доске
+  // слеп к строкам за её первой сотней (uwuwu-доска больше сотни)
+  const q = `query($n: Int!, $o: String!, $repo: String!, $num: Int!) {
+    viewer { projectV2(number: $n) {
+      id
+      statusField: field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+    } }
+    repository(owner: $o, name: $repo) { issue(number: $num) {
+      projectItems(first: 20) { nodes { id project { number } } }
+    } }
+  }`
+  const [owner, repoName] = hubRepo().split("/")
+  const d = JSON.parse(gh([ "api", "graphql", "--input", "-" ], JSON.stringify({
+    query: q, variables: { n: projNumber, o: owner, repo: repoName, num: Number(number) },
+  }))) as {
+    data: {
+      viewer: { projectV2: { id: string; statusField?: { id: string; options: Array<{ id: string; name: string }> } } | null }
+      repository: { issue: { projectItems: { nodes: Array<{ id: string; project: { number: number } }> } } | null }
+    }
   }
-  const proj = d.data.viewer.projectV2 as ProjectV2Node
-  const item = proj.items.nodes.find((n) => n.content?.number === Number(number))
-  const opt = proj.statusField.options.find((o) => o.name === status)
-  if (!item) throw new Error(`Projects v2: issue #${number} не в проекте после add-item`)
+  const proj = d.data.viewer.projectV2
+  if (!proj) throw new Error(`Projects v2: канбан «${project}» не найден`)
+  const item = d.data.repository.issue?.projectItems.nodes.find((n) => n.project.number === projNumber)
+  const opt = proj.statusField?.options.find((o) => o.name === status)
+  if (!item) throw new Error(`Projects v2: issue #${number} не в проекте «${project}»`)
   if (!opt) throw new Error(`Projects v2: опция Status «${status}» не найдена (канон срез A)`)
   const q2 = `mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId } }`
   gh([ "api", "graphql", "--input", "-" ], JSON.stringify({
     query: q2,
-    variables: { p: proj.id, i: item.id, f: proj.statusField.id, o: opt.id },
+    variables: { p: proj.id, i: item.id, f: proj.statusField!.id, o: opt.id },
   }))
 }
 
