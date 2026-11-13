@@ -88,9 +88,7 @@ pub(crate) async fn foreign_append_tail(
 /// <repo-slashes→__>. Env снимается Drop'ом гарда — не-serial тесты,
 /// идущие после, не увидят env на удалённом TempDir. Тест с env —
 /// #[serial] (гонка env-переменных).
-pub(crate) struct HubEnvGuard {
-    pub(crate) work: std::path::PathBuf,
-}
+pub(crate) struct HubEnvGuard;
 
 impl Drop for HubEnvGuard {
     fn drop(&mut self) {
@@ -104,5 +102,5 @@ pub(crate) async fn hub_env(tmp: &TempDir) -> Result<HubEnvGuard> {
     std::env::set_var("UWUWU_HUB_REPO", "local/test");
     let work = tmp.path().join("local__test");
     setup_at(&tmp.path().join("local__test-origin"), &work).await?;
-    Ok(HubEnvGuard { work })
+    Ok(HubEnvGuard)
 }

@@ -165,7 +165,7 @@ mod docs_cmd_tests {
     #[serial]
     async fn append_force_creates_missing_doc() -> Result<(), anyhow::Error> {
         let tmp = tempfile::TempDir::new()?;
-        let env = hub_env(&tmp).await?;
+        let _env = hub_env(&tmp).await?;
         let missing = "Experience/theme/по-force";
         super::docs_append(missing, false, &["дельта через force".to_string()], true).await?;
         let md = super::doc_store()
@@ -184,7 +184,7 @@ mod docs_cmd_tests {
     #[serial]
     async fn append_without_force_on_missing_doc_rejects() -> Result<(), anyhow::Error> {
         let tmp = tempfile::TempDir::new()?;
-        let env = hub_env(&tmp).await?;
+        let _env = hub_env(&tmp).await?;
         let missing = "Experience/theme/нет-дока";
         let err = super::docs_append(missing, false, &["дельта".to_string()], false)
             .await
@@ -198,7 +198,7 @@ mod docs_cmd_tests {
     #[serial]
     async fn append_empty_stdin_rejects() -> Result<(), anyhow::Error> {
         let tmp = tempfile::TempDir::new()?;
-        let env = hub_env(&tmp).await?;
+        let _env = hub_env(&tmp).await?;
         let err = super::docs_append(PLAIN_DOC, true, &[], false)
             .await
             .unwrap_err();
