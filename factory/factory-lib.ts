@@ -1713,7 +1713,8 @@ export function formatPassSummary(project: string, c: PassCounters): string {
 // ——— очередь CUP и часы пик (задача 20261112160316) ———
 
 /** Ранг приоритета для сортировки очереди: high → medium → low → пустые
- *  внизу (пустая клетка валидна, «не указан» — решение владельца). */
+ *  внизу (пустые — легаси-строки до 13.11: create без флага теперь пишет
+ *  medium, дефолт владельца). */
 export function priorityRank(priority: string): number {
   switch (priority.trim().toLowerCase()) {
     case "high":

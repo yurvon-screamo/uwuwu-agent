@@ -76,7 +76,8 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 фабрика сама мержит PR на входе в Review (GitHub gh / Gitea tea+API, merge-commit) и ставит
 Done; красный CI/конфликт — обратно в In Progress; без PR — Done сразу. Очередь CUP
 (`UWUWU_FACTORY_CUP`, деф. 7 глобально) — новые Design/In Progress берутся по приоритету
-(high → medium → low, колонка «Приоритет», триаж ставит явно). Пик-окно GLM
+(high → medium → low, колонка «Приоритет»; create без флага пишет medium —
+дефолт владельца 13.11, триаж явно ставит high/low). Пик-окно GLM
 (`UWUWU_FACTORY_PEAK`, деф. будни 06:00–10:00 UTC = 15:00–19:00 JST, off-выключатель) —
 спавны/будильники не-high откладываются до конца окна.
 `factory/` — Bun/TS: конфиг board/repo/local/env, env-lifecycle (factory/env.ts,
