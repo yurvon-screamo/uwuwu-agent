@@ -107,7 +107,10 @@ impl GitHubStore {
             )
             .await?;
         }
+        // status — тоже fm-зеркало: читатели (task get/list, демоны) читают
+        // fm из тела; поле Projects v2 пишется ниже отдельно
         let front_cells: Vec<(&str, &String)> = [
+            ("status", &patch.status),
             ("branch", &patch.branch),
             ("pr", &patch.pr),
             ("dev-session", &patch.dev_session),
@@ -121,6 +124,11 @@ impl GitHubStore {
             let cells: Vec<(&str, &str)> =
                 front_cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let body = Frontmatter::parse(&body_md).with_fields(&cells);
+            self.set_issue_body(&number, &body).await?;
+        }
+        if let Some((planned_date, _ms)) = &patch.planned {
+            let body_md = self.issue_body(&number).await?;
+            let body = Frontmatter::parse(&body_md).with_field("planned", planned_date);
             self.set_issue_body(&number, &body).await?;
         }
         if let Some(ad) = patch.autodone {
