@@ -12,6 +12,8 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { collectBoardView, type BoardViewPage } from "./board-view"
+import { hubConfigured, hubTool } from "./platform-hub"
+import { hubTool as hubToolsImpl } from "./platform-hub-tools"
 import { hubConfigured } from "./platform-hub"
 import { hubTool } from "./platform-hub-tools"
 
