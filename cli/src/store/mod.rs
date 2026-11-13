@@ -18,6 +18,8 @@ pub mod task_store;
 
 #[cfg(test)]
 mod store_tests;
+#[cfg(test)]
+mod github_doc_clone_tests;
 
 pub use doc_store::{DocEntry, DocStore};
 pub use task_store::{CommentInsert, CreateTask, EditTask, TaskStore, ThreadEntry};
