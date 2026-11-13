@@ -51,7 +51,7 @@ pub(crate) enum TaskSub {
         #[arg(
             long,
             value_name = "PRIORITY",
-            help = "Приоритет: high | medium | low (колонка «Приоритет» доски; дефолта нет — приоритет ставится явно, триаж обязан указывать)"
+            help = "Приоритет: high | medium | low (колонка «Приоритет» доски; без флага — medium, решение владельца 13.11)"
         )]
         priority: Option<String>,
         /// Autodone-галочка: автомерж PR при входе задачи в Review (ставит

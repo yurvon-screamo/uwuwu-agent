@@ -9,6 +9,33 @@ use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::{json, Map, Value};
 
+/// fm-шапка новой задачи: status всегда; priority — явный флаг, иначе
+/// дефолт medium (решение владельца 13.11), но авторский priority во
+/// fm тела (--stdin) перекрыт дефолтом не бывает; autodone при Some.
+/// Порядок ячеек стабилен: status, priority, autodone.
+pub(super) fn create_frontmatter(
+    body_md: &str,
+    status: &str,
+    priority: Option<&str>,
+    autodone: Option<bool>,
+) -> String {
+    let fm = Frontmatter::parse(body_md);
+    let mut cells: Vec<(&str, String)> = vec![("status", status.to_string())];
+    let priority_cell = match priority {
+        Some(p) => Some(p.to_string()),
+        None if fm.get("priority").is_none() => Some("medium".to_string()),
+        None => None,
+    };
+    if let Some(p) = priority_cell {
+        cells.push(("priority", p));
+    }
+    if let Some(ad) = autodone {
+        cells.push(("autodone", if ad { "true" } else { "false" }.to_string()));
+    }
+    let pairs: Vec<(&str, &str)> = cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fm.with_fields(&pairs)
+}
+
 impl GitHubStore {
     pub(super) async fn create_impl(
         &self,
@@ -34,15 +61,7 @@ impl GitHubStore {
                 input.title, input.task_type.0
             ),
         };
-        let mut fm_cells: Vec<(&str, String)> = vec![("status", status.clone())];
-        if let Some(pr) = &input.priority {
-            fm_cells.push(("priority", pr.clone()));
-        }
-        if let Some(ad) = input.autodone {
-            fm_cells.push(("autodone", if ad { "true" } else { "false" }.to_string()));
-        }
-        let fm_pairs: Vec<(&str, &str)> = fm_cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let body = Frontmatter::parse(&body_md).with_fields(&fm_pairs);
+        let body = create_frontmatter(&body_md, &status, input.priority.as_deref(), input.autodone);
         let mut payload = Map::new();
         payload.insert("title".into(), json!(input.title));
         payload.insert("body".into(), json!(body));

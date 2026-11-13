@@ -16,7 +16,8 @@ pub struct CreateTask {
     pub body_md: Option<String>,
     /// Аттачи: (путь, альт-текст) — медиа в md-референсы тела.
     pub attachments: Vec<(std::path::PathBuf, String)>,
-    /// Приоритет (канон CUP); None — не задан.
+    /// Приоритет (канон CUP); None — не задан (create write-path
+    /// подставит дефолт medium — решение владельца 13.11).
     pub priority: Option<String>,
     /// Autodone-галочка (владелец решает; триаж не ставит).
     pub autodone: Option<bool>,
