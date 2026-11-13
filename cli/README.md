@@ -1,20 +1,14 @@
 # uwuwu-cli
 
-CLI для базы знаний uwuwu (SiYuan-бекенд): живое чтение доков, полнотекстовый
-поиск, kernel-пробы, канбан-задачи, кроны. Rust + clap, SiYuan kernel API
-(REST + встроенный MCP-клиент database). **Stateless**: локального контент-
-кэша нет — каждая команда ходит в SiYuan kernel живьём, стейл-чтения
-невозможны по построению (kernel недоступен → честная ошибка).
-
-**Дисциплина волн деградации**: мутационные вызовы на «metadata is not ready»
-ретраятся ≤3 раз (+2s/+5s), затем bail с хинтом (`uwuwu-cli doctor`) и 90s
-внутрипроцессным fail-fast окном — волна кормится ретраями, таранить её
-бесполезно и вредно (репро 04.11: серии с шагом ~2–3с = ретраи клиента).
-Прочие ошибки ретраются как прежде и окно не армят.
+CLI для платформы uwuwu (**hub-бекенд**: приватное репо `yurvon-screamo/uwuwu-hub` —
+issues = задачи, Projects v2 = канбаны, docs md = вики). Rust + clap; транспорт —
+`gh` (REST + GraphQL), вики — через ленивый git-клон uwuwu-hub
+(`~/.local/share/uwuwu-cli/hub-clone/<owner>__<repo>`). **Stateless**: контент-кэша
+нет — каждая команда читает живьём; hub недоступен → честная ошибка.
 
 Накопление знаний (статьи опыта, правки доков, инфра-задачи) делает
 **дример** — агентная пост-обработка сессий (`dreamer/` в корне репо).
-CLI заявку/фактизацию/кэш не содержит (механизмы выпилены).
+CLI заявку/фактизацию/кэш не содержит.
 
 ## Setup
 
@@ -28,51 +22,31 @@ cargo install --path .
 ```bash
 which -a uwuwu-cli  # ровно одна строка: ~/.cargo/bin/uwuwu-cli
 uwuwu-cli --help    # грамматика актуальна
+uwuwu-cli task list --project uwuwu  # живой ответ доски
 ```
-
-Поиск — универсальный: полнотекст SiYuan + доки по заголовкам + семантика
-локального эмбеддинг-индекса (Ollama `qwen3-embedding:0.6b`, пер-машинный
-SQLite); обслуживание — `semantic rebuild/status/sync`.
 
 ## Контракт ответов мутаций
 
-Каждая мутирующая команда (task create/edit/claim/comment/close/body, goal add/edit,
+Каждая мутирующая команда (task create/edit/claim/comment/close/body,
 person append/replace) возвращает **либо явную ошибку, либо финальное состояние
-затронутой сущности** — перечитанное с ядра (read-after-write), не эхо ввода:
-
-- `task create` — шапка перечитанной строки + финальный экспорт тела (после ассетов);
-- `task edit/claim/close` — шапка карточки (все колонки + расписание/агент, без тела —
-  edit тело не меняет); `claim` показывает «Сессия dev»;
-- `task comment` — вставленный блок как записался (автор/таймстемп/вложенность);
-  бит-в-бит дедуп-хит печатается отдельной честной строкой «уже был, вставки не было»;
-- `task body` — строка записи + финальный экспорт тела (round-trip-артефакты ядра
-  видны сразу, artifact-report в stderr);
-- `goal add/edit` — карточка цели (цель/статус/строка/доска); add — плюс финальное тело;
-- `person append/replace` — финальный документ целиком (док компактный, мутаций мало).
-
-Отказ — ненулевой exit + текст на stderr с подсказкой следующего хода. Частично
-применённая мутация называет, что применилось и как докатить («колонки записаны,
-но X не записан — доставь: task edit …»). Ветка ADR-067 «мутация применена — после
-неё не падаем»: сбой перечитывания/экспорта после успешной записи → rc 0 + warning +
-рецепт контрольного get (агент не ретраит уже применённую мутацию).
-
-Ответ замещает контрольный get для сверки результата мутации — гет-цикл
-«отредачил → посмотрел» не нужен.
+затронутой сущности** (read-after-write), не эхо ввода. Отказ — ненулевой exit
++ текст на stderr с подсказкой следующего хода; частично применённая мутация
+называет, что применилось и как докатить.
 
 ## Usage
 
 | Команда | Что делает |
 | --- | --- |
-| `projects` | реестр проектов (живой проход по организ-дереву, описания из README-доков) |
-| `read <slug>` | живое чтение: слаг → docId (hpath/тайтл через kernel API); markdown-экспорт дока |
-| `person show\|append\|replace` | персона владельца (SiYuan-док Experience:/personal/PERSON): show — markdown дока (агенты читают в начале работы, дока нет → честная ошибка с подсказкой); append — дописать долговременный факт (владелец/дример; дока нет → создать со скелетом: шапка приватности + секции; пост-чек дубля hpath → громкий отказ); replace — полная перезапись на месте (docId стабилен, дока нет → создать без скелета). Один инстанс SiYuan на все машины — синков и пуш-политики нет; env-шов UWUWU_PERSON_NOTEBOOK/UWUWU_PERSON_HPATH — только для e2e |
-| `blob <key> [--out f]` | скачать ассет из assets/ воркспейса SiYuan |
-| `kernel ping\|sql\|file\|ls\|export\|render [--timeout SECS]` | живые kernel-пробы из агентской сессии без env-токена (токен из конфигурации cli): one-shot без ретраев — сырое состояние ядра на первом ответе; вердикты (Bytes/Missing, пустой export/ls) → exit 0, неудача пробы (Failed/таймаут/код≠0/auth 401) → exit ≠0. Классы: живость+auth (`ping`), деградация индекса («metadata is not ready») и произвольная диагностика (`sql`), «tree not found»/FS-истина (`file`/`ls`), пустые экспорты (`export`), доски/пагинация строк (`render`: view.rowCount/view.rows as-is) |
-| `doctor [--project uwuwu] [--since MIN]` | диагностика деградации ядра (read-only): kernel live, wave-скан docker logs («commit tx failed»; DEGRADED при ≥5 за окно, меньше — шум), доска проекта (мёртвые привязки, пустые ZWJ-тела), FS↔SQL count по открытым ноутбукам. Exit 0/1/2: чисто / деградация (включая недоступное ядро) / пробы не выполнились. Контейнер — `UWUWU_SIYUAN_CONTAINER` (деф. siyuan-demo), FS-проба — локальный `UWUWU_SIYUAN_WS` |
-| `shot <slug>` | НЕ портирован на SiYuan (v1): dispatcher отказывает; скрины — headless chromium вручную (playwright, Access Auth Code) |
-| `search "…" [--limit N --threshold X --sofa N]` | универсальный: полнотекст (SQL like по блокам SiYuan) + доки по заголовкам (hpath-матч) + семантика локального эмбеддинг-индекса (Ollama); title/snippet/UI-ссылка с docId, top-n на метод; SOFA опционально |
-| `task create/list/get/edit/comment/thread/body/close/rm --project <p>` | канбан-задачи («Задачи <Proj>»): типизированные тела Dev/Spike/Bug, комменты — секция «## Комменты» тела, ответ в тред — вложенный пункт: `comment <id> --reply <анкор>`; create идемпотентен — ретрай после таймаута достраивает сироту доски, дубль тайтла = явная ошибка; новая строка — **Draft** («задачи в пустоту не заводим» — триаж валидирует и переводит в Todo), `--status Todo` — машинные создания (крон-ран-карточки минтятся сразу Todo, минуя триаж); rm снимает строку и трэшит тело (сироту — по docId), **только Draft-строки** — живую не-Draft rm отклоняет (hint: close/clean) |
-| `cron list [--project <p>]` | мастера кронов (задачи с расписанием, статус **Вейт**) + last run; крон заводится `task create/edit --schedule "…"`, расписание живёт в доке-теле — выделенный крон-контур (доски «Кроны <Proj>», CLI set/pause/resume/rm) снесён |
+| `projects` | имена топ-папок вики (Experience/Projects/Daily); перечень проектов — `docs ls "Projects"` |
+| `read <slug>` | чтение вики-дока: слаг → docs/<slug>.md (фоллбек basename-поиск по docs/**); markdown |
+| `docs ls "<project>[/<folder>]"` | перечень доков папки вики |
+| `person show\|append\|replace` | персона владельца (вики-док Experience/personal/PERSON): show — markdown (агенты читают в начале работы); append — дописать долговременный факт (append_doc сам читает+конкатенирует); replace — полная перезапись. Мутации возвращают финальный документ или явную ошибку |
+| `search "…" [--limit N --threshold X]` | универсальный: полнотекст по docs/** клона + доки по заголовкам + семантика локального эмбеддинг-индекса (Ollama); title/snippet/UI-ссылка, top-n на метод |
+| `semantic rebuild\|status\|sync` | обслуживание локального эмбеддинг-индекса (Ollama `qwen3-embedding:0.6b`, SQLite) |
+| `task create\|list\|get\|edit\|comment\|thread\|body\|close\|rm\|clean\|undo --project <p>` | канбан-задачи («Задачи <Proj>» = Projects v2): issue + item канбана; статусы — Status-поле (канон Draft…Вейт) + fm-зеркало в теле; поля канбана — нативные (Приоритет/Autodone/Branch/PR/Сессии + «Запланировано» глобальные issue fields); новая задача — **Draft** (триаж валидирует → Todo), `--status Todo` — машинные создания; rm — только Draft; clean — батч-снос с guard'ом и undo-журналом |
+| `cron list [--project <p>]` | мастера кронов (задачи с расписанием, статус **Вейт**); крон заводится `task create/edit --schedule "…"` |
+
+вызов даёт громкий отказ с подсказкой hub-аналогов.
 
 ## Architecture
 
@@ -82,33 +56,35 @@ cli/
   src/
     lib.rs               # модули + run()
     main.rs              # thin binary entry
-| файл | роль |
-| --- | --- |
-| `siyuan.rs` | клиент SiYuan kernel (REST) + встроенный MCP (database) |
-| `siyuan_task.rs` | таск-модель: доски/строки/тела/комменты |
-| `siyuan_person.rs` | персона владельца: резолв/скелет/show/append/replace |
-| `cmd/sy_dispatch.rs` | хендлеры всех команд (единственный бекенд) |
-    cmd/                 # clap-грамматика + диспетчер команд
+    store/
+      github_task*.rs    # TaskStore: issues + Projects v2 (gh REST/GraphQL)
+      github_doc_*.rs    # DocStore: md-доки через git-клон (ff-only push)
+      github_gh.rs       # gh-транспорт (таймауты, envelope-барьеры)
+      task_store.rs      # TaskBoard/CreateTask/EditTask — контракт трейтов
+    cmd/
+      hub_task.rs        # task-семья (GitHubStore)
+      hub_docs.rs        # docs/read (GitHubDocStore)
+      run.rs             # маршрутизация + hub_repo_default()
   tests/
-    read_e2e.rs          # e2e read на живом ядре (UWUWU_E2E=1, серийно)
-    person_e2e.rs        # e2e person на живом ядре (UWUWU_E2E=1, zz-e2e-док через env-шов)
+    path_guard_e2e.rs    # гварды входов (--md/--attach/--base) на уровне процессов
+    deploy_artifacts.rs  # артефакты деплоя (journald-лимиты)
+    github_store_e2e.rs  # живой e2e GitHubStore (UWUWU_E2E_GITHUB=1, #[ignore])
 ```
 
 ## How search works
 
-Универсальный поиск (три секции): полнотекст по блокам kernel API (SQL like),
-доки по заголовкам (hpath-матч в Rust, AND-токены многословных тайтлов) и
-семантика локального эмбеддинг-индекса (Ollama `qwen3-embedding:0.6b`,
-пер-машинный SQLite `~/.local/share/uwuwu-cli/semantic.db`). Выдача — top-n
-на метод: title, snippet, UI-ссылка с docId. Дельта индекса дотягивается
-лениво перед поиском (бюджет 10 s), обслуживание — `semantic
-rebuild/status/sync`. Отказы маршрута (Ollama лежит, индекс пуст) — честный
+Универсальный поиск (три секции): полнотекст по docs/** git-клона,
+доки по заголовкам (basename/hpath) и семантика локального эмбеддинг-индекса
+(Ollama `qwen3-embedding:0.6b`, пер-машинный SQLite
+`~/.local/share/uwuwu-cli/semantic.db`). Выдача — top-n на метод: title,
+snippet, ссылка. Отказы маршрута (Ollama лежит, индекс пуст) — честный
 статус в секции, команду не роняют.
 
 ## Env vars
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `UWUWU_SIYUAN_URL` | `http://127.0.0.1:6806` | kernel SiYuan (REST+MCP) |
-| `UWUWU_WIKI` / `WIKI_ROOT` | `~/.uwuwu` | легаси миграционной map (path.rs мёртв — read резолвит через kernel API); кандидат на выпил |
+| `UWUWU_HUB_REPO` | `yurvon-screamo/uwuwu-hub` | hub-репо (пустое значение = дефолт) |
+| `GH_TOKEN` | — | токен GitHub (классический PAT с repo; иначе gh ходит в keyring) |
+| `UWUWU_HUB_CLONE_ROOT` | `~/.local/share/uwuwu-cli/hub-clone` | база клонов вики |
 | `RUST_LOG` | `info` | tracing filter (stderr) |

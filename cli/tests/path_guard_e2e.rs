@@ -10,7 +10,6 @@
 //! Здесь — живой бинарь. Гвард стоит до сети (sy_dispatch.rs:688–716,
 //! resolve_task :717), поэтому отказные кейсы не требуют живого ядра.
 //!
-//! Машина-нюанс: cli резолвит UWUWU_SIYUAN_TOKEN рано, до dispatch — на
 //! машине без fish vars/conf.json (CI-runner) отказ «токен не найден»
 //! стреляет раньше гварда. Отказные кейсы сами ставят dummy-токен и
 //! недостижимый URL: резолв проходит, гвард отказывает до сети — если
@@ -35,8 +34,6 @@ fn bin() -> &'static str {
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
     let out = Command::new(bin())
         .args(args)
-        .env("UWUWU_SIYUAN_TOKEN", "dummy-path-guard-test")
-        .env("UWUWU_SIYUAN_URL", "http://127.0.0.1:1")
         .env("UWUWU_HUB_REPO", "owner/hub-guard-test")
         .output()
         .expect("spawn uwuwu-cli");

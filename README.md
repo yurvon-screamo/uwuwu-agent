@@ -42,10 +42,11 @@ cd uwuwu-agent
 
 `link.sh` бэкапит существующие конфиги (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После — перезапустить opencode.
 
-## SiYuan-first 
+## Hub-first
 
-Вся база знаний живёт в SiYuan: статьи опыта и проектные доки через `uwuwu-cli`
-(kernel SiYuan — REST + встроенный MCP; `uwuwu-cli read/docs ls/...`).
+Вся база знаний живёт в приватном репо **uwuwu-hub**: статьи опыта и проектные
+доки — docs/*.md, задачи — issues + Projects v2 канбаны (`uwuwu-cli
+read/docs ls/task/...`).
 
 ### Фабрика разработки (uwuwu-factory)
 
@@ -176,15 +177,12 @@ uwuwu-проекта с пустым статусом (черновики вла
 `read/blob` (мультимодальное чтение; `shot` не портирован), `person show/append/replace` —
 персона владельца (агенты читают в начале работы, дример пишет факты после сессий).
 
-Платформа — SiYuan (с 04.11.2026; до этого — закрытая платформа-предшественник). CLI ходит в
-kernel SiYuan (REST + встроенный MCP), единый воркспейс на всех машинах.
+Платформа — **uwuwu-hub** (с 13.11.2026; история носителей: закрытый предшественник → легаси-бекенд → hub). CLI ходит в GitHub (gh REST/GraphQL), вики — git-клон uwuwu-hub, один инстанс на все машины.
 
-**Production**: контейнер `siyuan-demo` на ноуте (`127.0.0.1:6806`), публично —
-`https://siyuan-relay-production.up.railway.app` (Railway-релей + rathole-туннель)
+**Production**: приватное репо `yurvon-screamo/uwuwu-hub` (GitHub); локальный
+git-клон вики — `~/.local/share/uwuwu-cli/hub-clone/yurvon-screamo__uwuwu-hub`.
 
-Required env: `UWUWU_SIYUAN_URL`,
-`UWUWU_SIYUAN_TOKEN` (или `UWUWU_SIYUAN_WS` с conf.json). Бекенд один — SiYuan kernel API
-(сменимый бекенд выпилен PR #32, ADR-014).
+Required env: `UWUWU_HUB_REPO` (дефолт зашит в cli), `GH_TOKEN` (gh; иначе keyring).
 
 **Workspace structure**:
 
@@ -197,13 +195,9 @@ Folders handle organization; tags are only for lookup.
 
 **Commands**:
 
-- `search` — universal: полнотекст по блокам SiYuan (SQL kernel API) + доки по заголовкам + семантика локального эмбеддинг-индекса; `--limit/--threshold/--sofa`
-- `read` — live doc read (slug → docId через kernel API, markdown-экспорт ядра); rich content rendered inline
-- `blob <key>` — download workspace blobs (images/attachments)
-- `shot` — не портирован на SiYuan v1 (headless chromium + Access Auth Code при необходимости)
-- `projects` — live workspace project registry
-- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» boards, typed bodies), кроны = задачи с расписанием (`--schedule`, мастера в **Вейт**) + `cron list`, task-body markdown (live diagrams: ```html_embed fences convert to SiYuan html-blocks, marker-addressed `⁂ diagram:<name>`, see `skills/visual-diagrams`)
+- `search` — universal: полнотекст по docs/** клона + доки по заголовкам + семантика локального эмбеддинг-индекса; `--limit/--threshold`
+- `read` — live doc read (слаг → docs/<slug>.md клона); markdown
+- `projects` — имена топ-папок вики (Experience/Projects/Daily)
+- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» = Projects v2, типизированные тела), кроны = задачи с расписанием (`--schedule`, мастера в **Вейт**) + `cron list`; диаграммы в телах — mermaid (GitHub рендерит нативно), see `skills/visual-diagrams`
 
-**Infrastructure**: ноут (docker: siyuan-demo :6806, воркспейс ~/siyuan-demo-ws), наружу — Railway-релей + rathole (временно дефолт-домен Railway из-за бага сертов)
-
-- DNS on Bunny (siyuan.uwuwu.net за Pull Zone — ждёт фикс сертов Railway); Ollama — локальная на ноуте (semantic-индекс cli, localhost-only; релей rathole-ollama погашен 05.11). Redis афин-стека не живёт (афина остановлена).
+**Infrastructure**: GitHub (приватное репо uwuwu-hub) + локальный git-клон вики; gh-токен в env (`GH_TOKEN`).
