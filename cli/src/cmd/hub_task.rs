@@ -134,7 +134,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                             body_md,
                             attachments: vec![],
                             priority,
-                            autodone: Some(autodone),
+                            autodone: autodone.as_deref().map(|v| v == "on"),
                         },
                     )
                     .await?;

@@ -19,7 +19,9 @@ pub struct CreateTask {
     /// Приоритет (канон CUP); None — не задан (create write-path
     /// подставит дефолт medium — решение владельца 13.11).
     pub priority: Option<String>,
-    /// Autodone-галочка (владелец решает; триаж не ставит).
+    /// Autodone-галочка (владелец решает; триаж не ставит); None —
+    /// не задан (create write-path подставит дефолт true, если во fm
+    /// тела нет авторского — решение владельца 14.11).
     pub autodone: Option<bool>,
 }
 

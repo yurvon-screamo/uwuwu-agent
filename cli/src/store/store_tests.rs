@@ -193,8 +193,8 @@ fn by_title_matches_and_tokens_case_insensitive() {
     assert_eq!(hits[0].slug, "Задачи uwuwu/Замена бекенда");
 }
 
-/// Дефолт priority при create (задача 1052): fm-конструирование
-/// новой задачи — чистая функция write-path.
+/// Дефолты priority и autodone при create (задачи 1052 и 1050):
+/// fm-конструирование новой задачи — чистая функция write-path.
 mod create_frontmatter_tests {
     use crate::store::github_task_write::create_frontmatter;
 
@@ -249,6 +249,39 @@ mod create_frontmatter_tests {
         assert!(
             off.starts_with("---\nstatus: Draft\npriority: medium\nautodone: false\n"),
             "got: {off}"
+        );
+    }
+
+    #[test]
+    fn create_without_autodone_flag_defaults_to_true() {
+        let out = create_frontmatter("# заголовок\n\nтело", "Todo", None, None);
+        assert!(
+            out.starts_with("---\nstatus: Todo\npriority: medium\nautodone: true\n"),
+            "стабильный порядок + дефолт true (решение владельца 14.11), got: {out}"
+        );
+        assert!(out.ends_with("# заголовок\n\nтело"));
+    }
+
+    #[test]
+    fn authored_autodone_in_body_frontmatter_survives() {
+        let body = "---\nautodone: false\n---\nтело с авторским fm";
+        let out = create_frontmatter(body, "Todo", None, None);
+        assert!(out.contains("autodone: false"), "got: {out}");
+        assert!(
+            !out.contains("autodone: true"),
+            "дефолт не подставляется поверх авторского"
+        );
+        assert!(out.contains("status: Todo"));
+    }
+
+    #[test]
+    fn explicit_autodone_off_overrides_authored_frontmatter() {
+        let body = "---\nautodone: true\n---\nrest";
+        let out = create_frontmatter(body, "Todo", None, Some(false));
+        assert!(out.contains("autodone: false"), "got: {out}");
+        assert!(
+            !out.contains("autodone: true"),
+            "явный off перекрывает авторский fm"
         );
     }
 }
