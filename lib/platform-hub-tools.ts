@@ -3,6 +3,7 @@
 //! Status/Запланировано — Project v2 + frontmatter, Branch/PR/Сессия dev/
 //! Расписание — frontmatter.
 
+import { hubCloneRoot } from "./platform-hub"
 import type { GhIssue } from "./platform-hub"
 import {
   ghJson,
@@ -53,6 +54,18 @@ export async function hubTool<T = Record<string, unknown>>(
       const proj = projectOfBoardDocId(docId)
       if (proj) return { id: docId, title: `Задачи ${proj}`, box: "hub", hpath: `Задачи ${proj}` } as T
       const parsed = parseDocId(docId)
+      if (parsed?.kind === "doc") {
+        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
+        let title = parsed.payload.split("/").pop() ?? ""
+        let content = ""
+        try {
+          const raw = require("node:fs").readFileSync(mdPath, "utf8")
+          content = raw
+          const fmTitle = raw.match(/^title:\s*(.+)$/m)
+          if (fmTitle) title = fmTitle[1].trim()
+        } catch {}
+        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+      }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
         return {
@@ -129,6 +142,18 @@ export async function hubTool<T = Record<string, unknown>>(
     case "export_doc_markdown": {
       const docId = String(args.docId ?? "")
       const parsed = parseDocId(docId)
+      if (parsed?.kind === "doc") {
+        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
+        let title = parsed.payload.split("/").pop() ?? ""
+        let content = ""
+        try {
+          const raw = require("node:fs").readFileSync(mdPath, "utf8")
+          content = raw
+          const fmTitle = raw.match(/^title:\s*(.+)$/m)
+          if (fmTitle) title = fmTitle[1].trim()
+        } catch {}
+        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+      }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
         return issue
@@ -162,6 +187,18 @@ export async function hubTool<T = Record<string, unknown>>(
     case "get_doc_attrs": {
       const docId = String(args.docId ?? "")
       const parsed = parseDocId(docId)
+      if (parsed?.kind === "doc") {
+        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
+        let title = parsed.payload.split("/").pop() ?? ""
+        let content = ""
+        try {
+          const raw = require("node:fs").readFileSync(mdPath, "utf8")
+          content = raw
+          const fmTitle = raw.match(/^title:\s*(.+)$/m)
+          if (fmTitle) title = fmTitle[1].trim()
+        } catch {}
+        return { id: docId, title, box: "hub", hpath: parsed.payload, content } as T
+      }
       if (parsed?.kind === "issue") {
         const body = String(issueByNumber(parsed.payload)?.body ?? "")
         return { ...parseFrontmatter(body).fields } as T
@@ -175,6 +212,27 @@ export async function hubTool<T = Record<string, unknown>>(
       for (const project of projects()) {
         nodes.push({ id: `pf:${project}`, type: "folder", data: project, parentId: "nb-projects" })
         nodes.push({ id: `board:${project}`, type: "doc", data: `board:${project}`, parentId: `pf:${project}` })
+      }
+      // Вики-узлы: папки/доки docs/Projects и docs/Experience — например
+      // пиннинг-док «Node-pinning» в проекте uwuwu (resolvePinningDoc демонов)
+      const clone = hubCloneRoot()
+      const wikiRoots: Array<[string, string]> = [["Projects", "Projects"], ["Experience", "Experience"]]
+      for (const [dir, idPrefix] of wikiRoots) {
+        const folderId = `wiki:${idPrefix}`
+        nodes.push({ id: folderId, type: "folder", data: idPrefix, parentId: "nb-projects" })
+        const dirPath = `${clone}/docs/${dir}`
+        try {
+          for (const entry of require("node:fs").readdirSync(dirPath, { withFileTypes: true })) {
+            if (entry.name.startsWith(".")) continue
+            if (entry.isDirectory()) {
+              nodes.push({ id: `wikifolder:${dir}/${entry.name}`, type: "folder", data: entry.name, parentId: folderId })
+            } else if (entry.name.endsWith(".md")) {
+              const base = entry.name.replace(/\.md$/, "")
+              const docId = `doc:${dir}/${base}`
+              nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
+            }
+          }
+        } catch {}
       }
       return { nodes } as T
     }

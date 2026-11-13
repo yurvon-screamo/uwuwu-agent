@@ -33,6 +33,12 @@ export function ghJson<T>(args: string[], stdinBody?: string): T {
   return (out === "" ? {} : JSON.parse(out)) as T
 }
 
+export function hubCloneRoot(): string {
+  return process.env.UWUWU_HUB_CLONE_ROOT
+    ? process.env.UWUWU_HUB_CLONE_ROOT
+    : `${process.env.HOME ?? "."}/.local/share/uwuwu-cli/hub-clone`
+}
+
 export function hubRepo(): string {
   return process.env.UWUWU_HUB_REPO ?? ""
 }

@@ -11,14 +11,27 @@ impl super::github_doc_store::GitHubDocStore {
         if !self.clone_root.join(".git").exists() {
             std::fs::create_dir_all(&self.clone_root)?;
             let url = format!("https://github.com/{}.git", self.repo);
+            // Каталог может быть не пуст (мигратор выгрузил docs до клона) —
+            // init + remote + fetch + checkout -f поверх существующих файлов
+            git(&["-C", self.clone_root_str(), "init", "-q"]).await?;
+            git(&["-C", self.clone_root_str(), "remote", "add", "origin", &url]).await?;
             git(&[
                 "-C",
                 self.clone_root_str(),
-                "clone",
+                "fetch",
                 "--depth",
                 "1",
-                &url,
-                ".",
+                "origin",
+            ])
+            .await?;
+            git(&[
+                "-C",
+                self.clone_root_str(),
+                "checkout",
+                "-f",
+                "-B",
+                "main",
+                "origin/main",
             ])
             .await?;
             return Ok(());
