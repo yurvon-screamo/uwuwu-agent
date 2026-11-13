@@ -415,17 +415,91 @@ def date_iso(raw):
 # SiYuan-доски): статус канбана — поле, не тело. fm в теле остаётся только
 # зеркалом для CLI-чтения (контракт GitHubStore).
 NATIVE_FIELDS = [
+    # канбан: только Status (пайп) + Запланировано (date-колонка);
+    # остальное — глобальные issue fields (ISSUE_FIELDS ниже)
     ("Status", "SINGLE_SELECT",
      ["Draft", "Todo", "Design", "Ревью плана", "In Progress",
       "Ревью результата", "Review", "Done", "Needs attention", "Вейт"]),
     ("Запланировано", "DATE", None),
-    ("Приоритет", "SINGLE_SELECT", ["high", "medium", "low"]),
-    ("Autodone", "SINGLE_SELECT", ["on", "off"]),
-    ("Branch", "TEXT", None),
-    ("PR", "TEXT", None),
-    ("Сессия dev", "TEXT", None),
-    ("Расписание", "TEXT", None),
 ]
+
+# Глобальные issue fields (Settings → Issue fields, /user/issue-fields):
+# структурированные данные на issue, видны в сайдбаре любой репы
+ISSUE_FIELDS = [
+    ("Приоритет", "single_select", ["high", "medium", "low"]),
+    ("Autodone", "single_select", ["on", "off"]),
+    ("Branch", "text", None),
+    ("PR", "text", None),
+    ("Сессия dev", "text", None),
+    ("Расписание", "text", None),
+    ("Запланировано", "date", None),
+]
+ISSUE_FIELD_COLORS = {"high": "red", "medium": "yellow", "low": "gray",
+                      "on": "green", "off": "gray"}
+
+_GLOBAL_FIELDS = None
+
+
+def global_fields():
+    """name → field_id глобальных issue fields; отсутствующие создаются."""
+    global _GLOBAL_FIELDS
+    if _GLOBAL_FIELDS is not None:
+        return _GLOBAL_FIELDS
+    out = {}
+    try:
+        existing = gh_json(["api", "/user/issue-fields"])
+        for f in existing if isinstance(existing, list) else []:
+            out[f["name"]] = f["id"]
+    except RuntimeError as e:
+        print(f"  ! /user/issue-fields: {str(e)[:120]}")
+    for name, dtype, options in ISSUE_FIELDS:
+        if name in out:
+            continue
+        body = {"name": name, "data_type": dtype}
+        if options:
+            body["options"] = [{"name": n,
+                                "color": ISSUE_FIELD_COLORS.get(n, "gray"),
+                                "priority": i}
+                               for i, n in enumerate(options, 1)]
+        try:
+            f = gh_json(["api", "-X", "POST", "/user/issue-fields"],
+                        json.dumps(body))
+            out[name] = f["id"]
+            print(f"  глобальное поле «{name}» создано (id={f['id']})")
+        except RuntimeError as e:
+            print(f"  ! поле «{name}»: {str(e)[:120]}")
+    _GLOBAL_FIELDS = out
+    return out
+
+
+def sync_issue_fields(repo, number, fm):
+    """Глобальные issue fields одного вызовом: select — имя опции,
+    date — ISO, text — строка (POST issue-field-values)."""
+    fmap = global_fields()
+    vals = []
+    pr_val = (fm.get("priority") or "").strip().lower()
+    if pr_val in ("high", "medium", "low") and fmap.get("Приоритет"):
+        vals.append({"field_id": fmap["Приоритет"], "value": pr_val})
+    if fmap.get("Autodone"):
+        vals.append({"field_id": fmap["Autodone"],
+                     "value": "on" if fm.get("autodone") == "true" else "off"})
+    for name, key in (("Branch", "branch"), ("PR", "pr"),
+                      ("Сессия dev", "dev-session"),
+                      ("Расписание", "schedule")):
+        v = str(fm.get(key) or "").strip()
+        if v and fmap.get(name):
+            vals.append({"field_id": fmap[name], "value": v})
+    iso = date_iso(fm.get("planned"))
+    if iso and fmap.get("Запланировано"):
+        vals.append({"field_id": fmap["Запланировано"], "value": iso})
+    if not vals:
+        return
+    try:
+        gh_json(["api", "-X", "POST",
+                 f"repos/{repo}/issues/{number}/issue-field-values"],
+                json.dumps({"issue_field_values": vals}))
+    except RuntimeError as e:
+        print(f"  ! issue-fields #{number}: {str(e)[:140]}")
 
 FIELD_COLORS = {"high": "RED", "medium": "YELLOW", "low": "GRAY",
                 "on": "GREEN", "off": "GRAY"}
@@ -587,6 +661,7 @@ def sync_project_fields(repo, project, number, node_id, fm):
     if not ctx:
         return
     ensure_native_fields(ctx, project)
+    sync_issue_fields(repo, number, fm)
     items = project_items_map(ctx)
     cur = items.get(int(number))
     if cur is None:
