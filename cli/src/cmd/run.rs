@@ -156,17 +156,9 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 true => std::io::read_to_string(std::io::stdin())?,
                 false => text.join(" "),
             };
-            let current = store
-                .read(&crate::store::doc_store::DocRef { slug: slug.into() })
-                .await
-                .unwrap_or_default();
-            let mut next = current;
-            if !next.ends_with('\n') {
-                next.push('\n');
-            }
-            next.push_str(&addition);
-            next.push('\n');
-            store.append_doc(slug, &next).await?;
+            // append_doc сам читает текущий док и конкатенирует — передаём
+            // только addition (вариант с ручным склеиванием удваивал тело)
+            store.append_doc(slug, &addition).await?;
             println!("персона дописана");
             Ok(())
         }
