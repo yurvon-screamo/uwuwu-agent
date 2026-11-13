@@ -15,6 +15,7 @@ Usage: python3 tools/siyuan_to_hub.py --repo yurvon-screamo/uwuwu-hub \
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -45,6 +46,77 @@ def siyuan_api(path, payload):
     if d.get("code") != 0:
         raise RuntimeError(f"siyuan {path}: {d.get('msg')}")
     return d.get("data")
+
+
+# ——— MCP-транспорт (render досок): прямых REST endpoint'ов render в ядре
+# нет (/api/riff/* не существуют — 404/пусто, проба 13.11); CLI SiYuan-эры
+# ходил через POST /mcp (JSON-RPC, tool «database», action «render») —
+# паритет cli/src/siyuan.rs mcp_call_once.
+
+MCP_SID = None
+
+
+def mcp_post(method, params, notify=False):
+    global MCP_SID
+    body = {"jsonrpc": "2.0", "method": method, "params": params}
+    if not notify:
+        body["id"] = 1
+    hdrs = {"Authorization": f"Token {SIYUAN_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream"}
+    if MCP_SID:
+        hdrs["Mcp-Session-Id"] = MCP_SID
+    req = urllib.request.Request(SIYUAN_URL + "/mcp",
+                                 data=json.dumps(body).encode(), headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            text = r.read().decode()
+            sid = r.headers.get("Mcp-Session-Id")
+    except urllib.error.HTTPError as e:
+        text = e.read().decode()
+        if e.code == 404 and MCP_SID:
+            # стейл-сессия (рестарт ядра): ре-инициализация и один повтор
+            MCP_SID = None
+            mcp_initialize()
+            return mcp_post(method, params, notify)
+        raise RuntimeError(f"mcp {method}: HTTP {e.code}: {text[:200]}")
+    if sid:
+        MCP_SID = sid
+    if not text.strip():
+        return None  # notification → 202/пусто
+    for line in reversed(text.splitlines()):
+        if line.startswith("data: "):
+            return json.loads(line[6:])
+    return json.loads(text)
+
+
+def mcp_initialize():
+    mcp_post("initialize", {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "siyuan-to-hub", "version": "1"}})
+    try:
+        mcp_post("notifications/initialized", {}, notify=True)
+    except Exception:
+        pass
+
+
+def mcp_tool(name, args):
+    global MCP_SID
+    if not MCP_SID:
+        mcp_initialize()
+    r = mcp_post("tools/call", {"name": name, "arguments": args})
+    if isinstance(r, dict) and "result" in r:
+        r = r["result"]
+    if r is None:
+        raise RuntimeError(f"mcp {name}: пустой ответ")
+    if r.get("isError"):
+        raise RuntimeError((r.get("content") or [{}])[0].get("text") or f"{name} isError")
+    sc = r.get("structuredContent")
+    payload = sc if sc is not None else json.loads(
+        (r.get("content") or [{}])[0].get("text") or "{}")
+    if payload.get("ok") is False:
+        raise RuntimeError(payload.get("msg") or payload.get("error") or "ok=false")
+    return payload
 
 
 def gh(args, stdin=None):
@@ -128,34 +200,57 @@ def board_rows(av_id):
     return items
 
 
+MAX_RENDER_PAGES = 100
+
+
+def resolve_av(doc_id):
+    """(avID, blockID носителя) — паритет resolve_av CLI SiYuan-эры."""
+    rows = sql(f"select id, markdown from blocks where root_id='{doc_id}' "
+               f"and (type='av' or (type='i' and markdown like '%avID=%')) limit 5")
+    for r in rows:
+        md = r.get("markdown") or ""
+        m = re.search(r'avID="([^"]+)"', md) or re.search(r'data-av-id="([^"]+)"', md)
+        if m:
+            return m.group(1), r["id"]
+    return "", ""
+
+
 def render_board(doc_id):
-    """Полная выборка database render через прямой REST ядра SiYuan
-    (CLI kernel-команды вырезаны срезом F): /api/riff/render + пагинация;
-    колонки → keyID-мап для cell_value."""
-    rows, columns, page = [], {}, 1
-    while True:
-        req = urllib.request.Request(SIYUAN_URL + "/api/riff/render",
-            data=json.dumps({"id": doc_id, "page": page}).encode(),
-            headers={"Authorization": f"Token {SIYUAN_TOKEN}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            d = json.load(r)
-        data = d.get("data") or {}
+    """Полная выборка database render через MCP (POST /mcp, tool database,
+    action render; серверный pageSize 50). Колонки → keyID-мап для cell_value,
+    дедуп по id строки, терминация по rowCount/короткой странице."""
+    av_id, block_id = resolve_av(doc_id)
+    if not av_id:
+        print(f"  ! доска {doc_id}: av-блок не резолвится — skip")
+        return []
+    rows, columns, seen = [], {}, set()
+    page = 1
+    while page <= MAX_RENDER_PAGES:
+        v = mcp_tool("database", {"action": "render", "id": av_id,
+                                  "blockID": block_id, "page": page})
+        data = v.get("data") or v
         view = data.get("view") or {}
-        for col in view.get("columns") or []:
-            columns[col["id"]] = col["name"]
+        for col in view.get("columns") or view.get("fields") or []:
+            columns[col["id"]] = col.get("name", "")
         page_rows = view.get("rows") or []
+        for r in page_rows:
+            rid = r.get("id") or ""
+            if rid and rid in seen:
+                continue
+            seen.add(rid)
+            for c in r.get("cells") or []:
+                vv = c.get("value") or {}
+                k = vv.get("keyID")
+                if k in columns:
+                    c["name"] = columns[k]
+            rows.append(r)
         print(f"  render p{page}: {len(page_rows)} строк")
         if not page_rows:
             break
-        for r in page_rows:
-            # keyID → имя колонки (cell_value ищет name)
-            for cell in r.get("cells") or []:
-                v = cell.get("value") or {}
-                key = v.get("keyID")
-                if key in columns:
-                    cell["name"] = columns[key]
-        rows.extend(page_rows)
-        if len(page_rows) < data.get("pageSize", 50):
+        row_count = view.get("rowCount")
+        if isinstance(row_count, int) and len(rows) >= row_count:
+            break
+        if len(page_rows) < 50:
             break
         page += 1
     return rows
@@ -235,39 +330,9 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
                  dev_session, planned, schedule, priority, autodone,
                  comments, manifest, dry, body_doc_id=""):
     safe_title = issue_title_of(title)
-    existing = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
-                        "-f", f"labels=proj:{project}", "-F", "state=all",
-                        "-F", "per_page=100"])
-    for issue in existing if isinstance(existing, list) else []:
-        if str(issue.get("title", "")).lower() == safe_title.lower():
-            # тело из SiYuan полнее hub-версии (волна 1 писала пустые тела) —
-            # дополняем: PATCH body если hub короче SiYuan
-            hub_body = str(issue.get("body") or "")
-            if len(body_md) > len(hub_body):
-                fm_now = {"status": str(issue.get("state", "open")).lower()}
-                gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{issue['number']}"],
-                   json.dumps({"body": "---" + chr(10) + "".join(
-                       f"{k}: {v}" + chr(10) for k, v in fm_now.items()) + "---" + chr(10) + body_md}))
-                print(f"  дубль: «{title}» → #{issue['number']} (тело дополнено)")
-                manifest.append({"row_id": manifest_row(title), "issue": issue["number"],
-                                 "title": title, "status": "exists+body"})
-                return issue["number"]
-            print(f"  дубль: «{title}» → #{issue['number']} (skip)")
-            manifest.append({"row_id": manifest_row(title), "issue": issue["number"],
-                             "title": title, "status": "exists"})
-            return issue["number"]
-    if dry:
-        print(f"  [dry] issue «{safe_title}» ({status})")
-        return None
-    payload = {"title": safe_title, "body": body_md,
-               "labels": [f"proj:{project}"]}
-    ty = task_type if task_type in TASK_TYPES else None
-    if ty:
-        payload["type"] = {"bug": "bug", "feature": "feature"}.get(ty, ty)
-    number = gh_json_retry(["api", "-X", "POST", f"repos/{repo}/issues"],
-                           json.dumps(payload))["number"]
-    # frontmatter-ячейки поверх тела (Branch/PR/Сессия dev/Запланировано/
-    # Расписание + status-дубль для CLI-чтения)
+    # frontmatter — единый для обеих веток (status = пайп-статус канона,
+    # НЕ GitHub state; Branch/PR/Сессия dev/Запланировано/Расписание —
+    # status-дубль для CLI-чтения)
     fm = {"status": status}
     if branch: fm["branch"] = branch
     if pr: fm["pr"] = pr
@@ -276,13 +341,53 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     if schedule: fm["schedule"] = schedule
     if priority: fm["priority"] = priority
     if autodone: fm["autodone"] = autodone
-    if fm:
-        body = "---\n" + "".join(f"{k}: {v}\n" for k, v in fm.items()) + "---\n" + body_md
-        gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{number}"],
-           json.dumps({"body": body}))
-    if status and status != "Draft":
-        set_project_status(project, number, status)
-        time.sleep(1.5)
+    body_full = "---\n" + "".join(f"{k}: {v}\n" for k, v in fm.items()) \
+        + "---\n" + body_md
+    existing = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
+                        "-f", f"labels=proj:{project}", "-F", "state=all",
+                        "-F", "per_page=100"])
+    for issue in existing if isinstance(existing, list) else []:
+        if str(issue.get("title", "")).lower() == safe_title.lower():
+            num = issue["number"]
+            # тело из SiYuan — источник истины миграции: дополняем, если
+            # hub-версия короче (волна 1 писала пустые шапки); hub-правки
+            # длиннее снапшота не затираем
+            if len(body_full) > len(str(issue.get("body") or "")):
+                gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{num}"],
+                   json.dumps({"body": body_full}))
+                print(f"  дубль: «{title}» → #{num} (тело дополнено)")
+                tag = "exists+body"
+            else:
+                print(f"  дубль: «{title}» → #{num} (skip)")
+                tag = "exists"
+            # канбан + state: Status/Запланировано в Project v2 и
+            # Done↔closed синхронизируются и для существующих (ранние
+            # прогоны создавали issues без записи канбана — статусы
+            # «мигрировали» только в fm тела)
+            want_closed = status == "Done"
+            is_closed = issue.get("state") == "closed"
+            sync_project_fields(repo, project, num, issue.get("node_id", ""),
+                                status, planned, want_closed)
+            if want_closed != is_closed:
+                gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{num}"],
+                   json.dumps({"state": "closed" if want_closed else "open",
+                               **({"state_reason": "completed"} if want_closed else {})}))
+            manifest.append({"row_id": manifest_row(title), "issue": num,
+                             "title": title, "status": tag})
+            return num
+    if dry:
+        print(f"  [dry] issue «{safe_title}» ({status})")
+        return None
+    payload = {"title": safe_title, "body": body_full,
+               "labels": [f"proj:{project}"]}
+    ty = task_type if task_type in TASK_TYPES else None
+    if ty:
+        payload["type"] = {"bug": "bug", "feature": "feature"}.get(ty, ty)
+    created = gh_json_retry(["api", "-X", "POST", f"repos/{repo}/issues"],
+                            json.dumps(payload))
+    number, node_id = created["number"], created.get("node_id", "")
+    sync_project_fields(repo, project, number, node_id, status, planned,
+                        status == "Done")
     if status == "Done":
         gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{number}"],
            json.dumps({"state": "closed", "state_reason": "completed"}))
@@ -297,36 +402,131 @@ def manifest_row(title):
     return title  # row-id → тайтл резолв живой строкой (SiYuan id не в hub)
 
 
-def set_project_status(project, number, status):
-    try:
-        proj_number = None
-        d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
-            "query": "query { viewer { projectsV2(first: 30) { nodes { number title } } } }"}))
-        needle = f"Задачи {project}"
-        for n in d["data"]["viewer"]["projectsV2"]["nodes"]:
-            if n["title"] == needle:
-                proj_number = n["number"]
-        if proj_number is None:
-            return
-        q = ("query($n: Int!) { viewer { projectV2(number: $n) { id "
-             "items(first: 100) { nodes { id content { ... on Issue { number } } } } "
-             "statusField: field(name: \"Status\") { ... on ProjectV2SingleSelectField "
-             "{ id options { id name } } } } } }")
-        d2 = gh_json(["api", "graphql", "--input", "-"], json.dumps({"query": q, "variables": {"n": proj_number}}))
-        proj = d2["data"]["viewer"]["projectV2"]
-        item = next((i for i in proj["items"]["nodes"]
-                     if i["content"].get("number") == int(number)), None)
-        opt = next((o for o in proj["statusField"]["options"] if o["name"] == status), None)
-        if not item or not opt:
-            return
-        m = ("mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { "
-             "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, "
-             "fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId } }")
-        gh(["api", "graphql", "--input", "-"], json.dumps({
-            "query": m, "variables": {"p": proj["id"], "i": item["id"],
-                                       "f": proj["statusField"]["id"], "o": opt["id"]}}))
-    except Exception as e:
-        print(f"  ! Projects v2 status «{status}»: {e}")
+PROJECT_CACHE = {}
+
+
+def date_iso(raw):
+    """SiYuan date → ISO YYYY-MM-DD (форматы '2026-01-05'/'20260105')."""
+    digits = re.sub(r"\D", "", str(raw or ""))[:8]
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    return ""
+
+
+def project_ctx(project):
+    """id проекта + Status-field + опции + Запланировано (кэш на прогон)."""
+    if project in PROJECT_CACHE:
+        return PROJECT_CACHE[project]
+    d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
+        "query": "query { viewer { projectsV2(first: 30) "
+                 "{ nodes { id number title } } } }"}))
+    pid = None
+    for n in d["data"]["viewer"]["projectsV2"]["nodes"]:
+        if n["title"] == f"Задачи {project}":
+            pid = n["id"]
+    if pid is None:
+        PROJECT_CACHE[project] = None
+        return None
+    q = ('query($id: ID!) { node(id: $id) { ... on ProjectV2 { '
+         'statusField: field(name: "Status") { ... on ProjectV2SingleSelectField '
+         '{ id options { id name } } } '
+         'planned: field(name: "Запланировано") { ... on ProjectV2Field { id } } '
+         '} } }')
+    d2 = gh_json(["api", "graphql", "--input", "-"], json.dumps(
+        {"query": q, "variables": {"id": pid}}))
+    node = d2["data"]["node"] or {}
+    ctx = {"id": pid, "status_field": node.get("statusField"),
+           "planned_field": node.get("planned")}
+    PROJECT_CACHE[project] = ctx
+    return ctx
+
+
+def issue_item_id(repo, number):
+    """projectItems issue (паритет item_id_of CLI): без пагинации
+    project-стороны — issue входит в 1–2 проекта."""
+    owner, name = repo.split("/", 1)
+    q = ('query($owner: String!, $name: String!, $n: Int!) { '
+         'repository(owner: $owner, name: $name) { issue(number: $n) { '
+         'projectItems(first: 10) { nodes { id project { id } } } } } }')
+    d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
+        "query": q,
+        "variables": {"owner": owner, "name": name, "n": int(number)}}))
+    repo_data = ((d.get("data") or {}).get("repository") or {})
+    return ((((repo_data.get("issue") or {}).get("projectItems") or {})
+             .get("nodes")) or [])
+
+
+def sync_project_fields(repo, project, number, node_id, status, planned, closed):
+    """Status + Запланировано в Project v2 + state issue (Done↔closed).
+    Item id — из issue.projectItems либо ответа addProjectV2ItemById
+    (свежий item виден с лагом — ретраи 0/2/4/8/15s, проба 13.11)."""
+    ctx = project_ctx(project)
+    if not ctx:
+        return
+    item_id = None
+    for delay in (0, 2, 4, 8, 15):
+        if delay:
+            time.sleep(delay)
+        for n in issue_item_id(repo, number):
+            if (n.get("project") or {}).get("id") == ctx["id"]:
+                item_id = n["id"]
+                break
+        if item_id:
+            break
+        m = ("mutation($p: ID!, $c: ID!) { addProjectV2ItemById(input: "
+             "{projectId: $p, contentId: $c}) { item { id } } }")
+        try:
+            d = gh_json(["api", "graphql", "--input", "-"], json.dumps({
+                "query": m, "variables": {"p": ctx["id"], "c": node_id}}))
+            item_id = ((((d.get("data") or {}).get("addProjectV2ItemById")
+                         or {}).get("item") or {}).get("id"))
+            if item_id:
+                break
+        except RuntimeError as e:
+            print(f"  ! add-item #{number}: {str(e)[:120]}")
+    if not item_id:
+        print(f"  ! #{number}: item в Project v2 не резолвится после ретраев")
+        return
+    sf = ctx.get("status_field")
+    if sf and status:
+        opt = next((o["id"] for o in sf.get("options") or []
+                    if o["name"] == status), None)
+        if opt:
+            m = ("mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { "
+                 "updateProjectV2ItemFieldValue(input: {projectId: $p, "
+                 "itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}})"
+                 " { clientMutationId } }")
+            for delay in (0, 2, 4, 8):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    gh(["api", "graphql", "--input", "-"], json.dumps({
+                        "query": m,
+                        "variables": {"p": ctx["id"], "i": item_id,
+                                      "f": sf["id"], "o": opt}}))
+                    break
+                except RuntimeError as e:
+                    t = str(e)
+                    if ("Could not resolve to a node" in t
+                            or "was provided invalid value" in t):
+                        continue  # лаг платформы — ретрай
+                    print(f"  ! status «{status}» #{number}: {t[:120]}")
+                    break
+        else:
+            print(f"  ! #{number}: опция Status «{status}» не найдена")
+    pf = ctx.get("planned_field")
+    iso = date_iso(planned)
+    if pf and iso:
+        m = ("mutation($p: ID!, $i: ID!, $f: ID!, $d: JSON) { "
+             "updateProjectV2ItemFieldValue(input: {projectId: $p, "
+             "itemId: $i, fieldId: $f, value: {date: $d}}) "
+             "{ clientMutationId } }")
+        try:
+            gh(["api", "graphql", "--input", "-"], json.dumps({
+                "query": m, "variables": {"p": ctx["id"], "i": item_id,
+                                          "f": pf["id"], "d": iso}}))
+        except RuntimeError as e:
+            print(f"  ! запланировано #{number}: {str(e)[:120]}")
 
 
 # ——— вики ———
