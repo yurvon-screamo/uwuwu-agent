@@ -186,12 +186,19 @@ export async function hubTool<T = Record<string, unknown>>(
 // ——— хелперы ———
 
 function allIssues(): Array<Record<string, unknown>> {
-  const data = ghJson<unknown[]>([
-    "api", "-X", "GET", `repos/${hubRepo()}/issues`,
-    "-F", "state=all", "-F", "per_page=100",
-  ])
-  const arr = (Array.isArray(data) ? data : []) as GhIssue[]
-  return arr.filter((i) => !i.pull_request) as unknown as Array<Record<string, unknown>>
+  const out: GhIssue[] = []
+  let page = 1
+  for (;;) {
+    const data = ghJson<GhIssue[]>([
+      "api", "-X", "GET", `repos/${hubRepo()}/issues`,
+      "-F", "state=all", "-F", "per_page=100", "-F", `page=${page}`,
+    ])
+    const arr = Array.isArray(data) ? data : []
+    out.push(...arr)
+    if (arr.length < 100) break
+    page += 1
+  }
+  return out.filter((i) => !i.pull_request) as unknown as Array<Record<string, unknown>>
 }
 
 function githubTypeName(issue: unknown, fallback: string | undefined): string {

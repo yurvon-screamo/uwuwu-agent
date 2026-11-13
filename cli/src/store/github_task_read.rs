@@ -14,17 +14,33 @@ impl TaskStore for GitHubStore {
         // давала искажённую выборку (живой e2e 13.11 — свежий issue не
         // попадал в -f labels, ручной query-string видел).
         let label = crate::store::github_task::urlencoded(&self.label_of(board));
-        let data = gh_json(
-            &[
-                "api",
-                &format!(
-                    "repos/{}/issues?labels={label}&state=open&per_page=100",
-                    self.repo
-                ),
-            ],
-            None,
-        )
-        .await?;
+        // Полная выборка с пагинацией (контракт трейта): uwuwu-доска
+        // превышает первую страницу 100 (332 items).
+        let mut all_rows: Vec<Value> = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let data = gh_json(
+                &[
+                    "api",
+                    &format!(
+                        "repos/{}/issues?labels={label}&state=open&per_page=100&page={page}",
+                        self.repo
+                    ),
+                ],
+                None,
+            )
+            .await?;
+            let Some(arr) = data.as_array() else {
+                break;
+            };
+            let fetched = arr.len();
+            all_rows.extend(arr.iter().cloned());
+            if fetched < 100 {
+                break;
+            }
+            page += 1;
+        }
+        let data = Value::Array(all_rows);
         let mut out = Vec::new();
         if let Value::Array(items) = data {
             for issue in &items {

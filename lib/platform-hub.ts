@@ -52,13 +52,20 @@ export interface GhIssue {
 
 export function issuesForProject(project: string): Array<GhIssue> {
   // query-string: gh -f/-F форма на GET давала искажённую выборку
-  // (живой e2e 13.11)
+  // (живой e2e 13.11). Пагинация полная: uwuwu-доска > 100 items.
   const label = encodeURIComponent(`proj:${project}`)
-  const data = ghJson<GhIssue[]>([
-    "api", `repos/${hubRepo()}/issues?labels=${label}&state=all&per_page=100`,
-  ])
-  const arr = Array.isArray(data) ? data : []
-  return arr.filter((i) => !i.pull_request)
+  const out: GhIssue[] = []
+  let page = 1
+  for (;;) {
+    const data = ghJson<GhIssue[]>([
+      "api", `repos/${hubRepo()}/issues?labels=${label}&state=all&per_page=100&page=${page}`,
+    ])
+    const arr = Array.isArray(data) ? data : []
+    out.push(...arr.filter((i) => !i.pull_request))
+    if (arr.length < 100) break
+    page += 1
+  }
+  return out
 }
 
 export function issueByNumber(number: string): Record<string, unknown> | null {

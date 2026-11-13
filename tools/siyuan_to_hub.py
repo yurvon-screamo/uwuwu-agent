@@ -217,7 +217,8 @@ def issue_title_of(title):
 # ——— импорт issues ———
 
 def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
-                 dev_session, planned, schedule, comments, manifest, dry):
+                 dev_session, planned, schedule, priority, autodone,
+                 comments, manifest, dry):
     safe_title = issue_title_of(title)
     existing = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
                         "-f", f"labels=proj:{project}", "-F", "state=all",
@@ -246,6 +247,8 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     if dev_session: fm["dev-session"] = dev_session
     if planned: fm["planned"] = planned
     if schedule: fm["schedule"] = schedule
+    if priority: fm["priority"] = priority
+    if autodone: fm["autodone"] = autodone
     if fm:
         body = "---\n" + "".join(f"{k}: {v}\n" for k, v in fm.items()) + "---\n" + body_md
         gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{number}"],
@@ -386,7 +389,10 @@ def main():
                 if not title:
                     continue
                 status = STATUS_MAP.get(cell_value(row, "Status")[0], cell_value(row, "Status")[0])
-                ty = cell_value(row, "Тип")[0].strip().split(",")[0].lower()
+                ty = cell_value(row, "Тип")[0]
+                priority = cell_value(row, "Приоритет")[0]
+                autodone_raw = cell_value(row, "Autodone")[0]
+                autodone = "true" if autodone_raw.strip() not in ("", "false") else "false".strip().split(",")[0].lower()
                 branch = cell_value(row, "Branch")[0]
                 pr = cell_value(row, "PR")[0]
                 session = cell_value(row, "Сессия dev")[0]
@@ -397,6 +403,7 @@ def main():
                 comments = comments_of(body)
                 number = import_issue(args.repo, b["project"], title, body, status,
                                       ty, branch, pr, session, planned, schedule,
+                                      priority, autodone,
                                       comments, manifest, args.dry_run)
                 manifest.append({"row_id": doc_id, "issue": number, "title": title,
                                  "status": status, "project": b["project"]})

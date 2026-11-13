@@ -154,8 +154,8 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             pr,
             branch,
             r#type,
-            priority: _,
-            autodone: _,
+            priority,
+            autodone,
             schedule,
             agent: _,
             planned,
@@ -170,15 +170,15 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 pr: pr.clone(),
                 branch: branch.clone(),
                 task_type: r#type.clone().map(TaskType),
+                priority: priority.clone(),
+                autodone: autodone.as_deref().map(|v| v == "on"),
                 planned: planned.as_ref().map(|p| (p.clone(), 0)),
                 ..Default::default()
             };
-            let _ = &patch;
             let fresh = store.edit(&board, &task, &patch).await?;
             if let Some(s) = &schedule {
-                store
-                    .set_body_attr(&board, &fresh, "custom-schedule", s)
-                    .await?;
+                // ключ унифицирован: schedule (читают cron list/convert/демоны)
+                store.set_body_attr(&board, &fresh, "schedule", s).await?;
             }
             println!("изменена: issue #{} «{}»", fresh.id, fresh.title);
             Ok(())
@@ -208,6 +208,9 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             md,
             text,
         } => {
+            if let Some(path) = &md {
+                path_flag("--md", path, "--stdin")?;
+            }
             let task = store
                 .resolve(&board, &id)
                 .await
