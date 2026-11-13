@@ -607,37 +607,39 @@ def sync_project_fields(repo, project, number, node_id, fm):
     item_id, curf = cur["item_id"], cur["fields"]
     fields = ctx["fields"]
 
-    def want(name, value, label, kind="select"):
-        if fields.get(name) and value is not None \
-                and curf.get(name) != str(value):
-            if set_item_field(ctx, item_id, fields[name]["id"], value,
+    def want(name, cur_value, write_value, label, kind="select"):
+        # сравнение/кэш по значению как его отдаёт items-map (имя опции),
+        # запись — по id опции (singleSelectOptionId ждёт id, не имя)
+        if fields.get(name) and cur_value is not None \
+                and curf.get(name) != str(cur_value):
+            if set_item_field(ctx, item_id, fields[name]["id"], write_value,
                               f"#{number} {label}", kind):
-                curf[name] = str(value)
+                curf[name] = str(cur_value)
 
     st = fm.get("status") or ""
     sf = fields.get("Status") or {}
     opt = (sf.get("options") or {}).get(st)
     if st and opt:
-        want("Status", st, f"Status={st}")
+        want("Status", st, opt, f"Status={st}")
     elif st and not opt:
         print(f"  ! #{number}: опция Status «{st}» не найдена")
     iso = date_iso(fm.get("planned"))
     if iso:
-        want("Запланировано", iso, f"Запланировано={iso}", kind="date")
+        want("Запланировано", iso, iso, f"Запланировано={iso}", kind="date")
     pr_val = (fm.get("priority") or "").strip().lower()
     pf = (fields.get("Приоритет") or {}).get("options") or {}
     if pr_val in pf:
-        want("Приоритет", pr_val, f"Приоритет={pr_val}")
+        want("Приоритет", pr_val, pf[pr_val], f"Приоритет={pr_val}")
     adf = (fields.get("Autodone") or {}).get("options") or {}
     ad = "on" if fm.get("autodone") == "true" else "off"
     if ad in adf:
-        want("Autodone", ad, f"Autodone={ad}")
+        want("Autodone", ad, adf[ad], f"Autodone={ad}")
     for fname, key in (("Branch", "branch"), ("PR", "pr"),
                        ("Сессия dev", "dev-session"),
                        ("Расписание", "schedule")):
         val = str(fm.get(key) or "").strip()
         if val:
-            want(fname, val, f"{fname}={val[:40]}", kind="text")
+            want(fname, val, val, f"{fname}={val[:40]}", kind="text")
 
 
 # ——— вики ———
