@@ -38,8 +38,9 @@ export interface TaskRef {
   devSession?: string
   reviewSession?: string
   testSession?: string
-  /** колонка «Приоритет» (high/medium/low); "" — не указан (сортируется
-   *  ниже low; дефолта нет — решение владельца) */
+  /** колонка «Приоритет» (high/medium/low); "" — не указан (строки до
+   *  13.11; create без флага теперь пишет medium — дефолт владельца,
+   *  пустые сортируются ниже low) */
   priority?: string
   /** колонка «Autodone»: true — автомерж PR при входе в Review (галочка
    *  владельца; триаж не ставит) */
