@@ -405,7 +405,8 @@ def main():
                 # doc_id тела задачи: док-саб по hpath "<доска>/<тайтл>"
                 body_doc_id = ""
                 if board_hpath:
-                    bd2 = sql(f"select id from blocks where type='d' and hpath='{board_hpath}/{title.replace(chr(39), chr(39)*2)}' limit 1")
+                    safe_title = title.replace("'", "''")
+                    bd2 = sql(f"select id from blocks where type='d' and hpath='{board_hpath}/{safe_title}' limit 1")
                     if bd2:
                         body_doc_id = bd2[0].get("id", "")
                 pr = cell_value(row, "Приоритет")[0]
