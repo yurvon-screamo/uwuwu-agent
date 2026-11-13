@@ -31,7 +31,6 @@ export async function hubTool<T = Record<string, unknown>>(
         matches.push({ id: `board:${title.slice("Задачи ".length)}`, inTrash: false })
       } else {
         const needle = title.toLowerCase()
-        for (const issue of issuesForProject("misc").length > 0 ? [] : []) void issue
         for (const issue of allIssues()) {
           if (String(issue.title).toLowerCase() === needle) {
             matches.push({ id: `issue:${issue.number}`, inTrash: false })

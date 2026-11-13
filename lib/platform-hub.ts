@@ -128,16 +128,21 @@ export function issuePatch(number: string, payload: Record<string, unknown>): vo
 export function setProjectStatus(project: string, number: string, status: string): void {
   const projNumber = projectBoardNumber(project)
   if (projNumber === null) return
-  const q1 = `query($n: Int!) { viewer { projectV2(number: $n) { id items(first: 100) { nodes { id content { ... on Issue { number } } } } statusField: field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`
+  // item-резолв через issue.projectItems (без капа items(first:100) —
+  // доска uwuwu >700 items: хвост был слеп для статусов демонов)
+  const q1 = `query($n: Int!, $o: String!, $r: String!, $num: Int!) { viewer { projectV2(number: $n) { id statusField: field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } repository(owner: $o, name: $r) { issue(number: $num) { projectItems(first: 10) { nodes { id project { id } } } } } }`
   const d = JSON.parse(gh([ "api", "graphql", "--input", "-" ],
-    JSON.stringify({ query: q1, variables: { n: projNumber } })))
+    JSON.stringify({ query: q1, variables: { n: projNumber, o: "yurvon-screamo", r: "uwuwu-hub", num: Number(number) } })))
   interface ProjectV2Node {
     id: string
-    items: { nodes: Array<{ id: string; content?: { number?: number } }> }
     statusField: { id: string; options: Array<{ id: string; name: string }> }
   }
   const proj = d.data.viewer.projectV2 as ProjectV2Node
-  const item = proj.items.nodes.find((n) => n.content?.number === Number(number))
+  if (!proj?.id) throw new Error(`Projects v2: проект «${project}» не найден`)
+  if (!proj.statusField?.id) throw new Error(`Projects v2: поле Status не найдено в «${project}»`)
+  interface IssueItemsNode { id: string; project: { id: string } }
+  const items = (d.data as { repository?: { issue?: { projectItems?: { nodes: IssueItemsNode[] } } } }).repository?.issue?.projectItems?.nodes ?? []
+  const item = items.find((n) => n.project.id === proj.id)
   const opt = proj.statusField.options.find((o) => o.name === status)
   if (!item) throw new Error(`Projects v2: issue #${number} не в проекте после add-item`)
   if (!opt) throw new Error(`Projects v2: опция Status «${status}» не найдена (канон срез A)`)
