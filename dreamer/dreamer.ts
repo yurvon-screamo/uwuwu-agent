@@ -24,6 +24,7 @@ import {
 } from "./task-run-lib"
 import { fetchSessionById, sessionTimedOut } from "./session-row"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
+import { hubCloneRoot } from "../lib/platform-hub"
 
 // state: песочница — UWUWU_DREAMER_STATE_DIR двигает state+lock, в песочнице
 // лог тоже переезжает (прод-лог не засоряется смоук-тиками). Дефолт-изоляция:
@@ -54,8 +55,9 @@ const DB_PATH = process.env.UWUWU_DREAMER_DB
 // тулзы живут в этом же репо (демон — dreamer/, аудит — tools/)
 const AUDIT_PATH = process.env.UWUWU_DREAMER_AUDIT
   ?? resolve(import.meta.dir, "../tools/opencode_audit.py")
-const WIKI_OPS_PATH = process.env.UWUWU_DREAMER_WIKIOPS
-  ?? resolve(import.meta.dir, "../tools/wiki_ops.py")
+// клон hub: доки вики = md-файлы, запись = правка файла + git push
+// (методика — agents/dreamer.md; wiki_ops.py снесён, хвост 5 задачи 317)
+const HUB_CLONE_PATH = hubCloneRoot()
 
 const TICK_SEC = Number(process.env.UWUWU_DREAMER_TICK_SEC ?? 60)
 const ONCE = process.env.UWUWU_DREAMER_ONCE === "1"
@@ -327,7 +329,7 @@ function taskRunPromptFor(
     lastProcessedUpdate: tracked.lastProcessedUpdate,
     sessions,
     auditPath: AUDIT_PATH,
-    wikiOpsPath: WIKI_OPS_PATH,
+    hubClonePath: HUB_CLONE_PATH,
     dbPath: DB_PATH,
     retry,
   })
@@ -519,7 +521,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
           sessionId: cand.session.id,
           sessionTitle: cand.session.title,
           auditPath: AUDIT_PATH,
-          wikiOpsPath: WIKI_OPS_PATH,
+          hubClonePath: HUB_CLONE_PATH,
           dbPath: DB_PATH,
           sinceIso: new Date(prev.lastProcessedUpdate).toISOString(),
         })
@@ -545,7 +547,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
       sessionId: cand.session.id,
       sessionTitle: cand.session.title,
       auditPath: AUDIT_PATH,
-      wikiOpsPath: WIKI_OPS_PATH,
+      hubClonePath: HUB_CLONE_PATH,
       dbPath: DB_PATH,
     })
     const tracked = startRun(state, cand.session.id, cand.session.timeUpdated, cand.resetAttempts ? 0 : (prev?.attempts ?? 0))

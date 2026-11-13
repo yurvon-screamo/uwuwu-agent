@@ -183,10 +183,10 @@ describe("hasAssistantReply", () => {
 
 describe("dreamerPrompt / isValidTracked", () => {
   test("промпт содержит входы", () => {
-    const p = dreamerPrompt({ sessionId: "ses_abc", sessionTitle: "тема", auditPath: "/a/opencode_audit.py", wikiOpsPath: "/a/wiki_ops.py", dbPath: "/b/opencode.db" })
+    const p = dreamerPrompt({ sessionId: "ses_abc", sessionTitle: "тема", auditPath: "/a/opencode_audit.py", hubClonePath: "/h/hub-clone", dbPath: "/b/opencode.db" })
     expect(p).toContain("ses_abc")
     expect(p).toContain("opencode_audit.py")
-    expect(p).toContain("wiki_ops.py")
+    expect(p).toContain("hub-clone")
     expect(p).toContain("opencode.db")
     expect(p).toContain("uwuwu-cli read")
     expect(p).toContain("одной-двумя строками")
@@ -195,8 +195,8 @@ describe("dreamerPrompt / isValidTracked", () => {
     // Регресс 20261104072029: форма `session <id> --compact --db <путь>` падала
     // с `unrecognized arguments` — опции объявлены до subparsers.
     for (const p of [
-      dreamerPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db" }),
-      wakeupPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", wikiOpsPath: "/w.py", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" }),
+      dreamerPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", hubClonePath: "/h/hub-clone", dbPath: "/b.db" }),
+      wakeupPrompt({ sessionId: "ses_abc", sessionTitle: null, auditPath: "/a.py", hubClonePath: "/h/hub-clone", dbPath: "/b.db", sinceIso: "2026-11-01T12:00:00.000Z" }),
     ]) {
       const cmd = p.split("\n").find((l) => l.includes("python3 \"/a.py\""))
       expect(cmd).toBeDefined()

@@ -279,7 +279,7 @@ export interface PromptInput {
   sessionId: string
   sessionTitle: string | null
   auditPath: string
-  wikiOpsPath: string
+  hubClonePath: string
   dbPath: string
 }
 
@@ -296,7 +296,8 @@ export function dreamerPrompt(input: PromptInput): string {
     `- дамп сессии: python3 "${input.auditPath}" --db "${input.dbPath}" --compact session ${input.sessionId}`,
     `- БД опенкода (readonly, при необходимости прямых SELECT): ${input.dbPath}`,
     `- чтение вики: uwuwu-cli read "<slug>" (живое); поиск: uwuwu-cli search`,
-    `- запись в вики (абсолютный путь — cwd у тебя чужой проект): "${input.wikiOpsPath}"`,
+    `- запись в вики — клон hub (cwd у тебя чужой проект): "${input.hubClonePath}";`,
+    `  правки файлов docs/**.md + git add/commit/push (ff-only); методика записи — agents/dreamer.md`,
     ``,
     `Действуй строго по своей методике. Заверши одной-двумя строками: что`,
     `записал (тайтлы) / «нечего взять» / причина недоступности вики.`,
@@ -316,7 +317,7 @@ export function wakeupPrompt(input: PromptInput & { sinceIso: string }): string 
     ``,
     `Входы те же:`,
     `- дамп: python3 "${input.auditPath}" --db "${input.dbPath}" --compact session ${input.sessionId}`,
-    `- чтение вики: uwuwu-cli read; запись: "${input.wikiOpsPath}"`,
+    `- чтение вики: uwuwu-cli read; запись: клон hub "${input.hubClonePath}" (методика — agents/dreamer.md)`,
     ``,
     `Заверши одной-двумя строками: что дополнительно записал / «в дельте нечего взять».`,
   ].join("\n")
