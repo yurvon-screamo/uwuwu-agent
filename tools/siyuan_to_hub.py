@@ -327,7 +327,8 @@ def issue_title_of(title):
 # ——— импорт issues ———
 
 def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
-                 dev_session, planned, schedule, priority, autodone,
+                 dev_session, review_session, test_session,
+                 planned, schedule, priority, autodone,
                  comments, manifest, dry, body_doc_id=""):
     safe_title = issue_title_of(title)
     # frontmatter — единый для обеих веток (status = пайп-статус канона,
@@ -337,6 +338,8 @@ def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
     if branch: fm["branch"] = branch
     if pr: fm["pr"] = pr
     if dev_session: fm["dev-session"] = dev_session
+    if review_session: fm["review-session"] = review_session
+    if test_session: fm["test-session"] = test_session
     if planned: fm["planned"] = planned
     if schedule: fm["schedule"] = schedule
     if priority: fm["priority"] = priority
@@ -431,6 +434,8 @@ ISSUE_FIELDS = [
     ("Branch", "text", None),
     ("PR", "text", None),
     ("Сессия dev", "text", None),
+    ("Сессия ревью", "text", None),
+    ("Сессия тест", "text", None),
     ("Расписание", "text", None),
     ("Запланировано", "date", None),
 ]
@@ -485,6 +490,8 @@ def sync_issue_fields(repo, number, fm):
                      "value": "on" if fm.get("autodone") == "true" else "off"})
     for name, key in (("Branch", "branch"), ("PR", "pr"),
                       ("Сессия dev", "dev-session"),
+                      ("Сессия ревью", "review-session"),
+                      ("Сессия тест", "test-session"),
                       ("Расписание", "schedule")):
         v = str(fm.get(key) or "").strip()
         if v and fmap.get(name):
@@ -878,6 +885,8 @@ def main():
                 branch = cell_value(row, "Branch")[0]
                 pr = cell_value(row, "PR")[0]
                 session = cell_value(row, "Сессия dev")[0]
+                review_session = cell_value(row, "Сессия ревью")[0]
+                test_session = cell_value(row, "Сессия тест")[0]
                 planned, planned_ms = cell_value(row, "Запланировано")
                 schedule = cell_value(row, "Расписание")[0]
                 # doc_id тела задачи: док-саб по hpath "<доска>/<тайтл>"
@@ -890,7 +899,8 @@ def main():
                 body = row_body_md(body_doc_id, cache)
                 comments = comments_of(body)
                 number = import_issue(args.repo, b["project"], title, body, status,
-                                      ty, branch, pr, session, planned, schedule,
+                                      ty, branch, pr, session, review_session,
+                                      test_session, planned, schedule,
                                       priority, autodone,
                                       comments, manifest, args.dry_run, body_doc_id)
                 time.sleep(2)
