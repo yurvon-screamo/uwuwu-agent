@@ -150,14 +150,16 @@ export function setProjectStatus(project: string, number: string, status: string
   }
   const proj = d.data.viewer.projectV2
   if (!proj) throw new Error(`Projects v2: канбан «${project}» не найден`)
+  const statusField = proj.statusField
+  if (!statusField) throw new Error(`Projects v2: поле Status не найдено (канбан «${project}»)`)
   const item = d.data.repository.issue?.projectItems.nodes.find((n) => n.project.number === projNumber)
-  const opt = proj.statusField?.options.find((o) => o.name === status)
+  const opt = statusField.options.find((o) => o.name === status)
   if (!item) throw new Error(`Projects v2: issue #${number} не в проекте «${project}»`)
   if (!opt) throw new Error(`Projects v2: опция Status «${status}» не найдена (канон срез A)`)
   const q2 = `mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) { updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { clientMutationId } }`
   gh([ "api", "graphql", "--input", "-" ], JSON.stringify({
     query: q2,
-    variables: { p: proj.id, i: item.id, f: proj.statusField!.id, o: opt.id },
+    variables: { p: proj.id, i: item.id, f: statusField.id, o: opt.id },
   }))
 }
 
