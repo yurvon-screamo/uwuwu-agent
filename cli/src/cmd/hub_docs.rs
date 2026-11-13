@@ -83,10 +83,14 @@ pub(crate) async fn docs_append(
     if addition.trim().is_empty() {
         bail!("вход пуст — тихий no-op замаскирует сломанный пайп вызывающего");
     }
-    let doc = match store.exists(slug).await? {
-        true => store.append_doc(slug, &addition).await?,
-        false if force => store.create_doc(slug, &addition).await?.doc,
-        false => bail!("док «{slug}» не найден — создай через docs create (или append --force)"),
+    let doc = if store.exists(slug).await? {
+        store.append_doc(slug, &addition).await?
+    } else if force {
+        store.create_doc(slug, &addition).await?.doc
+    } else {
+        // отказ с basename-подсказкой делает store (not_found) —
+        // дублирующий exists-чек наводил юзера на дубль дока (пин 46)
+        store.append_doc(slug, &addition).await?
     };
     print!("{doc}");
     Ok(())

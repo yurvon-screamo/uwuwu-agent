@@ -41,7 +41,7 @@ impl GitHubDocStore {
     }
 
     /// Все md-файлы docs/** с данным basename (без .md).
-    fn md_by_basename(&self, base: &str) -> Vec<PathBuf> {
+    pub(super) fn md_by_basename(&self, base: &str) -> Vec<PathBuf> {
         let docs_root = self.clone_path().join("docs");
         let mut out = Vec::new();
         let mut stack = vec![docs_root.clone()];

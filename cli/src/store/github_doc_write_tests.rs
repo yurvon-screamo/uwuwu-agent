@@ -173,6 +173,36 @@ async fn append_survives_foreign_push_between_reads() -> Result<()> {
 }
 
 #[tokio::test]
+async fn basename_slug_write_rejects_hints_full_slug() -> Result<()> {
+    let (_tmp, work) = rig("basename").await?;
+    let store = hub(&work);
+    // легаси-слаг (basename) в append: отказ называет полный слаг —
+    // подсказка «создай через create» уводила юзера на дубль дока
+    // (пин бага тест-круга 46)
+    let err = store.append_doc("plain-doc", "добавка").await.unwrap_err();
+    assert!(
+        err.to_string().contains(PLAIN_DOC),
+        "подсказка полного слага: {err}"
+    );
+    let err = store
+        .replace_doc("plain-doc", "тело", None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(PLAIN_DOC));
+    let err = store.delete_doc("plain-doc").await.unwrap_err();
+    assert!(err.to_string().contains(PLAIN_DOC));
+    // create по basename-слагу — отказ на неоднозначность (иначе молча
+    // создаёт дубль существующего дока в корне docs/)
+    let err = store
+        .create_doc("plain-doc", "тело дубликата")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("неоднозначен"));
+    assert!(!store.exists("plain-doc").await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn tree_lists_sorted_slugs() -> Result<()> {
     let (_tmp, work) = rig("tree").await?;
     let slugs = hub(&work).tree().await?;

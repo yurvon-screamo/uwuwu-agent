@@ -23,6 +23,47 @@ impl GitHubDocStore {
         self.write_files(files, deleted, &msg).await
     }
 
+    /// Подсказка полного слага при basename-матче (контракт плана 46:
+    /// basename-фоллбек read в write не переезжает — отказ называет
+    /// полный слаг, иначе юзер уводится штатной подсказкой на дубль дока).
+    fn slug_hints(&self, slug: &str) -> Vec<String> {
+        let base = slug.trim_matches('/').rsplit('/').next().unwrap_or(slug);
+        let docs_root = self.clone_path().join("docs");
+        let mut out = self
+            .md_by_basename(base)
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&docs_root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().trim_end_matches(".md").to_string())
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    /// Отказ «док не найден» с basename-подсказкой (или create-подсказка,
+    /// если матчей нет).
+    fn not_found(&self, slug: &str, create_hint: bool) -> anyhow::Error {
+        let hints = self.slug_hints(slug);
+        if hints.is_empty() {
+            let tail = if create_hint {
+                " — создание только через docs create"
+            } else {
+                ""
+            };
+            return anyhow::anyhow!("док «{slug}» не найден{tail}");
+        }
+        anyhow::anyhow!(
+            "док «{slug}» не найден; по basename найден: {} — write-команды требуют полный слаг",
+            hints
+                .iter()
+                .map(|h| format!("«{h}»"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
     /// Создать док: шапку ведёт store (frontmatter + H1 из тайтла слага),
     /// вход — тело после шапки. Гварды: существует/frontmatter/path-safe;
     /// ADR-номер занят / новая папка — warn, не отказ.
@@ -31,6 +72,19 @@ impl GitHubDocStore {
         let file = self.doc_file(slug)?;
         if file.exists() {
             bail!("док «{slug}» существует — read/replace, создание не нужно");
+        }
+        // basename-матч — неоднозначный слаг: молча создаст дубль существующего
+        // дока в другом месте (сценарий тест-круга 46)
+        let hints = self.slug_hints(slug);
+        if !hints.is_empty() {
+            bail!(
+                "слаг «{slug}» неоднозначен: basename матчит существующий док {} — write-команды требуют полный слаг (для нового дока возьми другой basename)",
+                hints
+                    .iter()
+                    .map(|h| format!("«{h}»"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         let title = super::github_doc_guards::split_slug(slug).1;
         reject_frontmatter(content)?;
@@ -51,7 +105,7 @@ impl GitHubDocStore {
         self.ensure_clone().await?;
         let file = self.doc_file(slug)?;
         if !file.exists() {
-            bail!("док «{slug}» не найден — создание только через docs create");
+            return Err(self.not_found(slug, true));
         }
         let current = std::fs::read_to_string(&file)?;
         let mut next = current.clone();
@@ -78,7 +132,7 @@ impl GitHubDocStore {
         self.ensure_clone().await?;
         let file = self.doc_file(slug)?;
         if !file.exists() {
-            bail!("док «{slug}» не найден — replace не создаёт, см. docs create");
+            return Err(self.not_found(slug, true));
         }
         let current = std::fs::read(&file)?;
         if let Some(expected) = base {
@@ -106,7 +160,7 @@ impl GitHubDocStore {
         }
         let file = self.doc_file(slug)?;
         if !file.exists() {
-            bail!("док «{slug}» не найден");
+            return Err(self.not_found(slug, false));
         }
         self.write_doc_bytes(slug, &[], &[file], "delete").await
     }
