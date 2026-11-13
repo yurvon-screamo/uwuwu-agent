@@ -449,6 +449,10 @@ def main():
         for b in boards:
             print(f"проект «{b['project']}»:")
             rows = render_board(b["doc_id"])
+            board_hpath = None
+            bd = sql(f"select hpath from blocks where id='{b['doc_id']}' limit 1")
+            if bd:
+                board_hpath = bd[0].get("hpath")
             for row in rows:
                 # Primary Key канон разъехался по доскам (Primary Key /
                 # Название / Первичный ключ) — берём первую block-клетку
@@ -468,21 +472,26 @@ def main():
                 ty = cell_value(row, "Тип")[0]
                 priority = cell_value(row, "Приоритет")[0]
                 autodone_raw = cell_value(row, "Autodone")[0]
-                autodone = "true" if autodone_raw.strip() not in ("", "false") else "false".strip().split(",")[0].lower()
+                autodone = "true" if autodone_raw.strip() not in ("", "false") else "false"
                 branch = cell_value(row, "Branch")[0]
                 pr = cell_value(row, "PR")[0]
                 session = cell_value(row, "Сессия dev")[0]
                 planned, planned_ms = cell_value(row, "Запланировано")
                 schedule = cell_value(row, "Расписание")[0]
-                doc_id = row.get("doc") or ""
-                body = row_body_md(doc_id, cache)
-                comments = comments_of(body)
+                # doc_id тела задачи: док-саб по hpath "<доска>/<тайтл>"
+                body_doc_id = ""
+                if board_hpath:
+                    safe_title = title.replace("'", "''")
+                    bd2 = sql(f"select id from blocks where type='d' and hpath='{board_hpath}/{safe_title}' limit 1")
+                    if bd2:
+                        body_doc_id = bd2[0].get("id", "")
                 body = row_body_md(body_doc_id, cache)
+                comments = comments_of(body)
                 number = import_issue(args.repo, b["project"], title, body, status,
                                       ty, branch, pr, session, planned, schedule,
                                       priority, autodone,
                                       comments, manifest, args.dry_run, body_doc_id)
-                manifest.append({"row_id": doc_id, "issue": number, "title": title,
+                manifest.append({"row_id": body_doc_id, "issue": number, "title": title,
                                  "status": status, "project": b["project"]})
         with open("migration-manifest.json", "w") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=1)
