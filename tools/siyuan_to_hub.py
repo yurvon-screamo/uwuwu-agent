@@ -52,7 +52,7 @@ def gh(args, stdin=None):
     if stdin is not None:
         # gh api без --input - игнорирует stdin: тело мутации молча терялось
         full += ["--input", "-"]
-    delays = [0, 10, 30, 60, 120]
+    delays = [0, 60, 120, 300, 600]
     r = None
     for attempt, delay in enumerate(delays):
         if delay:
@@ -504,6 +504,7 @@ def main():
                                       ty, branch, pr, session, planned, schedule,
                                       priority, autodone,
                                       comments, manifest, args.dry_run, body_doc_id)
+                time.sleep(2)
                 manifest.append({"row_id": body_doc_id, "issue": number, "title": title,
                                  "status": status, "project": b["project"]})
         with open("migration-manifest.json", "w") as f:
