@@ -126,6 +126,10 @@ pub(super) fn dirs_data_home() -> PathBuf {
         .join("uwuwu-cli")
 }
 
+#[cfg(test)]
+#[path = "github_doc_clone_tests.rs"]
+mod github_doc_clone_tests;
+
 impl super::github_doc_store::GitHubDocStore {
     /// Дописать в конец дока (person append): read-modify-write ff-push.
     pub(crate) async fn append_doc(&self, slug: &str, addition: &str) -> Result<()> {
@@ -141,12 +145,12 @@ impl super::github_doc_store::GitHubDocStore {
         }
         next.push_str(addition);
         next.push('\n');
-        self.write_doc(slug_if_doc(slug), next).await
+        self.write_doc(slug.to_string(), next).await
     }
 
     /// Перезаписать док целиком (person replace).
     pub(crate) async fn replace_doc(&self, slug: &str, body: &str) -> Result<()> {
-        self.write_doc(slug_if_doc(slug), body.to_string()).await
+        self.write_doc(slug.to_string(), body.to_string()).await
     }
 
     async fn write_doc(&self, slug: String, content: String) -> Result<()> {
@@ -157,8 +161,4 @@ impl super::github_doc_store::GitHubDocStore {
         )
         .await
     }
-}
-
-fn slug_if_doc(slug: &str) -> String {
-    slug.to_string()
 }
