@@ -288,12 +288,32 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                         bail!("task body --replace требует --base (снапшот свежести) или --force");
                     }
                     // base — содержимое снапшота (файл): защита от
-                    // параллельной правки = сверка base vs текущее тело
-                    let base_md = match &base {
-                        Some(path) => std::fs::read_to_string(path)?,
-                        None => String::new(),
+                    // параллельной правки = сверка base vs текущее тело.
+                    // --force: сверка тривиально проходит (текущее тело
+                    // подставляется как base) — свежесть не проверяется.
+                    let base_md = if force {
+                        store.body_get(&board, &task).await?
+                    } else {
+                        match &base {
+                            Some(path) => std::fs::read_to_string(path)?,
+                            None => String::new(),
+                        }
                     };
+                    if let Some(section) = &replace_section {
+                        bail!(
+                            "task body --replace-section «{section}»: на hub-бекенде секционная \
+                             хирургия не поддерживается — правь body (--replace/--force) целиком"
+                        );
+                    }
                     store.body_replace(&board, &task, &md, &base_md).await?;
+                    if !attach.is_empty() {
+                        // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL
+                        // руками в теле) — загрузка через cli не портирована
+                        println!(
+                            "⚠ --attach на hub не портирован: файлы не загружены — \
+                             положи в assets/ репо uwuwu-hub и вставь raw-ссылки"
+                        );
+                    }
                     println!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
@@ -313,7 +333,6 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     println!("{current}");
                 }
             }
-            let _ = (force, attach, replace_section);
             Ok(())
         }
         other => {
