@@ -39,6 +39,29 @@ impl GitHubDocStore {
         self.clone_root.to_str().unwrap_or(".")
     }
 
+    /// Все md-файлы docs/** с данным basename (без .md).
+    fn md_by_basename(&self, base: &str) -> Vec<PathBuf> {
+        let docs_root = self.clone_path().join("docs");
+        let mut out = Vec::new();
+        let mut stack = vec![docs_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+                    && path.file_stem().and_then(|s| s.to_str()) == Some(base)
+                {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     /// Файл дока в worktree: slug → docs/<slug>.md (без ..-ходов).
     fn doc_file(&self, slug: &str) -> Result<PathBuf> {
         let safe = slug.trim_matches('/');
@@ -71,9 +94,29 @@ impl DocStore for GitHubDocStore {
     async fn read(&self, doc: &DocRef) -> Result<String> {
         self.ensure_clone().await?;
         let file = self.doc_file(&doc.slug)?;
-        let bytes = std::fs::read(&file)
-            .with_context(|| format!("док «{}» не найден ({})", doc.slug, file.display()))?;
-        Ok(String::from_utf8_lossy(&bytes).to_string())
+        match std::fs::read(&file) {
+            Ok(bytes) => {
+                return Ok(String::from_utf8_lossy(&bytes).to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Фоллбек basename: слаг старой схемы (<proj>/<doc>) мапится в
+        // docs/Projects/<proj>/<doc>.md — ищем уникальный файл по basename
+        let base = doc.slug.rsplit('/').next().unwrap_or(&doc.slug);
+        let candidates = self.md_by_basename(base);
+        match candidates.len() {
+            1 => {
+                let bytes = std::fs::read(&candidates[0])?;
+                Ok(String::from_utf8_lossy(&bytes).to_string())
+            }
+            0 => bail!("док «{}» не найден (docs/**)", doc.slug),
+            _ => bail!(
+                "док «{}»: неоднозначно, {} кандидатов в docs/** — уточни слаг",
+                doc.slug,
+                candidates.len()
+            ),
+        }
     }
 
     async fn ls(&self, path: &str) -> Result<Vec<DocEntry>> {
