@@ -17,7 +17,9 @@ const VERSION_STR: &str = concat!(
 
 #[derive(Parser)]
 #[command(name = "uwuwu-cli", version = VERSION_STR)]
-#[command(about = "CLI for uwuwu/wiki: доступ агентам к платформе uwuwu (SiYuan)")]
+#[command(
+    about = "CLI for uwuwu: доступ агентам к платформе uwuwu (uwuwu-hub: issues + Projects v2 + docs md)"
+)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -475,7 +477,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: DocsSub,
     },
-    /// Персона владельца (SiYuan-док Experience:/personal/PERSON): show —
+    /// Персона владельца (вики-док Experience/personal/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
     /// факт (владелец/дример), replace — полная перезапись на месте.
     /// Мутации возвращают финальный документ целиком или явную ошибку.
@@ -490,7 +492,6 @@ pub(crate) enum Commands {
         #[arg(long, help = "Output file ('-' = stdout). Default: <key> in cwd")]
         out: Option<String>,
     },
-    /// (не портирован на SiYuan v1)
     Shot {
         #[arg(help = "Doc slug or title (same addressing as read)")]
         slug: String,
@@ -530,7 +531,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: CronSub,
     },
-    /// Канбан-задачи («Задачи <Proj>» SiYuan database): create/list/get/
+    /// Канбан-задачи («Задачи <Proj>», канбан проекта): create/list/get/
     /// edit/comment/close; комменты — секция тел задач. Мутации create/edit/
     /// claim/comment/close/body возвращают финальное состояние сущности
     /// (read-after-write) или явную ошибку (rm/clean/undo несут undo-журнал/вердикты).
@@ -541,7 +542,7 @@ pub(crate) enum Commands {
         #[arg(long, global = true)]
         project: Option<String>,
     },
-    /// Реестр долгосрочных целей («Цели <Proj>» SiYuan database): доску
+    /// Реестр долгосрочных целей («Цели <Proj>»): доску
     /// заводит владелец руками в UI; list/add/edit/rm, close = edit --status done.
     /// Мутации возвращают финальное состояние сущности или явную ошибку.
     Goal {
@@ -551,7 +552,6 @@ pub(crate) enum Commands {
         #[arg(long, global = true)]
         project: Option<String>,
     },
-    /// Живые kernel-пробы SiYuan: ping/sql/file/ls/export/render —
     /// диагностика ядра из агентской сессии без env-токена.
     Kernel {
         #[command(subcommand)]
@@ -566,7 +566,6 @@ pub(crate) enum Commands {
         )]
         timeout: u64,
     },
-    /// Диагностика деградации ядра SiYuan: kernel/wave/доска/
     /// тела-сироты/FS↔SQL/история сносов. Exit: 0 чисто (OBSERVE и SKIP
     /// допустимы), 1 деградация (включая недоступное ядро), 2 пробы не
     /// выполнились.
@@ -596,8 +595,6 @@ pub(crate) enum DocsSub {
     },
 }
 
-/// Персона владельца: приватный SiYuan-док (Experience:/personal/PERSON).
-/// Один инстанс SiYuan на все машины — синков и пуш-политики нет.
 #[derive(Subcommand)]
 pub(crate) enum PersonSub {
     /// Актуальная персона (markdown). Дока нет — честная ошибка с подсказкой

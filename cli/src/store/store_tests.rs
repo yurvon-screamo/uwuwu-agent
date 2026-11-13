@@ -169,7 +169,7 @@ mod frontmatter_tests {
 /// Полнотекст-парсер GitHub DocStore: строки «path:line:text» → хиты.
 #[test]
 fn fulltext_parser_extracts_slug_and_snippet() {
-    let stdout = "docs/uwuwu/README.md:12:SiYuan бекенд нестабилен\ndocs/x.md:3:ещё\n";
+    let stdout = "docs/uwuwu/README.md:12:легаси-бекенд нестабилен\ndocs/x.md:3:ещё\n";
     let hits = crate::store::github_doc_search::parse_line_pairs(stdout);
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].title, "README");

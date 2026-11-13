@@ -27,7 +27,7 @@ const HERE = import.meta.dir
 const WATCH_SEC = parseWatchSec(process.env.UWUWU_TRIAGE_WATCH_SEC)
 /** refresh кэша досок (органи-дерево): часы, не минуты — проход дорогой */
 const BOARD_REFRESH_MS = 6 * 3600_000
-/** Порог тишины выходного потока: правило владельца (опыт «SiYuan-контур»,
+/** Порог тишины выходного потока: правило владельца (опыт «контур uwuwu»,
  *  Режим 5 дополнение) — волны черновиков ежедневные, сутки максимум. */
 const TRIAGE_SILENCE_TIMEOUT_MS = 24 * 3600_000
 
@@ -235,7 +235,7 @@ const draftWatcher: HubSource = {
   name: "draft",
   start: async (hub, ctl) => {
     if (!mcpConfigured()) {
-      hub.log("вотчер черновиков off: нет UWUWU_SIYUAN_* — ТГ-ветка работает как раньше")
+      hub.log("вотчер черновиков off: нет UWUWU_HUB_REPO — ТГ-ветка работает как раньше")
       ctl.done()
       return
     }

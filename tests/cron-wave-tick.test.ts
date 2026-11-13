@@ -8,7 +8,7 @@ import { KernelWaveError, KernelUnavailableError } from "../lib/platform"
 import { tickFailOutcome } from "../cron/cron"
 
 describe("tickFailOutcome — wave вне consecutiveFails", () => {
-  const wave = (): unknown => new KernelWaveError("siyuan POST: пропущено — окно fail-fast активно")
+  const wave = (): unknown => new KernelWaveError("hub POST: пропущено — окно fail-fast активно")
 
   test("5 тиков подряд с wave — рестарта нет ни на одном", () => {
     let fails = 0

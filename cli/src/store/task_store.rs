@@ -78,7 +78,7 @@ pub trait TaskStore: Send + Sync {
     async fn edit(&self, board: &TaskBoard, task: &Task, patch: &EditTask) -> StoreResult<Task>;
 
     /// Коммент в задачу; `reply_to` — префикс id верхнеуровневого коммента
-    /// (SiYuan: вложенный пункт секции «Комменты»; GitHub: тред-reply).
+    /// (легаси-бекенд: вложенный пункт; GitHub: тред-reply).
     /// Семантика append — реализация не дедупит (ретрай может задвоить,
     /// паритет текущего контура).
     async fn comment(
@@ -118,7 +118,7 @@ pub trait TaskStore: Send + Sync {
     /// Живой инвентарь досок проектов (list без --project).
     async fn discover_boards(&self) -> StoreResult<Vec<TaskBoard>>;
 
-    /// Машиночитаемые атрибуты тела (SiYuan: custom-schedule мастера и пр.).
+    /// Машиночитаемые атрибуты тела (fm-шапка: schedule мастера и пр.).
     async fn body_attrs(
         &self,
         board: &TaskBoard,

@@ -56,11 +56,11 @@ afterEach(() => {
 
 describe("runCardBody: шапка ран-карточки", () => {
   test("шапка предписывает агенту закрыть успешный ран сам — без «Закрывает владелец»", () => {
-    const body = cron.runCardBody("мастер X", "6h", "проверь SiYuan", new Date(2026, 10, 7, 9, 30))
+    const body = cron.runCardBody("мастер X", "6h", "проверь hub", new Date(2026, 10, 7, 9, 30))
     expect(body).toContain("закрывает агент рана")
     expect(body).not.toContain("Закрывает владелец")
     expect(body).toContain("## Инструкция мастера")
-    expect(body).toContain("проверь SiYuan")
+    expect(body).toContain("проверь hub")
     expect(body).toContain("расписание: `6h`")
   })
 })

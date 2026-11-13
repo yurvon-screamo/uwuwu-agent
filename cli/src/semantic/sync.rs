@@ -1,7 +1,7 @@
 //! Общий конвейер синка semantic-индекса: классификация длины, окна
 //! эмбеддинга, process_page (skip-unchanged/prune/drift), батчи с
 //! бюджет-гейтом. Источники строк — hub (hub_sync.rs, срез замены бекенда
-//! 20261112155302-ttyp35g); kernel-дельта SiYuan вырезана (срез F).
+//! 20261112155302-ttyp35g); kernel-дельта легаси-бекенда вырезана.
 
 use anyhow::Result;
 use serde_json::Value;

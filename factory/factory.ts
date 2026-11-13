@@ -1,4 +1,4 @@
-// uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью (SiYuan).
+// uwuwu-factory — будильник фабрики разработки + маршрутизатор ревью (hub).
 // Вся логика пайпа — у агентов (глобальный AGENTS.md, раздел «Работа над
 // задачей»). Демон делает четыре вещи:
 //   1. Design на доске (Draft = черновик на валидации триажа, пустой =
@@ -316,7 +316,7 @@ async function sh(cmd: string[], opts: { cwd?: string } = {}): Promise<string> {
   return out.trim()
 }
 
-// ——— доска (SiYuan database) ———
+// ——— доска задач ———
 
 interface BoardIds { docId: string; dbId: string }
 
@@ -2423,7 +2423,7 @@ async function main(): Promise<void> {
   // env шлюза обязателен на старте (раньше это делал process.exit на импорте
   // mcp.ts — теперь проверка явная, модуль шарится с ленивой конфигурацией)
   if (!mcp.mcpConfigured()) {
-    console.error("mcp: нужен UWUWU_SIYUAN_TOKEN (или UWUWU_SIYUAN_WS)")
+    console.error("hub: нужен UWUWU_HUB_REPO")
     process.exit(1)
   }
   // env-оверрайд проектов: валидируем ДО лока — невалидный конфиг не должен

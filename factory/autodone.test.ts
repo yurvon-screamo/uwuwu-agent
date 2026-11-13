@@ -30,7 +30,7 @@ describe("prCarrierOf", () => {
 
   test("wiki-URL (docs-only канон) — носитель «без ПР»", () => {
     const c = prCarrierOf(
-      "https://siyuan-relay-production.up.railway.app/doc/20261109235419-eniorw7",
+      "https://github.com/yurvon-screamo/uwuwu-hub/issues/1",
       "work/task-123", "yurvon-screamo/uwuwu-agent",
     )
     expect(c).toEqual({ kind: "none" })

@@ -1,7 +1,6 @@
-//! CLI-маршрутизация hub-режима (срез F вырезки SiYuan, задача
+//! CLI-маршрутизация hub-режима (задача
 //! 20261112155302-ttyp35g): task/search/read/docs/semantic/projects/person/
-//! cron — через uwuwu-hub (TaskStore/DocStore + gh); SiYuan-специфичные
-//! команды (goal/shot/blob/kernel/doctor) вырезаны вместе с SiYuan-слоем.
+//! cron — через uwuwu-hub (TaskStore/DocStore + gh).
 
 use crate::cmd::cli::{Commands, SemanticSub};
 use anyhow::{bail, Result};
@@ -44,7 +43,7 @@ fn not_on_hub(command: Commands) -> Result<()> {
         Commands::Doctor { .. } => "doctor",
         _ => "команда",
     };
-    bail!("hub-режим: команда «{name}» — SiYuan-специфика выпилена (срез F). Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
+    bail!("hub-режим: команда «{name}» не поддерживается. Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
 }
 
 /// Проекты = labels `proj:*` репо hub (источник истины — инвентарь срез A).
@@ -124,7 +123,6 @@ async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
 /// Персона = приватный md-док вики (Experience:/personal/PERSON): hub —
 /// docs/Experience/person/PERSON.md через git-клон (show) и ff-push
 /// (append/replace — контракт записи вики).
-
 /// Hub-репо по умолчанию: установка закреплена за yurvon-screamo/uwuwu-hub.
 /// Пустой env не роняет CLI зависаниями на пустом repo — отдаём дефолт.
 pub fn hub_repo_default() -> String {

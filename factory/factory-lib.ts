@@ -3,7 +3,7 @@ import { existsSync } from "node:fs"
 import { join } from "node:path"
 
 // factory-lib.ts — чистые функции uwuwu-factory: состояние, комменты, промпты.
-// Задача = строка SiYuan database (rowBlockId) + саб-док-тело.
+// Задача = issue канбана (rowBlockId) + тело.
 // Старые комменты (до бот-аккаунта) не несли автора — фоллбек-фильтр по маркеру 🤖/[factory].
 
 import { sanitizeRowId } from "./env"
@@ -279,7 +279,7 @@ export function latestComment(comments: TaskComment[]): TaskComment | null {
 // ——— bodyEdit: контент-хэш тела вне «Комменты» (дефекты №3/№5) ———
 
 // весь класс Format-символов (Cf): ZWSP/ZWNJ/ZWJ/WORD JOINER/BOM — рендер-
-// артефакты SiYuan-экспорта (инвентарь опыта «wakeup по собственному комменту»)
+// артефакты легаси-экспорта (инвентарь опыта «wakeup по собственному комменту»)
 const ZERO_WIDTH = /\p{Cf}/gu
 
 /** Контент тела вне коммент-записей: (а) секция «## Комменты» (от неё до
@@ -317,7 +317,7 @@ export function bodyOutsideComments(md: string): string {
 }
 
 /** Норм-форма markdown тела: frontmatter срезается (lastmod двигает каждое
- *  UI-пересохранение — дефект №5), format-символы SiYuan, \r\n, trailing,
+ *  UI-пересохранение — дефект №5), format-символы экспорта, \r\n, trailing,
  *  схлопывание пустых строк, канонизация таблиц (пэддинг/выравнивание ячеек
  *  перестраивается при UI-save — инвентарь round-trip артефактов) и пробелов
  *  после inline-bold. Правки «только форматирование» не будят; содержательные
@@ -385,7 +385,7 @@ export function adoptBodyDoc(tracked: TrackedTask, row: TaskRef): string | null 
 }
 
 /** Тайтл строки → безопасный сегмент hpath саб-дока доски (паритет CLI
- *  path_safe: '/' → U+2215 — SiYuan трактует '/' как разделитель сегментов;
+ *  path_safe: '/' → U+2215 — '/' трактуется как разделитель сегментов;
  *  конвенция миграции bind_rows.py). */
 export function pathSafe(title: string): string {
   return title.replaceAll("/", "\u{2215}")

@@ -1,7 +1,7 @@
 //! Hub-режим TS-демонов: реализации tool-имён lib/platform над uwuwu-hub
 //! (issues + Projects v2 + body frontmatter) через gh subprocess.
 //! Срез D задачи 20261112155302-ttyp35g: демоны живут на hub при
-//! UWUWU_HUB_REPO, SiYuan MCP не используется.
+//! UWUWU_HUB_REPO.
 //!
 //! docId-схема: `issue:<number>` (тело задачи), `doc:<slug>` (md вики из
 //! git-клона), `board:<proj>` / `db:<proj>` (фиктивные док/database-блок
@@ -44,7 +44,7 @@ export function hubRepo(): string {
 }
 
 /// Issues репо по label (state=all — доска несёт и Done-строки, паритет
-/// SiYuan-доски) + frontmatter-разбор body.
+/// канбаны) + frontmatter-разбор body.
 export interface GhIssue {
   number: number
   title: string
