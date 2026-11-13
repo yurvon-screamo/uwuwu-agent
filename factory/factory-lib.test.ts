@@ -999,6 +999,48 @@ describe("testingSpawnPrompt / testingRerunPrompt / testingCommentsPrompt", () =
   })
 })
 
+describe("DISPLAY-шов: лиз Xvfb-дисплея в промптах с env-контекстом (задача 20261112213522-hxepjy4)", () => {
+  const lease = { num: 100, file: "/env/x/display" }
+  // обе половины инцидента 12.11 в одной строке: уникальный номер + чистка
+  // только своего процесса (голый pkill Xvfb гасит чужие дисплеи)
+  const pin = (p: string): void => {
+    expect(p).toContain("Xvfb-дисплей задачи: :100")
+    expect(p).toContain(lease.file)
+    expect(p).toContain('pkill -f "[X]vfb :100"')
+    expect(p).toContain("чужие дисплеи не трогай")
+  }
+  test("spawnPrompt env-ветка: строка есть, env:false — строки нет", () => {
+    pin(spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", {
+      env: { repoDir: "/env/x/repo", branch: "work/task-x", scratchDir: "/env/x/scratch", display: lease },
+    }))
+    const noDisplay = spawnPrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", "implement", {
+      env: { repoDir: "/env/x/repo", branch: "work/task-x", scratchDir: "/env/x/scratch" },
+    })
+    expect(noDisplay).not.toContain("Xvfb-дисплей")
+  })
+  test("continuePrompt env-ветка: строка есть", () => {
+    pin(continuePrompt("r1", "uwuwu", "yurvon-screamo/uwuwu-agent", {
+      env: { repoDir: "/env/x/repo", branch: "work/task-x", scratchDir: "/env/x/scratch", display: lease },
+    }))
+  })
+  test("conflictFixPrompt env-ветка: строка есть", () => {
+    pin(conflictFixPrompt("r1", "https://pr/1", "uwuwu", {
+      env: { repoDir: "/env/x/repo", branch: "work/task-x", scratchDir: "/env/x/scratch", display: lease },
+    }))
+  })
+  test("testingSpawnPrompt: строка в секции изменений, без display — нет", () => {
+    pin(testingSpawnPrompt("r1", "uwuwu", { branch: "b", worktree: "/env/x/repo", pr: "", display: lease }))
+    const noDisplay = testingSpawnPrompt("r2", "uwuwu", { branch: "b", worktree: "/env/x/repo", pr: "" })
+    expect(noDisplay).not.toContain("Xvfb-дисплей")
+  })
+  test("testingRerunPrompt: строка есть, ревьюверские промпты дисплея не получают", () => {
+    pin(testingRerunPrompt("r1", { branch: "b", worktree: "/env/x/repo", pr: "", display: lease }))
+    // ревьювер UI в пайпе не гоняет — строка в его промпты не вставляется
+    const review = reviewSpawnPrompt("r1", "uwuwu", "result", { branch: "b", worktree: "/env/x/repo", pr: "", display: lease }, "code-quality-reviewer")
+    expect(review).not.toContain("Xvfb-дисплей")
+  })
+})
+
 // ——— resolvePromptWorktree: ворктри для промпт-ctx (env:false резолв) ———
 
 describe("resolvePromptWorktree: env:false-задачи с агентским ворктри не лгут в промпте", () => {
