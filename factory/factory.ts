@@ -751,7 +751,7 @@ async function prConflicted(pr: string, cwd: string): Promise<boolean> {
  *  (слаг для агента — «<proj>/<сегмент>»). */
 const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
 
-/** Идентификаторы ядерных контуров инита: резолвятся одним lsNotebooks. */
+/** Идентификаторы контуров инита: имена топ-папок вики. */
 const PERSON_NOTEBOOK = process.env.UWUWU_PERSON_NOTEBOOK ?? "Experience"
 const PROJECTS_NOTEBOOK = "Projects"
 

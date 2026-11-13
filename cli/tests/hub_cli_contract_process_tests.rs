@@ -62,17 +62,18 @@ fn setup_stub_gh() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     .expect("err422.json");
 
     let script = r#"#!/usr/bin/env bash
-# stub gh — см. док-коммент модуля. Эмулирует gh-контракт: при -f/-F без -X
-# метод POST (документированное поведение gh api), иначе GET.
-# Canned-ответы — файлами из $STUB_DIR; никакой интерполяции JSON.
+# stub gh — см. док-коммент модуля. Эмулирует gh-контракт: метод = -X если
+# задан; иначе POST при наличии -f/-F; иначе GET (документированное
+# поведение gh api). Canned-ответы — файлами из $STUB_DIR.
 set -u
-method=GET
+method=""
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-X" ]; then method="$a"; fi
-  case "$a" in -f|-F) [ "$method" = "GET" ] && method=POST ;; esac
+  case "$a" in -f|-F) [ -z "$method" ] && method=POST ;; esac
   prev="$a"
 done
+[ -z "$method" ] && method=GET
 route=""
 for a in "$@"; do
   case "$a" in repos/*) [ -z "$route" ] && route="$a" ;; esac
@@ -177,11 +178,8 @@ fn projects_sends_explicit_get_and_prints_clean_names() {
     let guards = setup_stub_gh();
     let (code, stdout, stderr) = run_stub(&guards, None, &["projects"]);
     assert_eq!(code, Some(0), "rc 0; stderr={stderr}");
-    assert!(
-        stdout.contains("422") || stdout.contains("Invalid request"),
-        "пин красный до фикса: CLI печатает тело ошибки 422 как данные: {stdout}"
-    );
-    // контракт после фикса: имена проектов, ничего сверх
+    // контракт фикса: имена проектов, ничего сверх (до фикса — тело
+    // ошибки 422 как данные, rc 0)
     assert_eq!(stdout, "uwuwu\noriga\n");
 }
 
