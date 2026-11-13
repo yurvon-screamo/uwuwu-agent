@@ -93,7 +93,9 @@ def sql(stmt):
 
 def task_boards():
     """Доки-доски: hpath «/<proj>/Задачи <proj>» (2 сегмента)."""
-    rows = sql("select id, hpath, box from blocks where type='d' and hpath like '/%/Задачи %'")
+    # SiYuan SQL без явного LIMIT молча отдаёт первые 64 строки — доски
+    # за пределами первой порции терялись (проба 13.11). Явный LIMIT 500.
+    rows = sql("select id, hpath, box from blocks where type='d' and hpath like '/%/Задачи %' limit 500")
     boards = []
     for r in rows:
         seg = r["hpath"].strip("/").split("/")
@@ -218,13 +220,25 @@ def issue_title_of(title):
 
 def import_issue(repo, project, title, body_md, status, task_type, branch, pr,
                  dev_session, planned, schedule, priority, autodone,
-                 comments, manifest, dry):
+                 comments, manifest, dry, body_doc_id=""):
     safe_title = issue_title_of(title)
     existing = gh_json(["api", "-X", "GET", f"repos/{repo}/issues",
                         "-f", f"labels=proj:{project}", "-F", "state=all",
                         "-F", "per_page=100"])
     for issue in existing if isinstance(existing, list) else []:
         if str(issue.get("title", "")).lower() == safe_title.lower():
+            # тело из SiYuan полнее hub-версии (волна 1 писала пустые тела) —
+            # дополняем: PATCH body если hub короче SiYuan
+            hub_body = str(issue.get("body") or "")
+            if len(body_md) > len(hub_body):
+                fm_now = {"status": str(issue.get("state", "open")).lower()}
+                gh(["api", "-X", "PATCH", f"repos/{repo}/issues/{issue['number']}"],
+                   json.dumps({"body": "---" + chr(10) + "".join(
+                       f"{k}: {v}" + chr(10) for k, v in fm_now.items()) + "---" + chr(10) + body_md}))
+                print(f"  дубль: «{title}» → #{issue['number']} (тело дополнено)")
+                manifest.append({"row_id": manifest_row(title), "issue": issue["number"],
+                                 "title": title, "status": "exists+body"})
+                return issue["number"]
             print(f"  дубль: «{title}» → #{issue['number']} (skip)")
             manifest.append({"row_id": manifest_row(title), "issue": issue["number"],
                              "title": title, "status": "exists"})
@@ -355,13 +369,74 @@ def export_notebooks(docs_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="yurvon-screamo/uwuwu-hub")
+    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--project", default=None, help="один проект (доска)")
     ap.add_argument("--skip-wiki", action="store_true")
     ap.add_argument("--skip-tasks", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--fill-priority", action="store_true",
+                    help="Дозаполнить priority/autodone у уже мигрированных issues (волна 1 до этих колонок)")
     ap.add_argument("--clone-root", default=os.path.expanduser(
         "~/.local/share/uwuwu-cli/hub-clone"))
     args = ap.parse_args()
+
+    if args.fill_priority:
+        # Дозаполнение волны 1: issue из hub по тайтлу → priority/autodone
+        # из SiYuan строки → PATCH body (fm). Волна 1 шла до этих колонок.
+        boards = task_boards()
+        if args.project:
+            boards = [b for b in boards if b["project"] == args.project]
+        patched = 0
+        for b in boards:
+            print(f"fill «{b['project']}»:")
+            rows = render_board(b["doc_id"])
+            board_hpath = None
+            bd = sql(f"select hpath from blocks where id='{b['doc_id']}' limit 1")
+            if bd:
+                board_hpath = bd[0].get("hpath")
+            for row in rows:
+                title = ""
+                for cell in row.get("cells") or []:
+                    v = cell.get("value") or {}
+                    if v.get("type") == "block":
+                        title = (v.get("block") or {}).get("content") or ""
+                        break
+                if not title:
+                    continue
+                # doc_id тела задачи: док-саб по hpath "<доска>/<тайтл>"
+                body_doc_id = ""
+                if board_hpath:
+                    bd2 = sql(f"select id from blocks where type='d' and hpath='{board_hpath}/{title.replace(chr(39), chr(39)*2)}' limit 1")
+                    if bd2:
+                        body_doc_id = bd2[0].get("id", "")
+                pr = cell_value(row, "Приоритет")[0]
+                ad_raw = cell_value(row, "Autodone")[0].strip()
+                ad = "true" if ad_raw not in ("", "false") else "false"
+                issues = gh_json(["api", "-X", "GET", f"repos/{args.repo}/issues",
+                                  "-F", "state=all", "-F", "per_page=100"], None)
+                target = next((i for i in (issues if isinstance(issues, list) else [])
+                               if str(i.get("title", "")).lower() == title.lower()), None)
+                if not target:
+                    continue
+                body = str(target.get("body") or "")
+                fm_needed = {}
+                if pr and f"priority: {pr}" not in body:
+                    fm_needed["priority"] = pr
+                if ad_raw and f"autodone: {ad}" not in body:
+                    fm_needed["autodone"] = ad
+                if not fm_needed:
+                    continue
+                fm = {"priority": pr, "autodone": ad}
+                if args.dry_run:
+                    print(f"  [dry] #{target['number']} <- {sorted(fm_needed)}")
+                    continue
+                fm_text = "---" + chr(10) + "".join(
+                    f"{k}: {v}" + chr(10) for k, v in fm.items()) + "---" + chr(10) + body
+                gh(["api", "-X", "PATCH", f"repos/{args.repo}/issues/{target['number']}"],
+                   json.dumps({"body": fm_text}))
+                patched += 1
+                print(f"  #{target['number']} <- {sorted(fm_needed)}")
+        print(f"fill: {patched} issues дополнены")
+        return
 
     if not args.skip_tasks:
         boards = task_boards()
@@ -401,10 +476,11 @@ def main():
                 doc_id = row.get("doc") or ""
                 body = row_body_md(doc_id, cache)
                 comments = comments_of(body)
+                body = row_body_md(body_doc_id, cache)
                 number = import_issue(args.repo, b["project"], title, body, status,
                                       ty, branch, pr, session, planned, schedule,
                                       priority, autodone,
-                                      comments, manifest, args.dry_run)
+                                      comments, manifest, args.dry_run, body_doc_id)
                 manifest.append({"row_id": doc_id, "issue": number, "title": title,
                                  "status": status, "project": b["project"]})
         with open("migration-manifest.json", "w") as f:
