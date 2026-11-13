@@ -6,9 +6,7 @@
 //! тела уже несёт статус (github_task_write) — канбан-запись синхронизирует
 //! Projects v2 (вид владельца).
 
-use super::github_project_resolve::{
-    add_issue_to_project, planned_field_id, project_for_label, status_field_ids,
-};
+use super::github_project_resolve::{add_issue_to_project, project_for_label, status_field_ids};
 use super::github_task::GitHubStore;
 use super::github_gh::gh_graphql;
 use anyhow::{Context, Result};
@@ -72,22 +70,53 @@ pub(super) async fn set_status_and_planned(
         }
     }
     if let Some(planned) = planned {
+        // «Запланировано» — глобальный issue field (REST), не project-поле:
+        // путешествует с issue вне канбанов, дубли project-полей снесены
         let date = normalize_date(planned)?;
-        let field_id = planned_field_id(&project_id).await?;
-        let value = match date.is_empty() {
-            true => json!(null),
-            false => json!(date),
-        };
-        gh_graphql(
-            "mutation($p: ID!, $i: ID!, $f: ID!, $d: JSON) {
-                updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i,
-                    fieldId: $f, value: {date: $d}}) { clientMutationId }
-            }",
-            &json!({ "p": project_id, "i": item_id, "f": field_id, "d": value }),
-        )
-        .await
-        .with_context(|| format!("Projects v2: «Запланировано» {date} не записано"))?;
+        set_global_field_value(store, issue_number, "Запланировано", &date).await?;
     }
+    Ok(())
+}
+
+/// Значение глобального issue field (text/date) по имени поля. Дата —
+/// ISO YYYY-MM-DD; пустая строка значение не сбрасывает (skip).
+pub(crate) async fn set_global_field_value(
+    store: &GitHubStore,
+    issue_number: &str,
+    field_name: &str,
+    value: &str,
+) -> Result<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let fields = super::github_gh::gh_json(&["api", "/user/issue-fields"], None).await?;
+    let fid = fields
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(field_name))
+                .and_then(|f| f.get("id").and_then(|i| i.as_i64()))
+        })
+        .with_context(|| format!("глобальное поле «{field_name}» не найдено"))?;
+    super::github_gh::gh_json(
+        &[
+            "api",
+            "-X",
+            "POST",
+            &format!(
+                "repos/{}/issues/{issue_number}/issue-field-values",
+                store.repo
+            ),
+        ],
+        Some(
+            &json!({
+                "issue_field_values": [ { "field_id": fid, "value": value } ]
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .with_context(|| format!("issue field «{field_name}» не записан"))?;
     Ok(())
 }
 

@@ -513,12 +513,12 @@ def date_iso(raw):
 # SiYuan-доски): статус канбана — поле, не тело. fm в теле остаётся только
 # зеркалом для CLI-чтения (контракт GitHubStore).
 NATIVE_FIELDS = [
-    # канбан: только Status (пайп) + Запланировано (date-колонка);
-    # остальное — глобальные issue fields (ISSUE_FIELDS ниже)
+    # канбан: только Status (пайп-колонка). «Запланировано» и остальные
+    # поля — глобальные issue fields (ISSUE_FIELDS), дубли project-полей
+    # снесены 13.11
     ("Status", "SINGLE_SELECT",
      ["Draft", "Todo", "Design", "Ревью плана", "In Progress",
       "Ревью результата", "Review", "Done", "Needs attention", "Вейт"]),
-    ("Запланировано", "DATE", None),
 ]
 
 # Глобальные issue fields (Settings → Issue fields, /user/issue-fields):
@@ -801,9 +801,6 @@ def sync_project_fields(repo, project, number, node_id, fm):
         want("Status", st, opt, f"Status={st}")
     elif st and not opt:
         print(f"  ! #{number}: опция Status «{st}» не найдена")
-    iso = date_iso(fm.get("planned"))
-    if iso:
-        want("Запланировано", iso, iso, f"Запланировано={iso}", kind="date")
     pr_val = (fm.get("priority") or "").strip().lower()
     pf = (fields.get("Приоритет") or {}).get("options") or {}
     if pr_val in pf:
