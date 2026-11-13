@@ -214,7 +214,9 @@ export async function hubTool<T = Record<string, unknown>>(
         nodes.push({ id: `board:${project}`, type: "doc", data: `board:${project}`, parentId: `pf:${project}` })
       }
       // Вики-узлы: папки/доки docs/Projects и docs/Experience — например
-      // пиннинг-док «Node-pinning» в проекте uwuwu (resolvePinningDoc демонов)
+      // пиннинг-док «Node-pinning» в проекте uwuwu (resolvePinningDoc демонов).
+      // Папка проекта <proj> в wiki-ветке Projects нужна демону resolvePinningDoc
+      // (он ищет папку с data == «<proj>», в ней — док «Node-pinning»).
       const clone = hubCloneRoot()
       const wikiRoots: Array<[string, string]> = [["Projects", "Projects"], ["Experience", "Experience"]]
       for (const [dir, idPrefix] of wikiRoots) {
@@ -231,6 +233,21 @@ export async function hubTool<T = Record<string, unknown>>(
               const docId = `doc:${dir}/${base}`
               nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
             }
+          }
+        } catch {}
+      }
+      // Проектные папки в wiki-ветке Projects: data == имя проекта — там
+      // resolvePinningDoc находит док «Node-pinning»
+      for (const project of projects()) {
+        const folderId = `wikiproject:${project}`
+        nodes.push({ id: folderId, type: "folder", data: project, parentId: "wiki:Projects" })
+        const dirPath = `${clone}/docs/Projects/${project}`
+        try {
+          for (const entry of require("node:fs").readdirSync(dirPath, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.endsWith(".md")) continue
+            const base = entry.name.replace(/\.md$/, "")
+            const docId = `doc:Projects/${project}/${base}`
+            nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
           }
         } catch {}
       }
