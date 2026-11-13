@@ -131,8 +131,11 @@ export function setProjectStatus(project: string, number: string, status: string
   // item-резолв через issue.projectItems (без капа items(first:100) —
   // доска uwuwu >700 items: хвост был слеп для статусов демонов)
   const q1 = `query($n: Int!, $o: String!, $r: String!, $num: Int!) { viewer { projectV2(number: $n) { id statusField: field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } repository(owner: $o, name: $r) { issue(number: $num) { projectItems(first: 10) { nodes { id project { id } } } } } }`
+  // owner/repo из hubRepo() (env-переопределение UWUWU_HUB_REPO — песочница/
+  // e2e): хардкод уводил статусные запросы демонов в прод-репо
+  const [owner, repoName] = hubRepo().split("/")
   const d = JSON.parse(gh([ "api", "graphql", "--input", "-" ],
-    JSON.stringify({ query: q1, variables: { n: projNumber, o: "yurvon-screamo", r: "uwuwu-hub", num: Number(number) } })))
+    JSON.stringify({ query: q1, variables: { n: projNumber, o: owner, r: repoName, num: Number(number) } })))
   interface ProjectV2Node {
     id: string
     statusField: { id: string; options: Array<{ id: string; name: string }> }

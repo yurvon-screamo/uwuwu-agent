@@ -39,7 +39,6 @@ fn not_on_hub(command: Commands) -> Result<()> {
         Commands::Goal { .. } => "goal",
         Commands::Blob { .. } => "blob",
         Commands::Shot { .. } => "shot",
-        Commands::Kernel { .. } => "kernel",
         Commands::Doctor { .. } => "doctor",
         _ => "команда",
     };
@@ -48,30 +47,38 @@ fn not_on_hub(command: Commands) -> Result<()> {
 
 /// Проекты = labels `proj:*` репо hub (источник истины — инвентарь срез A).
 async fn projects_hub() -> Result<()> {
-    let out = gh_labels();
+    let out = gh_labels()?;
     for project in out {
         println!("{project}");
     }
     Ok(())
 }
 
-fn gh_labels() -> Vec<String> {
+fn gh_labels() -> Result<Vec<String>> {
     let repo = hub_repo_default();
+    // gh-контракт: -f/-F без -X — это POST (labels POST = create → 422);
+    // явный GET обязательн, ошибка gh — громкий отказ, не данные в stdout
     let r = std::process::Command::new("gh")
         .args([
             "api",
+            "-X",
+            "GET",
             &format!("repos/{repo}/labels"),
             "-F",
             "per_page=100",
             "--jq",
-            r#"[.[].name | select(startswith("proj:")) | sub("proj:"; "")]"#,
+            r#".[].name | select(startswith("proj:")) | sub("proj:"; "")"#,
         ])
         .output()
         .expect("gh не запустился");
-    String::from_utf8_lossy(&r.stdout)
+    if !r.status.success() {
+        let err = String::from_utf8_lossy(&r.stderr);
+        anyhow::bail!("gh api labels упал ({}): {}", r.status, err.trim());
+    }
+    Ok(String::from_utf8_lossy(&r.stdout)
         .lines()
         .map(String::from)
-        .collect()
+        .collect())
 }
 
 /// Кроны = инвентарь крон-задач: issues с frontmatter schedule в статусе
