@@ -181,7 +181,8 @@ pub(super) async fn project_statuses(project: &str) -> Result<HashMap<String, St
         for item in &items {
             if let (Some(num), Some(status)) = (
                 item.pointer("/content/number").and_then(|x| x.as_i64()),
-                item.pointer("/fieldValueByName/name").and_then(|x| x.as_str()),
+                item.pointer("/fieldValueByName/name")
+                    .and_then(|x| x.as_str()),
             ) {
                 out.insert(num.to_string(), status.to_string());
             }

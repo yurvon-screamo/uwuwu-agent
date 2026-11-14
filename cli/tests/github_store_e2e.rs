@@ -224,11 +224,26 @@ async fn github_store_create_priority_contract_live() {
         .expect("create с авторским fm");
 
     // Assert: клетки через resolve (норм-форма полей)
-    let default_task = store.resolve(&board, &defaulted.title).await.expect("resolve дефолт");
-    let explicit_task = store.resolve(&board, &explicit.title).await.expect("resolve high");
-    let authored_task = store.resolve(&board, &authored.title).await.expect("resolve авторский");
-    assert_eq!(default_task.priority, "medium", "create без флага: дефолт medium");
-    assert_eq!(explicit_task.priority, "high", "явный --priority перекрывает дефолт");
+    let default_task = store
+        .resolve(&board, &defaulted.title)
+        .await
+        .expect("resolve дефолт");
+    let explicit_task = store
+        .resolve(&board, &explicit.title)
+        .await
+        .expect("resolve high");
+    let authored_task = store
+        .resolve(&board, &authored.title)
+        .await
+        .expect("resolve авторский");
+    assert_eq!(
+        default_task.priority, "medium",
+        "create без флага: дефолт medium"
+    );
+    assert_eq!(
+        explicit_task.priority, "high",
+        "явный --priority перекрывает дефолт"
+    );
     assert_eq!(
         authored_task.priority, "medium",
         "fm тела — мёртвый носитель (ADR-098): контент, клетка = дефолт"
@@ -311,11 +326,23 @@ async fn github_store_create_autodone_contract_live() {
         .expect("create с авторским fm");
 
     // Assert: клетки через resolve (норм-форма полей)
-    let default_task = store.resolve(&board, &defaulted.title).await.expect("resolve дефолт");
-    let off_task = store.resolve(&board, &explicit_off.title).await.expect("resolve off");
-    let authored_task = store.resolve(&board, &authored.title).await.expect("resolve авторский");
+    let default_task = store
+        .resolve(&board, &defaulted.title)
+        .await
+        .expect("resolve дефолт");
+    let off_task = store
+        .resolve(&board, &explicit_off.title)
+        .await
+        .expect("resolve off");
+    let authored_task = store
+        .resolve(&board, &authored.title)
+        .await
+        .expect("resolve авторский");
     assert!(default_task.autodone, "create без флага: дефолт on");
-    assert!(!off_task.autodone, "явный --autodone off перекрывает дефолт");
+    assert!(
+        !off_task.autodone,
+        "явный --autodone off перекрывает дефолт"
+    );
     assert!(
         authored_task.autodone,
         "fm тела — мёртвый носитель (ADR-098): контент, клетка = дефолт on"

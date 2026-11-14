@@ -199,10 +199,7 @@ fn run_stub(
         .env("STUB_DIR", dir.path())
         .env("STUB_LOG", log)
         .env("STUB_PAYLOAD", payload)
-        .env(
-            "STUB_GQLLOG",
-            dir.path().join("gql-calls.log"),
-        );
+        .env("STUB_GQLLOG", dir.path().join("gql-calls.log"));
     match stdin {
         Some(text) => {
             use std::io::Write;
@@ -384,9 +381,16 @@ fn wrapper_is_rejected_frontmatter_is_content() {
             "--stdin",
         ],
     );
-    assert_eq!(code, Some(0), "fm во входе = контент, пишется как есть: {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "fm во входе = контент, пишется как есть: {stderr}"
+    );
     let written = patch_body(&guards2).expect("PATCH записан");
-    assert_eq!(written, "---\ntitle: док-шапка как контент\n---\n\nконтент\n");
+    assert_eq!(
+        written,
+        "---\ntitle: док-шапка как контент\n---\n\nконтент\n"
+    );
 }
 
 /// F. `--replace` — тело записано ДОСЛОВНО входом (compose-обвязка снесена).
@@ -433,7 +437,12 @@ fn edit_status_goes_to_project_v2_not_body() {
             "In Progress",
         ],
     );
-    assert_eq!(code, Some(0), "edit успешен: {stderr} gql: {}", gql_log(&guards));
+    assert_eq!(
+        code,
+        Some(0),
+        "edit успешен: {stderr} gql: {}",
+        gql_log(&guards)
+    );
     let gql = gql_log(&guards);
     assert!(
         gql.contains("updateProjectV2ItemFieldValue"),
@@ -444,10 +453,7 @@ fn edit_status_goes_to_project_v2_not_body() {
         !rest.contains("PATCH repos/owner/hub-guard-test/issues/999"),
         "PATCH тела (fm-письмо) отсутствует: {rest}"
     );
-    assert!(
-        patch_body(&guards).is_none(),
-        "тело не мутировано"
-    );
+    assert!(patch_body(&guards).is_none(), "тело не мутировано");
 }
 
 /// H. `task edit --branch` — клетка через REST issue-field-values (батч),
@@ -458,7 +464,15 @@ fn edit_branch_goes_to_issue_field_values() {
     let (code, _stdout, stderr) = run_stub(
         &guards,
         None,
-        &["task", "edit", "999", "--project", "uwuwu", "--branch", "work/task-9"],
+        &[
+            "task",
+            "edit",
+            "999",
+            "--project",
+            "uwuwu",
+            "--branch",
+            "work/task-9",
+        ],
     );
     assert_eq!(code, Some(0), "edit успешен: {stderr}");
     let payload = last_payload_raw(&guards).expect("POST issue-field-values записан");

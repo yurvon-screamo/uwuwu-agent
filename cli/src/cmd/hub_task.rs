@@ -262,8 +262,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 anyhow::bail!("UWUWU_HUB_REPO пуст — миграция требует hub-репо");
             }
             let store = crate::store::github_task::GitHubStore::new(hub_repo);
-            let outcomes =
-                crate::store::task_migrate::migrate_all(&store, apply).await?;
+            let outcomes = crate::store::task_migrate::migrate_all(&store, apply).await?;
             let mut migrated = 0usize;
             let mut skipped = 0usize;
             let mut conflicts = 0usize;

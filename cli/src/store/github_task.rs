@@ -81,11 +81,17 @@ impl GitHubStore {
             pr: get(crate::store::github_issue_fields::names::PR),
             dev_session: get(crate::store::github_issue_fields::names::DEV_SESSION),
             planned: get(crate::store::github_issue_fields::names::PLANNED),
-            planned_ms: planned_ms(fields.get(crate::store::github_issue_fields::names::PLANNED).map(String::as_str)),
+            planned_ms: planned_ms(
+                fields
+                    .get(crate::store::github_issue_fields::names::PLANNED)
+                    .map(String::as_str),
+            ),
             schedule_cell: get(crate::store::github_issue_fields::names::SCHEDULE),
             priority: get(crate::store::github_issue_fields::names::PRIORITY),
             autodone: matches!(
-                fields.get(crate::store::github_issue_fields::names::AUTODONE).map(String::as_str),
+                fields
+                    .get(crate::store::github_issue_fields::names::AUTODONE)
+                    .map(String::as_str),
                 Some("on") | Some("true") | Some("✓")
             ),
         }

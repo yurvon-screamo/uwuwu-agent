@@ -104,9 +104,15 @@ pub(crate) async fn set_fields(
                     }
                 }
             }
-            Some(FieldValue::Text(s)) => batch.push(serde_json::json!({ "field_id": fid, "value": s })),
-            Some(FieldValue::Select(s)) => batch.push(serde_json::json!({ "field_id": fid, "value": s })),
-            Some(FieldValue::Date(d)) => batch.push(serde_json::json!({ "field_id": fid, "value": d })),
+            Some(FieldValue::Text(s)) => {
+                batch.push(serde_json::json!({ "field_id": fid, "value": s }))
+            }
+            Some(FieldValue::Select(s)) => {
+                batch.push(serde_json::json!({ "field_id": fid, "value": s }))
+            }
+            Some(FieldValue::Date(d)) => {
+                batch.push(serde_json::json!({ "field_id": fid, "value": d }))
+            }
         }
     }
     if batch.is_empty() {
@@ -145,7 +151,10 @@ mod tests {
         let f = fields_of(&issue);
         assert_eq!(f.get("Приоритет").map(String::as_str), Some("high"));
         assert_eq!(f.get("Branch").map(String::as_str), Some("work/x"));
-        assert_eq!(f.get("Запланировано").map(String::as_str), Some("2026-11-20"));
+        assert_eq!(
+            f.get("Запланировано").map(String::as_str),
+            Some("2026-11-20")
+        );
         assert_eq!(f.get("Autodone").map(String::as_str), Some("on"));
     }
 

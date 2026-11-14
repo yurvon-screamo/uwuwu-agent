@@ -68,14 +68,17 @@ pub(crate) fn fm_to_cells(
 ) -> Result<Vec<(&'static str, Option<FieldValue>)>> {
     let mut cells: Vec<(&'static str, Option<FieldValue>)> = Vec::new();
     let push = |name: &'static str,
-                    fm_value: Option<&String>,
-                    make: fn(&str) -> Result<FieldValue>,
-                    cells: &mut Vec<(&'static str, Option<FieldValue>)>|
+                fm_value: Option<&String>,
+                make: fn(&str) -> Result<FieldValue>,
+                cells: &mut Vec<(&'static str, Option<FieldValue>)>|
      -> Result<()> {
         let Some(v) = fm_value else {
             return Ok(());
         };
-        match cell_action(v, current_fields.get(name).map(String::as_str).unwrap_or("")) {
+        match cell_action(
+            v,
+            current_fields.get(name).map(String::as_str).unwrap_or(""),
+        ) {
             CellAction::Skip => Ok(()),
             CellAction::Write => {
                 cells.push((name, Some(make(v)?)));
@@ -89,12 +92,10 @@ pub(crate) fn fm_to_cells(
         |v| Ok(FieldValue::Select(v.to_string())),
         &mut cells,
     )?;
-    let autodone = fm
-        .get("autodone")
-        .map(|v| match v.as_str() {
-            "true" | "✓" | "on" => "on".to_string(),
-            _ => "off".to_string(),
-        });
+    let autodone = fm.get("autodone").map(|v| match v.as_str() {
+        "true" | "✓" | "on" => "on".to_string(),
+        _ => "off".to_string(),
+    });
     push(
         names::AUTODONE,
         autodone.as_ref(),
@@ -128,7 +129,11 @@ pub(crate) fn fm_to_cells(
     push(
         names::PLANNED,
         fm.get("planned"),
-        |v| Ok(FieldValue::Date(crate::store::github_project::normalize_date(v)?)),
+        |v| {
+            Ok(FieldValue::Date(
+                crate::store::github_project::normalize_date(v)?,
+            ))
+        },
         &mut cells,
     )?;
     Ok(cells)
@@ -246,7 +251,10 @@ mod tests {
         assert!(matches!(cell_action("", ""), CellAction::Skip));
         assert!(matches!(cell_action("work/x", ""), CellAction::Write));
         assert!(matches!(cell_action("work/x", "work/x"), CellAction::Skip));
-        assert!(matches!(cell_action("fm-val", "field-val"), CellAction::Skip));
+        assert!(matches!(
+            cell_action("fm-val", "field-val"),
+            CellAction::Skip
+        ));
     }
 
     #[test]

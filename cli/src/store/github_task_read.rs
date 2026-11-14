@@ -42,8 +42,7 @@ impl TaskStore for GitHubStore {
         }
         // Status — канон Pv2: батч-джойн статусов доски (GraphQL, пагинация
         // внутри). Пустая карта (канбана нет) — Todo-дефолт в convert.
-        let statuses =
-            super::github_project_resolve::project_statuses(&board.project).await?;
+        let statuses = super::github_project_resolve::project_statuses(&board.project).await?;
         let mut out = Vec::new();
         for issue in &all_rows {
             if issue.get("pull_request").is_some() {

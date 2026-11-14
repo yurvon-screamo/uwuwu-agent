@@ -80,7 +80,9 @@ impl GitHubStore {
                 ),
                 (
                     names::AUTODONE,
-                    Some(FieldValue::Select(if autodone { "on" } else { "off" }.into())),
+                    Some(FieldValue::Select(
+                        if autodone { "on" } else { "off" }.into(),
+                    )),
                 ),
             ],
         )
@@ -123,11 +125,10 @@ impl GitHubStore {
         // Клетки — один батч в глобальные поля; Some("") — очистка клетки
         // (DELETE); статус — Pv2-мутация отдельно (github_project.rs).
         let text_cell = |v: &Option<String>| -> Option<Option<FieldValue>> {
-            v.as_ref()
-                .map(|s| match s.as_str() {
-                    "" => None,
-                    other => Some(FieldValue::Text(other.to_string())),
-                })
+            v.as_ref().map(|s| match s.as_str() {
+                "" => None,
+                other => Some(FieldValue::Text(other.to_string())),
+            })
         };
         let mut cells: Vec<(&str, Option<FieldValue>)> = Vec::new();
         if let Some(v) = text_cell(&patch.branch) {
@@ -211,7 +212,10 @@ impl GitHubStore {
         github_issue_fields::set_fields(
             &task.id,
             &self.repo,
-            &[(names::DEV_SESSION, Some(FieldValue::Text(session.to_string())))],
+            &[(
+                names::DEV_SESSION,
+                Some(FieldValue::Text(session.to_string())),
+            )],
         )
         .await?;
         self.issue_fresh(&task.id).await

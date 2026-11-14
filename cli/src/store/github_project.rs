@@ -88,7 +88,10 @@ mod normalize_date_tests {
     #[test]
     fn дисплей_форма_срезает_хвост() {
         assert_eq!(normalize_date("2026-11-20 15:04").unwrap(), "2026-11-20");
-        assert_eq!(normalize_date("2026-11-20T15:04:00Z").unwrap(), "2026-11-20");
+        assert_eq!(
+            normalize_date("2026-11-20T15:04:00Z").unwrap(),
+            "2026-11-20"
+        );
         assert_eq!(normalize_date("2026-11-20").unwrap(), "2026-11-20");
     }
 
