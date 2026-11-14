@@ -129,7 +129,7 @@ async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
     Ok(())
 }
 
-/// Персона = приватный md-док вики (Experience:/personal/PERSON): hub —
+/// Персона = приватный md-док вики (Experience/person/PERSON): hub —
 /// docs/Experience/person/PERSON.md через git-клон (show) и ff-push
 /// (append/replace — контракт записи вики).
 /// Hub-репо по умолчанию: установка закреплена за yurvon-screamo/uwuwu-hub.
