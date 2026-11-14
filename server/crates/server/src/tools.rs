@@ -261,11 +261,15 @@ impl ToolHub {
             }
             "cron_list" => {
                 let dir = uwuwu_usecase::crons::crons_dir(&project);
-                let masters = self.wiki.list_docs(&dir).await.map_err(|e| e.to_string())?;
+                let prefix = format!("{dir}/");
                 let mut out = String::new();
-                for slug in masters {
-                    let path = format!("{dir}/{slug}");
-                    if let Some(md) = self.wiki.read_doc(&path).await.map_err(|e| e.to_string())? {
+                let all = self.wiki.list_docs(&dir).await.map_err(|e| e.to_string())?;
+                for slug in all {
+                    // list_docs даёт пути от docs/ целиком: только прямые дети
+                    if !slug.starts_with(&prefix) || slug[prefix.len()..].contains('/') {
+                        continue;
+                    }
+                    if let Some(md) = self.wiki.read_doc(&slug).await.map_err(|e| e.to_string())? {
                         if let Some(m) = uwuwu_usecase::crons::parse_master(&slug, &md) {
                             out.push_str(&format!("{} — `{}`\n", m.title, m.schedule));
                         }
