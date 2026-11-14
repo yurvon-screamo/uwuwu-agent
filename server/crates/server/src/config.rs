@@ -11,6 +11,7 @@ pub const ENV_GH_TOKEN: &str = "GH_TOKEN";
 pub const ENV_OPENCODE_PASSWORD: &str = "UWUWU_OPENCODE_PASSWORD";
 pub const ENV_BEARER: &str = "UWUWU_SERVER_BEARER";
 pub const ENV_STATE_PATH: &str = "UWUWU_SERVER_STATE";
+pub const ENV_MODE: &str = "UWUWU_SERVER_MODE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -107,6 +108,20 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Режим: env UWUWU_SERVER_MODE (observe|live) > TOML mode.
+    /// Флип конвейера в прод — переменной Railway, без пересборки образа.
+    pub fn mode(&self) -> ModeCfg {
+        match std::env::var(ENV_MODE)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .as_deref()
+        {
+            Some("live") => ModeCfg::Live,
+            Some("observe") => ModeCfg::Observe,
+            _ => self.mode,
+        }
+    }
+
     /// Порт: env PORT (Railway) > TOML port > дефолт.
     pub fn port(&self) -> u16 {
         std::env::var("PORT")
@@ -161,7 +176,7 @@ impl Config {
             ConfigError::Validation(format!("{ENV_BEARER} обязателен (HTTP/MCP гейт)"))
         })?;
         let opencode_password = non_empty_env(ENV_OPENCODE_PASSWORD);
-        if self.mode == ModeCfg::Live && opencode_password.is_none() {
+        if self.mode() == ModeCfg::Live && opencode_password.is_none() {
             return Err(ConfigError::Validation(format!(
                 "{ENV_OPENCODE_PASSWORD} обязателен в live-режиме (спавны)"
             )));
@@ -183,7 +198,7 @@ impl Config {
     /// Порт конфига → план тика юзкейса.
     pub fn to_tick_plan(&self) -> TickPlan {
         TickPlan {
-            mode: match self.mode {
+            mode: match self.mode() {
                 ModeCfg::Observe => Mode::Observe,
                 ModeCfg::Live => Mode::Live,
             },
