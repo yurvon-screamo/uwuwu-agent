@@ -22,7 +22,7 @@ import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from ".
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
   stripNonContent, decideFire, agentDriftAction, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
-  runCardTitle, SESSION_TITLE_MAX,
+  runCardTitle, SESSION_TITLE_MAX, truncateCodePoints,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
@@ -284,7 +284,7 @@ async function fireSession(title: string, prompt: string): Promise<string | null
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: title.replace(/[\r\n]+/g, " ").slice(0, SESSION_TITLE_MAX),
+      title: truncateCodePoints(title.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       model: { providerID: MODEL.providerID, id: MODEL.id },
       location: { directory: WORKSPACE },
     },
@@ -386,7 +386,7 @@ async function createAgentSession(
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: masterTitle.replace(/[\r\n]+/g, " ").slice(0, SESSION_TITLE_MAX),
+      title: truncateCodePoints(masterTitle.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       agent,
       model: model ?? MODEL,
       location: { directory: WORKSPACE },

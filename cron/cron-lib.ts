@@ -51,6 +51,12 @@ export function formatLocal(d: Date): string {
 /** Гард-лимит тайтла сессии opencode: строка целиком (паритет factory-lib). */
 export const SESSION_TITLE_MAX = 80
 
+/** Обрезка строки до max по code points — паритет factory-lib (slice по
+ *  UTF-16 units режет суррогатные пары: эмодзи на границе → lone-суррогат). */
+export function truncateCodePoints(s: string, max: number): string {
+  return Array.from(s).slice(0, max).join("")
+}
+
 /** Тайтл ран-карточки и файр-сессии: «⏰ <номер> — <тайтл мастера> · <дата>»
  *  (номер = номер issue). Пустой тайтл мастера — номер без «—» (легаси-вид).
  *  Секунды в дате делают тайтл уникальным на доске (дубли строк CLI ловит

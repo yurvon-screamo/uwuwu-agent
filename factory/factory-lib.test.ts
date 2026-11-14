@@ -23,6 +23,7 @@ import {
   pathSafe,
   sessionTitle,
   SESSION_TITLE_MAX,
+  truncateCodePoints,
   createBoardPathOnce,
   errText,
   type ProjectCfg,
@@ -1715,8 +1716,29 @@ describe("sessionTitle", () => {
 
   test("обрезка: финальная строка целиком до SESSION_TITLE_MAX (гард createSession идемпотентен)", () => {
     const out = sessionTitle("test", "uwuwu", "1051", "т".repeat(200))
-    expect(out.length).toBe(SESSION_TITLE_MAX)
+    // лимит — по code points (эмодзи-префикс даёт 81 UTF-16 unit при 80 points)
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
     expect(out.startsWith("🧪 uwuwu: тестирование 1051 — ")).toBe(true)
+  })
+
+  test("обрезка не режет суррогатную пару: эмодзи на границе лимита остаётся целым", () => {
+    const out = sessionTitle("dev", "uwuwu", "1051", "👍".repeat(200))
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
+    expect(out.endsWith("👍")).toBe(true)
+  })
+})
+
+describe("truncateCodePoints", () => {
+  test("BMP-строка — эквивалент slice", () => {
+    expect(truncateCodePoints("абвгдеж", 4)).toBe("абвг")
+    expect(truncateCodePoints("короткая", 100)).toBe("короткая")
+  })
+
+  test("астральные символы (эмодзи) не разрезаются пополам", () => {
+    // 10 эмодзи = 20 UTF-16 units: slice(0, 10) по units дал бы lone-суррогат
+    expect(truncateCodePoints("👍".repeat(10), 10)).toBe("👍".repeat(10))
+    expect(truncateCodePoints("👍".repeat(10), 5)).toBe("👍".repeat(5))
+    expect(truncateCodePoints("👍ai👍", 3)).toBe("👍ai")
   })
 })
 

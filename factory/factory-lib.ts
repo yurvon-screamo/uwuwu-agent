@@ -406,6 +406,13 @@ export function pathSafe(title: string): string {
  *  sessionTitle режет до него же — обрезка идемпотентна с createSession. */
 export const SESSION_TITLE_MAX = 80
 
+/** Обрезка строки до max по code points: slice по UTF-16 units режет
+ *  суррогатные пары (эмодзи в тайтле на границе лимита даёт lone-суррогат
+ *  в хвосте — артефакт рендера и грязный JSON на стороне opencode). */
+export function truncateCodePoints(s: string, max: number): string {
+  return Array.from(s).slice(0, max).join("")
+}
+
 /** Вид спавна фабрики: эмодзи + стейдж-слово в тайтле сессии. */
 export type SpawnKind = "dev" | "review" | "test"
 
@@ -423,7 +430,7 @@ export function sessionTitle(kind: SpawnKind, project: string, num: string, titl
   const safe = pathSafe(title.replace(/[\r\n]+/g, " ").trim())
   const head = stage === "" ? `${emoji} ${project}: ${num}` : `${emoji} ${project}: ${stage} ${num}`
   const full = safe === "" ? head : `${head} — ${safe}`
-  return full.slice(0, SESSION_TITLE_MAX)
+  return truncateCodePoints(full, SESSION_TITLE_MAX)
 }
 
 /** Короткий текст ошибки для сводок (лог полного стека — не её дело). */

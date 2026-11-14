@@ -6,7 +6,7 @@ import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
-  runCardTitle,
+  runCardTitle, truncateCodePoints,
   decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
   agentDriftAction,
 } from "./cron-lib"
@@ -302,6 +302,19 @@ describe("runCardTitle", () => {
     expect(a).not.toBe(b)
     expect(a.endsWith(":07")).toBe(true)
     expect(b.endsWith(":08")).toBe(true)
+  })
+})
+
+describe("truncateCodePoints", () => {
+  test("астральные символы (эмодзи) не разрезаются пополам", () => {
+    expect(truncateCodePoints("👍".repeat(10), 10)).toBe("👍".repeat(10))
+    expect(truncateCodePoints("👍".repeat(10), 5)).toBe("👍".repeat(5))
+    expect(truncateCodePoints("👍ai👍", 3)).toBe("👍ai")
+  })
+
+  test("BMP-строка — эквивалент slice", () => {
+    expect(truncateCodePoints("абвгдеж", 4)).toBe("абвг")
+    expect(truncateCodePoints("короткая", 100)).toBe("короткая")
   })
 })
 

@@ -80,6 +80,7 @@ import {
   pathSafe,
   sessionTitle,
   SESSION_TITLE_MAX,
+  truncateCodePoints,
   createBoardPathOnce,
   errText,
   deadSpawnVerdict,
@@ -651,7 +652,7 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: spec.title.replace(/[\r\n]+/g, " ").slice(0, SESSION_TITLE_MAX),
+      title: truncateCodePoints(spec.title.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       model: spec.model ?? MODEL,
       location: { directory: spec.directory },
       ...(spec.agent !== undefined ? { agent: spec.agent } : {}),
