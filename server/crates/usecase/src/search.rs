@@ -94,7 +94,8 @@ impl SearchUseCase {
     }
 }
 
-/// Пик-окно дотяжки индекса: семантика не жжёт запросы в пик.
+/// Гейт дотяжки индекса: не жжём эмбеддинги в пик-окно GLM (будни
+/// 06:00–10:00 UTC); вне окна (вкл. выходные) — дотяжка идёт.
 pub fn sync_allowed(now: UtcMinute) -> bool {
-    now.weekday <= 5 && !(now.minute_of_day >= 360 && now.minute_of_day < 600)
+    !(now.weekday <= 5 && now.minute_of_day >= 360 && now.minute_of_day < 600)
 }
