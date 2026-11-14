@@ -227,22 +227,41 @@ fn numeric_needle(exact: &str) -> Option<u64> {
 }
 
 /// Снапшот свежести → сырое тело: срезка обёртки `task get` (шапка
-/// «Задача:/…/Строка: issue #N» + пустая строка; help: «cli срезает
+/// «Задача:/…/Строка:   issue #N» + пустая строка; help: «cli срезает
 /// обёртку при сверке сам») и CRLF → LF. Снапшоты сырого тела (gh api)
-/// и чистого тела проходят без срезки — форма определяется по первой
-/// строке, телесный текст «Задача:…» без шапочного маркера не режется.
+/// и чистого тела проходят без срезки. Детектор шапки требует шапочную
+/// форму строки-маркера («Строка:» + 3 пробела + «issue #» + цифры):
+/// телесные «Строка:…» произвольной формы (таблицы и пр.) raw-снапшот
+/// не срезают; теоретический предел — raw-тело со строкой точь-в-точь
+/// шапочной формы после «Задача:»-старта — ложная срезка, направление
+/// безопасное (отказ свежести, не запись).
 fn snapshot_to_body(snapshot: &str) -> String {
     let normalized = snapshot.replace("\r\n", "\n");
     if normalized.starts_with("Задача:") {
-        // Маркер последней строки шапки get-принта; шапка в снапшоте
-        // первая — первый матч всегда шапочный, телесные «Строка:» не мешают
-        if let Some(pos) = normalized.find("\nСтрока:") {
-            let after_marker = &normalized[pos + 1..];
-            let after = after_marker.split_once('\n').map(|(_, r)| r).unwrap_or("");
-            return after.trim_start_matches('\n').to_string();
+        // Шапка get-принта идёт первой; телесные вхождения позже шапки
+        // не помешали бы, но сырой снапшот без get-шапки не срезается
+        let mut offset = 0usize;
+        for line in normalized.split('\n') {
+            if is_wrapper_marker_line(line) {
+                let after_marker = &normalized[offset + line.len()..];
+                return after_marker.trim_start_matches('\n').to_string();
+            }
+            offset += line.len() + 1;
         }
     }
     normalized
+}
+
+/// Шапочная форма маркера get-принта (cmd/hub_task.rs):
+/// «Строка:   issue #<номер>» — ровно 3 пробела и цифры до конца строки.
+fn is_wrapper_marker_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Строка:") else {
+        return false;
+    };
+    let Some(digits) = rest.strip_prefix("   issue #") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Сверка снапшота свежести с текущим телом. Хвостовые переводы строк
@@ -353,10 +372,38 @@ mod base_snapshot_tests {
 
     #[test]
     fn телесная_строка_после_шапки_не_путает_срезку() {
-        // «Строка:» в контенте — срезка по первому (шапочному) маркеру
+        // «Строка:» в контенте произвольной формы — срезка по шапочной форме
         let current = "таблица:\nСтрока:  (issue)\nконец\n";
         let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #9\n\n{current}");
         assert!(base_matches_snapshot(current, &snapshot));
+    }
+
+    #[test]
+    fn raw_снапшот_с_обоими_маркерами_не_режется() {
+        // Low-ревью 1097: сырой снапшот (gh api) тела, которое само
+        // начинается «Задача:» и содержит телесное «\nСтрока:» произвольной
+        // формы — не срезается (детектор требует шапочную форму
+        // «Строка:   issue #<цифры>»), сверка идёт как есть
+        let current = "Задача: сборка\n\nтаблица:\nСтрока:  (issue)\nконец\n";
+        assert!(base_matches_snapshot(current, current));
+        // get-снапшот того же тела — срезка по шапочному маркеру корректна
+        let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #9\n\n{current}");
+        assert!(base_matches_snapshot(current, &snapshot));
+    }
+
+    #[test]
+    fn шапочная_форма_требует_цифры_и_ровно_три_пробела() {
+        let current = "Задача: сделать Х\n\nтаблица:\nСтрока:  (issue)\nконец\n";
+        assert!(base_matches_snapshot(current, current));
+        // теоретический предел детектора (документирован в док-комменте):
+        // raw-тело со строкой точь-в-точь шапочной формы после «Задача:»-
+        // старта срезается → ложный отказ свежести; направление безопасное
+        // (отказ, не запись), реальный get-снапшот того же тела корректен —
+        // шапка get-принта всегда раньше телесной строки
+        let tricky = "Задача: Х\n\nСтрока:   issue #5\nконец\n";
+        assert!(!base_matches_snapshot(tricky, tricky));
+        let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #9\n\n{tricky}");
+        assert!(base_matches_snapshot(tricky, &snapshot));
     }
 
     #[test]

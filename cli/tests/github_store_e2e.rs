@@ -284,6 +284,32 @@ fn fm_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Проба create в канон-форме контракт-тестов рига: Todo-статус, bug-тип,
+/// параметризуемые body_md/priority/autodone; паника expect — live-тест.
+async fn create_probe(
+    store: &uwuwu_cli::store::github_task::GitHubStore,
+    title: String,
+    body_md: Option<String>,
+    priority: Option<String>,
+    autodone: Option<bool>,
+) -> uwuwu_cli::store::Task {
+    store
+        .create(
+            &board(),
+            &CreateTask {
+                title,
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md,
+                attachments: vec![],
+                priority,
+                autodone,
+            },
+        )
+        .await
+        .expect("create пробы")
+}
+
 /// Контракт priority при create (дефолт medium — решение владельца
 /// 13.11): create без флага рождает fm `priority: medium`; явный флаг
 /// перекрывает; авторский `priority` во fm тела (--stdin) перекрыт не
@@ -296,51 +322,30 @@ async fn github_store_create_priority_contract_live() {
     let stamp = chrono::Utc::now().timestamp_millis();
 
     // Act: три создания — дефолт, явный high, авторский priority в fm тела
-    let defaulted = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] priority дефолт {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create без флага");
-    let explicit = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] priority high {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: Some("high".into()),
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create с high");
-    let authored = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] priority в fm тела {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: Some("---\npriority: low\n---\nтело с авторским fm".into()),
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create с авторским fm");
+    let defaulted = create_probe(
+        &store,
+        format!("[e2e] priority дефолт {stamp}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let explicit = create_probe(
+        &store,
+        format!("[e2e] priority high {stamp}"),
+        None,
+        Some("high".into()),
+        None,
+    )
+    .await;
+    let authored = create_probe(
+        &store,
+        format!("[e2e] priority в fm тела {stamp}"),
+        Some("---\npriority: low\n---\nтело с авторским fm".into()),
+        None,
+        None,
+    )
+    .await;
 
     // Assert: fm каждого из трёх
     let default_body = store
@@ -393,51 +398,30 @@ async fn github_store_create_autodone_contract_live() {
     let stamp = chrono::Utc::now().timestamp_millis();
 
     // Act: три создания — дефолт, явный off, авторский autodone в fm тела
-    let defaulted = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] autodone дефолт {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create без флага");
-    let explicit_off = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] autodone off {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: Some(false),
-            },
-        )
-        .await
-        .expect("create с off");
-    let authored = store
-        .create(
-            &board,
-            &CreateTask {
-                title: format!("[e2e] autodone в fm тела {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: Some("---\nautodone: false\n---\nтело с авторским fm".into()),
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
-        )
-        .await
-        .expect("create с авторским fm");
+    let defaulted = create_probe(
+        &store,
+        format!("[e2e] autodone дефолт {stamp}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let explicit_off = create_probe(
+        &store,
+        format!("[e2e] autodone off {stamp}"),
+        None,
+        None,
+        Some(false),
+    )
+    .await;
+    let authored = create_probe(
+        &store,
+        format!("[e2e] autodone в fm тела {stamp}"),
+        Some("---\nautodone: false\n---\nтело с авторским fm".into()),
+        None,
+        None,
+    )
+    .await;
 
     // Assert: fm каждого из трёх
     let default_body = store
