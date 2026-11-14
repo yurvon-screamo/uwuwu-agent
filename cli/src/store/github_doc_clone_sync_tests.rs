@@ -170,7 +170,11 @@ async fn write_on_dirty_clone_fails_and_preserves_foreign_files() -> Result<()> 
     let store = test_store(&work);
     let target = work.join("docs/Experience/person/PERSON.md");
     let result = store
-        .write_files(&[(target, "новое тело\n".as_bytes().to_vec())], &[], "wiki: x")
+        .write_files(
+            &[(target, "новое тело\n".as_bytes().to_vec())],
+            &[],
+            "wiki: x",
+        )
         .await;
     assert!(
         result.is_err(),
@@ -199,7 +203,11 @@ async fn write_on_ahead_clone_fails_and_preserves_commit() -> Result<()> {
     let store = test_store(&work);
     let target = work.join("docs/Experience/person/PERSON.md");
     let result = store
-        .write_files(&[(target, "новое тело\n".as_bytes().to_vec())], &[], "wiki: x")
+        .write_files(
+            &[(target, "новое тело\n".as_bytes().to_vec())],
+            &[],
+            "wiki: x",
+        )
         .await;
     assert!(
         result.is_err(),
