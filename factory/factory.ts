@@ -1473,12 +1473,18 @@ async function runAutodoneTick(
  *  маршрутизации): state после терминальных исходов определён → reset.
  *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
  *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
- *  галочку не несёт — гард честно деградирует в no-op (транспорт hub). */
+ *  галочку не несёт — гард честно деградирует в no-op (транспорт hub).
+ *  Граница гарда (осознанная, ревью раунд 2): покрывает ТРЕКНУТЫЕ строки —
+ *  Review-строка вообще без записи в state (геометрия #317 «task в state
+ *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
+ *  гейт карантин-петли читает то же скан-поле; fm-экспорт всех строк доски
+ *  каждый тик — реальная цена, не платим. */
 async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
   const rowId = row.rowId
   const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
   const bodyKnown = md !== null && md !== ""
-  const fmAutodone = bodyKnown && autodoneCellValue(parseFrontmatter(md as string).fields.autodone) === "true"
+  const fmAutodone =
+    md !== null && md !== "" && autodoneCellValue(parseFrontmatter(md).fields.autodone) === "true"
   const act = autodoneWatchdog(
     {
       inReview: row.status === USER_REVIEW_STATUS,
