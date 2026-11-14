@@ -1374,9 +1374,48 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
       .toEqual({ t: "none" })
   })
-  test("не In Progress — none даже при застое", () => {
+  test("не In Progress и не Design — none даже при застое", () => {
     expect(stallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
-    expect(stallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ status: "Review" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("Design с зависшим ходом — signal (слот CUP не холдится вечно, инцидент 1101)", () => {
+    // Design-фантом: ход умер, запись сессии жива — вечная тишина держала слот
+    // CUP без эскалации (детекция была гейтнута только на In Progress)
+    const v = stallVerdict(facts({ status: "Design", branch: "", branchInWorktree: false }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("Design")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // на этапе утряски Branch/PR пустые в норме — веточных диагнозов быть не должно
+    expect(v.text).not.toContain("Branch-ячейка пуста")
+    expect(v.text).not.toContain("ветка на месте")
+  })
+  test("Design со свежей активностью — none (утряска идёт)", () => {
+    expect(stallVerdict(facts({ status: "Design", lastActivityAt: NOW - 5 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("Design повторный тик после сигнала — silent (анти-спам)", () => {
+    expect(stallVerdict(facts({ status: "Design", signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("цепочка фикса 1101: сигнал Design-фантома → эскалация в Needs attention → слот CUP свободен", () => {
+    // главный юзкейс постановки 1101: фантом в Design держал слот CUP вечно
+    // (детекция была гейтнута только на In Progress). Конец-в-конец чистых
+    // функций: вердикт signal на фантоме; прод-проводка signal-вердикта
+    // ставит Needs attention (lastStatus за доской) — статус вне
+    // LLM_ACTIVE_STATUSES, счёт активных падает, у очереди появляется бюджет.
+    const phantom = facts({ status: "Design", branch: "", branchInWorktree: false })
+    expect(stallVerdict(phantom, 30 * MIN).t).toBe("signal")
+    const slots = [
+      { status: "In Progress", priority: "medium" },
+      { status: "Needs attention", priority: "medium" }, // бывший Design-фантом
+    ]
+    const active = activeTaskCountEx(slots, { peak: false })
+    expect(active).toBe(1)
+    expect(cupBudget(active, 2)).toBe(1)
+    // и сама эскалация не вернула бы статус в активные (гват контракта статусов)
+    expect(LLM_ACTIVE_STATUSES.has("Needs attention")).toBe(false)
   })
   test("dead и unknown сессия — none (соседний код карантин / пропуск тика)", () => {
     expect(stallVerdict(facts({ sessionAlive: false }), 30 * MIN)).toEqual({ t: "none" })

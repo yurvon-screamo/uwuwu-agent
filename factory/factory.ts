@@ -21,11 +21,12 @@
 //      коммент юзера → рестарт)
 //   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
 //      state + термин живой ревью-сессии
-//   5. In Progress: сессия жива, юзер и агент молчат дольше порога
+//   5. In Progress и Design: сессия жива, юзер и агент молчат дольше порога
 //      (UWUWU_FACTORY_STALL_MIN, деф. 360 = 6 ч — трейд владельца 08.11:
 //      глубокие фоновые прогоны легитимно молчат часами) → сигнал-коммент
 //      + Needs attention раз за эпизод (потерянный/зависший ход: активный
-//      ход рождает сообщения)
+//      ход рождает сообщения; Design включён после инцидента 1101 —
+//      Design-фантом держал слот CUP вечно без эскалации)
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
 import { appendFileSync, copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
@@ -2480,10 +2481,11 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         saveState(state)
         await notify(tracked,
           `[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с ${baseOf(cfg)}).`)
-      } else if (quiet === "alive" && row.status === "In Progress") {
+      } else if (quiet === "alive" && (row.status === "In Progress" || row.status === "Design")) {
         // сессия жива — ловим зависший ход: агент молчит дольше порога
         // (активный ход рождает сообщения на каждом шаге LLM). Неизвестная
-        // активность (REST/формат) — пропуск тика без операций с флагом
+        // активность (REST/формат) — пропуск тика без операций с флагом.
+        // Design включён (инцидент 1101): Design-фантом держал слот CUP вечно
         const activity = await lastSessionActivity(tracked.sessionID)
         if (activity === "invalid") {
           log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
@@ -2505,15 +2507,19 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           const { stalled } = clock
           // кэш мержа действителен, пока совпадает с PR-ячейкой или ячейка
           // пуста (позитив фоллбек-пробы по ветке); смена PR на заполненной
-          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует
-          let prMerged = (tracked.mergedPrUrl ?? "") !== ""
+          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует.
+          // Только In Progress: Design-пере-вход (перепланировка после
+          // приёмки) не должен глушить сталл-детект старым merged-позитивом
+          let prMerged = row.status === "In Progress"
+            && (tracked.mergedPrUrl ?? "") !== ""
             && (row.pr === "" || tracked.mergedPrUrl === row.pr)
           // gh-проба ленивая (вердикт может стать signal) и только до первого
           // MERGED: merge необратим — без кэша это была бы проба каждые 3 мин
           // на всё время ожидания Done (дни). signaled=true глушит вердикт —
           // проба не нужна. Пустая клетка при непустой ветке — фоллбек по
-          // ветке (инцидент 09.11: мерженный PR не защитил от кика)
-          if (stalled && !prMerged && tracked.stallSignaled !== true) {
+          // ветке (инцидент 09.11: мерженный PR не защитил от кика).
+          // Design merged-пробу не вызывает: PR на этапе утряски не существует
+          if (stalled && !prMerged && row.status === "In Progress" && tracked.stallSignaled !== true) {
             const probe = row.pr !== ""
               ? await prProbeByCell(row.pr)
               : row.branch !== "" ? await prProbeByBranch(cfg.repo, row.branch) : null
@@ -2561,7 +2567,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           if (verdict.t === "signal") {
             // эскалация как у registerFailure/failReview: коммент + Needs
             // attention; lastStatus сразу за доской (как в failReview)
-            log(`задача ${rowId.slice(0, 8)}: In Progress при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
+            log(`задача ${rowId.slice(0, 8)}: ${row.status} при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
             if (DRY_RUN) {
               // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
               // без флага анти-спам в песочнице не работает — сигнал повторялся
