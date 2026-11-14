@@ -46,6 +46,19 @@ impl TaskBoardRepo for FakeBoard {
     async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
         Ok(vec![])
     }
+    async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<crate::ports::IssueView> {
+        let task = self
+            .rows
+            .iter()
+            .find(|t| t.number == n)
+            .cloned()
+            .unwrap_or_else(|| Task::new(n, String::new(), Status::Empty));
+        Ok(crate::ports::IssueView {
+            task,
+            body: String::new(),
+            comments: vec![],
+        })
+    }
 }
 
 struct FakeSessions {

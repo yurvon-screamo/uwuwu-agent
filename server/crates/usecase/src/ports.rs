@@ -25,6 +25,25 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn close_issue(&self, number: u64) -> UsecaseResult<()>;
     /// Хвост комментов задачи (для wakeup: новые против последнего).
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>>;
+    /// Полная карта задачи: агрегат + тело issue + все комменты.
+    async fn read_issue(&self, board: &str, number: u64) -> UsecaseResult<IssueView>;
+}
+
+/// Задача целиком: для карточки task_get (агентские чтения).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueView {
+    pub task: Task,
+    pub body: String,
+    pub comments: Vec<CommentRef>,
+}
+
+/// Вики-репозиторий: чтение доков и листинг (MCP docs_read/docs_ls).
+#[async_trait]
+pub trait WikiRepo: Send + Sync {
+    /// markdown дока по слагу (docs/** без .md); None — не найден.
+    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>>;
+    /// Пути .md под префиксом (напр. «Projects/uwuwu»), без docs/.
+    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>>;
 }
 
 /// Коммент задачи в терминах wakeup: идентичность + время создания.
