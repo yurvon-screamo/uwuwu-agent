@@ -13,8 +13,11 @@
 //!    labels (422), печатал тело ошибки как данные и завершался 0.
 //! B. `task body --stdin` (append) — тело дописано PATCH'ем как контент;
 //!    fm-шапка не появляется (мета в md не живёт — ADR-098).
-//! C. `task body --replace --replace-section` — громкий отказ ДО мутации.
-//! D. `task body --attach` — вывод честно называет assets/ (не портирован).
+//! C. `task body --replace-section` — громкий отказ ДО мутации: комбо с
+//!    --replace (clap-конфликты снесены — доезжает до runtime-гварда) и
+//!    сольные вызовы (регресс тихого append'а/read'а, инстанс 1091);
+//!    текст отказа шарит формулировку help.
+//! D. `task body --attach` — громкий отказ до мутации, рецепт assets/.
 //! E. Гвард входа: обёртка `task get` — отказ; fm-шапка во входе — легитимный
 //!    контент (карточки больше нет, задача 1087).
 //! F. `task body --replace` — тело записано ДОСЛОВНО входом (без fm-переноса
@@ -371,6 +374,10 @@ fn replace_with_section_flag_cannot_silently_overwrite_body() {
         "отказ называет флаг: {stderr}"
     );
     assert!(
+        stderr.contains("не поддерживается"),
+        "фраза help в отказе: {stderr}"
+    );
+    assert!(
         patch_body(&guards).is_none(),
         "отказ ДО мутации: тело не перезаписано"
     );
@@ -441,15 +448,16 @@ fn replace_section_without_input_refuses_loudly() {
     );
 }
 
-/// D. `--attach` не теряется молча: вывод называет assets/.
+/// D. `--attach` — громкий отказ до мутации: rc=1, текст называет assets/
+/// (рецепт ручной загрузки), PATCH тела нет.
 #[test]
-fn attach_call_names_assets_in_output() {
+fn attach_call_refuses_and_names_assets() {
     let guards = setup_stub_gh();
     let md = guards.0.path().join("content.md");
     std::fs::write(&md, "новое тело\n").expect("content.md");
     let file = guards.0.path().join("shot.png");
     std::fs::write(&file, b"png-bytes").expect("attach file");
-    let (code, stdout, stderr) = run_stub(
+    let (code, _stdout, stderr) = run_stub(
         &guards,
         None,
         &[
@@ -466,11 +474,14 @@ fn attach_call_names_assets_in_output() {
             file.to_str().unwrap(),
         ],
     );
-    assert_eq!(code, Some(0), "replace успешен: {stderr}");
-    let said = format!("{stdout}{stderr}");
+    assert_eq!(code, Some(1), "attach — громкий отказ: {stderr}");
     assert!(
-        said.contains("assets/"),
-        "вывод обязан честно сказать про assets/ (подсказка или загрузка): {said}"
+        stderr.contains("не портирован") && stderr.contains("assets/"),
+        "отказ честен и называет рецепт assets/: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "отказ ДО мутации: тело не перезаписано"
     );
 }
 

@@ -303,13 +303,22 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
             // Секционная хирургия на hub не существует (снесена с легаси-слоем
-            // хранения, PR #248): любой вызов с флагом — отказ до резолва строки,
-            // чтения входа и сети. Формулировки шарятся с help --replace-section.
+            // хранения, PR #248), --attach не портирован: любой вызов с ними —
+            // отказ до резолва строки, чтения входа и сети, без тихих
+            // деградаций в append/read-ветки (инстанс 1091). Формулировки
+            // шарятся с help --replace-section/--attach.
             if let Some(section) = &replace_section {
                 bail!(
                     "task body --replace-section «{section}»: секционная хирургия \
                      на hub-бекенде не поддерживается — правь тело целиком: \
                      task body --replace с --base (снапшот) или --force"
+                );
+            }
+            if let Some(file) = attach.first() {
+                bail!(
+                    "task body --attach {}: на hub не портирован (файлы не загружены) — \
+                     положи его в assets/ репо uwuwu-hub и вставь raw-ссылку в тело",
+                    file.display()
                 );
             }
             let task = store
@@ -348,14 +357,6 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                         }
                     };
                     store.body_replace(&board, &task, &md, &base_md).await?;
-                    if !attach.is_empty() {
-                        // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL
-                        // руками в теле) — загрузка через cli не портирована
-                        println!(
-                            "⚠ --attach на hub не портирован: файлы не загружены — \
-                             положи в assets/ репо uwuwu-hub и вставь raw-ссылки"
-                        );
-                    }
                     println!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
