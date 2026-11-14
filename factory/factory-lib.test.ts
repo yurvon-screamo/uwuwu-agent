@@ -1332,9 +1332,30 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
       .toEqual({ t: "none" })
   })
-  test("не In Progress — none даже при застое", () => {
+  test("не In Progress и не Design — none даже при застое", () => {
     expect(stallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
-    expect(stallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ status: "Review" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("Design с зависшим ходом — signal (слот CUP не холдится вечно, инцидент 1101)", () => {
+    // Design-фантом: ход умер, запись сессии жива — вечная тишина держала слот
+    // CUP без эскалации (детекция была гейтнута только на In Progress)
+    const v = stallVerdict(facts({ status: "Design", branch: "", branchInWorktree: false }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("Design")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // на этапе утряски Branch/PR пустые в норме — веточных диагнозов быть не должно
+    expect(v.text).not.toContain("Branch-ячейка пуста")
+    expect(v.text).not.toContain("ветка на месте")
+  })
+  test("Design со свежей активностью — none (утряска идёт)", () => {
+    expect(stallVerdict(facts({ status: "Design", lastActivityAt: NOW - 5 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("Design повторный тик после сигнала — silent (анти-спам)", () => {
+    expect(stallVerdict(facts({ status: "Design", signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
   })
   test("dead и unknown сессия — none (соседний код карантин / пропуск тика)", () => {
     expect(stallVerdict(facts({ sessionAlive: false }), 30 * MIN)).toEqual({ t: "none" })

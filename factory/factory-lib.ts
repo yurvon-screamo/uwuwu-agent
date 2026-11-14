@@ -1243,15 +1243,17 @@ export type StallVerdict =
   | { t: "silent" }
 
 /** Единственная точка решения о застое (по образцу routeTask): трекнутая
- *  In Progress при живой сессии, но тишине дольше порога (или без сообщений
- *  вовсе) = потерянный/зависший ход — активный ход рождает сообщения на
- *  каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
+ *  In Progress или Design при живой сессии, но тишине дольше порога (или без
+ *  сообщений вовсе) = потерянный/зависший ход — активный ход рождает сообщения
+ *  на каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
  *  пропуск тика: оба → none. Повторный сигнал в эпизоде глушится флагом
  *  (silent); сброс флага — дело демона: смена статуса — штатный путь
- *  (пере-вход в In Progress = новый эпизод), none-вердикт при стоявшем
- *  флаге — эпизод завершён. */
+ *  (пере-вход в стадию = новый эпизод), none-вердикт при стоявшем флаге —
+ *  эпизод завершён. Design включён после инцидента 1101: Design-фантом
+ *  (ход умер при падении serve, запись сессии жива) держал слот CUP вечно —
+ *  тишина не эскалировалась, lastStatus не менялся, счёт активных не падал. */
 export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
-  if (f.status !== "In Progress") return { t: "none" }
+  if (f.status !== "In Progress" && f.status !== "Design") return { t: "none" }
   if (f.sessionAlive !== true) return { t: "none" }
   const clock = stallClock(
     { lastActivityAt: f.lastActivityAt, lastDevPromptAt: f.lastDevPromptAt },
@@ -1271,11 +1273,17 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
     : f.branchInWorktree
       ? `ветка на месте (${f.branch.slice(0, 60)})`
       : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
-  const text = [
-    `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
-    `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
-    "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
-  ].join(" ")
+  const text = f.status === "Design"
+    ? [
+      `[factory] Строка в Design, но сессия утряски молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+      "Ход потерян или завис (запись сессии жива, сообщений нет).",
+      "Напиши комментарий в задачу или переустанови статус (перевод в In Progress и обратно в Design будит агента и переоткрывает эпизод).",
+    ].join(" ")
+    : [
+      `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+      `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
+      "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
+    ].join(" ")
   return { t: "signal", text }
 }
 
