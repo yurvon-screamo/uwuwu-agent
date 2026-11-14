@@ -20,6 +20,12 @@
 //!    сказать про assets/ (подсказка или загрузка), не «успех» с потерей.
 //! E. Гвард входа тела: frontmatter-шапка и обёртка `task get` во входе —
 //!    отказ (контракт help: «Вход — контент тела, не обёртка task get»).
+//! F. `task close` verify-after-write (1127): stale-open в контрольном GET
+//!    при эхо-успехе PATCH — ретрай и добитое подтверждение, штатный close
+//!    жив с гардой.
+//! G. `task close` исчерпание ретраев: PATCH стабильно эхо-успех при open в
+//!    контрольном GET — громкий отказ с пином инцидента (1127), а не тихий
+//!    rc 0 (класс false-success).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -311,5 +317,161 @@ fn body_input_rejects_frontmatter_and_task_get_wrapper() {
     assert!(
         patch_body(&guards).is_none(),
         "отказ ДО мутации: тело не тронуто"
+    );
+}
+
+// --- F/G. task close verify-after-write (задача 1127) ---
+
+/// Сценарий close-гарды: PATCH эхо-успех (как настоящий GitHub при
+/// false-success — success-ответ при неприменённом переходе), контрольный
+/// GET issues/999 по счётчику вызовов: «stale_once» — первый GET open,
+/// далее closed (гарда ретраит и добивается); «always_open» — все GET open
+/// (исчерпание ретраев → громкий отказ).
+fn setup_stub_gh_close(mode: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let root = dir.path();
+    let bin_dir = root.join("bin");
+    let log = root.join("calls.log");
+    let payload = root.join("last-patch.json");
+    std::fs::create_dir(&bin_dir).expect("bin dir");
+
+    let body = issue_body_md().replace('\n', "\\n");
+    let issue = |state: &str| {
+        format!(
+            r#"{{"number": 999, "title": "Тестовая строка", "state": "{state}", "body": "{body}", "labels": [{{"name": "proj:uwuwu"}}]}}"#
+        )
+    };
+    std::fs::write(root.join("issue-open.json"), format!("{}\n", issue("open")))
+        .expect("issue-open.json");
+    std::fs::write(
+        root.join("issue-closed.json"),
+        format!("{}\n", issue("closed")),
+    )
+    .expect("issue-closed.json");
+    std::fs::write(root.join("list.json"), format!("[{}]\n", issue("open"))).expect("list.json");
+    // эхо-success PATCH: GitHub при false-success отвечал именно так
+    // ({"state":"closed"} при неприменённом переходе — задача 1127)
+    std::fs::write(
+        root.join("patch-echo.json"),
+        r#"{"number": 999, "state": "closed", "state_reason": "completed"}"#.to_string(),
+    )
+    .expect("patch-echo.json");
+    std::fs::write(root.join("mode"), format!("{mode}\n")).expect("mode");
+
+    let script = r#"#!/usr/bin/env bash
+# stub gh для close-гарды (1127) — маршрутизация как в setup_stub_gh;
+# GET issues/999 ведёт счётчик вызовов и раздаёт state по режиму $DIR/mode.
+set -u
+method=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-X" ]; then method="$a"; fi
+  case "$a" in -f|-F) [ -z "$method" ] && method=POST ;; esac
+  prev="$a"
+done
+[ -z "$method" ] && method=GET
+route=""
+for a in "$@"; do
+  case "$a" in repos/*) [ -z "$route" ] && route="$a" ;; esac
+done
+printf '%s %s\n' "$method" "$route" >> "$STUB_LOG"
+DIR="$STUB_DIR"
+REPO="owner/hub-guard-test"
+case "$route" in
+  "repos/$REPO/issues?"*)
+    cat "$DIR/list.json"
+    exit 0
+    ;;
+  "repos/$REPO/issues/999/comments")
+    printf '{"id": 42}\n'
+    exit 0
+    ;;
+  "repos/$REPO/issues/999")
+    if [ "$method" = "PATCH" ]; then
+      cat > "$STUB_PAYLOAD"
+      cat "$DIR/patch-echo.json"
+      exit 0
+    fi
+    n=$(cat "$DIR/getcount" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo "$n" > "$DIR/getcount"
+    mode=$(cat "$DIR/mode")
+    if [ "$mode" = "always_open" ] || [ "$n" -le 1 ]; then
+      cat "$DIR/issue-open.json"
+    else
+      cat "$DIR/issue-closed.json"
+    fi
+    exit 0
+    ;;
+esac
+printf '{"message":"stub: маршрут не обслужен"}\n'
+exit 1
+"#;
+    let gh = bin_dir.join("gh");
+    std::fs::write(&gh, script).expect("stub script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    (dir, log, payload, gh)
+}
+
+fn patch_call_count(guards: &(tempfile::TempDir, PathBuf, PathBuf, PathBuf)) -> usize {
+    let (_, log, _, _) = guards;
+    let calls = std::fs::read_to_string(log).expect("log");
+    calls
+        .lines()
+        .filter(|l| *l == "PATCH repos/owner/hub-guard-test/issues/999")
+        .count()
+}
+
+/// F. close verify-after-write (1127): stale-open в первом контрольном GET
+/// не маскируется эхо-успехом PATCH — гард ретраит и добивается
+/// подтверждённого закрытия (штатный close жив с гардой).
+#[test]
+fn task_close_retries_past_stale_read_and_confirms() {
+    let guards = setup_stub_gh_close("stale_once");
+    let (code, stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &["task", "close", "999", "--project", "uwuwu"],
+    );
+    assert_eq!(code, Some(0), "гарда добилась подтверждения: {stderr}");
+    assert!(stdout.contains("закрыта"), "stdout: {stdout}");
+    assert!(
+        patch_call_count(&guards) >= 2,
+        "ретрай PATCH после stale-open обязателен"
+    );
+}
+
+/// G. close исчерпание ретраев: PATCH трижды эхо-успех при стабильном open
+/// в контрольном GET — громкий отказ с пином инцидента (1127), числом
+/// попыток и применённой частью (note-коммент), а не тихий rc 0. Сам
+/// инцидент GitHub недетерминирован — пинится механика гарды на
+/// stub-мисматче (красный до фикса: близкий false-success вёл к rc 0).
+#[test]
+fn task_close_fails_loud_when_state_never_confirms() {
+    let guards = setup_stub_gh_close("always_open");
+    let (code, stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &["task", "close", "999", "--project", "uwuwu", "--note", "пин"],
+    );
+    assert_ne!(code, Some(0), "тихий успех запрещён; stdout={stdout}");
+    assert!(!stdout.contains("закрыта"), "stdout: {stdout}");
+    for pin in [
+        "false-success",
+        "1127",
+        "после 3 PATCH-попыток",
+        "#999",
+        "уже приземлён",
+    ] {
+        assert!(stderr.contains(pin), "нет пина «{pin}»; stderr={stderr}");
+    }
+    assert_eq!(
+        patch_call_count(&guards),
+        3,
+        "PATCH-попыток ровно RETRY_ATTEMPTS+1"
     );
 }
