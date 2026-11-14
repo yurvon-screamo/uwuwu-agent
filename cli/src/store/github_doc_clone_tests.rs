@@ -179,3 +179,17 @@ async fn children_sorted_on_empty_folder_yields_no_entries() -> Result<()> {
     assert!(entries.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn missing_hint_on_empty_ancestor_names_it_empty() -> Result<()> {
+    // пустая папка-предок возможна в dirty-клоне (mkdir без коммита) —
+    // раскладка без висячего «доступно в «X»: » (ревью Low, задача 1094)
+    let tmp = TempDir::new()?;
+    std::fs::create_dir_all(tmp.path().join("docs/Ранбуки"))?;
+    let store = GitHubDocStore::new("local/test".into(), tmp.path().to_path_buf());
+    let err = store.missing_hint("Ранбуки/nosuch", "Ранбуки/nosuch");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("«Ранбуки» пуст"), "msg: {msg}");
+    assert!(!msg.contains("доступно"), "msg: {msg}");
+    Ok(())
+}

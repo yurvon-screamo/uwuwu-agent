@@ -124,7 +124,8 @@ impl DocStore for GitHubDocStore {
     /// Дети папки: "Projects" → папки проектов; "Projects/<proj>" → доки.
     /// Неизвестный путь или путь-файл — Err с раскладкой доступных:
     /// дети ближайшего существующего предка (папка) / read-хинт со слагом
-    /// (файл-предок) — help-контракт `DocsSub::Ls`.
+    /// (файл-предок) — help-контракт `DocsSub::Ls`; остальные io-коды
+    /// наружу как есть.
     async fn ls(&self, path: &str) -> Result<Vec<DocEntry>> {
         self.ensure_clone().await?;
         let docs = self.clone_root.join("docs");

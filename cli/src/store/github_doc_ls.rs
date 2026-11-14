@@ -29,7 +29,8 @@ pub(crate) fn children_sorted(dir: &Path) -> std::io::Result<Vec<DocEntry>> {
     Ok(out)
 }
 
-/// ls-отказ неслучайных io-кодов (не NotFound/NotADirectory) — наружу как есть.
+/// true для io-кодов «путь не существует» и «путь — файл»: ls обрабатывает
+/// их отказом с раскладкой (`missing_hint`); остальные io-коды наружу как есть.
 pub(crate) fn is_ls_missing_kind(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
@@ -71,6 +72,9 @@ impl GitHubDocStore {
                 Err(e) => return anyhow::Error::new(e),
             };
             let scope = if rel.is_empty() { "docs" } else { rel.as_str() };
+            if names.is_empty() {
+                return anyhow!("путь «{path}» не найден в docs/; «{scope}» пуст");
+            }
             return anyhow!(
                 "путь «{path}» не найден в docs/; доступно в «{scope}»: {}",
                 names.join(", ")
