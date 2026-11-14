@@ -78,4 +78,19 @@ describe("read_database_cells e2e — живой скан (UWUWU_E2E=1)", () => 
     },
     120_000,
   )
+
+  test.skipIf(!hubE2E)(
+    "rows несут привязку linkedDocId issue:<number> — без неё readTasks даёт bodyDoc='' навсегда: комменты/notify/watchdog-fm глухие (баг-пин tester 1070)",
+    async () => {
+      const res = await hubTool<{
+        rows: Array<{ rowBlockId: string; linkedDocId?: string | null }>
+      }>("read_database_cells", { databaseBlockId: "db:uwuwu" })
+      expect(res.rows.length).toBeGreaterThan(0)
+      const unbound = res.rows.filter(
+        (r) => r.linkedDocId !== `issue:${r.rowBlockId}`,
+      )
+      expect(unbound.map((r) => r.rowBlockId)).toEqual([])
+    },
+    120_000,
+  )
 })

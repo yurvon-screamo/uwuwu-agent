@@ -87,8 +87,15 @@ export async function hubTool<T = Record<string, unknown>>(
         const body = String(issue.body ?? "")
         const { fields } = parseFrontmatter(body)
         const cell = (v: string) => ({ value: v })
+        const number = String(issue.number)
         return {
-          rowBlockId: String(issue.number),
+          rowBlockId: number,
+          // легаси-семантика привязки строки: docId тела — без него readTasks
+          // даёт bodyDoc='' навсегда (комменты/notify/watchdog-fm глухие),
+          // фоллбек по тайтлу мёртв (баг-пин tester 1070: 21/21 треков с
+          // bodyDoc='' в проде)
+          title: String(issue.title),
+          linkedDocId: `issue:${number}`,
           cells: {
             "Название": cell(String(issue.title)),
             "Status": cell(fields.status ?? "Todo"),
