@@ -6,6 +6,7 @@
 // имена легаси-носителя).
 // Чистые функции без gh — стабы не нужны (конвенция #264: тест в tests/).
 import { describe, expect, test } from "bun:test"
+import type { GhIssue } from "../lib/platform-hub"
 import { issueAttrs, issueRows, plannedToMs } from "../lib/platform-hub-tools"
 import { minuteStart } from "../cron/cron-lib"
 
@@ -21,15 +22,17 @@ const masterBody = [
   "крути индекс",
 ].join("\n")
 
+// типизированные фикстуры (не as never): тип-чек остаётся честным к контракту
+// issueRows — неверное поле в фикстуре ловится tsc (ревью 1110 Low)
 const issue = {
   number: 440,
   title: "Крон: суточный semantic sync",
   body: masterBody,
   state: "open",
-}
+} as unknown as GhIssue
 
 describe("issueRows: паритет схемы легаси-носителя строки", () => {
-  const rows = issueRows([issue as never])
+  const rows = issueRows([issue])
   const row = rows[0]
 
   test("linkedDocId — issue:<number> (гейт bodyDoc крона проходит)", () => {
@@ -48,7 +51,7 @@ describe("issueRows: паритет схемы легаси-носителя с�
 })
 
 describe("клетка «Запланировано»: dateMs локальной минуты", () => {
-  const cells = issueRows([issue as never])[0]?.cells
+  const cells = issueRows([issue])[0]?.cells
 
   test("паритет с minuteStart крона — reconcile не спамит", () => {
     const ms = cells?.Запланировано?.dateMs
@@ -69,6 +72,8 @@ describe("клетка «Запланировано»: dateMs локальной
     expect(plannedToMs("13 месяц кривой")).toBeNull()
     expect(plannedToMs("2026-13-99 99:99")).toBeNull() // диапазоны
     expect(plannedToMs("2026-02-30 05:00")).toBeNull() // несуществующая (прокрутка Date)
+    expect(plannedToMs("0000-01-01 00:00")).toBeNull() // JS-семантика 0-99 → 1900+year (ревью Low)
+    expect(plannedToMs("0099-06-01 12:00")).toBeNull()
   })
 })
 
@@ -94,7 +99,7 @@ describe("issueAttrs: легаси-алиасы custom-* из fm schedule/agent"
 })
 
 describe("issueRows: тело без fm — дефолты контракта", () => {
-  const rows = issueRows([{ number: 7, title: "X", body: "", state: "open" } as never])
+  const rows = issueRows([{ number: 7, title: "X", body: "", state: "open" } as unknown as GhIssue])
   test("Status дефолт Todo, planned без dateMs, linkedDocId жив", () => {
     const row = rows[0]
     expect(row?.linkedDocId).toBe("issue:7")

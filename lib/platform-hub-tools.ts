@@ -26,11 +26,14 @@ import {
  *  formatLocal/minuteStart (клетку пишет CLI тем же форматированием).
  *  Пусто/криво/вне диапазонов/несуществующая дата — null: клетка без
  *  dateMs → plannedMs null у потребителя (одна reconcile-запись с
- *  самолечением через CLI, не спам). */
+ *  самолечением через CLI, не спам). Год — окно 2000–2100: JS-семантика
+ *  двухзначных лет (0–99 → 1900+year) иначе вернула бы bogus-epoch
+ *  вместо null (ревью 1110 Low). */
 export function plannedToMs(v: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(v.trim())
   if (m === null) return null
   const [y, mo, d, h, mi] = m.slice(1).map(Number)
+  if (y < 2000 || y > 2100) return null
   if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59) return null
   const date = new Date(y, mo - 1, d, h, mi)
   if (Number.isNaN(date.getTime()) || date.getDate() !== d || date.getMonth() !== mo - 1) return null
