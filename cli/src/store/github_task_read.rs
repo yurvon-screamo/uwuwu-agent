@@ -104,7 +104,7 @@ impl TaskStore for GitHubStore {
         base: &str,
     ) -> StoreResult<Task> {
         let current = self.issue_body(&task.id).await?;
-        if current != base {
+        if !base_matches_snapshot(&current, base) {
             anyhow::bail!(
                 "тело изменилось с момента снапшота (--base) — перечитай task get и повтори"
             );
@@ -226,6 +226,34 @@ fn numeric_needle(exact: &str) -> Option<u64> {
     exact.parse::<u64>().ok()
 }
 
+/// Снапшот свежести → сырое тело: срезка обёртки `task get` (шапка
+/// «Задача:/…/Строка: issue #N» + пустая строка; help: «cli срезает
+/// обёртку при сверке сам») и CRLF → LF. Снапшоты сырого тела (gh api)
+/// и чистого тела проходят без срезки — форма определяется по первой
+/// строке, телесный текст «Задача:…» без шапочного маркера не режется.
+fn snapshot_to_body(snapshot: &str) -> String {
+    let normalized = snapshot.replace("\r\n", "\n");
+    if normalized.starts_with("Задача:") {
+        // Маркер последней строки шапки get-принта; шапка в снапшоте
+        // первая — первый матч всегда шапочный, телесные «Строка:» не мешают
+        if let Some(pos) = normalized.find("\nСтрока:") {
+            let after_marker = &normalized[pos + 1..];
+            let after = after_marker.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            return after.trim_start_matches('\n').to_string();
+        }
+    }
+    normalized
+}
+
+/// Сверка снапшота свежести с текущим телом. Хвостовые переводы строк
+/// не несут контента: get-принт (println) добавляет финальный \n, сырой
+/// issue.body его не всегда имеет (офф-бай-один отказов --base).
+/// U+200B и прочий контент сравниваются дословно — одинаковы в обеих
+/// сторонах, санитизация не нужна (1096/1100).
+fn base_matches_snapshot(current: &str, snapshot: &str) -> bool {
+    snapshot_to_body(snapshot).trim_end() == current.replace("\r\n", "\n").trim_end()
+}
+
 /// fm-карточка тела: `---\n…\n---\n` в начале строки (Option — карточки
 /// может не быть: issue создан руками в UI без шапки).
 fn fm_block(body: &str) -> Option<&str> {
@@ -255,6 +283,95 @@ fn compose_body_with_fm(new_md: &str, current: &str) -> String {
     match fm_block(current) {
         Some(fm) => format!("{fm}\n{new_md}"),
         None => new_md.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod base_snapshot_tests {
+    use super::base_matches_snapshot;
+
+    /// Снапшот в форме get-принта (cmd/hub_task.rs): шапка + пустая строка
+    /// + тело (fm-блок — часть тела issue).
+    fn get_snapshot(title: &str, status: &str, number: &str, body: &str) -> String {
+        let mut s = format!("Задача:   {title}\nСтатус:   {status}\n");
+        s.push_str(&format!("Тип:      bug\nСтрока:   issue #{number}\n\n"));
+        s.push_str(body);
+        s.push('\n'); // println добавляет финальный \n
+        s
+    }
+
+    const BODY_WITH_FM: &str = "---\npriority: high\nautodone: true\n---\n## Постановка\n\nтекст\n";
+
+    #[test]
+    fn полный_get_снапшот_матчится_обёртка_срезается() {
+        let current = BODY_WITH_FM;
+        assert!(
+            base_matches_snapshot(current, &get_snapshot("Т", "In Progress", "1097", current)),
+            "снапшот task get (обёртка + хвостовой \\n) — матчится"
+        );
+    }
+
+    #[test]
+    fn тело_без_fm_и_чистый_снапшот_матчатся() {
+        let current = "плоское тело\n";
+        assert!(base_matches_snapshot(current, "плоское тело\n"));
+        assert!(base_matches_snapshot(current, "плоское тело"));
+    }
+
+    #[test]
+    fn хвостовой_newline_не_ломает_сверку() {
+        let current = "тело без хвоста";
+        let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #9\n\n{current}\n");
+        assert!(base_matches_snapshot(current, &snapshot));
+    }
+
+    #[test]
+    fn crlf_снапшот_нормализуется() {
+        let current = "---\nstatus: Todo\n---\nконтент\n";
+        let snapshot = "Задача:   Т\r\nСтатус:   Todo\r\nСтрока:   issue #9\r\n\r\n---\r\nstatus: Todo\r\n---\r\nконтент\r\n";
+        assert!(base_matches_snapshot(current, snapshot));
+    }
+
+    #[test]
+    fn zero_width_пробелы_сравниваются_дословно_и_не_мешают() {
+        // U+200B в обеих сторонах (инстанс #56): сверка дословная — расхождений
+        // изнутри сверки нет
+        let current = "текст \u{200b}код\u{200b} хвост\n";
+        let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #56\n\n{current}\n");
+        assert!(base_matches_snapshot(current, &snapshot));
+    }
+
+    #[test]
+    fn телесный_задача_без_шапки_не_режется() {
+        let current = "Задача: сделать Х\n\nшаги\n";
+        assert!(base_matches_snapshot(current, current));
+        assert!(base_matches_snapshot(
+            current,
+            "Задача: сделать Х\n\nшаги\n\n\n"
+        ));
+    }
+
+    #[test]
+    fn телесная_строка_после_шапки_не_путает_срезку() {
+        // «Строка:» в контенте — срезка по первому (шапочному) маркеру
+        let current = "таблица:\nСтрока:  (issue)\nконец\n";
+        let snapshot = format!("Задача:   Т\nСтатус:   Todo\nСтрока:   issue #9\n\n{current}");
+        assert!(base_matches_snapshot(current, &snapshot));
+    }
+
+    #[test]
+    fn изменившееся_тело_отказ() {
+        let snapshot = get_snapshot("Т", "Todo", "1097", "---\nstatus: Todo\n---\nстарое\n");
+        assert!(!base_matches_snapshot(
+            "---\nstatus: Todo\n---\nновое\n",
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn параллельная_правка_хвоста_ловится() {
+        let snapshot = get_snapshot("Т", "Todo", "1097", "контент А\n");
+        assert!(!base_matches_snapshot("контент B\n", &snapshot));
     }
 }
 
