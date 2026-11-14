@@ -1847,8 +1847,9 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // работа) — но учитываются в счёте наравне.
   const isDevCandidate = (t: TaskRef) =>
     reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId)
-  const devCandidates = guard.t === "hold" ? [] : untracked.filter(isDevCandidate)
+  const devCandidateRows = untracked.filter(isDevCandidate)
   const agentCandidates = untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
+  const devCandidates = guard.t === "hold" ? [] : devCandidateRows
   const throttleSplit = guard.t === "throttle"
     ? splitThrottle(agentCandidates.length, devCandidates.length, SPAWN_LIMITS.burstMax)
     // не throttle (allow/state-loss): лимита нет — slice(0, Infinity) спавнит всех
@@ -1877,13 +1878,18 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     log(`часы пик: спавн не-high отложен (${frozen} задач(и), приоритеты medium/low/пусто — до конца окна)`)
   }
   if (guard.t === "hold") {
-    counters.held = untracked.length
+    // чистая гардовская атрибуция: строки, которые при allow поехали бы
+    // (externalSkip не едут и без гарда — в счёт не берутся)
+    counters.held = devCandidateRows.length + agentCandidates.length
     counters.heldReason = guard.reason
   } else if (guard.t === "throttle") {
-    const agentLimit = Math.min(agentCandidates.length, throttleSplit.agent)
-    counters.held = untracked.length - devWave.length - agentLimit
+    // кандидаты сверх burst-бюджета; CUP-очередь и пик-заморозка — не гард,
+    // видны в отдельных строках лога
+    counters.held = Math.max(0, devCandidateRows.length + agentCandidates.length - SPAWN_LIMITS.burstMax)
     counters.heldReason = "throttle"
-  }  if (devWave.length > 0 && !drain.isStopping()) {
+  }
+
+  if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
       try {

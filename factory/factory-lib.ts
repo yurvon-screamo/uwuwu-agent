@@ -1442,6 +1442,7 @@ export function spawnLimitsFromEnv(loss: string | undefined, burst: string | und
  *  none — в пределах окна (анти-спам). allow при стоящем флаге — сигнал
  *  демону снять флаг: эпизод завершён. */
 export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): SpawnGuardVerdict {
+  if (f.orphaned <= l.lossMax && f.totalUntracked <= l.burstMax) return { t: "allow" }
   const prevMs = f.holdSignaled !== undefined ? Date.parse(f.holdSignaled) : Number.NaN
   const alert: SpawnGuardAlert = Number.isNaN(prevMs)
     ? "first"
@@ -1458,16 +1459,14 @@ export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): Spaw
         "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон.",
     }
   }
-  if (f.totalUntracked > l.burstMax) {
-    return {
-      t: "throttle",
-      alert,
-      text: `[factory] Спавн дозируется — untracked=${f.totalUntracked} при пороге ${l.burstMax} (сирот-спавнов=${f.orphaned}): ` +
-        `волна импорта или массовых переносов, спавним не больше ${l.burstMax} за тик — волна доедет сама. ` +
-        "Если волна неожиданна — проверь доску и state.json.",
-    }
+  // остаток после hold-return: orphaned ≤ lossMax и untracked > burstMax
+  return {
+    t: "throttle",
+    alert,
+    text: `[factory] Спавн дозируется — untracked=${f.totalUntracked} при пороге ${l.burstMax} (сирот-спавнов=${f.orphaned}): ` +
+      `волна импорта или массовых переносов, спавним не больше ${l.burstMax} за тик — волна доедет сама. ` +
+      "Если волна неожиданна — проверь доску и state.json.",
   }
-  return { t: "allow" }
 }
 
 /** Распределение burst-бюджета тика: карантинные спавны (ревью/тест —
