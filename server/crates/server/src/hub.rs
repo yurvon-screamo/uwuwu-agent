@@ -25,6 +25,7 @@ const QUERY: &str = r#"
           items(first:100, after:$after){
             pageInfo{ hasNextPage endCursor }
             nodes{
+              id
               content{ __typename ...on Issue{ number title body state } }
               fieldValues(first:30){
                 nodes{ __typename

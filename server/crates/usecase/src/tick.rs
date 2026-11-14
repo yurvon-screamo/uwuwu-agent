@@ -37,6 +37,7 @@ pub struct TickPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TickOutcome {
+    pub actions_failed: usize,
     pub rows_total: usize,
     pub spawns_allowed: usize,
     pub spawns_done: usize,
@@ -66,7 +67,9 @@ impl TickUseCase {
             out.rows_total += tasks.len();
             out = self.run_board(plan, board, tasks, out).await?;
         }
-        self.state.save()?;
+        if let Err(e) = self.state.save() {
+            tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
+        }
         tracing::info!(
             event = "tick.completed",
             rows = out.rows_total,
@@ -76,6 +79,7 @@ impl TickUseCase {
             wakeups = out.wakeups,
             autodone = out.autodone_done,
             mode = ?plan.mode,
+            failed = out.actions_failed,
             "Tick completed"
         );
         Ok(out)
@@ -100,14 +104,24 @@ impl TickUseCase {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
                             if plan.mode == Mode::Live {
-                                let session = self
-                                    .spawn_stage(board, task, slot)
-                                    .await
-                                    .map_err(|e| self.log_action_failed(task, e))?;
-                                self.board
-                                    .set_session(&board.board, task.number, slot, &session)
-                                    .await?;
-                                out.spawns_done += 1;
+                                match self.spawn_stage(board, task, slot).await {
+                                    Ok(session) => {
+                                        if let Err(e) = self
+                                            .board
+                                            .set_session(&board.board, task.number, slot, &session)
+                                            .await
+                                        {
+                                            out.actions_failed += 1;
+                                            self.log_action_failed(task, e);
+                                        } else {
+                                            out.spawns_done += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        out.actions_failed += 1;
+                                        self.log_action_failed(task, e);
+                                    }
+                                }
                             }
                         }
                         Gate::HeldCup { active, cap } => {
@@ -147,8 +161,13 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        if self.wakeup_if_fresh(board, task).await? {
-                            out.wakeups += 1;
+                        match self.wakeup_if_fresh(board, task).await {
+                            Ok(true) => out.wakeups += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                out.actions_failed += 1;
+                                self.log_action_failed(task, e);
+                            }
                         }
                     } else {
                         out.observed += 1;
