@@ -1268,22 +1268,28 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.prMerged) return { t: "none" }
   if (f.signaled) return { t: "silent" }
   const quietText = clock.quietMin === null ? "сообщений в сессии нет" : `тишина ${clock.quietMin} мин`
-  const branchDiag = f.branch === ""
-    ? "Branch-ячейка пуста — агент умер до создания ветки"
-    : f.branchInWorktree
-      ? `ветка на месте (${f.branch.slice(0, 60)})`
-      : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
-  const text = f.status === "Design"
-    ? [
+  // branchDiag — только In Progress-путь: Design-текст веточных диагнозов
+  // не содержит (Branch/PR на этапе утряски пустые в норме), вычисление
+  // до ветвления строило и выбрасывало строку (ревью 1101, Low)
+  let text: string
+  if (f.status === "Design") {
+    text = [
       `[factory] Строка в Design, но сессия утряски молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
       "Ход потерян или завис (запись сессии жива, сообщений нет).",
       "Напиши комментарий в задачу или переустанови статус (перевод в In Progress и обратно в Design будит агента и переоткрывает эпизод).",
     ].join(" ")
-    : [
+  } else {
+    const branchDiag = f.branch === ""
+      ? "Branch-ячейка пуста — агент умер до создания ветки"
+      : f.branchInWorktree
+        ? `ветка на месте (${f.branch.slice(0, 60)})`
+        : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
+    text = [
       `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
       `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
       "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
     ].join(" ")
+  }
   return { t: "signal", text }
 }
 
