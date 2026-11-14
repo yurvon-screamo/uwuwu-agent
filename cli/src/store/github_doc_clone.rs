@@ -22,6 +22,9 @@ impl super::github_doc_store::GitHubDocStore {
     ) -> Result<()> {
         self.prepare_clone_dir().await?;
         let _guard = clone_lock(self.clone_root_str()).await?;
+        // Свой мусор от крэша чистим ДО гарды — иначе untracked .uwuwu-tmp
+        // валит dirty-проверку и write отказывает сам на себе.
+        cleanup_stale_tmp(Path::new(self.clone_root_str()))?;
         self.ensure_clone_locked(super::github_doc_sync::SyncMode::Strict)
             .await?;
         for (path, bytes) in files {
@@ -42,8 +45,12 @@ impl super::github_doc_store::GitHubDocStore {
 }
 
 /// Запись через tmp-файл + rename в том же каталоге: reader вне лока не
-/// видит обрезанный файл посреди чужой записи.
+/// видит обрезанный файл посреди чужой записи. Родители создаются —
+/// «дока нет — не падай» (append в новый путь легитимен).
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let file_name = path
         .file_name()
         .context("путь записи без имени файла")?
@@ -51,6 +58,31 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(".{file_name}.uwuwu-tmp"));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Снести свой мусор от крэша между tmp-write и rename (`.{name}.uwuwu-tmp`):
+/// иначе следующий `git add -A` утащит его в вики.
+fn cleanup_stale_tmp(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != ".git") {
+                    stack.push(path);
+                }
+            } else {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') && name.ends_with(".uwuwu-tmp") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

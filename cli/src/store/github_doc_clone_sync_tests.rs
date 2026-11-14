@@ -270,3 +270,81 @@ async fn parallel_syncs_and_first_checkouts_all_succeed() -> Result<()> {
     }
     Ok(())
 }
+
+/// Crash-tail первого клона (fetch отработал, checkout не успел): ref есть,
+/// HEAD unborn — read самовосстанавливается (док дорисовывается), не
+/// вечный громкий отказ.
+#[tokio::test]
+async fn crash_tail_of_first_clone_self_heals_on_read() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (origin, _writer, _work) = setup_rig(tmp.path(), "crashtail").await?;
+    let fresh = tmp.path().join("tail-work");
+    std::fs::create_dir_all(&fresh)?;
+    let fresh_s = fresh.to_str().unwrap();
+    git_raw(&["-C", fresh_s, "init", "-q", "-b", "main"]).await?;
+    git_raw(&[
+        "-C",
+        fresh_s,
+        "remote",
+        "add",
+        "origin",
+        origin.to_str().unwrap(),
+    ])
+    .await?;
+    git_raw(&["-C", fresh_s, "fetch", "-q", "--depth", "1", "origin"]).await?;
+    // fetch есть, checkout не случился — HEAD unborn, origin/main существует
+    let store = test_store(&fresh);
+    let body = store
+        .read(&DocRef {
+            slug: "Experience/person/PERSON".into(),
+        })
+        .await?;
+    assert_eq!(
+        body, "база\n",
+        "crash-tail первого клона не самовосстановился"
+    );
+    Ok(())
+}
+
+/// Write в путь с несуществующими родителями — создаёт их (старое
+/// поведение, потерянное при переезде на атомарную запись).
+#[tokio::test]
+async fn write_creates_missing_parent_dirs() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_origin, _writer, work) = setup_rig(tmp.path(), "mkdirs").await?;
+    let store = test_store(&work);
+    let target = work.join("docs/Experience/foo/BAR.md");
+    store
+        .write_files(
+            &[(target, "новый док\n".as_bytes().to_vec())],
+            "wiki: foo/BAR",
+        )
+        .await?;
+    let body = store
+        .read(&DocRef {
+            slug: "Experience/foo/BAR".into(),
+        })
+        .await?;
+    assert_eq!(body, "новый док\n", "док в новых родителях не записан");
+    Ok(())
+}
+
+/// Крэш между tmp-write и rename оставляет `.X.uwuwu-tmp` — следующий
+/// write_files чистит свой мусор: он не уезжает в вики.
+#[tokio::test]
+async fn stale_tmp_files_are_cleaned_before_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_origin, _writer, work) = setup_rig(tmp.path(), "tmpcrash").await?;
+    let stale = work.join("docs/.PERSON.md.uwuwu-tmp");
+    std::fs::write(&stale, "обрезанный мусор")?;
+    let store = test_store(&work);
+    let target = work.join("docs/Experience/person/PERSON.md");
+    store
+        .write_files(
+            &[(target, "новое тело\n".as_bytes().to_vec())],
+            "wiki: person",
+        )
+        .await?;
+    assert!(!stale.exists(), "stale .uwuwu-tmp не почищен перед записью");
+    Ok(())
+}

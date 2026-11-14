@@ -36,7 +36,10 @@ impl super::github_doc_store::GitHubDocStore {
 
     /// Sync под уже взятым локом (ensure_clone / write_files).
     pub(crate) async fn ensure_clone_locked(&self, mode: SyncMode) -> Result<()> {
-        if !self.has_origin_ref().await {
+        // Crash-tail первого клона (fetch отработал, checkout не успел):
+        // ref существует, HEAD unborn — лечится той же веткой first-checkout,
+        // что и отсутствие ref (rev-parse HEAD на unborn падает).
+        if !self.has_origin_ref().await || !self.has_head().await {
             return self.first_checkout_locked().await;
         }
         self.sync_locked(mode).await
@@ -138,6 +141,19 @@ impl super::github_doc_store::GitHubDocStore {
             "--verify",
             "-q",
             "refs/remotes/origin/main",
+        ])
+        .await
+        .is_ok()
+    }
+
+    async fn has_head(&self) -> bool {
+        git(&[
+            "-C",
+            self.clone_root_str(),
+            "rev-parse",
+            "--verify",
+            "-q",
+            "HEAD",
         ])
         .await
         .is_ok()

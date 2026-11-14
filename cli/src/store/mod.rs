@@ -7,7 +7,7 @@ pub mod github_doc_blob;
 pub mod github_doc_clone;
 pub mod github_doc_search;
 pub mod github_doc_store;
-pub mod github_doc_sync;
+mod github_doc_sync;
 pub mod github_gh;
 pub mod github_project;
 pub mod github_project_resolve;
