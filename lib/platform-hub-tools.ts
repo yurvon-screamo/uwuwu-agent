@@ -1,22 +1,23 @@
 //! Hub-реализации tool-имён lib/platform (platform-hub.ts — транспорт и
-//! docId-схема). Маппинг семантики доски на issues: по контракту миграции
-//! Status/Запланировано — Project v2 + frontmatter, Branch/PR/Сессия dev/
-//! Расписание — frontmatter.
+//! docId-схема). Маппинг семантики доски на issues: по контракту задачи
+//! 1087 (ADR-098) клетки — глобальные issue fields, Status — Pv2
+//! (projectStatuses-джойн), closed → Done (проекция state).
 
 import { hubCloneRoot } from "./platform-hub"
 import type { GhIssue } from "./platform-hub"
 import {
+  FIELD_NAMES,
+  fieldsOf,
   ghJson,
   hubRepo,
   issueByNumber,
-  issuePatch,
   issuesForProject,
   parseDocId,
-  parseFrontmatter,
   projectOfBoardDocId,
   projectOfDbId,
+  projectStatuses,
+  setIssueFields,
   setProjectStatus,
-  withFields,
 } from "./platform-hub"
 
 export async function hubTool<T = Record<string, unknown>>(
@@ -83,11 +84,17 @@ export async function hubTool<T = Record<string, unknown>>(
       const dbId = String(args.databaseBlockId ?? "")
       const project = projectOfDbId(dbId)
       if (!project) throw new Error(`hub: read_database_cells вне доски (${dbId})`)
-      const rows = issuesForProject(project).map((issue) => {
-        const body = String(issue.body ?? "")
-        const { fields } = parseFrontmatter(body)
-        const cell = (v: string) => ({ value: v })
-        const number = String(issue.number)
+      const issues = issuesForProject(project)
+      // Status — Pv2-канон: батч-джойн статусов доски
+      const statuses = projectStatuses(project)
+      const rows = issues.map((issue) => {
+        const f = fieldsOf(issue)
+        const cell = (v: string) => ({ value: v, ...(v !== "" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? { dateMs: dateToMs(v) } : {}) })
+        // проекция state: закрытый issue = Done независимо от карточки
+        const status = issue.state === "closed"
+          ? "Done"
+          : (statuses.get(issue.number) ?? "Todo")
+        const autodoneRaw = f[FIELD_NAMES.autodone] ?? ""
         return {
           rowBlockId: number,
           // легаси-семантика привязки строки: docId тела — без него readTasks
@@ -98,15 +105,17 @@ export async function hubTool<T = Record<string, unknown>>(
           linkedDocId: `issue:${number}`,
           cells: {
             "Название": cell(String(issue.title)),
-            "Status": cell(fields.status ?? "Todo"),
-            "Тип": cell(githubTypeName(issue, fields.type)),
-            "Branch": cell(fields.branch ?? ""),
-            "PR": cell(fields.pr ?? ""),
-            "Сессия dev": cell(fields["dev-session"] ?? ""),
-            "Запланировано": cell(fields.planned ?? ""),
-            "Расписание": cell(fields.schedule ?? ""),
-            "Autodone": cell(autodoneCellValue(fields.autodone)),
-            "Приоритет": cell(fields.priority ?? ""),
+            "Status": cell(status),
+            "Тип": cell(githubTypeName(issue, f.type ?? "")),
+            "Branch": cell(f[FIELD_NAMES.branch] ?? ""),
+            "PR": cell(f[FIELD_NAMES.pr] ?? ""),
+            "Сессия dev": cell(f[FIELD_NAMES.devSession] ?? ""),
+            "Сессия ревью": cell(f[FIELD_NAMES.reviewSession] ?? ""),
+            "Сессия тест": cell(f[FIELD_NAMES.testSession] ?? ""),
+            "Запланировано": cell(f[FIELD_NAMES.planned] ?? ""),
+            "Расписание": cell(f[FIELD_NAMES.schedule] ?? ""),
+            "Autodone": cell(autodoneRaw === "on" || autodoneRaw === "true" || autodoneRaw === "✓" ? "true" : "false"),
+            "Приоритет": cell(f[FIELD_NAMES.priority] ?? ""),
           },
         }
       })
@@ -115,26 +124,44 @@ export async function hubTool<T = Record<string, unknown>>(
     case "update_database_row": {
       const rowBlockId = String(args.rowBlockId ?? "")
       const cells = (args.cells ?? {}) as Record<string, { value?: string }>
-      const plain: Record<string, string> = {}
-      const fm: Record<string, string> = {}
+      const number = rowBlockId.replace(/^issue:/, "")
+      // Status — Pv2-мутация; прочие клетки — глобальные поля (батч).
+      // Пустое значение клетки — очистка поля (DELETE).
+      let status: string | undefined
+      const fields: Record<string, string | null> = {}
+      const text = (v: string) => (v === "" ? null : v)
       for (const [name, cell] of Object.entries(cells)) {
         const value = cell?.value ?? ""
         if (name === "Status") {
-          plain.status = value
-          fm.status = value
-        } else if (name === "Branch") fm.branch = value
-        else if (name === "PR") fm.pr = value
-        else if (name === "Сессия dev") fm["dev-session"] = value
-        else if (name === "Запланировано") fm.planned = value
-        else if (name === "Расписание") fm.schedule = value
-        else if (name === "Тип") fm.type = value
-        else if (name === "Autodone") fm.autodone = autodoneFmOf(value)
-        else if (name === "Приоритет") fm.priority = value
+          status = value
+        } else if (name === "Branch") {
+          fields[FIELD_NAMES.branch] = text(value)
+        } else if (name === "PR") {
+          fields[FIELD_NAMES.pr] = text(value)
+        } else if (name === "Сессия dev") {
+          fields[FIELD_NAMES.devSession] = text(value)
+        } else if (name === "Сессия ревью") {
+          fields[FIELD_NAMES.reviewSession] = text(value)
+        } else if (name === "Сессия тест") {
+          fields[FIELD_NAMES.testSession] = text(value)
+        } else if (name === "Запланировано") {
+          fields[FIELD_NAMES.planned] = text(value)
+        } else if (name === "Расписание") {
+          fields[FIELD_NAMES.schedule] = text(value)
+        } else if (name === "Autodone") {
+          fields[FIELD_NAMES.autodone] = value === "✓" || value === "true"
+            ? "on"
+            : "off"
+        } else if (name === "Приоритет") {
+          fields[FIELD_NAMES.priority] = text(value)
+        }
+        // «Тип» — нативный issue type: клетка только для чтения (пишется
+        // PATCH'ем type, путь cli edit --type) — молча пропускаем
       }
-      const number = rowBlockId.replace(/^issue:/, "")
-      const body = String(issueByNumber(number)?.body ?? "")
-      issuePatch(number, { body: withFields(body, fm) })
-      if (plain.status) setProjectStatus(projectOf(number), number, plain.status)
+      if (Object.keys(fields).length > 0) setIssueFields(number, fields)
+      if (status !== undefined && status !== "") {
+        setProjectStatus(projectOf(number), number, status)
+      }
       return { skipped: [] } as T
     }
     case "ensure_database_columns":
@@ -215,8 +242,7 @@ export async function hubTool<T = Record<string, unknown>>(
         return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
       }
       if (parsed?.kind === "issue") {
-        const body = String(issueByNumber(parsed.payload)?.body ?? "")
-        return { ...parseFrontmatter(body).fields } as T
+        return { ...fieldsOf(issueByNumber(parsed.payload) ?? {}) } as T
       }
       return {} as T
     }
@@ -273,22 +299,11 @@ export async function hubTool<T = Record<string, unknown>>(
 
 // ——— хелперы ———
 
-/** fm-флаг autodone → значение ячейки «Autodone» в легаси-семантике checkbox
- *  (factory readTasks ждёт "true"). Точный паритет cli-парсера
- *  (github_task.rs: `Some("true") | Some("✓")`, без trim — parseFrontmatter
- *  тримит значения сам). Инцидент 1070: скан отдавал "✓", consumer ждал
- *  "true" — автодон не видел ни одной галочки на hub-транспорте
- *  (мисс #317: 20+ часов тишины вместо автомержа/Done). */
-export function autodoneCellValue(fmAutodone?: string): string {
-  const v = fmAutodone ?? ""
-  return v === "true" || v === "✓" ? "true" : ""
-}
-
-/** Значение ячейки «Autodone» (update_database_row) → fm-строка. Принимает
- *  легаси-"true" и UI-"✓" — round-trip read→write не разворачивает флаг. */
-export function autodoneFmOf(cellValue: string): "true" | "false" {
-  const v = cellValue ?? ""
-  return v === "true" || v === "✓" ? "true" : "false"
+/// «Запланировано» YYYY-MM-DD → epoch ms (крон ждёт dateMs клетки).
+function dateToMs(date: string): number {
+  const d = new Date(`${date}T00:00:00Z`)
+  const ms = d.getTime()
+  return Number.isNaN(ms) ? 0 : ms
 }
 
 function allIssues(): Array<Record<string, unknown>> {
