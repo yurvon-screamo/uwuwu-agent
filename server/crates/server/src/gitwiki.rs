@@ -175,7 +175,7 @@ impl GitWikiWriter {
 }
 
 /// Стандартный base64-декодер (алфавит + /, с паддингом).
-fn base64_std(input: &str) -> Option<Vec<u8>> {
+pub fn base64_std(input: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut buf = 0u32;

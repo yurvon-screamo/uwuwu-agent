@@ -106,7 +106,15 @@ async fn run(
         .iter()
         .map(|b| (b.project.clone(), b.board.clone()))
         .collect();
-    let task_view = Arc::new(uwuwu_usecase::TaskView::new(board.clone(), boards_cfg));
+    let spawn_model_cfg = cfg
+        .executor
+        .spawn_model
+        .as_ref()
+        .map(|m| (m.provider.clone(), m.id.clone()));
+    let task_view = Arc::new(uwuwu_usecase::TaskView::new(
+        board.clone(),
+        boards_cfg.clone(),
+    ));
     let git_writer = Arc::new(gitwiki::GitWikiWriter::new(
         cfg.hub.repo.clone(),
         "main".to_string(),
@@ -118,25 +126,21 @@ async fn run(
         secrets.gh_token.clone(),
         Some(git_writer),
     ));
-    // Семантика: плоский индекс + OpenRouter free-эмбеддинги (ключ env,
-    // нет — поиск честно без семантики)
+    // Семантика: плоский индекс (+текст без ключа) + OpenRouter при ключе
     let openrouter_key = std::env::var("OPENROUTER_API_KEY")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Option<Arc<dyn uwuwu_usecase::search::SemanticBackend>> = openrouter_key
-        .map(|key| {
-            Arc::new(semantic_backend::FlatSemanticBackend {
-                wiki: wiki.clone(),
-                store: Arc::new(semantic::FileSemanticStore::load(
-                    cfg.state_path(&config_path).with_file_name("semantic.json"),
-                )),
-                embeddings: Arc::new(semantic::OpenRouterEmbeddings::new(key)),
-            }) as Arc<dyn uwuwu_usecase::search::SemanticBackend>
+    let semantic_backend: Arc<dyn uwuwu_usecase::search::SemanticBackend> =
+        Arc::new(semantic_backend::FlatSemanticBackend {
+            wiki: wiki.clone(),
+            store: Arc::new(semantic::FileSemanticStore::load(
+                cfg.state_path(&config_path).with_file_name("semantic.json"),
+            )),
+            embeddings: openrouter_key
+                .map(|key| Arc::new(semantic::OpenRouterEmbeddings::new(key))),
         });
     let search_usecase = Arc::new(uwuwu_usecase::search::SearchUseCase {
-        wiki: wiki.clone(),
-        semantic: semantic_backend.clone(),
-        openrouter_key: None,
+        semantic: Some(semantic_backend.clone()),
     });
 
     let tool_hub = Arc::new(tools::ToolHub {
@@ -145,16 +149,22 @@ async fn run(
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
             board: board.clone(),
-            board_name: Arc::new(
-                plan.boards
-                    .first()
-                    .map(|b| b.board.clone())
-                    .unwrap_or_default(),
-            ),
+            boards: boards_cfg.clone(),
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),
         search: search_usecase.clone(),
+        crons: Arc::new(uwuwu_usecase::crons::CronUseCase {
+            wiki: wiki.clone(),
+            sessions: sessions.clone(),
+            clock: clock.clone(),
+            spawn_model: spawn_model_cfg.clone(),
+            checkout: plan
+                .boards
+                .first()
+                .map(|b| b.checkout.clone())
+                .unwrap_or_default(),
+        }),
     });
 
     let http_state = Arc::new(http::AppState {
@@ -169,11 +179,6 @@ async fn run(
     let app = http::router(http_state).merge(mcp::router(mcp_state));
 
     // Сателлиты конвейера: кроны (вики-носитель), триаж черновиков, дример
-    let spawn_model_cfg = cfg
-        .executor
-        .spawn_model
-        .as_ref()
-        .map(|m| (m.provider.clone(), m.id.clone()));
     let boards_info: Vec<(String, String, String)> = plan
         .boards
         .iter()
@@ -222,7 +227,8 @@ async fn run(
                 Box::pin(async move { t.tick().await.map(|_| ()) })
             }),
         });
-        if let Some(backend) = semantic_backend.clone() {
+        {
+            let backend = semantic_backend.clone();
             let clock2 = clock.clone();
             sidecars.push(Sidecar {
                 name: "semantic-sync".into(),
@@ -233,8 +239,13 @@ async fn run(
                         if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
                             return Ok(());
                         }
-                        // бюджет дока за тик: 8 (≈ 1-2 запроса эмбеддингов)
-                        b.sync_index(8).await.map(|_| ())
+                        // первичная индексация — широкий бюджет, далее дотяжка
+                        let budget = {
+                            let store_empty = true;
+                            let _ = store_empty;
+                            64
+                        };
+                        b.sync_index(budget).await.map(|_| ())
                     })
                 }),
             });

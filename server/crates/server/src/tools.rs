@@ -13,6 +13,7 @@ pub struct ToolHub {
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
     pub sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway>,
     pub search: Arc<uwuwu_usecase::search::SearchUseCase>,
+    pub crons: Arc<uwuwu_usecase::crons::CronUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -20,142 +21,149 @@ pub const DEFAULT_PROJECT: &str = "uwuwu";
 
 impl ToolHub {
     pub fn descriptors(&self) -> Value {
-        json!([
-            tool(
-                "task_list",
-                "Строки доски проекта: number, статус, приоритет, тайтл",
-                object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
-            ),
-            tool(
-                "task_get",
-                "Карточка задачи целиком: fm-поля, тело issue, последние комменты",
-                object(json!({ "number": integer("номер задачи (row-id)"),
-                         "project": string("проект; дефолт uwuwu") }))
-            ),
-            tool(
-                "docs_ls",
-                "Список .md-доков вики под префиксом (слаги без docs/ и .md)",
-                object(json!({ "path": string("префикс: проект/папка; пусто — вся вики") }))
-            ),
-            tool(
-                "docs_read",
-                "Markdown дока по слагу (без docs/ и .md)",
-                object(json!({ "slug": string("слаг: Projects/uwuwu/README, Experience/...") }))
-            ),
-            tool(
-                "person_show",
-                "Персона владельца (язык/стиль/граны) — читают агенты в начале работы",
-                object(json!({}))
-            ),
-            tool(
-                "projects",
-                "Проекты конвейера (доски в конфиге сервера)",
-                object(json!({}))
-            ),
-            tool(
-                "task_create",
-                "Создать задачу на доске проекта (Draft; тайтл уникален)",
-                object(json!({
-                    "title": string("тайтл (уникален на доске)"),
-                    "project": string("проект; дефолт uwuwu"),
-                    "body": string("markdown-тело (Постановка…)"),
-                    "type": string("bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure"),
-                    "priority": string("high|medium|low; дефолт medium"),
-                    "autodone": json!({"type":"boolean","description":"автодон: мерж PR на Review; дефолт true"})
-                }))
-            ),
-            tool(
-                "task_edit",
-                "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл",
-                object(json!({
-                    "number": integer("номер задачи"),
-                    "project": string("проект; дефолт uwuwu"),
-                    "status": string("статус канона: Draft/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Review/Needs attention/Вейт"),
-                    "branch": string("имя ветки"),
-                    "pr": string("URL PR"),
-                    "priority": string("high|medium|low"),
-                    "title": string("новый тайтл")
-                }))
-            ),
-            tool(
-                "task_claim",
-                "Заявить свою сессию в слот dev (фабрика не спавнит дубля)",
-                object(json!({
-                    "number": integer("номер задачи"),
-                    "project": string("проект; дефолт uwuwu"),
-                    "session": string("свой session id (ses_…)")
-                }))
-            ),
-            tool(
-                "task_comment",
-                "Коммент в задачу (вопрос/доклад владельцу; будит агентов)",
-                object(json!({
-                    "number": integer("номер задачи"),
-                    "text": string("текст коммента"),
-                    "reply_to": string("цитата-якорь для ответа в тред (опционально)")
-                }))
-            ),
-            tool(
-                "task_close",
-                "Закрыть задачу (Done; reason not_planned для отказов)",
-                object(json!({
-                    "number": integer("номер задачи"),
-                    "project": string("проект; дефолт uwuwu"),
-                    "not_planned": json!({"type":"boolean","description":"true — отказ/дубль, false — выполнено"})
-                }))
-            ),
-            tool(
-                "docs_append",
-                "Дописать строку в конец дока вики (журналы кронов, классы опыта; commit ff-only)",
-                object(json!({
-                    "slug": string("слаг дока (без docs/ и .md)"),
-                    "line": string("строка целиком (markdown)"),
-                    "message": string("сообщение коммита; дефолт append")
-                }))
-            ),
-            tool(
-                "docs_write",
-                "Перезаписать док вики целиком (commit ff-only; для новых статей опыта)",
-                object(json!({
-                    "slug": string("слаг дока (без docs/ и .md)"),
-                    "content": string("markdown целиком"),
-                    "message": string("сообщение коммита; дефолт write")
-                }))
-            ),
-            tool(
-                "cron_list",
-                "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
-                object(json!({
-                    "project": string("проект; дефолт uwuwu")
-                }))
-            ),
-            tool(
-                "search",
-                "Гибридный поиск по вики: полнотекст + семантика (если индекс жив)",
-                object(json!({
-                    "query": string("поисковый запрос (токены AND + вектор)"),
-                    "top": json!({"type":"integer","description":"сколько попаданий на секцию; дефолт 5"})
-                }))
-            ),
-            tool(
-                "session_export",
-                "Экспорт сессии опенкода (контент для дримера/аудита)",
-                object(json!({
-                    "session": string("id сессии (ses_…)")
-                }))
-            ),
-            tool(
-                "task_body",
-                "Полная замена тела задачи (fm-поля сохраняются)",
-                object(json!({
-                    "number": integer("номер задачи"),
-                    "project": string("проект; дефолт uwuwu"),
-                    "body": string("markdown-тело целиком (без fm)")
-                }))
-            ),
-        ])
+        tool_descriptors()
     }
+}
 
+/// Реестр инструментов MCP (сверка канона: «чего нет в списке — того нет»).
+pub fn tool_descriptors() -> Value {
+    json!([
+        tool(
+            "task_list",
+            "Строки доски проекта: number, статус, приоритет, тайтл",
+            object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
+        ),
+        tool(
+            "task_get",
+            "Карточка задачи целиком: fm-поля, тело issue, последние комменты",
+            object(json!({ "number": integer("номер задачи (row-id)"),
+                         "project": string("проект; дефолт uwuwu") }))
+        ),
+        tool(
+            "docs_ls",
+            "Список .md-доков вики под префиксом (слаги без docs/ и .md)",
+            object(json!({ "path": string("префикс: проект/папка; пусто — вся вики") }))
+        ),
+        tool(
+            "docs_read",
+            "Markdown дока по слагу (без docs/ и .md)",
+            object(json!({ "slug": string("слаг: Projects/uwuwu/README, Experience/...") }))
+        ),
+        tool(
+            "person_show",
+            "Персона владельца (язык/стиль/граны) — читают агенты в начале работы",
+            object(json!({}))
+        ),
+        tool(
+            "projects",
+            "Проекты конвейера (доски в конфиге сервера)",
+            object(json!({}))
+        ),
+        tool(
+            "task_create",
+            "Создать задачу на доске проекта (Draft; тайтл уникален)",
+            object(json!({
+                "title": string("тайтл (уникален на доске)"),
+                "project": string("проект; дефолт uwuwu"),
+                "body": string("markdown-тело (Постановка…)"),
+                "type": string("bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure"),
+                "priority": string("high|medium|low; дефолт medium"),
+                "autodone": json!({"type":"boolean","description":"автодон: мерж PR на Review; дефолт true"})
+            }))
+        ),
+        tool(
+            "task_edit",
+            "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл",
+            object(json!({
+                "number": integer("номер задачи"),
+                "project": string("проект; дефолт uwuwu"),
+                "status": string("статус канона: Draft/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Review/Needs attention/Вейт"),
+                "branch": string("имя ветки"),
+                "pr": string("URL PR"),
+                "priority": string("high|medium|low"),
+                "title": string("новый тайтл")
+            }))
+        ),
+        tool(
+            "task_claim",
+            "Заявить свою сессию в слот dev (фабрика не спавнит дубля)",
+            object(json!({
+                "number": integer("номер задачи"),
+                "project": string("проект; дефолт uwuwu"),
+                "session": string("свой session id (ses_…)")
+            }))
+        ),
+        tool(
+            "task_comment",
+            "Коммент в задачу (вопрос/доклад владельцу; будит агентов)",
+            object(json!({
+                "number": integer("номер задачи"),
+                "text": string("текст коммента"),
+                "reply_to": string("цитата-якорь для ответа в тред (опционально)")
+            }))
+        ),
+        tool(
+            "task_close",
+            "Закрыть задачу (Done; reason not_planned для отказов)",
+            object(json!({
+                "number": integer("номер задачи"),
+                "project": string("проект; дефолт uwuwu"),
+                "not_planned": json!({"type":"boolean","description":"true — отказ/дубль, false — выполнено"})
+            }))
+        ),
+        tool(
+            "docs_append",
+            "Дописать строку в конец дока вики (журналы кронов, классы опыта; commit ff-only)",
+            object(json!({
+                "slug": string("слаг дока (без docs/ и .md)"),
+                "line": string("строка целиком (markdown)"),
+                "message": string("сообщение коммита; дефолт append")
+            }))
+        ),
+        tool(
+            "docs_write",
+            "Перезаписать док вики целиком (commit ff-only; для новых статей опыта)",
+            object(json!({
+                "slug": string("слаг дока (без docs/ и .md)"),
+                "content": string("markdown целиком"),
+                "message": string("сообщение коммита; дефолт write")
+            }))
+        ),
+        tool(
+            "cron_list",
+            "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
+            object(json!({
+                "project": string("проект; дефолт uwuwu")
+            }))
+        ),
+        tool(
+            "search",
+            "Гибридный поиск по вики: полнотекст + семантика (если индекс жив)",
+            object(json!({
+                "query": string("поисковый запрос (токены AND + вектор)"),
+                "top": json!({"type":"integer","description":"сколько попаданий на секцию; дефолт 5"})
+            }))
+        ),
+        tool(
+            "session_export",
+            "Экспорт сессии опенкода (контент для дримера/аудита)",
+            object(json!({
+                "session": string("id сессии (ses_…)")
+            }))
+        ),
+        tool(
+            "task_body",
+            "Полная замена тела задачи (fm-поля сохраняются)",
+            object(json!({
+                "number": integer("номер задачи"),
+                "project": string("проект; дефолт uwuwu"),
+                "body": string("markdown-тело целиком (без fm)")
+            }))
+        ),
+    ])
+}
+
+impl ToolHub {
     pub async fn call(&self, msg: &Value) -> Result<Value, String> {
         let name = msg["params"]["name"].as_str().unwrap_or_default();
         let args = &msg["params"]["arguments"];
@@ -269,23 +277,18 @@ impl ToolHub {
                 ok_text(format!("док «{slug}» записан"))
             }
             "cron_list" => {
-                let dir = uwuwu_usecase::crons::crons_dir(&project);
-                let prefix = format!("{dir}/");
-                let mut out = String::new();
-                let all = self.wiki.list_docs(&dir).await.map_err(|e| e.to_string())?;
-                for slug in all {
-                    // list_docs даёт пути от docs/ целиком: только прямые дети
-                    if !slug.starts_with(&prefix) || slug[prefix.len()..].contains('/') {
-                        continue;
-                    }
-                    if let Some(md) = self.wiki.read_doc(&slug).await.map_err(|e| e.to_string())? {
-                        if let Some(m) = uwuwu_usecase::crons::parse_master(&slug, &md) {
-                            out.push_str(&format!("{} — `{}`\n", m.title, m.schedule));
-                        }
-                    }
-                }
+                // тонкая обёртка: инвентарь живёт в юзкейсе (masters())
+                let masters = self
+                    .crons
+                    .masters(&project)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let out = masters
+                    .iter()
+                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule))
+                    .collect::<String>();
                 ok_text(if out.is_empty() {
-                    format!("кроны в «{dir}» не найдены")
+                    format!("кроны проекта {project} не найдены")
                 } else {
                     out
                 })
@@ -479,33 +482,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_helpers_shape() {
-        let d = tool("x", "desc", object(json!({ "a": string("b") })));
-        assert_eq!(d["name"], "x");
-        assert_eq!(d["inputSchema"]["type"], "object");
-        assert_eq!(d["inputSchema"]["properties"]["a"]["type"], "string");
-    }
-
-    #[test]
-    fn descriptors_static_names() {
-        // перечень имён инструментов — контракт MCP-поверхности (срез 2b)
-        let names = [
+    fn descriptors_are_the_real_surface() {
+        let list = tool_descriptors();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for expected in [
             "task_list",
             "task_get",
-            "docs_ls",
-            "docs_read",
-            "person_show",
-            "projects",
+            "task_claim",
             "task_create",
             "task_edit",
-            "task_claim",
             "task_comment",
             "task_close",
             "task_body",
-        ];
-        for n in names {
-            assert!(!n.is_empty());
+            "docs_ls",
+            "docs_read",
+            "docs_write",
+            "docs_append",
+            "person_show",
+            "projects",
+            "search",
+            "cron_list",
+            "session_export",
+        ] {
+            assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 17, "контракт поверхности: {names:?}");
     }
 }

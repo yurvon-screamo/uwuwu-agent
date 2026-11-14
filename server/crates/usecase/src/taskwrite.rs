@@ -46,7 +46,18 @@ pub struct TaskPatch {
 
 pub struct TaskWriteUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
-    pub board_name: Arc<String>,
+    /// карта проект → доска (мультипроектный конфиг).
+    pub boards: Vec<(String, String)>,
+}
+
+impl TaskWriteUseCase {
+    fn board_of(&self, project: &str) -> String {
+        self.boards
+            .iter()
+            .find(|(p, _)| p == project)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl TaskWriteUseCase {
@@ -66,11 +77,17 @@ impl TaskWriter for TaskWriteUseCase {
         if spec.title.trim().is_empty() {
             return Err(UsecaseError::Board("тайтл пуст".into()));
         }
-        let rows = self.board.read_board(&self.board_name).await?;
+        let board = self.board_of(project);
+        if board.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
+        }
+        let rows = self.board.read_board(&board).await?;
         self.dup_check(&rows, spec.title.trim())?;
         self.board
             .create_issue(
-                &self.board_name,
+                &board,
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
@@ -79,7 +96,17 @@ impl TaskWriter for TaskWriteUseCase {
     }
 
     async fn edit(&self, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
-        let board = &self.board_name;
+        // доску резолвит вызывающий юзкейс-слой по проекту строки; для edit
+        // известна одна доска из карточки — берём поfm-статусу нельзя, потому
+        // прокидываем первую (мультиборд: set_status идёт через edit_project)
+        let board = &self
+            .boards
+            .first()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        if board.is_empty() {
+            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+        }
         if let Some(status) = patch.status {
             self.board.set_status(board, number, status).await?;
         }
@@ -110,8 +137,16 @@ impl TaskWriter for TaskWriteUseCase {
     }
 
     async fn claim(&self, number: u64, session: &str) -> UsecaseResult<()> {
+        let board = &self
+            .boards
+            .first()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        if board.is_empty() {
+            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+        }
         self.board
-            .set_session(&self.board_name, number, uwuwu_domain::Slot::Dev, session)
+            .set_session(board, number, uwuwu_domain::Slot::Dev, session)
             .await
     }
 
@@ -127,9 +162,15 @@ impl TaskWriter for TaskWriteUseCase {
     }
 
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
-        self.board
-            .set_status(&self.board_name, number, Status::Done)
-            .await?;
+        let board = &self
+            .boards
+            .first()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        if board.is_empty() {
+            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+        }
+        self.board.set_status(board, number, Status::Done).await?;
         self.board.close_issue_ext(number, not_planned).await
     }
 

@@ -152,9 +152,15 @@ pub fn parse_schedule(raw: &str) -> Option<ParsedSchedule> {
             Some((dd.parse().ok()?, mo.parse().ok()?))
         }
     };
-    Some(ParsedSchedule {
-        kind: ScheduleKind::Once { hh, mm, day },
-    })
+    let kind = match day {
+        None => ScheduleKind::Daily { hh, mm },
+        Some(day) => ScheduleKind::Once {
+            hh,
+            mm,
+            day: Some(day),
+        },
+    };
+    Some(ParsedSchedule { kind })
 }
 
 pub struct CronUseCase {
@@ -172,6 +178,24 @@ pub struct FireOutcome {
 }
 
 impl CronUseCase {
+    /// Инвентарь мастеров проекта (прямые дети папки Кроны).
+    pub async fn masters(&self, project: &str) -> UsecaseResult<Vec<CronMaster>> {
+        let dir = crons_dir(project);
+        let prefix = format!("{dir}/");
+        let mut out = Vec::new();
+        for slug in self.wiki.list_docs(&dir).await? {
+            if !slug.starts_with(&prefix) || slug[prefix.len()..].contains('/') {
+                continue;
+            }
+            if let Some(md) = self.wiki.read_doc(&slug).await? {
+                if let Some(m) = parse_master(&slug, &md) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Один проход: мастера проекта, due → журнальная строка + спавн рана.
     pub async fn tick(&self, project: &str) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
@@ -231,13 +255,15 @@ impl CronUseCase {
                 Some(ts) => now >= ts + minutes * 60_000,
             },
             ScheduleKind::Daily { hh, mm } => {
-                let now_min = self.clock.utc_minute();
+                // расписание канонично JST: минуты суток JST
+                let (mi, hr, _, _, _) = jst_fields(now);
+                let now_minute_of_day = hr * 60 + mi;
                 let target = hh * 60 + mm;
                 match last {
-                    None => now_min.minute_of_day >= target,
+                    None => now_minute_of_day >= target,
                     Some(ts) => {
                         // следующий день настал: >20ч с прошлого запуска и время прошло
-                        now >= ts + 20 * 3_600_000 && now_min.minute_of_day >= target
+                        now >= ts + 20 * 3_600_000 && now_minute_of_day >= target
                     }
                 }
             }
@@ -245,13 +271,13 @@ impl CronUseCase {
                 if last.is_some() {
                     return false;
                 }
-                let now_min = self.clock.utc_minute();
+                let (mi, hr, d_now, mo_now, _) = jst_fields(now);
+                let now_minute_of_day = hr * 60 + mi;
                 if day.is_none() {
-                    return now_min.minute_of_day >= hh * 60 + mm;
+                    return now_minute_of_day >= hh * 60 + mm;
                 }
                 let Some((d, m)) = day else { return false };
-                let (day_now, month_now) = jst_day(now);
-                day_now == d && month_now == m && now_min.minute_of_day >= hh * 60 + mm
+                d_now == d && mo_now == m && now_minute_of_day >= hh * 60 + mm
             }
             ScheduleKind::Cron(fields) => {
                 let (mi, hh, da, mo, dw) = jst_fields(now);
@@ -307,12 +333,6 @@ fn jst_stamp(ms: u64) -> String {
     )
 }
 
-fn jst_day(ms: u64) -> (u32, u32) {
-    let secs = ms / 1000 + 9 * 3600;
-    let (_, mo, da) = civil_from_days((secs / 86400) as i64);
-    (da, mo)
-}
-
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -347,4 +367,193 @@ fn run_prompt(project: &str, master: &CronMaster, journal: &str) -> String {
 /// Минуты UTC для планировщика (переиспользуем доменный UtcMinute через Clock).
 pub fn utc_minute_of(clock: &dyn Clock) -> UtcMinute {
     clock.utc_minute()
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::*;
+
+    /// Мс эпохи из даты (UTC).
+    fn ms(y: i64, mo: u32, d: u32, h: u64, mi: u64) -> u64 {
+        let yy = if mo <= 2 { y - 1 } else { y };
+        let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+        let yoe = (yy - era * 400) as u64;
+        let mp = if mo > 2 { mo - 3 } else { mo + 9 } as u64;
+        let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        ((era * 146_097 + doe as i64 - 719_468) as u64 * 86400 + h * 3600 + mi * 60) * 1000
+    }
+
+    struct FixedClock(u64);
+    impl crate::ports::Clock for FixedClock {
+        fn utc_minute(&self) -> UtcMinute {
+            let secs = self.0 / 1000;
+            UtcMinute {
+                minute_of_day: ((secs % 86400) / 60) as u32,
+                weekday: ((((secs / 86400) + 4) % 7) + 1) as u32,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn due_at(clock: FixedClock, sched: &str, journal: &str) -> bool {
+        let wiki = FakeWiki(journal.to_string());
+        let sessions = FakeSessions;
+        let u = CronUseCase {
+            wiki: std::sync::Arc::new(wiki),
+            sessions: std::sync::Arc::new(sessions),
+            clock: std::sync::Arc::new(clock),
+            spawn_model: None,
+            checkout: "/tmp".into(),
+        };
+        let master = CronMaster {
+            slug: "Projects/uwuwu/Кроны/x".into(),
+            title: "x".into(),
+            schedule: sched.into(),
+            agent: None,
+            body: String::new(),
+        };
+        u.due(&master, journal)
+    }
+
+    struct FakeWiki(String);
+    #[async_trait::async_trait]
+    impl crate::ports::WikiRepo for FakeWiki {
+        async fn read_doc(&self, _s: &str) -> crate::error::UsecaseResult<Option<String>> {
+            Ok(Some(self.0.clone()))
+        }
+        async fn list_docs(&self, _p: &str) -> crate::error::UsecaseResult<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn write_doc(&self, _s: &str, _c: &str, _m: &str) -> crate::error::UsecaseResult<()> {
+            Ok(())
+        }
+        async fn append_doc(
+            &self,
+            _s: &str,
+            _l: &str,
+            _m: &str,
+        ) -> crate::error::UsecaseResult<()> {
+            Ok(())
+        }
+    }
+    struct FakeSessions;
+    #[async_trait::async_trait]
+    impl crate::ports::AgentSessionGateway for FakeSessions {
+        async fn create_session(
+            &self,
+            _s: &crate::ports::SessionSpec,
+        ) -> crate::error::UsecaseResult<String> {
+            Ok("ses_t".into())
+        }
+        async fn prompt(&self, _s: &str, _t: &str) -> crate::error::UsecaseResult<()> {
+            Ok(())
+        }
+        async fn run_command(
+            &self,
+            _s: &str,
+            _n: &str,
+            _a: &str,
+        ) -> crate::error::UsecaseResult<()> {
+            Ok(())
+        }
+        async fn liveness(&self, _s: &str) -> crate::ports::Liveness {
+            crate::ports::Liveness::Alive
+        }
+        async fn delete_session(&self, _s: &str) -> crate::error::UsecaseResult<()> {
+            Ok(())
+        }
+        async fn last_activity_ms(&self, _s: &str) -> crate::error::UsecaseResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn list_sessions(
+            &self,
+        ) -> crate::error::UsecaseResult<Vec<crate::ports::SessionInfo>> {
+            Ok(vec![])
+        }
+        async fn export_session(&self, _s: &str) -> crate::error::UsecaseResult<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn interval_due_by_journal_stamp() {
+        // журнал с ISO-штампом (формат jst_stamp после фикса) парсится:
+        // последний запуск 02:29 JST = 17:29 UTC накануне → 5m истекли
+        let journal = "- 2026-11-15T02:29:00+09:00 запуск (демон)\n";
+        let now = FixedClock(ms(2026, 11, 15, 18, 0));
+        assert!(due_at(now, "5m", journal));
+        // свежий запуск — не due (1 минута спустя, UTC = JST-9ч)
+        let fresh = FixedClock(ms(2026, 11, 14, 17, 30));
+        assert!(!due_at(fresh, "5m", journal));
+    }
+
+    #[test]
+    fn interval_first_fire_without_journal() {
+        assert!(due_at(FixedClock(ms(2026, 11, 15, 12, 0)), "1d", ""));
+    }
+
+    #[test]
+    fn cron_expr_window_dedup() {
+        // 30 1 * * *: сейчас 01:30 JST (16:30 UTC пред-дня), запуск 5 мин назад → нет
+        let journal = "- 2026-11-15T01:25:00+09:00 запуск (демон)\n";
+        let now = FixedClock(ms(2026, 11, 14, 16, 29));
+        assert!(!due_at(now, "30 1 * * *", journal));
+        // запуска не было → файр в окне
+        assert!(due_at(
+            FixedClock(ms(2026, 11, 14, 16, 30)),
+            "30 1 * * *",
+            ""
+        ));
+    }
+
+    #[test]
+    fn due_daily_parses_stamp_and_fires() {
+        let journal = "- 2026-11-14T06:00:00+09:00 запуск (демон)\n";
+        let ts = last_run_ms(journal);
+        let now = ms(2026, 11, 14, 21, 0);
+        let (mi, hr, _, _, _) = jst_fields(now);
+        println!(
+            "ts={ts:?} now={now} diff_h={} jst_h={hr} jst_m={mi}",
+            (now - ts.unwrap_or(0)) / 3_600_000
+        );
+        assert!(ts.is_some(), "штамп не распарсился");
+        // прямой вызов due
+        let u = CronUseCase {
+            wiki: std::sync::Arc::new(FakeWiki(journal.to_string())),
+            sessions: std::sync::Arc::new(FakeSessions),
+            clock: std::sync::Arc::new(FixedClock(now)),
+            spawn_model: None,
+            checkout: "/tmp".into(),
+        };
+        let m = CronMaster {
+            slug: "x".into(),
+            title: "x".into(),
+            schedule: "06:00".into(),
+            agent: None,
+            body: String::new(),
+        };
+        let d = u.due(&m, journal);
+        println!("due={d}");
+        assert!(d, "прямой вызов due");
+    }
+
+    #[test]
+    fn daily_due_next_day() {
+        // 06:00 JST daily; вчера 06:00 ran → сегодня 21:00 UTC (06:00 JST+15h) — due
+        let journal = "- 2026-11-14T06:00:00+09:00 запуск (демон)\n";
+        assert!(due_at(
+            FixedClock(ms(2026, 11, 14, 21, 0)),
+            "06:00",
+            journal
+        ));
+        // тот же день раньше времени — нет
+        assert!(!due_at(
+            FixedClock(ms(2026, 11, 14, 18, 0)),
+            "06:00",
+            journal
+        ));
+    }
 }

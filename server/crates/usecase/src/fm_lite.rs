@@ -86,6 +86,14 @@ mod tests {
     }
 
     #[test]
+    fn iso_jst_stamp() {
+        // штамп журнала кронов (jst_stamp)
+        let v = parse_iso_ms("2026-11-14T06:00:00+09:00").unwrap();
+        // 06:00 JST = 21:00 UTC пред-дня
+        assert_eq!(v % 86_400_000, 21 * 3_600_000, "UTC-время суток");
+    }
+
+    #[test]
     fn iso_parsing() {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
         let ms = parse_iso_ms("2026-11-15T06:35:00Z");

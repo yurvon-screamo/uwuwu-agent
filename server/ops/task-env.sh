@@ -20,6 +20,8 @@ if [ -d "$repo/.git" ]; then
   # переиспользование: подтянуть master, не трогая рабочее состояние
   git -C "$repo" fetch -q origin || true
 else
+  # гигиена stale-регистраций (env снесён, регистрация осталась)
+  git -C "$src" worktree prune 2>/dev/null || true
   # worktree от текущего мастер-чекаута (cwd команды = чекаут проекта)
   src="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   git -C "$src" fetch -q origin

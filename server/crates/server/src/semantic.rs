@@ -1,8 +1,7 @@
 //! Семантика: EmbeddingClient (OpenRouter free-модель, батчи) и
-//! SemanticStore (плоский векторный индекс на диске, cosine в RAM).
-//! Движок заменяем трейтом (решение #1133: LanceDB pre-1.0 — изоляция);
-//! текущая реализация: чанки × f32-векторы в одном файле, корпус вики
-//! в RAM-бюджете (десятки MB на тысячи чанков).
+//! SemanticStore (плоский векторный индекс + полнотекст по чанкам).
+//! Отклонение от решения «LanceDB» задокументировано в теле #1133
+//! (трейт SemanticBackend — движок заменяем).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,8 +15,6 @@ pub const EMBED_BATCH: usize = 32;
 pub struct OpenRouterEmbeddings {
     key: String,
     http: reqwest::Client,
-    /// Фоллбэк не строим (решение владельца: только локальная Ollama —
-    /// разовые туннели операционкой; постоянного механизма нет).
     pub model: String,
 }
 
@@ -34,9 +31,10 @@ impl OpenRouterEmbeddings {
         }
     }
 
-    /// Эмбеддинги батча входов (2048-dim каждый).
+    /// Эмбеддинги батча входов (2048-dim каждый); порядок ответа
+    /// верифицируется по index-полю (защита от склейки не по порядку).
     pub async fn embed_batch(&self, inputs: &[String]) -> UsecaseResult<Vec<Vec<f32>>> {
-        let mut out = Vec::with_capacity(inputs.len());
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(EMBED_BATCH) {
             let resp = self
                 .http
@@ -57,62 +55,102 @@ impl OpenRouterEmbeddings {
                     body.to_string().chars().take(160).collect::<String>()
                 )));
             }
-            let mut vecs: Vec<Vec<f32>> = body["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|d| {
-                            d["embedding"].as_array().map(|v| {
-                                v.iter()
-                                    .filter_map(|x| x.as_f64().map(|f| f as f32))
-                                    .collect()
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if vecs.len() != chunk.len() {
+            let arr = body["data"].as_array().cloned().unwrap_or_default();
+            if arr.len() != chunk.len() {
                 return Err(UsecaseError::State(format!(
                     "embeddings: ждали {} векторов, пришло {}",
                     chunk.len(),
-                    vecs.len()
+                    arr.len()
                 )));
             }
-            vecs.sort_by_key(|_| 0);
-            out.append(&mut vecs);
+            // порядок по index-полю ответа
+            let mut ordered: Vec<Option<Vec<f32>>> = (0..chunk.len()).map(|_| None).collect();
+            for d in &arr {
+                let idx = d["index"].as_u64().unwrap_or(u64::MAX) as usize;
+                let vec: Vec<f32> = d["embedding"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(|x| x.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if idx >= ordered.len() || vec.is_empty() {
+                    return Err(UsecaseError::State("embeddings: битый index/вектор".into()));
+                }
+                ordered[idx] = Some(vec);
+            }
+            for v in ordered {
+                out.push(v.ok_or_else(|| {
+                    UsecaseError::State("embeddings: пропуск в порядке векторов".into())
+                })?);
+            }
         }
         Ok(out)
     }
 }
 
+/// Чанк дока: текст (полнотекст) + вектор (семантика) + хэш дока (инкремент).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
+    /// Слаг дока (без #idx — выдача поиска читается docs_read).
     pub slug: String,
-    /// Порядковый номер чанка дока.
     pub idx: u32,
-    pub text_head: String,
+    /// Хэш всего дока на момент индексации (инкрементальность).
+    pub doc_hash: u64,
+    /// Полный текст чанка (полнотекст по контенту).
+    pub text: String,
+    #[serde(default)]
     pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FlatIndex {
-    /// slug → chunks.
+    /// slug → чанки (целиком замещаются при реиндексации дока).
     pub docs: HashMap<String, Vec<Chunk>>,
 }
 
 impl FlatIndex {
     /// Топ-n по cosine.
-    pub fn search(&self, query: &[f32], top: usize) -> Vec<(f32, String, u32)> {
-        let mut scores: Vec<(f32, String, u32)> = Vec::new();
+    pub fn search(&self, query: &[f32], top: usize) -> Vec<(f32, String)> {
+        let mut best: HashMap<String, f32> = HashMap::new();
         for chunks in self.docs.values() {
             for c in chunks {
+                if c.vector.is_empty() {
+                    continue;
+                }
                 let s = cosine(query, &c.vector);
-                scores.push((s, c.slug.clone(), c.idx));
+                let e = best.entry(c.slug.clone()).or_insert(f32::MIN);
+                if s > *e {
+                    *e = s;
+                }
             }
         }
+        let mut scores: Vec<(f32, String)> = best.into_iter().map(|(s, v)| (v, s)).collect();
         scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(top);
         scores
+    }
+
+    /// Полнотекст: все токены (lowercase, >1 символа) в тексте чанков дока.
+    pub fn fulltext(&self, tokens: &[String], top: usize) -> Vec<String> {
+        let mut hits = Vec::new();
+        'doc: for (slug, chunks) in &self.docs {
+            for t in tokens {
+                let needle = t.to_lowercase();
+                let found = chunks
+                    .iter()
+                    .any(|c| c.text.to_lowercase().contains(&needle));
+                if !found {
+                    continue 'doc;
+                }
+            }
+            hits.push(slug.clone());
+            if hits.len() >= top {
+                break;
+            }
+        }
+        hits
     }
 }
 
@@ -131,8 +169,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Персистентный плоский индекс: один bincode-подобный файл (json-строки
-/// честны и отлаживаемы; объём десятки MB — приемлемо).
+/// Персистентный плоский индекс (json, атомарная запись).
 pub struct FileSemanticStore {
     path: PathBuf,
     pub index: std::sync::Mutex<FlatIndex>,
@@ -160,14 +197,14 @@ impl FileSemanticStore {
         Ok(())
     }
 
-    /// Хэш текущего содержимого дока для инкрементальности.
+    /// Текущий хэш дока в индексе (по первому чанку).
     pub fn doc_hash(&self, slug: &str) -> Option<u64> {
         self.index
             .lock()
             .expect("index lock")
             .docs
             .get(slug)
-            .map(|cs| cs.first().map(|c| text_hash(&c.text_head)).unwrap_or(0))
+            .and_then(|cs| cs.first().map(|c| c.doc_hash))
     }
 }
 
@@ -181,7 +218,7 @@ pub fn text_hash(s: &str) -> u64 {
     h
 }
 
-/// Чанковка дока: полные чанки (текст) для эмбеддинга, ~1200 символов.
+/// Чанковка дока: абзацы группами ~1200 символов.
 pub fn chunk_text(md: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -214,14 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn flat_index_search_top() {
+    fn flat_index_search_doc_slug() {
         let mut idx = FlatIndex::default();
         idx.docs.insert(
             "a".into(),
             vec![Chunk {
                 slug: "a".into(),
                 idx: 0,
-                text_head: "x".into(),
+                doc_hash: 1,
+                text: "x".into(),
                 vector: vec![1.0, 0.0],
             }],
         );
@@ -230,13 +268,46 @@ mod tests {
             vec![Chunk {
                 slug: "b".into(),
                 idx: 0,
-                text_head: "y".into(),
+                doc_hash: 2,
+                text: "y".into(),
                 vector: vec![0.0, 1.0],
             }],
         );
         let hits = idx.search(&[1.0, 0.1], 1);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1, "a");
+        assert_eq!(hits[0].1, "a", "слог дока без #idx");
+    }
+
+    #[test]
+    fn fulltext_and_tokens() {
+        let mut idx = FlatIndex::default();
+        idx.docs.insert(
+            "rust-опыт".into(),
+            vec![Chunk {
+                slug: "rust-опыт".into(),
+                idx: 0,
+                doc_hash: 1,
+                text: "Канон: cargo clippy -D warnings в CI".into(),
+                vector: vec![],
+            }],
+        );
+        idx.docs.insert(
+            "other".into(),
+            vec![Chunk {
+                slug: "other".into(),
+                idx: 0,
+                doc_hash: 2,
+                text: "мусор".into(),
+                vector: vec![],
+            }],
+        );
+        assert_eq!(
+            idx.fulltext(&["clippy".into(), "cargo".into()], 5),
+            vec!["rust-опыт".to_string()]
+        );
+        assert!(idx
+            .fulltext(&["clippy".into(), "нетам".into()], 5)
+            .is_empty());
     }
 
     #[test]
