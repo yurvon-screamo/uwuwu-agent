@@ -78,6 +78,8 @@ import {
   type PrProbeResult,
   adoptBodyDoc,
   pathSafe,
+  sessionTitle,
+  SESSION_TITLE_MAX,
   createBoardPathOnce,
   errText,
   deadSpawnVerdict,
@@ -649,7 +651,7 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: spec.title.replace(/[\r\n]+/g, " ").slice(0, 64),
+      title: spec.title.replace(/[\r\n]+/g, " ").slice(0, SESSION_TITLE_MAX),
       model: spec.model ?? MODEL,
       location: { directory: spec.directory },
       ...(spec.agent !== undefined ? { agent: spec.agent } : {}),
@@ -955,6 +957,9 @@ async function startTask(
     const doc = await mcp.tool<{ title?: string }>("get_doc", { docId: task.bodyDoc })
     title = (doc.title ?? "").trim()
   }
+  // сессионный тайтл — от доставшегося тайтла (пусто → номер-only);
+  // fallback-слово ниже — init-промпту и треку, сессии не нужен
+  const spawnedTitle = sessionTitle("dev", projectName, task.rowId, title)
   if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
 
   // инит-блок первого промпта: юзер/проект/задача до старта сессии
@@ -965,10 +970,10 @@ async function startTask(
     task: { title, status: task.status, type: task.type, branch: task.branch, pr: task.pr },
   }
 
-  // имя сессии «проект: тайтл» — осмысленно в списке сессий опенкода
+  // имя сессии «номер — тайтл» — читаемо и сверяемо с доской в списке сессий
   const sessionID = await createSession({
     directory: envCtx?.repoDir ?? cfg.local,
-    title: `📋 ${projectName}: ${title}`,
+    title: spawnedTitle,
   })
   if (sessionID === null) throw new Error("сессия не создалась")
 
@@ -1638,7 +1643,7 @@ async function startReview(
   const reviewer = kind === "plan" ? PLAN_REVIEWER : REVIEWER
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
-    title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
+    title: sessionTitle("review", projectName, task.rowId, tracked.title || task.title),
     agent: reviewer.agent,
     model: reviewer.model,
   })
@@ -1710,7 +1715,7 @@ async function startTesting(
   }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
-    title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
+    title: sessionTitle("test", projectName, task.rowId, tracked.title || task.title),
     agent: TESTER.agent,
     model: TESTER.model,
   })

@@ -21,6 +21,8 @@ import {
   formatPassSummary,
   adoptBodyDoc,
   pathSafe,
+  sessionTitle,
+  SESSION_TITLE_MAX,
   createBoardPathOnce,
   errText,
   type ProjectCfg,
@@ -1680,6 +1682,41 @@ describe("pathSafe", () => {
 
   test("уже санитизированный остаётся как есть (идемпотентность)", () => {
     expect(pathSafe("уже \u{2215} санитизирован")).toBe("уже \u{2215} санитизирован")
+  })
+})
+
+// ——— тайтлы спавн-сессий opencode ———
+
+describe("sessionTitle", () => {
+  test("dev — номер и тайтл, без стейджа", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "Фабрика: тайтлы спавн-сессий")).toBe(
+      "📋 uwuwu: 1051 — Фабрика: тайтлы спавн-сессий",
+    )
+  })
+
+  test("review/test — стейдж-слово перед номером", () => {
+    expect(sessionTitle("review", "uwuwu", "1051", "план")).toBe("🔍 uwuwu: ревью 1051 — план")
+    expect(sessionTitle("test", "uwuwu", "61", "help comment --reply")).toBe("🧪 uwuwu: тестирование 61 — help comment --reply")
+  })
+
+  test("path-safe: '/' → U+2215 в тайтле задачи", () => {
+    expect(sessionTitle("dev", "uwuwu", "1099", "снос serial_test")).toBe("📋 uwuwu: 1099 — снос serial_test")
+    expect(sessionTitle("dev", "uwuwu", "46", "RU/EN слэш")).toBe("📋 uwuwu: 46 — RU∕EN слэш")
+  })
+
+  test("CRLF → пробел", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "строка\r\nстрока")).toBe("📋 uwuwu: 1051 — строка строка")
+  })
+
+  test("пустой/пробельный тайтл — номер без «—»", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "")).toBe("📋 uwuwu: 1051")
+    expect(sessionTitle("review", "origa", "965", "   ")).toBe("🔍 origa: ревью 965")
+  })
+
+  test("обрезка: финальная строка целиком до SESSION_TITLE_MAX (гард createSession идемпотентен)", () => {
+    const out = sessionTitle("test", "uwuwu", "1051", "т".repeat(200))
+    expect(out.length).toBe(SESSION_TITLE_MAX)
+    expect(out.startsWith("🧪 uwuwu: тестирование 1051 — ")).toBe(true)
   })
 })
 

@@ -400,6 +400,32 @@ export function pathSafe(title: string): string {
   return title.replaceAll("/", "\u{2215}")
 }
 
+// ——— тайтлы спавн-сессий opencode ———
+
+/** Гард-лимит тайтла сессии: финальная строка целиком (постановка «~80»).
+ *  sessionTitle режет до него же — обрезка идемпотентна с createSession. */
+export const SESSION_TITLE_MAX = 80
+
+/** Вид спавна фабрики: эмодзи + стейдж-слово в тайтле сессии. */
+export type SpawnKind = "dev" | "review" | "test"
+
+const SPAWN_TITLE_STAGES: Record<SpawnKind, { emoji: string; stage: string }> = {
+  dev: { emoji: "📋", stage: "" },
+  review: { emoji: "🔍", stage: "ревью" },
+  test: { emoji: "🧪", stage: "тестирование" },
+}
+
+/** Тайтл спавн-сессии: «<emoji> <проект>: [стейдж ]<номер> — <тайтл>»
+ *  (номер = номер issue). Пустой тайтл — номер без «—»; CRLF → пробел,
+ *  pathSafe; финальная строка режется до SESSION_TITLE_MAX. */
+export function sessionTitle(kind: SpawnKind, project: string, num: string, title: string): string {
+  const { emoji, stage } = SPAWN_TITLE_STAGES[kind]
+  const safe = pathSafe(title.replace(/[\r\n]+/g, " ").trim())
+  const head = stage === "" ? `${emoji} ${project}: ${num}` : `${emoji} ${project}: ${stage} ${num}`
+  const full = safe === "" ? head : `${head} — ${safe}`
+  return full.slice(0, SESSION_TITLE_MAX)
+}
+
 /** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
 export function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
