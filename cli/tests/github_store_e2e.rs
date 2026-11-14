@@ -368,3 +368,62 @@ async fn github_store_create_autodone_contract_live() {
         assert_eq!(closed.status, "Done");
     }
 }
+
+/// Reply-маркер (задача 61): живой write→read круг на границе GitHub —
+/// comment(Some(метка)) ложит цитатный маркер в тело, thread распознаёт
+/// его как reply_to, верхнеуровневый остаётся None (структура ответов
+/// видна в треде). Уборка — close (канон рига).
+#[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
+async fn github_store_reply_marker_thread_recognition_live() {
+    let store = sandbox();
+    let board = board();
+    let stamp = chrono::Utc::now().timestamp_millis();
+
+    let task = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] reply-маркер в thread {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: Some("живой e2e: reply-маркер задача 61".into()),
+                attachments: vec![],
+                priority: None,
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create пробы");
+
+    store
+        .comment(&board, &task, "верхнеуровневый коммент e2e", None)
+        .await
+        .expect("comment верхний");
+    store
+        .comment(&board, &task, "ответ по e2e", Some("метка-ответа"))
+        .await
+        .expect("comment reply");
+
+    let entries = store.thread(&board, &task).await.expect("thread");
+    let top = entries
+        .iter()
+        .find(|e| e.text.contains("верхнеуровневый коммент e2e"))
+        .expect("верхний коммент в thread");
+    assert!(top.reply_to.is_none(), "верхний без reply_to: {top:?}");
+    let reply = entries
+        .iter()
+        .find(|e| e.text.contains("ответ по e2e"))
+        .expect("reply-коммент в thread");
+    assert_eq!(
+        reply.reply_to.as_deref(),
+        Some("метка-ответа"),
+        "маркер распознан как reply_to: {reply:?}"
+    );
+
+    let closed = store
+        .close(&board, &task, Some("e2e reply-маркер"))
+        .await
+        .expect("close пробы");
+    assert_eq!(closed.status, "Done");
+}
