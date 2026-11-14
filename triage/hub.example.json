@@ -1,6 +1,0 @@
-{
-  "token": "<TG-BOT-TOKEN>",
-  "owner": "<username-владельца-без-@>",
-  "// model": "опционально; дефолт — zai-coding-plan/glm-5.3-flash",
-  "model": { "providerID": "zai-coding-plan", "id": "glm-5.3-flash" }
-}
