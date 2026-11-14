@@ -271,3 +271,100 @@ async fn github_store_create_priority_contract_live() {
         assert_eq!(closed.status, "Done");
     }
 }
+
+/// Контракт autodone при create (дефолт true — решение владельца
+/// 14.11, задача 1050): create без флага рождает fm `autodone: true`;
+/// явный `off` перекрывает; авторский `autodone` во fm тела (--stdin)
+/// перекрыт дефолтом не бывает. Уборка проб — close (канон рига).
+#[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
+async fn github_store_create_autodone_contract_live() {
+    let store = sandbox();
+    let board = board();
+    let stamp = chrono::Utc::now().timestamp_millis();
+
+    // Act: три создания — дефолт, явный off, авторский autodone в fm тела
+    let defaulted = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] autodone дефолт {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: None,
+                attachments: vec![],
+                priority: None,
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create без флага");
+    let explicit_off = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] autodone off {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: None,
+                attachments: vec![],
+                priority: None,
+                autodone: Some(false),
+            },
+        )
+        .await
+        .expect("create с off");
+    let authored = store
+        .create(
+            &board,
+            &CreateTask {
+                title: format!("[e2e] autodone в fm тела {stamp}"),
+                task_type: TaskType("bug".into()),
+                status: Some("Todo".into()),
+                body_md: Some("---\nautodone: false\n---\nтело с авторским fm".into()),
+                attachments: vec![],
+                priority: None,
+                autodone: None,
+            },
+        )
+        .await
+        .expect("create с авторским fm");
+
+    // Assert: fm каждого из трёх
+    let default_body = store
+        .body_get(&board, &defaulted)
+        .await
+        .expect("body_get дефолт");
+    let off_body = store
+        .body_get(&board, &explicit_off)
+        .await
+        .expect("body_get off");
+    let authored_body = store
+        .body_get(&board, &authored)
+        .await
+        .expect("body_get авторский");
+    assert_eq!(
+        fm_field(&default_body, "autodone").as_deref(),
+        Some("true"),
+        "create без флага: fm обязан нести autodone: true"
+    );
+    assert_eq!(
+        fm_field(&off_body, "autodone").as_deref(),
+        Some("false"),
+        "явный --autodone off перекрывает дефолт"
+    );
+    assert_eq!(
+        fm_field(&authored_body, "autodone").as_deref(),
+        Some("false"),
+        "авторский autodone во fm тела перекрыт дефолтом не бывает"
+    );
+
+    // Уборка: пробы не копятся (close — канон рига)
+    for task in [&defaulted, &explicit_off, &authored] {
+        let closed = store
+            .close(&board, task, Some("e2e autodone-контракт"))
+            .await
+            .expect("close пробы");
+        assert_eq!(closed.status, "Done");
+    }
+}

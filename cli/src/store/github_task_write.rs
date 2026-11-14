@@ -11,7 +11,9 @@ use serde_json::{json, Map, Value};
 
 /// fm-шапка новой задачи: status всегда; priority — явный флаг, иначе
 /// дефолт medium (решение владельца 13.11), но авторский priority во
-/// fm тела (--stdin) перекрыт дефолтом не бывает; autodone при Some.
+/// fm тела (--stdin) перекрыт дефолтом не бывает; autodone — явный
+/// флаг, иначе дефолт true (решение владельца 14.11), авторский
+/// autodone во fm тела перекрыт дефолтом не бывает.
 /// Порядок ячеек стабилен: status, priority, autodone.
 pub(super) fn create_frontmatter(
     body_md: &str,
@@ -29,8 +31,13 @@ pub(super) fn create_frontmatter(
     if let Some(p) = priority_cell {
         cells.push(("priority", p));
     }
-    if let Some(ad) = autodone {
-        cells.push(("autodone", if ad { "true" } else { "false" }.to_string()));
+    let autodone_cell = match autodone {
+        Some(ad) => Some(if ad { "true" } else { "false" }.to_string()),
+        None if fm.get("autodone").is_none() => Some("true".to_string()),
+        None => None,
+    };
+    if let Some(ad) = autodone_cell {
+        cells.push(("autodone", ad));
     }
     let pairs: Vec<(&str, &str)> = cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
     fm.with_fields(&pairs)

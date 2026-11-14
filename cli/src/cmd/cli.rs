@@ -54,13 +54,18 @@ pub(crate) enum TaskSub {
             help = "Приоритет: high | medium | low (колонка «Приоритет» доски; без флага — medium, решение владельца 13.11)"
         )]
         priority: Option<String>,
-        /// Autodone-галочка: автомерж PR при входе задачи в Review (ставит
-        /// только владелец, триаж не ставит)
+        /// Autodone: автомерж PR при входе задачи в Review; значение
+        /// опционально — без значения on; без флага — store-дефолт on
+        /// (валовое решение владельца 14.11: автодон получают все
+        /// create, вкл. триаж и крон-раны; off — точечный отказ)
         #[arg(
             long,
-            help = "Autodone: автомерж PR при входе в Review (галочка владельца)"
+            value_name = "ON_OFF",
+            num_args = 0..=1,
+            default_missing_value = "on",
+            help = "Autodone: on | off (без значения — on); без флага — on (дефолт владельца 14.11); автомерж PR при входе в Review"
         )]
-        autodone: bool,
+        autodone: Option<String>,
         #[arg(long, help = "Текст тела из stdin (опционально)")]
         stdin: bool,
         #[arg(
