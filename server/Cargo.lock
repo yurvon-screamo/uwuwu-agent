@@ -2804,6 +2804,7 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
+ "protobuf-src",
  "tokio",
  "tracing",
 ]
@@ -5598,6 +5599,7 @@ dependencies = [
  "chrono",
  "futures",
  "http-body-util",
+ "lance-datafusion",
  "lance-encoding",
  "lance-file",
  "lance-table",

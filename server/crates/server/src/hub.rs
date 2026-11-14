@@ -322,6 +322,17 @@ fn trunc(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
+/// Маппинг сырых имён полей → типизированный TaskFields (домен не знает имён).
+fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
+    uwuwu_domain::TaskFields {
+        dev_session: raw.get(crate::fields::F_DEV_SESSION).cloned(),
+        review_session: raw.get(crate::fields::F_REVIEW_SESSION).cloned(),
+        test_session: raw.get(crate::fields::F_TEST_SESSION).cloned(),
+        branch: raw.get("Branch").cloned(),
+        pr: raw.get("PR").cloned(),
+    }
+}
+
 #[async_trait]
 impl TaskBoardRepo for GitHubHub {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
@@ -402,7 +413,7 @@ impl TaskBoardRepo for GitHubHub {
         let body = issue["body"].as_str().unwrap_or_default().to_string();
         let status = self.board_status(number).await.unwrap_or_default();
         let mut task = Task::new(number, title, Status::parse(&status));
-        task.apply_fields(&parse_field_values(&issue));
+        task.apply_fields(&map_task_fields(&parse_field_values(&issue)));
         if issue["state"].as_str() == Some("closed") {
             task.status = Status::Done;
         }

@@ -33,6 +33,7 @@ lancedb = "0.41.0"
 lance-encoding = { version = "14", default-features = false, features = ["protoc"] }
 lance-file = { version = "14", default-features = false, features = ["protoc"] }
 lance-table = { version = "14", default-features = false, features = ["protoc"] }
+lance-datafusion = { version = "14", default-features = false, features = ["protoc"] }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

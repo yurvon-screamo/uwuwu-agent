@@ -129,6 +129,16 @@ impl Slot {
     }
 }
 
+/// Нативные поля issue, типизированные (маппинг имён — инфра, не домен).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskFields {
+    pub dev_session: Option<String>,
+    pub review_session: Option<String>,
+    pub test_session: Option<String>,
+    pub branch: Option<String>,
+    pub pr: Option<String>,
+}
+
 /// Агрегат: срез строки доски, достаточный конвейеру.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
@@ -183,24 +193,20 @@ impl Task {
         self.session_of(slot).is_none().then_some(slot)
     }
 
-    /// Обогащение нативными полями issue (сессии/ветка/PR; лениво).
-    pub fn apply_fields(&mut self, fields: &std::collections::HashMap<String, String>) {
-        let slot_of = |name: &str| match name {
-            "Сессия dev" => Some(Slot::Dev),
-            "Сессия ревью" => Some(Slot::PlanReview),
-            "Сессия тест" => Some(Slot::Test),
-            _ => None,
-        };
-        for (name, value) in fields {
-            if value.is_empty() {
-                continue;
-            }
-            if let Some(slot) = slot_of(name) {
-                self.sessions.insert(slot, value.clone());
-            }
+    /// Обогащение нативными полями (типизированы; лениво для кандидатов тика).
+    pub fn apply_fields(&mut self, fields: &TaskFields) {
+        if let Some(s) = &fields.dev_session {
+            self.sessions.insert(Slot::Dev, s.clone());
         }
-        self.branch = fields.get("Branch").filter(|v| !v.is_empty()).cloned();
-        self.pr = fields.get("PR").filter(|v| !v.is_empty()).cloned();
+        if let Some(s) = &fields.review_session {
+            self.sessions.insert(Slot::PlanReview, s.clone());
+            self.sessions.insert(Slot::ResultReview, s.clone());
+        }
+        if let Some(s) = &fields.test_session {
+            self.sessions.insert(Slot::Test, s.clone());
+        }
+        self.branch = fields.branch.clone();
+        self.pr = fields.pr.clone();
     }
 
     /// Автодон-кандидат: Review + autodone.
