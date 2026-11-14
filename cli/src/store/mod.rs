@@ -6,6 +6,7 @@ pub mod doc_store;
 pub mod github_doc_blob;
 pub mod github_doc_clone;
 pub mod github_doc_search;
+pub mod github_doc_ls;
 pub mod github_doc_store;
 mod github_doc_sync;
 pub mod github_gh;

@@ -56,6 +56,9 @@ pub trait DocStore: Send + Sync {
     async fn read(&self, doc: &DocRef) -> Result<String>;
 
     /// Дети папки: "Projects" → папки проектов; "Projects/<proj>" → доки.
+    /// Неизвестный путь или путь-файл — Err с раскладкой доступных:
+    /// дети ближайшего существующего предка (папка) / read-хинт со слагом
+    /// (файл-предок); отсутствующий корень docs/ — честный отказ о клоне.
     async fn ls(&self, path: &str) -> Result<Vec<DocEntry>>;
 
     /// Полнотекст (code search / grep —
