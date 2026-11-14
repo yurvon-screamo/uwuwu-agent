@@ -353,7 +353,7 @@ fn setup_stub_gh_close(mode: &str) -> (tempfile::TempDir, PathBuf, PathBuf, Path
     // ({"state":"closed"} при неприменённом переходе — задача 1127)
     std::fs::write(
         root.join("patch-echo.json"),
-        r#"{"number": 999, "state": "closed", "state_reason": "completed"}"#.to_string(),
+        r#"{"number": 999, "state": "closed", "state_reason": "completed"}"#,
     )
     .expect("patch-echo.json");
     std::fs::write(root.join("mode"), format!("{mode}\n")).expect("mode");
