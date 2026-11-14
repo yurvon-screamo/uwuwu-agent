@@ -690,6 +690,11 @@ export interface HubProfile {
   daemonName: string
   /** каталог входа: hub.json + agent.md (секреты и деф — не в lib) */
   here: string
+  /** override воркспейса сессии (location.directory + место материализации
+   *  дефа): per-бот реестра uwuwu-bots задаёт каталог из дока-спеки
+   *  (origa — корень своего репо); undefined — дефолт изоляции
+   *  RUN_ROOT/.local/share/<daemonName>/workspace */
+  workspace?: string
   /** имя нативного деф-агента сессии */
   agentName: string
   /** имя файла дефа в here (дефолт agent.md — как у триажа) */
@@ -783,8 +788,9 @@ export function createHub(profile: HubProfile): Hub {
    *  сессия видеть не должна; деф агента материализуется в .opencode/agents/
    *  отсюда (нативный механизм конфигурации). Деф без ограничений —
    *  осознанное решение владельца; сдерживание недоверенных текстов —
-   *  методичка + метаданные промпта + guard CLI. */
-  const WORKSPACE = join(RUN_ROOT, ".local/share", profile.daemonName, "workspace")
+   *  методичка + метаданные промпта + guard CLI. Override — profile.workspace
+   *  (реестр ботов uwuwu-bots: док-спека несёт workspace per-бот). */
+  const WORKSPACE = profile.workspace ?? join(RUN_ROOT, ".local/share", profile.daemonName, "workspace")
   const AGENT_DEF_DST = join(WORKSPACE, ".opencode/agents", `${profile.agentName}.md`)
   /** выгруженные вложения заявок (скрины/файлы) */
   const MEDIA_DIR = join(RUN_ROOT, ".local/share", profile.daemonName, "media")
@@ -1757,7 +1763,7 @@ export function createHub(profile: HubProfile): Hub {
     deliverWithRetries,
     run: async (): Promise<void> => {
       if (cfg.token === undefined || cfg.token === "" || cfg.owner === undefined || cfg.owner === "") {
-        console.error(`hub.json не прочитан или нет token/owner: ${CFG} — заполни по ${profile.here}/README.md`)
+        console.error(`${profile.daemonName}: hub.json не прочитан или нет token/owner (${CFG}) — заполни по контракту входа (${profile.here})`)
         process.exit(1)
       }
       if (!acquireLock({ stateDir: STATE_DIR, onStop: () => { stopping = true } })) {

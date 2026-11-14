@@ -6,6 +6,7 @@ import {
   parseSchedule, fieldMatches, due, isOneShot, isValidTracked, nextFire, cellPatches, formatLocal,
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
+  runCardTitle, truncateCodePoints,
   decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
   agentDriftAction,
 } from "./cron-lib"
@@ -271,6 +272,49 @@ describe("pathSafe", () => {
   test("'/' → U+2215 (конвенция CLI path_safe)", () => {
     expect(pathSafe("RU/EN слэш")).toBe("RU∕EN слэш")
     expect(pathSafe("без слэша")).toBe("без слэша")
+  })
+})
+
+describe("runCardTitle", () => {
+  const now = new Date(2026, 10, 14, 4, 30, 7) // 2026-11-14 04:30:07 локально
+
+  test("формат «⏰ номер — тайтл мастера · дата»", () => {
+    expect(runCardTitle({ rowId: "119", title: "Дример дримеров: аудит дрим-сессий" }, now)).toBe(
+      "⏰ 119 — Дример дримеров: аудит дрим-сессий · 2026-11-14 04:30:07",
+    )
+  })
+
+  test("path-safe и CRLF-нормализация тайтла мастера", () => {
+    expect(runCardTitle({ rowId: "58", title: "A/B-перезамер\nкредитов" }, now)).toBe(
+      "⏰ 58 — A∕B-перезамер кредитов · 2026-11-14 04:30:07",
+    )
+  })
+
+  test("пустой тайтл мастера — номер без «—» (легаси-вид голого номера)", () => {
+    expect(runCardTitle({ rowId: "119", title: "" }, now)).toBe("⏰ 119 · 2026-11-14 04:30:07")
+    expect(runCardTitle({ rowId: "119", title: "   " }, now)).toBe("⏰ 119 · 2026-11-14 04:30:07")
+  })
+
+  test("сек-пады: уникальность тайтла карточки на доске сохраняется", () => {
+    const sameMinuteNextSecond = new Date(2026, 10, 14, 4, 30, 8)
+    const a = runCardTitle({ rowId: "440", title: "semantic sync" }, now)
+    const b = runCardTitle({ rowId: "440", title: "semantic sync" }, sameMinuteNextSecond)
+    expect(a).not.toBe(b)
+    expect(a.endsWith(":07")).toBe(true)
+    expect(b.endsWith(":08")).toBe(true)
+  })
+})
+
+describe("truncateCodePoints", () => {
+  test("астральные символы (эмодзи) не разрезаются пополам", () => {
+    expect(truncateCodePoints("👍".repeat(10), 10)).toBe("👍".repeat(10))
+    expect(truncateCodePoints("👍".repeat(10), 5)).toBe("👍".repeat(5))
+    expect(truncateCodePoints("👍ai👍", 3)).toBe("👍ai")
+  })
+
+  test("BMP-строка — эквивалент slice", () => {
+    expect(truncateCodePoints("абвгдеж", 4)).toBe("абвг")
+    expect(truncateCodePoints("короткая", 100)).toBe("короткая")
   })
 })
 
