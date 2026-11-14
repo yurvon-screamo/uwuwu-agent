@@ -10,6 +10,8 @@ pub struct ToolHub {
     pub docs: Arc<DocsView>,
     pub person: Arc<PersonView>,
     pub writer: Arc<TaskWriteUseCase>,
+    pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
+    pub sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -102,6 +104,38 @@ impl ToolHub {
                 }))
             ),
             tool(
+                "docs_append",
+                "Дописать строку в конец дока вики (журналы кронов, классы опыта; commit ff-only)",
+                object(json!({
+                    "slug": string("слаг дока (без docs/ и .md)"),
+                    "line": string("строка целиком (markdown)"),
+                    "message": string("сообщение коммита; дефолт append")
+                }))
+            ),
+            tool(
+                "docs_write",
+                "Перезаписать док вики целиком (commit ff-only; для новых статей опыта)",
+                object(json!({
+                    "slug": string("слаг дока (без docs/ и .md)"),
+                    "content": string("markdown целиком"),
+                    "message": string("сообщение коммита; дефолт write")
+                }))
+            ),
+            tool(
+                "cron_list",
+                "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
+                object(json!({
+                    "project": string("проект; дефолт uwuwu")
+                }))
+            ),
+            tool(
+                "session_export",
+                "Экспорт сессии опенкода (контент для дримера/аудита)",
+                object(json!({
+                    "session": string("id сессии (ses_…)")
+                }))
+            ),
+            tool(
                 "task_body",
                 "Полная замена тела задачи (fm-поля сохраняются)",
                 object(json!({
@@ -184,6 +218,76 @@ impl ToolHub {
             "person_show" => {
                 let md = self.person.show().await.map_err(view_err)?;
                 ok_text(md)
+            }
+            "docs_append" => {
+                let slug = arg("slug");
+                let line = arg("line");
+                if slug.is_empty() || line.is_empty() {
+                    return Err("slug и line обязательны".into());
+                }
+                let msg = {
+                    let m = arg("message");
+                    if m.is_empty() {
+                        format!("append: {slug}")
+                    } else {
+                        m
+                    }
+                };
+                self.wiki
+                    .append_doc(&slug, &line, &msg)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("дописано в «{slug}»"))
+            }
+            "docs_write" => {
+                let slug = arg("slug");
+                let content = arg("content");
+                if slug.is_empty() || content.is_empty() {
+                    return Err("slug и content обязательны".into());
+                }
+                let msg = {
+                    let m = arg("message");
+                    if m.is_empty() {
+                        format!("write: {slug}")
+                    } else {
+                        m
+                    }
+                };
+                self.wiki
+                    .write_doc(&slug, &content, &msg)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("док «{slug}» записан"))
+            }
+            "cron_list" => {
+                let dir = uwuwu_usecase::crons::crons_dir(&project);
+                let masters = self.wiki.list_docs(&dir).await.map_err(|e| e.to_string())?;
+                let mut out = String::new();
+                for slug in masters {
+                    let path = format!("{dir}/{slug}");
+                    if let Some(md) = self.wiki.read_doc(&path).await.map_err(|e| e.to_string())? {
+                        if let Some(m) = uwuwu_usecase::crons::parse_master(&slug, &md) {
+                            out.push_str(&format!("{} — `{}`\n", m.title, m.schedule));
+                        }
+                    }
+                }
+                ok_text(if out.is_empty() {
+                    format!("кроны в «{dir}» не найдены")
+                } else {
+                    out
+                })
+            }
+            "session_export" => {
+                let session = arg("session");
+                if !session.starts_with("ses_") {
+                    return Err("session обязан быть ses_…".into());
+                }
+                let export = self
+                    .sessions
+                    .export_session(&session)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(export)
             }
             "task_create" => {
                 let spec = uwuwu_usecase::NewTask {

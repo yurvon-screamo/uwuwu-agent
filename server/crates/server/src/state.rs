@@ -18,6 +18,9 @@ struct StateFile {
     /// «board:number» → состояние строки.
     #[serde(default)]
     rows: BTreeMap<String, RowState>,
+    /// Сессии, отработанные дримером.
+    #[serde(default)]
+    dreamer_done: Vec<String>,
 }
 
 pub struct JsonStateStore {
@@ -58,6 +61,23 @@ impl TickStateStore for JsonStateStore {
             .entry(Self::key(board, number))
             .or_default()
             .last_comment_id = Some(id.to_string());
+    }
+
+    fn dreamer_done(&self, session: &str) -> bool {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_done
+            .iter()
+            .any(|s| s == session)
+    }
+
+    fn mark_dreamer_done(&self, session: &str) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_done
+            .push(session.to_string());
     }
 
     fn save(&self) -> UsecaseResult<()> {

@@ -16,11 +16,18 @@ pub struct GitHubWiki {
     http: reqwest::Client,
     tree_cache: Mutex<Option<(Instant, Vec<String>)>>,
     ttl: Duration,
+    writer: Option<std::sync::Arc<crate::gitwiki::GitWikiWriter>>,
 }
 
 impl GitHubWiki {
-    pub fn new(repo: String, branch: String, token: String) -> Self {
+    pub fn with_writer(
+        repo: String,
+        branch: String,
+        token: String,
+        writer: Option<std::sync::Arc<crate::gitwiki::GitWikiWriter>>,
+    ) -> Self {
         Self {
+            writer,
             repo,
             branch,
             token,
@@ -136,6 +143,24 @@ impl WikiRepo for GitHubWiki {
             .into_iter()
             .filter(|p| norm.is_empty() || p.starts_with(&format!("{norm}/")) || p == norm)
             .collect())
+    }
+
+    async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()> {
+        let Some(w) = &self.writer else {
+            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+        };
+        // инвентаризация кэша сбрасывается: состав изменился
+        *self.tree_cache.lock().expect("tree lock") = None;
+        w.commit_file(&format!("docs/{slug}.md"), content, message)
+            .await
+    }
+
+    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<()> {
+        let Some(w) = &self.writer else {
+            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+        };
+        w.append_line(&format!("docs/{slug}.md"), line, message)
+            .await
     }
 }
 

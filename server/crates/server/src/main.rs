@@ -6,6 +6,7 @@
 mod clock;
 mod config;
 mod fm;
+mod gitwiki;
 mod http;
 mod hub;
 mod mcp;
@@ -104,10 +105,16 @@ async fn run(
         .map(|b| (b.project.clone(), b.board.clone()))
         .collect();
     let task_view = Arc::new(uwuwu_usecase::TaskView::new(board.clone(), boards_cfg));
-    let wiki = Arc::new(wiki::GitHubWiki::new(
+    let git_writer = Arc::new(gitwiki::GitWikiWriter::new(
         cfg.hub.repo.clone(),
         "main".to_string(),
         secrets.gh_token.clone(),
+    ));
+    let wiki = Arc::new(wiki::GitHubWiki::with_writer(
+        cfg.hub.repo.clone(),
+        "main".to_string(),
+        secrets.gh_token.clone(),
+        Some(git_writer),
     ));
     let tool_hub = Arc::new(tools::ToolHub {
         tasks: task_view,
@@ -122,6 +129,8 @@ async fn run(
                     .unwrap_or_default(),
             ),
         }),
+        wiki: wiki.clone(),
+        sessions: sessions.clone(),
     });
 
     let http_state = Arc::new(http::AppState {
@@ -135,8 +144,75 @@ async fn run(
     });
     let app = http::router(http_state).merge(mcp::router(mcp_state));
 
+    // Сателлиты конвейера: кроны (вики-носитель), триаж черновиков, дример
+    let spawn_model_cfg = cfg
+        .executor
+        .spawn_model
+        .as_ref()
+        .map(|m| (m.provider.clone(), m.id.clone()));
+    let boards_info: Vec<(String, String, String)> = plan
+        .boards
+        .iter()
+        .map(|b| (b.project.clone(), b.board.clone(), b.checkout.clone()))
+        .collect();
+    let mut sidecars: Vec<Sidecar> = Vec::new();
+    for (project, _, checkout) in boards_info.iter() {
+        let cron = Arc::new(uwuwu_usecase::crons::CronUseCase {
+            wiki: wiki.clone(),
+            sessions: sessions.clone(),
+            clock: clock.clone(),
+            spawn_model: spawn_model_cfg.clone(),
+            checkout: checkout.clone(),
+        });
+        let project = project.clone();
+        sidecars.push(Sidecar {
+            name: format!("cron:{project}"),
+            tick: Box::new(move || {
+                let cron = cron.clone();
+                let project = project.clone();
+                Box::pin(async move { cron.tick(&project).await.map(|_| ()) })
+            }),
+        });
+    }
+    if let Some((_, board_title, checkout)) = boards_info.first().cloned() {
+        let triage = Arc::new(uwuwu_usecase::triage::TriageUseCase {
+            board: board.clone(),
+            board_name: Arc::new(board_title),
+            sessions: sessions.clone(),
+            spawn_model: spawn_model_cfg.clone(),
+            checkout: checkout.clone(),
+        });
+        let dreamer = Arc::new(uwuwu_usecase::dreamer::DreamerUseCase {
+            sessions: sessions.clone(),
+            state: state.clone(),
+            clock: clock.clone(),
+            spawn_model: spawn_model_cfg.clone(),
+            checkout,
+        });
+        sidecars.push(Sidecar {
+            name: "triage".into(),
+            tick: Box::new(move || {
+                let t = triage.clone();
+                Box::pin(async move { t.tick().await.map(|_| ()) })
+            }),
+        });
+        sidecars.push(Sidecar {
+            name: "dreamer".into(),
+            tick: Box::new(move || {
+                let d = dreamer.clone();
+                Box::pin(async move { d.tick().await.map(|_| ()) })
+            }),
+        });
+    }
+
     let http_task = tokio::spawn(serve(cfg.port(), app));
-    let tick_task = tokio::spawn(tick_loop(cfg.poll_sec, plan, usecase, shared));
+    let tick_task = tokio::spawn(tick_loop(
+        cfg.poll_sec,
+        plan,
+        usecase,
+        shared,
+        Arc::new(sidecars),
+    ));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -180,11 +256,36 @@ async fn serve(port: u16, app: axum::Router) {
     }
 }
 
+/// Сателлит тика: имя + замыкание-проход (мягкая изоляция отказов).
+struct Sidecar {
+    name: String,
+    #[allow(clippy::type_complexity)]
+    tick: Box<
+        dyn Fn() -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), uwuwu_usecase::UsecaseError>>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+}
+
+async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::UsecaseError> {
+    for s in sidecars {
+        if let Err(e) = (s.tick)().await {
+            tracing::error!(event = "sidecar.tick_failed", sidecar = %s.name, error = %e, "Sidecar failed");
+        }
+    }
+    Ok(())
+}
+
 async fn tick_loop(
     poll_sec: u64,
     plan: Arc<uwuwu_usecase::TickPlan>,
     usecase: Arc<TickUseCase>,
     shared: Arc<std::sync::RwLock<TickOutcome>>,
+    sidecars: Arc<Vec<Sidecar>>,
 ) {
     loop {
         let started = std::time::Instant::now();
@@ -201,6 +302,9 @@ async fn tick_loop(
                     "Tick failed"
                 );
             }
+        }
+        if let Err(e) = sidecar_ticks(&sidecars).await {
+            tracing::error!(event = "sidecar.failed", error = %e, "Sidecar tick failed");
         }
         tokio::time::sleep(std::time::Duration::from_secs(poll_sec)).await;
     }

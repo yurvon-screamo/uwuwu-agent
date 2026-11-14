@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
 use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec};
+use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionInfo, SessionSpec};
 
 pub struct OpencodeClient {
     base: String,
@@ -159,6 +159,52 @@ impl AgentSessionGateway for OpencodeClient {
                 "delete {session}: HTTP {status}"
             )))
         }
+    }
+
+    async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
+        let (status, resp) = self
+            .call("/session?limit=100", reqwest::Method::GET, None)
+            .await?;
+        Self::check(status, "list sessions")?;
+        let raw = if resp.is_array() {
+            resp
+        } else {
+            resp["data"].clone()
+        };
+        Ok(raw
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|s| {
+                        Some(SessionInfo {
+                            id: s["id"].as_str()?.to_string(),
+                            agent: s["agent"].as_str().unwrap_or_default().to_string(),
+                            updated_ms: s["time"]["updated"].as_u64().unwrap_or_default(),
+                            outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn export_session(&self, session: &str) -> UsecaseResult<String> {
+        let (status, resp) = self
+            .call(
+                &format!("/experimental/session/{session}/export"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await?;
+        Self::check(status, &format!("export {session}"))?;
+        // экспорт может быть data-обёрнут или plain-текстом
+        if let Some(text) = resp["data"].as_str() {
+            return Ok(text.to_string());
+        }
+        if let Some(text) = resp.as_str() {
+            return Ok(text.to_string());
+        }
+        Ok(resp.to_string())
     }
 
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>> {

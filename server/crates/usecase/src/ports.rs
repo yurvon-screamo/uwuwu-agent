@@ -57,13 +57,17 @@ pub struct IssueView {
     pub comments: Vec<CommentRef>,
 }
 
-/// Вики-репозиторий: чтение доков и листинг (MCP docs_read/docs_ls).
+/// Вики-репозиторий: чтение/запись доков (MCP docs_*, кроны, дример).
 #[async_trait]
 pub trait WikiRepo: Send + Sync {
     /// markdown дока по слагу (docs/** без .md); None — не найден.
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>>;
     /// Пути .md под префиксом (напр. «Projects/uwuwu»), без docs/.
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>>;
+    /// Перезапись дока (commit в ветку, ff-only).
+    async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()>;
+    /// Append строки в конец дока (создаёт при отсутствии).
+    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<()>;
 }
 
 /// Коммент задачи в терминах wakeup: идентичность + время создания.
@@ -103,6 +107,21 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
     /// ms последней активности сессии (последнее сообщение) или None.
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
+    /// Список сессий исполнителя (для дримера: idle-детект).
+    async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
+    /// Экспорт сессии (сообщения/сводка) — контент для дримера.
+    async fn export_session(&self, session: &str) -> UsecaseResult<String>;
+}
+
+/// Сессия исполнителя в терминах дримера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub id: String,
+    pub agent: String,
+    /// ms эпохи последнего обновления.
+    pub updated_ms: u64,
+    /// «succeeded»|«failed»|… финала (пусто — живая).
+    pub outcome: String,
 }
 
 /// Состояние PR проекта: источник вердиктов автодона.
@@ -137,9 +156,12 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
-/// Персистентное состояние тика (wakeup-дедуп): носитель — дело инфры.
+/// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str);
+    /// Дример уже отработал сессию (1 рабочая = 1 дример).
+    fn dreamer_done(&self, session: &str) -> bool;
+    fn mark_dreamer_done(&self, session: &str);
     fn save(&self) -> UsecaseResult<()>;
 }
