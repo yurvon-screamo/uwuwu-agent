@@ -50,45 +50,38 @@ jobs:
 
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          workspaces: cli
+          workspaces: cli,server
 
-      - name: cargo fmt
-        working-directory: cli
-        run: cargo fmt --check
+      - name: cargo fmt (cli, server)
+        run: |
+          for d in cli server; do (cd "$d" && cargo fmt --check); done
 
-      - name: cargo clippy
-        working-directory: cli
-        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (cli, server)
+        run: |
+          for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
 
-      - name: cargo test
+      - name: cargo test (cli, server)
         # e2e-тесты ходят в живой hub (uwuwu-hub) и гвардятся UWUWU_E2E_GITHUB=1:
         # без переменной они сразу зелёные (см. cli/tests/*_e2e.rs).
-        working-directory: cli
-        run: cargo test
+        run: |
+          for d in cli server; do (cd "$d" && cargo test); done
 
-      # TS-слой (plugins + пер-директорные агенты): tsc-гейт и bun-тесты.
-      # Пин версии = версия машин разработчиков (локи сгенерированы ею);
-      # плавающий latest = невоспроизводимые раны.
+      # TS-слой после сноса демон-контура (rewrite #1133): живой TS — только
+      # плагины опенкода (plugins/ + общие модули lib/). Пин версии = версия
+      # машин разработчиков (локи сгенерированы ею).
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
 
-      - name: bun install (ts-контуры)
-        run: |
-          for d in plugins factory cron dreamer triage bots; do
-            (cd "$d" && bun install --frozen-lockfile)
-          done
+      - name: bun install (plugins)
+        run: cd plugins && bun install --frozen-lockfile
 
-      - name: typecheck (tsc --noEmit, все ts-контуры)
-        run: |
-          for d in plugins factory cron dreamer triage bots; do
-            (cd "$d" && bun run typecheck)
-          done
+      - name: typecheck (tsc --noEmit, plugins)
+        run: cd plugins && bun run typecheck
 
-      # bun test из корня гоняет все контуры (lib/tests + тесты агентов);
-      # интеграционные тесты само-гвардятся и скипаются без живого ядра.
+      # юнит-тесты плагин-модулей (lib/*.test.ts): чистые функции без сети.
       - name: bun test
-        run: bun test
+        run: bun test lib/
 
       - name: Install qlty
         run: curl -sSfL https://qlty.sh | sh

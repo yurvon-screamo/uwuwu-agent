@@ -22,6 +22,7 @@ link "$SCRIPT_DIR/opencode.json" ~/.config/opencode/opencode.json
 link "$SCRIPT_DIR/cli.json"      ~/.config/opencode/cli.json
 link "$SCRIPT_DIR/AGENTS.md"     ~/.config/opencode/AGENTS.md
 link "$SCRIPT_DIR/agents"        ~/.config/opencode/agents
+link "$SCRIPT_DIR/commands"      ~/.config/opencode/commands
 link "$SCRIPT_DIR/plugins"       ~/.config/opencode/plugins
 link "$SCRIPT_DIR/skills"        ~/.agents/skills
 link "$SCRIPT_DIR/AGENTS.md"     ~/.agents/AGENTS.md

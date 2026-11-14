@@ -19,7 +19,7 @@
     "sticky-retry/contract.ts",
     "sticky-retry/tui.tsx",
     "../lib/goal-lib.ts",
-    "../tests/goal-mode.test.ts",
+    "../lib/goal-mode.test.ts",
     "qlty-review.ts",
     "../lib/qlty-review.ts",
     "../lib/qlty-review.test.ts",
