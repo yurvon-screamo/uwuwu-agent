@@ -10,6 +10,7 @@ agents/        агенты: developer, dreamer, plan-reviewer, code-quality-rev
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        скиллы (см. ниже)
 cli/           uwuwu-cli — задачи/кроны, поиск, вики-чтение, персона (бинарь: ~/.cargo/bin/uwuwu-cli)
+server/        uwuwu-server — единый сервер контура (hub#1133): конвейер + MCP; Rust
 lib/           общие модули плагинов опенкода (qlty-review, screen-review, goal-lib)
 link.sh        установка симлинками
 opencode.json  главный конфиг опенкода (jsonc)

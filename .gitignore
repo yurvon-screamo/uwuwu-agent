@@ -63,3 +63,7 @@ tools/*.npz
 # корневой cargo-таргет (ad-hoc CARGO_TARGET_DIR) и ворктри агентов
 /target/
 /wt/
+
+# uwuwu-server: локальный конфиг (пример — server/config.example.toml)
+server/config.toml
+server/target/

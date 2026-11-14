@@ -50,21 +50,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          workspaces: cli
+          workspaces: cli,server
 
-      - name: cargo fmt
-        working-directory: cli
-        run: cargo fmt --check
+      - name: cargo fmt (cli, server)
+        run: |
+          for d in cli server; do (cd "$d" && cargo fmt --check); done
 
-      - name: cargo clippy
-        working-directory: cli
-        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (cli, server)
+        run: |
+          for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
 
-      - name: cargo test
+      - name: cargo test (cli, server)
         # e2e-тесты ходят в живой hub (uwuwu-hub) и гвардятся UWUWU_E2E_GITHUB=1:
         # без переменной они сразу зелёные (см. cli/tests/*_e2e.rs).
-        working-directory: cli
-        run: cargo test
+        run: |
+          for d in cli server; do (cd "$d" && cargo test); done
 
       # TS-слой после сноса демон-контура (rewrite #1133): живой TS — только
       # плагины опенкода (plugins/ + общие модули lib/). Пин версии = версия
