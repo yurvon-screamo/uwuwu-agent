@@ -112,14 +112,14 @@ async fn ls_unknown_folder_child_errors_with_sibling_layout() -> Result<()> {
 async fn ls_of_file_hints_read_with_slug() -> Result<()> {
     let tmp = TempDir::new()?;
     let store = ls_store(tmp.path(), "ls-file").await?;
-    let err = store
-        .ls("Projects/uwuwu/Деплоймент.md")
-        .await
-        .unwrap_err();
+    let err = store.ls("Projects/uwuwu/Деплоймент.md").await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("файл"), "msg: {msg}");
     // слаг для read: путь в docs/ без «.md»
-    assert!(msg.contains("read \"Projects/uwuwu/Деплоймент\""), "msg: {msg}");
+    assert!(
+        msg.contains("read \"Projects/uwuwu/Деплоймент\""),
+        "msg: {msg}"
+    );
     assert!(!msg.contains("os error"), "msg: {msg}");
     Ok(())
 }
@@ -135,7 +135,10 @@ async fn ls_below_file_hints_read_of_file_ancestor() -> Result<()> {
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("файл"), "msg: {msg}");
-    assert!(msg.contains("read \"Projects/uwuwu/Деплоймент\""), "msg: {msg}");
+    assert!(
+        msg.contains("read \"Projects/uwuwu/Деплоймент\""),
+        "msg: {msg}"
+    );
     assert!(!msg.contains("Деплоймент.md/nosuch\""), "msg: {msg}");
     Ok(())
 }
@@ -145,7 +148,10 @@ async fn ls_known_paths_list_children_unchanged() -> Result<()> {
     let tmp = TempDir::new()?;
     let store = ls_store(tmp.path(), "ls-happy").await?;
     let names = |e: &[DocEntry]| -> Vec<String> { e.iter().map(|x| x.name.clone()).collect() };
-    assert_eq!(names(&store.ls("").await?), ["Daily/", "Experience/", "Projects/"]);
+    assert_eq!(
+        names(&store.ls("").await?),
+        ["Daily/", "Experience/", "Projects/"]
+    );
     assert_eq!(names(&store.ls("Projects").await?), ["origa/", "uwuwu/"]);
     assert_eq!(
         names(&store.ls("Projects/uwuwu").await?),
@@ -161,5 +167,15 @@ async fn ls_parent_walker_is_rejected_as_unsafe() -> Result<()> {
     let err = store.ls("Projects/../../etc").await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("небезопасен"), "msg: {msg}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn children_sorted_on_empty_folder_yields_no_entries() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let empty = tmp.path().join("docs/empty");
+    std::fs::create_dir_all(&empty)?;
+    let entries = crate::store::github_doc_ls::children_sorted(&empty)?;
+    assert!(entries.is_empty());
     Ok(())
 }
