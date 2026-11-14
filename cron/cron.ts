@@ -22,6 +22,7 @@ import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from ".
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
   stripNonContent, decideFire, agentDriftAction, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
+  runCardTitle, SESSION_TITLE_MAX, truncateCodePoints,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
 } from "./cron-lib"
@@ -239,7 +240,9 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
     .map((row) => ({
       rowId: row.rowBlockId as string,
       bodyDoc: row.linkedDocId ?? "",
-      title: (row.title ?? "").trim(),
+      // hub-эпоха: тайтл живёт в клетке «Название», row.title — легаси-поле
+      // прошлой платформы (паритет factory readTasks)
+      title: (row.title ?? row.cells?.Название?.value ?? "").trim(),
       schedule: "",
       agent: "",
       plannedMs: row.cells?.Запланировано?.dateMs ?? null,
@@ -281,7 +284,7 @@ async function fireSession(title: string, prompt: string): Promise<string | null
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: title.replace(/[\r\n]+/g, " ").slice(0, 60),
+      title: truncateCodePoints(title.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       model: { providerID: MODEL.providerID, id: MODEL.id },
       location: { directory: WORKSPACE },
     },
@@ -383,7 +386,7 @@ async function createAgentSession(
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: masterTitle.replace(/[\r\n]+/g, " ").slice(0, 60),
+      title: truncateCodePoints(masterTitle.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       agent,
       model: model ?? MODEL,
       location: { directory: WORKSPACE },
@@ -441,13 +444,6 @@ async function tick(state: CronState): Promise<void> {
  *  рана и комментов — агенту не нужно угадывать. */
 function projectOfBoard(boardTitle: string): string {
   return boardTitle.startsWith("Задачи ") ? boardTitle.slice("Задачи ".length) : "uwuwu"
-}
-
-/** Тайтл ран-карточки: метка времени делает его уникальным на доске
- *  (дубли тайтлов строк CLI ловит как ошибку). */
-function runCardTitle(master: CronRow, now: Date): string {
-  const sec = String(now.getSeconds()).padStart(2, "0")
-  return `⏰ ${master.title || master.rowId.slice(0, 8)} · ${formatLocal(now)}:${sec}`
 }
 
 /** Тело ран-карточки: шапка запуска + копия инструкции мастера на момент
