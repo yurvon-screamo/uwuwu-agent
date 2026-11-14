@@ -20,6 +20,10 @@
 //!    сказать про assets/ (подсказка или загрузка), не «успех» с потерей.
 //! E. Гвард входа тела: frontmatter-шапка и обёртка `task get` во входе —
 //!    отказ (контракт help: «Вход — контент тела, не обёртка task get»).
+//! F. Help-контракт reply (задача 61): честная формулировка цитатного
+//!    маркера, value_name ANCHOR, легаси «THREAD_ID/в тред» исчезла.
+//! G. reply-контракт записи (задача 61): значение ложится цитатным
+//!    маркером дословно, вольная метка проходит без резолва.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -99,6 +103,15 @@ case "$route" in
       cat > "$STUB_PAYLOAD"
     fi
     cat "$DIR/issue.json"
+    exit 0
+    ;;
+  "repos/$REPO/issues/999/comments")
+    if [ "$method" = "POST" ]; then
+      cat > "$STUB_PAYLOAD"
+      printf '{"id": 12345}\n'
+      exit 0
+    fi
+    cat "$DIR/comments.json"
     exit 0
     ;;
 esac
@@ -282,6 +295,101 @@ fn attach_call_names_assets_in_output() {
     );
 }
 
+fn canned_files() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let (dir, log, payload, gh) = setup_stub_gh();
+    let root = dir.path();
+    std::fs::write(root.join("comments.json"), "[]\n").expect("comments.json");
+    (dir, log, payload, gh)
+}
+
+/// F. Help-контракт reply (задача 61): честная формулировка — значение —
+/// метка, ложится цитатным маркером, без резолва; id комментов — в task
+/// thread. Легаси-семантика («THREAD_ID», «префикс… в тред») исчезла.
+#[test]
+fn comment_reply_help_describes_marker_semantics() {
+    let guards = canned_files();
+    let (code, stdout, stderr) = run_stub(&guards, None, &["task", "comment", "--help"]);
+    assert_eq!(code, Some(0), "--help rc 0: {stderr}");
+    let help = format!("{stdout}{stderr}");
+    assert!(
+        help.contains("ANCHOR"),
+        "value_name ANCHOR на месте: {help}"
+    );
+    assert!(
+        help.contains("цитатным маркером"),
+        "help описывает цитатный маркер: {help}"
+    );
+    assert!(
+        help.contains("без резолва"),
+        "help честен про отсутствие резолва: {help}"
+    );
+    assert!(
+        !help.contains("THREAD_ID"),
+        "легаси value_name исчез: {help}"
+    );
+    assert!(
+        !help.contains("Ответить в тред"),
+        "легаси «в тред» исчезло: {help}"
+    );
+}
+
+/// G. reply-контракт записи (задача 61): значение ложится цитатным
+/// маркером в POST-тело дословно; вольная метка (не id) проходит без
+/// резолва — контракт «свободная метка, без валидации».
+#[test]
+fn comment_reply_posts_marker_verbatim_without_resolution() {
+    let guards = canned_files();
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "comment",
+            "999",
+            "--project",
+            "uwuwu",
+            "--reply",
+            "6855341686",
+            "текст ответа",
+        ],
+    );
+    assert_eq!(code, Some(0), "comment успешен: {stderr}");
+    let (_, _, payload, _) = &guards;
+    let raw = std::fs::read_to_string(payload).expect("POST payload записан");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
+    let body = v["body"].as_str().expect("body str");
+    assert!(
+        body.starts_with("> ответ на 6855341686\n\nтекст ответа"),
+        "маркер + значение + текст в POST-теле: {body}"
+    );
+
+    // вольная метка: проходит тем же путём, резолва нет
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "comment",
+            "999",
+            "--project",
+            "uwuwu",
+            "--reply",
+            "вольная-метка",
+            "текст",
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "вольная метка не отклоняется (без резолва): {stderr}"
+    );
+    let (_, _, payload, _) = &guards;
+    let raw = std::fs::read_to_string(payload).expect("POST payload записан");
+    assert!(
+        raw.contains("> ответ на вольная-метка"),
+        "метка уходит дословно: {raw}"
+    );
+}
 /// E. Гвард входа: frontmatter-шапка и обёртка `task get` — отказ (контракт
 /// help «Вход — контент тела»; шапка в теле = мусор карточки).
 #[test]

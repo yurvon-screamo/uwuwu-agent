@@ -2,7 +2,7 @@
 //! write-side (github_task_write.rs). Структура/конвертация — github_task.rs.
 
 use super::github_task::GitHubStore;
-use super::task_store::{CreateTask, EditTask, StoreResult, TaskStore, ThreadEntry};
+use super::task_store::{parse_reply_marker, CreateTask, EditTask, StoreResult, TaskStore, ThreadEntry};
 use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
@@ -106,7 +106,9 @@ impl TaskStore for GitHubStore {
     }
 
     /// Тред = issue comments (плоский список; reply-семантика — цитатный
-    /// маркер, вложенности нет).
+    /// маркер, вложенности нет). Маркер «> ответ на <значение>» первой
+    /// строкой (его пишет comment_impl) читается как reply_to — структура
+    /// ответов видна в thread-выводе; текст коммента не режется.
     async fn thread(&self, _board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>> {
         let number = &task.id;
         let mut out = Vec::new();
@@ -131,15 +133,16 @@ impl TaskStore for GitHubStore {
             };
             let fetched = items.len();
             for c in items {
+                let text = c["body"].as_str().unwrap_or("").to_string();
                 out.push(ThreadEntry {
                     id: c["id"].to_string(),
-                    reply_to: None,
+                    reply_to: parse_reply_marker(&text),
                     author: c
                         .pointer("/user/login")
                         .and_then(|l| l.as_str())
                         .unwrap_or("unknown")
                         .to_string(),
-                    text: c["body"].as_str().unwrap_or("").to_string(),
+                    text,
                 });
             }
             if fetched < 100 {

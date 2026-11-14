@@ -147,3 +147,17 @@ pub struct ThreadEntry {
     pub author: String,
     pub text: String,
 }
+
+/// Префикс цитатного маркера reply: `comment_impl` (github) пишет
+/// «<префикс><значение>\n\n<текст>», `parse_reply_marker` при чтении
+/// распознаёт. Значение — свободная метка ответа, без резолва.
+pub const REPLY_MARKER_PREFIX: &str = "> ответ на ";
+
+/// Значение reply-маркера, если текст начинается им первой строкой
+/// (`> ответ на <значение>`): Some(значение). Остальное — None: обычный
+/// коммент, в т.ч. чужая цитата «> @author …» — не маркер.
+pub fn parse_reply_marker(text: &str) -> Option<String> {
+    let first = text.split('\n').next()?;
+    let value = first.strip_prefix(REPLY_MARKER_PREFIX)?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}

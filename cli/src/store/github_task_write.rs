@@ -4,7 +4,9 @@
 
 use super::github_project;
 use super::github_task::{Frontmatter, GitHubStore};
-use super::task_store::{CommentInsert, CreateTask, EditTask, StoreResult, TaskStore};
+use super::task_store::{
+    CommentInsert, CreateTask, EditTask, StoreResult, TaskStore, REPLY_MARKER_PREFIX,
+};
 use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::{json, Map, Value};
@@ -180,9 +182,10 @@ impl GitHubStore {
         reply_to: Option<&str>,
     ) -> Result<CommentInsert, StoreError> {
         // issue comments — плоский список (тредов нет): reply = цитатный
-        // маркер + текст, честный паритет вложенных пунктов
+        // маркер + текст, честный паритет вложенных пунктов; формат маркера
+        // — единый с parse_reply_marker (task_store)
         let body = match reply_to {
-            Some(anchor) => format!("> ответ на {anchor}\n\n{text}"),
+            Some(anchor) => format!("{REPLY_MARKER_PREFIX}{anchor}\n\n{text}"),
             None => text.to_string(),
         };
         let number = &task.id;
