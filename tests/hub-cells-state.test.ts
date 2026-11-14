@@ -28,34 +28,31 @@ test("read_database_cells: строка доски несёт нативный s
     const binDir = join(dir, "bin")
     mkdirSync(binDir)
     const ghBin = join(binDir, "gh")
-    // dispatch по URL: /issues раньше /labels — issues-вызов содержит labels
-    // в query-string (issues?labels=…) и первый матч решил бы неверно
+    // dispatch: graphql (stdin = query) → /issues (labels в query-string,
+    // раньше /labels — issues-вызов содержит labels и первый матч решил бы
+    // неверно) → /labels. Графл: проекты-доски + батч-джойн статусов
+    // (Pv2-канон Status, master-эпоха ADR-098).
     writeFileSync(ghBin, [
       "#!/usr/bin/env bash",
       'case "$2 $3" in',
+      '  *"graphql"*)',
+      '    q="$(cat)"',
+      '    case "$q" in',
+      '      *"projectsV2(first: 30)"*) printf \'{"data":{"viewer":{"projectsV2":{"nodes":[{"number":5,"title":"Задачи t1073sbx"}]}}}}\' ;;',
+      '      *"items(first: 100"*) printf \'{"data":{"viewer":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"content":{"number":1},"fieldValueByName":{"name":"Todo"}},{"content":{"number":2},"fieldValueByName":{"name":"Draft"}},{"content":{"number":3},"fieldValueByName":{"name":"Todo"}}]}}}}}\' ;;',
+      '      *) echo "fake gh: graphql-маршрут не обслужен" >&2; exit 1 ;;',
+      '    esac',
+      '    exit 0 ;;',
       '  *"/issues"*) cat "$FAKE_GH_ISSUES" ;;',
       '  *"/labels"*) cat "$FAKE_GH_LABELS" ;;',
-      '  *"graphql"*) cat "$FAKE_GH_GRAPHQL" ;;',
       '  *) echo "fake gh: неожиданный вызов: $*" >&2; exit 1 ;;',
       "esac",
     ].join("\n"))
     chmodSync(ghBin, 0o755)
-    const envPatch: Record<string, string> = { FAKE_GH_LABELS: "", FAKE_GH_ISSUES: "" }
     const labelsPath = join(dir, "labels.json")
     const issuesPath = join(dir, "issues.json")
     writeFileSync(labelsPath, LABELS_JSON)
     writeFileSync(issuesPath, ISSUES_JSON)
-    // Pv2-канон статусов (#1087): projectStatuses делает два graphql-запроса
-    // (список проектов + батч-джойн items) — canned отвечает обоим шейпам разом:
-    // статусы в тесте берутся из issue.state-гарда, не из карточек
-    const graphqlPath = join(dir, "graphql.json")
-    writeFileSync(graphqlPath, JSON.stringify({
-      data: { viewer: {
-        projectsV2: { nodes: [{ number: 5, title: "Задачи uwuwu" }] },
-        projectV2: { items: { pageInfo: { hasNextPage: false, endCursor: null }, items: [] } },
-      } },
-    }))
-    envPatch.FAKE_GH_GRAPHQL = graphqlPath
     const out = join(dir, "rows.json")
 
     const proc = Bun.spawn(["bun", CHILD, LIB_DIR, out], {
@@ -65,7 +62,6 @@ test("read_database_cells: строка доски несёт нативный s
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         FAKE_GH_LABELS: labelsPath,
         FAKE_GH_ISSUES: issuesPath,
-        ...envPatch,
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -85,8 +81,9 @@ test("read_database_cells: строка доски несёт нативный s
     expect(byId["1"]?.state).toBe("closed")
     expect(byId["2"]?.state).toBe("open")
     expect(byId["3"]?.state).toBe("open")
-    // контекст гарда: Status-ячейки из fm-шапок не перепутаны
-    expect(byId["1"]?.cells?.Status?.value).toBe("Draft")
+    // контекст: Status — Pv2-канон (closed → Done-проекция, остальные из
+    // батч-джойна доски); fm-шапки тел мертвы (ADR-098)
+    expect(byId["1"]?.cells?.Status?.value).toBe("Done")
     expect(byId["2"]?.cells?.Status?.value).toBe("Draft")
     expect(byId["3"]?.cells?.Status?.value).toBe("Todo")
   } finally {
