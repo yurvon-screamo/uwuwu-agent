@@ -219,3 +219,55 @@ fn task() -> Task {
         autodone: false,
     }
 }
+
+/// Reply-маркер (задача 61): comment_impl пишет «> ответ на <значение>»,
+/// thread при чтении распознаёт его первой строкой; чужая цитата — не
+/// маркер. Формат един: write↔read через REPLY_MARKER_PREFIX.
+mod reply_marker_tests {
+    use crate::store::task_store::{parse_reply_marker, REPLY_MARKER_PREFIX};
+
+    #[test]
+    fn marker_first_line_parses_anchor() {
+        let body = format!("{REPLY_MARKER_PREFIX}6855341686\n\nтекст ответа");
+        assert_eq!(parse_reply_marker(&body).as_deref(), Some("6855341686"));
+    }
+
+    #[test]
+    fn plain_comment_has_no_anchor() {
+        assert_eq!(parse_reply_marker("обычный коммент"), None);
+        assert_eq!(parse_reply_marker(""), None);
+    }
+
+    #[test]
+    fn foreign_quote_is_not_marker() {
+        // юзер-цитата в UI ("> @author …") и цитаты в середине текста —
+        // не reply-маркер: парсим только точный префикс первой строки
+        assert_eq!(parse_reply_marker("> @author цитата чужого коммента"), None);
+        assert_eq!(
+            parse_reply_marker("текст\n> ответ на в-середине-не-якорь"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_first_line_is_anchor_value() {
+        let body = format!("{REPLY_MARKER_PREFIX}якорь\nещё строка");
+        assert_eq!(parse_reply_marker(&body).as_deref(), Some("якорь"));
+    }
+
+    #[test]
+    fn empty_anchor_is_none() {
+        assert_eq!(parse_reply_marker("> ответ на \n\nтекст"), None);
+    }
+
+    /// Write-read круг: comment_impl-формат читается парсером тем же
+    /// значением (контракт единого формата).
+    #[test]
+    fn write_read_roundtrip() {
+        let anchor = "6869829500";
+        let text = "ответ тестировщику";
+        let body = format!("{REPLY_MARKER_PREFIX}{anchor}\n\n{text}");
+        assert_eq!(parse_reply_marker(&body).as_deref(), Some(anchor));
+        assert!(body.contains(text));
+    }
+}

@@ -82,10 +82,11 @@ pub trait TaskStore: Send + Sync {
 
     async fn edit(&self, board: &TaskBoard, task: &Task, patch: &EditTask) -> StoreResult<Task>;
 
-    /// Коммент в задачу; `reply_to` — префикс id верхнеуровневого коммента
-    /// (легаси-бекенд: вложенный пункт; GitHub: тред-reply).
-    /// Семантика append — реализация не дедупит (ретрай может задвоить,
-    /// паритет текущего контура).
+    /// Коммент в задачу; `reply_to` — свободная метка ответа (без резолва):
+    /// реализация ложит её цитатным маркером `REPLY_MARKER_PREFIX` в текст
+    /// коммента (issue comments плоские, тредов нет). Семантика append —
+    /// реализация не дедупит (ретрай может задвоить, паритет текущего
+    /// контура).
     async fn comment(
         &self,
         board: &TaskBoard,
@@ -94,8 +95,8 @@ pub trait TaskStore: Send + Sync {
         reply_to: Option<&str>,
     ) -> Result<CommentInsert, StoreError>;
 
-    /// Вид задачи как диалога: комменты с якорями (reply-вложенность —
-    /// элементы с `reply_to`).
+    /// Вид задачи как диалога: reply-комменты — элементы с `reply_to`
+    /// (значение маркера; вложенности в хранилище нет — плоский список).
     async fn thread(&self, board: &TaskBoard, task: &Task) -> StoreResult<Vec<ThreadEntry>>;
 
     /// Ячейка «Сессия dev»: claim агента / запись фабрики.
@@ -144,8 +145,22 @@ pub trait TaskStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct ThreadEntry {
     pub id: String,
-    /// None — верхнеуровневый; Some(id-префикс) — вложенный ответ.
+    /// None — верхнеуровневый; Some(метка ответа из маркера) — reply.
     pub reply_to: Option<String>,
     pub author: String,
     pub text: String,
+}
+
+/// Префикс цитатного маркера reply: `comment_impl` (github) пишет
+/// «<префикс><значение>\n\n<текст>», `parse_reply_marker` при чтении
+/// распознаёт. Значение — свободная метка ответа, без резолва.
+pub const REPLY_MARKER_PREFIX: &str = "> ответ на ";
+
+/// Значение reply-маркера, если текст начинается им первой строкой
+/// (`> ответ на <значение>`): Some(значение). Остальное — None: обычный
+/// коммент, в т.ч. чужая цитата «> @author …» — не маркер.
+pub fn parse_reply_marker(text: &str) -> Option<String> {
+    let first = text.split('\n').next()?;
+    let value = first.strip_prefix(REPLY_MARKER_PREFIX)?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }

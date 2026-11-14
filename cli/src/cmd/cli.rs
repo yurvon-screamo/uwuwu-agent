@@ -218,8 +218,8 @@ pub(crate) enum TaskSub {
         id: String,
         #[arg(
             long,
-            value_name = "THREAD_ID",
-            help = "Ответить в тред: префикс id верхнеуровневого коммента (id — в task thread)"
+            value_name = "ANCHOR",
+            help = "Ответить: значение — метка ответа, ложится цитатным маркером «> ответ на <значение>» в текст коммента (без резолва); id комментов — в task thread"
         )]
         reply: Option<String>,
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
