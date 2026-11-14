@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::store::github_gh::{gh_json, gh_pages, GH_PAGE_SIZE};
-use crate::store::github_task::{parse_frontmatter_public, urlencoded};
+use crate::store::github_task::urlencoded;
 
 /// `projects` — labels `proj:*` репо hub (источник истины — инвентарь
 /// среза A). Полный обход страниц labels: проекты за краем первой сотни
@@ -46,8 +46,9 @@ async fn gh_labels() -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// `cron list` — инвентарь крон-мастеров: issues с frontmatter schedule
-/// (мастера живут в статусе Вейт — канон унифицированных кронов ADR-075).
+/// `cron list` — инвентарь крон-мастеров: issues с клеткой «Расписание»
+/// (глобальные issue fields, ADR-098; fm-ключ schedule мёртв — задача 1087;
+/// мастера живут в статусе Вейт — канон унифицированных кронов ADR-075).
 /// Полный обход страниц issues (gh_pages), явный query-string с urlencoded
 /// labels (gh `-F` форма на GET искажала выборку — вероятный соучастник
 /// инцидента «2 из 7» 13.11) и пропуск PR-строк: REST /issues возвращает
@@ -72,9 +73,10 @@ pub(crate) async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
         if issue.get("pull_request").is_some() {
             continue;
         }
-        let body = issue["body"].as_str().unwrap_or("");
-        let fm = parse_frontmatter_public(body);
-        let Some(schedule) = fm.get("schedule") else {
+        // Расписание — глобальное поле «Расписание» (ADR-098), payload
+        // issue_field_values; fm-ключ schedule мёртв (задача 1087)
+        let fields = crate::store::github_issue_fields::fields_of(&issue);
+        let Some(schedule) = fields.get(crate::store::github_issue_fields::names::SCHEDULE) else {
             continue;
         };
         count += 1;

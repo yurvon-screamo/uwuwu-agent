@@ -891,7 +891,8 @@ export function reviewSpawnPrompt(
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    "3. Отчёт — одним сводным комментом в задачу (uwuwu-cli task comment, один вызов",
+    "   на раунд, не дроби находки), формат по своей методике,",
     kind === "plan"
       ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
       : [
@@ -919,7 +920,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
     `[factory] Задача ${rowId}: девелопер завершил раунд — статус снова «${status}».`,
     "",
     "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
-    "проверь устранение своих прошлых замечаний, отчёт комментом,",
+    "проверь устранение своих прошлых замечаний, отчёт одним сводным комментом,",
     "статус по вердикту " +
       (kind === "plan"
         ? "(approve → In Progress · request_changes → Design)."
@@ -949,7 +950,8 @@ export function reviewCommentsPrompt(rowId: string, comments: TaskComment[]): st
     "",
     quoted,
     "",
-    "Ответь/учти по своему протоколу ревью: ответ юзеру — uwuwu-cli task comment.",
+    "Ответь/учти по своему протоколу ревью: ответ на пачку вопросов — одним сводным",
+    "комментом (uwuwu-cli task comment), не реплаем на каждый.",
   ].join("\n")
 }
 
@@ -1141,6 +1143,17 @@ export function stallMinutesFromEnv(v: string | undefined): number {
   if (v === undefined || v.trim() === "") return 360
   const n = Number(v)
   return Number.isFinite(n) && n > 0 ? n : 360
+}
+
+/** Окно fresh-следа dead-гарда (мин, задача 1072): пусто/undefined → дефолт 30;
+ *  конечное число ≥ 0 → оно (0 — осознанное выключение гарда, канон README);
+ *  иначе (NaN, отрицательное, мусор) → дефолт 30 — пустая строка/опечатка не
+ *  должны молча возвращать защиту к выключенному состоянию (ревью 1072:
+ *  регресс к исходному багу без видимой ошибки). */
+export function deadFreshMinutesFromEnv(v: string | undefined): number {
+  if (v === undefined || v.trim() === "") return 30
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? n : 30
 }
 
 /** Активность сессии по последнему сообщению (список DESC — берём только
@@ -1405,12 +1418,21 @@ export type SpawnGuardAlert = "first" | "repeat" | "none"
 
 export type SpawnGuardHold = {
   t: "hold"
-  reason: "state-loss" | "burst"
+  reason: "state-loss"
   alert: SpawnGuardAlert
   text: string
 }
 
-export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold
+/** Burst не глушит спавны (задача 1109: полный HOLD не отпускался сам —
+ *  замкнутый круг «HOLD глушит спавны → untracked не падает»): волна
+ *  дозируется по burstMax спавнов за тик и дренажируется сама. */
+export type SpawnGuardThrottle = {
+  t: "throttle"
+  alert: SpawnGuardAlert
+  text: string
+}
+
+export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold | SpawnGuardThrottle
 
 /** UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX: пусто →
  *  дефолты 2/12; мусор/0/отрицательные → дефолт. Семантики «0 = выключено»
@@ -1425,28 +1447,48 @@ export function spawnLimitsFromEnv(loss: string | undefined, burst: string | und
 }
 
 /** Единственная точка решения гарда (по образцу routeTask/stallVerdict):
- *  превышение любого порога = HOLD спавнов на тик. reason=state-loss, когда
- *  сигнатура потери (сироты-спавны > lossMax); иначе burst. alert=first —
- *  вход в эпизод (флага нет или битый ISO), repeat — длящийся HOLD за окном
- *  повтора, none — в пределах окна (анти-спам). allow при стоящем флаге —
- *  сигнал демону снять флаг: эпизод завершён. */
+ *  сироты сверх lossMax = сигнатура потери state → HOLD спавнов на тик
+ *  (саморазряд: владелец восстанавливает state / чистит ячейки). Волна без
+ *  сирот (импорт/массовые переносы) сверх burstMax → throttle: спавн ≤
+ *  burstMax за тик, волна доезжает сама. alert=first — вход в эпизод
+ *  (флага нет или битый ISO), repeat — длящийся эпизод за окном повтора,
+ *  none — в пределах окна (анти-спам). allow при стоящем флаге — сигнал
+ *  демону снять флаг: эпизод завершён. */
 export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): SpawnGuardVerdict {
   if (f.orphaned <= l.lossMax && f.totalUntracked <= l.burstMax) return { t: "allow" }
-  const reason = f.orphaned > l.lossMax ? "state-loss" as const : "burst" as const
   const prevMs = f.holdSignaled !== undefined ? Date.parse(f.holdSignaled) : Number.NaN
   const alert: SpawnGuardAlert = Number.isNaN(prevMs)
     ? "first"
     : f.now - prevMs >= SPAWN_ALERT_REPEAT_MS ? "repeat" : "none"
-  const counts = `сирот-спавнов=${f.orphaned} (порог ${l.lossMax}), untracked=${f.totalUntracked} (порог ${l.burstMax})`
-  const text = reason === "state-loss"
-    ? `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
-      "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
-      "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
-      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон."
-    : `[factory] Спавн задержан — за один тик набралось untracked=${f.totalUntracked} при пороге ${l.burstMax} ` +
-      `(сирот-спавнов=${f.orphaned}): массовый импорт задач или потеря state без свидетелей-ячеек. ` +
-      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон; иначе проверь state.json."
-  return { t: "hold", reason, alert, text }
+  if (f.orphaned > l.lossMax) {
+    const counts = `сирот-спавнов=${f.orphaned} (порог ${l.lossMax}), untracked=${f.totalUntracked} (порог ${l.burstMax})`
+    return {
+      t: "hold",
+      reason: "state-loss",
+      alert,
+      text: `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
+        "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
+        "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
+        "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон.",
+    }
+  }
+  // остаток после hold-return: orphaned ≤ lossMax и untracked > burstMax
+  return {
+    t: "throttle",
+    alert,
+    text: `[factory] Спавн дозируется — untracked=${f.totalUntracked} при пороге ${l.burstMax} (сирот-спавнов=${f.orphaned}): ` +
+      `волна импорта или массовых переносов, спавним не больше ${l.burstMax} за тик — волна доедет сама. ` +
+      "Если волна неожиданна — проверь доску и state.json.",
+  }
+}
+
+/** Распределение burst-бюджета тика: карантинные спавны (ревью/тест —
+ *  продолжение пайпа, их задержка висит чужую задачу) получают бюджет
+ *  первыми, дев-волна — остаток. */
+export function splitThrottle(agentCount: number, devCount: number, limit: number): { agent: number; dev: number } {
+  const agent = Math.min(agentCount, limit)
+  const dev = Math.min(devCount, limit - agent)
+  return { agent, dev }
 }
 
 /** Свидетель спавна в строке: сессионная ячейка непуста. Поля опциональны —
@@ -1458,6 +1500,35 @@ export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSessio
 /** Живость сессии по REST-пробе опенкода: "unknown" — проба не удалась
  *  (транзиентный сбой), решение принимает вызывающий. */
 export type SessionLiveness = "alive" | "dead" | "unknown"
+
+/** Свежесть сессии по независимому от serve следу opencode.db (задача 1072):
+ *  "fresh" — строка session_v2 обновлялась в окне гарда (активный ход пишется
+ *  суб-минутно); "stale" — след старый/строки нет; "unknown" — БД-след
+ *  недоступен (ошибка чтения/песочница) — решение принимает вызывающий. */
+export type DeadFreshness = "fresh" | "stale" | "unknown"
+
+/** Вердикт спавна при dead-вердикте serve-пробы. Вход-инвариант: вызывается
+ *  ТОЛЬКО в dead-ветке (после liveness-пробы) — liveness в сигнатуру не
+ *  входит. fresh → skip: пробе не верим (serve при рестартах/деградации лжёт
+ *  404 при живом ходе — инстанс 13.11, задача 317); stale → spawn (dead
+ *  настоящий); unknown → spawn (деградация к прежнему поведению, never
+ *  worse). Единственная точка решения — по образцу routeTask. */
+export function deadSpawnVerdict(freshness: DeadFreshness): "spawn" | "skip" {
+  return freshness === "fresh" ? "skip" : "spawn"
+}
+
+/** Свежесть строки session_v2 против окна гарда (чистое ядро IO-читалки):
+ *  окно 0 = гард выключен (старое поведение); строки нет = stale; строка
+ *  обновлялась в окне = fresh. */
+export function freshnessOfRow(
+  row: { timeUpdated: number } | null,
+  nowMs: number,
+  windowMs: number,
+): DeadFreshness {
+  if (windowMs <= 0) return "stale"
+  if (row === null) return "stale"
+  return nowMs - row.timeUpdated < windowMs ? "fresh" : "stale"
+}
 
 /** Вердикт тика по untracked строке: спавнить ли её в дев-волне и считать ли
  *  сиротой-спавном (корм гарда каскада). Единственная точка решения (по
@@ -1474,7 +1545,12 @@ export type SessionLiveness = "alive" | "dead" | "unknown"
  *    сирот не менялась — при allow ре-спавн компенсирует (это путь автоком-
  *  пенсации lossMax-допуска: 1-2 сироты спавнятся, ≥3 — HOLD). Отличить
  *  «мёртвый claim» от «потери state» по одной строке невозможно, поэтому
- *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow. */
+ *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow.
+ *  Задача 1072: dead-вердикт пробы проверяется вторым источником —
+ *  deadFreshness (БД-след opencode.db: time_updated сессии или свежая
+ *  сессия directory env-задачи при пустой клетке): fresh → живая внешняя
+ *  заявка (skip без orphan — HOLD-гард каскада не кормится), stale/unknown
+ *  → прежнее поведение; undefined = след не проверялся (прежнее поведение). */
 export interface UntrackedRowDecision {
   /** спавнить в дев-волне этого тика (финально фильтруется статусом) */
   devWave: boolean
@@ -1485,14 +1561,21 @@ export interface UntrackedRowDecision {
 export function untrackedRowDecision(
   r: Pick<TaskRef, "devSession" | "reviewSession" | "testSession">,
   liveness: SessionLiveness,
+  deadFreshness?: DeadFreshness,
 ): UntrackedRowDecision {
   const devCell = r.devSession ?? ""
   if (devCell === "") {
+    if (liveness === "dead" && deadFreshness === "fresh") {
+      // работа в env задачи идёт (directory-ключ, инстанс #315): клетки
+      // легитимно пусты — ни спавна, ни orphan-свидетельства
+      return { devWave: false, orphan: false }
+    }
     return { devWave: true, orphan: (r.reviewSession ?? "") !== "" || (r.testSession ?? "") !== "" }
   }
   // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
   if (liveness !== "dead") return { devWave: false, orphan: false }
-  return { devWave: true, orphan: true }
+  // dead-вердикт пробы сверён с БД-следом (задача 1072): fresh — проба лжёт
+  return deadFreshness === "fresh" ? { devWave: false, orphan: false } : { devWave: true, orphan: true }
 }
 
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →
@@ -1688,10 +1771,10 @@ export interface PassCounters {
   /** автодон за тик: смержено/закрыто без ПР и возвращено в In Progress */
   autodoneMerged?: number
   autodoneBounced?: number
-  /** спавны, задержанные гардом каскада за тик (HOLD); undefined — гарда не было */
+  /** спавны, задержанные/дозируемые гардом каскада за тик; undefined — гарда не было */
   held?: number
-  /** причина HOLD для сводки; meaningful только при held */
-  heldReason?: "state-loss" | "burst"
+  /** причина (state-loss — полный HOLD, throttle — дозирование burst); meaningful только при held */
+  heldReason?: "state-loss" | "throttle"
   /** фейлы спавна: короткие «rowId-префикс: причина» */
   failures: string[]
 }
