@@ -158,7 +158,9 @@ pub(crate) enum TaskSub {
         )]
         priority: Option<String>,
         /// Autodone: автомерж PR при входе задачи в Review; значение
-        /// опционально — без значения on, off снимает галочку
+        /// опционально — без значения on; off — точечный отказ
+        /// (носитель — Pv2-поле select on/off; дефолт create — on,
+        /// решение владельца 14.11)
         #[arg(
             long,
             value_name = "ON_OFF",
@@ -297,29 +299,19 @@ pub(crate) enum TaskSub {
             long,
             value_name = "SNAPSHOT",
             requires = "replace",
-            conflicts_with_all = ["replace_section", "force"]
+            conflicts_with_all = ["force"]
         )]
         base: Option<String>,
         /// Осознанный overwrite для --replace: пишет без сверки свежести
         /// (--force старше --base). Секция «## Комменты» переносится как
         /// и без --force — сила флага только в отказе от сверки.
-        #[arg(
-            long,
-            requires = "replace",
-            conflicts_with_all = ["replace_section", "base"]
-        )]
+        #[arg(long, requires = "replace", conflicts_with_all = ["base"])]
         force: bool,
-        /// Заменить содержимое секции по заголовку («Решение» или «## Решение»):
-        /// блоки секции удаляются, новый markdown встаёт на их месте,
-        /// заголовок и аттачи/эмбеды вне секции не трогаются. Markdown — БЕЗ
-        /// строки заголовка; пустой ввод очищает секцию. Матч только ##:
-        /// ATX-префикс запроса срезается («## Решение» = «Решение»), тёзка
-        /// на уровне 1/≥3 (учёт двойных пробелов и ^block-id) — отказ
-        /// вместо тихого append-дубля в конец. html_embed-фенс в секции с
-        /// именем, уже живущим вне секции, даст два одинаковых маркера
-        /// ⁂ diagram:<имя> — последующий append адресует первый по порядку
-        /// (секция не ищет по всему доку).
-        #[arg(long, value_name = "HEADING", conflicts_with = "replace")]
+        /// Секционная хирургия на hub-бекенде не поддерживается (снесена
+        /// с легаси-слоем хранения, PR #248). Любой вызов с флагом — громкий
+        /// отказ до резолва строки, чтения входа и мутации; секцию правят
+        /// полным --replace с --base/--force.
+        #[arg(long, value_name = "HEADING")]
         replace_section: Option<String>,
         #[arg(
             long = "attach",
@@ -378,9 +370,12 @@ pub(crate) enum TaskSub {
 /// с задачами).
 #[derive(clap::Subcommand)]
 pub(crate) enum CronSub {
-    /// Мастера крон-задач доски проекта (--project, деф. uwuwu)
+    /// Мастера крон-задач: инвентарь проекта --project или всех проектов репо
     List {
-        #[arg(long, help = "Проект (доска «Задачи <proj>»; деф. uwuwu)")]
+        #[arg(
+            long,
+            help = "Проект-фильтр доски «Задачи <proj>» (без флага — мастера всех проектов репо)"
+        )]
         project: Option<String>,
     },
 }

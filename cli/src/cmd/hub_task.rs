@@ -302,6 +302,16 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             for path in &attach {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
+            // Секционная хирургия на hub не существует (снесена с легаси-слоем
+            // хранения, PR #248): любой вызов с флагом — отказ до резолва строки,
+            // чтения входа и сети. Формулировки шарятся с help --replace-section.
+            if let Some(section) = &replace_section {
+                bail!(
+                    "task body --replace-section «{section}»: секционная хирургия \
+                     на hub-бекенде не поддерживается — правь тело целиком: \
+                     task body --replace с --base (снапшот) или --force"
+                );
+            }
             let task = store
                 .resolve(&board, &id)
                 .await
@@ -337,12 +347,6 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                             None => String::new(),
                         }
                     };
-                    if let Some(section) = &replace_section {
-                        bail!(
-                            "task body --replace-section «{section}»: на hub-бекенде секционная \
-                             хирургия не поддерживается — правь body (--replace/--force) целиком"
-                        );
-                    }
                     store.body_replace(&board, &task, &md, &base_md).await?;
                     if !attach.is_empty() {
                         // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL

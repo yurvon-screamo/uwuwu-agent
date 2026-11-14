@@ -158,8 +158,8 @@ export function autodoneAction(
  *  первым тиком (state=pending), так что длительная тишина = аномалия
  *  (скан-мисрид, потерянный state, недостижимый гейт). Правила:
  *  !inReview или ticked — reset (условие не выполняется); тело недоступно
- *  (пустой bodyDoc до self-heal) — wait (канала нет, не судим); fm без
- *  галочки — reset (владелец снял); первая встреча условия — arm; дольше
+ *  (пустой bodyDoc до self-heal) — wait (канала нет, не судим); fm
+ *  autodone=false — reset (флаг снят); первая встреча условия — arm; дольше
  *  порога без сигнала — signal (раз за эпизод); после сигнала — wait. */
 export type WatchdogAction =
   | { t: "reset" }
