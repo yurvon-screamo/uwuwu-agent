@@ -1143,6 +1143,17 @@ export function stallMinutesFromEnv(v: string | undefined): number {
   return Number.isFinite(n) && n > 0 ? n : 360
 }
 
+/** Окно fresh-следа dead-гарда (мин, задача 1072): пусто/undefined → дефолт 30;
+ *  конечное число ≥ 0 → оно (0 — осознанное выключение гарда, канон README);
+ *  иначе (NaN, отрицательное, мусор) → дефолт 30 — пустая строка/опечатка не
+ *  должны молча возвращать защиту к выключенному состоянию (ревью 1072:
+ *  регресс к исходному багу без видимой ошибки). */
+export function deadFreshMinutesFromEnv(v: string | undefined): number {
+  if (v === undefined || v.trim() === "") return 30
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? n : 30
+}
+
 /** Активность сессии по последнему сообщению (список DESC — берём только
  *  [0]): max числовых полей time (created/streamed/completed). null —
  *  сообщений нет (= застой: трекнутая сессия минимум с промптом-сообщением).

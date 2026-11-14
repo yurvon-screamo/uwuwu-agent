@@ -81,6 +81,7 @@ import {
   createBoardPathOnce,
   errText,
   deadSpawnVerdict,
+  deadFreshMinutesFromEnv,
   freshnessOfRow,
   USER_REVIEW_STATUS,
   AGENT_MARK,
@@ -253,8 +254,9 @@ const OPENCODE_DB = process.env.UWUWU_FACTORY_OPENCODE_DB ?? join(homedir(), ".l
  *  при деградации лжёт 404 при живом ходе — dead-вердикт пробы сверяется со
  *  следом. Трейд: честно мёртвая сессия с посторонним касанием после смерти
  *  выглядит fresh до окна (пост-ходовой дрейф ~0.5% сессий — SQL-срез в
- *  плане 1072). 0 = гард выключен (прежнее поведение). */
-const DEAD_FRESH_MIN = Number(process.env.UWUWU_FACTORY_DEAD_FRESH_MIN ?? 30)
+ *  плане 1072). 0 = гард выключен (прежнее поведение). Парсер по канону
+ *  stallMinutesFromEnv: пустая строка/мусор → дефолт, не тихий выкл. */
+const DEAD_FRESH_MIN = deadFreshMinutesFromEnv(process.env.UWUWU_FACTORY_DEAD_FRESH_MIN)
 const DEAD_FRESH_MS = DEAD_FRESH_MIN > 0 ? DEAD_FRESH_MIN * 60_000 : 0
 /** периодичность GC легаси-ворктри в тиках: при poll 180s ≈ раз в час.
  *  Старт-проход отдельный — рестарт демона не обязан ждать час. */
@@ -2198,7 +2200,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
 
     const skipRest = await dispatchReviewAction(action, {
       row, tracked, project: tracked.project || projectName, cfg, board, state, fresh: foreign,
-      reviewerLiveness: reviewerLiveness, testerLiveness: testerLiveness,
+      reviewerLiveness, testerLiveness,
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
@@ -2369,6 +2371,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
       if (devFresh.length === 0) continue
+      // рестарт из карантина: id-ключ гарда неоткуда взять (sessionID затёрт
+      // карантином — в т.ч. ложным по false-dead пробе, 1072) — directory-
+      // ключ: свежая работа в env = живой ход, спавн поверх — дубль
+      if (deadSpawnVerdict(sessionDbFreshnessByDirectory(row.rowId)) === "skip") {
+        log(`задача ${rowId.slice(0, 8)}: карантин, БД-след env свежий — рестарт отложен (ложный карантин)`)
+        continue
+      }
       await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue
     }
@@ -2377,6 +2386,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       // юзер молчит, но сессия могла умереть посреди прогона
       const quiet = await sessionLiveness(tracked.sessionID)
       if (quiet === "dead") {
+        // dead-вердикт пробы сверяется с БД-следом (1072) ДО затирания
+        // sessionID: serve при деградации лжёт 404 живому ходу — ложный
+        // карантин не только будит юзера зря, но и лишает id-ключа гарда
+        // (следующий коммент идёт в рестарт уже без сессии в state)
+        if (sessionDbFreshness(tracked.sessionID) === "fresh") {
+          log(`задача ${rowId.slice(0, 8)}: проба dead, БД-след свежий — карантин отложен (ложный dead)`)
+          continue
+        }
         log(`задача ${rowId.slice(0, 8)}: сессия умерла (юзер молчит) — карантин + уведомление`)
         tracked.sessionID = ""
         saveState(state)
@@ -2496,6 +2513,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       continue
     }
     if (liveness === "dead") {
+      // dead-вердикт пробы сверяется с БД-следом (1072): serve при деградации
+      // лжёт 404 живому ходу — рестарт поверх живой сессии = дубль-агент
+      if (deadSpawnVerdict(sessionDbFreshness(tracked.sessionID)) === "skip") {
+        log(`задача ${rowId.slice(0, 8)}: проба dead, БД-след свежий — рестарт отложен (ложный dead)`)
+        continue
+      }
       log(`задача ${rowId.slice(0, 8)}: сессия умерла — перезапуск`)
       await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue

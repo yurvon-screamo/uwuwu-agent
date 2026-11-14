@@ -60,6 +60,7 @@ import {
   spawnLimitsFromEnv,
   untrackedRowDecision,
   deadSpawnVerdict,
+  deadFreshMinutesFromEnv,
   freshnessOfRow,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
@@ -2068,6 +2069,26 @@ describe("deadSpawnVerdict: вердикт спавна при dead-пробе (
 
   test("unknown — БД-след недоступен: деградация к прежнему поведению (spawn, never worse)", () => {
     expect(deadSpawnVerdict("unknown")).toBe("spawn")
+  })
+})
+
+describe("deadFreshMinutesFromEnv: окно гарда из env (1072, ревью: пустая строка — не тихий выкл)", () => {
+  test("пустая строка/undefined/whitespace — дефолт 30, не 0", () => {
+    expect(deadFreshMinutesFromEnv(undefined)).toBe(30)
+    expect(deadFreshMinutesFromEnv("")).toBe(30)
+    expect(deadFreshMinutesFromEnv("   ")).toBe(30)
+  })
+
+  test("мусор/отрицательное — дефолт 30", () => {
+    expect(deadFreshMinutesFromEnv("30м")).toBe(30)
+    expect(deadFreshMinutesFromEnv("abc")).toBe(30)
+    expect(deadFreshMinutesFromEnv("-5")).toBe(30)
+  })
+
+  test("конечное число ≥ 0 — оно (0 — осознанное выключение гарда)", () => {
+    expect(deadFreshMinutesFromEnv("0")).toBe(0)
+    expect(deadFreshMinutesFromEnv("45")).toBe(45)
+    expect(deadFreshMinutesFromEnv("7.5")).toBe(7.5)
   })
 })
 
