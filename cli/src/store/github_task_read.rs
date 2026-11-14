@@ -55,6 +55,23 @@ impl TaskStore for GitHubStore {
     }
 
     async fn resolve(&self, board: &TaskBoard, needle: &str) -> Result<Task, StoreError> {
+        if is_legacy_row_id(needle) {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "«{needle}» — легаси row-id досок до hub-миграции: отображения \
+                 row-id → issue не существует (миграция 12.11); адресуй задачу \
+                 issue-номером (#NNN) или подстрокой тайтла"
+            )));
+        }
+        // issue-номер без проекта: issues глобальны, write-пути store board
+        // не читают — прямой fetch вместо листинга доски
+        if board.project.is_empty()
+            && !needle.is_empty()
+            && needle.chars().all(|c| c.is_ascii_digit())
+        {
+            if let Some(task) = self.global_by_number(needle).await? {
+                return Ok(task);
+            }
+        }
         let tasks = self.list(board).await?;
         let exact = needle.trim_start_matches('-');
         if let Some(t) = tasks.iter().find(|t| t.id == exact) {
@@ -66,9 +83,18 @@ impl TaskStore for GitHubStore {
             .collect();
         match matched.as_slice() {
             [one] => Ok((*one).clone()),
-            [] => Err(StoreError::ListCheckedButNotFound {
-                needle: needle.to_string(),
-            }),
+            [] => {
+                if board.project.is_empty() {
+                    Err(StoreError::Other(anyhow::anyhow!(
+                        "«{needle}» не найдено: без --project тайтл-резолв по доскам \
+                         не выполняется — укажи --project (issue-номер резолвится и без него)"
+                    )))
+                } else {
+                    Err(StoreError::ListCheckedButNotFound {
+                        needle: needle.to_string(),
+                    })
+                }
+            }
             many => Err(StoreError::Other(anyhow::anyhow!(
                 "задача «{needle}»: неоднозначно на {} строках ({}) — уточни номер issue",
                 many.len(),
@@ -209,9 +235,45 @@ impl TaskStore for GitHubStore {
     }
 }
 
+/// Легаси row-id досок до hub-миграции: 14 цифр (YYYYMMDDHHMMSS) с
+/// опциональным `-суффиксом` из ascii-букв-цифр. На hub-бекенде отображения
+/// row-id → issue не существует (миграция 12.11) — такие указатели резолвятся
+/// громкой ошибкой с подсказкой, не тихим «не найдено» (агенты жгли ходы на
+/// повторных пробах мёртвого адреса — наблюдение 14.11, задача 1075).
+fn is_legacy_row_id(needle: &str) -> bool {
+    let s = needle.trim();
+    let (digits, suffix) = match s.split_once('-') {
+        Some((d, suf)) => (d, Some(suf)),
+        None => (s, None),
+    };
+    if digits.len() != 14 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match suffix {
+        None => true,
+        Some(suf) => !suf.is_empty() && suf.bytes().all(|b| b.is_ascii_alphanumeric()),
+    }
+}
+
 #[cfg(test)]
-mod fm_compose_tests {
-    // fm-обвязка тела снесена (ADR-098: мета не в md, задача 1087).
-    // Контракт body_replace — чистая перезапись, покрытие — процессные
-    // контракт-тесты hub_cli_contract_process_tests.
+mod legacy_row_id_tests {
+    use super::is_legacy_row_id;
+
+    #[test]
+    fn легаси_row_id_классификатор() {
+        // каноничные формы легаси-блоков досок до hub-миграции
+        assert!(is_legacy_row_id("20261109235429"));
+        assert!(is_legacy_row_id("20261109235429-t5rb3z0"));
+        assert!(is_legacy_row_id(" 20261113023006-aixemmm "));
+        // issue-номера и тайтлы — не легаси
+        assert!(!is_legacy_row_id("384"));
+        assert!(!is_legacy_row_id("1075"));
+        assert!(!is_legacy_row_id("QA аудит"));
+        assert!(!is_legacy_row_id("2026-11-13"));
+        // мусорные границы
+        assert!(!is_legacy_row_id("1234567890123")); // 13 цифр
+        assert!(!is_legacy_row_id("20261109235429-")); // пустой суффикс
+        assert!(!is_legacy_row_id("2026110923542a")); // нецифра в 14-символьной строке
+        assert!(!is_legacy_row_id(""));
+    }
 }
