@@ -425,6 +425,47 @@ fn replace_writes_body_verbatim() {
     assert_eq!(written, "полностью новое тело\n", "тело без обвязки");
 }
 
+/// K. Гвард --base сверяет ВЕРБАТИМ: снапшот с хвостовым \n (как даёт
+/// `gh api --jq .body` — jq всегда добавляет завершающий перенос) не
+/// матчится и replace отказывает, тело не затирается. Пин живой пробы
+/// тест-раунда 1087 (14.11): help long_about «task body» обещает матч для
+/// jq-снапшота — рецепт неисполним (лишний \n), чинится правкой док-текста
+/// (cli.rs, long_about), не гварда: параллельная правка по-прежнему громкая.
+#[test]
+fn replace_base_rejects_snapshot_with_trailing_jq_newline() {
+    let guards = setup_stub_gh();
+    let md = guards.0.path().join("content.md");
+    std::fs::write(&md, "новое тело\n").expect("content.md");
+    // jq-снапшот: canned-тело + хвостовой перенос от jq
+    let snap = guards.0.path().join("snapshot-jq.md");
+    std::fs::write(&snap, format!("{}\n", issue_body_md())).expect("snapshot");
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace",
+            "--md",
+            md.to_str().unwrap(),
+            "--base",
+            snap.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, Some(0), "jq-хвост ≠ тело — гвард обязан отказать");
+    assert!(
+        stderr.contains("тело изменилось"),
+        "внятное сообщение гварда: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "отказ до мутации: PATCH тела нет"
+    );
+}
+
 /// G. `task edit --status` — Pv2-мутация (graphql updateProjectV2ItemFieldValue),
 /// PATCH тела НЕТ (fm-письмо мертво).
 #[test]
