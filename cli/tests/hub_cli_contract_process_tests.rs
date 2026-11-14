@@ -466,6 +466,40 @@ fn replace_base_rejects_snapshot_with_trailing_jq_newline() {
     );
 }
 
+/// L. Задокументированный рецепт снапшота (long_about `task body`):
+/// `gh api … | jq -j '.body' > snap.md` — сырые байты тела без хвостового
+/// переноса → гвард проходит, replace пишет новое тело. Комплемент пина K:
+/// фикс help-а тест-раунда 1 (5215555) — рецепт теперь честен, оба теста
+/// кодируют пару «jq -j проходит / gh --jq отвалится на байте».
+#[test]
+fn replace_base_passes_snapshot_from_documented_recipe() {
+    let guards = setup_stub_gh();
+    let md = guards.0.path().join("content.md");
+    std::fs::write(&md, "новое тело по рецепту\n").expect("content.md");
+    // jq -j: сырые байты body, хвостового переноса нет
+    let snap = guards.0.path().join("snapshot-jq-j.md");
+    std::fs::write(&snap, issue_body_md()).expect("snapshot");
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace",
+            "--md",
+            md.to_str().unwrap(),
+            "--base",
+            snap.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "рецепт help-а проходит гвард: {stderr}");
+    let written = patch_body(&guards).expect("PATCH записан");
+    assert_eq!(written, "новое тело по рецепту\n", "тело дословно");
+}
+
 /// G. `task edit --status` — Pv2-мутация (graphql updateProjectV2ItemFieldValue),
 /// PATCH тела НЕТ (fm-письмо мертво).
 #[test]
