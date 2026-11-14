@@ -56,15 +56,6 @@ jobs:
         run: |
           for d in cli server; do (cd "$d" && cargo fmt --check); done
 
-      # protoc нужен lance-encoding (prost-build): включаем well-known types
-      # (include-путь /usr/include без deb-симлинков не видит empty.proto)
-      - name: Install protoc
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
-          echo "PROTOC=/usr/bin/protoc" >> "$GITHUB_ENV"
-          ls /usr/include/google/protobuf/ | head -5
-          protoc --version
-
       - name: cargo clippy (cli, server)
         run: |
           for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
