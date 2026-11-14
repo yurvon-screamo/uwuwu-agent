@@ -10,8 +10,6 @@ use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec};
 pub struct OpencodeClient {
     base: String,
     password: String,
-    /// Cookie гейта публичного эндпоинта (oc_gate=...); None — без гейта.
-    gate_cookie: Option<String>,
     http: reqwest::Client,
 }
 
@@ -27,6 +25,8 @@ pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
 }
 
 impl OpencodeClient {
+    /// gate_cookie — значение Cookie-хедера целиком (oc_gate=...):
+    /// потребляется в дефолтные хедеры клиента, полем не хранится.
     pub fn new(base: String, password: String, gate_cookie: Option<String>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(cookie) = &gate_cookie {
@@ -36,7 +36,6 @@ impl OpencodeClient {
         Self {
             base: base.trim_end_matches('/').to_string(),
             password,
-            gate_cookie,
             http: reqwest::Client::builder()
                 .default_headers(headers)
                 .timeout(Duration::from_secs(20))
@@ -203,6 +202,16 @@ mod tests {
     fn base_trims_trailing_slash() {
         let c = OpencodeClient::new("https://x.y/".into(), "p".into(), None);
         assert_eq!(c.base, "https://x.y");
-        assert!(c.gate_cookie.is_none());
+    }
+
+    #[test]
+    fn gate_cookie_accepted() {
+        // кука с ascii-значением проходит в хедеры без паники
+        let c = OpencodeClient::new(
+            "https://x.y".into(),
+            "p".into(),
+            Some("oc_gate=g77a99dcff9257cb30992ef970d7e8d1668d1130f".into()),
+        );
+        assert_eq!(c.base, "https://x.y");
     }
 }
