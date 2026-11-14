@@ -101,6 +101,23 @@ async fn default_create_cron_run_is_loud() {
     assert!(format!("{err}").contains("create_cron_run"));
 }
 
+/// Заголовочный поиск: AND-токены по путям, case-insensitive.
+#[test]
+fn by_title_matches_and_tokens_case_insensitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs/Задачи uwuwu");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("Замена бекенда.md"), "x").unwrap();
+    std::fs::write(docs.join("Другое.md"), "x").unwrap();
+    let hits = crate::store::github_doc_search::by_title_sync(
+        tmp.path().to_str().unwrap(),
+        "замена бекенда",
+        10,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slug, "Задачи uwuwu/Замена бекенда");
+}
+
 /// Носитель клеток (ADR-098): convert читает клетки из payload
 /// `issue_field_values` (норм-форма), Status — Pv2-джойн (параметр) с
 /// проекцией closed→Done; fm-шапка тела мертва.
