@@ -140,6 +140,27 @@ impl GitHubStore {
             pv2.as_deref(),
         ))
     }
+
+    /// Сырой state issue (verify-after-write close: сверяется напрямую,
+    /// без fm-проекций convert — closed может прятаться за fm-статусом).
+    /// Нештатная shape ответа (нет строкового state) — громкая parse-ошибка:
+    /// пустая строка в диагностике отказа маскировала бы причину.
+    pub(super) async fn issue_state(&self, number: &str) -> StoreResult<String> {
+        let issue = gh_json(
+            &["api", &format!("repos/{}/issues/{number}", self.repo)],
+            None,
+        )
+        .await?;
+        issue
+            .get("state")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "issue #{number}: ответ без строкового state — shape-аномалия GitHub, verify невозможен"
+                )
+            })
+    }
 }
 
 /// «Запланировано» → epoch ms ("" → 0). Поле несёт ISO-дату.

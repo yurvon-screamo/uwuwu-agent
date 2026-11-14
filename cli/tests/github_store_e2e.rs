@@ -135,6 +135,14 @@ async fn github_store_full_lifecycle_live() {
         .expect("close");
     assert_eq!(closed.status, "Done");
 
+    // verify-after-write (1127): повторный close идемпотентен — гарда
+    // (PATCH → пауза → GET-сверка) обязана пройти на уже закрытом issue.
+    let reclosed = store
+        .close(&board(), &edited, None)
+        .await
+        .expect("повторный close идемпотентен, verify проходит");
+    assert_eq!(reclosed.status, "Done");
+
     // Чистка тест-артефакта: закрыт — из list (open) сам уйдёт.
     tokio::time::sleep(LIST_LAG).await;
     let after = store.list(&board()).await.expect("list after close");

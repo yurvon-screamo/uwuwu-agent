@@ -3,6 +3,7 @@
 //! Клетки — глобальные issue fields (ADR-098), Status — Pv2 single-select
 //! (github_project.rs). fm-шапка тел снесена (задача 1087).
 
+use super::close_verify;
 use super::github_issue_fields::{self, names, FieldValue};
 use super::github_project;
 use super::github_task::GitHubStore;
@@ -243,17 +244,40 @@ impl GitHubStore {
                 .await?;
         }
         let number = &task.id;
-        gh_json(
-            &[
-                "api",
-                "-X",
-                "PATCH",
-                &format!("repos/{}/issues/{number}", self.repo),
-            ],
-            Some(&json!({ "state": "closed", "state_reason": "completed" }).to_string()),
-        )
-        .await?;
-        self.issue_fresh(number).await
+        // verify-after-write (1127): PATCH мог отчитаться success, не применив
+        // переход — сверяем контрольный GET и добиваем ретраями
+        let mut last_verdict = String::new();
+        for attempt in 0..=close_verify::RETRY_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(close_verify::VERIFY_PAUSE).await;
+            }
+            gh_json(
+                &[
+                    "api",
+                    "-X",
+                    "PATCH",
+                    &format!("repos/{}/issues/{number}", self.repo),
+                ],
+                Some(&json!({ "state": "closed", "state_reason": "completed" }).to_string()),
+            )
+            .await?;
+            tokio::time::sleep(close_verify::VERIFY_PAUSE).await;
+            let fresh_state = self.issue_state(number).await?;
+            match close_verify::state_verdict(&fresh_state) {
+                Ok(()) => return self.issue_fresh(number).await,
+                Err(verdict) => last_verdict = verdict,
+            }
+        }
+        // выход из цикла — только через Err-ветку match: last_verdict наполнен
+        let note_applied = note
+            .map(|_| {
+                " Коммент «закрыта» уже приземлён — при ручной докатке не дублируй.".to_string()
+            })
+            .unwrap_or_default();
+        Err(anyhow::anyhow!(
+            "закрытие #{number} не подтвердилось после {} PATCH-попыток: {last_verdict}.{note_applied}",
+            close_verify::RETRY_ATTEMPTS + 1,
+        ))
     }
 
     /// Атрибут тела: единственный потребитель — `--schedule` (клетка
