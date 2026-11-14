@@ -193,3 +193,18 @@ async fn missing_hint_on_empty_ancestor_names_it_empty() -> Result<()> {
     assert!(!msg.contains("доступно"), "msg: {msg}");
     Ok(())
 }
+
+#[tokio::test]
+async fn missing_hint_without_docs_dir_is_honest_clone_error() -> Result<()> {
+    // docs/ отсутствует (сломанный/пустой клон) — честный отказ о клоне,
+    // не маскировка под «не найдено» (ADR-094-дух, задача 1094)
+    let tmp = TempDir::new()?;
+    let store = GitHubDocStore::new("local/test".into(), tmp.path().to_path_buf());
+    let err = store.missing_hint("Projects", "Projects");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("без docs/"), "msg: {msg}");
+    assert!(msg.contains("разбери вручную"), "msg: {msg}");
+    assert!(!msg.contains("не найден"), "msg: {msg}");
+    assert!(!msg.contains("доступно"), "msg: {msg}");
+    Ok(())
+}
