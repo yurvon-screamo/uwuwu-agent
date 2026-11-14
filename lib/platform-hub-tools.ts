@@ -367,3 +367,16 @@ function projectOf(number: string): string {
   }
   return "uwuwu"
 }
+
+/** fm-значение autodone (легаси-семантика checkbox) → значение ячейки скана. */
+export function autodoneCellValue(fmAutodone?: string): string {
+  const v = fmAutodone ?? ""
+  return v === "true" || v === "✓" ? "true" : ""
+}
+
+/** Значение ячейки «Autodone» (update_database_row) → fm-строка. Принимает
+ *  легаси-"true" и UI-"✓" — round-trip read→write не разворачивает флаг. */
+export function autodoneFmOf(cellValue: string): "true" | "false" {
+  const v = cellValue ?? ""
+  return v === "true" || v === "✓" ? "true" : "false"
+}
