@@ -89,6 +89,7 @@ import {
   personMarkdown,
   projectDocSlugs,
   PERSON_SLUG,
+  PROJECTS_DIR,
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
@@ -872,7 +873,7 @@ async function fetchPersonMarkdown(): Promise<string | null> {
  *  «Projects/<proj>/<док>»). Нет папки проекта — пустой список; файл
  *  четвёрки отсутствует — док пропускается, не угадываем. */
 async function fetchProjectDocSlugs(projectName: string): Promise<string[]> {
-  const dir = `${hubCloneRoot()}/docs/Projects/${projectName}`
+  const dir = `${hubCloneRoot()}/docs/${PROJECTS_DIR}/${projectName}`
   try {
     return projectDocSlugs(projectName, readdirSync(dir))
   } catch (e) {

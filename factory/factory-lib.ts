@@ -613,8 +613,13 @@ export const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и арх�
 /** Слаг персоны владельца в вики, паритет cli run.rs (person_hub). */
 export const PERSON_SLUG = "Experience/person/PERSON"
 
-/** Имя файла персоны в клоне — последний сегмент PERSON_SLUG. */
-export const PERSON_FILE = "PERSON"
+/** Имя файла/заголовок персоны в клоне — деривация последнего сегмента
+ *  PERSON_SLUG (рассинхрон ручной пары молча ломал бы срез обёртки). */
+const PERSON_FILE = PERSON_SLUG.split("/").pop() ?? PERSON_SLUG
+
+/** Корень доков проектов в вики: сегмент слагов и имени каталога клоне
+ *  одновременно (docs/Projects/<proj>/) — одна точка определения. */
+export const PROJECTS_DIR = "Projects"
 
 /** Полные слаги канон-четвёрки по списку файлов каталога проекта:
  *  «<файл>.md» существует → «Projects/<proj>/<док>», нет → пропуск.
@@ -624,7 +629,7 @@ export function projectDocSlugs(projectName: string, dirFiles: ReadonlyArray<str
   const files = new Set(dirFiles)
   return PROJECT_INIT_DOCS
     .filter((title) => files.has(`${title}.md`))
-    .map((title) => `Projects/${projectName}/${title}`)
+    .map((title) => `${PROJECTS_DIR}/${projectName}/${title}`)
 }
 
 /** Тело персоны для спавн-промпта: обёртка md-дока срезается (паритет
