@@ -12,6 +12,8 @@ mod hub;
 mod mcp;
 mod opencode;
 mod prgate;
+mod semantic;
+mod semantic_backend;
 mod state;
 mod tools;
 mod wiki;
@@ -20,7 +22,7 @@ use config::{Config, ConfigError, ENV_CONFIG};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{TickOutcome, TickUseCase};
+use uwuwu_usecase::{Clock, TickOutcome, TickUseCase};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -116,6 +118,27 @@ async fn run(
         secrets.gh_token.clone(),
         Some(git_writer),
     ));
+    // Семантика: плоский индекс + OpenRouter free-эмбеддинги (ключ env,
+    // нет — поиск честно без семантики)
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::search::SemanticBackend>> = openrouter_key
+        .map(|key| {
+            Arc::new(semantic_backend::FlatSemanticBackend {
+                wiki: wiki.clone(),
+                store: Arc::new(semantic::FileSemanticStore::load(
+                    cfg.state_path(&config_path).with_file_name("semantic.json"),
+                )),
+                embeddings: Arc::new(semantic::OpenRouterEmbeddings::new(key)),
+            }) as Arc<dyn uwuwu_usecase::search::SemanticBackend>
+        });
+    let search_usecase = Arc::new(uwuwu_usecase::search::SearchUseCase {
+        wiki: wiki.clone(),
+        semantic: semantic_backend.clone(),
+        openrouter_key: None,
+    });
+
     let tool_hub = Arc::new(tools::ToolHub {
         tasks: task_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
@@ -131,6 +154,7 @@ async fn run(
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),
+        search: search_usecase.clone(),
     });
 
     let http_state = Arc::new(http::AppState {
@@ -196,6 +220,23 @@ async fn run(
                 Box::pin(async move { t.tick().await.map(|_| ()) })
             }),
         });
+        if let Some(backend) = semantic_backend.clone() {
+            let clock2 = clock.clone();
+            sidecars.push(Sidecar {
+                name: "semantic-sync".into(),
+                tick: Box::new(move || {
+                    let b = backend.clone();
+                    let clock = clock2.clone();
+                    Box::pin(async move {
+                        if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
+                            return Ok(());
+                        }
+                        // бюджет дока за тик: 8 (≈ 1-2 запроса эмбеддингов)
+                        b.sync_index(8).await.map(|_| ())
+                    })
+                }),
+            });
+        }
         sidecars.push(Sidecar {
             name: "dreamer".into(),
             tick: Box::new(move || {

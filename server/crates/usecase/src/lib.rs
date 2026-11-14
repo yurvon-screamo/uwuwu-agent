@@ -8,6 +8,7 @@ pub mod dreamer;
 pub mod error;
 pub mod fm_lite;
 pub mod ports;
+pub mod search;
 pub mod taskwrite;
 pub mod tick;
 #[cfg(test)]
