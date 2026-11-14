@@ -95,11 +95,15 @@ const { hubTool } = await import("../lib/platform-hub-tools")
 const { fieldsOf } = await import("../lib/platform-hub").then((m) => ({ fieldsOf: (m as { fieldsOf?: typeof fieldsOfImpl }).fieldsOf ?? fieldsOfImpl }))
 const { FIELD_NAMES } = await import("../lib/platform-hub")
 
-function issueWith(n: number, opts: {
-  state?: string
-  fields?: Record<string, string>
-  type?: string
-} = {}): Record<string, unknown> {
+function issueWith(
+  n: number,
+  opts: {
+    state?: string
+    fields?: Record<string, string>
+    type?: string
+    labels?: string[]
+  } = {},
+): Record<string, unknown> {
   const values = Object.entries(opts.fields ?? {}).map(([name, value]) => ({
     issue_field_name: name,
     single_select_option: ["Приоритет", "Autodone"].includes(name) ? { name: value } : undefined,
@@ -111,6 +115,7 @@ function issueWith(n: number, opts: {
     state: opts.state ?? "open",
     body: "чистый контент",
     type: opts.type ? { name: opts.type } : undefined,
+    labels: opts.labels,
     issue_field_values: values,
   }
 }
@@ -143,15 +148,17 @@ describe("read_database_cells: клетки из полей", () => {
       "read_database_cells", { databaseBlockId: "db:uwuwu" },
     )
     const row1 = r.rows.find((x) => x.rowBlockId === "1")
-    expect(row1).toBeDefined()
-    expect(row1.cells["Status"].value).toBe("In Progress", "Pv2-джойн")
+    if (row1 === undefined) throw new Error("строка 1 не вернулась")
+    // Pv2-джойн
+    expect(row1.cells["Status"].value).toBe("In Progress")
     expect(row1.cells["Приоритет"].value).toBe("high")
     expect(row1.cells["Autodone"].value).toBe("true")
     expect(row1.cells["Branch"].value).toBe("work/t")
     expect(row1.cells["Запланировано"].dateMs).toBe(Date.parse("2026-11-20T00:00:00Z"))
     const row2 = r.rows.find((x) => x.rowBlockId === "2")
-    expect(row2).toBeDefined()
-    expect(row2.cells["Status"].value).toBe("Done", "closed → Done")
+    if (row2 === undefined) throw new Error("строка 2 не вернулась")
+    // проекция closed → Done
+    expect(row2.cells["Status"].value).toBe("Done")
     expect(row2.cells["Autodone"].value).toBe("false")
   })
 
@@ -169,7 +176,7 @@ describe("update_database_row: запись в поля", () => {
   test("клетки → setIssueFields (пустое = null-очистка), Status → Pv2-мутация", async () => {
     state.issues = [issueWith(9, { labels: ["proj:uwuwu"] })]
     state.fieldWrites = []
-    state.statusMutation = null
+    state.statusMutation = null as string | null
     await hubTool("update_database_row", {
       rowBlockId: "issue:9",
       cells: {
@@ -183,9 +190,9 @@ describe("update_database_row: запись в поля", () => {
     })
     expect(state.fieldWrites.length).toBe(1)
     const fields = state.fieldWrites[0]
-    expect(fields).toBeDefined()
+    if (fields === undefined) throw new Error("батч полей не записан")
     expect(fields["Branch"]).toBe("work/task-9")
-    expect(fields["PR"]).toBeNull()
+    expect(fields["PR"] ?? null).toBe(null)
     expect(fields["Autodone"]).toBe("on")
     expect(fields["Сессия ревью"]).toBe("ses_rev_1")
     expect(fields["Сессия тест"]).toBe("ses_test_1")
@@ -194,9 +201,9 @@ describe("update_database_row: запись в поля", () => {
 
   test("статус пустой строкой — мутации нет", async () => {
     state.issues = [issueWith(10)]
-    state.statusMutation = null
+    state.statusMutation = null as string | null
     await hubTool("update_database_row", { rowBlockId: "issue:10", cells: { "Status": { value: "" } } })
-    expect(state.statusMutation).toBeNull()
+    expect(state.statusMutation).toBe(null)
   })
 })
 

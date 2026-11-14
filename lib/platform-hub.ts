@@ -122,7 +122,9 @@ export interface GhIssue {
 
 /// Норм-форма клеток issue: text/date — `value`, single_select — имя опции;
 /// отсутствующее/пустое поле в карте нет (пустая клетка).
-export function fieldsOf(issue: Record<string, unknown>): Record<string, string> {
+export function fieldsOf(
+  issue: { issue_field_values?: IssueFieldValue[] } | Record<string, unknown>,
+): Record<string, string> {
   const out: Record<string, string> = {}
   const values = (issue["issue_field_values"] ?? []) as IssueFieldValue[]
   for (const f of values) {
