@@ -665,7 +665,7 @@ describe("projectDocSlugs: полные слаги канон-четвёрки �
   })
   test("пустая папка и посторонние файлы — без слагов и без шума", () => {
     expect(projectDocSlugs("uwuwu", [])).toEqual([])
-    expect(projectDocSlugs("uwuwu", ["Задачи uwuwu.md", "scratch/", "ADR"])).toEqual([])
+    expect(projectDocSlugs("uwuwu", ["Задачи uwuwu.md", "scratch", "ADR"])).toEqual([])
   })
   test("слаг персоны — паритет cli run.rs (person_hub)", () => {
     expect(PERSON_SLUG).toBe("Experience/person/PERSON")
