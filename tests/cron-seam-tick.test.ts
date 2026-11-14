@@ -52,6 +52,24 @@ if (a.includes("issues?labels=")) {
   process.stdout.write(JSON.stringify(fixtures))
   process.exit(0)
 }
+// Pv2-канон статусов (мастер-склейка #1097/1087): projectStatuses бьёт graphql
+// двумя запросами — canned отвечает обоим шейпам; статусы в клетках берутся
+// из issue.state-проекции, гейты файр-решений читают fm-attrs как раньше
+if (a.includes("graphql")) {
+  process.stdout.write(JSON.stringify({
+    data: { viewer: {
+      projectsV2: { nodes: [{ number: 5, title: "Задачи uwuwu" }] },
+      projectV2: { items: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+        { content: { number: 137 }, fieldValueByName: { name: "Вейт" } },
+        { content: { number: 440 }, fieldValueByName: { name: "Вейт" } },
+        { content: { number: 114 }, fieldValueByName: { name: "Вейт" } },
+        { content: { number: 555 }, fieldValueByName: { name: "Todo" } },
+        { content: { number: 556 }, fieldValueByName: { name: "Вейт" } },
+      ] } },
+    } },
+  }))
+  process.exit(0)
+}
 const m = /\\/issues\\/(\\d+)$/.exec(a)
 if (m !== null) {
   const hit = fixtures.find((i) => i.number === Number(m[1]))
