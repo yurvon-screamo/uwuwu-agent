@@ -645,11 +645,13 @@ export function stripExportWrapper(md: string, docTitle: string): string {
     : body
 }
 
-/** Канон-четвёрка доков проекта: имена файлов под docs/Projects/<proj>/
+/** Канон-тройка доков проекта: имена файлов под docs/Projects/<proj>/
  *  (слаг для агента — полный «Projects/<proj>/<док>»: cli read резолвит
  *  его прямой путь, сокращение «<proj>/<док>» падает на неоднозначности
- *  basename-фоллбека — по «README» кандидатов больше одного). */
-export const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
+ *  basename-фоллбека — по «README» кандидатов больше одного).
+ *  Канон 14.11.2026 (Design Spec, задача uwuwu #1046): Домены/Стек и архитектура
+ *  поглощены спекой — в списке README, Design Spec, Деплоймент. */
+export const PROJECT_INIT_DOCS = ["README", "Design Spec", "Деплоймент"]
 
 /** Слаг персоны владельца в вики, паритет cli run.rs (person_hub). */
 export const PERSON_SLUG = "Experience/person/PERSON"
@@ -657,7 +659,7 @@ export const PERSON_SLUG = "Experience/person/PERSON"
 /** Имя файла персоны в клоне — последний сегмент PERSON_SLUG. */
 export const PERSON_FILE = "PERSON"
 
-/** Полные слаги канон-четвёрки по списку файлов каталога проекта:
+/** Полные слаги канон-тройки по списку файлов каталога проекта:
  *  «<файл>.md» существует → «Projects/<proj>/<док>», нет → пропуск.
  *  Порядок слагов — порядок PROJECT_INIT_DOCS; каталоги и не-md игнорируются
  *  (readdir отдаёт и их — фильтр здесь, а не в FS-слое). */
@@ -689,7 +691,7 @@ export function spawnInitBlock(init: SpawnInit, rowId: string, project: string):
     ...(init.localPath !== undefined ? [`чекаут ${init.localPath} (env:false — ворктри/ветка сам)`] : []),
     init.projectDocs.length > 0
       ? `живые доки — uwuwu-cli read ${init.projectDocs.map((s) => `"${s}"`).join(", ")}`
-      : "канон-доки (README/Домены/Стек/Деплоймент) не нашлись — глубокое чтение по месту",
+      : "канон-доки (README/Design Spec/Деплоймент) не нашлись — глубокое чтение по месту",
   ]
   const projectLine = `Проект: ${projectParts.join("; ")}.`
   const personLine = init.person === null
