@@ -254,6 +254,35 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             println!("закрыта: issue #{} «{}»", closed.id, closed.title);
             Ok(())
         }
+        TaskSub::MigrateFm { apply } => {
+            // board-флаг команды сюда не относится: миграция гонит все доски
+            // (discover_boards) — hub-функция, не проектная
+            let hub_repo = crate::cmd::run::hub_repo_default();
+            if hub_repo.trim().is_empty() {
+                anyhow::bail!("UWUWU_HUB_REPO пуст — миграция требует hub-репо");
+            }
+            let store = crate::store::github_task::GitHubStore::new(hub_repo);
+            let outcomes = crate::store::task_migrate::migrate_all(&store, apply).await?;
+            let mut migrated = 0usize;
+            let mut skipped = 0usize;
+            let mut conflicts = 0usize;
+            for o in &outcomes {
+                match o.action {
+                    "migrated" => migrated += 1,
+                    "skipped" => skipped += 1,
+                    _ => conflicts += 1,
+                }
+                println!("#{} [{}] {}", o.number, o.action, o.detail);
+            }
+            println!(
+                "итог: {} мигрировано, {} пропущено, {} расхождений fm≠поле ({})",
+                migrated,
+                skipped,
+                conflicts,
+                if apply { "APPLY" } else { "dry-run" }
+            );
+            Ok(())
+        }
         TaskSub::Body {
             id,
             stdin,
@@ -273,6 +302,16 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             for path in &attach {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
+            // Секционная хирургия на hub не существует (снесена с легаси-слоем
+            // хранения, PR #248): любой вызов с флагом — отказ до резолва строки,
+            // чтения входа и сети. Формулировки шарятся с help --replace-section.
+            if let Some(section) = &replace_section {
+                bail!(
+                    "task body --replace-section «{section}»: секционная хирургия \
+                     на hub-бекенде не поддерживается — правь тело целиком: \
+                     task body --replace с --base (снапшот) или --force"
+                );
+            }
             let task = store
                 .resolve(&board, &id)
                 .await
@@ -282,24 +321,13 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 (false, Some(path)) => Some(std::fs::read_to_string(path)?),
                 _ => None,
             };
-            // вход — контент тела: обёртка task get и fm-карточка в тело не
-            // вставляются (frontmatter ведёт store, шапка — печать get;
-            // help-контракт «frontmatter-шапка — отказ») — отказ ДО мутации.
-            // Append-ветка мягче: "---" первой строкой может быть легитимной
-            // линейкой контента, отказ только на полный fm-блок.
+            // вход — контент тела: обёртка task get в тело не вставляется
+            // (шапка — печать get). fm-шапка во входе — легитимный контент
+            // (карточки тела больше нет: мета в глобальных полях, ADR-098).
             if let Some(md) = &new_body {
-                // полный fm-блок: "---\n" первой строкой + закрывающая "---"
-                // ниже (саму первую строку не считаем — "---\n<текст>" без
-                // закрывающей это легитимная линейка контента)
-                let full_fm_block = md.starts_with("---\n")
-                    && md
-                        .split('\n')
-                        .skip(1)
-                        .take(29)
-                        .any(|l| l.trim_end() == "---");
                 let wrap = md.starts_with("Задача:");
-                if wrap || (replace && md.starts_with("---\n")) || (!replace && full_fm_block) {
-                    bail!("вход task body — контент тела: frontmatter-шапка и обёртка task get в тело не вставляются")
+                if wrap {
+                    bail!("вход task body — контент тела: обёртка task get в тело не вставляется")
                 }
             }
             match (replace, new_body) {
@@ -319,12 +347,6 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                             None => String::new(),
                         }
                     };
-                    if let Some(section) = &replace_section {
-                        bail!(
-                            "task body --replace-section «{section}»: на hub-бекенде секционная \
-                             хирургия не поддерживается — правь body (--replace/--force) целиком"
-                        );
-                    }
                     store.body_replace(&board, &task, &md, &base_md).await?;
                     if !attach.is_empty() {
                         // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL

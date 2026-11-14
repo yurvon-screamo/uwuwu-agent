@@ -21,6 +21,9 @@ import {
   formatPassSummary,
   adoptBodyDoc,
   pathSafe,
+  sessionTitle,
+  SESSION_TITLE_MAX,
+  truncateCodePoints,
   createBoardPathOnce,
   errText,
   type ProjectCfg,
@@ -63,7 +66,11 @@ import {
   parseHoldEpisodes,
   guardAlertChannel,
   formatGuardEpisodeEnd,
+  splitThrottle,
   untrackedRowDecision,
+  deadSpawnVerdict,
+  deadFreshMinutesFromEnv,
+  freshnessOfRow,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
   type SpawnGuardLimits,
@@ -78,6 +85,9 @@ import {
   spawnInitBlock,
   stripExportWrapper,
   stripFrontmatter,
+  personMarkdown,
+  projectDocSlugs,
+  PERSON_SLUG,
   resolvePromptWorktree,
   type SpawnInit,
   priorityRank,
@@ -642,11 +652,47 @@ describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", 
   })
 })
 
+describe("projectDocSlugs: полные слаги канон-четвёрки по файлам каталога", () => {
+  const fullDir = ["README.md", "Домены.md", "Стек и архитектура.md", "Деплоймент.md"]
+  test("все четыре файла → полные слаги в порядке четвёрки", () => {
+    expect(projectDocSlugs("uwuwu", fullDir)).toEqual([
+      "Projects/uwuwu/README",
+      "Projects/uwuwu/Домены",
+      "Projects/uwuwu/Стек и архитектура",
+      "Projects/uwuwu/Деплоймент",
+    ])
+  })
+  test("частичная папка: отсутствующие доки пропускаются, не угадываем", () => {
+    expect(projectDocSlugs("origa", ["README.md", "Домены.md"])).toEqual([
+      "Projects/origa/README",
+      "Projects/origa/Домены",
+    ])
+  })
+  test("пустая папка и посторонние файлы — без слагов и без шума", () => {
+    expect(projectDocSlugs("uwuwu", [])).toEqual([])
+    expect(projectDocSlugs("uwuwu", ["Задачи uwuwu.md", "scratch/", "ADR"])).toEqual([])
+  })
+  test("слаг персоны — паритет cli run.rs (person_hub)", () => {
+    expect(PERSON_SLUG).toBe("Experience/person/PERSON")
+  })
+})
+
+describe("personMarkdown: тело персоны для спавн-промпта", () => {
+  const wikiDoc = "---\ntitle: PERSON\ndate: 2026-11-06\n---\n\n# PERSON\n\nЯзык — русский.\nКомпактность.\n"
+  test("обёртка wiki-дока (frontmatter + # PERSON) срезана", () => {
+    expect(personMarkdown(wikiDoc)).toBe("Язык — русский.\nКомпактность.")
+  })
+  test("пустое тело после среза — null (деградация, не пустая инжекция)", () => {
+    expect(personMarkdown("---\ntitle: PERSON\n---\n\n# PERSON\n\n")).toBeNull()
+    expect(personMarkdown("")).toBeNull()
+  })
+})
+
 describe("spawnInitBlock: инит-данные первого промпта", () => {
   const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
-    projectDocs: ["uwuwu/README", "uwuwu/Домены"],
+    projectDocs: ["Projects/uwuwu/README", "Projects/uwuwu/Домены"],
     task: { title: "Фича", status: "Design", type: "feature", branch: "work/task-r1", pr: "" },
   }
   test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
@@ -658,9 +704,9 @@ describe("spawnInitBlock: инит-данные первого промпта", 
     const b = spawnInitBlock({ ...baseInit, task: { ...baseInit.task, type: "" } }, "r1", "uwuwu")
     expect(b).toContain("Задача: «Фича», статус Design, тип —, ветка work/task-r1, PR —.")
   })
-  test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
+  test("проект: слаги живых доков как готовые uwuwu-cli read (полные)", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain('uwuwu-cli read "uwuwu/README", "uwuwu/Домены"')
+    expect(b).toContain('uwuwu-cli read "Projects/uwuwu/README", "Projects/uwuwu/Домены"')
     expect(b).not.toContain("чекаут")
   })
   test("проект без живых доков — честная строка вместо заглушек", () => {
@@ -1333,9 +1379,48 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
       .toEqual({ t: "none" })
   })
-  test("не In Progress — none даже при застое", () => {
+  test("не In Progress и не Design — none даже при застое", () => {
     expect(stallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
-    expect(stallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ status: "Review" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("Design с зависшим ходом — signal (слот CUP не холдится вечно, инцидент 1101)", () => {
+    // Design-фантом: ход умер, запись сессии жива — вечная тишина держала слот
+    // CUP без эскалации (детекция была гейтнута только на In Progress)
+    const v = stallVerdict(facts({ status: "Design", branch: "", branchInWorktree: false }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("Design")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // на этапе утряски Branch/PR пустые в норме — веточных диагнозов быть не должно
+    expect(v.text).not.toContain("Branch-ячейка пуста")
+    expect(v.text).not.toContain("ветка на месте")
+  })
+  test("Design со свежей активностью — none (утряска идёт)", () => {
+    expect(stallVerdict(facts({ status: "Design", lastActivityAt: NOW - 5 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("Design повторный тик после сигнала — silent (анти-спам)", () => {
+    expect(stallVerdict(facts({ status: "Design", signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("цепочка фикса 1101: сигнал Design-фантома → эскалация в Needs attention → слот CUP свободен", () => {
+    // главный юзкейс постановки 1101: фантом в Design держал слот CUP вечно
+    // (детекция была гейтнута только на In Progress). Конец-в-конец чистых
+    // функций: вердикт signal на фантоме; прод-проводка signal-вердикта
+    // ставит Needs attention (lastStatus за доской) — статус вне
+    // LLM_ACTIVE_STATUSES, счёт активных падает, у очереди появляется бюджет.
+    const phantom = facts({ status: "Design", branch: "", branchInWorktree: false })
+    expect(stallVerdict(phantom, 30 * MIN).t).toBe("signal")
+    const slots = [
+      { status: "In Progress", priority: "medium" },
+      { status: "Needs attention", priority: "medium" }, // бывший Design-фантом
+    ]
+    const active = activeTaskCountEx(slots, { peak: false })
+    expect(active).toBe(1)
+    expect(cupBudget(active, 2)).toBe(1)
+    // и сама эскалация не вернула бы статус в активные (гват контракта статусов)
+    expect(LLM_ACTIVE_STATUSES.has("Needs attention")).toBe(false)
   })
   test("dead и unknown сессия — none (соседний код карантин / пропуск тика)", () => {
     expect(stallVerdict(facts({ sessionAlive: false }), 30 * MIN)).toEqual({ t: "none" })
@@ -1684,6 +1769,89 @@ describe("pathSafe", () => {
   })
 })
 
+// ——— тайтлы спавн-сессий opencode ———
+
+describe("sessionTitle", () => {
+  test("dev — номер и тайтл, без стейджа", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "Фабрика: тайтлы спавн-сессий")).toBe(
+      "📋 uwuwu: 1051 — Фабрика: тайтлы спавн-сессий",
+    )
+  })
+
+  test("review/test — стейдж-слово перед номером", () => {
+    expect(sessionTitle("review", "uwuwu", "1051", "план")).toBe("🔍 uwuwu: ревью 1051 — план")
+    expect(sessionTitle("test", "uwuwu", "61", "help comment --reply")).toBe("🧪 uwuwu: тестирование 61 — help comment --reply")
+  })
+
+  test("path-safe: '/' → U+2215 в тайтле задачи", () => {
+    expect(sessionTitle("dev", "uwuwu", "1099", "снос serial_test")).toBe("📋 uwuwu: 1099 — снос serial_test")
+    expect(sessionTitle("dev", "uwuwu", "46", "RU/EN слэш")).toBe("📋 uwuwu: 46 — RU∕EN слэш")
+  })
+
+  test("CRLF → пробел", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "строка\r\nстрока")).toBe("📋 uwuwu: 1051 — строка строка")
+  })
+
+  test("пустой/пробельный тайтл — номер без «—»", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "")).toBe("📋 uwuwu: 1051")
+    expect(sessionTitle("review", "origa", "965", "   ")).toBe("🔍 origa: ревью 965")
+  })
+
+  test("обрезка: финальная строка целиком до SESSION_TITLE_MAX (гард createSession идемпотентен)", () => {
+    const out = sessionTitle("test", "uwuwu", "1051", "т".repeat(200))
+    // лимит — по code points (эмодзи-префикс даёт 81 UTF-16 unit при 80 points)
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
+    expect(out.startsWith("🧪 uwuwu: тестирование 1051 — ")).toBe(true)
+  })
+
+  test("обрезка не режет суррогатную пару: эмодзи на границе лимита остаётся целым", () => {
+    const out = sessionTitle("dev", "uwuwu", "1051", "👍".repeat(200))
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
+    expect(out.endsWith("👍")).toBe(true)
+  })
+
+  test("граница контракта: ровно 80 points не режется, 81-й point срезается (пин tester 1051)", () => {
+    const points = (t: string): number => Array.from(t).length
+    const head = `📋 uwuwu: 1051 — `
+    const tail = `${"х".repeat(SESSION_TITLE_MAX - Array.from(head).length - 1)}◆`
+    // ровно 80 — не тронут: маркер-хвост на месте
+    const fit = sessionTitle("dev", "uwuwu", "1051", tail)
+    expect(points(fit)).toBe(SESSION_TITLE_MAX)
+    expect(fit.endsWith("◆")).toBe(true)
+    // 81-й point срезается без lone-суррогата и без сдвига лимита
+    const over1 = sessionTitle("dev", "uwuwu", "1051", `${tail}z`)
+    expect(points(over1)).toBe(SESSION_TITLE_MAX)
+    expect(over1.endsWith("z")).toBe(false)
+    expect(over1.endsWith("◆")).toBe(true)
+    const over2 = sessionTitle("dev", "uwuwu", "1051", `${tail}zz`)
+    expect(points(over2)).toBe(SESSION_TITLE_MAX)
+    expect(over2.endsWith("zz")).toBe(false)
+  })
+
+  test("идемпотентность гарда: sessionTitle-вывод проходит createSession-гард без изменений (пин tester 1051)", () => {
+    // гард createSession: truncateCodePoints(title.replace(CRLF), SESSION_TITLE_MAX)
+    const guard = (t: string): string => truncateCodePoints(t.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX)
+    for (const kind of ["dev", "review", "test"] as const) {
+      const out = sessionTitle(kind, "uwuwu", "1051", "длинный ".repeat(30))
+      expect(guard(out)).toBe(out)
+    }
+  })
+})
+
+describe("truncateCodePoints", () => {
+  test("BMP-строка — эквивалент slice", () => {
+    expect(truncateCodePoints("абвгдеж", 4)).toBe("абвг")
+    expect(truncateCodePoints("короткая", 100)).toBe("короткая")
+  })
+
+  test("астральные символы (эмодзи) не разрезаются пополам", () => {
+    // 10 эмодзи = 20 UTF-16 units: slice(0, 10) по units дал бы lone-суррогат
+    expect(truncateCodePoints("👍".repeat(10), 10)).toBe("👍".repeat(10))
+    expect(truncateCodePoints("👍".repeat(10), 5)).toBe("👍".repeat(5))
+    expect(truncateCodePoints("👍ai👍", 3)).toBe("👍ai")
+  })
+})
+
 // ——— мемоизер пути доски на проход (фоллбек тела detached-строк) ———
 
 describe("createBoardPathOnce — ленивый мемоизер пути доски на проход", () => {
@@ -1821,20 +1989,49 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(verdict.text).toContain("state")
   })
 
-  test("сироты в пределах lossMax, но всего untracked > burst — hold(burst)", () => {
+  test("сироты в пределах lossMax, но всего untracked > burst — throttle: волна дозируется, не глушится", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 1, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict.t).toBe("throttle")
+    if (verdict.t !== "throttle") return
+    expect(verdict.alert).toBe("first")
+    expect(verdict.text).toContain("20")
+    expect(verdict.text).toContain("дозируется")
+    expect(verdict.text).not.toContain("перезапусти")
   })
 
-  test("чистый burst без сирот — hold(burst), alert=first", () => {
+  test("чистый burst без сирот — throttle с тем же текстом дозирования", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict).toMatchObject({ t: "throttle", alert: "first" })
+  })
+
+  test("повторный тик throttle-эпизода в пределах окна повтора — alert=none", () => {
+    // Arrange: алерт был 10 минут назад (окно — час)
+    const signaled = new Date(GUARD_NOW - 10 * 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "none" })
+  })
+
+  test("длящийся throttle дольше окна повтора — alert=repeat", () => {
+    // Arrange: алерт был 2 часа назад (волна не дренажируется — признак аномалии)
+    const signaled = new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "repeat" })
   })
 
   test("повторный тик эпизода в пределах окна повтора — alert=none", () => {
@@ -1889,7 +2086,44 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(spawnGuardVerdict({ orphaned: 3, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS))
       .toMatchObject({ t: "hold", reason: "state-loss" })
     expect(spawnGuardVerdict({ orphaned: 0, totalUntracked: 13, now: GUARD_NOW }, GUARD_LIMITS))
-      .toMatchObject({ t: "hold", reason: "burst" })
+      .toMatchObject({ t: "throttle" })
+  })
+
+  test("пин задачи 1109: волна 21 при пороге 12 дренажируется сама за два тика, без env-рестарта", () => {
+    // Arrange: CUP в симуляции не моделируется — дев-бюджет тика считается по burstMax;
+    // прод-волна при дефолтном CUP=7 доедет за 3 тика.
+    // Act: тик 1 — волна входит, вердикт разрешает дозированный спавн
+    const tick1 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 21, now: GUARD_NOW }, GUARD_LIMITS)
+    const budget1 = splitThrottle(0, 21, GUARD_LIMITS.burstMax)
+
+    // Assert: тик 1 — throttle, дев-волна получает burstMax
+    expect(tick1).toMatchObject({ t: "throttle", alert: "first" })
+    expect(budget1).toEqual({ agent: 0, dev: 12 })
+
+    // Act: тик 2 — 12 строк заспавнены и трекнуты, untracked = 9
+    const tick2 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 9, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert: порог больше не превышен — allow доезжает остаток
+    expect(tick2).toEqual({ t: "allow" })
+  })
+})
+
+describe("splitThrottle: burst-бюджет спавнов на тик (карантинные — приоритет пайпа)", () => {
+  test("все кандидаты влезают в лимит — никого не режем", () => {
+    // Act / Assert
+    expect(splitThrottle(2, 5, 12)).toEqual({ agent: 2, dev: 5 })
+    expect(splitThrottle(0, 12, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("волна больше лимита — карантинные спавны первыми, дев-волна — остаток", () => {
+    // Act / Assert
+    expect(splitThrottle(3, 15, 12)).toEqual({ agent: 3, dev: 9 })
+    expect(splitThrottle(0, 21, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("карантинных больше лимита — дев не достаётся ничего (пайп не виснет)", () => {
+    // Act / Assert
+    expect(splitThrottle(14, 10, 12)).toEqual({ agent: 12, dev: 0 })
   })
 })
 
@@ -1978,6 +2212,28 @@ describe("guardAlertChannel: канал алерта по классу верд�
     // Act / Assert
     expect(guardAlertChannel(hold("burst", "repeat"))).toBe("silent")
     expect(guardAlertChannel(hold("burst", "none"))).toBe("silent")
+  })
+
+  test("throttle (burst-класс 1109) — канал как у burst: first — лог эпизода, repeat/none — тишина", () => {
+    // Arrange: сирот в норме, untracked сверх burstMax → throttle-вердикт
+    const throttle = (alert: "first" | "repeat" | "none") =>
+      spawnGuardVerdict(
+        {
+          orphaned: 0,
+          totalUntracked: 18,
+          holdSignaled: alert === "first" ? undefined
+            : alert === "repeat"
+              ? new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+              : new Date(GUARD_NOW - 10 * 60_000).toISOString(),
+          now: GUARD_NOW,
+        },
+        GUARD_LIMITS,
+      ) as Extract<ReturnType<typeof spawnGuardVerdict>, { t: "throttle" }>
+
+    // Act / Assert
+    expect(guardAlertChannel(throttle("first"))).toBe("episode-log")
+    expect(guardAlertChannel(throttle("repeat"))).toBe("silent")
+    expect(guardAlertChannel(throttle("none"))).toBe("silent")
   })
 })
 
@@ -2146,6 +2402,106 @@ describe("untrackedRowDecision: вердикт untracked строки (матр�
 
   test("мёртвый claim с ревью-свидетельством — сирота (любое свидетельство)", () => {
     expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("dead-проба + свежий БД-след — инстанс 317 (1072): ложный dead, ни спавна, ни сироты", () => {
+    // serve при деградации лжёт 404 при живом ходе: гард не спавнит дубль
+    // и не кормит HOLD-гард каскада orphan-счётом
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("dead-проба + stale БД-след — dead настоящий: прежнее поведение (сирота в дев-волне)", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "stale"))
+      .toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "unknown"))
+      .toEqual({ devWave: true, orphan: true })
+  })
+
+  test("directory-ключ при легитимно пустой клетке (инстанс #315): работа в env идёт — ни спавна, ни сироты", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell(undefined, undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("карантинная ревью-строка с пустой дев-клеткой и свежей directory-сессией — orphan подавлен (1072, ревью-рекомендация)", () => {
+    // ревью-свидетельство без трека — сирота как прежде, но живая работа
+    // в env задачи (directory-ключ) сильнее свидетельства: спавн дубля
+    // держателя поверх живого хода недопустим
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell("", "", "ses_test01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("пустая клетка + stale след — прежнее поведение (спавн обычного пути, сирота по свидетельству)", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "stale")).toEqual({ devWave: true, orphan: false })
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "stale")).toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "unknown")).toEqual({ devWave: true, orphan: false })
+  })
+})
+
+describe("deadSpawnVerdict: вердикт спавна при dead-пробе (1072, вход-инвариант: только dead-ветка)", () => {
+  test("fresh — пробе не верим: skip", () => {
+    expect(deadSpawnVerdict("fresh")).toBe("skip")
+  })
+
+  test("stale — dead настоящий: spawn", () => {
+    expect(deadSpawnVerdict("stale")).toBe("spawn")
+  })
+
+  test("unknown — БД-след недоступен: деградация к прежнему поведению (spawn, never worse)", () => {
+    expect(deadSpawnVerdict("unknown")).toBe("spawn")
+  })
+})
+
+describe("deadFreshMinutesFromEnv: окно гарда из env (1072, ревью: пустая строка — не тихий выкл)", () => {
+  test("пустая строка/undefined/whitespace — дефолт 30, не 0", () => {
+    expect(deadFreshMinutesFromEnv(undefined)).toBe(30)
+    expect(deadFreshMinutesFromEnv("")).toBe(30)
+    expect(deadFreshMinutesFromEnv("   ")).toBe(30)
+  })
+
+  test("мусор/отрицательное — дефолт 30", () => {
+    expect(deadFreshMinutesFromEnv("30м")).toBe(30)
+    expect(deadFreshMinutesFromEnv("abc")).toBe(30)
+    expect(deadFreshMinutesFromEnv("-5")).toBe(30)
+  })
+
+  test("конечное число ≥ 0 — оно (0 — осознанное выключение гарда)", () => {
+    expect(deadFreshMinutesFromEnv("0")).toBe(0)
+    expect(deadFreshMinutesFromEnv("45")).toBe(45)
+    expect(deadFreshMinutesFromEnv("7.5")).toBe(7.5)
+  })
+})
+
+describe("freshnessOfRow: свежесть строки session_v2 против окна гарда (1072)", () => {
+  const now = 1_000_000_000_000
+  const windowMs = 30 * 60_000
+
+  test("окно 0 — гард выключен: stale без чтения строки", () => {
+    expect(freshnessOfRow({ timeUpdated: now }, now, 0)).toBe("stale")
+    expect(freshnessOfRow(null, now, 0)).toBe("stale")
+  })
+
+  test("строки нет в БД — stale", () => {
+    expect(freshnessOfRow(null, now, windowMs)).toBe("stale")
+  })
+
+  test("обновлялась в окне — fresh (активный ход пишет session_v2 суб-минутно)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - 60_000 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+  })
+
+  test("след старее окна — stale (честно мёртвая сессия без посторонних касаний)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
+    expect(freshnessOfRow({ timeUpdated: now - 9 * 3600_000 }, now, windowMs)).toBe("stale")
+  })
+
+  test("граница окна: свежее — fresh, ровно окно — stale (интервал полуоткрытый)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
   })
 })
 
