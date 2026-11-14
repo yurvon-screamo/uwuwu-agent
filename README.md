@@ -79,7 +79,8 @@ env-механики (`env: false` в конфиге — сейчас true-washi
 выключен), путь БД `UWUWU_FACTORY_OPENCODE_DB` (деф. `~/.local/share/opencode/opencode.db`).
 Вся логика пайпа (тело, типы, PR, самозаведённый крон проверки мержа) — у агента:
 глобальный AGENTS.md «Работа над задачей» + AGENTS.md репо проекта.
-Автодон/очередь/пик (задача 20261112160316): галочка «Autodone» (ставит только владелец) —
+Автодон/очередь/пик (задача 20261112160316): клетка «Autodone» (с 14.11 — дефолт
+`task create`: on у всех create, вкл. триаж и крон-раны; `--autodone off` — точечный отказ) —
 фабрика сама мержит PR на входе в Review (GitHub gh / Gitea tea+API, merge-commit) и ставит
 Done; красный CI/конфликт — обратно в In Progress; без PR — Done сразу. Очередь CUP
 (`UWUWU_FACTORY_CUP`, деф. 7 глобально) — новые Design/In Progress берутся по приоритету

@@ -1280,7 +1280,7 @@ async function prProbeByBranch(repo: string, branch: string): Promise<PrProbeOut
   } catch { return { result: "unknown", mergedUrl: null } }
 }
 
-// ——— автодон: галочка владельца → проба/мерж PR на входе в Review ———
+// ——— автодон: проба/мерж PR на входе в Review ———
 // (задача 20261112160316; решение одного тика — autodoneAction в autodone.ts)
 
 /** Токен tea-логина по имени-хосту (конфиг ~/.config/tea/config.yml).
@@ -1400,7 +1400,7 @@ async function mergePr(pr: PrCarrier): Promise<boolean> {
   }
 }
 
-/** Один тик автодона по задаче в Review с галочкой: проба → вердикт →
+/** Один тик автодона по задаче в Review с autodone=true: проба → вердикт →
  *  исход. Все статусы-пишутся через setCells (DRY_RUN гейтится внутри),
  *  merge-вызовы гейтятся явно (новый класс внешних мутаций — замечание
  *  ревью High). Bounce НЕ трогает lastStatus: следующий тик вернёт мяч
@@ -1521,7 +1521,7 @@ async function runAutodoneTick(
  *  маршрутизации): state после терминальных исходов определён → reset.
  *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
  *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
- *  галочку не несёт — гард честно деградирует в no-op (транспорт hub).
+ *  autodone не несёт — гард честно деградирует в no-op (транспорт hub).
  *  Граница гарда (осознанная, ревью раунд 2): покрывает ТРЕКНУТЫЕ строки —
  *  Review-строка вообще без записи в state (геометрия #317 «task в state
  *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
@@ -1575,7 +1575,7 @@ async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: F
       log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — fm autodone:true, тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
       await notify(
         tracked,
-        `${AGENT_MARK} autodone: задача в Review с fm-галочкой autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
+        `${AGENT_MARK} autodone: задача в Review с fm autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
       )
       return
     }
@@ -2174,7 +2174,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.priority = row.priority
       healed = true
     }
-    // галочка снята → сброс seen: переустановка позже = свежая активация
+    // флаг снят (off) → сброс seen: переустановка позже = свежая активация
     // автодона (ревью Common-2)
     if (!(row.autodone ?? false) && tracked.autodoneSeen === true) {
       tracked.autodoneSeen = false
@@ -2287,12 +2287,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
     if (skipRest === "skip-rest") continue
 
-    // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
+    // ——— автодон: fm/клетка autodone=true на входе в Review (задача 20261112160316) ———
     // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
     // пайпа — следующий тик возвращает мяч девелоперу штатным return-to-dev.
     // Эпизод: pending бежит; терминальный исход (merged/escalated) того же
     // эпизода (lastStatus всё ещё Review) не перезапускается — но НОВЫЙ вход
-    // в Review (lastStatusedge) или переустановка галочки (off→on, ревью
+    // в Review (lastStatusedge) или переустановка флага (off→on, ревью
     // Common-2) перезапускают эпизод: эскалация не убивает автодон навсегда.
     const autodoneFreshActivation = (row.autodone ?? false) && tracked.autodoneSeen !== true
     const autodoneNewEntry = tracked.lastStatus !== USER_REVIEW_STATUS
