@@ -56,6 +56,12 @@ jobs:
         run: |
           for d in cli server; do (cd "$d" && cargo fmt --check); done
 
+      # protoc нужен lance-encoding (prost-build) для серверного крейта
+      - name: Install protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
       - name: cargo clippy (cli, server)
         run: |
           for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
