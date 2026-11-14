@@ -1935,6 +1935,8 @@ describe("эпизоды гарда: holdEpisodeKey / parseHoldEpisodes", () => 
     expect(parseHoldEpisodes(null)).toEqual({})
     expect(parseHoldEpisodes(undefined)).toEqual({})
     expect(parseHoldEpisodes(42)).toEqual({})
+    // массив typeof-объект: entries пустые — тоже пустой record, не падение
+    expect(parseHoldEpisodes([])).toEqual({})
     expect(parseHoldEpisodes({ "x/burst": "строка вместо эпизода", "": { since: "a", signaled: "b" } }))
       .toEqual({})
     expect(parseHoldEpisodes({ "y/burst": { since: 1, signaled: "b" } })).toEqual({})
@@ -2006,6 +2008,14 @@ describe("spawnGuardReason / formatGuardEpisodeEnd: общая точка кла
     // Assert
     expect(line).toContain("state-loss")
     expect(line).toContain("н/д")
+  })
+
+  test("мгновенный эпизод — длительность 0 мин, не отрицательная", () => {
+    // Act
+    const line = formatGuardEpisodeEnd("burst", new Date(GUARD_NOW).toISOString(), GUARD_NOW)
+
+    // Assert
+    expect(line).toContain("0 мин")
   })
 })
 
