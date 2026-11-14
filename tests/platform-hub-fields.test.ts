@@ -81,17 +81,16 @@ describe("setIssueFields: реальный write-path на PATH-стабе gh", 
     const log = readFileSync(stub.log, "utf8")
     // пин: батч из двух клеток — ровно один POST (каталог-резолв покрыт
     // живой пробой #1092; стаб-лог ловит только issue-field-values-маршруты)
-    expect((log.match(/POST .*issue-field-values/g) ?? []).length).toBe(
-      1,
-      "один батч-POST на две клетки",
-    )
+    // один батч-POST на две клетки
+    expect((log.match(/POST .*issue-field-values/g) ?? []).length).toBe(1)
   })
 
   test("очистка: DELETE идемпотентен — no-op без POST", () => {
     withStub(() => realSetIssueFields("778", { "Расписание": null }))
     const log = readFileSync(stub.log, "utf8")
     expect((log.match(/DELETE .*issue-field-values/g) ?? []).length).toBe(1)
-    expect((log.match(/POST/g) ?? []).length).toBe(0, "POST нет — только очистка")
+    // POST нет — только очистка
+    expect((log.match(/POST/g) ?? []).length).toBe(0)
   })
 
   test("смешанный: очистка + запись в одном вызове", () => {
