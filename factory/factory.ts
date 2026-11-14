@@ -85,6 +85,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  splitThrottle,
   untrackedRowDecision,
   activeTaskGuards,
   parseAgentHeadTs,
@@ -107,6 +108,7 @@ import {
   type SpawnEnvContext,
   type DisplayLease,
   type SpawnGuardHold,
+  type SpawnGuardThrottle,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
@@ -1108,24 +1110,26 @@ function backupSuspectState(): void {
   }
 }
 
-/** HOLD-тик гарда каскада: спавны отложены (обслуживание существующих
- *  треков продолжается — гард бьёт только по новому спавну). Алерт-политика:
- *  first — вход в эпизод (бэкап + коммент владельцу), repeat — длящийся
- *  HOLD за окном повтора (коммент снова), none — в пределах окна (только
- *  лог). Флаг эпизода ставится по факту ПОПЫТКИ алерта, не доставки:
- *  недоставимый алерт не должен ретраиться каждый тик — окно повтора
- *  вернётся к нему через час. */
+/** HOLD/throttle-тик гарда каскада: state-loss глушит спавны полностью
+ *  (обслуживание существующих треков продолжается — гард бьёт только по
+ *  новому спавну), throttle дозирует burst-волну по burstMax за тик — она
+ *  дренажируется сама (задача 1109: полный HOLD по burst не отпускался
+ *  никогда). Алерт-политика: first — вход в эпизод (state-loss: бэкап
+ *  state + коммент владельцу; throttle: только коммент — state не
+ *  подозрительный), repeat — длящийся эпизод за окном повтора (коммент
+ *  снова), none — в пределах окна (только лог). Флаг эпизода ставится по
+ *  факту ПОПЫТКИ алерта, не доставки: недоставимый алерт не должен
+ *  ретраиться каждый тик — окно повтора вернётся к нему через час. */
 async function holdSpawns(
-  guard: SpawnGuardHold, untracked: TaskRef[], orphaned: number,
-  state: FactoryState, counters: PassCounters,
+  guard: SpawnGuardHold | SpawnGuardThrottle, untracked: TaskRef[], orphaned: number,
+  state: FactoryState,
 ): Promise<void> {
   const targets = untracked.slice(0, 10).map((r) => r.rowId.slice(0, 8))
-  counters.held = untracked.length
-  counters.heldReason = guard.reason
-  log(`гард спавна: HOLD (${guard.reason}), сирот=${orphaned}, untracked=${untracked.length}` +
-    ` — спавны отложены: ${targets.join(", ") || "нет"}`)
+  const action = guard.t === "hold" ? "спавны отложены" : "спавн дозируется по burstMax"
+  log(`гард спавна: ${guard.t === "hold" ? guard.reason : "throttle"}, сирот=${orphaned}, untracked=${untracked.length}` +
+    ` — ${action}: ${targets.join(", ") || "нет"}`)
   if (guard.alert === "none") return
-  if (guard.alert === "first") backupSuspectState()
+  if (guard.alert === "first" && guard.t === "hold") backupSuspectState()
   const target = alertTargetOf(untracked)
   if (target === null) {
     log("гард спавна: адресата алерта нет (ни одной строки с телом) — только лог")
@@ -1818,11 +1822,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
     SPAWN_LIMITS,
   )
-  if (guard.t === "hold") {
-    await holdSpawns(guard, untracked, orphaned, state, counters)
+  if (guard.t !== "allow") {
+    await holdSpawns(guard, untracked, orphaned, state)
   } else if (state.holdSignaled !== undefined) {
-    // сигнатура ушла (state восстановлен) — эпизод завершён, снимаем флаг:
-    // следующий эпизод снова получит alert=first с алертом и бэкапом
+    // сигнатура ушла (state восстановлен / волна дренажировалась) — эпизод
+    // завершён, снимаем флаг: следующий эпизод снова получит alert=first
+    // с алертом (и бэкапом для state-loss)
     delete state.holdSignaled
     saveState(state)
     log("гард спавна: сигнатура ушла — эпизод HOLD завершён, флаг снят")
@@ -1831,7 +1836,8 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
   // и fast-track In Progress владельца) получают сессии за ОДИН проход
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
-  // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
+  // растягивали волну из 4 задач на 12+ минут). Полный HOLD (state-loss)
+  // глушит волну; throttle (задача 1109) режет её до остатка burst-бюджета.
   // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
   // Очередь CUP (задача 20261112160316): кап активных (LLM-тратящих) задач
   // глобально по всем проектам; берём первые budget в порядке приоритет →
@@ -1839,10 +1845,15 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // замороженные не-high слотов не держат. Возвраты трекнутых задач девелоперу
   // и карантинные спавны ревью/теста не гейтятся (продолжение пайпа, не новая
   // работа) — но учитываются в счёте наравне.
+  const isDevCandidate = (t: TaskRef) =>
+    reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId)
+  const devCandidates = guard.t === "hold" ? [] : untracked.filter(isDevCandidate)
+  const agentCandidates = untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
+  const throttleSplit = guard.t === "throttle"
+    ? splitThrottle(agentCandidates.length, devCandidates.length, SPAWN_LIMITS.burstMax)
+    // не throttle (allow/state-loss): лимита нет — slice(0, Infinity) спавнит всех
+    : { agent: Infinity, dev: Infinity }
   const peakNow = isPeakHours(new Date(), PEAK)
-  const devCandidates = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId))
-    : []
   // пик-заморозка не-high: спавн откладывается до конца окна (выполняющиеся
   // ходы сессий доигрывают — процессы не трогаем)
   const candidatesNow = peakNow
@@ -1853,18 +1864,26 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     priority: t.priority ?? "",
   }))
   const active = activeTaskCountEx(activeEntries, { peak: peakNow })
-  const budget = cupBudget(active, CUP)
-  const devWave = queueOrder(candidatesNow).slice(0, budget)
+  const cup = cupBudget(active, CUP)
+  const devLimit = Math.min(cup, throttleSplit.dev)
+  const devWave = queueOrder(candidatesNow).slice(0, devLimit)
   const queued = candidatesNow.length - devWave.length
   if (queued > 0) {
-    const head = queueOrder(candidatesNow)[budget]?.title
+    const head = queueOrder(candidatesNow)[devLimit]?.title
     log(`очередь CUP: активных=${active}/${CUP}${peakNow ? " (пик: счёт только high)" : ""}, ждут=${queued}, голова — «${head ?? "?"}»`)
   }
   if (peakNow && devCandidates.length > candidatesNow.length) {
     const frozen = devCandidates.length - candidatesNow.length
     log(`часы пик: спавн не-high отложен (${frozen} задач(и), приоритеты medium/low/пусто — до конца окна)`)
   }
-  if (devWave.length > 0 && !drain.isStopping()) {
+  if (guard.t === "hold") {
+    counters.held = untracked.length
+    counters.heldReason = guard.reason
+  } else if (guard.t === "throttle") {
+    const agentLimit = Math.min(agentCandidates.length, throttleSplit.agent)
+    counters.held = untracked.length - devWave.length - agentLimit
+    counters.heldReason = "throttle"
+  }  if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
       try {
@@ -1882,10 +1901,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   }
 
   // карантинные спавны untracked (ревьювер/тестировщик): тоже под гардом
-  // (HOLD глушит — каскад агентских сессий так же опасен, как дев-волна)
-  const agentUntracked = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
-    : []
+  // (полный HOLD глушит — каскад агентских сессий так же опасен, как
+  // дев-волна; throttle режет до остатка burst-бюджета — пайп приоритетен,
+  // но скорость ограничена тем же рубежом)
+  const agentUntracked = guard.t === "hold"
+    ? []
+    : agentCandidates.slice(0, throttleSplit.agent)
   for (const task of agentUntracked) {
     const kind = reviewKindOf(task.status)
     // ревью-статус/«Тестирование» без state (даунтайм демона при переходе) —
