@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use uwuwu_domain::{Priority, Slot, Status, Task};
 use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, FmMutator, IssueView, TaskBoardRepo};
 
 pub struct GitHubHub {
     repo: String,
@@ -279,9 +279,13 @@ impl TaskBoardRepo for GitHubHub {
             json!({ "p": meta.project_id, "i": item, "f": field, "o": option }),
         )
         .await?;
-        self.patch_fm(number, |fields| {
-            fields.insert("status".into(), status.as_str().into());
-        })
+        let value = status.as_str().to_string();
+        self.patch_fm(
+            number,
+            Box::new(move |fields| {
+                fields.insert("status".into(), value);
+            }),
+        )
         .await
     }
 
@@ -293,9 +297,14 @@ impl TaskBoardRepo for GitHubHub {
         session: &str,
     ) -> UsecaseResult<()> {
         let _ = board;
-        self.patch_fm(number, |fields| {
-            fields.insert(slot.fm_key().into(), session.into());
-        })
+        let key = slot.fm_key().to_string();
+        let sid = session.to_string();
+        self.patch_fm(
+            number,
+            Box::new(move |fields| {
+                fields.insert(key, sid);
+            }),
+        )
         .await
     }
 
@@ -354,6 +363,99 @@ impl TaskBoardRepo for GitHubHub {
             body,
             comments,
         })
+    }
+
+    async fn create_issue(
+        &self,
+        board: &str,
+        project: &str,
+        title: &str,
+        body: &str,
+    ) -> UsecaseResult<u64> {
+        let (status, resp) = self
+            .rest(
+                reqwest::Method::POST,
+                &format!("/repos/{}/issues", self.repo),
+                Some(
+                    json!({ "title": title, "body": body, "labels": [format!("proj:{project}")] }),
+                ),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "create issue: HTTP {status}: {}",
+                trunc(&resp.to_string())
+            )));
+        }
+        let number = resp["number"].as_u64().unwrap_or_default();
+        if number == 0 {
+            return Err(UsecaseError::Board(
+                "create issue: нет номера в ответе".into(),
+            ));
+        }
+        let node_id = resp["node_id"].as_str().unwrap_or_default().to_string();
+        self.add_to_board(board, number, &node_id).await?;
+        Ok(number)
+    }
+
+    async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
+        let (status, _) = self
+            .rest(
+                reqwest::Method::PATCH,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                Some(json!({ "title": title })),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "rename #{number}: HTTP {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()> {
+        self.patch_fm(number, mutate).await
+    }
+
+    async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
+        let reason = if not_planned {
+            "not_planned"
+        } else {
+            "completed"
+        };
+        let (status, body) = self
+            .rest(
+                reqwest::Method::PATCH,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                Some(json!({ "state": "closed", "state_reason": reason })),
+            )
+            .await?;
+        let closed = status.is_success() && body["state"].as_str() == Some("closed");
+        if !closed {
+            return Err(UsecaseError::Board(format!(
+                "close #{number}: false-success PATCH (state={})",
+                body["state"]
+            )));
+        }
+        Ok(())
+    }
+
+    async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
+        let (status, resp) = self
+            .rest(
+                reqwest::Method::PATCH,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                Some(json!({ "body": body_md })),
+            )
+            .await?;
+        let applied = status.is_success() && resp["body"].as_str() == Some(body_md);
+        if !applied {
+            return Err(UsecaseError::Board(format!(
+                "replace body #{number}: не применилось (HTTP {status})"
+            )));
+        }
+        Ok(())
     }
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
@@ -425,12 +527,40 @@ impl GitHubHub {
         Ok(out)
     }
 
+    /// Добавление issue на доску + Status=Draft.
+    async fn add_to_board(&self, board: &str, number: u64, node_id: &str) -> UsecaseResult<()> {
+        let meta = self.meta_of(board).await?;
+        let mutation = r#"
+          mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){
+            item{ id } } }"#;
+        let added = self
+            .gql(mutation, json!({ "p": meta.project_id, "c": node_id }))
+            .await?;
+        let item = added["addProjectV2ItemById"]["item"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if item.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "add #{number} to board «{board}»: нет item id"
+            )));
+        }
+        if let Some(draft) = meta.options.get("Draft") {
+            let set = r#"
+              mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
+                updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
+                  value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }"#;
+            self.gql(
+                set,
+                json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": draft }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// fm-пересборка тела: PATCH с сохранением контента дословно.
-    async fn patch_fm(
-        &self,
-        number: u64,
-        mutate: impl FnOnce(&mut std::collections::BTreeMap<String, String>),
-    ) -> UsecaseResult<()> {
+    async fn patch_fm(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()> {
         let (_, body) = self
             .rest(
                 reqwest::Method::GET,
