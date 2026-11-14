@@ -11,7 +11,7 @@
 //! Write-side операции — github_task_write.rs (единый trait-impl).
 
 use super::task_store::StoreResult;
-use super::{Task, TaskBoard, TaskType};
+use super::{StoreError, Task, TaskBoard, TaskType};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
 
@@ -116,6 +116,64 @@ impl GitHubStore {
             )
             .await?,
         ))
+    }
+
+    /// Точный резолв по issue-номеру — закрытые строки включительно
+    /// (list-резолв видит только open, канон резолва ставит номер выше
+    /// substring-фоллбека). PR — отказ; не на доске (label) — громкий
+    /// отказ: substring-подмена точного номера недопустима. Ok(None) —
+    /// нет issue с таким номером (caller продолжает substring).
+    pub(super) async fn issue_by_number(
+        &self,
+        board: &TaskBoard,
+        number: &str,
+    ) -> Result<Option<Task>, StoreError> {
+        let Some(issue) = self.issue_by_number_raw(number).await? else {
+            return Ok(None);
+        };
+        if issue.get("pull_request").is_some() {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "issue #{number} — pull request, не строка доски «{}»",
+                board.project
+            )));
+        }
+        let label = self.label_of(board);
+        let on_board = issue
+            .pointer("/labels")
+            .and_then(|l| l.as_array())
+            .is_some_and(|labels| {
+                labels
+                    .iter()
+                    .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(label.as_str()))
+            });
+        if !on_board {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "issue #{number} не на доске «{}» (label {label} отсутствует)",
+                board.project
+            )));
+        }
+        Ok(Some(self.convert(&issue)))
+    }
+
+    /// Direct GET issue: Ok(None) — 404 (нет такого issue); транспортные
+    /// сбои и прочие коды — Err (404 — единственный «честный промах»).
+    async fn issue_by_number_raw(&self, number: &str) -> Result<Option<Value>, StoreError> {
+        match gh_json(
+            &["api", &format!("repos/{}/issues/{number}", self.repo)],
+            None,
+        )
+        .await
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                let text = format!("{e:#}");
+                if text.contains("404") {
+                    Ok(None)
+                } else {
+                    Err(StoreError::Other(e))
+                }
+            }
+        }
     }
 }
 
