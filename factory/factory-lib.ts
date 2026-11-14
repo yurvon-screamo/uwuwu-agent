@@ -891,7 +891,8 @@ export function reviewSpawnPrompt(
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    "3. Отчёт — одним сводным комментом в задачу (uwuwu-cli task comment, один вызов",
+    "   на раунд, не дроби находки), формат по своей методике,",
     kind === "plan"
       ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
       : [
@@ -919,7 +920,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
     `[factory] Задача ${rowId}: девелопер завершил раунд — статус снова «${status}».`,
     "",
     "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
-    "проверь устранение своих прошлых замечаний, отчёт комментом,",
+    "проверь устранение своих прошлых замечаний, отчёт одним сводным комментом,",
     "статус по вердикту " +
       (kind === "plan"
         ? "(approve → In Progress · request_changes → Design)."
@@ -949,7 +950,8 @@ export function reviewCommentsPrompt(rowId: string, comments: TaskComment[]): st
     "",
     quoted,
     "",
-    "Ответь/учти по своему протоколу ревью: ответ юзеру — uwuwu-cli task comment.",
+    "Ответь/учти по своему протоколу ревью: ответ на пачку вопросов — одним сводным",
+    "комментом (uwuwu-cli task comment), не реплаем на каждый.",
   ].join("\n")
 }
 
