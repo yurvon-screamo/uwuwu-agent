@@ -102,6 +102,21 @@ impl TickStateStore for JsonStateStore {
     }
 
     fn save(&self) -> UsecaseResult<()> {
+        // гигиена роста: dreamer_done — последние 500
+        {
+            let mut guard = self.state.lock().expect("state lock");
+            if guard.dreamer_done.len() > 500 {
+                let cut = guard.dreamer_done.len() - 500;
+                guard.dreamer_done.drain(0..cut);
+            }
+            if guard.spawns.len() > 5000 {
+                let keys: Vec<String> = guard.spawns.keys().cloned().collect();
+                let cut = guard.spawns.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawns.remove(&k);
+                }
+            }
+        }
         let raw = {
             let guard = self.state.lock().expect("state lock");
             serde_json::to_vec_pretty(&*guard)

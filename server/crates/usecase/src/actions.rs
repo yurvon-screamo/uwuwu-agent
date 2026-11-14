@@ -38,21 +38,37 @@ impl TickUseCase {
                 model: self.spawn_model.clone(),
             })
             .await?;
+        // любой сбой после создания bootstrap гасит его (нет утечки сессий)
+        let result = self
+            .spawn_stage_inner(&bootstrap, &env_repo, board, task, slot, &title)
+            .await;
+        let _ = self.sessions.delete_session(&bootstrap).await;
+        result
+    }
+
+    async fn spawn_stage_inner(
+        &self,
+        bootstrap: &str,
+        env_repo: &str,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        title: &str,
+    ) -> UsecaseResult<String> {
         self.sessions
-            .run_command(&bootstrap, "task-env", &task.number.to_string())
+            .run_command(bootstrap, "task-env", &task.number.to_string())
             .await?;
         let work = self
             .sessions
             .create_session(&SessionSpec {
-                directory: env_repo.clone(),
-                title,
+                directory: env_repo.to_string(),
+                title: title.to_string(),
                 agent: agent_of(slot).map(String::from),
                 model: self.spawn_model.clone(),
             })
             .await?;
         let prompt = spawn_prompt(board, task, slot);
         self.sessions.prompt(&work, &prompt).await?;
-        self.sessions.delete_session(&bootstrap).await?;
         tracing::info!(event = "spawn.done", number = task.number, slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
@@ -101,7 +117,12 @@ impl TickUseCase {
             }
             Liveness::Dead | Liveness::Unknown => {
                 tracing::warn!(event = "wakeup.dead_session", number = task.number,
-                    session = %session, "Stage session dead: respawn on next tick");
+                    session = %session, "Stage session dead: respawning stage");
+                // мёртвая сессия стадии → респавн (кулдаун тика страхует от шторма)
+                let fresh = self.spawn_stage(board, task, slot).await?;
+                self.board
+                    .set_session(&board.board, task.number, slot, &fresh)
+                    .await?;
                 Ok(false)
             }
         }
@@ -115,7 +136,16 @@ impl TickUseCase {
             .prs
             .probe(&board.repo, task.pr.as_deref(), task.branch.as_deref())
             .await?;
+        if state == PrState::Pending {
+            tracing::info!(
+                event = "autodone.pending",
+                number = task.number,
+                "Autodone: PR pending (mergeable/чекси считаются) — ждём следующего тика"
+            );
+            return Ok(());
+        }
         match state {
+            PrState::Pending => unreachable!("pending обработан выше"),
             PrState::Merged => self.finish_done(board, task, "PR смержен").await?,
             PrState::Missing if task.branch.is_none() => {
                 self.finish_done(board, task, "задача без PR (docs-only)")

@@ -131,7 +131,7 @@ impl WikiRepo for GitHubWiki {
             .as_str()
             .unwrap_or_default()
             .replace('\n', "");
-        let bytes = base64_decode(&b64)
+        let bytes = crate::gitwiki::base64_std(&b64)
             .ok_or_else(|| UsecaseError::Board(format!("read «{slug}»: base64")))?;
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
@@ -179,27 +179,6 @@ fn encode_path(path: &str) -> String {
     out
 }
 
-/// Минимальный base64 (стандартный алфавит, без пада-толерантности к мусору).
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(input.len() / 4 * 3);
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-    for ch in input.bytes() {
-        if ch == b'=' {
-            break;
-        }
-        let val = TABLE.iter().position(|&t| t == ch)? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,43 +187,5 @@ mod tests {
     fn encodes_spaces_and_unicode() {
         assert!(encode_path("docs/Projects/uwuwu/Домены.md").contains('%'));
         assert_eq!(encode_path("docs/a/b.md"), "docs/a/b.md");
-    }
-
-    #[test]
-    fn base64_round_trip() {
-        let text = "# Привет, вики\n\nконтент";
-        let b64 = {
-            // закодируем руками тем же алфавитом
-            let bytes = text.as_bytes();
-            let mut out = String::new();
-            for chunk in bytes.chunks(3) {
-                let b = [
-                    chunk[0],
-                    *chunk.get(1).unwrap_or(&0),
-                    *chunk.get(2).unwrap_or(&0),
-                ];
-                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-                out.push(table_char((n >> 18) & 63));
-                out.push(table_char((n >> 12) & 63));
-                out.push(if chunk.len() > 1 {
-                    table_char((n >> 6) & 63)
-                } else {
-                    '='
-                });
-                out.push(if chunk.len() > 2 {
-                    table_char(n & 63)
-                } else {
-                    '='
-                });
-            }
-            out
-        };
-        assert_eq!(base64_decode(&b64).unwrap(), text.as_bytes());
-    }
-
-    fn table_char(i: u32) -> char {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        TABLE[i as usize] as char
     }
 }

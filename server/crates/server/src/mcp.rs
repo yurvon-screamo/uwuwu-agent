@@ -44,7 +44,8 @@ async fn handle(
         Ok(v) => v,
         Err(e) => return json_error(None, -32700, &format!("parse error: {e}")),
     };
-    // batch — обрабатываем первое сообщение (клиенты шлют по одному)
+    // batch — обрабатываем только первое сообщение (задокументированное
+    // упрощение stateless-сервера; клиенты шлют по одному сообщению)
     let msg = if msg.is_array() {
         match msg.as_array().and_then(|a| a.first()) {
             Some(first) => first.clone(),

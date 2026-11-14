@@ -129,6 +129,8 @@ pub struct SessionInfo {
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.
     Missing,
+    /// GitHub считает (mergeable=null / чеки бегут): вердикт следующего тика.
+    Pending,
     Open {
         mergeable: bool,
         ci_green: bool,
