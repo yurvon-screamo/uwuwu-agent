@@ -45,8 +45,24 @@ export function plannedToMs(v: string): number | null {
  *  1110: без алиасов расписание читалось null — второй тихий скип после
  *  linkedDocId). Транзиент fm-мира: мир #264 сносит fm, attrsOf
  *  переключается на поля — алиасы умирают вместе с ним. */
+/** fm-поле из шапки тела (легаси-носитель): строки "key: value" до конца
+ *  fm-блока. Локальный — platform-hub выпилил fm-парсер в мире нативных
+ *  полей (пин «Unexpected export»), юниты паритета легаси-схемы нужны
+ *  без него. */
+function fmFieldsOf(body: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!body.startsWith("---\n")) return out
+  const end = body.indexOf("\n---\n", 4)
+  if (end === -1) return out
+  for (const line of body.slice(4, end).split("\n")) {
+    const i = line.indexOf(": ")
+    if (i !== -1) out[line.slice(0, i).trim()] = line.slice(i + 2).trim()
+  }
+  return out
+}
+
 export function issueAttrs(body: string): Record<string, string> {
-  const fields = parseFrontmatter(body).fields
+  const fields = fmFieldsOf(body)
   if (fields.schedule !== undefined) fields["custom-schedule"] = fields.schedule
   if (fields.agent !== undefined) fields["custom-agent"] = fields.agent
   return fields
@@ -68,7 +84,7 @@ export interface HubRow {
 export function issueRows(issues: GhIssue[]): HubRow[] {
   return issues.map((issue) => {
     const body = String(issue.body ?? "")
-    const { fields } = parseFrontmatter(body)
+    const fields = fmFieldsOf(body)
     const number = String(issue.number)
     const cell = (v: string) => ({ value: v })
     const planned = fields.planned ?? ""
