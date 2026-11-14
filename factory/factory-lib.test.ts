@@ -58,7 +58,11 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  splitThrottle,
   untrackedRowDecision,
+  deadSpawnVerdict,
+  deadFreshMinutesFromEnv,
+  freshnessOfRow,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
   type SpawnGuardLimits,
@@ -1816,20 +1820,49 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(verdict.text).toContain("state")
   })
 
-  test("сироты в пределах lossMax, но всего untracked > burst — hold(burst)", () => {
+  test("сироты в пределах lossMax, но всего untracked > burst — throttle: волна дозируется, не глушится", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 1, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict.t).toBe("throttle")
+    if (verdict.t !== "throttle") return
+    expect(verdict.alert).toBe("first")
+    expect(verdict.text).toContain("20")
+    expect(verdict.text).toContain("дозируется")
+    expect(verdict.text).not.toContain("перезапусти")
   })
 
-  test("чистый burst без сирот — hold(burst), alert=first", () => {
+  test("чистый burst без сирот — throttle с тем же текстом дозирования", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict).toMatchObject({ t: "throttle", alert: "first" })
+  })
+
+  test("повторный тик throttle-эпизода в пределах окна повтора — alert=none", () => {
+    // Arrange: алерт был 10 минут назад (окно — час)
+    const signaled = new Date(GUARD_NOW - 10 * 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "none" })
+  })
+
+  test("длящийся throttle дольше окна повтора — alert=repeat", () => {
+    // Arrange: алерт был 2 часа назад (волна не дренажируется — признак аномалии)
+    const signaled = new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "repeat" })
   })
 
   test("повторный тик эпизода в пределах окна повтора — alert=none", () => {
@@ -1884,7 +1917,44 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(spawnGuardVerdict({ orphaned: 3, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS))
       .toMatchObject({ t: "hold", reason: "state-loss" })
     expect(spawnGuardVerdict({ orphaned: 0, totalUntracked: 13, now: GUARD_NOW }, GUARD_LIMITS))
-      .toMatchObject({ t: "hold", reason: "burst" })
+      .toMatchObject({ t: "throttle" })
+  })
+
+  test("пин задачи 1109: волна 21 при пороге 12 дренажируется сама за два тика, без env-рестарта", () => {
+    // Arrange: CUP в симуляции не моделируется — дев-бюджет тика считается по burstMax;
+    // прод-волна при дефолтном CUP=7 доедет за 3 тика.
+    // Act: тик 1 — волна входит, вердикт разрешает дозированный спавн
+    const tick1 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 21, now: GUARD_NOW }, GUARD_LIMITS)
+    const budget1 = splitThrottle(0, 21, GUARD_LIMITS.burstMax)
+
+    // Assert: тик 1 — throttle, дев-волна получает burstMax
+    expect(tick1).toMatchObject({ t: "throttle", alert: "first" })
+    expect(budget1).toEqual({ agent: 0, dev: 12 })
+
+    // Act: тик 2 — 12 строк заспавнены и трекнуты, untracked = 9
+    const tick2 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 9, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert: порог больше не превышен — allow доезжает остаток
+    expect(tick2).toEqual({ t: "allow" })
+  })
+})
+
+describe("splitThrottle: burst-бюджет спавнов на тик (карантинные — приоритет пайпа)", () => {
+  test("все кандидаты влезают в лимит — никого не режем", () => {
+    // Act / Assert
+    expect(splitThrottle(2, 5, 12)).toEqual({ agent: 2, dev: 5 })
+    expect(splitThrottle(0, 12, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("волна больше лимита — карантинные спавны первыми, дев-волна — остаток", () => {
+    // Act / Assert
+    expect(splitThrottle(3, 15, 12)).toEqual({ agent: 3, dev: 9 })
+    expect(splitThrottle(0, 21, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("карантинных больше лимита — дев не достаётся ничего (пайп не виснет)", () => {
+    // Act / Assert
+    expect(splitThrottle(14, 10, 12)).toEqual({ agent: 12, dev: 0 })
   })
 })
 
@@ -2015,6 +2085,106 @@ describe("untrackedRowDecision: вердикт untracked строки (матр�
 
   test("мёртвый claim с ревью-свидетельством — сирота (любое свидетельство)", () => {
     expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("dead-проба + свежий БД-след — инстанс 317 (1072): ложный dead, ни спавна, ни сироты", () => {
+    // serve при деградации лжёт 404 при живом ходе: гард не спавнит дубль
+    // и не кормит HOLD-гард каскада orphan-счётом
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("dead-проба + stale БД-след — dead настоящий: прежнее поведение (сирота в дев-волне)", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "stale"))
+      .toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "unknown"))
+      .toEqual({ devWave: true, orphan: true })
+  })
+
+  test("directory-ключ при легитимно пустой клетке (инстанс #315): работа в env идёт — ни спавна, ни сироты", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell(undefined, undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("карантинная ревью-строка с пустой дев-клеткой и свежей directory-сессией — orphan подавлен (1072, ревью-рекомендация)", () => {
+    // ревью-свидетельство без трека — сирота как прежде, но живая работа
+    // в env задачи (directory-ключ) сильнее свидетельства: спавн дубля
+    // держателя поверх живого хода недопустим
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell("", "", "ses_test01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("пустая клетка + stale след — прежнее поведение (спавн обычного пути, сирота по свидетельству)", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "stale")).toEqual({ devWave: true, orphan: false })
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "stale")).toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "unknown")).toEqual({ devWave: true, orphan: false })
+  })
+})
+
+describe("deadSpawnVerdict: вердикт спавна при dead-пробе (1072, вход-инвариант: только dead-ветка)", () => {
+  test("fresh — пробе не верим: skip", () => {
+    expect(deadSpawnVerdict("fresh")).toBe("skip")
+  })
+
+  test("stale — dead настоящий: spawn", () => {
+    expect(deadSpawnVerdict("stale")).toBe("spawn")
+  })
+
+  test("unknown — БД-след недоступен: деградация к прежнему поведению (spawn, never worse)", () => {
+    expect(deadSpawnVerdict("unknown")).toBe("spawn")
+  })
+})
+
+describe("deadFreshMinutesFromEnv: окно гарда из env (1072, ревью: пустая строка — не тихий выкл)", () => {
+  test("пустая строка/undefined/whitespace — дефолт 30, не 0", () => {
+    expect(deadFreshMinutesFromEnv(undefined)).toBe(30)
+    expect(deadFreshMinutesFromEnv("")).toBe(30)
+    expect(deadFreshMinutesFromEnv("   ")).toBe(30)
+  })
+
+  test("мусор/отрицательное — дефолт 30", () => {
+    expect(deadFreshMinutesFromEnv("30м")).toBe(30)
+    expect(deadFreshMinutesFromEnv("abc")).toBe(30)
+    expect(deadFreshMinutesFromEnv("-5")).toBe(30)
+  })
+
+  test("конечное число ≥ 0 — оно (0 — осознанное выключение гарда)", () => {
+    expect(deadFreshMinutesFromEnv("0")).toBe(0)
+    expect(deadFreshMinutesFromEnv("45")).toBe(45)
+    expect(deadFreshMinutesFromEnv("7.5")).toBe(7.5)
+  })
+})
+
+describe("freshnessOfRow: свежесть строки session_v2 против окна гарда (1072)", () => {
+  const now = 1_000_000_000_000
+  const windowMs = 30 * 60_000
+
+  test("окно 0 — гард выключен: stale без чтения строки", () => {
+    expect(freshnessOfRow({ timeUpdated: now }, now, 0)).toBe("stale")
+    expect(freshnessOfRow(null, now, 0)).toBe("stale")
+  })
+
+  test("строки нет в БД — stale", () => {
+    expect(freshnessOfRow(null, now, windowMs)).toBe("stale")
+  })
+
+  test("обновлялась в окне — fresh (активный ход пишет session_v2 суб-минутно)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - 60_000 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+  })
+
+  test("след старее окна — stale (честно мёртвая сессия без посторонних касаний)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
+    expect(freshnessOfRow({ timeUpdated: now - 9 * 3600_000 }, now, windowMs)).toBe("stale")
+  })
+
+  test("граница окна: свежее — fresh, ровно окно — stale (интервал полуоткрытый)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
   })
 })
 
