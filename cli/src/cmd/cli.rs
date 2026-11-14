@@ -71,7 +71,7 @@ pub(crate) enum TaskSub {
         #[arg(
             long = "attach",
             value_name = "FILE",
-            help = "Аттач в тело (repeatable)"
+            help = "Аттач в тело (на hub не портирован — отказ)"
         )]
         attach: Vec<std::path::PathBuf>,
         /// Расписание крона: атрибут custom-schedule в доке-теле; демона
@@ -258,8 +258,10 @@ pub(crate) enum TaskSub {
     /// пустой (```html_embed имя без тела) — удаляет её,
     /// анонимный — вставляет html инлайн. Отказ до мутации: дубль
     /// имени фенса в вводе, пустая строка внутри html-тела.
-    /// --attach (repeatable) грузит файлы в assets/ и дописывает референсы
-    /// после контент-операции; вызов с одними аттачами (без --stdin/--md) валиден.
+    /// --attach и --replace-section на hub не реализованы: вызов с ними
+    /// громко отказывает до резолва строки и мутации. Ассеты — вручную:
+    /// файл в assets/ репо uwuwu-hub, raw-ссылка — в контенте входа;
+    /// секция — правка тела целиком (--replace со снапшотом --base/--force).
     /// Вход — контент тела, не обёртка task get: шапка «Задача:/Статус:/
     /// Строка:…» во входе — отказ (детектор «Задача:» первой строкой).
     /// fm-шапка во входе — легитимный контент (мета задач живёт в глобальных
@@ -297,7 +299,7 @@ pub(crate) enum TaskSub {
             long,
             value_name = "SNAPSHOT",
             requires = "replace",
-            conflicts_with_all = ["replace_section", "force"]
+            conflicts_with_all = ["force"]
         )]
         base: Option<String>,
         /// Осознанный overwrite для --replace: пишет без сверки свежести
@@ -306,25 +308,18 @@ pub(crate) enum TaskSub {
         #[arg(
             long,
             requires = "replace",
-            conflicts_with_all = ["replace_section", "base"]
+            conflicts_with_all = ["base"]
         )]
         force: bool,
-        /// Заменить содержимое секции по заголовку («Решение» или «## Решение»):
-        /// блоки секции удаляются, новый markdown встаёт на их месте,
-        /// заголовок и аттачи/эмбеды вне секции не трогаются. Markdown — БЕЗ
-        /// строки заголовка; пустой ввод очищает секцию. Матч только ##:
-        /// ATX-префикс запроса срезается («## Решение» = «Решение»), тёзка
-        /// на уровне 1/≥3 (учёт двойных пробелов и ^block-id) — отказ
-        /// вместо тихого append-дубля в конец. html_embed-фенс в секции с
-        /// именем, уже живущим вне секции, даст два одинаковых маркера
-        /// ⁂ diagram:<имя> — последующий append адресует первый по порядку
-        /// (секция не ищет по всему доку).
-        #[arg(long, value_name = "HEADING", conflicts_with = "replace")]
+        /// Hub-бекенд: секционная хирургия не поддерживается — вызов громко
+        /// отказывает до резолва строки и чтения входа. Правь тело целиком:
+        /// task get → правка → --replace со снапшотом --base (или --force).
+        #[arg(long, value_name = "HEADING")]
         replace_section: Option<String>,
         #[arg(
             long = "attach",
             value_name = "FILE",
-            help = "Аттач в конец тела (repeatable)"
+            help = "Аттач файла — на hub не портирован (громкий отказ)"
         )]
         attach: Vec<std::path::PathBuf>,
     },

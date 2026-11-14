@@ -255,6 +255,10 @@ fn person_replace_md_inline_text_bails_at_process_level() {
 /// до адресации — отказ «задача не найдена» доказывает, что гвард пропустил
 /// (не подсказка, не FS-ошибка). Один файл на все три роли: гварды смотрят
 /// форму входа, не содержимое.
+///
+/// Исключение — `--attach`: после task-1076 валидный путь не доходит до
+/// адресации — флаг громко отказывает ДО резолва (unsupported раньше
+/// resolve). Проверяется отдельным тестом ниже.
 #[test]
 fn valid_paths_reach_task_resolution_on_live_kernel() {
     if !e2e_enabled() {
@@ -264,41 +268,29 @@ fn valid_paths_reach_task_resolution_on_live_kernel() {
     std::fs::write(&tmp, "контент тела\n").unwrap();
     let path = tmp.to_string_lossy().into_owned();
 
-    let cases: [(&str, Vec<&str>); 2] = [
-        (
-            "--md + --base (replace)",
-            vec![
-                "task",
-                "body",
-                "nosuchtask-zzz",
-                "--project",
-                "uwuwu",
-                "--replace",
-                "--md",
-                path.as_str(),
-                "--base",
-                path.as_str(),
-            ],
-        ),
-        (
-            "--attach",
-            vec![
-                "task",
-                "body",
-                "nosuchtask-zzz",
-                "--project",
-                "uwuwu",
-                "--attach",
-                path.as_str(),
-            ],
-        ),
-    ];
+    let cases: [(&str, Vec<&str>); 1] = [(
+        "--md + --base (replace)",
+        vec![
+            "task",
+            "body",
+            "nosuchtask-zzz",
+            "--project",
+            "uwuwu",
+            "--replace",
+            "--md",
+            path.as_str(),
+            "--base",
+            path.as_str(),
+        ],
+    )];
 
     for (what, args) in &cases {
         let (code, _, stderr) = run_live(args);
         assert_eq!(code, Some(1), "{what}: stderr={stderr}");
         assert!(
-            stderr.contains("не найдена"),
+            // «не найден» без флексии рода: живой текст резолва менялся
+            // («не найдена» → «не найдено») — пин на корень, не на флексию
+            stderr.contains("не найден"),
             "{what}: гвард пропустил валидный путь — отказ от адресации, не от гварда: {stderr}"
         );
         assert!(
@@ -306,5 +298,41 @@ fn valid_paths_reach_task_resolution_on_live_kernel() {
             "{what}: гвард ложно сработал на валидном пути: {stderr}"
         );
     }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Гейтнутый (живое ядро, read-only): валидный путь в `--attach` проходит
+/// path_flag, но не доходит до адресации — task-1076: флаг громко отказывает
+/// ДО резолва с рецептом assets/.
+#[test]
+fn valid_attach_path_refuses_before_resolution_on_live_kernel() {
+    if !e2e_enabled() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join("uwuwu-path-guard-attach.png");
+    std::fs::write(&tmp, b"png-bytes").unwrap();
+    let path = tmp.to_string_lossy().into_owned();
+    let (code, _, stderr) = run_live(&[
+        "task",
+        "body",
+        "nosuchtask-zzz",
+        "--project",
+        "uwuwu",
+        "--attach",
+        path.as_str(),
+    ]);
+    assert_eq!(code, Some(1), "attach — отказ: {stderr}");
+    assert!(
+        stderr.contains("не портирован") && stderr.contains("assets/"),
+        "отказ с рецептом assets/, не адресация: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ждёт путь к файлу"),
+        "гвард ложно сработал на валидном пути: {stderr}"
+    );
+    assert!(
+        !stderr.contains("не найдена"),
+        "отказ ДО резолва — до адресации не дошло: {stderr}"
+    );
     let _ = std::fs::remove_file(&tmp);
 }

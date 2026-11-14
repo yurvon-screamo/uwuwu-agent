@@ -13,8 +13,11 @@
 //!    labels (422), печатал тело ошибки как данные и завершался 0.
 //! B. `task body --stdin` (append) — тело дописано PATCH'ем как контент;
 //!    fm-шапка не появляется (мета в md не живёт — ADR-098).
-//! C. `task body --replace --replace-section` — громкий отказ ДО мутации.
-//! D. `task body --attach` — вывод честно называет assets/ (не портирован).
+//! C. `task body --replace-section` — громкий отказ ДО мутации: комбо с
+//!    --replace (clap-конфликты снесены — доезжает до runtime-гварда) и
+//!    сольные вызовы (регресс тихого append'а/read'а, инстанс 1091);
+//!    текст отказа шарит формулировку help.
+//! D. `task body --attach` — громкий отказ до мутации, рецепт assets/.
 //! E. Гвард входа: обёртка `task get` — отказ; fm-шапка во входе — легитимный
 //!    контент (карточки больше нет, задача 1087).
 //! F. `task body --replace` — тело записано ДОСЛОВНО входом (без fm-переноса
@@ -284,8 +287,9 @@ fn body_appends_content_without_frontmatter() {
     assert!(!written.contains("status:"), "fm-карточка не возникает");
 }
 
-/// C. `--replace --replace-section` — не мутит тело: комбинация отсекается
-/// (громкий отказ ДО мутации).
+/// C. `--replace --replace-section` — не мутит тело: runtime-гвард отказывает
+/// ДО мутации (clap-конфликты снесены — комбо доезжает до гварда), текст
+/// шарит формулировку help.
 #[test]
 fn replace_with_section_flag_cannot_silently_overwrite_body() {
     let guards = setup_stub_gh();
@@ -314,20 +318,87 @@ fn replace_with_section_flag_cannot_silently_overwrite_body() {
         "отказ называет флаг: {stderr}"
     );
     assert!(
+        stderr.contains("не поддерживается"),
+        "фраза help в отказе: {stderr}"
+    );
+    assert!(
         patch_body(&guards).is_none(),
         "отказ ДО мутации: тело не перезаписано"
     );
 }
 
-/// D. `--attach` не теряется молча: вывод называет assets/.
+/// C2. `--replace-section` без `--replace` — отказ, не тихий append
+/// (инстанс 1091: вход молча дописывался в конец тела, exit 0).
 #[test]
-fn attach_call_names_assets_in_output() {
+fn replace_section_without_replace_refuses_instead_of_silent_append() {
+    let guards = setup_stub_gh();
+    let md = guards.0.path().join("sec.md");
+    std::fs::write(&md, "содержимое секции\n").expect("sec.md");
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace-section",
+            "Решение",
+            "--md",
+            md.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(1), "сольный вызов — отказ: {stderr}");
+    assert!(
+        stderr.contains("не поддерживается"),
+        "фраза help в отказе: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "тихого append'а нет: тело не перезаписано"
+    );
+}
+
+/// C3. `--replace-section` без stdin/--md — отказ, не тихий read
+/// (флаг не игнорируется молча).
+#[test]
+fn replace_section_without_input_refuses_instead_of_silent_read() {
+    let guards = setup_stub_gh();
+    let (code, stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace-section",
+            "Решение",
+        ],
+    );
+    assert_eq!(code, Some(1), "вызов без входа — отказ: {stderr}");
+    assert!(
+        stderr.contains("не поддерживается"),
+        "фраза help в отказе: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "тихого read'а нет: тело не печатается как успех: {stdout}"
+    );
+}
+
+/// D. `--attach` — громкий отказ до мутации: rc=1, текст называет assets/
+/// (рецепт ручной загрузки), PATCH тела нет.
+#[test]
+fn attach_call_refuses_and_names_assets() {
     let guards = setup_stub_gh();
     let md = guards.0.path().join("content.md");
     std::fs::write(&md, "новое тело\n").expect("content.md");
     let file = guards.0.path().join("shot.png");
     std::fs::write(&file, b"png-bytes").expect("attach file");
-    let (code, stdout, stderr) = run_stub(
+    let (code, _stdout, stderr) = run_stub(
         &guards,
         None,
         &[
@@ -344,11 +415,14 @@ fn attach_call_names_assets_in_output() {
             file.to_str().unwrap(),
         ],
     );
-    assert_eq!(code, Some(0), "replace успешен: {stderr}");
-    let said = format!("{stdout}{stderr}");
+    assert_eq!(code, Some(1), "attach — громкий отказ: {stderr}");
     assert!(
-        said.contains("assets/"),
-        "вывод обязан честно сказать про assets/ (подсказка или загрузка): {said}"
+        stderr.contains("не портирован") && stderr.contains("assets/"),
+        "отказ честен и называет рецепт assets/: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "отказ ДО мутации: тело не перезаписано"
     );
 }
 

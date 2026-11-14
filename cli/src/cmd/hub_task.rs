@@ -302,6 +302,22 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             for path in &attach {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
+            // hub-контракт (формулировки шарят help): секционная хирургия
+            // и аттач не реализованы — громкий отказ до резолва/входа/сети,
+            // без тихих деградаций в append/read-ветки (инстанс 1091)
+            if let Some(section) = &replace_section {
+                bail!(
+                    "task body --replace-section «{section}»: на hub-бекенде секционная \
+                     хирургия не поддерживается — правь тело целиком (--replace с --base/--force)"
+                );
+            }
+            if let Some(file) = attach.first() {
+                bail!(
+                    "task body --attach {}: на hub не портирован (файлы не загружены) — \
+                     положи его в assets/ репо uwuwu-hub и вставь raw-ссылку в тело",
+                    file.display()
+                );
+            }
             let task = store
                 .resolve(&board, &id)
                 .await
@@ -337,21 +353,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                             None => String::new(),
                         }
                     };
-                    if let Some(section) = &replace_section {
-                        bail!(
-                            "task body --replace-section «{section}»: на hub-бекенде секционная \
-                             хирургия не поддерживается — правь body (--replace/--force) целиком"
-                        );
-                    }
                     store.body_replace(&board, &task, &md, &base_md).await?;
-                    if !attach.is_empty() {
-                        // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL
-                        // руками в теле) — загрузка через cli не портирована
-                        println!(
-                            "⚠ --attach на hub не портирован: файлы не загружены — \
-                             положи в assets/ репо uwuwu-hub и вставь raw-ссылки"
-                        );
-                    }
                     println!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
