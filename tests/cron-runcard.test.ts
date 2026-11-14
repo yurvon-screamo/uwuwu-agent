@@ -12,6 +12,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 process.env.UWUWU_CLI_BIN = "uwuwu-cli-test-mock"
 
 const cron = await import("../cron/cron")
+const cronlib = await import("../cron/cron-lib")
 
 interface SpawnCall {
   argv: string[]
@@ -116,5 +117,40 @@ describe("createRunCard: позитивный путь", () => {
     const rowId = await cron.createRunCard("uwuwu", "⏰ X", "тело", new Date(2026, 10, 7, 9, 30))
     expect(rowId).toBeNull()
     expect(calls.length).toBe(1)
+  })
+
+  test("hub-формат stdout create («создана: issue #N») — rowId = номер issue, edit идёт по нему", async () => {
+    const { calls } = scriptSpawn([
+      { stdout: "создана: issue #912 «⏰ QA · 2026-11-14 02:30:00» (Todo)\n" },
+      { stdout: "изменена: issue #912 «⏰ QA · 2026-11-14 02:30:00»\n" },
+    ])
+
+    const rowId = await cron.createRunCard("true-washing", "⏰ QA · 2026-11-14 02:30:00", "тело", new Date(2026, 10, 14, 2, 30))
+    expect(rowId).toBe("912")
+    expect(calls.length).toBe(2)
+    const [, editCall] = calls
+    expect(editCall?.argv.slice(1)).toEqual([
+      "task", "edit", "912", "--project", "true-washing", "--type", "", "--planned", "2026-11-14 02:30",
+    ])
+  })
+})
+
+describe("runRowIdFromCreateOutput: контракты форматов stdout", () => {
+  const parse = cronlib.runRowIdFromCreateOutput
+  test("hub create → номер issue", () => {
+    expect(parse("создана: issue #912 «X» (Todo)\n")).toBe("912")
+  })
+  test("легаси create → «Строка: <rowId>» шапки", () => {
+    expect(parse("Задача:   X\nСтатус:   Todo\nСтрока:   20261107090000-run001\n")).toBe("20261107090000-run001")
+  })
+  test("get-форма «Строка: issue #N» — не create-контракт, null (не минтить «issue» как id)", () => {
+    expect(parse("Задача:   X\nСтрока:   issue #384\n")).toBeNull()
+  })
+  test("нераспознанный вывод → null", () => {
+    expect(parse("")).toBeNull()
+    expect(parse("какой-то дрейф формата\n")).toBeNull()
+  })
+  test("hub-формат приоритетен над легаси-веткой", () => {
+    expect(parse("создана: issue #5 «Y» (Todo)\nСтрока:   20261107090000-run001\n")).toBe("5")
   })
 })

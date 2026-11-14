@@ -8,7 +8,7 @@
 import { toTelegramHTML, splitMessage } from "md-to-telegram"
 import { hostname } from "node:os"
 import { mcpConfigured, tool as mcpTool } from "../lib/platform"
-import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
+import { startPinned } from "../lib/node-pinning"
 import {
   createHub, type Hub, type HubFinalHook, type HubProfile, type HubSource, type DraftRef, type DraftVerdict,
   type Request,
@@ -324,13 +324,13 @@ const profile: HubProfile = {
   sources: [draftWatcher],
   beforeLoops: async (hub) => {
     // пиннинг за нодами (ADR-076): триаж — singleton-класс, второй экземпляр
-    // валидировал бы черновики дважды; строка «triage: нода» в доке — контракт
-    const pinning = await checkNodePinning(mcpTool, {
+    // валидировал бы черновики дважды; строка «triage: нода» в доке — контракт.
+    // Недоступный док — ретрай с бэкоффом внутри startPinned (инцидент 13–14.11)
+    const pinning = await startPinned(mcpTool, {
       singletonDaemon: "triage",
       envNodeName: process.env.UWUWU_NODE_NAME,
       hostname: hostname(),
-    })
-    failPinnedStart(pinning)
+    }, { log: hub.log })
     hub.log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   },
   onFinal: triageFinalHook,

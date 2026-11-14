@@ -46,6 +46,39 @@ impl GitHubStore {
         Self { repo }
     }
 
+    /// Issue по номеру без проекта (глобальная адресация id-команд): прямой
+    /// GET + гвард «это задачная строка» (label proj:*, не PR). Сбой сети/404
+    /// → None (вызывающий падает в обычный list-путь с его честной ошибкой).
+    /// Status — точечный Pv2-джойн (паритет list-канона ADR-098; канбана нет
+    /// → Todo-дефолт convert'а).
+    pub(super) async fn global_by_number(&self, number: &str) -> StoreResult<Option<Task>> {
+        let Ok(data) = gh_json(
+            &["api", &format!("repos/{}/issues/{number}", self.repo)],
+            None,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        if data.get("pull_request").is_some() {
+            return Ok(None);
+        }
+        let is_task = data["labels"]
+            .as_array()
+            .map(|ls| {
+                ls.iter()
+                    .any(|l| l["name"].as_str().unwrap_or("").starts_with("proj:"))
+            })
+            .unwrap_or(false);
+        if !is_task {
+            return Ok(None);
+        }
+        let pv2 = super::github_project_resolve::project_status_of(self, number)
+            .await
+            .unwrap_or(None);
+        Ok(Some(self.convert(&data, pv2.as_deref())))
+    }
+
     pub(super) fn label_of(&self, board: &TaskBoard) -> String {
         format!("proj:{}", board.project)
     }

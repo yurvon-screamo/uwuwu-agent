@@ -16,12 +16,13 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, r
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import * as mcp from "../lib/platform"
-import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
+import { startPinned } from "../lib/node-pinning"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import { compactProbe, compactTick, sessionCompact, type CompactPolicy } from "../lib/compact"
 import {
   due, fireGate, isOneShot, isValidTracked, cellPatches, formatLocal, parseSchedule, firePrompt, resolveBody, titleFromBody,
   stripNonContent, decideFire, agentDriftAction, resolveAgentIssue, parseAgentDefModel, runLandedAt, agentFirePrompt,
+  runRowIdFromCreateOutput, parsePlannedCellMs,
   runCardTitle, SESSION_TITLE_MAX, truncateCodePoints,
   type PlatformTool,
   type AgentModel, type CronRow, type CronState, type Sched, type SessionMsg, type TrackedCron,
@@ -245,7 +246,7 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
       title: (row.title ?? row.cells?.Название?.value ?? "").trim(),
       schedule: "",
       agent: "",
-      plannedMs: row.cells?.Запланировано?.dateMs ?? null,
+      plannedMs: parsePlannedCellMs(row.cells?.Запланировано),
       scheduleCell: row.cells?.Расписание?.value ?? "",
       status: (row.cells?.Status?.value ?? "").toLowerCase(),
     }))
@@ -481,9 +482,10 @@ export async function createRunCard(project: string, runTitle: string, bodyMd: s
     log(`task create упал (code ${code}): ${err.trim().slice(0, 200)}`)
     return null
   }
-  // контракта ответов (PR #226): create печатает шапку карточки — rowId в строке «Строка:   <id>»
-  const rowId = /Строка:\s+(\S+)/.exec(out)?.[1]
-  if (rowId === undefined) {
+  // контракт ответов: hub — «создана: issue #NNN …», легаси — «Строка: <id>»
+  // шапки get-формы; разбор — чистая runRowIdFromCreateOutput (cron-lib)
+  const rowId = runRowIdFromCreateOutput(out)
+  if (rowId === null) {
     log(`task create без строки в выводе: ${out.trim().slice(0, 200)}`)
     return null
   }
@@ -978,13 +980,13 @@ async function main(): Promise<void> {
   mkdirSync(WORKSPACE, { recursive: true })
   await mcp.connect()
   // пиннинг за нодами (ADR-076): крон — singleton-класс, второй экземпляр
-  // файрил бы кроны дважды; строка «cron: нода» в доке — контракт
-  const pinning = await checkNodePinning(mcp.tool, {
+  // файрил бы кроны дважды; строка «cron: нода» в доке — контракт.
+  // Недоступный док — ретрай с бэкоффом внутри startPinned (инцидент 13–14.11)
+  const pinning = await startPinned(mcp.tool, {
     singletonDaemon: "cron",
     envNodeName: process.env.UWUWU_NODE_NAME,
     hostname: hostname(),
-  })
-  failPinnedStart(pinning)
+  }, { log })
   log(`пиннинг: нода ${pinning.nodeName} подтверждена`)
   log(`uwuwu-cron: старт (задачные доски «Задачи <proj>», гейт Вейт, tick=${TICK_SEC}s, model=${MODEL.id}${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   // громкое замечание резолюции state — в лог и stderr (journald)
