@@ -117,6 +117,20 @@ impl GitHubStore {
             .await?,
         ))
     }
+
+    /// Сырой state issue (verify-after-write close: сверяется напрямую,
+    /// без fm-проекций convert — closed может прятаться за fm-статусом).
+    pub(super) async fn issue_state(&self, number: &str) -> StoreResult<String> {
+        Ok(gh_json(
+            &["api", &format!("repos/{}/issues/{number}", self.repo)],
+            None,
+        )
+        .await?
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string())
+    }
 }
 
 /// Публичный доступ к frontmatter-полям тела (cron list и пр.).
