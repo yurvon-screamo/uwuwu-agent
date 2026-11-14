@@ -90,6 +90,7 @@ export async function hubTool<T = Record<string, unknown>>(
       const rows = issues.map((issue) => {
         const f = fieldsOf(issue)
         const cell = (v: string) => ({ value: v, ...(v !== "" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? { dateMs: dateToMs(v) } : {}) })
+        const number = String(issue.number)
         // проекция state: закрытый issue = Done независимо от карточки
         const status = issue.state === "closed"
           ? "Done"

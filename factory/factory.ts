@@ -133,8 +133,6 @@ import {
   type PrProbeState,
 } from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
-import { autodoneCellValue } from "../lib/platform-hub-tools"
-import { parseFrontmatter } from "../lib/platform-hub"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, envPaths, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 import { fetchSessionById, fetchLatestSessionByDirectory } from "../lib/session-row"
@@ -1562,12 +1560,20 @@ async function runAutodoneTick(
  *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
  *  гейт карантин-петли читает то же скан-поле; fm-экспорт всех строк доски
  *  каждый тик — реальная цена, не платим. */
+/** fm-поле из шапки тела задачи (первый --- блок): легаси-носитель autodone
+ *  до полного переезда на нативные issue-поля (#1087). */
+function fmAutodoneOf(md: string): boolean {
+  const head = md.startsWith("---") ? md.slice(0, Math.max(md.indexOf("\n---", 3), 0) + 5) : ""
+  const m = head.match(/^autodone:[ \t]*(\S+)/m)
+  const raw = (m?.[1] ?? "").toLowerCase()
+  return raw === "on" || raw === "true" || raw === "✓".toLowerCase()
+}
+
 async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
   const rowId = row.rowId
   const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
   const bodyKnown = md !== null && md !== ""
-  const fmAutodone =
-    md !== null && md !== "" && autodoneCellValue(parseFrontmatter(md).fields.autodone) === "true"
+  const fmAutodone = md !== null && md !== "" && fmAutodoneOf(md)
   const act = autodoneWatchdog(
     {
       inReview: row.status === USER_REVIEW_STATUS,
