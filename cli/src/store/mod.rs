@@ -8,15 +8,20 @@ pub mod github_doc_guards;
 pub mod github_doc_clone;
 pub mod github_doc_search;
 pub mod github_doc_store;
+mod github_doc_sync;
 pub mod github_doc_write;
 pub mod github_gh;
+pub mod github_issue_fields;
 pub mod github_project;
 pub mod github_project_resolve;
 pub mod github_task;
 pub mod github_task_read;
 pub mod github_task_write;
 pub mod git_util;
+pub mod task_migrate;
 pub mod task_store;
+
+mod github_doc_lock;
 
 #[cfg(test)]
 mod store_tests;
@@ -24,6 +29,10 @@ mod store_tests;
 mod github_doc_clone_tests;
 #[cfg(test)]
 pub(crate) mod github_doc_rig;
+#[cfg(test)]
+mod github_doc_clone_sync_tests;
+#[cfg(test)]
+mod github_gh_tests;
 #[cfg(test)]
 mod github_doc_write_tests;
 
@@ -75,7 +84,8 @@ pub struct Task {
     pub schedule_cell: String,
     /// Приоритет (канон CUP-очереди: high/medium/low, "" — не задан).
     pub priority: String,
-    /// Autodone: галочка автомержа PR при входе в Review.
+    /// Autodone: автомерж PR при входе в Review (Pv2-поле select
+    /// on/off, не галочка).
     pub autodone: bool,
 }
 

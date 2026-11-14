@@ -16,9 +16,14 @@ pub struct CreateTask {
     pub body_md: Option<String>,
     /// Аттачи: (путь, альт-текст) — медиа в md-референсы тела.
     pub attachments: Vec<(std::path::PathBuf, String)>,
-    /// Приоритет (канон CUP); None — не задан.
+    /// Приоритет (канон CUP); None — не задан (create write-path
+    /// подставит дефолт medium — решение владельца 13.11).
     pub priority: Option<String>,
-    /// Autodone-галочка (владелец решает; триаж не ставит).
+    /// Autodone: автомерж PR при входе в Review (Pv2-поле select
+    /// on/off); None — не задан (create write-path подставит дефолт
+    /// true, если во fm тела нет авторского — валовое решение
+    /// владельца 14.11: автодон у всех create, вкл. триаж и
+    /// крон-раны; `off` — точечный отказ).
     pub autodone: Option<bool>,
 }
 

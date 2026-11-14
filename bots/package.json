@@ -1,0 +1,18 @@
+{
+  "name": "uwuwu-bots",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "md-to-telegram": "^0.1.1"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.4",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "katex": "^0.18.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

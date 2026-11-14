@@ -4,8 +4,12 @@
 
 pub(crate) mod cli;
 pub(crate) mod hub_docs;
+pub(crate) mod hub_lists;
 pub(crate) mod hub_task;
 pub(crate) mod run;
+
+#[cfg(test)]
+mod parser_tests;
 
 use anyhow::Result;
 use clap::Parser as _;

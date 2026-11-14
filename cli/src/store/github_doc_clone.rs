@@ -1,84 +1,34 @@
-//! Клон-менеджмент GitHub DocStore: ленивый clone/fetch, ff-only write
-//! (commit+push, retry после rebase — контракт записи вики).
+//! Write-путь клон-менеджмента: commit + push ff-only под flock-локом
+//! (нулевое окно commit→push для cli-писателей), атомарная запись файлов.
+//! Sync-семантика (ensure_clone) — github_doc_sync.rs; лок —
+//! github_doc_lock.rs.
 
-use super::git_util::{git_raw, git_sync_with_author};
-use anyhow::{bail, Result};
-use std::path::PathBuf;
+use super::git_util::{git, git_raw, git_sync_with_author};
+use super::github_doc_lock::clone_lock;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 impl super::github_doc_store::GitHubDocStore {
-    pub(crate) async fn ensure_clone(&self) -> Result<()> {
-        if !self.clone_root.join(".git").exists() {
-            std::fs::create_dir_all(&self.clone_root)?;
-            let url = format!("https://github.com/{}.git", self.repo);
-            // Каталог может быть не пуст (мигратор выгрузил docs до клона) —
-            // init + remote + fetch + checkout -f поверх существующих файлов
-            git(&["-C", self.clone_root_str(), "init", "-q"]).await?;
-            git(&["-C", self.clone_root_str(), "remote", "add", "origin", &url]).await?;
-            git(&[
-                "-C",
-                self.clone_root_str(),
-                "fetch",
-                "--depth",
-                "1",
-                "origin",
-            ])
-            .await?;
-            git(&[
-                "-C",
-                self.clone_root_str(),
-                "checkout",
-                "-f",
-                "-B",
-                "main",
-                "origin/main",
-            ])
-            .await?;
-            return Ok(());
-        }
-        // fetch + ff reset; dirty worktree — отказ
-        if git_status_dirty(self.clone_root_str()).await? {
-            bail!(
-                "git-клон {} грязный (локальные правки) — CLI-клон чужих правок не \
-                 переезжает: разбери вручную",
-                self.clone_root.display()
-            );
-        }
-        git(&[
-            "-C",
-            self.clone_root_str(),
-            "fetch",
-            "--depth",
-            "1",
-            "origin",
-        ])
-        .await?;
-        git(&[
-            "-C",
-            self.clone_root_str(),
-            "reset",
-            "--hard",
-            "origin/main",
-        ])
-        .await?;
-        Ok(())
-    }
-
-    /// Запись файлов в клон + commit + push ff-only. add — точечный по
-    /// целевым путям (чужой незакоммиченный мусор клона уехать не может —
-    /// класс инцидента b46b8fd; ensure_clone с dirty-гардом зовёт caller
-    /// ДО записи). Конфликт push (нон-фф) — fetch/rebase/retry единожды;
-    /// повторный конфликт — громкий отказ.
+    /// Запись файлов в клон + commit + push ff-only — весь сегмент под
+    /// локом: sync strict-режимом (dirty/ahead → громкий отказ) не даёт
+    /// снести чужую правку/коммит, чужой sync не вклинивается между
+    /// check и reset. Конфликт push (нон-фф) — fetch/rebase/retry
+    /// единожды; повторный конфликт — громкий отказ.
     pub(crate) async fn write_files(
         &self,
         files: &[(PathBuf, Vec<u8>)],
         deleted: &[PathBuf],
         message: &str,
     ) -> Result<()> {
+        self.prepare_clone_dir().await?;
+        let _guard = clone_lock(self.clone_root_str()).await?;
+        // Свой мусор от крэша чистим ДО гарды — иначе untracked .uwuwu-tmp
+        // валит dirty-проверку и write отказывает сам на себе.
+        cleanup_stale_tmp(Path::new(self.clone_root_str()))?;
+        self.ensure_clone_locked(super::github_doc_sync::SyncMode::Strict)
+            .await?;
         for (path, bytes) in files {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, bytes)?;
+            write_file_atomic(path, bytes)?;
         }
         for path in deleted {
             std::fs::remove_file(path)?;
@@ -100,37 +50,58 @@ impl super::github_doc_store::GitHubDocStore {
         let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
         git_raw(&add_refs).await?;
         git_c_user(&["-C", self.clone_root_str(), "commit", "-m", message])?;
-        match git_status_ok(&["-C", self.clone_root_str(), "push", "origin", "main"]).await {
+        match git(&["-C", self.clone_root_str(), "push", "origin", "main"]).await {
             Ok(()) => Ok(()),
             Err(_) => {
-                git(&[
-                    "-C",
-                    self.clone_root_str(),
-                    "fetch",
-                    "--depth",
-                    "1",
-                    "origin",
-                ])
-                .await?;
+                self.fetch_shallow().await?;
                 git(&["-C", self.clone_root_str(), "rebase", "origin/main"]).await?;
-                git_status_ok(&["-C", self.clone_root_str(), "push", "origin", "main"]).await?;
+                git(&["-C", self.clone_root_str(), "push", "origin", "main"]).await?;
                 Ok(())
             }
         }
     }
 }
 
-async fn git_status_dirty(dir: &str) -> Result<bool> {
-    let out = git_raw(&["-C", dir, "status", "--porcelain"]).await?;
-    Ok(!out.trim().is_empty())
+/// Запись через tmp-файл + rename в том же каталоге: reader вне лока не
+/// видит обрезанный файл посреди чужой записи. Родители создаются —
+/// «дока нет — не падай» (append в новый путь легитимен).
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .context("путь записи без имени файла")?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{file_name}.uwuwu-tmp"));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
-async fn git_status_ok(args: &[&str]) -> Result<()> {
-    git_raw(args).await.map(|_| ())
-}
-
-async fn git(args: &[&str]) -> Result<()> {
-    git_raw(args).await.map(|_| ())
+/// Снести свой мусор от крэша между tmp-write и rename (`.{name}.uwuwu-tmp`):
+/// иначе следующий `git add -A` утащит его в вики.
+fn cleanup_stale_tmp(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != ".git") {
+                    stack.push(path);
+                }
+            } else {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') && name.ends_with(".uwuwu-tmp") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn git_c_user(args: &[&str]) -> Result<()> {

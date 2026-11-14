@@ -3,8 +3,9 @@
 //! копия одновременно: запись вики (контракт в теле задачи
 //! 20261112155302-ttyp35g) — commit + push fast-forward only.
 //!
-//! Клон-менеджмент (ensure_clone/write_files) — github_doc_clone.rs;
-//! write-семейство docs — github_doc_write.rs; поиск —
+//! Клон-менеджмент: sync (ensure_clone) — github_doc_sync.rs; write-path
+//! (write_files/append/replace) — github_doc_clone.rs; write-семейство
+//! docs — github_doc_write.rs; лок — github_doc_lock.rs; поиск —
 //! github_doc_search.rs; blob — github_doc_blob.rs.
 
 use super::doc_store::{BlobGet, BlobRef, DocEntry, DocRef, DocStore, FulltextHit, TitleHit};
