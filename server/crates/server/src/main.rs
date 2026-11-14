@@ -41,7 +41,7 @@ fn main() -> Result<(), BootError> {
     let plan = Arc::new(cfg.to_tick_plan());
     tracing::info!(
         event = "server.started",
-        mode = ?plan.mode,
+        mode = ?cfg.mode(),
         executor = %cfg.executor.name,
         projects = plan.boards.len(),
         poll_sec = cfg.poll_sec,
