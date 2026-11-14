@@ -19,9 +19,11 @@ pub struct CreateTask {
     /// Приоритет (канон CUP); None — не задан (create write-path
     /// подставит дефолт medium — решение владельца 13.11).
     pub priority: Option<String>,
-    /// Autodone-галочка (владелец решает; триаж не ставит); None —
-    /// не задан (create write-path подставит дефолт true, если во fm
-    /// тела нет авторского — решение владельца 14.11).
+    /// Autodone: автомерж PR при входе в Review (Pv2-поле select
+    /// on/off); None — не задан (create write-path подставит дефолт
+    /// true, если во fm тела нет авторского — валовое решение
+    /// владельца 14.11: автодон у всех create, вкл. триаж и
+    /// крон-раны; `off` — точечный отказ).
     pub autodone: Option<bool>,
 }
 

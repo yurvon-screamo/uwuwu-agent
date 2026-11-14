@@ -42,8 +42,9 @@ export interface TaskRef {
    *  13.11; create без флага теперь пишет medium — дефолт владельца,
    *  пустые сортируются ниже low) */
   priority?: string
-  /** колонка «Autodone»: true — автомерж PR при входе в Review (галочка
-   *  владельца; триаж не ставит) */
+  /** колонка «Autodone»: true — автомерж PR при входе в Review (с 14.11 —
+   *  дефолт create: on у всех create, вкл. триаж и крон-раны; off —
+   *  точечный отказ) */
   autodone?: boolean
 }
 
@@ -131,15 +132,22 @@ export interface TrackedTask {
   lastWakeup?: WakeupStamp
   /** автодон: "pending" — проба/мерж в ходу, "merged"/"bounced"/"escalated"
    *  — исходы эпизода. НОВЫЙ вход в Review (lastStatusedge) или
-   *  переустановка галочки перезаписывают в pending — эскалация не убивает
+   *  переустановка флага (off→on) перезаписывают в pending — эскалация не убивает
    *  автодон навсегда: задача, прошедшая пайп заново после разбора,
    *  мержится автоматически (ревью Common-2) */
   autodoneState?: "pending" | "merged" | "bounced" | "escalated"
   /** ms-время входа в Review с autodone (часы таймаута pending-проб) */
   autodoneSince?: number
-  /** последнее виденное значение галочки: false→true переход = свежая
+  /** последнее виденное значение флага: false→true переход = свежая
    *  активация (переустановка в Review перезапускает эпизод) */
   autodoneSeen?: boolean
+  /** watchdog автодона (инцидент 1070): ms-время первой встречи условия
+   *  «Review + autodone=true, но тик автодона не выполнялся» — порог тишины
+   *  до громкого сигнала; снимается reset'ом watchdog'а */
+  adStallSince?: number
+  /** watchdog автодона: громкий сигнал уже отправлен в этом эпизоде
+   *  (раз за эпизод; сброс — смена статуса/выполненный тик/снятие флага) */
+  adWatchdogSignaled?: boolean
   /** приоритет строки (обновляется каждый тик из скана) — глобальный счёт
    *  активных CUP в пик учитывает только high (замороженные не-high слоты
    *  не держат); undefined — старый state до фичи, трактуется как не-high */
@@ -393,6 +401,39 @@ export function pathSafe(title: string): string {
   return title.replaceAll("/", "\u{2215}")
 }
 
+// ——— тайтлы спавн-сессий opencode ———
+
+/** Гард-лимит тайтла сессии: финальная строка целиком (постановка «~80»).
+ *  sessionTitle режет до него же — обрезка идемпотентна с createSession. */
+export const SESSION_TITLE_MAX = 80
+
+/** Обрезка строки до max по code points: slice по UTF-16 units режет
+ *  суррогатные пары (эмодзи в тайтле на границе лимита даёт lone-суррогат
+ *  в хвосте — артефакт рендера и грязный JSON на стороне opencode). */
+export function truncateCodePoints(s: string, max: number): string {
+  return Array.from(s).slice(0, max).join("")
+}
+
+/** Вид спавна фабрики: эмодзи + стейдж-слово в тайтле сессии. */
+export type SpawnKind = "dev" | "review" | "test"
+
+const SPAWN_TITLE_STAGES: Record<SpawnKind, { emoji: string; stage: string }> = {
+  dev: { emoji: "📋", stage: "" },
+  review: { emoji: "🔍", stage: "ревью" },
+  test: { emoji: "🧪", stage: "тестирование" },
+}
+
+/** Тайтл спавн-сессии: «<emoji> <проект>: [стейдж ]<номер> — <тайтл>»
+ *  (номер = номер issue). Пустой тайтл — номер без «—»; CRLF → пробел,
+ *  pathSafe; финальная строка режется до SESSION_TITLE_MAX. */
+export function sessionTitle(kind: SpawnKind, project: string, num: string, title: string): string {
+  const { emoji, stage } = SPAWN_TITLE_STAGES[kind]
+  const safe = pathSafe(title.replace(/[\r\n]+/g, " ").trim())
+  const head = stage === "" ? `${emoji} ${project}: ${num}` : `${emoji} ${project}: ${stage} ${num}`
+  const full = safe === "" ? head : `${head} — ${safe}`
+  return truncateCodePoints(full, SESSION_TITLE_MAX)
+}
+
 /** Короткий текст ошибки для сводок (лог полного стека — не её дело). */
 export function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -551,7 +592,8 @@ export interface SpawnEnvContext {
 export interface SpawnInit {
   /** markdown персоны владельца; null — дока нет/не резолвится */
   person: string | null
-  /** слаги живых доков проекта для uwuwu-cli read («<proj>/README») */
+  /** слаги живых доков проекта для uwuwu-cli read — полные
+   *  («Projects/<proj>/README»: сокращение «<proj>/README» неоднозначно) */
   projectDocs: string[]
   /** локальный чекаут env:false-проекта; env-задачам не нужен — пути в env-строке промпта */
   localPath?: string
@@ -601,6 +643,37 @@ export function stripExportWrapper(md: string, docTitle: string): string {
   return body.startsWith(titleHeading)
     ? body.slice(titleHeading.length).replace(/^\n+/, "")
     : body
+}
+
+/** Канон-четвёрка доков проекта: имена файлов под docs/Projects/<proj>/
+ *  (слаг для агента — полный «Projects/<proj>/<док>»: cli read резолвит
+ *  его прямой путь, сокращение «<proj>/<док>» падает на неоднозначности
+ *  basename-фоллбека — по «README» кандидатов больше одного). */
+export const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
+
+/** Слаг персоны владельца в вики, паритет cli run.rs (person_hub). */
+export const PERSON_SLUG = "Experience/person/PERSON"
+
+/** Имя файла персоны в клоне — последний сегмент PERSON_SLUG. */
+export const PERSON_FILE = "PERSON"
+
+/** Полные слаги канон-четвёрки по списку файлов каталога проекта:
+ *  «<файл>.md» существует → «Projects/<proj>/<док>», нет → пропуск.
+ *  Порядок слагов — порядок PROJECT_INIT_DOCS; каталоги и не-md игнорируются
+ *  (readdir отдаёт и их — фильтр здесь, а не в FS-слое). */
+export function projectDocSlugs(projectName: string, dirFiles: ReadonlyArray<string>): string[] {
+  const files = new Set(dirFiles)
+  return PROJECT_INIT_DOCS
+    .filter((title) => files.has(`${title}.md`))
+    .map((title) => `Projects/${projectName}/${title}`)
+}
+
+/** Тело персоны для спавн-промпта: обёртка md-дока срезается (паритет
+ *  strip_export_wrapper), пустое после среза — null (деградация «персоны
+ *  нет» вместо пустой инжекции). */
+export function personMarkdown(md: string): string | null {
+  const body = stripExportWrapper(md, PERSON_FILE).trim()
+  return body === "" ? null : body
 }
 
 /** Блок инит-данных первого промпта: ориентация без стартового поиска
@@ -891,7 +964,8 @@ export function reviewSpawnPrompt(
     ...(ctx.branch !== "" ? [`   Ветка: ${ctx.branch}`] : []),
     ...(ctx.pr !== "" ? [`   PR: ${ctx.pr}`] : []),
     ...(ctx.type !== undefined && ctx.type !== "" ? [`   Тип задачи: ${ctx.type}`] : []),
-    "3. Отчёт — комментом в задачу (uwuwu-cli task comment), формат по своей методике,",
+    "3. Отчёт — одним сводным комментом в задачу (uwuwu-cli task comment, один вызов",
+    "   на раунд, не дроби находки), формат по своей методике,",
     kind === "plan"
       ? "   вердикт-строка «Статус: approve|request_changes» обязательна."
       : [
@@ -919,7 +993,7 @@ export function reviewRerunPrompt(rowId: string, kind: ReviewKind, ctx: ReviewCo
     `[factory] Задача ${rowId}: девелопер завершил раунд — статус снова «${status}».`,
     "",
     "Доревьюируй в этой же сессии: перечитай задачу (uwuwu-cli task get + треды),",
-    "проверь устранение своих прошлых замечаний, отчёт комментом,",
+    "проверь устранение своих прошлых замечаний, отчёт одним сводным комментом,",
     "статус по вердикту " +
       (kind === "plan"
         ? "(approve → In Progress · request_changes → Design)."
@@ -949,7 +1023,8 @@ export function reviewCommentsPrompt(rowId: string, comments: TaskComment[]): st
     "",
     quoted,
     "",
-    "Ответь/учти по своему протоколу ревью: ответ юзеру — uwuwu-cli task comment.",
+    "Ответь/учти по своему протоколу ревью: ответ на пачку вопросов — одним сводным",
+    "комментом (uwuwu-cli task comment), не реплаем на каждый.",
   ].join("\n")
 }
 
@@ -1234,15 +1309,17 @@ export type StallVerdict =
   | { t: "silent" }
 
 /** Единственная точка решения о застое (по образцу routeTask): трекнутая
- *  In Progress при живой сессии, но тишине дольше порога (или без сообщений
- *  вовсе) = потерянный/зависший ход — активный ход рождает сообщения на
- *  каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
+ *  In Progress или Design при живой сессии, но тишине дольше порога (или без
+ *  сообщений вовсе) = потерянный/зависший ход — активный ход рождает сообщения
+ *  на каждом шаге LLM. dead обрабатывает соседний код (карантин), unknown —
  *  пропуск тика: оба → none. Повторный сигнал в эпизоде глушится флагом
  *  (silent); сброс флага — дело демона: смена статуса — штатный путь
- *  (пере-вход в In Progress = новый эпизод), none-вердикт при стоявшем
- *  флаге — эпизод завершён. */
+ *  (пере-вход в стадию = новый эпизод), none-вердикт при стоявшем флаге —
+ *  эпизод завершён. Design включён после инцидента 1101: Design-фантом
+ *  (ход умер при падении serve, запись сессии жива) держал слот CUP вечно —
+ *  тишина не эскалировалась, lastStatus не менялся, счёт активных не падал. */
 export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
-  if (f.status !== "In Progress") return { t: "none" }
+  if (f.status !== "In Progress" && f.status !== "Design") return { t: "none" }
   if (f.sessionAlive !== true) return { t: "none" }
   const clock = stallClock(
     { lastActivityAt: f.lastActivityAt, lastDevPromptAt: f.lastDevPromptAt },
@@ -1257,16 +1334,28 @@ export function stallVerdict(f: StallFacts, stallMs: number): StallVerdict {
   if (f.prMerged) return { t: "none" }
   if (f.signaled) return { t: "silent" }
   const quietText = clock.quietMin === null ? "сообщений в сессии нет" : `тишина ${clock.quietMin} мин`
-  const branchDiag = f.branch === ""
-    ? "Branch-ячейка пуста — агент умер до создания ветки"
-    : f.branchInWorktree
-      ? `ветка на месте (${f.branch.slice(0, 60)})`
-      : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
-  const text = [
-    `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
-    `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
-    "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
-  ].join(" ")
+  // branchDiag — только In Progress-путь: Design-текст веточных диагнозов
+  // не содержит (Branch/PR на этапе утряски пустые в норме), вычисление
+  // до ветвления строило и выбрасывало строку (ревью 1101, Low)
+  let text: string
+  if (f.status === "Design") {
+    text = [
+      `[factory] Строка в Design, но сессия утряски молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+      "Ход потерян или завис (запись сессии жива, сообщений нет).",
+      "Напиши комментарий в задачу или переустанови статус (перевод в In Progress и обратно в Design будит агента и переоткрывает эпизод).",
+    ].join(" ")
+  } else {
+    const branchDiag = f.branch === ""
+      ? "Branch-ячейка пуста — агент умер до создания ветки"
+      : f.branchInWorktree
+        ? `ветка на месте (${f.branch.slice(0, 60)})`
+        : `ветки нет в ворктри (${f.branch.slice(0, 60)})`
+    text = [
+      `[factory] Строка в In Progress, но сессия разработки молчит: ${quietText} при пороге ${Math.round(stallMs / 60_000)} мин.`,
+      `Ход потерян или завис (диагноз ветки: ${branchDiag}).`,
+      "Напиши комментарий в задачу, переведи строку в Design (перепланировка) или в In Progress (fast-track «поправь») — любой из путей будит агента.",
+    ].join(" ")
+  }
   return { t: "signal", text }
 }
 

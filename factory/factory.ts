@@ -21,19 +21,21 @@
 //      коммент юзера → рестарт)
 //   4. Done (кто бы ни поставил — мерж-крон агента или юзер) → чистка
 //      state + термин живой ревью-сессии
-//   5. In Progress: сессия жива, юзер и агент молчат дольше порога
+//   5. In Progress и Design: сессия жива, юзер и агент молчат дольше порога
 //      (UWUWU_FACTORY_STALL_MIN, деф. 360 = 6 ч — трейд владельца 08.11:
 //      глубокие фоновые прогоны легитимно молчат часами) → сигнал-коммент
 //      + Needs attention раз за эпизод (потерянный/зависший ход: активный
-//      ход рождает сообщения)
+//      ход рождает сообщения; Design включён после инцидента 1101 —
+//      Design-фантом держал слот CUP вечно без эскалации)
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
+import { hubCloneRoot } from "../lib/platform-hub"
 import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
@@ -78,6 +80,9 @@ import {
   type PrProbeResult,
   adoptBodyDoc,
   pathSafe,
+  sessionTitle,
+  SESSION_TITLE_MAX,
+  truncateCodePoints,
   createBoardPathOnce,
   errText,
   deadSpawnVerdict,
@@ -85,7 +90,9 @@ import {
   freshnessOfRow,
   USER_REVIEW_STATUS,
   AGENT_MARK,
-  stripExportWrapper,
+  personMarkdown,
+  projectDocSlugs,
+  PERSON_SLUG,
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
@@ -128,6 +135,7 @@ import {
   githubProbeVerdict,
   giteaProbeVerdict,
   autodoneAction,
+  autodoneWatchdog,
   type PrCarrier,
   type PrProbeState,
 } from "./autodone"
@@ -648,7 +656,7 @@ async function createSession(spec: SessionSpec): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      title: spec.title.replace(/[\r\n]+/g, " ").slice(0, 64),
+      title: truncateCodePoints(spec.title.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX),
       model: spec.model ?? MODEL,
       location: { directory: spec.directory },
       ...(spec.agent !== undefined ? { agent: spec.agent } : {}),
@@ -828,33 +836,17 @@ async function prConflicted(pr: string, cwd: string): Promise<boolean> {
 
 // ——— инит-данные первого промпта (юзер/проект/задача) ———
 
-/** Канон-четвёрка доков проекта: hpath-сегменты под папкой проекта
- *  (слаг для агента — «<proj>/<сегмент>»). */
-const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
-
-/** Идентификаторы контуров инита: имена топ-папок вики. */
-const PERSON_NOTEBOOK = process.env.UWUWU_PERSON_NOTEBOOK ?? "Experience"
-const PROJECTS_NOTEBOOK = "Projects"
-
 /** Инит-блок спавна (постановка: фабрика знает юзер/проект/задачу ДО
  *  спавна — агент не тратит ход на person show/доки/task get ради
- *  ориентации). Деградация любого источника честная (null/пустой список
- *  + строка в блоке), спавн от полноты инита не зависит. */
+ *  ориентации). Источник — локальный git-клон hub-репо (docs/**): клон
+ *  синкается cli-вызовами (каждый cli call = ensure_clone), фабрика
+ *  читает как есть — синк из демона дублировал бы cli-локи (задача 1062).
+ *  Деградация любого источника честная (null/пустой список + строка в
+ *  блоке), спавн от полноты инита не зависит. */
 async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omit<SpawnInit, "task">> {
-  // резолв ноутбуков — под тем же контрактом честной деградации, что и
-  // источники: сбой одного kernel-вызова не фейлит спавн (фетчеры увидят
-  // пустой id и отлогируют пропуск своего контура)
-  let notebookIds: Record<string, string> = {}
-  try {
-    notebookIds = (await mcp.tool<{ ids?: Record<string, string> }>("notebook_ids_by_names", {
-      names: [PERSON_NOTEBOOK, PROJECTS_NOTEBOOK],
-    })).ids ?? {}
-  } catch (e) {
-    log(`инит: резолв ноутбуков не удался (${errText(e)})`)
-  }
   const [person, projectDocs] = await Promise.all([
-    fetchPersonMarkdown(notebookIds[PERSON_NOTEBOOK] ?? ""),
-    fetchProjectDocSlugs(projectName, notebookIds[PROJECTS_NOTEBOOK] ?? ""),
+    fetchPersonMarkdown(),
+    fetchProjectDocSlugs(projectName),
   ])
   return {
     person,
@@ -865,55 +857,29 @@ async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omi
   }
 }
 
-/** Персона владельца: Experience:/personal/PERSON (env-шов паритета CLI).
- *  null — дока нет, дубль hpath (≥2 id — не угадываем, паритет person show)
- *  или сбой ядра: во всех случаях пропуск источника, не ошибка спавна. */
-async function fetchPersonMarkdown(personNotebookId: string): Promise<string | null> {
+/** Персона владельца: файл PERSON.md в клоне вики (слаг PERSON_SLUG —
+ *  паритет cli person show). null — дока нет/пустая/не читается: во всех
+ *  случаях пропуск источника, не ошибка спавна. */
+async function fetchPersonMarkdown(): Promise<string | null> {
+  const file = `${hubCloneRoot()}/docs/${PERSON_SLUG}.md`
   try {
-    const hpath = process.env.UWUWU_PERSON_HPATH ?? "/personal/PERSON"
-    if (personNotebookId === "") {
-      log(`инит: ноутбук «${PERSON_NOTEBOOK}» не найден — персона пропущена`)
-      return null
-    }
-    const ids = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", { notebook: personNotebookId, path: hpath })).ids ?? []
-    if (ids.length !== 1) {
-      log(`инит: персона ${ids.length === 0 ? "не найдена" : `неоднозначна (${ids.length} id)`} — пропущена`)
-      return null
-    }
-    const doc = await mcp.tool<{ markdown?: string; exists?: boolean; title?: string }>("export_doc_markdown", { docId: ids[0] as string })
-    const md = stripExportWrapper(doc.exists === true ? doc.markdown ?? "" : "", doc.title ?? "").trim()
-    if (md === "") {
-      log("инит: экспорт персоны пуст — пропущена")
-      return null
-    }
-    return md
+    const md = readFileSync(file, "utf8")
+    const body = personMarkdown(md)
+    if (body === null) log(`инит: персона пуста (${PERSON_SLUG}) — пропущена`)
+    return body
   } catch (e) {
     log(`инит: персона не получена (${errText(e)}) — пропущена`)
     return null
   }
 }
 
-/** Слаги живых доков канон-четвёрки проекта (uwuwu-cli read «<proj>/<док>»).
- *  Мёртвый/неоднозначный hpath — док пропускается, не угадываем; четвёрка
- *  резолвится параллельно (порядок слагов — порядок PROJECT_INIT_DOCS). */
-async function fetchProjectDocSlugs(projectName: string, projectsNotebookId: string): Promise<string[]> {
+/** Полные слаги живых доков канон-четвёрки проекта (uwuwu-cli read
+ *  «Projects/<proj>/<док>»). Нет папки проекта — пустой список; файл
+ *  четвёрки отсутствует — док пропускается, не угадываем. */
+async function fetchProjectDocSlugs(projectName: string): Promise<string[]> {
+  const dir = `${hubCloneRoot()}/docs/Projects/${projectName}`
   try {
-    if (projectsNotebookId === "") {
-      log(`инит: ноутбук «${PROJECTS_NOTEBOOK}» не найден — доки проекта пропущены`)
-      return []
-    }
-    const resolved = await Promise.all(PROJECT_INIT_DOCS.map(async (title) => ({
-      title,
-      ids: (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-        notebook: projectsNotebookId, path: `/${projectName}/${title}`,
-      })).ids ?? [],
-    })))
-    const slugs: string[] = []
-    for (const { title, ids } of resolved) {
-      if (ids.length === 1) slugs.push(`${projectName}/${title}`)
-      else log(`инит: док «${projectName}/${title}» ${ids.length === 0 ? "не найден" : `неоднозначен (${ids.length} id)`} — пропущен`)
-    }
-    return slugs
+    return projectDocSlugs(projectName, readdirSync(dir))
   } catch (e) {
     log(`инит: доки проекта не резолвятся (${errText(e)}) — пропущены`)
     return []
@@ -954,6 +920,9 @@ async function startTask(
     const doc = await mcp.tool<{ title?: string }>("get_doc", { docId: task.bodyDoc })
     title = (doc.title ?? "").trim()
   }
+  // сессионный тайтл — от доставшегося тайтла (пусто → номер-only);
+  // fallback-слово ниже — init-промпту и треку, сессии не нужен
+  const spawnedTitle = sessionTitle("dev", projectName, task.rowId, title)
   if (title === "") title = `задача ${task.rowId.slice(0, 8)}`
 
   // инит-блок первого промпта: юзер/проект/задача до старта сессии
@@ -964,10 +933,10 @@ async function startTask(
     task: { title, status: task.status, type: task.type, branch: task.branch, pr: task.pr },
   }
 
-  // имя сессии «проект: тайтл» — осмысленно в списке сессий опенкода
+  // имя сессии «номер — тайтл» — читаемо и сверяемо с доской в списке сессий
   const sessionID = await createSession({
     directory: envCtx?.repoDir ?? cfg.local,
-    title: `📋 ${projectName}: ${title}`,
+    title: spawnedTitle,
   })
   if (sessionID === null) throw new Error("сессия не создалась")
 
@@ -1312,7 +1281,7 @@ async function prProbeByBranch(repo: string, branch: string): Promise<PrProbeOut
   } catch { return { result: "unknown", mergedUrl: null } }
 }
 
-// ——— автодон: галочка владельца → проба/мерж PR на входе в Review ———
+// ——— автодон: проба/мерж PR на входе в Review ———
 // (задача 20261112160316; решение одного тика — autodoneAction в autodone.ts)
 
 /** Токен tea-логина по имени-хосту (конфиг ~/.config/tea/config.yml).
@@ -1432,7 +1401,7 @@ async function mergePr(pr: PrCarrier): Promise<boolean> {
   }
 }
 
-/** Один тик автодона по задаче в Review с галочкой: проба → вердикт →
+/** Один тик автодона по задаче в Review с autodone=true: проба → вердикт →
  *  исход. Все статусы-пишутся через setCells (DRY_RUN гейтится внутри),
  *  merge-вызовы гейтятся явно (новый класс внешних мутаций — замечание
  *  ревью High). Bounce НЕ трогает lastStatus: следующий тик вернёт мяч
@@ -1541,6 +1510,81 @@ async function runAutodoneTick(
   }
 }
 
+/** Тик watchdog'а автодона (инцидент 1070): строка в Review, fm тела несёт
+ *  `autodone: true`, но тик автодона не выполнялся (autodoneState undefined)
+ *  дольше AUTODONE_TIMEOUT_MS → громкий сигнал (лог + коммент в задачу),
+ *  раз за эпизод. Канал — fm тела, не Autodone-ячейка скана: в инциденте
+ *  ломалось именно скан-поле (fm-true при скане-false), гард на том же
+ *  поле молчал бы вместе с ним. При исправном демоне fm-true доезжает до
+ *  автодон-блока первым тиком (state=pending), поэтому длительная тишина —
+ *  аномалия (скан-мисрид, потерянный state, недостижимый гейт). Вызов —
+ *  на безусловном пути каждой трекнутой строки (после Done-ветки, до
+ *  маршрутизации): state после терминальных исходов определён → reset.
+ *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
+ *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
+ *  autodone не несёт — гард честно деградирует в no-op (транспорт hub).
+ *  Граница гарда (осознанная, ревью раунд 2): покрывает ТРЕКНУТЫЕ строки —
+ *  Review-строка вообще без записи в state (геометрия #317 «task в state
+ *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
+ *  гейт карантин-петли читает то же скан-поле; fm-экспорт всех строк доски
+ *  каждый тик — реальная цена, не платим. */
+/** fm-поле из шапки тела задачи (первый --- блок): легаси-носитель autodone
+ *  до полного переезда на нативные issue-поля (#1087). */
+function fmAutodoneOf(md: string): boolean {
+  const head = md.startsWith("---") ? md.slice(0, Math.max(md.indexOf("\n---", 3), 0) + 5) : ""
+  const m = head.match(/^autodone:[ \t]*(\S+)/m)
+  const raw = (m?.[1] ?? "").toLowerCase()
+  return raw === "on" || raw === "true" || raw === "✓".toLowerCase()
+}
+
+async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
+  const rowId = row.rowId
+  const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
+  const bodyKnown = md !== null && md !== ""
+  const fmAutodone = md !== null && md !== "" && fmAutodoneOf(md)
+  const act = autodoneWatchdog(
+    {
+      inReview: row.status === USER_REVIEW_STATUS,
+      fmAutodone,
+      bodyKnown,
+      ticked: tracked.autodoneState !== undefined,
+      stallSince: tracked.adStallSince,
+      signaled: tracked.adWatchdogSignaled === true,
+      now: Date.now(),
+    },
+    AUTODONE_TIMEOUT_MS,
+  )
+  switch (act.t) {
+    case "reset": {
+      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
+        delete tracked.adStallSince
+        delete tracked.adWatchdogSignaled
+        saveState(state)
+        log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — сброс (условие не выполняется)`)
+      }
+      return
+    }
+    case "arm": {
+      tracked.adStallSince = act.since
+      saveState(state)
+      return
+    }
+    case "signal": {
+      const silentMs = Date.now() - (tracked.adStallSince ?? Date.now())
+      tracked.adWatchdogSignaled = true
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — fm autodone:true, тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
+      await notify(
+        tracked,
+        `${AGENT_MARK} autodone: задача в Review с fm autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
+      )
+      return
+    }
+    case "wait":
+      return
+  }
+}
+
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
  *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
  *  нужен cwd ворктри. Выбрасывает при фейле. */
@@ -1562,7 +1606,7 @@ async function startReview(
   const reviewer = kind === "plan" ? PLAN_REVIEWER : REVIEWER
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
-    title: `🔍 ${projectName}: ревью — ${tracked.title || task.title}`,
+    title: sessionTitle("review", projectName, task.rowId, tracked.title || task.title),
     agent: reviewer.agent,
     model: reviewer.model,
   })
@@ -1634,7 +1678,7 @@ async function startTesting(
   }
   const sessionID = await createSession({
     directory: worktree !== "" ? worktree : cfg.local,
-    title: `🧪 ${projectName}: тестирование — ${tracked.title || task.title}`,
+    title: sessionTitle("test", projectName, task.rowId, tracked.title || task.title),
     agent: TESTER.agent,
     model: TESTER.model,
   })
@@ -2131,7 +2175,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       tracked.priority = row.priority
       healed = true
     }
-    // галочка снята → сброс seen: переустановка позже = свежая активация
+    // флаг снят (off) → сброс seen: переустановка позже = свежая активация
     // автодона (ревью Common-2)
     if (!(row.autodone ?? false) && tracked.autodoneSeen === true) {
       tracked.autodoneSeen = false
@@ -2161,6 +2205,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       counters.cleanups++
       continue
     }
+
+    // ——— watchdog автодона: fm-канал (инцидент 1070) ———
+    // Безусловный путь каждой трекнутой строки: сторожим «Review + fm
+    // autodone:true, тик не выполнялся» независимо от Autodone-ячейки
+    // скана (в инциденте ломалось именно скан-поле). bodyExport кэшируется
+    // per-tick — маршрутизация ниже берёт то же тело из кэша.
+    await autodoneWatchdogTick(row, tracked, state, bodyExports)
 
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
     const comments = await taskComments(tracked.bodyDoc, bodyExports)
@@ -2237,12 +2288,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
     if (skipRest === "skip-rest") continue
 
-    // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
+    // ——— автодон: fm/клетка autodone=true на входе в Review (задача 20261112160316) ———
     // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
     // пайпа — следующий тик возвращает мяч девелоперу штатным return-to-dev.
     // Эпизод: pending бежит; терминальный исход (merged/escalated) того же
     // эпизода (lastStatus всё ещё Review) не перезапускается — но НОВЫЙ вход
-    // в Review (lastStatusedge) или переустановка галочки (off→on, ревью
+    // в Review (lastStatusedge) или переустановка флага (off→on, ревью
     // Common-2) перезапускают эпизод: эскалация не убивает автодон навсегда.
     const autodoneFreshActivation = (row.autodone ?? false) && tracked.autodoneSeen !== true
     const autodoneNewEntry = tracked.lastStatus !== USER_REVIEW_STATUS
@@ -2430,10 +2481,11 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
         saveState(state)
         await notify(tracked,
           `[factory] сессия разработки потеряна. Напиши комментарий — перезапущу (несохранённое в ворктри будет перезаписано с ${baseOf(cfg)}).`)
-      } else if (quiet === "alive" && row.status === "In Progress") {
+      } else if (quiet === "alive" && (row.status === "In Progress" || row.status === "Design")) {
         // сессия жива — ловим зависший ход: агент молчит дольше порога
         // (активный ход рождает сообщения на каждом шаге LLM). Неизвестная
-        // активность (REST/формат) — пропуск тика без операций с флагом
+        // активность (REST/формат) — пропуск тика без операций с флагом.
+        // Design включён (инцидент 1101): Design-фантом держал слот CUP вечно
         const activity = await lastSessionActivity(tracked.sessionID)
         if (activity === "invalid") {
           log(`задача ${rowId.slice(0, 8)}: активность сессии неизвестна — пропуск тика`)
@@ -2455,15 +2507,19 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           const { stalled } = clock
           // кэш мержа действителен, пока совпадает с PR-ячейкой или ячейка
           // пуста (позитив фоллбек-пробы по ветке); смена PR на заполненной
-          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует
-          let prMerged = (tracked.mergedPrUrl ?? "") !== ""
+          // клетке — stacked/ремедиация, штатный пайп-путь — инвалидирует.
+          // Только In Progress: Design-пере-вход (перепланировка после
+          // приёмки) не должен глушить сталл-детект старым merged-позитивом
+          let prMerged = row.status === "In Progress"
+            && (tracked.mergedPrUrl ?? "") !== ""
             && (row.pr === "" || tracked.mergedPrUrl === row.pr)
           // gh-проба ленивая (вердикт может стать signal) и только до первого
           // MERGED: merge необратим — без кэша это была бы проба каждые 3 мин
           // на всё время ожидания Done (дни). signaled=true глушит вердикт —
           // проба не нужна. Пустая клетка при непустой ветке — фоллбек по
-          // ветке (инцидент 09.11: мерженный PR не защитил от кика)
-          if (stalled && !prMerged && tracked.stallSignaled !== true) {
+          // ветке (инцидент 09.11: мерженный PR не защитил от кика).
+          // Design merged-пробу не вызывает: PR на этапе утряски не существует
+          if (stalled && !prMerged && row.status === "In Progress" && tracked.stallSignaled !== true) {
             const probe = row.pr !== ""
               ? await prProbeByCell(row.pr)
               : row.branch !== "" ? await prProbeByBranch(cfg.repo, row.branch) : null
@@ -2511,7 +2567,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
           if (verdict.t === "signal") {
             // эскалация как у registerFailure/failReview: коммент + Needs
             // attention; lastStatus сразу за доской (как в failReview)
-            log(`задача ${rowId.slice(0, 8)}: In Progress при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
+            log(`задача ${rowId.slice(0, 8)}: ${row.status} при живой сессии, тишина > ${STALL_MIN} мин — сигнал + Needs attention`)
             if (DRY_RUN) {
               // setCells/notify в DRY_RUN сами глухие, а state-мутации не пишем:
               // без флага анти-спам в песочнице не работает — сигнал повторялся

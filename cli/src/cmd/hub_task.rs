@@ -302,13 +302,16 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             for path in &attach {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
-            // hub-контракт (формулировки шарят help): секционная хирургия
-            // и аттач не реализованы — громкий отказ до резолва/входа/сети,
-            // без тихих деградаций в append/read-ветки (инстанс 1091)
+            // Секционная хирургия на hub не существует (снесена с легаси-слоем
+            // хранения, PR #248), --attach не портирован: любой вызов с ними —
+            // отказ до резолва строки, чтения входа и сети, без тихих
+            // деградаций в append/read-ветки (инстанс 1091). Формулировки
+            // шарятся с help --replace-section/--attach.
             if let Some(section) = &replace_section {
                 bail!(
-                    "task body --replace-section «{section}»: на hub-бекенде секционная \
-                     хирургия не поддерживается — правь тело целиком (--replace с --base/--force)"
+                    "task body --replace-section «{section}»: секционная хирургия \
+                     на hub-бекенде не поддерживается — правь тело целиком: \
+                     task body --replace с --base (снапшот) или --force"
                 );
             }
             if let Some(file) = attach.first() {
