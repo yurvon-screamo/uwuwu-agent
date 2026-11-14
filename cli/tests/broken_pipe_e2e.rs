@@ -31,7 +31,7 @@ fn stdout_closed_pipe_is_quiet_success() {
     let (reader, writer) = pipe().expect("pipe");
     drop(reader); // read-end закрыт до спавна: первый write ребёнка — гарантированный EPIPE
 
-    let mut child = Command::new(bin())
+    let child = Command::new(bin())
         .args(["semantic", "status"])
         .env("UWUWU_SEMANTIC_DB", &db)
         .stdout(Stdio::from(writer))
