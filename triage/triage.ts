@@ -154,11 +154,11 @@ async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   for (const row of r.rows ?? []) {
     if (typeof row.rowBlockId !== "string" || row.cells?.Status?.value !== "Draft") continue
     // hub-эпоха (#1126): тайтл в cells["Название"], тело черновика — сам issue
-    const isHubRow = row.cells?.["Название"] !== undefined
+    const isHubRow = row.cells?.Название !== undefined
     const docId = typeof row.linkedDocId === "string" && row.linkedDocId !== ""
       ? row.linkedDocId
       : isHubRow ? `issue:${row.rowBlockId}` : ""
-    let title = (row.title ?? row.cells?.["Название"]?.value ?? "").trim()
+    let title = (row.title ?? row.cells?.Название?.value ?? "").trim()
     // заголовок линкованной строки живёт в доке-теле (read_database_cells
     // отдаёт пустоту) — доставали для промпта/skip-уведомления
     if (title === "" && docId !== "") {
