@@ -37,9 +37,9 @@ fn create_input(title: &str) -> CreateTask {
     }
 }
 
-/// Полный жизненный цикл на живом sandbox-репо: create (frontmatter status)
-/// → list видит → resolve по тайтлу → edit (branch+type) → comment →
-/// claim (dev-session) → close (Done закрыл issue).
+/// Полный жизненный цикл на живом sandbox-репо: create (Pv2-статус + поля)
+/// → list видит → resolve по тайтлу → edit (branch в поле) → comment →
+/// claim (Сессия dev в поле) → body чист от fm → close (Done закрыл issue).
 #[tokio::test]
 #[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
 async fn github_store_full_lifecycle_live() {
@@ -123,7 +123,11 @@ async fn github_store_full_lifecycle_live() {
 
     let body = store.body_get(&board(), &edited).await.expect("body_get");
     assert!(body.contains("живой e2e: полный цикл"));
-    assert!(body.contains("dev-session: ses_e2e_probe"));
+    assert!(
+        !body.trim_start().starts_with("---\n"),
+        "тело без fm-карточки (ADR-098): {body}"
+    );
+    assert!(!body.contains("dev-session:"), "клетка не в теле: {body}");
 
     let closed = store
         .close(&board(), &edited, Some("e2e завершён"))
@@ -160,25 +164,11 @@ async fn github_store_create_duplicate_is_loud() {
     assert!(format!("{err}").contains("дубль"));
 }
 
-/// fm-поля тела задачи: ручная вычитка frontmatter-блока (тестовый
-/// crate не видит pub(crate)-парсер стора, regex запрещён).
-fn fm_field(body: &str, key: &str) -> Option<String> {
-    let after_open = body.strip_prefix("---\n")?;
-    let end = after_open.find("\n---\n")?;
-    for line in after_open[..end].lines() {
-        if let Some((k, v)) = line.split_once(": ") {
-            if k.trim() == key {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
 /// Контракт priority при create (дефолт medium — решение владельца
-/// 13.11): create без флага рождает fm `priority: medium`; явный флаг
-/// перекрывает; авторский `priority` во fm тела (--stdin) перекрыт не
-/// бывает. Уборка проб — close (канон рига).
+/// 13.11): create без флага рождает клетку Приоритет=medium; явный флаг
+/// перекрывает. Авторский fm в теле (--stdin) — мёртвый носитель: это
+/// контент, клетка получает дефолт (ADR-098, задача 1087).
+/// Уборка проб — close (канон рига).
 #[tokio::test]
 #[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
 async fn github_store_create_priority_contract_live() {
@@ -233,33 +223,23 @@ async fn github_store_create_priority_contract_live() {
         .await
         .expect("create с авторским fm");
 
-    // Assert: fm каждого из трёх
-    let default_body = store
-        .body_get(&board, &defaulted)
-        .await
-        .expect("body_get дефолт");
-    let explicit_body = store
-        .body_get(&board, &explicit)
-        .await
-        .expect("body_get high");
+    // Assert: клетки через resolve (норм-форма полей)
+    let default_task = store.resolve(&board, &defaulted.title).await.expect("resolve дефолт");
+    let explicit_task = store.resolve(&board, &explicit.title).await.expect("resolve high");
+    let authored_task = store.resolve(&board, &authored.title).await.expect("resolve авторский");
+    assert_eq!(default_task.priority, "medium", "create без флага: дефолт medium");
+    assert_eq!(explicit_task.priority, "high", "явный --priority перекрывает дефолт");
+    assert_eq!(
+        authored_task.priority, "medium",
+        "fm тела — мёртвый носитель (ADR-098): контент, клетка = дефолт"
+    );
     let authored_body = store
         .body_get(&board, &authored)
         .await
         .expect("body_get авторский");
-    assert_eq!(
-        fm_field(&default_body, "priority").as_deref(),
-        Some("medium"),
-        "create без флага: fm обязан нести priority: medium"
-    );
-    assert_eq!(
-        fm_field(&explicit_body, "priority").as_deref(),
-        Some("high"),
-        "явный --priority перекрывает дефолт"
-    );
-    assert_eq!(
-        fm_field(&authored_body, "priority").as_deref(),
-        Some("low"),
-        "авторский priority во fm тела перекрыт дефолтом не бывает"
+    assert!(
+        authored_body.contains("priority: low"),
+        "авторский fm остаётся контентом тела: {authored_body}"
     );
 
     // Уборка: пробы не копятся (close — канон рига)
@@ -273,9 +253,9 @@ async fn github_store_create_priority_contract_live() {
 }
 
 /// Контракт autodone при create (дефолт true — решение владельца
-/// 14.11, задача 1050): create без флага рождает fm `autodone: true`;
-/// явный `off` перекрывает; авторский `autodone` во fm тела (--stdin)
-/// перекрыт дефолтом не бывает. Уборка проб — close (канон рига).
+/// 14.11, задача 1050): create без флага рождает клетку Autodone=on;
+/// явный `off` перекрывает. Авторский fm в теле — мёртвый носитель
+/// (ADR-098): контент, клетка получает дефолт. Уборка проб — close.
 #[tokio::test]
 #[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
 async fn github_store_create_autodone_contract_live() {
@@ -330,33 +310,15 @@ async fn github_store_create_autodone_contract_live() {
         .await
         .expect("create с авторским fm");
 
-    // Assert: fm каждого из трёх
-    let default_body = store
-        .body_get(&board, &defaulted)
-        .await
-        .expect("body_get дефолт");
-    let off_body = store
-        .body_get(&board, &explicit_off)
-        .await
-        .expect("body_get off");
-    let authored_body = store
-        .body_get(&board, &authored)
-        .await
-        .expect("body_get авторский");
-    assert_eq!(
-        fm_field(&default_body, "autodone").as_deref(),
-        Some("true"),
-        "create без флага: fm обязан нести autodone: true"
-    );
-    assert_eq!(
-        fm_field(&off_body, "autodone").as_deref(),
-        Some("false"),
-        "явный --autodone off перекрывает дефолт"
-    );
-    assert_eq!(
-        fm_field(&authored_body, "autodone").as_deref(),
-        Some("false"),
-        "авторский autodone во fm тела перекрыт дефолтом не бывает"
+    // Assert: клетки через resolve (норм-форма полей)
+    let default_task = store.resolve(&board, &defaulted.title).await.expect("resolve дефолт");
+    let off_task = store.resolve(&board, &explicit_off.title).await.expect("resolve off");
+    let authored_task = store.resolve(&board, &authored.title).await.expect("resolve авторский");
+    assert!(default_task.autodone, "create без флага: дефолт on");
+    assert!(!off_task.autodone, "явный --autodone off перекрывает дефолт");
+    assert!(
+        authored_task.autodone,
+        "fm тела — мёртвый носитель (ADR-098): контент, клетка = дефолт on"
     );
 
     // Уборка: пробы не копятся (close — канон рига)

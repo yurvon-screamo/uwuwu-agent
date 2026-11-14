@@ -118,7 +118,7 @@ pub(super) async fn project_status_of(
                     projectItems(first: 10) {
                         nodes {
                             project { ... on ProjectV2 { number } }
-                            fieldValueByName(fieldName: \"Status\") {
+                            fieldValueByName(name: \"Status\") {
                                 ... on ProjectV2ItemFieldSingleSelectValue { name }
                             }
                         }
@@ -160,7 +160,7 @@ pub(super) async fn project_statuses(project: &str) -> Result<HashMap<String, St
                         pageInfo { hasNextPage endCursor }
                         nodes {
                             content { ... on Issue { number } }
-                            fieldValueByName(fieldName: \"Status\") {
+                            fieldValueByName(name: \"Status\") {
                                 ... on ProjectV2ItemFieldSingleSelectValue { name }
                             }
                         }
