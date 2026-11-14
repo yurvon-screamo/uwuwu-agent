@@ -156,11 +156,20 @@ export interface TrackedTask {
 
 export interface FactoryState {
   tasks: Record<string, TrackedTask>
-  /** ISO последнего алерта эпизода гарда спавна (HOLD каскада); undefined —
-   *  эпизода нет. Снимает демон: verdict=allow при стоящем флаге → удалить
+  /** Эпизоды HOLD гарда спавна, ключ "project/reason" (инцидент 10.11: общий
+   *  флаг всех проектов сносился allow-вердиктом тихого соседа — алерт=first
+   *  каждый тик). since — ISO входа в эпизод (агрегат «длительность» в логе
+   *  выхода), signaled — ISO последней попытки коммента (окно повтора).
+   *  Снимает демон: verdict=allow при стоящих ключах проекта → удалить их
    *  (зеркало сброса stallSignaled — без сброса следующий эпизод остался бы
    *  без алерта и бэкапа навсегда) */
-  holdSignaled?: string
+  holdEpisodes?: Record<string, HoldEpisode>
+}
+
+/** Эпизод HOLD гарда спавна одного проекта: вход и последний алерт. */
+export interface HoldEpisode {
+  since: string
+  signaled: string
 }
 
 /** Комменты агента — с этим префиксом, чтобы не петлить себя. */
@@ -1496,7 +1505,7 @@ export interface SpawnGuardFacts {
   orphaned: number
   /** всего untracked spawnable (сироты + легитимно новые) */
   totalUntracked: number
-  /** ISO последнего алерта эпизода (state.holdSignaled); undefined — эпизода нет */
+  /** ISO последнего алерта эпизода (holdEpisodes[key].signaled); undefined — эпизода нет */
   holdSignaled?: string
   now: number
 }
@@ -1531,6 +1540,68 @@ export function spawnLimitsFromEnv(loss: string | undefined, burst: string | und
     return Number.isFinite(n) && n > 0 ? n : fallback
   }
   return { lossMax: parse(loss, SPAWN_LOSS_MAX_DEFAULT), burstMax: parse(burst, SPAWN_BURST_MAX_DEFAULT) }
+}
+
+/** Ключ эпизода в state.holdEpisodes: эпизод ведётся на пару проект×reason —
+ *  burst и state-loss одного проекта живут независимо (разные каналы и окна),
+ *  allow сносит оба ключа проекта. */
+export function holdEpisodeKey(project: string, reason: "state-loss" | "burst"): string {
+  return `${project}/${reason}`
+}
+
+/** Парсинг holdEpisodes из сырого state.json: валидный record строк-эпизодов
+ *  переносится как есть; мусорные ключи/значения пропускаются; легаси-флаг
+ *  (строка top-level holdSignaled до инцидента 10.11) отбрасывается — эпизод
+ *  самозаживится одним лишним алертом. Ключ валидируется форматом
+ *  "<имя>/<reason>" — мусорный ключ повреждённого state не доедёт до лога
+ *  выхода как причина. */
+export function parseHoldEpisodes(raw: unknown): Record<string, HoldEpisode> {
+  if (raw === null || typeof raw !== "object") return {}
+  const out: Record<string, HoldEpisode> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const slash = typeof k === "string" ? k.lastIndexOf("/") : -1
+    const reason = slash > 0 ? k.slice(slash + 1) : ""
+    if (reason !== "burst" && reason !== "state-loss") continue
+    if (v === null || typeof v !== "object") continue
+    const e = v as Record<string, unknown>
+    if (typeof e.since !== "string" || typeof e.signaled !== "string") continue
+    out[k] = { since: e.since, signaled: e.signaled }
+  }
+  return out
+}
+
+/** Политика канала алерта по вердикту (точка решения, инцидент 10.11):
+ *  comment — state-loss first/repeat: исключение, требующее действия
+ *  владельца (коммент в задачу, окно повтора сечёт частоту);
+ *  episode-log — burst-класс first (hold-burst и throttle-волна 1109):
+ *  механика (волна импорта), одна агрегированная строка лога на вход в
+ *  эпизод; silent — всё прочее (в пределах окна повтора / длящийся
+ *  burst): per-tick видимость даёт per-tick строку гарда. */
+export type GuardAlertChannel = "comment" | "episode-log" | "silent"
+
+export function guardAlertChannel(guard: SpawnGuardHold | SpawnGuardThrottle): GuardAlertChannel {
+  // burst-класс = throttle (1109, hold.reason сужен до state-loss): волна
+  // импорта — механика, владельцу не ходит; hold — всегда state-loss
+  if (guard.t === "throttle") return guard.alert === "first" ? "episode-log" : "silent"
+  return guard.alert === "none" ? "silent" : "comment"
+}
+
+/** Агрегированная строка лога на выход из эпизода: длительность — главное,
+ *  чего per-tick «проход»-строки не дают. */
+export function formatGuardEpisodeEnd(reason: "state-loss" | "burst", sinceIso: string, nowMs: number): string {
+  const sinceMs = Date.parse(sinceIso)
+  const minutes = Number.isNaN(sinceMs) ? null : Math.max(0, Math.round((nowMs - sinceMs) / 60_000))
+  const duration = minutes === null ? "длительность н/д (битый since)" : `длительность ${minutes} мин`
+  return `гард спавна: эпизод HOLD (${reason}) завершён — ${duration}`
+}
+
+/** Класс эпизода гарда: сигнатура потери (сироты-спавны > lossMax) или
+ *  burst. Общая точка для вердикта и вызывающего (кормит вердикту signaled
+ *  своего эпизода из holdEpisodes). */
+export function spawnGuardReason(
+  f: Pick<SpawnGuardFacts, "orphaned">, l: SpawnGuardLimits,
+): "state-loss" | "burst" {
+  return f.orphaned > l.lossMax ? "state-loss" : "burst"
 }
 
 /** Единственная точка решения гарда (по образцу routeTask/stallVerdict):

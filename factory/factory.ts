@@ -95,7 +95,12 @@ import {
   PERSON_SLUG,
   alertTargetOf,
   spawnGuardVerdict,
+  spawnGuardReason,
   spawnLimitsFromEnv,
+  holdEpisodeKey,
+  parseHoldEpisodes,
+  guardAlertChannel,
+  formatGuardEpisodeEnd,
   splitThrottle,
   untrackedRowDecision,
   activeTaskGuards,
@@ -301,10 +306,10 @@ function loadState(): FactoryState {
     const raw: unknown = JSON.parse(readFileSync(STATE_FILE, "utf-8"))
     const tasks = (raw as { tasks?: unknown }).tasks
     const out: FactoryState = { tasks: {} }
-    // флаг эпизода гарда — top-level (не задачи): переносится между тиками,
-    // снимается allow-вердиктом (см. tickProject)
-    const holdSignaled = (raw as { holdSignaled?: unknown }).holdSignaled
-    if (typeof holdSignaled === "string") out.holdSignaled = holdSignaled
+    // эпизоды гарда спавна — top-level record "project/reason" (не задачи):
+    // переносятся между тиками, снимаются allow-вердиктом проекта
+    // (см. tickProject); легаси строка-флаг отбрасывается парсером
+    out.holdEpisodes = parseHoldEpisodes((raw as { holdEpisodes?: unknown }).holdEpisodes)
     if (tasks !== null && typeof tasks === "object") {
       for (const [k, v] of Object.entries(tasks as Record<string, unknown>)) {
         if (isValidTracked(v)) {
@@ -1162,22 +1167,53 @@ function backupSuspectState(): void {
  *  (обслуживание существующих треков продолжается — гард бьёт только по
  *  новому спавну), throttle дозирует burst-волну по burstMax за тик — она
  *  дренажируется сама (задача 1109: полный HOLD по burst не отпускался
- *  никогда). Алерт-политика: first — вход в эпизод (state-loss: бэкап
- *  state + коммент владельцу; throttle: только коммент — state не
- *  подозрительный), repeat — длящийся эпизод за окном повтора (коммент
- *  снова), none — в пределах окна (только лог). Флаг эпизода ставится по
- *  факту ПОПЫТКИ алерта, не доставки: недоставимый алерт не должен
- *  ретраиться каждый тик — окно повтора вернётся к нему через час. */
+ *  никогда). Канал алерта по классу (guardAlertChannel, инцидент 10.11):
+ *  burst-механика (throttle-волна) — только лог демона, без комментов в
+ *  задачи: одна агрегированная строка на вход в эпизод, heartbeat по
+ *  repeat; state-loss — исключение владельцу: first — бэкап + коммент,
+ *  repeat — коммент снова за окном повтора, none — тишина. Эпизод ведётся
+ *  per-(project, reason): тихий соседний проект не сносит чужой флаг.
+ *  Флаг алерта ставится по факту ПОПЫТКИ доставки, не доставки:
+ *  недоставимый коммент не ретраится каждый тик — окно вернётся к нему
+ *  через час. */
 async function holdSpawns(
-  guard: SpawnGuardHold | SpawnGuardThrottle, untracked: TaskRef[], orphaned: number,
-  state: FactoryState,
+  guard: SpawnGuardHold | SpawnGuardThrottle, projectName: string, untracked: TaskRef[],
+  orphaned: number, state: FactoryState,
 ): Promise<void> {
   const targets = untracked.slice(0, 10).map((r) => r.rowId.slice(0, 8))
   const action = guard.t === "hold" ? "спавны отложены" : "спавн дозируется по burstMax"
   log(`гард спавна: ${guard.t === "hold" ? guard.reason : "throttle"}, сирот=${orphaned}, untracked=${untracked.length}` +
     ` — ${action}: ${targets.join(", ") || "нет"}`)
-  if (guard.alert === "none") return
-  if (guard.alert === "first" && guard.t === "hold") backupSuspectState()
+  const reason: "state-loss" | "burst" = guard.t === "hold" ? guard.reason : "burst"
+  const key = holdEpisodeKey(projectName, reason)
+  const episodes = state.holdEpisodes ?? {}
+  const episode = episodes[key]
+  const nowIso = new Date().toISOString()
+  const channel = guardAlertChannel(guard)
+  if (channel === "episode-log") {
+    // вход в burst-эпизод (throttle-волна): одна агрегированная строка с
+    // вердиктом-порогами; per-tick видимость даёт строка выше, дальнейшая
+    // частота — heartbeat ветки silent/repeat
+    episodes[key] = { since: nowIso, signaled: nowIso }
+    state.holdEpisodes = episodes
+    saveState(state)
+    log(`гард спавна: вход в burst-эпизод — ${guard.text}`)
+    return
+  }
+  if (channel === "silent") {
+    if (guard.alert === "repeat") {
+      // heartbeat длящегося burst-эпизода: дрейф счётчиков виден в per-tick
+      // строке выше, окно повтора сдвигается — иначе после первого часа
+      // эпизод рапортовал бы каждый тик
+      episodes[key] = { since: episode.since, signaled: nowIso }
+      state.holdEpisodes = episodes
+      saveState(state)
+      log(`гард спавна: burst-эпизод продолжается — ${guard.text}`)
+    }
+    return
+  }
+  // comment: state-loss first/repeat
+  if (guard.alert === "first") backupSuspectState()
   const target = alertTargetOf(untracked)
   if (target === null) {
     log("гард спавна: адресата алерта нет (ни одной строки с телом) — только лог")
@@ -1186,7 +1222,26 @@ async function holdSpawns(
   } else {
     log(`гард спавна: алерт в ${target.rowId.slice(0, 8)} не доставлен — повтор в пределах окна`)
   }
-  state.holdSignaled = new Date().toISOString()
+  episodes[key] = { since: episode?.since ?? nowIso, signaled: nowIso }
+  state.holdEpisodes = episodes
+  saveState(state)
+}
+
+/** Allow-тик гарда: эпизоды проекта завершены — снять ключи проекта и
+ *  отагрегировать выход в лог (длительность из since, инцидент 10.11).
+ *  Чужие ключи (другие проекты) не трогаются — их allow-тики снимут своё. */
+function clearHoldEpisodes(projectName: string, state: FactoryState): void {
+  const episodes = state.holdEpisodes ?? {}
+  const ownKeys = Object.keys(episodes).filter((k) => k.startsWith(`${projectName}/`))
+  if (ownKeys.length === 0) return
+  for (const k of ownKeys) {
+    // суффикс-каст звука: ключи попадают сюда только через parseHoldEpisodes
+    // (валидация формата "<имя>/<reason>") или holdEpisodeKey (known reason)
+    const reason = k.slice(projectName.length + 1) as "state-loss" | "burst"
+    log(formatGuardEpisodeEnd(reason, episodes[k].since, Date.now()))
+    delete episodes[k]
+  }
+  state.holdEpisodes = episodes
   saveState(state)
 }
 
@@ -1977,18 +2032,25 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (decision.orphan) orphaned++
   }
   const guard = spawnGuardVerdict(
-    { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
+    {
+      orphaned,
+      totalUntracked: untracked.length,
+      holdSignaled: state.holdEpisodes?.[
+        holdEpisodeKey(projectName, spawnGuardReason({ orphaned }, SPAWN_LIMITS))
+      ]?.signaled,
+      now: Date.now(),
+    },
     SPAWN_LIMITS,
   )
   if (guard.t !== "allow") {
-    await holdSpawns(guard, untracked, orphaned, state)
-  } else if (state.holdSignaled !== undefined) {
-    // сигнатура ушла (state восстановлен / волна дренажировалась) — эпизод
-    // завершён, снимаем флаг: следующий эпизод снова получит alert=first
-    // с алертом (и бэкапом для state-loss)
-    delete state.holdSignaled
-    saveState(state)
-    log("гард спавна: сигнатура ушла — эпизод HOLD завершён, флаг снят")
+    await holdSpawns(guard, projectName, untracked, orphaned, state)
+  } else {
+    // сигнатура ушла (state восстановлен / волна дренажировалась) — эпизоды
+    // проекта завершены: снять его ключи с агрегатом выхода в лог
+    // (длительность), следующий эпизод снова получит alert=first с алертом
+    // (и бэкапом для state-loss). Чужие ключи (другие проекты) не трогаются —
+    // их allow-тики снимут своё.
+    clearHoldEpisodes(projectName, state)
   }
 
   // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
