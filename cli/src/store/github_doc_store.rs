@@ -121,34 +121,29 @@ impl DocStore for GitHubDocStore {
         }
     }
 
+    /// Дети папки: "Projects" → папки проектов; "Projects/<proj>" → доки.
+    /// Неизвестный путь или путь-файл — Err с раскладкой доступных:
+    /// дети ближайшего существующего предка (папка) / read-хинт со слагом
+    /// (файл-предок) — help-контракт `DocsSub::Ls`.
     async fn ls(&self, path: &str) -> Result<Vec<DocEntry>> {
         self.ensure_clone().await?;
-        let dir = match path.trim_matches('/') {
-            "" => self.clone_root.join("docs"),
-            clean => {
-                if clean.split('/').any(|seg| seg == "..") {
-                    bail!("путь «{path}» небезопасен");
-                }
-                self.clone_root.join("docs").join(clean)
-            }
-        };
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&dir)?.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
-                continue;
-            }
-            let is_folder = entry.file_type()?.is_dir();
-            out.push(DocEntry {
-                name: match is_folder {
-                    true => format!("{name}/"),
-                    false => name,
-                },
-                is_folder,
-            });
+        let docs = self.clone_root.join("docs");
+        let clean = path.trim_matches('/');
+        if clean.split('/').any(|seg| seg == "..") {
+            return Err(super::github_doc_ls::unsafe_path_error(path));
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let dir = if clean.is_empty() {
+            docs.clone()
+        } else {
+            docs.join(clean)
+        };
+        match super::github_doc_ls::children_sorted(&dir) {
+            Ok(entries) => Ok(entries),
+            Err(e) if super::github_doc_ls::is_ls_missing_kind(&e) => {
+                Err(self.missing_hint(clean, path))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn search_fulltext(&self, query: &str, top_n: usize) -> Result<Vec<FulltextHit>> {
