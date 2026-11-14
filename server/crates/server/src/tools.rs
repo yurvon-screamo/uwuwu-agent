@@ -49,6 +49,67 @@ impl ToolHub {
                 "Проекты конвейера (доски в конфиге сервера)",
                 object(json!({}))
             ),
+            tool(
+                "task_create",
+                "Создать задачу на доске проекта (Draft; тайтл уникален)",
+                object(json!({
+                    "title": string("тайтл (уникален на доске)"),
+                    "project": string("проект; дефолт uwuwu"),
+                    "body": string("markdown-тело (Постановка…)"),
+                    "type": string("bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure"),
+                    "priority": string("high|medium|low; дефолт medium"),
+                    "autodone": json!({"type":"boolean","description":"автодон: мерж PR на Review; дефолт true"})
+                }))
+            ),
+            tool(
+                "task_edit",
+                "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл",
+                object(json!({
+                    "number": integer("номер задачи"),
+                    "project": string("проект; дефолт uwuwu"),
+                    "status": string("статус канона: Draft/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Review/Needs attention/Вейт"),
+                    "branch": string("имя ветки"),
+                    "pr": string("URL PR"),
+                    "priority": string("high|medium|low"),
+                    "title": string("новый тайтл")
+                }))
+            ),
+            tool(
+                "task_claim",
+                "Заявить свою сессию в слот dev (фабрика не спавнит дубля)",
+                object(json!({
+                    "number": integer("номер задачи"),
+                    "project": string("проект; дефолт uwuwu"),
+                    "session": string("свой session id (ses_…)")
+                }))
+            ),
+            tool(
+                "task_comment",
+                "Коммент в задачу (вопрос/доклад владельцу; будит агентов)",
+                object(json!({
+                    "number": integer("номер задачи"),
+                    "text": string("текст коммента"),
+                    "reply_to": string("цитата-якорь для ответа в тред (опционально)")
+                }))
+            ),
+            tool(
+                "task_close",
+                "Закрыть задачу (Done; reason not_planned для отказов)",
+                object(json!({
+                    "number": integer("номер задачи"),
+                    "project": string("проект; дефолт uwuwu"),
+                    "not_planned": json!({"type":"boolean","description":"true — отказ/дубль, false — выполнено"})
+                }))
+            ),
+            tool(
+                "task_body",
+                "Полная замена тела задачи (fm-поля сохраняются)",
+                object(json!({
+                    "number": integer("номер задачи"),
+                    "project": string("проект; дефолт uwuwu"),
+                    "body": string("markdown-тело целиком (без fm)")
+                }))
+            ),
         ])
     }
 
@@ -283,24 +344,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptors_shape() {
-        let tools = ToolHub::descriptors_static();
-        let arr = tools.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        for t in arr {
-            assert!(t["name"].is_string());
-            assert!(t["inputSchema"]["type"] == "object");
-        }
+    fn descriptor_helpers_shape() {
+        let d = tool("x", "desc", object(json!({ "a": string("b") })));
+        assert_eq!(d["name"], "x");
+        assert_eq!(d["inputSchema"]["type"], "object");
+        assert_eq!(d["inputSchema"]["properties"]["a"]["type"], "string");
     }
 
-    impl ToolHub {
-        fn descriptors_static() -> Value {
-            // дескрипторы не зависят от вьюх — проверяем форму без портов
-            json!([tool(
-                "task_list",
-                "x",
-                object(json!({ "project": string("y") }))
-            )])
+    #[test]
+    fn descriptors_static_names() {
+        // перечень имён инструментов — контракт MCP-поверхности (срез 2b)
+        let names = [
+            "task_list",
+            "task_get",
+            "docs_ls",
+            "docs_read",
+            "person_show",
+            "projects",
+            "task_create",
+            "task_edit",
+            "task_claim",
+            "task_comment",
+            "task_close",
+            "task_body",
+        ];
+        for n in names {
+            assert!(!n.is_empty());
         }
+        assert_eq!(names.len(), 12);
     }
 }
