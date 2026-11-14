@@ -31,6 +31,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { Database } from "bun:sqlite"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
 import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
@@ -79,6 +80,8 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
+  deadSpawnVerdict,
+  freshnessOfRow,
   USER_REVIEW_STATUS,
   AGENT_MARK,
   stripExportWrapper,
@@ -126,8 +129,10 @@ import {
   type PrProbeState,
 } from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
-import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, type EnvDeps } from "./env"
+import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, envPaths, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
+import { fetchSessionById, fetchLatestSessionByDirectory } from "../lib/session-row"
+import type { DeadFreshness } from "./factory-lib"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 // ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
@@ -240,6 +245,17 @@ const WAKEUP_DEDUP_MS = 10 * 60_000
  *  не tmpfs — урок SIGSEGV 03.11). Песочница переопределяет вместе с state. */
 const ENV_ROOT = process.env.UWUWU_FACTORY_ENV_ROOT ?? join(homedir(), "agents-env")
 const ENV_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** opencode.db — независимый от serve след живости сессий (задача 1072):
+ *  read-only чтение session_v2; оверрайд для песочниц/переезда (дефолт
+ *  совпадает с дримерным UWUWU_DREAMER_DB-дефолтом). */
+const OPENCODE_DB = process.env.UWUWU_FACTORY_OPENCODE_DB ?? join(homedir(), ".local/share/opencode/opencode.db")
+/** окно fresh-следа (мин): активный ход пишет session_v2 суб-минутно; serve
+ *  при деградации лжёт 404 при живом ходе — dead-вердикт пробы сверяется со
+ *  следом. Трейд: честно мёртвая сессия с посторонним касанием после смерти
+ *  выглядит fresh до окна (пост-ходовой дрейф ~0.5% сессий — SQL-срез в
+ *  плане 1072). 0 = гард выключен (прежнее поведение). */
+const DEAD_FRESH_MIN = Number(process.env.UWUWU_FACTORY_DEAD_FRESH_MIN ?? 30)
+const DEAD_FRESH_MS = DEAD_FRESH_MIN > 0 ? DEAD_FRESH_MIN * 60_000 : 0
 /** периодичность GC легаси-ворктри в тиках: при poll 180s ≈ раз в час.
  *  Старт-проход отдельный — рестарт демона не обязан ждать час. */
 const GC_EVERY_TICKS = 20
@@ -657,6 +673,63 @@ async function sessionLiveness(sessionID: string): Promise<SessionLiveness> {
     const status = (e as { status?: number }).status
     if (status === 404 || status === 400) return "dead"
     return "unknown"
+  }
+}
+
+/** Единый read-only коннект к opencode.db на вызов: короткоживущий (лок-
+ *  безвреден для serve), ошибки чтения → "unknown" — dead-вердикт остаётся
+ *  без сверки (деградация к прежнему поведению, never worse). */
+function withSessionDb(read: (db: Database) => DeadFreshness, diag: string): DeadFreshness {
+  if (DEAD_FRESH_MS === 0) return "stale" // гард выключен — без чтения БД
+  try {
+    const db = new Database(OPENCODE_DB, { readonly: true })
+    try {
+      return read(db)
+    } finally {
+      db.close()
+    }
+  } catch (e) {
+    log(`dead-fresh ${diag}: БД-след недоступен (${errText(e)}) — dead-вердикт без сверки`)
+    return "unknown"
+  }
+}
+
+/** Свежесть сессии по БД-следу (time_updated в окне гарда) — второй,
+ *  независимый от serve источник живости для dead-вердикта пробы (1072). */
+function sessionDbFreshness(sessionID: string): DeadFreshness {
+  return withSessionDb(
+    (db) => freshnessOfRow(fetchSessionById(db, sessionID), Date.now(), DEAD_FRESH_MS),
+    sessionID.slice(0, 16),
+  )
+}
+
+/** Свежесть работы в env задачи по directory-ключу (1072, инстанс #315):
+ *  дев-клетка легитимно пуста — id-ключу не на чем держаться; свежая сессия
+ *  каталога env/repo = живой чужой ход, спавн поверх — дубль. */
+function sessionDbFreshnessByDirectory(rowId: string): DeadFreshness {
+  return withSessionDb(
+    (db) => freshnessOfRow(
+      fetchLatestSessionByDirectory(db, envPaths(ENV_ROOT, rowId).repoDir),
+      Date.now(), DEAD_FRESH_MS,
+    ),
+    rowId.slice(0, 8),
+  )
+}
+
+/** Стартовая диагностика доступности БД-следа: молчаливость unknown-деградации
+ *  в песочнице/при переезде компенсируется видимой строкой старта. */
+function deadFreshStartupVerdict(): string {
+  if (DEAD_FRESH_MS === 0) return "выключен (окно=0)"
+  try {
+    const db = new Database(OPENCODE_DB, { readonly: true })
+    try {
+      db.query("SELECT 1 FROM session_v2 LIMIT 1").get()
+      return "armed"
+    } finally {
+      db.close()
+    }
+  } catch (e) {
+    return `unavailable (${errText(e)})`
   }
 }
 
@@ -1599,6 +1672,10 @@ interface ReviewDeps {
   board: BoardIds
   state: FactoryState
   fresh: TaskComment[]
+  /** живость держателей по serve-пробе этого тика (null — проба не удалась);
+   *  гард БД-следа (1072) применяется только в dead-ветке спавна */
+  reviewerLiveness: SessionLiveness | null
+  testerLiveness: SessionLiveness | null
   consumeComments: () => void
   refreshBodyBaseline: () => Promise<void>
 }
@@ -1618,6 +1695,14 @@ async function dispatchReviewAction(
       const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind ||
         d.tracked.reviewKind !== action.kind
       const seed = entering ? 0 : d.tracked.reviewAttempts ?? 0
+      // dead-ветка пробы сверяется с БД-следом (1072): serve при деградации
+      // лжёт 404 при живом держателе → спавн дубля; kind-mismatch при живом
+      // держателе — легитимный спавн, гардом не гасится
+      if (d.reviewerLiveness === "dead" &&
+          deadSpawnVerdict(sessionDbFreshness(d.tracked.reviewSessionID ?? "")) === "skip") {
+        log(`задача ${shortId}: ревьювер dead по пробе, БД-след свежий — спавн отложен (ложный dead)`)
+        return undefined
+      }
       try {
         await startReview(d.row, d.project, d.cfg, d.board, d.state, action.kind, d.tracked)
         d.consumeComments()
@@ -1662,6 +1747,12 @@ async function dispatchReviewAction(
       // ревьювер поставил статус заново после Needs attention или баг-петли
       const entering = (d.tracked.lastStatus ?? "") !== TESTING_STATUS
       const seed = entering ? 0 : d.tracked.testAttempts ?? 0
+      // dead-ветка пробы сверяется с БД-следом (1072) — паритет spawn-reviewer
+      if (d.testerLiveness === "dead" &&
+          deadSpawnVerdict(sessionDbFreshness(d.tracked.testSessionID ?? "")) === "skip") {
+        log(`задача ${shortId}: тестер dead по пробе, БД-след свежий — спавн отложен (ложный dead)`)
+        return undefined
+      }
       try {
         await startTesting(d.row, d.project, d.cfg, d.board, d.state, d.tracked)
         d.consumeComments()
@@ -1734,6 +1825,15 @@ async function dispatchReviewAction(
         }
         return undefined
       }
+      // dead по пробе: сверка с БД-следом (1072) — serve при деградации лжёт
+      // 404 при живом ходе; fresh → рестарт отложен, следующий тик перепроверит
+      const deadFresh = d.tracked.sessionID !== ""
+        ? sessionDbFreshness(d.tracked.sessionID)
+        : sessionDbFreshnessByDirectory(d.row.rowId)
+      if (deadSpawnVerdict(deadFresh) === "skip") {
+        log(`задача ${shortId}: дев-сессия dead по пробе, БД-след свежий — рестарт отложен (ложный dead)`)
+        return undefined
+      }
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
       // агентские сессии сохраняем: инвариант 1 задача = 1 ревьювер и
       // 1 тестировщик. startTask заменяет запись state — дальше по циклу
@@ -1804,13 +1904,21 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   const verdicts = await Promise.all(untracked.map(async (r) => {
     const devCell = r.devSession ?? ""
     const liveness = devCell === "" ? "dead" : await sessionLiveness(devCell)
-    return { rowId: r.rowId, liveness, decision: untrackedRowDecision(r, liveness) }
+    // dead-вердикт пробы сверяется с БД-следом (1072): id-ключ при непустой
+    // клетке, directory-ключ при легитимно пустой (инстанс #315 — клетки
+    // пусты, а ход в env идёт)
+    const deadFresh = liveness === "dead"
+      ? (devCell !== "" ? sessionDbFreshness(devCell) : sessionDbFreshnessByDirectory(r.rowId))
+      : "unknown"
+    return { rowId: r.rowId, liveness, deadFresh, decision: untrackedRowDecision(r, liveness, deadFresh) }
   }))
   let orphaned = 0
-  for (const { rowId, liveness, decision } of verdicts) {
+  for (const { rowId, liveness, deadFresh, decision } of verdicts) {
     if (!decision.devWave) {
       externalSkip.add(rowId)
-      log(`внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
+      log(liveness === "dead" && deadFresh === "fresh"
+        ? `внешняя заявка ${rowId.slice(0, 8)}: проба dead, БД-след свежий — ложный dead, спавн отложен`
+        : `внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
     }
     if (decision.orphan) orphaned++
   }
@@ -2090,6 +2198,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
 
     const skipRest = await dispatchReviewAction(action, {
       row, tracked, project: tracked.project || projectName, cfg, board, state, fresh: foreign,
+      reviewerLiveness: reviewerLiveness, testerLiveness: testerLiveness,
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
@@ -2489,6 +2598,7 @@ async function main(): Promise<void> {
   emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
+  log(`dead-fresh гард: ${deadFreshStartupVerdict()} (БД ${OPENCODE_DB}, окно ${DEAD_FRESH_MS === 0 ? "0" : `${DEAD_FRESH_MIN}м`})`)
   // старт-свип окружений: сироты без записи в state и старый attic — только
   // прод (песочница/DRY_RUN не трогают реальный ENV_ROOT)
   if (!DRY_RUN && !STATE_RESOLVED.sandboxed) {
