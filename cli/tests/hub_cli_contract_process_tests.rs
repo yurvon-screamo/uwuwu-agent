@@ -456,7 +456,15 @@ fn task_close_fails_loud_when_state_never_confirms() {
     let (code, stdout, stderr) = run_stub(
         &guards,
         None,
-        &["task", "close", "999", "--project", "uwuwu", "--note", "пин"],
+        &[
+            "task",
+            "close",
+            "999",
+            "--project",
+            "uwuwu",
+            "--note",
+            "пин",
+        ],
     );
     assert_ne!(code, Some(0), "тихий успех запрещён; stdout={stdout}");
     assert!(!stdout.contains("закрыта"), "stdout: {stdout}");
