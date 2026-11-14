@@ -113,6 +113,15 @@ async fn run(
         tasks: task_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
+        writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
+            board: board.clone(),
+            board_name: Arc::new(
+                plan.boards
+                    .first()
+                    .map(|b| b.board.clone())
+                    .unwrap_or_default(),
+            ),
+        }),
     });
 
     let http_state = Arc::new(http::AppState {

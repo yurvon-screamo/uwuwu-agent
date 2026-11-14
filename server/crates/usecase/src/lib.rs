@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod error;
 pub mod ports;
+pub mod taskwrite;
 pub mod tick;
 #[cfg(test)]
 mod tick_tests;
@@ -12,8 +13,9 @@ pub mod views;
 
 pub use error::{UsecaseError, UsecaseResult};
 pub use ports::{
-    AgentSessionGateway, Clock, CommentRef, IssueView, Liveness, PrGateway, PrState, SessionSpec,
-    TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, Clock, CommentRef, FmMutator, IssueView, Liveness, PrGateway, PrState,
+    SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
+pub use taskwrite::{NewTask, TaskPatch, TaskWriteUseCase, TaskWriter};
 pub use tick::{BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase};
 pub use views::{DocsView, PersonView, TaskView, ViewError};

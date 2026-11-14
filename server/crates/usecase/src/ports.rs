@@ -6,6 +6,10 @@ use crate::error::UsecaseResult;
 use async_trait::async_trait;
 use uwuwu_domain::{Slot, Status, Task, UtcMinute};
 
+/// Мутатор fm-ячеек задачи (branch/pr/priority/…).
+pub type FmMutator =
+    Box<dyn for<'a> FnOnce(&'a mut std::collections::BTreeMap<String, String>) + Send>;
+
 /// Доска задач: чтение строк + мутации носителя (поля+fm синхронны —
 /// инвариант «fm ≡ поля» держит реализация).
 #[async_trait]
@@ -27,6 +31,22 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>>;
     /// Полная карта задачи: агрегат + тело issue + все комменты.
     async fn read_issue(&self, board: &str, number: u64) -> UsecaseResult<IssueView>;
+    /// Создание issue (лейбл proj:<project>) + строка на доске board (Draft).
+    async fn create_issue(
+        &self,
+        board: &str,
+        project: &str,
+        title: &str,
+        body: &str,
+    ) -> UsecaseResult<u64>;
+    /// Переименование (тайтл уникален — дубль отвергается юзкейсом выше).
+    async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()>;
+    /// Точечная правка fm-ячеек (branch/pr/priority/…) с сохранением контента.
+    async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
+    /// Закрытие с причиной (completed|not_planned).
+    async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
+    /// Полная замена тела issue (fm нового тела становится каноном).
+    async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
 }
 
 /// Задача целиком: для карточки task_get (агентские чтения).

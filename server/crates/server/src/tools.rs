@@ -3,12 +3,13 @@
 
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_usecase::{DocsView, PersonView, TaskView};
+use uwuwu_usecase::{DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter};
 
 pub struct ToolHub {
     pub tasks: Arc<TaskView>,
     pub docs: Arc<DocsView>,
     pub person: Arc<PersonView>,
+    pub writer: Arc<TaskWriteUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -123,6 +124,103 @@ impl ToolHub {
                 let md = self.person.show().await.map_err(view_err)?;
                 ok_text(md)
             }
+            "task_create" => {
+                let spec = uwuwu_usecase::NewTask {
+                    title: arg("title"),
+                    body_md: arg("body"),
+                    kind: arg("type"),
+                    priority: arg("priority"),
+                    autodone: args
+                        .get("autodone")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                };
+                let n = self
+                    .writer
+                    .create(&project, spec)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!(
+                    "создана задача #{n} (Draft) на доске проекта {project}"
+                ))
+            }
+            "task_edit" => {
+                let number = need_number(args)?;
+                let patch = uwuwu_usecase::TaskPatch {
+                    status: str_arg(args, "status").map(|s| uwuwu_domain::Status::parse(&s)),
+                    branch: str_arg(args, "branch"),
+                    pr: str_arg(args, "pr"),
+                    priority: str_arg(args, "priority"),
+                    title: str_arg(args, "title"),
+                };
+                if patch.status.is_none()
+                    && patch.branch.is_none()
+                    && patch.pr.is_none()
+                    && patch.priority.is_none()
+                    && patch.title.is_none()
+                {
+                    return Err("пустой патч: укажи хотя бы одно поле".into());
+                }
+                self.writer
+                    .edit(number, patch)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("задача #{number} обновлена"))
+            }
+            "task_claim" => {
+                let number = need_number(args)?;
+                let session = arg("session");
+                if !session.starts_with("ses_") {
+                    return Err("session обязан быть ses_…".into());
+                }
+                self.writer
+                    .claim(number, &session)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("задача #{number}: дев-слот заявлен за {session}"))
+            }
+            "task_comment" => {
+                let number = need_number(args)?;
+                let text = arg("text");
+                let reply = str_arg(args, "reply_to");
+                self.writer
+                    .comment(number, &text, reply.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("коммент отправлен в #{number}"))
+            }
+            "task_close" => {
+                let number = need_number(args)?;
+                let np = args
+                    .get("not_planned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.writer
+                    .close(number, np)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("задача #{number} закрыта"))
+            }
+            "task_body" => {
+                let number = need_number(args)?;
+                let body = arg("body");
+                if body.trim().is_empty() {
+                    return Err("пустое тело".into());
+                }
+                // fm текущей задачи сохраняется, контент заменяется
+                let current = self.tasks.card(&project, number).await.map_err(view_err)?;
+                let fm = fm_of(&current.body);
+                let next = format!(
+                    "---\n{}\n---\n\n{}",
+                    fm,
+                    body.trim_start_matches('-').trim_start_matches('#').trim()
+                );
+                self.writer
+                    .set_body(number, &next)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!("тело #{number} заменено"))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -130,6 +228,34 @@ impl ToolHub {
 
 fn view_err(e: uwuwu_usecase::ViewError) -> String {
     e.to_string()
+}
+
+fn str_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn need_number(args: &Value) -> Result<u64, String> {
+    args.get("number")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .ok_or("number обязателен (число)".to_string())
+}
+
+/// fm-блок целиком (между маркерами), либо дефолтный скелет.
+fn fm_of(body: &str) -> String {
+    if let Some(end) = body.find("\n---\n") {
+        return body[..end + 5]
+            .trim_start_matches('-')
+            .trim_matches('-')
+            .trim()
+            .to_string();
+    }
+    String::from("status: Draft\npriority: medium\nautodone: true")
 }
 
 fn ok_text(text: String) -> Result<Value, String> {

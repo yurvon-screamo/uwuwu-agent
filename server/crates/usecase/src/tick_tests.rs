@@ -59,6 +59,32 @@ impl TaskBoardRepo for FakeBoard {
             comments: vec![],
         })
     }
+    async fn create_issue(
+        &self,
+        _b: &str,
+        _p: &str,
+        title: &str,
+        _body: &str,
+    ) -> UsecaseResult<u64> {
+        let n = self.rows.len() as u64 + 100;
+        self.log.lock().unwrap().push(format!("create:{title}"));
+        Ok(n)
+    }
+    async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn patch_cells(&self, n: u64, _m: crate::ports::FmMutator) -> UsecaseResult<()> {
+        self.log.lock().unwrap().push(format!("cells#{n}"));
+        Ok(())
+    }
+    async fn close_issue_ext(&self, n: u64, _np: bool) -> UsecaseResult<()> {
+        self.log.lock().unwrap().push(format!("close_ext#{n}"));
+        Ok(())
+    }
+    async fn replace_body(&self, n: u64, _b: &str) -> UsecaseResult<()> {
+        self.log.lock().unwrap().push(format!("body#{n}"));
+        Ok(())
+    }
 }
 
 struct FakeSessions {
