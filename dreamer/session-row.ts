@@ -1,9 +1,11 @@
-// session-row.ts — базовая работа со строками session_v2 opencode.db:
-// тип строки, row-маппер, выборка по id, LIKE-паттерн e2e-исключений.
-// Отдельный модуль без контурной логики: посессионный (dreamer-lib) и
-// задачный (task-run-lib) контуры оба работают с этими строками.
+// session-row.ts — dreamer-контур над базовыми строками session_v2
+// (базовый слой: тип строки, row-маппер, выборки — в lib/session-row.ts):
+// e2e-исключения, выборки по родителям, доказательства работы ассистента.
 import type { Database } from "bun:sqlite"
 import { E2E_SESSION_PREFIX } from "../lib/e2e-tag"
+import { SESSION_COLUMNS, rowToSession, type SessionRow } from "../lib/session-row"
+
+export { fetchSessionById, rowToSession, type SessionRow } from "../lib/session-row"
 
 /** LIKE-паттерн исключения e2e-сессий — строится из константы конвенции,
  *  литерал `[e2e]` в SQL не дублируется. */
@@ -14,38 +16,6 @@ export const E2E_SKIP_LIKE = `${E2E_SESSION_PREFIX}%`
  *  Плейсхолдер LIKE-паттерна — второй параметр вызова. */
 export const SESSION_EXCLUSIONS_SQL =
   `COALESCE(agent, '') != 'dreamer' AND COALESCE(title, '') NOT LIKE ?`
-
-export interface SessionRow {
-  id: string
-  title: string | null
-  directory: string | null
-  agent: string | null
-  parentId: string | null
-  timeCreated: number
-  timeUpdated: number
-}
-
-export function rowToSession(r: Record<string, unknown>): SessionRow {
-  return {
-    id: String(r.id),
-    title: r.title === null ? null : String(r.title),
-    directory: r.directory === null ? null : String(r.directory),
-    agent: r.agent === null ? null : String(r.agent),
-    parentId: r.parent_id === null ? null : String(r.parent_id),
-    timeCreated: Number(r.time_created),
-    timeUpdated: Number(r.time_updated),
-  }
-}
-
-const SESSION_COLUMNS = `id, title, directory, agent, parent_id, time_created, time_updated`
-
-/** Одна сессия по id (реконсил живых прогонов не зависит от idle-списка). */
-export function fetchSessionById(db: Database, sid: string): SessionRow | null {
-  const row = db
-    .query(`SELECT ${SESSION_COLUMNS} FROM session_v2 WHERE id = ?`)
-    .get(sid) as Record<string, unknown> | null
-  return row === null ? null : rowToSession(row)
-}
 
 /** Дочерние сессии по родителям (один уровень BFS сбора задачи). */
 export function fetchSessionsByParents(db: Database, parentIds: string[]): SessionRow[] {

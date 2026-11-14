@@ -30,6 +30,11 @@ pub fn git_sync_with_author(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Асинхронный git-мутатор без чтения stdout (fetch/reset/checkout/…).
+pub async fn git(args: &[&str]) -> Result<()> {
+    git_raw(args).await.map(|_| ())
+}
+
 /// Асинхронный raw git (stdout строкой; stderr при неуспехе — в ошибку).
 pub async fn git_raw(args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new("git")

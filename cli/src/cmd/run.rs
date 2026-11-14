@@ -1,6 +1,7 @@
 //! CLI-маршрутизация hub-режима (задача
 //! 20261112155302-ttyp35g): task/search/read/docs/semantic/projects/person/
-//! cron — через uwuwu-hub (TaskStore/DocStore + gh).
+//! cron — через uwuwu-hub (TaskStore/DocStore + gh). Gh-листинги
+//! (projects/cron) — hub_lists (полная пагинация ADR-020).
 
 use crate::cmd::cli::{Commands, SemanticSub};
 use anyhow::{bail, Result};
@@ -27,8 +28,8 @@ pub(crate) async fn dispatch(command: Commands) -> Result<()> {
             crate::cmd::hub_docs::docs_ls(&prefix).await
         }
         Commands::Semantic { command } => semantic_run(command).await,
-        Commands::Projects => projects_hub().await,
-        Commands::Cron { command } => cron_hub(command).await,
+        Commands::Projects => crate::cmd::hub_lists::projects_hub().await,
+        Commands::Cron { command } => crate::cmd::hub_lists::cron_hub(command).await,
         Commands::Person { command } => person_hub(command).await,
         other => not_on_hub(other),
     }
@@ -43,88 +44,6 @@ fn not_on_hub(command: Commands) -> Result<()> {
         _ => "команда",
     };
     bail!("hub-режим: команда «{name}» не поддерживается. Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
-}
-
-/// Проекты = labels `proj:*` репо hub (источник истины — инвентарь срез A).
-async fn projects_hub() -> Result<()> {
-    let out = gh_labels()?;
-    for project in out {
-        println!("{project}");
-    }
-    Ok(())
-}
-
-fn gh_labels() -> Result<Vec<String>> {
-    let repo = hub_repo_default();
-    // gh-контракт: -f/-F без -X — это POST (labels POST = create → 422);
-    // явный GET обязательн, ошибка gh — громкий отказ, не данные в stdout
-    let r = std::process::Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "GET",
-            &format!("repos/{repo}/labels"),
-            "-F",
-            "per_page=100",
-            "--jq",
-            r#".[].name | select(startswith("proj:")) | sub("proj:"; "")"#,
-        ])
-        .output()
-        .expect("gh не запустился");
-    if !r.status.success() {
-        let err = String::from_utf8_lossy(&r.stderr);
-        anyhow::bail!("gh api labels упал ({}): {}", r.status, err.trim());
-    }
-    Ok(String::from_utf8_lossy(&r.stdout)
-        .lines()
-        .map(String::from)
-        .collect())
-}
-
-/// Кроны = инвентарь крон-задач: issues с frontmatter schedule в статусе
-/// Вейт (мастера). Семантика унифицированных кронов (ADR-075) сохраняется.
-async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
-    let crate::cmd::cli::CronSub::List { project } = command;
-    let repo = hub_repo_default();
-    let labels_filter = match &project {
-        Some(p) => format!("proj:{p}"),
-        None => String::new(),
-    };
-    let mut args = vec![
-        "api".to_string(),
-        format!("repos/{repo}/issues"),
-        "-F".to_string(),
-        "state=open".to_string(),
-        "-F".to_string(),
-        "per_page=100".to_string(),
-    ];
-    if !labels_filter.is_empty() {
-        args.push("-f".to_string());
-        args.push(format!("labels={labels_filter}"));
-    }
-    let mut argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    argv.insert(1, "-X");
-    argv.insert(2, "GET");
-    let data = crate::store::github_gh::gh_json(&argv, None).await?;
-    let mut count = 0;
-    if let serde_json::Value::Array(items) = &data {
-        for issue in items {
-            let body = issue["body"].as_str().unwrap_or("");
-            let fm = crate::store::github_task::parse_frontmatter_public(body);
-            let Some(schedule) = fm.get("schedule") else {
-                continue;
-            };
-            count += 1;
-            println!(
-                "#{} [Вейт] {} — {}",
-                issue["number"],
-                issue["title"].as_str().unwrap_or(""),
-                schedule
-            );
-        }
-    }
-    println!("крон-мастеров: {count}");
-    Ok(())
 }
 
 /// Персона = приватный md-док вики (Experience:/personal/PERSON): hub —

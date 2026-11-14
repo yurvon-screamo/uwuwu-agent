@@ -101,71 +101,6 @@ async fn default_create_cron_run_is_loud() {
     assert!(format!("{err}").contains("create_cron_run"));
 }
 
-fn board() -> TaskBoard {
-    TaskBoard {
-        project: "uwuwu".into(),
-    }
-}
-
-fn task() -> Task {
-    Task {
-        id: "row-1".into(),
-        title: "пробная".into(),
-        status: "Todo".into(),
-        task_type: crate::store::TaskType("bug".into()),
-        branch: String::new(),
-        pr: String::new(),
-        dev_session: String::new(),
-        planned: String::new(),
-        planned_ms: 0,
-        schedule_cell: String::new(),
-        priority: String::new(),
-        autodone: false,
-    }
-}
-
-/// Frontmatter GitHubStore: parse из тела issue, мульти-правка без потери
-/// rest-md и порядка полей (контракт миграции: Branch/PR/Сессия dev —
-/// frontmatter, тело не трогается).
-mod frontmatter_tests {
-    use crate::store::github_task::Frontmatter;
-
-    #[test]
-    fn parse_without_frontmatter_rests_whole_body() {
-        let f = Frontmatter::parse("тело без блока");
-        assert!(f.get("branch").is_none());
-        assert_eq!(f.rest_md, "тело без блока");
-    }
-
-    #[test]
-    fn parse_extracts_fields_and_rest() {
-        let f = Frontmatter::parse("---\nbranch: work/x\nstatus: Todo\n---\n\n# тело\n");
-        assert_eq!(f.get("branch").as_deref(), Some("work/x"));
-        assert_eq!(f.get("status").as_deref(), Some("Todo"));
-        assert!(f.rest_md.contains("# тело"));
-    }
-
-    #[test]
-    fn with_fields_replaces_keeps_order_and_rest() {
-        let f = Frontmatter::parse("---\nbranch: old\npr: https://x/1\n---\nтекст");
-        let out = f.with_fields(&[("branch", "new"), ("dev-session", "ses_1")]);
-        assert!(out.contains("branch: new"));
-        assert!(out.contains("pr: https://x/1"));
-        assert!(out.contains("dev-session: ses_1"));
-        assert!(out.starts_with("---\n"));
-        assert!(out.ends_with("текст"));
-        assert!(!out.contains("branch: old"));
-    }
-
-    #[test]
-    fn with_field_creates_block_on_plain_body() {
-        let f = Frontmatter::parse("просто тело");
-        let out = f.with_field("schedule", "6h");
-        assert!(out.starts_with("---\nschedule: 6h\n---\n"));
-        assert!(out.ends_with("просто тело"));
-    }
-}
-
 /// Полнотекст-парсер GitHub DocStore: строки «path:line:text» → хиты.
 #[test]
 fn fulltext_parser_extracts_slug_and_snippet() {
@@ -193,96 +128,95 @@ fn by_title_matches_and_tokens_case_insensitive() {
     assert_eq!(hits[0].slug, "Задачи uwuwu/Замена бекенда");
 }
 
-/// Дефолты priority и autodone при create (задачи 1052 и 1050):
-/// fm-конструирование новой задачи — чистая функция write-path.
-mod create_frontmatter_tests {
-    use crate::store::github_task_write::create_frontmatter;
+/// Носитель клеток (ADR-098): convert читает клетки из payload
+/// `issue_field_values` (норм-форма), Status — Pv2-джойн (параметр) с
+/// проекцией closed→Done; fm-шапка тела мертва.
+mod issue_fields_tests {
+    use crate::store::github_task::GitHubStore;
 
-    #[test]
-    fn create_without_priority_flag_defaults_to_medium() {
-        let out = create_frontmatter("# заголовок\n\nтело", "Todo", None, None);
-        assert!(
-            out.starts_with("---\nstatus: Todo\npriority: medium\n"),
-            "стабильный порядок + дефолт medium, got: {out}"
-        );
-        assert!(out.ends_with("# заголовок\n\nтело"));
+    fn issue_with_fields() -> serde_json::Value {
+        serde_json::json!({
+            "number": 42,
+            "title": "пробная задача",
+            "state": "open",
+            "type": { "name": "Bug" },
+            "body": "чистый контент без шапки\n",
+            "issue_field_values": [
+                { "issue_field_name": "Приоритет", "value": 87264165,
+                  "single_select_option": { "id": 87264165, "name": "high" } },
+                { "issue_field_name": "Autodone", "value": 87264196,
+                  "single_select_option": { "id": 87264196, "name": "on" } },
+                { "issue_field_name": "Branch", "value": "work/task-42" },
+                { "issue_field_name": "PR", "value": "https://github.com/x/y/pull/1" },
+                { "issue_field_name": "Сессия dev", "value": "ses_1" },
+                { "issue_field_name": "Расписание", "value": "30 5 * * *" },
+                { "issue_field_name": "Запланировано", "value": "2026-11-20" }
+            ]
+        })
     }
 
     #[test]
-    fn explicit_priority_flag_wins_over_default() {
-        let out = create_frontmatter("тело", "Draft", Some("high"), None);
-        assert!(
-            out.starts_with("---\nstatus: Draft\npriority: high\n"),
-            "got: {out}"
-        );
-        assert!(!out.contains("medium"));
+    fn convert_читает_клетки_из_issue_field_values() {
+        let store = GitHubStore::new("o/r".into());
+        let t = store.convert(&issue_with_fields(), Some("In Progress"));
+        assert_eq!(t.id, "42");
+        assert_eq!(t.status, "In Progress");
+        assert_eq!(t.priority, "high");
+        assert!(t.autodone);
+        assert_eq!(t.branch, "work/task-42");
+        assert_eq!(t.pr, "https://github.com/x/y/pull/1");
+        assert_eq!(t.dev_session, "ses_1");
+        assert_eq!(t.schedule_cell, "30 5 * * *");
+        assert_eq!(t.planned, "2026-11-20");
+        assert!(t.planned_ms > 0);
     }
 
     #[test]
-    fn authored_priority_in_body_frontmatter_survives() {
-        let body = "---\npriority: low\n---\nтело с авторским fm";
-        let out = create_frontmatter(body, "Todo", None, None);
-        assert!(out.contains("priority: low"), "got: {out}");
-        assert!(
-            !out.contains("medium"),
-            "дефолт не подставляется поверх авторского"
-        );
-        assert!(out.contains("status: Todo"));
+    fn convert_пустые_клетки_дефолты() {
+        let store = GitHubStore::new("o/r".into());
+        let issue = serde_json::json!({
+            "number": 7, "title": "x", "state": "open",
+            "body": "тело", "issue_field_values": []
+        });
+        let t = store.convert(&issue, Some(""));
+        assert_eq!(t.status, "Todo", "нет Pv2-статуса → Todo-дефолт");
+        assert_eq!(t.priority, "");
+        assert!(!t.autodone);
+        assert_eq!(t.branch, "");
+        assert_eq!(t.planned, "");
+        assert_eq!(t.planned_ms, 0);
     }
 
     #[test]
-    fn explicit_flag_overrides_authored_frontmatter_field() {
-        let body = "---\npriority: low\n---\nrest";
-        let out = create_frontmatter(body, "Todo", Some("high"), None);
-        assert!(out.contains("priority: high"), "got: {out}");
-        assert!(!out.contains("priority: low"));
+    fn convert_closed_проекция_done_поверх_всего() {
+        let store = GitHubStore::new("o/r".into());
+        let mut issue = issue_with_fields();
+        issue["state"] = serde_json::json!("closed");
+        let t = store.convert(&issue, Some("Ревью результата"));
+        assert_eq!(t.status, "Done", "closed issue → Done независимо от Pv2");
     }
+}
 
-    #[test]
-    fn autodone_cell_keeps_bool_parity_and_order() {
-        let out = create_frontmatter("тело", "Draft", Some("low"), Some(true));
-        assert!(
-            out.starts_with("---\nstatus: Draft\npriority: low\nautodone: true\n"),
-            "got: {out}"
-        );
-        let off = create_frontmatter("тело", "Draft", None, Some(false));
-        assert!(
-            off.starts_with("---\nstatus: Draft\npriority: medium\nautodone: false\n"),
-            "got: {off}"
-        );
+fn board() -> TaskBoard {
+    TaskBoard {
+        project: "uwuwu".into(),
     }
+}
 
-    #[test]
-    fn create_without_autodone_flag_defaults_to_true() {
-        let out = create_frontmatter("# заголовок\n\nтело", "Todo", None, None);
-        assert!(
-            out.starts_with("---\nstatus: Todo\npriority: medium\nautodone: true\n"),
-            "стабильный порядок + дефолт true (решение владельца 14.11), got: {out}"
-        );
-        assert!(out.ends_with("# заголовок\n\nтело"));
-    }
-
-    #[test]
-    fn authored_autodone_in_body_frontmatter_survives() {
-        let body = "---\nautodone: false\n---\nтело с авторским fm";
-        let out = create_frontmatter(body, "Todo", None, None);
-        assert!(out.contains("autodone: false"), "got: {out}");
-        assert!(
-            !out.contains("autodone: true"),
-            "дефолт не подставляется поверх авторского"
-        );
-        assert!(out.contains("status: Todo"));
-    }
-
-    #[test]
-    fn explicit_autodone_off_overrides_authored_frontmatter() {
-        let body = "---\nautodone: true\n---\nrest";
-        let out = create_frontmatter(body, "Todo", None, Some(false));
-        assert!(out.contains("autodone: false"), "got: {out}");
-        assert!(
-            !out.contains("autodone: true"),
-            "явный off перекрывает авторский fm"
-        );
+fn task() -> Task {
+    Task {
+        id: "row-1".into(),
+        title: "пробная".into(),
+        status: "Todo".into(),
+        task_type: crate::store::TaskType("bug".into()),
+        branch: String::new(),
+        pr: String::new(),
+        dev_session: String::new(),
+        planned: String::new(),
+        planned_ms: 0,
+        schedule_cell: String::new(),
+        priority: String::new(),
+        autodone: false,
     }
 }
 
