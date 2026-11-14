@@ -3,7 +3,7 @@
 #
 # mode:
 #   observe — тик читает доски и логирует решения, мутаций нет (обкатка)
-#   live    — полный конвейер: спавны, будильники, автодон (срез 1b+)
+#   live    — полный конвейер: спавны, будильники, автодон
 mode = "observe"
 poll_sec = 180
 port = 8090
@@ -11,6 +11,15 @@ port = 8090
 [hub]
 repo = "yurvon-screamo/uwuwu-hub"
 # токен: env GH_TOKEN
+
+[executor]
+name = "kisa"
+url = "https://opencode.uwuwu.net"
+# basic-пароль опенкода: env UWUWU_OPENCODE_PASSWORD
+
+[executor.spawn_model]
+provider = "zai-coding-plan"
+id = "glm-5.3-flash"
 
 [policy]
 cup = 7
@@ -21,3 +30,7 @@ peak = { enabled = true, start_min = 360, end_min = 600 }
 name = "uwuwu"
 board = "Задачи uwuwu"
 repo = "yurvon-screamo/uwuwu-agent"
+# мастер-чекаут проекта на исполнителе (cwd bootstrap-сессии)
+checkout = "/home/yurvon/uwuwu-agent"
+# корень env задач на исполнителе (~/agents-env)
+env_root = "/home/yurvon/agents-env"

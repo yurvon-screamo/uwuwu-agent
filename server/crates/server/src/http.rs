@@ -1,6 +1,5 @@
-//! HTTP-слой: /health под bearer-гейтом (exposition MCP — срез 2).
+//! HTTP-presentation: /health под bearer-гейтом (MCP-поверхность — срез 2).
 
-use crate::pipeline::SharedTick;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -8,11 +7,12 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use std::sync::Arc;
+use uwuwu_usecase::TickOutcome;
 
 pub struct AppState {
     pub bearer: Arc<String>,
     pub mode: &'static str,
-    pub tick: SharedTick,
+    pub tick: Arc<std::sync::RwLock<TickOutcome>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -33,7 +33,7 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
             Json(json!({ "error": "unauthorized" })),
         );
     }
-    let tick = state.tick.read().map(|t| t.clone()).unwrap_or_default();
+    let tick = state.tick.read().expect("tick lock").clone();
     (
         StatusCode::OK,
         Json(json!({
@@ -48,7 +48,6 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::TickSummary;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -58,7 +57,7 @@ mod tests {
         let state = Arc::new(AppState {
             bearer: Arc::new("s3cret".into()),
             mode: "observe",
-            tick: Arc::new(std::sync::RwLock::new(TickSummary::default())),
+            tick: Arc::new(std::sync::RwLock::new(TickOutcome::default())),
         });
         router(state)
     }
