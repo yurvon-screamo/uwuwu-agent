@@ -28,12 +28,13 @@
 //      ход рождает сообщения)
 // Запуск: systemd --user (uwuwu-factory.service). Тик: 3 минуты.
 
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
+import { appendFileSync, copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { Database } from "bun:sqlite"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
+import { hubCloneRoot } from "../lib/platform-hub"
 import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
 import { acquireLock, makeDrain, resolveDaemonStateDir, daemonLogPath, emitNotice } from "../lib/single-instance"
 import {
@@ -85,7 +86,9 @@ import {
   freshnessOfRow,
   USER_REVIEW_STATUS,
   AGENT_MARK,
-  stripExportWrapper,
+  personMarkdown,
+  projectDocSlugs,
+  PERSON_SLUG,
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
@@ -828,33 +831,17 @@ async function prConflicted(pr: string, cwd: string): Promise<boolean> {
 
 // ——— инит-данные первого промпта (юзер/проект/задача) ———
 
-/** Канон-четвёрка доков проекта: hpath-сегменты под папкой проекта
- *  (слаг для агента — «<proj>/<сегмент>»). */
-const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
-
-/** Идентификаторы контуров инита: имена топ-папок вики. */
-const PERSON_NOTEBOOK = process.env.UWUWU_PERSON_NOTEBOOK ?? "Experience"
-const PROJECTS_NOTEBOOK = "Projects"
-
 /** Инит-блок спавна (постановка: фабрика знает юзер/проект/задачу ДО
  *  спавна — агент не тратит ход на person show/доки/task get ради
- *  ориентации). Деградация любого источника честная (null/пустой список
- *  + строка в блоке), спавн от полноты инита не зависит. */
+ *  ориентации). Источник — локальный git-клон hub-репо (docs/**): клон
+ *  синкается cli-вызовами (каждый cli call = ensure_clone), фабрика
+ *  читает как есть — синк из демона дублировал бы cli-локи (задача 1062).
+ *  Деградация любого источника честная (null/пустой список + строка в
+ *  блоке), спавн от полноты инита не зависит. */
 async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omit<SpawnInit, "task">> {
-  // резолв ноутбуков — под тем же контрактом честной деградации, что и
-  // источники: сбой одного kernel-вызова не фейлит спавн (фетчеры увидят
-  // пустой id и отлогируют пропуск своего контура)
-  let notebookIds: Record<string, string> = {}
-  try {
-    notebookIds = (await mcp.tool<{ ids?: Record<string, string> }>("notebook_ids_by_names", {
-      names: [PERSON_NOTEBOOK, PROJECTS_NOTEBOOK],
-    })).ids ?? {}
-  } catch (e) {
-    log(`инит: резолв ноутбуков не удался (${errText(e)})`)
-  }
   const [person, projectDocs] = await Promise.all([
-    fetchPersonMarkdown(notebookIds[PERSON_NOTEBOOK] ?? ""),
-    fetchProjectDocSlugs(projectName, notebookIds[PROJECTS_NOTEBOOK] ?? ""),
+    fetchPersonMarkdown(),
+    fetchProjectDocSlugs(projectName),
   ])
   return {
     person,
@@ -865,55 +852,29 @@ async function fetchSpawnInit(projectName: string, cfg: ProjectCfg): Promise<Omi
   }
 }
 
-/** Персона владельца: Experience:/personal/PERSON (env-шов паритета CLI).
- *  null — дока нет, дубль hpath (≥2 id — не угадываем, паритет person show)
- *  или сбой ядра: во всех случаях пропуск источника, не ошибка спавна. */
-async function fetchPersonMarkdown(personNotebookId: string): Promise<string | null> {
+/** Персона владельца: файл PERSON.md в клоне вики (слаг PERSON_SLUG —
+ *  паритет cli person show). null — дока нет/пустая/не читается: во всех
+ *  случаях пропуск источника, не ошибка спавна. */
+async function fetchPersonMarkdown(): Promise<string | null> {
+  const file = `${hubCloneRoot()}/docs/${PERSON_SLUG}.md`
   try {
-    const hpath = process.env.UWUWU_PERSON_HPATH ?? "/personal/PERSON"
-    if (personNotebookId === "") {
-      log(`инит: ноутбук «${PERSON_NOTEBOOK}» не найден — персона пропущена`)
-      return null
-    }
-    const ids = (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", { notebook: personNotebookId, path: hpath })).ids ?? []
-    if (ids.length !== 1) {
-      log(`инит: персона ${ids.length === 0 ? "не найдена" : `неоднозначна (${ids.length} id)`} — пропущена`)
-      return null
-    }
-    const doc = await mcp.tool<{ markdown?: string; exists?: boolean; title?: string }>("export_doc_markdown", { docId: ids[0] as string })
-    const md = stripExportWrapper(doc.exists === true ? doc.markdown ?? "" : "", doc.title ?? "").trim()
-    if (md === "") {
-      log("инит: экспорт персоны пуст — пропущена")
-      return null
-    }
-    return md
+    const md = readFileSync(file, "utf8")
+    const body = personMarkdown(md)
+    if (body === null) log(`инит: персона пуста (${PERSON_SLUG}) — пропущена`)
+    return body
   } catch (e) {
     log(`инит: персона не получена (${errText(e)}) — пропущена`)
     return null
   }
 }
 
-/** Слаги живых доков канон-четвёрки проекта (uwuwu-cli read «<proj>/<док>»).
- *  Мёртвый/неоднозначный hpath — док пропускается, не угадываем; четвёрка
- *  резолвится параллельно (порядок слагов — порядок PROJECT_INIT_DOCS). */
-async function fetchProjectDocSlugs(projectName: string, projectsNotebookId: string): Promise<string[]> {
+/** Полные слаги живых доков канон-четвёрки проекта (uwuwu-cli read
+ *  «Projects/<proj>/<док>»). Нет папки проекта — пустой список; файл
+ *  четвёрки отсутствует — док пропускается, не угадываем. */
+async function fetchProjectDocSlugs(projectName: string): Promise<string[]> {
+  const dir = `${hubCloneRoot()}/docs/Projects/${projectName}`
   try {
-    if (projectsNotebookId === "") {
-      log(`инит: ноутбук «${PROJECTS_NOTEBOOK}» не найден — доки проекта пропущены`)
-      return []
-    }
-    const resolved = await Promise.all(PROJECT_INIT_DOCS.map(async (title) => ({
-      title,
-      ids: (await mcp.tool<{ ids?: string[] }>("doc_ids_by_hpath", {
-        notebook: projectsNotebookId, path: `/${projectName}/${title}`,
-      })).ids ?? [],
-    })))
-    const slugs: string[] = []
-    for (const { title, ids } of resolved) {
-      if (ids.length === 1) slugs.push(`${projectName}/${title}`)
-      else log(`инит: док «${projectName}/${title}» ${ids.length === 0 ? "не найден" : `неоднозначен (${ids.length} id)`} — пропущен`)
-    }
-    return slugs
+    return projectDocSlugs(projectName, readdirSync(dir))
   } catch (e) {
     log(`инит: доки проекта не резолвятся (${errText(e)}) — пропущены`)
     return []

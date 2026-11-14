@@ -77,6 +77,9 @@ import {
   spawnInitBlock,
   stripExportWrapper,
   stripFrontmatter,
+  personMarkdown,
+  projectDocSlugs,
+  PERSON_SLUG,
   resolvePromptWorktree,
   type SpawnInit,
   priorityRank,
@@ -641,11 +644,47 @@ describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", 
   })
 })
 
+describe("projectDocSlugs: полные слаги канон-четвёрки по файлам каталога", () => {
+  const fullDir = ["README.md", "Домены.md", "Стек и архитектура.md", "Деплоймент.md"]
+  test("все четыре файла → полные слаги в порядке четвёрки", () => {
+    expect(projectDocSlugs("uwuwu", fullDir)).toEqual([
+      "Projects/uwuwu/README",
+      "Projects/uwuwu/Домены",
+      "Projects/uwuwu/Стек и архитектура",
+      "Projects/uwuwu/Деплоймент",
+    ])
+  })
+  test("частичная папка: отсутствующие доки пропускаются, не угадываем", () => {
+    expect(projectDocSlugs("origa", ["README.md", "Домены.md"])).toEqual([
+      "Projects/origa/README",
+      "Projects/origa/Домены",
+    ])
+  })
+  test("пустая папка и посторонние файлы — без слагов и без шума", () => {
+    expect(projectDocSlugs("uwuwu", [])).toEqual([])
+    expect(projectDocSlugs("uwuwu", ["Задачи uwuwu.md", "scratch/", "ADR"])).toEqual([])
+  })
+  test("слаг персоны — паритет cli run.rs (person_hub)", () => {
+    expect(PERSON_SLUG).toBe("Experience/person/PERSON")
+  })
+})
+
+describe("personMarkdown: тело персоны для спавн-промпта", () => {
+  const wikiDoc = "---\ntitle: PERSON\ndate: 2026-11-06\n---\n\n# PERSON\n\nЯзык — русский.\nКомпактность.\n"
+  test("обёртка wiki-дока (frontmatter + # PERSON) срезана", () => {
+    expect(personMarkdown(wikiDoc)).toBe("Язык — русский.\nКомпактность.")
+  })
+  test("пустое тело после среза — null (деградация, не пустая инжекция)", () => {
+    expect(personMarkdown("---\ntitle: PERSON\n---\n\n# PERSON\n\n")).toBeNull()
+    expect(personMarkdown("")).toBeNull()
+  })
+})
+
 describe("spawnInitBlock: инит-данные первого промпта", () => {
   const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
-    projectDocs: ["uwuwu/README", "uwuwu/Домены"],
+    projectDocs: ["Projects/uwuwu/README", "Projects/uwuwu/Домены"],
     task: { title: "Фича", status: "Design", type: "feature", branch: "work/task-r1", pr: "" },
   }
   test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
@@ -657,9 +696,9 @@ describe("spawnInitBlock: инит-данные первого промпта", 
     const b = spawnInitBlock({ ...baseInit, task: { ...baseInit.task, type: "" } }, "r1", "uwuwu")
     expect(b).toContain("Задача: «Фича», статус Design, тип —, ветка work/task-r1, PR —.")
   })
-  test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
+  test("проект: слаги живых доков как готовые uwuwu-cli read (полные)", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain('uwuwu-cli read "uwuwu/README", "uwuwu/Домены"')
+    expect(b).toContain('uwuwu-cli read "Projects/uwuwu/README", "Projects/uwuwu/Домены"')
     expect(b).not.toContain("чекаут")
   })
   test("проект без живых доков — честная строка вместо заглушек", () => {
