@@ -434,8 +434,12 @@ export async function readTasks(
   const orphans: string[] = []
   const rows: TaskRef[] = []
   for (const row of raw) {
-    const title = (row.title ?? "").trim()
-    let bodyDoc = row.linkedDocId ?? ""
+    // hub-эпоха (#1126): read_database_cells отдаёт тайтл в cells["Название"],
+    // тело строки — сам issue (docId «issue:<номер>»); title/linkedDocId
+    // верхнего уровня — легаси-формат прошлой платформы, фоллбек сохранён.
+    const isHubRow = row.cells?.Название !== undefined
+    const title = (row.title ?? row.cells?.Название?.value ?? "").trim()
+    let bodyDoc = row.linkedDocId ?? (isHubRow ? `issue:${row.rowBlockId}` : "")
     if (bodyDoc === "") {
       // Трек уже знает тело (self-heal прошлых тиков): state выигрывает у
       // фоллбека без единого API-вызова — per-tick трафик не растёт с числом
