@@ -302,8 +302,8 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             for path in &attach {
                 path_flag("--attach", path.to_str().unwrap_or(""), "--stdin")?;
             }
-            // Секционная хирургия на hub не существует (SiYuan-слой снесён,
-            // PR #248): любой вызов с флагом — отказ до резолва строки,
+            // Секционная хирургия на hub не существует (снесена с легаси-слоем
+            // хранения, PR #248): любой вызов с флагом — отказ до резолва строки,
             // чтения входа и сети. Формулировки шарятся с help --replace-section.
             if let Some(section) = &replace_section {
                 bail!(

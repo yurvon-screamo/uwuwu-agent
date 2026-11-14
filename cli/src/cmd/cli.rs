@@ -306,7 +306,7 @@ pub(crate) enum TaskSub {
         #[arg(long, requires = "replace", conflicts_with_all = ["base"])]
         force: bool,
         /// Секционная хирургия на hub-бекенде не поддерживается (снесена
-        /// вместе с SiYuan-слоем, PR #248). Любой вызов с флагом — громкий
+        /// с легаси-слоем хранения, PR #248). Любой вызов с флагом — громкий
         /// отказ до резолва строки, чтения входа и мутации; секцию правят
         /// полным --replace с --base/--force.
         #[arg(long, value_name = "HEADING")]
