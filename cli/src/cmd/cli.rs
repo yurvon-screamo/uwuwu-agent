@@ -439,7 +439,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: DocsSub,
     },
-    /// Персона владельца (вики-док Experience/personal/PERSON): show —
+    /// Персона владельца (вики-док Experience/person/PERSON): show —
     /// прочитать (агенты в начале работы), append — дописать долговременный
     /// факт (владелец/дример), replace — полная перезапись на месте.
     /// Мутации возвращают финальный документ целиком или явную ошибку.

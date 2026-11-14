@@ -46,7 +46,6 @@ fn not_on_hub(command: Commands) -> Result<()> {
     bail!("hub-режим: команда «{name}» не поддерживается. Аналоги: задачи/issues — uwuwu-cli task, вики — docs/read, ассеты — assets/ репо hub")
 }
 
-/// Персона = приватный md-док вики (Experience:/personal/PERSON): hub —
 /// docs/Experience/person/PERSON.md через git-клон (show) и ff-push
 /// (append/replace — контракт записи вики).
 /// Hub-репо по умолчанию: установка закреплена за yurvon-screamo/uwuwu-hub.
