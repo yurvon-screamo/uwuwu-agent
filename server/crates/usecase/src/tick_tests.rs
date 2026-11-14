@@ -118,6 +118,12 @@ impl AgentSessionGateway for FakeSessions {
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
         Ok(Some(1000))
     }
+    async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
+        Ok(vec![])
+    }
+    async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
+        Ok(String::new())
+    }
 }
 
 struct FakePrs {
@@ -157,6 +163,10 @@ impl TickStateStore for MemState {
     fn set_last_comment_id(&self, _b: &str, _n: u64, id: &str) {
         self.0.lock().unwrap().push(id.into());
     }
+    fn dreamer_done(&self, _s: &str) -> bool {
+        false
+    }
+    fn mark_dreamer_done(&self, _s: &str) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
