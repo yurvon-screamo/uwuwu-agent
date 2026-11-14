@@ -31,6 +31,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs"
 import { homedir, hostname } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { Database } from "bun:sqlite"
 import * as mcp from "../lib/platform"
 import { parseCommentsMarkdown } from "../lib/platform"
 import { PLAN_REVIEWER_AGENT_ID, REVIEWER_AGENT_ID, TESTER_AGENT_ID } from "../lib/agents"
@@ -79,12 +80,16 @@ import {
   pathSafe,
   createBoardPathOnce,
   errText,
+  deadSpawnVerdict,
+  deadFreshMinutesFromEnv,
+  freshnessOfRow,
   USER_REVIEW_STATUS,
   AGENT_MARK,
   stripExportWrapper,
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  splitThrottle,
   untrackedRowDecision,
   activeTaskGuards,
   parseAgentHeadTs,
@@ -107,6 +112,7 @@ import {
   type SpawnEnvContext,
   type DisplayLease,
   type SpawnGuardHold,
+  type SpawnGuardThrottle,
   type TaskComment,
   type TaskRef,
   type TrackedTask,
@@ -122,12 +128,15 @@ import {
   githubProbeVerdict,
   giteaProbeVerdict,
   autodoneAction,
+  autodoneWatchdog,
   type PrCarrier,
   type PrProbeState,
 } from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
-import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, type EnvDeps } from "./env"
+import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, envPaths, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
+import { fetchSessionById, fetchLatestSessionByDirectory } from "../lib/session-row"
+import type { DeadFreshness } from "./factory-lib"
 
 // ——— конфиг проектов (только точки входа; пайпы живут в AGENTS.md репо) ———
 // ProjectCfg и env-оверрайд (UWUWU_FACTORY_PROJECTS_JSON) — factory-lib;
@@ -240,6 +249,18 @@ const WAKEUP_DEDUP_MS = 10 * 60_000
  *  не tmpfs — урок SIGSEGV 03.11). Песочница переопределяет вместе с state. */
 const ENV_ROOT = process.env.UWUWU_FACTORY_ENV_ROOT ?? join(homedir(), "agents-env")
 const ENV_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** opencode.db — независимый от serve след живости сессий (задача 1072):
+ *  read-only чтение session_v2; оверрайд для песочниц/переезда (дефолт
+ *  совпадает с дримерным UWUWU_DREAMER_DB-дефолтом). */
+const OPENCODE_DB = process.env.UWUWU_FACTORY_OPENCODE_DB ?? join(homedir(), ".local/share/opencode/opencode.db")
+/** окно fresh-следа (мин): активный ход пишет session_v2 суб-минутно; serve
+ *  при деградации лжёт 404 при живом ходе — dead-вердикт пробы сверяется со
+ *  следом. Трейд: честно мёртвая сессия с посторонним касанием после смерти
+ *  выглядит fresh до окна (пост-ходовой дрейф ~0.5% сессий — SQL-срез в
+ *  плане 1072). 0 = гард выключен (прежнее поведение). Парсер по канону
+ *  stallMinutesFromEnv: пустая строка/мусор → дефолт, не тихий выкл. */
+const DEAD_FRESH_MIN = deadFreshMinutesFromEnv(process.env.UWUWU_FACTORY_DEAD_FRESH_MIN)
+const DEAD_FRESH_MS = DEAD_FRESH_MIN > 0 ? DEAD_FRESH_MIN * 60_000 : 0
 /** периодичность GC легаси-ворктри в тиках: при poll 180s ≈ раз в час.
  *  Старт-проход отдельный — рестарт демона не обязан ждать час. */
 const GC_EVERY_TICKS = 20
@@ -416,8 +437,12 @@ export async function readTasks(
   const orphans: string[] = []
   const rows: TaskRef[] = []
   for (const row of raw) {
-    const title = (row.title ?? "").trim()
-    let bodyDoc = row.linkedDocId ?? ""
+    // hub-эпоха (#1126): read_database_cells отдаёт тайтл в cells["Название"],
+    // тело строки — сам issue (docId «issue:<номер>»); title/linkedDocId
+    // верхнего уровня — легаси-формат прошлой платформы, фоллбек сохранён.
+    const isHubRow = row.cells?.Название !== undefined
+    const title = (row.title ?? row.cells?.Название?.value ?? "").trim()
+    let bodyDoc = row.linkedDocId ?? (isHubRow ? `issue:${row.rowBlockId}` : "")
     if (bodyDoc === "") {
       // Трек уже знает тело (self-heal прошлых тиков): state выигрывает у
       // фоллбека без единого API-вызова — per-tick трафик не растёт с числом
@@ -657,6 +682,63 @@ async function sessionLiveness(sessionID: string): Promise<SessionLiveness> {
     const status = (e as { status?: number }).status
     if (status === 404 || status === 400) return "dead"
     return "unknown"
+  }
+}
+
+/** Единый read-only коннект к opencode.db на вызов: короткоживущий (лок-
+ *  безвреден для serve), ошибки чтения → "unknown" — dead-вердикт остаётся
+ *  без сверки (деградация к прежнему поведению, never worse). */
+function withSessionDb(read: (db: Database) => DeadFreshness, diag: string): DeadFreshness {
+  if (DEAD_FRESH_MS === 0) return "stale" // гард выключен — без чтения БД
+  try {
+    const db = new Database(OPENCODE_DB, { readonly: true })
+    try {
+      return read(db)
+    } finally {
+      db.close()
+    }
+  } catch (e) {
+    log(`dead-fresh ${diag}: БД-след недоступен (${errText(e)}) — dead-вердикт без сверки`)
+    return "unknown"
+  }
+}
+
+/** Свежесть сессии по БД-следу (time_updated в окне гарда) — второй,
+ *  независимый от serve источник живости для dead-вердикта пробы (1072). */
+function sessionDbFreshness(sessionID: string): DeadFreshness {
+  return withSessionDb(
+    (db) => freshnessOfRow(fetchSessionById(db, sessionID), Date.now(), DEAD_FRESH_MS),
+    sessionID.slice(0, 16),
+  )
+}
+
+/** Свежесть работы в env задачи по directory-ключу (1072, инстанс #315):
+ *  дев-клетка легитимно пуста — id-ключу не на чем держаться; свежая сессия
+ *  каталога env/repo = живой чужой ход, спавн поверх — дубль. */
+function sessionDbFreshnessByDirectory(rowId: string): DeadFreshness {
+  return withSessionDb(
+    (db) => freshnessOfRow(
+      fetchLatestSessionByDirectory(db, envPaths(ENV_ROOT, rowId).repoDir),
+      Date.now(), DEAD_FRESH_MS,
+    ),
+    rowId.slice(0, 8),
+  )
+}
+
+/** Стартовая диагностика доступности БД-следа: молчаливость unknown-деградации
+ *  в песочнице/при переезде компенсируется видимой строкой старта. */
+function deadFreshStartupVerdict(): string {
+  if (DEAD_FRESH_MS === 0) return "выключен (окно=0)"
+  try {
+    const db = new Database(OPENCODE_DB, { readonly: true })
+    try {
+      db.query("SELECT 1 FROM session_v2 LIMIT 1").get()
+      return "armed"
+    } finally {
+      db.close()
+    }
+  } catch (e) {
+    return `unavailable (${errText(e)})`
   }
 }
 
@@ -1108,24 +1190,26 @@ function backupSuspectState(): void {
   }
 }
 
-/** HOLD-тик гарда каскада: спавны отложены (обслуживание существующих
- *  треков продолжается — гард бьёт только по новому спавну). Алерт-политика:
- *  first — вход в эпизод (бэкап + коммент владельцу), repeat — длящийся
- *  HOLD за окном повтора (коммент снова), none — в пределах окна (только
- *  лог). Флаг эпизода ставится по факту ПОПЫТКИ алерта, не доставки:
- *  недоставимый алерт не должен ретраиться каждый тик — окно повтора
- *  вернётся к нему через час. */
+/** HOLD/throttle-тик гарда каскада: state-loss глушит спавны полностью
+ *  (обслуживание существующих треков продолжается — гард бьёт только по
+ *  новому спавну), throttle дозирует burst-волну по burstMax за тик — она
+ *  дренажируется сама (задача 1109: полный HOLD по burst не отпускался
+ *  никогда). Алерт-политика: first — вход в эпизод (state-loss: бэкап
+ *  state + коммент владельцу; throttle: только коммент — state не
+ *  подозрительный), repeat — длящийся эпизод за окном повтора (коммент
+ *  снова), none — в пределах окна (только лог). Флаг эпизода ставится по
+ *  факту ПОПЫТКИ алерта, не доставки: недоставимый алерт не должен
+ *  ретраиться каждый тик — окно повтора вернётся к нему через час. */
 async function holdSpawns(
-  guard: SpawnGuardHold, untracked: TaskRef[], orphaned: number,
-  state: FactoryState, counters: PassCounters,
+  guard: SpawnGuardHold | SpawnGuardThrottle, untracked: TaskRef[], orphaned: number,
+  state: FactoryState,
 ): Promise<void> {
   const targets = untracked.slice(0, 10).map((r) => r.rowId.slice(0, 8))
-  counters.held = untracked.length
-  counters.heldReason = guard.reason
-  log(`гард спавна: HOLD (${guard.reason}), сирот=${orphaned}, untracked=${untracked.length}` +
-    ` — спавны отложены: ${targets.join(", ") || "нет"}`)
+  const action = guard.t === "hold" ? "спавны отложены" : "спавн дозируется по burstMax"
+  log(`гард спавна: ${guard.t === "hold" ? guard.reason : "throttle"}, сирот=${orphaned}, untracked=${untracked.length}` +
+    ` — ${action}: ${targets.join(", ") || "нет"}`)
   if (guard.alert === "none") return
-  if (guard.alert === "first") backupSuspectState()
+  if (guard.alert === "first" && guard.t === "hold") backupSuspectState()
   const target = alertTargetOf(untracked)
   if (target === null) {
     log("гард спавна: адресата алерта нет (ни одной строки с телом) — только лог")
@@ -1458,6 +1542,81 @@ async function runAutodoneTick(
   }
 }
 
+/** Тик watchdog'а автодона (инцидент 1070): строка в Review, fm тела несёт
+ *  `autodone: true`, но тик автодона не выполнялся (autodoneState undefined)
+ *  дольше AUTODONE_TIMEOUT_MS → громкий сигнал (лог + коммент в задачу),
+ *  раз за эпизод. Канал — fm тела, не Autodone-ячейка скана: в инциденте
+ *  ломалось именно скан-поле (fm-true при скане-false), гард на том же
+ *  поле молчал бы вместе с ним. При исправном демоне fm-true доезжает до
+ *  автодон-блока первым тиком (state=pending), поэтому длительная тишина —
+ *  аномалия (скан-мисрид, потерянный state, недостижимый гейт). Вызов —
+ *  на безусловном пути каждой трекнутой строки (после Done-ветки, до
+ *  маршрутизации): state после терминальных исходов определён → reset.
+ *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
+ *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
+ *  галочку не несёт — гард честно деградирует в no-op (транспорт hub).
+ *  Граница гарда (осознанная, ревью раунд 2): покрывает ТРЕКНУТЫЕ строки —
+ *  Review-строка вообще без записи в state (геометрия #317 «task в state
+ *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
+ *  гейт карантин-петли читает то же скан-поле; fm-экспорт всех строк доски
+ *  каждый тик — реальная цена, не платим. */
+/** fm-поле из шапки тела задачи (первый --- блок): легаси-носитель autodone
+ *  до полного переезда на нативные issue-поля (#1087). */
+function fmAutodoneOf(md: string): boolean {
+  const head = md.startsWith("---") ? md.slice(0, Math.max(md.indexOf("\n---", 3), 0) + 5) : ""
+  const m = head.match(/^autodone:[ \t]*(\S+)/m)
+  const raw = (m?.[1] ?? "").toLowerCase()
+  return raw === "on" || raw === "true" || raw === "✓".toLowerCase()
+}
+
+async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
+  const rowId = row.rowId
+  const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
+  const bodyKnown = md !== null && md !== ""
+  const fmAutodone = md !== null && md !== "" && fmAutodoneOf(md)
+  const act = autodoneWatchdog(
+    {
+      inReview: row.status === USER_REVIEW_STATUS,
+      fmAutodone,
+      bodyKnown,
+      ticked: tracked.autodoneState !== undefined,
+      stallSince: tracked.adStallSince,
+      signaled: tracked.adWatchdogSignaled === true,
+      now: Date.now(),
+    },
+    AUTODONE_TIMEOUT_MS,
+  )
+  switch (act.t) {
+    case "reset": {
+      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
+        delete tracked.adStallSince
+        delete tracked.adWatchdogSignaled
+        saveState(state)
+        log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — сброс (условие не выполняется)`)
+      }
+      return
+    }
+    case "arm": {
+      tracked.adStallSince = act.since
+      saveState(state)
+      return
+    }
+    case "signal": {
+      const silentMs = Date.now() - (tracked.adStallSince ?? Date.now())
+      tracked.adWatchdogSignaled = true
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — fm autodone:true, тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
+      await notify(
+        tracked,
+        `${AGENT_MARK} autodone: задача в Review с fm-галочкой autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
+      )
+      return
+    }
+    case "wait":
+      return
+  }
+}
+
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
  *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
  *  нужен cwd ворктри. Выбрасывает при фейле. */
@@ -1599,6 +1758,10 @@ interface ReviewDeps {
   board: BoardIds
   state: FactoryState
   fresh: TaskComment[]
+  /** живость держателей по serve-пробе этого тика (null — проба не удалась);
+   *  гард БД-следа (1072) применяется только в dead-ветке спавна */
+  reviewerLiveness: SessionLiveness | null
+  testerLiveness: SessionLiveness | null
   consumeComments: () => void
   refreshBodyBaseline: () => Promise<void>
 }
@@ -1618,6 +1781,14 @@ async function dispatchReviewAction(
       const entering = reviewKindOf(d.tracked.lastStatus ?? "") !== action.kind ||
         d.tracked.reviewKind !== action.kind
       const seed = entering ? 0 : d.tracked.reviewAttempts ?? 0
+      // dead-ветка пробы сверяется с БД-следом (1072): serve при деградации
+      // лжёт 404 при живом держателе → спавн дубля; kind-mismatch при живом
+      // держателе — легитимный спавн, гардом не гасится
+      if (d.reviewerLiveness === "dead" &&
+          deadSpawnVerdict(sessionDbFreshness(d.tracked.reviewSessionID ?? "")) === "skip") {
+        log(`задача ${shortId}: ревьювер dead по пробе, БД-след свежий — спавн отложен (ложный dead)`)
+        return undefined
+      }
       try {
         await startReview(d.row, d.project, d.cfg, d.board, d.state, action.kind, d.tracked)
         d.consumeComments()
@@ -1662,6 +1833,12 @@ async function dispatchReviewAction(
       // ревьювер поставил статус заново после Needs attention или баг-петли
       const entering = (d.tracked.lastStatus ?? "") !== TESTING_STATUS
       const seed = entering ? 0 : d.tracked.testAttempts ?? 0
+      // dead-ветка пробы сверяется с БД-следом (1072) — паритет spawn-reviewer
+      if (d.testerLiveness === "dead" &&
+          deadSpawnVerdict(sessionDbFreshness(d.tracked.testSessionID ?? "")) === "skip") {
+        log(`задача ${shortId}: тестер dead по пробе, БД-след свежий — спавн отложен (ложный dead)`)
+        return undefined
+      }
       try {
         await startTesting(d.row, d.project, d.cfg, d.board, d.state, d.tracked)
         d.consumeComments()
@@ -1734,6 +1911,15 @@ async function dispatchReviewAction(
         }
         return undefined
       }
+      // dead по пробе: сверка с БД-следом (1072) — serve при деградации лжёт
+      // 404 при живом ходе; fresh → рестарт отложен, следующий тик перепроверит
+      const deadFresh = d.tracked.sessionID !== ""
+        ? sessionDbFreshness(d.tracked.sessionID)
+        : sessionDbFreshnessByDirectory(d.row.rowId)
+      if (deadSpawnVerdict(deadFresh) === "skip") {
+        log(`задача ${shortId}: дев-сессия dead по пробе, БД-след свежий — рестарт отложен (ложный dead)`)
+        return undefined
+      }
       // сессия девелопера потеряна — свежий старт (контекст живёт в задаче),
       // агентские сессии сохраняем: инвариант 1 задача = 1 ревьювер и
       // 1 тестировщик. startTask заменяет запись state — дальше по циклу
@@ -1804,13 +1990,21 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   const verdicts = await Promise.all(untracked.map(async (r) => {
     const devCell = r.devSession ?? ""
     const liveness = devCell === "" ? "dead" : await sessionLiveness(devCell)
-    return { rowId: r.rowId, liveness, decision: untrackedRowDecision(r, liveness) }
+    // dead-вердикт пробы сверяется с БД-следом (1072): id-ключ при непустой
+    // клетке, directory-ключ при легитимно пустой (инстанс #315 — клетки
+    // пусты, а ход в env идёт)
+    const deadFresh = liveness === "dead"
+      ? (devCell !== "" ? sessionDbFreshness(devCell) : sessionDbFreshnessByDirectory(r.rowId))
+      : "unknown"
+    return { rowId: r.rowId, liveness, deadFresh, decision: untrackedRowDecision(r, liveness, deadFresh) }
   }))
   let orphaned = 0
-  for (const { rowId, liveness, decision } of verdicts) {
+  for (const { rowId, liveness, deadFresh, decision } of verdicts) {
     if (!decision.devWave) {
       externalSkip.add(rowId)
-      log(`внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
+      log(liveness === "dead" && deadFresh === "fresh"
+        ? `внешняя заявка ${rowId.slice(0, 8)}: проба dead, БД-след свежий — ложный dead, спавн отложен`
+        : `внешняя заявка ${rowId.slice(0, 8)}: сессия ${liveness} — спавн не требуется`)
     }
     if (decision.orphan) orphaned++
   }
@@ -1818,11 +2012,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
     SPAWN_LIMITS,
   )
-  if (guard.t === "hold") {
-    await holdSpawns(guard, untracked, orphaned, state, counters)
+  if (guard.t !== "allow") {
+    await holdSpawns(guard, untracked, orphaned, state)
   } else if (state.holdSignaled !== undefined) {
-    // сигнатура ушла (state восстановлен) — эпизод завершён, снимаем флаг:
-    // следующий эпизод снова получит alert=first с алертом и бэкапом
+    // сигнатура ушла (state восстановлен / волна дренажировалась) — эпизод
+    // завершён, снимаем флаг: следующий эпизод снова получит alert=first
+    // с алертом (и бэкапом для state-loss)
     delete state.holdSignaled
     saveState(state)
     log("гард спавна: сигнатура ушла — эпизод HOLD завершён, флаг снят")
@@ -1831,7 +2026,8 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
   // и fast-track In Progress владельца) получают сессии за ОДИН проход
   // (прод-кейс 05.11: последовательный спавн и слепота страницы 1
-  // растягивали волну из 4 задач на 12+ минут). HOLD гарда глушит волну.
+  // растягивали волну из 4 задач на 12+ минут). Полный HOLD (state-loss)
+  // глушит волну; throttle (задача 1109) режет её до остатка burst-бюджета.
   // Строки с живой внешней заявкой (externalSkip) в волну не попадают.
   // Очередь CUP (задача 20261112160316): кап активных (LLM-тратящих) задач
   // глобально по всем проектам; берём первые budget в порядке приоритет →
@@ -1839,10 +2035,16 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   // замороженные не-high слотов не держат. Возвраты трекнутых задач девелоперу
   // и карантинные спавны ревью/теста не гейтятся (продолжение пайпа, не новая
   // работа) — но учитываются в счёте наравне.
+  const isDevCandidate = (t: TaskRef) =>
+    reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId)
+  const devCandidateRows = untracked.filter(isDevCandidate)
+  const agentCandidates = untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
+  const devCandidates = guard.t === "hold" ? [] : devCandidateRows
+  const throttleSplit = guard.t === "throttle"
+    ? splitThrottle(agentCandidates.length, devCandidates.length, SPAWN_LIMITS.burstMax)
+    // не throttle (allow/state-loss): лимита нет — slice(0, Infinity) спавнит всех
+    : { agent: Infinity, dev: Infinity }
   const peakNow = isPeakHours(new Date(), PEAK)
-  const devCandidates = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) === null && t.status !== TESTING_STATUS && !externalSkip.has(t.rowId))
-    : []
   // пик-заморозка не-high: спавн откладывается до конца окна (выполняющиеся
   // ходы сессий доигрывают — процессы не трогаем)
   const candidatesNow = peakNow
@@ -1853,17 +2055,30 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     priority: t.priority ?? "",
   }))
   const active = activeTaskCountEx(activeEntries, { peak: peakNow })
-  const budget = cupBudget(active, CUP)
-  const devWave = queueOrder(candidatesNow).slice(0, budget)
+  const cup = cupBudget(active, CUP)
+  const devLimit = Math.min(cup, throttleSplit.dev)
+  const devWave = queueOrder(candidatesNow).slice(0, devLimit)
   const queued = candidatesNow.length - devWave.length
   if (queued > 0) {
-    const head = queueOrder(candidatesNow)[budget]?.title
+    const head = queueOrder(candidatesNow)[devLimit]?.title
     log(`очередь CUP: активных=${active}/${CUP}${peakNow ? " (пик: счёт только high)" : ""}, ждут=${queued}, голова — «${head ?? "?"}»`)
   }
   if (peakNow && devCandidates.length > candidatesNow.length) {
     const frozen = devCandidates.length - candidatesNow.length
     log(`часы пик: спавн не-high отложен (${frozen} задач(и), приоритеты medium/low/пусто — до конца окна)`)
   }
+  if (guard.t === "hold") {
+    // чистая гардовская атрибуция: строки, которые при allow поехали бы
+    // (externalSkip не едут и без гарда — в счёт не берутся)
+    counters.held = devCandidateRows.length + agentCandidates.length
+    counters.heldReason = guard.reason
+  } else if (guard.t === "throttle") {
+    // кандидаты сверх burst-бюджета; CUP-очередь и пик-заморозка — не гард,
+    // видны в отдельных строках лога
+    counters.held = Math.max(0, devCandidateRows.length + agentCandidates.length - SPAWN_LIMITS.burstMax)
+    counters.heldReason = "throttle"
+  }
+
   if (devWave.length > 0 && !drain.isStopping()) {
     await runBatch(devWave, async (task) => {
       if (drain.isStopping()) return // стоп в середине пачки — доедет следующий старт
@@ -1882,10 +2097,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
   }
 
   // карантинные спавны untracked (ревьювер/тестировщик): тоже под гардом
-  // (HOLD глушит — каскад агентских сессий так же опасен, как дев-волна)
-  const agentUntracked = guard.t === "allow"
-    ? untracked.filter((t) => reviewKindOf(t.status) !== null || t.status === TESTING_STATUS)
-    : []
+  // (полный HOLD глушит — каскад агентских сессий так же опасен, как
+  // дев-волна; throttle режет до остатка burst-бюджета — пайп приоритетен,
+  // но скорость ограничена тем же рубежом)
+  const agentUntracked = guard.t === "hold"
+    ? []
+    : agentCandidates.slice(0, throttleSplit.agent)
   for (const task of agentUntracked) {
     const kind = reviewKindOf(task.status)
     // ревью-статус/«Тестирование» без state (даунтайм демона при переходе) —
@@ -2021,6 +2238,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       continue
     }
 
+    // ——— watchdog автодона: fm-канал (инцидент 1070) ———
+    // Безусловный путь каждой трекнутой строки: сторожим «Review + fm
+    // autodone:true, тик не выполнялся» независимо от Autodone-ячейки
+    // скана (в инциденте ломалось именно скан-поле). bodyExport кэшируется
+    // per-tick — маршрутизация ниже берёт то же тело из кэша.
+    await autodoneWatchdogTick(row, tracked, state, bodyExports)
+
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
     const comments = await taskComments(tracked.bodyDoc, bodyExports)
     const users = comments.filter((c) => isUserComment(c, BOT_USER_ID))
@@ -2090,6 +2314,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
 
     const skipRest = await dispatchReviewAction(action, {
       row, tracked, project: tracked.project || projectName, cfg, board, state, fresh: foreign,
+      reviewerLiveness, testerLiveness,
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
@@ -2260,6 +2485,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (tracked.sessionID === "") {
       // карантин: ждём явной активности юзера
       if (devFresh.length === 0) continue
+      // рестарт из карантина: id-ключ гарда неоткуда взять (sessionID затёрт
+      // карантином — в т.ч. ложным по false-dead пробе, 1072) — directory-
+      // ключ: свежая работа в env = живой ход, спавн поверх — дубль
+      if (deadSpawnVerdict(sessionDbFreshnessByDirectory(row.rowId)) === "skip") {
+        log(`задача ${rowId.slice(0, 8)}: карантин, БД-след env свежий — рестарт отложен (ложный карантин)`)
+        continue
+      }
       await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue
     }
@@ -2268,6 +2500,14 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       // юзер молчит, но сессия могла умереть посреди прогона
       const quiet = await sessionLiveness(tracked.sessionID)
       if (quiet === "dead") {
+        // dead-вердикт пробы сверяется с БД-следом (1072) ДО затирания
+        // sessionID: serve при деградации лжёт 404 живому ходу — ложный
+        // карантин не только будит юзера зря, но и лишает id-ключа гарда
+        // (следующий коммент идёт в рестарт уже без сессии в state)
+        if (sessionDbFreshness(tracked.sessionID) === "fresh") {
+          log(`задача ${rowId.slice(0, 8)}: проба dead, БД-след свежий — карантин отложен (ложный dead)`)
+          continue
+        }
         log(`задача ${rowId.slice(0, 8)}: сессия умерла (юзер молчит) — карантин + уведомление`)
         tracked.sessionID = ""
         saveState(state)
@@ -2387,6 +2627,12 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       continue
     }
     if (liveness === "dead") {
+      // dead-вердикт пробы сверяется с БД-следом (1072): serve при деградации
+      // лжёт 404 живому ходу — рестарт поверх живой сессии = дубль-агент
+      if (deadSpawnVerdict(sessionDbFreshness(tracked.sessionID)) === "skip") {
+        log(`задача ${rowId.slice(0, 8)}: проба dead, БД-след свежий — рестарт отложен (ложный dead)`)
+        continue
+      }
       log(`задача ${rowId.slice(0, 8)}: сессия умерла — перезапуск`)
       await restartTask(row, tracked.project || projectName, cfg, board, state, devFresh)
       continue
@@ -2489,6 +2735,7 @@ async function main(): Promise<void> {
   emitNotice(STATE_RESOLVED.notice, log)
   const state = loadState()
   log(`восстановлено задач: ${Object.keys(state.tasks).length}`)
+  log(`dead-fresh гард: ${deadFreshStartupVerdict()} (БД ${OPENCODE_DB}, окно ${DEAD_FRESH_MS === 0 ? "0" : `${DEAD_FRESH_MIN}м`})`)
   // старт-свип окружений: сироты без записи в state и старый attic — только
   // прод (песочница/DRY_RUN не трогают реальный ENV_ROOT)
   if (!DRY_RUN && !STATE_RESOLVED.sandboxed) {

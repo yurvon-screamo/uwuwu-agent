@@ -147,3 +147,42 @@ export function autodoneAction(
         : { t: "wait" }
   }
 }
+
+/** Watchdog автодона (инцидент 1070): строка сидит в Review, fm тела несёт
+ *  `autodone: true`, но тик автодона не выполнялся (autodoneState undefined)
+ *  дольше порога — мисс должен быть громким (лог + сигнал в задачу), не
+ *  тихим: дев-агент не должен узнавать об аномалии собственным поллингом.
+ *  Канал — fm тела, НЕ Autodone-ячейка скана: в инциденте ломалось именно
+ *  скан-поле (fm-true при скане-false) — гард, читающий то же поле, молчал
+ *  бы вместе с ним. При исправном демоне fm-true доезжает до автодон-блока
+ *  первым тиком (state=pending), так что длительная тишина = аномалия
+ *  (скан-мисрид, потерянный state, недостижимый гейт). Правила:
+ *  !inReview или ticked — reset (условие не выполняется); тело недоступно
+ *  (пустой bodyDoc до self-heal) — wait (канала нет, не судим); fm без
+ *  галочки — reset (владелец снял); первая встреча условия — arm; дольше
+ *  порога без сигнала — signal (раз за эпизод); после сигнала — wait. */
+export type WatchdogAction =
+  | { t: "reset" }
+  | { t: "arm"; since: number }
+  | { t: "wait" }
+  | { t: "signal" }
+
+export function autodoneWatchdog(
+  input: {
+    inReview: boolean
+    fmAutodone: boolean
+    bodyKnown: boolean
+    ticked: boolean
+    stallSince?: number
+    signaled: boolean
+    now: number
+  },
+  watchdogMs: number,
+): WatchdogAction {
+  if (!input.inReview || input.ticked) return { t: "reset" }
+  if (!input.bodyKnown) return { t: "wait" }
+  if (!input.fmAutodone) return { t: "reset" }
+  if (input.stallSince === undefined) return { t: "arm", since: input.now }
+  if (input.signaled) return { t: "wait" }
+  return input.now - input.stallSince >= watchdogMs ? { t: "signal" } : { t: "wait" }
+}
