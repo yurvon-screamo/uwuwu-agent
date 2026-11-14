@@ -22,8 +22,8 @@ pub fn git_sync_with_author(args: &[&str]) -> Result<()> {
         .context("git не запустился")?;
     if !out.status.success() {
         bail!(
-            "git {} упал: {}",
-            args.first().unwrap_or(&""),
+            "git [{}] упал: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -45,8 +45,8 @@ pub async fn git_raw(args: &[&str]) -> Result<String> {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         bail!(
-            "git {} упал: {}",
-            args.first().unwrap_or(&""),
+            "git [{}] упал: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
     }

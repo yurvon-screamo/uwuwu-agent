@@ -23,10 +23,28 @@ pub(crate) async fn dispatch(command: Commands) -> Result<()> {
             print!("{md}");
             Ok(())
         }
-        Commands::Docs { command } => {
-            let crate::cmd::cli::DocsSub::Ls { prefix } = command;
-            crate::cmd::hub_docs::docs_ls(&prefix).await
-        }
+        Commands::Docs { command } => match command {
+            crate::cmd::cli::DocsSub::Ls { prefix } => crate::cmd::hub_docs::docs_ls(&prefix).await,
+            crate::cmd::cli::DocsSub::Create { slug, stdin, md } => {
+                crate::cmd::hub_docs::docs_create(&slug, stdin, &md).await
+            }
+            crate::cmd::cli::DocsSub::Append {
+                slug,
+                stdin,
+                text,
+                force,
+            } => crate::cmd::hub_docs::docs_append(&slug, stdin, &text, force).await,
+            crate::cmd::cli::DocsSub::Replace {
+                slug,
+                stdin,
+                md,
+                base,
+            } => crate::cmd::hub_docs::docs_replace(&slug, stdin, &md, &base).await,
+            crate::cmd::cli::DocsSub::Delete { slug } => {
+                crate::cmd::hub_docs::docs_delete(&slug).await
+            }
+            crate::cmd::cli::DocsSub::Tree => crate::cmd::hub_docs::docs_tree().await,
+        },
         Commands::Semantic { command } => semantic_run(command).await,
         Commands::Projects => crate::cmd::hub_lists::projects_hub().await,
         Commands::Cron { command } => crate::cmd::hub_lists::cron_hub(command).await,
@@ -83,8 +101,13 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 false => text.join(" "),
             };
             // append_doc сам читает текущий док и конкатенирует — передаём
-            // только addition (вариант с ручным склеиванием удваивал тело)
-            store.append_doc(slug, &addition).await?;
+            // только addition (вариант с ручным склеиванием удваивал тело);
+            // дока нет — create со шапкой (семантика person «создать»).
+            if store.exists(slug).await? {
+                store.append_doc(slug, &addition).await?;
+            } else {
+                store.create_doc(slug, &addition).await?;
+            }
             println!("персона дописана");
             Ok(())
         }
@@ -97,7 +120,13 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 (false, Some(path)) => std::fs::read_to_string(path)?,
                 _ => String::new(),
             };
-            store.replace_doc(slug, &body).await?;
+            // create-or-replace: дока нет — create со шапкой (frontmatter+
+            // H1 из тайтла слага, frontmatter-гард входа)
+            if store.exists(slug).await? {
+                store.replace_doc(slug, &body, None).await?;
+            } else {
+                store.create_doc(slug, &body).await?;
+            }
             println!("персона перезаписана");
             Ok(())
         }

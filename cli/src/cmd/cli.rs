@@ -527,7 +527,10 @@ pub(crate) enum Commands {
     },
 }
 
-/// Сабкоманды `docs`.
+/// Сабкоманды `docs`: ls — чтение; create/append/replace/delete/tree —
+/// write-path (слаг только строгий: полный путь в docs/, basename-фоллбек
+/// read в write не переезжает). Мутации возвращают финальный документ
+/// (read-after-write) или явную ошибку.
 #[derive(Subcommand)]
 pub(crate) enum DocsSub {
     /// Прямые дети hpath-префикса: доки именами, подпапки с хвостовым «/».
@@ -541,6 +544,58 @@ pub(crate) enum DocsSub {
         #[arg(help = "hpath-слаг: <проект>[/<подпапка>] | имя ноутбука (дети корня)")]
         prefix: String,
     },
+    /// Создать док: slug = полный путь («Projects/proj/ADR-096: …»),
+    /// последний сегмент = тайтл. Шапку ведёт create (frontmatter
+    /// title/date/lastmod + H1); вход с frontmatter — отказ; первая строка
+    /// входа `# <тайтл>` срезается. Занятый ADR-номер / новая папка —
+    /// warn-строки, не отказ. Вывод: warn-строки + финальный док.
+    Create {
+        #[arg(help = "полный путь дока в docs/ («Projects/proj/ADR-096: …»)")]
+        slug: String,
+        #[arg(long, conflicts_with = "md", help = "Тело из stdin")]
+        stdin: bool,
+        #[arg(long, help = "Файл с телом (обязателен без --stdin)")]
+        md: Option<String>,
+    },
+    /// Дописать markdown в конец дока. Дока нет → отказ; --force — создать
+    /// при отсутствии (шапка как create). Вывод: финальный док.
+    Append {
+        #[arg(help = "полный путь дока в docs/")]
+        slug: String,
+        #[arg(long, conflicts_with = "text", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(trailing_var_arg = true, help = "Markdown-текст добавки")]
+        text: Vec<String>,
+        #[arg(long, help = "Создать док при отсутствии (шапка как create)")]
+        force: bool,
+    },
+    /// Перезаписать док контентом входа как есть (шапку ведёт пишущий:
+    /// read отдаёт файл целиком). --base <sha256> — снапшот свежести:
+    /// sha256 stdout `read <slug>` на момент чтения (read байт-в-байт равен
+    /// файлу клона); расхождение — громкий отказ. Вывод: финальный док.
+    Replace {
+        #[arg(help = "полный путь дока в docs/")]
+        slug: String,
+        #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
+        stdin: bool,
+        #[arg(long, help = "Файл с markdown (обязателен без --stdin)")]
+        md: Option<String>,
+        #[arg(
+            long,
+            value_name = "SHA256",
+            help = "sha256 read-экспорта на момент чтения"
+        )]
+        base: Option<String>,
+    },
+    /// Снести док (только док-файл; папка — по одному). git-история hub —
+    /// носитель отката (git revert). Маркер-заглушку «канон/заглушка» и
+    /// детей проверяет пишущий — гварды ADR-029 не портированы.
+    Delete {
+        #[arg(help = "полный путь дока в docs/")]
+        slug: String,
+    },
+    /// Все md-слаги вики, отсортированные построчно (полное дерево).
+    Tree,
 }
 
 #[derive(Subcommand)]
@@ -557,8 +612,10 @@ pub(crate) enum PersonSub {
         #[arg(trailing_var_arg = true, help = "Markdown-текст (факт или секция)")]
         text: Vec<String>,
     },
-    /// Перезаписать контент целиком на месте (docId стабилен); дока нет —
-    /// создать без скелета (полная ответственность пишущего за контент).
+    /// Перезаписать контент целиком на месте, контент пишется как есть
+    /// (шапку ведёт пишущий: show отдаёт файл целиком). Дока нет — создать
+    /// со шапкой (frontmatter+H1). Полная ответственность пишущего за
+    /// контент.
     Replace {
         #[arg(long, conflicts_with = "md", help = "Текст из stdin")]
         stdin: bool,
