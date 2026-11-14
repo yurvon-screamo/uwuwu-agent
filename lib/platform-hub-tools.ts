@@ -20,6 +20,98 @@ import {
   setProjectStatus,
 } from "./platform-hub"
 
+// ——— контракты строк доски (чистые функции — юниты без gh-стабов) ———
+
+/** «YYYY-MM-DD HH:MM» → epoch ms в локальной TZ — паритет cron-lib
+ *  formatLocal/minuteStart (клетку пишет CLI тем же форматированием).
+ *  Пусто/криво/вне диапазонов/несуществующая дата — null: клетка без
+ *  dateMs → plannedMs null у потребителя (одна reconcile-запись с
+ *  самолечением через CLI, не спам). Год — окно 2000–2100: JS-семантика
+ *  двухзначных лет (0–99 → 1900+year) иначе вернула бы bogus-epoch
+ *  вместо null (ревью 1110 Low). */
+export function plannedToMs(v: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(v.trim())
+  if (m === null) return null
+  const [y, mo, d, h, mi] = m.slice(1).map(Number)
+  if (y < 2000 || y > 2100) return null
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59) return null
+  const date = new Date(y, mo - 1, d, h, mi)
+  if (Number.isNaN(date.getTime()) || date.getDate() !== d || date.getMonth() !== mo - 1) return null
+  return date.getTime()
+}
+
+/** fm-поля тела issue + легаси-алиасы имён легаси-носителя: attrsOf крона ждёт
+ *  custom-schedule/custom-agent, fm-мир несёт schedule/agent (инцидент
+ *  1110: без алиасов расписание читалось null — второй тихий скип после
+ *  linkedDocId). Транзиент fm-мира: мир #264 сносит fm, attrsOf
+ *  переключается на поля — алиасы умирают вместе с ним. */
+/** fm-поле из шапки тела (легаси-носитель): строки "key: value" до конца
+ *  fm-блока. Локальный — platform-hub выпилил fm-парсер в мире нативных
+ *  полей (пин «Unexpected export»), юниты паритета легаси-схемы нужны
+ *  без него. */
+function fmFieldsOf(body: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!body.startsWith("---\n")) return out
+  const end = body.indexOf("\n---\n", 4)
+  if (end === -1) return out
+  for (const line of body.slice(4, end).split("\n")) {
+    const i = line.indexOf(": ")
+    if (i !== -1) out[line.slice(0, i).trim()] = line.slice(i + 2).trim()
+  }
+  return out
+}
+
+export function issueAttrs(body: string): Record<string, string> {
+  const fields = fmFieldsOf(body)
+  if (fields.schedule !== undefined) fields["custom-schedule"] = fields.schedule
+  if (fields.agent !== undefined) fields["custom-agent"] = fields.agent
+  return fields
+}
+
+export interface HubRow {
+  rowBlockId: string
+  /** docId тела задачи — паритет docId-схемы легаси-носителя (тело = issue:<number>).
+   *  Инцидент 1110: без linkedDocId крон/factory/triage читали bodyDoc=""
+   *  и тихо скипали строки до attrs-чтения — файры молчали после миграции. */
+  linkedDocId: string
+  title: string
+  cells: Record<string, { value: string; dateMs?: number }>
+}
+
+/** Срез доски проекта → строки канбанной семантики. linkedDocId/title —
+ *  потерянные при миграции поля схемы легаси-носителя (потребители ждут их
+ *  контрактом read_database_cells). */
+export function issueRows(issues: GhIssue[]): HubRow[] {
+  return issues.map((issue) => {
+    const body = String(issue.body ?? "")
+    const fields = fmFieldsOf(body)
+    const number = String(issue.number)
+    const cell = (v: string) => ({ value: v })
+    const planned = fields.planned ?? ""
+    const plannedMs = plannedToMs(planned)
+    return {
+      rowBlockId: number,
+      linkedDocId: `issue:${number}`,
+      title: String(issue.title ?? ""),
+      cells: {
+        "Название": cell(String(issue.title ?? "")),
+        "Status": cell(fields.status ?? "Todo"),
+        "Тип": cell(githubTypeName(issue, fields.type)),
+        "Branch": cell(fields.branch ?? ""),
+        "PR": cell(fields.pr ?? ""),
+        "Сессия dev": cell(fields["dev-session"] ?? ""),
+        "Запланировано": {
+          value: planned,
+          ...(plannedMs !== null ? { dateMs: plannedMs } : {}),
+        },
+        "Расписание": cell(fields.schedule ?? ""),
+        "Autodone": cell(fields.autodone === "true" ? "✓" : ""),
+        "Приоритет": cell(fields.priority ?? ""),
+      },
+    }
+  })
+}
+
 export async function hubTool<T = Record<string, unknown>>(
   name: string,
   args: Record<string, unknown>,
