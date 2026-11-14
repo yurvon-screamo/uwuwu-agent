@@ -1,14 +1,15 @@
 //! Глобальные issue fields — носитель клеток задачи (ADR-098: мета не в md).
 //!
-//! Контракт живых проб (issue #1092, задача 1087):
+//! Контракт живых проб (issue #1092, задача 1087; 404-проба подтверждена
+//! ревью round-2 на 2 репо):
 //! - батч-POST `POST repos/{repo}/issues/{n}/issue-field-values` идемпотентен
 //!   (overwrite); тело `{"issue_field_values":[{"field_id":N,"value":V}]}`;
 //! - text/date — значением-строкой, single_select — **именем опции строкой**
 //!   («on», «high»; числовой id даёт 422 «must be a string option name»);
-//! - очистка — `DELETE repos/{repo}/issues/{n}/issue-field-values/{field_id}`,
-//!   идемпотентен: повтор на отсутствующем значении — exit 0, пустой вывод
-//!   (проба-2 14.11; «404» из пробы-1 — артефакт -i-режима gh); POST с
-//!   пустой строкой — HTTP 500 (очистка только DELETE);
+//! - очистка — `DELETE repos/{repo}/issues/{n}/issue-field-values/{field_id}`;
+//!   POST с пустой строкой — HTTP 500 (очистка только DELETE); DELETE на
+//!   отсутствующем значении — gh exit 1, {"status":"404"} в stdout и
+//!   "(HTTP 404)" в stderr → гвард no-op (идемпотентность повторных клинапов);
 //! - чтение: `issue_field_values` прямо в payload GET issues (и list тоже):
 //!   text/date — `value`, select — `single_select_option.name`; отсутствующее
 //!   поле = пустая клетка.
@@ -92,17 +93,23 @@ pub(crate) async fn set_fields(
         let fid = field_id(name).await?;
         match value {
             None => {
-                // Очистка: DELETE — идемпотентен (повтор на отсутствующем
-                // значении: exit 0, пустой вывод; живая проба-2 #1092)
+                // Очистка: DELETE; 404 (значения не было) — no-op.
+                // Живая проба (подтверждена ревью round-2 на 2 репо): DELETE на
+                // отсутствующем значении — gh exit 1, тело {"status":"404"} в
+                // stdout И "(HTTP 404)" в stderr; гвард по сообщению ошибки
+                // ловит оба канала.
                 let args = [
                     "api",
                     "-X",
                     "DELETE",
                     &format!("repos/{repo}/issues/{issue_number}/issue-field-values/{fid}"),
                 ];
-                super::github_gh::gh_json(&args, None)
-                    .await
-                    .with_context(|| format!("поле «{name}» не очищено"))?;
+                if let Err(e) = super::github_gh::gh_json(&args, None).await {
+                    let text = format!("{e:#}");
+                    if !text.contains("404") {
+                        return Err(e).with_context(|| format!("поле «{name}» не очищено"));
+                    }
+                }
             }
             Some(FieldValue::Text(s)) => {
                 batch.push(serde_json::json!({ "field_id": fid, "value": s }))

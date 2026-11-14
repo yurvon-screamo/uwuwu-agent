@@ -162,6 +162,12 @@ case "$route" in
   "repos/$REPO/issues/999/issue-field-values")
     if [ "$method" = "POST" ]; then printf '[]'; exit 0; fi
     ;;
+  "repos/$REPO/issues/999/issue-field-values/"*)
+    # очистка несуществующего значения: 404, тело в stdout + stderr (реальный gh)
+    printf '{"message":"Issue field value not found","status":"404"}'
+    echo "gh: Issue field value not found (HTTP 404)" >&2
+    exit 1
+    ;;
   "repos/$REPO/issues/999")
     cat "$DIR/issue.json"
     exit 0
@@ -469,6 +475,19 @@ fn task_get_status_comes_from_project_v2_join() {
         stdout.contains("In Progress"),
         "статус из Pv2-джойна (canned In Progress, не Todo-фоллбэк): {stdout}"
     );
+}
+
+/// J. Очистка клетки: `--branch ""` → DELETE → 404 на отсутствующем значении
+/// → no-op (rc 0): идемпотентность повторных клинапов (ревью round-2 High).
+#[test]
+fn edit_clear_branch_tolerates_404_on_missing_value() {
+    let guards = setup_stub_gh();
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &["task", "edit", "999", "--project", "uwuwu", "--branch", ""],
+    );
+    assert_eq!(code, Some(0), "очистка пустой клетки — no-op: {stderr}");
 }
 
 /// H. `task edit --branch` — клетка через REST issue-field-values (батч),

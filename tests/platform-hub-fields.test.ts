@@ -5,6 +5,8 @@
 //! Порядок файла детерминирован (bun test — общий процесс): стаб-тесты
 //! setIssueFields на РЕАЛЬНОМ platform-hub идут до mock.module — иначе
 //! мок соседнего describe подменяет кеш модуля (ревью Low-5).
+//! DELETE-стаб кодирует реальный контракт: 404 exit 1, тело в stdout+stderr
+//! (подтверждено ревью round-2 на 2 репо) — no-op-гвард шва глотает.
 
 import { describe, expect, mock, test } from "bun:test"
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, unlinkSync } from "node:fs"
@@ -44,7 +46,11 @@ if [ "$route" = "user/issue-fields" ]; then
 fi
 if [[ "$route" == *"/issue-field-values"* ]]; then
   if [ "$method" = "DELETE" ]; then
-    exit 0   # идемпотентная очистка: exit 0, пустой вывод (проба-2 #1092)
+    # 404 на отсутствующем значении: тело в stdout И stderr (как реальный gh,
+    # подтверждено ревью round-2 на 2 репо) — гвард no-op глотает
+    printf '{"message":"Issue field value not found","status":"404"}'
+    echo "gh: Issue field value not found (HTTP 404)" >&2
+    exit 1
   fi
   printf '[]'
   exit 0
@@ -85,7 +91,7 @@ describe("setIssueFields: реальный write-path на PATH-стабе gh", 
     expect((log.match(/POST .*issue-field-values/g) ?? []).length).toBe(1)
   })
 
-  test("очистка: DELETE идемпотентен — no-op без POST", () => {
+  test("очистка: DELETE 404 на отсутствующем — no-op без POST", () => {
     withStub(() => realSetIssueFields("778", { "Расписание": null }))
     const log = readFileSync(stub.log, "utf8")
     expect((log.match(/DELETE .*issue-field-values/g) ?? []).length).toBe(1)

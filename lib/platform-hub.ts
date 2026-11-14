@@ -188,9 +188,15 @@ export function setIssueFields(
   for (const [name, value] of Object.entries(fields)) {
     const fid = idOf(name)
     if (value === null || value === "") {
-      // очистка: DELETE — идемпотентен (повтор на отсутствующем значении:
-      // exit 0, пустой вывод; живая проба-2 #1092, задача 1087)
-      gh([ "api", "-X", "DELETE", `repos/${hubRepo()}/issues/${number}/issue-field-values/${fid}` ])
+      // очистка: DELETE; 404 (значения не было) — no-op. Живая проба
+      // (подтверждена ревью round-2 на 2 репо): gh exit 1, тело
+      // {"status":"404"} в stdout И "(HTTP 404)" в stderr — гвард по
+      // сообщению ошибки ловит оба канала (идемпотентность повторных клинапов).
+      try {
+        gh([ "api", "-X", "DELETE", `repos/${hubRepo()}/issues/${number}/issue-field-values/${fid}` ])
+      } catch (e) {
+        if (!String(e).includes("404")) throw e
+      }
       continue
     }
     batch.push({ field_id: fid, value })
