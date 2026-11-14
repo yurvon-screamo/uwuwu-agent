@@ -348,3 +348,35 @@ async fn stale_tmp_files_are_cleaned_before_write() -> Result<()> {
     assert!(!stale.exists(), "stale .uwuwu-tmp не почищен перед записью");
     Ok(())
 }
+
+/// Stale `shallow.lock` (посторонний git-процесс умер на полпути):
+/// shallow-класс ошибки должен ретраиться (паузы 300+600мс — нижняя
+/// граница elapsed их ловит) и по исчерпании дать громкий отказ с
+/// shallow-текстом — не Ok, не зависание, не мангал ошибки. Постановка:
+/// «shallow-отказы лечатся ручными ретраями» — дисциплина ретрая теперь
+/// внутри cli.
+#[tokio::test]
+async fn shallow_race_fetch_retries_then_fails_loud() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_origin, _writer, work) = setup_rig(tmp.path(), "shallowlock").await?;
+    // фейковый lock: любой fetch упадёт «Unable to create …/shallow.lock»
+    std::fs::write(work.join(".git/shallow.lock"), "x")?;
+    let store = test_store(&work);
+    let started = std::time::Instant::now();
+    let err = store
+        .fetch_shallow()
+        .await
+        .expect_err("stale shallow.lock должен дать громкий отказ");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(800),
+        "shallow-ошибка не ретраилась (elapsed {elapsed:?}) — дисциплина \
+         ретрая потеряна"
+    );
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("shallow.lock"),
+        "текст ошибки потерял shallow-класс: {text}"
+    );
+    Ok(())
+}
