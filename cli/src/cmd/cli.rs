@@ -371,7 +371,10 @@ pub(crate) enum TaskSub {
 pub(crate) enum CronSub {
     /// Мастера крон-задач доски проекта (--project, деф. uwuwu)
     List {
-        #[arg(long, help = "Проект (доска «Задачи <proj>»; деф. uwuwu)")]
+        #[arg(
+            long,
+            help = "Проект-фильтр доски «Задачи <proj>» (без флага — мастера всех проектов репо)"
+        )]
         project: Option<String>,
     },
 }
