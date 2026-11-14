@@ -1,11 +1,13 @@
-[package]
-name = "uwuwu-server"
+[workspace]
+resolver = "2"
+members = ["crates/domain", "crates/usecase", "crates/server"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "uwuwu-server: единый сервер контура uwuwu (конвейер задач + MCP) — задача hub#1133"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
@@ -18,8 +20,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-[dev-dependencies]
+# dev
 http-body-util = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }

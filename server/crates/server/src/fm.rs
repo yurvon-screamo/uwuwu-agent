@@ -1,6 +1,6 @@
 //! fm-зеркало тела задачи: frontmatter `---`…`---` в начале issue body.
 //! Ручной парсинг строк (без regex): формат плоский `key: value`.
-//! Инвариант канона: fm ≡ поля канбана (писатели синхронизируют оба носителя).
+//! Инвариант канона: fm ≡ поля канбана (писатель-хаб синхронизирует оба).
 
 use std::collections::BTreeMap;
 
@@ -33,9 +33,6 @@ impl Frontmatter {
     }
 
     /// Тело без fm-блока (контент задач).
-    // write-path статуса/автодона — потребитель приезжает срезом 1b
-    // (мутации issue body + fm-пересборка); тесты контракта уже здесь
-    #[allow(dead_code)]
     pub fn strip(body: &str) -> &str {
         match fm_bounds(body) {
             Some((_, end)) => body[end..].trim_start_matches('\n'),
@@ -44,7 +41,6 @@ impl Frontmatter {
     }
 
     /// Пересобирает тело с новым fm (контент сохраняется дословно).
-    #[allow(dead_code)] // write-path среза 1b, см. strip
     pub fn render(body: &str, fields: &BTreeMap<String, String>) -> String {
         let content = Self::strip(body);
         let mut fm = String::from("---\n");
@@ -57,15 +53,16 @@ impl Frontmatter {
     }
 }
 
+/// (конец внутренностей, конец закрывающего маркера) в координатах тела.
+/// Формат: блок обязан открывать тело (`---\n`) и закрываться `\n---`
+/// в конце строки; иначе это не fm (например, `---`-разделитель в контенте).
 fn fm_bounds(body: &str) -> Option<(usize, usize)> {
     let rest = body.strip_prefix("---\n")?;
     let marker = rest.find("\n---")?;
     let after = &rest[marker + 4..];
-    // закрывающий маркер — конец строки: `\n---\n` или `\n---` в конце тела
     if !after.is_empty() && !after.starts_with('\n') && !after.starts_with('\r') {
         return None;
     }
-    // (конец внутренностей, конец закрывающего маркера) — оба в координатах тела
     Some((4 + marker, 4 + marker + 4))
 }
 
@@ -91,8 +88,9 @@ mod tests {
 
     #[test]
     fn empty_fm_without_block() {
-        let fm = Frontmatter::parse("## Постановка\n\nБез fm.");
-        assert!(fm.fields.is_empty());
+        assert!(Frontmatter::parse("## Постановка\n\nБез fm.")
+            .fields
+            .is_empty());
         assert_eq!(Frontmatter::strip("## X"), "## X");
     }
 
@@ -113,8 +111,8 @@ mod tests {
 
     #[test]
     fn horizontal_rule_is_not_fm() {
-        // `---` как разделитель внутри контента (не в начале) — не fm
-        let body = "Текст\n\n---\n\nЕщё текст";
-        assert!(Frontmatter::parse(body).fields.is_empty());
+        assert!(Frontmatter::parse("Текст\n\n---\n\nЕщё текст")
+            .fields
+            .is_empty());
     }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "uwuwu-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uwuwu-server: инфра и композиция (gh-hub, опенкод, HTTP, конфиг) — задача hub#1133"
+
+# Внешний слой: реализации портов юзкейсов + presentation (HTTP/MCP).
+# Направление зависимостей: server → usecase → domain (только внутрь).
+# Ошибки портов — нативные (UsecaseError), своих — свои нативные enum.
+
+[[bin]]
+name = "uwuwu-server"
+path = "src/main.rs"
+
+[dependencies]
+uwuwu-domain = { path = "../domain" }
+uwuwu-usecase = { path = "../usecase" }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tower = { workspace = true }
