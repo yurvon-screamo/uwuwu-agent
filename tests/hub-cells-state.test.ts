@@ -35,14 +35,27 @@ test("read_database_cells: строка доски несёт нативный s
       'case "$2 $3" in',
       '  *"/issues"*) cat "$FAKE_GH_ISSUES" ;;',
       '  *"/labels"*) cat "$FAKE_GH_LABELS" ;;',
+      '  *"graphql"*) cat "$FAKE_GH_GRAPHQL" ;;',
       '  *) echo "fake gh: неожиданный вызов: $*" >&2; exit 1 ;;',
       "esac",
     ].join("\n"))
     chmodSync(ghBin, 0o755)
+    const envPatch: Record<string, string> = { FAKE_GH_LABELS: "", FAKE_GH_ISSUES: "" }
     const labelsPath = join(dir, "labels.json")
     const issuesPath = join(dir, "issues.json")
     writeFileSync(labelsPath, LABELS_JSON)
     writeFileSync(issuesPath, ISSUES_JSON)
+    // Pv2-канон статусов (#1087): projectStatuses делает два graphql-запроса
+    // (список проектов + батч-джойн items) — canned отвечает обоим шейпам разом:
+    // статусы в тесте берутся из issue.state-гарда, не из карточек
+    const graphqlPath = join(dir, "graphql.json")
+    writeFileSync(graphqlPath, JSON.stringify({
+      data: { viewer: {
+        projectsV2: { nodes: [{ number: 5, title: "Задачи uwuwu" }] },
+        projectV2: { items: { pageInfo: { hasNextPage: false, endCursor: null }, items: [] } },
+      } },
+    }))
+    envPatch.FAKE_GH_GRAPHQL = graphqlPath
     const out = join(dir, "rows.json")
 
     const proc = Bun.spawn(["bun", CHILD, LIB_DIR, out], {
@@ -52,6 +65,7 @@ test("read_database_cells: строка доски несёт нативный s
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         FAKE_GH_LABELS: labelsPath,
         FAKE_GH_ISSUES: issuesPath,
+        ...envPatch,
       },
       stdout: "pipe",
       stderr: "pipe",
