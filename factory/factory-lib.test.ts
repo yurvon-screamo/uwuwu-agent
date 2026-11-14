@@ -1915,6 +1915,20 @@ describe("эпизоды гарда: holdEpisodeKey / parseHoldEpisodes", () => 
     expect(parsed).toEqual(raw)
   })
 
+  test("мусорный ключ повреждённого state не доедет до лога как причина", () => {
+    // Arrange
+    const raw = {
+      "uwuwu/garbage": { since: "2026-11-10T10:00:16Z", signaled: "2026-11-10T10:00:16Z" },
+      "без-слэша": { since: "a", signaled: "b" },
+    }
+
+    // Act
+    const parsed = parseHoldEpisodes(raw)
+
+    // Assert
+    expect(parsed).toEqual({})
+  })
+
   test("легаси строка-флаг и прочий мусор отбрасываются без ошибки", () => {
     // Act / Assert
     expect(parseHoldEpisodes("2026-11-10T10:00:16Z")).toEqual({})
@@ -1950,14 +1964,18 @@ describe("guardAlertChannel: канал алерта по классу верд�
 
   test("state-loss в пределах окна повтора — тишина (анти-спам)", () => {
     // Act / Assert
-    expect(guardAlertChannel(hold("state-loss", "none"))).toBe("log")
+    expect(guardAlertChannel(hold("state-loss", "none"))).toBe("silent")
   })
 
-  test("burst при любом алерте — только лог демона (механика не ходит в задачи)", () => {
+  test("burst first — строка лога на вход в эпизод (механика не ходит в задачи)", () => {
     // Act / Assert
-    expect(guardAlertChannel(hold("burst", "first"))).toBe("log")
-    expect(guardAlertChannel(hold("burst", "repeat"))).toBe("log")
-    expect(guardAlertChannel(hold("burst", "none"))).toBe("log")
+    expect(guardAlertChannel(hold("burst", "first"))).toBe("episode-log")
+  })
+
+  test("burst repeat/none — тишина между агрегатными строками (heartbeat решает repeat)", () => {
+    // Act / Assert
+    expect(guardAlertChannel(hold("burst", "repeat"))).toBe("silent")
+    expect(guardAlertChannel(hold("burst", "none"))).toBe("silent")
   })
 })
 

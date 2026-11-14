@@ -1134,18 +1134,29 @@ async function holdSpawns(
   const episodes = state.holdEpisodes ?? {}
   const episode = episodes[key]
   const nowIso = new Date().toISOString()
-  if (guardAlertChannel(guard) === "log") {
-    if (guard.reason === "burst" && guard.alert === "first") {
-      // вход в burst-эпизод: одна агрегированная строка лога; per-tick
-      // видимость далее даёт «проход … задержано гардом=N (burst)»
-      episodes[key] = { since: nowIso, signaled: nowIso }
+  const channel = guardAlertChannel(guard)
+  if (channel === "episode-log") {
+    // вход в burst-эпизод: одна агрегированная строка лога; далее раз в час
+    // heartbeat с живыми счётчиками, между ними — «проход … задержано гардом=N»
+    episodes[key] = { since: nowIso, signaled: nowIso }
+    state.holdEpisodes = episodes
+    saveState(state)
+    log(`гард спавна: вход в burst-эпизод — ${guard.text} ` +
+      `Цели задержки: ${targets.join(", ") || "нет"}.`)
+    return
+  }
+  if (channel === "silent") {
+    if (guard.reason === "burst" && guard.alert === "repeat") {
+      // heartbeat длящегося burst-эпизода: дрейф счётчиков виден в логе,
+      // окно повтора сдвигается — иначе после первого часа он был бы каждый тик
+      episodes[key] = { since: episode.since, signaled: nowIso }
       state.holdEpisodes = episodes
       saveState(state)
-      log(`гард спавна: вход в burst-эпизод — ${guard.text} ` +
-        `Цели задержки: ${targets.join(", ") || "нет"}.`)
+      log(`гард спавна: burst-эпизод продолжается — ${guard.text}`)
     }
     return
   }
+  // comment: state-loss first/repeat
   if (guard.alert === "first") backupSuspectState()
   const target = alertTargetOf(untracked)
   if (target === null) {
@@ -1168,6 +1179,8 @@ function clearHoldEpisodes(projectName: string, state: FactoryState): void {
   const ownKeys = Object.keys(episodes).filter((k) => k.startsWith(`${projectName}/`))
   if (ownKeys.length === 0) return
   for (const k of ownKeys) {
+    // суффикс-каст звука: ключи попадают сюда только через parseHoldEpisodes
+    // (валидация формата "<имя>/<reason>") или holdEpisodeKey (known reason)
     const reason = k.slice(projectName.length + 1) as "state-loss" | "burst"
     log(formatGuardEpisodeEnd(reason, episodes[k].since, Date.now()))
     delete episodes[k]

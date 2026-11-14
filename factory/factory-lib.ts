@@ -1443,12 +1443,16 @@ export function holdEpisodeKey(project: string, reason: "state-loss" | "burst"):
 /** Парсинг holdEpisodes из сырого state.json: валидный record строк-эпизодов
  *  переносится как есть; мусорные ключи/значения пропускаются; легаси-флаг
  *  (строка top-level holdSignaled до инцидента 10.11) отбрасывается — эпизод
- *  самозаживится одним лишним алертом. */
+ *  самозаживится одним лишним алертом. Ключ валидируется форматом
+ *  "<имя>/<reason>" — мусорный ключ повреждённого state не доедёт до лога
+ *  выхода как причина. */
 export function parseHoldEpisodes(raw: unknown): Record<string, HoldEpisode> {
   if (raw === null || typeof raw !== "object") return {}
   const out: Record<string, HoldEpisode> = {}
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof k !== "string" || k === "") continue
+    const slash = typeof k === "string" ? k.lastIndexOf("/") : -1
+    const reason = slash > 0 ? k.slice(slash + 1) : ""
+    if (reason !== "burst" && reason !== "state-loss") continue
     if (v === null || typeof v !== "object") continue
     const e = v as Record<string, unknown>
     if (typeof e.since !== "string" || typeof e.signaled !== "string") continue
@@ -1458,14 +1462,17 @@ export function parseHoldEpisodes(raw: unknown): Record<string, HoldEpisode> {
 }
 
 /** Политика канала алерта по вердикту (точка решения, инцидент 10.11):
- *  state-loss — исключение, требующее действия владельца (коммент в задачу,
- *  окно повтора сечёт частоту); burst — механика (волна импорта), только лог
- *  демона; в пределах окна повтора — тишина (per-tick видимость даёт
- *  «проход … задержано гардом=N»). */
-export type GuardAlertChannel = "comment" | "log"
+ *  comment — state-loss first/repeat: исключение, требующее действия
+ *  владельца (коммент в задачу, окно повтора сечёт частоту);
+ *  episode-log — burst first: механика (волна импорта), одна агрегированная
+ *  строка лога на вход в эпизод; silent — всё прочее (в пределах окна
+ *  повтора / длящийся burst): per-tick видимость даёт «проход … задержано
+ *  гардом=N». */
+export type GuardAlertChannel = "comment" | "episode-log" | "silent"
 
 export function guardAlertChannel(guard: SpawnGuardHold): GuardAlertChannel {
-  return guard.reason === "state-loss" && guard.alert !== "none" ? "comment" : "log"
+  if (guard.reason === "burst") return guard.alert === "first" ? "episode-log" : "silent"
+  return guard.alert === "none" ? "silent" : "comment"
 }
 
 /** Агрегированная строка лога на выход из эпизода: длительность — главное,
