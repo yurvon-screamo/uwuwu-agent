@@ -132,7 +132,7 @@ import {
   type PrCarrier,
   type PrProbeState,
 } from "./autodone"
-import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
+import { startPinned } from "../lib/node-pinning"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, envPaths, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 import { fetchSessionById, fetchLatestSessionByDirectory } from "../lib/session-row"
@@ -2719,14 +2719,14 @@ async function main(): Promise<void> {
   await mcp.connect()
   // пиннинг за нодами (ADR-076): док-истина топологии; перепин или незапиненный
   // конфиг в проде — громкий отказ старта; песочница смоук-тиков (ADR-059)
-  // unknown-проекты пропускает (их в доке нет и не должно быть)
-  const pinning = await checkNodePinning(mcp.tool, {
+  // unknown-проекты пропускает (их в доке нет и не должно быть).
+  // Недоступный док — ретрай с бэкоффом внутри startPinned (инцидент 13–14.11)
+  const pinning = await startPinned(mcp.tool, {
     factoryProjects: Object.keys(projects),
     sandboxed: STATE_RESOLVED.sandboxed,
     envNodeName: process.env.UWUWU_NODE_NAME,
     hostname: hostname(),
-  })
-  failPinnedStart(pinning)
+  }, { log })
   log(`пиннинг: нода ${pinning.nodeName} подтверждена${pinning.sandboxSkipped.length > 0 ? ` (песочница пропустила незапиненные: ${pinning.sandboxSkipped.join(", ")})` : ""}`)
   log(`uwuwu-factory: старт (проекты: ${Object.keys(projects).join(", ")}, poll=${POLL_SEC}s, stall=${STALL_MIN}m, model=${MODEL.id}, гард каскада: loss>${SPAWN_LIMITS.lossMax}/burst>${SPAWN_LIMITS.burstMax}, CUP=${CUP}, пик=${PEAK.enabled ? `${PEAK.startMin}-${PEAK.endMin} UTC` : "off"}, autodone-timeout=${Math.round(AUTODONE_TIMEOUT_MS / 60_000)}m${DRY_RUN ? ", DRY_RUN" : ""}${STATE_RESOLVED.sandboxed ? `, state=${STATE_DIR}` : ""})`)
   await ensureBoardColumns(projects)

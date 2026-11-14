@@ -175,6 +175,51 @@ export function failPinnedStart(check: PinningCheck, print: (line: string) => vo
   process.exit(1)
 }
 
+/** Прод-старт демона: подтверждённый пиннинг или ничего. Сбой wiki-стороны
+ *  (док недоступен/не экспортируется/кривой формат) — ретрай с бэкоффом:
+ *  демон остаётся жив без тиков, починка дока подхватывается сама, systemd
+ *  не штормит рестартами (инцидент 13–14.11, задача 1075: стухший клон
+ *  демонов читался как «пиннинг-док не найден» — три демона рестартовались
+ *  каждые ~15 с невидимо владельцу). Нарушения пиннинга (чужая нода,
+ *  незапиненный проект) — отказ старта как прежде: это секьюрити-класс,
+ *  ретраем его не лечат. Возврат — только подтверждённый чек. */
+export async function startPinned(tool: PinningTool, opts: Parameters<typeof checkNodePinning>[1], hooks: {
+  log: (m: string) => void
+  /** дефолт console.error — канал отказа по violations */
+  print?: (m: string) => void
+  /** пауза между ретраями недоступного дока (дефолт 60с) */
+  retryDelayMs?: number
+  /** пауза-инжект для тестов (дефолт реальный sleep) */
+  sleep?: (ms: number) => Promise<void>
+  /** инжект исхода violations для тестов (дефолт print + process.exit(1)) */
+  onViolations?: (check: PinningCheck) => void
+}): Promise<PinningCheck> {
+  const delay = hooks.retryDelayMs ?? 60_000
+  const sleep = hooks.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)))
+  const print = hooks.print ?? console.error
+  for (;;) {
+    let check: PinningCheck
+    try {
+      check = await checkNodePinning(tool, opts)
+    } catch (e) {
+      hooks.log(`пиннинг: док недоступен (${String(e)}) — ретрай через ${Math.round(delay / 1000)}с (тики не запускаются, exit-шторма нет)`)
+      await sleep(delay)
+      continue
+    }
+    if (check.violations.length > 0) {
+      if (hooks.onViolations !== undefined) {
+        // тестовый инжект: исход нарушений — на вызывающего; после хука
+        // возвращаем чек (дефолтный путь ниже — exit 1)
+        hooks.onViolations(check)
+        return check
+      }
+      print(`пиннинг: отказ старта (нода ${check.nodeName}):\n- ${check.violations.join("\n- ")}`)
+      process.exit(1)
+    }
+    return check
+  }
+}
+
 function pinnedFactoryProjects(pinning: PinningDoc): string[] {
   return Object.values(pinning.factories).flat()
 }
