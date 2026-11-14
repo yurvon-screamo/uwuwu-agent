@@ -12,6 +12,7 @@ pub struct ToolHub {
     pub writer: Arc<TaskWriteUseCase>,
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
     pub sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway>,
+    pub search: Arc<uwuwu_usecase::search::SearchUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -126,6 +127,14 @@ impl ToolHub {
                 "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
                 object(json!({
                     "project": string("проект; дефолт uwuwu")
+                }))
+            ),
+            tool(
+                "search",
+                "Гибридный поиск по вики: полнотекст + семантика (если индекс жив)",
+                object(json!({
+                    "query": string("поисковый запрос (токены AND + вектор)"),
+                    "top": json!({"type":"integer","description":"сколько попаданий на секцию; дефолт 5"})
                 }))
             ),
             tool(
@@ -280,6 +289,24 @@ impl ToolHub {
                 } else {
                     out
                 })
+            }
+            "search" => {
+                let query = arg("query");
+                if query.is_empty() {
+                    return Err("query обязателен".into());
+                }
+                let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let hits = self
+                    .search
+                    .search(&query, top)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let out = hits
+                    .iter()
+                    .map(|h| format!("[{}] {} {}", h.section, h.slug, h.score))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ok_text(out)
             }
             "session_export" => {
                 let session = arg("session");
