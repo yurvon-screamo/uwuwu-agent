@@ -4,6 +4,7 @@
 //! (projects/cron) — hub_lists (полная пагинация ADR-020).
 
 use crate::cmd::cli::{Commands, SemanticSub};
+use crate::out::{out, outln};
 use anyhow::{bail, Result};
 
 pub(crate) async fn dispatch(command: Commands) -> Result<()> {
@@ -20,7 +21,7 @@ pub(crate) async fn dispatch(command: Commands) -> Result<()> {
         } => crate::cmd::hub_docs::search(&query, limit, threshold).await,
         Commands::Read { slug } => {
             let md = crate::cmd::hub_docs::read(&slug).await?;
-            print!("{md}");
+            out!("{md}");
             Ok(())
         }
         Commands::Docs { command } => {
@@ -74,7 +75,7 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
             let md = store
                 .read(&crate::store::doc_store::DocRef { slug: slug.into() })
                 .await?;
-            println!("{md}");
+            outln!("{md}");
             Ok(())
         }
         crate::cmd::cli::PersonSub::Append { stdin, text } => {
@@ -85,7 +86,7 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
             // append_doc сам читает текущий док и конкатенирует — передаём
             // только addition (вариант с ручным склеиванием удваивал тело)
             store.append_doc(slug, &addition).await?;
-            println!("персона дописана");
+            outln!("персона дописана");
             Ok(())
         }
         crate::cmd::cli::PersonSub::Replace { stdin, md } => {
@@ -98,7 +99,7 @@ async fn person_hub(command: crate::cmd::cli::PersonSub) -> Result<()> {
                 _ => String::new(),
             };
             store.replace_doc(slug, &body).await?;
-            println!("персона перезаписана");
+            outln!("персона перезаписана");
             Ok(())
         }
     }
@@ -109,21 +110,23 @@ async fn semantic_run(command: SemanticSub) -> Result<()> {
     match command {
         SemanticSub::Rebuild { resume } => {
             let report = crate::semantic::rebuild(&cfg, None, resume).await?;
-            println!(
+            outln!(
                 "пересбор: {} встроено, коротких пропущено {}, время {:?}",
-                report.embedded, report.skipped_short, report.elapsed
+                report.embedded,
+                report.skipped_short,
+                report.elapsed
             );
             Ok(())
         }
         SemanticSub::Status => {
             for line in crate::semantic::status(&cfg).await? {
-                println!("{line}");
+                outln!("{line}");
             }
             Ok(())
         }
         SemanticSub::Sync => {
             for line in crate::semantic::sync_once(&cfg).await? {
-                println!("{line}");
+                outln!("{line}");
             }
             Ok(())
         }

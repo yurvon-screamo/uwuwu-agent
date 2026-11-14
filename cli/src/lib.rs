@@ -3,6 +3,7 @@
 //! бекенда 20261112155302-ttyp35g (история носителей: AFFiNE → hub).
 
 pub mod cmd;
+pub(crate) mod out;
 pub mod path;
 pub mod semantic;
 pub mod store;

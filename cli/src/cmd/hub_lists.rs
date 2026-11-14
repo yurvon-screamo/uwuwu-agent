@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 
+use crate::out::outln;
 use crate::store::github_gh::{gh_json, gh_pages, GH_PAGE_SIZE};
 use crate::store::github_task::urlencoded;
 
@@ -14,7 +15,7 @@ use crate::store::github_task::urlencoded;
 /// (422 как данные, баг 13.11), форма на GET искажала выборку (e2e 13.11).
 pub(crate) async fn projects_hub() -> Result<()> {
     for project in gh_labels().await? {
-        println!("{project}");
+        outln!("{project}");
     }
     Ok(())
 }
@@ -80,13 +81,13 @@ pub(crate) async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
             continue;
         };
         count += 1;
-        println!(
+        outln!(
             "#{} [Вейт] {} — {}",
             issue["number"],
             issue["title"].as_str().unwrap_or(""),
             schedule
         );
     }
-    println!("крон-мастеров: {count}");
+    outln!("крон-мастеров: {count}");
     Ok(())
 }

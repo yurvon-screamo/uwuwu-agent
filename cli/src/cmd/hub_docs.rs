@@ -2,6 +2,7 @@
 //! (git-клон uwuwu-hub). Перехват в run() по UWUWU_HUB_REPO. Срез D,
 //! задача 20261112155302-ttyp35g.
 
+use crate::out::outln;
 use crate::store::doc_store::{DocRef, DocStore};
 use crate::store::github_doc_store::GitHubDocStore;
 use anyhow::Result;
@@ -21,11 +22,11 @@ pub(crate) async fn read(slug: &str) -> Result<String> {
 pub(crate) async fn docs_ls(prefix: &str) -> Result<()> {
     let entries = doc_store().ls(prefix).await?;
     if entries.is_empty() {
-        println!("пусто");
+        outln!("пусто");
         return Ok(());
     }
     for e in &entries {
-        println!("{}", e.name);
+        outln!("{}", e.name);
     }
     Ok(())
 }
@@ -38,28 +39,28 @@ pub(crate) async fn search(query: &str, limit: usize, threshold: f32) -> Result<
     let fulltext = store.search_fulltext(query, limit).await?;
     let titles = store.search_by_title(query, limit).await?;
 
-    println!("Полнотекст (git-клон uwuwu-hub):");
+    outln!("Полнотекст (git-клон uwuwu-hub):");
     if fulltext.is_empty() {
-        println!("  — пусто");
+        outln!("  — пусто");
     }
     for h in &fulltext {
-        println!("  — {}: {}", h.title, h.snippet);
+        outln!("  — {}: {}", h.title, h.snippet);
     }
-    println!("Доки по заголовкам:");
+    outln!("Доки по заголовкам:");
     if titles.is_empty() {
-        println!("  — пусто");
+        outln!("  — пусто");
     }
     for t in &titles {
-        println!("  — {}", t.slug);
+        outln!("  — {}", t.slug);
     }
     // Semantic-секция: индекс per-машинный; дельта в остатке бюджета —
     // hub-источник (semantic::search_half с None-sy). Деградация секции —
     // честный статус, команда не падает.
     let cfg = crate::semantic::SemanticConfig::from_env();
     let section = crate::semantic::search_half(&cfg, query, limit, threshold).await;
-    println!();
+    outln!();
     for line in section {
-        println!("{line}");
+        outln!("{line}");
     }
     Ok(())
 }
