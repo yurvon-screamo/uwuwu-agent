@@ -27,6 +27,8 @@ mod store_tests;
 mod github_doc_clone_tests;
 #[cfg(test)]
 mod github_doc_clone_sync_tests;
+#[cfg(test)]
+mod github_gh_tests;
 
 pub use doc_store::{DocEntry, DocStore};
 pub use task_store::{CommentInsert, CreateTask, EditTask, TaskStore, ThreadEntry};

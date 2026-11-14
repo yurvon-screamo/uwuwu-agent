@@ -22,6 +22,43 @@ pub async fn gh_json(args: &[&str], stdin_body: Option<&str>) -> Result<Value> {
         .with_context(|| format!("gh {:?}: не-JSON ответ: {}", &args[..3], clip(&raw)))
 }
 
+/// Размер страницы gh-листингов (per_page GitHub, максимум 100).
+pub(crate) const GH_PAGE_SIZE: usize = 100;
+
+/// Полная пагинация gh-листингов — канон ADR-020 (класс «молчаливый кап
+/// листингов»: первая сотня тихо скрывала хвост инвентаря, баг 1086).
+/// Цикл до короткой страницы; дрейф-дубли между страницами (конкурентные
+/// мутации во время обхода) дедупятся по `id`, элементы без `id` проходят
+/// как есть; кап 100 страниц → громкий `bail!` — тихая усечка запрещена.
+/// `fetch(page)` отдаёт одну страницу элементов (для листингов без пагинации
+/// сервер отдаёт всё разом — короткая страница терминация сработает сразу).
+pub(crate) async fn gh_pages(
+    mut fetch: impl AsyncFnMut(usize) -> Result<Vec<Value>>,
+) -> Result<Vec<Value>> {
+    const PAGES_CAP: usize = 100;
+    let mut all = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=PAGES_CAP {
+        let items = fetch(page).await?;
+        let fetched = items.len();
+        for item in items {
+            match item.get("id").and_then(Value::as_u64) {
+                Some(id) if seen.insert(id) => all.push(item),
+                Some(_) => {}
+                None => all.push(item),
+            }
+        }
+        if fetched < GH_PAGE_SIZE {
+            return Ok(all);
+        }
+    }
+    bail!(
+        "листинг: кап {PAGES_CAP} страниц ({} элементов, {GH_PAGE_SIZE}/стр) — \
+         выборка неполна, тихая усечка запрещена (ADR-020); сузь фильтр",
+        all.len()
+    )
+}
+
 /// GraphQL-мутация/запрос одной строкой + переменные (serde map).
 /// gh graphql --input - читает {query, variables} JSON со stdin.
 pub async fn gh_graphql(query: &str, variables: &Value) -> Result<Value> {
