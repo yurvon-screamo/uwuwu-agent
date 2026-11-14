@@ -58,6 +58,7 @@ import {
   alertTargetOf,
   spawnGuardVerdict,
   spawnLimitsFromEnv,
+  splitThrottle,
   untrackedRowDecision,
   deadSpawnVerdict,
   deadFreshMinutesFromEnv,
@@ -1819,20 +1820,49 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(verdict.text).toContain("state")
   })
 
-  test("сироты в пределах lossMax, но всего untracked > burst — hold(burst)", () => {
+  test("сироты в пределах lossMax, но всего untracked > burst — throttle: волна дозируется, не глушится", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 1, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict.t).toBe("throttle")
+    if (verdict.t !== "throttle") return
+    expect(verdict.alert).toBe("first")
+    expect(verdict.text).toContain("20")
+    expect(verdict.text).toContain("дозируется")
+    expect(verdict.text).not.toContain("перезапусти")
   })
 
-  test("чистый burst без сирот — hold(burst), alert=first", () => {
+  test("чистый burst без сирот — throttle с тем же текстом дозирования", () => {
     // Act
     const verdict = spawnGuardVerdict({ orphaned: 0, totalUntracked: 20, now: GUARD_NOW }, GUARD_LIMITS)
 
     // Assert
-    expect(verdict).toMatchObject({ t: "hold", reason: "burst", alert: "first" })
+    expect(verdict).toMatchObject({ t: "throttle", alert: "first" })
+  })
+
+  test("повторный тик throttle-эпизода в пределах окна повтора — alert=none", () => {
+    // Arrange: алерт был 10 минут назад (окно — час)
+    const signaled = new Date(GUARD_NOW - 10 * 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "none" })
+  })
+
+  test("длящийся throttle дольше окна повтора — alert=repeat", () => {
+    // Arrange: алерт был 2 часа назад (волна не дренажируется — признак аномалии)
+    const signaled = new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+
+    // Act
+    const verdict = spawnGuardVerdict(
+      { orphaned: 0, totalUntracked: 20, holdSignaled: signaled, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert
+    expect(verdict).toMatchObject({ t: "throttle", alert: "repeat" })
   })
 
   test("повторный тик эпизода в пределах окна повтора — alert=none", () => {
@@ -1887,7 +1917,44 @@ describe("spawnGuardVerdict: потеря state не превращается в
     expect(spawnGuardVerdict({ orphaned: 3, totalUntracked: 12, now: GUARD_NOW }, GUARD_LIMITS))
       .toMatchObject({ t: "hold", reason: "state-loss" })
     expect(spawnGuardVerdict({ orphaned: 0, totalUntracked: 13, now: GUARD_NOW }, GUARD_LIMITS))
-      .toMatchObject({ t: "hold", reason: "burst" })
+      .toMatchObject({ t: "throttle" })
+  })
+
+  test("пин задачи 1109: волна 21 при пороге 12 дренажируется сама за два тика, без env-рестарта", () => {
+    // Arrange: CUP в симуляции не моделируется — дев-бюджет тика считается по burstMax;
+    // прод-волна при дефолтном CUP=7 доедет за 3 тика.
+    // Act: тик 1 — волна входит, вердикт разрешает дозированный спавн
+    const tick1 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 21, now: GUARD_NOW }, GUARD_LIMITS)
+    const budget1 = splitThrottle(0, 21, GUARD_LIMITS.burstMax)
+
+    // Assert: тик 1 — throttle, дев-волна получает burstMax
+    expect(tick1).toMatchObject({ t: "throttle", alert: "first" })
+    expect(budget1).toEqual({ agent: 0, dev: 12 })
+
+    // Act: тик 2 — 12 строк заспавнены и трекнуты, untracked = 9
+    const tick2 = spawnGuardVerdict({ orphaned: 0, totalUntracked: 9, now: GUARD_NOW }, GUARD_LIMITS)
+
+    // Assert: порог больше не превышен — allow доезжает остаток
+    expect(tick2).toEqual({ t: "allow" })
+  })
+})
+
+describe("splitThrottle: burst-бюджет спавнов на тик (карантинные — приоритет пайпа)", () => {
+  test("все кандидаты влезают в лимит — никого не режем", () => {
+    // Act / Assert
+    expect(splitThrottle(2, 5, 12)).toEqual({ agent: 2, dev: 5 })
+    expect(splitThrottle(0, 12, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("волна больше лимита — карантинные спавны первыми, дев-волна — остаток", () => {
+    // Act / Assert
+    expect(splitThrottle(3, 15, 12)).toEqual({ agent: 3, dev: 9 })
+    expect(splitThrottle(0, 21, 12)).toEqual({ agent: 0, dev: 12 })
+  })
+
+  test("карантинных больше лимита — дев не достаётся ничего (пайп не виснет)", () => {
+    // Act / Assert
+    expect(splitThrottle(14, 10, 12)).toEqual({ agent: 12, dev: 0 })
   })
 })
 

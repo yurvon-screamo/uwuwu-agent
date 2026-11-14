@@ -1416,12 +1416,21 @@ export type SpawnGuardAlert = "first" | "repeat" | "none"
 
 export type SpawnGuardHold = {
   t: "hold"
-  reason: "state-loss" | "burst"
+  reason: "state-loss"
   alert: SpawnGuardAlert
   text: string
 }
 
-export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold
+/** Burst не глушит спавны (задача 1109: полный HOLD не отпускался сам —
+ *  замкнутый круг «HOLD глушит спавны → untracked не падает»): волна
+ *  дозируется по burstMax спавнов за тик и дренажируется сама. */
+export type SpawnGuardThrottle = {
+  t: "throttle"
+  alert: SpawnGuardAlert
+  text: string
+}
+
+export type SpawnGuardVerdict = { t: "allow" } | SpawnGuardHold | SpawnGuardThrottle
 
 /** UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX: пусто →
  *  дефолты 2/12; мусор/0/отрицательные → дефолт. Семантики «0 = выключено»
@@ -1436,28 +1445,48 @@ export function spawnLimitsFromEnv(loss: string | undefined, burst: string | und
 }
 
 /** Единственная точка решения гарда (по образцу routeTask/stallVerdict):
- *  превышение любого порога = HOLD спавнов на тик. reason=state-loss, когда
- *  сигнатура потери (сироты-спавны > lossMax); иначе burst. alert=first —
- *  вход в эпизод (флага нет или битый ISO), repeat — длящийся HOLD за окном
- *  повтора, none — в пределах окна (анти-спам). allow при стоящем флаге —
- *  сигнал демону снять флаг: эпизод завершён. */
+ *  сироты сверх lossMax = сигнатура потери state → HOLD спавнов на тик
+ *  (саморазряд: владелец восстанавливает state / чистит ячейки). Волна без
+ *  сирот (импорт/массовые переносы) сверх burstMax → throttle: спавн ≤
+ *  burstMax за тик, волна доезжает сама. alert=first — вход в эпизод
+ *  (флага нет или битый ISO), repeat — длящийся эпизод за окном повтора,
+ *  none — в пределах окна (анти-спам). allow при стоящем флаге — сигнал
+ *  демону снять флаг: эпизод завершён. */
 export function spawnGuardVerdict(f: SpawnGuardFacts, l: SpawnGuardLimits): SpawnGuardVerdict {
   if (f.orphaned <= l.lossMax && f.totalUntracked <= l.burstMax) return { t: "allow" }
-  const reason = f.orphaned > l.lossMax ? "state-loss" as const : "burst" as const
   const prevMs = f.holdSignaled !== undefined ? Date.parse(f.holdSignaled) : Number.NaN
   const alert: SpawnGuardAlert = Number.isNaN(prevMs)
     ? "first"
     : f.now - prevMs >= SPAWN_ALERT_REPEAT_MS ? "repeat" : "none"
-  const counts = `сирот-спавнов=${f.orphaned} (порог ${l.lossMax}), untracked=${f.totalUntracked} (порог ${l.burstMax})`
-  const text = reason === "state-loss"
-    ? `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
-      "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
-      "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
-      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон."
-    : `[factory] Спавн задержан — за один тик набралось untracked=${f.totalUntracked} при пороге ${l.burstMax} ` +
-      `(сирот-спавнов=${f.orphaned}): массовый импорт задач или потеря state без свидетелей-ячеек. ` +
-      "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон; иначе проверь state.json."
-  return { t: "hold", reason, alert, text }
+  if (f.orphaned > l.lossMax) {
+    const counts = `сирот-спавнов=${f.orphaned} (порог ${l.lossMax}), untracked=${f.totalUntracked} (порог ${l.burstMax})`
+    return {
+      t: "hold",
+      reason: "state-loss",
+      alert,
+      text: `[factory] Спавн задержан — подозрение на потерю state.json: на доске строки с сессионными ячейками, а трека в state нет (${counts}). ` +
+        "Восстанови state из бэкапа (state.json.bak / bak-suspect-* рядом с state.json) — каскад снимется сам. " +
+        "Если это заявленные агентами строки (task claim) с мёртвыми сессиями — state не тронут: очисти или перезапиши ячейку «Сессия dev», гард снимется сам. " +
+        "Если волна ожидаема — подними UWUWU_FACTORY_SPAWN_LOSS_MAX / UWUWU_FACTORY_SPAWN_BURST_MAX и перезапусти демон.",
+    }
+  }
+  // остаток после hold-return: orphaned ≤ lossMax и untracked > burstMax
+  return {
+    t: "throttle",
+    alert,
+    text: `[factory] Спавн дозируется — untracked=${f.totalUntracked} при пороге ${l.burstMax} (сирот-спавнов=${f.orphaned}): ` +
+      `волна импорта или массовых переносов, спавним не больше ${l.burstMax} за тик — волна доедет сама. ` +
+      "Если волна неожиданна — проверь доску и state.json.",
+  }
+}
+
+/** Распределение burst-бюджета тика: карантинные спавны (ревью/тест —
+ *  продолжение пайпа, их задержка висит чужую задачу) получают бюджет
+ *  первыми, дев-волна — остаток. */
+export function splitThrottle(agentCount: number, devCount: number, limit: number): { agent: number; dev: number } {
+  const agent = Math.min(agentCount, limit)
+  const dev = Math.min(devCount, limit - agent)
+  return { agent, dev }
 }
 
 /** Свидетель спавна в строке: сессионная ячейка непуста. Поля опциональны —
@@ -1740,10 +1769,10 @@ export interface PassCounters {
   /** автодон за тик: смержено/закрыто без ПР и возвращено в In Progress */
   autodoneMerged?: number
   autodoneBounced?: number
-  /** спавны, задержанные гардом каскада за тик (HOLD); undefined — гарда не было */
+  /** спавны, задержанные/дозируемые гардом каскада за тик; undefined — гарда не было */
   held?: number
-  /** причина HOLD для сводки; meaningful только при held */
-  heldReason?: "state-loss" | "burst"
+  /** причина (state-loss — полный HOLD, throttle — дозирование burst); meaningful только при held */
+  heldReason?: "state-loss" | "throttle"
   /** фейлы спавна: короткие «rowId-префикс: причина» */
   failures: string[]
 }
