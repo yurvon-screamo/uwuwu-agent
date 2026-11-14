@@ -127,6 +127,8 @@ import {
   type PrProbeState,
 } from "./autodone"
 import { checkNodePinning, failPinnedStart } from "../lib/node-pinning"
+import { autodoneCellValue } from "../lib/platform-hub-tools"
+import { parseFrontmatter } from "../lib/platform-hub"
 import { ensureEnv, cleanupEnv, sweepEnvs, sanitizeRowId, displayFilePath, readDisplayNumber, type EnvDeps } from "./env"
 import { gcLegacyWorktrees, MERGE_GRACE_MS_DEFAULT } from "./worktree-gc"
 
@@ -1459,18 +1461,29 @@ async function runAutodoneTick(
   }
 }
 
-/** Тик watchdog'а автодона (инцидент 1070): строка в Review с галочкой, но
- *  тик автодона не выполнялся (autodoneState undefined — гейты цикла до
- *  автодон-блока увели continue) дольше AUTODONE_TIMEOUT_MS → громкий
- *  сигнал (лог + коммент в задачу) раз за эпизод. Вызывается в ветке
- *  skip-rest — единственном месте, где Review+autodone-строка минует
- *  автодон-блок длительно; после выполненного тика ticked=true → reset. */
-async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState): Promise<void> {
+/** Тик watchdog'а автодона (инцидент 1070): строка в Review, fm тела несёт
+ *  `autodone: true`, но тик автодона не выполнялся (autodoneState undefined)
+ *  дольше AUTODONE_TIMEOUT_MS → громкий сигнал (лог + коммент в задачу),
+ *  раз за эпизод. Канал — fm тела, не Autodone-ячейка скана: в инциденте
+ *  ломалось именно скан-поле (fm-true при скане-false), гард на том же
+ *  поле молчал бы вместе с ним. При исправном демоне fm-true доезжает до
+ *  автодон-блока первым тиком (state=pending), поэтому длительная тишина —
+ *  аномалия (скан-мисрид, потерянный state, недостижимый гейт). Вызов —
+ *  на безусловном пути каждой трекнутой строки (после Done-ветки, до
+ *  маршрутизации): state после терминальных исходов определён → reset.
+ *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
+ *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
+ *  галочку не несёт — гард честно деградирует в no-op (транспорт hub). */
+async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
   const rowId = row.rowId
+  const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
+  const bodyKnown = md !== null && md !== ""
+  const fmAutodone = bodyKnown && autodoneCellValue(parseFrontmatter(md as string).fields.autodone) === "true"
   const act = autodoneWatchdog(
     {
       inReview: row.status === USER_REVIEW_STATUS,
-      autodone: row.autodone ?? false,
+      fmAutodone,
+      bodyKnown,
       ticked: tracked.autodoneState !== undefined,
       stallSince: tracked.adStallSince,
       signaled: tracked.adWatchdogSignaled === true,
@@ -1497,10 +1510,10 @@ async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: F
       const silentMs = Date.now() - (tracked.adStallSince ?? Date.now())
       tracked.adWatchdogSignaled = true
       saveState(state)
-      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
+      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — fm autodone:true, тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
       await notify(
         tracked,
-        `${AGENT_MARK} autodone: задача в Review с галочкой, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070). Проверь демона/скан (лог фабрики); после починки переставь Review — автодон перезапустится.`,
+        `${AGENT_MARK} autodone: задача в Review с fm-галочкой autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
       )
       return
     }
@@ -2072,6 +2085,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       continue
     }
 
+    // ——— watchdog автодона: fm-канал (инцидент 1070) ———
+    // Безусловный путь каждой трекнутой строки: сторожим «Review + fm
+    // autodone:true, тик не выполнялся» независимо от Autodone-ячейки
+    // скана (в инциденте ломалось именно скан-поле). bodyExport кэшируется
+    // per-tick — маршрутизация ниже берёт то же тело из кэша.
+    await autodoneWatchdogTick(row, tracked, state, bodyExports)
+
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
     const comments = await taskComments(tracked.bodyDoc, bodyExports)
     const users = comments.filter((c) => isUserComment(c, BOT_USER_ID))
@@ -2144,13 +2164,7 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
-    if (skipRest === "skip-rest") {
-      // skip-rest — единственный длительный пропуск автодон-блока для
-      // Review+autodone-строк: watchdog следит, чтобы мисс не был тихим
-      // (инцидент 1070: 20+ часов тишины без единого следа в логе)
-      await autodoneWatchdogTick(row, tracked, state)
-      continue
-    }
+    if (skipRest === "skip-rest") continue
 
     // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
     // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
@@ -2182,11 +2196,6 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       if (tracked.reviewStallSignaled === true) {
         delete tracked.reviewStallSignaled
         log(`задача ${rowId.slice(0, 8)}: статус сменился — флаг ревью-тишины сброшен (новый эпизод)`)
-      }
-      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
-        delete tracked.adStallSince
-        delete tracked.adWatchdogSignaled
-        log(`задача ${rowId.slice(0, 8)}: статус сменился — watchdog автодона сброшен (новый эпизод)`)
       }
       saveState(state)
     }

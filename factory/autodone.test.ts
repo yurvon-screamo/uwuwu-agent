@@ -176,13 +176,23 @@ describe("autodoneAction", () => {
 })
 
 describe("autodoneWatchdog (инцидент 1070: мисс автодона должен быть громким)", () => {
-  const base = { inReview: true, autodone: true, ticked: false, signaled: false, now: 1_000_000 }
+  const base = {
+    inReview: true, fmAutodone: true, bodyKnown: true,
+    ticked: false, signaled: false, now: 1_000_000,
+  }
   const hour = 60 * 60_000
 
-  test("условие не выполняется → reset (не Review / галочки нет / тик выполнялся)", () => {
+  test("условие не выполняется → reset (не Review / тик выполнялся / fm без галочки)", () => {
     expect(autodoneWatchdog({ ...base, inReview: false }, hour)).toEqual({ t: "reset" })
-    expect(autodoneWatchdog({ ...base, autodone: false }, hour)).toEqual({ t: "reset" })
     expect(autodoneWatchdog({ ...base, ticked: true }, hour)).toEqual({ t: "reset" })
+    expect(autodoneWatchdog({ ...base, fmAutodone: false }, hour)).toEqual({ t: "reset" })
+  })
+
+  test("тело недоступно (пустой bodyDoc до self-heal) → wait — канала нет, не судим", () => {
+    expect(autodoneWatchdog({ ...base, bodyKnown: false }, hour)).toEqual({ t: "wait" })
+    // но reset-условия сильнее: не-Review и ticked сбрасывают и без тела
+    expect(autodoneWatchdog({ ...base, bodyKnown: false, inReview: false }, hour)).toEqual({ t: "reset" })
+    expect(autodoneWatchdog({ ...base, bodyKnown: false, ticked: true }, hour)).toEqual({ t: "reset" })
   })
 
   test("первая встреча условия без stallSince → arm (засечь время)", () => {
@@ -198,5 +208,13 @@ describe("autodoneWatchdog (инцидент 1070: мисс автодона д�
     expect(
       autodoneWatchdog({ ...base, stallSince: 1_000_000 - 5 * hour, signaled: true }, hour),
     ).toEqual({ t: "wait" })
+  })
+
+  test("канальная независимость: скан-поле роли не играет — вход только fm (инцидент-класс: fm-true при скане-false ловится)", () => {
+    // сигнатура функции физически не принимает Autodone-ячейку скана —
+    // повторение корневого бага 1070 (скан отдаёт false) не глушит гард:
+    // fm тела всё ещё true → дотикает до signal
+    const incident = { ...base, stallSince: 1_000_000 - 2 * hour }
+    expect(autodoneWatchdog(incident, hour)).toEqual({ t: "signal" })
   })
 })

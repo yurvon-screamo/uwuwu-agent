@@ -20,9 +20,9 @@ describe("autodoneCellValue (fm → ячейка скана, легаси-сем
     expect(autodoneCellValue(undefined)).toBe("")
   })
 
-  test("мусор в fm → '' (не бросает)", () => {
+  test("мусор в fm → '' (не бросает; паритет cli — точные 'true'|'✓' без trim)", () => {
     expect(autodoneCellValue("yes")).toBe("")
-    expect(autodoneCellValue(" true ")).toBe("true")
+    expect(autodoneCellValue(" true ")).toBe("")
   })
 })
 

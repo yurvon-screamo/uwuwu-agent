@@ -267,19 +267,20 @@ export async function hubTool<T = Record<string, unknown>>(
 // ——— хелперы ———
 
 /** fm-флаг autodone → значение ячейки «Autodone» в легаси-семантике checkbox
- *  (factory readTasks ждёт "true"). fm может нести "true" (cli/UI) или "✓"
- *  (ручная правка) — паритет cli-парсера. Инцидент 1070: скан отдавал "✓",
- *  consumer ждал "true" — автодон не видел ни одной галочки на hub-транспорте
+ *  (factory readTasks ждёт "true"). Точный паритет cli-парсера
+ *  (github_task.rs: `Some("true") | Some("✓")`, без trim — parseFrontmatter
+ *  тримит значения сам). Инцидент 1070: скан отдавал "✓", consumer ждал
+ *  "true" — автодон не видел ни одной галочки на hub-транспорте
  *  (мисс #317: 20+ часов тишины вместо автомержа/Done). */
 export function autodoneCellValue(fmAutodone?: string): string {
-  const v = (fmAutodone ?? "").trim()
+  const v = fmAutodone ?? ""
   return v === "true" || v === "✓" ? "true" : ""
 }
 
 /** Значение ячейки «Autodone» (update_database_row) → fm-строка. Принимает
  *  легаси-"true" и UI-"✓" — round-trip read→write не разворачивает флаг. */
 export function autodoneFmOf(cellValue: string): "true" | "false" {
-  const v = (cellValue ?? "").trim()
+  const v = cellValue ?? ""
   return v === "true" || v === "✓" ? "true" : "false"
 }
 
