@@ -150,16 +150,16 @@ describe("read_database_cells: клетки из полей", () => {
     const row1 = r.rows.find((x) => x.rowBlockId === "1")
     if (row1 === undefined) throw new Error("строка 1 не вернулась")
     // Pv2-джойн
-    expect(row1.cells["Status"].value).toBe("In Progress")
+    expect(row1.cells.Status.value).toBe("In Progress")
     expect(row1.cells["Приоритет"].value).toBe("high")
-    expect(row1.cells["Autodone"].value).toBe("true")
-    expect(row1.cells["Branch"].value).toBe("work/t")
+    expect(row1.cells.Autodone.value).toBe("true")
+    expect(row1.cells.Branch.value).toBe("work/t")
     expect(row1.cells["Запланировано"].dateMs).toBe(Date.parse("2026-11-20T00:00:00Z"))
     const row2 = r.rows.find((x) => x.rowBlockId === "2")
     if (row2 === undefined) throw new Error("строка 2 не вернулась")
     // проекция closed → Done
-    expect(row2.cells["Status"].value).toBe("Done")
-    expect(row2.cells["Autodone"].value).toBe("false")
+    expect(row2.cells.Status.value).toBe("Done")
+    expect(row2.cells.Autodone.value).toBe("false")
   })
 
   test("карточки нет в джойне → Todo-дефолт (паритет cli convert)", async () => {
@@ -168,7 +168,7 @@ describe("read_database_cells: клетки из полей", () => {
     const r = await hubTool<{ rows: Array<{ cells: Record<string, { value: string }> }> }>(
       "read_database_cells", { databaseBlockId: "db:uwuwu" },
     )
-    expect(r.rows[0].cells["Status"].value).toBe("Todo")
+    expect(r.rows[0].cells.Status.value).toBe("Todo")
   })
 })
 
