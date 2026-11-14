@@ -10,6 +10,8 @@ use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec};
 pub struct OpencodeClient {
     base: String,
     password: String,
+    /// Cookie гейта публичного эндпоинта (oc_gate=...); None — без гейта.
+    gate_cookie: Option<String>,
     http: reqwest::Client,
 }
 
@@ -25,11 +27,18 @@ pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
 }
 
 impl OpencodeClient {
-    pub fn new(base: String, password: String) -> Self {
+    pub fn new(base: String, password: String, gate_cookie: Option<String>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(cookie) = &gate_cookie {
+            let value = reqwest::header::HeaderValue::from_str(cookie).expect("gate cookie: ascii");
+            headers.insert(reqwest::header::COOKIE, value);
+        }
         Self {
             base: base.trim_end_matches('/').to_string(),
             password,
+            gate_cookie,
             http: reqwest::Client::builder()
+                .default_headers(headers)
                 .timeout(Duration::from_secs(20))
                 .build()
                 .expect("reqwest client"),
@@ -192,7 +201,8 @@ mod tests {
 
     #[test]
     fn base_trims_trailing_slash() {
-        let c = OpencodeClient::new("https://x.y/".into(), "p".into());
+        let c = OpencodeClient::new("https://x.y/".into(), "p".into(), None);
         assert_eq!(c.base, "https://x.y");
+        assert!(c.gate_cookie.is_none());
     }
 }

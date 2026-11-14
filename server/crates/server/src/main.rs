@@ -70,6 +70,7 @@ async fn run(
     let sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
+        secrets.opencode_gate_cookie.clone(),
     ));
     let prs = Arc::new(prgate::GhPrGateway::new(secrets.gh_token.clone()));
     let clock = Arc::new(clock::SystemClock);

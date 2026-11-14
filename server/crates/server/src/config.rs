@@ -12,6 +12,7 @@ pub const ENV_OPENCODE_PASSWORD: &str = "UWUWU_OPENCODE_PASSWORD";
 pub const ENV_BEARER: &str = "UWUWU_SERVER_BEARER";
 pub const ENV_STATE_PATH: &str = "UWUWU_SERVER_STATE";
 pub const ENV_MODE: &str = "UWUWU_SERVER_MODE";
+pub const ENV_OPENCODE_GATE: &str = "UWUWU_OPENCODE_GATE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +89,9 @@ fn default_port() -> u16 {
 pub struct Secrets {
     pub gh_token: String,
     pub opencode_password: Option<String>,
+    /// Гейт публичного опенкода: значение Cookie-хедера целиком
+    /// (oc_gate=<hash>) — эндпоинт за Caddy-заглушкой.
+    pub opencode_gate_cookie: Option<String>,
     pub bearer: String,
 }
 
@@ -176,6 +180,7 @@ impl Config {
             ConfigError::Validation(format!("{ENV_BEARER} обязателен (HTTP/MCP гейт)"))
         })?;
         let opencode_password = non_empty_env(ENV_OPENCODE_PASSWORD);
+        let opencode_gate_cookie = non_empty_env(ENV_OPENCODE_GATE);
         if self.mode() == ModeCfg::Live && opencode_password.is_none() {
             return Err(ConfigError::Validation(format!(
                 "{ENV_OPENCODE_PASSWORD} обязателен в live-режиме (спавны)"
@@ -184,6 +189,7 @@ impl Config {
         Ok(Secrets {
             gh_token,
             opencode_password,
+            opencode_gate_cookie,
             bearer,
         })
     }
