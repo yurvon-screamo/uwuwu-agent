@@ -26,7 +26,7 @@ const state = {
 
 const fieldsOfImpl = (issue: Record<string, unknown>): Record<string, string> => {
   const out: Record<string, string> = {}
-  for (const f of (issue["issue_field_values"] ?? []) as Array<{ issue_field_name?: string; value?: string | number | null; single_select_option?: { name?: string } }>) {
+  for (const f of (issue.issue_field_values ?? []) as Array<{ issue_field_name?: string; value?: string | number | null; single_select_option?: { name?: string } }>) {
     const name = f.issue_field_name ?? ""
     if (name === "") continue
     const value = f.single_select_option?.name ?? (typeof f.value === "string" ? f.value : "")
@@ -72,7 +72,7 @@ mock.module("../lib/platform-hub", () => ({
   },
   issuesForProject: (_project: string) => state.issues as never,
   issueByNumber: (number: string) =>
-    state.issues.find((i) => String(i["number"]) === number) ?? null,
+    state.issues.find((i) => String(i.number) === number) ?? null,
   // Pv2-джойн статусов — stub на уровне модуля (projectStatuses зовёт gh):
   // здесь подменяем результат через state.statuses
   projectStatuses: (_project: string) => state.statuses,
@@ -126,9 +126,9 @@ describe("fieldsOf: норм-форма payload", () => {
       [FIELD_NAMES.priority]: "high",
       [FIELD_NAMES.branch]: "work/x",
     } }))
-    expect(f["Приоритет"]).toBe("high")
-    expect(f["Branch"]).toBe("work/x")
-    expect(f["PR"]).toBeUndefined()
+    expect(f.Приоритет).toBe("high")
+    expect(f.Branch).toBe("work/x")
+    expect(f.PR).toBeUndefined()
   })
 })
 
@@ -151,10 +151,10 @@ describe("read_database_cells: клетки из полей", () => {
     if (row1 === undefined) throw new Error("строка 1 не вернулась")
     // Pv2-джойн
     expect(row1.cells.Status.value).toBe("In Progress")
-    expect(row1.cells["Приоритет"].value).toBe("high")
+    expect(row1.cells.Приоритет.value).toBe("high")
     expect(row1.cells.Autodone.value).toBe("true")
     expect(row1.cells.Branch.value).toBe("work/t")
-    expect(row1.cells["Запланировано"].dateMs).toBe(Date.parse("2026-11-20T00:00:00Z"))
+    expect(row1.cells.Запланировано.dateMs).toBe(Date.parse("2026-11-20T00:00:00Z"))
     const row2 = r.rows.find((x) => x.rowBlockId === "2")
     if (row2 === undefined) throw new Error("строка 2 не вернулась")
     // проекция closed → Done
@@ -191,9 +191,9 @@ describe("update_database_row: запись в поля", () => {
     expect(state.fieldWrites.length).toBe(1)
     const fields = state.fieldWrites[0]
     if (fields === undefined) throw new Error("батч полей не записан")
-    expect(fields["Branch"]).toBe("work/task-9")
-    expect(fields["PR"] ?? null).toBe(null)
-    expect(fields["Autodone"]).toBe("on")
+    expect(fields.Branch).toBe("work/task-9")
+    expect(fields.PR ?? null).toBe(null)
+    expect(fields.Autodone).toBe("on")
     expect(fields["Сессия ревью"]).toBe("ses_rev_1")
     expect(fields["Сессия тест"]).toBe("ses_test_1")
     expect(state.statusMutation).toBe("uwuwu#9")
@@ -211,7 +211,7 @@ describe("get_doc_attrs: issue — поля (норм-имена)", () => {
   test("Расписание живёт под именем поля", async () => {
     state.issues = [issueWith(449, { fields: { [FIELD_NAMES.schedule]: "30 5 * * *" } })]
     const attrs = await hubTool<Record<string, string>>("get_doc_attrs", { docId: "issue:449" })
-    expect(attrs["Расписание"]).toBe("30 5 * * *")
+    expect(attrs.Расписание).toBe("30 5 * * *")
     expect(attrs["custom-schedule"]).toBeUndefined()
   })
 })

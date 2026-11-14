@@ -100,7 +100,7 @@ export async function hubTool<T = Record<string, unknown>>(
           cells: {
             "Название": cell(String(issue.title)),
             "Status": cell(status),
-            "Тип": cell(githubTypeName(issue, f["type"] ?? "")),
+            "Тип": cell(githubTypeName(issue, f.type ?? "")),
             "Branch": cell(f[FIELD_NAMES.branch] ?? ""),
             "PR": cell(f[FIELD_NAMES.pr] ?? ""),
             "Сессия dev": cell(f[FIELD_NAMES.devSession] ?? ""),

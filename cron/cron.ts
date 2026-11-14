@@ -255,7 +255,7 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
  *  schedule null — поля нет (обычная припаркованная в Вейт задача, не крон). */
 async function attrsOf(tool: PlatformTool, bodyDoc: string): Promise<{ schedule: string | null; agent: string }> {
   const attrs = await tool<{ [k: string]: string }>("get_doc_attrs", { docId: bodyDoc })
-  return { schedule: attrs["Расписание"] ?? null, agent: "" }
+  return { schedule: attrs.Расписание ?? null, agent: "" }
 }
 
 // ——— opencode REST ———

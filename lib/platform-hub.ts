@@ -126,7 +126,7 @@ export function fieldsOf(
   issue: { issue_field_values?: IssueFieldValue[] } | Record<string, unknown>,
 ): Record<string, string> {
   const out: Record<string, string> = {}
-  const values = (issue["issue_field_values"] ?? []) as IssueFieldValue[]
+  const values = (issue.issue_field_values ?? []) as IssueFieldValue[]
   for (const f of values) {
     const name = f.issue_field_name ?? ""
     if (name === "") continue
