@@ -158,7 +158,9 @@ pub(crate) enum TaskSub {
         )]
         priority: Option<String>,
         /// Autodone: автомерж PR при входе задачи в Review; значение
-        /// опционально — без значения on, off снимает галочку
+        /// опционально — без значения on; off — точечный отказ
+        /// (носитель — Pv2-поле select on/off; дефолт create — on,
+        /// решение владельца 14.11)
         #[arg(
             long,
             value_name = "ON_OFF",

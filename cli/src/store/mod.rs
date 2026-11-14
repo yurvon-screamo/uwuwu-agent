@@ -76,7 +76,8 @@ pub struct Task {
     pub schedule_cell: String,
     /// Приоритет (канон CUP-очереди: high/medium/low, "" — не задан).
     pub priority: String,
-    /// Autodone: галочка автомержа PR при входе в Review.
+    /// Autodone: автомерж PR при входе в Review (Pv2-поле select
+    /// on/off, не галочка).
     pub autodone: bool,
 }
 
