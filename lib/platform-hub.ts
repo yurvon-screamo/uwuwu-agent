@@ -171,9 +171,9 @@ export function projectStatuses(project: string): Map<number, string> {
   return out
 }
 
-/// Батч-запись клеток: `null` — очистка (DELETE; 404 на отсутствующем
-/// значении — no-op), строка — запись (text/date значение-строкой,
-/// single_select — именем опции; контракт живой пробы #1092).
+/// Батч-запись клеток: `null` — очистка (DELETE идемпотентен), строка —
+/// запись (text/date значение-строкой, single_select — именем опции;
+/// контракт живых проб #1092).
 export function setIssueFields(
   number: string,
   fields: Record<string, string | null>,
@@ -188,12 +188,9 @@ export function setIssueFields(
   for (const [name, value] of Object.entries(fields)) {
     const fid = idOf(name)
     if (value === null || value === "") {
-      // очистка: DELETE; 404 (значения не было) — no-op
-      try {
-        gh([ "api", "-X", "DELETE", `repos/${hubRepo()}/issues/${number}/issue-field-values/${fid}` ])
-      } catch (e) {
-        if (!String(e).includes("404")) throw e
-      }
+      // очистка: DELETE — идемпотентен (повтор на отсутствующем значении:
+      // exit 0, пустой вывод; живая проба-2 #1092, задача 1087)
+      gh([ "api", "-X", "DELETE", `repos/${hubRepo()}/issues/${number}/issue-field-values/${fid}` ])
       continue
     }
     batch.push({ field_id: fid, value })
@@ -203,7 +200,7 @@ export function setIssueFields(
     JSON.stringify({ issue_field_values: batch }))
 }
 
-/// Status (single-select) на item issue — Pv2-канан; мутация уже канон
+/// Status (single-select) на item issue — Pv2-канон; мутация уже канон
 /// (set-путь не тронут миграцией 1087).
 export function setProjectStatus(project: string, number: string, status: string): void {
   const projNumber = projectBoardNumber(project)

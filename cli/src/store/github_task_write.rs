@@ -257,8 +257,9 @@ impl GitHubStore {
     }
 
     /// Атрибут тела: единственный потребитель — `--schedule` (клетка
-    /// «Расписание»). Прочие ключи — громкий отказ (молчаливая запись в
-    /// несуществующий носитель маскировала бы потерю).
+    /// «Расписание»). Пустое значение — очистка клетки (паритет edit).
+    /// Прочие ключи — громкий отказ (молчаливая запись в несуществующий
+    /// носитель маскировала бы потерю).
     pub(super) async fn set_body_attr_impl(
         &self,
         _board: &TaskBoard,
@@ -272,7 +273,14 @@ impl GitHubStore {
         github_issue_fields::set_fields(
             &task.id,
             &self.repo,
-            &[(names::SCHEDULE, Some(FieldValue::Text(value.to_string())))],
+            &[(
+                names::SCHEDULE,
+                if value.is_empty() {
+                    None // очистка: DELETE (POST с "" — HTTP 500, проба #1092)
+                } else {
+                    Some(FieldValue::Text(value.to_string()))
+                },
+            )],
         )
         .await?;
         Ok(())

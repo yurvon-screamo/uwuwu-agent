@@ -101,6 +101,16 @@ async fn default_create_cron_run_is_loud() {
     assert!(format!("{err}").contains("create_cron_run"));
 }
 
+/// Полнотекст-парсер GitHub DocStore: строки «path:line:text» → хиты.
+#[test]
+fn fulltext_parser_extracts_slug_and_snippet() {
+    let stdout = "docs/uwuwu/README.md:12:легаси-бекенд нестабилен\ndocs/x.md:3:ещё\n";
+    let hits = crate::store::github_doc_search::parse_line_pairs(stdout);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].title, "README");
+    assert!(hits[0].snippet.contains("нестабилен"));
+}
+
 /// Заголовочный поиск: AND-токены по путям, case-insensitive.
 #[test]
 fn by_title_matches_and_tokens_case_insensitive() {

@@ -172,7 +172,8 @@ async fn migrate_row(
     let current = github_issue_fields::fields_of(&issue);
     let cells = fm_to_cells(&fm.fields, &current)?;
     let mut outcome = Vec::new();
-    // расхождения fm vs поле-канон — лог без перезаписи
+    // расхождения fm vs канон — лог без перезаписи (Low-1 ревью: статус —
+    // Pv2 через task.status, autodone — поле; оба канона не перезаписываются)
     for (key, field_name) in [
         ("priority", names::PRIORITY),
         ("branch", names::BRANCH),
@@ -185,6 +186,20 @@ async fn migrate_row(
             if !fm_v.is_empty() && fm_v != cur {
                 outcome.push(format!("{key}: fm «{fm_v}» ≠ поле «{cur}»"));
             }
+        }
+    }
+    if let Some(fm_status) = fm.fields.get("status") {
+        if !fm_status.is_empty() && fm_status != &task.status {
+            outcome.push(format!("status: fm «{fm_status}» ≠ Pv2 «{}»", task.status));
+        }
+    }
+    if let Some(fm_ad) = fm.fields.get("autodone") {
+        let fm_on = matches!(fm_ad.as_str(), "true" | "✓" | "on");
+        if !fm_ad.is_empty() && fm_on != task.autodone {
+            outcome.push(format!(
+                "autodone: fm «{fm_ad}» ≠ поле «{}»",
+                if task.autodone { "on" } else { "off" }
+            ));
         }
     }
     let (action, detail) = if apply {

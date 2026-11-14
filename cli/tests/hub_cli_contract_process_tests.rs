@@ -109,7 +109,7 @@ if [ "$route" = "graphql" ]; then
       printf '{"data":{"addProjectV2ItemById":{"item":{"id":"IT_1"}}}}'
       exit 0 ;;
     *fieldValueByName*projectItems*)
-      printf '{"data":{"repository":{"issue":{"projectItems":{"nodes":[{"project":{"number":5},"fieldValueByName":{"name":"Todo"}}]}}}}}'
+      printf '{"data":{"repository":{"issue":{"projectItems":{"nodes":[{"project":{"number":5},"fieldValueByName":{"name":"In Progress"}}]}}}}}'
       exit 0 ;;
     *projectItems*)
       printf '{"data":{"repository":{"issue":{"projectItems":{"nodes":[{"id":"IT_1","project":{"id":"PVT_1","number":5}}]}}}}}'
@@ -124,7 +124,7 @@ if [ "$route" = "graphql" ]; then
       printf '{"data":{"repository":{"issue":{"id":"ISS_1"}}}}'
       exit 0 ;;
     *'items(first: 100'*)
-      printf '{"data":{"viewer":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"content":{"number":999},"fieldValueByName":{"name":"Todo"}}]}}}}}'
+      printf '{"data":{"viewer":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"content":{"number":999},"fieldValueByName":{"name":"In Progress"}}]}}}}}'
       exit 0 ;;
     *'labels(first: 10)'*)
       printf '{"data":{"repository":{"issue":{"labels":{"nodes":[{"name":"proj:uwuwu"}]}}}}}'
@@ -454,6 +454,21 @@ fn edit_status_goes_to_project_v2_not_body() {
         "PATCH тела (fm-письмо) отсутствует: {rest}"
     );
     assert!(patch_body(&guards).is_none(), "тело не мутировано");
+}
+
+/// I. task get — Status списка читается из Pv2-джойна доски (canned
+/// «In Progress» ≠ Todo-дефолт — фоллбэк не спутать с каноном; точечный
+/// read-after-write матч High-1 пинится юнитом item_status).
+#[test]
+fn task_get_status_comes_from_project_v2_join() {
+    let guards = setup_stub_gh();
+    let (code, stdout, stderr) =
+        run_stub(&guards, None, &["task", "get", "999", "--project", "uwuwu"]);
+    assert_eq!(code, Some(0), "get успешен: {stderr}");
+    assert!(
+        stdout.contains("In Progress"),
+        "статус из Pv2-джойна (canned In Progress, не Todo-фоллбэк): {stdout}"
+    );
 }
 
 /// H. `task edit --branch` — клетка через REST issue-field-values (батч),

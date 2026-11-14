@@ -1,13 +1,14 @@
 //! Глобальные issue fields — носитель клеток задачи (ADR-098: мета не в md).
 //!
-//! Контракт живой пробы (issue #1092, задача 1087):
+//! Контракт живых проб (issue #1092, задача 1087):
 //! - батч-POST `POST repos/{repo}/issues/{n}/issue-field-values` идемпотентен
 //!   (overwrite); тело `{"issue_field_values":[{"field_id":N,"value":V}]}`;
 //! - text/date — значением-строкой, single_select — **именем опции строкой**
 //!   («on», «high»; числовой id даёт 422 «must be a string option name»);
-//! - очистка — `DELETE repos/{repo}/issues/{n}/issue-field-values/{field_id}`;
-//!   POST с пустой строкой — HTTP 500; DELETE на отсутствующем значении — 404,
-//!   трактуется как no-op;
+//! - очистка — `DELETE repos/{repo}/issues/{n}/issue-field-values/{field_id}`,
+//!   идемпотентен: повтор на отсутствующем значении — exit 0, пустой вывод
+//!   (проба-2 14.11; «404» из пробы-1 — артефакт -i-режима gh); POST с
+//!   пустой строкой — HTTP 500 (очистка только DELETE);
 //! - чтение: `issue_field_values` прямо в payload GET issues (и list тоже):
 //!   text/date — `value`, select — `single_select_option.name`; отсутствующее
 //!   поле = пустая клетка.
@@ -42,7 +43,6 @@ pub(crate) enum FieldValue {
     /// Date: YYYY-MM-DD.
     Date(String),
 }
-
 /// Норм-форма клеток из payload issue: `issue_field_values` →
 /// {имя поля: значение}. select — имя опции; text/date — value;
 /// отсутствующее поле в карте нет (пустая клетка).
@@ -64,8 +64,10 @@ pub(crate) fn fields_of(issue: &Value) -> HashMap<String, String> {
     out
 }
 
-/// field_id по имени из GET /user/issue-fields. Кэша нет: один REST на
-/// операцию записи (writers пишут один батч за мутацию).
+/// field_id по имени из GET /user/issue-fields. Без кэша: на каждую клетку
+/// один REST (set_fields зовёт per-cell) — мутация N клеток = N запросов
+/// каталога; для батчей бэкфилла это заметный хвост (183 строки × клетки),
+/// в rate-бюджете учтён. Кэширование — при первом упоре.
 pub(crate) async fn field_id(name: &str) -> Result<i64> {
     let fields = super::github_gh::gh_json(&["api", "/user/issue-fields"], None).await?;
     fields
@@ -90,19 +92,17 @@ pub(crate) async fn set_fields(
         let fid = field_id(name).await?;
         match value {
             None => {
-                // Очистка: DELETE; 404 (значения не было) — no-op.
+                // Очистка: DELETE — идемпотентен (повтор на отсутствующем
+                // значении: exit 0, пустой вывод; живая проба-2 #1092)
                 let args = [
                     "api",
                     "-X",
                     "DELETE",
                     &format!("repos/{repo}/issues/{issue_number}/issue-field-values/{fid}"),
                 ];
-                if let Err(e) = super::github_gh::gh_json(&args, None).await {
-                    let text = format!("{e:#}");
-                    if !text.contains("404") {
-                        return Err(e).with_context(|| format!("поле «{name}» не очищено"));
-                    }
-                }
+                super::github_gh::gh_json(&args, None)
+                    .await
+                    .with_context(|| format!("поле «{name}» не очищено"))?;
             }
             Some(FieldValue::Text(s)) => {
                 batch.push(serde_json::json!({ "field_id": fid, "value": s }))

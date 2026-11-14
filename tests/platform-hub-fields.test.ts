@@ -1,8 +1,108 @@
 //! Юниты шова клеток (задача 1087, ADR-098): platform-hub-tools читает/
 //! пишет глобальные issue fields, Status — Pv2-джойн, closed → Done.
 //! Транспорт platform-hub мокается: проверяется маппинг, не gh.
+//!
+//! Порядок файла детерминирован (bun test — общий процесс): стаб-тесты
+//! setIssueFields на РЕАЛЬНОМ platform-hub идут до mock.module — иначе
+//! мок соседнего describe подменяет кеш модуля (ревью Low-5).
 
 import { describe, expect, mock, test } from "bun:test"
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, unlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { setIssueFields as realSetIssueFieldsBinding } from "../lib/platform-hub"
+
+// Live-binding ESM: mock.module ниже подменяет экспорт — снапшот реальной
+// функции ДО мока (ревью Low-5: стаб-тесты пишут реальным write-path)
+const realSetIssueFields = realSetIssueFieldsBinding
+
+// ——— стаб-тесты setIssueFields (PATH-стаб gh, реальная функция) ———
+
+function setupStubGh(): { pathEnv: string; log: string } {
+  const dir = mkdtempSync(join(tmpdir(), "ghstub-"))
+  const bin = join(dir, "bin")
+  mkdirSync(bin)
+  const log = join(dir, "calls.log")
+  const script = `#!/usr/bin/env bash
+set -u
+route=""
+method=""
+prev=""
+for a in "$@"; do
+  case "$a" in
+    repos/*|user/*) [ -z "$route" ] && route="$a" ;;
+    /*) [ -z "$route" ] && route="\${a#/}" ;;
+  esac
+  if [ "$prev" = "-X" ]; then method="$a"; fi
+  prev="$a"
+done
+echo "$method $route" >> ${log}
+[ -f "${dir}/stdin" ] && cat > "${dir}/stdin.last"
+if [ "$route" = "user/issue-fields" ]; then
+  printf '[{"id":101,"name":"Приоритет"},{"id":106,"name":"Расписание"}]'
+  exit 0
+fi
+if [[ "$route" == *"/issue-field-values"* ]]; then
+  if [ "$method" = "DELETE" ]; then
+    exit 0   # идемпотентная очистка: exit 0, пустой вывод (проба-2 #1092)
+  fi
+  printf '[]'
+  exit 0
+fi
+printf '{"message":"stub: не обслужен"}'
+exit 1
+`
+  const gh = join(bin, "gh")
+  writeFileSync(gh, script)
+  chmodSync(gh, 0o755)
+  return { pathEnv: `${bin}:${process.env.PATH ?? ""}`, log }
+}
+
+describe("setIssueFields: реальный write-path на PATH-стабе gh", () => {
+  const savedPath = process.env.PATH
+  const stub = setupStubGh()
+
+  function withStub(fn: () => void): void {
+    process.env.PATH = stub.pathEnv
+    try {
+      // лог общий на стаб — чистим перед ходом, счётчики честные
+      try {
+        readFileSync(stub.log, "utf8")
+        unlinkSync(stub.log)
+      } catch {}
+      fn()
+    } finally {
+      process.env.PATH = savedPath
+    }
+  }
+
+  test("батч: text-клетки одним POST, каталог-резолв по имени поля", () => {
+    withStub(() => realSetIssueFields("777", { "Расписание": "30 5 * * *", "Приоритет": "high" }))
+    const log = readFileSync(stub.log, "utf8")
+    // пин: батч из двух клеток — ровно один POST (каталог-резолв покрыт
+    // живой пробой #1092; стаб-лог ловит только issue-field-values-маршруты)
+    expect((log.match(/POST .*issue-field-values/g) ?? []).length).toBe(
+      1,
+      "один батч-POST на две клетки",
+    )
+  })
+
+  test("очистка: DELETE идемпотентен — no-op без POST", () => {
+    withStub(() => realSetIssueFields("778", { "Расписание": null }))
+    const log = readFileSync(stub.log, "utf8")
+    expect((log.match(/DELETE .*issue-field-values/g) ?? []).length).toBe(1)
+    expect((log.match(/POST/g) ?? []).length).toBe(0, "POST нет — только очистка")
+  })
+
+  test("смешанный: очистка + запись в одном вызове", () => {
+    withStub(() => realSetIssueFields("779", { "Расписание": null, "Приоритет": "low" }))
+    const log = readFileSync(stub.log, "utf8")
+    expect((log.match(/DELETE/g) ?? []).length).toBe(1)
+    expect((log.match(/POST/g) ?? []).length).toBe(1)
+  })
+})
+
+// ——— мок-контур platform-hub-tools (шов) ———
 
 const fieldsCatalog = [
   { id: 101, name: "Приоритет" },
