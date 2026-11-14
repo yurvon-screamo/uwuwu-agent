@@ -6,6 +6,7 @@ import {
   githubProbeVerdict,
   giteaProbeVerdict,
   autodoneAction,
+  autodoneWatchdog,
 } from "./autodone"
 
 describe("prCarrierOf", () => {
@@ -171,5 +172,31 @@ describe("autodoneAction", () => {
   test("unknown до предела streak → wait, на пределе — escalate", () => {
     expect(autodoneAction("unknown", { ...base, unknownStreak: 1 })).toEqual({ t: "wait" })
     expect(autodoneAction("unknown", { ...base, unknownStreak: 2 })).toMatchObject({ t: "escalate" })
+  })
+})
+
+describe("autodoneWatchdog (инцидент 1070: мисс автодона должен быть громким)", () => {
+  const base = { inReview: true, autodone: true, ticked: false, signaled: false, now: 1_000_000 }
+  const hour = 60 * 60_000
+
+  test("условие не выполняется → reset (не Review / галочки нет / тик выполнялся)", () => {
+    expect(autodoneWatchdog({ ...base, inReview: false }, hour)).toEqual({ t: "reset" })
+    expect(autodoneWatchdog({ ...base, autodone: false }, hour)).toEqual({ t: "reset" })
+    expect(autodoneWatchdog({ ...base, ticked: true }, hour)).toEqual({ t: "reset" })
+  })
+
+  test("первая встреча условия без stallSince → arm (засечь время)", () => {
+    expect(autodoneWatchdog({ ...base, stallSince: undefined }, hour)).toEqual({ t: "arm", since: 1_000_000 })
+  })
+
+  test("в пороге → wait; порог достигнут, без сигнала → signal", () => {
+    expect(autodoneWatchdog({ ...base, stallSince: 1_000_000 - 59 * 60_000 }, hour)).toEqual({ t: "wait" })
+    expect(autodoneWatchdog({ ...base, stallSince: 1_000_000 - 61 * 60_000 }, hour)).toEqual({ t: "signal" })
+  })
+
+  test("уже засигналено → wait (раз за эпизод, без спама)", () => {
+    expect(
+      autodoneWatchdog({ ...base, stallSince: 1_000_000 - 5 * hour, signaled: true }, hour),
+    ).toEqual({ t: "wait" })
   })
 })

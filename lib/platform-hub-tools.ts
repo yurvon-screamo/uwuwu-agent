@@ -98,7 +98,7 @@ export async function hubTool<T = Record<string, unknown>>(
             "Сессия dev": cell(fields["dev-session"] ?? ""),
             "Запланировано": cell(fields.planned ?? ""),
             "Расписание": cell(fields.schedule ?? ""),
-            "Autodone": cell(fields.autodone === "true" ? "✓" : ""),
+            "Autodone": cell(autodoneCellValue(fields.autodone)),
             "Приоритет": cell(fields.priority ?? ""),
           },
         }
@@ -121,7 +121,7 @@ export async function hubTool<T = Record<string, unknown>>(
         else if (name === "Запланировано") fm.planned = value
         else if (name === "Расписание") fm.schedule = value
         else if (name === "Тип") fm.type = value
-        else if (name === "Autodone") fm.autodone = value === "✓" ? "true" : "false"
+        else if (name === "Autodone") fm.autodone = autodoneFmOf(value)
         else if (name === "Приоритет") fm.priority = value
       }
       const number = rowBlockId.replace(/^issue:/, "")
@@ -265,6 +265,23 @@ export async function hubTool<T = Record<string, unknown>>(
 }
 
 // ——— хелперы ———
+
+/** fm-флаг autodone → значение ячейки «Autodone» в легаси-семантике checkbox
+ *  (factory readTasks ждёт "true"). fm может нести "true" (cli/UI) или "✓"
+ *  (ручная правка) — паритет cli-парсера. Инцидент 1070: скан отдавал "✓",
+ *  consumer ждал "true" — автодон не видел ни одной галочки на hub-транспорте
+ *  (мисс #317: 20+ часов тишины вместо автомержа/Done). */
+export function autodoneCellValue(fmAutodone?: string): string {
+  const v = (fmAutodone ?? "").trim()
+  return v === "true" || v === "✓" ? "true" : ""
+}
+
+/** Значение ячейки «Autodone» (update_database_row) → fm-строка. Принимает
+ *  легаси-"true" и UI-"✓" — round-trip read→write не разворачивает флаг. */
+export function autodoneFmOf(cellValue: string): "true" | "false" {
+  const v = (cellValue ?? "").trim()
+  return v === "true" || v === "✓" ? "true" : "false"
+}
 
 function allIssues(): Array<Record<string, unknown>> {
   const out: GhIssue[] = []

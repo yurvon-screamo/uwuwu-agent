@@ -147,3 +147,33 @@ export function autodoneAction(
         : { t: "wait" }
   }
 }
+
+/** Watchdog автодона (инцидент 1070): строка сидит в Review с галочкой, но
+ *  тик автодона не выполнялся (autodoneState undefined) дольше порога —
+ *  мисс должен быть громким (лог + сигнал в задачу), не тихим: дев-агент
+ *  не должен узнавать об аномалии собственным поллингом. Чистые правила:
+ *  условие не выполняется (не Review / галочки нет / тик выполнялся) — reset
+ *  (снять поля); первая встреча условия — arm (засечь время); дольше порога
+ *  без сигнала — signal (раз за эпизод); после сигнала — wait (не спамить). */
+export type WatchdogAction =
+  | { t: "reset" }
+  | { t: "arm"; since: number }
+  | { t: "wait" }
+  | { t: "signal" }
+
+export function autodoneWatchdog(
+  input: {
+    inReview: boolean
+    autodone: boolean
+    ticked: boolean
+    stallSince?: number
+    signaled: boolean
+    now: number
+  },
+  watchdogMs: number,
+): WatchdogAction {
+  if (!input.inReview || !input.autodone || input.ticked) return { t: "reset" }
+  if (input.stallSince === undefined) return { t: "arm", since: input.now }
+  if (input.signaled) return { t: "wait" }
+  return input.now - input.stallSince >= watchdogMs ? { t: "signal" } : { t: "wait" }
+}

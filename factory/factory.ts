@@ -122,6 +122,7 @@ import {
   githubProbeVerdict,
   giteaProbeVerdict,
   autodoneAction,
+  autodoneWatchdog,
   type PrCarrier,
   type PrProbeState,
 } from "./autodone"
@@ -1458,6 +1459,56 @@ async function runAutodoneTick(
   }
 }
 
+/** Тик watchdog'а автодона (инцидент 1070): строка в Review с галочкой, но
+ *  тик автодона не выполнялся (autodoneState undefined — гейты цикла до
+ *  автодон-блока увели continue) дольше AUTODONE_TIMEOUT_MS → громкий
+ *  сигнал (лог + коммент в задачу) раз за эпизод. Вызывается в ветке
+ *  skip-rest — единственном месте, где Review+autodone-строка минует
+ *  автодон-блок длительно; после выполненного тика ticked=true → reset. */
+async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState): Promise<void> {
+  const rowId = row.rowId
+  const act = autodoneWatchdog(
+    {
+      inReview: row.status === USER_REVIEW_STATUS,
+      autodone: row.autodone ?? false,
+      ticked: tracked.autodoneState !== undefined,
+      stallSince: tracked.adStallSince,
+      signaled: tracked.adWatchdogSignaled === true,
+      now: Date.now(),
+    },
+    AUTODONE_TIMEOUT_MS,
+  )
+  switch (act.t) {
+    case "reset": {
+      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
+        delete tracked.adStallSince
+        delete tracked.adWatchdogSignaled
+        saveState(state)
+        log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — сброс (условие не выполняется)`)
+      }
+      return
+    }
+    case "arm": {
+      tracked.adStallSince = act.since
+      saveState(state)
+      return
+    }
+    case "signal": {
+      const silentMs = Date.now() - (tracked.adStallSince ?? Date.now())
+      tracked.adWatchdogSignaled = true
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
+      await notify(
+        tracked,
+        `${AGENT_MARK} autodone: задача в Review с галочкой, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070). Проверь демона/скан (лог фабрики); после починки переставь Review — автодон перезапустится.`,
+      )
+      return
+    }
+    case "wait":
+      return
+  }
+}
+
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
  *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
  *  нужен cwd ворктри. Выбрасывает при фейле. */
@@ -2093,7 +2144,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       consumeComments, refreshBodyBaseline,
     })
     if (action.t !== "noop") counters.wakeups++ // спавн/реран/комменты/возврат — будильники ревью-контура
-    if (skipRest === "skip-rest") continue
+    if (skipRest === "skip-rest") {
+      // skip-rest — единственный длительный пропуск автодон-блока для
+      // Review+autodone-строк: watchdog следит, чтобы мисс не был тихим
+      // (инцидент 1070: 20+ часов тишины без единого следа в логе)
+      await autodoneWatchdogTick(row, tracked, state)
+      continue
+    }
 
     // ——— автодон: галочка владельца на входе в Review (задача 20261112160316) ———
     // Решение до перезаписи lastStatus: bounce оставляет lastStatus в стадии
@@ -2125,6 +2182,11 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       if (tracked.reviewStallSignaled === true) {
         delete tracked.reviewStallSignaled
         log(`задача ${rowId.slice(0, 8)}: статус сменился — флаг ревью-тишины сброшен (новый эпизод)`)
+      }
+      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
+        delete tracked.adStallSince
+        delete tracked.adWatchdogSignaled
+        log(`задача ${rowId.slice(0, 8)}: статус сменился — watchdog автодона сброшен (новый эпизод)`)
       }
       saveState(state)
     }
