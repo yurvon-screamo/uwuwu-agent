@@ -2,6 +2,9 @@
 // выборка по id и по каталогу на tmp-БД с минимальной схемой session_v2.
 import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
+import { existsSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { fetchSessionById, fetchLatestSessionByDirectory } from "./session-row"
 
 /** Минимальная схема session_v2 (колонки базового слоя; прод-схема шире —
@@ -89,4 +92,38 @@ describe("fetchLatestSessionByDirectory: свежайшая сессия кат�
       db.close()
     }
   })
+})
+
+// ——— живая opencode.db: прод-схема session_v2 (гвард UWUWU_E2E=1) ———
+// Минимальная фикстура выше пинит логику выборок; живая БД пинит реальную
+// схему таблицы — дрейф схемы (переименование/тип колонки) ловится здесь,
+// а не неизвестной деградацией гарда dead-спавна в проде (1072). Read-only
+// коннект — тот же вызов, что у factory.withSessionDb; гвард по культуре
+// репо (qlty-review.test.ts): без UWUWU_E2E=1 и файла БД сразу зелёный.
+const liveDbPath = join(homedir(), ".local/share/opencode/opencode.db")
+const liveE2E = process.env.UWUWU_E2E === "1" && existsSync(liveDbPath)
+
+describe("живая opencode.db — прод-схема session_v2 (UWUWU_E2E=1)", () => {
+  test.skipIf(!liveE2E)(
+    "id- и directory-выборки парсят живую строку реальной схемы",
+    () => {
+      const db = new Database(liveDbPath, { readonly: true })
+      try {
+        const anyRow = db
+          .query("SELECT id, directory FROM session_v2 ORDER BY time_updated DESC LIMIT 1")
+          .get() as { id: string; directory: string | null } | null
+        if (anyRow === null) return // пустая БД — пинить нечего
+        const byId = fetchSessionById(db, anyRow.id)
+        expect(byId?.id).toBe(anyRow.id)
+        expect(typeof byId?.timeUpdated).toBe("number")
+        expect(typeof byId?.timeCreated).toBe("number")
+        if (anyRow.directory !== null) {
+          const byDir = fetchLatestSessionByDirectory(db, anyRow.directory)
+          expect(byDir?.directory).toBe(anyRow.directory)
+        }
+      } finally {
+        db.close()
+      }
+    },
+  )
 })
