@@ -59,6 +59,8 @@ import {
   spawnGuardVerdict,
   spawnLimitsFromEnv,
   untrackedRowDecision,
+  deadSpawnVerdict,
+  freshnessOfRow,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
   type SpawnGuardLimits,
@@ -2015,6 +2017,86 @@ describe("untrackedRowDecision: вердикт untracked строки (матр�
 
   test("мёртвый claim с ревью-свидетельством — сирота (любое свидетельство)", () => {
     expect(untrackedRowDecision(cell("ses_dev01", "ses_rev01"), "dead")).toEqual({ devWave: true, orphan: true })
+  })
+
+  test("dead-проба + свежий БД-след — инстанс 317 (1072): ложный dead, ни спавна, ни сироты", () => {
+    // serve при деградации лжёт 404 при живом ходе: гард не спавнит дубль
+    // и не кормит HOLD-гард каскада orphan-счётом
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("dead-проба + stale БД-след — dead настоящий: прежнее поведение (сирота в дев-волне)", () => {
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "stale"))
+      .toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("ses_dev01", undefined), "dead", "unknown"))
+      .toEqual({ devWave: true, orphan: true })
+  })
+
+  test("directory-ключ при легитимно пустой клетке (инстанс #315): работа в env идёт — ни спавна, ни сироты", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell(undefined, undefined), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("карантинная ревью-строка с пустой дев-клеткой и свежей directory-сессией — orphan подавлен (1072, ревью-рекомендация)", () => {
+    // ревью-свидетельство без трека — сирота как прежде, но живая работа
+    // в env задачи (directory-ключ) сильнее свидетельства: спавн дубля
+    // держателя поверх живого хода недопустим
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+    expect(untrackedRowDecision(cell("", "", "ses_test01"), "dead", "fresh"))
+      .toEqual({ devWave: false, orphan: false })
+  })
+
+  test("пустая клетка + stale след — прежнее поведение (спавн обычного пути, сирота по свидетельству)", () => {
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "stale")).toEqual({ devWave: true, orphan: false })
+    expect(untrackedRowDecision(cell("", "ses_rev01"), "dead", "stale")).toEqual({ devWave: true, orphan: true })
+    expect(untrackedRowDecision(cell("", "", ""), "dead", "unknown")).toEqual({ devWave: true, orphan: false })
+  })
+})
+
+describe("deadSpawnVerdict: вердикт спавна при dead-пробе (1072, вход-инвариант: только dead-ветка)", () => {
+  test("fresh — пробе не верим: skip", () => {
+    expect(deadSpawnVerdict("fresh")).toBe("skip")
+  })
+
+  test("stale — dead настоящий: spawn", () => {
+    expect(deadSpawnVerdict("stale")).toBe("spawn")
+  })
+
+  test("unknown — БД-след недоступен: деградация к прежнему поведению (spawn, never worse)", () => {
+    expect(deadSpawnVerdict("unknown")).toBe("spawn")
+  })
+})
+
+describe("freshnessOfRow: свежесть строки session_v2 против окна гарда (1072)", () => {
+  const now = 1_000_000_000_000
+  const windowMs = 30 * 60_000
+
+  test("окно 0 — гард выключен: stale без чтения строки", () => {
+    expect(freshnessOfRow({ timeUpdated: now }, now, 0)).toBe("stale")
+    expect(freshnessOfRow(null, now, 0)).toBe("stale")
+  })
+
+  test("строки нет в БД — stale", () => {
+    expect(freshnessOfRow(null, now, windowMs)).toBe("stale")
+  })
+
+  test("обновлялась в окне — fresh (активный ход пишет session_v2 суб-минутно)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - 60_000 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+  })
+
+  test("след старее окна — stale (честно мёртвая сессия без посторонних касаний)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
+    expect(freshnessOfRow({ timeUpdated: now - 9 * 3600_000 }, now, windowMs)).toBe("stale")
+  })
+
+  test("граница окна: свежее — fresh, ровно окно — stale (интервал полуоткрытый)", () => {
+    expect(freshnessOfRow({ timeUpdated: now - windowMs + 1 }, now, windowMs)).toBe("fresh")
+    expect(freshnessOfRow({ timeUpdated: now - windowMs }, now, windowMs)).toBe("stale")
   })
 })
 
