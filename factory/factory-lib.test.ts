@@ -647,20 +647,19 @@ describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", 
   })
 })
 
-describe("projectDocSlugs: полные слаги канон-четвёрки по файлам каталога", () => {
-  const fullDir = ["README.md", "Домены.md", "Стек и архитектура.md", "Деплоймент.md"]
-  test("все четыре файла → полные слаги в порядке четвёрки", () => {
+describe("projectDocSlugs: полные слаги канон-тройки по файлам каталога", () => {
+  const fullDir = ["README.md", "Design Spec.md", "Деплоймент.md"]
+  test("все три файла → полные слаги в порядке тройки", () => {
     expect(projectDocSlugs("uwuwu", fullDir)).toEqual([
       "Projects/uwuwu/README",
-      "Projects/uwuwu/Домены",
-      "Projects/uwuwu/Стек и архитектура",
+      "Projects/uwuwu/Design Spec",
       "Projects/uwuwu/Деплоймент",
     ])
   })
   test("частичная папка: отсутствующие доки пропускаются, не угадываем", () => {
-    expect(projectDocSlugs("origa", ["README.md", "Домены.md"])).toEqual([
+    expect(projectDocSlugs("origa", ["README.md", "Design Spec.md"])).toEqual([
       "Projects/origa/README",
-      "Projects/origa/Домены",
+      "Projects/origa/Design Spec",
     ])
   })
   test("пустая папка и посторонние файлы — без слагов и без шума", () => {
@@ -687,7 +686,7 @@ describe("spawnInitBlock: инит-данные первого промпта", 
   const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
-    projectDocs: ["Projects/uwuwu/README", "Projects/uwuwu/Домены"],
+    projectDocs: ["Projects/uwuwu/README", "Projects/uwuwu/Design Spec"],
     task: { title: "Фича", status: "Design", type: "feature", branch: "work/task-r1", pr: "" },
   }
   test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
@@ -701,12 +700,12 @@ describe("spawnInitBlock: инит-данные первого промпта", 
   })
   test("проект: слаги живых доков как готовые uwuwu-cli read (полные)", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain('uwuwu-cli read "Projects/uwuwu/README", "Projects/uwuwu/Домены"')
+    expect(b).toContain('uwuwu-cli read "Projects/uwuwu/README", "Projects/uwuwu/Design Spec"')
     expect(b).not.toContain("чекаут")
   })
   test("проект без живых доков — честная строка вместо заглушек", () => {
     const b = spawnInitBlock({ ...baseInit, projectDocs: [] }, "r1", "uwuwu")
-    expect(b).toContain("канон-доки (README/Домены/Стек/Деплоймент) не нашлись")
+    expect(b).toContain("канон-доки (README/Design Spec/Деплоймент) не нашлись")
     expect(b).not.toContain("uwuwu-cli read")
   })
   test("env:false-проект: чекаут назван с маркером env:false", () => {

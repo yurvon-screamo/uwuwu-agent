@@ -873,9 +873,9 @@ async function fetchPersonMarkdown(): Promise<string | null> {
   }
 }
 
-/** Полные слаги живых доков канон-четвёрки проекта (uwuwu-cli read
+/** Полные слаги живых доков канон-тройки проекта (uwuwu-cli read
  *  «Projects/<proj>/<док>»). Нет папки проекта — пустой список; файл
- *  четвёрки отсутствует — док пропускается, не угадываем. */
+ *  тройки отсутствует — док пропускается, не угадываем. */
 async function fetchProjectDocSlugs(projectName: string): Promise<string[]> {
   const dir = `${hubCloneRoot()}/docs/Projects/${projectName}`
   try {
