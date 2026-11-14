@@ -25,6 +25,11 @@ const SINGLE_COMMENT_SIGNATURES = [
   "одно уведомление владельцу", // инвариант уведомлений
 ]
 
+/** Запрет суррогатов контракта — дословно в обеих методичках: подмена одного
+ *  сводного коммента N реплаями-тредами рождает те же N уведомлений (постановка
+ *  задачи 1089 закрывает этот класс явно). */
+const NO_THREAD_REPLIES_SIGNATURES = ["не разносите реплаями-тредами"]
+
 /** Шапка сводки раунда + отношение к Summary — дословно в обеих методичках. */
 const ROUND_HEADER_SIGNATURES = [
   "Ревью-раунд: [вердикт], N находок (X high, Y common, Z low)", // строка шапки
@@ -53,6 +58,12 @@ describe("контракт «один ревью-раунд = один комм�
         expect(md).toContain(s)
       }
     })
+    test(`${name} — запрет разноски находок реплаями-тредами`, () => {
+      const md = norm(readFileSync(path, "utf-8"))
+      for (const s of NO_THREAD_REPLIES_SIGNATURES) {
+        expect(md).toContain(s)
+      }
+    })
   }
 })
 
@@ -63,6 +74,7 @@ describe("контракт «один ревью-раунд = один комм�
     for (const kind of ["plan", "result"] as const) {
       const p = norm(reviewSpawnPrompt("r1", "uwuwu", kind, NO_CTX, "reviewer"))
       expect(p).toContain("одним сводным комментом")
+      expect(p).toContain("не дроби находки")
     }
   })
 
@@ -74,5 +86,6 @@ describe("контракт «один ревью-раунд = один комм�
   test("reviewCommentsPrompt — ответ на пачку вопросов одним комментом", () => {
     const p = norm(reviewCommentsPrompt("r1", [{ id: "c1", text: "а точно?", createdAt: 1 }]))
     expect(p).toContain("одним сводным комментом")
+    expect(p).toContain("не реплаем на каждый")
   })
 })
