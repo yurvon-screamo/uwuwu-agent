@@ -194,10 +194,14 @@ export function draftRowOf(row: BoardRow): DraftRow | null {
   if (typeof row.rowBlockId !== "string") return null
   if (row.cells?.Status?.value !== "Draft") return null
   if (row.state === "closed") return null
+  // hub-эпоха (#1126): тайтл в cells["Название"], тело черновика — сам issue
+  const docId = typeof row.linkedDocId === "string" && row.linkedDocId !== ""
+    ? row.linkedDocId
+    : row.cells?.Название !== undefined ? `issue:${row.rowBlockId}` : ""
   return {
     rowId: row.rowBlockId,
-    docId: typeof row.linkedDocId === "string" ? row.linkedDocId : "",
-    title: (row.title ?? "").trim(),
+    docId,
+    title: (row.title ?? row.cells?.Название?.value ?? "").trim(),
   }
 }
 
