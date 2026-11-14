@@ -21,6 +21,9 @@ import {
   formatPassSummary,
   adoptBodyDoc,
   pathSafe,
+  sessionTitle,
+  SESSION_TITLE_MAX,
+  truncateCodePoints,
   createBoardPathOnce,
   errText,
   type ProjectCfg,
@@ -77,6 +80,9 @@ import {
   spawnInitBlock,
   stripExportWrapper,
   stripFrontmatter,
+  personMarkdown,
+  projectDocSlugs,
+  PERSON_SLUG,
   resolvePromptWorktree,
   type SpawnInit,
   priorityRank,
@@ -641,11 +647,47 @@ describe("stripFrontmatter/stripExportWrapper: паритет CLI markdown.rs", 
   })
 })
 
+describe("projectDocSlugs: полные слаги канон-четвёрки по файлам каталога", () => {
+  const fullDir = ["README.md", "Домены.md", "Стек и архитектура.md", "Деплоймент.md"]
+  test("все четыре файла → полные слаги в порядке четвёрки", () => {
+    expect(projectDocSlugs("uwuwu", fullDir)).toEqual([
+      "Projects/uwuwu/README",
+      "Projects/uwuwu/Домены",
+      "Projects/uwuwu/Стек и архитектура",
+      "Projects/uwuwu/Деплоймент",
+    ])
+  })
+  test("частичная папка: отсутствующие доки пропускаются, не угадываем", () => {
+    expect(projectDocSlugs("origa", ["README.md", "Домены.md"])).toEqual([
+      "Projects/origa/README",
+      "Projects/origa/Домены",
+    ])
+  })
+  test("пустая папка и посторонние файлы — без слагов и без шума", () => {
+    expect(projectDocSlugs("uwuwu", [])).toEqual([])
+    expect(projectDocSlugs("uwuwu", ["Задачи uwuwu.md", "scratch/", "ADR"])).toEqual([])
+  })
+  test("слаг персоны — паритет cli run.rs (person_hub)", () => {
+    expect(PERSON_SLUG).toBe("Experience/person/PERSON")
+  })
+})
+
+describe("personMarkdown: тело персоны для спавн-промпта", () => {
+  const wikiDoc = "---\ntitle: PERSON\ndate: 2026-11-06\n---\n\n# PERSON\n\nЯзык — русский.\nКомпактность.\n"
+  test("обёртка wiki-дока (frontmatter + # PERSON) срезана", () => {
+    expect(personMarkdown(wikiDoc)).toBe("Язык — русский.\nКомпактность.")
+  })
+  test("пустое тело после среза — null (деградация, не пустая инжекция)", () => {
+    expect(personMarkdown("---\ntitle: PERSON\n---\n\n# PERSON\n\n")).toBeNull()
+    expect(personMarkdown("")).toBeNull()
+  })
+})
+
 describe("spawnInitBlock: инит-данные первого промпта", () => {
   const env = { repoDir: "/env/r", branch: "work/task-r1", scratchDir: "/env/s" }
   const baseInit: SpawnInit = {
     person: "Язык — русский.\nАнти-паттерн: не дробить задачи.",
-    projectDocs: ["uwuwu/README", "uwuwu/Домены"],
+    projectDocs: ["Projects/uwuwu/README", "Projects/uwuwu/Домены"],
     task: { title: "Фича", status: "Design", type: "feature", branch: "work/task-r1", pr: "" },
   }
   test("строка задачи: тайтл/статус/тип/ячейки, пустые — тире", () => {
@@ -657,9 +699,9 @@ describe("spawnInitBlock: инит-данные первого промпта", 
     const b = spawnInitBlock({ ...baseInit, task: { ...baseInit.task, type: "" } }, "r1", "uwuwu")
     expect(b).toContain("Задача: «Фича», статус Design, тип —, ветка work/task-r1, PR —.")
   })
-  test("проект: слаги живых доков как готовые uwuwu-cli read", () => {
+  test("проект: слаги живых доков как готовые uwuwu-cli read (полные)", () => {
     const b = spawnInitBlock(baseInit, "r1", "uwuwu")
-    expect(b).toContain('uwuwu-cli read "uwuwu/README", "uwuwu/Домены"')
+    expect(b).toContain('uwuwu-cli read "Projects/uwuwu/README", "Projects/uwuwu/Домены"')
     expect(b).not.toContain("чекаут")
   })
   test("проект без живых доков — честная строка вместо заглушек", () => {
@@ -1332,9 +1374,48 @@ describe("stallVerdict: зависший ход при живой сессии",
     expect(stallVerdict(facts({ signaled: true, lastActivityAt: NOW - 2 * MIN }), 30 * MIN))
       .toEqual({ t: "none" })
   })
-  test("не In Progress — none даже при застое", () => {
+  test("не In Progress и не Design — none даже при застое", () => {
     expect(stallVerdict(facts({ status: "Needs attention" }), 30 * MIN)).toEqual({ t: "none" })
-    expect(stallVerdict(facts({ status: "Design" }), 30 * MIN)).toEqual({ t: "none" })
+    expect(stallVerdict(facts({ status: "Review" }), 30 * MIN)).toEqual({ t: "none" })
+  })
+  test("Design с зависшим ходом — signal (слот CUP не холдится вечно, инцидент 1101)", () => {
+    // Design-фантом: ход умер, запись сессии жива — вечная тишина держала слот
+    // CUP без эскалации (детекция была гейтнута только на In Progress)
+    const v = stallVerdict(facts({ status: "Design", branch: "", branchInWorktree: false }), 30 * MIN)
+    expect(v.t).toBe("signal")
+    if (v.t !== "signal") return
+    expect(v.text).toContain("[factory]")
+    expect(v.text).toContain("Design")
+    expect(v.text).toContain("тишина 40 мин")
+    expect(v.text).toContain("пороге 30 мин")
+    // на этапе утряски Branch/PR пустые в норме — веточных диагнозов быть не должно
+    expect(v.text).not.toContain("Branch-ячейка пуста")
+    expect(v.text).not.toContain("ветка на месте")
+  })
+  test("Design со свежей активностью — none (утряска идёт)", () => {
+    expect(stallVerdict(facts({ status: "Design", lastActivityAt: NOW - 5 * MIN }), 30 * MIN))
+      .toEqual({ t: "none" })
+  })
+  test("Design повторный тик после сигнала — silent (анти-спам)", () => {
+    expect(stallVerdict(facts({ status: "Design", signaled: true }), 30 * MIN)).toEqual({ t: "silent" })
+  })
+  test("цепочка фикса 1101: сигнал Design-фантома → эскалация в Needs attention → слот CUP свободен", () => {
+    // главный юзкейс постановки 1101: фантом в Design держал слот CUP вечно
+    // (детекция была гейтнута только на In Progress). Конец-в-конец чистых
+    // функций: вердикт signal на фантоме; прод-проводка signal-вердикта
+    // ставит Needs attention (lastStatus за доской) — статус вне
+    // LLM_ACTIVE_STATUSES, счёт активных падает, у очереди появляется бюджет.
+    const phantom = facts({ status: "Design", branch: "", branchInWorktree: false })
+    expect(stallVerdict(phantom, 30 * MIN).t).toBe("signal")
+    const slots = [
+      { status: "In Progress", priority: "medium" },
+      { status: "Needs attention", priority: "medium" }, // бывший Design-фантом
+    ]
+    const active = activeTaskCountEx(slots, { peak: false })
+    expect(active).toBe(1)
+    expect(cupBudget(active, 2)).toBe(1)
+    // и сама эскалация не вернула бы статус в активные (гват контракта статусов)
+    expect(LLM_ACTIVE_STATUSES.has("Needs attention")).toBe(false)
   })
   test("dead и unknown сессия — none (соседний код карантин / пропуск тика)", () => {
     expect(stallVerdict(facts({ sessionAlive: false }), 30 * MIN)).toEqual({ t: "none" })
@@ -1680,6 +1761,89 @@ describe("pathSafe", () => {
 
   test("уже санитизированный остаётся как есть (идемпотентность)", () => {
     expect(pathSafe("уже \u{2215} санитизирован")).toBe("уже \u{2215} санитизирован")
+  })
+})
+
+// ——— тайтлы спавн-сессий opencode ———
+
+describe("sessionTitle", () => {
+  test("dev — номер и тайтл, без стейджа", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "Фабрика: тайтлы спавн-сессий")).toBe(
+      "📋 uwuwu: 1051 — Фабрика: тайтлы спавн-сессий",
+    )
+  })
+
+  test("review/test — стейдж-слово перед номером", () => {
+    expect(sessionTitle("review", "uwuwu", "1051", "план")).toBe("🔍 uwuwu: ревью 1051 — план")
+    expect(sessionTitle("test", "uwuwu", "61", "help comment --reply")).toBe("🧪 uwuwu: тестирование 61 — help comment --reply")
+  })
+
+  test("path-safe: '/' → U+2215 в тайтле задачи", () => {
+    expect(sessionTitle("dev", "uwuwu", "1099", "снос serial_test")).toBe("📋 uwuwu: 1099 — снос serial_test")
+    expect(sessionTitle("dev", "uwuwu", "46", "RU/EN слэш")).toBe("📋 uwuwu: 46 — RU∕EN слэш")
+  })
+
+  test("CRLF → пробел", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "строка\r\nстрока")).toBe("📋 uwuwu: 1051 — строка строка")
+  })
+
+  test("пустой/пробельный тайтл — номер без «—»", () => {
+    expect(sessionTitle("dev", "uwuwu", "1051", "")).toBe("📋 uwuwu: 1051")
+    expect(sessionTitle("review", "origa", "965", "   ")).toBe("🔍 origa: ревью 965")
+  })
+
+  test("обрезка: финальная строка целиком до SESSION_TITLE_MAX (гард createSession идемпотентен)", () => {
+    const out = sessionTitle("test", "uwuwu", "1051", "т".repeat(200))
+    // лимит — по code points (эмодзи-префикс даёт 81 UTF-16 unit при 80 points)
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
+    expect(out.startsWith("🧪 uwuwu: тестирование 1051 — ")).toBe(true)
+  })
+
+  test("обрезка не режет суррогатную пару: эмодзи на границе лимита остаётся целым", () => {
+    const out = sessionTitle("dev", "uwuwu", "1051", "👍".repeat(200))
+    expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
+    expect(out.endsWith("👍")).toBe(true)
+  })
+
+  test("граница контракта: ровно 80 points не режется, 81-й point срезается (пин tester 1051)", () => {
+    const points = (t: string): number => Array.from(t).length
+    const head = `📋 uwuwu: 1051 — `
+    const tail = `${"х".repeat(SESSION_TITLE_MAX - Array.from(head).length - 1)}◆`
+    // ровно 80 — не тронут: маркер-хвост на месте
+    const fit = sessionTitle("dev", "uwuwu", "1051", tail)
+    expect(points(fit)).toBe(SESSION_TITLE_MAX)
+    expect(fit.endsWith("◆")).toBe(true)
+    // 81-й point срезается без lone-суррогата и без сдвига лимита
+    const over1 = sessionTitle("dev", "uwuwu", "1051", `${tail}z`)
+    expect(points(over1)).toBe(SESSION_TITLE_MAX)
+    expect(over1.endsWith("z")).toBe(false)
+    expect(over1.endsWith("◆")).toBe(true)
+    const over2 = sessionTitle("dev", "uwuwu", "1051", `${tail}zz`)
+    expect(points(over2)).toBe(SESSION_TITLE_MAX)
+    expect(over2.endsWith("zz")).toBe(false)
+  })
+
+  test("идемпотентность гарда: sessionTitle-вывод проходит createSession-гард без изменений (пин tester 1051)", () => {
+    // гард createSession: truncateCodePoints(title.replace(CRLF), SESSION_TITLE_MAX)
+    const guard = (t: string): string => truncateCodePoints(t.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX)
+    for (const kind of ["dev", "review", "test"] as const) {
+      const out = sessionTitle(kind, "uwuwu", "1051", "длинный ".repeat(30))
+      expect(guard(out)).toBe(out)
+    }
+  })
+})
+
+describe("truncateCodePoints", () => {
+  test("BMP-строка — эквивалент slice", () => {
+    expect(truncateCodePoints("абвгдеж", 4)).toBe("абвг")
+    expect(truncateCodePoints("короткая", 100)).toBe("короткая")
+  })
+
+  test("астральные символы (эмодзи) не разрезаются пополам", () => {
+    // 10 эмодзи = 20 UTF-16 units: slice(0, 10) по units дал бы lone-суррогат
+    expect(truncateCodePoints("👍".repeat(10), 10)).toBe("👍".repeat(10))
+    expect(truncateCodePoints("👍".repeat(10), 5)).toBe("👍".repeat(5))
+    expect(truncateCodePoints("👍ai👍", 3)).toBe("👍ai")
   })
 })
 

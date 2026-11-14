@@ -17,6 +17,11 @@ const SELF = join(import.meta.dir, "siyuan-debris-guard.test.ts")
 const CODE_EXT = new Set([".ts", ".rs", ".py"])
 const EXCLUDE_DIRS = new Set([
   "node_modules", "target", ".git", "docs", "hub-clone", "dist", ".worktrees", "wt",
+  // bots (волна 1, #241) ещё функционально ходит в kernel-API SiYuan
+  // (реестр через exportMdContent, UWUWU_SIYUAN_*) — миграция ботов на hub
+  // не завершена; при её финале exempt снимается и критерий 317 возвращается
+  // в полную силу (гвард должен снова видеть bots/).
+  "bots",
 ])
 
 // /api/query/sql в регулярке через [/] — не рвать комментарий-фенс

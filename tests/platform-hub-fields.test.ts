@@ -275,6 +275,21 @@ describe("read_database_cells: клетки из полей", () => {
     )
     expect(r.rows[0].cells.Status.value).toBe("Todo")
   })
+
+  test("клетка «Название» = issue.title на каждой строке — шов фоллбека readRows крона (пин tester 1051)", async () => {
+    // cron readRows: title = row.title ?? cells.Название?.value — ран-тайтл
+    // «⏰ <номер> — <тайтл>» собирается только если проекция несёт «Название»;
+    // снос проекции молча деградирует кроны к «⏰ <номер> · дата»
+    state.issues = [issueWith(5, {}), issueWith(6, {})]
+    const r = await hubTool<{ rows: Array<{ rowBlockId: string; title: string; cells: Record<string, { value?: string }> }> }>(
+      "read_database_cells", { databaseBlockId: "db:uwuwu" },
+    )
+    for (const row of r.rows) {
+      const name = row.cells.Название
+      expect(name?.value, `row ${row.rowBlockId}: клетки «Название» нет`).toBeDefined()
+      expect(name?.value, `row ${row.rowBlockId}: «Название» ≠ title`).toBe(row.title)
+    }
+  })
 })
 
 describe("update_database_row: запись в поля", () => {
