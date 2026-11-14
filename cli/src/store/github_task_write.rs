@@ -133,8 +133,14 @@ impl GitHubStore {
             )
             .await?;
         }
+        if let Some(status) = &patch.status {
+            // Pv2 первый: громкий отказ (опции нет, лаг платформы) до
+            // fm-записи — при отказе носители согласованы (fm не тронут),
+            // ложного/полу-успеха нет (1020)
+            github_project::set_status_and_planned(self, &number, Some(status), None).await?;
+        }
         // status — тоже fm-зеркало: читатели (task get/list, демоны) читают
-        // fm из тела; поле Projects v2 пишется ниже отдельно
+        // fm из тела; поле Projects v2 пишется выше отдельно
         let front_cells: Vec<(&str, &String)> = [
             ("status", &patch.status),
             ("branch", &patch.branch),
@@ -162,9 +168,6 @@ impl GitHubStore {
             let body = Frontmatter::parse(&body_md)
                 .with_field("autodone", if ad { "true" } else { "false" });
             self.set_issue_body(&number, &body).await?;
-        }
-        if let Some(status) = &patch.status {
-            github_project::set_status_and_planned(self, &number, Some(status), None).await?;
         }
         if let Some((planned, _ms)) = &patch.planned {
             github_project::set_status_and_planned(self, &number, None, Some(planned)).await?;
