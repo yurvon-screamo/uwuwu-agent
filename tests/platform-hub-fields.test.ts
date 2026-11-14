@@ -70,7 +70,7 @@ mock.module("../lib/platform-hub", () => ({
     if (args.includes("DELETE")) return ""
     throw new Error(`stub: необработанный gh ${args.join(" ")}`)
   },
-  issuesForProject: (project: string) => state.issues as never,
+  issuesForProject: (_project: string) => state.issues as never,
   issueByNumber: (number: string) =>
     state.issues.find((i) => String(i["number"]) === number) ?? null,
   // Pv2-джойн статусов — stub на уровне модуля (projectStatuses зовёт gh):
