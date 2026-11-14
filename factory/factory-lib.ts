@@ -591,7 +591,8 @@ export interface SpawnEnvContext {
 export interface SpawnInit {
   /** markdown персоны владельца; null — дока нет/не резолвится */
   person: string | null
-  /** слаги живых доков проекта для uwuwu-cli read («<proj>/README») */
+  /** слаги живых доков проекта для uwuwu-cli read — полные
+   *  («Projects/<proj>/README»: сокращение «<proj>/README» неоднозначно) */
   projectDocs: string[]
   /** локальный чекаут env:false-проекта; env-задачам не нужен — пути в env-строке промпта */
   localPath?: string
@@ -641,6 +642,37 @@ export function stripExportWrapper(md: string, docTitle: string): string {
   return body.startsWith(titleHeading)
     ? body.slice(titleHeading.length).replace(/^\n+/, "")
     : body
+}
+
+/** Канон-четвёрка доков проекта: имена файлов под docs/Projects/<proj>/
+ *  (слаг для агента — полный «Projects/<proj>/<док>»: cli read резолвит
+ *  его прямой путь, сокращение «<proj>/<док>» падает на неоднозначности
+ *  basename-фоллбека — по «README» кандидатов больше одного). */
+export const PROJECT_INIT_DOCS = ["README", "Домены", "Стек и архитектура", "Деплоймент"]
+
+/** Слаг персоны владельца в вики, паритет cli run.rs (person_hub). */
+export const PERSON_SLUG = "Experience/person/PERSON"
+
+/** Имя файла персоны в клоне — последний сегмент PERSON_SLUG. */
+export const PERSON_FILE = "PERSON"
+
+/** Полные слаги канон-четвёрки по списку файлов каталога проекта:
+ *  «<файл>.md» существует → «Projects/<proj>/<док>», нет → пропуск.
+ *  Порядок слагов — порядок PROJECT_INIT_DOCS; каталоги и не-md игнорируются
+ *  (readdir отдаёт и их — фильтр здесь, а не в FS-слое). */
+export function projectDocSlugs(projectName: string, dirFiles: ReadonlyArray<string>): string[] {
+  const files = new Set(dirFiles)
+  return PROJECT_INIT_DOCS
+    .filter((title) => files.has(`${title}.md`))
+    .map((title) => `Projects/${projectName}/${title}`)
+}
+
+/** Тело персоны для спавн-промпта: обёртка md-дока срезается (паритет
+ *  strip_export_wrapper), пустое после среза — null (деградация «персоны
+ *  нет» вместо пустой инжекции). */
+export function personMarkdown(md: string): string | null {
+  const body = stripExportWrapper(md, PERSON_FILE).trim()
+  return body === "" ? null : body
 }
 
 /** Блок инит-данных первого промпта: ориентация без стартового поиска
