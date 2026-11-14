@@ -15,6 +15,7 @@ pub mod github_task;
 pub mod github_task_read;
 pub mod github_task_write;
 pub mod git_util;
+pub mod task_migrate;
 pub mod task_store;
 
 #[cfg(test)]

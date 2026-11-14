@@ -254,6 +254,36 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             println!("закрыта: issue #{} «{}»", closed.id, closed.title);
             Ok(())
         }
+        TaskSub::MigrateFm { apply } => {
+            // board-флаг команды сюда не относится: миграция гонит все доски
+            // (discover_boards) — hub-функция, не проектная
+            let hub_repo = crate::cmd::run::hub_repo_default();
+            if hub_repo.trim().is_empty() {
+                anyhow::bail!("UWUWU_HUB_REPO пуст — миграция требует hub-репо");
+            }
+            let store = crate::store::github_task::GitHubStore::new(hub_repo);
+            let outcomes =
+                crate::store::task_migrate::migrate_all(&store, apply).await?;
+            let mut migrated = 0usize;
+            let mut skipped = 0usize;
+            let mut conflicts = 0usize;
+            for o in &outcomes {
+                match o.action {
+                    "migrated" => migrated += 1,
+                    "skipped" => skipped += 1,
+                    _ => conflicts += 1,
+                }
+                println!("#{} [{}] {}", o.number, o.action, o.detail);
+            }
+            println!(
+                "итог: {} мигрировано, {} пропущено, {} расхождений fm≠поле ({})",
+                migrated,
+                skipped,
+                conflicts,
+                if apply { "APPLY" } else { "dry-run" }
+            );
+            Ok(())
+        }
         TaskSub::Body {
             id,
             stdin,
