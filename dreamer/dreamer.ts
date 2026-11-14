@@ -406,15 +406,16 @@ async function reconcileTaskRuns(state: DreamerState, db: Database): Promise<voi
  *  Заморозка без DELETE: история дедупа остаётся в БД, выборки dreamer-детей
  *  исключают (agent != 'dreamer'). Возвраты: "woken" (wakeup выполнен),
  *  "failed" (wakeup-промпт упал, попытка записана), "unknown" (REST молчит —
- *  не решаем), "migrated" (dreamerSes обнулён — нужен спавн замены). */
+ *  не решаем), "fallback" (dreamerSes обнулён — spawn-путь тика спавнит
+ *  замену; источники: замороженный legacy-child или мёртвая 404/400 сессия). */
 async function wakeupOrMigrateLegacy(
   state: DreamerState, db: Database, cand: Candidate, prev: TrackedSession, dreamerSes: string,
-): Promise<"woken" | "failed" | "unknown" | "migrated"> {
+): Promise<"woken" | "failed" | "unknown" | "fallback"> {
   const legacyRow = fetchSessionById(db, dreamerSes)
   if (legacyRow !== null && legacyRow.parentId !== null) {
     log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} — legacy parentID-child, миграция на detached-спавн`)
     prev.dreamerSes = null
-    return "migrated"
+    return "fallback"
   }
   // верификация живости: либа детерминирована от state, REST — здесь
   const alive = await sessionAlive(dreamerSes)
@@ -423,7 +424,7 @@ async function wakeupOrMigrateLegacy(
     // 404/400: дример-сессия удалена → spawn-fallback (инвариант ≤1 живого)
     log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
     prev.dreamerSes = null
-    return "migrated"
+    return "fallback"
   }
   // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
   // закроет как failed+attempt, восстановления без потерь)
@@ -456,17 +457,18 @@ async function wakeupOrMigrateLegacy(
  *  спавнились detached изначально — parent_id всегда NULL). Гвард dreamerSes
  *  локальный — инвариант «wakeup ⇒ сессия есть» живёт в адмиссии другого
  *  модуля, кросс-модульной зависимости не строим. Возвраты: "woken"/"failed"/
- *  "unknown" — кандидат закрыт; "respawn" (404/400) — spawn-fallback тика. */
+ *  "unknown" — кандидат закрыт; "fallback" (404/400, dreamerSes обнулён) —
+ *  spawn-fallback тика. */
 async function taskRunWakeup(
   state: DreamerState, db: Database, rowId: string, tracked: TrackedTaskRun, dreamerSes: string,
-): Promise<"woken" | "failed" | "unknown" | "respawn"> {
+): Promise<"woken" | "failed" | "unknown" | "fallback"> {
   const alive = await sessionAlive(dreamerSes)
   if (alive === null) return "unknown" // неизвестно — не решаем
   if (!alive) {
     // 404/400: дример-сессия удалена → spawn-fallback
     log(`задача ${rowId.slice(0, 8)}: дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
     tracked.dreamerSes = null
-    return "respawn"
+    return "fallback"
   }
   // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
   // закроет как failed+attempt, восстановления без потерь)
@@ -594,7 +596,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
 
     if (cand.action === "wakeup" && prev !== undefined && prev.dreamerSes !== null) {
       const outcome = await wakeupOrMigrateLegacy(state, db, cand, prev, prev.dreamerSes)
-      if (outcome !== "migrated") continue // woken/failed/unknown — кандидат закрыт; migrated → spawn замены ниже
+      if (outcome !== "fallback") continue // woken/failed/unknown — кандидат закрыт; fallback → spawn-путь ниже
     }
 
     const prompt = dreamerPrompt({
@@ -639,7 +641,7 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     if (drain.isStopping()) break
     if (cand.action === "wakeup" && tracked.dreamerSes !== null) {
       const outcome = await taskRunWakeup(state, db, rowId, tracked, tracked.dreamerSes)
-      if (outcome !== "respawn") continue // woken/failed/unknown — кандидат закрыт; respawn → spawn-fallback ниже
+      if (outcome !== "fallback") continue // woken/failed/unknown — кандидат закрыт; fallback → spawn-fallback ниже
     }
     if (DRY_RUN) {
       log(`DRY_RUN: задачный прогон над ${rowId.slice(0, 8)} — пропущен`)
