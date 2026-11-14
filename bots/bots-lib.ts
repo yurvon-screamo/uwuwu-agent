@@ -56,8 +56,9 @@ const unquote = (raw: string): string => {
   return t
 }
 
-/** Стрип export-обвязки ядра (паритет cli strip_export_wrapper / wiki_ops
- *  _strip_export_wrapper): frontmatter-блок и ведущая title-H1-строка. */
+/** Стрип export-обвязки ядра (паритет cli strip_export_wrapper и
+ *  легаси-питон-инструмента `_strip_export_wrapper`): frontmatter-блок
+ *  и ведущая title-H1-строка. */
 export function stripExportWrapper(md: string): string {
   const lines = md.split("\n")
   let i = 0
