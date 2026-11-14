@@ -1,4 +1,14 @@
 {
+  "mcp": {
+    "servers": {
+      "uwuwu": {
+        "type": "remote",
+        "url": "https://uwuwu-server-production.up.railway.app/mcp",
+        "oauth": false,
+        "headers": { "Authorization": "Bearer 7cdb2c2484c0d3b89198b75d01b804ff33fa5a9db623ec4aa63e8825fd657c45" }
+      }
+    }
+  },
   "$schema": "https://opencode.ai/config.json",
   "commands": {
     "bdd-plan": {
