@@ -8,9 +8,12 @@ mod config;
 mod fm;
 mod http;
 mod hub;
+mod mcp;
 mod opencode;
 mod prgate;
 mod state;
+mod tools;
+mod wiki;
 
 use config::{Config, ConfigError, ENV_CONFIG};
 use std::path::PathBuf;
@@ -94,13 +97,36 @@ async fn run(
         uwuwu_usecase::Mode::Observe => "observe",
         uwuwu_usecase::Mode::Live => "live",
     };
+    // Query-вьюхи для MCP-инструментов (чтения)
+    let boards_cfg: Vec<(String, String)> = plan
+        .boards
+        .iter()
+        .map(|b| (b.project.clone(), b.board.clone()))
+        .collect();
+    let task_view = Arc::new(uwuwu_usecase::TaskView::new(board.clone(), boards_cfg));
+    let wiki = Arc::new(wiki::GitHubWiki::new(
+        cfg.hub.repo.clone(),
+        "main".to_string(),
+        secrets.gh_token.clone(),
+    ));
+    let tool_hub = Arc::new(tools::ToolHub {
+        tasks: task_view,
+        docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
+        person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
+    });
+
     let http_state = Arc::new(http::AppState {
         bearer: Arc::new(secrets.bearer.clone()),
         mode: mode_label,
         tick: shared.clone(),
     });
+    let mcp_state = Arc::new(mcp::McpState {
+        bearer: Arc::new(secrets.bearer.clone()),
+        tools: tool_hub,
+    });
+    let app = http::router(http_state).merge(mcp::router(mcp_state));
 
-    let http_task = tokio::spawn(serve(cfg.port(), http::router(http_state)));
+    let http_task = tokio::spawn(serve(cfg.port(), app));
     let tick_task = tokio::spawn(tick_loop(cfg.poll_sec, plan, usecase, shared));
 
     tokio::select! {

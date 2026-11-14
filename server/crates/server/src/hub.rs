@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use uwuwu_domain::{Priority, Slot, Status, Task};
 use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::{CommentRef, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
 
 pub struct GitHubHub {
     repo: String,
@@ -334,6 +334,28 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    async fn read_issue(&self, _board: &str, number: u64) -> UsecaseResult<IssueView> {
+        let (_, body_val) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                None,
+            )
+            .await?;
+        let title = body_val["title"].as_str().unwrap_or_default().to_string();
+        let body = body_val["body"].as_str().unwrap_or_default().to_string();
+        // статус — из fm-зеркала (инвариант fm ≡ поля; прямое чтение полей канбана — read_board)
+        let fm = crate::fm::Frontmatter::parse(&body);
+        let status = fm.get("status").unwrap_or_default().to_string();
+        let task = task_from(number, title, status, &body);
+        let comments = self.all_comments(number).await?;
+        Ok(IssueView {
+            task,
+            body,
+            comments,
+        })
+    }
+
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         let (status, body) = self
             .rest(
@@ -369,6 +391,40 @@ impl TaskBoardRepo for GitHubHub {
 }
 
 impl GitHubHub {
+    /// Все комменты задачи (до 100 последних, по возрастанию времени).
+    async fn all_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
+        let (status, body) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}/comments?per_page=100", self.repo),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "comments #{number}: HTTP {status}"
+            )));
+        }
+        let mut out: Vec<CommentRef> = body
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|c| {
+                        let created =
+                            chrono::DateTime::parse_from_rfc3339(c["created_at"].as_str()?).ok()?;
+                        Some(CommentRef {
+                            id: c["node_id"].as_str()?.to_string(),
+                            created_ms: created.timestamp_millis() as u64,
+                            body: c["body"].as_str().unwrap_or_default().to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|c| c.created_ms);
+        Ok(out)
+    }
+
     /// fm-пересборка тела: PATCH с сохранением контента дословно.
     async fn patch_fm(
         &self,
