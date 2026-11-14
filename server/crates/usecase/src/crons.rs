@@ -328,16 +328,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 fn run_prompt(project: &str, master: &CronMaster, journal: &str) -> String {
     let tail: Vec<&str> = journal.lines().rev().take(5).collect();
+    // slug мастера — полный путь от docs/: имя = хвост после последнего '/'
+    let name = master.slug.rsplit('/').next().unwrap_or(&master.slug);
     format!(
         "Крон-ран «{title}» (проект {project}, расписание `{schedule}`).\n\n\
          ## Инструкция мастера\n\n{body}\n\n\
          ## Журнал (последние записи, сверху новые)\n\n{tail}\n\n\
          Выполни ран автономно. Сводку допиши в журнал:\n\
-         uwuwu_docs_append {{slug: \"Projects/{project}/Кроны/{slug}/Журнал\", line: \"- <итог одной строкой>\"}}.\n\
+         uwuwu_docs_append {{slug: \"Projects/{project}/Кроны/{name}/Журнал\", line: \"- <итог одной строкой>\"}}.\n\
          Блокер — коммент в задачу-хвост не нужен; просто зафиксируй в журнале.",
         title = master.title,
         schedule = master.schedule,
-        slug = master.slug,
         body = master.body,
         tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
     )

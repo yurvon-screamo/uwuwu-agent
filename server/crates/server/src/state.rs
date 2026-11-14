@@ -21,6 +21,9 @@ struct StateFile {
     /// Сессии, отработанные дримером.
     #[serde(default)]
     dreamer_done: Vec<String>,
+    /// «board:number:slot» → ms последнего спавна (анти-шторм).
+    #[serde(default)]
+    spawns: BTreeMap<String, u64>,
 }
 
 pub struct JsonStateStore {
@@ -78,6 +81,24 @@ impl TickStateStore for JsonStateStore {
             .expect("state lock")
             .dreamer_done
             .push(session.to_string());
+    }
+
+    fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64> {
+        let key = format!("{board}:{number}:{slot}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .get(&key)
+            .copied()
+    }
+
+    fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .insert(format!("{board}:{number}:{slot}"), at_ms);
     }
 
     fn save(&self) -> UsecaseResult<()> {
