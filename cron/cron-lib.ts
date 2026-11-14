@@ -254,6 +254,21 @@ export function cellPatches(row: CronRow, sched: Sched, prevFire: number, now: D
   return patch
 }
 
+/** ms «Запланировано» клетки: dateMs легаси-ячейки или парс строки
+ *  «YYYY-MM-DD HH:MM» (hub-fm несёт формат formatLocal — локальное время;
+ *  паритет чтения нужен reconcile'у: без него клетка после файра «не
+ *  совпадала» бы никогда — gh-PATCH спам каждый тик, задача 1075).
+ *  null — пусто/нераспознано. */
+export function parsePlannedCellMs(cell: { value?: unknown; dateMs?: unknown } | undefined | null): number | null {
+  if (cell === undefined || cell === null) return null
+  if (typeof cell.dateMs === "number" && Number.isFinite(cell.dateMs)) return cell.dateMs
+  if (typeof cell.value !== "string") return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(cell.value.trim())
+  if (m === null) return null
+  const [, y, mo, d, h, mi] = m
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi)).getTime()
+}
+
 /** Валидация state-записи. */
 export function isValidTracked(v: unknown): v is TrackedCron {
   if (v === null || typeof v !== "object") return false
@@ -392,6 +407,20 @@ export async function resolveBody(tool: PlatformTool, boardDocId: string, row: C
   } catch (e) {
     return { kind: "infra", error: String(e) }
   }
+}
+
+// ——— ран-карточка ———
+
+/** rowId из stdout `task create`: hub-формат «создана: issue #NNN …» (первый
+ *  — он однозначен) или легаси «Строка: <id>» шапки get-формы. null — формат
+ *  не распознан (вызывающий логирует stdout и ретраит следующим тиком:
+ *  молча-созданные дубль-карточки — худший исход, инцидент #1111). */
+export function runRowIdFromCreateOutput(stdout: string): string | null {
+  const hub = /создана: issue #(\d+)/.exec(stdout)
+  if (hub !== null) return hub[1]
+  const legacy = /Строка:\s+(\S+)/.exec(stdout)?.[1]
+  if (legacy !== undefined && legacy !== "issue") return legacy
+  return null
 }
 
 // ——— промпты ———

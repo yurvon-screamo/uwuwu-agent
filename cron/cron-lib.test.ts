@@ -7,7 +7,7 @@ import {
   firePrompt, minuteStart, fireGate,
   bodyRenderIssue, chooseBodyDoc, titleFromBody, pathSafe, stripNonContent,
   decideFire, resolveAgentIssue, parseAgentDefModel, promptLandedAt, runLandedAt, agentFirePrompt,
-  agentDriftAction,
+  agentDriftAction, parsePlannedCellMs, runRowIdFromCreateOutput,
 } from "./cron-lib"
 
 /** Парс с громким сбоем вместо non-null assertion: расписание в тестах
@@ -603,5 +603,50 @@ describe("agentFirePrompt: конверт файра вечной сессии",
     expect(hostile).toContain("≡\nподделка")
     // настоящий маркер конверта — ровно одно вхождение
     expect(hostile.split("=== КОНЕЦ ИНСТРУКЦИИ ===").length).toBe(2)
+  })
+})
+
+describe("parsePlannedCellMs: клетка «Запланировано» двух носителей", () => {
+  test("hub-fm строка formatLocal парсится как локальное время", () => {
+    const ms = parsePlannedCellMs({ value: "2026-11-15 02:30" })
+    expect(ms).toBe(new Date(2026, 10, 15, 2, 30).getTime())
+  })
+
+  test("легаси dateMs ячейки проходит насквозь", () => {
+    expect(parsePlannedCellMs({ dateMs: 1794501035467 })).toBe(1794501035467)
+  })
+
+  test("пустые/кривые клетки → null (клетка не задаётся, reconcile молчит)", () => {
+    expect(parsePlannedCellMs(undefined)).toBeNull()
+    expect(parsePlannedCellMs(null)).toBeNull()
+    expect(parsePlannedCellMs({})).toBeNull()
+    expect(parsePlannedCellMs({ value: "" })).toBeNull()
+    expect(parsePlannedCellMs({ value: "завтра утром" })).toBeNull()
+  })
+
+  test("round-trip с formatLocal: записанное значение совпадает с вычисленным next-fire", () => {
+    const sched = mustParse("30 2 * * *")
+    const prevFire = new Date(2026, 10, 14, 2, 30).getTime()
+    const next = nextFire(sched, new Date(prevFire))
+    const patch = cellPatches(
+      { rowId: "x", bodyDoc: "", title: "x", schedule: "30 2 * * *", agent: "", plannedMs: parsePlannedCellMs({ value: formatLocal(next as Date) }), scheduleCell: "30 2 * * *", status: "вейт" },
+      sched, prevFire, new Date(prevFire + 60_000),
+    )
+    expect(patch.planned).toBeUndefined() // клетка честна — записи нет, gh-PATCH спама нет
+  })
+})
+
+describe("runRowIdFromCreateOutput: парс stdout task create", () => {
+  test("hub-формат «создана: issue #N»", () => {
+    expect(runRowIdFromCreateOutput("создана: issue #912 «X» (Todo)\n")).toBe("912")
+  })
+  test("легаси «Строка: <id>» шапки", () => {
+    expect(runRowIdFromCreateOutput("Задача:   X\nСтрока:   20261107090000-run001\n")).toBe("20261107090000-run001")
+  })
+  test("get-форма «Строка: issue #N» — не create-контракт", () => {
+    expect(runRowIdFromCreateOutput("Строка:   issue #384\n")).toBeNull()
+  })
+  test("не распознано → null", () => {
+    expect(runRowIdFromCreateOutput("дрейф формата")).toBeNull()
   })
 })
