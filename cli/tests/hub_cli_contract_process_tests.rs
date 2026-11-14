@@ -390,6 +390,7 @@ fn comment_reply_posts_marker_verbatim_without_resolution() {
         "метка уходит дословно: {raw}"
     );
 }
+
 /// E. Гвард входа: frontmatter-шапка и обёртка `task get` — отказ (контракт
 /// help «Вход — контент тела»; шапка в теле = мусор карточки).
 #[test]
