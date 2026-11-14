@@ -13,7 +13,7 @@
 //! Write-side операции — github_task_write.rs (единый trait-impl).
 
 use super::task_store::StoreResult;
-use super::{Task, TaskBoard, TaskType};
+use super::{StoreError, Task, TaskBoard, TaskType};
 use crate::store::github_gh::gh_json;
 use serde_json::Value;
 
@@ -140,6 +140,71 @@ impl GitHubStore {
             pv2.as_deref(),
         ))
     }
+
+    /// Точный резолв по issue-номеру — закрытые строки включительно
+    /// (list-резолв видит только open, канон резолва ставит номер выше
+    /// substring-фоллбека). PR — отказ; не на доске (label) — громкий
+    /// отказ: substring-подмена точного номера недопустима. Ok(None) —
+    /// нет issue с таким номером (caller продолжает substring).
+    pub(super) async fn issue_by_number(
+        &self,
+        board: &TaskBoard,
+        number: &str,
+    ) -> Result<Option<Task>, StoreError> {
+        let Some(issue) = self.issue_by_number_raw(number).await? else {
+            return Ok(None);
+        };
+        if issue.get("pull_request").is_some() {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "issue #{number} — pull request, не строка доски «{}»",
+                board.project
+            )));
+        }
+        let label = self.label_of(board);
+        let on_board = issue
+            .pointer("/labels")
+            .and_then(|l| l.as_array())
+            .is_some_and(|labels| {
+                labels
+                    .iter()
+                    .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(label.as_str()))
+            });
+        if !on_board {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "issue #{number} не на доске «{}» (label {label} отсутствует)",
+                board.project
+            )));
+        }
+        Ok(Some(self.convert(&issue, None)))
+    }
+
+    /// Direct GET issue: Ok(None) — 404 (нет такого issue); транспортные
+    /// сбои и прочие коды — Err (404 — единственный «честный промах»).
+    async fn issue_by_number_raw(&self, number: &str) -> Result<Option<Value>, StoreError> {
+        match gh_json(
+            &["api", &format!("repos/{}/issues/{number}", self.repo)],
+            None,
+        )
+        .await
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                if is_github_not_found(&format!("{e:#}")) {
+                    Ok(None)
+                } else {
+                    Err(StoreError::Other(e))
+                }
+            }
+        }
+    }
+}
+
+/// 404-детект по статус-маркеру stderr gh («Not Found (HTTP 404)») —
+/// не подстроке «404» по всей цепочке: она содержит URL args
+/// («repos/o/r/issues/1404»), и для номеров с «404» внутри любой
+/// транспортный сбой (403 rate limit, 5xx) маскировался бы под «не найдено».
+fn is_github_not_found(err_chain: &str) -> bool {
+    err_chain.contains("HTTP 404")
 }
 
 /// «Запланировано» → epoch ms ("" → 0). Поле несёт ISO-дату.
@@ -155,4 +220,53 @@ fn planned_ms(planned: Option<&str>) -> i64 {
                 .map(|dt| dt.and_utc().timestamp_millis())
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod not_found_detect_tests {
+    use super::is_github_not_found;
+
+    /// Форма gh_raw bail (github_gh.rs): argv-префикс с URL + stderr-хвост.
+    fn gh_fail(argv_url_number: &str, stderr: &str) -> String {
+        format!(
+            "gh [\"api\", \"repos/o/r/issues/{argv_url_number}\"] упал (exit status 1): {stderr}"
+        )
+    }
+
+    #[test]
+    fn честный_404_детектится() {
+        assert!(is_github_not_found(&gh_fail(
+            "999999999",
+            "Not Found (HTTP 404)"
+        )));
+        assert!(is_github_not_found("HTTP 404: Not Found"));
+    }
+
+    #[test]
+    fn номер_с_404_внутри_не_маскирует_транспортный_сбой() {
+        // Регресс Common-ревью 1097: подстрока «404» из URL #1404/4040 при
+        // 403 rate limit / 5xx — это НЕ «не найдено»
+        assert!(!is_github_not_found(&gh_fail(
+            "1404",
+            "rate limit exceeded (HTTP 403)"
+        )));
+        assert!(!is_github_not_found(&gh_fail(
+            "4040",
+            "Server Error (HTTP 500)"
+        )));
+        assert!(!is_github_not_found(&gh_fail(
+            "404",
+            "Bad credentials (HTTP 401)"
+        )));
+    }
+
+    #[test]
+    fn не_json_и_транспорт_не_404() {
+        assert!(!is_github_not_found(
+            "gh [\"api\", \"repos/o/r/issues/1\"]: не-JSON ответ: <html>"
+        ));
+        assert!(!is_github_not_found(
+            "gh не запустился — есть ли gh в PATH?"
+        ));
+    }
 }

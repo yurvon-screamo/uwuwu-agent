@@ -41,6 +41,23 @@ impl GitHubDocStore {
         self.clone_root.to_str().unwrap_or(".")
     }
 
+    /// Канон-фоллбек проекта: плоский слаг = имя папки в docs/Projects с
+    /// README — детерминированный резолв в README папки (1049: basename-скан
+    /// считает заглушку <proj>.md, док-карту <proj>/<proj>.md и вложенные —
+    /// ложная неоднозначность, канон-доки не доставались спавнам).
+    fn project_readme(&self, slug: &str) -> Option<PathBuf> {
+        if slug.contains('/') {
+            return None;
+        }
+        let readme = self
+            .clone_path()
+            .join("docs")
+            .join("Projects")
+            .join(slug)
+            .join("README.md");
+        readme.is_file().then_some(readme)
+    }
+
     /// Все md-файлы docs/** с данным basename (без .md).
     fn md_by_basename(&self, base: &str) -> Vec<PathBuf> {
         let docs_root = self.clone_path().join("docs");
@@ -91,6 +108,21 @@ fn sanitize_asset_name(name: &str) -> String {
         .replace([' ', '#', '?', '%'], "_")
 }
 
+/// Раскладка кандидатов в отказе неоднозначности (паритет task-резолва):
+/// пути от корня клона — читаемый перечень для «уточни слаг».
+fn candidate_layout(clone_root: &Path, candidates: &[PathBuf]) -> String {
+    candidates
+        .iter()
+        .map(|p| {
+            p.strip_prefix(clone_root)
+                .unwrap_or(p)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[async_trait::async_trait]
 impl DocStore for GitHubDocStore {
     async fn read(&self, doc: &DocRef) -> Result<String> {
@@ -103,6 +135,13 @@ impl DocStore for GitHubDocStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        // Канон-фоллбек проекта (1049): плоский слаг с живой папкой
+        // docs/Projects/<slug>/README.md — детерминированный README, до
+        // basename-скана
+        if let Some(readme) = self.project_readme(&doc.slug) {
+            let bytes = std::fs::read(&readme)?;
+            return Ok(String::from_utf8_lossy(&bytes).to_string());
+        }
         // Фоллбек basename: слаг старой схемы (<proj>/<doc>) мапится в
         // docs/Projects/<proj>/<doc>.md — ищем уникальный файл по basename
         let base = doc.slug.rsplit('/').next().unwrap_or(&doc.slug);
@@ -114,9 +153,10 @@ impl DocStore for GitHubDocStore {
             }
             0 => bail!("док «{}» не найден (docs/**)", doc.slug),
             _ => bail!(
-                "док «{}»: неоднозначно, {} кандидатов в docs/** — уточни слаг",
+                "док «{}»: неоднозначно, {} кандидатов в docs/** — уточни слаг: {}",
                 doc.slug,
-                candidates.len()
+                candidates.len(),
+                candidate_layout(&self.clone_root, &candidates)
             ),
         }
     }
@@ -208,5 +248,73 @@ impl DocStore for GitHubDocStore {
         self.write_files(&[(path, bytes)], &format!("asset: {dest_name}"))
             .await?;
         Ok(BlobRef { key })
+    }
+}
+
+#[cfg(test)]
+mod doc_read_fallback_tests {
+    use super::{candidate_layout, GitHubDocStore};
+
+    fn store_in(tmp: &std::path::Path) -> GitHubDocStore {
+        GitHubDocStore::new("o/r".into(), tmp.to_path_buf())
+    }
+
+    /// docs/Projects/<proj>/{README.md, <proj>.md} + внешняя заглушка
+    /// docs/Projects/<proj>.md — инстанс 1049 (origa: 2 кандидата).
+    #[test]
+    fn плоский_слаг_проекта_резолвится_в_readme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("docs/Projects/origa");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("README.md"), "# канон origa").unwrap();
+        std::fs::write(proj.join("origa.md"), "# карта ссылок").unwrap();
+        std::fs::write(
+            tmp.path().join("docs/Projects/origa.md"),
+            "# заглушка миграции",
+        )
+        .unwrap();
+        assert_eq!(
+            store_in(tmp.path()).project_readme("origa").map(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()),
+            Some("README.md".into())
+        );
+    }
+
+    #[test]
+    fn слаг_с_путём_и_чужие_имена_мимо_фоллбека() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("docs/Projects/ckii");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("README.md"), "x").unwrap();
+        let store = store_in(tmp.path());
+        assert!(store.project_readme("ckii/Ранбук X").is_none());
+        assert!(store.project_readme("нет-такого").is_none());
+        assert!(
+            store.project_readme("README").is_none(),
+            "README — не имя проекта"
+        );
+    }
+
+    #[test]
+    fn папка_без_readme_не_фоллбечится() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs/Projects/пусто")).unwrap();
+        assert!(store_in(tmp.path()).project_readme("пусто").is_none());
+    }
+
+    #[test]
+    fn раскладка_кандидатов_от_корня_клона() {
+        let root = std::path::Path::new("/clone");
+        let cands = vec![
+            root.join("docs/Projects/uwuwu.md"),
+            root.join("docs/Projects/uwuwu/uwuwu.md"),
+        ];
+        assert_eq!(
+            candidate_layout(root, &cands),
+            "docs/Projects/uwuwu.md, docs/Projects/uwuwu/uwuwu.md"
+        );
     }
 }

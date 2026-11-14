@@ -217,6 +217,17 @@ case "$route" in
     cat "$DIR/issue.json"
     exit 0
     ;;
+  "repos/$REPO/issues/4040")
+    # Пин 404-детекта direct GET (склейка 1097): 404 — «честный промах»,
+    # транспортные коды (403 rate limit) — громкий отказ. Маркер-файл
+    # direct-403 переключает режим; stderr gh несёт статус-маркер.
+    if [ -f "$STUB_DIR/direct-403" ]; then
+      printf 'gh: API rate limit exceeded (HTTP 403)' >&2
+    else
+      printf 'gh: Not Found (HTTP 404)' >&2
+    fi
+    exit 1
+    ;;
   "repos/$REPO/issues"?*)
     case "$route" in
       *page=2*) cat "$DIR/issues-page2.json" ;;
@@ -827,5 +838,55 @@ fn projects_walks_label_pages() {
         label_calls.len(),
         2,
         "обе страницы labels запрошены: {calls}"
+    );
+}
+
+/// F. Канон резолва, direct GET (граница gh-процесса, склейка 1097):
+/// numeric-needle после miss по open-списку идёт точечным GET issues/<N>.
+/// 404 — «честный промах» → substring-фоллбек → «не найдено» (не
+/// транспортная авария). Пин уровня процесса: юнит is_github_not_found
+/// не видит ни argv-сборку direct GET, ни склейку stderr в цепочку ошибки.
+#[test]
+fn direct_get_404_after_list_miss_falls_back_to_not_found() {
+    let guards = setup_stub_gh();
+    let (code, stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &["task", "get", "4040", "--project", "uwuwu", "--no-body"],
+    );
+    let said = format!("{stdout}{stderr}");
+    assert!(
+        said.contains("не найдено"),
+        "404 direct GET → substring-фоллбек → «не найдено»: {said}"
+    );
+    assert!(
+        !said.contains("HTTP 404") && !said.contains("упал"),
+        "404 не всплывает как транспортная авария: {said}"
+    );
+    assert_eq!(code, Some(1), "отказ rc 1");
+}
+
+/// G. Регресс Common-ревью 1097 (подстрочный 404-детект): номер с «404»
+/// внутри (issues/4040) при транспортном сбое 403 rate limit — громкий
+/// отказ, НЕ «не найдено» (иначе substring-подмена чужой строки —
+/// ровно класс бага 1088, который канон резолва закрывает).
+#[test]
+fn direct_get_403_on_number_with_404_inside_is_loud_not_notfound() {
+    let guards = setup_stub_gh();
+    std::fs::write(guards.0.path().join("direct-403"), "").expect("маркер 403");
+    let (code, stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &["task", "get", "4040", "--project", "uwuwu", "--no-body"],
+    );
+    let said = format!("{stdout}{stderr}");
+    assert_ne!(code, Some(0), "транспортный сбой — отказ: {said}");
+    assert!(
+        said.contains("HTTP 403"),
+        "транспортный сбой назван честно: {said}"
+    );
+    assert!(
+        !said.contains("не найдено"),
+        "403 НЕ маскируется под «не найдено» (регресс подстрочного 404-детекта): {said}"
     );
 }

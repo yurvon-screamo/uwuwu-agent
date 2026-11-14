@@ -347,3 +347,86 @@ async fn github_store_create_autodone_contract_live() {
         assert_eq!(closed.status, "Done");
     }
 }
+
+/// Канон резолва + write-контракт --base (склейка семьи 1097):
+/// закрытая строка резолвится по номеру (1048); числоподобный номер выше
+/// substring тайтла чужой строки (1088); снапшот task get (обёртка +
+/// хвостовой \n, U+200B в теле) — легитимный --base (978-2/1096/1100).
+/// Уборка — close (канон рига).
+#[tokio::test]
+#[ignore = "live sandbox: UWUWU_E2E_GITHUB=1 cargo test --features e2e-github -- --ignored"]
+async fn github_store_resolve_and_base_contract_live() {
+    let store = sandbox();
+    let board = board();
+    let stamp = chrono::Utc::now().timestamp_millis();
+
+    // (1) жертва А: создать → закрыть → точный номер становится вне list
+    let title_a = format!("[e2e] резолв закрытой по номеру {stamp}");
+    let a = store
+        .create(
+            &board,
+            &CreateTask {
+                title: title_a.clone(),
+                ..create_input(&title_a)
+            },
+        )
+        .await
+        .expect("create A");
+    store.close(&board, &a, None).await.expect("close A");
+    tokio::time::sleep(LIST_LAG).await;
+
+    // (2) приманка Б: open, тайтл содержит номер А как substring
+    // (до фикса resolve(номер А) перебивался этим substring — 1088)
+    let title_b = format!("[e2e] кейс {} в тайтле-приманке", a.id);
+    let b = store
+        .create(
+            &board,
+            &CreateTask {
+                title: title_b.clone(),
+                status: Some("Todo".into()),
+                ..create_input(&title_b)
+            },
+        )
+        .await
+        .expect("create B");
+    tokio::time::sleep(LIST_LAG).await;
+
+    let got = store
+        .resolve(&board, &a.id)
+        .await
+        .expect("resolve по номеру закрытой строки");
+    assert_eq!(
+        got.id, a.id,
+        "номер закрытой строки перебит substring (1048/1088)"
+    );
+    assert_eq!(got.status, "Done", "закрытая резолвится (state → Done)");
+
+    // (3) --base: снапшот task get-формы (обёртка + хвостовой \n) матчится
+    let b_resolved = store.resolve(&board, &b.id).await.expect("resolve Б");
+    let body = store
+        .body_get(&board, &b_resolved)
+        .await
+        .expect("body_get Б");
+    let snapshot = format!(
+        "Задача:   {title_b}\nСтатус:   Todo\nСтрока:   issue #{}\n\n{body}\n",
+        b.id
+    );
+    let new_body = "тело с \u{200b}zero-width\n";
+    store
+        .body_replace(&board, &b_resolved, new_body, &snapshot)
+        .await
+        .expect("replace со снапшотом task get (обёртка срезается, U+200B не мешает)");
+
+    // прежний снапшот против нового тела — громкий отказ свежести
+    let err = store
+        .body_replace(&board, &b_resolved, "ещё тело\n", &snapshot)
+        .await
+        .expect_err("устаревший снапшот должен отказать");
+    assert!(format!("{err}").contains("тело изменилось"), "got: {err}");
+
+    // (5) уборка: обе строки закрыты (из open-list уйдут сами)
+    store
+        .close(&board, &b_resolved, None)
+        .await
+        .expect("close Б");
+}

@@ -56,9 +56,18 @@ impl TaskStore for GitHubStore {
 
     async fn resolve(&self, board: &TaskBoard, needle: &str) -> Result<Task, StoreError> {
         let tasks = self.list(board).await?;
-        let exact = needle.trim_start_matches('-');
+        let exact = needle.trim_start_matches(['-', '#']);
         if let Some(t) = tasks.iter().find(|t| t.id == exact) {
             return Ok(t.clone());
+        }
+        // Точная форма — issue-номер (закрытые строки включительно):
+        // номер выше substring-фоллбека, иначе закрытая строка «не найдено»,
+        // а её номер перебивается substring чужого тайтла (1048/1088).
+        if let Some(number) = numeric_needle(exact) {
+            // Нет issue с таким номером — substring по доске как раньше
+            if let Some(t) = self.issue_by_number(board, &number.to_string()).await? {
+                return Ok(t);
+            }
         }
         let matched: Vec<&Task> = tasks
             .iter()
@@ -209,9 +218,27 @@ impl TaskStore for GitHubStore {
     }
 }
 
+/// Числоподобный needle → issue-номер (точная форма резолва: «1050»,
+/// «#1050»; «abc» и префиксы row-id — None → substring-фоллбек).
+fn numeric_needle(exact: &str) -> Option<u64> {
+    exact.parse::<u64>().ok()
+}
+
 #[cfg(test)]
-mod fm_compose_tests {
-    // fm-обвязка тела снесена (ADR-098: мета не в md, задача 1087).
-    // Контракт body_replace — чистая перезапись, покрытие — процессные
-    // контракт-тесты hub_cli_contract_process_tests.
+mod resolve_needle_tests {
+    use super::numeric_needle;
+
+    #[test]
+    fn числоподобные_формы_парсятся() {
+        assert_eq!(numeric_needle("1050"), Some(1050));
+        assert_eq!(numeric_needle("1097"), Some(1097));
+    }
+
+    #[test]
+    fn не_число_и_префиксы_это_substring_фоллбек() {
+        assert_eq!(numeric_needle("abc"), None);
+        assert_eq!(numeric_needle("20261114141050xyz"), None);
+        // «-» и «#» срезаются до numeric-проверки (trim в resolve)
+        assert_eq!(numeric_needle("42-foo"), None);
+    }
 }
