@@ -1,7 +1,7 @@
 //! Пин слага дока персоны в пользовательских поверхностях cli (задача 1047,
 //! стадия тестирования). После hub-миграции фактический слаг —
 //! `Experience/person/PERSON` (захардкожен в run.rs, пинен тестами
-//! клон-стора); help и README месяцами называли SiYuan-эру
+//! клон-стора); help и README месяцами называли до-hub-эру
 //! `Experience/personal/PERSON`. Три текстовые правки привели их к слагу.
 //!
 //! Почему эти два носителя, а не исходники: help — исполняемый артефакт
@@ -47,10 +47,11 @@ fn assert_honest_slug(out: &str, what: &str) {
         "{what}: легаси-слаг personal/PERSON вернулся в пользовательский вывод; начало: {:?}",
         out.chars().take(200).collect::<String>()
     );
-    // SiYuan-hpath-формат тоже не возвращается (второй вид легаси-пути).
+    // hpath-легаси-формат (второй вид пути до hub-миграции) тоже не
+    // возвращается.
     assert!(
         !out.contains("Experience:/personal"),
-        "{what}: SiYuan-hpath Experience:/personal вернулся в пользовательский вывод; начало: {:?}",
+        "{what}: hpath-легаси Experience:/personal вернулся в пользовательский вывод; начало: {:?}",
         out.chars().take(200).collect::<String>()
     );
 }
