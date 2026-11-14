@@ -14,7 +14,7 @@ import {
   applyRunOutcome, dreamerPrompt, emptyState, fetchRootSessions,
   hasAssistantReply, hasAssistantReplySince, idleBefore, isInPeakWindow, markBacklog,
   normalizeTracked, parsePeakWindow, pickCandidates, wakeupPrompt,
-  type DreamerState, type TrackedSession,
+  type Candidate, type DreamerState, type TrackedSession,
 } from "./dreamer-lib"
 import {
   acceptDoneSignal, applyTaskRunOutcome, batchMaxUpdated, collectTaskSessions,
@@ -142,18 +142,20 @@ async function restCall(path: string, init?: { method?: string; body?: unknown }
   return (j as { data?: unknown }).data ?? j
 }
 
-/** Спавн дочерней сессии дримера. Посессионный прогон: parentID наследует
- *  локацию (cwd проекта) и связывает пары «сессия ↔ её анализ» в дереве.
- *  Задачный прогон: directory = мастер-чекаут проекта (env задачи к моменту
- *  прогона снесён), parentID не задаётся — наследование локации родителем
- *  побеждает явный location. */
+/** Спавн дример-сессии — всегда detached (без parentID). Opencode инжектит
+ *  родителю анализируемой сессии synthetic `<subagent state="completed">` на
+ *  каждый idle ребёнка — completion будил анализируемую сессию паразитным
+ *  no-op-ходом и замыкал эхо-луп дример ↔ сессия (баг 1077). Явный location
+ *  заменяет parentID-наследование локации: «наследование каталога родителем
+ *  побеждает явный location» (проверено на opencode REST, см. фабричный
+ *  createSession). Прогон без каталога (пустая строка) — сессия в cwd демона:
+ *  все входы дримера абсолютные (дамп-аудит, dbPath, клон hub). */
 async function fireDreamer(
-  sid: string | null, directory: string, title: string, prompt: string,
+  directory: string, title: string, prompt: string,
 ): Promise<string | null> {
   const raw = await restCall("/session", {
     method: "POST",
     body: {
-      ...(sid !== null ? { parentID: sid } : {}),
       ...(directory !== "" ? { location: { directory } } : {}),
       agent: AGENT_ID,
       model: { providerID: MODEL.providerID, id: MODEL.id, variant: MODEL.variant },
@@ -331,9 +333,9 @@ function taskRunPromptFor(
 }
 
 /** Открыть задачный прогон: собрать пакет сессий, спавнить дример-сессию
- *  в мастер-чекауте проекта (без parentID — env снесён). Границу дедупа
- *  продвигает ТОЛЬКО финал прогона (applyTaskRunOutcome по replied): при
- *  провале граница не должна врать «пакет анализировался». */
+ *  detached в мастер-чекауте проекта (env задачи к моменту прогона снесён).
+ *  Границу дедупа продвигает ТОЛЬКО финал прогона (applyTaskRunOutcome по
+ *  replied): при провале граница не должна врать «пакет анализировался». */
 async function startTaskRun(state: DreamerState, db: Database, rowId: string, tracked: TrackedTaskRun): Promise<void> {
   const sessions = collectTaskSessions(db, tracked.rootSessions)
   if (sessions.length === 0) {
@@ -349,7 +351,7 @@ async function startTaskRun(state: DreamerState, db: Database, rowId: string, tr
   tracked.status = "running"
   tracked.at = Date.now()
   saveState(state)
-  const dreamerSes = await fireDreamer(null, tracked.directory, tracked.title || "задача", taskRunPromptFor(rowId, tracked, sessions, false))
+  const dreamerSes = await fireDreamer(tracked.directory, tracked.title || "задача", taskRunPromptFor(rowId, tracked, sessions, false))
   if (dreamerSes === null) {
     tracked.attempts += 1
     tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
@@ -395,6 +397,96 @@ async function reconcileTaskRuns(state: DreamerState, db: Database): Promise<voi
     log(`задачный прогон ${rowId.slice(0, 8)} → ${result} (replied=${replied}${timedOut ? ", timeout" : ""})`)
     saveState(state)
   }
+}
+
+/** Wakeup живой дример-сессии посессионного кандидата или миграция
+ *  legacy-child (баг 1077): child с parentID инжектит родителю synthetic на
+ *  каждый свой idle — вместо wakeup он замораживается (dreamerSes=null →
+ *  spawn-путь тика спавнит detached-замену, attempts переносит startRun).
+ *  Заморозка без DELETE: история дедупа остаётся в БД, выборки dreamer-детей
+ *  исключают (agent != 'dreamer'). Возвраты: "woken" (wakeup выполнен),
+ *  "failed" (wakeup-промпт упал, попытка записана), "unknown" (REST молчит —
+ *  не решаем), "migrated" (dreamerSes обнулён — нужен спавн замены). */
+async function wakeupOrMigrateLegacy(
+  state: DreamerState, db: Database, cand: Candidate, prev: TrackedSession, dreamerSes: string,
+): Promise<"woken" | "failed" | "unknown" | "migrated"> {
+  const legacyRow = fetchSessionById(db, dreamerSes)
+  if (legacyRow !== null && legacyRow.parentId !== null) {
+    log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} — legacy parentID-child, миграция на detached-спавн`)
+    prev.dreamerSes = null
+    return "migrated"
+  }
+  // верификация живости: либа детерминирована от state, REST — здесь
+  const alive = await sessionAlive(dreamerSes)
+  if (alive === null) return "unknown" // неизвестно — не решаем
+  if (!alive) {
+    // 404/400: дример-сессия удалена → spawn-fallback (инвариант ≤1 живого)
+    log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
+    prev.dreamerSes = null
+    return "migrated"
+  }
+  // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
+  // закроет как failed+attempt, восстановления без потерь)
+  prev.status = "running"
+  prev.wokenAt = Date.now()
+  prev.at = prev.wokenAt
+  if (cand.resetAttempts) prev.attempts = 0
+  saveState(state)
+  const prompt = wakeupPrompt({
+    sessionId: cand.session.id,
+    sessionTitle: cand.session.title,
+    auditPath: AUDIT_PATH,
+    dbPath: DB_PATH,
+    sinceIso: new Date(prev.lastProcessedUpdate).toISOString(),
+  })
+  const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
+  if (!ok) {
+    prev.attempts += 1
+    prev.status = prev.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
+    prev.at = Date.now()
+    log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup-промпт упал (попытка ${prev.attempts})`)
+    saveState(state)
+    return "failed"
+  }
+  log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup дримера ${dreamerSes}`)
+  return "woken"
+}
+
+/** Задачный wakeup живой дример-сессии (миграция не нужна: задачные прогоны
+ *  спавнились detached изначально — parent_id всегда NULL). Гвард dreamerSes
+ *  локальный — инвариант «wakeup ⇒ сессия есть» живёт в адмиссии другого
+ *  модуля, кросс-модульной зависимости не строим. Возвраты: "woken"/"failed"/
+ *  "unknown" — кандидат закрыт; "respawn" (404/400) — spawn-fallback тика. */
+async function taskRunWakeup(
+  state: DreamerState, db: Database, rowId: string, tracked: TrackedTaskRun, dreamerSes: string,
+): Promise<"woken" | "failed" | "unknown" | "respawn"> {
+  const alive = await sessionAlive(dreamerSes)
+  if (alive === null) return "unknown" // неизвестно — не решаем
+  if (!alive) {
+    // 404/400: дример-сессия удалена → spawn-fallback
+    log(`задача ${rowId.slice(0, 8)}: дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
+    tracked.dreamerSes = null
+    return "respawn"
+  }
+  // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
+  // закроет как failed+attempt, восстановления без потерь)
+  tracked.status = "running"
+  tracked.wokenAt = Date.now()
+  tracked.at = tracked.wokenAt
+  saveState(state)
+  const prompt = taskRunPromptFor(rowId, tracked, collectTaskSessions(db, tracked.rootSessions), true)
+  const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
+  if (!ok) {
+    tracked.attempts += 1
+    tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
+    tracked.at = Date.now()
+    log(`задача ${rowId.slice(0, 8)}: задачный wakeup упал (попытка ${tracked.attempts})`)
+    if (tracked.status === "gave_up") dropTaskActiveSessions(state.activeSessions, rowId)
+    saveState(state)
+    return "failed"
+  }
+  log(`задача ${rowId.slice(0, 8)}: задачный wakeup дримера ${dreamerSes}`)
+  return "woken"
 }
 
 async function tick(state: DreamerState, db: Database): Promise<void> {
@@ -501,50 +593,25 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     const prev = state.sessions[cand.session.id]
 
     if (cand.action === "wakeup" && prev !== undefined && prev.dreamerSes !== null) {
-      const dreamerSes = prev.dreamerSes
-      // верификация живости: либа детерминирована от state, REST — здесь
-      const alive = await sessionAlive(dreamerSes)
-      if (alive === true) {
-        // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
-        // закроет как failed+attempt, восстановления без потерь)
-        prev.status = "running"
-        prev.wokenAt = Date.now()
-        prev.at = prev.wokenAt
-        if (cand.resetAttempts) prev.attempts = 0
-        saveState(state)
-        const prompt = wakeupPrompt({
-          sessionId: cand.session.id,
-          sessionTitle: cand.session.title,
-          auditPath: AUDIT_PATH,
-                dbPath: DB_PATH,
-          sinceIso: new Date(prev.lastProcessedUpdate).toISOString(),
-        })
-        const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
-        if (!ok) {
-          prev.attempts += 1
-          prev.status = prev.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
-          prev.at = Date.now()
-          log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup-промпт упал (попытка ${prev.attempts})`)
-          saveState(state)
-          continue
-        }
-        log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): wakeup дримера ${dreamerSes}`)
-        continue
-      }
-      if (alive === null) continue // неизвестно — не решаем
-      // 404/400: дример-сессия удалена → spawn-fallback (инвариант ≤1 живого)
-      log(`сессия ${cand.session.id.slice(0, 8)} (${cand.reason}): дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
-      prev.dreamerSes = null
+      const outcome = await wakeupOrMigrateLegacy(state, db, cand, prev, prev.dreamerSes)
+      if (outcome !== "migrated") continue // woken/failed/unknown — кандидат закрыт; migrated → spawn замены ниже
     }
 
     const prompt = dreamerPrompt({
       sessionId: cand.session.id,
       sessionTitle: cand.session.title,
       auditPath: AUDIT_PATH,
-        dbPath: DB_PATH,
+      dbPath: DB_PATH,
     })
     const tracked = startRun(state, cand.session.id, cand.session.timeUpdated, cand.resetAttempts ? 0 : (prev?.attempts ?? 0))
-    const dreamerSes = await fireDreamer(cand.session.id, "", cand.session.title ?? "сессия", prompt)
+    // посессионный спавн: location = живой каталог исходной сессии. Гвард на
+    // call-site (не в fireDreamer): env-ворктри исходника мог быть снесён —
+    // тогда спавн без location (cwd демона); задачному прогону гвард не нужен —
+    // tracked.directory это мастер-чекаут проекта, он существует.
+    const spawnDir = cand.session.directory !== null && existsSync(cand.session.directory)
+      ? cand.session.directory
+      : ""
+    const dreamerSes = await fireDreamer(spawnDir, cand.session.title ?? "сессия", prompt)
     if (dreamerSes === null) {
       // спавн не удался: это тоже попытка — иначе вечный цикл
       tracked.attempts += 1
@@ -571,36 +638,8 @@ async function tick(state: DreamerState, db: Database): Promise<void> {
     if (activeRuns() >= CONCURRENCY) break
     if (drain.isStopping()) break
     if (cand.action === "wakeup" && tracked.dreamerSes !== null) {
-      const dreamerSes = tracked.dreamerSes
-      // верификация живости: либа детерминирована от state, REST — здесь;
-      // гвард dreamerSes локальный — инвариант «wakeup ⇒ сессия есть» живёт
-      // в адмиссии другого модуля, кросс-модульной зависимости не строим
-      const alive = await sessionAlive(dreamerSes)
-      if (alive === true) {
-        // атомарно: running+wokenAt ДО промпта (краш между ними → реконсилиация
-        // закроет как failed+attempt, восстановления без потерь)
-        tracked.status = "running"
-        tracked.wokenAt = Date.now()
-        tracked.at = tracked.wokenAt
-        saveState(state)
-        const prompt = taskRunPromptFor(rowId, tracked, collectTaskSessions(db, tracked.rootSessions), true)
-        const ok = await restCall(`/session/${dreamerSes}/prompt`, { method: "POST", body: { text: prompt } }).then(() => true).catch(() => false)
-        if (!ok) {
-          tracked.attempts += 1
-          tracked.status = tracked.attempts >= MAX_ATTEMPTS ? "gave_up" : "failed"
-          tracked.at = Date.now()
-          log(`задача ${rowId.slice(0, 8)}: задачный wakeup упал (попытка ${tracked.attempts})`)
-          if (tracked.status === "gave_up") dropTaskActiveSessions(state.activeSessions, rowId)
-          saveState(state)
-          continue
-        }
-        log(`задача ${rowId.slice(0, 8)}: задачный wakeup дримера ${dreamerSes}`)
-        continue
-      }
-      if (alive === null) continue // неизвестно — не решаем
-      // 404/400: дример-сессия удалена → spawn-fallback
-      log(`задача ${rowId.slice(0, 8)}: дример-сессия ${dreamerSes.slice(0, 8)} мертва — пересоздание`)
-      tracked.dreamerSes = null
+      const outcome = await taskRunWakeup(state, db, rowId, tracked, tracked.dreamerSes)
+      if (outcome !== "respawn") continue // woken/failed/unknown — кандидат закрыт; respawn → spawn-fallback ниже
     }
     if (DRY_RUN) {
       log(`DRY_RUN: задачный прогон над ${rowId.slice(0, 8)} — пропущен`)
