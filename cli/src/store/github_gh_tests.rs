@@ -99,7 +99,9 @@ async fn кап_страниц_это_громкий_отказ() {
     // Arrange: фитчер всегда отдаёт полную свежую страницу
     let fetch = async |n: usize| -> Result<Vec<Value>> {
         let base = (n as u64 - 1) * GH_PAGE_SIZE as u64;
-        Ok(page(&(base..base + GH_PAGE_SIZE as u64).collect::<Vec<_>>()))
+        Ok(page(
+            &(base..base + GH_PAGE_SIZE as u64).collect::<Vec<_>>(),
+        ))
     };
 
     // Act
