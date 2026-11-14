@@ -2,8 +2,8 @@
 //! нейтральные типы. Реализация — `github_task` (uwuwu-hub; срезы B/C
 //! задачи 20261112155302-ttyp35g).
 
-pub mod doc_store;
 mod close_verify;
+pub mod doc_store;
 pub mod github_doc_blob;
 pub mod github_doc_clone;
 pub mod github_doc_search;
