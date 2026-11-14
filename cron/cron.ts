@@ -248,13 +248,14 @@ async function readRows(board: BoardIds): Promise<CronRow[]> {
     }))
 }
 
-/** Свойства мастера из атрибутов дока-тела: расписание + базовый агент
- *  (один вызов get_doc_attrs на Вейт-строку, стоимость тика не растёт).
- *  schedule null — атрибута нет (обычная припаркованная в Вейт задача,
- *  не крон). REST getBlockAttrs, не SQL: колонка ial отстаёт от свежих записей. */
+/** Свойства мастера из клеток тела: расписание — глобальное поле
+ *  «Расписание» (ADR-098); agent — всегда "" (custom-agent — реликт
+ *  легаси-носителя, снесён задачей 1087; вечная сессия живёт деф-агентом).
+ *  Один вызов get_doc_attrs на Вейт-строку, стоимость тика не растёт.
+ *  schedule null — поля нет (обычная припаркованная в Вейт задача, не крон). */
 async function attrsOf(tool: PlatformTool, bodyDoc: string): Promise<{ schedule: string | null; agent: string }> {
   const attrs = await tool<{ [k: string]: string }>("get_doc_attrs", { docId: bodyDoc })
-  return { schedule: attrs["custom-schedule"] ?? null, agent: attrs["custom-agent"] ?? "" }
+  return { schedule: attrs["Расписание"] ?? null, agent: "" }
 }
 
 // ——— opencode REST ———

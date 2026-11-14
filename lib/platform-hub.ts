@@ -1,7 +1,9 @@
 //! Hub-режим TS-демонов: реализации tool-имён lib/platform над uwuwu-hub
-//! (issues + Projects v2 + body frontmatter) через gh subprocess.
+//! (issues + Projects v2 + глобальные issue fields) через gh subprocess.
 //! Срез D задачи 20261112155302-ttyp35g: демоны живут на hub при
-//! UWUWU_HUB_REPO.
+//! UWUWU_HUB_REPO. Носитель клеток переписан задачей 1087 (ADR-098):
+//! клетки — глобальные issue fields (payload issue_field_values), Status —
+//! Pv2 single-select; fm-шапка тел снесена.
 //!
 //! docId-схема: `issue:<number>` (тело задачи), `doc:<slug>` (md вики из
 //! git-клона), `board:<proj>` / `db:<proj>` (фиктивные док/database-блок
@@ -85,46 +87,122 @@ export function issueByNumber(number: string): Record<string, unknown> | null {
   }
 }
 
-/// Frontmatter issue body: строковые поля (status/branch/pr/dev-session/
-/// planned/schedule/custom-agent/autodone) + rest (тело после блока).
-export function parseFrontmatter(body: string): {
-  fields: Record<string, string>
-  rest: string
-} {
-  const fields: Record<string, string> = {}
-  if (body.startsWith("---\n")) {
-    const end = body.indexOf("\n---\n", 4)
-    if (end !== -1) {
-      for (const line of body.slice(4, end).split("\n")) {
-        const i = line.indexOf(": ")
-        if (i !== -1) fields[line.slice(0, i).trim()] = line.slice(i + 2).trim()
-      }
-      return { fields, rest: body.slice(end + 5) }
-    }
-  }
-  return { fields, rest: body }
+/// Имена глобальных issue fields — канон носителя (ADR-098).
+export const FIELD_NAMES = {
+  priority: "Приоритет",
+  autodone: "Autodone",
+  branch: "Branch",
+  pr: "PR",
+  devSession: "Сессия dev",
+  reviewSession: "Сессия ревью",
+  testSession: "Сессия тест",
+  schedule: "Расписание",
+  planned: "Запланировано",
+} as const
+
+/// Values payload глобальных полей issue (приходит прямо в GET issues
+/// и в list — живая проба #1092/задача 1087).
+interface IssueFieldValue {
+  issue_field_name?: string
+  value?: string | number | null
+  single_select_option?: { name?: string }
 }
 
-export function withFields(body: string, set: Record<string, string>): string {
-  const { fields, rest } = parseFrontmatter(body)
-  const merged: Array<[string, string]> = []
-  for (const [k, v] of Object.entries(fields)) {
-    if (!(k in set)) merged.push([k, v])
+export interface GhIssue {
+  number: number
+  title: string
+  body?: string | null
+  state: string
+  updated_at?: string
+  pull_request?: unknown
+  labels?: Array<{ name?: string }>
+  type?: { name?: string }
+  issue_field_values?: IssueFieldValue[]
+}
+
+/// Норм-форма клеток issue: text/date — `value`, single_select — имя опции;
+/// отсутствующее/пустое поле в карте нет (пустая клетка).
+export function fieldsOf(issue: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  const values = (issue["issue_field_values"] ?? []) as IssueFieldValue[]
+  for (const f of values) {
+    const name = f.issue_field_name ?? ""
+    if (name === "") continue
+    const value = f.single_select_option?.name
+      ?? (typeof f.value === "string" ? f.value : "")
+    if (value !== "") out[name] = value
   }
-  for (const [k, v] of Object.entries(set)) merged.push([k, v])
-  let out = "---\n"
-  for (const [k, v] of merged) out += `${k}: ${v}\n`
-  out += `---\n${rest}`
   return out
 }
 
-export function issuePatch(number: string, payload: Record<string, unknown>): void {
-  gh([ "api", "-X", "PATCH", `repos/${hubRepo()}/issues/${number}` ],
-    JSON.stringify(payload))
+/// Status-карта доски: issue number → имя статуса (Pv2-канон, батч-джойн;
+/// пагинация обязательна — доска uwuwu >700 items).
+export function projectStatuses(project: string): Map<number, string> {
+  const projNumber = projectBoardNumber(project)
+  const out = new Map<number, string>()
+  if (projNumber === null) return out
+  let cursor: string | null = null
+  for (;;) {
+    const d = JSON.parse(gh([ "api", "graphql", "--input", "-" ], JSON.stringify({
+      query: `query($n: Int!, $cursor: String) { viewer { projectV2(number: $n) {
+        items(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            content { ... on Issue { number } }
+            fieldValueByName(name: "Status") {
+              ... on ProjectV2ItemFieldSingleSelectValue { name }
+            }
+          }
+        } } } }`,
+      variables: { n: projNumber, cursor },
+    })))
+    const items = d.data?.viewer?.projectV2?.items?.nodes ?? []
+    for (const it of items) {
+      const num = it.content?.number
+      const status = it.fieldValueByName?.name
+      if (typeof num === "number" && typeof status === "string") out.set(num, status)
+    }
+    const page = d.data?.viewer?.projectV2?.items?.pageInfo
+    if (!page?.hasNextPage || typeof page.endCursor !== "string") break
+    cursor = page.endCursor
+  }
+  return out
 }
 
-/// Projects v2: Status (single-select) на item issue — канбан владельца
-/// ходит с frontmatter'ом (демоны пишут оба носителя).
+/// Батч-запись клеток: `null` — очистка (DELETE; 404 на отсутствующем
+/// значении — no-op), строка — запись (text/date значение-строкой,
+/// single_select — именем опции; контракт живой пробы #1092).
+export function setIssueFields(
+  number: string,
+  fields: Record<string, string | null>,
+): void {
+  const catalog = ghJson<Array<{ id: number; name: string }>>(["api", "/user/issue-fields"])
+  const idOf = (name: string): number => {
+    const f = catalog.find((c) => c.name === name)
+    if (f === undefined) throw new Error(`глобальное поле «${name}» не найдено`)
+    return f.id
+  }
+  const batch: Array<{ field_id: number; value: string }> = []
+  for (const [name, value] of Object.entries(fields)) {
+    const fid = idOf(name)
+    if (value === null || value === "") {
+      // очистка: DELETE; 404 (значения не было) — no-op
+      try {
+        gh([ "api", "-X", "DELETE", `repos/${hubRepo()}/issues/${number}/issue-field-values/${fid}` ])
+      } catch (e) {
+        if (!String(e).includes("404")) throw e
+      }
+      continue
+    }
+    batch.push({ field_id: fid, value })
+  }
+  if (batch.length === 0) return
+  gh([ "api", "-X", "POST", `repos/${hubRepo()}/issues/${number}/issue-field-values` ],
+    JSON.stringify({ issue_field_values: batch }))
+}
+
+/// Status (single-select) на item issue — Pv2-канан; мутация уже канон
+/// (set-путь не тронут миграцией 1087).
 export function setProjectStatus(project: string, number: string, status: string): void {
   const projNumber = projectBoardNumber(project)
   if (projNumber === null) return
