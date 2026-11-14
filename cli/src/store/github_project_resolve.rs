@@ -6,7 +6,8 @@
 use super::github_gh::gh_graphql;
 use super::github_task::GitHubStore;
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Канбаны «Задачи <proj>» пер-проектные: label issue → (номер, id) проекта.
 /// None — у issue нет proj-label (status-поле не применимо).
@@ -103,8 +104,119 @@ pub(super) async fn issue_node_id(store: &GitHubStore, issue_number: &str) -> Re
         .context("issue node id пуст")
 }
 
+/// Точечный Status одной задачи: issue.projectItems → Pv2 Status
+/// (read-after-write мутаций). Item матчится по номеру **доски проекта**,
+/// резолвленной из proj-label issue (ревью High-1: сравнение с номером
+/// issue всегда промахивалось — read-after-write отдавал Todo-дефолт).
+/// None — карточки в «её» доске нет/поля нет/канбана нет.
+pub(super) async fn project_status_of(
+    store: &GitHubStore,
+    issue_number: &str,
+) -> Result<Option<String>> {
+    // Доска задачи = проект её proj-label (паритет set_status: пишем туда же)
+    let Some((board_number, _)) = project_for_label(store, issue_number).await? else {
+        return Ok(None);
+    };
+    let data = gh_graphql(
+        "query($repo: String!, $owner: String!, $n: Int!) {
+            repository(name: $repo, owner: $owner) {
+                issue(number: $n) {
+                    projectItems(first: 10) {
+                        nodes {
+                            project { ... on ProjectV2 { number } }
+                            fieldValueByName(name: \"Status\") {
+                                ... on ProjectV2ItemFieldSingleSelectValue { name }
+                            }
+                        }
+                    }
+                }
+            }
+        }",
+        &(issue_ctx(store, issue_number).await),
+    )
+    .await?;
+    let nodes = data
+        .pointer("/repository/issue/projectItems/nodes")
+        .and_then(|nodes| nodes.as_array());
+    Ok(nodes.and_then(|a| item_status(a, board_number)))
+}
+
+/// Чистый матч item по номеру доски → имя Status (юнит-покрытие ревью High-1:
+/// номер канбана ≠ номер issue — предикат по issue-номеру всегда промах).
+fn item_status(items: &[Value], board_number: i64) -> Option<String> {
+    items
+        .iter()
+        .find(|item| item.pointer("/project/number").and_then(|x| x.as_i64()) == Some(board_number))
+        .and_then(|item| {
+            item.pointer("/fieldValueByName/name")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+}
+
+/// Батч Status всех items доски «Задачи <proj>» (джойн для list; пагинация
+/// обязательна — доска uwuwu >700 items). Возвращает {issue_number: status}.
+/// Пустая карта — канбана нет (резолв по тайтлу не нашёл проект).
+pub(super) async fn project_statuses(project: &str) -> Result<HashMap<String, String>> {
+    let Some(number) = project_number_by_title(project).await? else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let data = gh_graphql(
+            "query($n: Int!, $cursor: String) {
+                viewer { projectV2(number: $n) {
+                    items(first: 100, after: $cursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                            content { ... on Issue { number } }
+                            fieldValueByName(name: \"Status\") {
+                                ... on ProjectV2ItemFieldSingleSelectValue { name }
+                            }
+                        }
+                    }
+                } }
+            }",
+            &json!({
+                "n": number,
+                "cursor": cursor.as_deref(),
+            }),
+        )
+        .await?;
+        let items = data
+            .pointer("/viewer/projectV2/items/nodes")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            if let (Some(num), Some(status)) = (
+                item.pointer("/content/number").and_then(|x| x.as_i64()),
+                item.pointer("/fieldValueByName/name")
+                    .and_then(|x| x.as_str()),
+            ) {
+                out.insert(num.to_string(), status.to_string());
+            }
+        }
+        let has_next = data
+            .pointer("/viewer/projectV2/items/pageInfo/hasNextPage")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        cursor = data
+            .pointer("/viewer/projectV2/items/pageInfo/endCursor")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Item id через issue.projectItems (пагинация project items не нужна:
-/// issue входит в 1–2 проекта, first: 10 покрывает).
 pub(super) async fn item_id_of(
     store: &GitHubStore,
     issue_number: &str,
@@ -207,4 +319,32 @@ pub(super) async fn status_field_ids(project_id: &str, status: &str) -> Result<(
         .with_context(|| format!("опция Status «{needle}» не найдена (канон срез A)"))?
         .to_string();
     Ok((field_id, option_id))
+}
+
+#[cfg(test)]
+mod item_status_tests {
+    use super::{item_status, Value, json};
+
+    fn items() -> Vec<Value> {
+        vec![
+            json!({ "project": { "number": 5 }, "fieldValueByName": { "name": "In Progress" } }),
+            json!({ "project": { "number": 14 }, "fieldValueByName": { "name": "Draft" } }),
+            json!({ "project": { "number": 12 } }), // Status-поля нет
+        ]
+    }
+
+    #[test]
+    fn матч_по_номеру_доски_не_по_номеру_issue() {
+        // ревью High-1: issue #1087 живёт в канване #5 — предикат
+        // project.number == 1087 промахивался и съедал статус мутаций
+        assert_eq!(item_status(&items(), 5).as_deref(), Some("In Progress"));
+        assert_eq!(item_status(&items(), 14).as_deref(), Some("Draft"));
+    }
+
+    #[test]
+    fn нет_карточки_или_поля_none() {
+        assert_eq!(item_status(&items(), 7), None, "чужой канбан");
+        assert_eq!(item_status(&items(), 12), None, "item без Status-поля");
+        assert_eq!(item_status(&[], 5), None);
+    }
 }

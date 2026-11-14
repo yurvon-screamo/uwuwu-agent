@@ -8,12 +8,14 @@ pub mod github_doc_clone;
 pub mod github_doc_search;
 pub mod github_doc_store;
 pub mod github_gh;
+pub mod github_issue_fields;
 pub mod github_project;
 pub mod github_project_resolve;
 pub mod github_task;
 pub mod github_task_read;
 pub mod github_task_write;
 pub mod git_util;
+pub mod task_migrate;
 pub mod task_store;
 
 #[cfg(test)]

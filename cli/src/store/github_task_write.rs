@@ -1,46 +1,65 @@
 //! GitHubStore write-side: create/edit/comment/claim/close/attrs.
-//! Хелперы-методы (единый trait-impl с
-//! делегацией — E0119). Мутации Project v2 полей — github_project.rs.
+//! Хелперы-методы (единый trait-impl с делегацией — E0119).
+//! Клетки — глобальные issue fields (ADR-098), Status — Pv2 single-select
+//! (github_project.rs). fm-шапка тел снесена (задача 1087).
 
+use super::github_issue_fields::{self, names, FieldValue};
 use super::github_project;
-use super::github_task::{Frontmatter, GitHubStore};
+use super::github_task::GitHubStore;
 use super::task_store::{CommentInsert, CreateTask, EditTask, StoreResult, TaskStore};
 use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::{json, Map, Value};
 
-/// fm-шапка новой задачи: status всегда; priority — явный флаг, иначе
-/// дефолт medium (решение владельца 13.11), но авторский priority во
-/// fm тела (--stdin) перекрыт дефолтом не бывает; autodone — явный
-/// флаг, иначе дефолт true (решение владельца 14.11), авторский
-/// autodone во fm тела перекрыт дефолтом не бывает.
-/// Порядок ячеек стабилен: status, priority, autodone.
-pub(super) fn create_frontmatter(
-    body_md: &str,
-    status: &str,
-    priority: Option<&str>,
-    autodone: Option<bool>,
-) -> String {
-    let fm = Frontmatter::parse(body_md);
-    let mut cells: Vec<(&str, String)> = vec![("status", status.to_string())];
-    let priority_cell = match priority {
-        Some(p) => Some(p.to_string()),
-        None if fm.get("priority").is_none() => Some("medium".to_string()),
-        None => None,
+/// EditTask → батч клеток глобальных полей. Some("") — очистка клетки
+/// (None в значении); autodone — select on/off; planned — date
+/// (нормализация дисплей-формы).
+fn edit_cells(
+    patch: &EditTask,
+) -> StoreResult<Vec<(&'static str, Option<github_issue_fields::FieldValue>)>> {
+    use github_issue_fields::FieldValue;
+    let text_cell = |v: &Option<String>| -> Option<Option<FieldValue>> {
+        v.as_ref().map(|s| match s.as_str() {
+            "" => None,
+            other => Some(FieldValue::Text(other.to_string())),
+        })
     };
-    if let Some(p) = priority_cell {
-        cells.push(("priority", p));
+    let mut cells: Vec<(&'static str, Option<FieldValue>)> = Vec::new();
+    if let Some(v) = text_cell(&patch.branch) {
+        cells.push((names::BRANCH, v));
     }
-    let autodone_cell = match autodone {
-        Some(ad) => Some(if ad { "true" } else { "false" }.to_string()),
-        None if fm.get("autodone").is_none() => Some("true".to_string()),
-        None => None,
-    };
-    if let Some(ad) = autodone_cell {
-        cells.push(("autodone", ad));
+    if let Some(v) = text_cell(&patch.pr) {
+        cells.push((names::PR, v));
     }
-    let pairs: Vec<(&str, &str)> = cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    fm.with_fields(&pairs)
+    if let Some(v) = text_cell(&patch.dev_session) {
+        cells.push((names::DEV_SESSION, v));
+    }
+    if let Some(p) = &patch.priority {
+        cells.push((
+            names::PRIORITY,
+            match p.as_str() {
+                "" => None,
+                other => Some(FieldValue::Select(other.to_string())),
+            },
+        ));
+    }
+    if let Some(ad) = patch.autodone {
+        cells.push((
+            names::AUTODONE,
+            Some(FieldValue::Select(if ad { "on" } else { "off" }.into())),
+        ));
+    }
+    if let Some((planned, _ms)) = &patch.planned {
+        let date = github_project::normalize_date(planned)?;
+        cells.push((
+            names::PLANNED,
+            match date.as_str() {
+                "" => None,
+                other => Some(FieldValue::Date(other.to_string())),
+            },
+        ));
+    }
+    Ok(cells)
 }
 
 impl GitHubStore {
@@ -68,10 +87,12 @@ impl GitHubStore {
                 input.title, input.task_type.0
             ),
         };
-        let body = create_frontmatter(&body_md, &status, input.priority.as_deref(), input.autodone);
+        // тело пишется как есть: мета в md не живёт (ADR-098), дефолты
+        // клеток (priority medium — решение владельца 13.11, autodone true —
+        // 14.11) уходят в поля ниже
         let mut payload = Map::new();
         payload.insert("title".into(), json!(input.title));
-        payload.insert("body".into(), json!(body));
+        payload.insert("body".into(), json!(body_md));
         payload.insert("labels".into(), json!([self.label_of(board)]));
         if input.task_type.is_set() {
             payload.insert("type".into(), json!(input.task_type.0));
@@ -97,7 +118,26 @@ impl GitHubStore {
             }
         };
         let number = created["number"].to_string();
-        github_project::set_status_and_planned(self, &number, Some(&status), None).await?;
+        github_project::set_status(self, &number, Some(&status)).await?;
+        let priority = input.priority.as_deref().unwrap_or("medium");
+        let autodone = input.autodone.unwrap_or(true);
+        github_issue_fields::set_fields(
+            &number,
+            &self.repo,
+            &[
+                (
+                    names::PRIORITY,
+                    Some(FieldValue::Select(priority.to_string())),
+                ),
+                (
+                    names::AUTODONE,
+                    Some(FieldValue::Select(
+                        if autodone { "on" } else { "off" }.into(),
+                    )),
+                ),
+            ],
+        )
+        .await?;
         Ok(self.issue_fresh(&number).await?)
     }
 
@@ -133,41 +173,14 @@ impl GitHubStore {
             )
             .await?;
         }
-        // status — тоже fm-зеркало: читатели (task get/list, демоны) читают
-        // fm из тела; поле Projects v2 пишется ниже отдельно
-        let front_cells: Vec<(&str, &String)> = [
-            ("status", &patch.status),
-            ("branch", &patch.branch),
-            ("pr", &patch.pr),
-            ("dev-session", &patch.dev_session),
-            ("priority", &patch.priority),
-        ]
-        .into_iter()
-        .filter_map(|(k, v)| v.as_ref().map(|s| (k, s)))
-        .collect();
-        if !front_cells.is_empty() {
-            let body_md = self.issue_body(&number).await?;
-            let cells: Vec<(&str, &str)> =
-                front_cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let body = Frontmatter::parse(&body_md).with_fields(&cells);
-            self.set_issue_body(&number, &body).await?;
-        }
-        if let Some((planned_date, _ms)) = &patch.planned {
-            let body_md = self.issue_body(&number).await?;
-            let body = Frontmatter::parse(&body_md).with_field("planned", planned_date);
-            self.set_issue_body(&number, &body).await?;
-        }
-        if let Some(ad) = patch.autodone {
-            let body_md = self.issue_body(&number).await?;
-            let body = Frontmatter::parse(&body_md)
-                .with_field("autodone", if ad { "true" } else { "false" });
-            self.set_issue_body(&number, &body).await?;
+        // Клетки — один батч в глобальные поля (сборка — edit_cells);
+        // Some("") — очистка клетки (DELETE); статус — Pv2-мутация отдельно
+        let cells = edit_cells(patch)?;
+        if !cells.is_empty() {
+            github_issue_fields::set_fields(&number, &self.repo, &cells).await?;
         }
         if let Some(status) = &patch.status {
-            github_project::set_status_and_planned(self, &number, Some(status), None).await?;
-        }
-        if let Some((planned, _ms)) = &patch.planned {
-            github_project::set_status_and_planned(self, &number, None, Some(planned)).await?;
+            github_project::set_status(self, &number, Some(status)).await?;
         }
         self.issue_fresh(&number).await
     }
@@ -207,9 +220,15 @@ impl GitHubStore {
         task: &Task,
         session: &str,
     ) -> StoreResult<Task> {
-        let body_md = self.issue_body(&task.id).await?;
-        let body = Frontmatter::parse(&body_md).with_field("dev-session", session);
-        self.set_issue_body(&task.id, &body).await?;
+        github_issue_fields::set_fields(
+            &task.id,
+            &self.repo,
+            &[(
+                names::DEV_SESSION,
+                Some(FieldValue::Text(session.to_string())),
+            )],
+        )
+        .await?;
         self.issue_fresh(&task.id).await
     }
 
@@ -237,6 +256,10 @@ impl GitHubStore {
         self.issue_fresh(number).await
     }
 
+    /// Атрибут тела: единственный потребитель — `--schedule` (клетка
+    /// «Расписание»). Пустое значение — очистка клетки (паритет edit).
+    /// Прочие ключи — громкий отказ (молчаливая запись в несуществующий
+    /// носитель маскировала бы потерю).
     pub(super) async fn set_body_attr_impl(
         &self,
         _board: &TaskBoard,
@@ -244,8 +267,22 @@ impl GitHubStore {
         key: &str,
         value: &str,
     ) -> StoreResult<()> {
-        let body_md = self.issue_body(&task.id).await?;
-        let body = Frontmatter::parse(&body_md).with_field(key, value);
-        self.set_issue_body(&task.id, &body).await
+        if key != "schedule" {
+            anyhow::bail!("set_body_attr: ключ «{key}» не поддержан (только schedule)");
+        }
+        github_issue_fields::set_fields(
+            &task.id,
+            &self.repo,
+            &[(
+                names::SCHEDULE,
+                if value.is_empty() {
+                    None // очистка: DELETE (POST с "" — HTTP 500, проба #1092)
+                } else {
+                    Some(FieldValue::Text(value.to_string()))
+                },
+            )],
+        )
+        .await?;
+        Ok(())
     }
 }
