@@ -3,8 +3,8 @@
 //! 1087 (ADR-098) клетки — глобальные issue fields, Status — Pv2
 //! (projectStatuses-джойн), closed → Done (проекция state).
 
-import { hubCloneRoot } from "./platform-hub"
 import type { GhIssue } from "./platform-hub"
+import { hubGitExists, hubGitListDir, hubGitShow } from "./hub-git"
 import {
   FIELD_NAMES,
   fieldsOf,
@@ -55,19 +55,9 @@ export async function hubTool<T = Record<string, unknown>>(
       if (proj) return { id: docId, title: `Задачи ${proj}`, box: "hub", hpath: `Задачи ${proj}` } as T
       const parsed = parseDocId(docId)
       if (parsed?.kind === "doc") {
-        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
-        let title = parsed.payload.split("/").pop() ?? ""
-        let content = ""
-        let exists = false
-        try {
-          const raw = require("node:fs").readFileSync(mdPath, "utf8")
-          content = raw
-          exists = true
-          const fmTitle = raw.match(/^title:\s*(.+)$/m)
-          if (fmTitle) title = fmTitle[1].trim()
-        } catch {}
+        const doc = wikiDoc(parsed.payload)
         // контракт resolvePinningDoc: exists + markdown (не content)
-        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
+        return { id: docId, title: doc.title, box: "hub", hpath: parsed.payload, exists: doc.exists, markdown: doc.content } as T
       }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
@@ -180,19 +170,9 @@ export async function hubTool<T = Record<string, unknown>>(
       const docId = String(args.docId ?? "")
       const parsed = parseDocId(docId)
       if (parsed?.kind === "doc") {
-        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
-        let title = parsed.payload.split("/").pop() ?? ""
-        let content = ""
-        let exists = false
-        try {
-          const raw = require("node:fs").readFileSync(mdPath, "utf8")
-          content = raw
-          exists = true
-          const fmTitle = raw.match(/^title:\s*(.+)$/m)
-          if (fmTitle) title = fmTitle[1].trim()
-        } catch {}
+        const doc = wikiDoc(parsed.payload)
         // контракт resolvePinningDoc: exists + markdown (не content)
-        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
+        return { id: docId, title: doc.title, box: "hub", hpath: parsed.payload, exists: doc.exists, markdown: doc.content } as T
       }
       if (parsed?.kind === "issue") {
         const issue = issueByNumber(parsed.payload)
@@ -228,19 +208,9 @@ export async function hubTool<T = Record<string, unknown>>(
       const docId = String(args.docId ?? "")
       const parsed = parseDocId(docId)
       if (parsed?.kind === "doc") {
-        const mdPath = `${hubCloneRoot()}/docs/${parsed.payload}.md`
-        let title = parsed.payload.split("/").pop() ?? ""
-        let content = ""
-        let exists = false
-        try {
-          const raw = require("node:fs").readFileSync(mdPath, "utf8")
-          content = raw
-          exists = true
-          const fmTitle = raw.match(/^title:\s*(.+)$/m)
-          if (fmTitle) title = fmTitle[1].trim()
-        } catch {}
+        const doc = wikiDoc(parsed.payload)
         // контракт resolvePinningDoc: exists + markdown (не content)
-        return { id: docId, title, box: "hub", hpath: parsed.payload, exists, markdown: content } as T
+        return { id: docId, title: doc.title, box: "hub", hpath: parsed.payload, exists: doc.exists, markdown: doc.content } as T
       }
       if (parsed?.kind === "issue") {
         return { ...fieldsOf(issueByNumber(parsed.payload) ?? {}) } as T
@@ -259,37 +229,30 @@ export async function hubTool<T = Record<string, unknown>>(
       // пиннинг-док «Node-pinning» в проекте uwuwu (resolvePinningDoc демонов).
       // Папка проекта <proj> в wiki-ветке Projects нужна демону resolvePinningDoc
       // (он ищет папку с data == «<proj>», в ней — док «Node-pinning»).
-      const clone = hubCloneRoot()
       const wikiRoots: Array<[string, string]> = [["Projects", "Projects"], ["Experience", "Experience"]]
       for (const [dir, idPrefix] of wikiRoots) {
         const folderId = `wiki:${idPrefix}`
         nodes.push({ id: folderId, type: "folder", data: idPrefix, parentId: "nb-projects" })
-        const dirPath = `${clone}/docs/${dir}`
-        try {
-          for (const entry of require("node:fs").readdirSync(dirPath, { withFileTypes: true })) {
-            if (entry.name.startsWith(".")) continue
-            if (entry.isDirectory()) {
-              nodes.push({ id: `wikifolder:${dir}/${entry.name}`, type: "folder", data: entry.name, parentId: folderId })
-            } else if (entry.name.endsWith(".md")) {
-              const base = entry.name.replace(/\.md$/, "")
-              const docId = `doc:${dir}/${base}`
-              nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
-            }
+        for (const entry of hubGitListDir(`docs/${dir}`)) {
+          if (entry.name.startsWith(".")) continue
+          if (entry.isDir) {
+            nodes.push({ id: `wikifolder:${dir}/${entry.name}`, type: "folder", data: entry.name, parentId: folderId })
+          } else if (entry.name.endsWith(".md")) {
+            const base = entry.name.replace(/\.md$/, "")
+            const docId = `doc:${dir}/${base}`
+            nodes.push({ id: docId, type: "doc", data: docId, parentId: folderId })
           }
-        } catch {}
+        }
       }
       // Вики-доки проектов — прямые дети pf:<proj>: resolvePinningDoc
       // ищет док «Node-pinning» среди children папки проекта
       for (const project of projects()) {
-        const dirPath = `${clone}/docs/Projects/${project}`
-        try {
-          for (const entry of require("node:fs").readdirSync(dirPath, { withFileTypes: true })) {
-            if (!entry.isFile() || !entry.name.endsWith(".md")) continue
-            const base = entry.name.replace(/\.md$/, "")
-            const docId = `doc:Projects/${project}/${base}`
-            nodes.push({ id: docId, type: "doc", data: docId, parentId: `pf:${project}` })
-          }
-        } catch {}
+        for (const entry of hubGitListDir(`docs/Projects/${project}`)) {
+          if (entry.isDir || !entry.name.endsWith(".md")) continue
+          const base = entry.name.replace(/\.md$/, "")
+          const docId = `doc:Projects/${project}/${base}`
+          nodes.push({ id: docId, type: "doc", data: docId, parentId: `pf:${project}` })
+        }
       }
       return { nodes } as T
     }
@@ -339,21 +302,25 @@ function projects(): string[] {
     .filter((n) => n.startsWith("proj:"))
     .map((n) => n.slice("proj:".length))
 }
-function mdClonePath(slug: string): string {
-  const root = process.env.UWUWU_HUB_CLONE_ROOT
-    ? process.env.UWUWU_HUB_CLONE_ROOT
-    : `${process.env.HOME ?? "."}/.local/share/uwuwu-cli/hub-clone`
-  return `${root}/${hubRepo().replace("/", "__")}/docs/${slug.replace(/^\/+/, "")}.md`
+/** Wiki-файл из дерева origin/main (hub-git, без worktree): контент + тайтл
+ *  из frontmatter + exists. Единый контракт doc-веток адаптера. Демоны —
+ *  читатели: worktree клона мутирует cli (писатель) — чтение через git
+ *  дерево не пересекается с его reset/записью, клон свежеет fetch-гейтом
+ *  без внешнего cli-трафика (инцидент 13–14.11, задача 1075). */
+function wikiDoc(slug: string): { title: string; content: string; exists: boolean } {
+  const base = slug.split("/").pop() ?? ""
+  const content = hubGitShow(`docs/${slug}.md`)
+  if (content === null) return { title: base, content: "", exists: false }
+  const fmTitle = content.match(/^title:\s*(.+)$/m)
+  return { title: fmTitle ? fmTitle[1].trim() : base, content, exists: true }
 }
 
 function mdExists(slug: string): boolean {
-  const { statSync } = require("node:fs") as typeof import("node:fs")
-  return statSync(mdClonePath(slug)).isFile()
+  return hubGitExists(`docs/${slug}.md`)
 }
 
 function mdFromClone(slug: string): string {
-  const { readFileSync } = require("node:fs") as typeof import("node:fs")
-  return readFileSync(mdClonePath(slug), "utf8")
+  return hubGitShow(`docs/${slug}.md`) ?? ""
 }
 
 function projectOf(number: string): string {
