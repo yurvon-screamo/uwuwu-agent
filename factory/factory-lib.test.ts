@@ -1726,6 +1726,33 @@ describe("sessionTitle", () => {
     expect(Array.from(out).length).toBe(SESSION_TITLE_MAX)
     expect(out.endsWith("👍")).toBe(true)
   })
+
+  test("граница контракта: ровно 80 points не режется, 81-й point срезается (пин tester 1051)", () => {
+    const points = (t: string): number => Array.from(t).length
+    const head = `📋 uwuwu: 1051 — `
+    const tail = `${"х".repeat(SESSION_TITLE_MAX - Array.from(head).length - 1)}◆`
+    // ровно 80 — не тронут: маркер-хвост на месте
+    const fit = sessionTitle("dev", "uwuwu", "1051", tail)
+    expect(points(fit)).toBe(SESSION_TITLE_MAX)
+    expect(fit.endsWith("◆")).toBe(true)
+    // 81-й point срезается без lone-суррогата и без сдвига лимита
+    const over1 = sessionTitle("dev", "uwuwu", "1051", `${tail}z`)
+    expect(points(over1)).toBe(SESSION_TITLE_MAX)
+    expect(over1.endsWith("z")).toBe(false)
+    expect(over1.endsWith("◆")).toBe(true)
+    const over2 = sessionTitle("dev", "uwuwu", "1051", `${tail}zz`)
+    expect(points(over2)).toBe(SESSION_TITLE_MAX)
+    expect(over2.endsWith("zz")).toBe(false)
+  })
+
+  test("идемпотентность гарда: sessionTitle-вывод проходит createSession-гард без изменений (пин tester 1051)", () => {
+    // гард createSession: truncateCodePoints(title.replace(CRLF), SESSION_TITLE_MAX)
+    const guard = (t: string): string => truncateCodePoints(t.replace(/[\r\n]+/g, " "), SESSION_TITLE_MAX)
+    for (const kind of ["dev", "review", "test"] as const) {
+      const out = sessionTitle(kind, "uwuwu", "1051", "длинный ".repeat(30))
+      expect(guard(out)).toBe(out)
+    }
+  })
 })
 
 describe("truncateCodePoints", () => {
