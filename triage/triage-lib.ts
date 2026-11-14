@@ -174,6 +174,37 @@ export interface DraftRow {
   title: string
 }
 
+/** Строка доски из read_database_cells: шейп носителя (hub отдаёт ячейки,
+ *  легаси-транспорт — ещё и title/linkedDocId верхним уровнем). */
+export interface BoardRow {
+  rowBlockId?: string
+  /** Нативный state issue; отсутствует у легаси-носителя. */
+  state?: string
+  linkedDocId?: string | null
+  title?: string | null
+  cells?: Record<string, { value?: string }>
+}
+
+/** Матч строки доски → черновик: Draft-статус у открытого issue. Мёртвый
+ *  маркер (fm Draft у closed issue — закрытия мимо cli: миграции, gh UI,
+ *  одноразовые пробы) до трекера и очереди не доезжает — это гард первой
+ *  доставки, seen-ack (ADR-018) такие не ловит. Отсутствие state — прежнее
+ *  поведение (деградация без гарда, не падение). null — строка не черновик. */
+export function draftRowOf(row: BoardRow): DraftRow | null {
+  if (typeof row.rowBlockId !== "string") return null
+  if (row.cells?.Status?.value !== "Draft") return null
+  if (row.state === "closed") return null
+  // hub-эпоха (#1126): тайтл в cells["Название"], тело черновика — сам issue
+  const docId = typeof row.linkedDocId === "string" && row.linkedDocId !== ""
+    ? row.linkedDocId
+    : row.cells?.Название !== undefined ? `issue:${row.rowBlockId}` : ""
+  return {
+    rowId: row.rowBlockId,
+    docId,
+    title: (row.title ?? row.cells?.Название?.value ?? "").trim(),
+  }
+}
+
 /** Синк трекера vs доски: новые sighting'и, смена тайтла, чистка ушедших из
  *  Draft (вместе со снятием skip). Мутирует state-поля; fresh — готовые
  *  лог-строки новых sighting'ов (демон отдаёт в hub.log). */

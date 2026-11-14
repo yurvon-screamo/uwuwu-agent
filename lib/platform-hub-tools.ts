@@ -98,6 +98,9 @@ export async function hubTool<T = Record<string, unknown>>(
         const autodoneRaw = f[FIELD_NAMES.autodone] ?? ""
         return {
           rowBlockId: number,
+          // нативный state issue (не fm): гард драфт-матча триажа
+          // не доставляет fm-Draft маркеры закрытых issues (#1073)
+          state: issue.state,
           // легаси-семантика привязки строки: docId тела — без него readTasks
           // даёт bodyDoc='' навсегда (комменты/notify/watchdog-fm глухие),
           // фоллбек по тайтлу мёртв (баг-пин tester 1070: 21/21 треков с

@@ -14,8 +14,9 @@ import {
   type Request,
 } from "../lib/hub"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker as syncDraftTrackerState, tickOutcome, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, draftRowOf, parseWatchSec, setDraftAck, syncDraftTracker as syncDraftTrackerState, tickOutcome, validTriageExtras,
   DRAFT_MAX_TURNS,
+  type BoardRow,
   type DraftRow,
   type DraftTrack,
   type TickFailGate,
@@ -147,25 +148,18 @@ async function refreshBoards(hub: Hub): Promise<BoardRef[]> {
 }
 
 async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
-  const r = await mcpTool<{
-    rows?: { rowBlockId?: string; linkedDocId?: string | null; title?: string | null; cells?: Record<string, { value?: string }> }[]
-  }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
+  const r = await mcpTool<{ rows?: BoardRow[] }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
   const out: DraftRow[] = []
   for (const row of r.rows ?? []) {
-    if (typeof row.rowBlockId !== "string" || row.cells?.Status?.value !== "Draft") continue
-    // hub-эпоха (#1126): тайтл в cells["Название"], тело черновика — сам issue
-    const isHubRow = row.cells?.Название !== undefined
-    const docId = typeof row.linkedDocId === "string" && row.linkedDocId !== ""
-      ? row.linkedDocId
-      : isHubRow ? `issue:${row.rowBlockId}` : ""
-    let title = (row.title ?? row.cells?.Название?.value ?? "").trim()
+    const d = draftRowOf(row)
+    if (d === null) continue
     // заголовок линкованной строки живёт в доке-теле (read_database_cells
     // отдаёт пустоту) — доставали для промпта/skip-уведомления
-    if (title === "" && docId !== "") {
-      const d = await mcpTool<{ title?: string }>("get_doc", { docId }).catch(() => null)
-      title = typeof d?.title === "string" ? d.title.trim() : ""
+    if (d.title === "" && d.docId !== "") {
+      const doc = await mcpTool<{ title?: string }>("get_doc", { docId: d.docId }).catch(() => null)
+      d.title = typeof doc?.title === "string" ? doc.title.trim() : ""
     }
-    out.push({ rowId: row.rowBlockId, docId, title })
+    out.push(d)
   }
   return out
 }

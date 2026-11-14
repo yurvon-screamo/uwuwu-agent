@@ -2,8 +2,9 @@
 // (bun test, без сети; ядро демона — lib/hub.ts, его тесты рядом с ним)
 import { test, expect } from "bun:test"
 import {
-  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, parseWatchSec, setDraftAck, syncDraftTracker, tickOutcome, validTriageExtras,
+  applyBodyDelta, applyTurns, composeDraftPrompt, draftReady, draftRowOf, parseWatchSec, setDraftAck, syncDraftTracker, tickOutcome, validTriageExtras,
   DRAFT_ACK_TERMINAL, DRAFT_CAP_MS, DRAFT_QUIET_MS, DRAFT_REPOST_COOLDOWN_MS, DRAFT_TICK_FAIL_ALERT_AFTER, DRAFT_TICK_FAIL_ALERT_EVERY_MS,
+  type BoardRow,
   type DraftRow,
   type DraftTrack,
 } from "./triage-lib"
@@ -90,6 +91,37 @@ test("composeDraftPrompt: только метаданные, длинный за
   const long = composeDraftPrompt("uwuwu", "r1", "д".repeat(200))
   expect(long.length).toBeLessThan(400)
   expect(long).toContain("…")
+})
+
+// ——— draftRowOf: матч строки доски (state-гард мёртвых маркеров) ———
+
+const boardRow = (over: Partial<BoardRow>): BoardRow => ({
+  rowBlockId: "r1", state: "open", linkedDocId: "doc-1", title: "Черновик",
+  cells: { Status: { value: "Draft" } },
+  ...over,
+})
+
+test("draftRowOf: closed issue с Draft-маркером — null (мёртвый маркер не доставляется)", () => {
+  expect(draftRowOf(boardRow({ rowBlockId: "1060", state: "closed" }))).toBeNull()
+})
+
+test("draftRowOf: живой черновик отдаётся; легаси-строка без state — прежнее поведение", () => {
+  // открытый issue в Draft — обычный черновик
+  expect(draftRowOf(boardRow({}))).toEqual({ rowId: "r1", docId: "doc-1", title: "Черновик" })
+  // носитель без state (легаси-шейп) — деградация без гарда, не падение
+  expect(draftRowOf(boardRow({ state: undefined }))).toEqual({ rowId: "r1", docId: "doc-1", title: "Черновик" })
+})
+
+test("draftRowOf: не-Draft и нестроковый rowBlockId — null (прежние инварианты матча)", () => {
+  expect(draftRowOf(boardRow({ cells: { Status: { value: "Todo" } } }))).toBeNull()
+  expect(draftRowOf(boardRow({ cells: undefined }))).toBeNull()
+  expect(draftRowOf(boardRow({ rowBlockId: undefined }))).toBeNull()
+})
+
+test("draftRowOf: пустые тайтл/линковка отдаются как есть — фолбэк демона не задет", () => {
+  expect(draftRowOf(boardRow({ title: "", linkedDocId: null }))).toEqual({ rowId: "r1", docId: "", title: "" })
+  expect(draftRowOf(boardRow({ title: "  с пробелами  ", linkedDocId: undefined })))
+    .toEqual({ rowId: "r1", docId: "", title: "с пробелами" })
 })
 
 // ——— syncDraftTracker: трекер vs доски ———
