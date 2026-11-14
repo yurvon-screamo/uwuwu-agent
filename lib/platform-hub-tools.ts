@@ -1,7 +1,8 @@
 //! Hub-реализации tool-имён lib/platform (platform-hub.ts — транспорт и
 //! docId-схема). Маппинг семантики доски на issues: по контракту миграции
 //! Status/Запланировано — Project v2 + frontmatter, Branch/PR/Сессия dev/
-//! Расписание — frontmatter.
+//! Расписание — frontmatter; строки несут linkedDocId/title — паритет
+//! docId-схемы легаси-носителя (тело = issue:<number>; инцидент 1110).
 
 import { hubCloneRoot } from "./platform-hub"
 import type { GhIssue } from "./platform-hub"
@@ -18,6 +19,79 @@ import {
   setProjectStatus,
   withFields,
 } from "./platform-hub"
+
+// ——— контракты строк доски (чистые функции — юниты без gh-стабов) ———
+
+/** «YYYY-MM-DD HH:MM» → epoch ms в локальной TZ — паритет cron-lib
+ *  formatLocal/minuteStart (клетку пишет CLI тем же форматированием).
+ *  Пусто/криво/вне диапазонов/несуществующая дата — null: клетка без
+ *  dateMs → plannedMs null у потребителя (одна reconcile-запись с
+ *  самолечением через CLI, не спам). */
+export function plannedToMs(v: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(v.trim())
+  if (m === null) return null
+  const [y, mo, d, h, mi] = m.slice(1).map(Number)
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59) return null
+  const date = new Date(y, mo - 1, d, h, mi)
+  if (Number.isNaN(date.getTime()) || date.getDate() !== d || date.getMonth() !== mo - 1) return null
+  return date.getTime()
+}
+
+/** fm-поля тела issue + легаси-алиасы имён легаси-носителя: attrsOf крона ждёт
+ *  custom-schedule/custom-agent, fm-мир несёт schedule/agent (инцидент
+ *  1110: без алиасов расписание читалось null — второй тихий скип после
+ *  linkedDocId). Транзиент fm-мира: мир #264 сносит fm, attrsOf
+ *  переключается на поля — алиасы умирают вместе с ним. */
+export function issueAttrs(body: string): Record<string, string> {
+  const fields = parseFrontmatter(body).fields
+  if (fields.schedule !== undefined) fields["custom-schedule"] = fields.schedule
+  if (fields.agent !== undefined) fields["custom-agent"] = fields.agent
+  return fields
+}
+
+export interface HubRow {
+  rowBlockId: string
+  /** docId тела задачи — паритет docId-схемы легаси-носителя (тело = issue:<number>).
+   *  Инцидент 1110: без linkedDocId крон/factory/triage читали bodyDoc=""
+   *  и тихо скипали строки до attrs-чтения — файры молчали после миграции. */
+  linkedDocId: string
+  title: string
+  cells: Record<string, { value: string; dateMs?: number }>
+}
+
+/** Срез доски проекта → строки канбанной семантики. linkedDocId/title —
+ *  потерянные при миграции поля схемы легаси-носителя (потребители ждут их
+ *  контрактом read_database_cells). */
+export function issueRows(issues: GhIssue[]): HubRow[] {
+  return issues.map((issue) => {
+    const body = String(issue.body ?? "")
+    const { fields } = parseFrontmatter(body)
+    const number = String(issue.number)
+    const cell = (v: string) => ({ value: v })
+    const planned = fields.planned ?? ""
+    const plannedMs = plannedToMs(planned)
+    return {
+      rowBlockId: number,
+      linkedDocId: `issue:${number}`,
+      title: String(issue.title ?? ""),
+      cells: {
+        "Название": cell(String(issue.title ?? "")),
+        "Status": cell(fields.status ?? "Todo"),
+        "Тип": cell(githubTypeName(issue, fields.type)),
+        "Branch": cell(fields.branch ?? ""),
+        "PR": cell(fields.pr ?? ""),
+        "Сессия dev": cell(fields["dev-session"] ?? ""),
+        "Запланировано": {
+          value: planned,
+          ...(plannedMs !== null ? { dateMs: plannedMs } : {}),
+        },
+        "Расписание": cell(fields.schedule ?? ""),
+        "Autodone": cell(fields.autodone === "true" ? "✓" : ""),
+        "Приоритет": cell(fields.priority ?? ""),
+      },
+    }
+  })
+}
 
 export async function hubTool<T = Record<string, unknown>>(
   name: string,
@@ -83,26 +157,7 @@ export async function hubTool<T = Record<string, unknown>>(
       const dbId = String(args.databaseBlockId ?? "")
       const project = projectOfDbId(dbId)
       if (!project) throw new Error(`hub: read_database_cells вне доски (${dbId})`)
-      const rows = issuesForProject(project).map((issue) => {
-        const body = String(issue.body ?? "")
-        const { fields } = parseFrontmatter(body)
-        const cell = (v: string) => ({ value: v })
-        return {
-          rowBlockId: String(issue.number),
-          cells: {
-            "Название": cell(String(issue.title)),
-            "Status": cell(fields.status ?? "Todo"),
-            "Тип": cell(githubTypeName(issue, fields.type)),
-            "Branch": cell(fields.branch ?? ""),
-            "PR": cell(fields.pr ?? ""),
-            "Сессия dev": cell(fields["dev-session"] ?? ""),
-            "Запланировано": cell(fields.planned ?? ""),
-            "Расписание": cell(fields.schedule ?? ""),
-            "Autodone": cell(fields.autodone === "true" ? "✓" : ""),
-            "Приоритет": cell(fields.priority ?? ""),
-          },
-        }
-      })
+      const rows = issueRows(issuesForProject(project))
       return { rows, rowCount: rows.length, columns: Object.keys(rows[0]?.cells ?? {}) } as T
     }
     case "update_database_row": {
@@ -209,7 +264,7 @@ export async function hubTool<T = Record<string, unknown>>(
       }
       if (parsed?.kind === "issue") {
         const body = String(issueByNumber(parsed.payload)?.body ?? "")
-        return { ...parseFrontmatter(body).fields } as T
+        return issueAttrs(body) as T
       }
       return {} as T
     }
