@@ -146,6 +146,82 @@ pub(crate) struct RowOutcome {
     pub detail: String,
 }
 
+/// Миграция одной строки: fm-клетки → поля, снос шапки. apply=false —
+/// dry-run. Итог — один RowOutcome (conflict-лог — отдельным исходом,
+/// миграция при этом выполняется).
+async fn migrate_row(
+    store: &GitHubStore,
+    task: &crate::store::Task,
+    apply: bool,
+) -> Result<RowOutcome> {
+    let number = task.id.clone();
+    let issue = gh_json(
+        &["api", &format!("repos/{}/issues/{number}", store.repo)],
+        None,
+    )
+    .await
+    .with_context(|| format!("#{number}: issue не прочитан"))?;
+    let fm = parse_legacy_fm(issue["body"].as_str().unwrap_or(""));
+    if fm.fields.is_empty() {
+        return Ok(RowOutcome {
+            number,
+            action: "skipped",
+            detail: "fm-шапки нет".into(),
+        });
+    }
+    let current = github_issue_fields::fields_of(&issue);
+    let cells = fm_to_cells(&fm.fields, &current)?;
+    let mut outcome = Vec::new();
+    // расхождения fm vs поле-канон — лог без перезаписи
+    for (key, field_name) in [
+        ("priority", names::PRIORITY),
+        ("branch", names::BRANCH),
+        ("pr", names::PR),
+        ("dev-session", names::DEV_SESSION),
+        ("schedule", names::SCHEDULE),
+        ("planned", names::PLANNED),
+    ] {
+        if let (Some(fm_v), Some(cur)) = (fm.fields.get(key), current.get(field_name)) {
+            if !fm_v.is_empty() && fm_v != cur {
+                outcome.push(format!("{key}: fm «{fm_v}» ≠ поле «{cur}»"));
+            }
+        }
+    }
+    let (action, detail) = if apply {
+        if !cells.is_empty() {
+            github_issue_fields::set_fields(&number, &store.repo, &cells)
+                .await
+                .with_context(|| format!("#{number}: клетки не записаны"))?;
+        }
+        // снос fm-шапки: тело = rest_md (единый write-path store)
+        store
+            .set_issue_body(&number, &fm.rest_md)
+            .await
+            .with_context(|| format!("#{number}: fm-шапка не снесена"))?;
+        ("migrated", format!("клеток записано: {}", cells.len()))
+    } else {
+        (
+            "migrated",
+            format!(
+                "dry-run: клеток к записи {}, шапка была бы снесена",
+                cells.len()
+            ),
+        )
+    };
+    if outcome.is_empty() {
+        return Ok(RowOutcome {
+            number,
+            action,
+            detail,
+        });
+    }
+    Ok(RowOutcome {
+        number,
+        action: "conflict",
+        detail: format!("{detail}; {}", outcome.join("; ")),
+    })
+}
+
 /// Проход по всем открытым строкам всех досок: fm-клетки → поля, снос шапки.
 /// `apply` = false — dry-run (только отчёт, мутаций нет).
 pub(crate) async fn migrate_all(store: &GitHubStore, apply: bool) -> Result<Vec<RowOutcome>> {
@@ -154,74 +230,7 @@ pub(crate) async fn migrate_all(store: &GitHubStore, apply: bool) -> Result<Vec<
     for board in boards {
         let tasks = store.list(&board).await?;
         for task in tasks {
-            let number = task.id.clone();
-            let issue = gh_json(
-                &["api", &format!("repos/{}/issues/{number}", store.repo)],
-                None,
-            )
-            .await
-            .with_context(|| format!("#{number}: issue не прочитан"))?;
-            let body = issue["body"].as_str().unwrap_or("");
-            let fm = parse_legacy_fm(body);
-            if fm.fields.is_empty() {
-                out.push(RowOutcome {
-                    number,
-                    action: "skipped",
-                    detail: "fm-шапки нет".into(),
-                });
-                continue;
-            }
-            let current = github_issue_fields::fields_of(&issue);
-            let cells = fm_to_cells(&fm.fields, &current)?;
-            // расхождения fm vs поле-канон — лог без перезаписи
-            let mut conflicts = Vec::new();
-            for (key, field_name) in [
-                ("priority", names::PRIORITY),
-                ("branch", names::BRANCH),
-                ("pr", names::PR),
-                ("dev-session", names::DEV_SESSION),
-                ("schedule", names::SCHEDULE),
-                ("planned", names::PLANNED),
-            ] {
-                if let (Some(fm_v), Some(cur)) = (fm.fields.get(key), current.get(field_name)) {
-                    if !fm_v.is_empty() && fm_v != cur {
-                        conflicts.push(format!("{key}: fm «{fm_v}» ≠ поле «{cur}»"));
-                    }
-                }
-            }
-            if !conflicts.is_empty() {
-                out.push(RowOutcome {
-                    number: number.clone(),
-                    action: "conflict",
-                    detail: conflicts.join("; "),
-                });
-            }
-            if apply {
-                if !cells.is_empty() {
-                    github_issue_fields::set_fields(&number, &store.repo, &cells)
-                        .await
-                        .with_context(|| format!("#{number}: клетки не записаны"))?;
-                }
-                // снос fm-шапки: тело = rest_md (единый write-path store)
-                store
-                    .set_issue_body(&number, &fm.rest_md)
-                    .await
-                    .with_context(|| format!("#{number}: fm-шапка не снесена"))?;
-                out.push(RowOutcome {
-                    number,
-                    action: "migrated",
-                    detail: format!("клеток записано: {}", cells.len()),
-                });
-            } else {
-                out.push(RowOutcome {
-                    number,
-                    action: "migrated",
-                    detail: format!(
-                        "dry-run: клеток к записи {}, шапка была бы снесена",
-                        cells.len()
-                    ),
-                });
-            }
+            out.push(migrate_row(store, &task, apply).await?);
         }
     }
     Ok(out)

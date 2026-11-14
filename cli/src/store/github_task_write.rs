@@ -11,6 +11,57 @@ use super::{StoreError, Task, TaskBoard};
 use crate::store::github_gh::gh_json;
 use serde_json::{json, Map, Value};
 
+/// EditTask → батч клеток глобальных полей. Some("") — очистка клетки
+/// (None в значении); autodone — select on/off; planned — date
+/// (нормализация дисплей-формы).
+fn edit_cells(
+    patch: &EditTask,
+) -> StoreResult<Vec<(&'static str, Option<github_issue_fields::FieldValue>)>> {
+    use github_issue_fields::FieldValue;
+    let text_cell = |v: &Option<String>| -> Option<Option<FieldValue>> {
+        v.as_ref().map(|s| match s.as_str() {
+            "" => None,
+            other => Some(FieldValue::Text(other.to_string())),
+        })
+    };
+    let mut cells: Vec<(&'static str, Option<FieldValue>)> = Vec::new();
+    if let Some(v) = text_cell(&patch.branch) {
+        cells.push((names::BRANCH, v));
+    }
+    if let Some(v) = text_cell(&patch.pr) {
+        cells.push((names::PR, v));
+    }
+    if let Some(v) = text_cell(&patch.dev_session) {
+        cells.push((names::DEV_SESSION, v));
+    }
+    if let Some(p) = &patch.priority {
+        cells.push((
+            names::PRIORITY,
+            match p.as_str() {
+                "" => None,
+                other => Some(FieldValue::Select(other.to_string())),
+            },
+        ));
+    }
+    if let Some(ad) = patch.autodone {
+        cells.push((
+            names::AUTODONE,
+            Some(FieldValue::Select(if ad { "on" } else { "off" }.into())),
+        ));
+    }
+    if let Some((planned, _ms)) = &patch.planned {
+        let date = github_project::normalize_date(planned)?;
+        cells.push((
+            names::PLANNED,
+            match date.as_str() {
+                "" => None,
+                other => Some(FieldValue::Date(other.to_string())),
+            },
+        ));
+    }
+    Ok(cells)
+}
+
 impl GitHubStore {
     pub(super) async fn create_impl(
         &self,
@@ -122,49 +173,9 @@ impl GitHubStore {
             )
             .await?;
         }
-        // Клетки — один батч в глобальные поля; Some("") — очистка клетки
-        // (DELETE); статус — Pv2-мутация отдельно (github_project.rs).
-        let text_cell = |v: &Option<String>| -> Option<Option<FieldValue>> {
-            v.as_ref().map(|s| match s.as_str() {
-                "" => None,
-                other => Some(FieldValue::Text(other.to_string())),
-            })
-        };
-        let mut cells: Vec<(&str, Option<FieldValue>)> = Vec::new();
-        if let Some(v) = text_cell(&patch.branch) {
-            cells.push((names::BRANCH, v));
-        }
-        if let Some(v) = text_cell(&patch.pr) {
-            cells.push((names::PR, v));
-        }
-        if let Some(v) = text_cell(&patch.dev_session) {
-            cells.push((names::DEV_SESSION, v));
-        }
-        if let Some(p) = &patch.priority {
-            cells.push((
-                names::PRIORITY,
-                match p.as_str() {
-                    "" => None,
-                    other => Some(FieldValue::Select(other.to_string())),
-                },
-            ));
-        }
-        if let Some(ad) = patch.autodone {
-            cells.push((
-                names::AUTODONE,
-                Some(FieldValue::Select(if ad { "on" } else { "off" }.into())),
-            ));
-        }
-        if let Some((planned, _ms)) = &patch.planned {
-            let date = super::github_project::normalize_date(planned)?;
-            cells.push((
-                names::PLANNED,
-                match date.as_str() {
-                    "" => None,
-                    other => Some(FieldValue::Date(other.to_string())),
-                },
-            ));
-        }
+        // Клетки — один батч в глобальные поля (сборка — edit_cells);
+        // Some("") — очистка клетки (DELETE); статус — Pv2-мутация отдельно
+        let cells = edit_cells(patch)?;
         if !cells.is_empty() {
             github_issue_fields::set_fields(&number, &self.repo, &cells).await?;
         }

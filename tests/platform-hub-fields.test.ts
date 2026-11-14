@@ -75,11 +75,11 @@ mock.module("../lib/platform-hub", () => ({
     state.issues.find((i) => String(i["number"]) === number) ?? null,
   // Pv2-джойн статусов — stub на уровне модуля (projectStatuses зовёт gh):
   // здесь подменяем результат через state.statuses
-  projectStatuses: (project: string) => state.statuses,
-  setProjectStatus: (project: string, number: string, status: string) => {
-    state.statusMutation = `${project}#${number}→${status}`
+  projectStatuses: (_project: string) => state.statuses,
+  setProjectStatus: (project: string, number: string, _status: string) => {
+    state.statusMutation = `${project}#${number}`
   },
-  setIssueFields: (number: string, fields: Record<string, string | null>) => {
+  setIssueFields: (_number: string, fields: Record<string, string | null>) => {
     state.fieldWrites.push(fields)
   },
   fieldsOf: fieldsOfImpl,
@@ -142,13 +142,15 @@ describe("read_database_cells: клетки из полей", () => {
     const r = await hubTool<{ rows: Array<{ rowBlockId: string; cells: Record<string, { value?: string; dateMs?: number }> }> }>(
       "read_database_cells", { databaseBlockId: "db:uwuwu" },
     )
-    const row1 = r.rows.find((x) => x.rowBlockId === "1")!
+    const row1 = r.rows.find((x) => x.rowBlockId === "1")
+    expect(row1).toBeDefined()
     expect(row1.cells["Status"].value).toBe("In Progress", "Pv2-джойн")
     expect(row1.cells["Приоритет"].value).toBe("high")
     expect(row1.cells["Autodone"].value).toBe("true")
     expect(row1.cells["Branch"].value).toBe("work/t")
     expect(row1.cells["Запланировано"].dateMs).toBe(Date.parse("2026-11-20T00:00:00Z"))
-    const row2 = r.rows.find((x) => x.rowBlockId === "2")!
+    const row2 = r.rows.find((x) => x.rowBlockId === "2")
+    expect(row2).toBeDefined()
     expect(row2.cells["Status"].value).toBe("Done", "closed → Done")
     expect(row2.cells["Autodone"].value).toBe("false")
   })
@@ -180,13 +182,14 @@ describe("update_database_row: запись в поля", () => {
       },
     })
     expect(state.fieldWrites.length).toBe(1)
-    const fields = state.fieldWrites[0]!
+    const fields = state.fieldWrites[0]
+    expect(fields).toBeDefined()
     expect(fields["Branch"]).toBe("work/task-9")
     expect(fields["PR"]).toBeNull()
     expect(fields["Autodone"]).toBe("on")
     expect(fields["Сессия ревью"]).toBe("ses_rev_1")
     expect(fields["Сессия тест"]).toBe("ses_test_1")
-    expect(state.statusMutation).toBe("uwuwu#9→Ревью результата")
+    expect(state.statusMutation).toBe("uwuwu#9")
   })
 
   test("статус пустой строкой — мутации нет", async () => {

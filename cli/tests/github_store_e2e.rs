@@ -164,6 +164,24 @@ async fn github_store_create_duplicate_is_loud() {
     assert!(format!("{err}").contains("дубль"));
 }
 
+/// Todo-проба контрактов клеток: вариации priority/autodone/body_md.
+fn create_todo(
+    title: &str,
+    priority: Option<&str>,
+    autodone: Option<bool>,
+    body_md: Option<&str>,
+) -> CreateTask {
+    CreateTask {
+        title: title.to_string(),
+        task_type: TaskType("bug".into()),
+        status: Some("Todo".into()),
+        body_md: body_md.map(String::from),
+        attachments: vec![],
+        priority: priority.map(String::from),
+        autodone,
+    }
+}
+
 /// Контракт priority при create (дефолт medium — решение владельца
 /// 13.11): create без флага рождает клетку Приоритет=medium; явный флаг
 /// перекрывает. Авторский fm в теле (--stdin) — мёртвый носитель: это
@@ -180,45 +198,31 @@ async fn github_store_create_priority_contract_live() {
     let defaulted = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] priority дефолт {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
+            &create_todo(&format!("[e2e] priority дефолт {stamp}"), None, None, None),
         )
         .await
         .expect("create без флага");
     let explicit = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] priority high {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: Some("high".into()),
-                autodone: None,
-            },
+            &create_todo(
+                &format!("[e2e] priority high {stamp}"),
+                Some("high"),
+                None,
+                None,
+            ),
         )
         .await
         .expect("create с high");
     let authored = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] priority в fm тела {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: Some("---\npriority: low\n---\nтело с авторским fm".into()),
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
+            &create_todo(
+                &format!("[e2e] priority в fm тела {stamp}"),
+                None,
+                None,
+                Some("---\npriority: low\n---\nтело с авторским fm"),
+            ),
         )
         .await
         .expect("create с авторским fm");
@@ -282,45 +286,31 @@ async fn github_store_create_autodone_contract_live() {
     let defaulted = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] autodone дефолт {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
+            &create_todo(&format!("[e2e] autodone дефолт {stamp}"), None, None, None),
         )
         .await
         .expect("create без флага");
     let explicit_off = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] autodone off {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: None,
-                attachments: vec![],
-                priority: None,
-                autodone: Some(false),
-            },
+            &create_todo(
+                &format!("[e2e] autodone off {stamp}"),
+                None,
+                Some(false),
+                None,
+            ),
         )
         .await
         .expect("create с off");
     let authored = store
         .create(
             &board,
-            &CreateTask {
-                title: format!("[e2e] autodone в fm тела {stamp}"),
-                task_type: TaskType("bug".into()),
-                status: Some("Todo".into()),
-                body_md: Some("---\nautodone: false\n---\nтело с авторским fm".into()),
-                attachments: vec![],
-                priority: None,
-                autodone: None,
-            },
+            &create_todo(
+                &format!("[e2e] autodone в fm тела {stamp}"),
+                None,
+                None,
+                Some("---\nautodone: false\n---\nтело с авторским fm"),
+            ),
         )
         .await
         .expect("create с авторским fm");
