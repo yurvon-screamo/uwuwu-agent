@@ -1,7 +1,7 @@
 // platform-hub-tools.test.ts — юнит-тесты чистых функций hub-маппинга
 // (bun test, без сети). Живой кейс — инцидент 1070: скан отдаёт ячейку
 // Autodone в UI-семантике "✓", consumer демона ждёт легаси-"true" —
-// автодон не видел ни одной галочки на hub-транспорте.
+// автодон не видел ни одного autodone=true на hub-транспорте.
 import { describe, expect, test } from "bun:test"
 import { autodoneCellValue, autodoneFmOf, hubTool } from "./platform-hub-tools"
 
