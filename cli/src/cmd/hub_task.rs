@@ -5,6 +5,7 @@
 //! 20261112155302-ttyp35g, план срез F/B-2).
 
 use crate::cmd::cli::TaskSub;
+use crate::out::outln;
 use crate::store::task_store::{CreateTask, EditTask};
 use crate::store::{task_store, TaskBoard, TaskType};
 use anyhow::{bail, Result};
@@ -68,9 +69,9 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 } else {
                     "    ".to_string()
                 };
-                println!("{:>8} {:>10}{} {}", t.id, t.status, ty, t.title);
+                outln!("{:>8} {:>10}{} {}", t.id, t.status, ty, t.title);
             }
-            println!("строк: {}", tasks.len());
+            outln!("строк: {}", tasks.len());
             Ok(())
         }
         TaskSub::Get { id, no_body } => {
@@ -78,25 +79,25 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 .resolve(&board, &id)
                 .await
                 .map_err(anyhow::Error::new)?;
-            println!("Задача:   {}", task.title);
-            println!("Статус:   {}", task.status);
+            outln!("Задача:   {}", task.title);
+            outln!("Статус:   {}", task.status);
             if task.task_type.is_set() {
-                println!("Тип:      {}", task.task_type.0);
+                outln!("Тип:      {}", task.task_type.0);
             }
             if !task.branch.is_empty() {
-                println!("Ветка:    {}", task.branch);
+                outln!("Ветка:    {}", task.branch);
             }
             if !task.pr.is_empty() {
-                println!("PR:       {}", task.pr);
+                outln!("PR:       {}", task.pr);
             }
             if !task.dev_session.is_empty() {
-                println!("Сессия:   {}", task.dev_session);
+                outln!("Сессия:   {}", task.dev_session);
             }
-            println!("Строка:   issue #{}", task.id);
+            outln!("Строка:   issue #{}", task.id);
             if !no_body {
                 let body = store.body_get(&board, &task).await?;
-                println!();
-                println!("{body}");
+                outln!();
+                outln!("{body}");
             }
             Ok(())
         }
@@ -116,7 +117,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
             }
             if dry_run {
                 let body = create_body_md(&title, ty.as_deref().unwrap_or("feature"), "");
-                println!("{body}");
+                outln!("{body}");
                 return Ok(());
             }
             if attach.is_empty() {
@@ -138,9 +139,11 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                         },
                     )
                     .await?;
-                println!(
+                outln!(
                     "создана: issue #{} «{}» ({})",
-                    created.id, created.title, created.status
+                    created.id,
+                    created.title,
+                    created.status
                 );
                 Ok(())
             } else {
@@ -180,7 +183,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 // ключ унифицирован: schedule (читают cron list/convert/демоны)
                 store.set_body_attr(&board, &fresh, "schedule", s).await?;
             }
-            println!("изменена: issue #{} «{}»", fresh.id, fresh.title);
+            outln!("изменена: issue #{} «{}»", fresh.id, fresh.title);
             Ok(())
         }
         TaskSub::Claim { id, session } => {
@@ -195,9 +198,10 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     anyhow::anyhow!("нет sessionID: --session или OPENCODE_SESSION_ID")
                 })?;
             let claimed = store.claim(&board, &task, &session).await?;
-            println!(
+            outln!(
                 "заявлена: issue #{} сессия {}",
-                claimed.id, claimed.dev_session
+                claimed.id,
+                claimed.dev_session
             );
             Ok(())
         }
@@ -224,7 +228,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 .comment(&board, &task, &body, reply.as_deref())
                 .await
                 .map_err(anyhow::Error::new)?;
-            println!("коммент записан: issue #{}", task.id);
+            outln!("коммент записан: issue #{}", task.id);
             Ok(())
         }
         TaskSub::Thread { id } => {
@@ -234,13 +238,13 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 .map_err(anyhow::Error::new)?;
             let entries = store.thread(&board, &task).await?;
             if entries.is_empty() {
-                println!("комментов нет");
+                outln!("комментов нет");
                 return Ok(());
             }
             for e in &entries {
                 match &e.reply_to {
-                    Some(anchor) => println!("  ↳ [{}] {}: {}", anchor, e.author, e.text),
-                    None => println!("[{}] {}: {}", e.id, e.author, e.text),
+                    Some(anchor) => outln!("  ↳ [{}] {}: {}", anchor, e.author, e.text),
+                    None => outln!("[{}] {}: {}", e.id, e.author, e.text),
                 }
             }
             Ok(())
@@ -251,7 +255,7 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                 .await
                 .map_err(anyhow::Error::new)?;
             let closed = store.close(&board, &task, note.as_deref()).await?;
-            println!("закрыта: issue #{} «{}»", closed.id, closed.title);
+            outln!("закрыта: issue #{} «{}»", closed.id, closed.title);
             Ok(())
         }
         TaskSub::MigrateFm { apply } => {
@@ -272,9 +276,9 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     "skipped" => skipped += 1,
                     _ => conflicts += 1,
                 }
-                println!("#{} [{}] {}", o.number, o.action, o.detail);
+                outln!("#{} [{}] {}", o.number, o.action, o.detail);
             }
-            println!(
+            outln!(
                 "итог: {} мигрировано, {} пропущено, {} расхождений fm≠поле ({})",
                 migrated,
                 skipped,
@@ -347,12 +351,12 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                     if !attach.is_empty() {
                         // ассеты hub: assets/ репо uwuwu-hub (ссылка raw-URL
                         // руками в теле) — загрузка через cli не портирована
-                        println!(
+                        outln!(
                             "⚠ --attach на hub не портирован: файлы не загружены — \
                              положи в assets/ репо uwuwu-hub и вставь raw-ссылки"
                         );
                     }
-                    println!("тело заменено: issue #{}", task.id);
+                    outln!("тело заменено: issue #{}", task.id);
                 }
                 (true, None) => bail!("task body --replace: вход пуст (stdin/--md)"),
                 (false, Some(md)) => {
@@ -366,11 +370,11 @@ pub(crate) async fn run(project: &str, command: TaskSub) -> Result<()> {
                         next.push('\n');
                     }
                     store.body_replace(&board, &task, &next, &current).await?;
-                    println!("дописано в тело: issue #{}", task.id);
+                    outln!("дописано в тело: issue #{}", task.id);
                 }
                 _ => {
                     let current = store.body_get(&board, &task).await?;
-                    println!("{current}");
+                    outln!("{current}");
                 }
             }
             Ok(())
