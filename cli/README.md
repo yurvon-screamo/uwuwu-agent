@@ -38,7 +38,7 @@ person append/replace) возвращает **либо явную ошибку, 
 | Команда | Что делает |
 | --- | --- |
 | `projects` | имена топ-папок вики (Experience/Projects/Daily); перечень проектов — `docs ls "Projects"` |
-| `read <slug>` | чтение вики-дока: слаг → docs/<slug>.md (фоллбек basename-поиск по docs/**); markdown |
+| `read <slug>` | чтение вики-дока: слаг → docs/<slug>.md (фоллбек: канон-README проекта docs/Projects/<slug>/README.md для плоского слага, затем basename-поиск по docs/** — при неоднозначности отказ с раскладкой кандидатов); markdown |
 | `docs ls "<project>[/<folder>]"` | перечень доков папки вики |
 | `person show\|append\|replace` | персона владельца (вики-док Experience/personal/PERSON): show — markdown (агенты читают в начале работы); append — дописать долговременный факт (append_doc сам читает+конкатенирует); replace — полная перезапись. Мутации возвращают финальный документ или явную ошибку |
 | `search "…" [--limit N --threshold X]` | универсальный: полнотекст по docs/** клона + доки по заголовкам + семантика локального эмбеддинг-индекса (Ollama); title/snippet/UI-ссылка, top-n на метод |
