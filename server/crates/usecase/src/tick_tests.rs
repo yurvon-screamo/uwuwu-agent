@@ -167,6 +167,10 @@ impl TickStateStore for MemState {
         false
     }
     fn mark_dreamer_done(&self, _s: &str) {}
+    fn last_spawn_ms(&self, _b: &str, _n: u64, _s: &str) -> Option<u64> {
+        None
+    }
+    fn mark_spawn(&self, _b: &str, _n: u64, _s: &str, _at: u64) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

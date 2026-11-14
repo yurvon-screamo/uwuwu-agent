@@ -163,5 +163,8 @@ pub trait TickStateStore: Send + Sync {
     /// Дример уже отработал сессию (1 рабочая = 1 дример).
     fn dreamer_done(&self, session: &str) -> bool;
     fn mark_dreamer_done(&self, session: &str);
+    /// Анти-шторм: ms последнего спавна слота строки (cooldown).
+    fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64>;
+    fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64);
     fn save(&self) -> UsecaseResult<()>;
 }

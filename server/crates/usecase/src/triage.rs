@@ -11,6 +11,8 @@ pub struct TriageUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     pub board_name: Arc<String>,
     pub sessions: Arc<dyn AgentSessionGateway>,
+    pub state: Arc<dyn crate::ports::TickStateStore>,
+    pub clock: Arc<dyn crate::ports::Clock>,
     pub spawn_model: Option<(String, String)>,
     pub checkout: String,
 }
@@ -19,9 +21,19 @@ impl TriageUseCase {
     /// Один проход триажа: не больше одного спавна за тик (мягкий гейт).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         let rows = self.board.read_board(&self.board_name).await?;
+        // cooldown: строку триажим не чаще раза в 15 минут (шторм-гард)
+        let now = self.clock.now_ms();
         let candidate = rows
             .iter()
-            .find(|t| t.status == Status::Draft && !t.title.is_empty())
+            .find(|t| {
+                t.status == Status::Draft
+                    && !t.title.is_empty()
+                    && self
+                        .state
+                        .last_spawn_ms(&self.board_name, t.number, "triage")
+                        .map(|ts| now.saturating_sub(ts) >= 15 * 60_000)
+                        .unwrap_or(true)
+            })
             .cloned();
         let Some(task) = candidate else { return Ok(0) };
         let spec = SessionSpec {
@@ -30,6 +42,8 @@ impl TriageUseCase {
             agent: None,
             model: self.spawn_model.clone(),
         };
+        self.state
+            .mark_spawn(&self.board_name, task.number, "triage", self.clock.now_ms());
         let session = self.sessions.create_session(&spec).await?;
         let prompt = triage_prompt(&task);
         self.sessions.prompt(&session, &prompt).await?;

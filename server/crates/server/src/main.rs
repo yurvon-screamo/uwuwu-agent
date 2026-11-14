@@ -203,6 +203,8 @@ async fn run(
             board: board.clone(),
             board_name: Arc::new(board_title),
             sessions: sessions.clone(),
+            state: state.clone(),
+            clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
             checkout: checkout.clone(),
         });

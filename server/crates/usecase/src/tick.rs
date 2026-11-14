@@ -8,6 +8,19 @@ use std::sync::Arc;
 use uwuwu_domain::{decide, gate, Action, Awaits, Gate, SpawnPolicy, Task};
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
+/// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
+pub const SPAWN_COOLDOWN_MS: u64 = 15 * 60_000;
+
+fn slot_name(slot: uwuwu_domain::Slot) -> &'static str {
+    match slot {
+        uwuwu_domain::Slot::Design => "design",
+        uwuwu_domain::Slot::Dev => "dev",
+        uwuwu_domain::Slot::PlanReview => "plan-review",
+        uwuwu_domain::Slot::ResultReview => "result-review",
+        uwuwu_domain::Slot::Test => "test",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Observe,
@@ -99,11 +112,29 @@ impl TickUseCase {
             let action = decide(task);
             match action {
                 Action::Spawn { slot } => {
+                    // Анти-шторм: слот строки не спавнится чаще кулдауна
+                    let cooldown_left = {
+                        let last =
+                            self.state
+                                .last_spawn_ms(&board.board, task.number, slot_name(slot));
+                        last.map(|ts| self.clock.now_ms().saturating_sub(ts))
+                            .unwrap_or(u64::MAX)
+                    };
+                    if cooldown_left < SPAWN_COOLDOWN_MS {
+                        out.observed += 1;
+                        continue;
+                    }
                     let gated = gate(task, &action, plan.policy, active, now);
                     match gated {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
                             if plan.mode == Mode::Live {
+                                self.state.mark_spawn(
+                                    &board.board,
+                                    task.number,
+                                    slot_name(slot),
+                                    self.clock.now_ms(),
+                                );
                                 match self.spawn_stage(board, task, slot).await {
                                     Ok(session) => {
                                         if let Err(e) = self
