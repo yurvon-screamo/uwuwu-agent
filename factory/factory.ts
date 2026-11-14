@@ -418,7 +418,7 @@ export async function readTasks(
   for (const row of raw) {
     // hub-эпоха (#1126): read_database_cells отдаёт тайтл в cells["Название"],
     // тело строки — сам issue (docId «issue:<номер>»); title/linkedDocId
-    // верхнего уровня — легаси-формат SiYuan-эры, фоллбек сохранён.
+    // верхнего уровня — легаси-формат прошлой платформы, фоллбек сохранён.
     const isHubRow = row.cells?.["Название"] !== undefined
     const title = (row.title ?? row.cells?.["Название"]?.value ?? "").trim()
     let bodyDoc = row.linkedDocId ?? (isHubRow ? `issue:${row.rowBlockId}` : "")
