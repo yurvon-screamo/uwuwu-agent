@@ -1,0 +1,12 @@
+[package]
+name = "uwuwu-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Домен uwuwu: агрегаты и инварианты контура (задача hub#1133). Ноль зависимостей."
+
+# Домен — самый внутренний слой: НЕ зависит ни от юзкейсов, ни от инфры.
+# Направление зависимостей домен ← юзкейсы ← инфра фиксируется крейтами;
+# добавление [dependencies] сюда — архитектурное нарушение.
+
+[dependencies]

@@ -21,12 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1374,10 +1368,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
+name = "uwuwu-domain"
+version = "0.1.0"
+
+[[package]]
 name = "uwuwu-server"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -1391,6 +1388,19 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uwuwu-domain",
+ "uwuwu-usecase",
+]
+
+[[package]]
+name = "uwuwu-usecase"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "tokio",
+ "tracing",
+ "uwuwu-domain",
 ]
 
 [[package]]
