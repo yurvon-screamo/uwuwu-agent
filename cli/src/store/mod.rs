@@ -27,6 +27,8 @@ mod store_tests;
 mod github_doc_clone_tests;
 #[cfg(test)]
 mod github_doc_clone_sync_tests;
+#[cfg(test)]
+mod github_gh_tests;
 
 pub use doc_store::{DocEntry, DocStore};
 pub use task_store::{CommentInsert, CreateTask, EditTask, TaskStore, ThreadEntry};
@@ -76,7 +78,8 @@ pub struct Task {
     pub schedule_cell: String,
     /// Приоритет (канон CUP-очереди: high/medium/low, "" — не задан).
     pub priority: String,
-    /// Autodone: галочка автомержа PR при входе в Review.
+    /// Autodone: автомерж PR при входе в Review (Pv2-поле select
+    /// on/off, не галочка).
     pub autodone: bool,
 }
 

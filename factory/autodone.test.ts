@@ -182,7 +182,7 @@ describe("autodoneWatchdog (инцидент 1070: мисс автодона д�
   }
   const hour = 60 * 60_000
 
-  test("условие не выполняется → reset (не Review / тик выполнялся / fm без галочки)", () => {
+  test("условие не выполняется → reset (не Review / тик выполнялся / fm autodone=false)", () => {
     expect(autodoneWatchdog({ ...base, inReview: false }, hour)).toEqual({ t: "reset" })
     expect(autodoneWatchdog({ ...base, ticked: true }, hour)).toEqual({ t: "reset" })
     expect(autodoneWatchdog({ ...base, fmAutodone: false }, hour)).toEqual({ t: "reset" })

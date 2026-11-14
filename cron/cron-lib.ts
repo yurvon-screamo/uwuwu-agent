@@ -48,6 +48,26 @@ export function formatLocal(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/** Гард-лимит тайтла сессии opencode: строка целиком (паритет factory-lib). */
+export const SESSION_TITLE_MAX = 80
+
+/** Обрезка строки до max по code points — паритет factory-lib (slice по
+ *  UTF-16 units режет суррогатные пары: эмодзи на границе → lone-суррогат). */
+export function truncateCodePoints(s: string, max: number): string {
+  return Array.from(s).slice(0, max).join("")
+}
+
+/** Тайтл ран-карточки и файр-сессии: «⏰ <номер> — <тайтл мастера> · <дата>»
+ *  (номер = номер issue). Пустой тайтл мастера — номер без «—» (легаси-вид).
+ *  Секунды в дате делают тайтл уникальным на доске (дубли строк CLI ловит
+ *  как ошибку). CRLF → пробел, pathSafe. */
+export function runCardTitle(master: { rowId: string; title: string }, now: Date): string {
+  const sec = String(now.getSeconds()).padStart(2, "0")
+  const safe = pathSafe(master.title.replace(/[\r\n]+/g, " ").trim())
+  const head = safe === "" ? master.rowId : `${master.rowId} — ${safe}`
+  return `⏰ ${head} · ${formatLocal(now)}:${sec}`
+}
+
 // ——— расписания ———
 
 export type Sched =
