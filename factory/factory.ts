@@ -128,6 +128,7 @@ import {
   githubProbeVerdict,
   giteaProbeVerdict,
   autodoneAction,
+  autodoneWatchdog,
   type PrCarrier,
   type PrProbeState,
 } from "./autodone"
@@ -1541,6 +1542,81 @@ async function runAutodoneTick(
   }
 }
 
+/** Тик watchdog'а автодона (инцидент 1070): строка в Review, fm тела несёт
+ *  `autodone: true`, но тик автодона не выполнялся (autodoneState undefined)
+ *  дольше AUTODONE_TIMEOUT_MS → громкий сигнал (лог + коммент в задачу),
+ *  раз за эпизод. Канал — fm тела, не Autodone-ячейка скана: в инциденте
+ *  ломалось именно скан-поле (fm-true при скане-false), гард на том же
+ *  поле молчал бы вместе с ним. При исправном демоне fm-true доезжает до
+ *  автодон-блока первым тиком (state=pending), поэтому длительная тишина —
+ *  аномалия (скан-мисрид, потерянный state, недостижимый гейт). Вызов —
+ *  на безусловном пути каждой трекнутой строки (после Done-ветки, до
+ *  маршрутизации): state после терминальных исходов определён → reset.
+ *  bodyExport кэшируется per-tick — чтение тела для маршрутизации ниже
+ *  не дублируется (taskComments берёт тот же кэш). В легаси-режиме fm
+ *  галочку не несёт — гард честно деградирует в no-op (транспорт hub).
+ *  Граница гарда (осознанная, ревью раунд 2): покрывает ТРЕКНУТЫЕ строки —
+ *  Review-строка вообще без записи в state (геометрия #317 «task в state
+ *  отсутствует») невидима: цикл активных строк итерирует state.tasks, а
+ *  гейт карантин-петли читает то же скан-поле; fm-экспорт всех строк доски
+ *  каждый тик — реальная цена, не платим. */
+/** fm-поле из шапки тела задачи (первый --- блок): легаси-носитель autodone
+ *  до полного переезда на нативные issue-поля (#1087). */
+function fmAutodoneOf(md: string): boolean {
+  const head = md.startsWith("---") ? md.slice(0, Math.max(md.indexOf("\n---", 3), 0) + 5) : ""
+  const m = head.match(/^autodone:[ \t]*(\S+)/m)
+  const raw = (m?.[1] ?? "").toLowerCase()
+  return raw === "on" || raw === "true" || raw === "✓".toLowerCase()
+}
+
+async function autodoneWatchdogTick(row: TaskRef, tracked: TrackedTask, state: FactoryState, exports: Map<string, string | null>): Promise<void> {
+  const rowId = row.rowId
+  const md = tracked.bodyDoc === "" ? null : await bodyExport(tracked.bodyDoc, exports)
+  const bodyKnown = md !== null && md !== ""
+  const fmAutodone = md !== null && md !== "" && fmAutodoneOf(md)
+  const act = autodoneWatchdog(
+    {
+      inReview: row.status === USER_REVIEW_STATUS,
+      fmAutodone,
+      bodyKnown,
+      ticked: tracked.autodoneState !== undefined,
+      stallSince: tracked.adStallSince,
+      signaled: tracked.adWatchdogSignaled === true,
+      now: Date.now(),
+    },
+    AUTODONE_TIMEOUT_MS,
+  )
+  switch (act.t) {
+    case "reset": {
+      if (tracked.adStallSince !== undefined || tracked.adWatchdogSignaled === true) {
+        delete tracked.adStallSince
+        delete tracked.adWatchdogSignaled
+        saveState(state)
+        log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — сброс (условие не выполняется)`)
+      }
+      return
+    }
+    case "arm": {
+      tracked.adStallSince = act.since
+      saveState(state)
+      return
+    }
+    case "signal": {
+      const silentMs = Date.now() - (tracked.adStallSince ?? Date.now())
+      tracked.adWatchdogSignaled = true
+      saveState(state)
+      log(`задача ${rowId.slice(0, 8)}: autodone-watchdog — fm autodone:true, тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — громкий сигнал`)
+      await notify(
+        tracked,
+        `${AGENT_MARK} autodone: задача в Review с fm-галочкой autodone:true, но тик автодона не выполнялся ${Math.round(silentMs / 60_000)} мин — автодон молча пропущен (инцидент-класс 1070: проверь скан/гейты демона по логу фабрики). После починки переставь Review — автодон перезапустится.`,
+      )
+      return
+    }
+    case "wait":
+      return
+  }
+}
+
 /** Спавн ревьювера: 1 сессия на задачу. Без parentID: наследование каталога
  *  родителем побеждает явный location (проверено на opencode REST) — а ревьюверу
  *  нужен cwd ворктри. Выбрасывает при фейле. */
@@ -2161,6 +2237,13 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
       counters.cleanups++
       continue
     }
+
+    // ——— watchdog автодона: fm-канал (инцидент 1070) ———
+    // Безусловный путь каждой трекнутой строки: сторожим «Review + fm
+    // autodone:true, тик не выполнялся» независимо от Autodone-ячейки
+    // скана (в инциденте ломалось именно скан-поле). bodyExport кэшируется
+    // per-tick — маршрутизация ниже берёт то же тело из кэша.
+    await autodoneWatchdogTick(row, tracked, state, bodyExports)
 
     // ——— маршрутизация: решение ДО перезаписи lastStatus и карантинных веток ———
     const comments = await taskComments(tracked.bodyDoc, bodyExports)

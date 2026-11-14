@@ -90,13 +90,20 @@ export async function hubTool<T = Record<string, unknown>>(
       const rows = issues.map((issue) => {
         const f = fieldsOf(issue)
         const cell = (v: string) => ({ value: v, ...(v !== "" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? { dateMs: dateToMs(v) } : {}) })
+        const number = String(issue.number)
         // проекция state: закрытый issue = Done независимо от карточки
         const status = issue.state === "closed"
           ? "Done"
           : (statuses.get(issue.number) ?? "Todo")
         const autodoneRaw = f[FIELD_NAMES.autodone] ?? ""
         return {
-          rowBlockId: String(issue.number),
+          rowBlockId: number,
+          // легаси-семантика привязки строки: docId тела — без него readTasks
+          // даёт bodyDoc='' навсегда (комменты/notify/watchdog-fm глухие),
+          // фоллбек по тайтлу мёртв (баг-пин tester 1070: 21/21 треков с
+          // bodyDoc='' в проде)
+          title: String(issue.title),
+          linkedDocId: `issue:${number}`,
           cells: {
             "Название": cell(String(issue.title)),
             "Status": cell(status),
@@ -359,4 +366,17 @@ function projectOf(number: string): string {
     }
   }
   return "uwuwu"
+}
+
+/** fm-значение autodone (легаси-семантика checkbox) → значение ячейки скана. */
+export function autodoneCellValue(fmAutodone?: string): string {
+  const v = fmAutodone ?? ""
+  return v === "true" || v === "✓" ? "true" : ""
+}
+
+/** Значение ячейки «Autodone» (update_database_row) → fm-строка. Принимает
+ *  легаси-"true" и UI-"✓" — round-trip read→write не разворачивает флаг. */
+export function autodoneFmOf(cellValue: string): "true" | "false" {
+  const v = cellValue ?? ""
+  return v === "true" || v === "✓" ? "true" : "false"
 }
