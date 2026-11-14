@@ -57,7 +57,12 @@ import {
   type TrackedTask,
   alertTargetOf,
   spawnGuardVerdict,
+  spawnGuardReason,
   spawnLimitsFromEnv,
+  holdEpisodeKey,
+  parseHoldEpisodes,
+  guardAlertChannel,
+  formatGuardEpisodeEnd,
   untrackedRowDecision,
   activeTaskGuards,
   SPAWN_ALERT_REPEAT_MS,
@@ -1885,6 +1890,104 @@ describe("spawnGuardVerdict: потеря state не превращается в
       .toMatchObject({ t: "hold", reason: "state-loss" })
     expect(spawnGuardVerdict({ orphaned: 0, totalUntracked: 13, now: GUARD_NOW }, GUARD_LIMITS))
       .toMatchObject({ t: "hold", reason: "burst" })
+  })
+})
+
+describe("эпизоды гарда: holdEpisodeKey / parseHoldEpisodes", () => {
+  test("ключ — пара проект/reason: соседние проекты и причины не смешиваются", () => {
+    // Assert
+    expect(holdEpisodeKey("uwuwu", "burst")).toBe("uwuwu/burst")
+    expect(holdEpisodeKey("uwuwu", "state-loss")).toBe("uwuwu/state-loss")
+    expect(holdEpisodeKey("true-washing", "burst")).toBe("true-washing/burst")
+  })
+
+  test("валидный record эпизодов переносится как есть", () => {
+    // Arrange
+    const raw = {
+      "uwuwu/burst": { since: "2026-11-10T10:00:16Z", signaled: "2026-11-10T10:00:16Z" },
+      "uwuwu/state-loss": { since: "2026-11-06T03:00:00Z", signaled: "2026-11-06T04:00:00Z" },
+    }
+
+    // Act
+    const parsed = parseHoldEpisodes(raw)
+
+    // Assert
+    expect(parsed).toEqual(raw)
+  })
+
+  test("легаси строка-флаг и прочий мусор отбрасываются без ошибки", () => {
+    // Act / Assert
+    expect(parseHoldEpisodes("2026-11-10T10:00:16Z")).toEqual({})
+    expect(parseHoldEpisodes(null)).toEqual({})
+    expect(parseHoldEpisodes(undefined)).toEqual({})
+    expect(parseHoldEpisodes(42)).toEqual({})
+    expect(parseHoldEpisodes({ "x/burst": "строка вместо эпизода", "": { since: "a", signaled: "b" } }))
+      .toEqual({})
+    expect(parseHoldEpisodes({ "y/burst": { since: 1, signaled: "b" } })).toEqual({})
+  })
+})
+
+describe("guardAlertChannel: канал алерта по классу вердикта (инцидент 10.11)", () => {
+  const hold = (reason: "state-loss" | "burst", alert: "first" | "repeat" | "none") =>
+    spawnGuardVerdict(
+      {
+        orphaned: reason === "state-loss" ? 15 : 0,
+        totalUntracked: 18,
+        holdSignaled: alert === "first" ? undefined
+          : alert === "repeat"
+            ? new Date(GUARD_NOW - SPAWN_ALERT_REPEAT_MS - 60_000).toISOString()
+            : new Date(GUARD_NOW - 10 * 60_000).toISOString(),
+        now: GUARD_NOW,
+      },
+      GUARD_LIMITS,
+    ) as Extract<ReturnType<typeof spawnGuardVerdict>, { t: "hold" }>
+
+  test("state-loss first/repeat — коммент владельцу (исключение, требует действия)", () => {
+    // Act / Assert
+    expect(guardAlertChannel(hold("state-loss", "first"))).toBe("comment")
+    expect(guardAlertChannel(hold("state-loss", "repeat"))).toBe("comment")
+  })
+
+  test("state-loss в пределах окна повтора — тишина (анти-спам)", () => {
+    // Act / Assert
+    expect(guardAlertChannel(hold("state-loss", "none"))).toBe("log")
+  })
+
+  test("burst при любом алерте — только лог демона (механика не ходит в задачи)", () => {
+    // Act / Assert
+    expect(guardAlertChannel(hold("burst", "first"))).toBe("log")
+    expect(guardAlertChannel(hold("burst", "repeat"))).toBe("log")
+    expect(guardAlertChannel(hold("burst", "none"))).toBe("log")
+  })
+})
+
+describe("spawnGuardReason / formatGuardEpisodeEnd: общая точка класса и агрегат выхода", () => {
+  test("класс эпизода: сироты сверх lossMax — state-loss, иначе burst", () => {
+    // Act / Assert
+    expect(spawnGuardReason({ orphaned: 3 }, GUARD_LIMITS)).toBe("state-loss")
+    expect(spawnGuardReason({ orphaned: 2 }, GUARD_LIMITS)).toBe("burst")
+    expect(spawnGuardReason({ orphaned: 0 }, GUARD_LIMITS)).toBe("burst")
+  })
+
+  test("агрегат выхода: длительность в минутах от since до сейчас", () => {
+    // Arrange
+    const since = new Date(GUARD_NOW - 125 * 60_000).toISOString()
+
+    // Act
+    const line = formatGuardEpisodeEnd("burst", since, GUARD_NOW)
+
+    // Assert
+    expect(line).toContain("burst")
+    expect(line).toContain("125 мин")
+  })
+
+  test("битый since — длительность н/д вместо NaN", () => {
+    // Act
+    const line = formatGuardEpisodeEnd("state-loss", "не-ISO", GUARD_NOW)
+
+    // Assert
+    expect(line).toContain("state-loss")
+    expect(line).toContain("н/д")
   })
 })
 

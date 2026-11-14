@@ -84,7 +84,12 @@ import {
   stripExportWrapper,
   alertTargetOf,
   spawnGuardVerdict,
+  spawnGuardReason,
   spawnLimitsFromEnv,
+  holdEpisodeKey,
+  parseHoldEpisodes,
+  guardAlertChannel,
+  formatGuardEpisodeEnd,
   untrackedRowDecision,
   activeTaskGuards,
   parseAgentHeadTs,
@@ -273,10 +278,10 @@ function loadState(): FactoryState {
     const raw: unknown = JSON.parse(readFileSync(STATE_FILE, "utf-8"))
     const tasks = (raw as { tasks?: unknown }).tasks
     const out: FactoryState = { tasks: {} }
-    // флаг эпизода гарда — top-level (не задачи): переносится между тиками,
-    // снимается allow-вердиктом (см. tickProject)
-    const holdSignaled = (raw as { holdSignaled?: unknown }).holdSignaled
-    if (typeof holdSignaled === "string") out.holdSignaled = holdSignaled
+    // эпизоды гарда спавна — top-level record "project/reason" (не задачи):
+    // переносятся между тиками, снимаются allow-вердиктом проекта
+    // (см. tickProject); легаси строка-флаг отбрасывается парсером
+    out.holdEpisodes = parseHoldEpisodes((raw as { holdEpisodes?: unknown }).holdEpisodes)
     if (tasks !== null && typeof tasks === "object") {
       for (const [k, v] of Object.entries(tasks as Record<string, unknown>)) {
         if (isValidTracked(v)) {
@@ -1109,22 +1114,38 @@ function backupSuspectState(): void {
 }
 
 /** HOLD-тик гарда каскада: спавны отложены (обслуживание существующих
- *  треков продолжается — гард бьёт только по новому спавну). Алерт-политика:
- *  first — вход в эпизод (бэкап + коммент владельцу), repeat — длящийся
- *  HOLD за окном повтора (коммент снова), none — в пределах окна (только
- *  лог). Флаг эпизода ставится по факту ПОПЫТКИ алерта, не доставки:
- *  недоставимый алерт не должен ретраиться каждый тик — окно повтора
- *  вернётся к нему через час. */
+ *  треков продолжается — гард бьёт только по новому спавну). Канал по классу
+ *  вердикта (guardAlertChannel, инцидент 10.11): burst — механика (волна
+ *  импорта), только лог демона (одна агрегированная строка на вход в
+ *  эпизод); state-loss — исключение владельцу: first — бэкап + коммент,
+ *  repeat — коммент снова за окном повтора, none — тишина. Эпизод ведётся
+ *  per-(project, reason): тихий соседний проект не сносит чужой флаг.
+ *  Флаг алерта ставится по факту ПОПЫТКИ доставки, не доставки:
+ *  недоставимый коммент не ретраится каждый тик — окно вернётся к нему
+ *  через час. */
 async function holdSpawns(
-  guard: SpawnGuardHold, untracked: TaskRef[], orphaned: number,
+  guard: SpawnGuardHold, projectName: string, untracked: TaskRef[],
   state: FactoryState, counters: PassCounters,
 ): Promise<void> {
   const targets = untracked.slice(0, 10).map((r) => r.rowId.slice(0, 8))
   counters.held = untracked.length
   counters.heldReason = guard.reason
-  log(`гард спавна: HOLD (${guard.reason}), сирот=${orphaned}, untracked=${untracked.length}` +
-    ` — спавны отложены: ${targets.join(", ") || "нет"}`)
-  if (guard.alert === "none") return
+  const key = holdEpisodeKey(projectName, guard.reason)
+  const episodes = state.holdEpisodes ?? {}
+  const episode = episodes[key]
+  const nowIso = new Date().toISOString()
+  if (guardAlertChannel(guard) === "log") {
+    if (guard.reason === "burst" && guard.alert === "first") {
+      // вход в burst-эпизод: одна агрегированная строка лога; per-tick
+      // видимость далее даёт «проход … задержано гардом=N (burst)»
+      episodes[key] = { since: nowIso, signaled: nowIso }
+      state.holdEpisodes = episodes
+      saveState(state)
+      log(`гард спавна: вход в burst-эпизод — ${guard.text} ` +
+        `Цели задержки: ${targets.join(", ") || "нет"}.`)
+    }
+    return
+  }
   if (guard.alert === "first") backupSuspectState()
   const target = alertTargetOf(untracked)
   if (target === null) {
@@ -1134,7 +1155,24 @@ async function holdSpawns(
   } else {
     log(`гард спавна: алерт в ${target.rowId.slice(0, 8)} не доставлен — повтор в пределах окна`)
   }
-  state.holdSignaled = new Date().toISOString()
+  episodes[key] = { since: episode?.since ?? nowIso, signaled: nowIso }
+  state.holdEpisodes = episodes
+  saveState(state)
+}
+
+/** Allow-тик гарда: эпизоды проекта завершены — снять ключи проекта и
+ *  отагрегировать выход в лог (длительность из since, инцидент 10.11).
+ *  Чужие ключи (другие проекты) не трогаются — их allow-тики снимут своё. */
+function clearHoldEpisodes(projectName: string, state: FactoryState): void {
+  const episodes = state.holdEpisodes ?? {}
+  const ownKeys = Object.keys(episodes).filter((k) => k.startsWith(`${projectName}/`))
+  if (ownKeys.length === 0) return
+  for (const k of ownKeys) {
+    const reason = k.slice(projectName.length + 1) as "state-loss" | "burst"
+    log(formatGuardEpisodeEnd(reason, episodes[k].since, Date.now()))
+    delete episodes[k]
+  }
+  state.holdEpisodes = episodes
   saveState(state)
 }
 
@@ -1815,17 +1853,22 @@ export async function tickProject(state: FactoryState, projectName: string, cfg:
     if (decision.orphan) orphaned++
   }
   const guard = spawnGuardVerdict(
-    { orphaned, totalUntracked: untracked.length, holdSignaled: state.holdSignaled, now: Date.now() },
+    {
+      orphaned,
+      totalUntracked: untracked.length,
+      holdSignaled: state.holdEpisodes?.[
+        holdEpisodeKey(projectName, spawnGuardReason({ orphaned }, SPAWN_LIMITS))
+      ]?.signaled,
+      now: Date.now(),
+    },
     SPAWN_LIMITS,
   )
   if (guard.t === "hold") {
-    await holdSpawns(guard, untracked, orphaned, state, counters)
-  } else if (state.holdSignaled !== undefined) {
-    // сигнатура ушла (state восстановлен) — эпизод завершён, снимаем флаг:
+    await holdSpawns(guard, projectName, untracked, state, counters)
+  } else {
+    // сигнатура ушла — эпизоды проекта завершены, снимаем его ключи:
     // следующий эпизод снова получит alert=first с алертом и бэкапом
-    delete state.holdSignaled
-    saveState(state)
-    log("гард спавна: сигнатура ушла — эпизод HOLD завершён, флаг снят")
+    clearHoldEpisodes(projectName, state)
   }
 
   // дев-волна — пачкой параллельно: все ненатрекенные задачи (Design-утряска
