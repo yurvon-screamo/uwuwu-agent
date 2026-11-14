@@ -7,6 +7,7 @@ use super::github_gh::gh_graphql;
 use super::github_task::GitHubStore;
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::HashMap;
 
 /// Канбаны «Задачи <proj>» пер-проектные: label issue → (номер, id) проекта.
 /// None — у issue нет proj-label (status-поле не применимо).
@@ -103,8 +104,107 @@ pub(super) async fn issue_node_id(store: &GitHubStore, issue_number: &str) -> Re
         .context("issue node id пуст")
 }
 
+/// Точечный Status одной задачи: issue.projectItems → Pv2 Status
+/// (read-after-write мутаций). None — карточки в «её» доске нет/поля нет.
+pub(super) async fn project_status_of(
+    store: &GitHubStore,
+    issue_number: &str,
+) -> Result<Option<String>> {
+    let n = issue_number.parse::<i64>()?;
+    let data = gh_graphql(
+        "query($repo: String!, $owner: String!, $n: Int!) {
+            repository(name: $repo, owner: $owner) {
+                issue(number: $n) {
+                    projectItems(first: 10) {
+                        nodes {
+                            project { ... on ProjectV2 { number } }
+                            fieldValueByName(fieldName: \"Status\") {
+                                ... on ProjectV2ItemFieldSingleSelectValue { name }
+                            }
+                        }
+                    }
+                }
+            }
+        }",
+        &(issue_ctx(store, issue_number).await),
+    )
+    .await?;
+    Ok(data
+        .pointer("/repository/issue/projectItems/nodes")
+        .and_then(|nodes| nodes.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|item| item.pointer("/project/number").and_then(|x| x.as_i64()) == Some(n))
+                .and_then(|item| {
+                    item.pointer("/fieldValueByName/name")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                })
+        }))
+}
+
+/// Батч Status всех items доски «Задачи <proj>» (джойн для list; пагинация
+/// обязательна — доска uwuwu >700 items). Возвращает {issue_number: status}.
+/// Пустая карта — канбана нет (резолв по тайтлу не нашёл проект).
+pub(super) async fn project_statuses(project: &str) -> Result<HashMap<String, String>> {
+    let Some(number) = project_number_by_title(project).await? else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let data = gh_graphql(
+            "query($n: Int!, $cursor: String) {
+                viewer { projectV2(number: $n) {
+                    items(first: 100, after: $cursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                            content { ... on Issue { number } }
+                            fieldValueByName(fieldName: \"Status\") {
+                                ... on ProjectV2ItemFieldSingleSelectValue { name }
+                            }
+                        }
+                    }
+                } }
+            }",
+            &json!({
+                "n": number,
+                "cursor": cursor.as_deref(),
+            }),
+        )
+        .await?;
+        let items = data
+            .pointer("/viewer/projectV2/items/nodes")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            if let (Some(num), Some(status)) = (
+                item.pointer("/content/number").and_then(|x| x.as_i64()),
+                item.pointer("/fieldValueByName/name").and_then(|x| x.as_str()),
+            ) {
+                out.insert(num.to_string(), status.to_string());
+            }
+        }
+        let has_next = data
+            .pointer("/viewer/projectV2/items/pageInfo/hasNextPage")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        cursor = data
+            .pointer("/viewer/projectV2/items/pageInfo/endCursor")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Item id через issue.projectItems (пагинация project items не нужна:
-/// issue входит в 1–2 проекта, first: 10 покрывает).
 pub(super) async fn item_id_of(
     store: &GitHubStore,
     issue_number: &str,

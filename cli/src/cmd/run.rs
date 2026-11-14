@@ -109,9 +109,11 @@ async fn cron_hub(command: crate::cmd::cli::CronSub) -> Result<()> {
     let mut count = 0;
     if let serde_json::Value::Array(items) = &data {
         for issue in items {
-            let body = issue["body"].as_str().unwrap_or("");
-            let fm = crate::store::github_task::parse_frontmatter_public(body);
-            let Some(schedule) = fm.get("schedule") else {
+            // Расписание — глобальное поле «Расписание» (ADR-098), payload
+            // issue_field_values; fm-ключ schedule мёртв (задача 1087)
+            let fields = crate::store::github_issue_fields::fields_of(issue);
+            let Some(schedule) = fields.get(crate::store::github_issue_fields::names::SCHEDULE)
+            else {
                 continue;
             };
             count += 1;
