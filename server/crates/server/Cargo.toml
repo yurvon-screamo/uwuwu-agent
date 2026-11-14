@@ -31,6 +31,7 @@ futures = "0.3.34"
 lancedb = "0.41.0"
 # lance-encoding: feature protoc тянет protobuf-src (свой бинарь) — CI без системного protoc
 lance-encoding = { version = "14", default-features = false, features = ["protoc"] }
+lance-file = { version = "14", default-features = false, features = ["protoc"] }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
