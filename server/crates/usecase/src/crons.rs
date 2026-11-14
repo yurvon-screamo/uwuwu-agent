@@ -176,15 +176,20 @@ impl CronUseCase {
     pub async fn tick(&self, project: &str) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
         let dir = crons_dir(project);
+        // list_docs даёт пути от docs/ целиком: берём только прямых детей папки
+        let prefix = format!("{dir}/");
         for slug in self.wiki.list_docs(&dir).await? {
-            let path = format!("{dir}/{slug}");
-            let Some(md) = self.wiki.read_doc(&path).await? else {
+            if !slug.starts_with(&prefix) || slug[prefix.len()..].contains('/') {
+                continue; // журнал/ассеты в подпапке — не мастер
+            }
+            let Some(md) = self.wiki.read_doc(&slug).await? else {
                 continue;
             };
             let Some(master) = parse_master(&slug, &md) else {
                 continue;
             };
-            let journal = format!("{dir}/{slug}/Журнал");
+            let name = slug[prefix.len()..].to_string();
+            let journal = format!("{dir}/{name}/Журнал");
             let journal_md = self.wiki.read_doc(&journal).await?.unwrap_or_default();
             if !self.due(&master, &journal_md) {
                 continue;
