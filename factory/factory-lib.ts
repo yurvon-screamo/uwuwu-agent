@@ -1143,6 +1143,17 @@ export function stallMinutesFromEnv(v: string | undefined): number {
   return Number.isFinite(n) && n > 0 ? n : 360
 }
 
+/** Окно fresh-следа dead-гарда (мин, задача 1072): пусто/undefined → дефолт 30;
+ *  конечное число ≥ 0 → оно (0 — осознанное выключение гарда, канон README);
+ *  иначе (NaN, отрицательное, мусор) → дефолт 30 — пустая строка/опечатка не
+ *  должны молча возвращать защиту к выключенному состоянию (ревью 1072:
+ *  регресс к исходному багу без видимой ошибки). */
+export function deadFreshMinutesFromEnv(v: string | undefined): number {
+  if (v === undefined || v.trim() === "") return 30
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? n : 30
+}
+
 /** Активность сессии по последнему сообщению (список DESC — берём только
  *  [0]): max числовых полей time (created/streamed/completed). null —
  *  сообщений нет (= застой: трекнутая сессия минимум с промптом-сообщением).
@@ -1459,6 +1470,35 @@ export function hasSessionEvidence(r: Pick<TaskRef, "devSession" | "reviewSessio
  *  (транзиентный сбой), решение принимает вызывающий. */
 export type SessionLiveness = "alive" | "dead" | "unknown"
 
+/** Свежесть сессии по независимому от serve следу opencode.db (задача 1072):
+ *  "fresh" — строка session_v2 обновлялась в окне гарда (активный ход пишется
+ *  суб-минутно); "stale" — след старый/строки нет; "unknown" — БД-след
+ *  недоступен (ошибка чтения/песочница) — решение принимает вызывающий. */
+export type DeadFreshness = "fresh" | "stale" | "unknown"
+
+/** Вердикт спавна при dead-вердикте serve-пробы. Вход-инвариант: вызывается
+ *  ТОЛЬКО в dead-ветке (после liveness-пробы) — liveness в сигнатуру не
+ *  входит. fresh → skip: пробе не верим (serve при рестартах/деградации лжёт
+ *  404 при живом ходе — инстанс 13.11, задача 317); stale → spawn (dead
+ *  настоящий); unknown → spawn (деградация к прежнему поведению, never
+ *  worse). Единственная точка решения — по образцу routeTask. */
+export function deadSpawnVerdict(freshness: DeadFreshness): "spawn" | "skip" {
+  return freshness === "fresh" ? "skip" : "spawn"
+}
+
+/** Свежесть строки session_v2 против окна гарда (чистое ядро IO-читалки):
+ *  окно 0 = гард выключен (старое поведение); строки нет = stale; строка
+ *  обновлялась в окне = fresh. */
+export function freshnessOfRow(
+  row: { timeUpdated: number } | null,
+  nowMs: number,
+  windowMs: number,
+): DeadFreshness {
+  if (windowMs <= 0) return "stale"
+  if (row === null) return "stale"
+  return nowMs - row.timeUpdated < windowMs ? "fresh" : "stale"
+}
+
 /** Вердикт тика по untracked строке: спавнить ли её в дев-волне и считать ли
  *  сиротой-спавном (корм гарда каскада). Единственная точка решения (по
  *  образцу routeTask) — матрица плана задачи 20261105174319:
@@ -1474,7 +1514,12 @@ export type SessionLiveness = "alive" | "dead" | "unknown"
  *    сирот не менялась — при allow ре-спавн компенсирует (это путь автоком-
  *  пенсации lossMax-допуска: 1-2 сироты спавнятся, ≥3 — HOLD). Отличить
  *  «мёртвый claim» от «потери state» по одной строке невозможно, поэтому
- *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow. */
+ *  обе ситуации ведут себя одинаково: сирота в гарде + спавн при allow.
+ *  Задача 1072: dead-вердикт пробы проверяется вторым источником —
+ *  deadFreshness (БД-след opencode.db: time_updated сессии или свежая
+ *  сессия directory env-задачи при пустой клетке): fresh → живая внешняя
+ *  заявка (skip без orphan — HOLD-гард каскада не кормится), stale/unknown
+ *  → прежнее поведение; undefined = след не проверялся (прежнее поведение). */
 export interface UntrackedRowDecision {
   /** спавнить в дев-волне этого тика (финально фильтруется статусом) */
   devWave: boolean
@@ -1485,14 +1530,21 @@ export interface UntrackedRowDecision {
 export function untrackedRowDecision(
   r: Pick<TaskRef, "devSession" | "reviewSession" | "testSession">,
   liveness: SessionLiveness,
+  deadFreshness?: DeadFreshness,
 ): UntrackedRowDecision {
   const devCell = r.devSession ?? ""
   if (devCell === "") {
+    if (liveness === "dead" && deadFreshness === "fresh") {
+      // работа в env задачи идёт (directory-ключ, инстанс #315): клетки
+      // легитимно пусты — ни спавна, ни orphan-свидетельства
+      return { devWave: false, orphan: false }
+    }
     return { devWave: true, orphan: (r.reviewSession ?? "") !== "" || (r.testSession ?? "") !== "" }
   }
   // unknown (проба не удалась) трактуем как живую — skip, как в routeTask
   if (liveness !== "dead") return { devWave: false, orphan: false }
-  return { devWave: true, orphan: true }
+  // dead-вердикт пробы сверён с БД-следом (задача 1072): fresh — проба лжёт
+  return deadFreshness === "fresh" ? { devWave: false, orphan: false } : { devWave: true, orphan: true }
 }
 
 /** Адресат алерта — фолбэк-цепочка по порядку скана доски: сирота с телом →
