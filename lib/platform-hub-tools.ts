@@ -89,6 +89,9 @@ export async function hubTool<T = Record<string, unknown>>(
         const cell = (v: string) => ({ value: v })
         return {
           rowBlockId: String(issue.number),
+          // нативный state issue (не fm): гард драфт-матча триажа не
+          // доставляет fm-Draft маркеры закрытых issues
+          state: issue.state,
           cells: {
             "Название": cell(String(issue.title)),
             "Status": cell(fields.status ?? "Todo"),
