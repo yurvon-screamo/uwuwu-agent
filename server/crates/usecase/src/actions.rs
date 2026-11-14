@@ -191,8 +191,15 @@ fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
     format!(
         "Задача #{number} «{title}» (доска «{board}», проект {project}).\n\
          Ты — агент конвейера uwuwu (методичка репо). {stage}.\n\
-         Контекст задачи: тело issue #{number} в uwuwu-hub (uwuwu-cli task get {number}).\n\
-         Работай по канону AGENTS.md; доклады и вопросы — комментом в задачу.",
+         \n\
+         Платформа — через MCP-инструменты сервера uwuwu (Code Mode: tools.uwuwu.*):\n\
+         - тело задачи и комменты: uwuwu_task_get {{number: {number}}}\n\
+         - персона владельца (читай первой): uwuwu_person_show\n\
+         - канон-доки проекта: uwuwu_docs_read {{slug: \"Projects/{project}/README\"}},\n\
+           Design Spec (Projects/{project}/Design Spec; нет — штатный skip), Деплоймент\n\
+         - вести задачу: uwuwu_task_edit / task_comment / task_claim {{session: свой ses_…}}\n\
+         \n\
+         Работай по канону AGENTS.md; доклады и вопросы — комментом (uwuwu_task_comment).",
         number = task.number,
         title = task.title,
         board = board.board,
