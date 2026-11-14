@@ -345,6 +345,16 @@ mod base_snapshot_tests {
     }
 
     #[test]
+    fn raw_jq_артефакт_двойной_хвост_не_ломает_сверку_1109() {
+        // Инстанс #1109: base = `gh api --jq .body` — jq печатает тело
+        // (уже с хвостовым \n) плюс свой \n → двойной хвост 0a0a;
+        // вербатим-сверка отказывала, trim_end-сверка проходит
+        let current = BODY_WITH_FM;
+        let raw = format!("{current}\n\n");
+        assert!(base_matches_snapshot(current, &raw));
+    }
+
+    #[test]
     fn crlf_снапшот_нормализуется() {
         let current = "---\nstatus: Todo\n---\nконтент\n";
         let snapshot = "Задача:   Т\r\nСтатус:   Todo\r\nСтрока:   issue #9\r\n\r\n---\r\nstatus: Todo\r\n---\r\nконтент\r\n";

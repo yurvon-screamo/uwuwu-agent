@@ -262,6 +262,29 @@ async fn github_store_resolve_and_base_contract_live() {
         "Pv2-отказ не должен трогать fm-зеркало (носители согласованы)"
     );
 
+    // (4b) валидный edit --status: Pv2 + fm-зеркало согласованы (1039 —
+    // «cli-вид статуса врёт»): fm в теле обновлён синхронно с Pv2
+    store
+        .edit(
+            &board,
+            &b_resolved,
+            &EditTask {
+                status: Some("In Progress".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit с валидным статусом");
+    let body_moved = store
+        .body_get(&board, &b_resolved)
+        .await
+        .expect("body после edit статуса");
+    assert_eq!(
+        fm_field(&body_moved, "status").as_deref(),
+        Some("In Progress"),
+        "fm-зеркало статуса отстаёт от Pv2 (регрессия 1039)"
+    );
+
     // (5) уборка: обе строки закрыты (из open-list уйдут сами)
     store
         .close(&board, &b_resolved, None)
