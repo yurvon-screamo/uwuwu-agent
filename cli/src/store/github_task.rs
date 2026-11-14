@@ -166,8 +166,7 @@ impl GitHubStore {
         {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                let text = format!("{e:#}");
-                if text.contains("404") {
+                if is_github_not_found(&format!("{e:#}")) {
                     Ok(None)
                 } else {
                     Err(StoreError::Other(e))
@@ -175,6 +174,14 @@ impl GitHubStore {
             }
         }
     }
+}
+
+/// 404-детект по статус-маркеру stderr gh («Not Found (HTTP 404)») —
+/// не подстроке «404» по всей цепочке: она содержит URL args
+/// («repos/o/r/issues/1404»), и для номеров с «404» внутри любой
+/// транспортный сбой (403 rate limit, 5xx) маскировался бы под «не найдено».
+fn is_github_not_found(err_chain: &str) -> bool {
+    err_chain.contains("HTTP 404")
 }
 
 /// Публичный доступ к frontmatter-полям тела (cron list и пр.).
@@ -262,5 +269,53 @@ impl Frontmatter {
         out.push_str("---\n");
         out.push_str(&self.rest_md);
         out
+    }
+}
+#[cfg(test)]
+mod not_found_detect_tests {
+    use super::is_github_not_found;
+
+    /// Форма gh_raw bail (github_gh.rs): argv-префикс с URL + stderr-хвост.
+    fn gh_fail(argv_url_number: &str, stderr: &str) -> String {
+        format!(
+            "gh [\"api\", \"repos/o/r/issues/{argv_url_number}\"] упал (exit status 1): {stderr}"
+        )
+    }
+
+    #[test]
+    fn честный_404_детектится() {
+        assert!(is_github_not_found(&gh_fail(
+            "999999999",
+            "Not Found (HTTP 404)"
+        )));
+        assert!(is_github_not_found("HTTP 404: Not Found"));
+    }
+
+    #[test]
+    fn номер_с_404_внутри_не_маскирует_транспортный_сбой() {
+        // Регресс Common-ревью 1097: подстрока «404» из URL #1404/4040 при
+        // 403 rate limit / 5xx — это НЕ «не найдено»
+        assert!(!is_github_not_found(&gh_fail(
+            "1404",
+            "rate limit exceeded (HTTP 403)"
+        )));
+        assert!(!is_github_not_found(&gh_fail(
+            "4040",
+            "Server Error (HTTP 500)"
+        )));
+        assert!(!is_github_not_found(&gh_fail(
+            "404",
+            "Bad credentials (HTTP 401)"
+        )));
+    }
+
+    #[test]
+    fn не_json_и_транспорт_не_404() {
+        assert!(!is_github_not_found(
+            "gh [\"api\", \"repos/o/r/issues/1\"]: не-JSON ответ: <html>"
+        ));
+        assert!(!is_github_not_found(
+            "gh не запустился — есть ли gh в PATH?"
+        ));
     }
 }
