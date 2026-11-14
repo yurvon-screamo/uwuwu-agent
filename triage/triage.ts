@@ -151,7 +151,6 @@ async function readDraftRows(board: BoardRef): Promise<DraftRow[]> {
   const r = await mcpTool<{ rows?: BoardRow[] }>("read_database_cells", { docId: board.docId, databaseBlockId: board.dbId })
   const out: DraftRow[] = []
   for (const row of r.rows ?? []) {
-    // state-гард внутри: мёртвый fm-Draft маркер закрытого issue — null
     const d = draftRowOf(row)
     if (d === null) continue
     // заголовок линкованной строки живёт в доке-теле (read_database_cells
