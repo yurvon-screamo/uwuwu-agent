@@ -158,6 +158,15 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.
+#[async_trait]
+pub trait IssueFieldStore: Send + Sync {
+    /// Значения полей задачи (непустые).
+    async fn load(&self, number: u64) -> UsecaseResult<std::collections::HashMap<String, String>>;
+    /// Батч-запись: Some — значение, None — очистка.
+    async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()>;
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;

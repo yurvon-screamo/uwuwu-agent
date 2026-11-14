@@ -3,10 +3,10 @@
 //! fm ≡ поля (двойная запись держится портом), комменты — issue comments.
 
 use crate::error::{UsecaseError, UsecaseResult};
-use crate::ports::TaskBoardRepo;
+use crate::ports::{IssueFieldStore, TaskBoardRepo};
 use async_trait::async_trait;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{Slot, Status, Task};
 
 /// Параметры создания задачи (fm-канон).
 #[derive(Debug, Clone, Default)]
@@ -22,10 +22,11 @@ pub struct NewTask {
 pub trait TaskWriter: Send + Sync {
     /// Создание: Draft, лейбл proj:<project>, fm-скелет; дубль тайтла — ошибка.
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
-    /// Правка ячеек: статус/ветка/PR/приоритет/тайтл (двойная запись).
-    async fn edit(&self, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
-    /// Заявка сессии в слот dev.
-    async fn claim(&self, number: u64, session: &str) -> UsecaseResult<()>;
+    /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
+    /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
+    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
+    /// Заявка сессии в слот (dev — по умолчанию).
+    async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()>;
     /// Коммент (reply — цитатный якорь).
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()>;
     /// Закрытие: Status=Done + issue closed (reason: completed|not_planned).
@@ -46,6 +47,8 @@ pub struct TaskPatch {
 
 pub struct TaskWriteUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
+    /// Нативные поля issue (ветка/PR/приоритет/сессии).
+    pub fields: Arc<dyn IssueFieldStore>,
     /// карта проект → доска (мультипроектный конфиг).
     pub boards: Vec<(String, String)>,
 }
@@ -95,20 +98,15 @@ impl TaskWriter for TaskWriteUseCase {
             .await
     }
 
-    async fn edit(&self, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
-        // доску резолвит вызывающий юзкейс-слой по проекту строки; для edit
-        // известна одна доска из карточки — берём поfm-статусу нельзя, потому
-        // прокидываем первую (мультиборд: set_status идёт через edit_project)
-        let board = &self
-            .boards
-            .first()
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default();
+    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
+        let board = self.board_of(project);
         if board.is_empty() {
-            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
         }
         if let Some(status) = patch.status {
-            self.board.set_status(board, number, status).await?;
+            self.board.set_status(&board, number, status).await?;
         }
         if let Some(title) = &patch.title {
             self.board.rename_issue(number, title).await?;
@@ -136,18 +134,9 @@ impl TaskWriter for TaskWriteUseCase {
             .await
     }
 
-    async fn claim(&self, number: u64, session: &str) -> UsecaseResult<()> {
-        let board = &self
-            .boards
-            .first()
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default();
-        if board.is_empty() {
-            return Err(UsecaseError::Board("нет досок в конфиге".into()));
-        }
-        self.board
-            .set_session(board, number, uwuwu_domain::Slot::Dev, session)
-            .await
+    async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()> {
+        let resolved = slot.unwrap_or(uwuwu_domain::Slot::Dev);
+        self.board.set_session("", number, resolved, session).await
     }
 
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()> {

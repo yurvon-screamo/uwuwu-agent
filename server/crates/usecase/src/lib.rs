@@ -19,8 +19,8 @@ pub mod views;
 pub use error::{UsecaseError, UsecaseResult};
 pub use ports::SessionInfo;
 pub use ports::{
-    AgentSessionGateway, Clock, CommentRef, FmMutator, IssueView, Liveness, PrGateway, PrState,
-    SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, Clock, CommentRef, FmMutator, IssueFieldStore, IssueView, Liveness,
+    PrGateway, PrState, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use taskwrite::{NewTask, TaskPatch, TaskWriteUseCase, TaskWriter};
 pub use tick::{BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase};

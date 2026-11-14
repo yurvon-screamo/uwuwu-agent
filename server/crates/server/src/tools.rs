@@ -361,7 +361,7 @@ impl ToolHub {
                     return Err("пустой патч: укажи хотя бы одно поле".into());
                 }
                 self.writer
-                    .edit(number, patch)
+                    .edit(&project, number, patch)
                     .await
                     .map_err(|e| e.to_string())?;
                 ok_text(format!("задача #{number} обновлена"))
@@ -373,7 +373,7 @@ impl ToolHub {
                     return Err("session обязан быть ses_…".into());
                 }
                 self.writer
-                    .claim(number, &session)
+                    .claim(number, &session, None)
                     .await
                     .map_err(|e| e.to_string())?;
                 ok_text(format!("задача #{number}: дев-слот заявлен за {session}"))

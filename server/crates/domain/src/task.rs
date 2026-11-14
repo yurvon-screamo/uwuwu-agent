@@ -183,6 +183,26 @@ impl Task {
         self.session_of(slot).is_none().then_some(slot)
     }
 
+    /// Обогащение нативными полями issue (сессии/ветка/PR; лениво).
+    pub fn apply_fields(&mut self, fields: &std::collections::HashMap<String, String>) {
+        let slot_of = |name: &str| match name {
+            "Сессия dev" => Some(Slot::Dev),
+            "Сессия ревью" => Some(Slot::PlanReview),
+            "Сессия тест" => Some(Slot::Test),
+            _ => None,
+        };
+        for (name, value) in fields {
+            if value.is_empty() {
+                continue;
+            }
+            if let Some(slot) = slot_of(name) {
+                self.sessions.insert(slot, value.clone());
+            }
+        }
+        self.branch = fields.get("Branch").filter(|v| !v.is_empty()).cloned();
+        self.pr = fields.get("PR").filter(|v| !v.is_empty()).cloned();
+    }
+
     /// Автодон-кандидат: Review + autodone.
     pub fn autodone_ready(&self) -> bool {
         self.status == Status::UserReview && self.autodone

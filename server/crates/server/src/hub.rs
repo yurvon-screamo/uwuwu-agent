@@ -1,18 +1,22 @@
-//! gh-hub adapter: Projects v2 доска → доменные задачи (чтение) и
-//! мутации носителя (Status-поле + fm-зеркало + issue). Инвариант
-//! «fm ≡ поля» держит писатель: каждая мутация пишет оба носителя.
+//! gh-hub adapter: доска (bulk select-колонки) + issue REST (тело/комменты/
+//! нативные поля). fm-зеркало снесено (владелец 15.11): операционные данные —
+//! Status/Приоритет/Autodone на доске, сессии/ветка/PR — глобальные поля issue
+//! (fields.rs). Тело задачи — чистый контент.
 
+use crate::fields::{parse_field_values, Fields, IssueFields};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use uwuwu_domain::{Priority, Slot, Status, Task};
+use std::sync::Arc;
+use uwuwu_domain::{Priority, Status, Task};
 use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::{CommentRef, FmMutator, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
 
 pub struct GitHubHub {
     repo: String,
     token: String,
     http: reqwest::Client,
+    /// Нативные поля issue (сессии/ветка/PR/тип).
+    pub fields: Arc<IssueFields>,
 }
 
 const QUERY: &str = r#"
@@ -21,16 +25,16 @@ const QUERY: &str = r#"
       projectsV2(first:20, query:$board){
         nodes{
           id title
-          field(name: "Status"){ ... on ProjectV2SingleSelectField{ id options{ id name } } }
+          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
           items(first:100, after:$after){
             pageInfo{ hasNextPage endCursor }
             nodes{
               id
-              content{ __typename ...on Issue{ number title body state } }
+              content{ __typename ...on Issue{ number title state } }
               fieldValues(first:30){
                 nodes{ __typename
                   ...on ProjectV2ItemFieldSingleSelectValue{
-                    name field{ ...on ProjectV2FieldCommon{ id name } }
+                    name field{ ...on ProjectV2FieldCommon{ name } }
                   }
                 }
               }
@@ -41,25 +45,20 @@ const QUERY: &str = r#"
     }
   }"#;
 
-/// Потолок страниц на доску (100/стр): защита от бесконечного цикла.
 const MAX_PAGES: usize = 10;
 
-/// Снимок доски: строки + id для мутаций (project/field/option/item).
 #[derive(Default)]
 struct BoardMeta {
     project_id: String,
     status_field_id: String,
-    /// имя статуса → id опции
-    options: HashMap<String, String>,
-    /// номер issue → item id
-    items: HashMap<u64, String>,
-    /// номер → тело issue (fm-пересборка при мутациях)
-    bodies: HashMap<u64, String>,
+    options: std::collections::HashMap<String, String>,
+    items: std::collections::HashMap<u64, String>,
 }
 
 impl GitHubHub {
     pub fn new(repo: String, token: String) -> Self {
         Self {
+            fields: Arc::new(IssueFields::new(repo.clone(), token.clone())),
             repo,
             token,
             http: reqwest::Client::builder()
@@ -67,6 +66,10 @@ impl GitHubHub {
                 .build()
                 .expect("reqwest client"),
         }
+    }
+
+    pub fn fields(&self) -> Arc<IssueFields> {
+        self.fields.clone()
     }
 
     async fn gql(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
@@ -130,7 +133,7 @@ impl GitHubHub {
         Ok((status, value))
     }
 
-    /// Полный снимок доски: строки (домен) + меты мутаций.
+    /// Снимок доски: bulk-задачи (Status/Приоритет/Autodone) + мета мутаций.
     async fn snapshot(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
             UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
@@ -158,7 +161,18 @@ impl GitHubHub {
                     ))
                 })?;
             if meta.project_id.is_empty() {
-                collect_meta(project, &mut meta);
+                meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
+                meta.status_field_id = project["field"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(options) = project["field"]["options"].as_array() {
+                    for o in options {
+                        if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
+                            meta.options.insert(n.to_string(), id.to_string());
+                        }
+                    }
+                }
                 if meta.project_id.is_empty() {
                     return Err(UsecaseError::Board(format!(
                         "доска «{board}»: нет project id"
@@ -179,25 +193,76 @@ impl GitHubHub {
         )))
     }
 
-    async fn meta_of(&self, board: &str) -> UsecaseResult<BoardMeta> {
-        let (_, meta) = self.snapshot(board).await?;
-        Ok(meta)
-    }
-}
-
-fn collect_meta(project: &Value, meta: &mut BoardMeta) {
-    meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
-    let field = &project["field"];
-    meta.status_field_id = field["id"].as_str().unwrap_or_default().to_string();
-    if let Some(options) = field["options"].as_array() {
-        for o in options {
-            if let (Some(id), Some(name)) = (o["id"].as_str(), o["name"].as_str()) {
-                meta.options.insert(name.to_string(), id.to_string());
+    /// Статус строки на доске (по номеру issue, через projectItems).
+    async fn board_status(&self, number: u64) -> UsecaseResult<String> {
+        let q = r#"
+          query($owner:String!,$name:String!,$n:Int!){
+            repository(owner:$owner,name:$name){
+              issue(number:$n){
+                projectItems(first:3){
+                  nodes{ fieldValues(first:20){ nodes{
+                    __typename ...on ProjectV2ItemFieldSingleSelectValue{
+                      name field{ ...on ProjectV2FieldCommon{ name } } } } } }
+                }
+              }
+            }
+          }"#;
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
+        let data = self
+            .gql(
+                q,
+                json!({ "owner": owner, "name": name, "n": number as i64 }),
+            )
+            .await?;
+        if let Some(items) = data["repository"]["issue"]["projectItems"]["nodes"].as_array() {
+            for item in items {
+                if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
+                    for v in vals {
+                        if v["field"]["name"].as_str() == Some("Status") {
+                            return Ok(v["name"].as_str().unwrap_or_default().to_string());
+                        }
+                    }
+                }
             }
         }
+        Ok(String::new())
     }
-    if let Some(items) = project["items"]["nodes"].as_array() {
-        parse_page(items, meta);
+
+    /// Комменты задачи: последняя страница (свежие), по возрастанию.
+    async fn all_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
+        let (status, body) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}/comments?per_page=100", self.repo),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "comments #{number}: HTTP {status}"
+            )));
+        }
+        let mut out: Vec<CommentRef> = body
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|c| {
+                        let created =
+                            chrono::DateTime::parse_from_rfc3339(c["created_at"].as_str()?).ok()?;
+                        Some(CommentRef {
+                            id: c["node_id"].as_str()?.to_string(),
+                            created_ms: created.timestamp_millis() as u64,
+                            body: c["body"].as_str().unwrap_or_default().to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|c| c.created_ms);
+        Ok(out)
     }
 }
 
@@ -211,42 +276,46 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             }
             let number = issue["number"].as_u64()?;
             let title = issue["title"].as_str()?.to_string();
-            let body = issue["body"].as_str().unwrap_or_default().to_string();
-            let status = item_status(item);
+            let v = item_values(item);
+            let mut task = Task::new(number, title, Status::parse(&v.status));
+            task.priority = Priority::parse(&v.priority);
+            task.autodone = v.autodone;
+            if issue["state"].as_str() == Some("closed") {
+                task.status = Status::Done;
+            }
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
-            meta.bodies.insert(number, body.clone());
-            Some(task_from(number, title, status, &body))
+            Some(task)
         })
         .collect()
 }
 
-/// Сборка доменной задачи из fm-зеркала тела.
-pub fn task_from(number: u64, title: String, status_raw: String, body: &str) -> Task {
-    let fm = crate::fm::Frontmatter::parse(body);
-    let mut task = Task::new(number, title, Status::parse(&status_raw));
-    task.priority = Priority::parse(fm.get("priority").unwrap_or_default());
-    task.autodone = fm.get("autodone").map(|v| v != "false").unwrap_or(false);
-    task.branch = fm.get("branch").filter(|v| !v.is_empty()).map(String::from);
-    task.pr = fm.get("pr").filter(|v| !v.is_empty()).map(String::from);
-    for slot in [Slot::Design, Slot::Dev, Slot::PlanReview, Slot::Test] {
-        if let Some(s) = fm.get(slot.fm_key()).filter(|v| !v.is_empty()) {
-            task.claim(slot, s.to_string());
-        }
-    }
-    task
+/// Bulk-значения select-колонок доски (поля issue ленивые — fields.rs).
+struct ItemValues {
+    status: String,
+    priority: String,
+    autodone: bool,
 }
 
-fn item_status(item: &Value) -> String {
-    item["fieldValues"]["nodes"]
-        .as_array()
-        .and_then(|vals| {
-            vals.iter().find_map(|v| {
-                let field = v["field"]["name"].as_str()?;
-                (field == "Status").then(|| v["name"].as_str().unwrap_or_default().to_string())
-            })
-        })
-        .unwrap_or_default()
+fn item_values(item: &Value) -> ItemValues {
+    let mut out = ItemValues {
+        status: String::new(),
+        priority: String::new(),
+        autodone: false,
+    };
+    if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
+        for v in vals {
+            let field = v["field"]["name"].as_str().unwrap_or_default();
+            let value = v["name"].as_str().unwrap_or_default();
+            match field {
+                "Status" => out.status = value.to_string(),
+                "Приоритет" | "Priority" => out.priority = value.to_string(),
+                "Autodone" => out.autodone = value == "on" || value == "true",
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn trunc(s: &str) -> String {
@@ -260,14 +329,13 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
-        let meta = self.meta_of(board).await?;
-        let option = meta.options.get(status.as_str()).ok_or_else(|| {
+        let (_, mut meta) = self.snapshot(board).await?;
+        let option = meta.options.remove(status.as_str()).ok_or_else(|| {
             UsecaseError::Board(format!("Status-опция «{}» не найдена", status.as_str()))
         })?;
-        let item = meta.items.get(&number).ok_or_else(|| {
+        let item = meta.items.remove(&number).ok_or_else(|| {
             UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
         })?;
-        let field = &meta.status_field_id;
         let mutation = r#"
           mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -276,36 +344,30 @@ impl TaskBoardRepo for GitHubHub {
           }"#;
         self.gql(
             mutation,
-            json!({ "p": meta.project_id, "i": item, "f": field, "o": option }),
+            json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": option }),
         )
         .await?;
-        let value = status.as_str().to_string();
-        self.patch_fm(
-            number,
-            Box::new(move |fields| {
-                fields.insert("status".into(), value);
-            }),
-        )
-        .await
+        Ok(())
     }
 
     async fn set_session(
         &self,
-        board: &str,
+        _board: &str,
         number: u64,
-        slot: Slot,
+        slot: uwuwu_domain::Slot,
         session: &str,
     ) -> UsecaseResult<()> {
-        let _ = board;
-        let key = slot.fm_key().to_string();
-        let sid = session.to_string();
-        self.patch_fm(
-            number,
-            Box::new(move |fields| {
-                fields.insert(key, sid);
-            }),
-        )
-        .await
+        let name = match slot {
+            uwuwu_domain::Slot::Dev => crate::fields::F_DEV_SESSION,
+            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
+                crate::fields::F_REVIEW_SESSION
+            }
+            uwuwu_domain::Slot::Test => crate::fields::F_TEST_SESSION,
+            uwuwu_domain::Slot::Design => crate::fields::F_DEV_SESSION,
+        };
+        self.fields
+            .store(number, &[(name, Some(session.to_string()))])
+            .await
     }
 
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
@@ -325,38 +387,25 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn close_issue(&self, number: u64) -> UsecaseResult<()> {
-        let (status, body) = self
-            .rest(
-                reqwest::Method::PATCH,
-                &format!("/repos/{}/issues/{number}", self.repo),
-                Some(json!({ "state": "closed" })),
-            )
-            .await?;
-        let closed = status.is_success() && body["state"].as_str() == Some("closed");
-        if !closed {
-            // гард false-success PATCH (кейс #1127): верификация read-back
-            return Err(UsecaseError::Board(format!(
-                "close #{number}: false-success PATCH (state={})",
-                body["state"]
-            )));
-        }
-        Ok(())
+        self.close_issue_ext(number, false).await
     }
 
     async fn read_issue(&self, _board: &str, number: u64) -> UsecaseResult<IssueView> {
-        let (_, body_val) = self
+        let (_, issue) = self
             .rest(
                 reqwest::Method::GET,
                 &format!("/repos/{}/issues/{number}", self.repo),
                 None,
             )
             .await?;
-        let title = body_val["title"].as_str().unwrap_or_default().to_string();
-        let body = body_val["body"].as_str().unwrap_or_default().to_string();
-        // статус — из fm-зеркала (инвариант fm ≡ поля; прямое чтение полей канбана — read_board)
-        let fm = crate::fm::Frontmatter::parse(&body);
-        let status = fm.get("status").unwrap_or_default().to_string();
-        let task = task_from(number, title, status, &body);
+        let title = issue["title"].as_str().unwrap_or_default().to_string();
+        let body = issue["body"].as_str().unwrap_or_default().to_string();
+        let status = self.board_status(number).await.unwrap_or_default();
+        let mut task = Task::new(number, title, Status::parse(&status));
+        task.apply_fields(&parse_field_values(&issue));
+        if issue["state"].as_str() == Some("closed") {
+            task.status = Status::Done;
+        }
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -384,14 +433,12 @@ impl TaskBoardRepo for GitHubHub {
         if !status.is_success() {
             return Err(UsecaseError::Board(format!(
                 "create issue: HTTP {status}: {}",
-                trunc(&resp.to_string())
+                resp.to_string().chars().take(140).collect::<String>()
             )));
         }
         let number = resp["number"].as_u64().unwrap_or_default();
         if number == 0 {
-            return Err(UsecaseError::Board(
-                "create issue: нет номера в ответе".into(),
-            ));
+            return Err(UsecaseError::Board("create issue: нет номера".into()));
         }
         let node_id = resp["node_id"].as_str().unwrap_or_default().to_string();
         self.add_to_board(board, number, &node_id).await?;
@@ -414,8 +461,13 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
-    async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()> {
-        self.patch_fm(number, mutate).await
+    async fn patch_cells(
+        &self,
+        _number: u64,
+        _mutate: uwuwu_usecase::FmMutator,
+    ) -> UsecaseResult<()> {
+        // fm-ячейки снесены: ветка/PR/приоритет — нативные поля (taskwrite)
+        Ok(())
     }
 
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
@@ -459,77 +511,19 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
-        let (status, body) = self
-            .rest(
-                reqwest::Method::GET,
-                &format!("/repos/{}/issues/{number}/comments?per_page=5", self.repo),
-                None,
-            )
-            .await?;
-        if !status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "comments #{number}: HTTP {status}"
-            )));
-        }
-        let mut out: Vec<CommentRef> = body
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(|c| {
-                        let created =
-                            chrono::DateTime::parse_from_rfc3339(c["created_at"].as_str()?).ok()?;
-                        Some(CommentRef {
-                            id: c["node_id"].as_str()?.to_string(),
-                            created_ms: created.timestamp_millis() as u64,
-                            body: c["body"].as_str().unwrap_or_default().to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.sort_by_key(|c| c.created_ms);
-        Ok(out)
+        self.all_comments(number).await
     }
 }
 
 impl GitHubHub {
-    /// Все комменты задачи (до 100 последних, по возрастанию времени).
-    async fn all_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
-        let (status, body) = self
-            .rest(
-                reqwest::Method::GET,
-                &format!("/repos/{}/issues/{number}/comments?per_page=100", self.repo),
-                None,
-            )
-            .await?;
-        if !status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "comments #{number}: HTTP {status}"
-            )));
-        }
-        let mut out: Vec<CommentRef> = body
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(|c| {
-                        let created =
-                            chrono::DateTime::parse_from_rfc3339(c["created_at"].as_str()?).ok()?;
-                        Some(CommentRef {
-                            id: c["node_id"].as_str()?.to_string(),
-                            created_ms: created.timestamp_millis() as u64,
-                            body: c["body"].as_str().unwrap_or_default().to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.sort_by_key(|c| c.created_ms);
-        Ok(out)
+    /// Поля задачи (нативные): лениво для строк-кандидатов тика.
+    #[allow(dead_code)] // точка входа ленивых чтений тика (срез анти-шторма подключит)
+    pub async fn load_fields(&self, number: u64) -> UsecaseResult<Fields> {
+        self.fields.load(number).await
     }
 
-    /// Добавление issue на доску + Status=Draft.
     async fn add_to_board(&self, board: &str, number: u64, node_id: &str) -> UsecaseResult<()> {
-        let meta = self.meta_of(board).await?;
+        let (_, meta) = self.snapshot(board).await?;
         let mutation = r#"
           mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){
             item{ id } } }"#;
@@ -541,9 +535,7 @@ impl GitHubHub {
             .unwrap_or_default()
             .to_string();
         if item.is_empty() {
-            return Err(UsecaseError::Board(format!(
-                "add #{number} to board «{board}»: нет item id"
-            )));
+            return Err(UsecaseError::Board(format!("add #{number}: нет item id")));
         }
         if let Some(draft) = meta.options.get("Draft") {
             let set = r#"
@@ -558,36 +550,6 @@ impl GitHubHub {
         }
         Ok(())
     }
-
-    /// fm-пересборка тела: PATCH с сохранением контента дословно.
-    async fn patch_fm(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()> {
-        let (_, body) = self
-            .rest(
-                reqwest::Method::GET,
-                &format!("/repos/{}/issues/{number}", self.repo),
-                None,
-            )
-            .await?;
-        let current = body["body"].as_str().unwrap_or_default().to_string();
-        let fm = crate::fm::Frontmatter::parse(&current);
-        let mut fields = fm.fields;
-        mutate(&mut fields);
-        let next = crate::fm::Frontmatter::render(&current, &fields);
-        let (status, resp) = self
-            .rest(
-                reqwest::Method::PATCH,
-                &format!("/repos/{}/issues/{number}", self.repo),
-                Some(json!({ "body": next })),
-            )
-            .await?;
-        let applied = status.is_success() && resp["body"].as_str() == Some(next.as_str());
-        if !applied {
-            return Err(UsecaseError::Board(format!(
-                "patch body #{number}: не применилось (HTTP {status})"
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -595,20 +557,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_from_parses_fm() {
-        let body = "---\ndev-session: ses_a\nautodone: true\npriority: high\npr: https://x/1\n---\nконтент";
-        let t = task_from(7, "т".into(), "In Progress".into(), body);
-        assert_eq!(t.status, Status::InProgress);
-        assert_eq!(t.session_of(Slot::Dev), Some("ses_a"));
-        assert!(t.autodone);
-        assert_eq!(t.priority, Priority::High);
-        assert_eq!(t.pr.as_deref(), Some("https://x/1"));
+    fn item_values_maps_board_columns() {
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "In Progress", "field": { "name": "Status" } },
+                { "name": "high", "field": { "name": "Приоритет" } },
+                { "name": "on", "field": { "name": "Autodone" } },
+            ]}
+        });
+        let v = item_values(&item);
+        assert_eq!(v.status, "In Progress");
+        assert_eq!(v.priority, "high");
+        assert!(v.autodone);
     }
 
     #[test]
-    fn task_from_survives_empty_body() {
-        let t = task_from(1, "t".into(), String::new(), "");
-        assert_eq!(t.status, Status::Empty);
-        assert!(!t.autodone);
+    fn parse_page_marks_closed_done() {
+        let mut meta = BoardMeta::default();
+        let items = vec![json!({
+            "id": "IT_x",
+            "content": { "__typename": "Issue", "number": 7, "title": "t", "state": "closed" },
+            "fieldValues": { "nodes": [] }
+        })];
+        let rows = parse_page(&items, &mut meta);
+        assert_eq!(rows[0].status, Status::Done);
+        assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
     }
 }

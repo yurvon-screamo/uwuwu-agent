@@ -5,7 +5,7 @@
 
 mod clock;
 mod config;
-mod fm;
+mod fields;
 mod gitwiki;
 mod http;
 mod hub;
@@ -22,7 +22,7 @@ use config::{Config, ConfigError, ENV_CONFIG};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{Clock, TickOutcome, TickUseCase};
+use uwuwu_usecase::{TickOutcome, TickUseCase};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -69,10 +69,11 @@ async fn run(
     config_path: PathBuf,
 ) -> Result<(), String> {
     // Композиция: реализации портов → оркестратор
-    let board = Arc::new(hub::GitHubHub::new(
+    let hub = Arc::new(hub::GitHubHub::new(
         cfg.hub.repo.clone(),
         secrets.gh_token.clone(),
     ));
+    let board = hub.clone();
     let sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
@@ -126,21 +127,39 @@ async fn run(
         secrets.gh_token.clone(),
         Some(git_writer),
     ));
-    // Семантика: плоский индекс (+текст без ключа) + OpenRouter при ключе
-    let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+    // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
+    // нет туннеля — поиск честно без индекса)
+    let embed_url = std::env::var("UWUWU_EMBED_URL")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Arc<dyn uwuwu_usecase::search::SemanticBackend> =
-        Arc::new(semantic_backend::FlatSemanticBackend {
-            wiki: wiki.clone(),
-            store: Arc::new(semantic::FileSemanticStore::load(
-                cfg.state_path(&config_path).with_file_name("semantic.json"),
-            )),
-            embeddings: openrouter_key
-                .map(|key| Arc::new(semantic::OpenRouterEmbeddings::new(key))),
-        });
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::search::SemanticBackend>> = match embed_url
+    {
+        Some(url) => {
+            let embed = Arc::new(semantic::OllamaEmbeddings::new(
+                url,
+                std::env::var("UWUWU_EMBED_MODEL")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| semantic::EMBED_MODEL.to_string()),
+            ));
+            match semantic_backend::LanceSemanticBackend::open(
+                cfg.state_path(&config_path).with_file_name("lancedb"),
+                wiki.clone(),
+                embed,
+            )
+            .await
+            {
+                Ok(b) => Some(Arc::new(b)),
+                Err(e) => {
+                    tracing::error!(event = "semantic.open_failed", error = %e, "LanceDB open failed");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let search_usecase = Arc::new(uwuwu_usecase::search::SearchUseCase {
-        semantic: Some(semantic_backend.clone()),
+        semantic: semantic_backend.clone(),
     });
 
     let tool_hub = Arc::new(tools::ToolHub {
@@ -149,6 +168,7 @@ async fn run(
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
             board: board.clone(),
+            fields: hub.fields(),
             boards: boards_cfg.clone(),
         }),
         wiki: wiki.clone(),
@@ -227,29 +247,6 @@ async fn run(
                 Box::pin(async move { t.tick().await.map(|_| ()) })
             }),
         });
-        {
-            let backend = semantic_backend.clone();
-            let clock2 = clock.clone();
-            sidecars.push(Sidecar {
-                name: "semantic-sync".into(),
-                tick: Box::new(move || {
-                    let b = backend.clone();
-                    let clock = clock2.clone();
-                    Box::pin(async move {
-                        if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
-                            return Ok(());
-                        }
-                        // первичная индексация — широкий бюджет, далее дотяжка
-                        let budget = {
-                            let store_empty = true;
-                            let _ = store_empty;
-                            64
-                        };
-                        b.sync_index(budget).await.map(|_| ())
-                    })
-                }),
-            });
-        }
         sidecars.push(Sidecar {
             name: "dreamer".into(),
             tick: Box::new(move || {
