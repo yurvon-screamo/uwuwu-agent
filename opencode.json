@@ -1,6 +1,4 @@
 {
-  // remote MCP uwuwu-server (hub#1133): задачи/вики/персона через сервер.
-  // TODO(slice-5): после рестарта opencode serve перевести на {env:UWUWU_MCP_TOKEN}
   "mcp": {
     "servers": {
       "uwuwu": {
