@@ -341,7 +341,8 @@ fn body_appends_content_without_frontmatter() {
 }
 
 /// C. `--replace --replace-section` — не мутит тело: комбинация отсекается
-/// (громкий отказ ДО мутации).
+/// гардoм входа (громкий отказ ДО мутации; комбинации, нарушающие
+/// requires base/force, отсекает clap usage-error — осознанно без рецепта).
 #[test]
 fn replace_with_section_flag_cannot_silently_overwrite_body() {
     let guards = setup_stub_gh();
@@ -365,6 +366,71 @@ fn replace_with_section_flag_cannot_silently_overwrite_body() {
         ],
     );
     assert_ne!(code, Some(0), "комбинация не может пройти как успех");
+    assert!(
+        stderr.contains("--replace-section"),
+        "отказ называет флаг: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "отказ ДО мутации: тело не перезаписано"
+    );
+}
+
+/// L. `--replace-section` без `--replace` со входом — не мутит тело:
+/// флаг громко отказывает с рецептом ДО сети и мутации (было: тихий
+/// игнор — append-ветка дописывала вход в конец тела и рапортовала
+/// успех; при существующей секции — тот самый h2-дубль, задача 67).
+#[test]
+fn replace_section_without_replace_refuses_loudly_no_mutation() {
+    let guards = setup_stub_gh();
+    let md = guards.0.path().join("sec.md");
+    std::fs::write(&md, "## Решение\nновое содержимое секции\n").expect("sec.md");
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace-section",
+            "Решение",
+            "--md",
+            md.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, Some(0), "флаг не может пройти как успех");
+    assert!(
+        stderr.contains("--replace-section"),
+        "отказ называет флаг: {stderr}"
+    );
+    assert!(
+        patch_body(&guards).is_none(),
+        "отказ ДО мутации: тело не дописано"
+    );
+}
+
+/// M. `--replace-section` без stdin/--md — громкий отказ, тело не
+/// печатается как успех (было: read-ветка молча игнорила флаг и
+/// печатала тело; задача 67).
+#[test]
+fn replace_section_without_input_refuses_loudly() {
+    let guards = setup_stub_gh();
+    let (code, _stdout, stderr) = run_stub(
+        &guards,
+        None,
+        &[
+            "task",
+            "body",
+            "999",
+            "--project",
+            "uwuwu",
+            "--replace-section",
+            "Решение",
+        ],
+    );
+    assert_ne!(code, Some(0), "флаг не может пройти как успех");
     assert!(
         stderr.contains("--replace-section"),
         "отказ называет флаг: {stderr}"
