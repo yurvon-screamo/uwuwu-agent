@@ -1,7 +1,9 @@
-//! GitHubStore: TaskStore над uwuwu-hub (issues + Projects v2 + body
-//! frontmatter). Контракт миграции — тело задачи 20261112155302-ttyp35g:
-//! label `proj:<имя>` = доска проекта; Status/Запланировано — поля Project
-//! v2; Branch/PR/Сессия dev/Расписание — frontmatter в body.
+//! GitHubStore: TaskStore над uwuwu-hub (issues + Projects v2 + глобальные
+//! issue fields). Контракт миграции — тело задачи 20261112155302-ttyp35g:
+//! label `proj:<имя>` = доска проекта; Status — Pv2 single-select (канбан);
+//! клетки (Приоритет/Autodone/Branch/PR/Сессии/Расписание/Запланировано) —
+//! глобальные issue fields, payload `issue_field_values` (ADR-098, задача
+//! 1087); fm-шапка тел снесена.
 //!
 //! Идемпотентный дубль-резолв — list-issues по label+тайтл с паузой ≥2s
 //! (ретрай после таймаута): ЖИВАЯ ПРОБА 13.11 — list GitHub имеет лаг ~2–4s
@@ -48,14 +50,21 @@ impl GitHubStore {
         format!("proj:{}", board.project)
     }
 
-    /// Конвертация issue-API ответа (body с frontmatter) в нейтральный Task.
-    pub(super) fn convert(&self, issue: &Value) -> Task {
-        let front = Frontmatter::parse(issue["body"].as_str().unwrap_or(""));
+    /// Конвертация issue-API ответа в нейтральный Task. Клетки — payload
+    /// `issue_field_values` (норм-форма, ADR-098); Status — Pv2-джойн
+    /// (`pv2_status`, "" — карточки/канбана нет) с проекцией closed→Done;
+    /// fm-шапка тела мертва (снесена миграцией 1087).
+    pub(super) fn convert(&self, issue: &Value, pv2_status: Option<&str>) -> Task {
+        let fields = crate::store::github_issue_fields::fields_of(issue);
+        let get = |key: &str| fields.get(key).cloned().unwrap_or_default();
         // state — проекция статуса: closed = Done (контракт миграции),
-        // иначе frontmatter/поле проекта
+        // иначе Pv2-поле канбана (карточки нет → Todo-дефолт)
         let status = match issue["state"].as_str() {
             Some("closed") => "Done".to_string(),
-            _ => front.get("status").unwrap_or_else(|| "Todo".into()),
+            _ => match pv2_status {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => "Todo".to_string(),
+            },
         };
         Task {
             id: issue["number"].to_string(),
@@ -68,14 +77,23 @@ impl GitHubStore {
                     .unwrap_or("")
                     .to_lowercase(),
             ),
-            branch: front.get("branch").unwrap_or_default(),
-            pr: front.get("pr").unwrap_or_default(),
-            dev_session: front.get("dev-session").unwrap_or_default(),
-            planned: front.get("planned").unwrap_or_default(),
-            planned_ms: planned_ms(front.get("planned").as_deref()),
-            schedule_cell: front.get("schedule").unwrap_or_default(),
-            priority: front.get("priority").unwrap_or_default(),
-            autodone: matches!(front.get("autodone").as_deref(), Some("true") | Some("✓")),
+            branch: get(crate::store::github_issue_fields::names::BRANCH),
+            pr: get(crate::store::github_issue_fields::names::PR),
+            dev_session: get(crate::store::github_issue_fields::names::DEV_SESSION),
+            planned: get(crate::store::github_issue_fields::names::PLANNED),
+            planned_ms: planned_ms(
+                fields
+                    .get(crate::store::github_issue_fields::names::PLANNED)
+                    .map(String::as_str),
+            ),
+            schedule_cell: get(crate::store::github_issue_fields::names::SCHEDULE),
+            priority: get(crate::store::github_issue_fields::names::PRIORITY),
+            autodone: matches!(
+                fields
+                    .get(crate::store::github_issue_fields::names::AUTODONE)
+                    .map(String::as_str),
+                Some("on") | Some("true") | Some("✓")
+            ),
         }
     }
 
@@ -107,14 +125,19 @@ impl GitHubStore {
         Ok(())
     }
 
-    /// Issue после мутации (read-after-write контракта).
+    /// Issue после мутации (read-after-write контракта). Статус — точечный
+    /// Pv2-резолв (issue.projectItems → Status).
     pub(super) async fn issue_fresh(&self, number: &str) -> StoreResult<Task> {
+        let pv2 = super::github_project_resolve::project_status_of(self, number)
+            .await
+            .unwrap_or(None);
         Ok(self.convert(
             &gh_json(
                 &["api", &format!("repos/{}/issues/{number}", self.repo)],
                 None,
             )
             .await?,
+            pv2.as_deref(),
         ))
     }
 
@@ -140,12 +163,7 @@ impl GitHubStore {
     }
 }
 
-/// Публичный доступ к frontmatter-полям тела (cron list и пр.).
-pub(crate) fn parse_frontmatter_public(body: &str) -> std::collections::HashMap<String, String> {
-    Frontmatter::parse(body).fields_public()
-}
-
-/// «Запланировано» → epoch ms ("" → 0). Frontmatter несёт ISO-дату.
+/// «Запланировано» → epoch ms ("" → 0). Поле несёт ISO-дату.
 fn planned_ms(planned: Option<&str>) -> i64 {
     let Some(s) = planned else { return 0 };
     if s.is_empty() {
@@ -158,72 +176,4 @@ fn planned_ms(planned: Option<&str>) -> i64 {
                 .map(|dt| dt.and_utc().timestamp_millis())
         })
         .unwrap_or(0)
-}
-
-/// Body frontmatter задачи: машиночитаемые ячейки доски на GitHub
-/// (Branch/PR/Сессия dev/Запланировано/Расписание/status-draft); Status —
-/// поле Project v2, сюда дублируется для read-паритета list без GraphQL.
-pub(crate) struct Frontmatter {
-    raw_fields: Vec<(String, String)>,
-    /// Тело после frontmatter-блока (или всё тело, если блока не было).
-    pub rest_md: String,
-}
-
-impl Frontmatter {
-    pub(crate) fn parse(body_md: &str) -> Self {
-        let mut raw_fields = Vec::new();
-        let mut rest_md = body_md.to_string();
-        if let Some(after_open) = body_md.strip_prefix("---\n") {
-            if let Some(end) = after_open.find("\n---\n") {
-                let block = &after_open[..end];
-                rest_md = after_open[end + 5..].to_string();
-                for line in block.lines() {
-                    if let Some((k, v)) = line.split_once(": ") {
-                        raw_fields.push((k.trim().to_string(), v.trim().to_string()));
-                    }
-                }
-            }
-        }
-        Self {
-            raw_fields,
-            rest_md,
-        }
-    }
-
-    pub(crate) fn fields_public(&self) -> std::collections::HashMap<String, String> {
-        self.raw_fields.iter().cloned().collect()
-    }
-
-    pub(crate) fn get(&self, key: &str) -> Option<String> {
-        self.raw_fields
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-    }
-
-    /// Body с заменой/вставкой ключа frontmatter (блок пересобирается,
-    /// порядок полей сохраняется; тело после блока не трогается).
-    pub(crate) fn with_field(&self, key: &str, value: &str) -> String {
-        self.with_fields(&[(key, value)])
-    }
-
-    /// Мульти-правка frontmatter одним проходом (edit пачки ячеек).
-    pub(crate) fn with_fields(&self, fields: &[(&str, &str)]) -> String {
-        let mut merged: Vec<(String, String)> = self
-            .raw_fields
-            .iter()
-            .filter(|(k, _)| !fields.iter().any(|(fk, _)| fk == k))
-            .cloned()
-            .collect();
-        for (k, v) in fields {
-            merged.push(((*k).to_string(), (*v).to_string()));
-        }
-        let mut out = String::from("---\n");
-        for (k, v) in &merged {
-            out.push_str(&format!("{k}: {v}\n"));
-        }
-        out.push_str("---\n");
-        out.push_str(&self.rest_md);
-        out
-    }
 }
