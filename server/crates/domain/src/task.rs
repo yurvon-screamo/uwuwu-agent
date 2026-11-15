@@ -167,6 +167,12 @@ impl TaskFields {
         self.assignments.insert(slot, session);
     }
 
+    /// Снятие сессии слота (раунд свежих глаз: ревью/тест не переживают
+    /// смену стадии — канон сессий).
+    pub fn clear_session(&mut self, slot: Slot) {
+        self.assignments.remove(&slot);
+    }
+
     /// Мутатор: заявка/смена ветки; открытый PR сохраняется (ветка задачи
     /// одна — канон).
     pub fn set_branch(&mut self, name: BranchName) {
@@ -323,6 +329,12 @@ impl Task {
 
     /// Заявка сессии (claim): терминальная строка не принимает заявок —
     /// конвейер закончился, спавн поверх Done — ошибка.
+    /// Снятие сессии слота самой строкой (тик после clear_session доски —
+    /// локальный клон должен видеть свежие глаза).
+    pub fn clear_slot_session(&mut self, slot: Slot) {
+        self.fields.clear_session(slot);
+    }
+
     pub fn claim(&mut self, slot: Slot, session: SessionRef) -> Result<(), String> {
         if self.status.is_terminal() {
             return Err(format!(

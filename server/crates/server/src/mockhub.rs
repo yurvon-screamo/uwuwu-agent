@@ -120,6 +120,13 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn clear_session(&self, _board: &str, number: u64, slot: Slot) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            state.fields.entry(number).or_default().clear_session(slot);
+            Ok(())
+        })
+    }
+
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
         self.with_state(|state| {
             let counter = &mut state.counter;

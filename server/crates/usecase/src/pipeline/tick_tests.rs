@@ -31,6 +31,13 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("session#{n}={s}"));
         Ok(())
     }
+    async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("clear#{n}={:?}", slot));
+        Ok(())
+    }
     async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
         self.log
             .lock()
@@ -157,6 +164,7 @@ impl Clock for FixedClock {
 #[derive(Default)]
 struct MemStateInner {
     comments: Vec<String>,
+    statuses: Vec<(u64, Status)>,
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
     resets: Vec<(u64, Status)>,
@@ -168,6 +176,19 @@ impl TickStateStore for MemState {
     }
     fn set_last_comment_id(&self, _b: &str, _n: u64, id: &str) {
         self.0.lock().unwrap().comments.push(id.into());
+    }
+    fn last_seen_status(&self, _b: &str, n: u64) -> Option<Status> {
+        self.0
+            .lock()
+            .unwrap()
+            .statuses
+            .iter()
+            .rev()
+            .find(|(num, _)| *num == n)
+            .map(|(_, st)| *st)
+    }
+    fn set_last_seen_status(&self, _b: &str, n: u64, status: Status) {
+        self.0.lock().unwrap().statuses.push((n, status));
     }
     fn dreamer_done(&self, _s: &str) -> bool {
         false
@@ -181,6 +202,7 @@ impl TickStateStore for MemState {
         None
     }
     fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
+    fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
     fn last_triage_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
     }
@@ -510,4 +532,95 @@ async fn multi_round_reentry_never_escalates() {
         let _ = sessions;
     }
     assert_eq!(escalations, 0, "три круга доработки — ни одной эскалации");
+}
+
+#[tokio::test]
+async fn stage_transition_gives_fresh_eyes_to_review() {
+    // Канон сессий: ревью-сессии всегда новые — переход в стадию ревью
+    // снимает прошлую сессию слота, спавнится свежий ревьюер
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(30, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev").unwrap(),
+    );
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_old_reviewer").unwrap(),
+    );
+    t.apply_fields(f);
+    // прошлый тик видел In Progress → сейчас ReviewResult = переход
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((30, Status::InProgress));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("clear#30=")),
+        "ревью-сессия снята при переходе: {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "свежий ревьюер заспавнен");
+    assert!(!sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn same_round_keeps_session_no_clear() {
+    // Тот же раунд (статус не менялся): сессия слота живёт, будится
+    // по комментам — никакого fresh-eyes внутри раунда
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(31, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_reviewer").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((31, Status::ReviewResult));
+    let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#31=")),
+        "внутри раунда сессию не трогаем: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn dev_session_survives_all_transitions() {
+    // Канон сессий: дев-сессия едина между этапами и откатами —
+    // переходы стадий её никогда не снимают
+    let state = Arc::new(MemState(Mutex::default()));
+    for status in [
+        Status::Design,
+        Status::ReviewPlan,
+        Status::InProgress,
+        Status::ReviewResult,
+    ] {
+        let mut t = task(32, status);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse("ses_dev_forever").unwrap(),
+        );
+        t.apply_fields(f);
+        let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+        u.run(&plan(Mode::Live, 7)).await.unwrap();
+        let mut log = board.log.lock().unwrap();
+        assert!(
+            !log.iter()
+                .any(|l| l.starts_with("clear#32=") && l.contains("Dev")),
+            "dev-ячейка неприкосновенна ({status:?}): {log:?}"
+        );
+        log.clear();
+    }
 }
