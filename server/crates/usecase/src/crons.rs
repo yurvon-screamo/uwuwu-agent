@@ -54,6 +54,22 @@ impl CronUseCase {
             let journal = format!("{dir}/{name}/Журнал");
             let journal_md = self.wiki.read_doc(&journal).await?.unwrap_or_default();
             let now = self.clock.now_ms();
+            // Инвариант DS: ран не закрылся = сигнал сбоя — последняя строка
+            // журнала «запуск» без сводки старше 2 часов → warn (наблюдаемость)
+            if let Some(last) = journal_md.lines().rev().find(|l| !l.trim().is_empty()) {
+                if last.contains("запуск (демон)") {
+                    let stale = crate::fm_lite::parse_iso_ms(
+                        last.split_whitespace().nth(1).unwrap_or_default(),
+                    )
+                    .map(|ts| now.saturating_sub(ts) > 2 * 3_600_000)
+                    .unwrap_or(false);
+                    if stale {
+                        tracing::warn!(event = "cron.run_stale", cron = %slug,
+                            last = %last.chars().take(60).collect::<String>(),
+                            "Крон-ран не закрылся >2ч — сигнал сбоя");
+                    }
+                }
+            }
             if !master.schedule.is_due(now, last_run_ms(&journal_md)) {
                 continue;
             }

@@ -55,6 +55,11 @@ pub fn tool_descriptors() -> Value {
             object(json!({}))
         ),
         tool(
+            "goal_list",
+            "Реестр долгосрочных целей проекта — читай перед работой над задачей",
+            object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
+        ),
+        tool(
             "projects",
             "Проекты конвейера (доски в конфиге сервера)",
             object(json!({}))
@@ -235,6 +240,18 @@ impl ToolHub {
             "person_show" => {
                 let md = self.person.show().await.map_err(view_err)?;
                 ok_text(md)
+            }
+            "goal_list" => {
+                // Реестр целей проекта: док Projects/<proj>/Goals (тело правит
+                // владелец в UI; агент — читает перед работой над задачей)
+                let slug = format!("Projects/{project}/Goals");
+                match self.docs.read(&slug).await {
+                    Ok(md) => ok_text(md),
+                    Err(_) => ok_text(format!(
+                        "реестр целей пуст: док {slug} не заведён \
+                         (цели ведёт владелец в UI)"
+                    )),
+                }
             }
             "docs_append" => {
                 let slug = arg("slug");
@@ -511,6 +528,7 @@ mod tests {
             "docs_write",
             "docs_append",
             "person_show",
+            "goal_list",
             "projects",
             "search",
             "cron_list",
@@ -518,6 +536,6 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 17, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 18, "контракт поверхности: {names:?}");
     }
 }

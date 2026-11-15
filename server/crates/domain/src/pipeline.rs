@@ -181,48 +181,6 @@ impl SpawnLoop {
     }
 }
 
-/// Круги ревью задачи: инварианты канона — approve-with-notes ≤ 1 на задачу,
-/// третий круг тех же замечаний → тупик владельцу.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReviewRounds {
-    pub request_changes_rounds: u32,
-    pub approve_with_notes_used: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoundOutcome {
-    /// Круг зачтён, конвейер продолжается.
-    Continue,
-    /// Тупик: эскалация владельцу (Needs attention).
-    Escalate,
-}
-
-impl ReviewRounds {
-    /// request_changes от ревьювера: 3 подряд → эскалация.
-    pub fn register_request_changes(&mut self) -> RoundOutcome {
-        self.request_changes_rounds += 1;
-        if self.request_changes_rounds >= 3 {
-            return RoundOutcome::Escalate;
-        }
-        RoundOutcome::Continue
-    }
-
-    /// Прочие вердикты сбрасывают счётчик одних и тех же замечаний.
-    pub fn register_progress(&mut self) {
-        self.request_changes_rounds = 0;
-    }
-
-    /// approve-with-notes выдаётся один раз на задачу.
-    pub fn register_approve_with_notes(&mut self) -> Result<(), &'static str> {
-        if self.approve_with_notes_used {
-            return Err("approve-with-notes уже выдавался на эту задачу");
-        }
-        self.approve_with_notes_used = true;
-        self.register_progress();
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,24 +333,5 @@ mod tests {
             minute_of_day: 540,
             weekday: 3
         }));
-    }
-
-    #[test]
-    fn review_rounds_invariants() {
-        let mut r = ReviewRounds::default();
-        assert_eq!(r.register_request_changes(), RoundOutcome::Continue);
-        assert_eq!(r.register_request_changes(), RoundOutcome::Continue);
-        assert_eq!(r.register_request_changes(), RoundOutcome::Escalate);
-        r.register_progress();
-        assert_eq!(
-            r.register_request_changes(),
-            RoundOutcome::Continue,
-            "прогресс сбросил счётчик"
-        );
-        assert!(r.register_approve_with_notes().is_ok());
-        assert!(
-            r.register_approve_with_notes().is_err(),
-            "второй approve-with-notes запрещён"
-        );
     }
 }

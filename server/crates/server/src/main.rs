@@ -73,6 +73,7 @@ async fn run(
     // Композиция: реализации портов → оркестратор
     // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit)
     let use_memory_hub = cfg.hub.driver == "memory";
+    let mut github_hub: Option<Arc<hub::GitHubHub>> = None;
     let (board, field_store): (
         Arc<dyn uwuwu_usecase::TaskBoardRepo>,
         Arc<dyn uwuwu_usecase::IssueFieldStore>,
@@ -85,10 +86,12 @@ async fn run(
             cfg.hub.repo.clone(),
             secrets.gh_token.clone(),
         ));
-        (
+        let out = (
             gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
-            gh.fields(),
-        )
+            gh.fields() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
+        );
+        github_hub = Some(gh);
+        out
     };
     let raw_sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
@@ -163,9 +166,14 @@ async fn run(
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| semantic::EMBED_MODEL.to_string()),
             ));
+            // github-хаб индексирует и задачи (юзер-стори «по вики/задачам»)
+            let issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>> = github_hub
+                .clone()
+                .map(|gh| gh as Arc<dyn uwuwu_usecase::IssueIndexSource>);
             match semantic_backend::LanceSemanticBackend::open(
                 cfg.state_path(&config_path).with_file_name("lancedb"),
                 wiki.clone(),
+                issues,
                 embed,
             )
             .await

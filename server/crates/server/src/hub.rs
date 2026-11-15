@@ -580,6 +580,58 @@ impl GitHubHub {
     }
 }
 
+/// Источник задач для семантического индекса: последние issues репо
+/// (state=all, новейшие первыми), тело — как есть.
+#[async_trait]
+impl uwuwu_usecase::IssueIndexSource for GitHubHub {
+    async fn recent_issues(
+        &self,
+        limit: usize,
+    ) -> uwuwu_usecase::error::UsecaseResult<Vec<uwuwu_usecase::IssueDigest>> {
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        while out.len() < limit && page <= 5 {
+            let (status, body) = self
+                .rest(
+                    reqwest::Method::GET,
+                    &format!(
+                        "/repos/{}/issues?state=all&per_page=100&page={page}",
+                        self.repo
+                    ),
+                    None,
+                )
+                .await?;
+            if !status.is_success() {
+                return Err(UsecaseError::Board(format!("recent issues: HTTP {status}")));
+            }
+            let list = body.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                break;
+            }
+            for i in list {
+                // PR тоже issues в этом эндпоинте — фильтруем
+                if i["pull_request"].is_object() {
+                    continue;
+                }
+                let number = i["number"].as_u64().unwrap_or_default();
+                if number == 0 {
+                    continue;
+                }
+                out.push(uwuwu_usecase::IssueDigest {
+                    number,
+                    title: i["title"].as_str().unwrap_or_default().to_string(),
+                    body: i["body"].as_str().unwrap_or_default().to_string(),
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,6 +31,8 @@ fn err(msg: String) -> UsecaseError {
 
 pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
+    /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
+    issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
     embeddings: Arc<OllamaEmbeddings>,
 }
@@ -62,6 +64,7 @@ impl LanceSemanticBackend {
     pub async fn open(
         path: PathBuf,
         wiki: Arc<dyn WikiRepo>,
+        issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
         embeddings: Arc<OllamaEmbeddings>,
     ) -> UsecaseResult<Self> {
         let db = ConnectBuilder::new(path.to_str().unwrap_or_default())
@@ -70,6 +73,7 @@ impl LanceSemanticBackend {
             .map_err(|e| err(format!("connect: {e}")))?;
         let this = Self {
             wiki,
+            issues,
             db,
             embeddings,
         };
@@ -316,6 +320,29 @@ impl SemanticBackend for LanceSemanticBackend {
                 if known.get(&slug).copied() != Some(h) {
                     self.reindex_doc(&slug, &md, h).await?;
                     changed += 1;
+                }
+            }
+        }
+        // задачи в индекс (юзер-стори: «найти решённое раньше по вики/задачам»):
+        // слаг task-N — выдача читается task_get по номеру
+        if let Some(issues) = &self.issues {
+            if changed < budget {
+                for digest in issues.recent_issues(400).await? {
+                    if changed >= budget {
+                        break;
+                    }
+                    let slug = format!("task-{}", digest.number);
+                    let text = format!(
+                        "#{} {}\n\n{}",
+                        digest.number,
+                        digest.title,
+                        digest.body.chars().take(4000).collect::<String>()
+                    );
+                    let h = Self::hash(&text);
+                    if known.get(&slug).copied() != Some(h) {
+                        self.reindex_doc(&slug, &text, h).await?;
+                        changed += 1;
+                    }
                 }
             }
         }
