@@ -158,11 +158,27 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_body",
-            "Полная замена тела задачи (fm-поля сохраняются)",
+            "Полная замена тела задачи целиком (fm в тело не пишется — поля \
+             нативные; большое тело правь секционно через task_body_section)",
             object(json!({
                 "number": integer("номер задачи"),
                 "project": string("проект; дефолт uwuwu"),
                 "body": string("markdown-тело целиком (без fm)")
+            }))
+        ),
+        tool(
+            "task_body_section",
+            "Секционная правка тела задачи: дельта секции вместо полного body \
+             (большие тела — только этот путь); свежесть — base_hash",
+            object(json!({
+                "number": integer("номер задачи"),
+                "project": string("проект; дефолт uwuwu"),
+                "section": string("заголовок секции; ATX-префикс пинит уровень \
+                                  («### X» — h3), bare/«## X» — дефолт h2"),
+                "content": string("новый контент секции без заголовка; пустая \
+                                  строка — очистка секции"),
+                "base_hash": string("body_hash тела на момент чтения (fm-блок \
+                                    task_get или прошлая квитанция); обязателен")
             }))
         ),
     ])
@@ -212,13 +228,14 @@ impl ToolHub {
                     .ok_or("number обязателен (число)")?;
                 let view = self.tasks.card(&project, number).await.map_err(view_err)?;
                 let mut out = format!(
-                    "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautodone: {}\n\n",
+                    "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautodone: {}\nbody_hash: {}\n\n",
                     view.task.number(),
                     view.task.title(),
                     uwuwu_usecase::status_name(view.task.status()),
                     view.task.branch().map(|b| b.as_str()).unwrap_or("—"),
                     view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
                     view.task.autodone(),
+                    uwuwu_usecase::body_hash(&view.body),
                 );
                 out.push_str(&view.body);
                 if !view.comments.is_empty() {
@@ -436,19 +453,33 @@ impl ToolHub {
                 if body.trim().is_empty() {
                     return Err("пустое тело".into());
                 }
-                // fm текущей задачи сохраняется, контент заменяется
-                let current = self.tasks.card(&project, number).await.map_err(view_err)?;
-                let fm = fm_of(&current.body);
-                let next = format!(
-                    "---\n{}\n---\n\n{}",
-                    fm,
-                    body.trim_start_matches('-').trim_start_matches('#').trim()
-                );
-                self.writer
-                    .set_body(number, &next)
+                let receipt = self
+                    .writer
+                    .set_body(number, &body)
                     .await
                     .map_err(|e| e.to_string())?;
-                ok_text(format!("тело #{number} заменено"))
+                ok_text(format!(
+                    "тело #{number} заменено; {} байт; body_hash: {}",
+                    receipt.body_size, receipt.body_hash
+                ))
+            }
+            "task_body_section" => {
+                let number = need_number(args)?;
+                let section = arg("section");
+                let content = arg("content");
+                let base_hash = arg("base_hash");
+                if section.trim().is_empty() {
+                    return Err("section обязателен (заголовок секции)".into());
+                }
+                if base_hash.trim().is_empty() {
+                    return Err("base_hash обязателен (body_hash из fm task_get)".into());
+                }
+                let report = self
+                    .writer
+                    .set_body_section(&project, number, &section, &content, &base_hash)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(render_section_report(&section, &report))
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -475,16 +506,23 @@ fn need_number(args: &Value) -> Result<u64, String> {
         .ok_or("number обязателен (число)".to_string())
 }
 
-/// fm-блок целиком (между маркерами), либо дефолтный скелет.
-fn fm_of(body: &str) -> String {
-    if let Some(end) = body.find("\n---\n") {
-        return body[..end + 5]
-            .trim_start_matches('-')
-            .trim_matches('-')
-            .trim()
-            .to_string();
+/// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
+/// Компактно — полное тело не возвращается (сознательное сужение #1152:
+/// возврат больших тел убивал бы экономию секционного пути).
+fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditReport) -> String {
+    use uwuwu_usecase::SectionAction;
+    let mut verdict = match (report.action, report.cleared) {
+        (SectionAction::Replaced, true) => format!("секция «{section}» очищена"),
+        (SectionAction::Replaced, false) => format!("секция «{section}» заменена"),
+        (SectionAction::Appended, _) => format!("секция «{section}» добавлена в конец"),
+    };
+    if report.duplicates_removed > 0 {
+        verdict.push_str(&format!(" (дублей снят ×{})", report.duplicates_removed));
     }
-    String::from("status: Draft\npriority: medium\nautodone: true")
+    format!(
+        "{verdict}; тело {} байт; body_hash: {}",
+        report.body_size, report.body_hash
+    )
 }
 
 fn ok_text(text: String) -> Result<Value, String> {
@@ -529,6 +567,7 @@ mod tests {
             "task_comment",
             "task_close",
             "task_body",
+            "task_body_section",
             "docs_ls",
             "docs_read",
             "docs_write",
@@ -542,6 +581,6 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 18, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 19, "контракт поверхности: {names:?}");
     }
 }

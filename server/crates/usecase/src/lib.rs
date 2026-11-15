@@ -30,5 +30,6 @@ pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use tasks::body_hash;
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};
 pub use tasks::write::{
-    BodyWriteReceipt, NewTask, SectionEditReport, TaskPatch, TaskWriteUseCase, TaskWriter,
+    BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, TaskPatch, TaskWriteUseCase,
+    TaskWriter,
 };
