@@ -114,12 +114,21 @@ impl IssueFields {
 
     /// Батч-запись: Some — значение, None — очистка (идемпотентно).
     pub async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()> {
-        let catalog = self.catalog().await?;
+        let mut catalog = self.catalog().await?;
         let mut batch = Vec::new();
         for (name, value) in patch {
-            let fid = catalog.get(*name).ok_or_else(|| {
-                UsecaseError::Board(format!("глобальное поле «{name}» не найдено"))
-            })?;
+            // self-heal: отсутствующее поле создаём (инцидент #1149 —
+            // create задачи падал целиком из-за неготового «Тип»)
+            let fid = match catalog.get(*name) {
+                Some(f) => *f,
+                None => {
+                    self.ensure_field(name).await?;
+                    catalog = self.catalog().await?;
+                    *catalog.get(*name).ok_or_else(|| {
+                        UsecaseError::Board(format!("глобальное поле «{name}» не найдено"))
+                    })?
+                }
+            };
             match value {
                 Some(v) if !v.is_empty() => batch.push(json!({ "field_id": fid, "value": v })),
                 _ => {
@@ -167,12 +176,27 @@ impl IssueFields {
         if catalog.contains_key(name) {
             return Ok(());
         }
+        // «Тип» — single-select канона (create без поля падал «глобальное
+        // поле не найдено», инцидент #1149); прочие имена — текст
+        let body = if name == "Тип" {
+            let colors = [
+                "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
+                "green", "blue",
+            ];
+            let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
+                            "priority": i + 1 })
+                })
+                .collect();
+            json!({ "name": name, "data_type": "single_select", "options": options })
+        } else {
+            json!({ "name": name, "data_type": "text" })
+        };
         let (status, _resp) = self
-            .rest(
-                reqwest::Method::POST,
-                "/user/issue-fields",
-                Some(json!({ "name": name, "type": "text" })),
-            )
+            .rest(reqwest::Method::POST, "/user/issue-fields", Some(body))
             .await?;
         if !status.is_success() && status.as_u16() != 422 {
             return Err(UsecaseError::Board(format!(

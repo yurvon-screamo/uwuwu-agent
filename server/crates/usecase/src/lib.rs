@@ -16,7 +16,7 @@ pub use crons::{crons_dir, parse_schedule_text, CronUseCase, FireOutcome};
 pub use error::{UsecaseError, UsecaseResult};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
-    schedule_label, slot_key, status_name, task_type_name,
+    schedule_label, slot_key, status_name, task_type_name, TASK_TYPES,
 };
 pub use pipeline::{
     BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, TriageBoard, TriageUseCase,
