@@ -15,7 +15,7 @@ use uwuwu_usecase::bots::{
 use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec, TickStateStore, UsecaseResult};
 
 pub(crate) const TG_POLL_SEC: u64 = 25;
-const POLL_RETRY_MS: u64 = 10_000;
+pub(crate) const RETRY_PAUSE_MS: u64 = 10_000;
 const FALLBACK: &str = "Не успел ответить — напиши ещё раз.";
 
 /// Структурные поля спеки: фиксируются на жизнь задачи (смена = рестарт
@@ -39,6 +39,8 @@ pub(crate) struct BotDeps {
     /// Потолок ожидания реплая и шаг опроса (константы — поля ради тестов).
     pub reply_cap_ms: u64,
     pub reply_poll_ms: u64,
+    /// Пауза между поллами: после сбоя обработки и в poll-fail ветке.
+    pub retry_pause_ms: u64,
 }
 
 /// Запустить бот-задачу; падение задачи — рестарт с луп-гвардом супервизора.
@@ -46,38 +48,51 @@ pub(crate) fn spawn_bot_task(deps: BotDeps) -> JoinHandle<()> {
     let slug = deps.slug.clone();
     tokio::spawn(async move {
         tracing::info!(event = "bot.started", slug = %deps.slug, "Бот-задача запущена");
+        let mut offset = deps.state.bot_offset(&deps.slug);
         loop {
-            let offset = deps.state.bot_offset(&deps.slug);
             match deps.tg.get_updates(offset, TG_POLL_SEC).await {
                 Ok(updates) => {
                     for u in updates {
-                        handle_update(&deps, u).await;
+                        if !handle_update(&deps, &u).await {
+                            // Обработка не удалась: offset НЕ двигается —
+                            // апдейт и хвост батча переедут с следующим
+                            // поллом (план #1150: offset персистится после
+                            // отправки; дубль при ретрае лучше потери).
+                            tracing::warn!(event = "bot.offset_held", slug = %deps.slug,
+                                update_id = u.update_id, "Апдейт не обработан — ретрай");
+                            tokio::time::sleep(Duration::from_millis(deps.retry_pause_ms)).await;
+                            break;
+                        }
+                        offset = Some(u.update_id + 1);
+                        deps.state.set_bot_offset(&deps.slug, u.update_id + 1);
+                        if let Err(e) = deps.state.save() {
+                            tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug,
+                                error = %e, "Offset не персистится");
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(event = "bot.poll_failed", slug = %slug, error = %e,
                         "TG long-poll failed — пауза до следующей попытки");
-                    tokio::time::sleep(Duration::from_millis(POLL_RETRY_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(deps.retry_pause_ms)).await;
                 }
             }
         }
     })
 }
 
-/// Апдейт обрабатывается, затем offset растёт (персистится) — дубль-ответ
-/// при крахе mid-processing принят осознанно (редкий класс, план #1150).
-async fn handle_update(deps: &BotDeps, u: TgUpdate) {
-    if let Some(m) = &u.message {
-        if let Err(e) = process_message(deps, m).await {
-            tracing::warn!(event = "bot.process_failed", slug = %deps.slug,
-                update_id = u.update_id, error = %e, "Апдейт не обработан");
-        }
+/// Апдейт: true — обработан/поглощён (offset можно двигать), false —
+/// сбой обработки (offset держится до успешного ретрая).
+async fn handle_update(deps: &BotDeps, u: &TgUpdate) -> bool {
+    let Some(m) = &u.message else {
+        return true; // не-message апдейт поглощается без обработки
+    };
+    if let Err(e) = process_message(deps, m).await {
+        tracing::warn!(event = "bot.process_failed", slug = %deps.slug,
+            update_id = u.update_id, error = %e, "Апдейт не обработан");
+        return false;
     }
-    deps.state.set_bot_offset(&deps.slug, u.update_id + 1);
-    if let Err(e) = deps.state.save() {
-        tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
-            "Offset не персистится");
-    }
+    true
 }
 
 async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {

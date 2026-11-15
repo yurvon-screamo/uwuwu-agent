@@ -75,12 +75,14 @@ impl WikiRepo for FakeWiki {
 }
 
 /// FakeTg: async-поллинг очереди (прод — long-poll HTTP); panic_mode —
-/// смерть задачи для теста луп-гварда.
+/// смерть задачи для теста луп-гварда. Апдейты остаются в очереди до
+/// сдвига offset (семантика TG), fail_send — сбой sendMessage.
 struct FakeTg {
     queue: Mutex<Vec<TgUpdate>>,
     sent: Mutex<Vec<(i64, String)>>,
     fail: AtomicBool,
     panic: AtomicBool,
+    fail_send: AtomicBool,
     polls: AtomicU32,
 }
 
@@ -91,6 +93,7 @@ impl FakeTg {
             sent: Mutex::new(vec![]),
             fail: AtomicBool::new(false),
             panic: AtomicBool::new(false),
+            fail_send: AtomicBool::new(false),
             polls: AtomicU32::new(0),
         })
     }
@@ -116,14 +119,19 @@ impl TelegramGateway for FakeTg {
         if self.fail.load(Ordering::SeqCst) {
             return Err(UsecaseError::Telegram("fake tg down".into()));
         }
-        // async-поллинг очереди до timeout (мок возвращает сразу)
+        // async-поллинг очереди до timeout; апдейты НЕ удаляются —
+        // подтверждение происходит сдвигом offset у клиента (как в TG)
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_sec);
         loop {
             {
-                let mut q = self.queue.lock().expect("tg lock");
-                q.sort_by_key(|u| u.update_id);
-                if let Some(pos) = q.iter().position(|u| Some(u.update_id) >= offset) {
-                    return Ok(q.split_off(pos));
+                let q = self.queue.lock().expect("tg lock");
+                let pending: Vec<TgUpdate> = q
+                    .iter()
+                    .filter(|u| Some(u.update_id) >= offset)
+                    .cloned()
+                    .collect();
+                if !pending.is_empty() {
+                    return Ok(pending);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -133,6 +141,11 @@ impl TelegramGateway for FakeTg {
         }
     }
     async fn send_message(&self, chat_id: i64, text: &str) -> UsecaseResult<()> {
+        if self.fail_send.load(Ordering::SeqCst) {
+            return Err(UsecaseError::Telegram(
+                "fake tg: sendMessage refused".into(),
+            ));
+        }
         self.sent
             .lock()
             .expect("tg lock")
@@ -432,6 +445,7 @@ fn deps(
         tick_state: Arc::new(MemTickState::default()),
         reply_cap_ms,
         reply_poll_ms,
+        retry_pause_ms: 10,
     }
 }
 
@@ -441,7 +455,14 @@ fn supervisor(
     state: Arc<FakeState>,
     clock: Arc<FakeClock>,
     tg: Arc<FakeTg>,
+    tokens: Vec<(&'static str, &'static str)>,
 ) -> BotSupervisor {
+    let tokens: Arc<HashMap<String, String>> = Arc::new(
+        tokens
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
     let mut sup = BotSupervisor::new(
         wiki,
         sessions,
@@ -453,6 +474,7 @@ fn supervisor(
             Arc::new(TgHandle(handle)) as Arc<dyn TelegramGateway>
         }),
     );
+    sup.token_of = Arc::new(move |env| tokens.get(env).cloned());
     sup.reply_cap_ms = 300;
     sup.reply_poll_ms = 10;
     sup.guard = GuardTiming {
@@ -625,6 +647,50 @@ async fn long_reply_chunked() {
 }
 
 #[tokio::test]
+async fn send_failure_holds_offset_and_retries() {
+    let tg = FakeTg::new(vec![private_update(
+        4,
+        "yurvon",
+        "не дойдёт с первого раза",
+    )]);
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    tg.fail_send.store(true, Ordering::SeqCst);
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    // сбой отправки: offset держится, апдейт не подтверждён
+    let held = wait_until(|| tg.polls.load(Ordering::SeqCst) >= 2, 3000).await;
+    assert!(held, "раннер сделал повторный полл после сбоя");
+    assert_eq!(
+        state.bot_offset(SLUG),
+        None,
+        "offset не двигается при неудачной отправке (план: персист после отправки)"
+    );
+    // ТГ ожил → апдейт переедет с очереди и ответ уйдёт
+    tg.fail_send.store(false, Ordering::SeqCst);
+    let ok = wait_until(
+        || {
+            !tg.sent_snapshot().is_empty()
+                && tg.sent_snapshot()[0].1.contains("эхо:")
+                && state.bot_offset(SLUG) == Some(5)
+        },
+        3000,
+    )
+    .await;
+    task.abort();
+    assert!(
+        ok,
+        "после восстановления ТГ сообщение обработано и offset сдвинут"
+    );
+}
+
+#[tokio::test]
 async fn alive_session_reused_dead_recreated() {
     // живая сессия в state — реюз без create
     let tg = FakeTg::new(vec![private_update(9, "yurvon", "раз")]);
@@ -707,13 +773,13 @@ async fn doc_created_spawns_bot_and_survives_ticks() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![private_update(1, "yurvon", "привет")]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T1", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T1", "tok")],
     ));
     sup.tick().await.unwrap();
     let ok = wait_until(|| !sessions.created.lock().expect("lock").is_empty(), 2000).await;
@@ -736,13 +802,13 @@ async fn doc_removed_stops_bot_keeps_session() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![private_update(1, "yurvon", "привет")]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T2", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T2", "tok")],
     ));
     sup.tick().await.unwrap();
     wait_until(
@@ -766,13 +832,13 @@ async fn model_change_recreates_session_memory_reset() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![private_update(1, "yurvon", "привет")]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T3", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T3", "tok")],
     ));
     sup.tick().await.unwrap();
     wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
@@ -803,14 +869,16 @@ async fn token_env_change_rearms_keeps_session() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![private_update(1, "yurvon", "привет")]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T4A", "tok-a");
-    std::env::set_var("UWUWU_BOT_TOKEN_T4B", "tok-b");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![
+            ("UWUWU_BOT_TOKEN_T4A", "tok"),
+            ("UWUWU_BOT_TOKEN_T4B", "tok"),
+        ],
     ));
     sup.tick().await.unwrap();
     wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
@@ -852,13 +920,13 @@ async fn manual_edit_is_hot_without_restart() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![private_update(1, "yurvon", "вопрос")]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T5", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T5", "tok")],
     ));
     sup.tick().await.unwrap();
     wait_until(|| sup.is_running(SLUG), 2000).await;
@@ -897,13 +965,13 @@ async fn supervisor_restart_restores_bots_with_memory() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![]);
-    std::env::set_var("UWUWU_BOT_TOKEN_T6", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T6", "tok")],
     ));
     sup.tick().await.unwrap();
     wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
@@ -915,6 +983,7 @@ async fn supervisor_restart_restores_bots_with_memory() {
         state.clone(),
         clock.clone(),
         sup2_tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T6", "tok")],
     ));
     sup2.tick().await.unwrap();
     sup2_tg.inject(private_update(2, "yurvon", "после рестарта"));
@@ -935,13 +1004,13 @@ async fn missing_token_does_not_spawn() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![]);
-    std::env::remove_var("UWUWU_BOT_TOKEN_T7_MISSING");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T7", "tok")],
     ));
     sup.tick().await.unwrap();
     sup.tick().await.unwrap();
@@ -958,13 +1027,13 @@ async fn dead_task_restarts_with_backoff() {
     let clock = FakeClock::at(10_000);
     let tg = FakeTg::new(vec![]);
     tg.panic.store(true, Ordering::SeqCst); // задача умрёт на первом полле
-    std::env::set_var("UWUWU_BOT_TOKEN_T8", "tok");
     let sup = Arc::new(supervisor(
         wiki.clone(),
         sessions.clone(),
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T8", "tok")],
     ));
     sup.tick().await.unwrap();
     let ok = wait_until(|| sup.is_running(SLUG) && sup.running_task_dead(SLUG), 2000).await;
@@ -996,6 +1065,7 @@ async fn broken_spec_fails_loudly_without_spawn() {
         state.clone(),
         clock.clone(),
         tg.clone(),
+        vec![],
     ));
     sup.tick().await.unwrap();
     assert!(!sup.is_running(SLUG), "битая спека не поднимается");

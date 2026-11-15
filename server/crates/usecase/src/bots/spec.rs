@@ -30,7 +30,9 @@ pub fn parse_bot_doc(slug: &str, md: &str) -> Result<BotSpec, String> {
     Ok(BotSpec {
         slug: slug.to_string(),
         title: field(&fm, "title").unwrap_or(name).to_string(),
-        enabled: field(&fm, "enabled").map(|v| v != "false").unwrap_or(true),
+        enabled: field(&fm, "enabled")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true),
         model,
         token_env,
         owner: field(&fm, "owner").map(|v| v.trim_start_matches('@').to_string()),
@@ -90,6 +92,16 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
         assert_eq!(s.model.variant, None);
         assert_eq!(s.owner, None);
         assert_eq!(s.manual, "тело");
+    }
+
+    #[test]
+    fn enabled_false_is_case_insensitive() {
+        // yaml-конвенция False/FALSE — тоже погашено
+        for v in ["false", "False", "FALSE"] {
+            let md = format!("---\nmodel: p/id\ntoken_env: TOK\nworkspace: /w\nenabled: {v}\n---");
+            let s = parse_bot_doc("s", &md).unwrap();
+            assert!(!s.enabled, "enabled: {v} должно гасить бота");
+        }
     }
 
     #[test]

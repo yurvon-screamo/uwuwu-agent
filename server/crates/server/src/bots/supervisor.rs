@@ -10,11 +10,13 @@ use uwuwu_domain::{BotAction, BotSpec};
 use uwuwu_usecase::bots::{parse_bot_doc, plan_action, BotStateStore, TelegramGateway};
 use uwuwu_usecase::{AgentSessionGateway, Clock, TickStateStore, UsecaseResult, WikiRepo};
 
-use super::runner::{spawn_bot_task, BotStructural};
+use super::runner::{spawn_bot_task, BotStructural, RETRY_PAUSE_MS};
 use super::BotLive;
 
 /// Фабрика ТГ-клиента: прод — TelegramClient(token), тесты/e2e — фейки.
 pub(crate) type TgFactory = Arc<dyn Fn(&str) -> Arc<dyn TelegramGateway> + Send + Sync>;
+/// Резолв токена по имени env-переменной (прод — std::env, тесты — map).
+pub(crate) type TokenLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Ритм луп-гварда рестартов.
 #[derive(Clone, Copy)]
@@ -57,6 +59,7 @@ pub struct BotSupervisor {
     tick_state: Arc<dyn TickStateStore>,
     clock: Arc<dyn Clock>,
     make_tg: TgFactory,
+    pub(crate) token_of: TokenLookup,
     /// Потолок/шаг ожидания реплая (поля ради тестов).
     pub(crate) reply_cap_ms: u64,
     pub(crate) reply_poll_ms: u64,
@@ -80,6 +83,7 @@ impl BotSupervisor {
             tick_state,
             clock,
             make_tg,
+            token_of: Arc::new(|env| std::env::var(env).ok().filter(|v| !v.trim().is_empty())),
             reply_cap_ms: 240_000,
             reply_poll_ms: 2_000,
             guard: GuardTiming::default(),
@@ -273,8 +277,7 @@ impl BotSupervisor {
                                 "Смена token_env — задача перезапускается, сессия живёт");
                             self.replace_entry(running, slug, spec);
                         }
-                        // Spawn из plan_action не приходит (новые — ветка None выше)
-                        Some(BotAction::Spawn) | None => entry.spec = spec.clone(),
+                        None => entry.spec = spec.clone(),
                     }
                 }
             }
@@ -337,13 +340,10 @@ impl BotSupervisor {
         spec: &BotSpec,
         live: Arc<BotLive>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let token = match std::env::var(&spec.token_env) {
-            Ok(t) if !t.trim().is_empty() => t,
-            _ => {
-                tracing::warn!(event = "bot.token_missing", slug = %spec.slug,
-                    env = %spec.token_env, "Токена нет в env — бот-задача не поднимается");
-                return None;
-            }
+        let Some(token) = (self.token_of)(&spec.token_env) else {
+            tracing::warn!(event = "bot.token_missing", slug = %spec.slug,
+                env = %spec.token_env, "Токена нет в env — бот-задача не поднимается");
+            return None;
         };
         let deps = super::runner::BotDeps {
             slug: spec.slug.clone(),
@@ -359,6 +359,7 @@ impl BotSupervisor {
             tick_state: self.tick_state.clone(),
             reply_cap_ms: self.reply_cap_ms,
             reply_poll_ms: self.reply_poll_ms,
+            retry_pause_ms: RETRY_PAUSE_MS,
         };
         Some(spawn_bot_task(deps))
     }

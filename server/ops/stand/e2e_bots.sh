@@ -22,9 +22,12 @@ STATE=ops/state.json
 say()  { printf '\033[1;34m[e2e-bots]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e-bots FAIL]\033[0m %s\n' "$*"; exit 1; }
 
-cleanup() { pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
-            pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
-            pkill -f 'mock_tg.py' 2>/dev/null || true; }
+# PID-гигиена: гасим только свои процессы (чужие стенды на том же
+# бинаре не трогаем)
+SRV_PID=""; MOCK_PID=""; TG_PID=""
+cleanup() { for pid in "$SRV_PID" "$MOCK_PID" "$TG_PID"; do
+              [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+            done; }
 trap cleanup EXIT
 
 mcp() { # MCP-вызов на локальный сервер (health-проба)
@@ -39,7 +42,9 @@ rm -f "$STATE"
 
 say "стенд: mock_tg ($PORT_TG) + mock_opencode ($PORT_MOCK)"
 python3 ops/stand/mock_tg.py >"$LOG_TG" 2>&1 &
+TG_PID=$!
 MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=200 ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
 sleep 1
 
 # вики-док бота: «один док = один бот», токен только в env стенда
@@ -55,6 +60,7 @@ UWUWU_BOT_TOKEN_E2E="$TOKEN" \
 UWUWU_MOCK_DOCS="$BOT_DOC" \
 RUST_LOG=info \
   ./target/debug/uwuwu-server >"$LOG_SRV" 2>&1 &
+SRV_PID=$!
 
 # супервизор спавнит бота на первом тике
 say "ожидание bot.spawned…"
@@ -115,7 +121,7 @@ PY
 
 # рестарт сервера: боты восстанавливаются с памятью (liveness Alive → реюз)
 say "рестарт сервера…"
-pkill -f 'target/debug/uwuwu-server' || true
+kill "$SRV_PID" 2>/dev/null || true
 sleep 1
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml \
 UWUWU_SERVER_MODE=live \
@@ -126,6 +132,7 @@ UWUWU_BOT_TOKEN_E2E="$TOKEN" \
 UWUWU_MOCK_DOCS="$BOT_DOC" \
 RUST_LOG=info \
   ./target/debug/uwuwu-server >>"$LOG_SRV" 2>&1 &
+SRV_PID=$!
 CREATED_BEFORE=$(grep -c '"event":"bot.session_created"' "$LOG_SRV" || true)
 for _ in $(seq 1 20); do
   sleep 1

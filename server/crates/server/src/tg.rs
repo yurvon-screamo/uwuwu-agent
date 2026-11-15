@@ -42,6 +42,28 @@ impl TelegramClient {
         }
     }
 
+    /// Краткая классификация транспортной ошибки БЕЗ URL: reqwest в
+    /// Display печатает полный url запроса, а в пути — токен бота
+    /// (NFT-04: токен не попадает в логи).
+    fn describe(e: &reqwest::Error) -> String {
+        if e.is_timeout() {
+            return "timeout".into();
+        }
+        if e.is_connect() {
+            return "connect failed".into();
+        }
+        if e.is_decode() {
+            return "response decode failed".into();
+        }
+        if e.is_request() {
+            return "request build failed".into();
+        }
+        match e.status() {
+            Some(s) => format!("http {s}"),
+            None => "transport".into(),
+        }
+    }
+
     async fn call(&self, method: &str, body: Value) -> UsecaseResult<Value> {
         let resp = self
             .http
@@ -49,17 +71,16 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| UsecaseError::Telegram(format!("tg {method}: {e}")))?;
+            .map_err(|e| UsecaseError::Telegram(format!("tg {method}: {}", Self::describe(&e))))?;
         let status = resp.status();
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| UsecaseError::Telegram(format!("tg {method} body: {e}")))?;
+        let value: Value = resp.json().await.map_err(|e| {
+            UsecaseError::Telegram(format!("tg {method} body: {}", Self::describe(&e)))
+        })?;
         if !status.is_success() || value["ok"].as_bool() != Some(true) {
             let desc = value["description"].as_str().unwrap_or_default();
-            return Err(UsecaseError::Board(format!(
-                "tg {method}: HTTP {status} {}",
-                desc
+            // 409 «два поллера» и прочий ТГ-неок — Telegram-класс ошибки
+            return Err(UsecaseError::Telegram(format!(
+                "tg {method}: HTTP {status} {desc}"
             )));
         }
         Ok(value["result"].clone())
