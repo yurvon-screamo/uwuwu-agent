@@ -205,5 +205,11 @@ pub trait TickStateStore: Send + Sync {
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;
     fn set_spawn_loop(&self, board: &str, number: u64, slot: Slot, status: Status, repeats: u32);
+    /// Attention-механика: строка наблюдается в статусе, отличном от
+    /// сохранённого у счётчиков её слотов — прошлые попытки спавна
+    /// устарели (строка ушла в другую стадию и вернулась), сброс.
+    /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
+    /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
+    fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
     fn save(&self) -> UsecaseResult<()>;
 }

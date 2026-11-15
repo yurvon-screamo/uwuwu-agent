@@ -154,13 +154,20 @@ impl Clock for FixedClock {
     }
 }
 
-struct MemState(Mutex<Vec<String>>);
+#[derive(Default)]
+struct MemStateInner {
+    comments: Vec<String>,
+    /// (number, slot) → (status, repeats)
+    loops: Vec<(u64, Slot, Status, u32)>,
+    resets: Vec<(u64, Status)>,
+}
+struct MemState(Mutex<MemStateInner>);
 impl TickStateStore for MemState {
     fn last_comment_id(&self, _b: &str, _n: u64) -> Option<String> {
         None
     }
     fn set_last_comment_id(&self, _b: &str, _n: u64, id: &str) {
-        self.0.lock().unwrap().push(id.into());
+        self.0.lock().unwrap().comments.push(id.into());
     }
     fn dreamer_done(&self, _s: &str) -> bool {
         false
@@ -178,10 +185,34 @@ impl TickStateStore for MemState {
         None
     }
     fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
-    fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
-        None
+    fn spawn_loop(&self, _b: &str, n: u64, s: Slot) -> Option<(Status, u32)> {
+        self.0
+            .lock()
+            .unwrap()
+            .loops
+            .iter()
+            .rev()
+            .find(|(num, slot, _, _)| *num == n && *slot == s)
+            .map(|(_, _, st, r)| (*st, *r))
     }
-    fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _status: Status, _r: u32) {}
+    fn set_spawn_loop(&self, _b: &str, n: u64, s: Slot, status: Status, r: u32) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(e) = g
+            .loops
+            .iter_mut()
+            .find(|(num, slot, _, _)| *num == n && *slot == s)
+        {
+            *e = (n, s, status, r);
+        } else {
+            g.loops.push((n, s, status, r));
+        }
+    }
+    fn reset_stale_spawn_loops(&self, _b: &str, n: u64, current: Status) {
+        let mut g = self.0.lock().unwrap();
+        g.resets.push((n, current));
+        g.loops
+            .retain(|(num, _, st, _)| !(*num == n && *st != current));
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -216,6 +247,14 @@ fn usecase(
     rows: Vec<Task>,
     pr: PrState,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    usecase_with_state(rows, pr, Arc::new(MemState(Mutex::default())))
+}
+
+fn usecase_with_state(
+    rows: Vec<Task>,
+    pr: PrState,
+    state: Arc<MemState>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
         rows,
         log: Mutex::default(),
@@ -233,7 +272,7 @@ fn usecase(
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
-        state: Arc::new(MemState(Mutex::default())),
+        state,
         spawn_model: None,
     };
     (u, board, sessions, prs)
@@ -372,4 +411,69 @@ async fn autodone_docs_only_done() {
         .unwrap()
         .iter()
         .any(|l| l.contains("status#7=Done")));
+}
+
+#[tokio::test]
+async fn observe_does_not_charge_spawn_loops() {
+    // Инцидент #1046 (15.11): observe-тики заряжали счётчик спавн-петли
+    // (set_spawn_loop звался до Live-гейта) — live эскалировал строку
+    // в Needs attention первым же спавном.
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(11, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+    let out = u.run(&plan(Mode::Observe, 7)).await.unwrap();
+    assert_eq!(out.spawns_allowed, 1, "решение логируется");
+    assert!(
+        state.0.lock().unwrap().loops.is_empty(),
+        "observe не пишет счётчики петель"
+    );
+}
+
+#[tokio::test]
+async fn status_journey_resets_loop_counter() {
+    // Счётчик (In Progress, 2) пережил путь IP→Design→Ревью плана→IP:
+    // без сброса при наблюдении строки в другом статусе первый же
+    // спавн после возврата эскалирует (инцидент #1046).
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((12, Slot::Dev, Status::InProgress, 2));
+    // тик, пока строка в Design: счётчик dev-слота устарел — сброс
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(12, Status::Design)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        !state
+            .0
+            .lock()
+            .unwrap()
+            .loops
+            .iter()
+            .any(|(n, slot, _, _)| *n == 12 && *slot == Slot::Dev),
+        "счётчик dev-слота чужого статуса сброшен"
+    );
+    // возврат в In Progress: спавн чистый, без эскалации
+    let (u2, board, _, _) = usecase_with_state(
+        vec![task(12, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+    let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "спавн прошёл");
+    assert_eq!(out.attention_flagged, 0, "эскалации нет");
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.starts_with("session#12=")));
 }

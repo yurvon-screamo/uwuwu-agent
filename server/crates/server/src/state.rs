@@ -164,6 +164,21 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
+    fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status) {
+        let prefix = format!("{board}:{number}:");
+        let current_name = naming::status_name(current);
+        let mut guard = self.state.lock().expect("state lock");
+        let stale: Vec<String> = guard
+            .spawn_loops
+            .iter()
+            .filter(|(k, (status, _))| k.starts_with(&prefix) && status != current_name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            guard.spawn_loops.remove(&key);
+        }
+    }
+
     fn save(&self) -> UsecaseResult<()> {
         // гигиена роста: dreamer_done — последние 500
         {
