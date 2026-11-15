@@ -148,20 +148,27 @@ impl BotSupervisor {
         running: &mut HashMap<String, Running>,
         scanned: &[(String, Result<BotSpec, String>)],
     ) {
-        let gone: Vec<String> = running
-            .keys()
-            .filter(|slug| {
-                !scanned.iter().any(|(s, spec)| {
-                    s == *slug && spec.as_ref().map(|b| b.enabled).unwrap_or(false)
-                })
-            })
-            .cloned()
-            .collect();
-        for slug in gone {
+        // Точные причины погашения: снос/переименование дока, битая
+        // fm-спека (опечатка владельца), enabled:false — диагностика
+        // по полю reason, не одной строкой на три случая.
+        let mut gone: Vec<(String, &'static str)> = Vec::new();
+        for slug in running.keys() {
+            let parsed = scanned
+                .iter()
+                .find(|(s, _)| s.as_str() == slug)
+                .map(|(_, spec)| spec);
+            match parsed {
+                None => gone.push((slug.clone(), "док снесён или переименован")),
+                Some(Err(_)) => gone.push((slug.clone(), "спека не парсится (fm сломан)")),
+                Some(Ok(b)) if !b.enabled => gone.push((slug.clone(), "enabled:false")),
+                Some(Ok(_)) => {}
+            }
+        }
+        for (slug, reason) in gone {
             if let Some(entry) = running.remove(&slug) {
                 entry.task.abort();
-                tracing::info!(event = "bot.stopped", slug = %slug,
-                    "Бот погашен (док снесён/переименован/enabled:false) — сессия сохранена");
+                tracing::info!(event = "bot.stopped", slug = %slug, reason,
+                    "Бот погашен — сессия сохранена");
             }
         }
     }
