@@ -40,6 +40,10 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
             "service": "uwuwu-server",
             "mode": state.mode,
             "version": env!("CARGO_PKG_VERSION"),
+            // git-sha рантайма: Railway передаёт коммит деплоя в env
+            "commit": std::env::var("RAILWAY_SNAPSHOT_ID")
+                .or_else(|_| std::env::var("RAILWAY_GIT_COMMIT"))
+                .unwrap_or_else(|_| "unknown".into()),
             "tick": tick,
         })),
     )

@@ -60,6 +60,12 @@ impl AgentSessionGateway for StubSessions {
     async fn export_session(&self, _: &str) -> UsecaseResult<String> {
         Ok(String::new())
     }
+    async fn last_assistant_reply(
+        &self,
+        _s: &str,
+    ) -> UsecaseResult<Option<uwuwu_usecase::AssistantReply>> {
+        Ok(None)
+    }
 }
 
 /// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.

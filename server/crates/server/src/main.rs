@@ -473,8 +473,15 @@ struct Sidecar {
 
 async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::UsecaseError> {
     for s in sidecars {
-        if let Err(e) = (s.tick)().await {
-            tracing::error!(event = "sidecar.tick_failed", sidecar = %s.name, error = %e, "Sidecar failed");
+        // таймаут: один зависший сайдкар не хоронит очередь остальных
+        // (инцидент 16.11: bot-события пропали при живом основном тике)
+        match tokio::time::timeout(std::time::Duration::from_secs(120), (s.tick)()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                event = "sidecar.tick_failed", sidecar = %s.name, error = %e, "Sidecar failed"),
+            Err(_) => tracing::error!(
+                event = "sidecar.timeout", sidecar = %s.name,
+                "Sidecar tick завис (>120с) — пропущен, очередь живёт"),
         }
     }
     Ok(())
