@@ -215,5 +215,49 @@ fn render_create_body(spec: &NewTask) -> String {
     } else {
         spec.body_md.clone()
     };
-    format!("## Постановка\n\n{content}\n")
+    // тело уже в канон-форме (агенты шлют «## Постановка…») — не дублируем
+    // H2 (инцидент #1149: скелет prepend'ался к готовому телу)
+    if content.trim_start().starts_with('#') {
+        format!("{content}\n")
+    } else {
+        format!("## Постановка\n\n{content}\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(body: &str) -> NewTask {
+        NewTask {
+            title: "t".into(),
+            body_md: body.into(),
+            kind: None,
+            priority: String::new(),
+            autodone: true,
+        }
+    }
+
+    #[test]
+    fn create_body_no_duplicate_h2() {
+        // инцидент #1149: агент шлёт тело в канон-форме — скелет не дублируется
+        let canon = "## Постановка\n\nТекст.";
+        assert_eq!(
+            render_create_body(&spec(canon)),
+            "## Постановка\n\nТекст.\n"
+        );
+        assert_eq!(
+            render_create_body(&spec(canon))
+                .matches("## Постановка")
+                .count(),
+            1
+        );
+        // голый текст — скелет добавляется
+        assert_eq!(
+            render_create_body(&spec("просто текст")),
+            "## Постановка\n\nпросто текст\n"
+        );
+        // пустое тело — тайтл как постановка
+        assert_eq!(render_create_body(&spec("")), "## Постановка\n\nt\n");
+    }
 }

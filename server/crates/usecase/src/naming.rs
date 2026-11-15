@@ -156,6 +156,21 @@ pub fn schedule_label(s: &Schedule) -> String {
     }
 }
 
+/// Все типы канона (порядок = порядок опций поля «Тип»).
+pub const TASK_TYPES: [TaskType; 11] = [
+    TaskType::Bug,
+    TaskType::Spike,
+    TaskType::Analys,
+    TaskType::Docs,
+    TaskType::Other,
+    TaskType::Feature,
+    TaskType::Refactoring,
+    TaskType::Legacy,
+    TaskType::Idea,
+    TaskType::Qa,
+    TaskType::Infrastructure,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
