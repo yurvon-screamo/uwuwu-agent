@@ -25,6 +25,8 @@ struct HubState {
     /// number → issue closed
     closed: HashMap<u64, bool>,
     counter: u64,
+    /// Слэг → markdown (вики стенда; seed UWUWU_MOCK_DOCS — JSON-карта).
+    docs: HashMap<String, String>,
 }
 
 pub struct MemoryHub {
@@ -35,6 +37,7 @@ pub struct MemoryHub {
 
 impl MemoryHub {
     /// Seed-строка для E2E-прогона (UWUWU_MOCK_SEED="1148:Design").
+    /// Вики-сид: UWUWU_MOCK_DOCS — JSON «слаг → markdown» (боты e2e).
     pub fn from_env() -> Self {
         let seed = std::env::var("UWUWU_MOCK_SEED").ok().and_then(|raw| {
             let (n, s) = raw.split_once(':')?;
@@ -43,9 +46,21 @@ impl MemoryHub {
                 uwuwu_usecase::parse_status(s.trim()),
             ))
         });
+        let docs: HashMap<String, String> = std::env::var("UWUWU_MOCK_DOCS")
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        if !docs.is_empty() {
+            tracing::info!(
+                event = "mockhub.docs_seeded",
+                count = docs.len(),
+                "Вики стенда засеяна (UWUWU_MOCK_DOCS)"
+            );
+        }
         Self {
             state: Mutex::new(HubState {
                 next_number: 1,
+                docs,
                 ..HubState::default()
             }),
             seed,
@@ -231,6 +246,47 @@ impl TaskBoardRepo for MemoryHub {
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         self.with_state(|state| Ok(state.comments.get(&number).cloned().unwrap_or_default()))
+    }
+}
+
+#[async_trait]
+impl uwuwu_usecase::WikiRepo for MemoryHub {
+    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
+        self.with_state(|state| Ok(state.docs.get(slug).cloned()))
+    }
+
+    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
+        self.with_state(|state| {
+            let norm = prefix.trim_matches('/');
+            let mut out: Vec<String> = state
+                .docs
+                .keys()
+                .filter(|p| {
+                    norm.is_empty() || p.starts_with(&format!("{norm}/")) || p.as_str() == norm
+                })
+                .cloned()
+                .collect();
+            out.sort();
+            Ok(out)
+        })
+    }
+
+    async fn write_doc(&self, slug: &str, content: &str, _message: &str) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            state.docs.insert(slug.to_string(), content.to_string());
+            Ok(())
+        })
+    }
+
+    async fn append_doc(&self, slug: &str, line: &str, _message: &str) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            let entry = state.docs.entry(slug.to_string()).or_default();
+            if !entry.is_empty() {
+                entry.push('\n');
+            }
+            entry.push_str(line);
+            Ok(())
+        })
     }
 }
 

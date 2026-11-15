@@ -86,7 +86,10 @@ impl TickUseCase {
         // комменты (инцидент ночи 15-16.11).
         for (bp, tasks) in boards.iter_mut() {
             for t in tasks.iter_mut() {
-                if t.stage_slot().is_some() {
+                // stage-строки (wakeup/needs_spawn) + Review-строки
+                // (автодон: PR/ветка — глобальные поля, без enrichment
+                // автодон слеп — PR #338/#339 висели немержеными)
+                if t.stage_slot().is_some() || t.status() == Status::UserReview {
                     match self.board.issue_fields(t.number()).await {
                         Ok(f) => t.apply_fields(f),
                         Err(e) => tracing::warn!(

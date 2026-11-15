@@ -55,7 +55,8 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
     /// Закрытие с причиной (completed|not_planned).
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
-    /// Полная замена тела issue (fm нового тела становится каноном).
+    /// Полная замена тела issue (как записано; fm-шапка стрипается на
+    /// границе юзкейса — тела без fm, поля нативные).
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
 }
 
@@ -98,6 +99,8 @@ pub struct SessionSpec {
     pub agent: AgentSlot,
     /// Модель спавна; None — дефолт исполнителя.
     pub model: Option<ModelRef>,
+    /// Вариант модели (opencode model.variant, напр. «low»); None — без.
+    pub variant: Option<String>,
     /// Bootstrap-сессия подготовки env: НЕ тарифицируется спавн-бюджетом —
     /// логический спавн тарифа = рабочая сессия (e2e 15.11: полный цикл
     /// с ре-энтри съедал 10/10 из-за bootstrap-пар).
@@ -111,6 +114,18 @@ pub enum Liveness {
     Unknown,
 }
 
+/// Последний ответ ассистента сессии (форма message tail сверена живой
+/// пробой опенкода 2.3.0: type/finish/content[].text, time.created).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantReply {
+    /// ms создания сообщения (базовая метка «до промпта» vs «после»).
+    pub created_ms: u64,
+    /// Текстовые части ответа (content[].text), склеенные новой строкой.
+    pub text: String,
+    /// finish-маркер присутствует — ответ завершён (иначе ещё стримится).
+    pub finished: bool,
+}
+
 #[async_trait]
 pub trait AgentSessionGateway: Send + Sync {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String>;
@@ -121,6 +136,8 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
     /// ms последней активности сессии (последнее сообщение) или None.
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
+    /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
+    async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>>;
     /// Список сессий исполнителя (для дримера: idle-детект).
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
     /// Экспорт сессии (сообщения/сводка) — контент для дримера.

@@ -15,6 +15,8 @@ pub enum UsecaseError {
     Pr(String),
     /// Персистентное состояние тика.
     State(String),
+    /// Telegram Bot API (боты, #1150).
+    Telegram(String),
 }
 
 impl fmt::Display for UsecaseError {
@@ -24,6 +26,7 @@ impl fmt::Display for UsecaseError {
             Self::Session(m) => write!(f, "сессия: {m}"),
             Self::Pr(m) => write!(f, "pr: {m}"),
             Self::State(m) => write!(f, "состояние: {m}"),
+            Self::Telegram(m) => write!(f, "telegram: {m}"),
         }
     }
 }

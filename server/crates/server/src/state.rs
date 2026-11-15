@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
+use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -17,6 +18,17 @@ struct RowState {
     /// канон сессий: ревью/тест-раунды всегда со свежей сессией).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_status: Option<String>,
+}
+
+/// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
+/// Сессия переживает stop/re-arm; пересоздание — clear session, offset
+/// остаётся (поллинг продолжается с непрочитанного).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BotRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,6 +49,9 @@ struct StateFile {
     /// Дневной счётчик дримера: (дата JST, спавнов).
     #[serde(default)]
     dreamer_day: Option<(String, u32)>,
+    /// «slug бота» → сессия + offset (раннер ботов, #1150).
+    #[serde(default)]
+    bots: BTreeMap<String, BotRow>,
 }
 
 pub struct JsonStateStore {
@@ -58,6 +73,47 @@ impl JsonStateStore {
 
     fn key(board: &str, number: u64) -> String {
         format!("{board}:{number}")
+    }
+
+    /// Атомарная запись файла (единая точка: оба трейта — делегаты).
+    fn save_now(&self) -> UsecaseResult<()> {
+        // гигиена роста: dreamer_done — последние 500
+        {
+            let mut guard = self.state.lock().expect("state lock");
+            if guard.dreamer_done.len() > 500 {
+                let cut = guard.dreamer_done.len() - 500;
+                guard.dreamer_done.drain(0..cut);
+            }
+            if guard.spawns.len() > 5000 {
+                let keys: Vec<String> = guard.spawns.keys().cloned().collect();
+                let cut = guard.spawns.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawns.remove(&k);
+                }
+            }
+            if guard.spawn_loops.len() > 5000 {
+                let keys: Vec<String> = guard.spawn_loops.keys().cloned().collect();
+                let cut = guard.spawn_loops.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawn_loops.remove(&k);
+                }
+            }
+        }
+        let raw = {
+            let guard = self.state.lock().expect("state lock");
+            serde_json::to_vec_pretty(&*guard)
+        };
+        let raw = raw.map_err(|e| UsecaseError::State(format!("сериализация: {e}")))?;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| UsecaseError::State(format!("mkdir {}: {e}", dir.display())))?;
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, &raw)
+            .map_err(|e| UsecaseError::State(format!("write {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| UsecaseError::State(format!("rename {}: {e}", self.path.display())))?;
+        Ok(())
     }
 }
 
@@ -211,43 +267,54 @@ impl TickStateStore for JsonStateStore {
     }
 
     fn save(&self) -> UsecaseResult<()> {
-        // гигиена роста: dreamer_done — последние 500
-        {
-            let mut guard = self.state.lock().expect("state lock");
-            if guard.dreamer_done.len() > 500 {
-                let cut = guard.dreamer_done.len() - 500;
-                guard.dreamer_done.drain(0..cut);
-            }
-            if guard.spawns.len() > 5000 {
-                let keys: Vec<String> = guard.spawns.keys().cloned().collect();
-                let cut = guard.spawns.len() - 5000;
-                for k in keys.into_iter().take(cut) {
-                    guard.spawns.remove(&k);
-                }
-            }
-            if guard.spawn_loops.len() > 5000 {
-                let keys: Vec<String> = guard.spawn_loops.keys().cloned().collect();
-                let cut = guard.spawn_loops.len() - 5000;
-                for k in keys.into_iter().take(cut) {
-                    guard.spawn_loops.remove(&k);
+        self.save_now()
+    }
+}
+
+impl BotStateStore for JsonStateStore {
+    fn bot_session(&self, slug: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.session.clone())
+    }
+
+    fn set_bot_session(&self, slug: &str, session: Option<&str>) {
+        let mut guard = self.state.lock().expect("state lock");
+        match session {
+            // старая сессия в opencode.db живёт — забывается только ссылка
+            Some(s) => guard.bots.entry(slug.to_string()).or_default().session = Some(s.into()),
+            None => {
+                if let Some(row) = guard.bots.get_mut(slug) {
+                    row.session = None;
                 }
             }
         }
-        let raw = {
-            let guard = self.state.lock().expect("state lock");
-            serde_json::to_vec_pretty(&*guard)
-        };
-        let raw = raw.map_err(|e| UsecaseError::State(format!("сериализация: {e}")))?;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| UsecaseError::State(format!("mkdir {}: {e}", dir.display())))?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &raw)
-            .map_err(|e| UsecaseError::State(format!("write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| UsecaseError::State(format!("rename {}: {e}", self.path.display())))?;
-        Ok(())
+    }
+
+    fn bot_offset(&self, slug: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.offset)
+    }
+
+    fn set_bot_offset(&self, slug: &str, offset: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .entry(slug.to_string())
+            .or_default()
+            .offset = Some(offset);
+    }
+
+    fn save(&self) -> UsecaseResult<()> {
+        self.save_now()
     }
 }
 
@@ -263,16 +330,41 @@ mod tests {
         {
             let s = JsonStateStore::load(path.clone());
             s.set_last_comment_id("Задачи uwuwu", 7, "c1");
-            s.save().unwrap();
+            // бот: сессия + offset переживают рестарт (секция bots)
+            s.set_bot_session("Projects/uwuwu/Боты/x", Some("ses_abc"));
+            s.set_bot_offset("Projects/uwuwu/Боты/x", 42);
+            TickStateStore::save(&s).unwrap();
         }
         let s = JsonStateStore::load(path.clone());
         assert_eq!(s.last_comment_id("Задачи uwuwu", 7).as_deref(), Some("c1"));
+        assert_eq!(
+            s.bot_session("Projects/uwuwu/Боты/x").as_deref(),
+            Some("ses_abc"),
+            "рестарт восстанавливает сессию бота"
+        );
+        assert_eq!(s.bot_offset("Projects/uwuwu/Боты/x"), Some(42));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bot_session_clear_keeps_offset_row() {
+        let s = JsonStateStore::load(PathBuf::from("/nonexistent/uwuwu/x.json"));
+        s.set_bot_session("slug", Some("ses_1"));
+        s.set_bot_offset("slug", 9);
+        s.set_bot_session("slug", None);
+        assert_eq!(s.bot_session("slug"), None, "сессия забыта");
+        assert_eq!(
+            s.bot_offset("slug"),
+            Some(9),
+            "offset переживает пересоздание"
+        );
     }
 
     #[test]
     fn missing_file_is_fresh_state() {
         let s = JsonStateStore::load(PathBuf::from("/nonexistent/uwuwu/x.json"));
         assert!(s.last_comment_id("b", 1).is_none());
+        assert!(s.bot_session("slug").is_none());
+        assert!(s.bot_offset("slug").is_none());
     }
 }

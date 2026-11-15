@@ -26,6 +26,7 @@ impl TickUseCase {
                 title: format!("bootstrap {title}"),
                 agent: AgentSlot::Default,
                 model: self.spawn_model.clone(),
+                variant: None,
                 bootstrap: true,
             })
             .await?;
@@ -56,6 +57,7 @@ impl TickUseCase {
                 title: title.to_string(),
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
+                variant: None,
                 bootstrap: false,
             })
             .await?;
