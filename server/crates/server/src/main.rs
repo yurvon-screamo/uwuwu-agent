@@ -5,6 +5,7 @@
 //! Зависимости: server → usecase → domain, только внутрь.
 
 mod api;
+mod bots;
 mod clock;
 mod config;
 mod executor;
@@ -12,6 +13,7 @@ mod github;
 mod mockhub;
 mod search;
 mod state;
+mod tg;
 mod wiki;
 
 use config::{Config, ConfigError, ENV_CONFIG};
@@ -65,27 +67,37 @@ async fn run(
     config_path: PathBuf,
 ) -> Result<(), String> {
     // Композиция: реализации портов → оркестратор
-    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit)
+    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit);
+    // memory-стенд держит и вики (seed UWUWU_MOCK_DOCS) — полный e2e без сети
     let use_memory_hub = cfg.hub.driver == "memory";
+    let memory_hub: Option<Arc<mockhub::MemoryHub>> = if use_memory_hub {
+        Some(Arc::new(mockhub::MemoryHub::from_env()))
+    } else {
+        None
+    };
     let mut github_hub: Option<Arc<github::GitHubHub>> = None;
     let (board, field_store): (
         Arc<dyn uwuwu_usecase::TaskBoardRepo>,
         Arc<dyn uwuwu_usecase::IssueFieldStore>,
-    ) = if use_memory_hub {
-        let mem = Arc::new(mockhub::MemoryHub::from_env());
-        tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
-        (mem.clone(), mem)
-    } else {
-        let gh = Arc::new(github::GitHubHub::new(
-            cfg.hub.repo.clone(),
-            secrets.gh_token.clone(),
-        ));
-        let out = (
-            gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
-            gh.fields() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
-        );
-        github_hub = Some(gh);
-        out
+    ) = match &memory_hub {
+        Some(mem) => {
+            tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
+            (
+                mem.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                mem.clone() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
+            )
+        }
+        None => {
+            let gh = Arc::new(github::GitHubHub::new(
+                cfg.hub.repo.clone(),
+                secrets.gh_token.clone(),
+            ));
+            github_hub = Some(gh.clone());
+            (
+                gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                gh.fields() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
+            )
+        }
     };
     let raw_sessions = Arc::new(executor::OpencodeClient::new(
         cfg.executor.url.clone(),
@@ -101,7 +113,7 @@ async fn run(
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(10);
     let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(
-        executor::BudgetedSessions::new(raw_sessions, spawn_cap, clock.clone()),
+        executor::BudgetedSessions::new(raw_sessions.clone(), spawn_cap, clock.clone()),
     );
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
@@ -134,17 +146,19 @@ async fn run(
         board.clone(),
         boards_cfg.clone(),
     ));
-    let git_writer = Arc::new(wiki::GitWikiWriter::new(
-        cfg.hub.repo.clone(),
-        "main".to_string(),
-        secrets.gh_token.clone(),
-    ));
-    let wiki = Arc::new(wiki::GitHubWiki::with_writer(
-        cfg.hub.repo.clone(),
-        "main".to_string(),
-        secrets.gh_token.clone(),
-        Some(git_writer),
-    ));
+    let wiki: Arc<dyn uwuwu_usecase::WikiRepo> = match &memory_hub {
+        Some(mem) => mem.clone(),
+        None => Arc::new(wiki::GitHubWiki::with_writer(
+            cfg.hub.repo.clone(),
+            "main".to_string(),
+            secrets.gh_token.clone(),
+            Some(Arc::new(wiki::GitWikiWriter::new(
+                cfg.hub.repo.clone(),
+                "main".to_string(),
+                secrets.gh_token.clone(),
+            ))),
+        )),
+    };
     // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
     // нет туннеля — поиск честно без индекса)
     let embed_url = std::env::var("UWUWU_EMBED_URL")
@@ -314,6 +328,36 @@ async fn run(
             }),
         });
     }
+    {
+        // боты (#1150): тик супервизора быстрый (wiki-скан) — обычный
+        // сайдкар; long-poll живёт в per-bot задачах. Сессии ботов —
+        // через raw-гейтвей (вне спавн-бюджета/CUP)
+        let bot_sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = raw_sessions.clone();
+        let bot_supervisor = Arc::new(bots::BotSupervisor::new(
+            wiki.clone(),
+            bot_sessions,
+            state.clone(),
+            state.clone() as Arc<dyn uwuwu_usecase::TickStateStore>,
+            clock.clone(),
+            Arc::new(|token| {
+                Arc::new(tg::TelegramClient::new(token.to_string()))
+                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>
+            }),
+        ));
+        sidecars.push(Sidecar {
+            name: "bots".into(),
+            tick: Box::new(move || {
+                let s = bot_supervisor.clone();
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    s.tick().await
+                })
+            }),
+        });
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
