@@ -122,6 +122,12 @@ impl BotSupervisor {
 
     pub async fn tick(&self) -> UsecaseResult<()> {
         let scanned = self.scan().await?;
+        tracing::info!(
+            event = "bot.scan",
+            found = scanned.len(),
+            running = self.running.lock().expect("bots lock").len(),
+            "Супервизор: скан реестра"
+        );
         for (slug, spec) in &scanned {
             if let Err(e) = spec {
                 tracing::warn!(event = "bot.spec_invalid", slug, error = %e,
