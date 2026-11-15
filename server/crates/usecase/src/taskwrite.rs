@@ -3,17 +3,18 @@
 //! fm ≡ поля (двойная запись держится портом), комменты — issue comments.
 
 use crate::error::{UsecaseError, UsecaseResult};
-use crate::ports::TaskBoardRepo;
+use crate::ports::{IssueFieldStore, TaskBoardRepo};
 use async_trait::async_trait;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{Slot, Status, Task, TaskType};
 
-/// Параметры создания задачи (fm-канон).
+/// Параметры создания задачи (канон create: Draft + дефолты).
 #[derive(Debug, Clone, Default)]
 pub struct NewTask {
     pub title: String,
     pub body_md: String,
-    pub kind: String,
+    /// Тип задачи; None — дефолт feature (канон).
+    pub kind: Option<TaskType>,
     pub priority: String,
     pub autodone: bool,
 }
@@ -22,10 +23,11 @@ pub struct NewTask {
 pub trait TaskWriter: Send + Sync {
     /// Создание: Draft, лейбл proj:<project>, fm-скелет; дубль тайтла — ошибка.
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
-    /// Правка ячеек: статус/ветка/PR/приоритет/тайтл (двойная запись).
-    async fn edit(&self, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
-    /// Заявка сессии в слот dev.
-    async fn claim(&self, number: u64, session: &str) -> UsecaseResult<()>;
+    /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
+    /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
+    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
+    /// Заявка сессии в слот (dev — по умолчанию).
+    async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()>;
     /// Коммент (reply — цитатный якорь).
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()>;
     /// Закрытие: Status=Done + issue closed (reason: completed|not_planned).
@@ -46,6 +48,8 @@ pub struct TaskPatch {
 
 pub struct TaskWriteUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
+    /// Нативные поля issue (ветка/PR/приоритет/сессии).
+    pub fields: Arc<dyn IssueFieldStore>,
     /// карта проект → доска (мультипроектный конфиг).
     pub boards: Vec<(String, String)>,
 }
@@ -62,7 +66,7 @@ impl TaskWriteUseCase {
 
 impl TaskWriteUseCase {
     fn dup_check(&self, rows: &[Task], title: &str) -> UsecaseResult<()> {
-        if rows.iter().any(|t| t.title == title) {
+        if rows.iter().any(|t| t.title() == title) {
             return Err(UsecaseError::Board(format!(
                 "тайтл «{title}» уже есть на доске — дубль запрещён"
             )));
@@ -85,69 +89,93 @@ impl TaskWriter for TaskWriteUseCase {
         }
         let rows = self.board.read_board(&board).await?;
         self.dup_check(&rows, spec.title.trim())?;
-        self.board
+        let number = self
+            .board
             .create_issue(
                 &board,
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
             )
-            .await
+            .await?;
+        // приоритет/тип — нативные поля issue (fm снесён)
+        let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
+        let mut field_patch: Vec<(&str, Option<String>)> =
+            vec![("Тип", Some(kind.as_str().to_string()))];
+        if !spec.priority.is_empty() {
+            field_patch.push(("Приоритет", Some(spec.priority.clone())));
+        }
+        self.fields.store(number, &field_patch).await?;
+        Ok(number)
     }
 
-    async fn edit(&self, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
-        // доску резолвит вызывающий юзкейс-слой по проекту строки; для edit
-        // известна одна доска из карточки — берём поfm-статусу нельзя, потому
-        // прокидываем первую (мультиборд: set_status идёт через edit_project)
-        let board = &self
-            .boards
-            .first()
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default();
+    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
+        let board = self.board_of(project);
         if board.is_empty() {
-            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
         }
+        let need_rows = patch.status.is_some() || patch.title.is_some();
+        let rows = if need_rows {
+            self.board.read_board(&board).await?
+        } else {
+            Vec::new()
+        };
         if let Some(status) = patch.status {
-            self.board.set_status(board, number, status).await?;
+            // канон переходов — домен: запрещённое ребро = громкая ошибка
+            let current = rows
+                .iter()
+                .find(|t| t.number() == number)
+                .map(|t| t.status())
+                .ok_or_else(|| {
+                    UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+                })?;
+            if !uwuwu_domain::Status::can_transition(current, status) {
+                return Err(UsecaseError::Board(format!(
+                    "переход «{}» → «{}» вне канона конвейера",
+                    current.as_str(),
+                    status.as_str()
+                )));
+            }
+            self.board.set_status(&board, number, status).await?;
         }
         if let Some(title) = &patch.title {
+            if rows
+                .iter()
+                .any(|t| t.number() != number && t.title() == title)
+            {
+                return Err(UsecaseError::Board(format!(
+                    "тайтл «{title}» уже занят другой строкой"
+                )));
+            }
             self.board.rename_issue(number, title).await?;
         }
-        let (branch, pr, priority) = (
-            patch.branch.clone(),
-            patch.pr.clone(),
-            patch.priority.clone(),
-        );
-        self.board
-            .patch_cells(
-                number,
-                Box::new(move |fields| {
-                    if let Some(b) = branch {
-                        fields.insert("branch".into(), b);
-                    }
-                    if let Some(p) = pr {
-                        fields.insert("pr".into(), p);
-                    }
-                    if let Some(pr) = priority {
-                        fields.insert("priority".into(), pr);
-                    }
-                }),
-            )
-            .await
+        // ветка/PR/приоритет — нативные поля issue (value-объекты валидируют)
+        let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
+        if let Some(b) = &patch.branch {
+            let name = uwuwu_domain::BranchName::parse(b).ok_or_else(|| {
+                UsecaseError::Board(format!("ветка «{b}» не валидна (пробелы/глоб-символы)"))
+            })?;
+            field_patch.push(("Branch", Some(name.as_str().to_string())));
+        }
+        if let Some(p) = &patch.pr {
+            let url = uwuwu_domain::PrUrl::parse(p)
+                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
+            field_patch.push(("PR", Some(url.as_str().to_string())));
+        }
+        if let Some(pr) = &patch.priority {
+            field_patch.push(("Приоритет", Some(pr.clone())));
+        }
+        if !field_patch.is_empty() {
+            self.fields.store(number, &field_patch).await?;
+        }
+        Ok(())
     }
 
-    async fn claim(&self, number: u64, session: &str) -> UsecaseResult<()> {
-        let board = &self
-            .boards
-            .first()
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default();
-        if board.is_empty() {
-            return Err(UsecaseError::Board("нет досок в конфиге".into()));
-        }
-        self.board
-            .set_session(board, number, uwuwu_domain::Slot::Dev, session)
-            .await
+    async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()> {
+        let resolved = slot.unwrap_or(uwuwu_domain::Slot::Dev);
+        self.board.set_session("", number, resolved, session).await
     }
 
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()> {
@@ -179,26 +207,13 @@ impl TaskWriter for TaskWriteUseCase {
     }
 }
 
-/// fm-скелет новой задачи (канон create: Draft + дефолты).
+/// Тело новой задачи: чистый markdown (fm снесён; приоритет/тип — нативные поля).
 fn render_create_body(spec: &NewTask) -> String {
     let safe_title: String = spec.title.chars().take(120).collect();
-    format!(
-        "---\nstatus: Draft\npriority: {}\nautodone: {}\ntype: {}\n---\n\n## Постановка\n\n{}\n",
-        if spec.priority.is_empty() {
-            "medium"
-        } else {
-            &spec.priority
-        },
-        spec.autodone,
-        if spec.kind.is_empty() {
-            "feature"
-        } else {
-            &spec.kind
-        },
-        if spec.body_md.is_empty() {
-            safe_title
-        } else {
-            spec.body_md.clone()
-        },
-    )
+    let content = if spec.body_md.is_empty() {
+        safe_title
+    } else {
+        spec.body_md.clone()
+    };
+    format!("## Постановка\n\n{content}\n")
 }

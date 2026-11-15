@@ -189,10 +189,10 @@ impl ToolHub {
                 for t in rows {
                     out.push_str(&format!(
                         "{:>6}  {:<14} {:<7} {}\n",
-                        t.number,
-                        t.status.as_str(),
-                        format!("{:?}", t.priority).to_lowercase(),
-                        t.title
+                        t.number(),
+                        t.status().as_str(),
+                        format!("{:?}", t.priority()).to_lowercase(),
+                        t.title()
                     ));
                 }
                 ok_text(out)
@@ -208,12 +208,12 @@ impl ToolHub {
                 let view = self.tasks.card(&project, number).await.map_err(view_err)?;
                 let mut out = format!(
                     "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautodone: {}\n\n",
-                    view.task.number,
-                    view.task.title,
-                    view.task.status.as_str(),
-                    view.task.branch.as_deref().unwrap_or("—"),
-                    view.task.pr.as_deref().unwrap_or("—"),
-                    view.task.autodone,
+                    view.task.number(),
+                    view.task.title(),
+                    view.task.status().as_str(),
+                    view.task.branch().map(|b| b.as_str()).unwrap_or("—"),
+                    view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
+                    view.task.autodone(),
                 );
                 out.push_str(&view.body);
                 if !view.comments.is_empty() {
@@ -285,7 +285,7 @@ impl ToolHub {
                     .map_err(|e| e.to_string())?;
                 let out = masters
                     .iter()
-                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule))
+                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule.raw()))
                     .collect::<String>();
                 ok_text(if out.is_empty() {
                     format!("кроны проекта {project} не найдены")
@@ -324,10 +324,16 @@ impl ToolHub {
                 ok_text(export)
             }
             "task_create" => {
+                let raw_kind = arg("type");
+                if !raw_kind.is_empty() && uwuwu_domain::TaskType::parse(&raw_kind).is_none() {
+                    return Err(format!(
+                        "неизвестный тип «{raw_kind}»: bug|spike|analys|docs|feature|refactoring|legacy|idea|qa|infrastructure|other"
+                    ));
+                }
                 let spec = uwuwu_usecase::NewTask {
                     title: arg("title"),
                     body_md: arg("body"),
-                    kind: arg("type"),
+                    kind: uwuwu_domain::TaskType::parse(&raw_kind),
                     priority: arg("priority"),
                     autodone: args
                         .get("autodone")
@@ -361,7 +367,7 @@ impl ToolHub {
                     return Err("пустой патч: укажи хотя бы одно поле".into());
                 }
                 self.writer
-                    .edit(number, patch)
+                    .edit(&project, number, patch)
                     .await
                     .map_err(|e| e.to_string())?;
                 ok_text(format!("задача #{number} обновлена"))
@@ -369,11 +375,12 @@ impl ToolHub {
             "task_claim" => {
                 let number = need_number(args)?;
                 let session = arg("session");
-                if !session.starts_with("ses_") {
-                    return Err("session обязан быть ses_…".into());
+                // валидация — в домене (SessionRef): мусорный id не заявка
+                if uwuwu_domain::SessionRef::parse(&session).is_none() {
+                    return Err("session обязан быть ses_… (валидный id опенкода)".into());
                 }
                 self.writer
-                    .claim(number, &session)
+                    .claim(number, &session, None)
                     .await
                     .map_err(|e| e.to_string())?;
                 ok_text(format!("задача #{number}: дев-слот заявлен за {session}"))

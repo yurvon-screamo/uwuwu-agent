@@ -91,10 +91,10 @@ impl AgentSessionGateway for OpencodeClient {
             "location": { "directory": spec.directory },
         });
         if let Some(agent) = &spec.agent {
-            body["agent"] = json!(agent);
+            body["agent"] = json!(agent.as_str());
         }
-        if let Some((provider, id)) = &spec.model {
-            body["model"] = json!({ "providerID": provider, "id": id });
+        if let Some(model) = &spec.model {
+            body["model"] = json!({ "providerID": model.provider(), "id": model.id() });
         }
         let (status, resp) = self
             .call("/session", reqwest::Method::POST, Some(body))
@@ -181,6 +181,8 @@ impl AgentSessionGateway for OpencodeClient {
                             agent: s["agent"].as_str().unwrap_or_default().to_string(),
                             updated_ms: s["time"]["updated"].as_u64().unwrap_or_default(),
                             outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
+                            total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
+                                + s["tokens"]["output"].as_u64().unwrap_or_default(),
                         })
                     })
                     .collect()

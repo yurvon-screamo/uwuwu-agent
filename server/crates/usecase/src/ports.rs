@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{Slot, Status, Task, UtcMinute};
+use uwuwu_domain::{Agent, ModelRef, Slot, Status, Task, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -84,10 +84,10 @@ pub struct SessionSpec {
     /// cwd сессии на исполнителе (мастер-чекаут или env задачи).
     pub directory: String,
     pub title: String,
-    /// Кастомный агент (developer/plan-reviewer/code-quality-reviewer/tester).
-    pub agent: Option<String>,
-    /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub model: Option<(String, String)>,
+    /// Кастомный агент (жёсткая привязка слот → агент — Agent::of_slot).
+    pub agent: Option<Agent>,
+    /// Модель спавна; None — дефолт исполнителя.
+    pub model: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +122,8 @@ pub struct SessionInfo {
     pub updated_ms: u64,
     /// «succeeded»|«failed»|… финала (пусто — живая).
     pub outcome: String,
+    /// Токены сессии (in+out): пустышки-прерывания = 0 — дример их не берёт.
+    pub total_tokens: u64,
 }
 
 /// Состояние PR проекта: источник вердиктов автодона.
@@ -158,6 +160,15 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.
+#[async_trait]
+pub trait IssueFieldStore: Send + Sync {
+    /// Значения полей задачи (непустые).
+    async fn load(&self, number: u64) -> UsecaseResult<std::collections::HashMap<String, String>>;
+    /// Батч-запись: Some — значение, None — очистка.
+    async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()>;
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
@@ -165,8 +176,15 @@ pub trait TickStateStore: Send + Sync {
     /// Дример уже отработал сессию (1 рабочая = 1 дример).
     fn dreamer_done(&self, session: &str) -> bool;
     fn mark_dreamer_done(&self, session: &str);
+    /// Дример: спавнов за сутки (day_key = дата JST) — дневной кап.
+    fn dreamer_day_spawns(&self, day_key: &str) -> u32;
+    fn mark_dreamer_spawn(&self, day_key: &str);
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
     fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64>;
     fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64);
+    /// Attention-механика: счётчик повторных спавнов слота
+    /// (сырой статус на момент прошлого спавна, число повторов).
+    fn spawn_loop(&self, board: &str, number: u64, slot: &str) -> Option<(String, u32)>;
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: &str, status: &str, repeats: u32);
     fn save(&self) -> UsecaseResult<()>;
 }

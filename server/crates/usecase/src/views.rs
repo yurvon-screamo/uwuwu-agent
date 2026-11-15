@@ -67,7 +67,7 @@ impl TaskView {
             .board_of(project)
             .ok_or_else(|| ViewError::NotFound(format!("проект «{project}» вне конфига")))?;
         let view = self.board.read_issue(board, number).await?;
-        if view.task.status == uwuwu_domain::Status::Empty && view.body.is_empty() {
+        if view.task.status() == uwuwu_domain::Status::Empty && view.body.is_empty() {
             return Err(ViewError::NotFound(format!("задача #{number}")));
         }
         Ok(IssueView {

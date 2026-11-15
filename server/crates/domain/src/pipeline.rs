@@ -103,7 +103,7 @@ pub fn decide(task: &Task) -> Action {
         return Action::Autodone;
     }
     Action::Observe {
-        awaits: awaits(task.status),
+        awaits: awaits(task.status()),
     }
 }
 
@@ -118,7 +118,7 @@ pub fn gate(
     let Action::Spawn { .. } = action else {
         return Gate::Allowed;
     };
-    if policy.peak.holds(now) && task.priority != Priority::High {
+    if policy.peak.holds(now) && task.priority() != Priority::High {
         return Gate::DeferredPeak;
     }
     if active >= policy.cup {
@@ -128,6 +128,57 @@ pub fn gate(
         };
     }
     Gate::Allowed
+}
+
+/// Attention-механика (директива владельца 15.11): спавн слота при
+/// неизменном статусе строки — повтор; третий повтор = петля, строка
+/// эскалируется владельцу (Needs attention), конвейер её бросает.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnLoop {
+    status: Status,
+    repeats: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopOutcome {
+    /// Спавн допустим.
+    Continue,
+    /// Петля: Needs attention + коммент, спавн запрещён.
+    Escalate,
+}
+
+impl SpawnLoop {
+    pub fn new(status: Status) -> Self {
+        Self { status, repeats: 0 }
+    }
+
+    /// Восстановление из персистента (сырой статус + счётчик).
+    pub fn from_parts(status_raw: &str, repeats: u32) -> Self {
+        Self {
+            status: Status::parse(status_raw),
+            repeats,
+        }
+    }
+
+    /// Зарегистрировать очередной спавн слота; смена статуса строки
+    /// (прогресс конвейера) обнуляет счётчик.
+    pub fn register_spawn(&mut self, current: Status) -> LoopOutcome {
+        if current != self.status {
+            self.status = current;
+            self.repeats = 0;
+        }
+        self.repeats += 1;
+        if self.repeats > 2 {
+            LoopOutcome::Escalate
+        } else {
+            LoopOutcome::Continue
+        }
+    }
+
+    /// Персист-вид: (сырой статус, счётчик).
+    pub fn parts(&self) -> (&'static str, u32) {
+        (self.status.as_str(), self.repeats)
+    }
 }
 
 /// Круги ревью задачи: инварианты канона — approve-with-notes ≤ 1 на задачу,
@@ -181,6 +232,48 @@ mod tests {
     }
 
     #[test]
+    fn spawn_loop_escalates_after_two_repeats() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        // два повтора при неизменном статусе — ещё работаем
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Continue
+        );
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Continue
+        );
+        // третий — петля
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Escalate
+        );
+    }
+
+    #[test]
+    fn spawn_loop_progress_resets() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        // статус поехал (прогресс конвейера) — счётчик с нуля
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Escalate);
+    }
+
+    #[test]
+    fn spawn_loop_persists_parts() {
+        let mut guard = SpawnLoop::from_parts("Ревью результата", 1);
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Continue
+        );
+        let (status, repeats) = guard.parts();
+        assert_eq!(status, "Ревью результата");
+        assert_eq!(repeats, 2);
+    }
+
+    #[test]
     fn decide_spawns_stage_without_session() {
         for status in [
             Status::Design,
@@ -198,7 +291,8 @@ mod tests {
     #[test]
     fn decide_respects_claimed_session() {
         let mut t = task(Status::InProgress);
-        t.claim(Slot::Dev, "ses_1".into());
+        t.claim(Slot::Dev, crate::task::SessionRef::parse("ses_1").unwrap())
+            .unwrap();
         assert!(matches!(decide(&t), Action::Observe { .. }));
     }
 
@@ -206,7 +300,7 @@ mod tests {
     fn decide_autodone_only_with_flag() {
         let mut t = task(Status::UserReview);
         assert!(matches!(decide(&t), Action::Observe { .. }));
-        t.autodone = true;
+        t.set_autodone(true);
         assert_eq!(decide(&t), Action::Autodone);
     }
 
@@ -238,7 +332,7 @@ mod tests {
         );
 
         let mut high = task(Status::InProgress);
-        high.priority = Priority::High;
+        high.set_priority(Priority::High);
         assert_eq!(
             gate(&high, &decide(&high), policy, 0, in_peak),
             Gate::Allowed

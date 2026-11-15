@@ -3,9 +3,10 @@
 //! presentation (HTTP; MCP — срез 2) + композиция.
 //! Зависимости: server → usecase → domain, только внутрь.
 
+mod budget;
 mod clock;
 mod config;
-mod fm;
+mod fields;
 mod gitwiki;
 mod http;
 mod hub;
@@ -22,7 +23,7 @@ use config::{Config, ConfigError, ENV_CONFIG};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{Clock, TickOutcome, TickUseCase};
+use uwuwu_usecase::{Clock as _, TickOutcome, TickUseCase};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -44,7 +45,7 @@ fn main() -> Result<(), BootError> {
         .unwrap_or_else(|_| PathBuf::from("config.toml"));
     let cfg = Config::load(&config_path)?;
     let secrets = cfg.secrets()?;
-    let plan = Arc::new(cfg.to_tick_plan());
+    let plan = Arc::new(cfg.to_tick_plan().map_err(BootError::Runtime)?);
     tracing::info!(
         event = "server.started",
         mode = ?cfg.mode(),
@@ -69,30 +70,41 @@ async fn run(
     config_path: PathBuf,
 ) -> Result<(), String> {
     // Композиция: реализации портов → оркестратор
-    let board = Arc::new(hub::GitHubHub::new(
+    let hub = Arc::new(hub::GitHubHub::new(
         cfg.hub.repo.clone(),
         secrets.gh_token.clone(),
     ));
-    let sessions = Arc::new(opencode::OpencodeClient::new(
+    let board = hub.clone();
+    let raw_sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
         secrets.opencode_gate_cookie.clone(),
     ));
     let prs = Arc::new(prgate::GhPrGateway::new(secrets.gh_token.clone()));
     let clock = Arc::new(clock::SystemClock);
+    // Глобальный спавн-бюджет: все create_session через один потолок;
+    // UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
+    let spawn_cap: usize = std::env::var("UWUWU_SPAWNS_MAX_PER_HOUR")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10);
+    let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(
+        budget::BudgetedSessions::new(raw_sessions, spawn_cap, clock.clone()),
+    );
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
+    let spawn_model_cfg = cfg
+        .executor
+        .spawn_model
+        .as_ref()
+        .map(|m| uwuwu_domain::ModelRef::new(m.provider.clone(), m.id.clone()));
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: clock.clone(),
         state: state.clone(),
-        spawn_model: cfg
-            .executor
-            .spawn_model
-            .as_ref()
-            .map(|m| (m.provider.clone(), m.id.clone())),
+        spawn_model: spawn_model_cfg.clone(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -106,11 +118,6 @@ async fn run(
         .iter()
         .map(|b| (b.project.clone(), b.board.clone()))
         .collect();
-    let spawn_model_cfg = cfg
-        .executor
-        .spawn_model
-        .as_ref()
-        .map(|m| (m.provider.clone(), m.id.clone()));
     let task_view = Arc::new(uwuwu_usecase::TaskView::new(
         board.clone(),
         boards_cfg.clone(),
@@ -126,21 +133,39 @@ async fn run(
         secrets.gh_token.clone(),
         Some(git_writer),
     ));
-    // Семантика: плоский индекс (+текст без ключа) + OpenRouter при ключе
-    let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+    // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
+    // нет туннеля — поиск честно без индекса)
+    let embed_url = std::env::var("UWUWU_EMBED_URL")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Arc<dyn uwuwu_usecase::search::SemanticBackend> =
-        Arc::new(semantic_backend::FlatSemanticBackend {
-            wiki: wiki.clone(),
-            store: Arc::new(semantic::FileSemanticStore::load(
-                cfg.state_path(&config_path).with_file_name("semantic.json"),
-            )),
-            embeddings: openrouter_key
-                .map(|key| Arc::new(semantic::OpenRouterEmbeddings::new(key))),
-        });
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::search::SemanticBackend>> = match embed_url
+    {
+        Some(url) => {
+            let embed = Arc::new(semantic::OllamaEmbeddings::new(
+                url,
+                std::env::var("UWUWU_EMBED_MODEL")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| semantic::EMBED_MODEL.to_string()),
+            ));
+            match semantic_backend::LanceSemanticBackend::open(
+                cfg.state_path(&config_path).with_file_name("lancedb"),
+                wiki.clone(),
+                embed,
+            )
+            .await
+            {
+                Ok(b) => Some(Arc::new(b)),
+                Err(e) => {
+                    tracing::error!(event = "semantic.open_failed", error = %e, "LanceDB open failed");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let search_usecase = Arc::new(uwuwu_usecase::search::SearchUseCase {
-        semantic: Some(semantic_backend.clone()),
+        semantic: semantic_backend.clone(),
     });
 
     let tool_hub = Arc::new(tools::ToolHub {
@@ -149,6 +174,7 @@ async fn run(
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
             board: board.clone(),
+            fields: hub.fields(),
             boards: boards_cfg.clone(),
         }),
         wiki: wiki.clone(),
@@ -203,22 +229,34 @@ async fn run(
             }),
         });
     }
-    if let Some((_, board_title, checkout)) = boards_info.first().cloned() {
+    {
+        // триаж: черновики всех досок (мультиборд); дример — чекаут первой
         let triage = Arc::new(uwuwu_usecase::triage::TriageUseCase {
             board: board.clone(),
-            board_name: Arc::new(board_title),
+            boards: boards_info
+                .iter()
+                .map(
+                    |(project, board_title, checkout)| uwuwu_usecase::triage::TriageBoard {
+                        project: project.clone(),
+                        board: board_title.clone(),
+                        checkout: checkout.clone(),
+                    },
+                )
+                .collect(),
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
-            checkout: checkout.clone(),
         });
         let dreamer = Arc::new(uwuwu_usecase::dreamer::DreamerUseCase {
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
-            checkout,
+            checkout: boards_info
+                .first()
+                .map(|(_, _, checkout)| checkout.clone())
+                .unwrap_or_default(),
         });
         sidecars.push(Sidecar {
             name: "triage".into(),
@@ -227,34 +265,45 @@ async fn run(
                 Box::pin(async move { t.tick().await.map(|_| ()) })
             }),
         });
-        {
-            let backend = semantic_backend.clone();
-            let clock2 = clock.clone();
-            sidecars.push(Sidecar {
-                name: "semantic-sync".into(),
-                tick: Box::new(move || {
-                    let b = backend.clone();
-                    let clock = clock2.clone();
-                    Box::pin(async move {
-                        if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
-                            return Ok(());
-                        }
-                        // первичная индексация — широкий бюджет, далее дотяжка
-                        let budget = {
-                            let store_empty = true;
-                            let _ = store_empty;
-                            64
-                        };
-                        b.sync_index(budget).await.map(|_| ())
-                    })
-                }),
-            });
-        }
         sidecars.push(Sidecar {
             name: "dreamer".into(),
             tick: Box::new(move || {
                 let d = dreamer.clone();
                 Box::pin(async move { d.tick().await.map(|_| ()) })
+            }),
+        });
+    }
+    if let Some(backend) = semantic_backend.clone() {
+        let clock2 = clock.clone();
+        // backoff: отказ туннеля/Ollama → тишина на час (не долбим каждые 3 мин)
+        let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
+        sidecars.push(Sidecar {
+            name: "semantic-sync".into(),
+            tick: Box::new(move || {
+                let b = backend.clone();
+                let clock = clock2.clone();
+                let backoff = backoff_until.clone();
+                Box::pin(async move {
+                    let now = clock.now_ms();
+                    if now < *backoff.lock().expect("backoff lock") {
+                        return Ok(());
+                    }
+                    if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
+                        return Ok(());
+                    }
+                    // локальная Ollama без квот: бюджет щедрее free-плана
+                    match b.sync_index(16).await {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let until = now + 3_600_000;
+                            *backoff.lock().expect("backoff lock") = until;
+                            tracing::warn!(event = "semantic.backoff",
+                                until_ms = until, error = %e,
+                                "Semantic sync: отказ, тишина на час");
+                            Ok(())
+                        }
+                    }
+                })
             }),
         });
     }

@@ -56,6 +56,19 @@ jobs:
         run: |
           for d in cli server; do (cd "$d" && cargo fmt --check); done
 
+      # protoc: lance-стек (prost-build); берём свежий бинаррь с GitHub,
+      # deb-пакет старый и не находит well-known types
+      - name: Install protoc
+        run: |
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          PB_VER="29.3"
+          curl -sSL "$PB_REL/download/v${PB_VER}/protoc-${PB_VER}-linux-x86_64.zip" -o /tmp/protoc.zip
+          # bin/protoc + include/* (well-known типы: empty.proto для lance-стека)
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+          ls /usr/local/include/google/protobuf/empty.proto
+
       - name: cargo clippy (cli, server)
         run: |
           for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
