@@ -84,8 +84,8 @@ impl Status {
         }
         matches!(
             (from, to),
-            (S::Draft, S::Todo)
-                | (S::Todo, S::Design | S::InProgress)
+            (S::Draft, S::Todo | S::Deleted)
+                | (S::Todo, S::Design | S::InProgress | S::Deleted)
                 | (S::Wait, S::Todo | S::Design | S::InProgress)
                 | (S::Design, S::ReviewPlan | S::InProgress | S::NeedsAttention)
                 | (S::ReviewPlan, S::InProgress | S::NeedsAttention)
@@ -514,6 +514,13 @@ mod tests {
         assert!(
             !S::can_transition(S::Empty, S::Todo),
             "легаси-черновик — владельцу в UI"
+        );
+        // мягкое удаление своей ошибки: только с ранних стадий (DS user story)
+        assert!(S::can_transition(S::Draft, S::Deleted));
+        assert!(S::can_transition(S::Todo, S::Deleted));
+        assert!(
+            !S::can_transition(S::InProgress, S::Deleted),
+            "в работе — не удаляют"
         );
         // Needs attention — из любой рабочей стадии
         for from in [

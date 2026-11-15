@@ -169,6 +169,22 @@ pub trait IssueFieldStore: Send + Sync {
     async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()>;
 }
 
+/// Дайджест задачи для семантического индекса (юзер-стори: «найти решённое
+/// раньше по вики/задачам/опыту»).
+#[derive(Debug, Clone)]
+pub struct IssueDigest {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+}
+
+/// Источник задач для индексации поиска (реализация — hub; memory-стенд — нет).
+#[async_trait]
+pub trait IssueIndexSource: Send + Sync {
+    /// Последние задачи репо-хаба (новейшие первыми), до limit.
+    async fn recent_issues(&self, limit: usize) -> UsecaseResult<Vec<IssueDigest>>;
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
