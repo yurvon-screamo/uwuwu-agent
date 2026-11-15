@@ -5,6 +5,7 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{IssueFieldStore, TaskBoardRepo};
+use crate::tasks::md_section;
 use async_trait::async_trait;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status, Task, TaskType};
@@ -20,6 +21,39 @@ pub struct NewTask {
     pub autodone: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionAction {
+    /// Секция заменена на месте.
+    Replaced,
+    /// Секции не было (пин h2) — добавлена в конец.
+    Appended,
+}
+
+/// Квитанция записи тела: хэш и размер тела как записано (fm-граница
+/// применена). body_hash — токен свежести последующих секционных правок.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyWriteReceipt {
+    pub body_hash: String,
+    pub body_size: usize,
+}
+
+/// Квитанция секционной правки (#1152): исход + тело после записи.
+/// Полное тело не возвращается — сознательное сужение: возврат больших
+/// тел убивал бы экономию секционного пути; порча ловится точечным
+/// перечитыванием task_get по подозрению.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionEditReport {
+    pub action: SectionAction,
+    /// снятые одноимённые дубли на уровне пина (хилинг).
+    pub duplicates_removed: usize,
+    /// контент секции был пуст — секция очищена (заголовок жив).
+    pub cleared: bool,
+    /// FNV-1a 64 тела после записи (как записано в GitHub).
+    pub body_hash: String,
+    /// размер тела после записи, байт.
+    pub body_size: usize,
+}
+
 #[async_trait]
 pub trait TaskWriter: Send + Sync {
     /// Создание: Draft, лейбл proj:<project>, fm-скелет; дубль тайтла — ошибка.
@@ -33,8 +67,23 @@ pub trait TaskWriter: Send + Sync {
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()>;
     /// Закрытие: Status=Done + issue closed (reason: completed|not_planned).
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
-    /// Полная замена тела (fm-поля сохраняются/обновляются из нового fm).
-    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
+    /// Полная замена тела (fm на границе стрипается — тела без fm, поля
+    /// нативные и от тела не зависят); возвращает квитанцию записанного.
+    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<BodyWriteReceipt>;
+    /// Секционная правка тела (#1152): агент передаёт дельту секции, сервер
+    /// собирает тело сам — большое тело не гоняется через контекст агента.
+    /// Свежесть: base_hash (body_hash из fm task_get/квитанции) против
+    /// текущего тела; мимо — громкий отказ с актуальным хэшем, записи нет
+    /// (lost-update вместо молчаливого затирания; TOCTOU-окно сверка→PATCH
+    /// неустранимо на GitHub Issues API — гран владельца).
+    async fn set_body_section(
+        &self,
+        project: &str,
+        number: u64,
+        section: &str,
+        content: &str,
+        base_hash: &str,
+    ) -> UsecaseResult<SectionEditReport>;
 }
 
 /// Точечная правка ячеек: None — не трогаем.
@@ -202,11 +251,63 @@ impl TaskWriter for TaskWriteUseCase {
         self.board.close_issue_ext(number, not_planned).await
     }
 
-    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
+    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<BodyWriteReceipt> {
         // инвариант на границе: тело без fm (агенты могут копировать
         // старый канон — сервер держит «fm снесён» сам, #1151)
         let clean = crate::fm_lite::strip(body_md);
-        self.board.replace_body(number, clean).await
+        self.board.replace_body(number, clean).await?;
+        Ok(BodyWriteReceipt {
+            body_hash: md_section::body_hash(clean),
+            body_size: clean.len(),
+        })
+    }
+
+    async fn set_body_section(
+        &self,
+        project: &str,
+        number: u64,
+        section: &str,
+        content: &str,
+        base_hash: &str,
+    ) -> UsecaseResult<SectionEditReport> {
+        if section.trim().is_empty() {
+            return Err(UsecaseError::Board("секция пуста — укажи заголовок".into()));
+        }
+        if base_hash.trim().is_empty() {
+            return Err(UsecaseError::Board(
+                "base_hash обязателен (body_hash из fm task_get)".into(),
+            ));
+        }
+        let board = self.board_of(project);
+        if board.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
+        }
+        let current = self.board.read_issue(&board, number).await?;
+        let actual = md_section::body_hash(&current.body);
+        if actual != base_hash {
+            return Err(UsecaseError::Board(format!(
+                "тело #{number} изменилось с момента чтения (base_hash мимо); \
+                 актуальный body_hash: {actual} — перечитай task_get и повтори"
+            )));
+        }
+        let (next, edit) = md_section::replace_md_section(&current.body, section, content)
+            .map_err(UsecaseError::Board)?;
+        let receipt = self.set_body(number, &next).await?;
+        let (action, duplicates_removed) = match edit {
+            md_section::SectionEdit::Replaced { duplicates_removed } => {
+                (SectionAction::Replaced, duplicates_removed)
+            }
+            md_section::SectionEdit::Appended => (SectionAction::Appended, 0),
+        };
+        Ok(SectionEditReport {
+            cleared: action == SectionAction::Replaced && content.trim().is_empty(),
+            action,
+            duplicates_removed,
+            body_hash: receipt.body_hash,
+            body_size: receipt.body_size,
+        })
     }
 }
 

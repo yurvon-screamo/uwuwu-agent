@@ -49,7 +49,8 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
     /// Закрытие с причиной (completed|not_planned).
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
-    /// Полная замена тела issue (fm нового тела становится каноном).
+    /// Полная замена тела issue (как записано; fm-шапка стрипается на
+    /// границе юзкейса — тела без fm, поля нативные).
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
 }
 

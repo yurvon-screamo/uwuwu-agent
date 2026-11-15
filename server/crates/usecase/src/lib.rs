@@ -27,5 +27,8 @@ pub use ports::{
     TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
+pub use tasks::body_hash;
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};
-pub use tasks::write::{NewTask, TaskPatch, TaskWriteUseCase, TaskWriter};
+pub use tasks::write::{
+    BodyWriteReceipt, NewTask, SectionEditReport, TaskPatch, TaskWriteUseCase, TaskWriter,
+};
