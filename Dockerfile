@@ -18,3 +18,8 @@ COPY --from=rathole /app/rathole /usr/local/bin/rathole
 COPY server/ops/relay/entrypoint.sh /entrypoint.sh
 ENTRYPOINT []
 CMD ["/bin/sh", "/entrypoint.sh"]
+# Healthcheck: control-порт жив (rathole слушает). Без него Railway держал
+# деплой SUCCESS при мгновенном падении процесса (crash-loop 15.11).
+# bash /dev/tcp — в dash этой фичи нет, зовём bash явно.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/2333' || exit 1

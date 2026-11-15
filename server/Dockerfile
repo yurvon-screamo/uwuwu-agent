@@ -22,4 +22,8 @@ COPY config.example.toml /app/config.toml
 WORKDIR /app
 ENV UWUWU_SERVER_CONFIG=/app/config.toml
 EXPOSE 8090
+# Healthcheck: HTTP-порт жив. /health под bearer-гейтом (401 без токена) —
+# платформенный HTTP-healthcheck не подошёл бы, проверяем TCP; bash /dev/tcp.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090' || exit 1
 CMD ["uwuwu-server"]

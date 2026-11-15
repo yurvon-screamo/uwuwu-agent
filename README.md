@@ -1,6 +1,6 @@
 # uwuwu-agent
 
-Конфиги, агенты, плагины и скиллы опенкода + исходники uwuwu-cli. Репозиторий — единственное место, где файлы существуют: живые конфиги (`~/.config/opencode`, `~/.agents`, `~/.claude/skills`) — симлинки сюда.
+Конфиги, агенты, плагины и скиллы опенкода + исходники uwuwu-server. Репозиторий — единственное место, где файлы существуют: живые конфиги (`~/.config/opencode`, `~/.agents`, `~/.claude/skills`) — симлинки сюда.
 
 ## Структура
 
@@ -9,8 +9,7 @@ opencodereview/ правила ревью
 agents/        агенты: developer, dreamer, plan-reviewer, code-quality-reviewer, tester; TASK-TEMPLATE.md — канон тел задач
 plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
 skills/        скиллы (см. ниже)
-cli/           uwuwu-cli — задачи/кроны, поиск, вики-чтение, персона (бинарь: ~/.cargo/bin/uwuwu-cli)
-server/        uwuwu-server — единый сервер контура (hub#1133): конвейер + MCP; Rust
+server/        uwuwu-server — единый сервер контура (hub#1133): конвейер + MCP + relay; Rust
 lib/           общие модули плагинов опенкода (qlty-review, screen-review, goal-lib)
 link.sh        установка симлинками
 opencode.json  главный конфиг опенкода (jsonc)
@@ -18,10 +17,11 @@ cli.json       TUI-конфиг
 AGENTS.md      системные инструкции (глобальные)
 ```
 
-> 14.11.2026: демон-контур (factory/cron/triage/dreamer, cli-tools, tools,
+> 14.11: демон-контур (factory/cron/triage/dreamer, cli-tools, tools,
 > scripts, deploy, TS-тесты) снесён — перепись на единый Rust-сервер
-> uwuwu-server (задача hub#1133). Бэкап снесённого — ветка
-> `backup/pre-server-rewrite`.
+> uwuwu-server (задача hub#1133). 15.11: сервер задеплоен (Railway,
+> observe→live), cli-крейт снесён (бэкап снесённого — ветки
+> `backup/pre-server-rewrite` и история git).
 
 ## Скиллы (30)
 
@@ -46,8 +46,9 @@ cd uwuwu-agent
 ## Hub-first
 
 Вся база знаний живёт в приватном репо **uwuwu-hub**: статьи опыта и проектные
-доки — docs/*.md, задачи — issues + Projects v2 канбаны (`uwuwu-cli
-read/docs ls/task/...`).
+доки — docs/*.md, задачи — issues + Projects v2 канбаны. Доступ агентов —
+MCP-инструменты uwuwu-server (`task_get`/`docs_read`/`search`/…; endpoint
+`mcp.agent.uwuwu.net`).
 
 ### Конвейер uwuwu (остановлен 14.11.2026 — перепись на uwuwu-server)
 
@@ -79,11 +80,12 @@ read/docs ls/task/...`).
 ### CI (GitHub Actions)
 
 `.github/workflows/ci.yml` — на каждый PR: cargo fmt --check, cargo clippy
---all-targets -- -D warnings, cargo test (e2e скипаются без живого ядра) и
-qlty delta-check по конфигу репо. Зелёный CI — обязательное условие мержа
-(branch protection master, required check «CI»); ревьювер ручных прогонов
-не делает — опирается на CI-статусы. Локально то же самое: `cd cli && cargo
-fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+--all-targets -- -D warnings, cargo test и qlty delta-check по конфигу репо
+(path-фильтры: джобы включаются только по затронутым областям). Зелёный CI —
+обязательное условие мержа (branch protection master, required check «CI»);
+ревьювер ручных прогонов не делает — опирается на CI-статусы. Локально то же
+самое: `cd server && cargo fmt --check && cargo clippy --all-targets -- -D
+warnings && cargo test`.
 
 ### Кроны (uwuwu-cron — контур снесён, см. «Конвейер uwuwu»)
 
@@ -104,25 +106,21 @@ AGENTS.md.
 в uwuwu-server на REST-only чтение сессий (без opencode.db). Методичка агента —
 `agents/dreamer.md`.
 
-### CLI
+### CLI (снесён 15.11)
 
-`uwuwu-cli task create/list/get/edit/comment/thread/body/close/rm [--project X]` — задачи
-(id/заголовок; id-команды без `--project` — глобальный резолв по доскам всех проектов
-с требованием уникальности: матчи на нескольких досках/неоднозначность — громкая ошибка;
-доска «Задачи <proj>», крон-доски сняты; кроны — `--schedule` у task, мастера в Вейт,
-инвентарь `cron list`); аттачи в тело — `--attach` на `create`/`body`
-(kernel `/api/asset/upload`, kernel-имена, референсы append-ом); переименование —
-`edit --title` (renameDoc + verify Title-клетки, `/` в тайтле → `∕`); `search`
-(полнотекст + доки по заголовкам + семантика локального эмбеддинг-индекса),
-`read/blob` (мультимодальное чтение; `shot` не портирован), `person show/append/replace` —
-персона владельца (агенты читают в начале работы, дример пишет факты после сессий).
+Клиентская эпоха закрыта: uwuwu-cli (задачи/кроны/поиск/вики/персона поверх gh
+REST/GraphQL + git-клон хаба) полностью заменён uwuwu-server — те же операции
+живут MCP-инструментами сервера (см. серверный `tools`-реестр: task_*, docs_*,
+person_show, goal_list, search, cron_list). Источник — ветка
+`backup/pre-server-rewrite` и история git.
 
-Платформа — **uwuwu-hub** (с 13.11.2026; история носителей: закрытый предшественник → легаси-бекенд → hub). CLI ходит в GitHub (gh REST/GraphQL), вики — git-клон uwuwu-hub, один инстанс на все машины.
+Платформа — **uwuwu-hub** (с 13.11.2026; история носителей: закрытый
+предшественник → легаси-бекенд → hub). Сервер ходит в GitHub (REST/GraphQL),
+вики — git-клон uwuwu-hub.
 
-**Production**: приватное репо `yurvon-screamo/uwuwu-hub` (GitHub); локальный
-git-клон вики — `~/.local/share/uwuwu-cli/hub-clone/yurvon-screamo__uwuwu-hub`.
-
-Required env: `UWUWU_HUB_REPO` (дефолт зашит в cli), `GH_TOKEN` (gh; иначе keyring).
+**Production**: приватное репо `yurvon-screamo/uwuwu-hub` (GitHub); сервер —
+Railway (`uwuwu-server` + `relay`-туннель Ollama), env — в сервисе Railway
+(GH_TOKEN, UWUWU_SERVER_BEARER, …).
 
 **Workspace structure**:
 

@@ -54,7 +54,7 @@ jobs:
           plugins=false
           while IFS= read -r f; do
             case "$f" in
-              cli/*|server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
+              server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
               plugins/*|lib/*) plugins=true ;;
             esac
           done <<< "$files"
@@ -72,9 +72,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
-      - name: cargo fmt --check (cli, server)
-        run: |
-          for d in cli server; do (cd "$d" && cargo fmt --check); done
+      - name: cargo fmt --check (server)
+        run: cd server && cargo fmt --check
 
   rust:
     # clippy+test в одной джобе: депы (lance-стек, ~600 крейтов)
@@ -92,7 +91,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          workspaces: cli,server
+          workspaces: server
           # общий ключ между ранами/ветками одного workflow: депы из
           # Cargo.lock стабильны — холодная пересборка только при смене lock
           shared-key: rust-ci-deps
@@ -107,14 +106,10 @@ jobs:
           sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
           sudo chmod +x /usr/local/bin/protoc
           protoc --version
-      - name: cargo clippy (cli, server)
-        run: |
-          for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
-      - name: cargo test (cli, server)
-        # e2e-тесты ходят в живой hub и гвардятся UWUWU_E2E_GITHUB=1:
-        # без переменной сразу зелёные (cli/tests/*_e2e.rs)
-        run: |
-          for d in cli server; do (cd "$d" && cargo test); done
+      - name: cargo clippy (server)
+        run: cd server && cargo clippy --all-targets -- -D warnings
+      - name: cargo test (server)
+        run: cd server && cargo test
 
   plugins:
     name: plugins (bun)
