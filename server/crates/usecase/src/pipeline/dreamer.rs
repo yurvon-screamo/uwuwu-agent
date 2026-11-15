@@ -67,6 +67,7 @@ impl DreamerUseCase {
             title: format!("дример {}", &target.id[..12.min(target.id.len())]),
             agent: AgentSlot::Role(Agent::Dreamer),
             model: self.spawn_model.clone(),
+            bootstrap: false,
         };
         let session = self.sessions.create_session(&spec).await?;
         let prompt = dreamer_prompt(&target.id);

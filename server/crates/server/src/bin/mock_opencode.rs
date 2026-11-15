@@ -11,7 +11,9 @@
 //!   dead   — созданные сессии сразу 404 (dead-respawn путь)
 //!
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
-//!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»).
+//!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
+//!      MOCK_VERDICTS («plan:request_changes;result:request_changes;...») —
+//!      сценарные вердикты ревью-стадий по порядку (ре-энтри-циклы).
 //!
 //! Запуск рядом с локальным uwuwu-server (executor.url = http://127.0.0.1:8099).
 
@@ -44,6 +46,8 @@ struct MockSession {
 #[derive(Default)]
 struct Store {
     sessions: Mutex<HashMap<String, MockSession>>,
+    /// Сценарные вердикты ревью (MOCK_VERDICTS), расходуются по порядку.
+    verdicts: Mutex<Vec<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -61,25 +65,52 @@ fn cfg(name: &str, default: &str) -> String {
 }
 
 /// Стадия по спавн-промпту (маркеры из spawn_prompt юзкейса) →
-/// канон-переод, который делает «агент» этой стадии.
-fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str)> {
-    // (статус-цель, вердикт-строка для коммента)
+/// канон-переход, который делает «агент» этой стадии.
+/// Возвращает (ключ стадии, статус-цель, вердикт-строка).
+fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    // (стадия, статус-цель, вердикт-строка для коммента)
     Some(if prompt.contains("стадия утряски") {
-        ("Ревью плана", "план собран, на ревью (мок)")
+        ("design", "Ревью плана", "план собран, на ревью (мок)")
     } else if prompt.contains("ревью плана") {
-        ("In Progress", "план approve (мок)")
+        ("plan", "In Progress", "план approve (мок)")
     } else if prompt.contains("реализация по утверждённому плану") {
-        ("Ревью результата", "реализация завершена (мок)")
+        ("dev", "Ревью результата", "реализация завершена (мок)")
     } else if prompt.contains("ревью результата") {
-        ("Тестирование", "ревью approve (мок)")
+        ("result", "Тестирование", "ревью approve (мок)")
     } else if prompt.contains("тестирование") {
-        ("Review", "тест pass (мок)")
+        ("test", "Review", "тест pass (мок)")
     } else if prompt.contains("Триаж черновика") {
-        ("Todo", "триаж: валидна (мок)")
+        ("triage", "Todo", "триаж: валидна (мок)")
     } else {
         // wakeup/крон/дример/прочее: без перехода статуса
-        ("", "сводка (мок)")
+        ("other", "", "сводка (мок)")
     })
+}
+
+/// Сценарный вердикт ревью-стадии из MOCK_VERDICTS (очередь
+/// «stage:verdict» через «;», напр. «plan:request_changes;result:approve»).
+/// Расходуется по порядку; пустая очередь/нет записи — дефолт (approve).
+/// request_changes: plan → Design (возврат на утряску), result →
+/// In Progress (на доработку) — кейс ре-энтри (инцидент #1046).
+fn scripted_verdict(verdicts: &Mutex<Vec<String>>, stage: &str) -> Option<String> {
+    let mut q = verdicts.lock().expect("verdicts");
+    let prefix = format!("{stage}:");
+    let pos = q.iter().position(|v| v.starts_with(&prefix))?;
+    Some(q.remove(pos))
+}
+
+/// Действие «агента» при wakeup по ТЕКУЩЕМУ СТАТУСУ строки (стадию из
+/// промпта не извлечь — wakeup-промпт общий). Дев дорабатывает и ведёт
+/// на ревью, ревью-стадии подтверждают, тест проходит.
+fn action_for_status(status: &str) -> (&'static str, &'static str) {
+    match status.trim() {
+        "Design" => ("Ревью плана", "план доработан (мок)"),
+        "In Progress" => ("Ревью результата", "доработка завершена (мок)"),
+        "Ревью результата" => ("Тестирование", "ревью approve (мок)"),
+        "Тестирование" => ("Review", "тест pass (мок)"),
+        "Ревью плана" => ("In Progress", "план approve (мок)"),
+        _ => ("", "сводка (мок)"),
+    }
 }
 
 /// Номер задачи из title сессии («#42 …»).
@@ -93,7 +124,7 @@ fn task_number_of(title: &str) -> Option<u64> {
 }
 
 /// MCP-вызов uwuwu-server (tools/call). Ошибки — в лог, не роняют мок.
-async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) {
+async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) -> String {
     let client = reqwest::Client::new();
     let mut req = client
         .post(format!("{base}/mcp"))
@@ -119,8 +150,12 @@ async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) {
                 tracing::info!(event = "mock.mcp_call", tool, %status, reply = %text,
                     "→ uwuwu");
             }
+            text.to_string()
         }
-        Err(e) => tracing::warn!(event = "mock.mcp_failed", tool, error = %e, "uwuwu недоступен"),
+        Err(e) => {
+            tracing::warn!(event = "mock.mcp_failed", tool, error = %e, "uwuwu недоступен");
+            String::new()
+        }
     }
 }
 
@@ -138,9 +173,19 @@ async fn main() {
     let mcp_token = cfg("MOCK_MCP_TOKEN", "");
     let port: u16 = cfg("MOCK_PORT", "8099").parse().unwrap_or(8099);
 
-    tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url, "mock-opencode up");
-
-    let store = Arc::new(Store::default());
+    let store = Arc::new(Store {
+        verdicts: Mutex::new(
+            cfg("MOCK_VERDICTS", "")
+                .split(';')
+                .filter(|v| v.contains(':'))
+                .map(str::to_string)
+                .collect(),
+        ),
+        ..Store::default()
+    });
+    let verdicts_left = store.verdicts.lock().expect("verdicts").len();
+    tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
+        verdicts_left, "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
 
     let app = Router::new()
@@ -364,7 +409,60 @@ async fn work_like_agent(
     step_ms: u64,
 ) {
     tokio::time::sleep(Duration::from_millis(step_ms)).await;
-    let (status, verdict) = stage_action_of_prompt(&prompt_text).unwrap_or(("", "сводка (мок)"));
+    let (stage, mut status, mut verdict) =
+        stage_action_of_prompt(&prompt_text).unwrap_or(("other", "", "сводка (мок)"));
+    // wakeup: стадию из промпта не извлечь — действуем по текущему
+    // статусу строки (дев дорабатывает, ревью подтверждают)
+    if stage == "other" && prompt_text.starts_with("Wakeup") {
+        if let Some(number) = task_number_of(&session.title) {
+            let reply = mcp_call(
+                &mcp_url,
+                &mcp_token,
+                "task_get",
+                json!({ "number": number }),
+            )
+            .await;
+            if let Some(line) = reply.lines().next() {
+                if let Some(cur) = line.split("— ").nth(1) {
+                    let (s, v) = action_for_status(cur);
+                    status = s;
+                    verdict = v;
+                }
+            }
+        }
+    }
+    // сценарный вердикт ревью-стадии (MOCK_VERDICTS): request_changes
+    // возвращает строку по канону (plan → Design, result → In Progress);
+    // суффикс «+die» одновременно убивает сессии строки (кроме текущей) —
+    // ре-энтри в форме инцидента #1046: dev-ячейка мертва → respawn
+    if let Some(v) = scripted_verdict(&store.verdicts, stage) {
+        let die = v.ends_with("+die");
+        if v.trim_end_matches("+die").ends_with(":request_changes") {
+            match stage {
+                "plan" => {
+                    status = "Design";
+                    verdict = "план request_changes (мок) — возврат на утряску";
+                }
+                "result" => {
+                    status = "In Progress";
+                    verdict = "ревью request_changes (мок) — на доработку";
+                }
+                _ => {}
+            }
+            if die {
+                let keep = session.id.clone();
+                store
+                    .sessions
+                    .lock()
+                    .expect("store")
+                    .retain(|id, _| *id == keep);
+                tracing::info!(
+                    event = "mock.env_died",
+                    "сценарий +die: сессии строки убиты (respawn-путь)"
+                );
+            }
+        }
+    }
     if let Some(number) = task_number_of(&session.title) {
         tracing::info!(event = "mock.agent_work", id = %session.id,
             agent = %session.agent, number, status = %status, "агент действует");
@@ -445,14 +543,14 @@ mod tests {
             ("Триаж черновика #5", "Todo"),
         ];
         for (prompt, want) in cases {
-            let (status, _) = stage_action_of_prompt(prompt).unwrap();
+            let (_, status, _) = stage_action_of_prompt(prompt).unwrap();
             assert_eq!(status, want, "промпт «{prompt}»");
         }
         // wakeup/крон/дример — без перехода статуса
         assert_eq!(
-            stage_action_of_prompt("Wakeup: новый коммент").unwrap().0,
+            stage_action_of_prompt("Wakeup: новый коммент").unwrap().1,
             ""
         );
-        assert_eq!(stage_action_of_prompt("Крон-ран «X»").unwrap().0, "");
+        assert_eq!(stage_action_of_prompt("Крон-ран «X»").unwrap().1, "");
     }
 }

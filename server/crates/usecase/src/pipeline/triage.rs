@@ -62,6 +62,7 @@ impl TriageUseCase {
             title: format!("триаж #{}", task.number()),
             agent: uwuwu_domain::AgentSlot::Role(uwuwu_domain::Agent::Triage),
             model: self.spawn_model.clone(),
+            bootstrap: false,
         };
         self.state
             .mark_triage_spawn(&tb.board, task.number(), self.clock.now_ms());

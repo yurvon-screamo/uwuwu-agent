@@ -88,6 +88,10 @@ pub struct SessionSpec {
     pub agent: AgentSlot,
     /// Модель спавна; None — дефолт исполнителя.
     pub model: Option<ModelRef>,
+    /// Bootstrap-сессия подготовки env: НЕ тарифицируется спавн-бюджетом —
+    /// логический спавн тарифа = рабочая сессия (e2e 15.11: полный цикл
+    /// с ре-энтри съедал 10/10 из-за bootstrap-пар).
+    pub bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
