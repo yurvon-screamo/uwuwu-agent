@@ -160,7 +160,9 @@ impl SpawnLoop {
             self.repeats = 0;
         }
         self.repeats += 1;
-        if self.repeats > 2 {
+        // Порог 4 (владелец 16.11): сложные задачи легитимно ходят кругами —
+        // >4 повторов без прогресса статуса = петля
+        if self.repeats > 4 {
             LoopOutcome::Escalate
         } else {
             LoopOutcome::Continue
@@ -187,21 +189,27 @@ mod tests {
     }
 
     #[test]
-    fn spawn_loop_escalates_after_two_repeats() {
-        let mut guard = SpawnLoop::new(Status::ReviewResult);
-        // два повтора при неизменном статусе — ещё работаем
+    fn spawn_loop_escalates_after_four_repeats() {
+        // Порог владельца 16.11: >4 повторов без прогресса = петля;
+        // сложные задачи легитимно ходят кругами до 4 включительно
+        let mut g = SpawnLoop::new(Status::InProgress);
+        for _ in 0..4 {
+            assert_eq!(g.register_spawn(Status::InProgress), LoopOutcome::Continue);
+        }
+        assert_eq!(g.register_spawn(Status::InProgress), LoopOutcome::Escalate);
+        // прогресс статуса обнуляет счётчик: смена статуса регистрируется
+        // как первый повтор в новом статусе
+        let mut g2 = SpawnLoop::new(Status::InProgress);
+        g2.register_spawn(Status::InProgress);
+        g2.register_spawn(Status::InProgress);
         assert_eq!(
-            guard.register_spawn(Status::ReviewResult),
+            g2.register_spawn(Status::ReviewResult),
             LoopOutcome::Continue
         );
         assert_eq!(
-            guard.register_spawn(Status::ReviewResult),
-            LoopOutcome::Continue
-        );
-        // третий — петля
-        assert_eq!(
-            guard.register_spawn(Status::ReviewResult),
-            LoopOutcome::Escalate
+            g2.repeats(),
+            1,
+            "смена статуса = первый повтор нового раунда"
         );
     }
 
@@ -210,7 +218,11 @@ mod tests {
         let mut guard = SpawnLoop::new(Status::ReviewResult);
         guard.register_spawn(Status::ReviewResult);
         guard.register_spawn(Status::ReviewResult);
-        // статус поехал (прогресс конвейера) — счётчик с нуля
+        // статус поехал (прогресс конвейера) — счётчик с нуля;
+        // порог 4: эскалация на пятом повторе нового раунда
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
+        assert_eq!(guard.repeats(), 1);
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
         assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
         assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
         assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Escalate);

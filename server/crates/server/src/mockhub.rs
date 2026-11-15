@@ -127,6 +127,10 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields> {
+        self.with_state(|state| Ok(state.fields.get(&number).cloned().unwrap_or_default()))
+    }
+
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
         self.with_state(|state| {
             let counter = &mut state.counter;

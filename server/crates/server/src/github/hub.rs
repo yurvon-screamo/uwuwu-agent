@@ -528,6 +528,17 @@ impl TaskBoardRepo for GitHubHub {
         Ok(number)
     }
 
+    async fn issue_fields(&self, number: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+        let (_, issue) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                None,
+            )
+            .await?;
+        Ok(map_task_fields(&parse_field_values(&issue)))
+    }
+
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .rest(
