@@ -236,25 +236,27 @@ impl TickUseCase {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
                             if plan.mode == Mode::Live {
-                                // счётчик пишем только при реальном спавне:
-                                // observe не накручивает петли (инцидент
-                                // #1046 — observe-тики зарядили счётчик до 2
-                                // и live эскалировал первый же спавн)
-                                self.state.set_spawn_loop(
-                                    &board.board,
-                                    task.number(),
-                                    slot,
-                                    guard.status(),
-                                    guard.repeats(),
-                                );
-                                self.state.mark_spawn(
-                                    &board.board,
-                                    task.number(),
-                                    slot,
-                                    self.clock.now_ms(),
-                                );
                                 match self.spawn_stage(board, task, slot).await {
                                     Ok(session) => {
+                                        // счётчик/кулдаун пишем только при
+                                        // реальном спавне: observe не накручивает
+                                        // петли (#1046), а временный отказ
+                                        // (бюджет 10/ч) — не петля и не спавн
+                                        // (15.11: #1151 high ложно эскалировала
+                                        // бы за 3 бюджет-отказа)
+                                        self.state.set_spawn_loop(
+                                            &board.board,
+                                            task.number(),
+                                            slot,
+                                            guard.status(),
+                                            guard.repeats(),
+                                        );
+                                        self.state.mark_spawn(
+                                            &board.board,
+                                            task.number(),
+                                            slot,
+                                            self.clock.now_ms(),
+                                        );
                                         if let Err(e) = self
                                             .board
                                             .set_session(
