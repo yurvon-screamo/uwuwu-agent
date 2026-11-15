@@ -81,6 +81,14 @@ impl TaskBoardRepo for MemoryHub {
         self.with_state(|state| {
             self.ensure_seed(state);
             let mut rows: Vec<Task> = state.tasks.values().cloned().collect();
+            // поля (сессии/ветка/PR) — часть строки: без них тик не видит
+            // заявленных сессий и решает спавнить (гэп стенда, ловился как
+            // «wakeup не стреляет» — находка e2e ре-энтри)
+            for t in rows.iter_mut() {
+                if let Some(f) = state.fields.get(&t.number()) {
+                    t.apply_fields(f.clone());
+                }
+            }
             rows.sort_by_key(|t| t.number());
             Ok(rows)
         })

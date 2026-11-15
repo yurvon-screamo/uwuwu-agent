@@ -477,3 +477,37 @@ async fn status_journey_resets_loop_counter() {
         .iter()
         .any(|l| l.starts_with("session#12=")));
 }
+
+#[tokio::test]
+async fn multi_round_reentry_never_escalates() {
+    // Популярный кейс (инцидент #1046): строка ходит по кругу
+    // In Progress → Ревью результата → (request_changes) → In Progress —
+    // три круга доработки. Прогресс есть — луп-гвард не эскалирует.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut escalations = 0usize;
+    for round in 0..3 {
+        // круг: спавн dev → результат (ReviewResult) → вердикт на доработку
+        let (u1, _, sessions, _) = usecase_with_state(
+            vec![task(20, Status::InProgress)],
+            PrState::Missing,
+            state.clone(),
+        );
+        let out = u1.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.spawns_done, 1, "круг {round}: dev-спавн");
+        assert_eq!(out.attention_flagged, 0, "круг {round}: без эскалации");
+        // ревью результата (свой слот)
+        let mut t = task(20, Status::ReviewResult);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse(&format!("ses_round{round}")).unwrap(),
+        );
+        t.apply_fields(f);
+        let (u2, _, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+        let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out2.attention_flagged, 0, "круг {round}: ревью чисто");
+        escalations += out.attention_flagged + out2.attention_flagged;
+        let _ = sessions;
+    }
+    assert_eq!(escalations, 0, "три круга доработки — ни одной эскалации");
+}

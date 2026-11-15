@@ -49,7 +49,7 @@ impl Status {
                 | (S::Todo, S::Design | S::InProgress | S::Deleted)
                 | (S::Wait, S::Todo | S::Design | S::InProgress)
                 | (S::Design, S::ReviewPlan | S::InProgress | S::NeedsAttention)
-                | (S::ReviewPlan, S::InProgress | S::NeedsAttention)
+                | (S::ReviewPlan, S::Design | S::InProgress | S::NeedsAttention)
                 | (
                     S::InProgress,
                     S::ReviewPlan | S::ReviewResult | S::NeedsAttention
@@ -464,9 +464,11 @@ mod tests {
             (S::Todo, S::Deleted),
             (S::Design, S::ReviewPlan),
             (S::Design, S::InProgress),
+            (S::Design, S::NeedsAttention),
+            (S::ReviewPlan, S::Design),
+            (S::ReviewPlan, S::InProgress),
             (S::InProgress, S::ReviewPlan),
             (S::InProgress, S::ReviewResult),
-            (S::ReviewPlan, S::InProgress),
             (S::ReviewResult, S::Testing),
             (S::ReviewResult, S::InProgress),
             (S::Testing, S::UserReview),
