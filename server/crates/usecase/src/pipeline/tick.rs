@@ -7,7 +7,8 @@ use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickSta
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
-    decide, gate, Action, Awaits, Gate, LoopOutcome, ModelRef, SpawnLoop, SpawnPolicy, Status, Task,
+    decide, gate, Action, Awaits, Gate, LoopOutcome, ModelRef, Slot, SpawnLoop, SpawnPolicy,
+    Status, Task,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -122,14 +123,59 @@ impl TickUseCase {
             }
         }
         tasks.sort_by_key(|t| t.priority().rank());
-        for task in &tasks {
+        for task_ref in &tasks {
+            let mut cleared_clone: Option<Task> = None;
             // Attention-механика: счётчики слотов, сохранённые при другом
             // статусе строки, устарели (строка ушла и вернулась) — сброс.
             // Live-only: observe стейт не пишет.
             if plan.mode == Mode::Live {
-                self.state
-                    .reset_stale_spawn_loops(&board.board, task.number(), task.status());
+                self.state.reset_stale_spawn_loops(
+                    &board.board,
+                    task_ref.number(),
+                    task_ref.status(),
+                );
+                // Канон сессий: переход стадии = новый раунд для свежеглазых
+                // слотов (ревью/тест — всегда новая сессия, незамыленность
+                // оценки); dev-семья (Design/Dev) неприкосновенна — дев
+                // сессия едина между этапами и откатами (требование владельца).
+                let prev = self.state.last_seen_status(&board.board, task_ref.number());
+                if prev.as_ref() != Some(&task_ref.status()) {
+                    if let Some(slot) = task_ref.stage_slot() {
+                        if matches!(slot, Slot::PlanReview | Slot::ResultReview | Slot::Test)
+                            && task_ref.session_of(slot).is_some()
+                        {
+                            if let Err(e) = self
+                                .board
+                                .clear_session(&board.board, task_ref.number(), slot)
+                                .await
+                            {
+                                out.actions_failed += 1;
+                                self.log_action_failed(task_ref, e);
+                            } else {
+                                let mut t = task_ref.clone();
+                                t.clear_slot_session(slot);
+                                cleared_clone = Some(t);
+                                // новый раунд: кулдаун прошлого не переносится
+                                self.state
+                                    .clear_spawn_ms(&board.board, task_ref.number(), slot);
+                                tracing::info!(
+                                    event = "stage.fresh_eyes",
+                                    number = task_ref.number(),
+                                    slot = naming::slot_key(slot),
+                                    "Переход стадии: раунд свежих глаз (сессия слота снята)"
+                                );
+                            }
+                        }
+                    }
+                    self.state.set_last_seen_status(
+                        &board.board,
+                        task_ref.number(),
+                        task_ref.status(),
+                    );
+                }
             }
+            // тень: если слот снят переходом — работаем с очищенным клоном
+            let task: &Task = cleared_clone.as_ref().unwrap_or(task_ref);
             let action = decide(task);
             match action {
                 Action::Spawn { slot } => {
@@ -220,14 +266,14 @@ impl TickUseCase {
                                             .await
                                         {
                                             out.actions_failed += 1;
-                                            self.log_action_failed(task, e);
+                                            self.log_action_failed(task_ref, e);
                                         } else {
                                             out.spawns_done += 1;
                                         }
                                     }
                                     Err(e) => {
                                         out.actions_failed += 1;
-                                        self.log_action_failed(task, e);
+                                        self.log_action_failed(task_ref, e);
                                     }
                                 }
                             }
@@ -274,7 +320,7 @@ impl TickUseCase {
                             Ok(false) => {}
                             Err(e) => {
                                 out.actions_failed += 1;
-                                self.log_action_failed(task, e);
+                                self.log_action_failed(task_ref, e);
                             }
                         }
                     } else {

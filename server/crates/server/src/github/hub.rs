@@ -420,6 +420,24 @@ impl TaskBoardRepo for GitHubHub {
             .await
     }
 
+    async fn clear_session(
+        &self,
+        _board: &str,
+        number: u64,
+        slot: uwuwu_domain::Slot,
+    ) -> UsecaseResult<()> {
+        let name = match slot {
+            uwuwu_domain::Slot::Dev | uwuwu_domain::Slot::Design => {
+                crate::github::fields::F_DEV_SESSION
+            }
+            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
+                crate::github::fields::F_REVIEW_SESSION
+            }
+            uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
+        };
+        self.fields.store(number, &[(name, None)]).await
+    }
+
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .rest(

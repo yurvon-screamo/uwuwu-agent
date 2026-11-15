@@ -24,6 +24,10 @@ pub trait TaskBoardRepo: Send + Sync {
         slot: Slot,
         session: &str,
     ) -> UsecaseResult<()>;
+
+    /// Очистить сессию слота строки (переход в раунд свежих глаз:
+    /// ревью/тест-сессии не переживают смену стадии — канон сессий).
+    async fn clear_session(&self, board: &str, number: u64, slot: Slot) -> UsecaseResult<()>;
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()>;
     /// Закрыть issue (Done по канону = closed).
     async fn close_issue(&self, number: u64) -> UsecaseResult<()>;
@@ -192,6 +196,10 @@ pub trait IssueIndexSource: Send + Sync {
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
+    /// Последний статус строки, виденный тиком: переход стадии = новый
+    /// раунд для свежеглазых слотов (ревью/тест — канон сессий).
+    fn last_seen_status(&self, board: &str, number: u64) -> Option<Status>;
+    fn set_last_seen_status(&self, board: &str, number: u64, status: Status);
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str);
     /// Дример уже отработал сессию (1 рабочая = 1 дример).
     fn dreamer_done(&self, session: &str) -> bool;
@@ -202,6 +210,8 @@ pub trait TickStateStore: Send + Sync {
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
     fn last_spawn_ms(&self, board: &str, number: u64, slot: Slot) -> Option<u64>;
     fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64);
+    /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
+    fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Триаж: ms последнего спавна строки (кулдаун — не слот стадии).
     fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64>;
     fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64);

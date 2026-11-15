@@ -13,6 +13,10 @@ use uwuwu_usecase::{UsecaseError, UsecaseResult};
 struct RowState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_comment_id: Option<String>,
+    /// Последний статус, виденный тиком (детект переходов стадии —
+    /// канон сессий: ревью/тест-раунды всегда со свежей сессией).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +68,25 @@ impl TickStateStore for JsonStateStore {
             .rows
             .get(&Self::key(board, number))
             .and_then(|r| r.last_comment_id.clone())
+    }
+
+    fn last_seen_status(&self, board: &str, number: u64) -> Option<Status> {
+        let guard = self.state.lock().expect("state lock");
+        guard
+            .rows
+            .get(&Self::key(board, number))
+            .and_then(|r| r.last_status.as_deref())
+            .map(naming::parse_status)
+    }
+
+    fn set_last_seen_status(&self, board: &str, number: u64, status: Status) {
+        let mut guard = self.state.lock().expect("state lock");
+        let name = naming::status_name(status).to_string();
+        guard
+            .rows
+            .entry(Self::key(board, number))
+            .or_default()
+            .last_status = Some(name);
     }
 
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str) {
@@ -122,6 +145,14 @@ impl TickStateStore for JsonStateStore {
             .spawns
             .get(&key)
             .copied()
+    }
+
+    fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .remove(&format!("{board}:{number}:{}", naming::slot_key(slot)));
     }
 
     fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64) {
