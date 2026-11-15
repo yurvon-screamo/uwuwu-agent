@@ -77,9 +77,21 @@ impl TickUseCase {
             return Ok(false);
         };
         // dead-детект до чтения комментов: дедуп/пустой журнал не должны
-        // прятать мёртвую сессию стадии (находка мок-стенда)
-        if !matches!(self.sessions.liveness(session).await, Liveness::Alive) {
-            return self.respawn_dead_stage(board, task, slot, session).await;
+        // прятать мёртвую сессию стадии (находка мок-стенда).
+        // Unknown (гейт недоступен — рестарт serve, сеть) ≠ мёртвая:
+        // спешный respawn плодил бы дубли на каждом окне недоступности
+        // (15.11: рестарт opencode serve) — пропускаем тик, повторим.
+        match self.sessions.liveness(session).await {
+            Liveness::Alive => {}
+            Liveness::Unknown => {
+                tracing::warn!(event = "wakeup.liveness_unknown", number = task.number(),
+                    session = %session,
+                    "Liveness unknown (гейт недоступен?) — без respawn, повтор на тике");
+                return Ok(false);
+            }
+            Liveness::Dead => {
+                return self.respawn_dead_stage(board, task, slot, session).await;
+            }
         }
         let comments = self.board.latest_comments(task.number()).await?;
         let Some(last) = comments.last() else {
