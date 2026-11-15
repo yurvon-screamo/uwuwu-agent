@@ -146,14 +146,25 @@ impl Schedule {
                 }
             }
             ScheduleKind::Cron(fields) => {
-                let (mi, hh, da, mo, dw) = jst_fields(now);
-                let matched = fields[0].matches(mi)
-                    && fields[1].matches(hh)
-                    && fields[2].matches(da)
-                    && fields[3].matches(mo)
-                    && fields[4].matches(dw);
-                // один файр на матчащее окно: прошлый запуск старше 5 минут
-                matched && last.map(|ts| now >= ts + 5 * 60_000).unwrap_or(true)
+                // Дрейф-иммунный матч: последняя матчащая минута в окне
+                // [now − 24ч, now] (тик ~3 мин — минута матча между тиками
+                // не теряется). Файр = эта минута новее прошлого запуска.
+                let step = 60_000;
+                let horizon = now.saturating_sub(24 * 3_600_000);
+                let mut probe = now;
+                while probe >= horizon {
+                    let (mi, hh, da, mo, dw) = jst_fields(probe);
+                    if fields[0].matches(mi)
+                        && fields[1].matches(hh)
+                        && fields[2].matches(da)
+                        && fields[3].matches(mo)
+                        && fields[4].matches(dw)
+                    {
+                        return last.map(|ts| probe > ts).unwrap_or(true);
+                    }
+                    probe -= step;
+                }
+                false
             }
         }
     }
@@ -279,15 +290,27 @@ mod tests {
     #[test]
     fn cron_expr_window_dedup() {
         let s = Schedule::parse("30 1 * * *").unwrap();
-        let now = nov14_1630_utc(); // 01:30 JST 15.11
-                                    // запуск 4 мин назад — окно ещё держит → нет
-        assert!(!s.is_due(now, Some(now - 4 * 60_000)));
-        // запуска не было → файр в окне
-        assert!(s.is_due(now, None));
-        // запуск 6 мин назад (окно истекло) → новый файр
-        assert!(s.is_due(now, Some(now - 6 * 60_000)));
-        // вне окна (01:29 JST) — нет
-        assert!(!s.is_due(now - 60_000, None));
+        // тик проскочил матч-минуту: сейчас 01:33 JST, матч был в 01:30 —
+        // окно догона файрит (старая семантика «ровно в минуту» теряла его)
+        let now = ms(20771, 16, 33); // 01:33 JST 15.11
+        let yesterday = now - 24 * 3_600_000;
+        assert!(s.is_due(now, None), "матч был, запуска не было");
+        assert!(
+            s.is_due(now, Some(yesterday)),
+            "вчерашний запуск — файрим сегодня"
+        );
+        // запуск после матча (01:31) — окно уже отработано
+        assert!(
+            !s.is_due(now, Some(ms(20771, 16, 31))),
+            "01:31 JST — после матча"
+        );
+        // запуск в саму матч-минуту — не повторяем
+        assert!(
+            !s.is_due(now, Some(ms(20771, 16, 30))),
+            "01:30 JST — сам матч"
+        );
+        // вне окна (01:29 JST, матча ещё не было сегодня) — нет
+        assert!(!s.is_due(ms(20771, 16, 29), Some(yesterday)));
     }
 
     #[test]

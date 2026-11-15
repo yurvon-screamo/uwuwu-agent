@@ -231,12 +231,17 @@ impl GitHubHub {
         Ok(String::new())
     }
 
-    /// Комменты задачи: последняя страница (свежие), по возрастанию.
+    /// Комменты задачи: свежий хвост (direction=desc, последние 100),
+    /// возврат по возрастанию. GitHub без direction отдаёт старейшие —
+    /// wakeup был слеп к свежим комментам при длинных тредах (раунд 3).
     async fn all_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         let (status, body) = self
             .rest(
                 reqwest::Method::GET,
-                &format!("/repos/{}/issues/{number}/comments?per_page=100", self.repo),
+                &format!(
+                    "/repos/{}/issues/{number}/comments?per_page=100&direction=desc",
+                    self.repo
+                ),
                 None,
             )
             .await?;
