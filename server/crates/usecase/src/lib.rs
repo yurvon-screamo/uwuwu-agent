@@ -3,6 +3,7 @@
 //! pub use из lib. Папки: pipeline/ (тик, действия, триаж, дример),
 //! tasks/ (запись, вьюхи), crons/, search/.
 
+pub mod bots;
 mod crons;
 mod error;
 mod fm_lite;
@@ -12,6 +13,10 @@ mod ports;
 mod search;
 mod tasks;
 
+pub use bots::{
+    build_prompt, chunk_reply, classify_message, parse_bot_doc, plan_action, BotStateStore,
+    TelegramGateway, TgMessage, TgUpdate,
+};
 pub use crons::{crons_dir, parse_schedule_text, CronUseCase, FireOutcome};
 pub use error::{UsecaseError, UsecaseResult};
 pub use naming::{
@@ -22,9 +27,9 @@ pub use pipeline::{
     BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, TriageBoard, TriageUseCase,
 };
 pub use ports::{
-    AgentSessionGateway, Clock, CommentRef, FmMutator, IssueDigest, IssueFieldStore,
-    IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
-    TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AssistantReply, Clock, CommentRef, FmMutator, IssueDigest,
+    IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo,
+    SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};

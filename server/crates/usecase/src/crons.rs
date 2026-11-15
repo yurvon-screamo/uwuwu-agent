@@ -90,6 +90,7 @@ impl CronUseCase {
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,
                 model: self.spawn_model.clone(),
+                variant: None,
                 bootstrap: false,
             };
             let session = self.sessions.create_session(&spec).await?;

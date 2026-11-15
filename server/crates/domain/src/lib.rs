@@ -5,6 +5,7 @@
 //! порты юзкейс-слоя.
 
 mod agent;
+mod bot;
 mod budget;
 mod cron;
 mod pipeline;
@@ -13,6 +14,7 @@ mod task;
 mod task_type;
 
 pub use agent::{Agent, AgentSlot, ModelRef};
+pub use bot::{BotAction, BotModel, BotSpec};
 pub use budget::{BudgetVerdict, SpawnBudget};
 pub use cron::{
     civil_from_days, jst_fields, CronField, CronMaster, CronSchedule, CronValues, IntervalMinutes,

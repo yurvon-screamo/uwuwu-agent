@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
-use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionInfo, SessionSpec};
+use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct OpencodeClient {
@@ -97,7 +97,11 @@ impl AgentSessionGateway for OpencodeClient {
             uwuwu_domain::AgentSlot::Default => {}
         }
         if let Some(model) = &spec.model {
-            body["model"] = json!({ "providerID": model.provider(), "id": model.id() });
+            let mut m = json!({ "providerID": model.provider(), "id": model.id() });
+            if let Some(v) = &spec.variant {
+                m["variant"] = json!(v);
+            }
+            body["model"] = m;
         }
         let (status, resp) = self
             .call("/session", reqwest::Method::POST, Some(body))
@@ -225,6 +229,47 @@ impl AgentSessionGateway for OpencodeClient {
             .as_array()
             .and_then(|msgs| msgs.first())
             .and_then(|m| m["time"]["updated"].as_u64()))
+    }
+
+    /// Форма хвоста сверена живой пробой опенкода 2.3.0 (задача #1150):
+    /// сообщения несут `type` («user»|«assistant»|…), у ассистента —
+    /// `content[].text`, `finish` и `time.created`; лимит 5 — в хвосте
+    /// могут висеть служебные события (idle) поверх ответа.
+    async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>> {
+        let (status, resp) = self
+            .call(
+                &format!("/session/{session}/message?limit=5&order=desc"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await?;
+        Self::check(status, &format!("message tail {session}"))?;
+        let raw = if resp.is_array() {
+            resp
+        } else {
+            resp["data"].clone()
+        };
+        let Some(msg) = raw
+            .as_array()
+            .and_then(|msgs| msgs.iter().find(|m| m["type"] == "assistant"))
+        else {
+            return Ok(None);
+        };
+        let text: Vec<&str> = msg["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(AssistantReply {
+            created_ms: msg["time"]["created"].as_u64().unwrap_or_default(),
+            text: text.join("\n"),
+            finished: msg["finish"].as_str().is_some(),
+        }))
     }
 }
 

@@ -124,6 +124,12 @@ impl AgentSessionGateway for FakeSessions {
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
         Ok(Some(1000))
     }
+    async fn last_assistant_reply(
+        &self,
+        _s: &str,
+    ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
+        Ok(None)
+    }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
         Ok(vec![])
     }
@@ -651,6 +657,12 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
             Liveness::Alive
         }
         async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn last_assistant_reply(
+            &self,
+            _s: &str,
+        ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
             Ok(None)
         }
         async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
