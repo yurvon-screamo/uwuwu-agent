@@ -123,6 +123,13 @@ impl TickUseCase {
         }
         tasks.sort_by_key(|t| t.priority().rank());
         for task in &tasks {
+            // Attention-механика: счётчики слотов, сохранённые при другом
+            // статусе строки, устарели (строка ушла и вернулась) — сброс.
+            // Live-only: observe стейт не пишет.
+            if plan.mode == Mode::Live {
+                self.state
+                    .reset_stale_spawn_loops(&board.board, task.number(), task.status());
+            }
             let action = decide(task);
             match action {
                 Action::Spawn { slot } => {
@@ -178,18 +185,22 @@ impl TickUseCase {
                         }
                         continue;
                     }
-                    self.state.set_spawn_loop(
-                        &board.board,
-                        task.number(),
-                        slot,
-                        guard.status(),
-                        guard.repeats(),
-                    );
                     let gated = gate(task, &action, plan.policy, global_active, now);
                     match gated {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
                             if plan.mode == Mode::Live {
+                                // счётчик пишем только при реальном спавне:
+                                // observe не накручивает петли (инцидент
+                                // #1046 — observe-тики зарядили счётчик до 2
+                                // и live эскалировал первый же спавн)
+                                self.state.set_spawn_loop(
+                                    &board.board,
+                                    task.number(),
+                                    slot,
+                                    guard.status(),
+                                    guard.repeats(),
+                                );
                                 self.state.mark_spawn(
                                     &board.board,
                                     task.number(),
