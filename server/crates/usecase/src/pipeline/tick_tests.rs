@@ -57,6 +57,14 @@ impl TaskBoardRepo for FakeBoard {
                         f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
                     }
                 }
+                let mut f = f.clone();
+                // VCS тоже переносим (как настоящий hub: Branch/PR-поля issue)
+                if let Some(b) = t.branch().cloned() {
+                    f.set_branch(b);
+                }
+                if let Some(p) = t.pr().cloned() {
+                    let _ = f.open_pr(p);
+                }
                 f
             })
             .unwrap_or_default())
