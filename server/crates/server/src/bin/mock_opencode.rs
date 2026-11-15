@@ -41,6 +41,9 @@ struct MockSession {
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
     dead: bool,
+    /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
+    /// читает хвост как ответ сессии.
+    reply: Option<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -291,6 +294,7 @@ async fn create_session(
         tokens_out: 0,
         busy: false,
         dead: mode == "dead",
+        reply: None,
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -354,6 +358,15 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        // реплай бота готов сразу (storm — исключение: прерывание без ответа)
+        if mode != "storm" {
+            let tail = text
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default();
+            s.reply = Some((now_ms(), format!("мок-ответ на: {tail}")));
+        }
     }
     drop(sessions);
 
@@ -497,10 +510,23 @@ async fn work_like_agent(
 async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
-        Some(s) => (
-            StatusCode::OK,
-            Json(json!([{ "time": { "updated": s.updated_ms }, "role": "assistant" }])),
-        ),
+        Some(s) => {
+            // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
+            // у ассистента finish/content[].text/time.created; time.updated
+            // держим для last_activity_ms (wakeup-контур)
+            let mut msg = json!({
+                "type": "assistant",
+                "role": "assistant",
+                "time": { "updated": s.updated_ms },
+            });
+            if let Some((created_ms, text)) = &s.reply {
+                msg["finish"] = json!("stop");
+                msg["time"]["created"] = json!(created_ms);
+                msg["time"]["completed"] = json!(created_ms);
+                msg["content"] = json!([{ "type": "text", "text": text }]);
+            }
+            (StatusCode::OK, Json(json!([msg])))
+        }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }
 }

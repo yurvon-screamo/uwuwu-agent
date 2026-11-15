@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{BudgetVerdict, SpawnBudget};
-use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionInfo, SessionSpec};
+use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct BudgetedSessions {
@@ -78,6 +78,10 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.last_activity_ms(session).await
     }
 
+    async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>> {
+        self.inner.last_assistant_reply(session).await
+    }
+
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
         self.inner.list_sessions().await
     }
@@ -114,6 +118,9 @@ mod tests {
         async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
             Ok(None)
         }
+        async fn last_assistant_reply(&self, _s: &str) -> UsecaseResult<Option<AssistantReply>> {
+            Ok(None)
+        }
         async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
             Ok(vec![])
         }
@@ -140,6 +147,7 @@ mod tests {
             title: "t".into(),
             agent: uwuwu_domain::AgentSlot::Default,
             model: None,
+            variant: None,
             bootstrap,
         }
     }
