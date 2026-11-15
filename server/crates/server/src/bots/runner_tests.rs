@@ -1071,3 +1071,28 @@ async fn broken_spec_fails_loudly_without_spawn() {
     assert!(!sup.is_running(SLUG), "битая спека не поднимается");
     assert!(sessions.created.lock().expect("lock").is_empty());
 }
+
+#[test]
+fn stop_reason_discriminates_the_three_cases() {
+    use super::supervisor::stop_reason;
+    use uwuwu_domain::BotSpec;
+    use uwuwu_usecase::bots::parse_bot_doc;
+    // регресс диагностики: одна причина на случай, не одна строка на три
+    assert_eq!(stop_reason(None), Some("док снесён или переименован"));
+    let broken: Result<BotSpec, String> = Err("нет fm model".into());
+    assert_eq!(
+        stop_reason(Some(&broken)),
+        Some("спека не парсится (fm сломан)")
+    );
+    let md = |enabled: &str| {
+        format!("---\nmodel: p/m\ntoken_env: T\nworkspace: /w\nenabled: {enabled}\n---")
+    };
+    let off = parse_bot_doc("s", &md("false")).unwrap();
+    assert_eq!(stop_reason(Some(&Ok(off))), Some("enabled:false"));
+    let on = parse_bot_doc("s", &md("true")).unwrap();
+    assert_eq!(
+        stop_reason(Some(&Ok(on))),
+        None,
+        "живая запись — гасить нечего"
+    );
+}

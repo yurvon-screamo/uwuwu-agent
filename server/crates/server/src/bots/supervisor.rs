@@ -49,6 +49,17 @@ struct Running {
     dead_seen: bool,
 }
 
+/// Причина погашения по записи скана: None — запись жива и включена,
+/// гасить нечего. Классификация вынесена для теста регресса диагностики.
+pub(crate) fn stop_reason(parsed: Option<&Result<BotSpec, String>>) -> Option<&'static str> {
+    match parsed {
+        None => Some("док снесён или переименован"),
+        Some(Err(_)) => Some("спека не парсится (fm сломан)"),
+        Some(Ok(b)) if !b.enabled => Some("enabled:false"),
+        Some(Ok(_)) => None,
+    }
+}
+
 pub struct BotSupervisor {
     wiki: Arc<dyn WikiRepo>,
     /// Raw-гейтвей: бот-спавны вне спавн-бюджета (create редкий — один на
@@ -148,20 +159,14 @@ impl BotSupervisor {
         running: &mut HashMap<String, Running>,
         scanned: &[(String, Result<BotSpec, String>)],
     ) {
-        // Точные причины погашения: снос/переименование дока, битая
-        // fm-спека (опечатка владельца), enabled:false — диагностика
-        // по полю reason, не одной строкой на три случая.
         let mut gone: Vec<(String, &'static str)> = Vec::new();
         for slug in running.keys() {
             let parsed = scanned
                 .iter()
                 .find(|(s, _)| s.as_str() == slug)
                 .map(|(_, spec)| spec);
-            match parsed {
-                None => gone.push((slug.clone(), "док снесён или переименован")),
-                Some(Err(_)) => gone.push((slug.clone(), "спека не парсится (fm сломан)")),
-                Some(Ok(b)) if !b.enabled => gone.push((slug.clone(), "enabled:false")),
-                Some(Ok(_)) => {}
+            if let Some(reason) = stop_reason(parsed) {
+                gone.push((slug.clone(), reason));
             }
         }
         for (slug, reason) in gone {
@@ -263,12 +268,10 @@ impl BotSupervisor {
                             "Методичка обновлена — доедет с ближайшим сообщением");
                     }
                     match plan_action(&entry.spec, spec) {
-                        Some(BotAction::Stop) => {
-                            let entry = running.remove(slug).expect("entry");
-                            entry.task.abort();
-                            tracing::info!(event = "bot.stopped", slug = %slug,
-                                reason = "enabled:false", "Бот погашен — сессия сохранена");
-                        }
+                        // Stop здесь недостижим: apply_stops в этом же тике
+                        // раньше гасит Err/!enabled/отсутствующие записи
+                        // (сейф-нет на смену порядка тика, не мёртвый лог).
+                        Some(BotAction::Stop) => {}
                         Some(BotAction::RecreateSession) => {
                             entry.task.abort();
                             self.state.set_bot_session(slug, None);
