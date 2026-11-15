@@ -71,7 +71,7 @@ fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str)> 
     } else if prompt.contains("реализация по утверждённому плану") {
         ("Ревью результата", "реализация завершена (мок)")
     } else if prompt.contains("ревью результата") {
-        ("Testing", "ревью approve (мок)")
+        ("Тестирование", "ревью approve (мок)")
     } else if prompt.contains("тестирование") {
         ("Review", "тест pass (мок)")
     } else if prompt.contains("Триаж черновика") {
@@ -107,7 +107,18 @@ async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) {
     }
     match req.send().await {
         Ok(resp) => {
-            tracing::info!(event = "mock.mcp_call", tool, status = %resp.status(), "→ uwuwu")
+            let status = resp.status();
+            // JSON-RPC ошибки живут в теле при HTTP 200 — логируем результат
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let is_err = body["result"]["isError"].as_bool().unwrap_or(false);
+            let text = body["result"]["content"][0]["text"].as_str().unwrap_or("");
+            if is_err {
+                tracing::warn!(event = "mock.mcp_rejected", tool, %status, reply = %text,
+                    "uwuwu отклонил вызов");
+            } else {
+                tracing::info!(event = "mock.mcp_call", tool, %status, reply = %text,
+                    "→ uwuwu");
+            }
         }
         Err(e) => tracing::warn!(event = "mock.mcp_failed", tool, error = %e, "uwuwu недоступен"),
     }
@@ -429,7 +440,7 @@ mod tests {
             ("стадия утряски: изучи постановку", "Ревью плана"),
             ("ревью плана: парафриз", "In Progress"),
             ("реализация по утверждённому плану", "Ревью результата"),
-            ("ревью результата: код/CI", "Testing"),
+            ("ревью результата: код/CI", "Тестирование"),
             ("тестирование: качество фичи", "Review"),
             ("Триаж черновика #5", "Todo"),
         ];

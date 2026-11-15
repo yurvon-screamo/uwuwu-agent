@@ -1,0 +1,29 @@
+# uwuwu-server — memory-стенд: полный цикл конвейера без GitHub и rate-limit
+# (доска/поля в памяти; вики/кроны — локальный git-клон).
+# Запуск:
+#   1) MOCK_MODE=agent MOCK_MCP_TOKEN=$UWUWU_SERVER_BEARER cargo run --bin mock_opencode
+#   2) UWUWU_SERVER_CONFIG=server/ops/config.memory.toml \
+#      UWUWU_SERVER_BEARER=… UWUWU_OPENCODE_PASSWORD=mockpass \
+#      UWUWU_MOCK_SEED="1148:Design" cargo run --bin uwuwu-server
+mode = "live"
+poll_sec = 10
+port = 8090
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:8099"
+
+[policy]
+cup = 7
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"

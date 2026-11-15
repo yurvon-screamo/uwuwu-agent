@@ -192,6 +192,15 @@ impl TaskFields {
         self.pr.as_ref()
     }
 
+    /// Мутатор: заявка сессии в слот (инфра-маппинг полей и спавны).
+    pub fn set_session(&mut self, slot: Slot, session: SessionRef) {
+        match slot {
+            Slot::Dev | Slot::Design => self.dev_session = Some(session),
+            Slot::PlanReview | Slot::ResultReview => self.review_session = Some(session),
+            Slot::Test => self.test_session = Some(session),
+        }
+    }
+
     /// Мутатор: заявка PR-ячейки.
     pub fn set_pr(&mut self, url: PrUrl) {
         self.pr = Some(url);

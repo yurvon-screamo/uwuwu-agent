@@ -11,6 +11,7 @@ mod gitwiki;
 mod http;
 mod hub;
 mod mcp;
+mod mockhub;
 mod opencode;
 mod prgate;
 mod semantic;
@@ -70,11 +71,25 @@ async fn run(
     config_path: PathBuf,
 ) -> Result<(), String> {
     // Композиция: реализации портов → оркестратор
-    let hub = Arc::new(hub::GitHubHub::new(
-        cfg.hub.repo.clone(),
-        secrets.gh_token.clone(),
-    ));
-    let board = hub.clone();
+    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit)
+    let use_memory_hub = cfg.hub.driver == "memory";
+    let (board, field_store): (
+        Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+        Arc<dyn uwuwu_usecase::IssueFieldStore>,
+    ) = if use_memory_hub {
+        let mem = Arc::new(mockhub::MemoryHub::from_env());
+        tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
+        (mem.clone(), mem)
+    } else {
+        let gh = Arc::new(hub::GitHubHub::new(
+            cfg.hub.repo.clone(),
+            secrets.gh_token.clone(),
+        ));
+        (
+            gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+            gh.fields(),
+        )
+    };
     let raw_sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
@@ -174,7 +189,7 @@ async fn run(
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
             board: board.clone(),
-            fields: hub.fields(),
+            fields: field_store,
             boards: boards_cfg.clone(),
         }),
         wiki: wiki.clone(),

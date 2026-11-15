@@ -24,6 +24,13 @@ pub enum ModeCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HubCfg {
     pub repo: String,
+    /// "github" (деф.) | "memory" — мок-хаб для E2E-стенда без GitHub.
+    #[serde(default = "default_hub_driver")]
+    pub driver: String,
+}
+
+fn default_hub_driver() -> String {
+    "github".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
