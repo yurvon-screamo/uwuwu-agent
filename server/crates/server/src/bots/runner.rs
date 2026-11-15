@@ -83,7 +83,7 @@ async fn handle_update(deps: &BotDeps, u: TgUpdate) {
 async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
     let view = deps.live.view();
     let Some(text) = classify_message(m, view.owner.as_deref()) else {
-        tracing::debug!(event = "bot.skipped", slug = %deps.slug, chat_id = m.chat_id,
+        tracing::info!(event = "bot.skipped", slug = %deps.slug, chat_id = m.chat_id,
             "Не private или не владелец — молча");
         return Ok(());
     };
