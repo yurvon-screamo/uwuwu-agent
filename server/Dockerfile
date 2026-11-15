@@ -11,21 +11,13 @@ RUN apt-get update \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# BuildKit cache mounts: registry + target переживают билды —
-# инкрементальная сборка вместо полной пересборки lance/arrow/tokio
-# на каждую правку (было ~20 мин, с кешем точечные правки ~3-5 мин).
-# Гоча: target под cache mount не попадает в слои — бинарь копируем
-# в образ из RUN до его завершения.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --bin uwuwu-server \
-    && cp /build/target/release/uwuwu-server /build/uwuwu-server
+RUN cargo build --release --bin uwuwu-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /build/uwuwu-server /usr/local/bin/uwuwu-server
+COPY --from=build /build/target/release/uwuwu-server /usr/local/bin/uwuwu-server
 COPY config.example.toml /app/config.toml
 WORKDIR /app
 ENV UWUWU_SERVER_CONFIG=/app/config.toml
