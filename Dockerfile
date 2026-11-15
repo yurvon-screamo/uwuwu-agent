@@ -6,10 +6,14 @@
 # ВАЖНО: rapiz1/rathole:latest — distroless (без /bin/sh): конфиг в
 # рантайме генерить нечем, `CMD ["/bin/sh", …]` умирает мгновенно без
 # логов (деплои 15.11 06:10/06:28 UTC). Multi-stage: бинаррь из
-# официального образа + debian:12-slim (glibc —-binary может быть
-# слинкован динамически, musl/alpine не угадываем; sh есть).
+# официального образа + debian:12-slim. Бинаррь ДИНАМИЧЕСКИЙ — требует
+# libssl.so.3/libcrypto.so.3 (пакет libssl3; деплой 09:10 падал на
+# «error while loading shared libraries: libssl.so.3»).
 FROM docker.io/rapiz1/rathole:latest AS rathole
 FROM docker.io/library/debian:12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=rathole /app/rathole /usr/local/bin/rathole
 COPY server/ops/relay/entrypoint.sh /entrypoint.sh
 ENTRYPOINT []
