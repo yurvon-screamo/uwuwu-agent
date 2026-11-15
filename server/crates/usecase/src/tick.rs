@@ -79,10 +79,22 @@ pub struct TickUseCase {
 impl TickUseCase {
     pub async fn run(&self, plan: &TickPlan) -> UsecaseResult<TickOutcome> {
         let mut out = TickOutcome::default();
+        // CUP-кап глобальный по проектам (канон #1133): активные строки
+        // считаются по всем доскам до обхода, не per-board
+        let mut boards = Vec::with_capacity(plan.boards.len());
         for board in &plan.boards {
             let tasks = self.board.read_board(&board.board).await?;
             out.rows_total += tasks.len();
-            out = self.run_board(plan, board, tasks, out).await?;
+            boards.push((board, tasks));
+        }
+        let global_active: usize = boards
+            .iter()
+            .map(|(_, tasks)| tasks.iter().filter(|t| t.status().is_active()).count())
+            .sum();
+        for (board, tasks) in boards {
+            out = self
+                .run_board(plan, board, tasks, global_active, out)
+                .await?;
         }
         if let Err(e) = self.state.save() {
             tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
@@ -107,9 +119,9 @@ impl TickUseCase {
         plan: &TickPlan,
         board: &BoardPlan,
         mut tasks: Vec<Task>,
+        global_active: usize,
         mut out: TickOutcome,
     ) -> UsecaseResult<TickOutcome> {
-        let active = tasks.iter().filter(|t| t.status().is_active()).count();
         let now = self.clock.utc_minute();
         tasks.sort_by_key(|t| t.priority().rank());
         for task in &tasks {
@@ -172,7 +184,7 @@ impl TickUseCase {
                         g_status,
                         g_repeats,
                     );
-                    let gated = gate(task, &action, plan.policy, active, now);
+                    let gated = gate(task, &action, plan.policy, global_active, now);
                     match gated {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;

@@ -201,9 +201,16 @@ impl Config {
             .unwrap_or_else(|_| config_path.with_file_name("state.json"))
     }
 
-    /// Порт конфига → план тика юзкейса.
-    pub fn to_tick_plan(&self) -> TickPlan {
-        TickPlan {
+    /// Порт конфига → план тика юзкейса. Проекты проходят доменную
+    /// валидацию (ProjectRegistry): битый конфиг — громкая ошибка старта.
+    pub fn to_tick_plan(&self) -> Result<TickPlan, String> {
+        let mut registry = uwuwu_domain::ProjectRegistry::new();
+        for p in &self.project {
+            let project =
+                uwuwu_domain::Project::new(&p.name, &p.board, &p.repo, &p.checkout, &p.env_root)?;
+            registry.add(project)?;
+        }
+        Ok(TickPlan {
             mode: match self.mode() {
                 ModeCfg::Observe => Mode::Observe,
                 ModeCfg::Live => Mode::Live,
@@ -216,18 +223,17 @@ impl Config {
                     end_min: self.policy.peak.end_min,
                 },
             },
-            boards: self
-                .project
+            boards: registry
                 .iter()
                 .map(|p| BoardPlan {
-                    project: p.name.clone(),
-                    board: p.board.clone(),
-                    repo: p.repo.clone(),
-                    checkout: p.checkout.clone(),
-                    env_root: p.env_root.clone(),
+                    project: p.name().to_string(),
+                    board: p.board().to_string(),
+                    repo: p.repo().to_string(),
+                    checkout: p.checkout().to_string(),
+                    env_root: p.env_root().to_string(),
                 })
                 .collect(),
-        }
+        })
     }
 }
 
@@ -249,7 +255,7 @@ mod tests {
         assert_eq!(cfg.mode, ModeCfg::Observe);
         assert_eq!(cfg.project.len(), 1);
         assert!(cfg.policy.peak.enabled);
-        let plan = cfg.to_tick_plan();
+        let plan = cfg.to_tick_plan().expect("проекты валидны");
         assert_eq!(plan.boards[0].board, "Задачи uwuwu");
         assert_eq!(plan.policy.cup, 7);
         assert_eq!(plan.mode, Mode::Observe);
@@ -270,5 +276,30 @@ mod tests {
         "#;
         let err = toml::from_str::<Config>(raw).expect_err("должен упасть");
         assert!(err.to_string().contains("project"), "{err}");
+    }
+
+    #[test]
+    fn broken_project_fails_loudly_in_domain() {
+        // repo без owner/ — домен отклоняет при сборке плана (не в рантайме)
+        let raw = r#"
+            mode = "observe"
+            [hub]
+            repo = "a/b"
+            [executor]
+            name = "kisa"
+            url = "http://127.0.0.1:1"
+            [policy]
+            cup = 7
+            peak = { enabled = false, start_min = 0, end_min = 0 }
+            [[project]]
+            name = "p"
+            board = "B"
+            repo = "просто-имя"
+            checkout = "/c"
+            env_root = "/e"
+        "#;
+        let cfg = toml::from_str::<Config>(raw).expect("toml парсится");
+        let err = cfg.to_tick_plan().expect_err("домен отклоняет");
+        assert!(err.contains("owner/name"), "{err}");
     }
 }

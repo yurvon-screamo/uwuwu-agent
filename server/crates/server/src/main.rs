@@ -45,7 +45,7 @@ fn main() -> Result<(), BootError> {
         .unwrap_or_else(|_| PathBuf::from("config.toml"));
     let cfg = Config::load(&config_path)?;
     let secrets = cfg.secrets()?;
-    let plan = Arc::new(cfg.to_tick_plan());
+    let plan = Arc::new(cfg.to_tick_plan().map_err(BootError::Runtime)?);
     tracing::info!(
         event = "server.started",
         mode = ?cfg.mode(),
