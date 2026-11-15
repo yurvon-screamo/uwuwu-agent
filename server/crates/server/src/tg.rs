@@ -167,4 +167,77 @@ mod tests {
         assert_eq!(u.update_id, 8);
         assert!(u.message.is_none());
     }
+
+    /// Пин токен-маскировки (#1150, High ревью раунда 1): Display reqwest
+    /// печатает полный URL с токеном в пути — транспортные ошибки обязаны
+    /// уходить в лог только в виде краткой классификации describe().
+    #[tokio::test]
+    async fn transport_errors_never_carry_token_or_url() {
+        // порт 1 — соединение всегда отказано (частый класс на Railway)
+        let c = TelegramClient::with_base("http://127.0.0.1:1", "sekret-token".into());
+        let err = c
+            .get_updates(None, 0)
+            .await
+            .expect_err("connect to closed port must fail");
+        let msg = err.to_string();
+        assert!(!msg.contains("sekret-token"), "токен утёк в ошибку: {msg}");
+        assert!(!msg.contains("/bot"), "URL с токеном утёк в ошибку: {msg}");
+    }
+
+    /// Пин семантики ошибок (ревью раунда 1, Common): ТГ-неок (включая
+    /// 409 «два поллера») — Telegram-вариант с видимым статусом, не Board.
+    #[tokio::test]
+    async fn non_ok_response_maps_to_telegram_variant() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // читаем запрос целиком (заголовки + тело по Content-Length),
+            // иначе ранний close даёт RST и reqwest падает на отправке
+            let mut data = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                }
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl: usize = data[..pos]
+                        .split(|b| *b == b'\n')
+                        .find_map(|line| {
+                            String::from_utf8_lossy(line)
+                                .to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"ok":false,"description":"Conflict: terminated by other getUpdates request"}"#;
+            let resp = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        let c = TelegramClient::with_base(&format!("http://127.0.0.1:{port}"), "tok".into());
+        let err = c
+            .get_updates(None, 0)
+            .await
+            .expect_err("non-ok response must be an error");
+        assert!(
+            matches!(err, UsecaseError::Telegram(_)),
+            "ожидал Telegram-вариант, получено: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("409"), "статус 409 потерян в ошибке: {msg}");
+    }
 }
