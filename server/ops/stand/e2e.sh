@@ -71,8 +71,11 @@ UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:Design" \
   RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &
-# сценарий вердиктов: первое ревью результата — на доработку, дальше approve
-for i in $(seq 1 60); do   # до 5 минут
+# сценарий вердиктов: первое ревью результата — на доработку (с мёртвой
+# dev-ячейкой), дальше approve
+SEEN_OK=0
+while [ $SEEN_OK -lt 60 ]; do   # до 5 минут
+  SEEN_OK=$((SEEN_OK + 1))
   sleep 5
   S="$(task_status || true)"
   case "$S" in
