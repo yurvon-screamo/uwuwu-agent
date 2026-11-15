@@ -27,7 +27,12 @@ pub fn strip(md: &str) -> &str {
     let Some(end) = rest.find("\n---") else {
         return md;
     };
-    rest[end + 4..].trim_start_matches('\n')
+    let body = rest[end + 4..].trim_start_matches('\n');
+    // хвостовой сепаратор fm-эпохи: «fm\n---\n---\nконтент» — после вырезки
+    // блока остаётся одинокий «---» (закрытие + разделитель старого формата)
+    body.strip_prefix("---\n")
+        .map(|b| b.trim_start_matches('\n'))
+        .unwrap_or(body)
 }
 
 /// ISO (2026-11-15T06:35:00Z | +09:00 | без зоны) → epoch ms.
@@ -103,5 +108,16 @@ mod tests {
         let b = parse_iso_ms("2026-11-15T15:35:00+09:00").unwrap();
         assert_eq!(a, b);
         assert_eq!(parse_iso_ms("мусор"), None);
+    }
+
+    #[test]
+    fn strip_double_separator() {
+        // fm-эпоха: закрытие fm + разделитель тела → одинокий «---»
+        let md = "---\nstatus: Draft\n---\n---\n\n## Постановка\n";
+        assert_eq!(strip(md), "## Постановка\n");
+        // обычный fm
+        assert_eq!(strip("---\na: 1\n---\nтекст"), "текст");
+        // без fm — как есть
+        assert_eq!(strip("просто текст"), "просто текст");
     }
 }

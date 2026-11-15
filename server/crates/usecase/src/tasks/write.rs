@@ -203,17 +203,23 @@ impl TaskWriter for TaskWriteUseCase {
     }
 
     async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
-        self.board.replace_body(number, body_md).await
+        // инвариант на границе: тело без fm (агенты могут копировать
+        // старый канон — сервер держит «fm снесён» сам, #1151)
+        let clean = crate::fm_lite::strip(body_md);
+        self.board.replace_body(number, clean).await
     }
 }
 
 /// Тело новой задачи: чистый markdown (fm снесён; приоритет/тип — нативные поля).
+/// Инвариант держит граница: fm-шапку (агенты копируют старый канон)
+/// вырезаем из любого входа — тело не несёт fm независимо от дисциплины
+/// вызывающего (инцидент #1151: дример завёл задачу с fm в теле).
 fn render_create_body(spec: &NewTask) -> String {
     let safe_title: String = spec.title.chars().take(120).collect();
     let content = if spec.body_md.is_empty() {
         safe_title
     } else {
-        spec.body_md.clone()
+        crate::fm_lite::strip(&spec.body_md).to_string()
     };
     // тело уже в канон-форме (агенты шлют «## Постановка…») — не дублируем
     // H2 (инцидент #1149: скелет prepend'ался к готовому телу)
@@ -259,5 +265,15 @@ mod tests {
         );
         // пустое тело — тайтл как постановка
         assert_eq!(render_create_body(&spec("")), "## Постановка\n\nt\n");
+    }
+
+    #[test]
+    fn create_body_strips_fm() {
+        // инцидент #1151: дример скопировал fm-шапку старого канона —
+        // граница вырезает fm независимо от дисциплины агента
+        let with_fm = "---\nstatus: Draft\npriority: medium\n---\n## Постановка\n\nТекст.";
+        let out = render_create_body(&spec(with_fm));
+        assert!(!out.contains("status:"), "fm вырезан: {out}");
+        assert_eq!(out.matches("## Постановка").count(), 1);
     }
 }
