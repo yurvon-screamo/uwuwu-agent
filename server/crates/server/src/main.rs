@@ -211,6 +211,15 @@ async fn run(
         .map(|b| (b.project.clone(), b.board.clone(), b.checkout.clone()))
         .collect();
     let mut sidecars: Vec<Sidecar> = Vec::new();
+    // observe — полностью без мутаций: сайдкары (кроны/триаж/дример/семантика)
+    // не исполняются, решения видны только в логе основного тика
+    let is_observe = matches!(plan.mode, uwuwu_usecase::Mode::Observe);
+    if is_observe {
+        tracing::info!(
+            event = "sidecars.observe_mode",
+            "observe: кроны/триаж/дример/семантика не исполняются"
+        );
+    }
     for (project, _, checkout) in boards_info.iter() {
         let cron = Arc::new(uwuwu_usecase::crons::CronUseCase {
             wiki: wiki.clone(),
@@ -220,12 +229,18 @@ async fn run(
             checkout: checkout.clone(),
         });
         let project = project.clone();
+
         sidecars.push(Sidecar {
             name: format!("cron:{project}"),
             tick: Box::new(move || {
                 let cron = cron.clone();
                 let project = project.clone();
-                Box::pin(async move { cron.tick(&project).await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    cron.tick(&project).await.map(|_| ())
+                })
             }),
         });
     }
@@ -262,19 +277,30 @@ async fn run(
             name: "triage".into(),
             tick: Box::new(move || {
                 let t = triage.clone();
-                Box::pin(async move { t.tick().await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    t.tick().await.map(|_| ())
+                })
             }),
         });
         sidecars.push(Sidecar {
             name: "dreamer".into(),
             tick: Box::new(move || {
                 let d = dreamer.clone();
-                Box::pin(async move { d.tick().await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    d.tick().await.map(|_| ())
+                })
             }),
         });
     }
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
+
         // backoff: отказ туннеля/Ollama → тишина на час (не долбим каждые 3 мин)
         let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
         sidecars.push(Sidecar {
@@ -284,6 +310,9 @@ async fn run(
                 let clock = clock2.clone();
                 let backoff = backoff_until.clone();
                 Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
                     let now = clock.now_ms();
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());
