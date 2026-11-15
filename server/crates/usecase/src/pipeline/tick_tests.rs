@@ -38,6 +38,29 @@ impl TaskBoardRepo for FakeBoard {
             .push(format!("clear#{n}={:?}", slot));
         Ok(())
     }
+    async fn issue_fields(&self, n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+        // enrichment-фейк: поля несут строки (как настоящий hub из REST)
+        Ok(self
+            .rows
+            .iter()
+            .find(|t| t.number() == n)
+            .map(|t| {
+                let mut f = TaskFields::default();
+                for slot in [
+                    Slot::Dev,
+                    Slot::Design,
+                    Slot::PlanReview,
+                    Slot::ResultReview,
+                    Slot::Test,
+                ] {
+                    if let Some(s) = t.session_of(slot) {
+                        f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
+                    }
+                }
+                f
+            })
+            .unwrap_or_default())
+    }
     async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
         self.log
             .lock()
