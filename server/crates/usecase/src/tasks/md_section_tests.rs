@@ -408,6 +408,21 @@ fn append_writes_clean_heading_bare_and_prefixed_h2() {
 }
 
 #[test]
+fn clear_request_for_absent_section_refuses() {
+    // очистка отсутствующей секции создала бы пустую «## X» — исход
+    // неожидаем (находка дельта-ревью #1152): громкий отказ, записи нет
+    let md = "## А\nтело\n";
+    for query in ["Новая", "## Новая"] {
+        let err = replace_md_section(md, query, "").unwrap_err();
+        assert!(err.contains("очищать нечего"), "{query}: {err}");
+        assert!(
+            err.contains("не найдена"),
+            "причина — отсутствие секции: {err}"
+        );
+    }
+}
+
+#[test]
 fn prefixed_h3_query_absent_section_refuses_no_append() {
     // легаси-факт 06.11: prefixed-h3 при отсутствии секции писал мусор
     // «## ### …» — под пином громкий отказ (append только h2)

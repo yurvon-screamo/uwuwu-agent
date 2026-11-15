@@ -338,6 +338,40 @@ async fn pinned_h3_edits_report_inner_section_case_1046() {
 }
 
 #[tokio::test]
+async fn clear_of_absent_section_refuses_at_surface() {
+    // находка дельта-ревью #1152: очистка отсутствующей секции — громкий
+    // отказ на границе тула, пустая секция не создаётся
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: clear-miss", "## А\nтело\n").await;
+    let err = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "Новая",
+            "content": "",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect_err("очищать нечего");
+    assert!(err.contains("очищать нечего"), "{err}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .unwrap()
+        .body;
+    assert!(
+        stored.contains("## А\nтело"),
+        "исходное тело живо: {stored:?}"
+    );
+    assert!(
+        !stored.contains("Новая"),
+        "пустая секция не создана: {stored:?}"
+    );
+}
+
+#[tokio::test]
 async fn task_body_receipt_keeps_leading_hashes() {
     let (tools, memory) = hub();
     let (number, _) = create_task(&tools, "t: full", "## Постановка\n\nЧерновик.\n").await;
