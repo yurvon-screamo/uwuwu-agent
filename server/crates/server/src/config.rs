@@ -280,10 +280,14 @@ mod tests {
     fn parses_example_into_tick_plan() {
         let cfg = toml::from_str::<Config>(example()).expect("example валиден");
         assert_eq!(cfg.mode, ModeCfg::Observe);
-        assert_eq!(cfg.project.len(), 1);
+        // uwuwu + origa + true-washing + foilcap (подключены 16.11)
+        assert_eq!(cfg.project.len(), 4);
         assert!(cfg.policy.peak.enabled);
         let plan = cfg.to_tick_plan().expect("проекты валидны");
         assert_eq!(plan.boards[0].board, "Задачи uwuwu");
+        assert_eq!(plan.boards[1].board, "Задачи origa");
+        assert_eq!(plan.boards[2].board, "Задачи true-washing");
+        assert_eq!(plan.boards[3].board, "Задачи foilcap");
         assert_eq!(plan.policy.cup, 7);
         assert_eq!(plan.mode, Mode::Observe);
     }
