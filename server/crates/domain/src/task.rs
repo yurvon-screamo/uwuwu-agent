@@ -87,7 +87,7 @@ impl Status {
             (S::Draft, S::Todo)
                 | (S::Todo, S::Design | S::InProgress)
                 | (S::Wait, S::Todo | S::Design | S::InProgress)
-                | (S::Design, S::InProgress | S::NeedsAttention)
+                | (S::Design, S::ReviewPlan | S::InProgress | S::NeedsAttention)
                 | (S::ReviewPlan, S::InProgress | S::NeedsAttention)
                 | (
                     S::InProgress,
@@ -478,6 +478,7 @@ mod tests {
             (S::Draft, S::Todo),
             (S::Todo, S::Design),
             (S::Todo, S::InProgress),
+            (S::Design, S::ReviewPlan),
             (S::Design, S::InProgress),
             (S::InProgress, S::ReviewPlan),
             (S::InProgress, S::ReviewResult),

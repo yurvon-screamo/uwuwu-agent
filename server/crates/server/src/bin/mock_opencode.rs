@@ -97,7 +97,7 @@ async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) {
     let client = reqwest::Client::new();
     let mut req = client
         .post(format!("{base}/mcp"))
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45))
         .json(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": tool, "arguments": args }
@@ -360,7 +360,7 @@ async fn work_like_agent(
         mcp_call(
             &mcp_url,
             &mcp_token,
-            "uwuwu_task_comment",
+            "task_comment",
             json!({ "number": number, "text": format!("[мок] {verdict}") }),
         )
         .await;
@@ -368,7 +368,7 @@ async fn work_like_agent(
             mcp_call(
                 &mcp_url,
                 &mcp_token,
-                "uwuwu_task_edit",
+                "task_edit",
                 json!({ "number": number, "status": status }),
             )
             .await;
