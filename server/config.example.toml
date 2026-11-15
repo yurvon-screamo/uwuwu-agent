@@ -34,3 +34,28 @@ repo = "yurvon-screamo/uwuwu-agent"
 checkout = "/home/yurvon/uwuwu-agent"
 # корень env задач на исполнителе (~/agents-env)
 env_root = "/home/yurvon/agents-env"
+
+# Подключены 16.11 (доски смигрированы: fm→колонки/поля, ∅→Todo); строки
+# вне действующих стадий — конвейер не спавнит (владелец: «в работу не берём»).
+# true-washing/foilcap: каркасные GitHub-репо (основной код в Gitea —
+# см. их Деплоймент в вики).
+[[project]]
+name = "origa"
+board = "Задачи origa"
+repo = "yurvon-screamo/origa"
+checkout = "/home/yurvon/origa"
+env_root = "/home/yurvon/agents-env"
+
+[[project]]
+name = "true-washing"
+board = "Задачи true-washing"
+repo = "yurvon-screamo/true-washing"
+checkout = "/home/yurvon/true-washing"
+env_root = "/home/yurvon/agents-env"
+
+[[project]]
+name = "foilcap"
+board = "Задачи foilcap"
+repo = "yurvon-screamo/foilcap"
+checkout = "/home/yurvon/foilcap"
+env_root = "/home/yurvon/agents-env"
