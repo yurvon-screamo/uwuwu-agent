@@ -229,22 +229,34 @@ async fn run(
             }),
         });
     }
-    if let Some((_, board_title, checkout)) = boards_info.first().cloned() {
+    {
+        // триаж: черновики всех досок (мультиборд); дример — чекаут первой
         let triage = Arc::new(uwuwu_usecase::triage::TriageUseCase {
             board: board.clone(),
-            board_name: Arc::new(board_title),
+            boards: boards_info
+                .iter()
+                .map(
+                    |(project, board_title, checkout)| uwuwu_usecase::triage::TriageBoard {
+                        project: project.clone(),
+                        board: board_title.clone(),
+                        checkout: checkout.clone(),
+                    },
+                )
+                .collect(),
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
-            checkout: checkout.clone(),
         });
         let dreamer = Arc::new(uwuwu_usecase::dreamer::DreamerUseCase {
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
-            checkout,
+            checkout: boards_info
+                .first()
+                .map(|(_, _, checkout)| checkout.clone())
+                .unwrap_or_default(),
         });
         sidecars.push(Sidecar {
             name: "triage".into(),
