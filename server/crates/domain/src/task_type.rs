@@ -84,6 +84,6 @@ mod tests {
     fn unknown_falls_to_feature() {
         assert_eq!(TaskType::default_or_parse("nope"), TaskType::Feature);
         assert_eq!(TaskType::default_or_parse(""), TaskType::Feature);
-        assert_eq!(TaskType::default_or_parse("BUG"), TaskType::Bug);
+        assert_eq!(TaskType::default_or_parse("Qa"), TaskType::Qa, "кейс-инсенсивно");
     }
 }
