@@ -2,7 +2,7 @@
 //! Stateless-сервер: GET/DELETE → 405 (спека допускает), сессий нет —
 //! клиенты обязаны это переваривать. Auth — bearer (тот же, что /health).
 
-use crate::tools::ToolHub;
+use crate::api::tools::ToolHub;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};

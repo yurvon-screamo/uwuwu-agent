@@ -17,31 +17,6 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// Имя агента опенкода (agent-параметр create_session).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Developer => "developer",
-            Self::PlanReviewer => "plan-reviewer",
-            Self::CodeQualityReviewer => "code-quality-reviewer",
-            Self::Tester => "tester",
-            Self::Dreamer => "dreamer",
-            Self::Triage => "triage",
-        }
-    }
-
-    /// Парсинг имени агента (сессии исполнителя, конфиг крона).
-    pub fn parse(raw: &str) -> Option<Self> {
-        Some(match raw.trim() {
-            "developer" => Self::Developer,
-            "plan-reviewer" => Self::PlanReviewer,
-            "code-quality-reviewer" => Self::CodeQualityReviewer,
-            "tester" => Self::Tester,
-            "dreamer" => Self::Dreamer,
-            "triage" => Self::Triage,
-            _ => return None,
-        })
-    }
-
     /// Жёсткая привязка слот стадии → агент (канон конвейера).
     /// Dev/Design — дефолтная сессия исполнителя, без кастомного агента.
     pub fn of_slot(slot: Slot) -> Option<Self> {
@@ -51,6 +26,23 @@ impl Agent {
             Slot::PlanReview => Some(Self::PlanReviewer),
             Slot::ResultReview => Some(Self::CodeQualityReviewer),
             Slot::Test => Some(Self::Tester),
+        }
+    }
+}
+
+/// Агент исполнения: явное «дефолтная сессия» вместо Option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentSlot {
+    #[default]
+    Default,
+    Role(Agent),
+}
+
+impl AgentSlot {
+    pub fn of(agent: Option<Agent>) -> Self {
+        match agent {
+            Some(a) => Self::Role(a),
+            None => Self::Default,
         }
     }
 }
@@ -96,18 +88,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_round_trip() {
-        for a in [
-            Agent::Developer,
-            Agent::PlanReviewer,
-            Agent::CodeQualityReviewer,
-            Agent::Tester,
-            Agent::Dreamer,
-            Agent::Triage,
-        ] {
-            assert_eq!(Agent::parse(a.as_str()), Some(a));
-        }
-        assert_eq!(Agent::parse("nope"), None);
+    fn agent_slot_explicit() {
+        assert_eq!(AgentSlot::of(None), AgentSlot::Default);
+        assert_eq!(
+            AgentSlot::of(Some(Agent::Dreamer)),
+            AgentSlot::Role(Agent::Dreamer)
+        );
     }
 
     #[test]

@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uwuwu_domain::{Slot, Status, Task, TaskFields};
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::ports::{IssueFieldStore, TaskBoardRepo};
 use uwuwu_usecase::{CommentRef, IssueView};
+use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Состояние мок-хаба: строки «доски» (все имена досок → один стенд).
 #[derive(Default)]
@@ -38,7 +38,10 @@ impl MemoryHub {
     pub fn from_env() -> Self {
         let seed = std::env::var("UWUWU_MOCK_SEED").ok().and_then(|raw| {
             let (n, s) = raw.split_once(':')?;
-            Some((n.trim().parse().ok()?, Status::parse(s.trim())))
+            Some((
+                n.trim().parse().ok()?,
+                uwuwu_usecase::parse_status(s.trim()),
+            ))
         });
         Self {
             state: Mutex::new(HubState {
@@ -220,9 +223,9 @@ impl IssueFieldStore for MemoryHub {
             let mut out = HashMap::new();
             if let Some(f) = state.fields.get(&number) {
                 for (name, slot) in [
-                    (crate::fields::F_DEV_SESSION, Slot::Dev),
-                    (crate::fields::F_REVIEW_SESSION, Slot::PlanReview),
-                    (crate::fields::F_TEST_SESSION, Slot::Test),
+                    (crate::github::F_DEV_SESSION, Slot::Dev),
+                    (crate::github::F_REVIEW_SESSION, Slot::PlanReview),
+                    (crate::github::F_TEST_SESSION, Slot::Test),
                 ] {
                     if let Some(s) = f.session(slot) {
                         out.insert(name.into(), s.as_str().to_string());
@@ -248,9 +251,9 @@ impl IssueFieldStore for MemoryHub {
             let f = state.fields.entry(number).or_default();
             for (name, value) in patch {
                 let slot = match *name {
-                    crate::fields::F_DEV_SESSION => Some(Slot::Dev),
-                    crate::fields::F_REVIEW_SESSION => Some(Slot::PlanReview),
-                    crate::fields::F_TEST_SESSION => Some(Slot::Test),
+                    crate::github::F_DEV_SESSION => Some(Slot::Dev),
+                    crate::github::F_REVIEW_SESSION => Some(Slot::PlanReview),
+                    crate::github::F_TEST_SESSION => Some(Slot::Test),
                     _ => None,
                 };
                 if let (Some(slot), Some(v)) = (slot, value) {
@@ -267,7 +270,7 @@ impl IssueFieldStore for MemoryHub {
                     }
                     ("PR", Some(v)) => {
                         if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
-                            f.set_pr(p);
+                            let _ = f.open_pr(p);
                         }
                     }
                     _ => {}

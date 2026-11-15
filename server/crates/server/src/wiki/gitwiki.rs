@@ -3,7 +3,7 @@
 //! Единый писатель — сервер (конвейер), конфликт ff громко отвергается.
 
 use serde_json::{json, Value};
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitWikiWriter {
     repo: String,

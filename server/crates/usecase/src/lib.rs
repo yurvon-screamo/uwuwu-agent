@@ -1,28 +1,31 @@
-//! uwuwu-usecase: оркестрация доменом, порты инфры (трейты).
-//! Слой не знает ни MCP, ни gh, ни git, ни HTTP — только доменные типы
-//! и требования к инфре (порты). Реализации приезжают из uwuwu-server.
+//! uwuwu-usecase: оркестрация конвейера + инфра-порты + naming (маппинг
+//! имён носителей). Структура крейта инкапсулирована: наружу — только
+//! pub use из lib. Папки: pipeline/ (тик, действия, триаж, дример),
+//! tasks/ (запись, вьюхи), crons/, search/.
 
-pub mod actions;
-pub mod crons;
-pub mod dreamer;
-pub mod error;
-pub mod fm_lite;
-pub mod ports;
-pub mod search;
-pub mod taskwrite;
-pub mod tick;
-#[cfg(test)]
-mod tick_tests;
-pub mod triage;
-pub mod views;
+mod crons;
+mod error;
+mod fm_lite;
+mod naming;
+mod pipeline;
+mod ports;
+mod search;
+mod tasks;
 
+pub use crons::{crons_dir, parse_schedule_text, CronUseCase, FireOutcome};
 pub use error::{UsecaseError, UsecaseResult};
-pub use ports::SessionInfo;
+pub use naming::{
+    agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
+    schedule_label, slot_key, status_name, task_type_name,
+};
+pub use pipeline::{
+    BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, TriageBoard, TriageUseCase,
+};
 pub use ports::{
     AgentSessionGateway, Clock, CommentRef, FmMutator, IssueDigest, IssueFieldStore,
-    IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionSpec, TaskBoardRepo,
-    TickStateStore, WikiRepo,
+    IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
+    TaskBoardRepo, TickStateStore, WikiRepo,
 };
-pub use taskwrite::{NewTask, TaskPatch, TaskWriteUseCase, TaskWriter};
-pub use tick::{BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase};
-pub use views::{DocsView, PersonView, TaskView, ViewError};
+pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
+pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};
+pub use tasks::write::{NewTask, TaskPatch, TaskWriteUseCase, TaskWriter};

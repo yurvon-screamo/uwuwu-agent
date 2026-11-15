@@ -152,14 +152,6 @@ impl SpawnLoop {
         Self { status, repeats: 0 }
     }
 
-    /// Восстановление из персистента (сырой статус + счётчик).
-    pub fn from_parts(status_raw: &str, repeats: u32) -> Self {
-        Self {
-            status: Status::parse(status_raw),
-            repeats,
-        }
-    }
-
     /// Зарегистрировать очередной спавн слота; смена статуса строки
     /// (прогресс конвейера) обнуляет счётчик.
     pub fn register_spawn(&mut self, current: Status) -> LoopOutcome {
@@ -175,9 +167,14 @@ impl SpawnLoop {
         }
     }
 
-    /// Персист-вид: (сырой статус, счётчик).
-    pub fn parts(&self) -> (&'static str, u32) {
-        (self.status.as_str(), self.repeats)
+    /// Текущий счётчик повторов.
+    pub fn repeats(&self) -> u32 {
+        self.repeats
+    }
+
+    /// Статус, при котором считали.
+    pub fn status(&self) -> Status {
+        self.status
     }
 }
 
@@ -220,15 +217,13 @@ mod tests {
     }
 
     #[test]
-    fn spawn_loop_persists_parts() {
-        let mut guard = SpawnLoop::from_parts("Ревью результата", 1);
-        assert_eq!(
-            guard.register_spawn(Status::ReviewResult),
-            LoopOutcome::Continue
-        );
-        let (status, repeats) = guard.parts();
-        assert_eq!(status, "Ревью результата");
-        assert_eq!(repeats, 2);
+    fn spawn_loop_tracks_status_and_repeats() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        assert_eq!(guard.repeats(), 1);
+        assert_eq!(guard.status(), Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        assert_eq!(guard.repeats(), 2);
     }
 
     #[test]

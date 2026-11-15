@@ -2,6 +2,7 @@
 //! через порты. Оркестрация знает слова (логи/промпты) — домен нет.
 
 use crate::error::{UsecaseError, UsecaseResult};
+use crate::naming;
 use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickStateStore};
 use serde::Serialize;
 use std::sync::Arc;
@@ -12,16 +13,6 @@ use uwuwu_domain::{
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
 /// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
 pub const SPAWN_COOLDOWN_MS: u64 = 15 * 60_000;
-
-pub(crate) fn slot_name(slot: uwuwu_domain::Slot) -> &'static str {
-    match slot {
-        uwuwu_domain::Slot::Design => "design",
-        uwuwu_domain::Slot::Dev => "dev",
-        uwuwu_domain::Slot::PlanReview => "plan-review",
-        uwuwu_domain::Slot::ResultReview => "result-review",
-        uwuwu_domain::Slot::Test => "test",
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -137,9 +128,7 @@ impl TickUseCase {
                 Action::Spawn { slot } => {
                     // Анти-шторм: слот строки не спавнится чаще кулдауна
                     let cooldown_left = {
-                        let last =
-                            self.state
-                                .last_spawn_ms(&board.board, task.number(), slot_name(slot));
+                        let last = self.state.last_spawn_ms(&board.board, task.number(), slot);
                         last.map(|ts| self.clock.now_ms().saturating_sub(ts))
                             .unwrap_or(u64::MAX)
                     };
@@ -151,15 +140,21 @@ impl TickUseCase {
                     // статусе = петля → Needs attention, конвейер бросает строку
                     let mut guard = self
                         .state
-                        .spawn_loop(&board.board, task.number(), slot_name(slot))
-                        .map(|(s, r)| SpawnLoop::from_parts(&s, r))
+                        .spawn_loop(&board.board, task.number(), slot)
+                        .map(|(status, repeats)| {
+                            let mut g = SpawnLoop::new(status);
+                            for _ in 0..repeats {
+                                g.register_spawn(status);
+                            }
+                            g
+                        })
                         .unwrap_or_else(|| SpawnLoop::new(task.status()));
                     if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
                         out.attention_flagged += 1;
                         tracing::warn!(
                             event = "spawn.loop_escalated",
                             number = task.number(),
-                            slot = slot_name(slot),
+                            slot = naming::slot_key(slot),
                             "Spawn loop >2: Needs attention"
                         );
                         if plan.mode == Mode::Live {
@@ -173,23 +168,22 @@ impl TickUseCase {
                                     task.number(),
                                     &format!(
                                         "⚠︎ Спавн-петля: слот `{}` спавнился >2 раз без \
-                                         прогресса статуса ({}). Строка переведена в \
+                                         прогресса статуса ({:?}). Строка переведена в \
                                          Needs attention — разбор владельца.",
-                                        slot_name(slot),
-                                        task.status().as_str()
+                                        naming::slot_key(slot),
+                                        task.status()
                                     ),
                                 )
                                 .await;
                         }
                         continue;
                     }
-                    let (g_status, g_repeats) = guard.parts();
                     self.state.set_spawn_loop(
                         &board.board,
                         task.number(),
-                        slot_name(slot),
-                        g_status,
-                        g_repeats,
+                        slot,
+                        guard.status(),
+                        guard.repeats(),
                     );
                     let gated = gate(task, &action, plan.policy, global_active, now);
                     match gated {
@@ -199,7 +193,7 @@ impl TickUseCase {
                                 self.state.mark_spawn(
                                     &board.board,
                                     task.number(),
-                                    slot_name(slot),
+                                    slot,
                                     self.clock.now_ms(),
                                 );
                                 match self.spawn_stage(board, task, slot).await {

@@ -1,7 +1,7 @@
 //! Эмбеддинги: Ollama-совместимый /api/embeddings (локальная машина через
 //! туннель relay; решения #1133: LanceDB embedded, free-квоты не участвуют).
 
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Модель эмбеддингов локальной Ollama.
 pub const EMBED_MODEL: &str = "qwen3-embedding:0.6b";

@@ -12,8 +12,8 @@ pub struct ToolHub {
     pub writer: Arc<TaskWriteUseCase>,
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
     pub sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway>,
-    pub search: Arc<uwuwu_usecase::search::SearchUseCase>,
-    pub crons: Arc<uwuwu_usecase::crons::CronUseCase>,
+    pub search: Arc<uwuwu_usecase::SearchUseCase>,
+    pub crons: Arc<uwuwu_usecase::CronUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -195,7 +195,7 @@ impl ToolHub {
                     out.push_str(&format!(
                         "{:>6}  {:<14} {:<7} {}\n",
                         t.number(),
-                        t.status().as_str(),
+                        uwuwu_usecase::status_name(t.status()),
                         format!("{:?}", t.priority()).to_lowercase(),
                         t.title()
                     ));
@@ -215,7 +215,7 @@ impl ToolHub {
                     "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautodone: {}\n\n",
                     view.task.number(),
                     view.task.title(),
-                    view.task.status().as_str(),
+                    uwuwu_usecase::status_name(view.task.status()),
                     view.task.branch().map(|b| b.as_str()).unwrap_or("—"),
                     view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
                     view.task.autodone(),
@@ -302,7 +302,13 @@ impl ToolHub {
                     .map_err(|e| e.to_string())?;
                 let out = masters
                     .iter()
-                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule.raw()))
+                    .map(|m| {
+                        format!(
+                            "{} — `{}`\n",
+                            m.title,
+                            uwuwu_usecase::schedule_label(&m.schedule)
+                        )
+                    })
                     .collect::<String>();
                 ok_text(if out.is_empty() {
                     format!("кроны проекта {project} не найдены")
@@ -342,7 +348,7 @@ impl ToolHub {
             }
             "task_create" => {
                 let raw_kind = arg("type");
-                if !raw_kind.is_empty() && uwuwu_domain::TaskType::parse(&raw_kind).is_none() {
+                if !raw_kind.is_empty() && uwuwu_usecase::parse_task_type(&raw_kind).is_none() {
                     return Err(format!(
                         "неизвестный тип «{raw_kind}»: bug|spike|analys|docs|feature|refactoring|legacy|idea|qa|infrastructure|other"
                     ));
@@ -350,7 +356,7 @@ impl ToolHub {
                 let spec = uwuwu_usecase::NewTask {
                     title: arg("title"),
                     body_md: arg("body"),
-                    kind: uwuwu_domain::TaskType::parse(&raw_kind),
+                    kind: uwuwu_usecase::parse_task_type(&raw_kind),
                     priority: arg("priority"),
                     autodone: args
                         .get("autodone")
@@ -369,7 +375,7 @@ impl ToolHub {
             "task_edit" => {
                 let number = need_number(args)?;
                 let patch = uwuwu_usecase::TaskPatch {
-                    status: str_arg(args, "status").map(|s| uwuwu_domain::Status::parse(&s)),
+                    status: str_arg(args, "status").map(|s| uwuwu_usecase::parse_status(&s)),
                     branch: str_arg(args, "branch"),
                     pr: str_arg(args, "pr"),
                     priority: str_arg(args, "priority"),

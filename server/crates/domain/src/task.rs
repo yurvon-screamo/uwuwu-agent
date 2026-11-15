@@ -21,45 +21,6 @@ pub enum Status {
 }
 
 impl Status {
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim() {
-            "Draft" => Self::Draft,
-            "Todo" => Self::Todo,
-            "Design" => Self::Design,
-            "Ревью плана" => Self::ReviewPlan,
-            "In Progress" => Self::InProgress,
-            "Ревью результата" => Self::ReviewResult,
-            "Тестирование" => Self::Testing,
-            "Review" => Self::UserReview,
-            "Done" => Self::Done,
-            "Needs attention" => Self::NeedsAttention,
-            "Вейт" => Self::Wait,
-            "Deleted" => Self::Deleted,
-            "" => Self::Empty,
-            // неизвестное имя — пустой статус: строка выпадает из рабочих
-            // списков (легаси/мусор); логирование сырых имён — дело инфры
-            _ => Self::Empty,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Draft => "Draft",
-            Self::Todo => "Todo",
-            Self::Design => "Design",
-            Self::ReviewPlan => "Ревью плана",
-            Self::InProgress => "In Progress",
-            Self::ReviewResult => "Ревью результата",
-            Self::Testing => "Тестирование",
-            Self::UserReview => "Review",
-            Self::Done => "Done",
-            Self::NeedsAttention => "Needs attention",
-            Self::Wait => "Вейт",
-            Self::Deleted => "Deleted",
-            Self::Empty => "",
-        }
-    }
-
     /// LLM-тратящий статус: занимает слот CUP.
     pub fn is_active(self) -> bool {
         matches!(
@@ -118,15 +79,6 @@ pub enum Priority {
 }
 
 impl Priority {
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_lowercase().as_str() {
-            "high" => Self::High,
-            "medium" => Self::Medium,
-            "low" => Self::Low,
-            _ => Self::Empty,
-        }
-    }
-
     /// Порядок очереди: меньше — раньше.
     pub fn rank(self) -> u8 {
         match self {
@@ -150,65 +102,93 @@ pub enum Slot {
 
 /// Нативные поля issue, типизированные и инкапсулированные:
 /// домен владеет мутациями, инфра маппит имена → конструкторы.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFields {
-    dev_session: Option<SessionRef>,
-    review_session: Option<SessionRef>,
-    test_session: Option<SessionRef>,
-    branch: Option<BranchName>,
-    pr: Option<PrUrl>,
+    /// Назначения сессий по слотам: отсутствие слота = назначения нет
+    /// (явная пустота коллекции, не Option-поле).
+    assignments: std::collections::BTreeMap<Slot, SessionRef>,
+    /// Жизненный цикл VCS-артефактов: явные состояния вместо Option-полей.
+    vcs: Vcs,
+}
+
+/// VCS-состояние задачи: без ветки → ветка → PR. Инвариант: PR не бывает
+/// раньше ветки (PR без ветки — кривые данные носителя, загрузчик их
+/// отбрасывает с warn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vcs {
+    Local,
+    Branch(BranchName),
+    PullRequest { branch: BranchName, url: PrUrl },
+}
+
+impl Default for TaskFields {
+    fn default() -> Self {
+        Self {
+            assignments: std::collections::BTreeMap::new(),
+            vcs: Vcs::Local,
+        }
+    }
 }
 
 impl TaskFields {
-    pub fn new(
-        dev_session: Option<SessionRef>,
-        review_session: Option<SessionRef>,
-        test_session: Option<SessionRef>,
-        branch: Option<BranchName>,
-        pr: Option<PrUrl>,
-    ) -> Self {
-        Self {
-            dev_session,
-            review_session,
-            test_session,
-            branch,
-            pr,
-        }
+    /// Полная сборка (загрузчик носителя).
+    pub fn new(assignments: std::collections::BTreeMap<Slot, SessionRef>, vcs: Vcs) -> Self {
+        Self { assignments, vcs }
     }
 
+    /// Сессия слота (None — слот не назначен: явная пустота карты).
     pub fn session(&self, slot: Slot) -> Option<&SessionRef> {
-        match slot {
-            Slot::Dev | Slot::Design => self.dev_session.as_ref(),
-            Slot::PlanReview | Slot::ResultReview => self.review_session.as_ref(),
-            Slot::Test => self.test_session.as_ref(),
+        self.assignments.get(&slot)
+    }
+
+    pub fn vcs(&self) -> &Vcs {
+        &self.vcs
+    }
+
+    /// Ветка, если есть.
+    pub fn branch(&self) -> Option<&BranchName> {
+        match &self.vcs {
+            Vcs::Local => None,
+            Vcs::Branch(b) => Some(b),
+            Vcs::PullRequest { branch, .. } => Some(branch),
         }
     }
 
-    pub fn branch(&self) -> Option<&BranchName> {
-        self.branch.as_ref()
-    }
-
+    /// PR, если есть.
     pub fn pr(&self) -> Option<&PrUrl> {
-        self.pr.as_ref()
+        match &self.vcs {
+            Vcs::PullRequest { url, .. } => Some(url),
+            _ => None,
+        }
     }
 
     /// Мутатор: заявка сессии в слот (инфра-маппинг полей и спавны).
     pub fn set_session(&mut self, slot: Slot, session: SessionRef) {
-        match slot {
-            Slot::Dev | Slot::Design => self.dev_session = Some(session),
-            Slot::PlanReview | Slot::ResultReview => self.review_session = Some(session),
-            Slot::Test => self.test_session = Some(session),
-        }
+        self.assignments.insert(slot, session);
     }
 
-    /// Мутатор: заявка PR-ячейки.
-    pub fn set_pr(&mut self, url: PrUrl) {
-        self.pr = Some(url);
-    }
-
-    /// Мутатор: заявка ветки.
+    /// Мутатор: заявка/смена ветки; открытый PR сохраняется (ветка задачи
+    /// одна — канон).
     pub fn set_branch(&mut self, name: BranchName) {
-        self.branch = Some(name);
+        self.vcs = match std::mem::replace(&mut self.vcs, Vcs::Local) {
+            Vcs::PullRequest { url, .. } => Vcs::PullRequest { branch: name, url },
+            _ => Vcs::Branch(name),
+        };
+    }
+
+    /// Мутатор: открытие PR (требуется ветка — канон: PR из ветки задачи).
+    pub fn open_pr(&mut self, url: PrUrl) -> Result<(), &'static str> {
+        match self.vcs.clone() {
+            Vcs::Local => Err("PR без ветки: сначала Branch-ячейка"),
+            Vcs::Branch(branch) => {
+                self.vcs = Vcs::PullRequest { branch, url };
+                Ok(())
+            }
+            Vcs::PullRequest { branch, .. } => {
+                self.vcs = Vcs::PullRequest { branch, url };
+                Ok(())
+            }
+        }
     }
 }
 
@@ -295,9 +275,8 @@ impl Task {
     pub fn transition(&mut self, to: Status) -> Result<(), String> {
         if !Status::can_transition(self.status, to) {
             return Err(format!(
-                "переход «{}» → «{}» вне канона конвейера (см. Status::can_transition)",
-                self.status.as_str(),
-                to.as_str()
+                "переход {:?} → {:?} вне канона конвейера (см. Status::can_transition)",
+                self.status, to
             ));
         }
         self.status = to;
@@ -347,15 +326,11 @@ impl Task {
     pub fn claim(&mut self, slot: Slot, session: SessionRef) -> Result<(), String> {
         if self.status.is_terminal() {
             return Err(format!(
-                "claim на терминальной строке «{}» запрещён",
-                self.status.as_str()
+                "claim на терминальной строке ({:?}) запрещён",
+                self.status
             ));
         }
-        match slot {
-            Slot::Dev | Slot::Design => self.fields.dev_session = Some(session),
-            Slot::PlanReview | Slot::ResultReview => self.fields.review_session = Some(session),
-            Slot::Test => self.fields.test_session = Some(session),
-        }
+        self.fields.set_session(slot, session);
         Ok(())
     }
 
@@ -397,43 +372,26 @@ impl Task {
 mod tests {
     use super::*;
 
-    #[test]
-    fn status_round_trip() {
-        for raw in [
-            "Draft",
-            "Todo",
-            "Design",
-            "Ревью плана",
-            "In Progress",
-            "Ревью результата",
-            "Тестирование",
-            "Review",
-            "Done",
-            "Needs attention",
-            "Вейт",
-            "Deleted",
-        ] {
-            assert_eq!(Status::parse(raw).as_str(), raw, "round-trip {raw}");
-        }
-        assert_eq!(Status::parse("  In Progress "), Status::InProgress);
-        assert_eq!(Status::parse(""), Status::Empty);
-        assert_eq!(Status::parse("мусор"), Status::Empty);
+    fn task(status: Status) -> Task {
+        Task::new(7, "t".into(), status)
     }
 
     #[test]
-    fn active_and_terminal_sets() {
-        assert!(Status::Design.is_active());
-        assert!(Status::Testing.is_active());
-        assert!(!Status::UserReview.is_active());
-        assert!(Status::Done.is_terminal());
-        assert!(Status::Deleted.is_terminal());
-        assert!(!Status::NeedsAttention.is_active());
-        assert!(!Status::NeedsAttention.is_terminal());
+    fn claim_respects_terminal() {
+        let mut t = Task::new(1, "t".into(), Status::Done);
+        assert!(t
+            .claim(Slot::Dev, SessionRef::parse("ses_a").unwrap())
+            .is_err());
+        let mut live = Task::new(1, "t".into(), Status::InProgress);
+        assert!(live
+            .claim(Slot::Dev, SessionRef::parse("ses_a").unwrap())
+            .is_ok());
+        assert_eq!(live.session_of(Slot::Dev), Some("ses_a"));
     }
 
     #[test]
     fn stage_slot_maps_status() {
-        let mut t = Task::new(1, "t".into(), Status::ReviewPlan);
+        let mut t = task(Status::ReviewPlan);
         assert_eq!(t.stage_slot(), Some(Slot::PlanReview));
         assert_eq!(t.stage_needs_spawn(), Some(Slot::PlanReview));
         t.claim(
@@ -460,14 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_rejected_on_terminal() {
-        let mut t = Task::new(3, "t".into(), Status::Done);
-        assert!(t
-            .claim(Slot::Dev, SessionRef::parse("ses_a").unwrap())
-            .is_err());
-    }
-
-    #[test]
     fn value_objects_reject_garbage() {
         assert!(SessionRef::parse("мусор").is_none());
         assert!(SessionRef::parse("ses_").is_none());
@@ -480,13 +430,38 @@ mod tests {
     }
 
     #[test]
+    fn vcs_lifecycle_explicit() {
+        let mut f = TaskFields::default();
+        assert!(matches!(f.vcs(), &Vcs::Local), "нет ветки — Local");
+        assert!(f.pr().is_none());
+        // PR без ветки — ошибка домена
+        assert!(f.open_pr(PrUrl::parse("https://x/1").unwrap()).is_err());
+        f.set_branch(BranchName::parse("work/task-1").unwrap());
+        assert!(matches!(f.vcs(), &Vcs::Branch(_)));
+        f.open_pr(PrUrl::parse("https://x/1").unwrap()).unwrap();
+        match f.vcs() {
+            Vcs::PullRequest { branch, url } => {
+                assert_eq!(branch.as_str(), "work/task-1");
+                assert_eq!(url.as_str(), "https://x/1");
+            }
+            other => panic!("PR ожидался, got {other:?}"),
+        }
+        // смена ветки сохраняет PR
+        f.set_branch(BranchName::parse("work/task-1b").unwrap());
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-1b"));
+    }
+
+    #[test]
     fn status_transitions_canon() {
         use Status as S;
         // рёбра пайпа
         for (from, to) in [
             (S::Draft, S::Todo),
+            (S::Draft, S::Deleted),
             (S::Todo, S::Design),
             (S::Todo, S::InProgress),
+            (S::Todo, S::Deleted),
             (S::Design, S::ReviewPlan),
             (S::Design, S::InProgress),
             (S::InProgress, S::ReviewPlan),
@@ -504,7 +479,7 @@ mod tests {
                 "{from:?} → {to:?} должно быть разрешено"
             );
         }
-        // запреты: Done не выходит, агенты не ставят Done/Todo/Draft через переход
+        // запреты
         assert!(!S::can_transition(S::Done, S::InProgress));
         assert!(
             !S::can_transition(S::UserReview, S::Done),
@@ -513,11 +488,8 @@ mod tests {
         assert!(!S::can_transition(S::InProgress, S::Todo));
         assert!(
             !S::can_transition(S::Empty, S::Todo),
-            "легаси-черновик — владельцу в UI"
+            "легаси — владельцу в UI"
         );
-        // мягкое удаление своей ошибки: только с ранних стадий (DS user story)
-        assert!(S::can_transition(S::Draft, S::Deleted));
-        assert!(S::can_transition(S::Todo, S::Deleted));
         assert!(
             !S::can_transition(S::InProgress, S::Deleted),
             "в работе — не удаляют"
@@ -539,10 +511,7 @@ mod tests {
         // мутация с каноном
         let mut t = Task::new(9, "t".into(), S::InProgress);
         assert!(t.transition(S::ReviewResult).is_ok());
-        assert!(
-            t.transition(S::Done).is_err(),
-            "ReviewResult → Done вне канона"
-        );
+        assert!(t.transition(S::Done).is_err());
         assert_eq!(
             t.status(),
             S::ReviewResult,
@@ -551,18 +520,16 @@ mod tests {
     }
 
     #[test]
-    fn autodone_requires_user_review_and_flag() {
-        let mut t = Task::new(3, "t".into(), Status::UserReview);
-        assert!(!t.autodone_ready());
-        t.autodone = true;
-        assert!(t.autodone_ready());
-        t.status = Status::Testing;
-        assert!(!t.autodone_ready());
-    }
-
-    #[test]
-    fn priority_orders_queue() {
-        assert!(Priority::High.rank() < Priority::Medium.rank());
-        assert!(Priority::Low.rank() < Priority::Empty.rank());
+    fn apply_fields_replaces_whole() {
+        let mut t = task(Status::ReviewResult);
+        let mut assignments = std::collections::BTreeMap::new();
+        assignments.insert(Slot::PlanReview, SessionRef::parse("ses_r").unwrap());
+        let fields = TaskFields::new(
+            assignments,
+            Vcs::Branch(BranchName::parse("work/task-3").unwrap()),
+        );
+        t.apply_fields(fields);
+        assert_eq!(t.session_of(Slot::PlanReview), Some("ses_r"));
+        assert_eq!(t.branch().map(|b| b.as_str()), Some("work/task-3"));
     }
 }

@@ -208,14 +208,33 @@ impl Config {
             .unwrap_or_else(|_| config_path.with_file_name("state.json"))
     }
 
-    /// Порт конфига → план тика юзкейса. Проекты проходят доменную
-    /// валидацию (ProjectRegistry): битый конфиг — громкая ошибка старта.
+    /// Порт конфига → план тика юзкейса. Валидация конфига — здесь
+    /// (деплой-данные): непустые имя/доска/чекауты, repo owner/name,
+    /// дубли имён; битый конфиг — громкая ошибка старта.
     pub fn to_tick_plan(&self) -> Result<TickPlan, String> {
-        let mut registry = uwuwu_domain::ProjectRegistry::new();
+        let mut names = std::collections::BTreeSet::new();
         for p in &self.project {
-            let project =
-                uwuwu_domain::Project::new(&p.name, &p.board, &p.repo, &p.checkout, &p.env_root)?;
-            registry.add(project)?;
+            let name = p.name.trim();
+            if name.is_empty() {
+                return Err("проект без имени".into());
+            }
+            if !names.insert(name.to_string()) {
+                return Err(format!("проект «{name}» уже в конфиге"));
+            }
+            if p.board.trim().is_empty() {
+                return Err(format!("проект «{name}»: пустая доска"));
+            }
+            if p.repo.trim().split('/').count() != 2 {
+                return Err(format!(
+                    "проект «{name}»: repo «{}» не в форме owner/name",
+                    p.repo.trim()
+                ));
+            }
+            if p.checkout.trim().is_empty() || p.env_root.trim().is_empty() {
+                return Err(format!(
+                    "проект «{name}»: пустой checkout/env_root (спавн невозможен)"
+                ));
+            }
         }
         Ok(TickPlan {
             mode: match self.mode() {
@@ -230,14 +249,15 @@ impl Config {
                     end_min: self.policy.peak.end_min,
                 },
             },
-            boards: registry
+            boards: self
+                .project
                 .iter()
                 .map(|p| BoardPlan {
-                    project: p.name().to_string(),
-                    board: p.board().to_string(),
-                    repo: p.repo().to_string(),
-                    checkout: p.checkout().to_string(),
-                    env_root: p.env_root().to_string(),
+                    project: p.name.trim().to_string(),
+                    board: p.board.trim().to_string(),
+                    repo: p.repo.trim().to_string(),
+                    checkout: p.checkout.trim().to_string(),
+                    env_root: p.env_root.trim().to_string(),
                 })
                 .collect(),
         })

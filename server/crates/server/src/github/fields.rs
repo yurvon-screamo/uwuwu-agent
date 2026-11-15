@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
 use uwuwu_usecase::IssueFieldStore;
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub const F_DEV_SESSION: &str = "Сессия dev";
 pub const F_REVIEW_SESSION: &str = "Сессия ревью";
