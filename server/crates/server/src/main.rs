@@ -1,23 +1,17 @@
 //! uwuwu-server — внешний слой контура uwuwu (hub#1133):
 //! реализации портов (gh-hub, опенкод, PR-шлюз, state, часы) +
-//! presentation (HTTP; MCP — срез 2) + композиция.
+//! presentation (HTTP; MCP) + композиция. Структура: api/ executor/
+//! github/ search/ wiki/ + main/config/state/clock/mockhub.
 //! Зависимости: server → usecase → domain, только внутрь.
 
-mod budget;
+mod api;
 mod clock;
 mod config;
-mod fields;
-mod gitwiki;
-mod http;
-mod hub;
-mod mcp;
+mod executor;
+mod github;
 mod mockhub;
-mod opencode;
-mod prgate;
-mod semantic;
-mod semantic_backend;
+mod search;
 mod state;
-mod tools;
 mod wiki;
 
 use config::{Config, ConfigError, ENV_CONFIG};
@@ -73,7 +67,7 @@ async fn run(
     // Композиция: реализации портов → оркестратор
     // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit)
     let use_memory_hub = cfg.hub.driver == "memory";
-    let mut github_hub: Option<Arc<hub::GitHubHub>> = None;
+    let mut github_hub: Option<Arc<github::GitHubHub>> = None;
     let (board, field_store): (
         Arc<dyn uwuwu_usecase::TaskBoardRepo>,
         Arc<dyn uwuwu_usecase::IssueFieldStore>,
@@ -82,7 +76,7 @@ async fn run(
         tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
         (mem.clone(), mem)
     } else {
-        let gh = Arc::new(hub::GitHubHub::new(
+        let gh = Arc::new(github::GitHubHub::new(
             cfg.hub.repo.clone(),
             secrets.gh_token.clone(),
         ));
@@ -93,12 +87,12 @@ async fn run(
         github_hub = Some(gh);
         out
     };
-    let raw_sessions = Arc::new(opencode::OpencodeClient::new(
+    let raw_sessions = Arc::new(executor::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
         secrets.opencode_gate_cookie.clone(),
     ));
-    let prs = Arc::new(prgate::GhPrGateway::new(secrets.gh_token.clone()));
+    let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let clock = Arc::new(clock::SystemClock);
     // Глобальный спавн-бюджет: все create_session через один потолок;
     // UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
@@ -107,7 +101,7 @@ async fn run(
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(10);
     let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(
-        budget::BudgetedSessions::new(raw_sessions, spawn_cap, clock.clone()),
+        executor::BudgetedSessions::new(raw_sessions, spawn_cap, clock.clone()),
     );
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
@@ -140,7 +134,7 @@ async fn run(
         board.clone(),
         boards_cfg.clone(),
     ));
-    let git_writer = Arc::new(gitwiki::GitWikiWriter::new(
+    let git_writer = Arc::new(wiki::GitWikiWriter::new(
         cfg.hub.repo.clone(),
         "main".to_string(),
         secrets.gh_token.clone(),
@@ -156,21 +150,20 @@ async fn run(
     let embed_url = std::env::var("UWUWU_EMBED_URL")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Option<Arc<dyn uwuwu_usecase::search::SemanticBackend>> = match embed_url
-    {
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match embed_url {
         Some(url) => {
-            let embed = Arc::new(semantic::OllamaEmbeddings::new(
+            let embed = Arc::new(search::OllamaEmbeddings::new(
                 url,
                 std::env::var("UWUWU_EMBED_MODEL")
                     .ok()
                     .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| semantic::EMBED_MODEL.to_string()),
+                    .unwrap_or_else(|| search::EMBED_MODEL.to_string()),
             ));
             // github-хаб индексирует и задачи (юзер-стори «по вики/задачам»)
             let issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>> = github_hub
                 .clone()
                 .map(|gh| gh as Arc<dyn uwuwu_usecase::IssueIndexSource>);
-            match semantic_backend::LanceSemanticBackend::open(
+            match search::LanceSemanticBackend::open(
                 cfg.state_path(&config_path).with_file_name("lancedb"),
                 wiki.clone(),
                 issues,
@@ -187,11 +180,11 @@ async fn run(
         }
         None => None,
     };
-    let search_usecase = Arc::new(uwuwu_usecase::search::SearchUseCase {
+    let search_usecase = Arc::new(uwuwu_usecase::SearchUseCase {
         semantic: semantic_backend.clone(),
     });
 
-    let tool_hub = Arc::new(tools::ToolHub {
+    let tool_hub = Arc::new(api::ToolHub {
         tasks: task_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
@@ -203,7 +196,7 @@ async fn run(
         wiki: wiki.clone(),
         sessions: sessions.clone(),
         search: search_usecase.clone(),
-        crons: Arc::new(uwuwu_usecase::crons::CronUseCase {
+        crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
@@ -216,16 +209,16 @@ async fn run(
         }),
     });
 
-    let http_state = Arc::new(http::AppState {
+    let http_state = Arc::new(api::AppState {
         bearer: Arc::new(secrets.bearer.clone()),
         mode: mode_label,
         tick: shared.clone(),
     });
-    let mcp_state = Arc::new(mcp::McpState {
+    let mcp_state = Arc::new(api::McpState {
         bearer: Arc::new(secrets.bearer.clone()),
         tools: tool_hub,
     });
-    let app = http::router(http_state).merge(mcp::router(mcp_state));
+    let app = api::http_router(http_state).merge(api::mcp_router(mcp_state));
 
     // Сателлиты конвейера: кроны (вики-носитель), триаж черновиков, дример
     let boards_info: Vec<(String, String, String)> = plan
@@ -244,7 +237,7 @@ async fn run(
         );
     }
     for (project, _, checkout) in boards_info.iter() {
-        let cron = Arc::new(uwuwu_usecase::crons::CronUseCase {
+        let cron = Arc::new(uwuwu_usecase::CronUseCase {
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
@@ -269,12 +262,12 @@ async fn run(
     }
     {
         // триаж: черновики всех досок (мультиборд); дример — чекаут первой
-        let triage = Arc::new(uwuwu_usecase::triage::TriageUseCase {
+        let triage = Arc::new(uwuwu_usecase::TriageUseCase {
             board: board.clone(),
             boards: boards_info
                 .iter()
                 .map(
-                    |(project, board_title, checkout)| uwuwu_usecase::triage::TriageBoard {
+                    |(project, board_title, checkout)| uwuwu_usecase::TriageBoard {
                         project: project.clone(),
                         board: board_title.clone(),
                         checkout: checkout.clone(),
@@ -286,7 +279,7 @@ async fn run(
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
         });
-        let dreamer = Arc::new(uwuwu_usecase::dreamer::DreamerUseCase {
+        let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
@@ -340,7 +333,7 @@ async fn run(
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());
                     }
-                    if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
+                    if !uwuwu_usecase::sync_allowed(clock.utc_minute()) {
                         return Ok(());
                     }
                     // локальная Ollama без квот: бюджет щедрее free-плана

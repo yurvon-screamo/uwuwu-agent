@@ -2,11 +2,11 @@
 //! юзкейсы — с фейками, без сети/досок).
 
 use crate::error::UsecaseResult;
+use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
     TaskBoardRepo, TickStateStore,
 };
-use crate::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
@@ -170,14 +170,18 @@ impl TickStateStore for MemState {
         0
     }
     fn mark_dreamer_spawn(&self, _day: &str) {}
-    fn last_spawn_ms(&self, _b: &str, _n: u64, _s: &str) -> Option<u64> {
+    fn last_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) -> Option<u64> {
         None
     }
-    fn mark_spawn(&self, _b: &str, _n: u64, _s: &str, _at: u64) {}
-    fn spawn_loop(&self, _b: &str, _n: u64, _s: &str) -> Option<(String, u32)> {
+    fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
+    fn last_triage_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
     }
-    fn set_spawn_loop(&self, _b: &str, _n: u64, _s: &str, _status: &str, _r: u32) {}
+    fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _status: Status, _r: u32) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -319,7 +323,9 @@ async fn autodone_green_merges() {
     let mut t = task(5, Status::UserReview);
     t.set_autodone(true);
     let mut f = TaskFields::default();
-    f.set_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
+    f.set_branch(BranchName::parse("work/task-5").unwrap());
+    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap())
+        .unwrap();
     t.apply_fields(f);
     let (u, board, _, prs) = usecase(
         vec![t],

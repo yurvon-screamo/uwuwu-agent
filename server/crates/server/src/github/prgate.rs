@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
 use uwuwu_usecase::{PrGateway, PrState};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GhPrGateway {
     token: String,

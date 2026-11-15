@@ -2,9 +2,10 @@
 //! wakeup по свежим комментам, автодон (проба PR → мерж/Done/bounce).
 
 use crate::error::UsecaseResult;
+use crate::naming;
+use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{Liveness, SessionSpec};
-use crate::tick::{slot_name, BoardPlan, TickUseCase};
-use uwuwu_domain::{Agent, LoopOutcome, Slot, SpawnLoop, Status, Task};
+use uwuwu_domain::{Agent, AgentSlot, LoopOutcome, Slot, SpawnLoop, Status, Task};
 
 impl TickUseCase {
     /// Спавн агента стадии: bootstrap-сессия в мастер-чекауте готовит env
@@ -23,7 +24,7 @@ impl TickUseCase {
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
-                agent: None,
+                agent: AgentSlot::Default,
                 model: self.spawn_model.clone(),
             })
             .await?;
@@ -52,7 +53,7 @@ impl TickUseCase {
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
                 title: title.to_string(),
-                agent: Agent::of_slot(slot),
+                agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
             })
             .await?;
@@ -125,14 +126,20 @@ impl TickUseCase {
             session = %session, "Stage session dead: respawn через луп-гвард");
         let mut guard = self
             .state
-            .spawn_loop(&board.board, task.number(), slot_name(slot))
-            .map(|(s, r)| SpawnLoop::from_parts(&s, r))
+            .spawn_loop(&board.board, task.number(), slot)
+            .map(|(status, repeats)| {
+                let mut g = SpawnLoop::new(status);
+                for _ in 0..repeats {
+                    g.register_spawn(status);
+                }
+                g
+            })
             .unwrap_or_else(|| SpawnLoop::new(task.status()));
         if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
             tracing::warn!(
                 event = "respawn.loop_escalated",
                 number = task.number(),
-                slot = slot_name(slot),
+                slot = naming::slot_key(slot),
                 "Dead-respawn loop >2: Needs attention"
             );
             self.board
@@ -143,21 +150,20 @@ impl TickUseCase {
                     task.number(),
                     &format!(
                         "⚠︎ Респавн-петля: сессия стадии `{}` умирает и респавнится \
-                         >2 раз без прогресса статуса ({}). Разбор владельца.",
-                        slot_name(slot),
-                        task.status().as_str()
+                         >2 раз без прогресса статуса ({:?}). Разбор владельца.",
+                        naming::slot_key(slot),
+                        task.status()
                     ),
                 )
                 .await?;
             return Ok(false);
         }
-        let (g_status, g_repeats) = guard.parts();
         self.state.set_spawn_loop(
             &board.board,
             task.number(),
-            slot_name(slot),
-            g_status,
-            g_repeats,
+            slot,
+            guard.status(),
+            guard.repeats(),
         );
         let fresh = self.spawn_stage(board, task, slot).await?;
         self.board

@@ -1,100 +1,112 @@
-//! Проект конвейера: имя + доска + репо + чекаут + env-корень.
-//! Инварианты проверяются при сборке реестра — битый конфиг валит старт
-//! сервера громко, а не молчит пустыми строками в рантайме.
+//! Проект конвейера: имя + персона + реестр долгосрочных целей (DS:
+//! дочерние сущности агрегата). Носитель (доки вики, конфиг деплоя) —
+//! вне домена: сегодня вики, завтра БД — агрегат не меняется.
 
-/// Проект конвейера (строка [[project]] конфига).
+/// Проект конвейера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
-    name: String,
-    board: String,
-    repo: String,
-    checkout: String,
-    env_root: String,
+    name: ProjectName,
+    persona: Persona,
+    goals: Vec<Goal>,
 }
 
-impl Project {
-    pub fn new(
-        name: impl Into<String>,
-        board: impl Into<String>,
-        repo: impl Into<String>,
-        checkout: impl Into<String>,
-        env_root: impl Into<String>,
-    ) -> Result<Self, String> {
-        let p = Self {
-            name: name.into().trim().to_string(),
-            board: board.into().trim().to_string(),
-            repo: repo.into().trim().to_string(),
-            checkout: checkout.into().trim().to_string(),
-            env_root: env_root.into().trim().to_string(),
-        };
-        if p.name.is_empty() {
-            return Err("проект без имени".into());
-        }
-        if p.board.is_empty() {
-            return Err(format!("проект «{}»: пустая доска", p.name));
-        }
-        if p.repo.split('/').count() != 2 {
-            return Err(format!(
-                "проект «{}»: repo «{}» не в форме owner/name",
-                p.name, p.repo
-            ));
-        }
-        if p.checkout.is_empty() || p.env_root.is_empty() {
-            return Err(format!(
-                "проект «{}»: пустой checkout/env_root (спавн невозможен)",
-                p.name
-            ));
-        }
-        Ok(p)
+/// Имя проекта (топ-папка вики; непустое).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectName(String);
+
+impl ProjectName {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        (!raw.is_empty() && !raw.contains('/')).then(|| Self(raw.to_string()))
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn board(&self) -> &str {
-        &self.board
-    }
-    pub fn repo(&self) -> &str {
-        &self.repo
-    }
-    pub fn checkout(&self) -> &str {
-        &self.checkout
-    }
-    pub fn env_root(&self) -> &str {
-        &self.env_root
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// Реестр проектов: имена уникальны (доски может делить — имя нет).
-#[derive(Debug, Clone, Default)]
-pub struct ProjectRegistry {
-    projects: Vec<Project>,
-}
+/// Персона владельца проекта: компактный профиль, ходит в каждый спавн.
+/// Пустая = «работай без персоны» (дока нет) — явное состояние.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Persona(String);
 
-impl ProjectRegistry {
-    pub fn new() -> Self {
-        Self::default()
+impl Persona {
+    pub fn empty() -> Self {
+        Self(String::new())
     }
 
-    /// Добавить проект; дубль имени — ошибка.
-    pub fn add(&mut self, project: Project) -> Result<(), String> {
-        if self.projects.iter().any(|p| p.name == project.name) {
-            return Err(format!("проект «{}» уже в реестре", project.name()));
-        }
-        self.projects.push(project);
-        Ok(())
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Project> {
-        self.projects.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.projects.len()
+    pub fn text(&self) -> &str {
+        &self.0
     }
 
     pub fn is_empty(&self) -> bool {
-        self.projects.is_empty()
+        self.0.is_empty()
+    }
+}
+
+/// Долгосрочная цель проекта: заголовок (тело цели ведёт владелец в UI —
+/// домен хранит реестр заголовков для сверки направления).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Goal {
+    title: String,
+}
+
+impl Goal {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into().trim().to_string(),
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+}
+
+impl Project {
+    pub fn new(name: ProjectName, persona: Persona, goals: Vec<Goal>) -> Self {
+        Self {
+            name,
+            persona,
+            goals,
+        }
+    }
+
+    pub fn name(&self) -> &ProjectName {
+        &self.name
+    }
+
+    pub fn persona(&self) -> &Persona {
+        &self.persona
+    }
+
+    pub fn goals(&self) -> &[Goal] {
+        &self.goals
+    }
+
+    /// Инвариант: цели уникальны по заголовку (дубль — ошибка сборки).
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for g in &self.goals {
+            if g.title.is_empty() {
+                return Err(format!(
+                    "проект «{}»: цель с пустым заголовком",
+                    self.name.as_str()
+                ));
+            }
+            if !seen.insert(g.title.clone()) {
+                return Err(format!(
+                    "проект «{}»: цель «{}» задублирована",
+                    self.name.as_str(),
+                    g.title
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -102,27 +114,31 @@ impl ProjectRegistry {
 mod tests {
     use super::*;
 
-    fn ok_project(name: &str) -> Project {
-        Project::new(name, "Задачи x", "owner/repo", "/co", "/env").expect("валидный проект")
-    }
-
     #[test]
-    fn rejects_broken_config() {
-        assert!(Project::new("", "B", "o/r", "/c", "/e").is_err());
-        assert!(Project::new("p", "", "o/r", "/c", "/e").is_err());
-        assert!(
-            Project::new("p", "B", "repo", "/c", "/e").is_err(),
-            "repo без owner/"
+    fn goals_unique() {
+        let p = Project::new(
+            ProjectName::parse("uwuwu").unwrap(),
+            Persona::empty(),
+            vec![
+                Goal::new("серверная архитектура"),
+                Goal::new("серверная архитектура"),
+            ],
         );
-        assert!(Project::new("p", "B", "o/r", "", "/e").is_err());
+        assert!(p.validate().is_err());
+        let ok = Project::new(
+            ProjectName::parse("uwuwu").unwrap(),
+            Persona::new("язык: русский"),
+            vec![Goal::new("a"), Goal::new("b")],
+        );
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.persona().text(), "язык: русский");
+        assert_eq!(ok.goals().len(), 2);
     }
 
     #[test]
-    fn registry_rejects_dup_names() {
-        let mut r = ProjectRegistry::new();
-        r.add(ok_project("uwuwu")).unwrap();
-        assert!(r.add(ok_project("uwuwu")).is_err());
-        r.add(ok_project("true-washing")).unwrap();
-        assert_eq!(r.len(), 2);
+    fn name_rejects_garbage() {
+        assert!(ProjectName::parse("").is_none());
+        assert!(ProjectName::parse("a/b").is_none());
+        assert!(ProjectName::parse(" uwuwu ").is_some());
     }
 }

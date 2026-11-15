@@ -4,8 +4,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
+use uwuwu_domain::{Slot, Status};
+use uwuwu_usecase as naming;
 use uwuwu_usecase::TickStateStore;
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RowState {
@@ -112,8 +114,8 @@ impl TickStateStore for JsonStateStore {
         guard.dreamer_day = Some((day_key.to_string(), n + 1));
     }
 
-    fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64> {
-        let key = format!("{board}:{number}:{slot}");
+    fn last_spawn_ms(&self, board: &str, number: u64, slot: Slot) -> Option<u64> {
+        let key = format!("{board}:{number}:{}", naming::slot_key(slot));
         self.state
             .lock()
             .expect("state lock")
@@ -122,27 +124,43 @@ impl TickStateStore for JsonStateStore {
             .copied()
     }
 
-    fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64) {
+    fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64) {
+        self.state.lock().expect("state lock").spawns.insert(
+            format!("{board}:{number}:{}", naming::slot_key(slot)),
+            at_ms,
+        );
+    }
+
+    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64> {
         self.state
             .lock()
             .expect("state lock")
             .spawns
-            .insert(format!("{board}:{number}:{slot}"), at_ms);
+            .get(&format!("{board}:{number}:triage"))
+            .copied()
     }
 
-    fn spawn_loop(&self, board: &str, number: u64, slot: &str) -> Option<(String, u32)> {
+    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .insert(format!("{board}:{number}:triage"), at_ms);
+    }
+
+    fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state
             .lock()
             .expect("state lock")
             .spawn_loops
-            .get(&format!("{board}:{number}:{slot}"))
-            .map(|(s, r)| (s.clone(), *r))
+            .get(&format!("{board}:{number}:{}", naming::slot_key(slot)))
+            .map(|(s, r)| (naming::parse_status(s), *r))
     }
 
-    fn set_spawn_loop(&self, board: &str, number: u64, slot: &str, status: &str, repeats: u32) {
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: Slot, status: Status, repeats: u32) {
         self.state.lock().expect("state lock").spawn_loops.insert(
-            format!("{board}:{number}:{slot}"),
-            (status.to_string(), repeats),
+            format!("{board}:{number}:{}", naming::slot_key(slot)),
+            (naming::status_name(status).to_string(), repeats),
         );
     }
 

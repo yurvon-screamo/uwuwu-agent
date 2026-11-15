@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
 use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionInfo, SessionSpec};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct OpencodeClient {
     base: String,
@@ -90,8 +90,11 @@ impl AgentSessionGateway for OpencodeClient {
             "title": spec.title.chars().take(64).collect::<String>(),
             "location": { "directory": spec.directory },
         });
-        if let Some(agent) = &spec.agent {
-            body["agent"] = json!(agent.as_str());
+        match &spec.agent {
+            uwuwu_domain::AgentSlot::Role(agent) => {
+                body["agent"] = json!(uwuwu_usecase::agent_name(*agent));
+            }
+            uwuwu_domain::AgentSlot::Default => {}
         }
         if let Some(model) = &spec.model {
             body["model"] = json!({ "providerID": model.provider(), "id": model.id() });

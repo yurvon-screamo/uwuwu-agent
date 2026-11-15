@@ -3,13 +3,13 @@
 //! Status/Приоритет/Autodone на доске, сессии/ветка/PR — глобальные поля issue
 //! (fields.rs). Тело задачи — чистый контент.
 
-use crate::fields::{parse_field_values, Fields, IssueFields};
+use super::fields::{parse_field_values, Fields, IssueFields};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_domain::{Priority, Status, Task};
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
+use uwuwu_domain::{Status, Task};
 use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubHub {
     repo: String,
@@ -287,10 +287,10 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             let status = if issue["state"].as_str() == Some("closed") {
                 Status::Done
             } else {
-                Status::parse(&v.status)
+                uwuwu_usecase::parse_status(&v.status)
             };
             let mut task = Task::new(number, title, status);
-            task.set_priority(Priority::parse(&v.priority));
+            task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_autodone(v.autodone);
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
@@ -335,16 +335,35 @@ fn trunc(s: &str) -> String {
 /// невалидные значения полей (не-ses_ id, не-http URL) → None: мусор в ячейке
 /// не становится заявкой — валидация в value-объектах домена).
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
+    use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
-    let b = |v: Option<&String>| v.and_then(|s| uwuwu_domain::BranchName::parse(s));
-    let u = |v: Option<&String>| v.and_then(|s| uwuwu_domain::PrUrl::parse(s));
-    uwuwu_domain::TaskFields::new(
-        s(raw.get(crate::fields::F_DEV_SESSION)),
-        s(raw.get(crate::fields::F_REVIEW_SESSION)),
-        s(raw.get(crate::fields::F_TEST_SESSION)),
-        b(raw.get("Branch")),
-        u(raw.get("PR")),
-    )
+    // слоты: dev/review/test; review-поле покрывает оба ревью-слота
+    let mut assignments = std::collections::BTreeMap::new();
+    for (name, slot) in [
+        (crate::github::fields::F_DEV_SESSION, Slot::Dev),
+        (crate::github::fields::F_REVIEW_SESSION, Slot::PlanReview),
+        (crate::github::fields::F_TEST_SESSION, Slot::Test),
+    ] {
+        if let Some(session) = s(raw.get(name)) {
+            assignments.insert(slot, session);
+        }
+    }
+    // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
+    // отбрасываем (домен PullRequest требует ветку)
+    let vcs = match (
+        raw.get("Branch")
+            .and_then(|s| uwuwu_domain::BranchName::parse(s)),
+        raw.get("PR").and_then(|s| uwuwu_domain::PrUrl::parse(s)),
+    ) {
+        (Some(branch), Some(url)) => Vcs::PullRequest { branch, url },
+        (Some(branch), None) => Vcs::Branch(branch),
+        (None, Some(_)) => {
+            tracing::warn!(event = "hub.pr_without_branch", "PR без ветки — отброшен");
+            Vcs::Local
+        }
+        (None, None) => Vcs::Local,
+    };
+    TaskFields::new(assignments, vcs)
 }
 
 #[async_trait]
@@ -355,9 +374,15 @@ impl TaskBoardRepo for GitHubHub {
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
         let (_, mut meta) = self.snapshot(board).await?;
-        let option = meta.options.remove(status.as_str()).ok_or_else(|| {
-            UsecaseError::Board(format!("Status-опция «{}» не найдена", status.as_str()))
-        })?;
+        let option = meta
+            .options
+            .remove(uwuwu_usecase::status_name(status))
+            .ok_or_else(|| {
+                UsecaseError::Board(format!(
+                    "Status-опция «{}» не найдена",
+                    uwuwu_usecase::status_name(status)
+                ))
+            })?;
         let item = meta.items.remove(&number).ok_or_else(|| {
             UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
         })?;
@@ -383,12 +408,12 @@ impl TaskBoardRepo for GitHubHub {
         session: &str,
     ) -> UsecaseResult<()> {
         let name = match slot {
-            uwuwu_domain::Slot::Dev => crate::fields::F_DEV_SESSION,
+            uwuwu_domain::Slot::Dev => crate::github::fields::F_DEV_SESSION,
             uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
-                crate::fields::F_REVIEW_SESSION
+                crate::github::fields::F_REVIEW_SESSION
             }
-            uwuwu_domain::Slot::Test => crate::fields::F_TEST_SESSION,
-            uwuwu_domain::Slot::Design => crate::fields::F_DEV_SESSION,
+            uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
+            uwuwu_domain::Slot::Design => crate::github::fields::F_DEV_SESSION,
         };
         self.fields
             .store(number, &[(name, Some(session.to_string()))])
@@ -430,7 +455,7 @@ impl TaskBoardRepo for GitHubHub {
         let status = if issue["state"].as_str() == Some("closed") {
             Status::Done
         } else {
-            Status::parse(&status)
+            uwuwu_usecase::parse_status(&status)
         };
         let mut task = Task::new(number, title, status);
         task.apply_fields(map_task_fields(&parse_field_values(&issue)));
@@ -587,7 +612,7 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
     async fn recent_issues(
         &self,
         limit: usize,
-    ) -> uwuwu_usecase::error::UsecaseResult<Vec<uwuwu_usecase::IssueDigest>> {
+    ) -> uwuwu_usecase::UsecaseResult<Vec<uwuwu_usecase::IssueDigest>> {
         let mut out = Vec::new();
         let mut page = 1u32;
         while out.len() < limit && page <= 5 {

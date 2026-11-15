@@ -45,7 +45,7 @@ impl TriageUseCase {
                     && !t.title().is_empty()
                     && self
                         .state
-                        .last_spawn_ms(&tb.board, t.number(), "triage")
+                        .last_triage_ms(&tb.board, t.number())
                         .map(|ts| now.saturating_sub(ts) >= 15 * 60_000)
                         .unwrap_or(true)
             });
@@ -60,11 +60,11 @@ impl TriageUseCase {
         let spec = SessionSpec {
             directory: tb.checkout.clone(),
             title: format!("триаж #{}", task.number()),
-            agent: Some(uwuwu_domain::Agent::Triage),
+            agent: uwuwu_domain::AgentSlot::Role(uwuwu_domain::Agent::Triage),
             model: self.spawn_model.clone(),
         };
         self.state
-            .mark_spawn(&tb.board, task.number(), "triage", self.clock.now_ms());
+            .mark_triage_spawn(&tb.board, task.number(), self.clock.now_ms());
         let session = self.sessions.create_session(&spec).await?;
         let prompt = triage_prompt(&tb.project, &task);
         self.sessions.prompt(&session, &prompt).await?;

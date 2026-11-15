@@ -3,6 +3,7 @@
 //! fm ≡ поля (двойная запись держится портом), комменты — issue comments.
 
 use crate::error::{UsecaseError, UsecaseResult};
+use crate::naming;
 use crate::ports::{IssueFieldStore, TaskBoardRepo};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -101,7 +102,7 @@ impl TaskWriter for TaskWriteUseCase {
         // приоритет/тип — нативные поля issue (fm снесён)
         let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
         let mut field_patch: Vec<(&str, Option<String>)> =
-            vec![("Тип", Some(kind.as_str().to_string()))];
+            vec![("Тип", Some(naming::task_type_name(kind).to_string()))];
         if !spec.priority.is_empty() {
             field_patch.push(("Приоритет", Some(spec.priority.clone())));
         }
@@ -133,9 +134,8 @@ impl TaskWriter for TaskWriteUseCase {
                 })?;
             if !uwuwu_domain::Status::can_transition(current, status) {
                 return Err(UsecaseError::Board(format!(
-                    "переход «{}» → «{}» вне канона конвейера",
-                    current.as_str(),
-                    status.as_str()
+                    "переход {:?} → {:?} вне канона конвейера",
+                    current, status
                 )));
             }
             self.board.set_status(&board, number, status).await?;

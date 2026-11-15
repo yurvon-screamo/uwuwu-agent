@@ -2,9 +2,10 @@
 //! решение #1133). Инвариант: 1 рабочая сессия = 1 дример-сессия;
 /// обработанные помечаются в состоянии тика.
 use crate::error::UsecaseResult;
+use crate::naming;
 use crate::ports::{AgentSessionGateway, Clock, SessionSpec, TickStateStore};
 use std::sync::Arc;
-use uwuwu_domain::{Agent, ModelRef};
+use uwuwu_domain::{Agent, AgentSlot, ModelRef};
 
 /// Idle-порог: уснувшая = нет активности 30 минут и есть финал.
 const IDLE_MS: u64 = 30 * 60_000;
@@ -32,7 +33,7 @@ impl DreamerUseCase {
         // ≤1 живого дримера одновременно
         if list
             .iter()
-            .any(|s| s.outcome.is_empty() && Agent::parse(&s.agent) == Some(Agent::Dreamer))
+            .any(|s| s.outcome.is_empty() && naming::parse_agent(&s.agent) == Some(Agent::Dreamer))
         {
             tracing::debug!(event = "dreamer.alive_skip", "Живой дример — спавна нет");
             return Ok(0);
@@ -53,7 +54,7 @@ impl DreamerUseCase {
             !s.outcome.is_empty()
                 && s.total_tokens > 0
                 && now.saturating_sub(s.updated_ms) > IDLE_MS
-                && Agent::parse(&s.agent)
+                && naming::parse_agent(&s.agent)
                     .map(|a| !SKIP_AGENTS.contains(&a))
                     .unwrap_or(true)
                 && !self.state.dreamer_done(&s.id)
@@ -64,7 +65,7 @@ impl DreamerUseCase {
         let spec = SessionSpec {
             directory: self.checkout.clone(),
             title: format!("дример {}", &target.id[..12.min(target.id.len())]),
-            agent: Some(Agent::Dreamer),
+            agent: AgentSlot::Role(Agent::Dreamer),
             model: self.spawn_model.clone(),
         };
         let session = self.sessions.create_session(&spec).await?;

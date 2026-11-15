@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{Agent, ModelRef, Slot, Status, Task, UtcMinute};
+use uwuwu_domain::{AgentSlot, ModelRef, Slot, Status, Task, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -84,8 +84,8 @@ pub struct SessionSpec {
     /// cwd сессии на исполнителе (мастер-чекаут или env задачи).
     pub directory: String,
     pub title: String,
-    /// Кастомный агент (жёсткая привязка слот → агент — Agent::of_slot).
-    pub agent: Option<Agent>,
+    /// Агент сессии: дефолтная или роль конвейера (AgentSlot).
+    pub agent: AgentSlot,
     /// Модель спавна; None — дефолт исполнителя.
     pub model: Option<ModelRef>,
 }
@@ -196,11 +196,14 @@ pub trait TickStateStore: Send + Sync {
     fn dreamer_day_spawns(&self, day_key: &str) -> u32;
     fn mark_dreamer_spawn(&self, day_key: &str);
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
-    fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64>;
-    fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64);
+    fn last_spawn_ms(&self, board: &str, number: u64, slot: Slot) -> Option<u64>;
+    fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64);
+    /// Триаж: ms последнего спавна строки (кулдаун — не слот стадии).
+    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64>;
+    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64);
     /// Attention-механика: счётчик повторных спавнов слота
-    /// (сырой статус на момент прошлого спавна, число повторов).
-    fn spawn_loop(&self, board: &str, number: u64, slot: &str) -> Option<(String, u32)>;
-    fn set_spawn_loop(&self, board: &str, number: u64, slot: &str, status: &str, repeats: u32);
+    /// (статус на момент прошлого спавна, число повторов).
+    fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: Slot, status: Status, repeats: u32);
     fn save(&self) -> UsecaseResult<()>;
 }

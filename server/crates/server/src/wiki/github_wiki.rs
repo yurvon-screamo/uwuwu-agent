@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
 use uwuwu_usecase::WikiRepo;
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubWiki {
     repo: String,
@@ -16,7 +16,7 @@ pub struct GitHubWiki {
     http: reqwest::Client,
     tree_cache: Mutex<Option<(Instant, Vec<String>)>>,
     ttl: Duration,
-    writer: Option<std::sync::Arc<crate::gitwiki::GitWikiWriter>>,
+    writer: Option<std::sync::Arc<crate::wiki::gitwiki::GitWikiWriter>>,
 }
 
 impl GitHubWiki {
@@ -24,7 +24,7 @@ impl GitHubWiki {
         repo: String,
         branch: String,
         token: String,
-        writer: Option<std::sync::Arc<crate::gitwiki::GitWikiWriter>>,
+        writer: Option<std::sync::Arc<crate::wiki::gitwiki::GitWikiWriter>>,
     ) -> Self {
         Self {
             writer,
@@ -131,7 +131,7 @@ impl WikiRepo for GitHubWiki {
             .as_str()
             .unwrap_or_default()
             .replace('\n', "");
-        let bytes = crate::gitwiki::base64_std(&b64)
+        let bytes = crate::wiki::gitwiki::base64_std(&b64)
             .ok_or_else(|| UsecaseError::Board(format!("read «{slug}»: base64")))?;
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }

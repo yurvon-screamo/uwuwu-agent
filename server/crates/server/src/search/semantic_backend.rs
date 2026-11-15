@@ -3,7 +3,7 @@
 //! Эмбеддинги — Ollama-совместимый endpoint (локальная машина через туннель).
 //! Инкремент — doc_hash в мета-таблице.
 
-use crate::semantic::{chunk_text, OllamaEmbeddings, EMBED_MODEL_DIMS};
+use crate::search::semantic::{chunk_text, OllamaEmbeddings, EMBED_MODEL_DIMS};
 use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
@@ -18,9 +18,9 @@ use lancedb::Connection;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
-use uwuwu_usecase::ports::WikiRepo;
-use uwuwu_usecase::search::SemanticBackend;
+use uwuwu_usecase::SemanticBackend;
+use uwuwu_usecase::WikiRepo;
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 const CHUNKS: &str = "chunks";
 const DOCS: &str = "doc_meta";
