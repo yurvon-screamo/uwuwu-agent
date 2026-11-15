@@ -4,8 +4,7 @@
 use crate::error::UsecaseResult;
 use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo};
 use std::sync::Arc;
-use uwuwu_domain::Status;
-use uwuwu_domain::Task;
+use uwuwu_domain::{ModelRef, Status, Task};
 
 pub struct TriageUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
@@ -13,7 +12,7 @@ pub struct TriageUseCase {
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn crate::ports::TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
-    pub spawn_model: Option<(String, String)>,
+    pub spawn_model: Option<ModelRef>,
     pub checkout: String,
 }
 
@@ -26,11 +25,11 @@ impl TriageUseCase {
         let candidate = rows
             .iter()
             .find(|t| {
-                t.status == Status::Draft
-                    && !t.title.is_empty()
+                t.status() == Status::Draft
+                    && !t.title().is_empty()
                     && self
                         .state
-                        .last_spawn_ms(&self.board_name, t.number, "triage")
+                        .last_spawn_ms(&self.board_name, t.number(), "triage")
                         .map(|ts| now.saturating_sub(ts) >= 15 * 60_000)
                         .unwrap_or(true)
             })
@@ -38,16 +37,20 @@ impl TriageUseCase {
         let Some(task) = candidate else { return Ok(0) };
         let spec = SessionSpec {
             directory: self.checkout.clone(),
-            title: format!("триаж #{}", task.number),
+            title: format!("триаж #{}", task.number()),
             agent: None,
             model: self.spawn_model.clone(),
         };
-        self.state
-            .mark_spawn(&self.board_name, task.number, "triage", self.clock.now_ms());
+        self.state.mark_spawn(
+            &self.board_name,
+            task.number(),
+            "triage",
+            self.clock.now_ms(),
+        );
         let session = self.sessions.create_session(&spec).await?;
         let prompt = triage_prompt(&task);
         self.sessions.prompt(&session, &prompt).await?;
-        tracing::info!(event = "triage.spawned", number = task.number, session = %session, "Triage agent spawned");
+        tracing::info!(event = "triage.spawned", number = task.number(), session = %session, "Triage agent spawned");
         Ok(1)
     }
 }
@@ -62,7 +65,7 @@ fn triage_prompt(task: &Task) -> String {
             дубль/мусор → uwuwu_task_close {{number: {number}, not_planned: true}} с комментом-обоснованием;\n\
             нужна правка — отредактируй тело uwuwu_task_body и переведи в Todo.\n\
          Ты — триаж-агент: не диагностируй баги, не чини код; только валидация заявки.",
-        number = task.number,
-        title = task.title,
+        number = task.number(),
+        title = task.title(),
     )
 }

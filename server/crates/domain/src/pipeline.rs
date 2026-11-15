@@ -103,7 +103,7 @@ pub fn decide(task: &Task) -> Action {
         return Action::Autodone;
     }
     Action::Observe {
-        awaits: awaits(task.status),
+        awaits: awaits(task.status()),
     }
 }
 
@@ -118,7 +118,7 @@ pub fn gate(
     let Action::Spawn { .. } = action else {
         return Gate::Allowed;
     };
-    if policy.peak.holds(now) && task.priority != Priority::High {
+    if policy.peak.holds(now) && task.priority() != Priority::High {
         return Gate::DeferredPeak;
     }
     if active >= policy.cup {
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn decide_respects_claimed_session() {
         let mut t = task(Status::InProgress);
-        t.claim(Slot::Dev, "ses_1".into());
+        t.claim(Slot::Dev, crate::task::SessionRef::new("ses_1"));
         assert!(matches!(decide(&t), Action::Observe { .. }));
     }
 
@@ -206,7 +206,7 @@ mod tests {
     fn decide_autodone_only_with_flag() {
         let mut t = task(Status::UserReview);
         assert!(matches!(decide(&t), Action::Observe { .. }));
-        t.autodone = true;
+        t.set_autodone(true);
         assert_eq!(decide(&t), Action::Autodone);
     }
 
@@ -238,7 +238,7 @@ mod tests {
         );
 
         let mut high = task(Status::InProgress);
-        high.priority = Priority::High;
+        high.set_priority(Priority::High);
         assert_eq!(
             gate(&high, &decide(&high), policy, 0, in_peak),
             Gate::Allowed

@@ -1,8 +1,5 @@
 //! Агрегат Task: строка доски + сессии стадий + переходы статусов.
-//! Чистый домен: ноль зависимостей на инфру/сеть/фм-формат (маппинг fm —
-//! дело инфры, см. infra::hub). Инварианты канона — здесь и в тестах.
-
-use std::collections::BTreeMap;
+//! Чистый домен: ноль зависимостей. Инварианты канона — здесь и в тестах.
 
 /// Статусы канона досок uwuwu. Empty — строка без статуса
 /// (легаси-черновик владельца: конвейер не трогает).
@@ -118,38 +115,112 @@ pub enum Slot {
     Test,
 }
 
-impl Slot {
-    pub fn fm_key(self) -> &'static str {
-        match self {
-            Self::Design => "design-session",
-            Self::Dev => "dev-session",
-            Self::PlanReview | Self::ResultReview => "review-session",
-            Self::Test => "test-session",
+/// Нативные поля issue, типизированные и инкапсулированные:
+/// домен владеет мутациями, инфра маппит имена → конструкторы.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskFields {
+    dev_session: Option<SessionRef>,
+    review_session: Option<SessionRef>,
+    test_session: Option<SessionRef>,
+    branch: Option<BranchName>,
+    pr: Option<PrUrl>,
+}
+
+impl TaskFields {
+    pub fn new(
+        dev_session: Option<SessionRef>,
+        review_session: Option<SessionRef>,
+        test_session: Option<SessionRef>,
+        branch: Option<BranchName>,
+        pr: Option<PrUrl>,
+    ) -> Self {
+        Self {
+            dev_session,
+            review_session,
+            test_session,
+            branch,
+            pr,
         }
+    }
+
+    pub fn session(&self, slot: Slot) -> Option<&SessionRef> {
+        match slot {
+            Slot::Dev | Slot::Design => self.dev_session.as_ref(),
+            Slot::PlanReview | Slot::ResultReview => self.review_session.as_ref(),
+            Slot::Test => self.test_session.as_ref(),
+        }
+    }
+
+    pub fn branch(&self) -> Option<&BranchName> {
+        self.branch.as_ref()
+    }
+
+    pub fn pr(&self) -> Option<&PrUrl> {
+        self.pr.as_ref()
+    }
+
+    /// Мутатор: заявка PR-ячейки.
+    pub fn set_pr(&mut self, url: PrUrl) {
+        self.pr = Some(url);
+    }
+
+    /// Мутатор: заявка ветки.
+    pub fn set_branch(&mut self, name: BranchName) {
+        self.branch = Some(name);
     }
 }
 
-/// Нативные поля issue, типизированные (маппинг имён — инфра, не домен).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TaskFields {
-    pub dev_session: Option<String>,
-    pub review_session: Option<String>,
-    pub test_session: Option<String>,
-    pub branch: Option<String>,
-    pub pr: Option<String>,
+/// Ссылка на сессию опенкода.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRef(String);
+
+impl SessionRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Имя ветки задачи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchName(String);
+
+impl BranchName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// URL PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrUrl(String);
+
+impl PrUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Агрегат: срез строки доски, достаточный конвейеру.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
-    pub number: u64,
-    pub title: String,
-    pub status: Status,
-    pub priority: Priority,
-    pub autodone: bool,
-    pub branch: Option<String>,
-    pub pr: Option<String>,
-    pub sessions: BTreeMap<Slot, String>,
+    number: u64,
+    title: String,
+    status: Status,
+    priority: Priority,
+    autodone: bool,
+    fields: TaskFields,
 }
 
 impl Task {
@@ -160,19 +231,65 @@ impl Task {
             status,
             priority: Priority::Empty,
             autodone: false,
-            branch: None,
-            pr: None,
-            sessions: BTreeMap::new(),
+            fields: TaskFields::default(),
         }
     }
 
-    pub fn session_of(&self, slot: Slot) -> Option<&str> {
-        self.sessions.get(&slot).map(|s| s.as_str())
+    /// Управление статусом (конвейер/владелец).
+    pub fn set_status(&mut self, s: Status) {
+        self.status = s;
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn status(&self) -> Status {
+        self.status
+    }
+
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    pub fn autodone(&self) -> bool {
+        self.autodone
+    }
+
+    pub fn branch(&self) -> Option<&BranchName> {
+        self.fields.branch()
+    }
+
+    pub fn pr(&self) -> Option<&PrUrl> {
+        self.fields.pr()
+    }
+
+    /// Управление приоритетом (владелец/триаж).
+    pub fn set_priority(&mut self, p: Priority) {
+        self.priority = p;
+    }
+
+    /// Управление автодоном (владелец/триаж).
+    pub fn set_autodone(&mut self, on: bool) {
+        self.autodone = on;
     }
 
     /// Заявка сессии (claim): живая заявка уважается — дубль-спавн запрещён.
-    pub fn claim(&mut self, slot: Slot, session: String) {
-        self.sessions.insert(slot, session);
+    pub fn claim(&mut self, slot: Slot, session: SessionRef) {
+        match slot {
+            Slot::Dev | Slot::Design => self.fields.dev_session = Some(session),
+            Slot::PlanReview | Slot::ResultReview => self.fields.review_session = Some(session),
+            Slot::Test => self.fields.test_session = Some(session),
+        }
+    }
+
+    /// Сессия слота (None — не заявлена).
+    pub fn session_of(&self, slot: Slot) -> Option<&str> {
+        self.fields.session(slot).map(|s| s.as_str())
     }
 
     /// Слот стадии статуса: чья сессия ведёт строку сейчас.
@@ -194,19 +311,8 @@ impl Task {
     }
 
     /// Обогащение нативными полями (типизированы; лениво для кандидатов тика).
-    pub fn apply_fields(&mut self, fields: &TaskFields) {
-        if let Some(s) = &fields.dev_session {
-            self.sessions.insert(Slot::Dev, s.clone());
-        }
-        if let Some(s) = &fields.review_session {
-            self.sessions.insert(Slot::PlanReview, s.clone());
-            self.sessions.insert(Slot::ResultReview, s.clone());
-        }
-        if let Some(s) = &fields.test_session {
-            self.sessions.insert(Slot::Test, s.clone());
-        }
-        self.branch = fields.branch.clone();
-        self.pr = fields.pr.clone();
+    pub fn apply_fields(&mut self, fields: TaskFields) {
+        self.fields = fields;
     }
 
     /// Автодон-кандидат: Review + autodone.
@@ -258,7 +364,7 @@ mod tests {
         let mut t = Task::new(1, "t".into(), Status::ReviewPlan);
         assert_eq!(t.stage_slot(), Some(Slot::PlanReview));
         assert_eq!(t.stage_needs_spawn(), Some(Slot::PlanReview));
-        t.claim(Slot::PlanReview, "ses_1".into());
+        t.claim(Slot::PlanReview, SessionRef::new("ses_1"));
         assert_eq!(t.stage_needs_spawn(), None, "заявлена сессия — спавна нет");
         assert_eq!(t.session_of(Slot::PlanReview), Some("ses_1"));
     }
@@ -266,11 +372,11 @@ mod tests {
     #[test]
     fn claim_respects_slot_dedup() {
         let mut t = Task::new(2, "t".into(), Status::InProgress);
-        t.claim(Slot::Dev, "ses_a".into());
-        t.claim(Slot::Dev, "ses_a".into());
+        t.claim(Slot::Dev, SessionRef::new("ses_a"));
+        t.claim(Slot::Dev, SessionRef::new("ses_a"));
         assert_eq!(
-            t.sessions.len(),
-            1,
+            t.session_of(Slot::Dev),
+            Some("ses_a"),
             "повторный claim той же сессии не плодит"
         );
     }

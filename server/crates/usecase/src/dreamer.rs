@@ -4,18 +4,19 @@
 use crate::error::UsecaseResult;
 use crate::ports::{AgentSessionGateway, Clock, SessionSpec, TickStateStore};
 use std::sync::Arc;
+use uwuwu_domain::{Agent, ModelRef};
 
 /// Idle-порог: уснувшая = нет активности 30 минут и есть финал.
 const IDLE_MS: u64 = 30 * 60_000;
 
 /// Агенты, чьи сессии не являются «рабочими» для дримера.
-const SKIP_AGENTS: [&str; 3] = ["dreamer", "triage", "plan-reviewer"];
+const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Triage, Agent::PlanReviewer];
 
 pub struct DreamerUseCase {
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<(String, String)>,
+    pub spawn_model: Option<ModelRef>,
     pub checkout: String,
 }
 
@@ -27,7 +28,9 @@ impl DreamerUseCase {
         let candidate = list.into_iter().find(|s| {
             !s.outcome.is_empty()
                 && now.saturating_sub(s.updated_ms) > IDLE_MS
-                && !SKIP_AGENTS.contains(&s.agent.as_str())
+                && Agent::parse(&s.agent)
+                    .map(|a| !SKIP_AGENTS.contains(&a))
+                    .unwrap_or(true)
                 && !self.state.dreamer_done(&s.id)
         });
         let Some(target) = candidate else {
@@ -36,7 +39,7 @@ impl DreamerUseCase {
         let spec = SessionSpec {
             directory: self.checkout.clone(),
             title: format!("дример {}", &target.id[..12.min(target.id.len())]),
-            agent: Some("dreamer".into()),
+            agent: Some(Agent::Dreamer),
             model: self.spawn_model.clone(),
         };
         let session = self.sessions.create_session(&spec).await?;

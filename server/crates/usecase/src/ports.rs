@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{Slot, Status, Task, UtcMinute};
+use uwuwu_domain::{Agent, ModelRef, Slot, Status, Task, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -84,10 +84,10 @@ pub struct SessionSpec {
     /// cwd сессии на исполнителе (мастер-чекаут или env задачи).
     pub directory: String,
     pub title: String,
-    /// Кастомный агент (developer/plan-reviewer/code-quality-reviewer/tester).
-    pub agent: Option<String>,
-    /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub model: Option<(String, String)>,
+    /// Кастомный агент (жёсткая привязка слот → агент — Agent::of_slot).
+    pub agent: Option<Agent>,
+    /// Модель спавна; None — дефолт исполнителя.
+    pub model: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

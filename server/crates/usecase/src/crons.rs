@@ -6,7 +6,7 @@
 use crate::error::UsecaseResult;
 use crate::ports::{AgentSessionGateway, Clock, SessionSpec, WikiRepo};
 use std::sync::Arc;
-use uwuwu_domain::UtcMinute;
+use uwuwu_domain::{Agent, ModelRef, UtcMinute};
 
 /// Слэг папки кронов проекта.
 pub fn crons_dir(project: &str) -> String {
@@ -18,7 +18,8 @@ pub struct CronMaster {
     pub slug: String,
     pub title: String,
     pub schedule: String,
-    pub agent: Option<String>,
+    /// Агент рана (парсится из тела; None — дефолтная сессия).
+    pub agent: Option<Agent>,
     pub body: String,
 }
 
@@ -167,7 +168,7 @@ pub struct CronUseCase {
     pub wiki: Arc<dyn WikiRepo>,
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<(String, String)>,
+    pub spawn_model: Option<ModelRef>,
     pub checkout: String,
 }
 
@@ -231,7 +232,7 @@ impl CronUseCase {
             let spec = SessionSpec {
                 directory: self.checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
-                agent: master.agent.clone(),
+                agent: master.agent,
                 model: self.spawn_model.clone(),
             };
             let session = self.sessions.create_session(&spec).await?;
@@ -304,7 +305,7 @@ pub fn parse_master(slug: &str, md: &str) -> Option<CronMaster> {
         slug: slug.to_string(),
         title: fm.get("title").cloned().unwrap_or_else(|| slug.to_string()),
         schedule,
-        agent: fm.get("agent").filter(|a| !a.is_empty()).cloned(),
+        agent: fm.get("agent").and_then(|a| Agent::parse(a)),
         body: crate::fm_lite::strip(md).to_string(),
     })
 }

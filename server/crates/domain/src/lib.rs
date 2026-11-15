@@ -3,11 +3,15 @@
 //! Значения времени/идентификаторов — value-типы здесь; источники
 //! (часы, сеть, ФС) — порты юзкейс-слоя.
 
+pub mod agent;
 pub mod pipeline;
 pub mod task;
+pub mod task_type;
 
+pub use agent::{Agent, ModelRef};
 pub use pipeline::{
     awaits, decide, gate, Action, Awaits, Gate, PeakWindow, ReviewRounds, RoundOutcome,
     SpawnPolicy, UtcMinute,
 };
-pub use task::{Priority, Slot, Status, Task, TaskFields};
+pub use task::{BranchName, PrUrl, Priority, SessionRef, Slot, Status, Task, TaskFields};
+pub use task_type::TaskType;

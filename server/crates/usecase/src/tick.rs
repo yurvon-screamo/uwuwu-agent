@@ -5,7 +5,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickStateStore};
 use serde::Serialize;
 use std::sync::Arc;
-use uwuwu_domain::{decide, gate, Action, Awaits, Gate, SpawnPolicy, Task};
+use uwuwu_domain::{decide, gate, Action, Awaits, Gate, ModelRef, SpawnPolicy, Task};
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
 /// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
@@ -69,7 +69,7 @@ pub struct TickUseCase {
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
     /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub spawn_model: Option<(String, String)>,
+    pub spawn_model: Option<ModelRef>,
 }
 
 impl TickUseCase {
@@ -105,9 +105,9 @@ impl TickUseCase {
         mut tasks: Vec<Task>,
         mut out: TickOutcome,
     ) -> UsecaseResult<TickOutcome> {
-        let active = tasks.iter().filter(|t| t.status.is_active()).count();
+        let active = tasks.iter().filter(|t| t.status().is_active()).count();
         let now = self.clock.utc_minute();
-        tasks.sort_by_key(|t| t.priority.rank());
+        tasks.sort_by_key(|t| t.priority().rank());
         for task in &tasks {
             let action = decide(task);
             match action {
@@ -116,7 +116,7 @@ impl TickUseCase {
                     let cooldown_left = {
                         let last =
                             self.state
-                                .last_spawn_ms(&board.board, task.number, slot_name(slot));
+                                .last_spawn_ms(&board.board, task.number(), slot_name(slot));
                         last.map(|ts| self.clock.now_ms().saturating_sub(ts))
                             .unwrap_or(u64::MAX)
                     };
@@ -131,7 +131,7 @@ impl TickUseCase {
                             if plan.mode == Mode::Live {
                                 self.state.mark_spawn(
                                     &board.board,
-                                    task.number,
+                                    task.number(),
                                     slot_name(slot),
                                     self.clock.now_ms(),
                                 );
@@ -139,7 +139,12 @@ impl TickUseCase {
                                     Ok(session) => {
                                         if let Err(e) = self
                                             .board
-                                            .set_session(&board.board, task.number, slot, &session)
+                                            .set_session(
+                                                &board.board,
+                                                task.number(),
+                                                slot,
+                                                &session,
+                                            )
                                             .await
                                         {
                                             out.actions_failed += 1;
@@ -159,7 +164,7 @@ impl TickUseCase {
                             out.held_cup += 1;
                             tracing::info!(
                                 event = "spawn.held_cup",
-                                number = task.number,
+                                number = task.number(),
                                 active,
                                 cap,
                                 "Spawn held: CUP cap"
@@ -169,7 +174,7 @@ impl TickUseCase {
                             out.deferred_peak += 1;
                             tracing::info!(
                                 event = "spawn.deferred_peak",
-                                number = task.number,
+                                number = task.number(),
                                 "Spawn deferred: peak window"
                             );
                         }
@@ -184,8 +189,8 @@ impl TickUseCase {
                     } else {
                         tracing::info!(
                             event = "autodone.probe",
-                            number = task.number,
-                            pr = task.pr.as_deref().unwrap_or(""),
+                            number = task.number(),
+                            pr = task.pr().map(|u| u.as_str()).unwrap_or(""),
                             "Autodone probe (observe)"
                         );
                     }
@@ -210,7 +215,7 @@ impl TickUseCase {
     }
 
     fn log_action_failed(&self, task: &Task, e: UsecaseError) -> UsecaseError {
-        tracing::error!(event = "action.failed", number = task.number, error = %e, "Action failed");
+        tracing::error!(event = "action.failed", number = task.number(), error = %e, "Action failed");
         e
     }
 }

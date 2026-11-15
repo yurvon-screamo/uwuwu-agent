@@ -680,15 +680,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "comfy-table"
 version = "7.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2804,7 +2795,6 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
- "protobuf-src",
  "tokio",
  "tracing",
 ]
@@ -2868,7 +2858,6 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
- "protobuf-src",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -2904,7 +2893,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "serde",
  "tokio",
  "tracing",
@@ -2966,7 +2954,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rand_distr",
  "rangemap",
@@ -3179,7 +3166,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rangemap",
  "roaring",
@@ -4111,15 +4097,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f29a7c4c7a84cef41a53d338a2d10d4f1b043ea5c3dde26db22ee2c9c1b1c75b"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "protobuf-src"
-version = "2.1.1+27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6217c3504da19b85a3a4b2e9a5183d635822d83507ba0986624b5c05b83bfc40"
-dependencies = [
- "cmake",
 ]
 
 [[package]]
@@ -5600,11 +5577,6 @@ dependencies = [
  "chrono",
  "futures",
  "http-body-util",
- "lance-datafusion",
- "lance-encoding",
- "lance-file",
- "lance-index",
- "lance-table",
  "lancedb",
  "reqwest",
  "serde",

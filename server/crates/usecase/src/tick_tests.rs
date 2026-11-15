@@ -9,7 +9,9 @@ use crate::ports::{
 use crate::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{PeakWindow, Slot, SpawnPolicy, Status, Task, UtcMinute};
+use uwuwu_domain::{
+    BranchName, PeakWindow, PrUrl, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
+};
 
 struct FakeBoard {
     rows: Vec<Task>,
@@ -25,11 +27,8 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
-    async fn set_session(&self, _b: &str, n: u64, slot: Slot, s: &str) -> UsecaseResult<()> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("session#{n}{}={s}", slot.fm_key()));
+    async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
+        self.log.lock().unwrap().push(format!("session#{n}={s}"));
         Ok(())
     }
     async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
@@ -50,7 +49,7 @@ impl TaskBoardRepo for FakeBoard {
         let task = self
             .rows
             .iter()
-            .find(|t| t.number == n)
+            .find(|t| t.number() == n)
             .cloned()
             .unwrap_or_else(|| Task::new(n, String::new(), Status::Empty));
         Ok(crate::ports::IssueView {
@@ -261,7 +260,7 @@ async fn live_spawns_and_claims_session() {
         .lock()
         .unwrap()
         .iter()
-        .any(|l| l.starts_with("session#1dev-session")));
+        .any(|l| l.starts_with("session#1")));
 }
 
 #[tokio::test]
@@ -278,7 +277,7 @@ async fn cup_holds_spawn_in_live() {
 #[tokio::test]
 async fn autodone_merged_finishes() {
     let mut t = task(3, Status::UserReview);
-    t.autodone = true;
+    t.set_autodone(true);
     let (u, board, _, _) = usecase(vec![t], PrState::Merged);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.autodone_done, 1);
@@ -290,7 +289,7 @@ async fn autodone_merged_finishes() {
 #[tokio::test]
 async fn autodone_red_ci_bounces_to_in_progress() {
     let mut t = task(4, Status::UserReview);
-    t.autodone = true;
+    t.set_autodone(true);
     let (u, board, _, _) = usecase(
         vec![t],
         PrState::Open {
@@ -310,8 +309,10 @@ async fn autodone_red_ci_bounces_to_in_progress() {
 #[tokio::test]
 async fn autodone_green_merges() {
     let mut t = task(5, Status::UserReview);
-    t.autodone = true;
-    t.pr = Some("https://github.com/a/c/pull/9".into());
+    t.set_autodone(true);
+    let mut f = TaskFields::default();
+    f.set_pr(PrUrl::new("https://github.com/a/c/pull/9"));
+    t.apply_fields(f);
     let (u, board, _, prs) = usecase(
         vec![t],
         PrState::Open {
@@ -332,8 +333,10 @@ async fn autodone_green_merges() {
 #[tokio::test]
 async fn autodone_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
-    t.autodone = true;
-    t.branch = Some("work/task-6".into());
+    t.set_autodone(true);
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::new("work/task-6"));
+    t.apply_fields(f);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
@@ -346,7 +349,7 @@ async fn autodone_missing_pr_with_branch_bounces() {
 #[tokio::test]
 async fn autodone_docs_only_done() {
     let mut t = task(7, Status::UserReview);
-    t.autodone = true;
+    t.set_autodone(true);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert!(board

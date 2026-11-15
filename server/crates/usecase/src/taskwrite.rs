@@ -6,14 +6,15 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{IssueFieldStore, TaskBoardRepo};
 use async_trait::async_trait;
 use std::sync::Arc;
-use uwuwu_domain::{Slot, Status, Task};
+use uwuwu_domain::{Slot, Status, Task, TaskType};
 
-/// Параметры создания задачи (fm-канон).
+/// Параметры создания задачи (канон create: Draft + дефолты).
 #[derive(Debug, Clone, Default)]
 pub struct NewTask {
     pub title: String,
     pub body_md: String,
-    pub kind: String,
+    /// Тип задачи; None — дефолт feature (канон).
+    pub kind: Option<TaskType>,
     pub priority: String,
     pub autodone: bool,
 }
@@ -65,7 +66,7 @@ impl TaskWriteUseCase {
 
 impl TaskWriteUseCase {
     fn dup_check(&self, rows: &[Task], title: &str) -> UsecaseResult<()> {
-        if rows.iter().any(|t| t.title == title) {
+        if rows.iter().any(|t| t.title() == title) {
             return Err(UsecaseError::Board(format!(
                 "тайтл «{title}» уже есть на доске — дубль запрещён"
             )));
@@ -88,14 +89,24 @@ impl TaskWriter for TaskWriteUseCase {
         }
         let rows = self.board.read_board(&board).await?;
         self.dup_check(&rows, spec.title.trim())?;
-        self.board
+        let number = self
+            .board
             .create_issue(
                 &board,
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
             )
-            .await
+            .await?;
+        // приоритет/тип — нативные поля issue (fm снесён)
+        let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
+        let mut field_patch: Vec<(&str, Option<String>)> =
+            vec![("Тип", Some(kind.as_str().to_string()))];
+        if !spec.priority.is_empty() {
+            field_patch.push(("Приоритет", Some(spec.priority.clone())));
+        }
+        self.fields.store(number, &field_patch).await?;
+        Ok(number)
     }
 
     async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
@@ -168,26 +179,13 @@ impl TaskWriter for TaskWriteUseCase {
     }
 }
 
-/// fm-скелет новой задачи (канон create: Draft + дефолты).
+/// Тело новой задачи: чистый markdown (fm снесён; приоритет/тип — нативные поля).
 fn render_create_body(spec: &NewTask) -> String {
     let safe_title: String = spec.title.chars().take(120).collect();
-    format!(
-        "---\nstatus: Draft\npriority: {}\nautodone: {}\ntype: {}\n---\n\n## Постановка\n\n{}\n",
-        if spec.priority.is_empty() {
-            "medium"
-        } else {
-            &spec.priority
-        },
-        spec.autodone,
-        if spec.kind.is_empty() {
-            "feature"
-        } else {
-            &spec.kind
-        },
-        if spec.body_md.is_empty() {
-            safe_title
-        } else {
-            spec.body_md.clone()
-        },
-    )
+    let content = if spec.body_md.is_empty() {
+        safe_title
+    } else {
+        spec.body_md.clone()
+    };
+    format!("## Постановка\n\n{content}\n")
 }

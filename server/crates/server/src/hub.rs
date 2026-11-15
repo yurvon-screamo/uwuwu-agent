@@ -278,10 +278,10 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             let title = issue["title"].as_str()?.to_string();
             let v = item_values(item);
             let mut task = Task::new(number, title, Status::parse(&v.status));
-            task.priority = Priority::parse(&v.priority);
-            task.autodone = v.autodone;
+            task.set_priority(Priority::parse(&v.priority));
+            task.set_autodone(v.autodone);
             if issue["state"].as_str() == Some("closed") {
-                task.status = Status::Done;
+                task.set_status(Status::Done);
             }
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
@@ -324,13 +324,25 @@ fn trunc(s: &str) -> String {
 
 /// Маппинг сырых имён полей → типизированный TaskFields (домен не знает имён).
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
-    uwuwu_domain::TaskFields {
-        dev_session: raw.get(crate::fields::F_DEV_SESSION).cloned(),
-        review_session: raw.get(crate::fields::F_REVIEW_SESSION).cloned(),
-        test_session: raw.get(crate::fields::F_TEST_SESSION).cloned(),
-        branch: raw.get("Branch").cloned(),
-        pr: raw.get("PR").cloned(),
-    }
+    let s = |v: Option<&String>| {
+        v.filter(|s| !s.is_empty())
+            .map(|s| uwuwu_domain::SessionRef::new(s.clone()))
+    };
+    let b = |v: Option<&String>| {
+        v.filter(|s| !s.is_empty())
+            .map(|s| uwuwu_domain::BranchName::new(s.clone()))
+    };
+    let u = |v: Option<&String>| {
+        v.filter(|s| !s.is_empty())
+            .map(|s| uwuwu_domain::PrUrl::new(s.clone()))
+    };
+    uwuwu_domain::TaskFields::new(
+        s(raw.get(crate::fields::F_DEV_SESSION)),
+        s(raw.get(crate::fields::F_REVIEW_SESSION)),
+        s(raw.get(crate::fields::F_TEST_SESSION)),
+        b(raw.get("Branch")),
+        u(raw.get("PR")),
+    )
 }
 
 #[async_trait]
@@ -413,9 +425,9 @@ impl TaskBoardRepo for GitHubHub {
         let body = issue["body"].as_str().unwrap_or_default().to_string();
         let status = self.board_status(number).await.unwrap_or_default();
         let mut task = Task::new(number, title, Status::parse(&status));
-        task.apply_fields(&map_task_fields(&parse_field_values(&issue)));
+        task.apply_fields(map_task_fields(&parse_field_values(&issue)));
         if issue["state"].as_str() == Some("closed") {
-            task.status = Status::Done;
+            task.set_status(Status::Done);
         }
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
@@ -592,7 +604,7 @@ mod tests {
             "fieldValues": { "nodes": [] }
         })];
         let rows = parse_page(&items, &mut meta);
-        assert_eq!(rows[0].status, Status::Done);
+        assert_eq!(rows[0].status(), Status::Done);
         assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
     }
 }

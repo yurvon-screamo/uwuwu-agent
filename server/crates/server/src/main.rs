@@ -83,17 +83,18 @@ async fn run(
     let clock = Arc::new(clock::SystemClock);
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
+    let spawn_model_cfg = cfg
+        .executor
+        .spawn_model
+        .as_ref()
+        .map(|m| uwuwu_domain::ModelRef::new(m.provider.clone(), m.id.clone()));
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: clock.clone(),
         state: state.clone(),
-        spawn_model: cfg
-            .executor
-            .spawn_model
-            .as_ref()
-            .map(|m| (m.provider.clone(), m.id.clone())),
+        spawn_model: spawn_model_cfg.clone(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -107,11 +108,6 @@ async fn run(
         .iter()
         .map(|b| (b.project.clone(), b.board.clone()))
         .collect();
-    let spawn_model_cfg = cfg
-        .executor
-        .spawn_model
-        .as_ref()
-        .map(|m| (m.provider.clone(), m.id.clone()));
     let task_view = Arc::new(uwuwu_usecase::TaskView::new(
         board.clone(),
         boards_cfg.clone(),
