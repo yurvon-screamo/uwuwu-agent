@@ -285,7 +285,7 @@ impl ToolHub {
                     .map_err(|e| e.to_string())?;
                 let out = masters
                     .iter()
-                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule))
+                    .map(|m| format!("{} — `{}`\n", m.title, m.schedule.raw()))
                     .collect::<String>();
                 ok_text(if out.is_empty() {
                     format!("кроны проекта {project} не найдены")
