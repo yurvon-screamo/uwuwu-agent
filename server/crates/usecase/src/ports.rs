@@ -177,5 +177,9 @@ pub trait TickStateStore: Send + Sync {
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
     fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64>;
     fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64);
+    /// Attention-механика: счётчик повторных спавнов слота
+    /// (сырой статус на момент прошлого спавна, число повторов).
+    fn spawn_loop(&self, board: &str, number: u64, slot: &str) -> Option<(String, u32)>;
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: &str, status: &str, repeats: u32);
     fn save(&self) -> UsecaseResult<()>;
 }

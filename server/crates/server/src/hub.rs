@@ -277,12 +277,16 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             let number = issue["number"].as_u64()?;
             let title = issue["title"].as_str()?.to_string();
             let v = item_values(item);
-            let mut task = Task::new(number, title, Status::parse(&v.status));
+            // closed issue терминален независимо от отстающего поля доски
+            // (вывод первоисточника, не переход конвейера — потому конструктор)
+            let status = if issue["state"].as_str() == Some("closed") {
+                Status::Done
+            } else {
+                Status::parse(&v.status)
+            };
+            let mut task = Task::new(number, title, status);
             task.set_priority(Priority::parse(&v.priority));
             task.set_autodone(v.autodone);
-            if issue["state"].as_str() == Some("closed") {
-                task.set_status(Status::Done);
-            }
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -322,20 +326,13 @@ fn trunc(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
-/// Маппинг сырых имён полей → типизированный TaskFields (домен не знает имён).
+/// Маппинг сырых имён полей → типизированный TaskFields (домен не знает имён;
+/// невалидные значения полей (не-ses_ id, не-http URL) → None: мусор в ячейке
+/// не становится заявкой — валидация в value-объектах домена).
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
-    let s = |v: Option<&String>| {
-        v.filter(|s| !s.is_empty())
-            .map(|s| uwuwu_domain::SessionRef::new(s.clone()))
-    };
-    let b = |v: Option<&String>| {
-        v.filter(|s| !s.is_empty())
-            .map(|s| uwuwu_domain::BranchName::new(s.clone()))
-    };
-    let u = |v: Option<&String>| {
-        v.filter(|s| !s.is_empty())
-            .map(|s| uwuwu_domain::PrUrl::new(s.clone()))
-    };
+    let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
+    let b = |v: Option<&String>| v.and_then(|s| uwuwu_domain::BranchName::parse(s));
+    let u = |v: Option<&String>| v.and_then(|s| uwuwu_domain::PrUrl::parse(s));
     uwuwu_domain::TaskFields::new(
         s(raw.get(crate::fields::F_DEV_SESSION)),
         s(raw.get(crate::fields::F_REVIEW_SESSION)),
@@ -424,11 +421,14 @@ impl TaskBoardRepo for GitHubHub {
         let title = issue["title"].as_str().unwrap_or_default().to_string();
         let body = issue["body"].as_str().unwrap_or_default().to_string();
         let status = self.board_status(number).await.unwrap_or_default();
-        let mut task = Task::new(number, title, Status::parse(&status));
+        // closed терминален (вывод первоисточника, не переход конвейера)
+        let status = if issue["state"].as_str() == Some("closed") {
+            Status::Done
+        } else {
+            Status::parse(&status)
+        };
+        let mut task = Task::new(number, title, status);
         task.apply_fields(map_task_fields(&parse_field_values(&issue)));
-        if issue["state"].as_str() == Some("closed") {
-            task.set_status(Status::Done);
-        }
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,

@@ -4,7 +4,7 @@ FROM rust:slim AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl unzip ca-certificates \
     && curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip" -o /tmp/protoc.zip \
-    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
     && chmod +x /usr/local/bin/protoc \
     && apt-get purge -y curl unzip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

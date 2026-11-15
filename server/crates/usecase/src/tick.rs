@@ -5,13 +5,15 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickStateStore};
 use serde::Serialize;
 use std::sync::Arc;
-use uwuwu_domain::{decide, gate, Action, Awaits, Gate, ModelRef, SpawnPolicy, Task};
+use uwuwu_domain::{
+    decide, gate, Action, Awaits, Gate, LoopOutcome, ModelRef, SpawnLoop, SpawnPolicy, Status, Task,
+};
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
 /// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
 pub const SPAWN_COOLDOWN_MS: u64 = 15 * 60_000;
 
-fn slot_name(slot: uwuwu_domain::Slot) -> &'static str {
+pub(crate) fn slot_name(slot: uwuwu_domain::Slot) -> &'static str {
     match slot {
         uwuwu_domain::Slot::Design => "design",
         uwuwu_domain::Slot::Dev => "dev",
@@ -59,6 +61,8 @@ pub struct TickOutcome {
     pub observed: usize,
     pub wakeups: usize,
     pub autodone_done: usize,
+    /// Строк, переведённых в Needs attention спавн-петлёй.
+    pub attention_flagged: usize,
 }
 
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
@@ -124,6 +128,50 @@ impl TickUseCase {
                         out.observed += 1;
                         continue;
                     }
+                    // Attention-механика: >2 спавнов слота при неизменном
+                    // статусе = петля → Needs attention, конвейер бросает строку
+                    let mut guard = self
+                        .state
+                        .spawn_loop(&board.board, task.number(), slot_name(slot))
+                        .map(|(s, r)| SpawnLoop::from_parts(&s, r))
+                        .unwrap_or_else(|| SpawnLoop::new(task.status()));
+                    if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
+                        out.attention_flagged += 1;
+                        tracing::warn!(
+                            event = "spawn.loop_escalated",
+                            number = task.number(),
+                            slot = slot_name(slot),
+                            "Spawn loop >2: Needs attention"
+                        );
+                        if plan.mode == Mode::Live {
+                            let _ = self
+                                .board
+                                .set_status(&board.board, task.number(), Status::NeedsAttention)
+                                .await;
+                            let _ = self
+                                .board
+                                .post_comment(
+                                    task.number(),
+                                    &format!(
+                                        "⚠︎ Спавн-петля: слот `{}` спавнился >2 раз без \
+                                         прогресса статуса ({}). Строка переведена в \
+                                         Needs attention — разбор владельца.",
+                                        slot_name(slot),
+                                        task.status().as_str()
+                                    ),
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
+                    let (g_status, g_repeats) = guard.parts();
+                    self.state.set_spawn_loop(
+                        &board.board,
+                        task.number(),
+                        slot_name(slot),
+                        g_status,
+                        g_repeats,
+                    );
                     let gated = gate(task, &action, plan.policy, active, now);
                     match gated {
                         Gate::Allowed => {

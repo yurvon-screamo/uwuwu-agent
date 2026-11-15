@@ -375,8 +375,9 @@ impl ToolHub {
             "task_claim" => {
                 let number = need_number(args)?;
                 let session = arg("session");
-                if !session.starts_with("ses_") {
-                    return Err("session обязан быть ses_…".into());
+                // валидация — в домене (SessionRef): мусорный id не заявка
+                if uwuwu_domain::SessionRef::parse(&session).is_none() {
+                    return Err("session обязан быть ses_… (валидный id опенкода)".into());
                 }
                 self.writer
                     .claim(number, &session, None)

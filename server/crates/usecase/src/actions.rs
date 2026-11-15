@@ -3,8 +3,8 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{Liveness, SessionSpec};
-use crate::tick::{BoardPlan, TickUseCase};
-use uwuwu_domain::{Agent, Slot, Status, Task};
+use crate::tick::{slot_name, BoardPlan, TickUseCase};
+use uwuwu_domain::{Agent, LoopOutcome, Slot, SpawnLoop, Status, Task};
 
 impl TickUseCase {
     /// Спавн агента стадии: bootstrap-сессия в мастер-чекауте готовит env
@@ -107,8 +107,45 @@ impl TickUseCase {
             }
             Liveness::Dead | Liveness::Unknown => {
                 tracing::warn!(event = "wakeup.dead_session", number = task.number(),
-                    session = %session, "Stage session dead: respawning stage");
-                // мёртвая сессия стадии → респавн (кулдаун тика страхует от шторма)
+                    session = %session, "Stage session dead: respawn через луп-гвард");
+                // attention-механика: респавн = повтор слота при неизменном
+                // статусе; >2 → Needs attention, конвейер бросает строку
+                let mut guard = self
+                    .state
+                    .spawn_loop(&board.board, task.number(), slot_name(slot))
+                    .map(|(s, r)| SpawnLoop::from_parts(&s, r))
+                    .unwrap_or_else(|| SpawnLoop::new(task.status()));
+                if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
+                    tracing::warn!(
+                        event = "respawn.loop_escalated",
+                        number = task.number(),
+                        slot = slot_name(slot),
+                        "Dead-respawn loop >2: Needs attention"
+                    );
+                    self.board
+                        .set_status(&board.board, task.number(), Status::NeedsAttention)
+                        .await?;
+                    self.board
+                        .post_comment(
+                            task.number(),
+                            &format!(
+                                "⚠︎ Респавн-петля: сессия стадии `{}` умирает и респавнится \
+                                 >2 раз без прогресса статуса ({}). Разбор владельца.",
+                                slot_name(slot),
+                                task.status().as_str()
+                            ),
+                        )
+                        .await?;
+                    return Ok(false);
+                }
+                let (g_status, g_repeats) = guard.parts();
+                self.state.set_spawn_loop(
+                    &board.board,
+                    task.number(),
+                    slot_name(slot),
+                    g_status,
+                    g_repeats,
+                );
                 let fresh = self.spawn_stage(board, task, slot).await?;
                 self.board
                     .set_session(&board.board, task.number(), slot, &fresh)

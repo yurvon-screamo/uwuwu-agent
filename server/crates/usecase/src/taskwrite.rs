@@ -116,33 +116,61 @@ impl TaskWriter for TaskWriteUseCase {
                 "проект «{project}» вне конфига"
             )));
         }
+        let need_rows = patch.status.is_some() || patch.title.is_some();
+        let rows = if need_rows {
+            self.board.read_board(&board).await?
+        } else {
+            Vec::new()
+        };
         if let Some(status) = patch.status {
+            // канон переходов — домен: запрещённое ребро = громкая ошибка
+            let current = rows
+                .iter()
+                .find(|t| t.number() == number)
+                .map(|t| t.status())
+                .ok_or_else(|| {
+                    UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+                })?;
+            if !uwuwu_domain::Status::can_transition(current, status) {
+                return Err(UsecaseError::Board(format!(
+                    "переход «{}» → «{}» вне канона конвейера",
+                    current.as_str(),
+                    status.as_str()
+                )));
+            }
             self.board.set_status(&board, number, status).await?;
         }
         if let Some(title) = &patch.title {
+            if rows
+                .iter()
+                .any(|t| t.number() != number && t.title() == title)
+            {
+                return Err(UsecaseError::Board(format!(
+                    "тайтл «{title}» уже занят другой строкой"
+                )));
+            }
             self.board.rename_issue(number, title).await?;
         }
-        let (branch, pr, priority) = (
-            patch.branch.clone(),
-            patch.pr.clone(),
-            patch.priority.clone(),
-        );
-        self.board
-            .patch_cells(
-                number,
-                Box::new(move |fields| {
-                    if let Some(b) = branch {
-                        fields.insert("branch".into(), b);
-                    }
-                    if let Some(p) = pr {
-                        fields.insert("pr".into(), p);
-                    }
-                    if let Some(pr) = priority {
-                        fields.insert("priority".into(), pr);
-                    }
-                }),
-            )
-            .await
+        // ветка/PR/приоритет — нативные поля issue (value-объекты валидируют)
+        let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
+        if let Some(b) = &patch.branch {
+            let name = uwuwu_domain::BranchName::parse(b).ok_or_else(|| {
+                UsecaseError::Board(format!("ветка «{b}» не валидна (пробелы/глоб-символы)"))
+            })?;
+            field_patch.push(("Branch", Some(name.as_str().to_string())));
+        }
+        if let Some(p) = &patch.pr {
+            let url = uwuwu_domain::PrUrl::parse(p)
+                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
+            field_patch.push(("PR", Some(url.as_str().to_string())));
+        }
+        if let Some(pr) = &patch.priority {
+            field_patch.push(("Приоритет", Some(pr.clone())));
+        }
+        if !field_patch.is_empty() {
+            self.fields.store(number, &field_patch).await?;
+        }
+        Ok(())
     }
 
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()> {

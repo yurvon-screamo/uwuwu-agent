@@ -24,6 +24,10 @@ struct StateFile {
     /// «board:number:slot» → ms последнего спавна (анти-шторм).
     #[serde(default)]
     spawns: BTreeMap<String, u64>,
+    /// «board:number:slot» → (статус на прошлом спавне, повторов) —
+    /// attention-механика.
+    #[serde(default)]
+    spawn_loops: BTreeMap<String, (String, u32)>,
 }
 
 pub struct JsonStateStore {
@@ -101,6 +105,22 @@ impl TickStateStore for JsonStateStore {
             .insert(format!("{board}:{number}:{slot}"), at_ms);
     }
 
+    fn spawn_loop(&self, board: &str, number: u64, slot: &str) -> Option<(String, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .get(&format!("{board}:{number}:{slot}"))
+            .map(|(s, r)| (s.clone(), *r))
+    }
+
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: &str, status: &str, repeats: u32) {
+        self.state.lock().expect("state lock").spawn_loops.insert(
+            format!("{board}:{number}:{slot}"),
+            (status.to_string(), repeats),
+        );
+    }
+
     fn save(&self) -> UsecaseResult<()> {
         // гигиена роста: dreamer_done — последние 500
         {
@@ -114,6 +134,13 @@ impl TickStateStore for JsonStateStore {
                 let cut = guard.spawns.len() - 5000;
                 for k in keys.into_iter().take(cut) {
                     guard.spawns.remove(&k);
+                }
+            }
+            if guard.spawn_loops.len() > 5000 {
+                let keys: Vec<String> = guard.spawn_loops.keys().cloned().collect();
+                let cut = guard.spawn_loops.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawn_loops.remove(&k);
                 }
             }
         }

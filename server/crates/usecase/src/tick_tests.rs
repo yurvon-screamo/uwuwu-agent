@@ -170,6 +170,10 @@ impl TickStateStore for MemState {
         None
     }
     fn mark_spawn(&self, _b: &str, _n: u64, _s: &str, _at: u64) {}
+    fn spawn_loop(&self, _b: &str, _n: u64, _s: &str) -> Option<(String, u32)> {
+        None
+    }
+    fn set_spawn_loop(&self, _b: &str, _n: u64, _s: &str, _status: &str, _r: u32) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -311,7 +315,7 @@ async fn autodone_green_merges() {
     let mut t = task(5, Status::UserReview);
     t.set_autodone(true);
     let mut f = TaskFields::default();
-    f.set_pr(PrUrl::new("https://github.com/a/c/pull/9"));
+    f.set_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
     t.apply_fields(f);
     let (u, board, _, prs) = usecase(
         vec![t],
@@ -335,7 +339,7 @@ async fn autodone_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
     t.set_autodone(true);
     let mut f = TaskFields::default();
-    f.set_branch(BranchName::new("work/task-6"));
+    f.set_branch(BranchName::parse("work/task-6").unwrap());
     t.apply_fields(f);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
