@@ -11,6 +11,7 @@ mod gitwiki;
 mod http;
 mod hub;
 mod mcp;
+mod mockhub;
 mod opencode;
 mod prgate;
 mod semantic;
@@ -70,11 +71,25 @@ async fn run(
     config_path: PathBuf,
 ) -> Result<(), String> {
     // Композиция: реализации портов → оркестратор
-    let hub = Arc::new(hub::GitHubHub::new(
-        cfg.hub.repo.clone(),
-        secrets.gh_token.clone(),
-    ));
-    let board = hub.clone();
+    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit)
+    let use_memory_hub = cfg.hub.driver == "memory";
+    let (board, field_store): (
+        Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+        Arc<dyn uwuwu_usecase::IssueFieldStore>,
+    ) = if use_memory_hub {
+        let mem = Arc::new(mockhub::MemoryHub::from_env());
+        tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
+        (mem.clone(), mem)
+    } else {
+        let gh = Arc::new(hub::GitHubHub::new(
+            cfg.hub.repo.clone(),
+            secrets.gh_token.clone(),
+        ));
+        (
+            gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+            gh.fields(),
+        )
+    };
     let raw_sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
@@ -174,7 +189,7 @@ async fn run(
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {
             board: board.clone(),
-            fields: hub.fields(),
+            fields: field_store,
             boards: boards_cfg.clone(),
         }),
         wiki: wiki.clone(),
@@ -211,6 +226,15 @@ async fn run(
         .map(|b| (b.project.clone(), b.board.clone(), b.checkout.clone()))
         .collect();
     let mut sidecars: Vec<Sidecar> = Vec::new();
+    // observe — полностью без мутаций: сайдкары (кроны/триаж/дример/семантика)
+    // не исполняются, решения видны только в логе основного тика
+    let is_observe = matches!(plan.mode, uwuwu_usecase::Mode::Observe);
+    if is_observe {
+        tracing::info!(
+            event = "sidecars.observe_mode",
+            "observe: кроны/триаж/дример/семантика не исполняются"
+        );
+    }
     for (project, _, checkout) in boards_info.iter() {
         let cron = Arc::new(uwuwu_usecase::crons::CronUseCase {
             wiki: wiki.clone(),
@@ -220,12 +244,18 @@ async fn run(
             checkout: checkout.clone(),
         });
         let project = project.clone();
+
         sidecars.push(Sidecar {
             name: format!("cron:{project}"),
             tick: Box::new(move || {
                 let cron = cron.clone();
                 let project = project.clone();
-                Box::pin(async move { cron.tick(&project).await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    cron.tick(&project).await.map(|_| ())
+                })
             }),
         });
     }
@@ -262,19 +292,30 @@ async fn run(
             name: "triage".into(),
             tick: Box::new(move || {
                 let t = triage.clone();
-                Box::pin(async move { t.tick().await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    t.tick().await.map(|_| ())
+                })
             }),
         });
         sidecars.push(Sidecar {
             name: "dreamer".into(),
             tick: Box::new(move || {
                 let d = dreamer.clone();
-                Box::pin(async move { d.tick().await.map(|_| ()) })
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    d.tick().await.map(|_| ())
+                })
             }),
         });
     }
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
+
         // backoff: отказ туннеля/Ollama → тишина на час (не долбим каждые 3 мин)
         let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
         sidecars.push(Sidecar {
@@ -284,6 +325,9 @@ async fn run(
                 let clock = clock2.clone();
                 let backoff = backoff_until.clone();
                 Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
                     let now = clock.now_ms();
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());

@@ -87,7 +87,7 @@ impl Status {
             (S::Draft, S::Todo)
                 | (S::Todo, S::Design | S::InProgress)
                 | (S::Wait, S::Todo | S::Design | S::InProgress)
-                | (S::Design, S::InProgress | S::NeedsAttention)
+                | (S::Design, S::ReviewPlan | S::InProgress | S::NeedsAttention)
                 | (S::ReviewPlan, S::InProgress | S::NeedsAttention)
                 | (
                     S::InProgress,
@@ -190,6 +190,15 @@ impl TaskFields {
 
     pub fn pr(&self) -> Option<&PrUrl> {
         self.pr.as_ref()
+    }
+
+    /// Мутатор: заявка сессии в слот (инфра-маппинг полей и спавны).
+    pub fn set_session(&mut self, slot: Slot, session: SessionRef) {
+        match slot {
+            Slot::Dev | Slot::Design => self.dev_session = Some(session),
+            Slot::PlanReview | Slot::ResultReview => self.review_session = Some(session),
+            Slot::Test => self.test_session = Some(session),
+        }
     }
 
     /// Мутатор: заявка PR-ячейки.
@@ -478,6 +487,7 @@ mod tests {
             (S::Draft, S::Todo),
             (S::Todo, S::Design),
             (S::Todo, S::InProgress),
+            (S::Design, S::ReviewPlan),
             (S::Design, S::InProgress),
             (S::InProgress, S::ReviewPlan),
             (S::InProgress, S::ReviewResult),

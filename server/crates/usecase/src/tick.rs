@@ -123,6 +123,13 @@ impl TickUseCase {
         mut out: TickOutcome,
     ) -> UsecaseResult<TickOutcome> {
         let now = self.clock.utc_minute();
+        // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
+        // конвейер действует только по ней, остальная доска read-only
+        if let Ok(only) = std::env::var("UWUWU_ONLY_TASK") {
+            if let Ok(n) = only.trim().parse::<u64>() {
+                tasks.retain(|t| t.number() == n);
+            }
+        }
         tasks.sort_by_key(|t| t.priority().rank());
         for task in &tasks {
             let action = decide(task);
