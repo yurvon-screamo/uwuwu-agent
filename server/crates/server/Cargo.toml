@@ -30,10 +30,12 @@ tracing-subscriber = { workspace = true }
 futures = "0.3.34"
 lancedb = "0.41.0"
 # lance-encoding: feature protoc тянет protobuf-src (свой бинарь) — CI без системного protoc
+# protoc через protobuf-src (self-contained, CI/Docker без системного protoc)
 lance-encoding = { version = "14", default-features = false, features = ["protoc"] }
 lance-file = { version = "14", default-features = false, features = ["protoc"] }
 lance-table = { version = "14", default-features = false, features = ["protoc"] }
 lance-datafusion = { version = "14", default-features = false, features = ["protoc"] }
+lance-index = { version = "14", default-features = false, features = ["protoc"] }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
