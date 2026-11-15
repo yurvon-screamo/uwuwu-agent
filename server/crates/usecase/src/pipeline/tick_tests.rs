@@ -38,6 +38,29 @@ impl TaskBoardRepo for FakeBoard {
             .push(format!("clear#{n}={:?}", slot));
         Ok(())
     }
+    async fn issue_fields(&self, n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+        // enrichment-фейк: поля несут строки (как настоящий hub из REST)
+        Ok(self
+            .rows
+            .iter()
+            .find(|t| t.number() == n)
+            .map(|t| {
+                let mut f = TaskFields::default();
+                for slot in [
+                    Slot::Dev,
+                    Slot::Design,
+                    Slot::PlanReview,
+                    Slot::ResultReview,
+                    Slot::Test,
+                ] {
+                    if let Some(s) = t.session_of(slot) {
+                        f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
+                    }
+                }
+                f
+            })
+            .unwrap_or_default())
+    }
     async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
         self.log
             .lock()
@@ -623,4 +646,54 @@ async fn dev_session_survives_all_transitions() {
         );
         log.clear();
     }
+}
+
+#[tokio::test]
+async fn failed_spawn_does_not_charge_loop_or_cooldown() {
+    // 15.11, #1151 (high): временный отказ спавна (бюджет 10/ч) не должен
+    // заряжать луп-счётчик (3 отказа = ложная эскалация) и кулдаун слота —
+    // заряжаем только состоявшийся спавн
+    struct FailingSessions;
+    #[async_trait::async_trait]
+    impl AgentSessionGateway for FailingSessions {
+        async fn create_session(&self, _s: &SessionSpec) -> UsecaseResult<String> {
+            Err(crate::error::UsecaseError::Session(
+                "бюджет исчерпан (мок)".into(),
+            ))
+        }
+        async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn liveness(&self, _s: &str) -> Liveness {
+            Liveness::Alive
+        }
+        async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
+            Ok(vec![])
+        }
+        async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
+            Ok(String::new())
+        }
+    }
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut u, _, _, _) = usecase(vec![task(40, Status::InProgress)], PrState::Missing);
+    u.sessions = Arc::new(FailingSessions);
+    u.state = state.clone();
+    for round in 0..4 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.spawns_done, 0, "круг {round}: спавн не состоялся");
+        assert_eq!(out.attention_flagged, 0, "круг {round}: без эскалации");
+    }
+    assert!(
+        state.0.lock().unwrap().loops.is_empty(),
+        "failed-спавны не заряжают луп-счётчик"
+    );
 }

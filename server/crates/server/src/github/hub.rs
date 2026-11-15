@@ -337,15 +337,27 @@ fn trunc(s: &str) -> String {
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
-    // слоты: dev/review/test; review-поле покрывает оба ревью-слота
+    // слоты: dev/review/test; review-поле покрывает оба ревью-слота,
+    // dev-поле — оба слота дев-семьи (Design/Dev единая сессия, канон
+    // сессий #328): иначе Design-строка читается без сессии и тик
+    // бесконечно пытается спавнить дубль (инцидент 15.11/16.11 —
+    // budget-отказы маскировали, budget-50 вскрыл бы спавном дублей)
     let mut assignments = std::collections::BTreeMap::new();
-    for (name, slot) in [
-        (crate::github::fields::F_DEV_SESSION, Slot::Dev),
-        (crate::github::fields::F_REVIEW_SESSION, Slot::PlanReview),
-        (crate::github::fields::F_TEST_SESSION, Slot::Test),
+    for (name, slots) in [
+        (
+            crate::github::fields::F_DEV_SESSION,
+            vec![Slot::Dev, Slot::Design],
+        ),
+        (
+            crate::github::fields::F_REVIEW_SESSION,
+            vec![Slot::PlanReview, Slot::ResultReview],
+        ),
+        (crate::github::fields::F_TEST_SESSION, vec![Slot::Test]),
     ] {
         if let Some(session) = s(raw.get(name)) {
-            assignments.insert(slot, session);
+            for slot in slots {
+                assignments.insert(slot, session.clone());
+            }
         }
     }
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
@@ -514,6 +526,17 @@ impl TaskBoardRepo for GitHubHub {
         let node_id = resp["node_id"].as_str().unwrap_or_default().to_string();
         self.add_to_board(board, number, &node_id).await?;
         Ok(number)
+    }
+
+    async fn issue_fields(&self, number: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+        let (_, issue) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                None,
+            )
+            .await?;
+        Ok(map_task_fields(&parse_field_values(&issue)))
     }
 
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
@@ -706,5 +729,31 @@ mod tests {
         let rows = parse_page(&items, &mut meta);
         assert_eq!(rows[0].status(), Status::Done);
         assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
+    }
+}
+
+#[cfg(test)]
+mod slot_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn dev_session_field_fills_design_slot() {
+        // инцидент 15/16.11: Design-строка с заполненной ячейкой «Сессия dev»
+        // читалась без сессии → тик спамил спавн-дублей (бюджет маскировал)
+        let mut raw = Fields::new();
+        raw.insert("Сессия dev".into(), "ses_abc123".into());
+        let f = map_task_fields(&raw);
+        let t = uwuwu_domain::Task::new(1, "t".into(), uwuwu_domain::Status::Design);
+        let mut task = t;
+        task.apply_fields(f);
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::Design),
+            Some("ses_abc123")
+        );
+        assert_eq!(task.session_of(uwuwu_domain::Slot::Dev), Some("ses_abc123"));
+        assert!(
+            task.stage_needs_spawn().is_none(),
+            "Design-слот видит сессию"
+        );
     }
 }

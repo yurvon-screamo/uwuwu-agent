@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, ModelRef, Slot, Status, Task, UtcMinute};
+use uwuwu_domain::{AgentSlot, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -35,6 +35,12 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>>;
     /// Полная карта задачи: агрегат + тело issue + все комменты.
     async fn read_issue(&self, board: &str, number: u64) -> UsecaseResult<IssueView>;
+    /// Дешёвое обогащение: только нативные поля issue (сессии/ветка/PR/
+    /// приоритет/тип) одним REST-зовом — без тела и повторного snapshot
+    /// доски. Snapshot Projects v2 глобальных полей issue не несёт:
+    /// без enrichment тик не видит сессии стадии (wakeup недостижим,
+    /// needs_spawn вечен — инцидент ночи 15-16.11).
+    async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields>;
     /// Создание issue (лейбл proj:<project>) + строка на доске board (Draft).
     async fn create_issue(
         &self,
