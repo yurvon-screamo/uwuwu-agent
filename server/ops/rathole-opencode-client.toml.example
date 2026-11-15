@@ -1,0 +1,10 @@
+# rathole-клиент опенкод-гейта на kisa (ночь 16.11, поручение владельца):
+# uwuwu-server → http://relay.railway.internal:2335 → туннель → kisa :49374.
+# Схема зеркальна ollama-туннелю: control = TCP proxy Railway, сервис —
+# внутренний порт relay. Снимает публичный домен/Caddy/куки из цепочки.
+[client]
+remote_addr = "mainline.proxy.rlwy.net:36390"
+
+[client.services.opencode]
+local_addr = "127.0.0.1:49374"
+token = "<RATHOLE_TOKEN>"
