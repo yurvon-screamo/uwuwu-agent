@@ -8,6 +8,8 @@ use uwuwu_domain::{Agent, ModelRef};
 
 /// Idle-порог: уснувшая = нет активности 30 минут и есть финал.
 const IDLE_MS: u64 = 30 * 60_000;
+/// Дневной кап дример-спавнов (канон: ~раз в час).
+const DAY_CAP: u32 = 24;
 
 /// Агенты, чьи сессии не являются «рабочими» для дримера.
 const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Triage, Agent::PlanReviewer];
@@ -21,12 +23,35 @@ pub struct DreamerUseCase {
 }
 
 impl DreamerUseCase {
-    /// Один проход: до одного дрим-спавна за тик.
+    /// Один проход: до одного дрим-спавна за тик. Капы (директива
+    /// владельца 15.11): ≤1 живого дримера, ≤24/день, цели — только
+    /// сессии с финалом И реальной работой (токены > 0, не пустышки).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         let now = self.clock.now_ms();
         let list = self.sessions.list_sessions().await?;
+        // ≤1 живого дримера одновременно
+        if list
+            .iter()
+            .any(|s| s.outcome.is_empty() && Agent::parse(&s.agent) == Some(Agent::Dreamer))
+        {
+            tracing::debug!(event = "dreamer.alive_skip", "Живой дример — спавна нет");
+            return Ok(0);
+        }
+        // дневной кап (сутки JST — канон расписаний)
+        let day_key = jst_day_key(now);
+        let today = self.state.dreamer_day_spawns(&day_key);
+        if today >= DAY_CAP {
+            tracing::debug!(
+                event = "dreamer.day_cap",
+                today,
+                cap = DAY_CAP,
+                "Дневной кап"
+            );
+            return Ok(0);
+        }
         let candidate = list.into_iter().find(|s| {
             !s.outcome.is_empty()
+                && s.total_tokens > 0
                 && now.saturating_sub(s.updated_ms) > IDLE_MS
                 && Agent::parse(&s.agent)
                     .map(|a| !SKIP_AGENTS.contains(&a))
@@ -46,9 +71,17 @@ impl DreamerUseCase {
         let prompt = dreamer_prompt(&target.id);
         self.sessions.prompt(&session, &prompt).await?;
         self.state.mark_dreamer_done(&target.id);
+        self.state.mark_dreamer_spawn(&day_key);
         tracing::info!(event = "dreamer.spawned", target = %target.id, session = %session, "Dreamer spawned");
         Ok(1)
     }
+}
+
+/// Ключ суток JST (YYYY-MM-DD) для дневного капа.
+fn jst_day_key(ms: u64) -> String {
+    let secs = ms / 1000 + 9 * 3600;
+    let (y, mo, da) = uwuwu_domain::civil_from_days((secs / 86400) as i64);
+    format!("{y:04}-{mo:02}-{da:02}")
 }
 
 fn dreamer_prompt(target: &str) -> String {

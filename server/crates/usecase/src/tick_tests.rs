@@ -166,6 +166,10 @@ impl TickStateStore for MemState {
         false
     }
     fn mark_dreamer_done(&self, _s: &str) {}
+    fn dreamer_day_spawns(&self, _day: &str) -> u32 {
+        0
+    }
+    fn mark_dreamer_spawn(&self, _day: &str) {}
     fn last_spawn_ms(&self, _b: &str, _n: u64, _s: &str) -> Option<u64> {
         None
     }

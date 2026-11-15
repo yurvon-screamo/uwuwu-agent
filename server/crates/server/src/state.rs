@@ -28,6 +28,9 @@ struct StateFile {
     /// attention-механика.
     #[serde(default)]
     spawn_loops: BTreeMap<String, (String, u32)>,
+    /// Дневной счётчик дримера: (дата JST, спавнов).
+    #[serde(default)]
+    dreamer_day: Option<(String, u32)>,
 }
 
 pub struct JsonStateStore {
@@ -85,6 +88,28 @@ impl TickStateStore for JsonStateStore {
             .expect("state lock")
             .dreamer_done
             .push(session.to_string());
+    }
+
+    fn dreamer_day_spawns(&self, day_key: &str) -> u32 {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day_key)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    fn mark_dreamer_spawn(&self, day_key: &str) {
+        let mut guard = self.state.lock().expect("state lock");
+        let n = guard
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day_key)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        guard.dreamer_day = Some((day_key.to_string(), n + 1));
     }
 
     fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64> {

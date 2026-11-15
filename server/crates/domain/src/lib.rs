@@ -4,12 +4,14 @@
 //! (часы, сеть, ФС) — порты юзкейс-слоя.
 
 pub mod agent;
+pub mod budget;
 pub mod cron;
 pub mod pipeline;
 pub mod task;
 pub mod task_type;
 
 pub use agent::{Agent, ModelRef};
+pub use budget::{BudgetVerdict, SpawnBudget};
 pub use cron::{civil_from_days, jst_fields, jst_stamp, CronMaster, Schedule};
 pub use pipeline::{
     awaits, decide, gate, Action, Awaits, Gate, LoopOutcome, PeakWindow, ReviewRounds,

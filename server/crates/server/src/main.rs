@@ -3,6 +3,7 @@
 //! presentation (HTTP; MCP — срез 2) + композиция.
 //! Зависимости: server → usecase → domain, только внутрь.
 
+mod budget;
 mod clock;
 mod config;
 mod fields;
@@ -22,7 +23,7 @@ use config::{Config, ConfigError, ENV_CONFIG};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{TickOutcome, TickUseCase};
+use uwuwu_usecase::{Clock as _, TickOutcome, TickUseCase};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -74,13 +75,22 @@ async fn run(
         secrets.gh_token.clone(),
     ));
     let board = hub.clone();
-    let sessions = Arc::new(opencode::OpencodeClient::new(
+    let raw_sessions = Arc::new(opencode::OpencodeClient::new(
         cfg.executor.url.clone(),
         secrets.opencode_password.clone().unwrap_or_default(),
         secrets.opencode_gate_cookie.clone(),
     ));
     let prs = Arc::new(prgate::GhPrGateway::new(secrets.gh_token.clone()));
     let clock = Arc::new(clock::SystemClock);
+    // Глобальный спавн-бюджет: все create_session через один потолок;
+    // UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
+    let spawn_cap: usize = std::env::var("UWUWU_SPAWNS_MAX_PER_HOUR")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10);
+    let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(
+        budget::BudgetedSessions::new(raw_sessions, spawn_cap, clock.clone()),
+    );
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
     let spawn_model_cfg = cfg
@@ -248,6 +258,40 @@ async fn run(
             tick: Box::new(move || {
                 let d = dreamer.clone();
                 Box::pin(async move { d.tick().await.map(|_| ()) })
+            }),
+        });
+    }
+    if let Some(backend) = semantic_backend.clone() {
+        let clock2 = clock.clone();
+        // backoff: отказ туннеля/Ollama → тишина на час (не долбим каждые 3 мин)
+        let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
+        sidecars.push(Sidecar {
+            name: "semantic-sync".into(),
+            tick: Box::new(move || {
+                let b = backend.clone();
+                let clock = clock2.clone();
+                let backoff = backoff_until.clone();
+                Box::pin(async move {
+                    let now = clock.now_ms();
+                    if now < *backoff.lock().expect("backoff lock") {
+                        return Ok(());
+                    }
+                    if !uwuwu_usecase::search::sync_allowed(clock.utc_minute()) {
+                        return Ok(());
+                    }
+                    // локальная Ollama без квот: бюджет щедрее free-плана
+                    match b.sync_index(16).await {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let until = now + 3_600_000;
+                            *backoff.lock().expect("backoff lock") = until;
+                            tracing::warn!(event = "semantic.backoff",
+                                until_ms = until, error = %e,
+                                "Semantic sync: отказ, тишина на час");
+                            Ok(())
+                        }
+                    }
+                })
             }),
         });
     }

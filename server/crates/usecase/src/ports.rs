@@ -122,6 +122,8 @@ pub struct SessionInfo {
     pub updated_ms: u64,
     /// «succeeded»|«failed»|… финала (пусто — живая).
     pub outcome: String,
+    /// Токены сессии (in+out): пустышки-прерывания = 0 — дример их не берёт.
+    pub total_tokens: u64,
 }
 
 /// Состояние PR проекта: источник вердиктов автодона.
@@ -174,6 +176,9 @@ pub trait TickStateStore: Send + Sync {
     /// Дример уже отработал сессию (1 рабочая = 1 дример).
     fn dreamer_done(&self, session: &str) -> bool;
     fn mark_dreamer_done(&self, session: &str);
+    /// Дример: спавнов за сутки (day_key = дата JST) — дневной кап.
+    fn dreamer_day_spawns(&self, day_key: &str) -> u32;
+    fn mark_dreamer_spawn(&self, day_key: &str);
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
     fn last_spawn_ms(&self, board: &str, number: u64, slot: &str) -> Option<u64>;
     fn mark_spawn(&self, board: &str, number: u64, slot: &str, at_ms: u64);
