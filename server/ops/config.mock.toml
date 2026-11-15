@@ -1,0 +1,31 @@
+# uwuwu-server — локальный дебаг-контур с mock-opencode (без LLM/Railway).
+# Запуск:
+#   1) сервер мока:  MOCK_MODE=agent MOCK_MCP_TOKEN=$UWUWU_MCP_TOKEN \
+#                     cargo run --bin mock_opencode   (порт 8099)
+#   2) сам сервер:   UWUWU_SERVER_CONFIG=server/ops/config.mock.toml \
+#                     GH_TOKEN=… cargo run --bin uwuwu-server
+# mode=live исполняет конвейер против реальной доски — для полного цикла
+# нужна тестовая доска/строка; observe — только решения в лог.
+mode = "observe"
+poll_sec = 30
+port = 8090
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+# токен: env GH_TOKEN
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:8099"
+# basic-пароль: env UWUWU_OPENCODE_PASSWORD (мок не проверяет — любое)
+
+[policy]
+cup = 7
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"

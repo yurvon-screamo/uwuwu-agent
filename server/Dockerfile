@@ -1,6 +1,13 @@
 # uwuwu-server: образ Railway (root directory сервиса = server/)
-# Workspace: crates/{domain,usecase,server}
+# Workspace: crates/{domain,usecase,server}; protoc — свежий бинаррь для lance-стека
 FROM rust:slim AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+    && curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip" -o /tmp/protoc.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
+    && chmod +x /usr/local/bin/protoc \
+    && apt-get purge -y curl unzip && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -13,8 +20,10 @@ RUN apt-get update \
 COPY --from=build /build/target/release/uwuwu-server /usr/local/bin/uwuwu-server
 COPY config.example.toml /app/config.toml
 WORKDIR /app
-# Конфиг в образе — канон-пример; секреты (GH_TOKEN, UWUWU_SERVER_BEARER,
-# UWUWU_OPENCODE_PASSWORD, UWUWU_SERVER_MODE, UWUWU_SERVER_STATE) — Railway env
 ENV UWUWU_SERVER_CONFIG=/app/config.toml
 EXPOSE 8090
+# Healthcheck: HTTP-порт жив. /health под bearer-гейтом (401 без токена) —
+# платформенный HTTP-healthcheck не подошёл бы, проверяем TCP; bash /dev/tcp.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090' || exit 1
 CMD ["uwuwu-server"]

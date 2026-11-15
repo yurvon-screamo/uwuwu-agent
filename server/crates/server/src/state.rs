@@ -4,8 +4,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use uwuwu_usecase::error::{UsecaseError, UsecaseResult};
+use uwuwu_domain::{Slot, Status};
+use uwuwu_usecase as naming;
 use uwuwu_usecase::TickStateStore;
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RowState {
@@ -18,6 +20,19 @@ struct StateFile {
     /// «board:number» → состояние строки.
     #[serde(default)]
     rows: BTreeMap<String, RowState>,
+    /// Сессии, отработанные дримером.
+    #[serde(default)]
+    dreamer_done: Vec<String>,
+    /// «board:number:slot» → ms последнего спавна (анти-шторм).
+    #[serde(default)]
+    spawns: BTreeMap<String, u64>,
+    /// «board:number:slot» → (статус на прошлом спавне, повторов) —
+    /// attention-механика.
+    #[serde(default)]
+    spawn_loops: BTreeMap<String, (String, u32)>,
+    /// Дневной счётчик дримера: (дата JST, спавнов).
+    #[serde(default)]
+    dreamer_day: Option<(String, u32)>,
 }
 
 pub struct JsonStateStore {
@@ -60,7 +75,133 @@ impl TickStateStore for JsonStateStore {
             .last_comment_id = Some(id.to_string());
     }
 
+    fn dreamer_done(&self, session: &str) -> bool {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_done
+            .iter()
+            .any(|s| s == session)
+    }
+
+    fn mark_dreamer_done(&self, session: &str) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_done
+            .push(session.to_string());
+    }
+
+    fn dreamer_day_spawns(&self, day_key: &str) -> u32 {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day_key)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    fn mark_dreamer_spawn(&self, day_key: &str) {
+        let mut guard = self.state.lock().expect("state lock");
+        let n = guard
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day_key)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        guard.dreamer_day = Some((day_key.to_string(), n + 1));
+    }
+
+    fn last_spawn_ms(&self, board: &str, number: u64, slot: Slot) -> Option<u64> {
+        let key = format!("{board}:{number}:{}", naming::slot_key(slot));
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .get(&key)
+            .copied()
+    }
+
+    fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64) {
+        self.state.lock().expect("state lock").spawns.insert(
+            format!("{board}:{number}:{}", naming::slot_key(slot)),
+            at_ms,
+        );
+    }
+
+    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .get(&format!("{board}:{number}:triage"))
+            .copied()
+    }
+
+    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .insert(format!("{board}:{number}:triage"), at_ms);
+    }
+
+    fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .get(&format!("{board}:{number}:{}", naming::slot_key(slot)))
+            .map(|(s, r)| (naming::parse_status(s), *r))
+    }
+
+    fn set_spawn_loop(&self, board: &str, number: u64, slot: Slot, status: Status, repeats: u32) {
+        self.state.lock().expect("state lock").spawn_loops.insert(
+            format!("{board}:{number}:{}", naming::slot_key(slot)),
+            (naming::status_name(status).to_string(), repeats),
+        );
+    }
+
+    fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status) {
+        let prefix = format!("{board}:{number}:");
+        let current_name = naming::status_name(current);
+        let mut guard = self.state.lock().expect("state lock");
+        let stale: Vec<String> = guard
+            .spawn_loops
+            .iter()
+            .filter(|(k, (status, _))| k.starts_with(&prefix) && status != current_name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            guard.spawn_loops.remove(&key);
+        }
+    }
+
     fn save(&self) -> UsecaseResult<()> {
+        // гигиена роста: dreamer_done — последние 500
+        {
+            let mut guard = self.state.lock().expect("state lock");
+            if guard.dreamer_done.len() > 500 {
+                let cut = guard.dreamer_done.len() - 500;
+                guard.dreamer_done.drain(0..cut);
+            }
+            if guard.spawns.len() > 5000 {
+                let keys: Vec<String> = guard.spawns.keys().cloned().collect();
+                let cut = guard.spawns.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawns.remove(&k);
+                }
+            }
+            if guard.spawn_loops.len() > 5000 {
+                let keys: Vec<String> = guard.spawn_loops.keys().cloned().collect();
+                let cut = guard.spawn_loops.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.spawn_loops.remove(&k);
+                }
+            }
+        }
         let raw = {
             let guard = self.state.lock().expect("state lock");
             serde_json::to_vec_pretty(&*guard)

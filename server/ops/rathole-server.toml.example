@@ -1,0 +1,18 @@
+# rathole-server для Railway-сервиса `relay` (туннель Ollama kisa → Railway).
+# Образ: docker.io/rapiz1/rathole. Переменные сервиса (Railway):
+#   RATHOLE_TOKEN — общий секрет сервис-клиент (у владельца)
+#   PORT          — 2333 (внутренний порт Railway)
+# Start command сервиса (конфиг генерируется из env, файл в образ не нужен):
+#   sh -c 'printf "[server]\nbind_addr=\"0.0.0.0:%s\"\n\n[server.services.ollama]\ntoken=\"%s\"\n" "$PORT" "$RATHOLE_TOKEN" > /tmp/rathole.toml && rathole /tmp/rathole.toml'
+#
+# Схема: uwuwu-server → http://relay.railway.internal:2333 → (туннель) → kisa ollama :11434
+# Наружу — только публичный TCP-домен relay (для kisa-клиента), Ollama в интернет не торчит.
+#
+# Эквивалентный статический конфиг (если класть файл):
+[server]
+bind_addr = "0.0.0.0:2333"
+# heartbeat — дефолты rathole достаточны для idle-туннеля
+
+[server.services.ollama]
+# token = "$RATHOLE_TOKEN" — подставляется env в start command
+token = "CHANGE_ME"

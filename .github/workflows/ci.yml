@@ -1,22 +1,16 @@
-# CI: fmt + clippy + test + qlty (delta) — на PR и на мастер-пуше.
-# Без concurrency: cancel-in-progress ест свои раны (опыт origa, док cicd).
-# Required-чек branch protection «CI» прицепляется именно к PR-ранам —
-# push-ран мастер-коммита гейтом PR не становится, он валидирует сам мердж.
+# CI: параллельные джобы (fmt / clippy+test / plugins / qlty) + агрегатор «CI».
 #
-# Зачем push на master (кейс #221): батч-мерджи вносят артефакты, невидимые
-# на PR-ветках — каждый PR-ран гоняет merge-коммит со своей копией master,
-# и зелёные по отдельности диффы двух PR конфликтуют только на
-# мастер-коммите (дубль strictPathPin, TS2300 — всплыл красным CI чужого
-# PR #224, hotfix cee4c0c). Push-ран мастер-коммита ловит это в момент
-# мерджа. Развилка «merge queue» (предотвращение до мастера) отвергнута:
-# сериализация мерджей и пересборка autodone-механики против редкого
-# эпизода — детекция достаточна (линия stress-tests.yml: сигнал =
-# красная джоба + нативный email GitHub, автозаведение задач не строим).
-#
-# Красный push-ран — не всегда батч-артефакт: семейство тайминг-флейков
-# cargo test (search_lines #145, mcp_transport, semantic_tests #195) изредка
-# красит и мастер-раны. Отличие: флейк исчезает на перезапуске
-# (gh run rerun), батч-артефакт воспроизводится.
+# Path-фильтры (15.11, «нахуй для баша ждать сборку сервера»): джоба
+# changes считает дифф origin/master...HEAD и включает только джобы
+# затронутых областей — правка entrypoint.sh/Dockerfile не ждёт
+# rust-компиляцию. Исключения, где гоняем ВСЁ:
+#   - push-ран мастер-коммита: его работа — ловить батч-артефакты,
+#     невидимые на PR-ветках (кейс #221: зелёные по отдельности диффы
+#     конфликтуют на merge-коммите) — скип здесь открывал бы дыру;
+#   - правка самого ci.yml — самопроверка.
+# Агрегатор «CI» держит required-контекст branch protection (гейт
+# матчит имя посимвольно) и принимает success|skipped, краснея от
+# failure|cancelled.
 name: CI
 
 on:
@@ -29,73 +23,163 @@ permissions:
   contents: read
 
 jobs:
-  ci:
-    # Чекран называется по job name (не по id): required-контекст в branch
-    # protection — «CI», GitHub матчит посимвольно (инцидент: джоба без name
-    # давала чекран «ci» и гейт блокировал вообще все PR).
-    name: CI
+  changes:
+    name: changed areas
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.areas.outputs.rust }}
+      plugins: ${{ steps.areas.outputs.plugins }}
     steps:
-      # fetch-depth: 0 — нужна дельта origin/master...HEAD для qlty
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Diff → области
+        id: areas
+        run: |
+          run_all=0
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            run_all=1
+          fi
+          if git diff --name-only origin/master...HEAD | grep -qF '.github/workflows/ci.yml'; then
+            run_all=1
+          fi
+          if [ "$run_all" = 1 ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "plugins=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only origin/master...HEAD)"
+          rust=false
+          plugins=false
+          while IFS= read -r f; do
+            case "$f" in
+              server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
+              plugins/*|lib/*) plugins=true ;;
+            esac
+          done <<< "$files"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
 
-      # Пины по SHA: плавающие теги = supply-chain поверхность и
-      # невоспроизводимость ранов (правило ревью workflows, образец — origa).
+  fmt:
+    name: rust fmt
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - name: cargo fmt --check (server)
+        run: cd server && cargo fmt --check
 
+  rust:
+    # clippy+test в одной джобе: депы (lance-стек, ~600 крейтов)
+    # компилируются ОДИН раз, test переиспользует target/ от clippy —
+    # раздельные джобы удваивали компиляцию и GitHub Actions usage
+    name: rust clippy+test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          workspaces: cli,server
-
-      - name: cargo fmt (cli, server)
+          workspaces: server
+          # общий ключ между ранами/ветками одного workflow: депы из
+          # Cargo.lock стабильны — холодная пересборка только при смене lock
+          shared-key: rust-ci-deps
+          cache-on-failure: true
+      # protoc: lance-стек (prost-build); свежий бинаррь с GitHub + include/*
+      # (well-known типы: deb-пакет старый и не находит empty.proto)
+      - name: Install protoc
         run: |
-          for d in cli server; do (cd "$d" && cargo fmt --check); done
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          PB_VER="29.3"
+          curl -sSL "$PB_REL/download/v${PB_VER}/protoc-${PB_VER}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+      - name: cargo clippy (server)
+        run: cd server && cargo clippy --all-targets -- -D warnings
+      - name: cargo test (server)
+        run: cd server && cargo test
 
-      - name: cargo clippy (cli, server)
-        run: |
-          for d in cli server; do (cd "$d" && cargo clippy --all-targets -- -D warnings); done
-
-      - name: cargo test (cli, server)
-        # e2e-тесты ходят в живой hub (uwuwu-hub) и гвардятся UWUWU_E2E_GITHUB=1:
-        # без переменной они сразу зелёные (см. cli/tests/*_e2e.rs).
-        run: |
-          for d in cli server; do (cd "$d" && cargo test); done
-
-      # TS-слой после сноса демон-контура (rewrite #1133): живой TS — только
-      # плагины опенкода (plugins/ + общие модули lib/). Пин версии = версия
-      # машин разработчиков (локи сгенерированы ею).
+  plugins:
+    name: plugins (bun)
+    needs: changes
+    if: needs.changes.outputs.plugins == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # TS-слой после сноса демон-контура (#1133): живой TS — только плагины
+      # опенкода (plugins/ + lib/). Пин версии = версия машин разработчиков.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-
       - name: bun install (plugins)
         run: cd plugins && bun install --frozen-lockfile
-
       - name: typecheck (tsc --noEmit, plugins)
         run: cd plugins && bun run typecheck
-
-      # юнит-тесты плагин-модулей (lib/*.test.ts): чистые функции без сети.
+      # юнит-тесты плагин-модулей (lib/*.test.ts): чистые функции без сети
       - name: bun test
         run: bun test lib/
 
+  qlty:
+    # всегда: qlty сам сканирует дифф изменённых строк (нативный upstream),
+    # отдельная джоба дешёвая (секунды) и независимо полезна
+    name: qlty (delta)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 — нужна дельта origin/master...HEAD
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install qlty
         run: curl -sSfL https://qlty.sh | sh
-
-      - name: qlty check (delta)
-        # Настоящая строковая дельта против upstream (нативный режим qlty):
-        # находки репортятся только в добавленных/изменённых строках PR —
-        # pre-existing baseline-долг тронутого файла CI не красит (инцидент
-        # PR #158: 8 pre-existing находок lib/hub.ts на файл-скоупе).
-        # Семантика merge-base: отставшая ветка сравнивается с
-        # точкой форка, чужие изменения master не красят. Пустая дельта
-        # обрабатывается нативно («No modified files», exit 0) — git-обёртка
-        # со списком путей не нужна; механика — живые пробы от 08.11,
-        # опыт /tools/«qlty CI Gate Analysis». Готча чтения вывода:
-        # строка «No modified files» в tracked-чекаутах диагностическая,
-        # скоуп --upstream-прогона не отменяет.
+      # Настоящая строковая дельта против upstream (нативный режим qlty):
+      # находки только в добавленных/изменённых строках PR — pre-existing
+      # baseline-долг тронутого файла CI не красит (инцидент PR #158).
+      # Семантика merge-base: отставшая ветка сравнивается с точкой форка.
+      # Готча: «No modified files» в tracked-чекаутах — диагностическая
+      # строка, скоуп --upstream-прогона не отменяет.
+      - name: qlty check
         run: $HOME/.qlty/bin/qlty check --no-fix --no-progress --upstream origin/master
+
+  # Агрегатор: держит required-контекст «CI» (branch protection матчит
+  # имя) — краснеет от любого упавшего входа, пропускает скипнутые
+  # (path-фильтр: область не затронута), сам ничего не исполняет.
+  CI:
+    name: CI
+    needs: [changes, fmt, rust, plugins, qlty]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Gate
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          FMT: ${{ needs.fmt.result }}
+          RUST: ${{ needs.rust.result }}
+          PLUGINS: ${{ needs.plugins.result }}
+          QLTY: ${{ needs.qlty.result }}
+        run: |
+          for name in CHANGES FMT RUST PLUGINS QLTY; do
+            r="${!name}"
+            case "$r" in
+              success|skipped) ;;
+              *)
+                echo "вход не прошёл: $name=$r"
+                exit 1
+                ;;
+            esac
+          done
+          echo "все затронутые входы зелёные"

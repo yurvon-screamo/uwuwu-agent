@@ -1,6 +1,0 @@
-/target/
-.cache/
-*.db
-*.db-shm
-*.db-wal
-build.log

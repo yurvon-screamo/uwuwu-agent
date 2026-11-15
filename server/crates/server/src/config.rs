@@ -24,6 +24,13 @@ pub enum ModeCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HubCfg {
     pub repo: String,
+    /// "github" (деф.) | "memory" — мок-хаб для E2E-стенда без GitHub.
+    #[serde(default = "default_hub_driver")]
+    pub driver: String,
+}
+
+fn default_hub_driver() -> String {
+    "github".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,9 +208,35 @@ impl Config {
             .unwrap_or_else(|_| config_path.with_file_name("state.json"))
     }
 
-    /// Порт конфига → план тика юзкейса.
-    pub fn to_tick_plan(&self) -> TickPlan {
-        TickPlan {
+    /// Порт конфига → план тика юзкейса. Валидация конфига — здесь
+    /// (деплой-данные): непустые имя/доска/чекауты, repo owner/name,
+    /// дубли имён; битый конфиг — громкая ошибка старта.
+    pub fn to_tick_plan(&self) -> Result<TickPlan, String> {
+        let mut names = std::collections::BTreeSet::new();
+        for p in &self.project {
+            let name = p.name.trim();
+            if name.is_empty() {
+                return Err("проект без имени".into());
+            }
+            if !names.insert(name.to_string()) {
+                return Err(format!("проект «{name}» уже в конфиге"));
+            }
+            if p.board.trim().is_empty() {
+                return Err(format!("проект «{name}»: пустая доска"));
+            }
+            if p.repo.trim().split('/').count() != 2 {
+                return Err(format!(
+                    "проект «{name}»: repo «{}» не в форме owner/name",
+                    p.repo.trim()
+                ));
+            }
+            if p.checkout.trim().is_empty() || p.env_root.trim().is_empty() {
+                return Err(format!(
+                    "проект «{name}»: пустой checkout/env_root (спавн невозможен)"
+                ));
+            }
+        }
+        Ok(TickPlan {
             mode: match self.mode() {
                 ModeCfg::Observe => Mode::Observe,
                 ModeCfg::Live => Mode::Live,
@@ -220,14 +253,14 @@ impl Config {
                 .project
                 .iter()
                 .map(|p| BoardPlan {
-                    project: p.name.clone(),
-                    board: p.board.clone(),
-                    repo: p.repo.clone(),
-                    checkout: p.checkout.clone(),
-                    env_root: p.env_root.clone(),
+                    project: p.name.trim().to_string(),
+                    board: p.board.trim().to_string(),
+                    repo: p.repo.trim().to_string(),
+                    checkout: p.checkout.trim().to_string(),
+                    env_root: p.env_root.trim().to_string(),
                 })
                 .collect(),
-        }
+        })
     }
 }
 
@@ -249,7 +282,7 @@ mod tests {
         assert_eq!(cfg.mode, ModeCfg::Observe);
         assert_eq!(cfg.project.len(), 1);
         assert!(cfg.policy.peak.enabled);
-        let plan = cfg.to_tick_plan();
+        let plan = cfg.to_tick_plan().expect("проекты валидны");
         assert_eq!(plan.boards[0].board, "Задачи uwuwu");
         assert_eq!(plan.policy.cup, 7);
         assert_eq!(plan.mode, Mode::Observe);
@@ -270,5 +303,30 @@ mod tests {
         "#;
         let err = toml::from_str::<Config>(raw).expect_err("должен упасть");
         assert!(err.to_string().contains("project"), "{err}");
+    }
+
+    #[test]
+    fn broken_project_fails_loudly_in_domain() {
+        // repo без owner/ — домен отклоняет при сборке плана (не в рантайме)
+        let raw = r#"
+            mode = "observe"
+            [hub]
+            repo = "a/b"
+            [executor]
+            name = "kisa"
+            url = "http://127.0.0.1:1"
+            [policy]
+            cup = 7
+            peak = { enabled = false, start_min = 0, end_min = 0 }
+            [[project]]
+            name = "p"
+            board = "B"
+            repo = "просто-имя"
+            checkout = "/c"
+            env_root = "/e"
+        "#;
+        let cfg = toml::from_str::<Config>(raw).expect("toml парсится");
+        let err = cfg.to_tick_plan().expect_err("домен отклоняет");
+        assert!(err.contains("owner/name"), "{err}");
     }
 }

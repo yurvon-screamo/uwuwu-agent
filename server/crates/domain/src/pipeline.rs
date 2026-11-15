@@ -103,7 +103,7 @@ pub fn decide(task: &Task) -> Action {
         return Action::Autodone;
     }
     Action::Observe {
-        awaits: awaits(task.status),
+        awaits: awaits(task.status()),
     }
 }
 
@@ -118,7 +118,7 @@ pub fn gate(
     let Action::Spawn { .. } = action else {
         return Gate::Allowed;
     };
-    if policy.peak.holds(now) && task.priority != Priority::High {
+    if policy.peak.holds(now) && task.priority() != Priority::High {
         return Gate::DeferredPeak;
     }
     if active >= policy.cup {
@@ -130,45 +130,51 @@ pub fn gate(
     Gate::Allowed
 }
 
-/// Круги ревью задачи: инварианты канона — approve-with-notes ≤ 1 на задачу,
-/// третий круг тех же замечаний → тупик владельцу.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReviewRounds {
-    pub request_changes_rounds: u32,
-    pub approve_with_notes_used: bool,
+/// Attention-механика (директива владельца 15.11): спавн слота при
+/// неизменном статусе строки — повтор; третий повтор = петля, строка
+/// эскалируется владельцу (Needs attention), конвейер её бросает.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnLoop {
+    status: Status,
+    repeats: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoundOutcome {
-    /// Круг зачтён, конвейер продолжается.
+pub enum LoopOutcome {
+    /// Спавн допустим.
     Continue,
-    /// Тупик: эскалация владельцу (Needs attention).
+    /// Петля: Needs attention + коммент, спавн запрещён.
     Escalate,
 }
 
-impl ReviewRounds {
-    /// request_changes от ревьювера: 3 подряд → эскалация.
-    pub fn register_request_changes(&mut self) -> RoundOutcome {
-        self.request_changes_rounds += 1;
-        if self.request_changes_rounds >= 3 {
-            return RoundOutcome::Escalate;
-        }
-        RoundOutcome::Continue
+impl SpawnLoop {
+    pub fn new(status: Status) -> Self {
+        Self { status, repeats: 0 }
     }
 
-    /// Прочие вердикты сбрасывают счётчик одних и тех же замечаний.
-    pub fn register_progress(&mut self) {
-        self.request_changes_rounds = 0;
+    /// Зарегистрировать очередной спавн слота; смена статуса строки
+    /// (прогресс конвейера) обнуляет счётчик.
+    pub fn register_spawn(&mut self, current: Status) -> LoopOutcome {
+        if current != self.status {
+            self.status = current;
+            self.repeats = 0;
+        }
+        self.repeats += 1;
+        if self.repeats > 2 {
+            LoopOutcome::Escalate
+        } else {
+            LoopOutcome::Continue
+        }
     }
 
-    /// approve-with-notes выдаётся один раз на задачу.
-    pub fn register_approve_with_notes(&mut self) -> Result<(), &'static str> {
-        if self.approve_with_notes_used {
-            return Err("approve-with-notes уже выдавался на эту задачу");
-        }
-        self.approve_with_notes_used = true;
-        self.register_progress();
-        Ok(())
+    /// Текущий счётчик повторов.
+    pub fn repeats(&self) -> u32 {
+        self.repeats
+    }
+
+    /// Статус, при котором считали.
+    pub fn status(&self) -> Status {
+        self.status
     }
 }
 
@@ -178,6 +184,46 @@ mod tests {
 
     fn task(status: Status) -> Task {
         Task::new(7, "t".into(), status)
+    }
+
+    #[test]
+    fn spawn_loop_escalates_after_two_repeats() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        // два повтора при неизменном статусе — ещё работаем
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Continue
+        );
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Continue
+        );
+        // третий — петля
+        assert_eq!(
+            guard.register_spawn(Status::ReviewResult),
+            LoopOutcome::Escalate
+        );
+    }
+
+    #[test]
+    fn spawn_loop_progress_resets() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        // статус поехал (прогресс конвейера) — счётчик с нуля
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Continue);
+        assert_eq!(guard.register_spawn(Status::Testing), LoopOutcome::Escalate);
+    }
+
+    #[test]
+    fn spawn_loop_tracks_status_and_repeats() {
+        let mut guard = SpawnLoop::new(Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        assert_eq!(guard.repeats(), 1);
+        assert_eq!(guard.status(), Status::ReviewResult);
+        guard.register_spawn(Status::ReviewResult);
+        assert_eq!(guard.repeats(), 2);
     }
 
     #[test]
@@ -198,7 +244,8 @@ mod tests {
     #[test]
     fn decide_respects_claimed_session() {
         let mut t = task(Status::InProgress);
-        t.claim(Slot::Dev, "ses_1".into());
+        t.claim(Slot::Dev, crate::task::SessionRef::parse("ses_1").unwrap())
+            .unwrap();
         assert!(matches!(decide(&t), Action::Observe { .. }));
     }
 
@@ -206,7 +253,7 @@ mod tests {
     fn decide_autodone_only_with_flag() {
         let mut t = task(Status::UserReview);
         assert!(matches!(decide(&t), Action::Observe { .. }));
-        t.autodone = true;
+        t.set_autodone(true);
         assert_eq!(decide(&t), Action::Autodone);
     }
 
@@ -238,7 +285,7 @@ mod tests {
         );
 
         let mut high = task(Status::InProgress);
-        high.priority = Priority::High;
+        high.set_priority(Priority::High);
         assert_eq!(
             gate(&high, &decide(&high), policy, 0, in_peak),
             Gate::Allowed
@@ -281,24 +328,5 @@ mod tests {
             minute_of_day: 540,
             weekday: 3
         }));
-    }
-
-    #[test]
-    fn review_rounds_invariants() {
-        let mut r = ReviewRounds::default();
-        assert_eq!(r.register_request_changes(), RoundOutcome::Continue);
-        assert_eq!(r.register_request_changes(), RoundOutcome::Continue);
-        assert_eq!(r.register_request_changes(), RoundOutcome::Escalate);
-        r.register_progress();
-        assert_eq!(
-            r.register_request_changes(),
-            RoundOutcome::Continue,
-            "прогресс сбросил счётчик"
-        );
-        assert!(r.register_approve_with_notes().is_ok());
-        assert!(
-            r.register_approve_with_notes().is_err(),
-            "второй approve-with-notes запрещён"
-        );
     }
 }
