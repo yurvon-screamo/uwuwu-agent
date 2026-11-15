@@ -38,7 +38,15 @@ fn main() -> Result<(), BootError> {
     let config_path = std::env::var(ENV_CONFIG)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("config.toml"));
-    let cfg = Config::load(&config_path)?;
+    let mut cfg = Config::load(&config_path)?;
+    // env-оверрайды прод-окружения (Railway): executor через внутренний
+    // rathole-релей (relay.railway.internal:2335) — без публичного домена,
+    // Caddy-прокси и внешних куки (снимает класс «гейт недоступен»).
+    if let Ok(url) = std::env::var("UWUWU_EXECUTOR_URL") {
+        if !url.is_empty() {
+            cfg.executor.url = url;
+        }
+    }
     let secrets = cfg.secrets()?;
     let plan = Arc::new(cfg.to_tick_plan().map_err(BootError::Runtime)?);
     tracing::info!(
