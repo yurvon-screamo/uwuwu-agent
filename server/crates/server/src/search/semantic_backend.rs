@@ -31,6 +31,8 @@ fn err(msg: String) -> UsecaseError {
 
 pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
+    /// Персист sha-инкремента: /…/semantic_shas.json рядом с Lance-том.
+    shas_file: PathBuf,
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
@@ -71,8 +73,10 @@ impl LanceSemanticBackend {
             .execute()
             .await
             .map_err(|e| err(format!("connect: {e}")))?;
+        let shas_file = path.join("semantic_shas.json");
         let this = Self {
             wiki,
+            shas_file,
             issues,
             db,
             embeddings,
@@ -114,6 +118,28 @@ impl LanceSemanticBackend {
             .execute()
             .await
             .map_err(|e| err(format!("open docs: {e}")))
+    }
+
+    /// slug → git blob-sha последнего проиндексированного док-слага
+    /// (мелкий JSON-персист рядом с Lance; sha-инкремент синка).
+    fn known_shas(&self) -> HashMap<String, String> {
+        std::fs::read_to_string(self.shas_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn mark_known_sha(&self, slug: &str, sha: &str) {
+        let mut m = self.known_shas();
+        m.insert(slug.to_string(), sha.to_string());
+        let _ = std::fs::write(
+            self.shas_path(),
+            serde_json::to_string(&m).unwrap_or_default(),
+        );
+    }
+
+    fn shas_path(&self) -> PathBuf {
+        self.shas_file.clone()
     }
 
     async fn known_hashes(&self) -> UsecaseResult<HashMap<String, i64>> {
@@ -308,19 +334,28 @@ impl SemanticBackend for LanceSemanticBackend {
     }
 
     async fn sync_index(&self, budget: usize) -> UsecaseResult<usize> {
-        let all = self.wiki.list_docs("").await?;
+        // sha-инкремент: git blob-sha из дерева (один вызов) отсекает
+        // неизменённые ДО чтения содержимого — иначе сотни read_doc
+        // до первого изменённого = таймаут сайдкара (каскад 16.11)
+        let shas: std::collections::HashMap<String, String> =
+            self.wiki.doc_shas().await?.into_iter().collect();
         let known = self.known_hashes().await?;
+        let known_shas = self.known_shas();
         let mut changed = 0usize;
-        for slug in all {
+        for (slug, sha) in &shas {
             if changed >= budget {
                 break;
             }
-            if let Some(md) = self.wiki.read_doc(&slug).await? {
+            if known_shas.get(slug).map(String::as_str) == Some(sha.as_str()) {
+                continue; // sha не шевелился — содержимое не читаем
+            }
+            if let Some(md) = self.wiki.read_doc(slug).await? {
                 let h = Self::hash(&md);
-                if known.get(&slug).copied() != Some(h) {
-                    self.reindex_doc(&slug, &md, h).await?;
+                if known.get(slug).copied() != Some(h) {
+                    self.reindex_doc(slug, &md, h).await?;
                     changed += 1;
                 }
+                self.mark_known_sha(slug, sha);
             }
         }
         // задачи в индекс (юзер-стори: «найти решённое раньше по вики/задачам»):

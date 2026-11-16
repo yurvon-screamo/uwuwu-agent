@@ -15,6 +15,8 @@ pub struct GitHubWiki {
     token: String,
     http: reqwest::Client,
     tree_cache: Mutex<Option<(Instant, Vec<String>)>>,
+    #[allow(clippy::type_complexity)]
+    shas_cache: Mutex<Option<(Instant, Vec<(String, String)>)>>,
     ttl: Duration,
     writer: Option<std::sync::Arc<crate::wiki::gitwiki::GitWikiWriter>>,
 }
@@ -36,6 +38,7 @@ impl GitHubWiki {
                 .build()
                 .expect("reqwest client"),
             tree_cache: Mutex::new(None),
+            shas_cache: Mutex::new(None),
             ttl: Duration::from_secs(300),
         }
     }
@@ -63,6 +66,54 @@ impl GitHubWiki {
     }
 
     /// Полное дерево docs/**/*.md (кэш с TTL).
+    async fn shas_cache(&self) -> UsecaseResult<Vec<(String, String)>> {
+        {
+            let guard = self.shas_cache.lock().expect("shas lock");
+            if let Some((at, tree)) = guard.as_ref() {
+                if at.elapsed() < self.ttl {
+                    return Ok(tree.clone());
+                }
+            }
+        }
+        let (status, body) = self
+            .get(&format!(
+                "/repos/{}/git/trees/{}?recursive=1",
+                self.repo, self.branch
+            ))
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "wiki tree {}: HTTP {status}",
+                self.branch
+            )));
+        }
+        let list: Vec<(String, String)> = body["tree"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| {
+                        let path = e["path"].as_str()?;
+                        let sha = e["sha"].as_str()?;
+                        let ok = e["type"].as_str()? == "blob"
+                            && path.ends_with(".md")
+                            && path.starts_with("docs/");
+                        ok.then(|| {
+                            (
+                                path.trim_start_matches("docs/")
+                                    .trim_end_matches(".md")
+                                    .to_string(),
+                                sha.to_string(),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        *self.shas_cache.lock().expect("shas lock") = Some((Instant::now(), list.clone()));
+        Ok(list)
+    }
+
     async fn docs_tree(&self) -> UsecaseResult<Vec<String>> {
         {
             let guard = self.tree_cache.lock().expect("tree lock");
@@ -143,6 +194,13 @@ impl WikiRepo for GitHubWiki {
             .into_iter()
             .filter(|p| norm.is_empty() || p.starts_with(&format!("{norm}/")) || p == norm)
             .collect())
+    }
+
+    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
+        // то же дерево, но с sha: docs_tree кеширует слаги — sha берём
+        // отдельным проходом (кеш общий по HTTP-ответу недоступен,
+        // держим собственный короткоживущий кеш)
+        self.shas_cache().await
     }
 
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()> {

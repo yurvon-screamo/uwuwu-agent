@@ -42,6 +42,9 @@ impl FakeWiki {
 
 #[async_trait::async_trait]
 impl WikiRepo for FakeWiki {
+    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
+        Ok(vec![])
+    }
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
         Ok(self.docs.lock().expect("wiki lock").get(slug).cloned())
     }
@@ -338,6 +341,10 @@ impl TickStateStore for MemTickState {
         None
     }
     fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn stall_ping(&self, _b: &str, _n: u64) -> Option<(uwuwu_domain::Status, u64, u32)> {
+        None
+    }
+    fn mark_stall_ping(&self, _b: &str, _n: u64, _s: uwuwu_domain::Status, _at: u64) {}
     fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
         None
     }

@@ -75,6 +75,11 @@ pub trait WikiRepo: Send + Sync {
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>>;
     /// Пути .md под префиксом (напр. «Projects/uwuwu»), без docs/.
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>>;
+    /// Слаги + git blob-sha всех доков (одно дерево): инкрементальный
+    /// синк сравнивает sha и читает содержимое ТОЛЬКО изменившихся
+    /// (иначе семантик-тик сканирует сотни read_doc до бюджета —
+    /// таймаут-каскад 16.11).
+    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>>;
     /// Перезапись дока (commit в ветку, ff-only).
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()>;
     /// Append строки в конец дока (создаёт при отсутствии).
@@ -233,6 +238,10 @@ pub trait TickStateStore: Send + Sync {
     /// Анти-шторм: ms последнего спавна слота строки (cooldown).
     fn last_spawn_ms(&self, board: &str, number: u64, slot: Slot) -> Option<u64>;
     fn mark_spawn(&self, board: &str, number: u64, slot: Slot, at_ms: u64);
+    /// Сталл-детект строки: (статус раунда, ms последнего пинга, счётчик).
+    /// Смена статуса строки = новый раунд (счётчик с нуля).
+    fn stall_ping(&self, board: &str, number: u64) -> Option<(uwuwu_domain::Status, u64, u32)>;
+    fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Триаж: ms последнего спавна строки (кулдаун — не слот стадии).
