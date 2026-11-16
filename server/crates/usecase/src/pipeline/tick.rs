@@ -15,6 +15,14 @@ use uwuwu_domain::{
 /// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
 pub const SPAWN_COOLDOWN_MS: u64 = 15 * 60_000;
 
+/// Сталл-детект: stage-сессия жива, но ход завершён (тишина) и статус
+/// не переведён — строка висит до внешнего толчка (паттерн 16.11:
+/// #1151, #1135, #384 — агент заканчивает ход без статусной транзакции).
+/// Автопинг через час молчания, повтор через два, затем Needs attention.
+pub const STALL_SILENCE_MS: u64 = 60 * 60_000;
+pub const STALL_PING_EVERY_MS: u64 = 2 * 60 * 60_000;
+pub const STALL_MAX_PINGS: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Observe,
@@ -55,6 +63,18 @@ pub struct TickOutcome {
     pub autodone_done: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
+    /// Автопингов сталл-детекта (ход завершён, статус не переведён).
+    pub stall_pings: usize,
+    /// Строк, переведённых в Needs attention сталл-детектом.
+    pub stall_flagged: usize,
+}
+
+/// Результат прохода сталл-детекта по строке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAct {
+    None,
+    Pinged,
+    Flagged,
 }
 
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
@@ -343,7 +363,15 @@ impl TickUseCase {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
                         match self.wakeup_if_fresh(board, task).await {
                             Ok(true) => out.wakeups += 1,
-                            Ok(false) => {}
+                            Ok(false) => match self.stall_pass(board, task).await {
+                                Ok(StallAct::None) => {}
+                                Ok(StallAct::Pinged) => out.stall_pings += 1,
+                                Ok(StallAct::Flagged) => out.stall_flagged += 1,
+                                Err(e) => {
+                                    out.actions_failed += 1;
+                                    self.log_action_failed(task_ref, e);
+                                }
+                            },
                             Err(e) => {
                                 out.actions_failed += 1;
                                 self.log_action_failed(task_ref, e);
@@ -356,6 +384,91 @@ impl TickUseCase {
             }
         }
         Ok(out)
+    }
+
+    /// Сталл-детект: stage-сессия жива, но молчит дольше STALL_SILENCE_MS —
+    /// ход завершён без статусного перевода (паттерн #1151/#1135/#384).
+    /// Пинг агенту → повтор → Needs attention. Будит через механизм
+    /// wakeup (пинг = коммент, следующий тик доставит его сессии).
+    async fn stall_pass(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<StallAct> {
+        let Some(slot) = task.stage_slot() else {
+            return Ok(StallAct::None);
+        };
+        let Some(session) = task.session_of(slot) else {
+            return Ok(StallAct::None);
+        };
+        let session = session.to_string();
+        // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide)
+        let Ok(Some(last_ms)) = self.sessions.last_activity_ms(&session).await else {
+            return Ok(StallAct::None);
+        };
+        let now = self.clock.now_ms();
+        let silence = now.saturating_sub(last_ms);
+        if silence < STALL_SILENCE_MS {
+            return Ok(StallAct::None);
+        }
+        // раунд = статус: смена статуса обнуляет счётчик пингов
+        let (prev_status, last_ping, mut count) = self
+            .state
+            .stall_ping(&board.board, task.number())
+            .map(|(st, ms, c)| (Some(st), ms, c))
+            .unwrap_or((None, 0, 0));
+        if prev_status != Some(task.status()) {
+            count = 0;
+        }
+        if count >= STALL_MAX_PINGS && now.saturating_sub(last_ping) >= STALL_PING_EVERY_MS {
+            // два пинга исчерпаны, тишина продолжается — мяч владельцу
+            tracing::warn!(
+                event = "stall.escalated",
+                number = task.number(),
+                silence_min = silence / 60_000,
+                "Сталл: сессия молчит после двух автопингов"
+            );
+            self.board
+                .set_status(&board.board, task.number(), Status::NeedsAttention)
+                .await?;
+            self.board
+                .post_comment(
+                    task.number(),
+                    &format!(
+                        "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
+                         автопингов — агент не завершает статусную транзакцию. Строка в \
+                         Needs attention, разбор владельца.",
+                        naming::slot_key(slot),
+                        silence / 60_000
+                    ),
+                )
+                .await?;
+            self.state
+                .mark_stall_ping(&board.board, task.number(), task.status(), now);
+            return Ok(StallAct::Flagged);
+        }
+        if count > 0 && now.saturating_sub(last_ping) < STALL_PING_EVERY_MS {
+            return Ok(StallAct::None);
+        }
+        tracing::info!(
+            event = "stall.ping",
+            number = task.number(),
+            silence_min = silence / 60_000,
+            "Сталл: автопинг зависшей стадии"
+        );
+        self.board
+            .post_comment(
+                task.number(),
+                &format!(
+                    "⏰ Автопинг сталл-детекта: сессия стадии `{}` молчит {} мин при статусе \
+                     {:?} — ход, похоже, завершён без перевода статуса. Заверши транзакцию: \
+                     переведи статус по канону пайпа (или продолжай работу и доведи её до \
+                     статусного перевода).",
+                    naming::slot_key(slot),
+                    silence / 60_000,
+                    task.status()
+                ),
+            )
+            .await?;
+        self.state
+            .mark_stall_ping(&board.board, task.number(), task.status(), now);
+        Ok(StallAct::Pinged)
     }
 
     fn log_action_failed(&self, task: &Task, e: UsecaseError) -> UsecaseError {

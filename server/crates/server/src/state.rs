@@ -18,6 +18,10 @@ struct RowState {
     /// канон сессий: ревью/тест-раунды всегда со свежей сессией).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_status: Option<String>,
+    /// Сталл-детект: (статус раунда, ms пинга, счётчик) — смена статуса
+    /// обнуляется записью нового статуса (см. mark_stall_ping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stall: Option<(String, u64, u32)>,
 }
 
 /// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
@@ -143,6 +147,26 @@ impl TickStateStore for JsonStateStore {
             .entry(Self::key(board, number))
             .or_default()
             .last_status = Some(name);
+    }
+
+    fn stall_ping(&self, board: &str, number: u64) -> Option<(uwuwu_domain::Status, u64, u32)> {
+        let guard = self.state.lock().expect("state lock");
+        guard
+            .rows
+            .get(&Self::key(board, number))
+            .and_then(|r| r.stall.as_ref())
+            .map(|(st, ms, c)| (naming::parse_status(st), *ms, *c))
+    }
+
+    fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.rows.entry(Self::key(board, number)).or_default();
+        // счётчик растёт внутри раунда (одинаковый статус); смена статуса = 1
+        let count = match &row.stall {
+            Some((st, _, c)) if naming::parse_status(st) == status => *c + 1,
+            _ => 1,
+        };
+        row.stall = Some((naming::status_name(status).to_string(), at_ms, count));
     }
 
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str) {

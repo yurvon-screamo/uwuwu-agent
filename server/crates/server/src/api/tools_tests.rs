@@ -18,6 +18,9 @@ struct StubWiki;
 
 #[async_trait]
 impl WikiRepo for StubWiki {
+    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
+        Ok(vec![])
+    }
     async fn read_doc(&self, _slug: &str) -> UsecaseResult<Option<String>> {
         Ok(None)
     }

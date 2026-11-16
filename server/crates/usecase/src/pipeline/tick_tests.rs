@@ -127,6 +127,8 @@ impl TaskBoardRepo for FakeBoard {
 struct FakeSessions {
     prompts: Mutex<Vec<String>>,
     spawned: Mutex<Vec<String>>,
+    /// ms последней активности любой сессии (сталл-детект-тесты).
+    activity_ms: u64,
 }
 
 #[async_trait]
@@ -153,7 +155,7 @@ impl AgentSessionGateway for FakeSessions {
         Ok(())
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
-        Ok(Some(1000))
+        Ok(Some(self.activity_ms))
     }
     async fn last_assistant_reply(
         &self,
@@ -205,6 +207,8 @@ struct MemStateInner {
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
     resets: Vec<(u64, Status)>,
+    /// сталл-детект: (number, статус раунда, ms пинга)
+    stalls: Vec<(u64, Status, u64)>,
 }
 struct MemState(Mutex<MemStateInner>);
 impl TickStateStore for MemState {
@@ -244,6 +248,19 @@ impl TickStateStore for MemState {
         None
     }
     fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn stall_ping(&self, _b: &str, n: u64) -> Option<(Status, u64, u32)> {
+        let g = self.0.lock().unwrap();
+        let last = g.stalls.iter().rev().find(|(num, ..)| *num == n)?;
+        let count = g
+            .stalls
+            .iter()
+            .filter(|(num, st, _)| *num == n && *st == last.1)
+            .count() as u32;
+        Some((last.1, last.2, count))
+    }
+    fn mark_stall_ping(&self, _b: &str, n: u64, status: Status, at_ms: u64) {
+        self.0.lock().unwrap().stalls.push((n, status, at_ms));
+    }
     fn spawn_loop(&self, _b: &str, n: u64, s: Slot) -> Option<(Status, u32)> {
         self.0
             .lock()
@@ -321,6 +338,7 @@ fn usecase_with_state(
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
+        activity_ms: 1000,
     });
     let prs = Arc::new(FakePrs {
         state: pr,
@@ -715,5 +733,93 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     assert!(
         state.0.lock().unwrap().loops.is_empty(),
         "failed-спавны не заряжают луп-счётчик"
+    );
+}
+
+#[tokio::test]
+async fn stall_detector_pings_then_flags() {
+    // Паттерн 16.11 (#1151/#1135/#384): ход stage-сессии завершён
+    // (тишина), статус не переведён — тик пингует агента комментом,
+    // после двух пингов и дальнейшей тишины — Needs attention.
+    use crate::pipeline::tick::{STALL_PING_EVERY_MS, STALL_SILENCE_MS};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let now: u64 = 1_000_000_000;
+    let mut t = task(21, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+    });
+    let sessions = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        // сессия молчит час+ — ход завершён без статусного перевода
+        activity_ms: now - STALL_SILENCE_MS - 60_000,
+    });
+    struct AdvClock(AtomicU64);
+    impl Clock for AdvClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let clock = Arc::new(AdvClock(AtomicU64::new(now)));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions,
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: clock.clone(),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    // тик 1: тишина > часа → первый автопинг
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.stall_pings, 1, "первый автопинг");
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("comment#21=")));
+    // тик 2 сразу: интервал 2ч не прошёл — без пинга
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.stall_pings, 0, "интервал пинга не прошёл");
+    // +2ч: второй пинг
+    clock
+        .0
+        .fetch_add(STALL_PING_EVERY_MS + 60_000, Ordering::SeqCst);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.stall_pings, 1, "второй автопинг");
+    // +2ч ещё: эскалация — Needs attention + коммент владельцу
+    clock
+        .0
+        .fetch_add(STALL_PING_EVERY_MS + 60_000, Ordering::SeqCst);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.stall_flagged, 1, "эскалация сталла");
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("status#21=NeedsAttention")));
+    // сразу после эскалации — без дубли (интервал держит)
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged + out.stall_pings,
+        0,
+        "без дублей эскалации"
     );
 }

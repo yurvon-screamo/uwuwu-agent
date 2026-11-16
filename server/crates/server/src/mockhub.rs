@@ -251,6 +251,19 @@ impl TaskBoardRepo for MemoryHub {
 
 #[async_trait]
 impl uwuwu_usecase::WikiRepo for MemoryHub {
+    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
+        self.with_state(|state| {
+            Ok(state
+                .docs
+                .iter()
+                .map(|(slug, md)| {
+                    let sha = format!("{:x}", md.len());
+                    (slug.clone(), sha)
+                })
+                .collect())
+        })
+    }
+
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
         self.with_state(|state| Ok(state.docs.get(slug).cloned()))
     }
