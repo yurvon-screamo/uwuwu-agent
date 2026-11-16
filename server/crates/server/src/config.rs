@@ -46,6 +46,15 @@ pub struct ExecutorCfg {
     pub spawn_model: Option<SpawnModelCfg>,
 }
 
+/// Дополнительный именованный исполнитель ([[executors]]): подмножество
+/// полей дефолтного — spawn_model у именованных не вводится (модели —
+/// дефы агентов, #1154).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedExecutorCfg {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct PeakCfg {
     pub enabled: bool,
@@ -68,6 +77,9 @@ pub struct ProjectCfg {
     pub checkout: String,
     /// Корень env задач на исполнителе (~/agents-env).
     pub env_root: String,
+    /// Исполнитель проекта: имя из [[executors]] или дефолтного
+    /// [executor]; None/пусто — дефолтный (#1203).
+    pub executor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +91,10 @@ pub struct Config {
     port_cfg: u16,
     pub hub: HubCfg,
     pub executor: ExecutorCfg,
+    /// Дополнительные именованные исполнители (#1203); пусто — один
+    /// дефолтный исполнитель, как раньше.
+    #[serde(default)]
+    pub executors: Vec<NamedExecutorCfg>,
     pub policy: PolicyCfg,
     pub project: Vec<ProjectCfg>,
 }
@@ -167,12 +183,49 @@ impl Config {
         if !self.executor.url.starts_with("http") {
             return Err(ConfigError::Validation("executor.url не http(s)".into()));
         }
+        // Именованные исполнители (#1203): имена уникальны и не равны
+        // дефолтному, url http(s), ссылки проектов резолвятся — битый
+        // конфиг громко падает на старте.
+        let mut executor_names = std::collections::BTreeSet::new();
+        for e in &self.executors {
+            if e.name.trim().is_empty() {
+                return Err(ConfigError::Validation("executors[].name пуст".into()));
+            }
+            if !e.url.starts_with("http") {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}»: url не http(s)",
+                    e.name
+                )));
+            }
+            if e.name == self.executor.name {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}» дублирует имя дефолтного [executor]",
+                    e.name
+                )));
+            }
+            if !executor_names.insert(e.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}» уже в конфиге",
+                    e.name
+                )));
+            }
+        }
         for p in &self.project {
             if p.name.is_empty() || p.board.is_empty() || p.repo.is_empty() {
                 return Err(ConfigError::Validation(format!(
                     "проект {}{{name,board,repo}} обязан быть непустым",
                     p.name
                 )));
+            }
+            if let Some(target) = p.executor.as_deref().map(str::trim) {
+                let known =
+                    target == self.executor.name || self.executors.iter().any(|e| e.name == target);
+                if !known {
+                    return Err(ConfigError::Validation(format!(
+                        "проект «{}»: executor «{}» не найден ([executor] или [[executors]])",
+                        p.name, target
+                    )));
+                }
             }
         }
         Ok(())
@@ -332,5 +385,107 @@ mod tests {
         let cfg = toml::from_str::<Config>(raw).expect("toml парсится");
         let err = cfg.to_tick_plan().expect_err("домен отклоняет");
         assert!(err.contains("owner/name"), "{err}");
+    }
+
+    fn base_two_projects() -> String {
+        r#"
+            mode = "observe"
+            [hub]
+            repo = "a/b"
+            [executor]
+            name = "kisa"
+            url = "http://127.0.0.1:1"
+            [policy]
+            cup = 7
+            peak = { enabled = false, start_min = 0, end_min = 0 }
+            [[project]]
+            name = "uwuwu"
+            board = "B1"
+            repo = "o/r"
+            checkout = "/c1"
+            env_root = "/e"
+        "#
+        .to_string()
+    }
+
+    #[test]
+    fn parses_named_executors_and_project_reference() {
+        let raw = format!(
+            "{}\n[[executors]]\nname = \"redmi\"\nurl = \"http://127.0.0.1:2\"\n\
+             [[project]]\nname = \"1xgames\"\nboard = \"B2\"\nrepo = \"o/r\"\n\
+             checkout = \"D:/1x\"\nenv_root = \"D:/e\"\nexecutor = \"redmi\"\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        assert_eq!(cfg.executors.len(), 1);
+        assert_eq!(cfg.executors[0].name, "redmi");
+        assert_eq!(
+            cfg.project[1].executor.as_deref(),
+            Some("redmi"),
+            "ссылка проекта на именованный исполнитель"
+        );
+        cfg.validate().expect("конфиг валиден");
+    }
+
+    #[test]
+    fn project_without_executor_defaults_silently() {
+        let raw = base_two_projects();
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        assert!(
+            cfg.project[0].executor.is_none(),
+            "нет поля — дефолтный исполнитель (обратная совместимость)"
+        );
+        cfg.validate().expect("конфиг валиден");
+    }
+
+    #[test]
+    fn rejects_duplicate_executor_names() {
+        let raw = format!(
+            "{}\n[[executors]]\nname = \"redmi\"\nurl = \"http://127.0.0.1:2\"\n\
+             [[executors]]\nname = \"redmi\"\nurl = \"http://127.0.0.1:3\"\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg.validate().expect_err("дубль имени должен падать");
+        assert!(err.to_string().contains("уже в конфиге"), "{err}");
+    }
+
+    #[test]
+    fn rejects_executor_named_as_default() {
+        let raw = format!(
+            "{}\n[[executors]]\nname = \"kisa\"\nurl = \"http://127.0.0.1:2\"\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg.validate().expect_err("имя дефолта должно падать");
+        assert!(
+            err.to_string().contains("дублирует имя дефолтного"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_named_executor_url() {
+        let raw = format!(
+            "{}\n[[executors]]\nname = \"redmi\"\nurl = \"127.0.0.1:2\"\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg.validate().expect_err("не-http url должен падать");
+        assert!(err.to_string().contains("не http(s)"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_executor_reference() {
+        let raw = format!(
+            "{}\n[[project]]\nname = \"1xgames\"\nboard = \"B2\"\nrepo = \"o/r\"\n\
+             checkout = \"D:/1x\"\nenv_root = \"D:/e\"\nexecutor = \"нет-такого\"\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg
+            .validate()
+            .expect_err("неизвестный executor должен падать");
+        assert!(err.to_string().contains("не найден"), "{err}");
     }
 }
