@@ -8,6 +8,7 @@ use crate::ports::{
     TaskBoardRepo, TickStateStore,
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
     BranchName, PeakWindow, PrUrl, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
@@ -18,6 +19,38 @@ struct FakeBoard {
     log: Mutex<Vec<String>>,
     /// Журнал комментов задач (будильник-сценарии: latest_comments).
     comments: Vec<CommentRef>,
+    /// Приоритет носителя (REST issue_field_values → enrichment): строки-кэш
+    /// бывает Empty, а носитель знает high — главный сценарий #1200.
+    carrier_priority: Mutex<HashMap<u64, uwuwu_domain::Priority>>,
+}
+
+impl FakeBoard {
+    /// Задать приоритет носителя, который увидит enrichment тика.
+    fn set_carrier_priority(&self, n: u64, p: uwuwu_domain::Priority) {
+        self.carrier_priority.lock().unwrap().insert(n, p);
+    }
+}
+
+/// Сессии stage-слотов строки: (слот, id) — сырьё для enrichment-фейка.
+fn stage_sessions(t: &Task) -> Vec<(Slot, String)> {
+    [
+        Slot::Dev,
+        Slot::Design,
+        Slot::PlanReview,
+        Slot::ResultReview,
+        Slot::Test,
+    ]
+    .iter()
+    .filter_map(|slot| t.session_of(*slot).map(|s| (*slot, s.to_string())))
+    .collect()
+}
+
+/// То же картой назначений — сборка TaskFields::new (носитель с приоритетом).
+fn stage_sessions_map(t: &Task) -> std::collections::BTreeMap<Slot, uwuwu_domain::SessionRef> {
+    stage_sessions(t)
+        .into_iter()
+        .map(|(slot, s)| (slot, uwuwu_domain::SessionRef::parse(&s).unwrap()))
+        .collect()
 }
 
 #[async_trait]
@@ -48,24 +81,27 @@ impl TaskBoardRepo for FakeBoard {
             .find(|t| t.number() == n)
             .map(|t| {
                 let mut f = TaskFields::default();
-                for slot in [
-                    Slot::Dev,
-                    Slot::Design,
-                    Slot::PlanReview,
-                    Slot::ResultReview,
-                    Slot::Test,
-                ] {
-                    if let Some(s) = t.session_of(slot) {
-                        f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
-                    }
+                for (slot, s) in stage_sessions(t) {
+                    f.set_session(slot, uwuwu_domain::SessionRef::parse(&s).unwrap());
                 }
-                let mut f = f.clone();
                 // VCS тоже переносим (как настоящий hub: Branch/PR-поля issue)
                 if let Some(b) = t.branch().cloned() {
                     f.set_branch(b);
                 }
                 if let Some(p) = t.pr().cloned() {
                     let _ = f.open_pr(p);
+                }
+                // приоритет носителя (REST issue_field_values) — как настоящий hub:
+                // TaskFields строится конструктором (мутатора приоритета в домене нет)
+                let carrier = self
+                    .carrier_priority
+                    .lock()
+                    .unwrap()
+                    .get(&n)
+                    .copied()
+                    .filter(|p| *p != uwuwu_domain::Priority::Empty);
+                if let Some(p) = carrier {
+                    f = TaskFields::new(stage_sessions_map(t), f.vcs().clone(), p);
                 }
                 f
             })
@@ -363,6 +399,7 @@ fn usecase_with_state(
         rows,
         log: Mutex::default(),
         comments: Vec::default(),
+        carrier_priority: Mutex::default(),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -412,6 +449,7 @@ fn peak_usecase(
         rows,
         log: Mutex::default(),
         comments,
+        carrier_priority: Mutex::default(),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -446,6 +484,7 @@ fn usecase_with_sessions(
         rows,
         log: Mutex::default(),
         comments: Vec::default(),
+        carrier_priority: Mutex::default(),
     });
     let sessions = Arc::new(sessions);
     let prs = Arc::new(FakePrs {
@@ -1023,6 +1062,39 @@ async fn high_respawn_passes_peak() {
 }
 
 #[tokio::test]
+async fn carrier_priority_high_reaches_gate_through_enrichment() {
+    // Главный сценарий #1200 сквозняком: приоритет едет с носителя (REST
+    // issue_field_values) через enrichment тика в гейт — строка-кэш без
+    // snapshot-приоритета не морозит high. Сломается перенос приоритета
+    // (map_task_fields/apply_fields/порядок enrichment в тике) → строка
+    // остаётся Empty → DeferredPeak → тест красный.
+    let state = Arc::new(MemState(Mutex::default()));
+    let t = task(40, Status::InProgress); // snapshot Priority::Empty
+    let (u, board, sessions, _) = peak_usecase(vec![t], Vec::new(), state);
+    board.set_carrier_priority(40, uwuwu_domain::Priority::High);
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "high с носителя через enrichment проходит пик-гейт"
+    );
+    assert_eq!(out.deferred_peak, 0);
+    assert!(!sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn carrier_priority_absent_stays_deferred_in_peak() {
+    // Контроль того же шва: носитель без поля приоритета (Empty) байпаса
+    // не даёт — строка в пике откладывается (канон: байпас только high).
+    let state = Arc::new(MemState(Mutex::default()));
+    let t = task(41, Status::InProgress); // Empty и на строке, и на носителе
+    let (u, board, _, _) = peak_usecase(vec![t], Vec::new(), state);
+    assert!(board.carrier_priority.lock().unwrap().get(&41).is_none());
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "Empty приоритет не байпасится");
+    assert_eq!(out.deferred_peak, 1, "строка с Empty-приоритетом отложена");
+}
+
+#[tokio::test]
 async fn respawn_escalation_does_not_count_wakeups() {
     // Low-находка ревью: луп-гвард Escalate (без спавна) не накручивает
     // счётчики запусков — строка уходит в Needs attention
@@ -1209,6 +1281,7 @@ async fn stall_detector_pings_then_flags() {
         rows: vec![t],
         log: Mutex::default(),
         comments: Vec::default(),
+        carrier_priority: Mutex::default(),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
