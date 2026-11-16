@@ -98,6 +98,22 @@ pub struct TaskPatch {
     pub title: Option<String>,
 }
 
+impl TaskPatch {
+    /// Патч без полей менять нечего — presentation отказывает громко.
+    pub fn is_empty(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                status: None,
+                branch: None,
+                pr: None,
+                priority: None,
+                title: None,
+            }
+        )
+    }
+}
+
 pub struct TaskWriteUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Нативные поля issue (ветка/PR/приоритет/сессии).
@@ -347,6 +363,38 @@ mod tests {
             kind: None,
             priority: String::new(),
             autodone: true,
+        }
+    }
+
+    #[test]
+    fn patch_is_empty_only_when_no_field_is_set() {
+        // дефолтный патч — менять нечего
+        assert!(TaskPatch::default().is_empty());
+        // каждое заполненное поле в отдельности делает патч непустым
+        let cases = [
+            TaskPatch {
+                status: Some(Status::Todo),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                branch: Some("work/x".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                pr: Some("https://example.test/pull/1".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                priority: Some("high".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                title: Some("новый тайтл".into()),
+                ..TaskPatch::default()
+            },
+        ];
+        for patch in &cases {
+            assert!(!patch.is_empty(), "патч с {patch:?} не пуст");
         }
     }
 
