@@ -3,7 +3,7 @@
 //! Оптики plan-reviewer'а: sourcing, форма/дедуп, соразмерность, readiness.
 
 use crate::error::UsecaseResult;
-use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, LoopOutcome, SpawnLoop, Status, Task};
 
@@ -16,7 +16,8 @@ pub struct AnalystReviewUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Доски: те же, что у аналитика (волна собирает со всех).
     pub boards: Vec<AnalystBoard>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавн ревьювера волны — гейтвей проекта.
+    pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
 }
@@ -29,7 +30,9 @@ impl AnalystReviewUseCase {
     /// вечно, строка уходит в Needs attention.
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // парность: ≤1 живого ревьювера аналитики одновременно
-        if self.sessions.list_sessions().await?.iter().any(|s| {
+        // Strict union (#1203): как у аналитика — живой ревьювер волны на
+        // офлайн-исполнителе не порождает дубль-спавн на другом
+        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
             s.outcome.is_empty()
                 && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer)
         }) {
@@ -103,11 +106,12 @@ impl AnalystReviewUseCase {
                 variant: None,
                 bootstrap: false,
             };
-            let session = self.sessions.create_session(&spec).await?;
+            let sessions = self.sessions.project(&tb.project);
+            let session = sessions.create_session(&spec).await?;
             // сортировка уже сделана на candidates (пары wave↔guards
             // построены в одном проходе) — здесь порядок не трогаем (L1)
             let prompt = analyst_review_prompt(&tb.project, &wave);
-            self.sessions.prompt(&session, &prompt).await?;
+            sessions.prompt(&session, &prompt).await?;
             for (t, guard) in wave.iter().zip(guards.iter()) {
                 self.state.set_analys_review_loop(
                     &tb.board,

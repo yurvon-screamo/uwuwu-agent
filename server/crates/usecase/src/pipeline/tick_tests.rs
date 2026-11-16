@@ -7,6 +7,7 @@ use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
     TaskBoardRepo, TickStateStore,
 };
+use crate::router::SessionRouter;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
@@ -506,7 +507,7 @@ fn usecase_with_state(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
@@ -558,7 +559,7 @@ fn peak_usecase(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(PeakClock),
         state,
@@ -586,7 +587,7 @@ fn usecase_with_sessions(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
@@ -1281,7 +1282,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         });
         let uc = TickUseCase {
             board: board.clone(),
-            sessions: sess.clone(),
+            sessions: Arc::new(SessionRouter::uniform(sess.clone())),
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: state.clone(),
@@ -1329,7 +1330,7 @@ async fn undelivered_comment_is_not_marked_seen() {
     });
     let u2 = TickUseCase {
         board: board.clone(),
-        sessions: sess2.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess2.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1391,7 +1392,7 @@ async fn multi_comment_tail_delivered_together() {
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sess.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1448,7 +1449,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sess.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1506,7 +1507,7 @@ async fn busy_session_not_pinged_early() {
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sess.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1560,7 +1561,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sess.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1676,7 +1677,7 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     }
     let state = Arc::new(MemState(Mutex::default()));
     let (mut u, _, _, _) = usecase(vec![task(40, Status::InProgress)], PrState::Missing);
-    u.sessions = Arc::new(FailingSessions);
+    u.sessions = Arc::new(SessionRouter::uniform(Arc::new(FailingSessions)));
     u.state = state.clone();
     for round in 0..4 {
         let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -1716,7 +1717,7 @@ fn analyst_uc(
     let u = AnalystUseCase {
         board: board.clone(),
         boards: vec![analyst_board()],
-        sessions,
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
         state,
         clock: Arc::new(FixedClock),
     };
@@ -1736,7 +1737,7 @@ fn review_uc(
     let u = AnalystReviewUseCase {
         board: board.clone(),
         boards: vec![analyst_board()],
-        sessions,
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
         state,
         clock: Arc::new(FixedClock),
     };
@@ -2209,7 +2210,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
                 checkout: "/checkout-2".into(),
             },
         ],
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FixedClock),
     };
@@ -2389,7 +2390,7 @@ async fn prune_skipped_when_a_board_read_fails() {
                 checkout: "/c2".into(),
             },
         ],
-        sessions,
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
         state: state.clone(),
         clock: Arc::new(FixedClock),
     };

@@ -11,7 +11,8 @@ pub struct ToolHub {
     pub person: Arc<PersonView>,
     pub writer: Arc<TaskWriteUseCase>,
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
-    pub sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway>,
+    /// Роутер «проект → executor»: session_export веером по исполнителям.
+    pub sessions: Arc<uwuwu_usecase::SessionRouter>,
     pub search: Arc<uwuwu_usecase::SearchUseCase>,
     pub crons: Arc<uwuwu_usecase::CronUseCase>,
 }
@@ -372,7 +373,7 @@ impl ToolHub {
         }
         let export = self
             .sessions
-            .export_session(&session)
+            .export_session_any(&session)
             .await
             .map_err(|e| e.to_string())?;
         ok_text(export)

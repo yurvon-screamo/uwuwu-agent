@@ -70,11 +70,13 @@ fn hub() -> Arc<ToolHub> {
             boards,
         }),
         wiki,
-        sessions,
+        sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
         crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: memory.clone(),
-            sessions: Arc::new(StubSessions),
+            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+                StubSessions,
+            ))),
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),

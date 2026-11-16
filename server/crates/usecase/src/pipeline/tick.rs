@@ -4,9 +4,8 @@
 use super::actions::WakeAct;
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{
-    AgentSessionGateway, Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore,
-};
+use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::router::SessionRouter;
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
@@ -93,7 +92,8 @@ enum StallAct {
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавны/будильники — гейтвей проекта.
+    pub sessions: Arc<SessionRouter>,
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
@@ -143,8 +143,10 @@ impl TickUseCase {
         // 16.11: held тест-спавн #1170 при живых-то 1-2 задачах).
         // Недоступность исполнителя ≠ «все мёртвые» — fallback на старый
         // статусный подсчёт (паралич конвейера хуже редкого овер-спавна).
+        // Strict union (#1203): отказ ЛЮБОГО исполнителя → полный фолбэк —
+        // частичный список представил бы офлайн-исполнителя мёртвым.
         let alive: Option<std::collections::HashSet<String>> =
-            match self.sessions.list_sessions().await {
+            match self.sessions.list_sessions_strict().await {
                 Ok(list) => Some(
                     list.into_iter()
                         .filter(|s| s.outcome.is_empty())
@@ -493,7 +495,12 @@ impl TickUseCase {
             return Ok(None);
         };
         if matches!(slot, Slot::Design | Slot::Dev)
-            && self.sessions.liveness(session).await != Liveness::Dead
+            && self
+                .sessions
+                .project(&board.project)
+                .liveness(session)
+                .await
+                != Liveness::Dead
         {
             return Ok(None);
         }
@@ -527,7 +534,12 @@ impl TickUseCase {
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
         // тишина короче мягкого порога — оба класса молчат, idle-пробу
         // (HTTP хвоста сообщений) не тратим на свежие строки
-        let silence = match self.sessions.last_activity_ms(&session).await {
+        let silence = match self
+            .sessions
+            .project(&board.project)
+            .last_activity_ms(&session)
+            .await
+        {
             Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
             _ => 0,
         };
@@ -539,7 +551,7 @@ impl TickUseCase {
         // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
         // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
         // классический порог 60 мин (длинные операции, #161).
-        let idle = self.session_idle(&session).await;
+        let idle = self.session_idle(board, &session).await;
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
@@ -627,6 +639,7 @@ impl TickUseCase {
     ) -> UsecaseResult<StallAct> {
         if soft {
             self.sessions
+                .project(&board.project)
                 .prompt(
                     session,
                     &format!(

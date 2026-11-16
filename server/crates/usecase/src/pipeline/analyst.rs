@@ -3,7 +3,7 @@
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
 use crate::error::UsecaseResult;
-use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, Status, Task};
 
@@ -17,7 +17,8 @@ pub struct AnalystUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Доски аналитики: (проект, доска, чекаут) — волна собирает со всех.
     pub boards: Vec<AnalystBoard>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавн волны — гейтвей проекта доски.
+    pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
 }
@@ -41,7 +42,10 @@ impl AnalystUseCase {
     /// проект — своей доски, C3 ревью).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // ≤1 живого аналитика одновременно (паттерн дримера)
-        if self.sessions.list_sessions().await?.iter().any(|s| {
+        // Strict union (#1203): живой аналитик на офлайн-исполнителе не
+        // должен порождать дубль-спавн волны на другом — как CUP, отказ
+        // любого исполнителя честно останавливает волну до следующего тика
+        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
             s.outcome.is_empty() && crate::naming::parse_agent(&s.agent) == Some(Agent::Analyst)
         }) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
@@ -127,9 +131,10 @@ impl AnalystUseCase {
                 variant: None,
                 bootstrap: false,
             };
-            let session = self.sessions.create_session(&spec).await?;
+            let sessions = self.sessions.project(&tb.project);
+            let session = sessions.create_session(&spec).await?;
             let prompt = analyst_prompt(&tb.project, &wave);
-            self.sessions.prompt(&session, &prompt).await?;
+            sessions.prompt(&session, &prompt).await?;
             for t in &wave {
                 let rounds = self
                     .state
