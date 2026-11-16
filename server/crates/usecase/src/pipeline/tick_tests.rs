@@ -7,6 +7,7 @@ use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
     TaskBoardRepo, TickStateStore,
 };
+use crate::router::SessionRouter;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
@@ -377,7 +378,7 @@ fn usecase_with_state(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
@@ -426,7 +427,7 @@ fn peak_usecase(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(PeakClock),
         state,
@@ -454,7 +455,7 @@ fn usecase_with_sessions(
     });
     let u = TickUseCase {
         board: board.clone(),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
@@ -1177,7 +1178,7 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     }
     let state = Arc::new(MemState(Mutex::default()));
     let (mut u, _, _, _) = usecase(vec![task(40, Status::InProgress)], PrState::Missing);
-    u.sessions = Arc::new(FailingSessions);
+    u.sessions = Arc::new(SessionRouter::uniform(Arc::new(FailingSessions)));
     u.state = state.clone();
     for round in 0..4 {
         let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -1233,7 +1234,7 @@ async fn stall_detector_pings_then_flags() {
     let clock = Arc::new(AdvClock(AtomicU64::new(now)));
     let u = TickUseCase {
         board: board.clone(),
-        sessions,
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),

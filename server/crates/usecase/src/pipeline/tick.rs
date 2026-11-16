@@ -4,9 +4,8 @@
 use super::actions::WakeAct;
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{
-    AgentSessionGateway, Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore,
-};
+use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::router::SessionRouter;
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
@@ -85,7 +84,8 @@ enum StallAct {
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавны/будильники — гейтвей проекта.
+    pub sessions: Arc<SessionRouter>,
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
@@ -135,8 +135,10 @@ impl TickUseCase {
         // 16.11: held тест-спавн #1170 при живых-то 1-2 задачах).
         // Недоступность исполнителя ≠ «все мёртвые» — fallback на старый
         // статусный подсчёт (паралич конвейера хуже редкого овер-спавна).
+        // Strict union (#1203): отказ ЛЮБОГО исполнителя → полный фолбэк —
+        // частичный список представил бы офлайн-исполнителя мёртвым.
         let alive: Option<std::collections::HashSet<String>> =
-            match self.sessions.list_sessions().await {
+            match self.sessions.list_sessions_strict().await {
                 Ok(list) => Some(
                     list.into_iter()
                         .filter(|s| s.outcome.is_empty())
@@ -484,7 +486,12 @@ impl TickUseCase {
             return Ok(None);
         };
         if matches!(slot, Slot::Design | Slot::Dev)
-            && self.sessions.liveness(session).await != Liveness::Dead
+            && self
+                .sessions
+                .project(&board.project)
+                .liveness(session)
+                .await
+                != Liveness::Dead
         {
             return Ok(None);
         }
@@ -517,7 +524,12 @@ impl TickUseCase {
         };
         let session = session.to_string();
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide)
-        let Ok(Some(last_ms)) = self.sessions.last_activity_ms(&session).await else {
+        let Ok(Some(last_ms)) = self
+            .sessions
+            .project(&board.project)
+            .last_activity_ms(&session)
+            .await
+        else {
             return Ok(StallAct::None);
         };
         let now = self.clock.now_ms();

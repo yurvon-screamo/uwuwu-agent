@@ -10,6 +10,9 @@ mod fm_lite;
 mod naming;
 mod pipeline;
 mod ports;
+mod router;
+#[cfg(test)]
+mod router_tests;
 mod search;
 mod tasks;
 
@@ -31,6 +34,7 @@ pub use ports::{
     IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
+pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use tasks::body_hash;
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};

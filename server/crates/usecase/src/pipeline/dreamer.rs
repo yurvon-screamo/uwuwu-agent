@@ -3,7 +3,8 @@
 /// обработанные помечаются в состоянии тика.
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::ports::{AgentSessionGateway, Clock, SessionSpec, TickStateStore};
+use crate::ports::{Clock, SessionSpec, TickStateStore};
+use crate::router::SessionRouter;
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, ModelRef};
 
@@ -16,7 +17,10 @@ const DAY_CAP: u32 = 24;
 const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Triage, Agent::PlanReviewer];
 
 pub struct DreamerUseCase {
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor» (#1203): скан сессий — best-effort union
+    /// по всем исполнителям (офлайн одного не останавливает пост-обработку),
+    /// собственный спавн — дефолтный исполнитель.
+    pub sessions: Arc<SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
     pub spawn_model: Option<ModelRef>,
@@ -29,7 +33,7 @@ impl DreamerUseCase {
     /// сессии с финалом И реальной работой (токены > 0, не пустышки).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         let now = self.clock.now_ms();
-        let list = self.sessions.list_sessions().await?;
+        let list = self.sessions.list_sessions_best_effort().await?;
         // ≤1 живого дримера одновременно
         if list
             .iter()
@@ -71,9 +75,10 @@ impl DreamerUseCase {
             variant: None,
             bootstrap: false,
         };
-        let session = self.sessions.create_session(&spec).await?;
+        let sessions = self.sessions.default();
+        let session = sessions.create_session(&spec).await?;
         let prompt = dreamer_prompt(&target.id);
-        self.sessions.prompt(&session, &prompt).await?;
+        sessions.prompt(&session, &prompt).await?;
         self.state.mark_dreamer_done(&target.id);
         self.state.mark_dreamer_spawn(&day_key);
         tracing::info!(event = "dreamer.spawned", target = %target.id, session = %session, "Dreamer spawned");

@@ -17,6 +17,7 @@ mod tg;
 mod wiki;
 
 use config::{Config, ConfigError, ENV_CONFIG};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -107,22 +108,84 @@ async fn run(
             )
         }
     };
-    let raw_sessions = Arc::new(executor::OpencodeClient::new(
-        cfg.executor.url.clone(),
-        secrets.opencode_password.clone().unwrap_or_default(),
-        secrets.opencode_gate_cookie.clone(),
-    ));
+    // Исполнители (#1203): дефолтный — [executor]/UWUWU_EXECUTOR_URL,
+    // именованные [[executors]] — клиенты на каждый url; basic-пароль и
+    // гейт-кука общие (redmi использует тот же UWUWU_OPENCODE_PASSWORD).
+    let raw_default: Arc<dyn uwuwu_usecase::AgentSessionGateway> =
+        Arc::new(executor::OpencodeClient::new(
+            cfg.executor.url.clone(),
+            secrets.opencode_password.clone().unwrap_or_default(),
+            secrets.opencode_gate_cookie.clone(),
+        ));
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let clock = Arc::new(clock::SystemClock);
-    // Глобальный спавн-бюджет: все create_session через один потолок;
+    // Глобальный спавн-бюджет: все create_session через один потолок,
+    // разделяемый per-project хэндлами всех исполнителей;
     // UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
     let spawn_cap: usize = std::env::var("UWUWU_SPAWNS_MAX_PER_HOUR")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(10);
-    let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(
-        executor::BudgetedSessions::new(raw_sessions.clone(), spawn_cap, clock.clone()),
-    );
+    let shared_budget = Arc::new(std::sync::Mutex::new(uwuwu_domain::SpawnBudget::new(
+        spawn_cap,
+    )));
+    let budgeted_default: Arc<dyn uwuwu_usecase::AgentSessionGateway> =
+        Arc::new(executor::BudgetedSessions::with_shared(
+            raw_default.clone(),
+            shared_budget.clone(),
+            clock.clone(),
+        ));
+    let mut named_gateways: HashMap<String, Arc<dyn uwuwu_usecase::AgentSessionGateway>> =
+        HashMap::new();
+    for e in &cfg.executors {
+        let raw: Arc<dyn uwuwu_usecase::AgentSessionGateway> =
+            Arc::new(executor::OpencodeClient::new(
+                e.url.clone(),
+                secrets.opencode_password.clone().unwrap_or_default(),
+                secrets.opencode_gate_cookie.clone(),
+            ));
+        named_gateways.insert(
+            e.name.clone(),
+            Arc::new(executor::BudgetedSessions::with_shared(
+                raw,
+                shared_budget.clone(),
+                clock.clone(),
+            )),
+        );
+    }
+    let mut by_project: HashMap<String, Arc<dyn uwuwu_usecase::AgentSessionGateway>> =
+        HashMap::new();
+    for p in &cfg.project {
+        // именованный маршрут — только явная ссылка на НЕ дефолтного
+        // исполнителя (None/дефолт/пусто → бюджетный дефолт-хэндл)
+        let handle = match p.executor.as_deref().map(str::trim) {
+            Some(target) if !target.is_empty() && target != cfg.executor.name => named_gateways
+                .get(target)
+                .expect("конфиг валиден: ссылка проекта резолвится")
+                .clone(),
+            _ => budgeted_default.clone(),
+        };
+        by_project.insert(p.name.trim().to_string(), handle);
+    }
+    let named: Vec<(String, Arc<dyn uwuwu_usecase::AgentSessionGateway>)> = cfg
+        .executors
+        .iter()
+        .map(|e| {
+            (
+                e.name.clone(),
+                named_gateways
+                    .get(&e.name)
+                    .expect("гейтвей именованного исполнителя")
+                    .clone(),
+            )
+        })
+        .collect();
+    let sessions: Arc<uwuwu_usecase::SessionRouter> = Arc::new(uwuwu_usecase::SessionRouter::new(
+        &cfg.executor.name,
+        budgeted_default.clone(),
+        named,
+        by_project,
+    ));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
     let spawn_model_cfg = cfg
@@ -339,8 +402,9 @@ async fn run(
     {
         // боты (#1150): тик супервизора быстрый (wiki-скан) — обычный
         // сайдкар; long-poll живёт в per-bot задачах. Сессии ботов —
-        // через raw-гейтвей (вне спавн-бюджета/CUP)
-        let bot_sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = raw_sessions.clone();
+        // через raw-гейтвей дефолтного исполнителя (вне спавн-бюджета/CUP;
+        // маршрутизация ботов по executor — вне скоупа #1203)
+        let bot_sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = raw_default.clone();
         let bot_supervisor = Arc::new(bots::BotSupervisor::new(
             wiki.clone(),
             bot_sessions,

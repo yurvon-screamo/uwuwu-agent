@@ -37,6 +37,7 @@ impl TickUseCase {
         let title = format!("#{} {}", task.number(), task.title());
         let bootstrap = self
             .sessions
+            .project(&board.project)
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
@@ -51,7 +52,11 @@ impl TickUseCase {
         let result = self
             .spawn_stage_inner(&bootstrap, &env_repo, board, task, slot, &title)
             .await;
-        let _ = self.sessions.delete_session(&bootstrap).await;
+        let _ = self
+            .sessions
+            .project(&board.project)
+            .delete_session(&bootstrap)
+            .await;
         result
     }
 
@@ -64,11 +69,11 @@ impl TickUseCase {
         slot: Slot,
         title: &str,
     ) -> UsecaseResult<String> {
-        self.sessions
+        let sessions = self.sessions.project(&board.project);
+        sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
             .await?;
-        let work = self
-            .sessions
+        let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
                 title: title.to_string(),
@@ -80,7 +85,10 @@ impl TickUseCase {
             })
             .await?;
         let prompt = spawn_prompt(board, task, slot);
-        self.sessions.prompt(&work, &prompt).await?;
+        self.sessions
+            .project(&board.project)
+            .prompt(&work, &prompt)
+            .await?;
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
@@ -111,7 +119,12 @@ impl TickUseCase {
         // Unknown (гейт недоступен — рестарт serve, сеть) ≠ мёртвая:
         // спешный respawn плодил бы дубли на каждом окне недоступности
         // (15.11: рестарт opencode serve) — пропускаем тик, повторим.
-        match self.sessions.liveness(session).await {
+        match self
+            .sessions
+            .project(&board.project)
+            .liveness(session)
+            .await
+        {
             Liveness::Alive => {
                 // будильник: пик держит не-high (живой агент в окне не будим)
                 if policy.peak.holds(now) && task.priority() != Priority::High {
@@ -159,10 +172,11 @@ impl TickUseCase {
             return Ok(WakeAct::None);
         };
         {
-            let activity = self.sessions.last_activity_ms(session).await?;
+            let sessions = self.sessions.project(&board.project);
+            let activity = sessions.last_activity_ms(session).await?;
             let fresh = last.created_ms > activity.unwrap_or(0);
             if fresh {
-                self.sessions
+                sessions
                     .prompt(
                         session,
                         &format!(

@@ -2,7 +2,8 @@
 //! (методичка agents/triage: дедуп/редактура/вердикт Todo или флаг владельцу).
 
 use crate::error::UsecaseResult;
-use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo};
+use crate::ports::{SessionSpec, TaskBoardRepo};
+use crate::router::SessionRouter;
 use std::sync::Arc;
 use uwuwu_domain::{ModelRef, Status, Task};
 
@@ -10,7 +11,8 @@ pub struct TriageUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Доски триажа: (проект, доска, чекаут) — канон: черновики всех досок.
     pub boards: Vec<TriageBoard>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: триаж-спавн — гейтвей проекта доски.
+    pub sessions: Arc<SessionRouter>,
     pub state: Arc<dyn crate::ports::TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
     pub spawn_model: Option<ModelRef>,
@@ -68,9 +70,10 @@ impl TriageUseCase {
         };
         self.state
             .mark_triage_spawn(&tb.board, task.number(), self.clock.now_ms());
-        let session = self.sessions.create_session(&spec).await?;
+        let sessions = self.sessions.project(&tb.project);
+        let session = sessions.create_session(&spec).await?;
         let prompt = triage_prompt(&tb.project, &task);
-        self.sessions.prompt(&session, &prompt).await?;
+        sessions.prompt(&session, &prompt).await?;
         tracing::info!(event = "triage.spawned", number = task.number(), session = %session, "Triage agent spawned");
         Ok(1)
     }
