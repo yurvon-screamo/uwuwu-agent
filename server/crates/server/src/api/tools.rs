@@ -66,7 +66,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_create",
-            "Создать задачу на доске проекта (Draft; тайтл уникален)",
+            "Создать задачу на доске проекта (Analys; тайтл уникален)",
             object(json!({
                 "title": string("тайтл (уникален на доске)"),
                 "project": string("проект; дефолт uwuwu"),
@@ -82,7 +82,7 @@ pub fn tool_descriptors() -> Value {
             object(json!({
                 "number": integer("номер задачи"),
                 "project": string("проект; дефолт uwuwu"),
-                "status": string("статус канона: Draft/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Review/Needs attention/Вейт"),
+                "status": string("статус канона: Draft/Analys/Review Analys/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Review/Needs attention/Вейт"),
                 "branch": string("имя ветки"),
                 "pr": string("URL PR"),
                 "priority": string("high|medium|low"),
@@ -367,7 +367,7 @@ impl ToolHub {
                 let raw_kind = arg("type");
                 if !raw_kind.is_empty() && uwuwu_usecase::parse_task_type(&raw_kind).is_none() {
                     return Err(format!(
-                        "неизвестный тип «{raw_kind}»: bug|spike|analys|docs|feature|refactoring|legacy|idea|qa|infrastructure|other"
+                        "неизвестный тип «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
                     ));
                 }
                 let spec = uwuwu_usecase::NewTask {
@@ -386,7 +386,7 @@ impl ToolHub {
                     .await
                     .map_err(|e| e.to_string())?;
                 ok_text(format!(
-                    "создана задача #{n} (Draft) на доске проекта {project}"
+                    "создана задача #{n} (Analys) на доске проекта {project}"
                 ))
             }
             "task_edit" => {

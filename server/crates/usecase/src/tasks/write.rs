@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status, Task, TaskType};
 
-/// Параметры создания задачи (канон create: Draft + дефолты).
+/// Параметры создания задачи (канон create: Analys + дефолты, #1135).
 #[derive(Debug, Clone, Default)]
 pub struct NewTask {
     pub title: String,
@@ -56,7 +56,8 @@ pub struct SectionEditReport {
 
 #[async_trait]
 pub trait TaskWriter: Send + Sync {
-    /// Создание: Draft, лейбл proj:<project>, fm-скелет; дубль тайтла — ошибка.
+    /// Создание: Analys (create-дефолт #1135), лейбл proj:<project>,
+    /// fm-скелет; дубль тайтла — ошибка.
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
     /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
     /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
