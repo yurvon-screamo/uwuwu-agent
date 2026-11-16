@@ -1472,6 +1472,61 @@ async fn spawn_prompt_demands_finish_transaction() {
 }
 
 #[tokio::test]
+async fn idle_sessions_do_not_hold_cup() {
+    // Регресс 17.11 (#1206-семья): «живая» в API конвейерная сессия,
+    // спящая между ходами (никогда не финализируется), считалась
+    // LLM-тратящей — кап забивался спящими, все новые спавны холдились
+    // всю ночь (active=18 при cap=7). Кап держат busy-строки (ход идёт)
+    // и спавн-кандидаты; idle-сессии не тратят LLM и кап не держат.
+    let mut rows = Vec::new();
+    for n in 70..80u64 {
+        let mut t = task(n, Status::InProgress);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse(&format!("ses_sleep_{n}")).unwrap(),
+        );
+        t.apply_fields(f);
+        rows.push(t);
+    }
+    rows.push(task(99, Status::InProgress)); // кандидат на спавн
+    let state = Arc::new(MemState(Mutex::default()));
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments: Vec::default(),
+    });
+    // все спящие сессии — живые в API (spawned), но idle (ход завершён)
+    let sessions = Arc::new(FakeSessions {
+        idle_reply: true,
+        ..Default::default()
+    });
+    sessions
+        .spawned
+        .lock()
+        .unwrap()
+        .extend((70..80u64).map(|n| format!("ses_sleep_{n}")));
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sessions.clone(),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state,
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "кандидат спавнится: спящие idle-сессии кап не держат"
+    );
+    assert_eq!(out.held_cup, 0, "active = busy + кандидаты, не «живые»");
+}
+
+#[tokio::test]
 async fn dev_session_survives_all_transitions() {
     // Канон сессий: дев-сессия едина между этапами и откатами —
     // переходы стадий её никогда не снимают
