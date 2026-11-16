@@ -69,59 +69,25 @@ fn main() -> Result<(), BootError> {
         .map_err(BootError::Runtime)
 }
 
-async fn run(
-    cfg: Config,
-    secrets: config::Secrets,
-    plan: Arc<uwuwu_usecase::TickPlan>,
-    config_path: PathBuf,
-) -> Result<(), String> {
-    // Композиция: реализации портов → оркестратор
-    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit);
-    // memory-стенд держит и вики (seed UWUWU_MOCK_DOCS) — полный e2e без сети
-    let use_memory_hub = cfg.hub.driver == "memory";
-    let memory_hub: Option<Arc<mockhub::MemoryHub>> = if use_memory_hub {
-        Some(Arc::new(mockhub::MemoryHub::from_env()))
-    } else {
-        None
-    };
-    let mut github_hub: Option<Arc<github::GitHubHub>> = None;
-    let (board, field_store): (
-        Arc<dyn uwuwu_usecase::TaskBoardRepo>,
-        Arc<dyn uwuwu_usecase::IssueFieldStore>,
-    ) = match &memory_hub {
-        Some(mem) => {
-            tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
-            (
-                mem.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
-                mem.clone() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
-            )
-        }
-        None => {
-            let gh = Arc::new(github::GitHubHub::new(
-                cfg.hub.repo.clone(),
-                secrets.gh_token.clone(),
-            ));
-            github_hub = Some(gh.clone());
-            (
-                gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
-                gh.fields() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
-            )
-        }
-    };
-    // Исполнители (#1203): дефолтный — [executor]/UWUWU_EXECUTOR_URL,
-    // именованные [[executors]] — клиенты на каждый url; basic-пароль и
-    // гейт-кука общие (redmi использует тот же UWUWU_OPENCODE_PASSWORD).
+/// Композиция исполнителей и роутера «проект → executor» (#1203):
+/// дефолтный [executor]/UWUWU_EXECUTOR_URL + клиенты именованных
+/// [[executors]]; basic-пароль и гейт-кука общие (redmi использует тот же
+/// UWUWU_OPENCODE_PASSWORD). Спавн-бюджет — один на все per-project
+/// хэндлы; UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
+fn build_sessions(
+    cfg: &Config,
+    secrets: &config::Secrets,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
+) -> (
+    Arc<dyn uwuwu_usecase::AgentSessionGateway>,
+    Arc<uwuwu_usecase::SessionRouter>,
+) {
     let raw_default: Arc<dyn uwuwu_usecase::AgentSessionGateway> =
         Arc::new(executor::OpencodeClient::new(
             cfg.executor.url.clone(),
             secrets.opencode_password.clone().unwrap_or_default(),
             secrets.opencode_gate_cookie.clone(),
         ));
-    let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
-    let clock = Arc::new(clock::SystemClock);
-    // Глобальный спавн-бюджет: все create_session через один потолок,
-    // разделяемый per-project хэндлами всех исполнителей;
-    // UWUWU_SPAWNS_MAX_PER_HOUR=0 — kill-switch (деф. 10).
     let spawn_cap: usize = std::env::var("UWUWU_SPAWNS_MAX_PER_HOUR")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -180,12 +146,58 @@ async fn run(
             )
         })
         .collect();
-    let sessions: Arc<uwuwu_usecase::SessionRouter> = Arc::new(uwuwu_usecase::SessionRouter::new(
+    let router = Arc::new(uwuwu_usecase::SessionRouter::new(
         &cfg.executor.name,
-        budgeted_default.clone(),
+        budgeted_default,
         named,
         by_project,
     ));
+    (raw_default, router)
+}
+
+async fn run(
+    cfg: Config,
+    secrets: config::Secrets,
+    plan: Arc<uwuwu_usecase::TickPlan>,
+    config_path: PathBuf,
+) -> Result<(), String> {
+    // Композиция: реализации портов → оркестратор
+    // Хаб: github (прод) | memory (E2E-стенд без GitHub/rate-limit);
+    // memory-стенд держит и вики (seed UWUWU_MOCK_DOCS) — полный e2e без сети
+    let use_memory_hub = cfg.hub.driver == "memory";
+    let memory_hub: Option<Arc<mockhub::MemoryHub>> = if use_memory_hub {
+        Some(Arc::new(mockhub::MemoryHub::from_env()))
+    } else {
+        None
+    };
+    let mut github_hub: Option<Arc<github::GitHubHub>> = None;
+    let (board, field_store): (
+        Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+        Arc<dyn uwuwu_usecase::IssueFieldStore>,
+    ) = match &memory_hub {
+        Some(mem) => {
+            tracing::info!(event = "hub.memory", "Хаб: memory (мок-E2E стенд)");
+            (
+                mem.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                mem.clone() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
+            )
+        }
+        None => {
+            let gh = Arc::new(github::GitHubHub::new(
+                cfg.hub.repo.clone(),
+                secrets.gh_token.clone(),
+            ));
+            github_hub = Some(gh.clone());
+            (
+                gh.clone() as Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                gh.fields() as Arc<dyn uwuwu_usecase::IssueFieldStore>,
+            )
+        }
+    };
+    // Исполнители и роутер «проект → executor» (#1203); боты — raw-дефолт
+    let clock = Arc::new(clock::SystemClock);
+    let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone());
+    let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
     let spawn_model_cfg = cfg

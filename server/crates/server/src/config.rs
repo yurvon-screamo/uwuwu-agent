@@ -183,33 +183,7 @@ impl Config {
         if !self.executor.url.starts_with("http") {
             return Err(ConfigError::Validation("executor.url не http(s)".into()));
         }
-        // Именованные исполнители (#1203): имена уникальны и не равны
-        // дефолтному, url http(s), ссылки проектов резолвятся — битый
-        // конфиг громко падает на старте.
-        let mut executor_names = std::collections::BTreeSet::new();
-        for e in &self.executors {
-            if e.name.trim().is_empty() {
-                return Err(ConfigError::Validation("executors[].name пуст".into()));
-            }
-            if !e.url.starts_with("http") {
-                return Err(ConfigError::Validation(format!(
-                    "executor «{}»: url не http(s)",
-                    e.name
-                )));
-            }
-            if e.name == self.executor.name {
-                return Err(ConfigError::Validation(format!(
-                    "executor «{}» дублирует имя дефолтного [executor]",
-                    e.name
-                )));
-            }
-            if !executor_names.insert(e.name.as_str()) {
-                return Err(ConfigError::Validation(format!(
-                    "executor «{}» уже в конфиге",
-                    e.name
-                )));
-            }
-        }
+        self.validate_executors()?;
         for p in &self.project {
             if p.name.is_empty() || p.board.is_empty() || p.repo.is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -226,6 +200,36 @@ impl Config {
                         p.name, target
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Именованные исполнители (#1203): имена уникальны и не равны
+    /// дефолтному, url http(s) — битый конфиг громко падает на старте.
+    fn validate_executors(&self) -> Result<(), ConfigError> {
+        let mut names = std::collections::BTreeSet::new();
+        for e in &self.executors {
+            if e.name.trim().is_empty() {
+                return Err(ConfigError::Validation("executors[].name пуст".into()));
+            }
+            if !e.url.starts_with("http") {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}»: url не http(s)",
+                    e.name
+                )));
+            }
+            if e.name == self.executor.name {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}» дублирует имя дефолтного [executor]",
+                    e.name
+                )));
+            }
+            if !names.insert(e.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "executor «{}» уже в конфиге",
+                    e.name
+                )));
             }
         }
         Ok(())

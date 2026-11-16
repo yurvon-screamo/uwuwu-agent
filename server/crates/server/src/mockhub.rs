@@ -38,6 +38,29 @@ struct SeedRow {
     status: Status,
 }
 
+/// Парсинг UWUWU_MOCK_SEED: «;»-раздельные строки «board:number:status»
+/// или «number:status» (без тега — видна на всех досках стенда).
+fn parse_seeds(raw: &str) -> Vec<SeedRow> {
+    raw.split(';')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            match parts.as_slice() {
+                [board, n, s] => Some(SeedRow {
+                    board: Some(board.trim().to_string()),
+                    number: n.trim().parse().ok()?,
+                    status: uwuwu_usecase::parse_status(s.trim()),
+                }),
+                [n, s] => Some(SeedRow {
+                    board: None,
+                    number: n.trim().parse().ok()?,
+                    status: uwuwu_usecase::parse_status(s.trim()),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 pub struct MemoryHub {
     state: Mutex<HubState>,
     /// seed-строки — создаются при пустой доске.
@@ -52,26 +75,7 @@ impl MemoryHub {
     pub fn from_env() -> Self {
         let seeds = std::env::var("UWUWU_MOCK_SEED")
             .ok()
-            .map(|raw| {
-                raw.split(';')
-                    .filter_map(|entry| {
-                        let parts: Vec<&str> = entry.split(':').collect();
-                        match parts.as_slice() {
-                            [board, n, s] => Some(SeedRow {
-                                board: Some(board.trim().to_string()),
-                                number: n.trim().parse().ok()?,
-                                status: uwuwu_usecase::parse_status(s.trim()),
-                            }),
-                            [n, s] => Some(SeedRow {
-                                board: None,
-                                number: n.trim().parse().ok()?,
-                                status: uwuwu_usecase::parse_status(s.trim()),
-                            }),
-                            _ => None,
-                        }
-                    })
-                    .collect()
-            })
+            .map(|raw| parse_seeds(&raw))
             .unwrap_or_default();
         let docs: HashMap<String, String> = std::env::var("UWUWU_MOCK_DOCS")
             .ok()
