@@ -87,10 +87,14 @@ impl TelegramClient {
     }
 
     /// Апдейт ТГ → TgUpdate (не-message типы — без сообщения).
+    /// Индексация через Value (Null на отсутствующих ключах), НЕ через
+    /// &Map: прямой m["chat"] на Map паникует «no entry found for key» —
+    /// ядовитый апдейт без chat/from (посты каналов, edited_*) убивал
+    /// бот-задачу каждые тик рестарт-лупом (инцидент 16.11).
     fn parse_update(raw: &Value) -> TgUpdate {
         TgUpdate {
             update_id: raw["update_id"].as_u64().unwrap_or_default(),
-            message: raw["message"].as_object().map(|m| TgMessage {
+            message: raw.get("message").map(|m| TgMessage {
                 chat_type: m["chat"]["type"].as_str().unwrap_or_default().to_string(),
                 chat_id: m["chat"]["id"].as_i64().unwrap_or_default(),
                 from_username: m["from"]["username"].as_str().map(String::from),
