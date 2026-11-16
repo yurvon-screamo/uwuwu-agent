@@ -399,7 +399,8 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
          1) статусный перевод (uwuwu_task_edit {{number, status}}): {finish};\n\
          2) вопрос владельцу комментом (uwuwu_task_comment) + статус\n\
          «Needs attention».\n\
-         «Поработал и замолчал» = строка зависает до часового автопинга.\n\
+         «Поработал и замолчал» = строка зависает до автопинга конвейера\n\
+         (15 мин при завершённом ходе, до 60 мин — если ход ещё идёт).\n\
          \n\
          Платформа — через MCP-инструменты сервера uwuwu (Code Mode: tools.uwuwu.*):\n\
          - тело задачи и комменты: uwuwu_task_get {{number: {number}}}\n\

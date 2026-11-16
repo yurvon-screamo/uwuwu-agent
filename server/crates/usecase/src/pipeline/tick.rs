@@ -521,21 +521,25 @@ impl TickUseCase {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
         };
-        let Some(session) = task.session_of(slot) else {
+        let Some(session) = task.session_of(slot).map(str::to_string) else {
             return Ok(StallAct::None);
         };
-        let session = session.to_string();
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide)
         let Ok(Some(last_ms)) = self.sessions.last_activity_ms(&session).await else {
             return Ok(StallAct::None);
         };
         let now = self.clock.now_ms();
         let silence = now.saturating_sub(last_ms);
+        // Ранний выход: тишина короче мягкого порога — оба класса молчат;
+        // idle-пробу (HTTP хвоста сообщений) не тратим на свежие строки
+        if silence < STALL_SOFT_SILENCE_MS {
+            return Ok(StallAct::None);
+        }
         // Два класса тишины (#1206, санкция владельца): ход завершён
-        // (последнее сообщение — финальный ответ агента), а статусная
-        // транзакция не закрыта → мягкий пинг прямо в сессию через
-        // 15 мин; ход идёт (tool-call/стрим) → классический порог 60 мин
-        // (защита от ложных пингов на длинных операциях, #161).
+        // (последнее содержательное сообщение — финальный ответ агента),
+        // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
+        // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
+        // классический порог 60 мин (длинные операции, #161).
         let idle = self.session_idle(&session).await;
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
