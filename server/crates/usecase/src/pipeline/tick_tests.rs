@@ -152,6 +152,9 @@ impl FakeSessions {
             specs: Mutex::default(),
             live: Mutex::default(),
             activity_ms: 1000,
+            dead_sessions: Mutex::default(),
+            list_fails: false,
+            idle_reply: false,
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -160,8 +163,6 @@ impl FakeSessions {
             ..Self::new()
         }
     }
-
-
 }
 
 #[async_trait]
@@ -177,8 +178,6 @@ impl AgentSessionGateway for FakeSessions {
             .lock()
             .unwrap()
             .push(format!("{session}|{text}"));
-            .push(format!("{session}: {text}"));
-
         Ok(())
     }
     async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
@@ -214,8 +213,9 @@ impl AgentSessionGateway for FakeSessions {
                 "list недоступен (мок)".into(),
             ));
         }
-        // spawned = живые сессии (outcome пуст — финала нет)
-        Ok(self
+        // spawned = живые сессии (outcome пуст — финала нет);
+        // live = синтетические роли для alive-гвардов тестов аналитики (#1135)
+        let mut out: Vec<crate::ports::SessionInfo> = self
             .spawned
             .lock()
             .unwrap()
@@ -225,20 +225,19 @@ impl AgentSessionGateway for FakeSessions {
                 agent: String::new(),
                 updated_ms: 0,
                 outcome: String::new(),
-        Ok(self
-            .live
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(agent, outcome)| crate::ports::SessionInfo {
+                total_tokens: 0,
+            })
+            .collect();
+        for (agent, outcome) in self.live.lock().unwrap().iter() {
+            out.push(crate::ports::SessionInfo {
                 id: format!("ses_live_{agent}"),
                 agent: agent.clone(),
                 updated_ms: 0,
                 outcome: outcome.clone(),
-
                 total_tokens: 0,
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
     async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
         Ok(String::new())
@@ -550,6 +549,8 @@ fn peak_usecase(
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
+        specs: Mutex::default(),
+        live: Mutex::default(),
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -986,6 +987,8 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         dead_sessions: Mutex::default(),
         list_fails: true,
         idle_reply: false,
+        specs: Mutex::default(),
+        live: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -1269,6 +1272,8 @@ async fn undelivered_comment_is_not_marked_seen() {
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
+            specs: Mutex::default(),
+            live: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -1319,6 +1324,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
+        specs: Mutex::default(),
+        live: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -1379,6 +1386,8 @@ async fn multi_comment_tail_delivered_together() {
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
+        specs: Mutex::default(),
+        live: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1491,6 +1500,8 @@ async fn busy_session_not_pinged_early() {
         // молчание ~30 мин (tool-call висит), idle_reply = false
         activity_ms: 100_000_000 - 30 * 60_000,
         idle_reply: false,
+        specs: Mutex::default(),
+        live: Mutex::default(),
         ..Default::default()
     });
     let u = TickUseCase {
@@ -1700,6 +1711,7 @@ fn analyst_uc(
     let board = Arc::new(FakeBoard {
         rows,
         log: Mutex::default(),
+        comments: vec![],
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -1719,6 +1731,7 @@ fn review_uc(
     let board = Arc::new(FakeBoard {
         rows,
         log: Mutex::default(),
+        comments: vec![],
     });
     let u = AnalystReviewUseCase {
         board: board.clone(),
