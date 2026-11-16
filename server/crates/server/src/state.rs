@@ -33,6 +33,8 @@ struct BotRow {
     session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -325,6 +327,25 @@ impl BotStateStore for JsonStateStore {
             .bots
             .get(slug)
             .and_then(|b| b.offset)
+    }
+
+    fn bot_manual_hash(&self, slug: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.manual_hash)
+    }
+
+    fn set_bot_manual_hash(&self, slug: &str, hash: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .entry(slug.to_string())
+            .or_default()
+            .manual_hash = Some(hash);
     }
 
     fn set_bot_offset(&self, slug: &str, offset: u64) {

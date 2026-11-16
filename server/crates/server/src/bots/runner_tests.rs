@@ -14,7 +14,7 @@ use uwuwu_usecase::{
     UsecaseError, UsecaseResult, WikiRepo,
 };
 
-use super::runner::{spawn_bot_task, BotDeps, BotStructural};
+use super::runner::{process_message, spawn_bot_task, BotDeps, BotStructural};
 use super::supervisor::{BotSupervisor, GuardTiming};
 use super::BotLive;
 
@@ -262,7 +262,7 @@ impl AgentSessionGateway for FakeSessions {
 }
 
 /// slug → (session, offset) — пара состояния бота.
-type BotRow = (Option<String>, Option<u64>);
+type BotRow = (Option<String>, Option<u64>, Option<u64>);
 
 #[derive(Default)]
 struct FakeState {
@@ -293,6 +293,18 @@ impl BotStateStore for FakeState {
         let mut rows = self.rows.lock().expect("state lock");
         let e = rows.entry(slug.to_string()).or_default();
         e.1 = Some(offset);
+    }
+    fn bot_manual_hash(&self, slug: &str) -> Option<u64> {
+        self.rows
+            .lock()
+            .expect("state lock")
+            .get(slug)
+            .and_then(|r| r.2)
+    }
+    fn set_bot_manual_hash(&self, slug: &str, hash: u64) {
+        let mut rows = self.rows.lock().expect("state lock");
+        let e = rows.entry(slug.to_string()).or_default();
+        e.2 = Some(hash);
     }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
@@ -444,6 +456,7 @@ fn deps(
                 variant: None,
             },
             workspace: "/tmp/opencode".into(),
+            agent: None,
         },
         live: Arc::new(live),
         tg,
@@ -1101,5 +1114,105 @@ fn stop_reason_discriminates_the_three_cases() {
         stop_reason(Some(&Ok(on))),
         None,
         "живая запись — гасить нечего"
+    );
+}
+
+#[tokio::test]
+async fn manual_rides_once_not_every_message() {
+    // Владелец 16.11: методичка не префиксует каждый промпт — едет
+    // одним сообщением при создании (hash-детект), дальше чистый текст.
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let live = BotLive::new(
+        Some("yurvon".into()),
+        Some("привет".into()),
+        "методичка-тело".into(),
+    );
+    let deps0 = deps(
+        FakeTg::new(vec![]),
+        sessions.clone(),
+        state.clone(),
+        50,
+        5,
+        live,
+    );
+    // сообщение 1: промпт несёт методичку (бутстрап)
+    let u1 = private_update(1, "yurvon", "вопрос один");
+    process_message(&deps0, u1.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    {
+        let ps = sessions.prompts_snapshot();
+        assert!(
+            ps.iter().any(|(_, p)| p.contains("методичка-тело")),
+            "первый промпт вшивает методичку: {ps:?}"
+        );
+    }
+    // сообщение 2: тот же hash — промпт чистый
+    let u2 = private_update(2, "yurvon", "вопрос два");
+    process_message(&deps0, u2.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    {
+        let ps = sessions.prompts_snapshot();
+        let second: Vec<&String> = ps
+            .iter()
+            .filter(|(_, p)| p.contains("вопрос два"))
+            .map(|(_, p)| p)
+            .collect();
+        assert!(second.len() == 1, "второй промпт есть: {ps:?}");
+        assert!(
+            second.iter().all(|p| !p.contains("методичка-тело")),
+            "повторной методички нет: {ps:?}"
+        );
+    }
+    // правка методички (горячая): следующий промпт несёт новую — один раз
+    let deps1 = deps(
+        FakeTg::new(vec![]),
+        sessions.clone(),
+        state.clone(),
+        50,
+        5,
+        BotLive::new(
+            Some("yurvon".into()),
+            Some("привет".into()),
+            "новая-методичка".into(),
+        ),
+    );
+    let u3 = private_update(3, "yurvon", "вопрос три");
+    process_message(&deps1, u3.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    {
+        let ps = sessions.prompts_snapshot();
+        assert!(
+            ps.iter()
+                .any(|(_, p)| p.contains("новая-методичка") && p.contains("вопрос три")),
+            "правка методички доезжает одним промптом: {ps:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_mode_prompt_is_raw_text() {
+    // fm agent: методичка в agents/<name>.md воркспейса — промпт
+    // пользователю несёт ТОЛЬКО текст сообщения, тело дока не едет.
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let live = BotLive::new(
+        Some("yurvon".into()),
+        None,
+        "методичка-дока-игнорируется".into(),
+    );
+    let mut d = deps(FakeTg::new(vec![]), sessions.clone(), state, 50, 5, live);
+    d.structural.agent = Some("marketing".into());
+    let u = private_update(1, "yurvon", "чистый вопрос");
+    process_message(&d, u.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let ps = sessions.prompts_snapshot();
+    assert!(
+        ps.iter().any(|(_, p)| p == "чистый вопрос"),
+        "agent-режим: промпт без методички, только текст: {ps:?}"
     );
 }

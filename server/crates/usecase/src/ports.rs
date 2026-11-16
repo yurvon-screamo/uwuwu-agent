@@ -102,6 +102,10 @@ pub struct SessionSpec {
     pub title: String,
     /// Агент сессии: дефолтная или роль конвейера (AgentSlot).
     pub agent: AgentSlot,
+    /// Именованный агент опенкода (agents/<name>.md в cwd сессии):
+    /// боты с fm agent — методичка в agent-md, не в промптах.
+    /// Приоритетнее agent-слота.
+    pub custom_agent: Option<String>,
     /// Модель спавна; None — дефолт исполнителя.
     pub model: Option<ModelRef>,
     /// Вариант модели (opencode model.variant, напр. «low»); None — без.

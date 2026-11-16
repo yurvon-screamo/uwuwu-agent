@@ -44,5 +44,10 @@ pub trait BotStateStore: Send + Sync {
     fn set_bot_session(&self, slug: &str, session: Option<&str>);
     fn bot_offset(&self, slug: &str) -> Option<u64>;
     fn set_bot_offset(&self, slug: &str, offset: u64);
+    /// Hash методички, вшитой в сессию бутстрап-промптом (doc-режим):
+    /// расхождение = правка методички → следующий промпт понесёт её
+    /// снова (один раз), дальше — чистый текст.
+    fn bot_manual_hash(&self, slug: &str) -> Option<u64>;
+    fn set_bot_manual_hash(&self, slug: &str, hash: u64);
     fn save(&self) -> UsecaseResult<()>;
 }

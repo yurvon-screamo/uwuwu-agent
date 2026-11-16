@@ -25,6 +25,9 @@ pub(crate) struct BotStructural {
     pub title: String,
     pub model: BotModel,
     pub workspace: String,
+    /// fm agent — именованный агент опенкода (agents/<name>.md в
+    /// workspace): методичка в agent-md, промпты — чистый текст.
+    pub agent: Option<String>,
 }
 
 pub(crate) struct BotDeps {
@@ -95,7 +98,7 @@ async fn handle_update(deps: &BotDeps, u: &TgUpdate) -> bool {
     true
 }
 
-async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
+pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
     let view = deps.live.view();
     let Some(text) = classify_message(m, view.owner.as_deref()) else {
         tracing::info!(event = "bot.skipped", slug = %deps.slug, chat_id = m.chat_id,
@@ -108,15 +111,30 @@ async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
         }
     }
     let session = ensure_session(deps).await?;
+    // Методичка НЕ префиксует каждое сообщение (владелец 16.11):
+    // - agent-режим: методичка в agents/<name>.md, промпт — чистый текст;
+    // - doc-режим: методичка едет одним сообщением при создании/правке
+    //   (hash-детект в state) и остаётся в памяти вечной сессии.
+    let manual_hash = view.manual.len() as u64 ^ view.manual.chars().count() as u64;
+    let need_manual = deps.state.bot_manual_hash(&deps.slug) != Some(manual_hash);
+    let prompt_text = if deps.structural.agent.is_some() {
+        text
+    } else if need_manual {
+        build_prompt(&view.manual, &text)
+    } else {
+        text
+    };
     let baseline = deps
         .sessions
         .last_assistant_reply(&session)
         .await?
         .map(|r| r.created_ms)
         .unwrap_or(0);
-    deps.sessions
-        .prompt(&session, &build_prompt(&view.manual, &text))
-        .await?;
+    deps.sessions.prompt(&session, &prompt_text).await?;
+    if need_manual && deps.structural.agent.is_none() {
+        deps.state.set_bot_manual_hash(&deps.slug, manual_hash);
+        deps.state.save().ok();
+    }
     match wait_reply(deps, &session, baseline).await {
         Some(reply) if !reply.trim().is_empty() => send(deps, m.chat_id, &reply).await?,
         _ => {
@@ -147,6 +165,7 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
     }
     let m = &deps.structural.model;
     let spec = SessionSpec {
+        custom_agent: deps.structural.agent.clone(),
         directory: deps.structural.workspace.clone(),
         title: format!("Бот: {}", deps.structural.title),
         agent: AgentSlot::Default,

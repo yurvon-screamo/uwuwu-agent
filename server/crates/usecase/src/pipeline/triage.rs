@@ -58,6 +58,7 @@ impl TriageUseCase {
             return Ok(0);
         };
         let spec = SessionSpec {
+            custom_agent: None,
             directory: tb.checkout.clone(),
             title: format!("триаж #{}", task.number()),
             agent: uwuwu_domain::AgentSlot::Role(uwuwu_domain::Agent::Triage),

@@ -143,6 +143,7 @@ mod tests {
 
     fn spec(bootstrap: bool) -> SessionSpec {
         SessionSpec {
+            custom_agent: None,
             directory: "/tmp".into(),
             title: "t".into(),
             agent: uwuwu_domain::AgentSlot::Default,
