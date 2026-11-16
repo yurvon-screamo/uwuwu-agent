@@ -640,14 +640,16 @@ impl GitHubHub {
         if item.is_empty() {
             return Err(UsecaseError::Board(format!("add #{number}: нет item id")));
         }
-        if let Some(draft) = meta.options.get("Draft") {
+        // create-дефолт Analys (#1135): опция ставится по имени колонки;
+        // колонки нет — строка остаётся без статуса (rollout плана)
+        if let Some(analys) = meta.options.get("Analys") {
             let set = r#"
               mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
                 updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
                   value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }"#;
             self.gql(
                 set,
-                json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": draft }),
+                json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": analys }),
             )
             .await?;
         }

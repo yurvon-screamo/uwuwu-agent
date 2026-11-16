@@ -283,23 +283,30 @@ async fn run(
         });
     }
     {
-        // триаж: черновики всех досок (мультиборд); дример — чекаут первой
-        let triage = Arc::new(uwuwu_usecase::TriageUseCase {
+        // аналитика (#1135, замена триажа): волны со всех досок; дример — чекаут первой
+        let analyst_boards: Vec<uwuwu_usecase::AnalystBoard> = boards_info
+            .iter()
+            .map(
+                |(project, board_title, checkout)| uwuwu_usecase::AnalystBoard {
+                    project: project.clone(),
+                    board: board_title.clone(),
+                    checkout: checkout.clone(),
+                },
+            )
+            .collect();
+        let analyst = Arc::new(uwuwu_usecase::AnalystUseCase {
             board: board.clone(),
-            boards: boards_info
-                .iter()
-                .map(
-                    |(project, board_title, checkout)| uwuwu_usecase::TriageBoard {
-                        project: project.clone(),
-                        board: board_title.clone(),
-                        checkout: checkout.clone(),
-                    },
-                )
-                .collect(),
+            boards: analyst_boards.clone(),
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
+        });
+        let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
+            board: board.clone(),
+            boards: analyst_boards,
+            sessions: sessions.clone(),
+            state: state.clone(),
+            clock: clock.clone(),
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
@@ -312,14 +319,26 @@ async fn run(
                 .unwrap_or_default(),
         });
         sidecars.push(Sidecar {
-            name: "triage".into(),
+            name: "analys".into(),
             tick: Box::new(move || {
-                let t = triage.clone();
+                let a = analyst.clone();
                 Box::pin(async move {
                     if is_observe {
                         return Ok(());
                     }
-                    t.tick().await.map(|_| ())
+                    a.tick().await.map(|_| ())
+                })
+            }),
+        });
+        sidecars.push(Sidecar {
+            name: "analys-review".into(),
+            tick: Box::new(move || {
+                let r = analyst_review.clone();
+                Box::pin(async move {
+                    if is_observe {
+                        return Ok(());
+                    }
+                    r.tick().await.map(|_| ())
                 })
             }),
         });

@@ -46,6 +46,11 @@ impl MemoryHub {
                 uwuwu_usecase::parse_status(s.trim()),
             ))
         });
+        Self::with_seed(seed)
+    }
+
+    /// Явный сид (юнит-тесты): строка (номер, статус) на пустой доске.
+    pub fn with_seed(seed: Option<(u64, Status)>) -> Self {
         let docs: HashMap<String, String> = std::env::var("UWUWU_MOCK_DOCS")
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -197,7 +202,7 @@ impl TaskBoardRepo for MemoryHub {
             state.next_number += 1;
             state
                 .tasks
-                .insert(number, Task::new(number, title.to_string(), Status::Draft));
+                .insert(number, Task::new(number, title.to_string(), Status::Analys));
             state.bodies.insert(number, body.to_string());
             Ok(number)
         })
