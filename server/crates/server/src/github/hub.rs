@@ -82,10 +82,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql transport: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+        }
         let body: Value = serde_json::from_str(&text)
             .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
@@ -95,6 +99,9 @@ impl GitHubHub {
             )));
         }
         if let Some(errors) = body.get("errors") {
+            if let Some(fail) = crate::gherr::classify_gql_errors(&body) {
+                return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+            }
             return Err(UsecaseError::Board(format!("graphql errors: {errors}")));
         }
         body.get("data")
@@ -121,10 +128,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("rest transport {path}: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("rest body {path}: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh api {path}: {fail}")));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {

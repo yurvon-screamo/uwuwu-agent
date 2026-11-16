@@ -41,10 +41,14 @@ impl GhPrGateway {
             .await
             .map_err(|e| UsecaseError::Pr(format!("transport {path}: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Pr(format!("body {path}: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Pr(format!("pr gate {path}: {fail}")));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {
@@ -169,6 +173,10 @@ impl PrGateway for GhPrGateway {
             .await
             .map_err(|e| UsecaseError::Pr(format!("merge transport: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Pr(format!("merge #{number}: {fail}")));
+        }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(UsecaseError::Pr(format!(
