@@ -71,6 +71,11 @@ fn other_statuses_and_success_are_not_classified() {
         None,
         "успешный ответ не ошибка даже с обнулённой квотой"
     );
+    assert_eq!(
+        classify(StatusCode::TOO_MANY_REQUESTS, &hdr(&[])),
+        None,
+        "bare 429 без rate-limit признаков не классифицируется (текущее поведение)"
+    );
 }
 
 #[test]

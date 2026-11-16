@@ -63,7 +63,9 @@ impl GhPrGateway {
             .get(&format!("/repos/{owner}/{repo}/commits/{sha}/check-runs"))
             .await?;
         if !status.is_success() {
-            // нет чеков/нет доступа — считаем зелёным (мерж-гейт только CI-ред)
+            // 403 сюда не доходит — gherr::classify выше отдаёт громкий Err
+            // (rate limit/permission); ветка осмысленна для 404 и прочих
+            // не-success: нет чеков — считаем зелёным (мерж-гейт только CI-ред)
             return Ok(true);
         }
         let runs = body["check_runs"].as_array().cloned().unwrap_or_default();

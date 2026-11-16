@@ -57,22 +57,17 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> Option<GhFail> {
     if code != 403 && code != 429 {
         return None;
     }
-    let header_value = |name: &str| {
+    let header_num = |name: &str| {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
-            .and_then(|value| value.parse::<u64>().ok())
     };
-    if header_value("x-ratelimit-remaining") == Some(0) {
-        let reset_epoch = headers
-            .get("x-ratelimit-reset")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .and_then(|value| value.parse::<i64>().ok());
+    if header_num("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok()) == Some(0) {
+        let reset_epoch = header_num("x-ratelimit-reset").and_then(|v| v.parse::<i64>().ok());
         return Some(GhFail::Core { reset_epoch });
     }
-    if let Some(retry_after_secs) = header_value("retry-after") {
+    if let Some(retry_after_secs) = header_num("retry-after").and_then(|v| v.parse::<u64>().ok()) {
         return Some(GhFail::Secondary { retry_after_secs });
     }
     if code == 403 {
