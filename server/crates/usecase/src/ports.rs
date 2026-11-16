@@ -133,6 +133,9 @@ pub struct AssistantReply {
     pub text: String,
     /// finish-маркер присутствует — ответ завершён (иначе ещё стримится).
     pub finished: bool,
+    /// Ответ — самое свежее сообщение сессии: после него нет ни промптов,
+    /// ни tool-call'ов. «Ход завершён»: агент ответил и ждёт (#1206).
+    pub is_latest: bool,
 }
 
 #[async_trait]

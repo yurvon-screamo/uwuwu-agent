@@ -126,6 +126,7 @@ impl TaskBoardRepo for FakeBoard {
     }
 }
 
+#[derive(Default)]
 struct FakeSessions {
     prompts: Mutex<Vec<String>>,
     spawned: Mutex<Vec<String>>,
@@ -135,6 +136,8 @@ struct FakeSessions {
     dead_sessions: Mutex<Vec<String>>,
     /// Недоступность list_sessions (fallback-сценарий CUP-подсчёта).
     list_fails: bool,
+    /// Последнее сообщение сессии — финальный ответ агента (idle).
+    idle_reply: bool,
 }
 
 #[async_trait]
@@ -171,7 +174,12 @@ impl AgentSessionGateway for FakeSessions {
         &self,
         _s: &str,
     ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
-        Ok(None)
+        Ok(self.idle_reply.then(|| crate::ports::AssistantReply {
+            created_ms: self.activity_ms,
+            text: String::new(),
+            finished: true,
+            is_latest: true,
+        }))
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
         if self.list_fails {
@@ -370,6 +378,7 @@ fn usecase_with_state(
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        idle_reply: false,
     });
     let prs = Arc::new(FakePrs {
         state: pr,
@@ -419,6 +428,7 @@ fn peak_usecase(
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        idle_reply: false,
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -854,6 +864,7 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: true,
+        idle_reply: false,
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -1136,6 +1147,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             activity_ms: 5000,
             dead_sessions: Mutex::default(),
             list_fails: false,
+            idle_reply: false,
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -1185,6 +1197,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        idle_reply: false,
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -1244,6 +1257,7 @@ async fn multi_comment_tail_delivered_together() {
         activity_ms: 900,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        idle_reply: false,
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1268,6 +1282,192 @@ async fn multi_comment_tail_delivered_together() {
     assert_eq!(
         state.0.lock().unwrap().comments.last().map(String::as_str),
         Some("c2")
+    );
+}
+
+#[tokio::test]
+async fn inflight_comment_delivered_after_agent_reply() {
+    // High-1 #1206: коммент создан ВО ВРЕМЯ хода агента (активность новее
+    // коммента — fresh=false навсегда, активность монотонна). После ответа
+    // агента (последнее сообщение — финальный ассистентский) хвост
+    // доставляется немедленно, без часового сталла
+    let mut t = task(62, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_62").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().comments.push("A".into());
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "verdict".into(),
+            created_ms: 3000,
+            body: "вердикт ревьювера".into(),
+        }],
+    });
+    // агент ответил ПОСЛЕ коммента: activity 5000 > created 3000 — но ход
+    // завершён (idle_reply: последнее сообщение — финальный ответ)
+    let sess = Arc::new(FakeSessions {
+        activity_ms: 5000,
+        idle_reply: true,
+        ..Default::default()
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sess.clone(),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state,
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "in-flight коммент доставлен после ответа");
+    assert!(sess
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.contains("вердикт ревьювера")));
+}
+
+#[tokio::test]
+async fn busy_session_not_pinged_early() {
+    // ход идёт (последнее сообщение — не ответ агента): мягкий порог не
+    // срабатывает, классический сталл ждёт свой час (#161 — длинные
+    // операции не пингуем)
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(63, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_63").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: Vec::default(),
+    });
+    let sess = Arc::new(FakeSessions {
+        // молчание ~30 мин (tool-call висит), idle_reply = false
+        activity_ms: 100_000_000 - 30 * 60_000,
+        idle_reply: false,
+        ..Default::default()
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sess.clone(),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_pings + out.soft_pings,
+        0,
+        "busy-сессия не пингуется (ход идёт)"
+    );
+    assert!(sess.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn soft_ping_wakes_idle_session_without_transaction() {
+    // Санкция владельца 16.11: сессия завершила активность, статус не
+    // переведён → мягкий пинг ПРЯМЫМ промптом в сессию через 15 мин
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(64, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_64").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: Vec::default(),
+    });
+    let sess = Arc::new(FakeSessions {
+        // молчание 16 мин, ход завершён (idle)
+        activity_ms: 100_000_000 - 16 * 60_000,
+        idle_reply: true,
+        ..Default::default()
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sess.clone(),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл в сессию");
+    assert!(sess
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.contains("Мягкий пинг")));
+}
+
+#[tokio::test]
+async fn spawn_prompt_demands_finish_transaction() {
+    // Дыра промптинга (владелец 16.11): контракт хода обязан быть в промпте
+    // спавна — «засыпает после ответа» + два легальных финала хода
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let task = Task::new(7, "t".into(), Status::Design);
+    let prompt = crate::pipeline::actions::spawn_prompt(&board, &task, Slot::Design);
+    assert!(prompt.contains("ЗАСЫПАЕТ"), "промпт объясняет сон сессии");
+    assert!(
+        prompt.contains("Ревью плана"),
+        "финал хода назван для стадии"
+    );
+    assert!(
+        prompt.contains("Needs attention"),
+        "вопрос владельцу — легальный финал"
     );
 }
 
@@ -1384,6 +1584,7 @@ async fn stall_detector_pings_then_flags() {
         activity_ms: now - STALL_SILENCE_MS - 60_000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        idle_reply: false,
     });
     struct AdvClock(AtomicU64);
     impl Clock for AdvClock {

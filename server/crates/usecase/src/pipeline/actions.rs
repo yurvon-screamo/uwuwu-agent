@@ -175,7 +175,13 @@ impl TickUseCase {
         {
             let activity = self.sessions.last_activity_ms(session).await?;
             let fresh = last.created_ms > activity.unwrap_or(0);
-            if fresh {
+            // Ход завершён (последнее сообщение сессии — финальный ответ
+            // агента): коммиты хвоста созданы во время хода — активность
+            // всегда новее, fresh=false навсегда; доставляем сразу после
+            // ответа агента (High-1 #1206: недостижимая «активность
+            // застынет ниже коммента» заменена честным idle-критерием)
+            let idle = !fresh && self.session_idle(session).await;
+            if fresh || idle {
                 let body = tail
                     .iter()
                     .map(|c| c.body.as_str())
@@ -195,18 +201,27 @@ impl TickUseCase {
                     event = "wakeup.delivered",
                     number = task.number(),
                     tail = tail.len(),
+                    idle,
                     "Wakeup delivered"
                 );
                 self.state
                     .set_last_comment_id(&board.board, task.number(), &last.id);
                 return Ok(WakeAct::Woke);
             }
-            // Коммент создан во время работы агента (активность новее):
-            // агент его ещё не видел — seen НЕ пишем, доставка повторится
-            // на тике, где ход застынет (гонка #1206: пометка навсегда
-            // прятала вердикты от будильника)
+            // Агент ещё работает (последнее сообщение — промпт/tool-call):
+            // seen НЕ пишем, доставка повторится на тике после ответа
             Ok(WakeAct::None)
         }
+    }
+
+    /// Ход сессии завершён: последнее сообщение — финальный ассистентский
+    /// ответ (после него нет ни промптов, ни tool-call'ов). Err трактуем
+    /// консервативно («не завершён») — пинги и доставки не спешат.
+    pub(crate) async fn session_idle(&self, session: &str) -> bool {
+        matches!(
+            self.sessions.last_assistant_reply(session).await,
+            Ok(Some(reply)) if reply.is_latest && reply.finished
+        )
     }
 
     /// Респавн мёртвой сессии стадии через луп-гвард (attention-механика:
@@ -359,7 +374,7 @@ impl TickUseCase {
     }
 }
 
-fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
+pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
     let stage = match slot {
         Slot::Design => "стадия утряски: изучи постановку, уточни у владельца, собери план",
         Slot::Dev => "реализация по утверждённому плану; веди задачу по канону AGENTS.md",
@@ -367,9 +382,24 @@ fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
         Slot::ResultReview => "ревью результата: код/CI/отчёт, вердикт комментом",
         Slot::Test => "тестирование: качество фичи, вердикт pass/fail с шагами",
     };
+    let finish = match slot {
+        Slot::Design => "план в тело → переведи статус в «Ревью плана»",
+        Slot::Dev => "код/CI/PR/отчёт готовы → переведи статус в «Ревью результата»",
+        Slot::PlanReview => "вердикт комментом → approve/request_changes и статус по вердикту",
+        Slot::ResultReview => "вердикт комментом → approve/request_changes и статус по вердикту",
+        Slot::Test => "вердикт pass/fail комментом → статус Review или In Progress",
+    };
     format!(
         "Задача #{number} «{title}» (доска «{board}», проект {project}).\n\
          Ты — агент конвейера uwuwu (методичка репо). {stage}.\n\
+         \n\
+         ⚠ Контракт хода: твоя сессия ЗАСЫПАЕТ после ответа — конвейер не\n\
+         продолжит работу, пока ты не закроешь транзакцию. Ход не завершай\n\
+         без одного из двух:\n\
+         1) статусный перевод (uwuwu_task_edit {{number, status}}): {finish};\n\
+         2) вопрос владельцу комментом (uwuwu_task_comment) + статус\n\
+         «Needs attention».\n\
+         «Поработал и замолчал» = строка зависает до часового автопинга.\n\
          \n\
          Платформа — через MCP-инструменты сервера uwuwu (Code Mode: tools.uwuwu.*):\n\
          - тело задачи и комменты: uwuwu_task_get {{number: {number}}}\n\
