@@ -365,17 +365,32 @@ mod tests {
     fn patch_is_empty_only_when_no_field_is_set() {
         // дефолтный патч — менять нечего
         assert!(TaskPatch::default().is_empty());
-        // любое заполненное поле делает патч непустым
-        let patch = TaskPatch {
-            status: Some(Status::Todo),
-            ..TaskPatch::default()
-        };
-        assert!(!patch.is_empty());
-        let patch = TaskPatch {
-            title: Some("новый тайтл".into()),
-            ..TaskPatch::default()
-        };
-        assert!(!patch.is_empty());
+        // каждое заполненное поле в отдельности делает патч непустым
+        let cases = [
+            TaskPatch {
+                status: Some(Status::Todo),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                branch: Some("work/x".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                pr: Some("https://example.test/pull/1".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                priority: Some("high".into()),
+                ..TaskPatch::default()
+            },
+            TaskPatch {
+                title: Some("новый тайтл".into()),
+                ..TaskPatch::default()
+            },
+        ];
+        for patch in &cases {
+            assert!(!patch.is_empty(), "патч с {patch:?} не пуст");
+        }
     }
 
     #[test]
