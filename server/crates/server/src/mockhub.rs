@@ -16,6 +16,8 @@ struct HubState {
     next_number: u64,
     /// number → задача
     tasks: HashMap<u64, Task>,
+    /// number → доска (тег; без тега — видна на всех досках стенда)
+    board_tags: HashMap<u64, String>,
     /// number → поля (сессии/ветка/PR)
     fields: HashMap<u64, TaskFields>,
     /// number → тело issue
@@ -29,23 +31,48 @@ struct HubState {
     docs: HashMap<String, String>,
 }
 
+/// Seed-строка стенда: доска (опционально), номер, стартовый статус.
+struct SeedRow {
+    board: Option<String>,
+    number: u64,
+    status: Status,
+}
+
 pub struct MemoryHub {
     state: Mutex<HubState>,
-    /// seed-строка: (номер, статус) — создаётся при пустой доске.
-    seed: Option<(u64, Status)>,
+    /// seed-строки — создаются при пустой доске.
+    seeds: Vec<SeedRow>,
 }
 
 impl MemoryHub {
-    /// Seed-строка для E2E-прогона (UWUWU_MOCK_SEED="1148:Design").
+    /// Seed-строки для E2E-прогона (UWUWU_MOCK_SEED), «;»-раздельные:
+    /// «1148:Design» (без тега — видна на всех досках) или
+    /// «Задачи uwuwu:1148:Design» (тег доски — мульти-экзекьютор #1203).
     /// Вики-сид: UWUWU_MOCK_DOCS — JSON «слаг → markdown» (боты e2e).
     pub fn from_env() -> Self {
-        let seed = std::env::var("UWUWU_MOCK_SEED").ok().and_then(|raw| {
-            let (n, s) = raw.split_once(':')?;
-            Some((
-                n.trim().parse().ok()?,
-                uwuwu_usecase::parse_status(s.trim()),
-            ))
-        });
+        let seeds = std::env::var("UWUWU_MOCK_SEED")
+            .ok()
+            .map(|raw| {
+                raw.split(';')
+                    .filter_map(|entry| {
+                        let parts: Vec<&str> = entry.split(':').collect();
+                        match parts.as_slice() {
+                            [board, n, s] => Some(SeedRow {
+                                board: Some(board.trim().to_string()),
+                                number: n.trim().parse().ok()?,
+                                status: uwuwu_usecase::parse_status(s.trim()),
+                            }),
+                            [n, s] => Some(SeedRow {
+                                board: None,
+                                number: n.trim().parse().ok()?,
+                                status: uwuwu_usecase::parse_status(s.trim()),
+                            }),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let docs: HashMap<String, String> = std::env::var("UWUWU_MOCK_DOCS")
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -63,7 +90,7 @@ impl MemoryHub {
                 docs,
                 ..HubState::default()
             }),
-            seed,
+            seeds,
         }
     }
 
@@ -76,26 +103,42 @@ impl MemoryHub {
         if !state.tasks.is_empty() {
             return;
         }
-        if let Some((number, status)) = self.seed {
+        for seed in &self.seeds {
             state.tasks.insert(
-                number,
-                Task::new(number, "мок-цикл конвейера".into(), status),
+                seed.number,
+                Task::new(seed.number, "мок-цикл конвейера".into(), seed.status),
             );
+            if let Some(board) = &seed.board {
+                state.board_tags.insert(seed.number, board.clone());
+            }
             state
                 .bodies
-                .insert(number, "## Постановка\n\nМок-E2E стенд.\n".into());
-            state.next_number = number + 1;
-            tracing::info!(event = "mockhub.seeded", number, "Seed-строка создана");
+                .insert(seed.number, "## Постановка\n\nМок-E2E стенд.\n".into());
+            state.next_number = state.next_number.max(seed.number + 1);
+            tracing::info!(
+                event = "mockhub.seeded",
+                number = seed.number,
+                board = seed.board.as_deref().unwrap_or("*"),
+                "Seed-строка создана"
+            );
         }
     }
 }
 
 #[async_trait]
 impl TaskBoardRepo for MemoryHub {
-    async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
+    async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
         self.with_state(|state| {
             self.ensure_seed(state);
-            let mut rows: Vec<Task> = state.tasks.values().cloned().collect();
+            let mut rows: Vec<Task> = state
+                .tasks
+                .values()
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .cloned()
+                .collect();
             // поля (сессии/ветка/PR) — часть строки: без них тик не видит
             // заявленных сессий и решает спавнить (гэп стенда, ловился как
             // «wakeup не стреляет» — находка e2e ре-энтри)
@@ -187,7 +230,7 @@ impl TaskBoardRepo for MemoryHub {
 
     async fn create_issue(
         &self,
-        _board: &str,
+        board: &str,
         _project: &str,
         title: &str,
         body: &str,
@@ -198,6 +241,7 @@ impl TaskBoardRepo for MemoryHub {
             state
                 .tasks
                 .insert(number, Task::new(number, title.to_string(), Status::Draft));
+            state.board_tags.insert(number, board.to_string());
             state.bodies.insert(number, body.to_string());
             Ok(number)
         })
