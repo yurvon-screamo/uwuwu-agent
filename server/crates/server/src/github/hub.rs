@@ -360,6 +360,20 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
             }
         }
     }
+    // Приоритет с носителя: опции доски в нижнем регистре (high/medium/low);
+    // регистр-независимо, неизвестное значение — Empty. Без этого мапинга
+    // гейт пика морозит ВСЕ спавны, включая high (инцидент #1170: high-таска
+    //deferred_peak'илась, ревьювер не поднимался в окно GLM).
+    let priority = raw
+        .get("Приоритет")
+        .map(|v| v.to_ascii_lowercase())
+        .map(|v| match v.as_str() {
+            "high" | "высокий" => uwuwu_domain::Priority::High,
+            "medium" | "средний" => uwuwu_domain::Priority::Medium,
+            "low" | "низкий" => uwuwu_domain::Priority::Low,
+            _ => uwuwu_domain::Priority::Empty,
+        })
+        .unwrap_or(uwuwu_domain::Priority::Empty);
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
     // отбрасываем (домен PullRequest требует ветку)
     let vcs = match (
@@ -375,7 +389,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         }
         (None, None) => Vcs::Local,
     };
-    TaskFields::new(assignments, vcs)
+    TaskFields::new(assignments, vcs, priority)
 }
 
 #[async_trait]
@@ -754,6 +768,29 @@ mod slot_mapping_tests {
         assert!(
             task.stage_needs_spawn().is_none(),
             "Design-слот видит сессию"
+        );
+    }
+    #[test]
+    fn priority_field_maps_case_insensitive() {
+        // #1170: опции доски в нижнем регистре — high обязан доезжать High,
+        // иначе гейт пика морозил ВСЕ спавны, включая high
+        let mut raw = Fields::new();
+        raw.insert("Приоритет".into(), "high".into());
+        let f = map_task_fields(&raw);
+        assert_eq!(f.priority(), uwuwu_domain::Priority::High);
+
+        let mut raw = Fields::new();
+        raw.insert("Приоритет".into(), "Medium".into());
+        assert_eq!(
+            map_task_fields(&raw).priority(),
+            uwuwu_domain::Priority::Medium
+        );
+
+        let mut raw = Fields::new();
+        raw.insert("Приоритет".into(), "что-то-иное".into());
+        assert_eq!(
+            map_task_fields(&raw).priority(),
+            uwuwu_domain::Priority::Empty
         );
     }
 }

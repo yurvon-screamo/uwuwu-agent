@@ -129,6 +129,10 @@ pub struct TaskFields {
     assignments: std::collections::BTreeMap<Slot, SessionRef>,
     /// Жизненный цикл VCS-артефактов: явные состояния вместо Option-полей.
     vcs: Vcs,
+    /// Приоритет с носителя: гейт пика пропускает High в окно GLM
+    /// (канон «high продолжают работать»; инцидент #1170 — приоритет
+    /// не мапился вовсе, пик морозил даже high).
+    priority: Priority,
 }
 
 /// VCS-состояние задачи: без ветки → ветка → PR. Инвариант: PR не бывает
@@ -146,14 +150,28 @@ impl Default for TaskFields {
         Self {
             assignments: std::collections::BTreeMap::new(),
             vcs: Vcs::Local,
+            priority: Priority::Empty,
         }
     }
 }
 
 impl TaskFields {
     /// Полная сборка (загрузчик носителя).
-    pub fn new(assignments: std::collections::BTreeMap<Slot, SessionRef>, vcs: Vcs) -> Self {
-        Self { assignments, vcs }
+    pub fn new(
+        assignments: std::collections::BTreeMap<Slot, SessionRef>,
+        vcs: Vcs,
+        priority: Priority,
+    ) -> Self {
+        Self {
+            assignments,
+            vcs,
+            priority,
+        }
+    }
+
+    /// Приоритет с носителя (гейт пика читает его).
+    pub fn priority(&self) -> Priority {
+        self.priority
     }
 
     /// Сессия слота (None — слот не назначен: явная пустота карты).
@@ -391,6 +409,9 @@ impl Task {
 
     /// Обогащение нативными полями (типизированы; лениво для кандидатов тика).
     pub fn apply_fields(&mut self, fields: TaskFields) {
+        // приоритет — поле самой задачи (гейт пика читает его напрямую),
+        // синхронизируем из носителя (инцидент #1170)
+        self.priority = fields.priority;
         self.fields = fields;
     }
 
@@ -590,9 +611,25 @@ mod tests {
         let fields = TaskFields::new(
             assignments,
             Vcs::Branch(BranchName::parse("work/task-3").unwrap()),
+            Priority::Empty,
         );
         t.apply_fields(fields);
         assert_eq!(t.session_of(Slot::PlanReview), Some("ses_r"));
         assert_eq!(t.branch().map(|b| b.as_str()), Some("work/task-3"));
+        assert_eq!(t.priority(), Priority::Empty);
+    }
+
+    #[test]
+    fn apply_fields_carries_priority() {
+        // #1170: приоритет с носителя обязан доезжать до задачи — гейт пика
+        // пропускает High в окно GLM (канон «high работают в пик»)
+        let mut t = task(Status::ReviewResult);
+        let fields = TaskFields::new(
+            std::collections::BTreeMap::new(),
+            Vcs::Local,
+            Priority::High,
+        );
+        t.apply_fields(fields);
+        assert_eq!(t.priority(), Priority::High);
     }
 }
