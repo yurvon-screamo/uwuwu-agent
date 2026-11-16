@@ -206,6 +206,11 @@ impl TickUseCase {
         mut out: TickOutcome,
     ) -> UsecaseResult<TickOutcome> {
         let now = self.clock.utc_minute();
+        // Активные для гейтов: снапшот обхода + состоявшиеся спавны этого
+        // тика — иначе несколько мёртвых stage-строк пройдут CUP по одному
+        // снапшоту и оверселят кап внутри одного прохода (Low-находка
+        // ревью #1200).
+        let mut active_now = global_active;
         // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
         // конвейер действует только по ней, остальная доска read-only
         if let Ok(only) = std::env::var("UWUWU_ONLY_TASK") {
@@ -298,13 +303,14 @@ impl TickUseCase {
                         }
                         continue;
                     }
-                    let gated = gate(task, &action, plan.policy, global_active, now);
+                    let gated = gate(task, &action, plan.policy, active_now, now);
                     match gated {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
                             if plan.mode == Mode::Live {
                                 match self.spawn_stage(board, task, slot).await {
                                     Ok(session) => {
+                                        active_now += 1;
                                         // счётчик/кулдаун пишем только при
                                         // реальном спавне: observe не накручивает
                                         // петли (#1046), а временный отказ
@@ -384,7 +390,7 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        self.observe_stage_session(board, plan, task, global_active, &mut out)
+                        self.observe_stage_session(board, plan, task, &mut active_now, &mut out)
                             .await;
                     } else {
                         out.observed += 1;
@@ -398,20 +404,25 @@ impl TickUseCase {
     /// Плечо Observe стадии: будильник/респавн под политикой запуска
     /// (UC-05: пик держит не-high и будильник, и респавн; CUP держит
     /// респавн — как прямой спавн), при тишине — проход сталл-детекта.
+    /// Респавн инкрементит active_now (фактический спавн в этом тике).
     /// Сбой логируется в outcome.
     async fn observe_stage_session(
         &self,
         board: &BoardPlan,
         plan: &TickPlan,
         task: &Task,
-        global_active: usize,
+        active_now: &mut usize,
         out: &mut TickOutcome,
     ) {
         match self
-            .wakeup_if_fresh(board, plan.policy, task, global_active)
+            .wakeup_if_fresh(board, plan.policy, task, *active_now)
             .await
         {
             Ok(WakeAct::Woke) => out.wakeups += 1,
+            Ok(WakeAct::Respawned) => {
+                out.spawns_done += 1;
+                *active_now += 1;
+            }
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::None) => match self.stall_pass(board, task).await {
                 Ok(StallAct::None) => {}

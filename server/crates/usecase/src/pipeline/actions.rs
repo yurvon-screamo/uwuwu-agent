@@ -13,11 +13,13 @@ use uwuwu_domain::{
 /// Итог попытки будильника/респавна stage-сессии.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeAct {
-    /// Живой сессии доставлен свежий коммент (или респавн состоялся).
+    /// Живой сессии доставлен свежий коммент.
     Woke,
+    /// Мёртвая сессия зареспавнена (фактический спавн).
+    Respawned,
     /// Запуск агента отложен политикой (пик/CUP) — сталл-пасс не нужен.
     Deferred,
-    /// Нечего будить: тишина или коммент уже отработан.
+    /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
 }
 
@@ -138,8 +140,14 @@ impl TickUseCase {
                     );
                     return Ok(WakeAct::Deferred);
                 }
-                self.respawn_dead_stage(board, task, slot, session).await?;
-                return Ok(WakeAct::Woke);
+                let spawned = self.respawn_dead_stage(board, task, slot, session).await?;
+                // луп-гвард эскалировал (Needs attention, без спавна) —
+                // счётчик запусков не трогаем, сталл-пасс мягко откажется
+                return Ok(if spawned {
+                    WakeAct::Respawned
+                } else {
+                    WakeAct::None
+                });
             }
         }
         let comments = self.board.latest_comments(task.number()).await?;
@@ -182,13 +190,14 @@ impl TickUseCase {
     /// Респавн мёртвой сессии стадии через луп-гвард (attention-механика:
     /// респавн = повтор слота при неизменном статусе; >2 → Needs attention).
     /// Политика запуска (пик/CUP) проверена вызывающим wakeup-путём.
+    /// Возвращает true, если спавн состоялся (эскалация — false).
     async fn respawn_dead_stage(
         &self,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
         session: &str,
-    ) -> UsecaseResult<()> {
+    ) -> UsecaseResult<bool> {
         tracing::warn!(event = "wakeup.dead_session", number = task.number(),
             session = %session, "Stage session dead: respawn через луп-гвард");
         let mut guard = self
@@ -223,7 +232,7 @@ impl TickUseCase {
                     ),
                 )
                 .await?;
-            return Ok(());
+            return Ok(false);
         }
         self.state.set_spawn_loop(
             &board.board,
@@ -236,7 +245,7 @@ impl TickUseCase {
         self.board
             .set_session(&board.board, task.number(), slot, &fresh)
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Автодон: проба PR → мерж/Done/bounce. Без PR и без ветки — Done сразу
