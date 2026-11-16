@@ -19,6 +19,7 @@ impl TickUseCase {
     ) -> UsecaseResult<String> {
         let env_repo = format!("{}/{}", board.env_root, task.number());
         let title = format!("#{} {}", task.number(), task.title());
+        let boot_model = self.models.for_default();
         let bootstrap = self
             .sessions
             .create_session(&SessionSpec {
@@ -26,10 +27,8 @@ impl TickUseCase {
                 title: format!("bootstrap {title}"),
                 custom_agent: None,
                 agent: AgentSlot::Default,
-                // модель спавна — деф агента/default_agent опенкода (#1154):
-                // body.model перекрыл бы деф-модель, сервер её не задаёт
-                model: None,
-                variant: None,
+                model: boot_model.model,
+                variant: boot_model.variant,
                 bootstrap: true,
             })
             .await?;
@@ -53,6 +52,10 @@ impl TickUseCase {
         self.sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
             .await?;
+        let work_model = match Agent::of_slot(slot) {
+            Some(agent) => self.models.for_agent(agent),
+            None => self.models.for_default(),
+        };
         let work = self
             .sessions
             .create_session(&SessionSpec {
@@ -60,9 +63,8 @@ impl TickUseCase {
                 title: title.to_string(),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
-                // модель спавна — деф агента стадии (#1154), не конфиг
-                model: None,
-                variant: None,
+                model: work_model.model,
+                variant: work_model.variant,
                 bootstrap: false,
             })
             .await?;

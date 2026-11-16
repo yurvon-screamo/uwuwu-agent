@@ -7,6 +7,7 @@
 use crate::error::UsecaseResult;
 use crate::naming;
 use crate::ports::{AgentSessionGateway, Clock, SessionSpec, WikiRepo};
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{
     civil_from_days, AgentSlot, CronField, CronMaster, CronSchedule, IntervalMinutes, JstDate,
@@ -22,6 +23,7 @@ pub struct CronUseCase {
     pub wiki: Arc<dyn WikiRepo>,
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub clock: Arc<dyn Clock>,
+    pub models: Arc<SpawnModels>,
     pub checkout: String,
 }
 
@@ -84,14 +86,17 @@ impl CronUseCase {
                 )
                 .await?;
             let prompt = run_prompt(project, &master, &journal_md);
+            let sm = match master.agent {
+                AgentSlot::Role(agent) => self.models.for_agent(agent),
+                AgentSlot::Default => self.models.for_default(),
+            };
             let spec = SessionSpec {
                 custom_agent: None,
                 directory: self.checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,
-                // модель — деф агента мастера (#1154), не конфиг
-                model: None,
-                variant: None,
+                model: sm.model,
+                variant: sm.variant,
                 bootstrap: false,
             };
             let session = self.sessions.create_session(&spec).await?;

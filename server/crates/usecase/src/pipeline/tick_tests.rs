@@ -354,6 +354,7 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -787,6 +788,7 @@ async fn stall_detector_pings_then_flags() {
         }),
         clock: clock.clone(),
         state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     // тик 1: тишина > часа → первый автопинг
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -828,11 +830,10 @@ async fn stall_detector_pings_then_flags() {
 }
 
 #[tokio::test]
-async fn stage_spawn_passes_no_model_to_session() {
-    // #1154: источник модели спавна — деф агента (agents/*.md) /
-    // default_agent опенкода; спеки стадии обязаны нести model: None —
-    // гейтвей применяет body.model поверх дефа, и любая подстановка
-    // сервера молча перекрывает деф-модели (bootstrap и work).
+async fn stage_spawn_carries_model_from_server_map() {
+    // #1154 (решение владельца 17.11): модель спавна — карта сервера
+    // (SpawnModels), каждый спавн несёт её в теле сессии; деф-файлы
+    // агентов моделей не несут. Dev-стадия — default-ключ карты.
     // Arrange
     let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
 
@@ -843,11 +844,9 @@ async fn stage_spawn_passes_no_model_to_session() {
     assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 2, "bootstrap + work");
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
     for spec in specs.iter() {
-        assert!(
-            spec.model.is_none(),
-            "сервер не задаёт модель спавна, получил: {:?}",
-            spec.model
-        );
+        assert_eq!(spec.model, want.model, "модель спавна = default карты");
+        assert_eq!(spec.variant, None, "default — без варианта");
     }
 }

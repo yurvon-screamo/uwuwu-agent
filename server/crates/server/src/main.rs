@@ -125,12 +125,27 @@ async fn run(
     );
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
+    let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
+        Some(raw) => {
+            let mut map = std::collections::HashMap::new();
+            for (key, model) in raw {
+                map.insert(
+                    key.clone(),
+                    uwuwu_domain::SpawnModel::parse(model)
+                        .map_err(|e| format!("[executor.models] {key}: {e}"))?,
+                );
+            }
+            uwuwu_usecase::SpawnModels::new(map)
+        }
+        None => uwuwu_usecase::SpawnModels::canonical(),
+    });
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: clock.clone(),
         state: state.clone(),
+        models: spawn_models.clone(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -216,6 +231,7 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
             checkout: plan
                 .boards
                 .first()
@@ -256,6 +272,7 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
             checkout: checkout.clone(),
         });
         let project = project.clone();
@@ -291,11 +308,13 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
             checkout: boards_info
                 .first()
                 .map(|(_, _, checkout)| checkout.clone())

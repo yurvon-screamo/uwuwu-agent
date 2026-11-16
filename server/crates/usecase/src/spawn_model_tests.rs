@@ -1,8 +1,7 @@
-//! Контракт спавна «модель — из декларации агента» (#1154): ни один
-//! спавн конвейера (триаж/дример/кроны) не кладёт модель в SessionSpec —
-//! иначе гейтвей opencode применяет body.model поверх дефа агента.
-//! Проводка сервера модель не задаёт вовсе; тесты — регресс-гард против
-//! возврата подстановки. Тик-спавны покрыты в pipeline/tick_tests.rs.
+//! Контракт моделей спавна (#1154, решение владельца 17.11): модель —
+//! карта сервера (`SpawnModels`), каждый спавн несёт её в теле сессии;
+//! деф-файлы агентов моделей не несут. Тик-спавны покрыты в
+//! pipeline/tick_tests.rs.
 
 use crate::crons::CronUseCase;
 use crate::error::UsecaseResult;
@@ -12,9 +11,15 @@ use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, IssueView, Liveness, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
+use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{Slot, Status, Task};
+use uwuwu_domain::{Slot, SpawnModel, Status, Task};
+
+/// Канон-карта владельца (единственный механизм моделей — #1154).
+fn models() -> Arc<SpawnModels> {
+    Arc::new(SpawnModels::canonical())
+}
 
 /// Захватывающий шлюз: спеки create_session + выдача list_sessions.
 struct CaptureSessions {
@@ -209,13 +214,14 @@ impl WikiRepo for CronWiki {
     }
 }
 
-fn assert_no_model(spec: Option<SessionSpec>, what: &str) {
+fn assert_model(spec: Option<SessionSpec>, what: &str, raw: &str) {
     let spec = spec.expect(what);
-    assert!(
-        spec.model.is_none(),
-        "{what}: конфиг-модель не должна попадать в спавн: {:?}",
-        spec.model
+    let want = SpawnModel::parse(raw).unwrap();
+    assert_eq!(
+        spec.model, want.model,
+        "{what}: модель спавна = карта сервера"
     );
+    assert_eq!(spec.variant, want.variant, "{what}: вариант из карты");
 }
 
 #[tokio::test]
@@ -232,6 +238,7 @@ async fn triage_spawn_passes_no_model() {
         sessions: sessions.clone(),
         state: Arc::new(NoopState),
         clock: Arc::new(TestClock),
+        models: models(),
     };
 
     // Act
@@ -239,7 +246,11 @@ async fn triage_spawn_passes_no_model() {
 
     // Assert
     assert_eq!(spawned, 1, "триаж-спавн состоялся");
-    assert_no_model(sessions.spec_of(), "триаж-спавн");
+    assert_model(
+        sessions.spec_of(),
+        "триаж-спавн",
+        "zai-coding-plan/glm-5.3-flash#max",
+    );
 }
 
 #[tokio::test]
@@ -256,6 +267,7 @@ async fn dreamer_spawn_passes_no_model() {
         sessions: sessions.clone(),
         state: Arc::new(NoopState),
         clock: Arc::new(TestClock),
+        models: models(),
         checkout: "/tmp".into(),
     };
 
@@ -264,7 +276,11 @@ async fn dreamer_spawn_passes_no_model() {
 
     // Assert
     assert_eq!(spawned, 1, "дример-спавн состоялся");
-    assert_no_model(sessions.spec_of(), "дример-спавн");
+    assert_model(
+        sessions.spec_of(),
+        "дример-спавн",
+        "zai-coding-plan/glm-5.3-flash#high",
+    );
 }
 
 #[tokio::test]
@@ -275,6 +291,7 @@ async fn cron_run_passes_no_model() {
         wiki: Arc::new(CronWiki),
         sessions: sessions.clone(),
         clock: Arc::new(TestClock),
+        models: models(),
         checkout: "/tmp".into(),
     };
 
@@ -283,5 +300,6 @@ async fn cron_run_passes_no_model() {
 
     // Assert
     assert_eq!(fired.len(), 1, "крон-файр состоялся");
-    assert_no_model(sessions.spec_of(), "крон-спавн");
+    // мастер без fm agent — Default-слот → default-модель карты
+    assert_model(sessions.spec_of(), "крон-спавн", "zai-coding-plan/glm-5.3");
 }

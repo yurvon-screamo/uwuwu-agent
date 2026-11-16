@@ -3,6 +3,7 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo};
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
 
@@ -13,6 +14,7 @@ pub struct TriageUseCase {
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn crate::ports::TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
+    pub models: Arc<SpawnModels>,
 }
 
 /// Доска триажа: где искать черновики и где спавнить агента.
@@ -56,14 +58,14 @@ impl TriageUseCase {
         let Some((task, tb)) = candidate else {
             return Ok(0);
         };
+        let sm = self.models.for_agent(uwuwu_domain::Agent::Triage);
         let spec = SessionSpec {
             custom_agent: None,
             directory: tb.checkout.clone(),
             title: format!("триаж #{}", task.number()),
             agent: uwuwu_domain::AgentSlot::Role(uwuwu_domain::Agent::Triage),
-            // модель — деф triage-агента (#1154), не конфиг
-            model: None,
-            variant: None,
+            model: sm.model,
+            variant: sm.variant,
             bootstrap: false,
         };
         self.state

@@ -147,7 +147,7 @@ mod tests {
             directory: "/tmp".into(),
             title: "t".into(),
             agent: uwuwu_domain::AgentSlot::Default,
-            model: None,
+            model: uwuwu_domain::ModelRef::new("zai-coding-plan", "glm-5.3-flash"),
             variant: None,
             bootstrap,
         }
