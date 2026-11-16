@@ -2514,3 +2514,69 @@ async fn task_close_resolves_board_of_the_row_multiboard() {
         "строки первой доски close не трогает, лог: {log:?}"
     );
 }
+
+#[tokio::test]
+async fn task_close_row_on_first_board_still_closes_there() {
+    // ветка скан-цикла close (#1135): строка первой доски конфига
+    // закрывается как раньше — мультиборд-скан не сломал старое поведение.
+    let board = Arc::new(CloseBoard {
+        boards: vec![("B1".into(), vec![1]), ("B2".into(), vec![5])],
+        log: Mutex::default(),
+    });
+    let fields: Arc<dyn crate::ports::IssueFieldStore> = Arc::new(FakeFields);
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields,
+        boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+    };
+    use crate::tasks::write::TaskWriter;
+
+    // Act
+    writer
+        .close(1, false)
+        .await
+        .expect("close строки первой доски");
+
+    // Assert
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|e| e == "status#1=Done"),
+        "строка первой доски переведена в Done на её доске, лог: {log:?}"
+    );
+    assert!(
+        log.iter().all(|e| !e.contains("status#5=")),
+        "вторая доска close не трогает, лог: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn task_close_missing_row_is_a_loud_error_without_mutations() {
+    // ветка скан-цикла close (#1135): строки нет ни на одной доске
+    // конфига — громкая ошибка, ни одна доска не мутирована.
+    let board = Arc::new(CloseBoard {
+        boards: vec![("B1".into(), vec![1]), ("B2".into(), vec![5])],
+        log: Mutex::default(),
+    });
+    let fields: Arc<dyn crate::ports::IssueFieldStore> = Arc::new(FakeFields);
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields,
+        boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+    };
+    use crate::tasks::write::TaskWriter;
+
+    // Act
+    let result = writer.close(99, true).await;
+
+    // Assert
+    let err = result.err().expect("нет строки нигде — должен быть отказ");
+    assert!(
+        err.to_string().contains("#99"),
+        "отказ называет искомую строку: {err}"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.is_empty(),
+        "промах close не мутирует доски, лог: {log:?}"
+    );
+}
