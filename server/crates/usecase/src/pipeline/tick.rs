@@ -25,6 +25,10 @@ pub const SPAWN_COOLDOWN_MS: u64 = 15 * 60_000;
 pub const STALL_SILENCE_MS: u64 = 60 * 60_000;
 pub const STALL_PING_EVERY_MS: u64 = 2 * 60 * 60_000;
 pub const STALL_MAX_PINGS: u32 = 2;
+/// Мягкий пинг (санкция владельца 16.11): ход завершён (idle), транзакция
+/// не закрыта — прямой промпт в сессию через 15 мин, повтор через 30.
+pub const STALL_SOFT_SILENCE_MS: u64 = 15 * 60_000;
+pub const STALL_SOFT_EVERY_MS: u64 = 30 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -70,6 +74,8 @@ pub struct TickOutcome {
     pub attention_flagged: usize,
     /// Автопингов сталл-детекта (ход завершён, статус не переведён).
     pub stall_pings: usize,
+    /// Мягких пингов (idle-сессия, прямой промпт — санкция владельца 16.11).
+    pub soft_pings: usize,
     /// Строк, переведённых в Needs attention сталл-детектом.
     pub stall_flagged: usize,
 }
@@ -79,6 +85,8 @@ pub struct TickOutcome {
 enum StallAct {
     None,
     Pinged,
+    /// Мягкий пинг: ход завершён (idle), прямой промпт в сессию.
+    SoftPinged,
     Flagged,
 }
 
@@ -427,6 +435,7 @@ impl TickUseCase {
             Ok(WakeAct::None) => match self.stall_pass(board, task).await {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
+                Ok(StallAct::SoftPinged) => out.soft_pings += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Err(e) => {
                     out.actions_failed += 1;
@@ -522,7 +531,18 @@ impl TickUseCase {
         };
         let now = self.clock.now_ms();
         let silence = now.saturating_sub(last_ms);
-        if silence < STALL_SILENCE_MS {
+        // Два класса тишины (#1206, санкция владельца): ход завершён
+        // (последнее сообщение — финальный ответ агента), а статусная
+        // транзакция не закрыта → мягкий пинг прямо в сессию через
+        // 15 мин; ход идёт (tool-call/стрим) → классический порог 60 мин
+        // (защита от ложных пингов на длинных операциях, #161).
+        let idle = self.session_idle(&session).await;
+        let (gate, every, soft) = if idle {
+            (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
+        } else {
+            (STALL_SILENCE_MS, STALL_PING_EVERY_MS, false)
+        };
+        if silence < gate {
             return Ok(StallAct::None);
         }
         // раунд = статус: смена статуса обнуляет счётчик пингов
@@ -534,7 +554,10 @@ impl TickUseCase {
         if prev_status != Some(task.status()) {
             count = 0;
         }
-        if count >= STALL_MAX_PINGS && now.saturating_sub(last_ping) >= STALL_PING_EVERY_MS {
+        if count > 0 && now.saturating_sub(last_ping) < every {
+            return Ok(StallAct::None);
+        }
+        if count >= STALL_MAX_PINGS {
             // два пинга исчерпаны, тишина продолжается — мяч владельцу
             tracing::warn!(
                 event = "stall.escalated",
@@ -561,8 +584,32 @@ impl TickUseCase {
                 .mark_stall_ping(&board.board, task.number(), task.status(), now);
             return Ok(StallAct::Flagged);
         }
-        if count > 0 && now.saturating_sub(last_ping) < STALL_PING_EVERY_MS {
-            return Ok(StallAct::None);
+        if soft {
+            // мягкий пинг — прямым промптом в сессию (мгновенное пробуждение,
+            // без обхода через коммент): ход завершён, транзакция не закрыта
+            self.sessions
+                .prompt(
+                    &session,
+                    &format!(
+                        "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
+                         строка #{} стоит. Заверши транзакцию по контракту хода: \
+                         uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
+                         или вопрос владельцу комментом + Needs attention.",
+                        task.number(),
+                        task.number()
+                    ),
+                )
+                .await?;
+            self.state
+                .mark_stall_ping(&board.board, task.number(), task.status(), now);
+            tracing::info!(
+                event = "stall.soft_pinged",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                silence_min = silence / 60_000,
+                "Мягкий пинг: ход завершён без транзакции"
+            );
+            return Ok(StallAct::SoftPinged);
         }
         tracing::info!(
             event = "stall.ping",

@@ -255,10 +255,13 @@ impl AgentSessionGateway for OpencodeClient {
         } else {
             resp["data"].clone()
         };
-        let Some(msg) = raw
-            .as_array()
-            .and_then(|msgs| msgs.iter().find(|m| m["type"] == "assistant"))
-        else {
+        let msgs = raw.as_array();
+        // самый свежий блок журнала (order=desc) — «после» него нет сообщений
+        let latest_is_assistant = msgs
+            .and_then(|m| m.first())
+            .map(|m| m["type"] == "assistant")
+            .unwrap_or(false);
+        let Some(msg) = msgs.and_then(|m| m.iter().find(|m| m["type"] == "assistant")) else {
             return Ok(None);
         };
         let text: Vec<&str> = msg["content"]
@@ -275,6 +278,7 @@ impl AgentSessionGateway for OpencodeClient {
             created_ms: msg["time"]["created"].as_u64().unwrap_or_default(),
             text: text.join("\n"),
             finished: msg["finish"].as_str().is_some(),
+            is_latest: latest_is_assistant,
         }))
     }
 }

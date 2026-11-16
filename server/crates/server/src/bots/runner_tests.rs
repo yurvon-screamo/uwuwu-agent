@@ -229,6 +229,7 @@ impl AgentSessionGateway for FakeSessions {
                 created_ms: created,
                 text: format!("эхо: {tail}"),
                 finished: true,
+                is_latest: true,
             });
         }
         Ok(())
@@ -645,6 +646,7 @@ async fn long_reply_chunked() {
         created_ms: 1_000_000,
         text: "а".repeat(9500),
         finished: true,
+        is_latest: true,
     });
     let state = Arc::new(FakeState::default());
     let task = spawn_bot_task(deps(
