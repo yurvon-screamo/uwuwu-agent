@@ -7,8 +7,7 @@ use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickSta
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
-    decide, gate, Action, Awaits, Gate, LoopOutcome, ModelRef, Slot, SpawnLoop, SpawnPolicy,
-    Status, Task,
+    decide, gate, Action, Awaits, Gate, LoopOutcome, Slot, SpawnLoop, SpawnPolicy, Status, Task,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -84,8 +83,6 @@ pub struct TickUseCase {
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
-    /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub spawn_model: Option<ModelRef>,
 }
 
 impl TickUseCase {

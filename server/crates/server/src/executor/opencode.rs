@@ -83,32 +83,41 @@ impl OpencodeClient {
     }
 }
 
+/// Тело POST /session из спека. Контракт моделей (#1154): body.model
+/// перекрывает деф-модель агента в опенкоде — в тело модель попадает
+/// только при Some (бот-контур с fm дока); иначе действует нативный
+/// каскад: деф агента → default_agent → дефолт платформы.
+fn create_session_body(spec: &SessionSpec) -> Value {
+    let mut body = json!({
+        "title": spec.title.chars().take(64).collect::<String>(),
+        "location": { "directory": spec.directory },
+    });
+    if let Some(name) = &spec.custom_agent {
+        // именованный агент опенкода (agents/<name>.md в cwd):
+        // боты с fm agent — методичка вшита системой (#349)
+        body["agent"] = json!(name);
+    } else {
+        match &spec.agent {
+            uwuwu_domain::AgentSlot::Role(agent) => {
+                body["agent"] = json!(uwuwu_usecase::agent_name(*agent));
+            }
+            uwuwu_domain::AgentSlot::Default => {}
+        }
+    }
+    if let Some(model) = &spec.model {
+        let mut m = json!({ "providerID": model.provider(), "id": model.id() });
+        if let Some(v) = &spec.variant {
+            m["variant"] = json!(v);
+        }
+        body["model"] = m;
+    }
+    body
+}
+
 #[async_trait]
 impl AgentSessionGateway for OpencodeClient {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String> {
-        let mut body = json!({
-            "title": spec.title.chars().take(64).collect::<String>(),
-            "location": { "directory": spec.directory },
-        });
-        if let Some(name) = &spec.custom_agent {
-            // именованный агент опенкода (agents/<name>.md в cwd):
-            // боты с fm agent — методичка вшита системой
-            body["agent"] = json!(name);
-        } else {
-            match &spec.agent {
-                uwuwu_domain::AgentSlot::Role(agent) => {
-                    body["agent"] = json!(uwuwu_usecase::agent_name(*agent));
-                }
-                uwuwu_domain::AgentSlot::Default => {}
-            }
-        }
-        if let Some(model) = &spec.model {
-            let mut m = json!({ "providerID": model.provider(), "id": model.id() });
-            if let Some(v) = &spec.variant {
-                m["variant"] = json!(v);
-            }
-            body["model"] = m;
-        }
+        let body = create_session_body(spec);
         let (status, resp) = self
             .call("/session", reqwest::Method::POST, Some(body))
             .await?;
@@ -282,6 +291,38 @@ impl AgentSessionGateway for OpencodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::{Agent, AgentSlot, ModelRef};
+
+    fn spec(agent: AgentSlot, model: Option<ModelRef>, variant: Option<&str>) -> SessionSpec {
+        SessionSpec {
+            directory: "/tmp".into(),
+            title: "t".into(),
+            agent,
+            custom_agent: None,
+            model,
+            variant: variant.map(str::to_string),
+            bootstrap: false,
+        }
+    }
+
+    #[test]
+    fn body_carries_model_and_variant_only_when_some() {
+        // #1154: body.model перекрывает деф агента — бот-контур (fm дока)
+        // с моделью посылает её, конвейер (None) — резолв дефа опенкода
+        let with = create_session_body(&spec(
+            AgentSlot::Role(Agent::Dreamer),
+            Some(ModelRef::new("zai-coding-plan", "glm-5.3-flash")),
+            Some("high"),
+        ));
+        assert_eq!(with["agent"], "dreamer");
+        assert_eq!(with["model"]["providerID"], "zai-coding-plan");
+        assert_eq!(with["model"]["id"], "glm-5.3-flash");
+        assert_eq!(with["model"]["variant"], "high");
+
+        let without = create_session_body(&spec(AgentSlot::Default, None, None));
+        assert!(without.get("agent").is_none(), "Default — без agent");
+        assert!(without.get("model").is_none(), "None — ключа model нет");
+    }
 
     #[test]
     fn liveness_maps_statuses() {

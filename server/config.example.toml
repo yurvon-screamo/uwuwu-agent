@@ -16,10 +16,8 @@ repo = "yurvon-screamo/uwuwu-hub"
 name = "kisa"
 url = "https://opencode.uwuwu.net"
 # basic-пароль опенкода: env UWUWU_OPENCODE_PASSWORD
-
-[executor.spawn_model]
-provider = "zai-coding-plan"
-id = "glm-5.3-flash"
+# Модели спавнов сервер не задаёт (#1154): источник — деф агента
+# (agents/*.md) / fm дока бота / default_agent опенкода.
 
 [policy]
 cup = 7

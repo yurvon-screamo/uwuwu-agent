@@ -34,16 +34,9 @@ fn default_hub_driver() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SpawnModelCfg {
-    pub provider: String,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ExecutorCfg {
     pub name: String,
     pub url: String,
-    pub spawn_model: Option<SpawnModelCfg>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

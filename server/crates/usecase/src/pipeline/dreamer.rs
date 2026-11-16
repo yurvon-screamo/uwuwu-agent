@@ -5,7 +5,7 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::ports::{AgentSessionGateway, Clock, SessionSpec, TickStateStore};
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, ModelRef};
+use uwuwu_domain::{Agent, AgentSlot};
 
 /// Idle-порог: уснувшая = нет активности 30 минут и есть финал.
 const IDLE_MS: u64 = 30 * 60_000;
@@ -19,7 +19,6 @@ pub struct DreamerUseCase {
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<ModelRef>,
     pub checkout: String,
 }
 
@@ -67,7 +66,8 @@ impl DreamerUseCase {
             title: format!("дример {}", &target.id[..12.min(target.id.len())]),
             custom_agent: None,
             agent: AgentSlot::Role(Agent::Dreamer),
-            model: self.spawn_model.clone(),
+            // модель — деф dreamer-агента (#1154), не конфиг
+            model: None,
             variant: None,
             bootstrap: false,
         };

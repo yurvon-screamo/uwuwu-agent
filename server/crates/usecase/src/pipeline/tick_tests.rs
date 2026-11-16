@@ -127,15 +127,18 @@ impl TaskBoardRepo for FakeBoard {
 struct FakeSessions {
     prompts: Mutex<Vec<String>>,
     spawned: Mutex<Vec<String>>,
+    /// Спеки create_session (контракты спавна: агент/модель/каталог).
+    specs: Mutex<Vec<SessionSpec>>,
     /// ms последней активности любой сессии (сталл-детект-тесты).
     activity_ms: u64,
 }
 
 #[async_trait]
 impl AgentSessionGateway for FakeSessions {
-    async fn create_session(&self, _spec: &SessionSpec) -> UsecaseResult<String> {
+    async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String> {
         let id = format!("ses_{}", self.spawned.lock().unwrap().len() + 1);
         self.spawned.lock().unwrap().push(id.clone());
+        self.specs.lock().unwrap().push(spec.clone());
         Ok(id)
     }
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
@@ -338,6 +341,7 @@ fn usecase_with_state(
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
+        specs: Mutex::default(),
         activity_ms: 1000,
     });
     let prs = Arc::new(FakePrs {
@@ -350,7 +354,6 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
     };
     (u, board, sessions, prs)
 }
@@ -758,6 +761,7 @@ async fn stall_detector_pings_then_flags() {
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
+        specs: Mutex::default(),
         // сессия молчит час+ — ход завершён без статусного перевода
         activity_ms: now - STALL_SILENCE_MS - 60_000,
     });
@@ -783,7 +787,6 @@ async fn stall_detector_pings_then_flags() {
         }),
         clock: clock.clone(),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
     };
     // тик 1: тишина > часа → первый автопинг
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -822,4 +825,29 @@ async fn stall_detector_pings_then_flags() {
         0,
         "без дублей эскалации"
     );
+}
+
+#[tokio::test]
+async fn stage_spawn_passes_no_model_to_session() {
+    // #1154: источник модели спавна — деф агента (agents/*.md) /
+    // default_agent опенкода; спеки стадии обязаны нести model: None —
+    // гейтвей применяет body.model поверх дефа, и любая подстановка
+    // сервера молча перекрывает деф-модели (bootstrap и work).
+    // Arrange
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    for spec in specs.iter() {
+        assert!(
+            spec.model.is_none(),
+            "сервер не задаёт модель спавна, получил: {:?}",
+            spec.model
+        );
+    }
 }

@@ -11,6 +11,8 @@ mod naming;
 mod pipeline;
 mod ports;
 mod search;
+#[cfg(test)]
+mod spawn_model_tests;
 mod tasks;
 
 pub use bots::{

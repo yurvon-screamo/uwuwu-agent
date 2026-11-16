@@ -96,7 +96,6 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
             wiki: Arc::new(StubWiki),
             sessions: Arc::new(StubSessions),
             clock: Arc::new(SystemClock),
-            spawn_model: None,
             checkout: String::new(),
         }),
     });
