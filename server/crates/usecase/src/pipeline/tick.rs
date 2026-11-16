@@ -4,9 +4,8 @@
 use super::actions::WakeAct;
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{
-    AgentSessionGateway, Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore,
-};
+use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::router::SessionRouter;
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
@@ -93,7 +92,8 @@ enum StallAct {
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавны/будильники — гейтвей проекта.
+    pub sessions: Arc<SessionRouter>,
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
@@ -144,8 +144,10 @@ impl TickUseCase {
         // спавны холдились). Мёртвая сессия не тратит и кап не держит.
         // Недоступность исполнителя — fallback на статусный подсчёт
         // (паралич конвейера хуже редкого овер-спавна).
+        // Strict union (#1203): отказ ЛЮБОГО исполнителя → полный фолбэк —
+        // частичный список представил бы офлайн-исполнителя мёртвым.
         let alive: Option<std::collections::HashSet<String>> =
-            match self.sessions.list_sessions().await {
+            match self.sessions.list_sessions_strict().await {
                 Ok(list) => Some(
                     list.into_iter()
                         .filter(|s| s.outcome.is_empty())
@@ -164,8 +166,8 @@ impl TickUseCase {
         // фаза 1: кандидаты (без сессии) — активны безусловно; строки
         // с живой сессией — копим для idle-проверки (фаза 2)
         let mut candidates = 0usize;
-        let mut live_sessions: Vec<String> = Vec::new();
-        for (_, tasks) in boards.iter() {
+        let mut live_sessions: Vec<(&BoardPlan, String)> = Vec::new();
+        for (bp, tasks) in boards.iter() {
             for t in tasks.iter() {
                 if !t.status().is_active() {
                     continue;
@@ -174,7 +176,7 @@ impl TickUseCase {
                     None => candidates += 1,
                     Some(session) => match &alive {
                         Some(alive) if !alive.contains(session) => {} // мёртвая
-                        Some(_) => live_sessions.push(session.to_string()),
+                        Some(_) => live_sessions.push((*bp, session.to_string())),
                         None => candidates += 1, // fallback: статусный подсчёт
                     },
                 }
@@ -182,8 +184,8 @@ impl TickUseCase {
         }
         // фаза 2: среди живых тратят только busy (ход идёт)
         let mut busy = 0usize;
-        for session in &live_sessions {
-            if !self.session_idle(session).await {
+        for (bp, session) in &live_sessions {
+            if !self.session_idle(bp, session).await {
                 busy += 1;
             }
         }
@@ -500,7 +502,12 @@ impl TickUseCase {
             return Ok(None);
         };
         if matches!(slot, Slot::Design | Slot::Dev)
-            && self.sessions.liveness(session).await != Liveness::Dead
+            && self
+                .sessions
+                .project(&board.project)
+                .liveness(session)
+                .await
+                != Liveness::Dead
         {
             return Ok(None);
         }
@@ -534,7 +541,12 @@ impl TickUseCase {
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
         // тишина короче мягкого порога — оба класса молчат, idle-пробу
         // (HTTP хвоста сообщений) не тратим на свежие строки
-        let silence = match self.sessions.last_activity_ms(&session).await {
+        let silence = match self
+            .sessions
+            .project(&board.project)
+            .last_activity_ms(&session)
+            .await
+        {
             Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
             _ => 0,
         };
@@ -546,7 +558,7 @@ impl TickUseCase {
         // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
         // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
         // классический порог 60 мин (длинные операции, #161).
-        let idle = self.session_idle(&session).await;
+        let idle = self.session_idle(board, &session).await;
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
@@ -634,6 +646,7 @@ impl TickUseCase {
     ) -> UsecaseResult<StallAct> {
         if soft {
             self.sessions
+                .project(&board.project)
                 .prompt(
                     session,
                     &format!(

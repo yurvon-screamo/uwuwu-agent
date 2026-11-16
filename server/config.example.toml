@@ -59,3 +59,17 @@ board = "Задачи foilcap"
 repo = "yurvon-screamo/foilcap"
 checkout = "/home/yurvon/foilcap"
 env_root = "/home/yurvon/agents-env"
+
+# Мульти-экзекьютор (#1203): дополнительные именованные исполнители и
+# ссылка проекта на них. Проект без executor — дефолтный [executor].
+# [[executors]]
+# name = "redmi"
+# url = "http://relay.railway.internal:2336"
+#
+# [[project]]
+# name = "1xgames"
+# board = "Задачи 1xgames"
+# repo = "yurvon-screamo/1xgames"
+# checkout = "D:/1xgames/game-service"
+# env_root = "D:/agents-env"
+# executor = "redmi"
