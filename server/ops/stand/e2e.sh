@@ -93,6 +93,10 @@ DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$L
 say "фаза 2 ок: ре-энтри круг пройден (dev-спавнов: $DEV_SPAWNS), эскалаций нет"
 
 say "фаза 3: мульти-экзекьютор — маршрутизация проект → executor + отказ исполнителя (#1203)"
+# фаза 2 оставила свой стек (сервер 8090 + мок 8099) — чистим перед стендом
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
 rm -f "$STATE"
 MOCK2_PORT=8098
 LOG_MOCK2=/tmp/uwuwu-stand-mock2.log
