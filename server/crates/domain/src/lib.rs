@@ -14,7 +14,7 @@ mod project;
 mod task;
 mod task_type;
 
-pub use agent::{Agent, AgentSlot, ModelRef};
+pub use agent::{Agent, AgentSlot, ModelRef, SpawnModel};
 pub use bot::{BotAction, BotModel, BotSpec};
 pub use budget::{BudgetVerdict, SpawnBudget};
 pub use cron::{

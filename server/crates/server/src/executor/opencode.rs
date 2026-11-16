@@ -161,10 +161,9 @@ impl OpencodeClient {
     }
 }
 
-/// Тело POST /session из спека. Контракт моделей (#1154): body.model
-/// перекрывает деф-модель агента в опенкоде — в тело модель попадает
-/// только при Some (бот-контур с fm дока); иначе действует нативный
-/// каскад: деф агента → default_agent → дефолт платформы.
+/// Тело POST /session из спека. Контракт моделей (#1154): модель —
+/// карта сервера, кладётся в тело всегда (body.model перекрывает деф
+/// агента — деф-файлы моделей не несут; решение владельца 17.11).
 fn create_session_body(spec: &SessionSpec) -> Value {
     let mut body = json!({
         "title": spec.title.chars().take(64).collect::<String>(),
@@ -182,13 +181,11 @@ fn create_session_body(spec: &SessionSpec) -> Value {
             uwuwu_domain::AgentSlot::Default => {}
         }
     }
-    if let Some(model) = &spec.model {
-        let mut m = json!({ "providerID": model.provider(), "id": model.id() });
-        if let Some(v) = &spec.variant {
-            m["variant"] = json!(v);
-        }
-        body["model"] = m;
+    let mut m = json!({ "providerID": spec.model.provider(), "id": spec.model.id() });
+    if let Some(v) = &spec.variant {
+        m["variant"] = json!(v);
     }
+    body["model"] = m;
     body
 }
 
@@ -372,7 +369,7 @@ mod tests {
     use super::*;
     use uwuwu_domain::{Agent, AgentSlot, ModelRef};
 
-    fn spec(agent: AgentSlot, model: Option<ModelRef>, variant: Option<&str>) -> SessionSpec {
+    fn spec(agent: AgentSlot, model: ModelRef, variant: Option<&str>) -> SessionSpec {
         SessionSpec {
             directory: "/tmp".into(),
             title: "t".into(),
@@ -385,12 +382,12 @@ mod tests {
     }
 
     #[test]
-    fn body_carries_model_and_variant_only_when_some() {
-        // #1154: body.model перекрывает деф агента — бот-контур (fm дока)
-        // с моделью посылает её, конвейер (None) — резолв дефа опенкода
+    fn body_always_carries_model_from_server_map() {
+        // #1154 (решение владельца 17.11): модель — карта сервера, тело
+        // спавна несёт её всегда (деф-файлы моделей не несут)
         let with = create_session_body(&spec(
             AgentSlot::Role(Agent::Dreamer),
-            Some(ModelRef::new("zai-coding-plan", "glm-5.3-flash")),
+            ModelRef::new("zai-coding-plan", "glm-5.3-flash"),
             Some("high"),
         ));
         assert_eq!(with["agent"], "dreamer");
@@ -398,9 +395,16 @@ mod tests {
         assert_eq!(with["model"]["id"], "glm-5.3-flash");
         assert_eq!(with["model"]["variant"], "high");
 
-        let without = create_session_body(&spec(AgentSlot::Default, None, None));
+        let without = create_session_body(&spec(
+            AgentSlot::Default,
+            ModelRef::new("zai-coding-plan", "glm-5.3"),
+            None,
+        ));
         assert!(without.get("agent").is_none(), "Default — без agent");
-        assert!(without.get("model").is_none(), "None — ключа model нет");
+        assert_eq!(
+            without["model"]["id"], "glm-5.3",
+            "модель в теле всегда (карта сервера)"
+        );
     }
 
     #[test]

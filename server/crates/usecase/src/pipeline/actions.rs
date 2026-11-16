@@ -39,16 +39,15 @@ impl TickUseCase {
         let sessions = self.sessions.project(&board.project);
         let env_repo = board.env_repo_dir(task.number());
         let title = format!("#{} {}", task.number(), task.title());
+        let boot_model = self.models.for_default();
         let bootstrap = sessions
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
                 custom_agent: None,
                 agent: AgentSlot::Default,
-                // модель спавна — деф агента/default_agent опенкода (#1154):
-                // body.model перекрыл бы деф-модель, сервер её не задаёт
-                model: None,
-                variant: None,
+                model: boot_model.model,
+                variant: boot_model.variant,
                 bootstrap: true,
             })
             .await?;
@@ -87,15 +86,18 @@ impl TickUseCase {
         self.board
             .set_branch(&board.board, task.number(), &branch)
             .await?;
+        let work_model = match Agent::of_slot(slot) {
+            Some(agent) => self.models.for_agent(agent),
+            None => self.models.for_default(),
+        };
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
                 title: format!("#{} {}", task.number(), task.title()),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
-                // модель спавна — деф агента стадии (#1154), не конфиг
-                model: None,
-                variant: None,
+                model: work_model.model,
+                variant: work_model.variant,
                 bootstrap: false,
             })
             .await?;

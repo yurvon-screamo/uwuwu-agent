@@ -6,6 +6,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
 use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -114,6 +115,7 @@ pub struct TickUseCase {
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
+    pub models: Arc<SpawnModels>,
 }
 
 /// Контекст строки тика: данные union-скана и enrichment, общие для

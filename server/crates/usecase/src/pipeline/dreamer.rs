@@ -5,6 +5,7 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::ports::{Clock, SessionSpec, TickStateStore};
 use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot};
 
@@ -23,6 +24,7 @@ pub struct DreamerUseCase {
     pub sessions: Arc<SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
+    pub models: Arc<SpawnModels>,
     pub checkout: String,
 }
 
@@ -65,14 +67,14 @@ impl DreamerUseCase {
         let Some(target) = candidate else {
             return Ok(0);
         };
+        let sm = self.models.for_agent(Agent::Dreamer);
         let spec = SessionSpec {
             directory: self.checkout.clone(),
             title: format!("дример {}", &target.id[..12.min(target.id.len())]),
             custom_agent: None,
             agent: AgentSlot::Role(Agent::Dreamer),
-            // модель — деф dreamer-агента (#1154), не конфиг
-            model: None,
-            variant: None,
+            model: sm.model,
+            variant: sm.variant,
             bootstrap: false,
         };
         let sessions = self.sessions.default();
