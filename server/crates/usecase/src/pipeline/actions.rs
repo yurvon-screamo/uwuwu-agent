@@ -4,7 +4,7 @@
 use crate::error::UsecaseResult;
 use crate::naming;
 use crate::pipeline::tick::{BoardPlan, TickUseCase};
-use crate::ports::{Liveness, SessionSpec};
+use crate::ports::{CommentRef, Liveness, SessionSpec};
 use uwuwu_domain::{
     gate, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop, SpawnPolicy,
     Status, Task,
@@ -151,30 +151,50 @@ impl TickUseCase {
             }
         }
         let comments = self.board.latest_comments(task.number()).await?;
-        let seen = self.state.last_comment_id(&board.board, task.number());
-        let Some(last) = comments
-            .last()
-            .filter(|c| seen.as_deref() != Some(c.id.as_str()))
-        else {
+        // Хвост непрочитанных: всё после последнего доставленного (seen).
+        // За один непрерывный ход агента копятся несколько комментов
+        // (вердикт ревьювера + ответ владельца) — доставка только
+        // последнего поглощала промежуточные навсегда (#1206 Common-1).
+        let tail: Vec<CommentRef> = match self
+            .state
+            .last_comment_id(&board.board, task.number())
+            .as_deref()
+        {
+            Some(seen_id) => match comments.iter().position(|c| c.id == seen_id) {
+                Some(i) => comments.into_iter().skip(i + 1).collect(),
+                // seen вымылся из журнала — доставляем последний
+                None => comments.into_iter().next_back().into_iter().collect(),
+            },
+            // seen ещё нет — доставляем последний (журнал целиком не
+            // спамим: у старых задач он длинный)
+            None => comments.into_iter().next_back().into_iter().collect(),
+        };
+        let Some(last) = tail.last().cloned() else {
             return Ok(WakeAct::None);
         };
         {
             let activity = self.sessions.last_activity_ms(session).await?;
             let fresh = last.created_ms > activity.unwrap_or(0);
             if fresh {
+                let body = tail
+                    .iter()
+                    .map(|c| c.body.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
                 self.sessions
                     .prompt(
                         session,
                         &format!(
-                            "Wakeup: новый коммент в задаче #{}:\n\n{}",
+                            "Wakeup: новые комменты в задаче #{}:\n\n{}",
                             task.number(),
-                            last.body
+                            body
                         ),
                     )
                     .await?;
                 tracing::info!(
                     event = "wakeup.delivered",
                     number = task.number(),
+                    tail = tail.len(),
                     "Wakeup delivered"
                 );
                 self.state
