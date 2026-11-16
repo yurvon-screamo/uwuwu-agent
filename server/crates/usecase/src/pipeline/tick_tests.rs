@@ -2569,11 +2569,8 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
     let result = writer.close(99, true).await;
 
     // Assert
-    let err = result.err().expect("нет строки нигде — должен быть отказ");
-    assert!(
-        err.to_string().contains("#99"),
-        "отказ называет искомую строку: {err}"
-    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("#99"), "отказ называет искомую строку: {err}");
     let log = board.log.lock().unwrap();
     assert!(
         log.is_empty(),
