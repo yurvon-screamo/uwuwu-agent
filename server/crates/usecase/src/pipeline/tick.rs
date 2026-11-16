@@ -1,9 +1,12 @@
 //! Тик конвейера: чтение досок → домен решает → гейты → исполнение
 //! через порты. Оркестрация знает слова (логи/промпты) — домен нет.
 
+use super::actions::WakeAct;
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{AgentSessionGateway, Clock, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::ports::{
+    AgentSessionGateway, Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
@@ -60,6 +63,8 @@ pub struct TickOutcome {
     pub deferred_peak: usize,
     pub observed: usize,
     pub wakeups: usize,
+    /// Будильников/респавнов, отложенных политикой (пик/CUP — #1200).
+    pub wakeups_deferred: usize,
     pub autodone_done: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
@@ -123,9 +128,50 @@ impl TickUseCase {
             }
             let _ = bp;
         }
+        // CUP честный (#1200): активные — строки активного статуса, чья
+        // stage-сессия жива, плюс спавн-кандидаты без сессии (нагрузку
+        // создадут в этом же тике). Мёртвая сессия LLM не тратит и кап не
+        // держит: призрачные строки не блокируют реальные спавны (инцидент
+        // 16.11: held тест-спавн #1170 при живых-то 1-2 задачах).
+        // Недоступность исполнителя ≠ «все мёртвые» — fallback на старый
+        // статусный подсчёт (паралич конвейера хуже редкого овер-спавна).
+        let alive: Option<std::collections::HashSet<String>> =
+            match self.sessions.list_sessions().await {
+                Ok(list) => Some(
+                    list.into_iter()
+                        .filter(|s| s.outcome.is_empty())
+                        .map(|s| s.id)
+                        .collect(),
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "cup.list_sessions_failed",
+                        error = %e,
+                        "list_sessions недоступен — CUP по статусам"
+                    );
+                    None
+                }
+            };
         let global_active: usize = boards
             .iter()
-            .map(|(_, tasks)| tasks.iter().filter(|t| t.status().is_active()).count())
+            .map(|(_, tasks)| {
+                tasks
+                    .iter()
+                    .filter(|t| {
+                        if !t.status().is_active() {
+                            return false;
+                        }
+                        let Some(session) = t.stage_slot().and_then(|slot| t.session_of(slot))
+                        else {
+                            return true; // кандидат на спавн — нагрузка в этом тике
+                        };
+                        match &alive {
+                            Some(alive) => alive.contains(session),
+                            None => true, // fallback: статусный подсчёт
+                        }
+                    })
+                    .count()
+            })
             .sum();
         for (board, tasks) in boards {
             out = self
@@ -142,6 +188,7 @@ impl TickUseCase {
             held_cup = out.held_cup,
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
+            wakeups_deferred = out.wakeups_deferred,
             autodone = out.autodone_done,
             mode = ?plan.mode,
             failed = out.actions_failed,
@@ -178,39 +225,15 @@ impl TickUseCase {
                     task_ref.number(),
                     task_ref.status(),
                 );
-                // Канон сессий: переход стадии = новый раунд для свежеглазых
-                // слотов (ревью/тест — всегда новая сессия, незамыленность
-                // оценки); dev-семья (Design/Dev) неприкосновенна — дев
-                // сессия едина между этапами и откатами (требование владельца).
+                // Канон сессий: переход стадии = новый раунд слота. Ревью/тест —
+                // свежие глаза всегда (незамыленность оценки); дев-семья едина
+                // между этапами и откатами (требование владельца), но мёртвая
+                // дев-ячейка не «едина» ни с чем и замораживает кик владельца
+                // навсегда (#397) — канон fast-track: исключение от спавна —
+                // живая дев-ячейка. Какой слот чистим — решает хелпер.
                 let prev = self.state.last_seen_status(&board.board, task_ref.number());
                 if prev.as_ref() != Some(&task_ref.status()) {
-                    if let Some(slot) = task_ref.stage_slot() {
-                        if matches!(slot, Slot::PlanReview | Slot::ResultReview | Slot::Test)
-                            && task_ref.session_of(slot).is_some()
-                        {
-                            if let Err(e) = self
-                                .board
-                                .clear_session(&board.board, task_ref.number(), slot)
-                                .await
-                            {
-                                out.actions_failed += 1;
-                                self.log_action_failed(task_ref, e);
-                            } else {
-                                let mut t = task_ref.clone();
-                                t.clear_slot_session(slot);
-                                cleared_clone = Some(t);
-                                // новый раунд: кулдаун прошлого не переносится
-                                self.state
-                                    .clear_spawn_ms(&board.board, task_ref.number(), slot);
-                                tracing::info!(
-                                    event = "stage.fresh_eyes",
-                                    number = task_ref.number(),
-                                    slot = naming::slot_key(slot),
-                                    "Переход стадии: раунд свежих глаз (сессия слота снята)"
-                                );
-                            }
-                        }
-                    }
+                    cleared_clone = self.round_transition(board, task_ref, &mut out).await;
                     self.state.set_last_seen_status(
                         &board.board,
                         task_ref.number(),
@@ -361,22 +384,8 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        match self.wakeup_if_fresh(board, task).await {
-                            Ok(true) => out.wakeups += 1,
-                            Ok(false) => match self.stall_pass(board, task).await {
-                                Ok(StallAct::None) => {}
-                                Ok(StallAct::Pinged) => out.stall_pings += 1,
-                                Ok(StallAct::Flagged) => out.stall_flagged += 1,
-                                Err(e) => {
-                                    out.actions_failed += 1;
-                                    self.log_action_failed(task_ref, e);
-                                }
-                            },
-                            Err(e) => {
-                                out.actions_failed += 1;
-                                self.log_action_failed(task_ref, e);
-                            }
-                        }
+                        self.observe_stage_session(board, plan, task, global_active, &mut out)
+                            .await;
                     } else {
                         out.observed += 1;
                     }
@@ -384,6 +393,104 @@ impl TickUseCase {
             }
         }
         Ok(out)
+    }
+
+    /// Плечо Observe стадии: будильник/респавн под политикой запуска
+    /// (UC-05: пик держит не-high и будильник, и респавн; CUP держит
+    /// респавн — как прямой спавн), при тишине — проход сталл-детекта.
+    /// Сбой логируется в outcome.
+    async fn observe_stage_session(
+        &self,
+        board: &BoardPlan,
+        plan: &TickPlan,
+        task: &Task,
+        global_active: usize,
+        out: &mut TickOutcome,
+    ) {
+        match self
+            .wakeup_if_fresh(board, plan.policy, task, global_active)
+            .await
+        {
+            Ok(WakeAct::Woke) => out.wakeups += 1,
+            Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
+            Ok(WakeAct::None) => match self.stall_pass(board, task).await {
+                Ok(StallAct::None) => {}
+                Ok(StallAct::Pinged) => out.stall_pings += 1,
+                Ok(StallAct::Flagged) => out.stall_flagged += 1,
+                Err(e) => {
+                    out.actions_failed += 1;
+                    self.log_action_failed(task, e);
+                }
+            },
+            Err(e) => {
+                out.actions_failed += 1;
+                self.log_action_failed(task, e);
+            }
+        }
+    }
+
+    /// Смена статуса строки = новый раунд слота: определить событие
+    /// (свежие глаза / кик-разморозка) и снять сессию, если раунд новый.
+    /// Сбой логируется в outcome. Возвращает очищенный клон строки.
+    async fn round_transition(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> Option<Task> {
+        let slot = task.stage_slot()?;
+        let event = if matches!(slot, Slot::Design | Slot::Dev) {
+            "stage.kick_unfreeze"
+        } else {
+            "stage.fresh_eyes"
+        };
+        match self.transition_clear_slot(board, task, slot, event).await {
+            Ok(cleared) => cleared,
+            Err(e) => {
+                out.actions_failed += 1;
+                self.log_action_failed(task, e);
+                None
+            }
+        }
+    }
+
+    /// Вход строки в стадию = новый раунд слота. Ревью/тест-сессии снимаются
+    /// всегда (свежие глаза, незамыленность оценки); дев-семья (Design/Dev) —
+    /// только мёртвая: живая едина между этапами и откатами (требование
+    /// владельца), а мёртвая блокирует разворот кика навсегда (#397) —
+    /// канон fast-track: исключение от спавна — живая дев-ячейка. Unknown
+    /// (serve недоступен) мёртвой не считается — консервативно, dead-детект
+    /// wakeup-пути подхватит строку на следующем тике.
+    /// Возвращает очищенный клон строки (тик работает с ним как с тенью).
+    async fn transition_clear_slot(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        log_event: &'static str,
+    ) -> UsecaseResult<Option<Task>> {
+        let Some(session) = task.session_of(slot) else {
+            return Ok(None);
+        };
+        if matches!(slot, Slot::Design | Slot::Dev)
+            && self.sessions.liveness(session).await != Liveness::Dead
+        {
+            return Ok(None);
+        }
+        self.board
+            .clear_session(&board.board, task.number(), slot)
+            .await?;
+        let mut cleared = task.clone();
+        cleared.clear_slot_session(slot);
+        // новый раунд: кулдаун прошлого не переносится
+        self.state.clear_spawn_ms(&board.board, task.number(), slot);
+        tracing::info!(
+            event = log_event,
+            number = task.number(),
+            slot = naming::slot_key(slot),
+            "Переход стадии: сессия слота снята — раунд с новой сессией"
+        );
+        Ok(Some(cleared))
     }
 
     /// Сталл-детект: stage-сессия жива, но молчит дольше STALL_SILENCE_MS —

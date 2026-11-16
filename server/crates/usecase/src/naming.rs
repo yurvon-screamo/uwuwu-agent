@@ -114,12 +114,18 @@ pub fn priority_name(p: Priority) -> &'static str {
     }
 }
 
+/// Имя нативного поля issue с приоритетом (чтение enrichment и запись
+/// create — одно знание; snapshot-колонка доски зовётся тем же словом).
+pub const F_PRIORITY: &str = "Приоритет";
+
 /// Парсинг приоритета; пустое/неизвестное → Empty (ниже low в очереди CUP).
+/// Один парсер на все носители (snapshot, fm, enrichment): английские и
+/// русские варианты опций, регистр и пробелы не влияют.
 pub fn parse_priority(raw: &str) -> Priority {
     match raw.trim().to_lowercase().as_str() {
-        "high" => Priority::High,
-        "medium" => Priority::Medium,
-        "low" => Priority::Low,
+        "high" | "высокий" => Priority::High,
+        "medium" | "средний" => Priority::Medium,
+        "low" | "низкий" => Priority::Low,
         _ => Priority::Empty,
     }
 }
@@ -174,6 +180,20 @@ pub const TASK_TYPES: [TaskType; 11] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_parsing_unified() {
+        // один парсер на все носители: английские опции доски, русские
+        // варианты, регистр и пробелы — всё доезжает до домена
+        assert_eq!(parse_priority("high"), Priority::High);
+        assert_eq!(parse_priority("High "), Priority::High);
+        assert_eq!(parse_priority("высокий"), Priority::High);
+        assert_eq!(parse_priority("Средний"), Priority::Medium);
+        assert_eq!(parse_priority(" низкий "), Priority::Low);
+        assert_eq!(parse_priority("LOW"), Priority::Low);
+        assert_eq!(parse_priority(""), Priority::Empty);
+        assert_eq!(parse_priority("что-то-иное"), Priority::Empty);
+    }
 
     #[test]
     fn status_round_trip() {

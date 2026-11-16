@@ -318,7 +318,7 @@ fn item_values(item: &Value) -> ItemValues {
             let value = v["name"].as_str().unwrap_or_default();
             match field {
                 "Status" => out.status = value.to_string(),
-                "Приоритет" | "Priority" => out.priority = value.to_string(),
+                crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
                 "Autodone" => out.autodone = value == "on" || value == "true",
                 _ => {}
             }
@@ -360,19 +360,14 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
             }
         }
     }
-    // Приоритет с носителя: опции доски в нижнем регистре (high/medium/low);
-    // регистр-независимо, неизвестное значение — Empty. Без этого мапинга
-    // гейт пика морозит ВСЕ спавны, включая high (инцидент #1170: high-таска
-    //deferred_peak'илась, ревьювер не поднимался в окно GLM).
+    // Приоритет с носителя: один парсер со snapshot-путём (naming::
+    // parse_priority — trim/регистр/русские варианты); неизвестное — Empty.
+    // Без мапинга гейт пика морозил бы ВСЕ спавны, включая high
+    // (инцидент #1170: high-таска deferred_peak'илась, ревьювер не
+    // поднимался в окно GLM).
     let priority = raw
-        .get("Приоритет")
-        .map(|v| v.to_ascii_lowercase())
-        .map(|v| match v.as_str() {
-            "high" | "высокий" => uwuwu_domain::Priority::High,
-            "medium" | "средний" => uwuwu_domain::Priority::Medium,
-            "low" | "низкий" => uwuwu_domain::Priority::Low,
-            _ => uwuwu_domain::Priority::Empty,
-        })
+        .get(crate::github::fields::F_PRIORITY)
+        .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
     // отбрасываем (домен PullRequest требует ветку)
@@ -770,6 +765,29 @@ mod slot_mapping_tests {
             "Design-слот видит сессию"
         );
     }
+    #[test]
+    fn priority_field_absent_maps_empty() {
+        // отсутствующее поле — самый частый кейс доски: не High и не паника
+        let f = map_task_fields(&Fields::new());
+        assert_eq!(f.priority(), uwuwu_domain::Priority::Empty);
+    }
+
+    #[test]
+    fn priority_field_maps_russian_variants() {
+        // enrichment-носитель несёт и русские опции — единый парсер
+        // (naming::parse_priority) обязан их мапить
+        for (value, expected) in [
+            ("высокий", uwuwu_domain::Priority::High),
+            ("Высокий", uwuwu_domain::Priority::High),
+            ("средний", uwuwu_domain::Priority::Medium),
+            ("низкий", uwuwu_domain::Priority::Low),
+        ] {
+            let mut raw = Fields::new();
+            raw.insert(crate::github::fields::F_PRIORITY.into(), value.into());
+            assert_eq!(map_task_fields(&raw).priority(), expected, "value: {value}");
+        }
+    }
+
     #[test]
     fn priority_field_maps_case_insensitive() {
         // #1170: опции доски в нижнем регистре — high обязан доезжать High,

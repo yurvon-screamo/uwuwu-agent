@@ -14,6 +14,9 @@ use uwuwu_usecase::{UsecaseError, UsecaseResult};
 pub const F_DEV_SESSION: &str = "Сессия dev";
 pub const F_REVIEW_SESSION: &str = "Сессия ревью";
 pub const F_TEST_SESSION: &str = "Сессия тест";
+/// Единое имя поля приоритета (пишется create-ом, читается enrichment-ом):
+/// источник — naming (usecase), здесь алиас для локальной конвенции.
+pub const F_PRIORITY: &str = uwuwu_usecase::F_PRIORITY;
 
 /// Карта значений полей задачи (непустые).
 pub type Fields = HashMap<String, String>;

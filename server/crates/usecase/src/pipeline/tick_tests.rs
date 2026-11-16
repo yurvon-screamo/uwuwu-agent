@@ -16,6 +16,8 @@ use uwuwu_domain::{
 struct FakeBoard {
     rows: Vec<Task>,
     log: Mutex<Vec<String>>,
+    /// Журнал комментов задач (будильник-сценарии: latest_comments).
+    comments: Vec<CommentRef>,
 }
 
 #[async_trait]
@@ -81,7 +83,7 @@ impl TaskBoardRepo for FakeBoard {
         Ok(())
     }
     async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
-        Ok(vec![])
+        Ok(self.comments.clone())
     }
     async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<crate::ports::IssueView> {
         let task = self
@@ -129,6 +131,10 @@ struct FakeSessions {
     spawned: Mutex<Vec<String>>,
     /// ms последней активности любой сессии (сталл-детект-тесты).
     activity_ms: u64,
+    /// Id мёртвых сессий (liveness-сценарии кик-разморозки/респавна).
+    dead_sessions: Mutex<Vec<String>>,
+    /// Недоступность list_sessions (fallback-сценарий CUP-подсчёта).
+    list_fails: bool,
 }
 
 #[async_trait]
@@ -148,8 +154,12 @@ impl AgentSessionGateway for FakeSessions {
     async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn liveness(&self, _s: &str) -> Liveness {
-        Liveness::Alive
+    async fn liveness(&self, s: &str) -> Liveness {
+        if self.dead_sessions.lock().unwrap().iter().any(|d| d == s) {
+            Liveness::Dead
+        } else {
+            Liveness::Alive
+        }
     }
     async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
         Ok(())
@@ -164,7 +174,25 @@ impl AgentSessionGateway for FakeSessions {
         Ok(None)
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
-        Ok(vec![])
+        if self.list_fails {
+            return Err(crate::error::UsecaseError::Session(
+                "list недоступен (мок)".into(),
+            ));
+        }
+        // spawned = живые сессии (outcome пуст — финала нет)
+        Ok(self
+            .spawned
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|id| crate::ports::SessionInfo {
+                id: id.clone(),
+                agent: String::new(),
+                updated_ms: 0,
+                outcome: String::new(),
+                total_tokens: 0,
+            })
+            .collect())
     }
     async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
         Ok(String::new())
@@ -334,11 +362,14 @@ fn usecase_with_state(
     let board = Arc::new(FakeBoard {
         rows,
         log: Mutex::default(),
+        comments: Vec::default(),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms: 1000,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
     });
     let prs = Arc::new(FakePrs {
         state: pr,
@@ -353,6 +384,97 @@ fn usecase_with_state(
         spawn_model: None,
     };
     (u, board, sessions, prs)
+}
+
+/// План с включённым пик-окном 06:00–10:00 UTC (PeakClock — внутри него).
+fn peak_plan(mode: Mode, cup: usize) -> TickPlan {
+    TickPlan {
+        mode,
+        policy: SpawnPolicy {
+            cup,
+            peak: PeakWindow {
+                enabled: true,
+                start_min: 360,
+                end_min: 600,
+            },
+        },
+        boards: vec![board_plan()],
+    }
+}
+
+/// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
+fn peak_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    state: Arc<MemState>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments,
+    });
+    let sessions = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        activity_ms: 1000,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sessions.clone(),
+        prs: prs.clone(),
+        clock: Arc::new(PeakClock),
+        state,
+        spawn_model: None,
+    };
+    (u, board, sessions, prs)
+}
+
+/// Юзкейс с готовым моком сессий (сценарии list_fails и пр.).
+fn usecase_with_sessions(
+    rows: Vec<Task>,
+    pr: PrState,
+    sessions: FakeSessions,
+    state: Arc<MemState>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments: Vec::default(),
+    });
+    let sessions = Arc::new(sessions);
+    let prs = Arc::new(FakePrs {
+        state: pr,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sessions.clone(),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state,
+        spawn_model: None,
+    };
+    (u, board, sessions, prs)
+}
+
+/// Часы внутри пик-окна (06:00–10:00 UTC, будни) — UC-05 тесты.
+struct PeakClock;
+impl Clock for PeakClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 400,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        2000
+    }
 }
 
 fn task(n: u64, status: Status) -> Task {
@@ -651,6 +773,248 @@ async fn same_round_keeps_session_no_clear() {
 }
 
 #[tokio::test]
+async fn kick_unfreezes_dead_dev_session() {
+    // #397: кик владельца в стадию с мёртвой дев-ячейкой обязан
+    // разворачиваться: мёртвая сессия снимается, свежий исполнитель
+    // спавнится (через гейт — не-high в пике останется замороженным)
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(33, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_dev").unwrap(),
+    );
+    t.apply_fields(f);
+    state.0.lock().unwrap().statuses.push((33, Status::Testing));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_dev".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("clear#33=")),
+        "мёртвая дев-сессия снята при кике: {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "свежий исполнитель заспавнен");
+}
+
+#[tokio::test]
+async fn dead_stage_session_does_not_hold_cup() {
+    // #1200: кап держат живые LLM-работы, не статусы — строка с мёртвой
+    // сессией не активна, и её слот достаётся спавн-кандидату
+    let mut dead = task(40, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_40").unwrap(),
+    );
+    dead.apply_fields(f);
+    let candidate = task(41, Status::InProgress);
+    let (u, _, sessions, _) = usecase(vec![dead, candidate], PrState::Missing);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_40".into());
+    // cup=2: по статусному подсчёту active=2 → held; честный: active=1 →
+    // влезают оба запуска: респавн мёртвой строки (гейтнутый) + кандидат
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 2,
+        "респавн + кандидат в слоте мёртвой строки"
+    );
+    assert_eq!(out.held_cup, 0);
+}
+
+#[tokio::test]
+async fn dead_stage_session_holds_cup_when_list_unavailable() {
+    // fallback: исполнитель недоступен — сессионные считаются активными
+    // (статусный подсчёт), консервативно против спавн-шторма
+    let mut dead = task(42, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_42").unwrap(),
+    );
+    dead.apply_fields(f);
+    let candidate = task(43, Status::InProgress);
+    let sessions = FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        activity_ms: 1000,
+        dead_sessions: Mutex::default(),
+        list_fails: true,
+    };
+    let (u, _, _, _) = usecase_with_sessions(
+        vec![dead, candidate],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "fallback держит консервативный кап");
+    assert_eq!(out.held_cup, 1);
+}
+
+#[tokio::test]
+async fn medium_wakeup_deferred_in_peak() {
+    // UC-05/#1200: пик держит будильник не-high строки — prompt не уходит,
+    // коммент копится (last_comment_id не пишется), доставка после окна
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(34, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::Medium);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u, _, sessions, _) = peak_usecase(
+        vec![t],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент".into(),
+        }],
+        state,
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "не-high в пике не будится"
+    );
+    assert_eq!(out.wakeups_deferred, 1);
+    assert_eq!(out.wakeups, 0);
+}
+
+#[tokio::test]
+async fn high_wakeup_passes_peak() {
+    // канон UC-05: high продолжают работать — будильник high в окне доставляется
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(35, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::High);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_high").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u, _, sessions, _) = peak_usecase(
+        vec![t],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент".into(),
+        }],
+        state,
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "high будится в пике");
+    assert!(!sessions.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn medium_respawn_deferred_in_peak() {
+    // #1161-класс: мёртвая stage-сессия не-high в окне — респавн отложен
+    let mut t = task(36, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::Medium);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_36").unwrap(),
+    );
+    t.apply_fields(f);
+    // тот же раунд (статус не менялся) — путь чистого respawn, без kick-ветки
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((36, Status::InProgress));
+    let (u, _, sessions, _) = peak_usecase(vec![t], Vec::new(), state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_36".into());
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "не-high в пике не респавнится"
+    );
+    assert_eq!(out.wakeups_deferred, 1);
+}
+
+#[tokio::test]
+async fn respawn_held_under_cup() {
+    // респавн = фактический спавн: CUP-кап держит его как прямой спавн
+    let mut t = task(37, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::High);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_37").unwrap(),
+    );
+    t.apply_fields(f);
+    // тот же раунд — путь чистого respawn
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((37, Status::InProgress));
+    let (u, _, sessions, _) = peak_usecase(vec![t], Vec::new(), state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_37".into());
+    // cup=0: даже одна кандидату-строка не влезает (active 0 >= 0)
+    let out = u.run(&peak_plan(Mode::Live, 0)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "респавн держится CUP-капом"
+    );
+    assert_eq!(out.wakeups_deferred, 1);
+}
+
+#[tokio::test]
+async fn high_respawn_passes_peak() {
+    // high в пике респавнится (байпас), CUP свободен
+    let mut t = task(38, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::High);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_38").unwrap(),
+    );
+    t.apply_fields(f);
+    // тот же раунд — путь чистого respawn
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((38, Status::InProgress));
+    let (u, _, sessions, _) = peak_usecase(vec![t], Vec::new(), state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_38".into());
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    // респавн идёт через wakeup-механику: Woke в outcome, сессия реально создана
+    assert_eq!(out.wakeups, 1, "high-респавн в пике проходит");
+    assert!(!sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn dev_session_survives_all_transitions() {
     // Канон сессий: дев-сессия едина между этапами и откатами —
     // переходы стадий её никогда не снимают
@@ -754,12 +1118,15 @@ async fn stall_detector_pings_then_flags() {
     let board = Arc::new(FakeBoard {
         rows: vec![t],
         log: Mutex::default(),
+        comments: Vec::default(),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         // сессия молчит час+ — ход завершён без статусного перевода
         activity_ms: now - STALL_SILENCE_MS - 60_000,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
     });
     struct AdvClock(AtomicU64);
     impl Clock for AdvClock {
