@@ -13,7 +13,6 @@ pub struct OpencodeClient {
     http: reqwest::Client,
 }
 
-/// HTTP-статус → liveness-вердикт (маппинг вынесен для тестов без сети).
 /// Хвост журнала (order=desc): является ли самый свежий содержательный
 /// блок (user|assistant) ассистентским. Служебные записи поверх ответа
 /// (idle и пр., #1150/#1206 Common-1) пропускаются.
@@ -24,6 +23,7 @@ fn latest_meaningful_is_assistant(msgs: &[serde_json::Value]) -> bool {
         .unwrap_or(false)
 }
 
+/// HTTP-статус → liveness-вердикт (маппинг вынесен для тестов без сети).
 pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
     if status.is_success() {
         Liveness::Alive
