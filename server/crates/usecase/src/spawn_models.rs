@@ -34,7 +34,8 @@ impl SpawnModels {
         put("plan-reviewer", "zai-coding-plan/glm-5.3");
         put("code-quality-reviewer", "zai-coding-plan/glm-5.3");
         put("tester", "zai-coding-plan/glm-5.3-flash#max");
-        put("triage", "zai-coding-plan/glm-5.3-flash#max");
+        put("analyst", "zai-coding-plan/glm-5.3-flash#high");
+        put("analyst-reviewer", "zai-coding-plan/glm-5.3#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
         Self { map }
     }

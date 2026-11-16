@@ -4,6 +4,7 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, LoopOutcome, SpawnLoop, Status, Task};
 
@@ -20,6 +21,7 @@ pub struct AnalystReviewUseCase {
     pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
+    pub models: Arc<SpawnModels>,
 }
 
 impl AnalystReviewUseCase {
@@ -97,13 +99,14 @@ impl AnalystReviewUseCase {
             }
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»):
             // сбой гейтвея не тратит попытку ревью и не заряжает кулдаун.
+            let sm = self.models.for_agent(Agent::AnalystReviewer);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
                 title: "ревью аналитики".into(),
                 agent: AgentSlot::Role(Agent::AnalystReviewer),
                 custom_agent: None,
-                model: None,
-                variant: None,
+                model: sm.model,
+                variant: sm.variant,
                 bootstrap: false,
             };
             let sessions = self.sessions.project(&tb.project);

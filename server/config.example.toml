@@ -28,7 +28,8 @@ developer = "zai-coding-plan/glm-5.3"
 plan-reviewer = "zai-coding-plan/glm-5.3"
 code-quality-reviewer = "zai-coding-plan/glm-5.3"
 tester = "zai-coding-plan/glm-5.3-flash#max"
-triage = "zai-coding-plan/glm-5.3-flash#max"
+analyst = "zai-coding-plan/glm-5.3-flash#high"
+analyst-reviewer = "zai-coding-plan/glm-5.3#high"
 dreamer = "zai-coding-plan/glm-5.3-flash#high"
 
 [policy]
