@@ -111,7 +111,11 @@ pub struct SessionSpec {
     /// боты с fm agent — методичка в agent-md, не в промптах.
     /// Приоритетнее agent-слота.
     pub custom_agent: Option<String>,
-    /// Модель спавна; None — дефолт исполнителя.
+    /// Модель в теле спавна (POST /session → body.model). Внимание (#1154):
+    /// body.model **перекрывает** деф-модель агента в opencode — Some здесь
+    /// легитимен только в бот-контуре (fm дока бота, runner). Конвейерные
+    /// спавны обязаны нести None: модель — из декларации агента (деф
+    /// agents/*.md → default_agent), гарды — spawn_model_tests / tick_tests.
     pub model: Option<ModelRef>,
     /// Вариант модели (opencode model.variant, напр. «low»); None — без.
     pub variant: Option<String>,
