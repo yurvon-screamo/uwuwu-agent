@@ -209,18 +209,12 @@ async fn run(
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
-    let spawn_model_cfg = cfg
-        .executor
-        .spawn_model
-        .as_ref()
-        .map(|m| uwuwu_domain::ModelRef::new(m.provider.clone(), m.id.clone()));
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: clock.clone(),
         state: state.clone(),
-        spawn_model: spawn_model_cfg.clone(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -306,7 +300,6 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
             checkout: plan
                 .boards
                 .first()
@@ -347,7 +340,6 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
             checkout: checkout.clone(),
         });
         let project = project.clone();
@@ -396,7 +388,6 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
             checkout: boards_info
                 .first()
                 .map(|(_, _, checkout)| checkout.clone())

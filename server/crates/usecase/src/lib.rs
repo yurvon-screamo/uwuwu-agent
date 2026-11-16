@@ -14,6 +14,8 @@ mod router;
 #[cfg(test)]
 mod router_tests;
 mod search;
+#[cfg(test)]
+mod spawn_model_tests;
 mod tasks;
 
 pub use bots::{

@@ -10,9 +10,11 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, ModelRef, SessionSighting, Slot,
+    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, SessionSighting, Slot,
     SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
 };
+use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
 /// Кулдаун спавна слота строки: 15 минут (анти-шторм любого происхождения).
@@ -112,8 +114,6 @@ pub struct TickUseCase {
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
-    /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub spawn_model: Option<ModelRef>,
 }
 
 /// Контекст строки тика: данные union-скана и enrichment, общие для

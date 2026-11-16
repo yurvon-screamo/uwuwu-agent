@@ -11,7 +11,7 @@ use crate::router::SessionRouter;
 use std::sync::Arc;
 use uwuwu_domain::{
     civil_from_days, AgentSlot, CronField, CronMaster, CronSchedule, IntervalMinutes, JstDate,
-    JstTime, ModelRef, Schedule, ScheduleKind,
+    JstTime, Schedule, ScheduleKind,
 };
 
 /// Слэг папки кронов проекта.
@@ -24,7 +24,6 @@ pub struct CronUseCase {
     /// Роутер «проект → executor»: крон-ран — гейтвей своего проекта.
     pub sessions: Arc<SessionRouter>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<ModelRef>,
     pub checkout: String,
 }
 
@@ -92,7 +91,8 @@ impl CronUseCase {
                 directory: self.checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,
-                model: self.spawn_model.clone(),
+                // модель — деф агента мастера (#1154), не конфиг
+                model: None,
                 variant: None,
                 bootstrap: false,
             };
