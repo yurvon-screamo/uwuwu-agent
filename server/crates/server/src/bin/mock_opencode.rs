@@ -435,6 +435,16 @@ async fn work_like_agent(
     step_ms: u64,
 ) {
     tokio::time::sleep(Duration::from_millis(step_ms)).await;
+    // проект MCP-вызовов: изолированные стенды (#1135 fullwave) гонят конфиг
+    // без uwuwu — без project сервер дефолтит uwuwu и отклоняет вызов.
+    // Дефолт пустой (прод-сценарии с uwuwu в конфиге работают как раньше).
+    let mcp_project = cfg("MOCK_MCP_PROJECT", "");
+    let project_of = |mut args: Value| -> Value {
+        if !mcp_project.is_empty() {
+            args["project"] = Value::String(mcp_project.clone());
+        }
+        args
+    };
     let (stage, mut status, mut verdict) =
         stage_action_of_prompt(&prompt_text).unwrap_or(("other", "", "сводка (мок)"));
     // wakeup: стадию из промпта не извлечь — действуем по текущему
@@ -445,7 +455,7 @@ async fn work_like_agent(
                 &mcp_url,
                 &mcp_token,
                 "task_get",
-                json!({ "number": number }),
+                project_of(json!({ "number": number })),
             )
             .await;
             if let Some(line) = reply.lines().next() {
@@ -501,7 +511,7 @@ async fn work_like_agent(
                 &mcp_url,
                 &mcp_token,
                 "task_comment",
-                json!({ "number": number, "text": format!("[мок] {verdict}") }),
+                project_of(json!({ "number": number, "text": format!("[мок] {verdict}") })),
             )
             .await;
             if !status.is_empty() {
@@ -509,7 +519,7 @@ async fn work_like_agent(
                     &mcp_url,
                     &mcp_token,
                     "task_edit",
-                    json!({ "number": number, "status": status }),
+                    project_of(json!({ "number": number, "status": status })),
                 )
                 .await;
             }
@@ -526,7 +536,7 @@ async fn work_like_agent(
             &mcp_url,
             &mcp_token,
             "task_comment",
-            json!({ "number": first, "text": format!("[мок] {verdict}") }),
+            project_of(json!({ "number": first, "text": format!("[мок] {verdict}") })),
         )
         .await;
         if !status.is_empty() {
@@ -534,7 +544,7 @@ async fn work_like_agent(
                 &mcp_url,
                 &mcp_token,
                 "task_edit",
-                json!({ "number": first, "status": status }),
+                project_of(json!({ "number": first, "status": status })),
             )
             .await;
         }
@@ -544,7 +554,7 @@ async fn work_like_agent(
                     &mcp_url,
                     &mcp_token,
                     "task_close",
-                    json!({ "number": n, "not_planned": true }),
+                    project_of(json!({ "number": n, "not_planned": true })),
                 )
                 .await;
             } else {
@@ -552,7 +562,7 @@ async fn work_like_agent(
                     &mcp_url,
                     &mcp_token,
                     "task_comment",
-                    json!({ "number": n, "text": format!("[мок] {verdict}") }),
+                    project_of(json!({ "number": n, "text": format!("[мок] {verdict}") })),
                 )
                 .await;
                 if !status.is_empty() {
@@ -560,7 +570,7 @@ async fn work_like_agent(
                         &mcp_url,
                         &mcp_token,
                         "task_edit",
-                        json!({ "number": n, "status": status }),
+                        project_of(json!({ "number": n, "status": status })),
                     )
                     .await;
                 }
