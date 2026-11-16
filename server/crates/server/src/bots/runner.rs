@@ -170,7 +170,11 @@ async fn wait_reply(deps: &BotDeps, session: &str, baseline_ms: u64) -> Option<S
     loop {
         tokio::time::sleep(Duration::from_millis(deps.reply_poll_ms)).await;
         if let Ok(Some(r)) = deps.sessions.last_assistant_reply(session).await {
-            if r.created_ms > baseline_ms && r.finished {
+            // промежуточные tool-call сообщения finished-без-текста НЕ
+            // считаем ответом (помощник зовёт uwuwu_task_create до
+            // финального текста — инцидент 16.11: мгновенный фоллбек
+            // «Не успел ответить» за минуту); ждём текстовое сообщение
+            if r.created_ms > baseline_ms && r.finished && !r.text.trim().is_empty() {
                 return Some(r.text);
             }
         }
