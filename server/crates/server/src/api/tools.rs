@@ -347,8 +347,10 @@ impl ToolHub {
     }
 
     async fn search(&self, args: &Value) -> Result<Value, String> {
-        require_args(args, &["query"])?;
         let query = arg_str(args, "query");
+        if query.is_empty() {
+            return Err("query обязателен".into());
+        }
         let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let hits = self
             .search
