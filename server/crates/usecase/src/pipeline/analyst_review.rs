@@ -103,7 +103,8 @@ impl AnalystReviewUseCase {
                 bootstrap: false,
             };
             let session = self.sessions.create_session(&spec).await?;
-            wave.sort_by_key(|t| t.priority().rank());
+            // сортировка уже сделана на candidates (пары wave↔guards
+            // построены в одном проходе) — здесь порядок не трогаем (L1)
             let prompt = analyst_review_prompt(&tb.project, &wave);
             self.sessions.prompt(&session, &prompt).await?;
             for (t, guard) in wave.iter().zip(guards.iter()) {

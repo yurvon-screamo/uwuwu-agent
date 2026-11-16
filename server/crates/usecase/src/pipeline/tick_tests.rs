@@ -2023,12 +2023,19 @@ impl AgentSessionGateway for FailingCreate {
 /// Доски с раздельными строками (мультиборд-кейс C3).
 struct FakeMultiBoard {
     boards: Vec<(String, Vec<Task>)>,
+    /// доски, чтение которых падает (кейс prune при частичном сбое)
+    fail_reads: Vec<String>,
     log: Mutex<Vec<String>>,
 }
 
 #[async_trait]
 impl TaskBoardRepo for FakeMultiBoard {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
+        if self.fail_reads.iter().any(|b| b == board) {
+            return Err(crate::error::UsecaseError::Board(format!(
+                "{board}: GitHub API (мок)"
+            )));
+        }
         Ok(self
             .boards
             .iter()
@@ -2172,6 +2179,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
             ("B1".into(), vec![titled(1, "проект-один", Status::Analys)]),
             ("B2".into(), vec![titled(2, "проект-два", Status::Analys)]),
         ],
+        fail_reads: vec![],
         log: Mutex::default(),
     });
     let u = AnalystUseCase {
@@ -2329,6 +2337,61 @@ async fn analyst_prunes_review_loops_of_gone_rows() {
     assert!(
         state.0.lock().unwrap().analys_review_loops.is_empty(),
         "мёртвый review-loop вычищен"
+    );
+}
+
+
+#[tokio::test]
+async fn prune_skipped_when_a_board_read_fails() {
+    // дельта R3-L2: непрочитанная доска → её строки не в live-наборе;
+    // prune откладывается, счётчики живых строк доски не стираются
+    let inner = MemStateInner {
+        analys_loops: vec![(1, Status::Analys, 2)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let board = Arc::new(FakeMultiBoard {
+        // #1 в Review Analys: мимо волны и мимо stale-сброса — тик изме­няет
+        // только prune, который при сбое B2 откладывается
+        boards: vec![
+            (
+                "B1".into(),
+                vec![titled(1, "живая застрявшая", Status::ReviewAnalys)],
+            ),
+            ("B2".into(), vec![titled(2, "живая вторая", Status::Analys)]),
+        ],
+        fail_reads: vec!["B2".into()],
+        log: Mutex::default(),
+    });
+    let u = AnalystUseCase {
+        board: board.clone(),
+        boards: vec![
+            AnalystBoard {
+                project: "p".into(),
+                board: "B1".into(),
+                checkout: "/c1".into(),
+            },
+            AnalystBoard {
+                project: "p".into(),
+                board: "B2".into(),
+                checkout: "/c2".into(),
+            },
+        ],
+        sessions,
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+    };
+    u.tick().await.unwrap();
+    assert!(
+        state
+            .0
+            .lock()
+            .unwrap()
+            .analys_loops
+            .iter()
+            .any(|(n, _, r)| *n == 1 && *r == 2),
+        "счётчик живой строки непрочитанной доски не стёрт"
     );
 }
 

@@ -50,10 +50,14 @@ impl AnalystUseCase {
         let now = self.clock.now_ms();
         let mut spawned = 0usize;
         let mut live_rows: std::collections::HashSet<String> = Default::default();
+        // непрочитанная доска — её строки не в live_rows; prune в этом тике
+        // не выполняется, иначе сотрёт счётчики живых строк (R2-L2/дельта R3)
+        let mut read_failed = false;
         for tb in &self.boards {
             let rows = match self.board.read_board(&tb.board).await {
                 Ok(rows) => rows,
                 Err(e) => {
+                    read_failed = true;
                     tracing::warn!(event = "analys.board_failed",
                         board = %tb.board, error = %e, "Аналитика: доска не прочитана");
                     continue;
@@ -140,8 +144,12 @@ impl AnalystUseCase {
             spawned += 1;
         }
         // гигиена состояния (R2-L3): счётчики обеих гвардов строк, ушедших
-        // с досок (deleted/closed), из state.json вычищаются
-        self.state.prune_analys_guards(&live_rows);
+        // с досок (deleted/closed), из state.json вычищаются. Частичный сбой
+        // чтения — prune откладывается: неполный live-набор стёр бы счётчики
+        // живых строк непрочитанной доски
+        if !read_failed {
+            self.state.prune_analys_guards(&live_rows);
+        }
         Ok(spawned)
     }
 
