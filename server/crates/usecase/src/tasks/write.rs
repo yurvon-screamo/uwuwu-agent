@@ -153,7 +153,7 @@ impl TaskWriter for TaskWriteUseCase {
         let mut field_patch: Vec<(&str, Option<String>)> =
             vec![("Тип", Some(naming::task_type_name(kind).to_string()))];
         if !spec.priority.is_empty() {
-            field_patch.push(("Приоритет", Some(spec.priority.clone())));
+            field_patch.push((naming::F_PRIORITY, Some(spec.priority.clone())));
         }
         self.fields.store(number, &field_patch).await?;
         Ok(number)
@@ -214,7 +214,7 @@ impl TaskWriter for TaskWriteUseCase {
             field_patch.push(("PR", Some(url.as_str().to_string())));
         }
         if let Some(pr) = &patch.priority {
-            field_patch.push(("Приоритет", Some(pr.clone())));
+            field_patch.push((naming::F_PRIORITY, Some(pr.clone())));
         }
         if !field_patch.is_empty() {
             self.fields.store(number, &field_patch).await?;
