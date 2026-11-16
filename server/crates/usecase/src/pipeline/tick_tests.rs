@@ -2395,3 +2395,126 @@ async fn prune_skipped_when_a_board_read_fails() {
     );
 }
 
+
+/// Заглушка issue-полей: close-путь полей не пишет.
+struct FakeFields;
+
+#[async_trait]
+impl crate::ports::IssueFieldStore for FakeFields {
+    async fn store(&self, _: u64, _: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
+        Ok(Default::default())
+    }
+}
+
+/// Доска с per-board валидацией мутаций (как живой GitHubHub: set_status
+/// на номер, не живущий на доске — громкая ошибка «строка не на доске»).
+struct CloseBoard {
+    boards: Vec<(String, Vec<u64>)>,
+    log: Mutex<Vec<String>>,
+}
+
+impl CloseBoard {
+    fn board_of(&self, board: &str) -> UsecaseResult<&Vec<u64>> {
+        self.boards
+            .iter()
+            .find(|(b, _)| b == board)
+            .map(|(_, rows)| rows)
+            .ok_or_else(|| crate::error::UsecaseError::Board(format!("нет доски {board}")))
+    }
+}
+
+#[async_trait]
+impl TaskBoardRepo for CloseBoard {
+    async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
+        let rows = self.board_of(board)?;
+        Ok(rows
+            .iter()
+            .map(|n| Task::new(*n, format!("строка {n}"), Status::Todo))
+            .collect())
+    }
+    async fn set_status(&self, b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+        if !self.board_of(b)?.contains(&n) {
+            return Err(crate::error::UsecaseError::Board(format!(
+                "строка #{n} не на доске «{b}»"
+            )));
+        }
+        self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
+        Ok(())
+    }
+    async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issue_fields(&self, _: u64) -> UsecaseResult<TaskFields> {
+        Ok(TaskFields::default())
+    }
+    async fn post_comment(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn close_issue(&self, _: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn latest_comments(&self, _: u64) -> UsecaseResult<Vec<CommentRef>> {
+        Ok(vec![])
+    }
+    async fn read_issue(&self, _: &str, _: u64) -> UsecaseResult<crate::ports::IssueView> {
+        Err(crate::error::UsecaseError::Board("мок".into()))
+    }
+    async fn create_issue(&self, _: &str, _: &str, _: &str, _: &str) -> UsecaseResult<u64> {
+        Ok(1)
+    }
+    async fn rename_issue(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn patch_cells(&self, _: u64, _: crate::ports::FmMutator) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn close_issue_ext(&self, _: u64, _: bool) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn replace_body(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn task_close_resolves_board_of_the_row_multiboard() {
+    // регресс-пин #1135 (живой прогон): вердикт аналитика «дубль/мусор →
+    // task_close not_planned» обязан работать на любой доске волны
+    // (мультиборд C3), а не только на первой доске конфига. Живой факт:
+    // close(number) резолвит первую доску конфига и падает «строка #N
+    // не на доске «Задачи uwuwu»» для строк второй доски — дубль
+    // остаётся в Analys, цикл-гвард эскалирует владельцу.
+    // Ожидаемое поведение: close резолвит доску строки (или идемпотентно
+    // Done на всех досках конфига) и закрывает строку второй доски.
+    let board = Arc::new(CloseBoard {
+        boards: vec![("B1".into(), vec![1]), ("B2".into(), vec![5])],
+        log: Mutex::default(),
+    });
+    let fields: Arc<dyn crate::ports::IssueFieldStore> = Arc::new(FakeFields);
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields,
+        boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+    };
+    use crate::tasks::write::TaskWriter;
+    writer
+        .close(5, true)
+        .await
+        .expect("close строки второй доски волны — вердикт аналитика «дубль»");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|e| e == "status#5=Done"),
+        "строка дубля на второй доске переведена в Done, лог: {log:?}"
+    );
+    assert!(
+        log.iter().all(|e| !e.contains("status#1=")),
+        "строки первой доски close не трогает, лог: {log:?}"
+    );
+}
+
