@@ -148,7 +148,7 @@ impl AgentSessionGateway for FakeSessions {
         self.prompts
             .lock()
             .unwrap()
-            .push(format!("{session}:{}", text.len()));
+            .push(format!("{session}|{text}"));
         Ok(())
     }
     async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
@@ -241,7 +241,7 @@ struct MemStateInner {
 struct MemState(Mutex<MemStateInner>);
 impl TickStateStore for MemState {
     fn last_comment_id(&self, _b: &str, _n: u64) -> Option<String> {
-        None
+        self.0.lock().unwrap().comments.last().cloned()
     }
     fn set_last_comment_id(&self, _b: &str, _n: u64, id: &str) {
         self.0.lock().unwrap().comments.push(id.into());
@@ -1200,6 +1200,75 @@ async fn undelivered_comment_is_not_marked_seen() {
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
     assert!(!sess2.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn multi_comment_tail_delivered_together() {
+    // #1206 Common-1: несколько комментов за один непрерывный ход агента
+    // (вердикт ревьювера + ответ владельца) доставляются одним промптом —
+    // доставка только последнего поглощала промежуточные навсегда
+    let mut t = task(61, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_61").unwrap(),
+    );
+    t.apply_fields(f);
+    // seen = агентский коммент "A": после него накопились два непрочитанных
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().comments.push("A".into());
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: vec![
+            CommentRef {
+                id: "A".into(),
+                created_ms: 900,
+                body: "агентский отчёт".into(),
+            },
+            CommentRef {
+                id: "c1".into(),
+                created_ms: 950,
+                body: "вердикт ревьювера".into(),
+            },
+            CommentRef {
+                id: "c2".into(),
+                created_ms: 980,
+                body: "ответ владельца".into(),
+            },
+        ],
+    });
+    let sess = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        activity_ms: 900,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: sess.clone(),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1);
+    let prompts = sess.prompts.lock().unwrap();
+    let sent = prompts.join("\n");
+    assert!(
+        sent.contains("вердикт ревьювера") && sent.contains("ответ владельца"),
+        "хвост доставлен целиком одним промптом: {prompts:?}"
+    );
+    // seen продвинулся на последний коммент хвоста
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("c2")
+    );
 }
 
 #[tokio::test]
