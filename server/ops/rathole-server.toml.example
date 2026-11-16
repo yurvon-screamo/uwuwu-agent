@@ -16,3 +16,9 @@ bind_addr = "0.0.0.0:2333"
 [server.services.ollama]
 # token = "$RATHOLE_TOKEN" — подставляется env в start command
 token = "CHANGE_ME"
+
+# Второй исполнитель (ноутбук-2, 16.11): тот же паттерн —
+# uwuwu-server → http://relay.railway.internal:2336 → (туннель) → ноут-2 opencode serve
+[server.services.opencode2]
+token = "<RATHOLE_TOKEN>"
+bind_addr = "0.0.0.0:2336"
