@@ -331,12 +331,20 @@ impl TickStateStore for JsonStateStore {
             .remove(&format!("{board}:{number}:analys-review-loop"));
     }
 
-    fn prune_analys_loops(&self, live: &std::collections::HashSet<String>) {
-        self.state
-            .lock()
-            .expect("state lock")
-            .analys_loops
-            .retain(|k, _| live.contains(k));
+    fn prune_analys_guards(&self, live: &std::collections::HashSet<String>) {
+        let mut guard = self.state.lock().expect("state lock");
+        guard.analys_loops.retain(|k, _| live.contains(k));
+        let suffix = ":analys-review-loop";
+        let dead: Vec<String> = guard
+            .spawn_loops
+            .keys()
+            .filter(|k| k.ends_with(suffix))
+            .filter(|k| !live.contains(k.strip_suffix(suffix).expect("суффикс проверен")))
+            .cloned()
+            .collect();
+        for k in dead {
+            guard.spawn_loops.remove(&k);
+        }
     }
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state

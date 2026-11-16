@@ -416,11 +416,11 @@ impl TickStateStore for MemState {
             .analys_review_loops
             .retain(|(num, _, _)| *num != n);
     }
-    fn prune_analys_loops(&self, live: &std::collections::HashSet<String>) {
-        self.0
-            .lock()
-            .unwrap()
-            .analys_loops
+    fn prune_analys_guards(&self, live: &std::collections::HashSet<String>) {
+        let mut g = self.0.lock().unwrap();
+        g.analys_loops
+            .retain(|(num, _, _)| live.contains(&format!("B:{num}")));
+        g.analys_review_loops
             .retain(|(num, _, _)| live.contains(&format!("B:{num}")));
 
     }
@@ -2227,6 +2227,108 @@ async fn analyst_prunes_loops_of_gone_rows() {
     assert!(
         inner.analys_loops.iter().any(|(n, _, _)| *n == 1),
         "счётчик живой строки на месте"
+    );
+}
+
+
+// ===== Дельта ревью R2: пары гвардов не разъезжаются, сброс на выходе, prune обоих =====
+
+#[tokio::test]
+async fn reviewer_guard_pairs_survive_priority_sort() {
+    // R2-H1: сортировка волны до построения гвардов — счётчик пишется
+    // своей строке. Доска отдаёт [#2 (Empty, свежая), #1 (High, 1 повтор)]:
+    // после сортировки волна [#1, #2], счётчики — по 2 и 1 соответственно.
+    let inner = MemStateInner {
+        analys_review_loops: vec![(1, Status::ReviewAnalys, 1)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let mut low = titled(2, "пустой приоритет", Status::ReviewAnalys);
+    low.set_priority(uwuwu_domain::Priority::Empty);
+    let mut high = titled(1, "высокий", Status::ReviewAnalys);
+    high.set_priority(uwuwu_domain::Priority::High);
+    // порядок строк доски: low первым, high вторым — сортировка переставит
+    let (u, _) = review_uc(
+        vec![low, high],
+        state.clone(),
+        Arc::new(FakeSessions::new()),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let inner = state.0.lock().unwrap();
+    let got = |n: u64| {
+        inner
+            .analys_review_loops
+            .iter()
+            .find(|(num, _, _)| *num == n)
+            .map(|(_, _, r)| *r)
+    };
+    assert_eq!(got(1), Some(2), "своя пара: 1+1=2");
+    assert_eq!(got(2), Some(1), "своя пара: 0+1=1");
+}
+
+#[tokio::test]
+async fn reviewer_guard_resets_when_row_leaves_review_analys() {
+    // R2-C1: легитимный перезаход (ревьювер вернул в Analys) — счётчик
+    // ревью-спавнов с нуля, ложной эскалации дорабатываемых строк нет
+    let inner = MemStateInner {
+        analys_review_loops: vec![(5, Status::ReviewAnalys, 3)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(5, "на доработке", Status::Analys)],
+        state.clone(),
+        sessions,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        state.0.lock().unwrap().analys_review_loops.is_empty(),
+        "счётчик ревью-спавнов сброшен при выходе из Review Analys"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_guard_survives_while_row_in_review_analys() {
+    // живой умирающий ревьювер: строка НЕ покидала Review Analys —
+    // счётчик копится (гвард R1-C2 работает)
+    let inner = MemStateInner {
+        analys_review_loops: vec![(7, Status::ReviewAnalys, 2)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(7, "ждёт ревью", Status::ReviewAnalys)],
+        state.clone(),
+        sessions,
+    );
+    u.tick().await.unwrap();
+    assert_eq!(
+        state.0.lock().unwrap().analys_review_loops.len(),
+        1,
+        "строка в Review Analys — счётчик не тронут"
+    );
+}
+
+#[tokio::test]
+async fn analyst_prunes_review_loops_of_gone_rows() {
+    // R2-L1: review-loop ключи ушедших строк вычищаются вместе с аналитическими
+    let inner = MemStateInner {
+        analys_review_loops: vec![(9, Status::ReviewAnalys, 1)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "живая", Status::Analys)],
+        state.clone(),
+        sessions,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        state.0.lock().unwrap().analys_review_loops.is_empty(),
+        "мёртвый review-loop вычищен"
     );
 }
 

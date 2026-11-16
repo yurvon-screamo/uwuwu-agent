@@ -50,8 +50,7 @@ impl AnalystReviewUseCase {
                     continue;
                 }
             };
-            let mut wave: Vec<&Task> = Vec::new();
-            let mut guards: Vec<SpawnLoop> = Vec::new();
+            let mut candidates: Vec<&Task> = Vec::new();
             for t in &rows {
                 if t.status() != Status::ReviewAnalys || t.title().is_empty() {
                     continue;
@@ -64,6 +63,14 @@ impl AnalystReviewUseCase {
                 if !fresh {
                     continue;
                 }
+                candidates.push(t);
+            }
+            // Сортировка ДО построения гвардов: пары (строка, счётчик)
+            // собираются в одном порядке — zip не разъезжается (H1 ревью).
+            candidates.sort_by_key(|t| t.priority().rank());
+            let mut wave: Vec<&Task> = Vec::new();
+            let mut guards: Vec<SpawnLoop> = Vec::new();
+            for t in candidates {
                 let mut guard = self
                     .state
                     .analys_review_loop(&tb.board, t.number())

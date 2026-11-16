@@ -267,9 +267,10 @@ pub trait TickStateStore: Send + Sync {
     fn analys_review_loop(&self, board: &str, number: u64) -> Option<(Status, u32)>;
     fn set_analys_review_loop(&self, board: &str, number: u64, status: Status, repeats: u32);
     fn clear_analys_review_loop(&self, board: &str, number: u64);
-    /// Гигиена (R2-L3): счётчики строк, ушедших с досок, вычищаются —
-    /// live = ключи «board:number» всех строк всех досок тика.
-    fn prune_analys_loops(&self, live: &std::collections::HashSet<String>);
+    /// Гигиена (R2-L3): счётчики обеих гвардов (аналитик + ревьювер) строк,
+    /// ушедших с досок, вычищаются — live = ключи «board:number» всех строк
+    /// всех досок тика.
+    fn prune_analys_guards(&self, live: &std::collections::HashSet<String>);
     /// Attention-механика: счётчик повторных спавнов слота
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;

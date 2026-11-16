@@ -69,6 +69,16 @@ impl AnalystUseCase {
                 {
                     self.state.clear_analys_loop(&tb.board, t.number());
                 }
+                // ревью-гвард (R2-C1): строка покинула Review Analys — счётчик
+                // ревью-спавнов устарел, легитимный перезаход начинает с нуля
+                if self
+                    .state
+                    .analys_review_loop(&tb.board, t.number())
+                    .is_some()
+                    && t.status() != Status::ReviewAnalys
+                {
+                    self.state.clear_analys_review_loop(&tb.board, t.number());
+                }
                 if t.status() != Status::Analys || t.title().is_empty() {
                     continue;
                 }
@@ -129,9 +139,9 @@ impl AnalystUseCase {
                 session = %session, "Analyst wave spawned");
             spawned += 1;
         }
-        // гигиена состояния (R2-L3): счётчики строк, ушедших с досок
-        // (deleted/closed), из state.json вычищаются
-        self.state.prune_analys_loops(&live_rows);
+        // гигиена состояния (R2-L3): счётчики обеих гвардов строк, ушедших
+        // с досок (deleted/closed), из state.json вычищаются
+        self.state.prune_analys_guards(&live_rows);
         Ok(spawned)
     }
 
