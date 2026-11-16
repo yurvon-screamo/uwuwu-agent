@@ -43,6 +43,26 @@ impl Status {
         if from == to {
             return true; // идемпотентная переустановка
         }
+        // Возврат в Вейт открыт из рабочих/финальных статусов: крон-мастер
+        // после правок тела обязан вернуться в Вейт (файр-гейт пускает только
+        // из него; унификация кронов с задачами забыла это ребро — мастер
+        // #384 застрял в In Progress, расписание умерло). Из Draft Вейт не
+        // ставится: черновики в Вейт проводит триаж.
+        let to_wait = matches!(to, S::Wait)
+            && matches!(
+                from,
+                S::Todo
+                    | S::Design
+                    | S::ReviewPlan
+                    | S::InProgress
+                    | S::ReviewResult
+                    | S::Testing
+                    | S::UserReview
+                    | S::NeedsAttention
+            );
+        if to_wait {
+            return true;
+        }
         matches!(
             (from, to),
             (S::Draft, S::Todo | S::Deleted)
@@ -531,6 +551,35 @@ mod tests {
             S::ReviewResult,
             "запрещённый переход не мутировал"
         );
+    }
+
+    #[test]
+    fn wait_return_edges() {
+        use Status as S;
+        // Крон-мастер после правок тела обязан вернуться в Вейт (файр-гейт
+        // пускает только из него) — ребро возврата открыто из рабочих и
+        // финальных статусов (инцидент #384: мастер застрял в In Progress,
+        // расписание умерло). Из Draft Вейт не ставится — это рука триажа.
+        for from in [
+            S::Todo,
+            S::Design,
+            S::ReviewPlan,
+            S::InProgress,
+            S::ReviewResult,
+            S::Testing,
+            S::UserReview,
+            S::NeedsAttention,
+        ] {
+            assert!(
+                S::can_transition(from, S::Wait),
+                "{from:?} → Wait обязана быть"
+            );
+        }
+        assert!(
+            !S::can_transition(S::Draft, S::Wait),
+            "Draft → Wait — триаж"
+        );
+        assert!(S::can_transition(S::Wait, S::Wait), "идемпотентность");
     }
 
     #[test]
