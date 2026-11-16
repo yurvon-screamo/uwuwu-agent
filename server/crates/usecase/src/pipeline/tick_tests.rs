@@ -1965,6 +1965,7 @@ fn analyst_uc(
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state,
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board)
 }
@@ -1987,6 +1988,7 @@ fn review_uc(
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state,
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board)
 }
@@ -2017,7 +2019,14 @@ async fn analyst_wave_one_session_for_all_rows() {
         specs[0].directory, "/tmp/checkout",
         "мастер-чекаут, без env"
     );
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+            .unwrap()
+            .model,
+        "модель аналитика — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
     // Todo-строка мимо волны; обе Analys-строки в пачке, счётчик первой попытки
     let inner = state.0.lock().unwrap();
     assert_eq!(inner.analys_loops.len(), 2, "только строки волны");
@@ -2403,7 +2412,14 @@ async fn reviewer_spawns_for_review_analys_wave() {
         specs[0].agent,
         AgentSlot::Role(Agent::AnalystReviewer)
     ));
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3#high")
+            .unwrap()
+            .model,
+        "модель ревьювера аналитики — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
 }
 
 #[tokio::test]
@@ -2689,6 +2705,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     assert_eq!(u.tick().await.unwrap(), 2, "по сессии на доску");
     let specs = sessions.specs.lock().unwrap();
@@ -2869,6 +2886,7 @@ async fn prune_skipped_when_a_board_read_fails() {
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state: state.clone(),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     u.tick().await.unwrap();
     assert!(

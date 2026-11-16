@@ -393,6 +393,7 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
         });
         let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
             board: board.clone(),

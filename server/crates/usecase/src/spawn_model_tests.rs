@@ -5,12 +5,13 @@
 
 use crate::crons::CronUseCase;
 use crate::error::UsecaseResult;
+use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::dreamer::DreamerUseCase;
-use crate::pipeline::triage::{TriageBoard, TriageUseCase};
 use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, IssueView, Liveness, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
+use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -116,10 +117,26 @@ impl TickStateStore for NoopState {
     }
     fn mark_stall_ping(&self, _b: &str, _n: u64, _s: Status, _at: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
-    fn last_triage_ms(&self, _b: &str, _n: u64) -> Option<u64> {
+    /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
+    fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
     }
-    fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn mark_analys_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn last_analys_review_ms(&self, _b: &str, _n: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn analys_loop(&self, _b: &str, _n: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _b: &str, _n: u64, _s: Status, _r: u32) {}
+    fn clear_analys_loop(&self, _b: &str, _n: u64) {}
+    fn analys_review_loop(&self, _b: &str, _n: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _b: &str, _n: u64, _s: Status, _r: u32) {}
+    fn clear_analys_review_loop(&self, _b: &str, _n: u64) {}
+    fn prune_analys_guards(&self, _live: &std::collections::HashSet<String>) {}
     fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
         None
     }
@@ -136,7 +153,10 @@ struct DraftBoard;
 #[async_trait]
 impl TaskBoardRepo for DraftBoard {
     async fn read_board(&self, _b: &str) -> UsecaseResult<Vec<Task>> {
-        Ok(vec![Task::new(7, "черновик".into(), Status::Draft)])
+        Ok(vec![
+            Task::new(7, "первая".into(), Status::Analys),
+            Task::new(8, "вторая".into(), Status::Analys),
+        ])
     }
     async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
         Ok(())
@@ -225,17 +245,17 @@ fn assert_model(spec: Option<SessionSpec>, what: &str, raw: &str) {
 }
 
 #[tokio::test]
-async fn triage_spawn_passes_no_model() {
-    // Arrange
+async fn analyst_spawn_carries_model_from_server_map() {
+    // Arrange: волна — две строки Analys
     let sessions = CaptureSessions::new(vec![]);
-    let u = TriageUseCase {
+    let u = AnalystUseCase {
         board: Arc::new(DraftBoard),
-        boards: vec![TriageBoard {
+        boards: vec![AnalystBoard {
             project: "uwuwu".into(),
             board: "Задачи uwuwu".into(),
             checkout: "/tmp".into(),
         }],
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(NoopState),
         clock: Arc::new(TestClock),
         models: models(),
@@ -245,11 +265,11 @@ async fn triage_spawn_passes_no_model() {
     let spawned = u.tick().await.unwrap();
 
     // Assert
-    assert_eq!(spawned, 1, "триаж-спавн состоялся");
+    assert!(spawned >= 1, "аналитик-спавн состоялся");
     assert_model(
         sessions.spec_of(),
-        "триаж-спавн",
-        "zai-coding-plan/glm-5.3-flash#max",
+        "аналитик-спавн",
+        "zai-coding-plan/glm-5.3-flash#high",
     );
 }
 
@@ -264,7 +284,7 @@ async fn dreamer_spawn_passes_no_model() {
         total_tokens: 42_000,
     }]);
     let u = DreamerUseCase {
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(NoopState),
         clock: Arc::new(TestClock),
         models: models(),
@@ -289,7 +309,7 @@ async fn cron_run_passes_no_model() {
     let sessions = CaptureSessions::new(vec![]);
     let u = CronUseCase {
         wiki: Arc::new(CronWiki),
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         clock: Arc::new(TestClock),
         models: models(),
         checkout: "/tmp".into(),

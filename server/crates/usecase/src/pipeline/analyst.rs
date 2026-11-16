@@ -4,6 +4,7 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, Status, Task};
 
@@ -24,6 +25,7 @@ pub struct AnalystUseCase {
     pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
+    pub models: Arc<SpawnModels>,
 }
 
 /// Доска аналитики: где искать очередь и где спавнить агента.
@@ -154,13 +156,14 @@ impl AnalystUseCase {
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»,
             // tick_tests failed_spawn_does_not_charge_loop_or_cooldown):
             // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
+            let sm = self.models.for_agent(Agent::Analyst);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
                 title: "аналитика волны".into(),
                 agent: AgentSlot::Role(Agent::Analyst),
                 custom_agent: None,
-                model: None,
-                variant: None,
+                model: sm.model,
+                variant: sm.variant,
                 bootstrap: false,
             };
             let sessions = self.sessions.project(&tb.project);
