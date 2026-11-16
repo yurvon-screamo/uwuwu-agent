@@ -2363,7 +2363,7 @@ async fn prune_skipped_when_a_board_read_fails() {
     let state = Arc::new(MemState(Mutex::new(inner)));
     let sessions = Arc::new(FakeSessions::new());
     let board = Arc::new(FakeMultiBoard {
-        // #1 в Review Analys: мимо волны и мимо stale-сброса — тик изме­няет
+        // #1 в Review Analys: мимо волны и мимо stale-сброса — тик изменяет
         // только prune, который при сбое B2 откладывается
         boards: vec![
             (
@@ -2402,7 +2402,7 @@ async fn prune_skipped_when_a_board_read_fails() {
             .analys_loops
             .iter()
             .any(|(n, _, r)| *n == 1 && *r == 2),
-        "счётчик живой строки непрочитанной доски не стёрт"
+        "счётчик живой строки прочитанной доски B1 не стёрт (prune отложен из-за сбоя B2)"
     );
 }
 
