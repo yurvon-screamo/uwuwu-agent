@@ -409,9 +409,12 @@ impl Task {
 
     /// Обогащение нативными полями (типизированы; лениво для кандидатов тика).
     pub fn apply_fields(&mut self, fields: TaskFields) {
-        // приоритет — поле самой задачи (гейт пика читает его напрямую),
-        // синхронизируем из носителя (инцидент #1170)
-        self.priority = fields.priority;
+        // приоритет — поле самой задачи; Empty на носителе = данных нет,
+        // существующий приоритет (snapshot-колонка доски) не стирается:
+        // перезапись Empty-ом сбрасывала high → пик морозил высокую строку
+        if fields.priority != Priority::Empty {
+            self.priority = fields.priority;
+        }
         self.fields = fields;
     }
 
@@ -630,6 +633,21 @@ mod tests {
             Priority::High,
         );
         t.apply_fields(fields);
+        assert_eq!(t.priority(), Priority::High);
+    }
+
+    #[test]
+    fn apply_fields_keeps_priority_when_carrier_empty() {
+        // Empty на носителе = данных нет: приоритет snapshot-колонки не
+        // стирается (перезапись Empty-ом сбрасывала high → пик морозил
+        // высокую строку — инцидент-семья #1200)
+        let mut t = task(Status::ReviewResult);
+        t.set_priority(Priority::High);
+        t.apply_fields(TaskFields::new(
+            std::collections::BTreeMap::new(),
+            Vcs::Local,
+            Priority::Empty,
+        ));
         assert_eq!(t.priority(), Priority::High);
     }
 }
