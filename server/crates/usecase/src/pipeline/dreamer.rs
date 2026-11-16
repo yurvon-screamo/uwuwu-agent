@@ -14,7 +14,7 @@ const IDLE_MS: u64 = 30 * 60_000;
 const DAY_CAP: u32 = 24;
 
 /// Агенты, чьи сессии не являются «рабочими» для дримера.
-const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Triage, Agent::PlanReviewer];
+const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Analyst, Agent::AnalystReviewer];
 
 pub struct DreamerUseCase {
     /// Роутер «проект → executor» (#1203): скан сессий — best-effort union

@@ -41,7 +41,8 @@ pub trait TaskBoardRepo: Send + Sync {
     /// без enrichment тик не видит сессии стадии (wakeup недостижим,
     /// needs_spawn вечен — инцидент ночи 15-16.11).
     async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields>;
-    /// Создание issue (лейбл proj:<project>) + строка на доске board (Draft).
+    /// Создание issue (лейбл proj:<project>) + строка на доске board
+    /// (Analys — create-дефолт #1135; опция ставится по имени колонки).
     async fn create_issue(
         &self,
         board: &str,
@@ -133,6 +134,9 @@ pub struct AssistantReply {
     pub text: String,
     /// finish-маркер присутствует — ответ завершён (иначе ещё стримится).
     pub finished: bool,
+    /// Ответ — самое свежее сообщение сессии: после него нет ни промптов,
+    /// ни tool-call'ов. «Ход завершён»: агент ответил и ждёт (#1206).
+    pub is_latest: bool,
 }
 
 #[async_trait]
@@ -248,9 +252,25 @@ pub trait TickStateStore: Send + Sync {
     fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
-    /// Триаж: ms последнего спавна строки (кулдаун — не слот стадии).
-    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64>;
-    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64);
+    /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
+    fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64>;
+    fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64);
+    fn last_analys_review_ms(&self, board: &str, number: u64) -> Option<u64>;
+    fn mark_analys_review_spawn(&self, board: &str, number: u64, at_ms: u64);
+    /// Цикл-гвард аналитики: (статус на прошлом спавне волны, кругов);
+    /// строка вне цикла Analys↔Review Analys — счётчик устарел.
+    fn analys_loop(&self, board: &str, number: u64) -> Option<(Status, u32)>;
+    fn set_analys_loop(&self, board: &str, number: u64, status: Status, rounds: u32);
+    fn clear_analys_loop(&self, board: &str, number: u64);
+    /// Цикл-гвард ревью-контура (R2-C2): спавны ревьювера при неизменном
+    /// статусе строки.
+    fn analys_review_loop(&self, board: &str, number: u64) -> Option<(Status, u32)>;
+    fn set_analys_review_loop(&self, board: &str, number: u64, status: Status, repeats: u32);
+    fn clear_analys_review_loop(&self, board: &str, number: u64);
+    /// Гигиена (R2-L3): счётчики обеих гвардов (аналитик + ревьювер) строк,
+    /// ушедших с досок, вычищаются — live = ключи «board:number» всех строк
+    /// всех досок тика.
+    fn prune_analys_guards(&self, live: &std::collections::HashSet<String>);
     /// Attention-механика: счётчик повторных спавнов слота
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;

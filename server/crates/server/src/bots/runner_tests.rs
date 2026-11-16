@@ -229,6 +229,7 @@ impl AgentSessionGateway for FakeSessions {
                 created_ms: created,
                 text: format!("эхо: {tail}"),
                 finished: true,
+                is_latest: true,
             });
         }
         Ok(())
@@ -349,14 +350,29 @@ impl TickStateStore for MemTickState {
     }
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
     fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
-    fn last_triage_ms(&self, _b: &str, _n: u64) -> Option<u64> {
+    fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
     }
-    fn mark_triage_spawn(&self, _b: &str, _n: u64, _at: u64) {}
     fn stall_ping(&self, _b: &str, _n: u64) -> Option<(uwuwu_domain::Status, u64, u32)> {
         None
     }
     fn mark_stall_ping(&self, _b: &str, _n: u64, _s: uwuwu_domain::Status, _at: u64) {}
+    fn mark_analys_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn last_analys_review_ms(&self, _b: &str, _n: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _b: &str, _n: u64, _at: u64) {}
+    fn analys_loop(&self, _b: &str, _n: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _b: &str, _n: u64, _st: Status, _r: u32) {}
+    fn clear_analys_loop(&self, _b: &str, _n: u64) {}
+    fn analys_review_loop(&self, _b: &str, _n: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _b: &str, _n: u64, _st: Status, _r: u32) {}
+    fn clear_analys_review_loop(&self, _b: &str, _n: u64) {}
+    fn prune_analys_guards(&self, _live: &std::collections::HashSet<String>) {}
     fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
         None
     }
@@ -645,6 +661,7 @@ async fn long_reply_chunked() {
         created_ms: 1_000_000,
         text: "а".repeat(9500),
         finished: true,
+        is_latest: true,
     });
     let state = Arc::new(FakeState::default());
     let task = spawn_bot_task(deps(

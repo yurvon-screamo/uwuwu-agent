@@ -1,11 +1,14 @@
 //! Агрегат Task: строка доски + сессии стадий + переходы статусов.
 //! Чистый домен: ноль зависимостей. Инварианты канона — здесь и в тестах.
 
-/// Статусы канона досок uwuwu. Empty — строка без статуса
+/// Статусы канона досок uwuwu. Analys/Review Analys — стадия аналитики
+/// (входящий поток, замена триажа #1135). Empty — строка без статуса
 /// (легаси-черновик владельца: конвейер не трогает).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Draft,
+    Analys,
+    ReviewAnalys,
     Todo,
     Design,
     ReviewPlan,
@@ -38,6 +41,8 @@ impl Status {
     /// рёбра пайплайна + Needs attention из любой рабочей стадии; Done —
     /// только через close/автодон (не task_edit); Done/Deleted/Empty —
     /// без исходящих рёбер (реопен/легаси — владелец в UI, мимо MCP).
+    /// Fast-track (#1135, развилка 6): Draft/Analys/Todo → In Progress —
+    /// владелец тащит простые задачи сразу в работу.
     pub fn can_transition(from: Self, to: Self) -> bool {
         use Status as S;
         if from == to {
@@ -65,9 +70,14 @@ impl Status {
         }
         matches!(
             (from, to),
-            (S::Draft, S::Todo | S::Deleted)
-                | (S::Todo, S::Design | S::InProgress | S::Deleted)
-                | (S::Wait, S::Todo | S::Design | S::InProgress)
+            (S::Draft, S::Todo | S::Analys | S::InProgress | S::Deleted)
+                | (
+                    S::Analys,
+                    S::ReviewAnalys | S::InProgress | S::NeedsAttention | S::Deleted
+                )
+                | (S::ReviewAnalys, S::Todo | S::Analys | S::NeedsAttention)
+                | (S::Todo, S::Design | S::InProgress | S::Analys | S::Deleted)
+                | (S::Wait, S::Todo | S::Design | S::InProgress | S::Analys)
                 | (S::Design, S::ReviewPlan | S::InProgress | S::NeedsAttention)
                 | (S::ReviewPlan, S::Design | S::InProgress | S::NeedsAttention)
                 | (
@@ -83,7 +93,7 @@ impl Status {
                     S::UserReview | S::InProgress | S::NeedsAttention
                 )
                 | (S::UserReview, S::InProgress | S::NeedsAttention)
-                | (S::NeedsAttention, S::InProgress)
+                | (S::NeedsAttention, S::InProgress | S::Analys)
         )
     }
 }
@@ -531,6 +541,20 @@ mod tests {
             (S::Testing, S::InProgress),
             (S::UserReview, S::InProgress),
             (S::NeedsAttention, S::InProgress),
+            // аналитика (#1135): вход потока и цикл с ревью
+            (S::Draft, S::Analys),
+            (S::Analys, S::ReviewAnalys),
+            (S::Analys, S::NeedsAttention),
+            (S::Analys, S::Deleted),
+            (S::ReviewAnalys, S::Todo),
+            (S::ReviewAnalys, S::Analys),
+            (S::ReviewAnalys, S::NeedsAttention),
+            (S::Todo, S::Analys),
+            (S::Wait, S::Analys),
+            (S::NeedsAttention, S::Analys),
+            // fast-track (развилка 6): Draft/Analys/Todo → In Progress
+            (S::Draft, S::InProgress),
+            (S::Analys, S::InProgress),
         ] {
             assert!(
                 S::can_transition(from, to),
@@ -551,6 +575,23 @@ mod tests {
         assert!(
             !S::can_transition(S::InProgress, S::Deleted),
             "в работе — не удаляют"
+        );
+        // аналитика: цикл замкнут, мимо ревью в пайп не пройти
+        assert!(
+            !S::can_transition(S::Analys, S::Todo),
+            "Todo — вердикт ревьювера"
+        );
+        assert!(
+            !S::can_transition(S::Analys, S::Design),
+            "Design — через Todo (мяч владельца)"
+        );
+        assert!(
+            !S::can_transition(S::Draft, S::ReviewAnalys),
+            "Review Analys ставит только аналитик"
+        );
+        assert!(
+            !S::can_transition(S::ReviewAnalys, S::InProgress),
+            "fast-track — из очереди и Todo, не из ревью аналитики"
         );
         // Needs attention — из любой рабочей стадии
         for from in [

@@ -77,6 +77,25 @@ impl MemoryHub {
             .ok()
             .map(|raw| parse_seeds(&raw))
             .unwrap_or_default();
+        Self::with_seeds(seeds)
+    }
+
+    /// Явный сид (юнит-тесты): строка (номер, статус) на пустой доске,
+    /// без тега — видна на всех досках стенда.
+    #[cfg(test)]
+    pub fn with_seed(seed: Option<(u64, Status)>) -> Self {
+        Self::with_seeds(match seed {
+            Some((number, status)) => vec![SeedRow {
+                board: None,
+                number,
+                status,
+            }],
+            None => Vec::new(),
+        })
+    }
+
+    /// Общий конструктор: готовый набор сидов (мульти-досочный стенд #1203).
+    fn with_seeds(seeds: Vec<SeedRow>) -> Self {
         let docs: HashMap<String, String> = std::env::var("UWUWU_MOCK_DOCS")
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -244,7 +263,7 @@ impl TaskBoardRepo for MemoryHub {
             state.next_number += 1;
             state
                 .tasks
-                .insert(number, Task::new(number, title.to_string(), Status::Draft));
+                .insert(number, Task::new(number, title.to_string(), Status::Analys));
             state.board_tags.insert(number, board.to_string());
             state.bodies.insert(number, body.to_string());
             Ok(number)
