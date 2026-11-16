@@ -440,3 +440,148 @@ fn descriptors_expose_task_body_section() {
         "секционный путь на поверхности: {names:?}"
     );
 }
+
+// ===== Аналитика #1135: create-дефолт, пайп-рёбра, круги волн на mockhub =====
+
+#[tokio::test]
+async fn task_create_defaults_to_analys() {
+    let (tools, memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "заявка агента", "body": "## Постановка\n\nХ" }),
+    )
+    .await
+    .expect("create ок");
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse())
+        .expect("номер в ответе");
+    assert!(n.contains("(Analys)"), "дефолт create: {n}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    let row = rows.iter().find(|t| t.number() == number).unwrap();
+    assert_eq!(row.status(), uwuwu_domain::Status::Analys);
+    // idea/analys — неизвестные типы: громкий отказ create
+    let err = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "старый тип", "type": "idea" }),
+    )
+    .await
+    .expect_err("idea выведен");
+    assert!(err.contains("неизвестный тип"), "{err}");
+}
+
+#[tokio::test]
+async fn analysis_pipeline_edges_on_mcp_surface() {
+    let (tools, _memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "круг волн" }),
+    )
+    .await
+    .unwrap();
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse())
+        .unwrap();
+    // волна аналитика: Analys → Review Analys
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Review Analys" }),
+    )
+    .await
+    .expect("ребро Analys → Review Analys");
+    // approve ревьювера: Review Analys → Todo
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Todo" }),
+    )
+    .await
+    .expect("ребро Review Analys → Todo");
+    // владелец вернул с замечаниями: Todo → Analys
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Analys" }),
+    )
+    .await
+    .expect("ребро Todo → Analys");
+    // fast-track (развилка 6): Analys → In Progress
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "In Progress" }),
+    )
+    .await
+    .expect("fast-track Analys → In Progress");
+    // запреты канона
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Todo" }),
+    )
+    .await
+    .expect_err("In Progress → Todo вне канона");
+    assert!(err.contains("вне канона"), "{err}");
+}
+
+#[tokio::test]
+async fn fast_track_from_draft_and_todo() {
+    // Draft (черновик владельца) → In Progress напрямую (создание через сид:
+    // Draft — владелец в UI, MCP-ребро тоже должно работать)
+    let memory = Arc::new(MemoryHub::with_seed(Some((1, uwuwu_domain::Status::Draft))));
+    let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
+    let fields: Arc<dyn uwuwu_usecase::IssueFieldStore> = memory.clone();
+    let wiki: Arc<dyn uwuwu_usecase::WikiRepo> = Arc::new(StubWiki);
+    let sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = Arc::new(StubSessions);
+    let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
+    let tools = Arc::new(ToolHub {
+        tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
+        docs: Arc::new(DocsView::new(wiki.clone())),
+        person: Arc::new(PersonView::new(wiki.clone())),
+        writer: Arc::new(TaskWriteUseCase {
+            board: board.clone(),
+            fields,
+            boards,
+        }),
+        wiki,
+        sessions,
+        search: Arc::new(SearchUseCase { semantic: None }),
+        crons: Arc::new(uwuwu_usecase::CronUseCase {
+            wiki: Arc::new(StubWiki),
+            sessions: Arc::new(StubSessions),
+            clock: Arc::new(SystemClock),
+            spawn_model: None,
+            checkout: String::new(),
+        }),
+    });
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": 1, "status": "In Progress" }),
+    )
+    .await
+    .expect("fast-track Draft → In Progress");
+    // Todo → In Progress (ребро существовало и до реформы)
+    memory
+        .set_status("Задачи uwuwu", 1, uwuwu_domain::Status::Todo)
+        .await
+        .unwrap();
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": 1, "status": "In Progress" }),
+    )
+    .await
+    .expect("fast-track Todo → In Progress");
+}

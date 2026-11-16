@@ -52,6 +52,9 @@ struct StateFile {
     /// attention-механика.
     #[serde(default)]
     spawn_loops: BTreeMap<String, (String, u32)>,
+    /// «board:number» → (статус цикла, кругов) — цикл-гвард аналитики (#1135).
+    #[serde(default)]
+    analys_loops: BTreeMap<String, (String, u32)>,
     /// Дневной счётчик дримера: (дата JST, спавнов).
     #[serde(default)]
     dreamer_day: Option<(String, u32)>,
@@ -244,23 +247,63 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
-    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64> {
+    fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64> {
         self.state
             .lock()
             .expect("state lock")
             .spawns
-            .get(&format!("{board}:{number}:triage"))
+            .get(&format!("{board}:{number}:analys"))
             .copied()
     }
 
-    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64) {
+    fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64) {
         self.state
             .lock()
             .expect("state lock")
             .spawns
-            .insert(format!("{board}:{number}:triage"), at_ms);
+            .insert(format!("{board}:{number}:analys"), at_ms);
     }
 
+    fn last_analys_review_ms(&self, board: &str, number: u64) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .get(&format!("{board}:{number}:analys-review"))
+            .copied()
+    }
+
+    fn mark_analys_review_spawn(&self, board: &str, number: u64, at_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .insert(format!("{board}:{number}:analys-review"), at_ms);
+    }
+
+    fn analys_loop(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analys_loops
+            .get(&Self::key(board, number))
+            .map(|(s, r)| (naming::parse_status(s), *r))
+    }
+
+    fn set_analys_loop(&self, board: &str, number: u64, status: Status, rounds: u32) {
+        self.state.lock().expect("state lock").analys_loops.insert(
+            Self::key(board, number),
+            (naming::status_name(status).to_string(), rounds),
+        );
+    }
+
+    fn clear_analys_loop(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analys_loops
+            .remove(&Self::key(board, number));
+    }
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state
             .lock()

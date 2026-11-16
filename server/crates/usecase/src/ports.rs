@@ -41,7 +41,8 @@ pub trait TaskBoardRepo: Send + Sync {
     /// без enrichment тик не видит сессии стадии (wakeup недостижим,
     /// needs_spawn вечен — инцидент ночи 15-16.11).
     async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields>;
-    /// Создание issue (лейбл proj:<project>) + строка на доске board (Draft).
+    /// Создание issue (лейбл proj:<project>) + строка на доске board
+    /// (Analys — create-дефолт #1135; опция ставится по имени колонки).
     async fn create_issue(
         &self,
         board: &str,
@@ -251,9 +252,16 @@ pub trait TickStateStore: Send + Sync {
     fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
-    /// Триаж: ms последнего спавна строки (кулдаун — не слот стадии).
-    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64>;
-    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64);
+    /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
+    fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64>;
+    fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64);
+    fn last_analys_review_ms(&self, board: &str, number: u64) -> Option<u64>;
+    fn mark_analys_review_spawn(&self, board: &str, number: u64, at_ms: u64);
+    /// Цикл-гвард аналитики: (статус на прошлом спавне волны, кругов);
+    /// строка вне цикла Analys↔Review Analys — счётчик устарел.
+    fn analys_loop(&self, board: &str, number: u64) -> Option<(Status, u32)>;
+    fn set_analys_loop(&self, board: &str, number: u64, status: Status, rounds: u32);
+    fn clear_analys_loop(&self, board: &str, number: u64);
     /// Attention-механика: счётчик повторных спавнов слота
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;

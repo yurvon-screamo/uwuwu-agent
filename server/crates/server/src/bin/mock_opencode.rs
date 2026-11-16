@@ -82,8 +82,10 @@ fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &
         ("result", "Тестирование", "ревью approve (мок)")
     } else if prompt.contains("тестирование") {
         ("test", "Review", "тест pass (мок)")
-    } else if prompt.contains("Триаж черновика") {
-        ("triage", "Todo", "триаж: валидна (мок)")
+    } else if prompt.contains("Аналитика волны") {
+        ("analys", "Review Analys", "аналитика: проработано (мок)")
+    } else if prompt.contains("Ревью аналитики") {
+        ("analys-review", "Todo", "ревью аналитики: approve (мок)")
     } else {
         // wakeup/крон/дример/прочее: без перехода статуса
         ("other", "", "сводка (мок)")
@@ -124,6 +126,17 @@ fn task_number_of(title: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Номера строк волн аналитики из промпта (строки списка «- #N «…»»).
+fn wave_numbers(prompt: &str) -> Vec<u64> {
+    prompt
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix("- #")?;
+            l.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        })
+        .collect()
 }
 
 /// MCP-вызов uwuwu-server (tools/call). Ошибки — в лог, не роняют мок.
@@ -445,9 +458,9 @@ async fn work_like_agent(
         }
     }
     // сценарный вердикт ревью-стадии (MOCK_VERDICTS): request_changes
-    // возвращает строку по канону (plan → Design, result → In Progress);
-    // суффикс «+die» одновременно убивает сессии строки (кроме текущей) —
-    // ре-энтри в форме инцидента #1046: dev-ячейка мертва → respawn
+    // возвращает строку по канону (plan → Design, result → In Progress,
+    // analys-review → Analys); суффикс «+die» одновременно убивает сессии
+    // строки (кроме текущей) — ре-энтри в форме инцидента #1046
     if let Some(v) = scripted_verdict(&store.verdicts, stage) {
         let die = v.ends_with("+die");
         if v.trim_end_matches("+die").ends_with(":request_changes") {
@@ -459,6 +472,10 @@ async fn work_like_agent(
                 "result" => {
                     status = "In Progress";
                     verdict = "ревью request_changes (мок) — на доработку";
+                }
+                "analys-review" => {
+                    status = "Analys";
+                    verdict = "ревью аналитики: request_changes (мок) — возврат в Analys";
                 }
                 _ => {}
             }
@@ -476,14 +493,40 @@ async fn work_like_agent(
             }
         }
     }
-    if let Some(number) = task_number_of(&session.title) {
+    if wave_numbers(&prompt_text).is_empty() {
+        if let Some(number) = task_number_of(&session.title) {
+            tracing::info!(event = "mock.agent_work", id = %session.id,
+                agent = %session.agent, number, status = %status, "агент действует");
+            mcp_call(
+                &mcp_url,
+                &mcp_token,
+                "task_comment",
+                json!({ "number": number, "text": format!("[мок] {verdict}") }),
+            )
+            .await;
+            if !status.is_empty() {
+                mcp_call(
+                    &mcp_url,
+                    &mcp_token,
+                    "task_edit",
+                    json!({ "number": number, "status": status }),
+                )
+                .await;
+            }
+        }
+    } else {
+        // волны аналитики (#1135): номера строк из промпта. Аналитик:
+        // первая строка — проработка (→ Review Analys), остальные —
+        // дубли (close not_planned). Ревьювер: все строки — вердикт.
+        let nums = wave_numbers(&prompt_text);
         tracing::info!(event = "mock.agent_work", id = %session.id,
-            agent = %session.agent, number, status = %status, "агент действует");
+            agent = %session.agent, rows = nums.len(), status = %status, "волновая работа");
+        let (first, rest) = nums.split_first().expect("непустая волна");
         mcp_call(
             &mcp_url,
             &mcp_token,
             "task_comment",
-            json!({ "number": number, "text": format!("[мок] {verdict}") }),
+            json!({ "number": first, "text": format!("[мок] {verdict}") }),
         )
         .await;
         if !status.is_empty() {
@@ -491,9 +534,37 @@ async fn work_like_agent(
                 &mcp_url,
                 &mcp_token,
                 "task_edit",
-                json!({ "number": number, "status": status }),
+                json!({ "number": first, "status": status }),
             )
             .await;
+        }
+        for n in rest {
+            if stage == "analys" {
+                mcp_call(
+                    &mcp_url,
+                    &mcp_token,
+                    "task_close",
+                    json!({ "number": n, "not_planned": true }),
+                )
+                .await;
+            } else {
+                mcp_call(
+                    &mcp_url,
+                    &mcp_token,
+                    "task_comment",
+                    json!({ "number": n, "text": format!("[мок] {verdict}") }),
+                )
+                .await;
+                if !status.is_empty() {
+                    mcp_call(
+                        &mcp_url,
+                        &mcp_token,
+                        "task_edit",
+                        json!({ "number": n, "status": status }),
+                    )
+                    .await;
+                }
+            }
         }
     }
     let mut sessions = store.sessions.lock().expect("store");
@@ -558,6 +629,15 @@ mod tests {
     }
 
     #[test]
+    fn wave_numbers_from_prompt() {
+        let prompt = "Аналитика волны (проект p) — строки в Analys, пачка целиком:\n\n\
+                      - #12 «фикс»\n- #15 «идея»\n\nДействуй по методичке.\n\
+                      остальной текст с числами 99 не считается";
+        assert_eq!(wave_numbers(prompt), vec![12, 15]);
+        assert!(wave_numbers("нет списка").is_empty());
+    }
+
+    #[test]
     fn stage_markers_map_to_canon_transitions() {
         // маркеры спавн-промптов → канон-переходы конвейера
         let cases = [
@@ -566,12 +646,24 @@ mod tests {
             ("реализация по утверждённому плану", "Ревью результата"),
             ("ревью результата: код/CI", "Тестирование"),
             ("тестирование: качество фичи", "Review"),
-            ("Триаж черновика #5", "Todo"),
+            (
+                "Аналитика волны (проект p) — строки в Analys",
+                "Review Analys",
+            ),
+            (
+                "Ревью аналитики (проект p) — строки в Review Analys",
+                "Todo",
+            ),
         ];
         for (prompt, want) in cases {
             let (_, status, _) = stage_action_of_prompt(prompt).unwrap();
             assert_eq!(status, want, "промпт «{prompt}»");
         }
+        // триаж выведен (#1135): старого маркера нет
+        assert_ne!(
+            stage_action_of_prompt("Триаж черновика #5").unwrap().0,
+            "triage"
+        );
         // wakeup/крон/дример — без перехода статуса
         assert_eq!(
             stage_action_of_prompt("Wakeup: новый коммент").unwrap().1,
