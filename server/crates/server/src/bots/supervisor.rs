@@ -95,7 +95,10 @@ impl BotSupervisor {
             clock,
             make_tg,
             token_of: Arc::new(|env| std::env::var(env).ok().filter(|v| !v.trim().is_empty())),
-            reply_cap_ms: 240_000,
+            // 900с (владелец 16.11: «кратно повысь»): flash-модель с богатой
+            // методичкой (маркетолог) не успевала за 4 мин — стабильно
+            // reply_timeout «напиши ещё раз»
+            reply_cap_ms: 900_000,
             reply_poll_ms: 2_000,
             guard: GuardTiming::default(),
             running: Mutex::new(HashMap::new()),
