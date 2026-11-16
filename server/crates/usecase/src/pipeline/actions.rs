@@ -5,7 +5,21 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{Liveness, SessionSpec};
-use uwuwu_domain::{Agent, AgentSlot, LoopOutcome, Slot, SpawnLoop, Status, Task};
+use uwuwu_domain::{
+    gate, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop, SpawnPolicy,
+    Status, Task,
+};
+
+/// Итог попытки будильника/респавна stage-сессии.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeAct {
+    /// Живой сессии доставлен свежий коммент (или респавн состоялся).
+    Woke,
+    /// Запуск агента отложен политикой (пик/CUP) — сталл-пасс не нужен.
+    Deferred,
+    /// Нечего будить: тишина или коммент уже отработан.
+    None,
+}
 
 impl TickUseCase {
     /// Спавн агента стадии: bootstrap-сессия в мастер-чекауте готовит env
@@ -73,12 +87,22 @@ impl TickUseCase {
     /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
     /// комментов — строка не висит, DS «dead-детект решает: будить или
     /// респавнить»); живая — будим по свежим комментам (новее активности).
-    pub async fn wakeup_if_fresh(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
+    /// Политика запуска едина для всех путей (UC-05, #1200): пик-окно
+    /// откладывает не-high и будильник, и респавн; CUP-кап держит респавн
+    /// (новая сессия — новый LLM-слот; будильник будит уже учтённую строку).
+    pub async fn wakeup_if_fresh(
+        &self,
+        board: &BoardPlan,
+        policy: SpawnPolicy,
+        task: &Task,
+        global_active: usize,
+    ) -> UsecaseResult<WakeAct> {
+        let now = self.clock.utc_minute();
         let Some(slot) = task.stage_slot() else {
-            return Ok(false);
+            return Ok(WakeAct::None);
         };
         let Some(session) = task.session_of(slot) else {
-            return Ok(false);
+            return Ok(WakeAct::None);
         };
         // dead-детект до чтения комментов: дедуп/пустой журнал не должны
         // прятать мёртвую сессию стадии (находка мок-стенда).
@@ -86,25 +110,46 @@ impl TickUseCase {
         // спешный respawn плодил бы дубли на каждом окне недоступности
         // (15.11: рестарт opencode serve) — пропускаем тик, повторим.
         match self.sessions.liveness(session).await {
-            Liveness::Alive => {}
+            Liveness::Alive => {
+                // будильник: пик держит не-high (живой агент в окне не будим)
+                if policy.peak.holds(now) && task.priority() != Priority::High {
+                    tracing::info!(
+                        event = "wakeup.deferred_peak",
+                        number = task.number(),
+                        "Wakeup deferred: peak window"
+                    );
+                    return Ok(WakeAct::Deferred);
+                }
+            }
             Liveness::Unknown => {
                 tracing::warn!(event = "wakeup.liveness_unknown", number = task.number(),
                     session = %session,
                     "Liveness unknown (гейт недоступен?) — без respawn, повтор на тике");
-                return Ok(false);
+                return Ok(WakeAct::None);
             }
             Liveness::Dead => {
-                return self.respawn_dead_stage(board, task, slot, session).await;
+                // респавн = фактический спавн — полный гейт (пик + CUP)
+                let spawn = Action::Spawn { slot };
+                if gate(task, &spawn, policy, global_active, now) != Gate::Allowed {
+                    tracing::info!(
+                        event = "respawn.held_by_policy",
+                        number = task.number(),
+                        "Respawn held: пик-окно/CUP"
+                    );
+                    return Ok(WakeAct::Deferred);
+                }
+                self.respawn_dead_stage(board, task, slot, session).await?;
+                return Ok(WakeAct::Woke);
             }
         }
         let comments = self.board.latest_comments(task.number()).await?;
-        let Some(last) = comments.last() else {
-            return Ok(false);
-        };
         let seen = self.state.last_comment_id(&board.board, task.number());
-        if seen.as_deref() == Some(last.id.as_str()) {
-            return Ok(false);
-        }
+        let Some(last) = comments
+            .last()
+            .filter(|c| seen.as_deref() != Some(c.id.as_str()))
+        else {
+            return Ok(WakeAct::None);
+        };
         {
             let activity = self.sessions.last_activity_ms(session).await?;
             let fresh = last.created_ms > activity.unwrap_or(0);
@@ -124,22 +169,26 @@ impl TickUseCase {
                     number = task.number(),
                     "Wakeup delivered"
                 );
+                self.state
+                    .set_last_comment_id(&board.board, task.number(), &last.id);
+                return Ok(WakeAct::Woke);
             }
             self.state
                 .set_last_comment_id(&board.board, task.number(), &last.id);
-            Ok(fresh)
+            Ok(WakeAct::None)
         }
     }
 
     /// Респавн мёртвой сессии стадии через луп-гвард (attention-механика:
     /// респавн = повтор слота при неизменном статусе; >2 → Needs attention).
+    /// Политика запуска (пик/CUP) проверена вызывающим wakeup-путём.
     async fn respawn_dead_stage(
         &self,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
         session: &str,
-    ) -> UsecaseResult<bool> {
+    ) -> UsecaseResult<()> {
         tracing::warn!(event = "wakeup.dead_session", number = task.number(),
             session = %session, "Stage session dead: respawn через луп-гвард");
         let mut guard = self
@@ -174,7 +223,7 @@ impl TickUseCase {
                     ),
                 )
                 .await?;
-            return Ok(false);
+            return Ok(());
         }
         self.state.set_spawn_loop(
             &board.board,
@@ -187,7 +236,7 @@ impl TickUseCase {
         self.board
             .set_session(&board.board, task.number(), slot, &fresh)
             .await?;
-        Ok(false)
+        Ok(())
     }
 
     /// Автодон: проба PR → мерж/Done/bounce. Без PR и без ветки — Done сразу
