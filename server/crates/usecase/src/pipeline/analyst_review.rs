@@ -98,6 +98,7 @@ impl AnalystReviewUseCase {
                 directory: tb.checkout.clone(),
                 title: "ревью аналитики".into(),
                 agent: AgentSlot::Role(Agent::AnalystReviewer),
+                custom_agent: None,
                 model: None,
                 variant: None,
                 bootstrap: false,

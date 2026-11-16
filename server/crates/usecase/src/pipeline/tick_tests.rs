@@ -151,6 +151,7 @@ impl FakeSessions {
             spawned: Mutex::default(),
             specs: Mutex::default(),
             live: Mutex::default(),
+            activity_ms: 1000,
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -387,6 +388,7 @@ impl TickStateStore for MemState {
     }
     fn mark_stall_ping(&self, _b: &str, n: u64, status: Status, at_ms: u64) {
         self.0.lock().unwrap().stalls.push((n, status, at_ms));
+    }
     fn analys_review_loop(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
         self.0
             .lock()
@@ -422,7 +424,6 @@ impl TickStateStore for MemState {
             .retain(|(num, _, _)| live.contains(&format!("B:{num}")));
         g.analys_review_loops
             .retain(|(num, _, _)| live.contains(&format!("B:{num}")));
-
     }
     fn spawn_loop(&self, _b: &str, n: u64, s: Slot) -> Option<(Status, u32)> {
         self.0
@@ -1677,7 +1678,6 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     );
 }
 
-    let sessions = Arc::new(FakeSessions::new());
 // ===== Аналитика (#1135): волновой сайдкар + парный ревьювер =====
 
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
@@ -2238,7 +2238,6 @@ async fn analyst_prunes_loops_of_gone_rows() {
     );
 }
 
-
 // ===== Дельта ревью R2: пары гвардов не разъезжаются, сброс на выходе, prune обоих =====
 
 #[tokio::test]
@@ -2340,7 +2339,6 @@ async fn analyst_prunes_review_loops_of_gone_rows() {
     );
 }
 
-
 #[tokio::test]
 async fn prune_skipped_when_a_board_read_fails() {
     // дельта R3-L2: непрочитанная доска → её строки не в live-наборе;
@@ -2394,7 +2392,6 @@ async fn prune_skipped_when_a_board_read_fails() {
         "счётчик живой строки непрочитанной доски не стёрт"
     );
 }
-
 
 /// Заглушка issue-полей: close-путь полей не пишет.
 struct FakeFields;
@@ -2517,4 +2514,3 @@ async fn task_close_resolves_board_of_the_row_multiboard() {
         "строки первой доски close не трогает, лог: {log:?}"
     );
 }
-

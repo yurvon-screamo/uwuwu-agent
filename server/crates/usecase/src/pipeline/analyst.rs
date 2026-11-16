@@ -122,6 +122,7 @@ impl AnalystUseCase {
                 directory: tb.checkout.clone(),
                 title: "аналитика волны".into(),
                 agent: AgentSlot::Role(Agent::Analyst),
+                custom_agent: None,
                 model: None,
                 variant: None,
                 bootstrap: false,
