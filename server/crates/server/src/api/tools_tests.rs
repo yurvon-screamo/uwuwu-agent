@@ -99,10 +99,25 @@ impl TickStateStore for StubState {
     }
     fn mark_spawn(&self, _: &str, _: u64, _: Slot, _: u64) {}
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
-    fn last_triage_ms(&self, _: &str, _: u64) -> Option<u64> {
+    fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None
     }
-    fn mark_triage_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn mark_analys_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn last_analys_review_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn analys_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_loop(&self, _: &str, _: u64) {}
+    fn analys_review_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_review_loop(&self, _: &str, _: u64) {}
+    fn prune_analys_guards(&self, _: &std::collections::HashSet<String>) {}
     fn stall_ping(&self, _: &str, _: u64) -> Option<(Status, u64, u32)> {
         None
     }
@@ -605,6 +620,8 @@ async fn fast_track_from_draft_and_todo() {
             board: board.clone(),
             fields,
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions,

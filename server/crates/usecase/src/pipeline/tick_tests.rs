@@ -652,6 +652,8 @@ fn wake_usecase(
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply,
+        specs: Mutex::default(),
+        live: Mutex::default(),
     });
     let u = TickUseCase {
         board,
@@ -2300,9 +2302,9 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn issue_fields(&self, _n: u64) -> UsecaseResult<TaskFields> {
         Ok(TaskFields::default())
     }
-    async fn post_comment(&self, n: u64, _body: &str) -> UsecaseResult<()> {
+    async fn post_comment(&self, n: u64, _body: &str) -> UsecaseResult<String> {
         self.log.lock().unwrap().push(format!("comment#{n}"));
-        Ok(())
+        Ok(format!("multi-comment#{n}"))
     }
     async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
         Ok(())
@@ -2694,8 +2696,8 @@ impl TaskBoardRepo for CloseBoard {
     async fn issue_fields(&self, _: u64) -> UsecaseResult<TaskFields> {
         Ok(TaskFields::default())
     }
-    async fn post_comment(&self, _: u64, _: &str) -> UsecaseResult<()> {
-        Ok(())
+    async fn post_comment(&self, _: u64, _: &str) -> UsecaseResult<String> {
+        Ok(String::new())
     }
     async fn close_issue(&self, _: u64) -> UsecaseResult<()> {
         Ok(())
@@ -2742,6 +2744,8 @@ async fn task_close_resolves_board_of_the_row_multiboard() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
     writer
@@ -2772,6 +2776,8 @@ async fn task_close_row_on_first_board_still_closes_there() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
 
@@ -2806,6 +2812,8 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
 
