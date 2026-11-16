@@ -648,13 +648,24 @@ async fn live_spawns_and_claims_session() {
 
 #[tokio::test]
 async fn cup_holds_spawn_in_live() {
+    // #1244: кап держат фактические запуски (busy + состоявшиеся спавны
+    // тика), не очередь кандидатов — 8 кандидатов при cap 7: 7 спавнов
+    // проходят, излишек ждёт следующего тика (старая формула считала
+    // кандидатов активными и холдила всех: дедлок бэклога)
     let rows: Vec<Task> = (1..=8).map(|n| task(n, Status::InProgress)).collect();
-    let (u, board, sessions, _) = usecase(rows, PrState::Missing);
+    let (u, board, _sessions, _) = usecase(rows, PrState::Missing);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(out.held_cup, 8, "активных 8 > капа 7");
-    assert_eq!(out.spawns_done, 0);
-    assert!(sessions.spawned.lock().unwrap().is_empty());
-    assert!(board.log.lock().unwrap().is_empty());
+    assert_eq!(out.spawns_done, 7, "бэклог заполняет кап до края");
+    assert_eq!(out.held_cup, 1, "излишек кандидатов ждёт следующего тика");
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("status#")),
+        "статусы не трогаем (сессии пишем — это спавны)"
+    );
 }
 
 #[tokio::test]
@@ -961,12 +972,14 @@ async fn dead_stage_session_does_not_hold_cup() {
         .lock()
         .unwrap()
         .push("ses_dead_40".into());
-    // cup=2: снапшот active=1 (кандидат), респавн инкрементит счётчик —
-    // по статусному подсчёту active=2 → held бы не было вовсе; честный
-    // счётчик вмещает ровно один запуск, кандидат ждёт следующего тика
+    // cup=2, busy=0: мёртвая сессия не держит кап, кандидат — очередь;
+    // респавн и кандидат оба проходят (active_now 0→2), никто не ждёт
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
-    assert_eq!(out.spawns_done, 1, "респавн мёртвой строки в слоте капа");
-    assert_eq!(out.held_cup, 1, "кандидат удержан честным счётчиком");
+    assert_eq!(
+        out.spawns_done, 2,
+        "респавн мёртвой строки и кандидат — оба в слоте капа"
+    );
+    assert_eq!(out.held_cup, 0, "мёртвая сессия и очередь кап не держат");
 }
 
 #[tokio::test]
@@ -1232,12 +1245,12 @@ async fn respawns_within_tick_do_not_oversell_cup() {
         dead.push("ses_dead_50".into());
         dead.push("ses_dead_51".into());
     }
-    // cup=2: снапшот active=1 (только кандидат), но респавны инкрементят
-    // счётчик — второй респавн и кандидат упираются в кап
+    // cup=2, busy=0: оба респавна проходят (active_now 0→2), кандидат
+    // упирается в наполненный кап — оверселла нет
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
-    assert_eq!(out.spawns_done, 1, "один спавн в слот капа");
-    assert_eq!(out.held_cup, 1, "кандидат удержан честным счётчиком");
-    assert_eq!(out.wakeups_deferred, 1, "второй респавн отложен CUP");
+    assert_eq!(out.spawns_done, 2, "два респавна заполняют кап");
+    assert_eq!(out.held_cup, 1, "кандидат удержан наполненным капом");
+    assert_eq!(out.wakeups_deferred, 0, "респавны не отложены — busy=0");
 }
 
 #[tokio::test]
@@ -1657,6 +1670,23 @@ async fn idle_sessions_do_not_hold_cup() {
         "кандидат спавнится: спящие idle-сессии кап не держат"
     );
     assert_eq!(out.held_cup, 0, "active = busy + кандидаты, не «живые»");
+}
+
+#[tokio::test]
+async fn spawn_backlog_fills_cap_without_deadlock() {
+    // #1244 (CUP-дедлок): 10 строк-кандидатов без сессий, cap 7 —
+    // очередь НЕ держит кап сама на себя: 7 спавнов проходят
+    // (busy=0 + состоявшиеся спавны тика), 3 ждут следующего тика.
+    // Старая формула считала кандидатов активными: 10 ≥ 7 → held
+    // всем навечно, ни один спавн (прод 23:15 UTC: spawns=0, held=24).
+    let rows: Vec<Task> = (100..110u64).map(|n| task(n, Status::InProgress)).collect();
+    let (u, _, _sessions, _) = usecase(rows, PrState::Missing);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 7,
+        "бэклог заполняет кап без самоблокировки"
+    );
+    assert_eq!(out.held_cup, 3, "излишек ждёт следующего тика");
 }
 
 #[tokio::test]
