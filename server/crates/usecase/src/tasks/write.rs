@@ -67,6 +67,7 @@ pub trait TaskWriter: Send + Sync {
     /// Коммент (reply — цитатный якорь).
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()>;
     /// Закрытие: Status=Done + issue closed (reason: completed|not_planned).
+    /// Доска строки резолвится по всему конфигу (мультиборд, #1135).
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
     /// Полная замена тела (fm на границе стрипается — тела без fm, поля
     /// нативные и от тела не зависят); возвращает квитанцию записанного.
@@ -240,16 +241,19 @@ impl TaskWriter for TaskWriteUseCase {
     }
 
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
-        let board = &self
-            .boards
-            .first()
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default();
-        if board.is_empty() {
-            return Err(UsecaseError::Board("нет досок в конфиге".into()));
+        // доска строки резолвится по всему конфигу (мультиборд, #1135):
+        // вердикт аналитика «дубль/мусор → close» обязан работать на любой
+        // доске волны, не только на первой (пин живого прогона)
+        for (_, board) in &self.boards {
+            let rows = self.board.read_board(board).await?;
+            if rows.iter().any(|t| t.number() == number) {
+                self.board.set_status(board, number, Status::Done).await?;
+                return self.board.close_issue_ext(number, not_planned).await;
+            }
         }
-        self.board.set_status(board, number, Status::Done).await?;
-        self.board.close_issue_ext(number, not_planned).await
+        Err(UsecaseError::Board(format!(
+            "строка #{number} не на досках конфига"
+        )))
     }
 
     async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<BodyWriteReceipt> {
