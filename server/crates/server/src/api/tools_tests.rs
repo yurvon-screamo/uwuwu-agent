@@ -100,7 +100,6 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
                 StubSessions,
             ))),
             clock: Arc::new(SystemClock),
-            spawn_model: None,
             checkout: String::new(),
         }),
     });

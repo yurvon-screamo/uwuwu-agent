@@ -43,7 +43,9 @@ impl TickUseCase {
                 title: format!("bootstrap {title}"),
                 custom_agent: None,
                 agent: AgentSlot::Default,
-                model: self.spawn_model.clone(),
+                // модель спавна — деф агента/default_agent опенкода (#1154):
+                // body.model перекрыл бы деф-модель, сервер её не задаёт
+                model: None,
                 variant: None,
                 bootstrap: true,
             })
@@ -74,7 +76,8 @@ impl TickUseCase {
                 title: format!("#{} {}", task.number(), task.title()),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
-                model: self.spawn_model.clone(),
+                // модель спавна — деф агента стадии (#1154), не конфиг
+                model: None,
                 variant: None,
                 bootstrap: false,
             })

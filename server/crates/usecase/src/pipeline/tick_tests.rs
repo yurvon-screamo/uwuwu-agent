@@ -131,6 +131,8 @@ impl TaskBoardRepo for FakeBoard {
 struct FakeSessions {
     prompts: Mutex<Vec<String>>,
     spawned: Mutex<Vec<String>>,
+    /// Спеки create_session (контракты спавна: агент/модель/каталог).
+    specs: Mutex<Vec<SessionSpec>>,
     /// ms последней активности любой сессии (сталл-детект-тесты).
     activity_ms: u64,
     /// Id мёртвых сессий (liveness-сценарии кик-разморозки/респавна).
@@ -169,9 +171,13 @@ impl FakeSessions {
 #[async_trait]
 impl AgentSessionGateway for FakeSessions {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String> {
+<<<<<<< HEAD
         self.specs.lock().unwrap().push(spec.clone());
+=======
+>>>>>>> 27b78cb (🐛 fix(server #1154): спавны без модели в теле — деф агента единственный источник)
         let id = format!("ses_{}", self.spawned.lock().unwrap().len() + 1);
         self.spawned.lock().unwrap().push(id.clone());
+        self.specs.lock().unwrap().push(spec.clone());
         Ok(id)
     }
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
@@ -500,7 +506,16 @@ fn usecase_with_state(
         log: Mutex::default(),
         comments: Vec::default(),
     });
+<<<<<<< HEAD
     let sessions = Arc::new(FakeSessions::new());
+=======
+    let sessions = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        specs: Mutex::default(),
+        activity_ms: 1000,
+    });
+>>>>>>> 27b78cb (🐛 fix(server #1154): спавны без модели в теле — деф агента единственный источник)
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
@@ -511,7 +526,6 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
     };
     (u, board, sessions, prs)
 }
@@ -1775,6 +1789,7 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     );
 }
 
+<<<<<<< HEAD
 // ===== Аналитика (#1135): волновой сайдкар + парный ревьювер =====
 
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
@@ -1786,6 +1801,45 @@ fn analyst_board() -> AnalystBoard {
         project: "p".into(),
         board: "B".into(),
         checkout: "/tmp/checkout".into(),
+=======
+#[tokio::test]
+async fn stall_detector_pings_then_flags() {
+    // Паттерн 16.11 (#1151/#1135/#384): ход stage-сессии завершён
+    // (тишина), статус не переведён — тик пингует агента комментом,
+    // после двух пингов и дальнейшей тишины — Needs attention.
+    use crate::pipeline::tick::{STALL_PING_EVERY_MS, STALL_SILENCE_MS};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let now: u64 = 1_000_000_000;
+    let mut t = task(21, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+    });
+    let sessions = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        specs: Mutex::default(),
+        // сессия молчит час+ — ход завершён без статусного перевода
+        activity_ms: now - STALL_SILENCE_MS - 60_000,
+    });
+    struct AdvClock(AtomicU64);
+    impl Clock for AdvClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+>>>>>>> 27b78cb (🐛 fix(server #1154): спавны без модели в теле — деф агента единственный источник)
     }
 }
 
@@ -1801,10 +1855,20 @@ fn analyst_uc(
     });
     let u = AnalystUseCase {
         board: board.clone(),
+<<<<<<< HEAD
         boards: vec![analyst_board()],
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state,
         clock: Arc::new(FixedClock),
+=======
+        sessions,
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: clock.clone(),
+        state: Arc::new(MemState(Mutex::default())),
+>>>>>>> 27b78cb (🐛 fix(server #1154): спавны без модели в теле — деф агента единственный источник)
     };
     (u, board)
 }
@@ -2781,4 +2845,29 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         log.is_empty(),
         "промах close не мутирует доски, лог: {log:?}"
     );
+}
+
+#[tokio::test]
+async fn stage_spawn_passes_no_model_to_session() {
+    // #1154: источник модели спавна — деф агента (agents/*.md) /
+    // default_agent опенкода; спеки стадии обязаны нести model: None —
+    // гейтвей применяет body.model поверх дефа, и любая подстановка
+    // сервера молча перекрывает деф-модели (bootstrap и work).
+    // Arrange
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    for spec in specs.iter() {
+        assert!(
+            spec.model.is_none(),
+            "сервер не задаёт модель спавна, получил: {:?}",
+            spec.model
+        );
+    }
 }
