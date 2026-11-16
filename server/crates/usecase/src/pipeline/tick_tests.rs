@@ -804,7 +804,7 @@ async fn kick_unfreezes_dead_dev_session() {
 #[tokio::test]
 async fn dead_stage_session_does_not_hold_cup() {
     // #1200: кап держат живые LLM-работы, не статусы — строка с мёртвой
-    // сессией не активна, и её слот достаётся спавн-кандидату
+    // сессией не активна, и её слот достаётся следующему запуску
     let mut dead = task(40, Status::InProgress);
     let mut f = TaskFields::default();
     f.set_session(
@@ -813,20 +813,27 @@ async fn dead_stage_session_does_not_hold_cup() {
     );
     dead.apply_fields(f);
     let candidate = task(41, Status::InProgress);
-    let (u, _, sessions, _) = usecase(vec![dead, candidate], PrState::Missing);
+    // тот же раунд (prev=In Progress) — dead40 идёт респавн-путём,
+    // не кик-разморозкой
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((40, Status::InProgress));
+    let (u, _, sessions, _) = usecase_with_state(vec![dead, candidate], PrState::Missing, state);
     sessions
         .dead_sessions
         .lock()
         .unwrap()
         .push("ses_dead_40".into());
-    // cup=2: по статусному подсчёту active=2 → held; честный: active=1 →
-    // влезают оба запуска: респавн мёртвой строки (гейтнутый) + кандидат
+    // cup=2: снапшот active=1 (кандидат), респавн инкрементит счётчик —
+    // по статусному подсчёту active=2 → held бы не было вовсе; честный
+    // счётчик вмещает ровно один запуск, кандидат ждёт следующего тика
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
-    assert_eq!(
-        out.spawns_done, 2,
-        "респавн + кандидат в слоте мёртвой строки"
-    );
-    assert_eq!(out.held_cup, 0);
+    assert_eq!(out.spawns_done, 1, "респавн мёртвой строки в слоте капа");
+    assert_eq!(out.held_cup, 1, "кандидат удержан честным счётчиком");
 }
 
 #[tokio::test]
@@ -1009,9 +1016,92 @@ async fn high_respawn_passes_peak() {
         .unwrap()
         .push("ses_dead_38".into());
     let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
-    // респавн идёт через wakeup-механику: Woke в outcome, сессия реально создана
-    assert_eq!(out.wakeups, 1, "high-респавн в пике проходит");
+    // респавн — фактический спавн: счёт в spawns_done, сессия создана
+    assert_eq!(out.spawns_done, 1, "high-респавн в пике проходит");
+    assert_eq!(out.wakeups, 0);
     assert!(!sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn respawn_escalation_does_not_count_wakeups() {
+    // Low-находка ревью: луп-гвард Escalate (без спавна) не накручивает
+    // счётчики запусков — строка уходит в Needs attention
+    let mut t = task(38, Status::InProgress);
+    t.set_priority(uwuwu_domain::Priority::High);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_38").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((38, Status::InProgress));
+    // луп-гвард на эскалации: 5 повторов без прогресса статуса
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((38, Slot::Dev, Status::InProgress, 5));
+    let (u, board, sessions, _) = peak_usecase(vec![t], Vec::new(), state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_38".into());
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "эскалация — не будильник");
+    assert_eq!(out.spawns_done, 0, "эскалация — не спавн");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("status#38=NeedsAttention")),
+        "строка ушла в Needs attention: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn respawns_within_tick_do_not_oversell_cup() {
+    // Low-находка ревью: global_active — снапшот обхода; несколько мёртвых
+    // stage-строк в одном тике не оверселяют кап — счётчик инкрементится
+    // по факту спавна
+    let mut rows = Vec::new();
+    for n in [50u64, 51] {
+        let mut t = task(n, Status::InProgress);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse(&format!("ses_dead_{n}")).unwrap(),
+        );
+        t.apply_fields(f);
+        rows.push(t);
+    }
+    rows.push(task(52, Status::InProgress));
+    // тот же раунд (prev=In Progress) — дед-строки идут респавн-путём,
+    // не кик-разморозкой
+    let state = Arc::new(MemState(Mutex::default()));
+    {
+        let mut g = state.0.lock().unwrap();
+        g.statuses.push((50, Status::InProgress));
+        g.statuses.push((51, Status::InProgress));
+    }
+    let (u, _, sessions, _) = usecase_with_state(rows, PrState::Missing, state);
+    {
+        let mut dead = sessions.dead_sessions.lock().unwrap();
+        dead.push("ses_dead_50".into());
+        dead.push("ses_dead_51".into());
+    }
+    // cup=2: снапшот active=1 (только кандидат), но респавны инкрементят
+    // счётчик — второй респавн и кандидат упираются в кап
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "один спавн в слот капа");
+    assert_eq!(out.held_cup, 1, "кандидат удержан честным счётчиком");
+    assert_eq!(out.wakeups_deferred, 1, "второй респавн отложен CUP");
 }
 
 #[tokio::test]
