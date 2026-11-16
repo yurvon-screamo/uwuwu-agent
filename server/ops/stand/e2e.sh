@@ -19,6 +19,7 @@ SEED_N=2046
 LOG_MOCK=/tmp/uwuwu-stand-mock.log
 LOG_SRV_OBS=/tmp/uwuwu-stand-server-observe.log
 LOG_SRV_LIVE=/tmp/uwuwu-stand-server-live.log
+LOG_SRV_ECHO=/tmp/uwuwu-stand-server-echo.log
 STATE=ops/state.json
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
@@ -92,4 +93,42 @@ DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$L
 [ "$DEV_SPAWNS" -ge 2 ] || fail "ре-энтри не случился (dev-спавнов: $DEV_SPAWNS)"
 say "фаза 2 ок: ре-энтри круг пройден (dev-спавнов: $DEV_SPAWNS), эскалаций нет"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри)"
+say "фаза 3: self-эхо — свой MCP-коммент не будит держащую сессию (#1204)"
+# Гасим сервер и быстрый мок фаз 1-2: фазе 3 нужен МЕДЛЕННЫЙ мок
+# (акт 11с при тике 10с) — каждый свежий сеанс на первом wake-тике видит
+# хвост из коммента предшественника (создан раньше его активности):
+# own-тест срезает тихо; до фикса тот же тик доставлял эхо (лишний акт).
+pkill -f 'target/debug/uwuwu-server' || true
+pkill -f 'target/debug/mock_opencode' || true
+sleep 1
+rm -f "$STATE"
+MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
+  MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=11000 \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+sleep 1
+UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:Design" \
+  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_ECHO" 2>&1 &
+# Цикл Design → … → Review на дефолтных approve с лагом актов: спавны
+# стадий идут сменой статуса, собственные комменты каждой стадии срезаются
+# на первом wake-тике её преемника (wakeup.self_echo_sliced).
+SEEN_OK=0
+while [ $SEEN_OK -lt 72 ]; do
+  SEEN_OK=$((SEEN_OK + 1))
+  sleep 5
+  S="$(task_status || true)"
+  case "$S" in
+    *Review*) say "цикл замкнут: $S"; break ;;
+    *attention*|*Needs*) fail "строка в $S" ;;
+  esac
+done
+case "$S" in *Review*) ;; *) fail "цикл не замкнут за 6 мин, статус: $S";; esac
+sleep 12   # окно эха: тик после idle-фазы последних актов
+DELIVERED=$(grep -c '"event":"wakeup.delivered"' "$LOG_SRV_ECHO" || true)
+SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
+[ "$SLICED" -ge 1 ] || fail "own-срез не сработал ни разу (sliced: $SLICED)"
+[ "$DELIVERED" -eq 0 ] || fail "wake-доставок: $DELIVERED (ожидался 0 — эхо?)"
+say "фаза 3 ок: sliced=$SLICED, delivered=0 — свои комменты не будят"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + self-эхо)"
