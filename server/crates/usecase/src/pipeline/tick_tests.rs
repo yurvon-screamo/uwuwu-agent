@@ -1105,6 +1105,104 @@ async fn respawns_within_tick_do_not_oversell_cup() {
 }
 
 #[tokio::test]
+async fn undelivered_comment_is_not_marked_seen() {
+    // #1206 (гонка доставки): коммент, созданный во время работы агента
+    // (активность новее коммента), не доставлен — и seen помечать нельзя:
+    // пометка навсегда прячет коммент от будильника (агент ждёт
+    // ревьювера, ревьювер — агента). После завершения хода коммент
+    // доставляется следующим тиком.
+    let mut t = task(60, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_60").unwrap(),
+    );
+    t.apply_fields(f);
+    // агент «работает»: активность новее коммента → fresh=false
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, sessions, _) = {
+        let board = Arc::new(FakeBoard {
+            rows: vec![t],
+            log: Mutex::default(),
+            comments: vec![CommentRef {
+                id: "verdict".into(),
+                created_ms: 3000,
+                body: "вердикт".into(),
+            }],
+        });
+        let sess = Arc::new(FakeSessions {
+            prompts: Mutex::default(),
+            spawned: Mutex::default(),
+            activity_ms: 5000,
+            dead_sessions: Mutex::default(),
+            list_fails: false,
+        });
+        let prs = Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        });
+        let uc = TickUseCase {
+            board: board.clone(),
+            sessions: sess.clone(),
+            prs: prs.clone(),
+            clock: Arc::new(FixedClock),
+            state: state.clone(),
+            spawn_model: None,
+        };
+        (uc, board, sess, prs)
+    };
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "коммент старее активности — доставка откладывается"
+    );
+    assert!(
+        state.0.lock().unwrap().comments.is_empty(),
+        "недоставленный коммент не помечается seen — иначе потерян навсегда"
+    );
+
+    // агент завершил ход (активность застыла) — тот же seen-стейт:
+    // следующий тик доставляет коммент
+    let mut t2 = task(60, Status::InProgress);
+    let mut f2 = TaskFields::default();
+    f2.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_60").unwrap(),
+    );
+    t2.apply_fields(f2);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t2],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "verdict".into(),
+            created_ms: 3000,
+            body: "вердикт".into(),
+        }],
+    });
+    let sess2 = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        activity_ms: 1000,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
+    });
+    let u2 = TickUseCase {
+        board: board.clone(),
+        sessions: sess2.clone(),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state,
+        spawn_model: None,
+    };
+    let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
+    assert!(!sess2.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn dev_session_survives_all_transitions() {
     // Канон сессий: дев-сессия едина между этапами и откатами —
     // переходы стадий её никогда не снимают

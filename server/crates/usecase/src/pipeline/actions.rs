@@ -181,8 +181,10 @@ impl TickUseCase {
                     .set_last_comment_id(&board.board, task.number(), &last.id);
                 return Ok(WakeAct::Woke);
             }
-            self.state
-                .set_last_comment_id(&board.board, task.number(), &last.id);
+            // Коммент создан во время работы агента (активность новее):
+            // агент его ещё не видел — seen НЕ пишем, доставка повторится
+            // на тике, где ход застынет (гонка #1206: пометка навсегда
+            // прятала вердикты от будильника)
             Ok(WakeAct::None)
         }
     }
