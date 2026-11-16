@@ -1831,7 +1831,7 @@ async fn analyst_wave_one_session_for_all_rows() {
     assert_eq!(inner.analys_loops.len(), 2, "только строки волны");
     for (n, st, r) in &inner.analys_loops {
         assert_eq!(*st, Status::Analys);
-        assert_eq!(*r, 1, "строка #{n}: первая попытка");
+        assert_eq!(*r, 0, "строка #{n}: захват без круга (#1241)");
     }
     assert!(
         !board
@@ -1967,6 +1967,127 @@ async fn analyst_resets_stale_cycle_counter() {
     assert!(
         state.0.lock().unwrap().analys_loops.is_empty(),
         "вне цикла Analys↔Review Analys счётчик сбрасывается"
+    );
+}
+
+#[tokio::test]
+async fn analyst_verdictless_waves_do_not_burn_cycles() {
+    // #1241: счётчик цикл-гварда считает реальные круги (строка сходила
+    // в Review Analys и вернулась), а не захваты волны: умирающая/без-
+    // вердиктная сессия аналитика круг НЕ сжигает — строка ретраится
+    // кулдауном, ложной эскалации в Needs attention нет
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct AdvClock(AtomicU64);
+    impl Clock for AdvClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let board = Arc::new(FakeBoard {
+        rows: vec![titled(1, "заявка", Status::Analys)],
+        log: Mutex::default(),
+        comments: vec![],
+    });
+    let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
+    let u = AnalystUseCase {
+        board: board.clone(),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: clock.clone(),
+    };
+    // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
+    // не двигается) — старый код сжигал круг за кругом и эскалировал
+    for _ in 0..4 {
+        assert_eq!(u.tick().await.unwrap(), 1, "волна берёт строку (ретрай)");
+        clock.0.fetch_add(16 * 60_000, Ordering::SeqCst); // кулдаун прошёл
+    }
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 4, "4 ретрай-волны");
+    let rounds = state
+        .0
+        .lock()
+        .unwrap()
+        .analys_loops
+        .iter()
+        .find(|(n, _, _)| *n == 1)
+        .map(|(_, _, r)| *r);
+    assert_eq!(rounds, Some(0), "захват волны круг не сжигает");
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("status#1=")),
+        "ложной эскалации нет — строка жива в Analys"
+    );
+}
+
+#[tokio::test]
+async fn analyst_real_circle_increments_counter() {
+    // #1241: реальный круг — последняя увиденная пара (ReviewAnalys, R),
+    // строка снова в Analys: наблюдение инкрементит счётчик
+    let inner = MemStateInner {
+        analys_loops: vec![(1, Status::ReviewAnalys, 1)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "вернулась из ревью", Status::Analys)],
+        state.clone(),
+        sessions,
+    );
+    u.tick().await.unwrap();
+    let g = state.0.lock().unwrap();
+    let (_, st, r) = g
+        .analys_loops
+        .iter()
+        .find(|(n, _, _)| *n == 1)
+        .copied()
+        .unwrap();
+    assert_eq!(
+        (st, r),
+        (Status::Analys, 2),
+        "реальный круг засчитан, пара — (Analys, 2)"
+    );
+}
+
+#[tokio::test]
+async fn analyst_review_seen_updates_pair_without_increment() {
+    // строка ушла в Review Analys — наблюдение фиксирует пару без
+    // инкремента: круг завершится только возвратом в Analys
+    let inner = MemStateInner {
+        analys_loops: vec![(1, Status::Analys, 1)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "на ревью", Status::ReviewAnalys)],
+        state.clone(),
+        sessions,
+    );
+    u.tick().await.unwrap();
+    let g = state.0.lock().unwrap();
+    let (_, st, r) = g
+        .analys_loops
+        .iter()
+        .find(|(n, _, _)| *n == 1)
+        .copied()
+        .unwrap();
+    assert_eq!(
+        (st, r),
+        (Status::ReviewAnalys, 1),
+        "наблюдение ревью без инкремента"
     );
 }
 

@@ -87,6 +87,35 @@ impl AnalystUseCase {
                 {
                     self.state.clear_analys_review_loop(&tb.board, t.number());
                 }
+                // Круг-наблюдение (#1241): счётчик цикл-гварда считают
+                // реальные круги — строка сходила в Review Analys и
+                // вернулась. Пара хранит последний увиденный статус цикла:
+                // возврат из ревью инкрементит, уход в ревью только
+                // фиксируется. Захват волны круг НЕ сжигает — умирающая
+                // без вердикта сессия аналитика ретраится кулдауном
+                // без ложной эскалации (инцидент 17.11: три волны за час
+                // сжигали счётчик при одном видимом переходе).
+                if let Some((last, rounds)) = self.state.analys_loop(&tb.board, t.number()) {
+                    match t.status() {
+                        Status::Analys if last == Status::ReviewAnalys => {
+                            self.state.set_analys_loop(
+                                &tb.board,
+                                t.number(),
+                                Status::Analys,
+                                rounds + 1,
+                            );
+                        }
+                        Status::ReviewAnalys if last == Status::Analys => {
+                            self.state.set_analys_loop(
+                                &tb.board,
+                                t.number(),
+                                Status::ReviewAnalys,
+                                rounds,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 if t.status() != Status::Analys || t.title().is_empty() {
                     continue;
                 }
@@ -141,8 +170,11 @@ impl AnalystUseCase {
                     .analys_loop(&tb.board, t.number())
                     .map(|(_, r)| r)
                     .unwrap_or(0);
+                // Захват волны круг не сжигает (#1241): пара только
+                // фиксируется (свежие строки — (Analys, 0)), rounds не
+                // растут — ретрай безвердиктной волны не является петлёй
                 self.state
-                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds + 1);
+                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
                 self.state.mark_analys_spawn(&tb.board, t.number(), now);
             }
             tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
@@ -184,8 +216,9 @@ impl AnalystUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Цикл-гвард аналитики: {rounds} круга Analys↔Review Analys без выхода \
-                     в Todo. Строка переведена в Needs attention — разбор владельца."
+                    "⚠︎ Цикл-гвард аналитики: {rounds} реальных круга (Review Analys → Analys) \
+                     без выхода в Todo — строка ходила на ревью и возвращалась. Строка переведена \
+                     в Needs attention — разбор владельца."
                 ),
             )
             .await
