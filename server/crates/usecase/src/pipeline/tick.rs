@@ -136,13 +136,14 @@ impl TickUseCase {
             }
             let _ = bp;
         }
-        // CUP честный (#1200): активные — строки активного статуса, чья
-        // stage-сессия жива, плюс спавн-кандидаты без сессии (нагрузку
-        // создадут в этом же тике). Мёртвая сессия LLM не тратит и кап не
-        // держит: призрачные строки не блокируют реальные спавны (инцидент
-        // 16.11: held тест-спавн #1170 при живых-то 1-2 задачах).
-        // Недоступность исполнителя ≠ «все мёртвые» — fallback на старый
-        // статусный подсчёт (паралич конвейера хуже редкого овер-спавна).
+        // CUP честный (#1200 + регресс 17.11): кап держат LLM-тратящие —
+        // busy-строки (ход идёт прямо сейчас) и спавн-кандидаты без
+        // сессии (нагрузка в этом же тике). Конвейерная сессия между
+        // ходами «жива» в API, но не тратит — idle не держат кап
+        // (инцидент ночи 16-17.11: active=18 при cap=7 из спящих, все
+        // спавны холдились). Мёртвая сессия не тратит и кап не держит.
+        // Недоступность исполнителя — fallback на статусный подсчёт
+        // (паралич конвейера хуже редкого овер-спавна).
         // Strict union (#1203): отказ ЛЮБОГО исполнителя → полный фолбэк —
         // частичный список представил бы офлайн-исполнителя мёртвым.
         let alive: Option<std::collections::HashSet<String>> =
@@ -162,27 +163,33 @@ impl TickUseCase {
                     None
                 }
             };
-        let global_active: usize = boards
-            .iter()
-            .map(|(_, tasks)| {
-                tasks
-                    .iter()
-                    .filter(|t| {
-                        if !t.status().is_active() {
-                            return false;
-                        }
-                        let Some(session) = t.stage_slot().and_then(|slot| t.session_of(slot))
-                        else {
-                            return true; // кандидат на спавн — нагрузка в этом тике
-                        };
-                        match &alive {
-                            Some(alive) => alive.contains(session),
-                            None => true, // fallback: статусный подсчёт
-                        }
-                    })
-                    .count()
-            })
-            .sum();
+        // фаза 1: кандидаты (без сессии) — активны безусловно; строки
+        // с живой сессией — копим для idle-проверки (фаза 2)
+        let mut candidates = 0usize;
+        let mut live_sessions: Vec<(&BoardPlan, String)> = Vec::new();
+        for (bp, tasks) in boards.iter() {
+            for t in tasks.iter() {
+                if !t.status().is_active() {
+                    continue;
+                }
+                match t.stage_slot().and_then(|slot| t.session_of(slot)) {
+                    None => candidates += 1,
+                    Some(session) => match &alive {
+                        Some(alive) if !alive.contains(session) => {} // мёртвая
+                        Some(_) => live_sessions.push((*bp, session.to_string())),
+                        None => candidates += 1, // fallback: статусный подсчёт
+                    },
+                }
+            }
+        }
+        // фаза 2: среди живых тратят только busy (ход идёт)
+        let mut busy = 0usize;
+        for (bp, session) in &live_sessions {
+            if !self.session_idle(bp, session).await {
+                busy += 1;
+            }
+        }
+        let global_active: usize = candidates + busy;
         for (board, tasks) in boards {
             out = self
                 .run_board(plan, board, tasks, global_active, out)
