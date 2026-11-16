@@ -53,9 +53,11 @@ pub enum Action {
 pub enum Awaits {
     /// Стадия ведётся живой сессией (мяч у агента стадии).
     StageSession,
-    /// Мяч у владельца: приёмка Review, Needs attention, выбор Design.
+    /// Мяч у владельца: приёмка Review, Needs attention, черновик Draft и
+    /// проработанный Todo (выбор Design / fast-track).
     Owner,
-    /// Вход в конвейер: Draft ждёт триаж, Todo ждёт Design.
+    /// Вход в конвейер: Analys ждёт аналитика, Review Analys — ревьювера
+    /// аналитики.
     Entry,
     /// Крон-мастер либо парковка (Вейт).
     Schedule,
@@ -74,7 +76,9 @@ pub fn awaits(status: Status) -> Awaits {
         | Status::ReviewResult
         | Status::Testing => Awaits::StageSession,
         Status::UserReview | Status::NeedsAttention => Awaits::Owner,
-        Status::Draft | Status::Todo => Awaits::Entry,
+        Status::Draft => Awaits::Owner,
+        Status::Todo => Awaits::Owner,
+        Status::Analys | Status::ReviewAnalys => Awaits::Entry,
         Status::Wait => Awaits::Schedule,
         Status::Done | Status::Deleted => Awaits::Terminal,
         Status::Empty => Awaits::Untracked,
@@ -267,6 +271,29 @@ mod tests {
         assert!(matches!(decide(&t), Action::Observe { .. }));
         t.set_autodone(true);
         assert_eq!(decide(&t), Action::Autodone);
+    }
+
+    #[test]
+    fn awaits_semantics_of_analysis_stage() {
+        // #1135: Draft/Todo — мяч владельца; Analys/Review Analys — вход
+        // в конвейер (очередь сайдкара аналитики)
+        assert_eq!(awaits(Status::Draft), Awaits::Owner);
+        assert_eq!(awaits(Status::Todo), Awaits::Owner);
+        assert_eq!(awaits(Status::Analys), Awaits::Entry);
+        assert_eq!(awaits(Status::ReviewAnalys), Awaits::Entry);
+    }
+
+    #[test]
+    fn analysis_statuses_are_not_active_and_have_no_slot() {
+        // территория сайдкара: CUP и пик-окно не задеваются, спавн — не тик
+        assert!(!Status::Analys.is_active());
+        assert!(!Status::ReviewAnalys.is_active());
+        assert_eq!(task(Status::Analys).stage_slot(), None);
+        assert_eq!(task(Status::ReviewAnalys).stage_slot(), None);
+        assert!(matches!(
+            decide(&task(Status::Analys)),
+            Action::Observe { .. }
+        ));
     }
 
     #[test]

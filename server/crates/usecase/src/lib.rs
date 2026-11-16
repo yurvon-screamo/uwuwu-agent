@@ -24,7 +24,8 @@ pub use naming::{
     schedule_label, slot_key, status_name, task_type_name, F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::{
-    BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, TriageBoard, TriageUseCase,
+    AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode,
+    TickOutcome, TickPlan, TickUseCase,
 };
 pub use ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, FmMutator, IssueDigest,

@@ -158,7 +158,7 @@ async fn task_get_accepts_number_as_string() {
     let text = call(&tools, "task_get", json!({ "number": number.to_string() }))
         .await
         .expect("get строкой");
-    assert!(text.starts_with(&format!("#{number} пин — Draft")));
+    assert!(text.starts_with(&format!("#{number} пин — Analys")));
     assert!(text.contains("body_hash: "));
 }
 
@@ -174,7 +174,7 @@ async fn task_create_rejects_unknown_type_with_canonical_list() {
     .expect_err("отказ");
     assert_eq!(
         err,
-        "неизвестный тип «супер»: bug|spike|analys|docs|feature|refactoring|legacy|idea|qa|infrastructure|other"
+        "неизвестный тип «супер»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
     );
 }
 
@@ -210,10 +210,10 @@ async fn unknown_tool_is_loud_at_dispatcher() {
     assert_eq!(err, "unknown tool: нет_такого_тула");
 }
 
-/// Главный сценарий через живой диспетчер: create → квитанция Draft,
+/// Главный сценарий через живой диспетчер: create → квитанция Analys,
 /// get → fm с body_hash и телом; task_list показывает строку.
 #[tokio::test]
-async fn create_get_list_roundtrip_reports_draft_receipt() {
+async fn create_get_list_roundtrip_reports_analys_receipt() {
     let tools = hub();
     let created = call(
         &tools,
@@ -222,14 +222,14 @@ async fn create_get_list_roundtrip_reports_draft_receipt() {
     )
     .await
     .expect("create");
-    assert_eq!(created, "создана задача #1 (Draft) на доске проекта uwuwu");
+    assert_eq!(created, "создана задача #1 (Analys) на доске проекта uwuwu");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");
-    assert!(get.starts_with("#1 круговерть — Draft"));
+    assert!(get.starts_with("#1 круговерть — Analys"));
     assert!(get.contains("body_hash: "));
     assert!(get.contains("## Постановка"));
     let list = call(&tools, "task_list", json!({})).await.expect("list");
     assert!(list.contains("круговерть"));
-    assert!(list.contains("Draft"));
+    assert!(list.contains("Analys"));
 }

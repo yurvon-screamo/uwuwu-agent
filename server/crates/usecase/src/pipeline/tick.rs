@@ -521,21 +521,24 @@ impl TickUseCase {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
         };
-        let Some(session) = task.session_of(slot) else {
+        let Some(session) = task.session_of(slot).map(str::to_string) else {
             return Ok(StallAct::None);
         };
-        let session = session.to_string();
-        // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide)
-        let Ok(Some(last_ms)) = self.sessions.last_activity_ms(&session).await else {
-            return Ok(StallAct::None);
+        // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
+        // тишина короче мягкого порога — оба класса молчат, idle-пробу
+        // (HTTP хвоста сообщений) не тратим на свежие строки
+        let silence = match self.sessions.last_activity_ms(&session).await {
+            Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
+            _ => 0,
         };
-        let now = self.clock.now_ms();
-        let silence = now.saturating_sub(last_ms);
+        if silence < STALL_SOFT_SILENCE_MS {
+            return Ok(StallAct::None);
+        }
         // Два класса тишины (#1206, санкция владельца): ход завершён
-        // (последнее сообщение — финальный ответ агента), а статусная
-        // транзакция не закрыта → мягкий пинг прямо в сессию через
-        // 15 мин; ход идёт (tool-call/стрим) → классический порог 60 мин
-        // (защита от ложных пингов на длинных операциях, #161).
+        // (последнее содержательное сообщение — финальный ответ агента),
+        // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
+        // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
+        // классический порог 60 мин (длинные операции, #161).
         let idle = self.session_idle(&session).await;
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
@@ -554,42 +557,78 @@ impl TickUseCase {
         if prev_status != Some(task.status()) {
             count = 0;
         }
+        let now = self.clock.now_ms();
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
-        if count >= STALL_MAX_PINGS {
-            // два пинга исчерпаны, тишина продолжается — мяч владельцу
-            tracing::warn!(
-                event = "stall.escalated",
-                number = task.number(),
-                silence_min = silence / 60_000,
-                "Сталл: сессия молчит после двух автопингов"
-            );
-            self.board
-                .set_status(&board.board, task.number(), Status::NeedsAttention)
-                .await?;
-            self.board
-                .post_comment(
-                    task.number(),
-                    &format!(
-                        "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
-                         автопингов — агент не завершает статусную транзакцию. Строка в \
-                         Needs attention, разбор владельца.",
-                        naming::slot_key(slot),
-                        silence / 60_000
-                    ),
-                )
-                .await?;
-            self.state
-                .mark_stall_ping(&board.board, task.number(), task.status(), now);
-            return Ok(StallAct::Flagged);
+        self.stall_action(board, task, slot, &session, soft, silence, count, now)
+            .await
+    }
+
+    /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),
+    /// мягкий пинг прямым промптом (ход завершён) или классический
+    /// коммент-автопинг (ход, возможно, идёт).
+    #[allow(clippy::too_many_arguments)]
+    async fn stall_action(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        soft: bool,
+        silence: u64,
+        count: u32,
+        now: u64,
+    ) -> UsecaseResult<StallAct> {
+        if count < STALL_MAX_PINGS {
+            return self
+                .stall_ping_round(board, task, slot, session, soft, silence, now)
+                .await;
         }
+        // два пинга исчерпаны, тишина продолжается — мяч владельцу
+        tracing::warn!(
+            event = "stall.escalated",
+            number = task.number(),
+            silence_min = silence / 60_000,
+            "Сталл: сессия молчит после двух автопингов"
+        );
+        self.board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await?;
+        self.board
+            .post_comment(
+                task.number(),
+                &format!(
+                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
+                     автопингов — агент не завершает статусную транзакцию. Строка в \
+                     Needs attention, разбор владельца.",
+                    naming::slot_key(slot),
+                    silence / 60_000
+                ),
+            )
+            .await?;
+        self.state
+            .mark_stall_ping(&board.board, task.number(), task.status(), now);
+        Ok(StallAct::Flagged)
+    }
+
+    /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное
+    /// пробуждение, без обхода через коммент), классический — комментом.
+    #[allow(clippy::too_many_arguments)]
+    async fn stall_ping_round(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        soft: bool,
+        silence: u64,
+        now: u64,
+    ) -> UsecaseResult<StallAct> {
         if soft {
-            // мягкий пинг — прямым промптом в сессию (мгновенное пробуждение,
-            // без обхода через коммент): ход завершён, транзакция не закрыта
             self.sessions
                 .prompt(
-                    &session,
+                    session,
                     &format!(
                         "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
                          строка #{} стоит. Заверши транзакцию по контракту хода: \
