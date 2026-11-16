@@ -4,9 +4,8 @@
 use super::actions::WakeAct;
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{
-    AgentSessionGateway, Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore,
-};
+use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::router::SessionRouter;
 use serde::Serialize;
 use std::sync::Arc;
 use uwuwu_domain::{
@@ -93,7 +92,8 @@ enum StallAct {
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавны/будильники — гейтвей проекта.
+    pub sessions: Arc<SessionRouter>,
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
@@ -136,15 +136,18 @@ impl TickUseCase {
             }
             let _ = bp;
         }
-        // CUP честный (#1200): активные — строки активного статуса, чья
-        // stage-сессия жива, плюс спавн-кандидаты без сессии (нагрузку
-        // создадут в этом же тике). Мёртвая сессия LLM не тратит и кап не
-        // держит: призрачные строки не блокируют реальные спавны (инцидент
-        // 16.11: held тест-спавн #1170 при живых-то 1-2 задачах).
-        // Недоступность исполнителя ≠ «все мёртвые» — fallback на старый
-        // статусный подсчёт (паралич конвейера хуже редкого овер-спавна).
+        // CUP честный (#1200 + регресс 17.11): кап держат LLM-тратящие —
+        // busy-строки (ход идёт прямо сейчас) и спавн-кандидаты без
+        // сессии (нагрузка в этом же тике). Конвейерная сессия между
+        // ходами «жива» в API, но не тратит — idle не держат кап
+        // (инцидент ночи 16-17.11: active=18 при cap=7 из спящих, все
+        // спавны холдились). Мёртвая сессия не тратит и кап не держит.
+        // Недоступность исполнителя — fallback на статусный подсчёт
+        // (паралич конвейера хуже редкого овер-спавна).
+        // Strict union (#1203): отказ ЛЮБОГО исполнителя → полный фолбэк —
+        // частичный список представил бы офлайн-исполнителя мёртвым.
         let alive: Option<std::collections::HashSet<String>> =
-            match self.sessions.list_sessions().await {
+            match self.sessions.list_sessions_strict().await {
                 Ok(list) => Some(
                     list.into_iter()
                         .filter(|s| s.outcome.is_empty())
@@ -160,27 +163,33 @@ impl TickUseCase {
                     None
                 }
             };
-        let global_active: usize = boards
-            .iter()
-            .map(|(_, tasks)| {
-                tasks
-                    .iter()
-                    .filter(|t| {
-                        if !t.status().is_active() {
-                            return false;
-                        }
-                        let Some(session) = t.stage_slot().and_then(|slot| t.session_of(slot))
-                        else {
-                            return true; // кандидат на спавн — нагрузка в этом тике
-                        };
-                        match &alive {
-                            Some(alive) => alive.contains(session),
-                            None => true, // fallback: статусный подсчёт
-                        }
-                    })
-                    .count()
-            })
-            .sum();
+        // фаза 1: кандидаты (без сессии) — активны безусловно; строки
+        // с живой сессией — копим для idle-проверки (фаза 2)
+        let mut candidates = 0usize;
+        let mut live_sessions: Vec<(&BoardPlan, String)> = Vec::new();
+        for (bp, tasks) in boards.iter() {
+            for t in tasks.iter() {
+                if !t.status().is_active() {
+                    continue;
+                }
+                match t.stage_slot().and_then(|slot| t.session_of(slot)) {
+                    None => candidates += 1,
+                    Some(session) => match &alive {
+                        Some(alive) if !alive.contains(session) => {} // мёртвая
+                        Some(_) => live_sessions.push((*bp, session.to_string())),
+                        None => candidates += 1, // fallback: статусный подсчёт
+                    },
+                }
+            }
+        }
+        // фаза 2: среди живых тратят только busy (ход идёт)
+        let mut busy = 0usize;
+        for (bp, session) in &live_sessions {
+            if !self.session_idle(bp, session).await {
+                busy += 1;
+            }
+        }
+        let global_active: usize = candidates + busy;
         for (board, tasks) in boards {
             out = self
                 .run_board(plan, board, tasks, global_active, out)
@@ -493,7 +502,12 @@ impl TickUseCase {
             return Ok(None);
         };
         if matches!(slot, Slot::Design | Slot::Dev)
-            && self.sessions.liveness(session).await != Liveness::Dead
+            && self
+                .sessions
+                .project(&board.project)
+                .liveness(session)
+                .await
+                != Liveness::Dead
         {
             return Ok(None);
         }
@@ -521,22 +535,30 @@ impl TickUseCase {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
         };
-        let Some(session) = task.session_of(slot) else {
+        let Some(session) = task.session_of(slot).map(str::to_string) else {
             return Ok(StallAct::None);
         };
-        let session = session.to_string();
-        // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide)
-        let Ok(Some(last_ms)) = self.sessions.last_activity_ms(&session).await else {
-            return Ok(StallAct::None);
+        // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
+        // тишина короче мягкого порога — оба класса молчат, idle-пробу
+        // (HTTP хвоста сообщений) не тратим на свежие строки
+        let silence = match self
+            .sessions
+            .project(&board.project)
+            .last_activity_ms(&session)
+            .await
+        {
+            Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
+            _ => 0,
         };
-        let now = self.clock.now_ms();
-        let silence = now.saturating_sub(last_ms);
+        if silence < STALL_SOFT_SILENCE_MS {
+            return Ok(StallAct::None);
+        }
         // Два класса тишины (#1206, санкция владельца): ход завершён
-        // (последнее сообщение — финальный ответ агента), а статусная
-        // транзакция не закрыта → мягкий пинг прямо в сессию через
-        // 15 мин; ход идёт (tool-call/стрим) → классический порог 60 мин
-        // (защита от ложных пингов на длинных операциях, #161).
-        let idle = self.session_idle(&session).await;
+        // (последнее содержательное сообщение — финальный ответ агента),
+        // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
+        // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
+        // классический порог 60 мин (длинные операции, #161).
+        let idle = self.session_idle(board, &session).await;
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
@@ -554,42 +576,79 @@ impl TickUseCase {
         if prev_status != Some(task.status()) {
             count = 0;
         }
+        let now = self.clock.now_ms();
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
-        if count >= STALL_MAX_PINGS {
-            // два пинга исчерпаны, тишина продолжается — мяч владельцу
-            tracing::warn!(
-                event = "stall.escalated",
-                number = task.number(),
-                silence_min = silence / 60_000,
-                "Сталл: сессия молчит после двух автопингов"
-            );
-            self.board
-                .set_status(&board.board, task.number(), Status::NeedsAttention)
-                .await?;
-            self.board
-                .post_comment(
-                    task.number(),
-                    &format!(
-                        "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
-                         автопингов — агент не завершает статусную транзакцию. Строка в \
-                         Needs attention, разбор владельца.",
-                        naming::slot_key(slot),
-                        silence / 60_000
-                    ),
-                )
-                .await?;
-            self.state
-                .mark_stall_ping(&board.board, task.number(), task.status(), now);
-            return Ok(StallAct::Flagged);
+        self.stall_action(board, task, slot, &session, soft, silence, count, now)
+            .await
+    }
+
+    /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),
+    /// мягкий пинг прямым промптом (ход завершён) или классический
+    /// коммент-автопинг (ход, возможно, идёт).
+    #[allow(clippy::too_many_arguments)]
+    async fn stall_action(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        soft: bool,
+        silence: u64,
+        count: u32,
+        now: u64,
+    ) -> UsecaseResult<StallAct> {
+        if count < STALL_MAX_PINGS {
+            return self
+                .stall_ping_round(board, task, slot, session, soft, silence, now)
+                .await;
         }
+        // два пинга исчерпаны, тишина продолжается — мяч владельцу
+        tracing::warn!(
+            event = "stall.escalated",
+            number = task.number(),
+            silence_min = silence / 60_000,
+            "Сталл: сессия молчит после двух автопингов"
+        );
+        self.board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await?;
+        self.board
+            .post_comment(
+                task.number(),
+                &format!(
+                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
+                     автопингов — агент не завершает статусную транзакцию. Строка в \
+                     Needs attention, разбор владельца.",
+                    naming::slot_key(slot),
+                    silence / 60_000
+                ),
+            )
+            .await?;
+        self.state
+            .mark_stall_ping(&board.board, task.number(), task.status(), now);
+        Ok(StallAct::Flagged)
+    }
+
+    /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное
+    /// пробуждение, без обхода через коммент), классический — комментом.
+    #[allow(clippy::too_many_arguments)]
+    async fn stall_ping_round(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        soft: bool,
+        silence: u64,
+        now: u64,
+    ) -> UsecaseResult<StallAct> {
         if soft {
-            // мягкий пинг — прямым промптом в сессию (мгновенное пробуждение,
-            // без обхода через коммент): ход завершён, транзакция не закрыта
             self.sessions
+                .project(&board.project)
                 .prompt(
-                    &session,
+                    session,
                     &format!(
                         "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
                          строка #{} стоит. Заверши транзакцию по контракту хода: \

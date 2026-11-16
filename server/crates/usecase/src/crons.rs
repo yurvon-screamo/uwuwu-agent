@@ -6,7 +6,8 @@
 
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::ports::{AgentSessionGateway, Clock, SessionSpec, WikiRepo};
+use crate::ports::{Clock, SessionSpec, WikiRepo};
+use crate::router::SessionRouter;
 use std::sync::Arc;
 use uwuwu_domain::{
     civil_from_days, AgentSlot, CronField, CronMaster, CronSchedule, IntervalMinutes, JstDate,
@@ -20,7 +21,8 @@ pub fn crons_dir(project: &str) -> String {
 
 pub struct CronUseCase {
     pub wiki: Arc<dyn WikiRepo>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: крон-ран — гейтвей своего проекта.
+    pub sessions: Arc<SessionRouter>,
     pub clock: Arc<dyn Clock>,
     pub spawn_model: Option<ModelRef>,
     pub checkout: String,
@@ -94,8 +96,9 @@ impl CronUseCase {
                 variant: None,
                 bootstrap: false,
             };
-            let session = self.sessions.create_session(&spec).await?;
-            self.sessions.prompt(&session, &prompt).await?;
+            let sessions = self.sessions.project(project);
+            let session = sessions.create_session(&spec).await?;
+            sessions.prompt(&session, &prompt).await?;
             tracing::info!(event = "cron.fired", cron = %slug, session = %session, "Cron fired");
             fired.push(FireOutcome { slug, session });
         }

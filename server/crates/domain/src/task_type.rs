@@ -1,18 +1,17 @@
 //! Тип задачи (колонка «Тип» доски; канон AGENTS.md). Управляет пайплайном:
-//! Bug → строго TDD, Spike → код не писать, Analys → находки без фиксов.
+//! Bug → строго TDD, Spike → код не писать. Idea/Analys выведены из канона
+//! (#1135): идеи прорабатывает аналитик до feature-уровня.
 
 /// Тип задачи канона досок uwuwu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
     Bug,
     Spike,
-    Analys,
     Docs,
     Other,
     Feature,
     Refactoring,
     Legacy,
-    Idea,
     Qa,
     Infrastructure,
 }
@@ -27,17 +26,15 @@ mod tests {
 
     #[test]
     fn enum_variants_canonical() {
-        // 11 типов канона — компилятор держит состав
+        // 9 типов канона (idea/analys удалены #1135) — компилятор держит состав
         let _ = [
             TaskType::Bug,
             TaskType::Spike,
-            TaskType::Analys,
             TaskType::Docs,
             TaskType::Other,
             TaskType::Feature,
             TaskType::Refactoring,
             TaskType::Legacy,
-            TaskType::Idea,
             TaskType::Qa,
             TaskType::Infrastructure,
         ];

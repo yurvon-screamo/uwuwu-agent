@@ -52,6 +52,9 @@ struct StateFile {
     /// attention-механика.
     #[serde(default)]
     spawn_loops: BTreeMap<String, (String, u32)>,
+    /// «board:number» → (статус цикла, кругов) — цикл-гвард аналитики (#1135).
+    #[serde(default)]
+    analys_loops: BTreeMap<String, (String, u32)>,
     /// Дневной счётчик дримера: (дата JST, спавнов).
     #[serde(default)]
     dreamer_day: Option<(String, u32)>,
@@ -104,6 +107,8 @@ impl JsonStateStore {
                     guard.spawn_loops.remove(&k);
                 }
             }
+            // legacy-ключи триажа (эпоха до #1135) — вечный мёртвый груз
+            guard.spawns.retain(|k, _| !k.ends_with(":triage"));
         }
         let raw = {
             let guard = self.state.lock().expect("state lock");
@@ -244,23 +249,103 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
-    fn last_triage_ms(&self, board: &str, number: u64) -> Option<u64> {
+    fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64> {
         self.state
             .lock()
             .expect("state lock")
             .spawns
-            .get(&format!("{board}:{number}:triage"))
+            .get(&format!("{board}:{number}:analys"))
             .copied()
     }
 
-    fn mark_triage_spawn(&self, board: &str, number: u64, at_ms: u64) {
+    fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64) {
         self.state
             .lock()
             .expect("state lock")
             .spawns
-            .insert(format!("{board}:{number}:triage"), at_ms);
+            .insert(format!("{board}:{number}:analys"), at_ms);
     }
 
+    fn last_analys_review_ms(&self, board: &str, number: u64) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .get(&format!("{board}:{number}:analys-review"))
+            .copied()
+    }
+
+    fn mark_analys_review_spawn(&self, board: &str, number: u64, at_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawns
+            .insert(format!("{board}:{number}:analys-review"), at_ms);
+    }
+
+    fn analys_loop(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analys_loops
+            .get(&Self::key(board, number))
+            .map(|(s, r)| (naming::parse_status(s), *r))
+    }
+
+    fn set_analys_loop(&self, board: &str, number: u64, status: Status, rounds: u32) {
+        self.state.lock().expect("state lock").analys_loops.insert(
+            Self::key(board, number),
+            (naming::status_name(status).to_string(), rounds),
+        );
+    }
+
+    fn clear_analys_loop(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analys_loops
+            .remove(&Self::key(board, number));
+    }
+
+    fn analys_review_loop(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .get(&format!("{board}:{number}:analys-review-loop"))
+            .map(|(s, r)| (naming::parse_status(s), *r))
+    }
+
+    fn set_analys_review_loop(&self, board: &str, number: u64, status: Status, repeats: u32) {
+        self.state.lock().expect("state lock").spawn_loops.insert(
+            format!("{board}:{number}:analys-review-loop"),
+            (naming::status_name(status).to_string(), repeats),
+        );
+    }
+
+    fn clear_analys_review_loop(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .remove(&format!("{board}:{number}:analys-review-loop"));
+    }
+
+    fn prune_analys_guards(&self, live: &std::collections::HashSet<String>) {
+        let mut guard = self.state.lock().expect("state lock");
+        guard.analys_loops.retain(|k, _| live.contains(k));
+        let suffix = ":analys-review-loop";
+        let dead: Vec<String> = guard
+            .spawn_loops
+            .keys()
+            .filter(|k| k.ends_with(suffix))
+            .filter(|k| !live.contains(k.strip_suffix(suffix).expect("суффикс проверен")))
+            .cloned()
+            .collect();
+        for k in dead {
+            guard.spawn_loops.remove(&k);
+        }
+    }
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state
             .lock()
