@@ -367,6 +367,12 @@ impl TickStateStore for MemTickState {
     }
     fn set_analys_loop(&self, _b: &str, _n: u64, _st: Status, _r: u32) {}
     fn clear_analys_loop(&self, _b: &str, _n: u64) {}
+    fn analys_review_loop(&self, _b: &str, _n: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _b: &str, _n: u64, _st: Status, _r: u32) {}
+    fn clear_analys_review_loop(&self, _b: &str, _n: u64) {}
+    fn prune_analys_loops(&self, _live: &std::collections::HashSet<String>) {}
     fn spawn_loop(&self, _b: &str, _n: u64, _s: Slot) -> Option<(Status, u32)> {
         None
     }

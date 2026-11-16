@@ -30,15 +30,15 @@ pub struct AnalystBoard {
     pub checkout: String,
 }
 
-/// Строка вAnalys вне цикл-гварда, готовая к волне.
-struct WaveRow {
-    task: Task,
-    board: AnalystBoard,
+/// Стабильный ключ строки в state-коллекциях.
+fn board_row_key(board: &str, number: u64) -> String {
+    format!("{board}:{number}")
 }
 
 impl AnalystUseCase {
-    /// Один проход: не больше одного спавна за тик — вся очередь
-    /// (все доски) летит в одну сессию пачкой.
+    /// Один проход: по каждой доске — не больше одного спавна за тик,
+    /// очередь доски летит в одну сессию пачкой (мультиборд: чекаут и
+    /// проект — своей доски, C3 ревью).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // ≤1 живого аналитика одновременно (паттерн дримера)
         if self.sessions.list_sessions().await?.iter().any(|s| {
@@ -48,7 +48,8 @@ impl AnalystUseCase {
             return Ok(0);
         }
         let now = self.clock.now_ms();
-        let mut wave: Vec<WaveRow> = Vec::new();
+        let mut spawned = 0usize;
+        let mut live_rows: std::collections::HashSet<String> = Default::default();
         for tb in &self.boards {
             let rows = match self.board.read_board(&tb.board).await {
                 Ok(rows) => rows,
@@ -58,15 +59,15 @@ impl AnalystUseCase {
                     continue;
                 }
             };
-            for t in rows {
+            let mut wave: Vec<&Task> = Vec::new();
+            for t in &rows {
+                live_rows.insert(board_row_key(&tb.board, t.number()));
                 // цикл-гвард: счётчик строки вне цикла Analys↔Review Analys
                 // устарел (строка уехала в пайп/терминал) — сброс
-                if let Some((st, _)) = self.state.analys_loop(&tb.board, t.number()) {
-                    if !matches!(t.status(), Status::Analys | Status::ReviewAnalys)
-                        && st != t.status()
-                    {
-                        self.state.clear_analys_loop(&tb.board, t.number());
-                    }
+                if self.state.analys_loop(&tb.board, t.number()).is_some()
+                    && !matches!(t.status(), Status::Analys | Status::ReviewAnalys)
+                {
+                    self.state.clear_analys_loop(&tb.board, t.number());
                 }
                 if t.status() != Status::Analys || t.title().is_empty() {
                     continue;
@@ -90,50 +91,53 @@ impl AnalystUseCase {
                     .map(|(_, r)| r)
                     .unwrap_or(0);
                 if rounds >= CYCLE_LIMIT {
-                    self.escalate(tb, &t, rounds).await;
+                    self.escalate(tb, t, rounds).await;
                     continue;
                 }
-                wave.push(WaveRow {
-                    task: t,
-                    board: tb.clone(),
-                });
+                wave.push(t);
             }
+            if wave.is_empty() {
+                continue;
+            }
+            // порядок пачки — приоритет очереди (high → … → пусто)
+            wave.sort_by_key(|t| t.priority().rank());
+            // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»,
+            // tick_tests failed_spawn_does_not_charge_loop_or_cooldown):
+            // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
+            let spec = SessionSpec {
+                directory: tb.checkout.clone(),
+                title: "аналитика волны".into(),
+                agent: AgentSlot::Role(Agent::Analyst),
+                model: None,
+                variant: None,
+                bootstrap: false,
+            };
+            let session = self.sessions.create_session(&spec).await?;
+            let prompt = analyst_prompt(&tb.project, &wave);
+            self.sessions.prompt(&session, &prompt).await?;
+            for t in &wave {
+                let rounds = self
+                    .state
+                    .analys_loop(&tb.board, t.number())
+                    .map(|(_, r)| r)
+                    .unwrap_or(0);
+                self.state
+                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds + 1);
+                self.state.mark_analys_spawn(&tb.board, t.number(), now);
+            }
+            tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
+                session = %session, "Analyst wave spawned");
+            spawned += 1;
         }
-        if wave.is_empty() {
-            return Ok(0);
-        }
-        // порядок пачки — приоритет очереди (high → … → пусто)
-        wave.sort_by_key(|w| w.task.priority().rank());
-        for w in &wave {
-            let rounds = self
-                .state
-                .analys_loop(&w.board.board, w.task.number())
-                .map(|(_, r)| r)
-                .unwrap_or(0);
-            self.state
-                .set_analys_loop(&w.board.board, w.task.number(), Status::Analys, rounds + 1);
-            self.state
-                .mark_analys_spawn(&w.board.board, w.task.number(), now);
-        }
-        let first = &wave[0].board;
-        let spec = SessionSpec {
-            directory: first.checkout.clone(),
-            title: "аналитика волны".into(),
-            agent: AgentSlot::Role(Agent::Analyst),
-            model: None,
-            variant: None,
-            bootstrap: false,
-        };
-        let session = self.sessions.create_session(&spec).await?;
-        let rows: Vec<&Task> = wave.iter().map(|w| &w.task).collect();
-        let prompt = analyst_prompt(&first.project, &rows);
-        self.sessions.prompt(&session, &prompt).await?;
-        tracing::info!(event = "analys.spawned", rows = rows.len(), session = %session,
-            "Analyst wave spawned");
-        Ok(1)
+        // гигиена состояния (R2-L3): счётчики строк, ушедших с досок
+        // (deleted/closed), из state.json вычищаются
+        self.state.prune_analys_loops(&live_rows);
+        Ok(spawned)
     }
 
     /// Тупик цикла: строка переведена в Needs attention + коммент владельцу.
+    /// Порядок: статус → сброс счётчика (сбой статуса счётчик сохраняет —
+    /// круг не теряется, R2-C1).
     async fn escalate(&self, tb: &AnalystBoard, task: &Task, rounds: u32) {
         tracing::warn!(
             event = "analys.cycle_escalated",
@@ -141,7 +145,6 @@ impl AnalystUseCase {
             rounds,
             "Цикл Analys↔Review Analys без выхода в Todo"
         );
-        self.state.clear_analys_loop(&tb.board, task.number());
         if let Err(e) = self
             .board
             .set_status(&tb.board, task.number(), Status::NeedsAttention)
@@ -150,6 +153,8 @@ impl AnalystUseCase {
             tracing::error!(event = "analys.escalate_failed", number = task.number(), error = %e, "Эскалация не применилась");
             return;
         }
+        // статус применился — счётчик круга сбрасывается (не раньше)
+        self.state.clear_analys_loop(&tb.board, task.number());
         if let Err(e) = self
             .board
             .post_comment(

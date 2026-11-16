@@ -107,6 +107,8 @@ impl JsonStateStore {
                     guard.spawn_loops.remove(&k);
                 }
             }
+            // legacy-ключи триажа (эпоха до #1135) — вечный мёртвый груз
+            guard.spawns.retain(|k, _| !k.ends_with(":triage"));
         }
         let raw = {
             let guard = self.state.lock().expect("state lock");
@@ -303,6 +305,38 @@ impl TickStateStore for JsonStateStore {
             .expect("state lock")
             .analys_loops
             .remove(&Self::key(board, number));
+    }
+
+    fn analys_review_loop(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .get(&format!("{board}:{number}:analys-review-loop"))
+            .map(|(s, r)| (naming::parse_status(s), *r))
+    }
+
+    fn set_analys_review_loop(&self, board: &str, number: u64, status: Status, repeats: u32) {
+        self.state.lock().expect("state lock").spawn_loops.insert(
+            format!("{board}:{number}:analys-review-loop"),
+            (naming::status_name(status).to_string(), repeats),
+        );
+    }
+
+    fn clear_analys_review_loop(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .remove(&format!("{board}:{number}:analys-review-loop"));
+    }
+
+    fn prune_analys_loops(&self, live: &std::collections::HashSet<String>) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analys_loops
+            .retain(|k, _| live.contains(k));
     }
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state

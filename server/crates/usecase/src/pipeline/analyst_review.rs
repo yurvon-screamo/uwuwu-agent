@@ -1,11 +1,13 @@
 //! Ревьювер аналитики (#1135): строки Review Analys → одна fresh-сессия
-//! на волну (парность «1 сессия аналитики = 1 сессия ревьювера»).
+//! на волну доски (парность «1 сессия аналитики = 1 сессия ревьювера»).
 //! Оптики plan-reviewer'а: sourcing, форма/дедуп, соразмерность, readiness.
 
 use crate::error::UsecaseResult;
 use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo, TickStateStore};
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, Status, Task};
+use uwuwu_domain::{Agent, AgentSlot, LoopOutcome, SpawnLoop, Status, Task};
+
+use crate::pipeline::analyst::AnalystBoard;
 
 /// Кулдаун ревью-волны по строке (ретрай умершей сессии — не чаще 15 мин).
 const REVIEW_COOLDOWN_MS: u64 = 15 * 60_000;
@@ -13,15 +15,18 @@ const REVIEW_COOLDOWN_MS: u64 = 15 * 60_000;
 pub struct AnalystReviewUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Доски: те же, что у аналитика (волна собирает со всех).
-    pub boards: Vec<crate::pipeline::analyst::AnalystBoard>,
+    pub boards: Vec<AnalystBoard>,
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
 }
 
 impl AnalystReviewUseCase {
-    /// Один проход: не больше одного спавна за тик — вся очередь
-    /// Review Analys уходит одной сессии.
+    /// Один проход: по каждой доске — не больше одного спавна за тик.
+    /// Цикл-гвард ревью-контура (R2-C2): спавны ревьювера при неизменном
+    /// статусе строки считаются SpawnLoop'ом (порог слотовых спавнов
+    /// владельца 16.11, >4) — систематически умирающий ревьювер не ретраится
+    /// вечно, строка уходит в Needs attention.
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // парность: ≤1 живого ревьювера аналитики одновременно
         if self.sessions.list_sessions().await?.iter().any(|s| {
@@ -35,8 +40,7 @@ impl AnalystReviewUseCase {
             return Ok(0);
         }
         let now = self.clock.now_ms();
-        let mut wave: Vec<Task> = Vec::new();
-        let mut first: Option<&crate::pipeline::analyst::AnalystBoard> = None;
+        let mut spawned = 0usize;
         for tb in &self.boards {
             let rows = match self.board.read_board(&tb.board).await {
                 Ok(rows) => rows,
@@ -46,7 +50,9 @@ impl AnalystReviewUseCase {
                     continue;
                 }
             };
-            for t in rows {
+            let mut wave: Vec<&Task> = Vec::new();
+            let mut guards: Vec<SpawnLoop> = Vec::new();
+            for t in &rows {
                 if t.status() != Status::ReviewAnalys || t.title().is_empty() {
                     continue;
                 }
@@ -58,40 +64,95 @@ impl AnalystReviewUseCase {
                 if !fresh {
                     continue;
                 }
-                wave.push(t);
-                if first.is_none() {
-                    first = Some(tb);
+                let mut guard = self
+                    .state
+                    .analys_review_loop(&tb.board, t.number())
+                    .map(|(status, repeats)| {
+                        let mut g = SpawnLoop::new(status);
+                        for _ in 0..repeats {
+                            g.register_spawn(status);
+                        }
+                        g
+                    })
+                    .unwrap_or_else(|| SpawnLoop::new(t.status()));
+                if guard.register_spawn(t.status()) == LoopOutcome::Escalate {
+                    self.escalate(tb, t, guard.repeats()).await;
+                    continue;
                 }
+                wave.push(t);
+                guards.push(guard);
             }
+            if wave.is_empty() {
+                continue;
+            }
+            // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»):
+            // сбой гейтвея не тратит попытку ревью и не заряжает кулдаун.
+            let spec = SessionSpec {
+                directory: tb.checkout.clone(),
+                title: "ревью аналитики".into(),
+                agent: AgentSlot::Role(Agent::AnalystReviewer),
+                model: None,
+                variant: None,
+                bootstrap: false,
+            };
+            let session = self.sessions.create_session(&spec).await?;
+            wave.sort_by_key(|t| t.priority().rank());
+            let prompt = analyst_review_prompt(&tb.project, &wave);
+            self.sessions.prompt(&session, &prompt).await?;
+            for (t, guard) in wave.iter().zip(guards.iter()) {
+                self.state.set_analys_review_loop(
+                    &tb.board,
+                    t.number(),
+                    guard.status(),
+                    guard.repeats(),
+                );
+                self.state
+                    .mark_analys_review_spawn(&tb.board, t.number(), now);
+            }
+            tracing::info!(event = "analys_review.spawned", board = %tb.board,
+                rows = wave.len(), session = %session, "Analyst-review wave spawned");
+            spawned += 1;
         }
-        let Some(tb) = first else {
-            return Ok(0);
-        };
-        let review_board = tb.clone();
-        for t in &wave {
-            self.state
-                .mark_analys_review_spawn(&review_board.board, t.number(), now);
+        Ok(spawned)
+    }
+
+    /// Петля ревью-спавнов: строка → Needs attention + коммент владельцу.
+    /// Порядок: статус → сброс счётчика (сбой статуса счётчик сохраняет).
+    async fn escalate(&self, tb: &AnalystBoard, task: &Task, repeats: u32) {
+        tracing::warn!(
+            event = "analys_review.loop_escalated",
+            number = task.number(),
+            repeats,
+            "Ревью-спавны без прогресса статуса"
+        );
+        if let Err(e) = self
+            .board
+            .set_status(&tb.board, task.number(), Status::NeedsAttention)
+            .await
+        {
+            tracing::error!(event = "analys_review.escalate_failed", number = task.number(), error = %e, "Эскалация не применилась");
+            return;
         }
-        let spec = SessionSpec {
-            directory: review_board.checkout.clone(),
-            title: "ревью аналитики".into(),
-            agent: AgentSlot::Role(Agent::AnalystReviewer),
-            model: None,
-            variant: None,
-            bootstrap: false,
-        };
-        let session = self.sessions.create_session(&spec).await?;
-        let mut sorted: Vec<Task> = wave;
-        sorted.sort_by_key(|t| t.priority().rank());
-        let prompt = analyst_review_prompt(&review_board.project, &sorted);
-        self.sessions.prompt(&session, &prompt).await?;
-        tracing::info!(event = "analys_review.spawned", rows = sorted.len(), session = %session,
-            "Analyst-review wave spawned");
-        Ok(1)
+        self.state
+            .clear_analys_review_loop(&tb.board, task.number());
+        if let Err(e) = self
+            .board
+            .post_comment(
+                task.number(),
+                &format!(
+                    "⚠︎ Цикл-гвард ревью аналитики: {repeats} спавнов ревьювера без прогресса \
+                     статуса (строка ждёт в Review Analys). Строка переведена в \
+                     Needs attention — разбор владельца."
+                ),
+            )
+            .await
+        {
+            tracing::error!(event = "analys_review.escalate_comment_failed", number = task.number(), error = %e, "Коммент эскалации не ушёл");
+        }
     }
 }
 
-fn analyst_review_prompt(project: &str, rows: &[Task]) -> String {
+fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
     let mut list = String::new();
     for t in rows {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
@@ -108,7 +169,7 @@ fn analyst_review_prompt(project: &str, rows: &[Task]) -> String {
          3. Вердикты: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
             request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + замечания комментами\n\
             (цикл-гвард считает круги); реальная проблема → Needs attention.\n\
-         Отчёт волны — одним сводным комментом (uwuwu_task_comment по каждой строке кратко,\n\
-         вердикт и причина)."
+         Отчёт — по одному комменту на строку (вердикт + причина кратко); никаких\n\
+         отдельных сводных постов по волне сверх этих комментов."
     )
 }
