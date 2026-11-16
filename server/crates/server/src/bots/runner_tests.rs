@@ -378,6 +378,10 @@ impl TickStateStore for MemTickState {
     }
     fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _st: Status, _r: u32) {}
     fn reset_stale_spawn_loops(&self, _b: &str, _n: u64, _c: Status) {}
+    fn own_comment(&self, _id: &str) -> bool {
+        false
+    }
+    fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

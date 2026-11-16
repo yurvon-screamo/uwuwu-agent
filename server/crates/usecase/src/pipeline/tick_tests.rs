@@ -8,6 +8,7 @@ use crate::ports::{
     TaskBoardRepo, TickStateStore,
 };
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
     BranchName, PeakWindow, PrUrl, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
@@ -71,12 +72,11 @@ impl TaskBoardRepo for FakeBoard {
             })
             .unwrap_or_default())
     }
-    async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("comment#{n}={}", body.len()));
-        Ok(())
+    async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<String> {
+        let mut log = self.log.lock().unwrap();
+        let id = format!("posted-{}", log.len() + 1);
+        log.push(format!("comment#{n}={}", body.len()));
+        Ok(id)
     }
     async fn close_issue(&self, n: u64) -> UsecaseResult<()> {
         self.log.lock().unwrap().push(format!("close#{n}"));
@@ -289,6 +289,8 @@ struct MemStateInner {
     resets: Vec<(u64, Status)>,
     /// сталл-детект: (number, статус раунда, ms пинга)
     stalls: Vec<(u64, Status, u64)>,
+    /// реестр серверных постов (own-тест self-эха #1204)
+    own: BTreeMap<String, u64>,
 }
 struct MemState(Mutex<MemStateInner>);
 impl TickStateStore for MemState {
@@ -451,6 +453,12 @@ impl TickStateStore for MemState {
         g.resets.push((n, current));
         g.loops
             .retain(|(num, _, st, _)| !(*num == n && *st != current));
+    }
+    fn own_comment(&self, id: &str) -> bool {
+        self.0.lock().unwrap().own.contains_key(id)
+    }
+    fn mark_own_comment(&self, id: &str, posted_ms: u64) {
+        self.0.lock().unwrap().own.insert(id.to_string(), posted_ms);
     }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())

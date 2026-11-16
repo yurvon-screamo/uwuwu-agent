@@ -4,7 +4,7 @@
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{IssueFieldStore, TaskBoardRepo};
+use crate::ports::{Clock, IssueFieldStore, TaskBoardRepo, TickStateStore};
 use crate::tasks::md_section;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -104,6 +104,10 @@ pub struct TaskWriteUseCase {
     pub fields: Arc<dyn IssueFieldStore>,
     /// карта проект → доска (мультипроектный конфиг).
     pub boards: Vec<(String, String)>,
+    /// Штамп времени для реестра серверных постов (GC по возрасту).
+    pub clock: Arc<dyn Clock>,
+    /// Реестр «своих» комментов (self-эхо-фильтр #1204): MCP-посты маркируются.
+    pub state: Arc<dyn TickStateStore>,
 }
 
 impl TaskWriteUseCase {
@@ -237,7 +241,15 @@ impl TaskWriter for TaskWriteUseCase {
             Some(anchor) => format!("> {anchor}\n\n{text}"),
             None => text.to_string(),
         };
-        self.board.post_comment(number, &body).await
+        let id = self.board.post_comment(number, &body).await?;
+        // Единственная точка маркировки реестра серверных постов (#1204):
+        // агентские комменты не будят держащую сессию. Фабричные посты
+        // (сталл-пинг, bounce, эскалация) идут мимо — всегда foreign.
+        // Пустой id — маркировки нет (fail-open: возможна разовая эхо-будка).
+        if !id.is_empty() {
+            self.state.mark_own_comment(&id, self.clock.now_ms());
+        }
+        Ok(())
     }
 
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
