@@ -13,11 +13,12 @@
 # failure|cancelled.
 name: CI
 
+# ВРЕМЕННО ОТКЛЮЧЕН (17.11, биллинг Actions исчерпан — PR-ивенты не создают
+# ранов, #1238/#1239): авто-триггеры сняты, запуск только вручную
+# (workflow_dispatch). Вернуть on: pull_request + push при восстановлении
+# биллинга. Локальная верификация обязательна: cargo fmt/clippy/test + qlty.
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 permissions:
   contents: read
