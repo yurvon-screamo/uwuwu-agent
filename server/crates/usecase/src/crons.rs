@@ -86,6 +86,7 @@ impl CronUseCase {
                 .await?;
             let prompt = run_prompt(project, &master, &journal_md);
             let spec = SessionSpec {
+                custom_agent: None,
                 directory: self.checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,

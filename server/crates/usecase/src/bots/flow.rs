@@ -164,12 +164,14 @@ mod tests {
             "без изменений — hot-путь"
         );
         let disabled = BotSpec {
+            agent: None,
             enabled: false,
             ..fixture()
         };
         assert_eq!(plan_action(&running, &disabled), Some(BotAction::Stop));
 
         let rearm = BotSpec {
+            agent: None,
             token_env: "OTHER".into(),
             ..fixture()
         };
@@ -191,6 +193,7 @@ mod tests {
 
     fn fixture() -> BotSpec {
         BotSpec {
+            agent: None,
             slug: "Projects/uwuwu/Боты/x".into(),
             title: "x".into(),
             enabled: true,

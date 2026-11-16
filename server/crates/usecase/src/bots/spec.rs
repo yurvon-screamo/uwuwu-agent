@@ -38,6 +38,7 @@ pub fn parse_bot_doc(slug: &str, md: &str) -> Result<BotSpec, String> {
         owner: field(&fm, "owner").map(|v| v.trim_start_matches('@').to_string()),
         workspace,
         greeting: field(&fm, "greeting").map(String::from),
+        agent: field(&fm, "agent").map(String::from),
         manual: fm_lite::strip(md).to_string(),
     })
 }

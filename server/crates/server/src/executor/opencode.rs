@@ -90,11 +90,17 @@ impl AgentSessionGateway for OpencodeClient {
             "title": spec.title.chars().take(64).collect::<String>(),
             "location": { "directory": spec.directory },
         });
-        match &spec.agent {
-            uwuwu_domain::AgentSlot::Role(agent) => {
-                body["agent"] = json!(uwuwu_usecase::agent_name(*agent));
+        if let Some(name) = &spec.custom_agent {
+            // именованный агент опенкода (agents/<name>.md в cwd):
+            // боты с fm agent — методичка вшита системой
+            body["agent"] = json!(name);
+        } else {
+            match &spec.agent {
+                uwuwu_domain::AgentSlot::Role(agent) => {
+                    body["agent"] = json!(uwuwu_usecase::agent_name(*agent));
+                }
+                uwuwu_domain::AgentSlot::Default => {}
             }
-            uwuwu_domain::AgentSlot::Default => {}
         }
         if let Some(model) = &spec.model {
             let mut m = json!({ "providerID": model.provider(), "id": model.id() });

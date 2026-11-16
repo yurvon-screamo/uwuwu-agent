@@ -29,14 +29,20 @@ pub struct BotSpec {
     pub workspace: String,
     /// fm greeting (опц.) — детерминированный ответ на /start без LLM.
     pub greeting: Option<String>,
-    /// Тело дока — методичка; правка горячая (префикс каждого prompt).
+    /// fm agent (опц.) — имя агента опенкода: методичка живёт в
+    /// agents/<name>.md воркспейса и вшита в сессию системой, промпты
+    /// несут только текст пользователя (владелец 16.11: «в агента мд
+    /// вшить и всё»). Без поля — методичка дока, бутстрап одним
+    /// промптом при создании/правке (не префиксом каждого сообщения).
+    pub agent: Option<String>,
+    /// Тело дока — методичка; в agent-режиме игнорируется.
     pub manual: String,
 }
 
 impl BotSpec {
     /// Структурные поля (model, workspace) — смена = пересоздание сессии.
     pub fn structural_changed(&self, other: &BotSpec) -> bool {
-        self.model != other.model || self.workspace != other.workspace
+        self.model != other.model || self.workspace != other.workspace || self.agent != other.agent
     }
 
     /// Runtime-поле token_env — смена = stop/start задачи, сессия живёт.
@@ -68,6 +74,7 @@ mod tests {
             .split_once('#')
             .map_or((rest, None), |(i, v)| (i, Some(v.to_string())));
         BotSpec {
+            agent: None,
             slug: "Projects/uwuwu/Боты/x".into(),
             title: "x".into(),
             enabled: true,

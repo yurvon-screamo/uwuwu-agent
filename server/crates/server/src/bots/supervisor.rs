@@ -369,6 +369,7 @@ impl BotSupervisor {
                 title: spec.title.clone(),
                 model: spec.model.clone(),
                 workspace: spec.workspace.clone(),
+                agent: spec.agent.clone(),
             },
             live,
             tg: (self.make_tg)(&token),

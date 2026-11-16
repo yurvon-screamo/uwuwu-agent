@@ -24,6 +24,7 @@ impl TickUseCase {
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
+                custom_agent: None,
                 agent: AgentSlot::Default,
                 model: self.spawn_model.clone(),
                 variant: None,
@@ -55,6 +56,7 @@ impl TickUseCase {
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
                 title: title.to_string(),
+                custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
                 variant: None,
