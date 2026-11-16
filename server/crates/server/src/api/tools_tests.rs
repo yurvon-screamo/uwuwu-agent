@@ -458,7 +458,7 @@ async fn task_create_defaults_to_analys() {
         .split('#')
         .nth(1)
         .and_then(|s| s.split(' ').next())
-        .and_then(|s| s.parse())
+        .and_then(|s| s.parse().ok())
         .expect("номер в ответе");
     assert!(n.contains("(Analys)"), "дефолт create: {n}");
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
@@ -490,7 +490,7 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
         .split('#')
         .nth(1)
         .and_then(|s| s.split(' ').next())
-        .and_then(|s| s.parse())
+        .and_then(|s| s.parse().ok())
         .unwrap();
     // волна аналитика: Analys → Review Analys
     call(

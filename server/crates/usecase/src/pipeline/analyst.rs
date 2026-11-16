@@ -90,7 +90,7 @@ impl AnalystUseCase {
                     .map(|(_, r)| r)
                     .unwrap_or(0);
                 if rounds >= CYCLE_LIMIT {
-                    self.escalate(&tb, &t, rounds).await;
+                    self.escalate(tb, &t, rounds).await;
                     continue;
                 }
                 wave.push(WaveRow {
