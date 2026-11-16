@@ -1,7 +1,6 @@
 ---
 description: Полный цикл разработки.
 mode: primary
-model: zai-coding-plan/glm-5.3
 color: success
 ---
 
