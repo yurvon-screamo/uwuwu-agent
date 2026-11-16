@@ -14,6 +14,16 @@ pub struct OpencodeClient {
 }
 
 /// HTTP-статус → liveness-вердикт (маппинг вынесен для тестов без сети).
+/// Хвост журнала (order=desc): является ли самый свежий содержательный
+/// блок (user|assistant) ассистентским. Служебные записи поверх ответа
+/// (idle и пр., #1150/#1206 Common-1) пропускаются.
+fn latest_meaningful_is_assistant(msgs: &[serde_json::Value]) -> bool {
+    msgs.iter()
+        .find(|m| matches!(m["type"].as_str(), Some("user") | Some("assistant")))
+        .map(|m| m["type"] == "assistant")
+        .unwrap_or(false)
+}
+
 pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
     if status.is_success() {
         Liveness::Alive
@@ -256,10 +266,11 @@ impl AgentSessionGateway for OpencodeClient {
             resp["data"].clone()
         };
         let msgs = raw.as_array();
-        // самый свежий блок журнала (order=desc) — «после» него нет сообщений
+        // Самый свежий СОДЕРЖАТЕЛЬНЫЙ блок журнала (order=desc): служебные
+        // события поверх финального ответа (#1150: «в хвосте могут висеть
+        // idle») не делают завершённую сессию busy — пропускаем их
         let latest_is_assistant = msgs
-            .and_then(|m| m.first())
-            .map(|m| m["type"] == "assistant")
+            .map(|m| latest_meaningful_is_assistant(m))
             .unwrap_or(false);
         let Some(msg) = msgs.and_then(|m| m.iter().find(|m| m["type"] == "assistant")) else {
             return Ok(None);
@@ -286,6 +297,26 @@ impl AgentSessionGateway for OpencodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_meaningful_skips_service_events() {
+        // #1206 Common-1: служебные события (idle и пр.) поверх финального
+        // ответа не делают завершённую сессию busy
+        let tail = serde_json::json!([
+            { "type": "idle" },
+            { "type": "assistant", "finish": "stop" }
+        ]);
+        assert!(latest_meaningful_is_assistant(tail.as_array().unwrap()));
+        // сверху промпт — сессия занята обработкой
+        let tail = serde_json::json!([
+            { "type": "user" },
+            { "type": "assistant", "finish": "stop" }
+        ]);
+        assert!(!latest_meaningful_is_assistant(tail.as_array().unwrap()));
+        // только служебные — данных нет, консервативно busy
+        let tail = serde_json::json!([{ "type": "idle" }]);
+        assert!(!latest_meaningful_is_assistant(tail.as_array().unwrap()));
+    }
 
     #[test]
     fn liveness_maps_statuses() {
