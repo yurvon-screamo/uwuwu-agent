@@ -6,3 +6,9 @@
 # ветки от pre-ренормального master, правящие эти файлы, мержить с merge.renormalize=true
 # (git -c merge.renormalize=true merge ...), иначе whole-file EOL-конфликт.
 * text=auto
+
+# Деплой-критичные скрипты: LF в ворктри на любой машине. text=auto держит LF
+# только в индексе — Windows-чекаут с autocrlf отдаёт .sh как CRLF, ручной
+# railway up кладёт его в билд-контекст, dash падает «set: Illegal option -»
+# (инцидент релея 16.11, задача #1202).
+*.sh text eol=lf
