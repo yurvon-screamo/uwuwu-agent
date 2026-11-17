@@ -707,6 +707,35 @@ async fn own_comment_of_holding_session_is_not_delivered_and_baseline_moves() {
 }
 
 #[tokio::test]
+async fn own_comment_before_first_session_wake_is_sliced_without_baseline() {
+    // #1204 (транзишн-класс NOTICED, live-репродакция 16.11): MCP-коммент,
+    // опубликованный до спавна свежей сессии (seen-бейзлайна нет, активность
+    // новее коммента — спавн и ход после поста), не доставляется
+    // idle-фоллбеком: хвост целиком свой → тихий сдвиг бейзлайна.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("triage-echo", 10);
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "triage-echo".into(),
+            created_ms: 3000,
+            body: "старый триаж-коммент".into(),
+        }],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "коммент до спавна не будит свежую сессию");
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("triage-echo"),
+        "бейзлайн тихо встал на последний — эхо не вернётся следующим тиком"
+    );
+}
+
+#[tokio::test]
 async fn mixed_tail_delivers_foreign_comments_only() {
     // #1204: хвост из своего и чужого — чужой доставляется, свой срезается,
     // seen двигается на фактический последний (здесь — чужой).
@@ -2655,6 +2684,11 @@ async fn reviewer_loop_escalates_repeated_spawns() {
     assert!(
         state.0.lock().unwrap().analys_review_loops.is_empty(),
         "счётчик после эскалации сброшен"
+    );
+    assert!(
+        state.0.lock().unwrap().own.is_empty(),
+        "фабричный пост эскалации мимо реестра серверных постов (#1204) — \
+         сигнал будит адресата как foreign"
     );
 }
 
