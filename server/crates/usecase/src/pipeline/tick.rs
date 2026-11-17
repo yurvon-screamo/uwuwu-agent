@@ -432,7 +432,11 @@ impl TickUseCase {
             .wakeup_if_fresh(board, plan.policy, task, *active_now)
             .await
         {
-            Ok(WakeAct::Woke) => out.wakeups += 1,
+            Ok(WakeAct::Woke) => {
+                out.wakeups += 1;
+                // доставленный ход занимает слот капа в этом же тике (#1231)
+                *active_now += 1;
+            }
             Ok(WakeAct::Respawned) => {
                 out.spawns_done += 1;
                 *active_now += 1;

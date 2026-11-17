@@ -1091,6 +1091,129 @@ async fn cup_busy_counts_non_pipeline_sessions() {
 }
 
 #[tokio::test]
+async fn wakeup_held_when_cup_full() {
+    // #1231: доставка промпта в idle-сессию — новый ход, тот же LLM-слот.
+    // При полном капе будильник откладывается; seen-маркер не пишется —
+    // доставка повторится на свободном тике (комменты не теряются).
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(170, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_wake_170").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент владельца".into(),
+        }],
+    });
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: 1000, // коммент свежее активности сессии → fresh
+        ..Default::default()
+    });
+    // сама строка idle + чужой ход в полёте — единый кап занят
+    for (id, busy) in [("ses_wake_170", false), ("ses_other", true)] {
+        sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
+            id: id.into(),
+            agent: String::new(),
+            updated_ms: 0,
+            outcome: "succeeded".into(),
+            total_tokens: 0,
+            busy,
+        });
+    }
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "при полном капе будильник не доставляется"
+    );
+    assert_eq!(out.wakeups, 0);
+    assert_eq!(out.wakeups_deferred, 1);
+    assert!(
+        state.0.lock().unwrap().comments.is_empty(),
+        "seen не пишется — доставка повторится на свободном тике"
+    );
+}
+
+#[tokio::test]
+async fn wakeup_delivery_occupies_cup_slot() {
+    // Доставленный будильник занимает слот капа в этом же тике (#1231):
+    // кандидат на спавн после доставки ждёт следующего тика — массовый
+    // штурм комментариев/бэклога не плодит ходы сверх капа.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut woken = task(180, Status::InProgress);
+    let mut fw = TaskFields::default();
+    fw.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_wake_180").unwrap(),
+    );
+    woken.apply_fields(fw);
+    let candidate = task(181, Status::InProgress);
+    let board = Arc::new(FakeBoard {
+        rows: vec![woken, candidate],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "c180".into(),
+            created_ms: 3000,
+            body: "свежий коммент владельца".into(),
+        }],
+    });
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: 1000,
+        ..Default::default()
+    });
+    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        id: "ses_wake_180".into(),
+        agent: String::new(),
+        updated_ms: 0,
+        outcome: "succeeded".into(),
+        total_tokens: 0,
+        busy: false,
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        sessions.prompts.lock().unwrap().len(),
+        1,
+        "будильник доставлен"
+    );
+    assert_eq!(out.wakeups, 1);
+    assert_eq!(
+        out.held_cup, 1,
+        "слот занят доставленным ходом — кандидат ждёт следующего тика"
+    );
+    assert_eq!(out.spawns_done, 0);
+}
+
+#[tokio::test]
 async fn medium_wakeup_deferred_in_peak() {
     // UC-05/#1200: пик держит будильник не-high строки — prompt не уходит,
     // коммент копится (last_comment_id не пишется), доставка после окна
