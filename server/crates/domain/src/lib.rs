@@ -8,6 +8,7 @@ mod agent;
 mod bot;
 mod budget;
 mod cron;
+mod guard;
 mod pipeline;
 mod project;
 mod task;
@@ -19,6 +20,10 @@ pub use budget::{BudgetVerdict, SpawnBudget};
 pub use cron::{
     civil_from_days, jst_fields, CronField, CronMaster, CronSchedule, CronValues, IntervalMinutes,
     JstDate, JstTime, Schedule,
+};
+pub use guard::{
+    sighting_is_live, sighting_known, spawn_guard, SessionSighting, SpawnGuard,
+    SLOT_SESSION_LIVE_MS,
 };
 pub use project::{Goal, Persona, Project, ProjectName};
 pub use task::Priority;
