@@ -97,7 +97,13 @@ impl TaskBoardRepo for FakeBoard {
                     f.set_branch(b);
                 }
                 if let Some(p) = t.pr().cloned() {
-                    let _ = f.open_pr(p);
+                    // зеркально мапперу носителя (#1155): ветка есть —
+                    // кодовый PullRequest, нет — безветочный артефакт
+                    if f.branch().is_some() {
+                        let _ = f.open_pr(p);
+                    } else {
+                        f.set_artifact(p);
+                    }
                 }
                 f
             })
@@ -351,11 +357,14 @@ impl AgentSessionGateway for FakeSessions {
 struct FakePrs {
     state: PrState,
     merges: Mutex<Vec<String>>,
+    /// URL-аргументы probe — фикс «артефакт доезжает до gateway» (#1155)
+    probes: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
 impl PrGateway for FakePrs {
-    async fn probe(&self, _r: &str, _u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrState> {
+    async fn probe(&self, _r: &str, u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrState> {
+        self.probes.lock().unwrap().push(u.map(str::to_string));
         Ok(self.state)
     }
     async fn merge(&self, _r: &str, pr: &str) -> UsecaseResult<()> {
@@ -642,6 +651,7 @@ fn usecase_with_state(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -699,6 +709,7 @@ fn peak_usecase(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -729,6 +740,7 @@ fn usecase_with_sessions(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1315,6 +1327,31 @@ async fn automerge_docs_only_is_not_probed() {
 }
 
 #[tokio::test]
+async fn autodone_branchless_pr_url_reaches_gateway() {
+    // #1155: безветочная PR-ячейка (Artifact) доезжает до probe как URL —
+    // реальный gateway пробит реальный PR; Missing (артефакт-URL не парсится
+    // strict-формой) → ветки нет → Done «задача без PR (docs-only)»
+    let mut t = task(8, Status::UserReview);
+    t.set_autodone(true);
+    let mut f = TaskFields::default();
+    f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        prs.probes.lock().unwrap().last().and_then(|u| u.as_deref()),
+        Some("https://github.com/a/c/pull/9"),
+        "артефакт-URL доходит до gateway"
+    );
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("status#8=Done")));
+}
+
+#[tokio::test]
 async fn observe_does_not_charge_spawn_loops() {
     // Инцидент #1046 (15.11): observe-тики заряжали счётчик спавн-петли
     // (set_spawn_loop звался до Live-гейта) — live эскалировал строку
@@ -1860,6 +1897,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         });
         let uc = TickUseCase {
             board: board.clone(),
@@ -1920,6 +1958,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -1987,6 +2026,7 @@ async fn multi_comment_tail_delivered_together() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
@@ -2048,6 +2088,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -2110,6 +2151,7 @@ async fn busy_session_not_pinged_early() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -2168,6 +2210,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -2250,6 +2293,7 @@ async fn idle_sessions_do_not_hold_cup() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3648,6 +3692,7 @@ fn tick_with_clock(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3845,6 +3890,7 @@ async fn enrichment_failure_skips_row() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -3880,6 +3926,7 @@ async fn orphan_deleted_when_set_session_fails() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
