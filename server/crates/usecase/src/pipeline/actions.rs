@@ -386,7 +386,7 @@ impl TickUseCase {
 
 /// Тайтл конвейерной сессии: `#<номер> <эмодзи стадии> <тайтл>` (задача
 /// #1212); единая точка сборки — bootstrap наследует тем же значением.
-pub(crate) fn session_title(task: &Task, slot: Slot) -> String {
+fn session_title(task: &Task, slot: Slot) -> String {
     format!("#{} {} {}", task.number(), slot.emoji(), task.title())
 }
 
