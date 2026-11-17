@@ -9,6 +9,7 @@ use crate::ports::{
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
     BranchName, PeakWindow, PrUrl, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
@@ -95,9 +96,11 @@ impl TaskBoardRepo for FakeBoard {
             })
             .unwrap_or_default())
     }
-    async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
-        self.log.lock().unwrap().push(format!("comment#{n}={body}"));
-        Ok(())
+    async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<String> {
+        let mut log = self.log.lock().unwrap();
+        let id = format!("posted-{}", log.len() + 1);
+        log.push(format!("comment#{n}={body}"));
+        Ok(id)
     }
     async fn close_issue(&self, n: u64) -> UsecaseResult<()> {
         self.log.lock().unwrap().push(format!("close#{n}"));
@@ -151,8 +154,9 @@ impl TaskBoardRepo for FakeBoard {
 struct FakeSessions {
     prompts: Mutex<Vec<String>>,
     spawned: Mutex<Vec<String>>,
-    /// ms последней активности любой сессии (сталл-детект-тесты).
-    activity_ms: u64,
+    /// ms последней активности любой сессии (сталл-детект/wake-тесты);
+    /// None — активность недоступна (fail-open own-теста #1204).
+    activity_ms: Option<u64>,
     /// Id мёртвых сессий (liveness-сценарии кик-разморозки/респавна).
     dead_sessions: Mutex<Vec<String>>,
     /// Недоступность list_sessions (fallback-сценарий CUP-подсчёта).
@@ -187,7 +191,7 @@ impl FakeSessions {
             spawned: Mutex::default(),
             specs: Mutex::default(),
             live: Mutex::default(),
-            activity_ms: 1000,
+            activity_ms: Some(1000),
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
@@ -261,14 +265,14 @@ impl AgentSessionGateway for FakeSessions {
         Ok(())
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
-        Ok(Some(self.activity_ms))
+        Ok(self.activity_ms)
     }
     async fn last_assistant_reply(
         &self,
         _s: &str,
     ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
         Ok(self.idle_reply.then(|| crate::ports::AssistantReply {
-            created_ms: self.activity_ms,
+            created_ms: self.activity_ms.unwrap_or_default(),
             text: String::new(),
             finished: true,
             is_latest: true,
@@ -366,6 +370,8 @@ struct MemStateInner {
     stalls: Vec<(u64, Status, u64)>,
     /// mark_spawn-журнал: (number, slot, ms) — кулдаун-сценарии (#1163)
     spawn_ms: Vec<(u64, Slot, u64)>,
+    /// реестр серверных постов (own-тест self-эха #1204)
+    own: BTreeMap<String, u64>,
 }
 struct MemState(Mutex<MemStateInner>);
 impl TickStateStore for MemState {
@@ -545,6 +551,12 @@ impl TickStateStore for MemState {
         g.loops
             .retain(|(num, _, st, _)| !(*num == n && *st != current));
     }
+    fn own_comment(&self, id: &str) -> bool {
+        self.0.lock().unwrap().own.contains_key(id)
+    }
+    fn mark_own_comment(&self, id: &str, posted_ms: u64) {
+        self.0.lock().unwrap().own.insert(id.to_string(), posted_ms);
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -642,7 +654,7 @@ fn peak_usecase(
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
-        activity_ms: 1000,
+        activity_ms: Some(1000),
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
@@ -833,7 +845,7 @@ async fn wakeup_prompt_routes_to_project_executor() {
     let default_gw = Arc::new(FakeSessions::new());
     // активность сессии старше коммента — fresh-доставка
     let named_gw = Arc::new(FakeSessions {
-        activity_ms: 1000,
+        activity_ms: Some(1000),
         ..FakeSessions::new()
     });
     let u = routed_usecase(
@@ -886,7 +898,7 @@ async fn soft_ping_prompt_routes_to_project_executor() {
     let default_gw = Arc::new(FakeSessions::new());
     // молчание 16 мин, ход завершён (idle) — мягкий пинг прямым промптом
     let named_gw = Arc::new(FakeSessions {
-        activity_ms: 100_000_000 - 16 * 60_000,
+        activity_ms: Some(100_000_000 - 16 * 60_000),
         idle_reply: true,
         ..FakeSessions::new()
     });
@@ -907,6 +919,315 @@ async fn soft_ping_prompt_routes_to_project_executor() {
     assert!(
         default_gw.prompts.lock().unwrap().is_empty(),
         "дефолтный гейтвей soft-ping НЕ получил"
+    );
+}
+
+/// Задача In Progress с живой дев-сессией (wake-сценарии #1204).
+fn dev_task(n: u64, session: &str) -> Task {
+    let mut t = task(n, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(Slot::Dev, uwuwu_domain::SessionRef::parse(session).unwrap());
+    t.apply_fields(f);
+    t
+}
+
+/// Юзкейс будильника: настраиваемые комменты, активность и idle-фаза хода
+/// (сценарии self-эха #1204).
+fn wake_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    activity_ms: Option<u64>,
+    idle_reply: bool,
+    state: Arc<MemState>,
+) -> (TickUseCase, Arc<FakeSessions>, Arc<MemState>) {
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments,
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions {
+        prompts: Mutex::default(),
+        spawned: Mutex::default(),
+        activity_ms,
+        dead_sessions: Mutex::default(),
+        list_fails: false,
+        idle_reply,
+        prompt_fails: false,
+        deleted: Mutex::default(),
+        specs: Mutex::default(),
+        live: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    (u, sessions, state)
+}
+
+#[tokio::test]
+async fn own_comment_of_holding_session_is_not_delivered_and_baseline_moves() {
+    // #1204 (self-эхо): агент опубликовал коммент в свой ход, ход закрылся
+    // (активность новее коммента) — эхо-будки нет, бейзлайн двигается тихо.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    // геометрия прод-эха: seen-бейзлайн стоит, хвост = свой коммент
+    state.set_last_comment_id("Задачи uwuwu", 61, "old-seen");
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "own-echo".into(),
+                created_ms: 3000,
+                body: "мой отчёт".into(),
+            },
+        ],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "свой коммент не будит");
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("own-echo"),
+        "бейзлайн двигается тихо — хвост не приедет в следующей доставке"
+    );
+}
+
+#[tokio::test]
+async fn own_comment_before_first_session_wake_is_sliced_without_baseline() {
+    // #1204 (транзишн-класс NOTICED, live-репродакция 16.11): MCP-коммент,
+    // опубликованный до спавна свежей сессии (seen-бейзлайна нет, активность
+    // новее коммента — спавн и ход после поста), не доставляется
+    // idle-фоллбеком: хвост целиком свой → тихий сдвиг бейзлайна.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("triage-echo", 10);
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "triage-echo".into(),
+            created_ms: 3000,
+            body: "старый триаж-коммент".into(),
+        }],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "коммент до спавна не будит свежую сессию");
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("triage-echo"),
+        "бейзлайн тихо встал на последний — эхо не вернётся следующим тиком"
+    );
+}
+
+#[tokio::test]
+async fn mixed_tail_delivers_foreign_comments_only() {
+    // #1204: хвост из своего и чужого — чужой доставляется, свой срезается,
+    // seen двигается на фактический последний (здесь — чужой).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    state.set_last_comment_id("Задачи uwuwu", 61, "old-seen");
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "own-echo".into(),
+                created_ms: 3000,
+                body: "мой отчёт".into(),
+            },
+            CommentRef {
+                id: "owner-reply".into(),
+                created_ms: 7000,
+                body: "ответ владельца".into(),
+            },
+        ],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "чужой будит");
+    let sent = sessions.prompts.lock().unwrap().join("\n");
+    assert!(sent.contains("ответ владельца"), "чужой в доставке: {sent}");
+    assert!(!sent.contains("мой отчёт"), "свой срезан: {sent}");
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("owner-reply"),
+        "seen на фактическом последнем"
+    );
+}
+
+#[tokio::test]
+async fn user_comment_wakes_holder_as_before() {
+    // #1204 (регресс-гард): юзерский коммент мимо реестра — будит как
+    // раньше, даже если создан в окно активности сессии.
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, sessions, _) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "user-q".into(),
+            created_ms: 3000,
+            body: "вопрос владельца".into(),
+        }],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1);
+    let sent = sessions.prompts.lock().unwrap().join("\n");
+    assert!(sent.contains("вопрос владельца"));
+}
+
+#[tokio::test]
+async fn fresh_agent_comment_of_another_stage_wakes_holder() {
+    // #1204 (регресс-гард): вердикт другой стадии (в реестре — любой
+    // MCP-пост, но свежее активности адресата) — foreign, будит.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("verdict", 10);
+    let (u, sessions, _) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "verdict".into(),
+            created_ms: 7000,
+            body: "request_changes ревьювера".into(),
+        }],
+        Some(5000),
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1);
+    let sent = sessions.prompts.lock().unwrap().join("\n");
+    assert!(sent.contains("request_changes"));
+}
+
+#[tokio::test]
+async fn own_comment_mid_turn_with_live_journal_is_not_delivered() {
+    // #1204 Low-2 (детерминированная часть): свой коммент в активном ходе
+    // (журнал жив — активность ≥ коммента) не доставляется и seen не
+    // двигает — доставка повторится после ответа (at-least-once).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "own-echo".into(),
+            created_ms: 3000,
+            body: "мой отчёт".into(),
+        }],
+        Some(5000),
+        false,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0);
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert!(
+        state.0.lock().unwrap().comments.is_empty(),
+        "seen не двигается при работающем агенте — доставка повторится"
+    );
+}
+
+#[tokio::test]
+async fn unknown_activity_fails_open_and_delivers_tail() {
+    // #1204 (fail-open): активность недоступна — срез не делается,
+    // лишняя эхо-будка лучше потерянного коммента (семантика TS).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "own-echo".into(),
+            created_ms: 3000,
+            body: "мой отчёт".into(),
+        }],
+        None,
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "без активности — доставляем всё");
+    let sent = sessions.prompts.lock().unwrap().join("\n");
+    assert!(sent.contains("мой отчёт"));
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("own-echo")
+    );
+}
+
+#[tokio::test]
+async fn mcp_comment_marks_registry_with_node_id() {
+    // #1204 (Low-1 ревью): единственная точка маркировки — writer.comment()
+    // кладёт node_id ответа поста в реестр; own-тест wake-пути режет эхо
+    // именно по этому id.
+    let board = Arc::new(FakeBoard {
+        rows: vec![],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields: Arc::new(FakeFields),
+        boards: vec![("uwuwu".into(), "B".into())],
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+    };
+    use crate::tasks::write::TaskWriter;
+    writer.comment(61, "мой отчёт", None).await.unwrap();
+    assert!(
+        state.own_comment("posted-1"),
+        "MCP-пост промаркирован node_id ответа"
+    );
+}
+
+#[tokio::test]
+async fn empty_node_id_post_is_not_marked() {
+    // #1204 (ветка fail-open маркировки): пустой node_id (нестандартный
+    // ответ POST) не попадает в реестр — коммент доставлен, срез не врёт.
+    let board = Arc::new(CloseBoard {
+        boards: vec![("B".into(), vec![61])],
+        log: Mutex::default(),
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields: Arc::new(FakeFields),
+        boards: vec![("uwuwu".into(), "B".into())],
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+    };
+    use crate::tasks::write::TaskWriter;
+    writer.comment(61, "текст", None).await.unwrap();
+    assert!(
+        !state.own_comment(""),
+        "пустой id не маркируется — иначе empty-id класс давал бы ложные срезы"
     );
 }
 
@@ -1317,7 +1638,7 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
     let sessions = FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
-        activity_ms: 1000,
+        activity_ms: Some(1000),
         dead_sessions: Mutex::default(),
         list_fails: true,
         idle_reply: false,
@@ -1606,7 +1927,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         let sess = Arc::new(FakeSessions {
             prompts: Mutex::default(),
             spawned: Mutex::default(),
-            activity_ms: 5000,
+            activity_ms: Some(5000),
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
@@ -1663,7 +1984,7 @@ async fn undelivered_comment_is_not_marked_seen() {
     let sess2 = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
-        activity_ms: 1000,
+        activity_ms: Some(1000),
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
@@ -1730,7 +2051,7 @@ async fn multi_comment_tail_delivered_together() {
     let sess = Arc::new(FakeSessions {
         prompts: Mutex::default(),
         spawned: Mutex::default(),
-        activity_ms: 900,
+        activity_ms: Some(900),
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply: false,
@@ -1795,7 +2116,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
     // агент ответил ПОСЛЕ коммента: activity 5000 > created 3000 — но ход
     // завершён (idle_reply: последнее сообщение — финальный ответ)
     let sess = Arc::new(FakeSessions {
-        activity_ms: 5000,
+        activity_ms: Some(5000),
         idle_reply: true,
         prompt_fails: false,
         deleted: Mutex::default(),
@@ -1855,7 +2176,7 @@ async fn busy_session_not_pinged_early() {
     });
     let sess = Arc::new(FakeSessions {
         // молчание ~30 мин (tool-call висит), idle_reply = false
-        activity_ms: 100_000_000 - 30 * 60_000,
+        activity_ms: Some(100_000_000 - 30 * 60_000),
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -1915,7 +2236,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
     });
     let sess = Arc::new(FakeSessions {
         // молчание 16 мин, ход завершён (idle)
-        activity_ms: 100_000_000 - 16 * 60_000,
+        activity_ms: Some(100_000_000 - 16 * 60_000),
         idle_reply: true,
         prompt_fails: false,
         deleted: Mutex::default(),
@@ -1971,8 +2292,9 @@ async fn idle_sessions_do_not_hold_cup() {
     // Регресс 17.11 (#1206-семья): «живая» в API конвейерная сессия,
     // спящая между ходами (никогда не финализируется), считалась
     // LLM-тратящей — кап забивался спящими, все новые спавны холдились
-    // всю ночь (active=18 при cap=7). Кап держат busy-строки (ход идёт)
-    // и спавн-кандидаты; idle-сессии не тратят LLM и кап не держат.
+    // всю ночь (active=18 при cap=7). Кап держат только busy-строки
+    // (ход идёт) и состоявшиеся спавны тика (#1244); idle-сессии
+    // не тратят LLM и кап не держат.
     let mut rows = Vec::new();
     for n in 70..80u64 {
         let mut t = task(n, Status::InProgress);
@@ -2022,7 +2344,10 @@ async fn idle_sessions_do_not_hold_cup() {
         out.spawns_done, 1,
         "кандидат спавнится: спящие idle-сессии кап не держат"
     );
-    assert_eq!(out.held_cup, 0, "active = busy + кандидаты, не «живые»");
+    assert_eq!(
+        out.held_cup, 0,
+        "active = busy, очередь кандидатов кап не держит (#1244)"
+    );
 }
 
 #[tokio::test]
@@ -2743,9 +3068,9 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn issue_fields(&self, _n: u64) -> UsecaseResult<TaskFields> {
         Ok(TaskFields::default())
     }
-    async fn post_comment(&self, n: u64, _body: &str) -> UsecaseResult<()> {
+    async fn post_comment(&self, n: u64, _body: &str) -> UsecaseResult<String> {
         self.log.lock().unwrap().push(format!("comment#{n}"));
-        Ok(())
+        Ok(format!("multi-comment#{n}"))
     }
     async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
         Ok(())
@@ -2854,6 +3179,11 @@ async fn reviewer_loop_escalates_repeated_spawns() {
     assert!(
         state.0.lock().unwrap().analys_review_loops.is_empty(),
         "счётчик после эскалации сброшен"
+    );
+    assert!(
+        state.0.lock().unwrap().own.is_empty(),
+        "фабричный пост эскалации мимо реестра серверных постов (#1204) — \
+         сигнал будит адресата как foreign"
     );
 }
 
@@ -3140,8 +3470,8 @@ impl TaskBoardRepo for CloseBoard {
     async fn issue_fields(&self, _: u64) -> UsecaseResult<TaskFields> {
         Ok(TaskFields::default())
     }
-    async fn post_comment(&self, _: u64, _: &str) -> UsecaseResult<()> {
-        Ok(())
+    async fn post_comment(&self, _: u64, _: &str) -> UsecaseResult<String> {
+        Ok(String::new())
     }
     async fn close_issue(&self, _: u64) -> UsecaseResult<()> {
         Ok(())
@@ -3188,6 +3518,8 @@ async fn task_close_resolves_board_of_the_row_multiboard() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
     writer
@@ -3218,6 +3550,8 @@ async fn task_close_row_on_first_board_still_closes_there() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
 
@@ -3252,6 +3586,8 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         board: board.clone(),
         fields,
         boards: vec![("uwuwu".into(), "B1".into()), ("origa".into(), "B2".into())],
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
     };
     use crate::tasks::write::TaskWriter;
 

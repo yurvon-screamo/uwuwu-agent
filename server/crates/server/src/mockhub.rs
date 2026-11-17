@@ -228,20 +228,21 @@ impl TaskBoardRepo for MemoryHub {
         self.with_state(|state| Ok(state.fields.get(&number).cloned().unwrap_or_default()))
     }
 
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
         self.with_state(|state| {
             let counter = &mut state.counter;
             *counter += 1;
+            let id = format!("mockc-{counter}");
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
             state.comments.entry(number).or_default().push(CommentRef {
-                id: format!("mockc-{counter}"),
+                id: id.clone(),
                 created_ms: now,
                 body: body.to_string(),
             });
-            Ok(())
+            Ok(id)
         })
     }
 

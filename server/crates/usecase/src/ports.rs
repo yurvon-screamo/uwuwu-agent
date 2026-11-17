@@ -32,7 +32,10 @@ pub trait TaskBoardRepo: Send + Sync {
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
     /// ревью/тест-сессии не переживают смену стадии — канон сессий).
     async fn clear_session(&self, board: &str, number: u64, slot: Slot) -> UsecaseResult<()>;
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()>;
+    /// Опубликовать коммент; возвращает node_id созданного коммента
+    /// (пустая строка — id недоступен: маркировка реестра невозможна,
+    /// self-эхо-фильтр деградирует честно — fail-open).
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String>;
     /// Закрыть issue (Done по канону = closed).
     async fn close_issue(&self, number: u64) -> UsecaseResult<()>;
     /// Хвост комментов задачи (для wakeup: новые против последнего).
@@ -293,5 +296,9 @@ pub trait TickStateStore: Send + Sync {
     /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
     /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
+    /// Реестр серверных постов (self-эхо-фильтр #1204): коммент опубликован
+    /// агентом через MCP task_comment (не юзером и не фабрикой).
+    fn own_comment(&self, id: &str) -> bool;
+    fn mark_own_comment(&self, id: &str, posted_ms: u64);
     fn save(&self) -> UsecaseResult<()>;
 }

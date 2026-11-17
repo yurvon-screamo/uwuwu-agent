@@ -4,9 +4,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
 use uwuwu_usecase::BotStateStore;
+use uwuwu_usecase::Clock;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -61,15 +63,21 @@ struct StateFile {
     /// «slug бота» → сессия + offset (раннер ботов, #1150).
     #[serde(default)]
     bots: BTreeMap<String, BotRow>,
+    /// Реестр серверных постов: node_id → ms поста (self-эхо-фильтр #1204).
+    /// Id GitHub глобально уникальны — плоский map без ключа доски.
+    #[serde(default)]
+    own_comments: BTreeMap<String, u64>,
 }
 
 pub struct JsonStateStore {
     path: PathBuf,
     state: std::sync::Mutex<StateFile>,
+    /// Штамп времени возрастного GC реестра серверных постов.
+    clock: Arc<dyn Clock>,
 }
 
 impl JsonStateStore {
-    pub fn load(path: PathBuf) -> Self {
+    pub fn load(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
         let state = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -77,6 +85,7 @@ impl JsonStateStore {
         Self {
             path,
             state: std::sync::Mutex::new(state),
+            clock,
         }
     }
 
@@ -109,6 +118,18 @@ impl JsonStateStore {
             }
             // legacy-ключи триажа (эпоха до #1135) — вечный мёртвый груз
             guard.spawns.retain(|k, _| !k.ends_with(":triage"));
+            // Реестр серверных постов (#1204): записи старше недели мертвы
+            // (журнал комментов задачи держит последнюю сотню) — возрастной
+            // GC; кап — страховка от аномального роста.
+            let week_ago = self.clock.now_ms().saturating_sub(7 * 24 * 60 * 60 * 1000);
+            guard.own_comments.retain(|_, posted| *posted >= week_ago);
+            if guard.own_comments.len() > 5000 {
+                let keys: Vec<String> = guard.own_comments.keys().cloned().collect();
+                let cut = guard.own_comments.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.own_comments.remove(&k);
+                }
+            }
         }
         let raw = {
             let guard = self.state.lock().expect("state lock");
@@ -377,6 +398,22 @@ impl TickStateStore for JsonStateStore {
         }
     }
 
+    fn own_comment(&self, id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("state lock")
+            .own_comments
+            .contains_key(id)
+    }
+
+    fn mark_own_comment(&self, id: &str, posted_ms: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .own_comments
+            .insert(id.to_string(), posted_ms);
+    }
+
     fn save(&self) -> UsecaseResult<()> {
         self.save_now()
     }
@@ -451,6 +488,29 @@ impl BotStateStore for JsonStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::SystemClock;
+
+    /// Часы-константа: тестовые метки задаются относительно «сейчас».
+    struct FixedTestClock(u64);
+    impl Clock for FixedTestClock {
+        fn utc_minute(&self) -> uwuwu_domain::UtcMinute {
+            uwuwu_domain::UtcMinute {
+                minute_of_day: 0,
+                weekday: 1,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn store(path: PathBuf) -> JsonStateStore {
+        JsonStateStore::load(path, Arc::new(SystemClock))
+    }
+
+    fn store_at(path: PathBuf, now_ms: u64) -> JsonStateStore {
+        JsonStateStore::load(path, Arc::new(FixedTestClock(now_ms)))
+    }
 
     #[test]
     fn round_trip_through_file() {
@@ -458,14 +518,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         {
-            let s = JsonStateStore::load(path.clone());
+            let s = store(path.clone());
             s.set_last_comment_id("Задачи uwuwu", 7, "c1");
             // бот: сессия + offset переживают рестарт (секция bots)
             s.set_bot_session("Projects/uwuwu/Боты/x", Some("ses_abc"));
             s.set_bot_offset("Projects/uwuwu/Боты/x", 42);
             TickStateStore::save(&s).unwrap();
         }
-        let s = JsonStateStore::load(path.clone());
+        let s = store(path.clone());
         assert_eq!(s.last_comment_id("Задачи uwuwu", 7).as_deref(), Some("c1"));
         assert_eq!(
             s.bot_session("Projects/uwuwu/Боты/x").as_deref(),
@@ -477,8 +537,71 @@ mod tests {
     }
 
     #[test]
+    fn own_comments_persist_across_restart() {
+        // #1204: реестр серверных постов переживает рестарт — комменты,
+        // опубликованные до перезапуска, остаются «своими»
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        {
+            let s = store_at(path.clone(), 10 * week_ms);
+            s.mark_own_comment("MAC_own1", 10 * week_ms - 1000);
+            s.mark_own_comment("MAC_own2", 10 * week_ms - 2000);
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert!(s.own_comment("MAC_own1"), "марка переживает рестарт");
+        assert!(s.own_comment("MAC_own2"));
+        assert!(!s.own_comment("MAC_user"), "чужой id не в реестре");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn own_comments_read_legacy_file_without_field() {
+        // #1204 Low-3: state.json, записанный пре-фиксом (без own_comments),
+        // читается — serde-дефолт пустого реестра, рестарт не падает
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"dreamer_done":[],"spawns":{},"spawn_loops":{},"bots":{}}"#,
+        )
+        .unwrap();
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        assert!(!s.own_comment("anything"), "легаси-файл — реестр пуст");
+        s.mark_own_comment("MAC_new", 10 * week_ms - 500);
+        TickStateStore::save(&s).unwrap();
+        let s = store(path.clone());
+        assert!(
+            s.own_comment("MAC_new"),
+            "марка доезжает после легаси-чтения"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn own_comments_gc_prunes_by_age() {
+        // #1204: записи старше недели срезаются при сохранении (журнал
+        // комментов держит последнюю сотню — старше не нужно)
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-gc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        s.mark_own_comment("MAC_fresh", 10 * week_ms - 1000);
+        s.mark_own_comment("MAC_stale", week_ms - 1000);
+        TickStateStore::save(&s).unwrap();
+        assert!(s.own_comment("MAC_fresh"), "свежая марка жива");
+        assert!(!s.own_comment("MAC_stale"), "недельная марка срезана");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn bot_session_clear_keeps_offset_row() {
-        let s = JsonStateStore::load(PathBuf::from("/nonexistent/uwuwu/x.json"));
+        let s = store(PathBuf::from("/nonexistent/uwuwu/x.json"));
         s.set_bot_session("slug", Some("ses_1"));
         s.set_bot_offset("slug", 9);
         s.set_bot_session("slug", None);
@@ -492,7 +615,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_fresh_state() {
-        let s = JsonStateStore::load(PathBuf::from("/nonexistent/uwuwu/x.json"));
+        let s = store(PathBuf::from("/nonexistent/uwuwu/x.json"));
         assert!(s.last_comment_id("b", 1).is_none());
         assert!(s.bot_session("slug").is_none());
         assert!(s.bot_offset("slug").is_none());
