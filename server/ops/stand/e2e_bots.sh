@@ -43,15 +43,18 @@ say "сборка…"
 cargo build -q --bin uwuwu-server --bin mock_opencode
 rm -f "$STATE"
 
-# конфиг стенда с портами прогона (дефолтный config.memory.toml не трогаем)
-sed -e "s/^port = .*/port = $PORT_SRV/" \
-    -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
+# конфиг стенда с executor-url прогона (дефолтный config.memory.toml не
+# трогаем; порт сервера в TOML не читается — config.rs: port() = env PORT
+# > дефолт, поэтому серверный порт задаётся env-ом при запуске ниже)
+sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
     ops/config.memory.toml > ops/config.memory.e2e.toml
 
-say "стенд: mock_tg ($PORT_TG) + mock_opencode ($PORT_MOCK)"
+say "стенд: mock_tg ($PORT_TG) + mock_opencode ($PORT_MOCK) + сервер ($PORT_SRV)"
 MOCK_TG_PORT=$PORT_TG python3 ops/stand/mock_tg.py >"$LOG_TG" 2>&1 &
 TG_PID=$!
-MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=200 ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=200 \
+  MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV/mcp" \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 
@@ -60,6 +63,7 @@ BOT_DOC='{"Projects/uwuwu/Боты/Проба-раннера": "---\ntitle: Пр
 
 say "сервер (live, memory-hub, вики в памяти)"
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \
+PORT=$PORT_SRV \
 UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
@@ -132,6 +136,7 @@ say "рестарт сервера…"
 kill "$SRV_PID" 2>/dev/null || true
 sleep 1
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \
+PORT=$PORT_SRV \
 UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
