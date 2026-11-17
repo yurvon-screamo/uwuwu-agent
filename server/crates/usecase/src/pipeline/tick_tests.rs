@@ -182,6 +182,7 @@ struct FakeSessions {
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
+/// total_tokens — кандидатность дримера (токены > 0 = реальная работа).
 #[derive(Clone)]
 struct LiveSighting {
     id: String,
@@ -189,6 +190,7 @@ struct LiveSighting {
     directory: String,
     outcome: String,
     updated_ms: u64,
+    total_tokens: u64,
 }
 
 impl FakeSessions {
@@ -214,6 +216,7 @@ impl FakeSessions {
                 directory: String::new(),
                 outcome: String::new(),
                 updated_ms: 0,
+                total_tokens: 0,
             }]),
             ..Self::new()
         }
@@ -233,6 +236,21 @@ impl FakeSessions {
                 directory: directory.into(),
                 outcome: outcome.into(),
                 updated_ms,
+                total_tokens: 0,
+            }]),
+            ..Self::new()
+        }
+    }
+    /// Завершённая сессия с финалом и токенами — дример-кандидат.
+    fn with_finished(agent: &str, outcome: &str) -> Self {
+        Self {
+            live: Mutex::new(vec![LiveSighting {
+                id: format!("ses_live_{agent}"),
+                agent: agent.into(),
+                directory: String::new(),
+                outcome: outcome.into(),
+                updated_ms: 0,
+                total_tokens: 1000,
             }]),
             ..Self::new()
         }
@@ -320,7 +338,7 @@ impl AgentSessionGateway for FakeSessions {
                 directory: s.directory.clone(),
                 updated_ms: s.updated_ms,
                 outcome: s.outcome.clone(),
-                total_tokens: 0,
+                total_tokens: s.total_tokens,
             });
         }
         Ok(out)
@@ -1080,6 +1098,32 @@ async fn live_spawns_and_claims_session() {
         .unwrap()
         .iter()
         .any(|l| l.starts_with("session#1")));
+}
+
+/// Тайтл спавн-сессии несёт эмодзи-маркер стадии между номером и тайтлом
+/// (задача #1212); bootstrap наследует тем же значением.
+#[tokio::test]
+async fn spawn_title_carries_stage_marker() {
+    // Dev-слот (In Progress): маркер 🔨, bootstrap и work — одинаково
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    {
+        let specs = sessions.specs.lock().unwrap();
+        assert_eq!(specs.len(), 2, "bootstrap + work");
+        assert_eq!(specs[0].title, "bootstrap #1 🔨 t1");
+        assert_eq!(specs[1].title, "#1 🔨 t1");
+    }
+
+    // PlanReview-слот: маркер 🔍 и агент plan-reviewer
+    let (u, _, sessions, _) = usecase(vec![task(2, Status::ReviewPlan)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs.last().expect("рабочая сессия");
+    assert_eq!(work.title, "#2 🔍 t2");
+    assert!(
+        matches!(work.agent, AgentSlot::Role(Agent::PlanReviewer)),
+        "ревью-план спавнится кастомным агентом"
+    );
 }
 
 #[tokio::test]
@@ -3489,6 +3533,86 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         log.is_empty(),
         "промах close не мутирует доски, лог: {log:?}"
     );
+}
+
+// ===== Тайтлы вневых ролей — эмодзи-маркер (#1212): спавн-тайтл каждой
+// роли несёт маркер таблицы Agent::emoji; если маппинг отломают — тест падает.
+
+#[tokio::test]
+async fn analyst_wave_title_carries_marker() {
+    // 🧠 в тайтле волновой сессии аналитика (свой юзкейс, вне конвейерного тика)
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "заявка", Status::Analys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("волновая сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} аналитика волны", Agent::Analyst.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Analyst)));
+}
+
+#[tokio::test]
+async fn analyst_review_title_carries_marker() {
+    // ⚖️ в тайтле парной сессии ревью-аналитики
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (r, _) = review_uc(
+        vec![titled(1, "заявка", Status::ReviewAnalys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(r.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("сессия ревью-аналитики");
+    assert_eq!(
+        spec.title,
+        format!("{} ревью аналитики", Agent::AnalystReviewer.emoji())
+    );
+    assert!(matches!(
+        spec.agent,
+        AgentSlot::Role(Agent::AnalystReviewer)
+    ));
+}
+
+#[tokio::test]
+async fn dreamer_title_carries_marker() {
+    // 🌙 в тайтле дример-сессии пост-обработки (кандидат: финал + токены + idle)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct FarClock(AtomicU64);
+    impl crate::ports::Clock for FarClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let sessions = Arc::new(FakeSessions::with_finished("dev", "готово"));
+    let u = crate::pipeline::dreamer::DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: Arc::new(MemState(Mutex::default())),
+        clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
+        spawn_model: None,
+        checkout: "/tmp/checkout".into(),
+    };
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("дример-сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} дример ses_live_dev", Agent::Dreamer.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Dreamer)));
 }
 
 // ===== Гард «одна живая сессия на строку» + зачистка спавн-путей (#1163) =====

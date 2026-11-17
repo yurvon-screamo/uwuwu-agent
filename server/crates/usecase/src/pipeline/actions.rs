@@ -38,7 +38,7 @@ impl TickUseCase {
     ) -> UsecaseResult<String> {
         let sessions = self.sessions.project(&board.project);
         let env_repo = board.env_repo_dir(task.number());
-        let title = format!("#{} {}", task.number(), task.title());
+        let title = session_title(task, slot);
         let bootstrap = sessions
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
@@ -88,7 +88,7 @@ impl TickUseCase {
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
-                title: format!("#{} {}", task.number(), task.title()),
+                title: session_title(task, slot),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
@@ -499,6 +499,12 @@ impl TickUseCase {
         );
         Ok(())
     }
+}
+
+/// Тайтл конвейерной сессии: `#<номер> <эмодзи стадии> <тайтл>` (задача
+/// #1212); единая точка сборки — bootstrap наследует тем же значением.
+fn session_title(task: &Task, slot: Slot) -> String {
+    format!("#{} {} {}", task.number(), slot.emoji(), task.title())
 }
 
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {

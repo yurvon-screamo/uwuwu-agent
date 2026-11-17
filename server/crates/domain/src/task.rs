@@ -130,6 +130,20 @@ pub enum Slot {
     Test,
 }
 
+impl Slot {
+    /// Эмодзи-маркер стадии в тайтле спавн-сессии (задача #1212).
+    /// Design/Dev == 🔨 осознанно: оба слота — дефолтная сессия
+    /// исполнителя; равенство с Agent::Developer.emoji() связано тестом.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Design | Self::Dev => "🔨",
+            Self::PlanReview => "🔍",
+            Self::ResultReview => "🔬",
+            Self::Test => "🧪",
+        }
+    }
+}
+
 /// Нативные поля issue, типизированные и инкапсулированные:
 /// домен владеет мутациями, инфра маппит имена → конструкторы.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,9 +461,37 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
 
     fn task(status: Status) -> Task {
         Task::new(7, "t".into(), status)
+    }
+
+    /// Маркеры слотов попарно различимы, кроме осознанной пары
+    /// Design/Dev (оба 🔨); связка слотов с ролями — ассертом равенства
+    /// (критерий различимости #1212).
+    #[test]
+    fn slot_emojis_distinct_and_linked_to_agents() {
+        let emojis: [&str; 5] = [
+            Slot::Design.emoji(),
+            Slot::Dev.emoji(),
+            Slot::PlanReview.emoji(),
+            Slot::ResultReview.emoji(),
+            Slot::Test.emoji(),
+        ];
+        for i in 0..emojis.len() {
+            for j in i + 1..emojis.len() {
+                if i == 0 && j == 1 {
+                    continue; // Design/Dev — осознанное совпадение
+                }
+                assert_ne!(emojis[i], emojis[j]);
+            }
+        }
+        assert_eq!(emojis[0], emojis[1], "Design == Dev == 🔨");
+        assert_eq!(emojis[1], Agent::Developer.emoji());
+        assert_eq!(emojis[2], Agent::PlanReviewer.emoji());
+        assert_eq!(emojis[3], Agent::CodeQualityReviewer.emoji());
+        assert_eq!(emojis[4], Agent::Tester.emoji());
     }
 
     #[test]
