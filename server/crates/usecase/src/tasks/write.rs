@@ -18,7 +18,9 @@ pub struct NewTask {
     /// Тип задачи; None — дефолт feature (канон).
     pub kind: Option<TaskType>,
     pub priority: String,
-    pub autodone: bool,
+    /// Автомерж: мерж PR при входе в Review, строка остаётся в Review (#1232).
+    /// Дефолт true — пишется на носитель явно (create-письмо, не умолчание чтения).
+    pub automerge: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,8 @@ pub struct TaskPatch {
     pub pr: Option<String>,
     pub priority: Option<String>,
     pub title: Option<String>,
+    /// Автомерж on/off (#1232): до-пометка старых строк, выключение.
+    pub automerge: Option<bool>,
 }
 
 impl TaskPatch {
@@ -109,6 +113,7 @@ impl TaskPatch {
                 pr: None,
                 priority: None,
                 title: None,
+                automerge: None,
             }
         )
     }
@@ -177,6 +182,12 @@ impl TaskWriter for TaskWriteUseCase {
         if !spec.priority.is_empty() {
             field_patch.push((naming::F_PRIORITY, Some(spec.priority.clone())));
         }
+        // автомерж пишется всегда — состояние на носителе явно, не умолчание
+        // чтения (баг #1232: create терял флаг, тик молчал)
+        field_patch.push((
+            crate::naming::F_AUTOMERGE,
+            Some(if spec.automerge { "on" } else { "off" }.to_string()),
+        ));
         self.fields.store(number, &field_patch).await?;
         Ok(number)
     }
@@ -237,6 +248,12 @@ impl TaskWriter for TaskWriteUseCase {
         }
         if let Some(pr) = &patch.priority {
             field_patch.push((naming::F_PRIORITY, Some(pr.clone())));
+        }
+        if let Some(on) = patch.automerge {
+            field_patch.push((
+                crate::naming::F_AUTOMERGE,
+                Some(if on { "on" } else { "off" }.to_string()),
+            ));
         }
         if !field_patch.is_empty() {
             self.fields.store(number, &field_patch).await?;
@@ -367,6 +384,9 @@ fn render_create_body(spec: &NewTask) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::{CommentRef, FmMutator, IssueView};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn spec(body: &str) -> NewTask {
         NewTask {
@@ -374,8 +394,186 @@ mod tests {
             body_md: body.into(),
             kind: None,
             priority: String::new(),
-            autodone: true,
+            automerge: true,
         }
+    }
+
+    /// Мок доски: доска пуста, issue создаётся с номером 1.
+    struct FakeBoard;
+
+    #[async_trait]
+    impl TaskBoardRepo for FakeBoard {
+        async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn clear_session(&self, _b: &str, _n: u64, _slot: Slot) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn set_branch(
+            &self,
+            _b: &str,
+            _n: u64,
+            _branch: &uwuwu_domain::BranchName,
+        ) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn post_comment(&self, _n: u64, _body: &str) -> UsecaseResult<String> {
+            Ok(String::new())
+        }
+        async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
+            Ok(Vec::new())
+        }
+        async fn read_issue(&self, _b: &str, _n: u64) -> UsecaseResult<IssueView> {
+            panic!("create не читает issue");
+        }
+        async fn issue_fields(&self, _n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+            panic!("create не читает поля доски");
+        }
+        async fn create_issue(
+            &self,
+            _board: &str,
+            _project: &str,
+            _title: &str,
+            _body: &str,
+        ) -> UsecaseResult<u64> {
+            Ok(1)
+        }
+        async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn patch_cells(&self, _n: u64, _m: FmMutator) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn close_issue_ext(&self, _n: u64, _np: bool) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Мок полей issue: записанные патчи хранит, load читает записанное —
+    /// read-after-write (ADR-093) прямо в тесте.
+    #[derive(Default)]
+    struct FakeFields {
+        stored: std::sync::Mutex<HashMap<String, String>>,
+    }
+
+    #[async_trait]
+    impl IssueFieldStore for FakeFields {
+        async fn load(&self, _n: u64) -> UsecaseResult<HashMap<String, String>> {
+            Ok(self.stored.lock().expect("fake fields").clone())
+        }
+        async fn store(&self, _n: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+            let mut map = self.stored.lock().expect("fake fields");
+            for (name, value) in patch {
+                match value {
+                    Some(v) if !v.is_empty() => {
+                        map.insert((*name).into(), v.clone());
+                    }
+                    _ => {
+                        map.remove(*name);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn writecase(fields: Arc<FakeFields>) -> TaskWriteUseCase {
+        TaskWriteUseCase {
+            board: Arc::new(FakeBoard),
+            fields,
+            boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
+            clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
+            state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
+        }
+    }
+
+    /// Красный тест бага #1232: create с automerge обязан записать значение
+    /// на носитель (field_patch → store) и приземлить его (load видит on).
+    /// До фикса create терял spec.automerge — параметр был мёртвый.
+    #[tokio::test]
+    async fn create_writes_automerge_value() {
+        let fields = Arc::new(FakeFields::default());
+        let u = writecase(fields.clone());
+        u.create("uwuwu", spec("тело")).await.unwrap();
+        let stored = fields
+            .stored
+            .lock()
+            .expect("fake fields")
+            .get("Automerge")
+            .cloned();
+        assert_eq!(stored.as_deref(), Some("on"), "create потерял automerge");
+        // приземление: read-after-write видит значение
+        let landed = fields.load(1).await.unwrap();
+        assert_eq!(landed.get("Automerge").map(String::as_str), Some("on"));
+    }
+
+    /// Выключенный automerge пишет off явно (состояние на носителе, не умолчание).
+    #[tokio::test]
+    async fn create_writes_automerge_off_when_disabled() {
+        let fields = Arc::new(FakeFields::default());
+        let u = writecase(fields.clone());
+        let mut s = spec("тело");
+        s.automerge = false;
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            fields
+                .stored
+                .lock()
+                .expect("fake fields")
+                .get("Automerge")
+                .cloned()
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    /// task_edit(automerge) — инструмент до-пометки старых строк (#1232).
+    #[tokio::test]
+    async fn edit_patches_automerge() {
+        let fields = Arc::new(FakeFields::default());
+        let u = writecase(fields.clone());
+        u.edit(
+            "uwuwu",
+            1,
+            TaskPatch {
+                automerge: Some(false),
+                ..TaskPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fields
+                .stored
+                .lock()
+                .expect("fake fields")
+                .get("Automerge")
+                .cloned()
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    /// TaskPatch с одним automerge непуст — пустой патч не глотается.
+    #[test]
+    fn patch_with_automerge_is_not_empty() {
+        let p = TaskPatch {
+            automerge: Some(true),
+            ..TaskPatch::default()
+        };
+        assert!(!p.is_empty());
     }
 
     #[test]

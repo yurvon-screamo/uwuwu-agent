@@ -39,7 +39,7 @@ impl Status {
 
     /// Канон переходов (AGENTS.md «статусы кто ставит» + пайп конвейера):
     /// рёбра пайплайна + Needs attention из любой рабочей стадии; Done —
-    /// только через close/автодон (не task_edit); Done/Deleted/Empty —
+    /// только через close владельца (не task_edit); Done/Deleted/Empty —
     /// без исходящих рёбер (реопен/легаси — владелец в UI, мимо MCP).
     /// Fast-track (#1135, развилка 6): Draft/Analys/Todo → In Progress —
     /// владелец тащит простые задачи сразу в работу.
@@ -308,7 +308,7 @@ pub struct Task {
     title: String,
     status: Status,
     priority: Priority,
-    autodone: bool,
+    automerge: bool,
     fields: TaskFields,
 }
 
@@ -319,7 +319,7 @@ impl Task {
             title,
             status,
             priority: Priority::Empty,
-            autodone: false,
+            automerge: false,
             fields: TaskFields::default(),
         }
     }
@@ -353,8 +353,8 @@ impl Task {
         self.priority
     }
 
-    pub fn autodone(&self) -> bool {
-        self.autodone
+    pub fn automerge(&self) -> bool {
+        self.automerge
     }
 
     pub fn branch(&self) -> Option<&BranchName> {
@@ -370,9 +370,9 @@ impl Task {
         self.priority = p;
     }
 
-    /// Управление автодоном (владелец/триаж).
-    pub fn set_autodone(&mut self, on: bool) {
-        self.autodone = on;
+    /// Управление автомержем (владелец/триаж).
+    pub fn set_automerge(&mut self, on: bool) {
+        self.automerge = on;
     }
 
     /// Заявка сессии (claim): терминальная строка не принимает заявок —
@@ -428,9 +428,11 @@ impl Task {
         self.fields = fields;
     }
 
-    /// Автодон-кандидат: Review + autodone.
-    pub fn autodone_ready(&self) -> bool {
-        self.status == Status::UserReview && self.autodone
+    /// Автомерж-кандидат (#1232): Review + automerge + носитель мержа
+    /// (PR или ветка). Docs-only (Vcs::Local) мержить нечего — строка
+    /// ждёт владельца в Review, тик её не прощупывает.
+    pub fn automerge_ready(&self) -> bool {
+        self.status == Status::UserReview && self.automerge && self.fields.vcs() != &Vcs::Local
     }
 }
 
@@ -565,7 +567,7 @@ mod tests {
         assert!(!S::can_transition(S::Done, S::InProgress));
         assert!(
             !S::can_transition(S::UserReview, S::Done),
-            "Done — только close/автодон"
+            "Done — только close владельца"
         );
         assert!(!S::can_transition(S::InProgress, S::Todo));
         assert!(

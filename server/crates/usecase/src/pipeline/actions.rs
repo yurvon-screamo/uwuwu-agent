@@ -1,5 +1,5 @@
 //! Действия тика: спавн стадии (bootstrap /command → сессия в env),
-//! wakeup по свежим комментам, автодон (проба PR → мерж/Done/bounce).
+//! wakeup по свежим комментам, автомерж (проба PR → мерж без закрытия / bounce).
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
@@ -399,9 +399,12 @@ impl TickUseCase {
         Ok(true)
     }
 
-    /// Автодон: проба PR → мерж/Done/bounce. Без PR и без ветки — Done сразу
-    /// (docs-only); ветка без PR — возврат в работу (PR ещё не создан).
-    pub async fn autodone(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<()> {
+    /// Автомерж (#1232): проба PR → мерж (строка остаётся в Review — Done
+    /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
+    /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
+    /// automerge_ready не прощупывает Vcs::Local).
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
+    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;
         let state = self
             .prs
@@ -413,27 +416,45 @@ impl TickUseCase {
             .await?;
         if state == PrState::Pending {
             tracing::info!(
-                event = "autodone.pending",
+                event = "automerge.pending",
                 number = task.number(),
-                "Autodone: PR pending (mergeable/чекси считаются) — ждём следующего тика"
+                "Automerge: PR pending (mergeable/чекси считаются) — ждём следующего тика"
             );
-            return Ok(());
+            return Ok(false);
         }
         match state {
             PrState::Pending => unreachable!("pending обработан выше"),
-            PrState::Merged => self.finish_done(board, task, "PR смержен").await?,
-            PrState::Missing if task.branch().is_none() => {
-                self.finish_done(board, task, "задача без PR (docs-only)")
-                    .await?
+            // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
+            // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
+            // ложный bounce вручную смерженной строки недопустим)
+            PrState::Merged => {
+                tracing::info!(
+                    event = "automerge.merged",
+                    number = task.number(),
+                    "Automerge: PR уже смержен — строка ждёт владельца в Review"
+                );
+                Ok(false)
             }
-            PrState::Missing => self.bounce(board, task, "ветка есть, PR не найден").await?,
-            PrState::Closed => self.bounce(board, task, "PR закрыт без мержа").await?,
+            PrState::Missing => {
+                self.bounce(board, task, "ветка есть, PR не найден").await?;
+                Ok(false)
+            }
+            PrState::Closed => {
+                self.bounce(board, task, "PR закрыт без мержа").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: false, ..
-            } => self.bounce(board, task, "PR в конфликте с master").await?,
+            } => {
+                self.bounce(board, task, "PR в конфликте с master").await?;
+                Ok(false)
+            }
             PrState::Open {
                 ci_green: false, ..
-            } => self.bounce(board, task, "красный CI у PR").await?,
+            } => {
+                self.bounce(board, task, "красный CI у PR").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
@@ -441,31 +462,23 @@ impl TickUseCase {
                 let pr = task.pr().map(|u| u.as_str()).unwrap_or_default();
                 match self.prs.merge(&board.repo, pr).await {
                     Ok(()) => {
-                        self.finish_done(board, task, "PR смержен автодоном")
-                            .await?
+                        // мерж без закрытия: строка остаётся в Review —
+                        // финализация (Done) всегда за владельцем (#1232)
+                        tracing::info!(
+                            event = "automerge.merged",
+                            number = task.number(),
+                            "Automerge: PR смержен — строка остаётся в Review"
+                        );
+                        Ok(true)
                     }
                     Err(e) => {
                         self.bounce(board, task, &format!("мерж не прошёл: {e}"))
-                            .await?
+                            .await?;
+                        Ok(false)
                     }
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn finish_done(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
-        self.board
-            .set_status(&board.board, task.number(), Status::Done)
-            .await?;
-        self.board.close_issue(task.number()).await?;
-        tracing::info!(
-            event = "autodone.done",
-            number = task.number(),
-            why,
-            "Autodone: done"
-        );
-        Ok(())
     }
 
     async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
@@ -475,14 +488,14 @@ impl TickUseCase {
         self.board
             .post_comment(
                 task.number(),
-                &format!("Автодон: возврат в работу — {why}."),
+                &format!("Автомерж: возврат в работу — {why}."),
             )
             .await?;
         tracing::info!(
-            event = "autodone.bounce",
+            event = "automerge.bounce",
             number = task.number(),
             why,
-            "Autodone: bounce"
+            "Automerge: bounce"
         );
         Ok(())
     }

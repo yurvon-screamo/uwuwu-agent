@@ -1,6 +1,6 @@
 //! gh-hub adapter: доска (bulk select-колонки) + issue REST (тело/комменты/
 //! нативные поля). fm-зеркало снесено (владелец 15.11): операционные данные —
-//! Status/Приоритет/Autodone на доске, сессии/ветка/PR — глобальные поля issue
+//! Status/Приоритет/Automerge на доске, сессии/ветка/PR — глобальные поля issue
 //! (fields.rs). Тело задачи — чистый контент.
 
 use super::fields::{parse_field_values, Fields, IssueFields};
@@ -234,7 +234,7 @@ impl GitHubHub {
         Ok((status, value))
     }
 
-    /// Снимок доски: bulk-задачи (Status/Приоритет/Autodone) + мета мутаций.
+    /// Снимок доски: bulk-задачи (Status/Приоритет/Automerge) + мета мутаций.
     /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
     /// добавленная на доску младше TTL, может не иметь item-id в мете —
     /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
@@ -438,7 +438,7 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             };
             let mut task = Task::new(number, title, status);
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
-            task.set_autodone(v.autodone);
+            task.set_automerge(v.automerge);
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -450,21 +450,21 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
 struct ItemValues {
     status: String,
     priority: String,
-    autodone: bool,
+    automerge: bool,
 }
 
 fn item_values(item: &Value) -> ItemValues {
     let mut out = ItemValues {
         status: String::new(),
         priority: String::new(),
-        autodone: false,
+        automerge: false,
     };
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
             let field = v["field"]["name"].as_str().unwrap_or_default();
             // Pv2-own поля несут значение на верхнем уровне узла;
             // issue-backed (каталог /user/issue-fields: «Приоритет»,
-            // «Autodone») — вложенным issueFieldValue (#1174)
+            // «Automerge») — вложенным issueFieldValue (#1174)
             let value = v["name"]
                 .as_str()
                 .or(v["issueFieldValue"]["name"].as_str())
@@ -472,7 +472,8 @@ fn item_values(item: &Value) -> ItemValues {
             match field {
                 "Status" => out.status = value.to_string(),
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
-                "Autodone" => out.autodone = value == "on" || value == "true",
+                // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
+                "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 _ => {}
             }
         }
@@ -672,8 +673,18 @@ impl TaskBoardRepo for GitHubHub {
         } else {
             uwuwu_usecase::parse_status(&status)
         };
+        let raw = parse_field_values(&issue);
         let mut task = Task::new(number, title, status);
-        task.apply_fields(map_task_fields(&parse_field_values(&issue)));
+        task.apply_fields(map_task_fields(&raw));
+        // automerge с носителя (fm-вью честен, баг-репорт тестировщика #1232:
+        // read_issue не мапил значение — task_get врал automerge: false);
+        // тик-путь (snapshot item_values) уже читал, это REST-путь MCP
+        let automerge = raw
+            .get("Automerge")
+            .or_else(|| raw.get("Autodone"))
+            .map(|v| v == "on" || v == "true")
+            .unwrap_or(false);
+        task.set_automerge(automerge);
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -999,21 +1010,41 @@ mod tests {
                         "name": "on", "value": "on", "optionId": "IFSSO_y"
                     }
                 },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Automerge" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "on", "value": "on", "optionId": "IFSSO_z"
+                    }
+                },
                 { "__typename": "ProjectV2ItemFieldSingleSelectValue",
                   "name": "Design", "field": { "__typename": "ProjectV2FieldCommon", "name": "Status" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.priority, "medium");
-        assert!(v.autodone);
+        assert!(v.automerge);
         assert_eq!(v.status, "Design");
     }
 
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
-    fn live_snapshot_reads_issue_backed_priorities() {
-        // #1174: живой e2e read-path — снапшот доски «Задачи uwuwu»
-        // против реального hub; сверка с REST-носителем issue_field_values
+    fn live_snapshot_reads_issue_backed_automerge() {
+        // #1174: живой e2e read-path — снапшот парсит issue-backed
+        // single-select значения (каталог /user/issue-fields) из Pv2-отражения.
+        // Носитель — sandbox #1265 (Autodone=on, раунд тестирования #1232,
+        // строка открыта): отражение стабильно с 17.11.
+        //
+        // NB дрейф GitHub (дельта-раунд #1232, 18.11): Pv2-отражение
+        // issue-backed значений стало избирательным. Приоритет перестал
+        // отражаться вовсе (носители #1174/#1232/#1272 живы по REST,
+        // ProjectV2ItemIssueFieldValue для «Приоритет» отсутствует); у
+        // закрытой #1174 отражение существовало 17.11 и исчезло. Пин на
+        // priority-через-снапшот на живом носителе не держится; приоритет
+        // конвейерных стадий читается enrichment'ом (REST, #1163), для
+        // не-stage строк (#1174-срез CUP-очереди) — слепота, флаг
+        // владельцу в отчёте #1232.
         let repo =
             std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
         let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
@@ -1021,25 +1052,47 @@ mod tests {
         let rows: Vec<Task> = rt
             .block_on(async {
                 let hub = GitHubHub::new(repo, token);
-                hub.read_board("Задачи uwuwu").await
+                hub.read_board("Задачи sandbox").await
             })
             .expect("read_board");
         assert!(!rows.is_empty(), "доска не пуста");
 
-        // #1174: на носителе medium (REST issue_field_values) — снапшот
-        // обязан показать то же; до фикса priority был всегда Empty
+        // носитель on (REST issue_field_values) — снапшот обязан показать то же
         let t = rows
             .iter()
-            .find(|t| t.number() == 1174)
-            .expect("#1174 на доске");
-        assert_eq!(t.priority(), Priority::Medium);
+            .find(|t| t.number() == 1265)
+            .expect("#1265 на доске");
+        assert!(
+            t.automerge(),
+            "снапшот слеп к issue-backed automerge-носителю (Autodone=on у #1265): \
+             #1174-срез парсинга Pv2-отражения деградировал"
+        );
+    }
 
-        let filled = rows
-            .iter()
-            .filter(|t| t.priority() != Priority::Empty)
-            .count();
-        println!("строк с приоритетом на снапшоте: {filled}");
-        assert!(filled > 0, "снапшот видит приоритеты строк");
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_read_issue_sees_automerge() {
+        // БАГ-ПИН ручного прогона #1232 (tester, 17.11): fm-вью task_get
+        // показывает automerge: false при Autodone=on на носителе —
+        // read_issue собирает Task через map_task_fields, который не мапит
+        // automerge из issue_field_values (тик-снапшот item_values видит
+        // верно). Красный до фикса; зелёный — после. Строка sandbox #1265
+        // («Автомерж-bounce: битый PR») выставлена в on ручным прогоном.
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let view = rt
+            .block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                hub.read_issue("Задачи sandbox", 1265).await
+            })
+            .expect("read_issue");
+        assert!(
+            view.task.automerge(),
+            "fm-вью read_issue слеп к automerge-носителю (Autodone=on у #1265): \
+             баг-пин ручного прогона #1232"
+        );
     }
 
     #[test]
@@ -1050,12 +1103,13 @@ mod tests {
                 { "name": "In Progress", "field": { "name": "Status" } },
                 { "name": "high", "field": { "name": "Приоритет" } },
                 { "name": "on", "field": { "name": "Autodone" } },
+                { "name": "on", "field": { "name": "Automerge" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.status, "In Progress");
         assert_eq!(v.priority, "high");
-        assert!(v.autodone);
+        assert!(v.automerge);
     }
 
     #[test]

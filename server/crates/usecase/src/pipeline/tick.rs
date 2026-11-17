@@ -78,7 +78,8 @@ pub struct TickOutcome {
     pub wakeups: usize,
     /// Будильников/респавнов, отложенных политикой (пик/CUP — #1200).
     pub wakeups_deferred: usize,
-    pub autodone_done: usize,
+    /// Мержей автомержа: строка остаётся в Review (#1232).
+    pub automerged: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
     /// Автопингов сталл-детекта (ход завершён, статус не переведён).
@@ -164,8 +165,8 @@ impl TickUseCase {
         for (bp, tasks) in boards.iter_mut() {
             for t in tasks.iter_mut() {
                 // stage-строки (wakeup/needs_spawn) + Review-строки
-                // (автодон: PR/ветка — глобальные поля, без enrichment
-                // автодон слеп — PR #338/#339 висели немержеными)
+                // (автомерж: PR/ветка — глобальные поля, без enrichment
+                // автомерж слеп — PR #338/#339 висели немержеными)
                 if t.stage_slot().is_some() || t.status() == Status::UserReview {
                     match self.board.issue_fields(t.number()).await {
                         Ok(f) => t.apply_fields(f),
@@ -298,7 +299,7 @@ impl TickUseCase {
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,
-            autodone = out.autodone_done,
+            automerged = out.automerged,
             held_live = out.held_live,
             enrich_skipped = out.enrich_skipped,
             mode = ?plan.mode,
@@ -517,18 +518,22 @@ impl TickUseCase {
                         }
                     }
                 }
-                Action::Autodone => {
+                Action::Automerge => {
                     if plan.mode == Mode::Live {
-                        out.autodone_done += 1;
-                        self.autodone(board, task)
+                        let merged = self
+                            .automerge(board, task)
                             .await
                             .map_err(|e| self.log_action_failed(task, e))?;
+                        // счётчик — факты мержа: bounce/pending/no-op не считаются
+                        if merged {
+                            out.automerged += 1;
+                        }
                     } else {
                         tracing::info!(
-                            event = "autodone.probe",
+                            event = "automerge.probe",
                             number = task.number(),
                             pr = task.pr().map(|u| u.as_str()).unwrap_or(""),
-                            "Autodone probe (observe)"
+                            "Automerge probe (observe)"
                         );
                     }
                 }

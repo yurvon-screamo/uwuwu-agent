@@ -63,9 +63,10 @@ MCP-инструменты uwuwu-server (`task_get`/`docs_read`/`search`/…; en
 - **Статусная модель и переходы** — глобальный AGENTS.md «Работа над задачей»
   (Draft → Todo → Design → Ревью плана → In Progress → Ревью результата →
   Тестирование → Review → Done; Needs attention, Вейт).
-- **Автодон** (клетка «Autodone», дефолт `task create` — on с 14.11): вход в
-  Review → сервер мержит PR и ставит Done; красный CI/конфликт — обратно в
-  In Progress; без PR — Done сразу.
+- **Автомерж** (поле `Automerge`, legacy `Autodone` читается; дефолт `task
+  create` — on): вход в Review → сервер мержит PR, **строка остаётся в
+  Review** — Done всегда за владельцем; красный CI/конфликт/нет PR —
+  обратно в In Progress с комментом.
 - **Очередь CUP** (кап активных LLM-задач, деф. 7, глобально; приоритеты
   high → medium → low) и **пик-окно GLM** (будни 06:00–10:00 UTC, off-выключатель):
   спавны/будильники не-high откладываются до конца окна.

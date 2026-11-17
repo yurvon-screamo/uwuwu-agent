@@ -339,7 +339,7 @@ impl PrGateway for FakePrs {
     }
 }
 
-struct FixedClock;
+pub(crate) struct FixedClock;
 impl Clock for FixedClock {
     fn utc_minute(&self) -> UtcMinute {
         UtcMinute {
@@ -373,7 +373,14 @@ struct MemStateInner {
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
 }
-struct MemState(Mutex<MemStateInner>);
+pub(crate) struct MemState(Mutex<MemStateInner>);
+
+impl MemState {
+    /// Пустое состояние: no-op-реестры для тестов вне тика (write/т.п.).
+    pub(crate) fn empty() -> Self {
+        Self(Mutex::default())
+    }
+}
 impl TickStateStore for MemState {
     fn last_comment_id(&self, _b: &str, _n: u64) -> Option<String> {
         self.0.lock().unwrap().comments.last().cloned()
@@ -1111,22 +1118,42 @@ async fn cup_holds_spawn_in_live() {
     );
 }
 
-#[tokio::test]
-async fn autodone_merged_finishes() {
-    let mut t = task(3, Status::UserReview);
-    t.set_autodone(true);
-    let (u, board, _, _) = usecase(vec![t], PrState::Merged);
-    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(out.autodone_done, 1);
-    let log = board.log.lock().unwrap();
-    assert!(log.iter().any(|l| l.contains("status#3=Done")), "{log:?}");
-    assert!(log.iter().any(|l| l.contains("close#3")));
+/// Фикстура носителя мержа: ветка (+PR) + automerge — для кейсов
+/// действия Automerge.
+fn carrier(t: &mut Task, n: u64, with_pr: bool) {
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::parse(&format!("work/task-{n}")).unwrap());
+    if with_pr {
+        f.open_pr(PrUrl::parse(&format!("https://github.com/a/c/pull/{n}")).unwrap())
+            .unwrap();
+    }
+    t.apply_fields(f);
+    t.set_automerge(true);
 }
 
 #[tokio::test]
-async fn autodone_red_ci_bounces_to_in_progress() {
+async fn automerge_merged_is_noop_row_stays_review() {
+    // #1232: PR уже влит (вручную/раньше) — no-op: merge-API не зовётся,
+    // Done/close не ставятся, строка ждёт владельца в Review
+    // (инцидент #1151/#1162 — ложный bounce смерженной строки недопустим)
+    let mut t = task(3, Status::UserReview);
+    carrier(&mut t, 3, true);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0, "no-op не считается мержем");
+    assert_eq!(prs.merges.lock().unwrap().len(), 0, "merge-API не зовётся");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#3")),
+        "статус не трогается: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#3")));
+}
+
+#[tokio::test]
+async fn automerge_red_ci_bounces_to_in_progress() {
     let mut t = task(4, Status::UserReview);
-    t.set_autodone(true);
+    carrier(&mut t, 4, true);
     let (u, board, _, _) = usecase(
         vec![t],
         PrState::Open {
@@ -1140,18 +1167,19 @@ async fn autodone_red_ci_bounces_to_in_progress() {
         log.iter().any(|l| l.contains("status#4=InProgress")),
         "{log:?}"
     );
+    assert!(
+        log.iter().any(|l| l.contains("comment#4=")),
+        "bounce несёт коммент: {log:?}"
+    );
     assert!(!log.iter().any(|l| l.contains("close#4")));
 }
 
 #[tokio::test]
-async fn autodone_green_merges() {
+async fn automerge_green_merges_row_stays_review() {
+    // #1232: зелёный мержит, но строка остаётся в Review — Done всегда
+    // за владельцем
     let mut t = task(5, Status::UserReview);
-    t.set_autodone(true);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-5").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap())
-        .unwrap();
-    t.apply_fields(f);
+    carrier(&mut t, 5, true);
     let (u, board, _, prs) = usecase(
         vec![t],
         PrState::Open {
@@ -1159,23 +1187,40 @@ async fn autodone_green_merges() {
             ci_green: true,
         },
     );
-    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(prs.merges.lock().unwrap().len(), 1);
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#5=Done")));
+    assert_eq!(out.automerged, 1);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#5")),
+        "статус не трогается (остаётся Review): {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#5")));
 }
 
 #[tokio::test]
-async fn autodone_missing_pr_with_branch_bounces() {
+async fn automerge_conflict_bounces_to_in_progress() {
+    let mut t = task(8, Status::UserReview);
+    carrier(&mut t, 8, true);
+    let (u, board, _, _) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: false,
+            ci_green: true,
+        },
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.contains("status#8=InProgress")),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
-    t.set_autodone(true);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-6").unwrap());
-    t.apply_fields(f);
+    carrier(&mut t, 6, false);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
@@ -1186,17 +1231,36 @@ async fn autodone_missing_pr_with_branch_bounces() {
 }
 
 #[tokio::test]
-async fn autodone_docs_only_done() {
-    let mut t = task(7, Status::UserReview);
-    t.set_autodone(true);
-    let (u, board, _, _) = usecase(vec![t], PrState::Missing);
+async fn automerge_pending_is_quiet() {
+    // mergeable считается / чеки бегут — вердикт следующего тика,
+    // строку не трогаем (#1232: ложный конфликт/green недопустим)
+    let mut t = task(9, Status::UserReview);
+    carrier(&mut t, 9, true);
+    let (u, board, _, _) = usecase(vec![t], PrState::Pending);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#7=Done")));
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#9") || l.contains("comment#9")),
+        "pending тих: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_docs_only_is_not_probed() {
+    // docs-only (нет PR и ветки) — домен не решает Automerge: тик не
+    // прощупывает PR, строка ждёт владельца в Review (#1232)
+    let mut t = task(7, Status::UserReview);
+    t.set_automerge(true);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(prs.merges.lock().unwrap().len(), 0);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#7") || l.contains("comment#7")),
+        "docs-only строка не трогается: {log:?}"
+    );
 }
 
 #[tokio::test]

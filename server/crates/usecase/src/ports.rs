@@ -185,7 +185,7 @@ pub struct SessionInfo {
     pub total_tokens: u64,
 }
 
-/// Состояние PR проекта: источник вердиктов автодона.
+/// Состояние PR проекта: источник вердиктов автомержа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.

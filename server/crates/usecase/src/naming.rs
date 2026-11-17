@@ -121,6 +121,11 @@ pub fn priority_name(p: Priority) -> &'static str {
 /// create — одно знание; snapshot-колонка доски зовётся тем же словом).
 pub const F_PRIORITY: &str = "Приоритет";
 
+/// Единое имя поля автомержа (#1232): записывается create/task_edit.
+/// Legacy «Autodone» резолвится на границе носителя (fields.rs store,
+/// item_values) — сервер читает/пишет оба имени.
+pub const F_AUTOMERGE: &str = "Automerge";
+
 /// Парсинг приоритета; пустое/неизвестное → Empty (ниже low в очереди CUP).
 /// Один парсер на все носители (snapshot, fm, enrichment): английские и
 /// русские варианты опций, регистр и пробелы не влияют.
