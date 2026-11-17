@@ -678,6 +678,13 @@ impl TaskBoardRepo for GitHubHub {
                 )));
             }
         }
+        tracing::info!(
+            event = "board.set_status",
+            board,
+            number,
+            to = %uwuwu_usecase::status_name(status),
+            "Статус строки обновлён и подтверждён чтением"
+        );
         Ok(())
     }
 
@@ -1085,7 +1092,8 @@ mod tests {
         hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
         hub.write_through_status("B", 7, Status::InProgress);
         let snap = hub
-            .snap_cache.get("B", std::time::Instant::now())
+            .snap_cache
+            .get("B", std::time::Instant::now())
             .expect("write-through сохраняет ключ");
         assert_eq!(
             snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
@@ -1105,7 +1113,8 @@ mod tests {
     }
 
     #[test]
-    fn ttl_cache_hits_within_ttl_and_misses_after() {        // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
+    fn ttl_cache_hits_within_ttl_and_misses_after() {
+        // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
         // после, перезапись по ключу
         let ttl = std::time::Duration::from_secs(120);
         let cache: TtlCache<u64> = TtlCache::new(ttl);

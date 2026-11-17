@@ -216,11 +216,25 @@ impl TaskWriter for TaskWriteUseCase {
                 Some(current) => current,
             };
             if !uwuwu_domain::Status::can_transition(current, status) {
+                tracing::warn!(
+                    event = "board.guard_rejected",
+                    number,
+                    from = %naming::status_name(current),
+                    to = %naming::status_name(status),
+                    "Гард канона: переход запрещён (fresh row_status)"
+                );
                 return Err(UsecaseError::Board(format!(
                     "переход {:?} → {:?} вне канона конвейера",
                     current, status
                 )));
             }
+            tracing::info!(
+                event = "board.status_transition",
+                number,
+                from = %naming::status_name(current),
+                to = %naming::status_name(status),
+                "Гард канона пропустил переход"
+            );
             self.board.set_status(&board, number, status).await?;
         }
         if let Some(title) = &patch.title {
