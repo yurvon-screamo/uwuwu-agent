@@ -222,6 +222,13 @@ impl AgentSessionGateway for OpencodeClient {
             .map(|list| {
                 list.iter()
                     .filter_map(|s| {
+                        // busy = ход в полёте (Started): time.busy пишется на
+                        // старте хода и не очищается, time.idle — на idle;
+                        // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231).
+                        // При апгрейде opencode семантику перепроверить.
+                        let busy_ms = s["time"]["busy"].as_u64();
+                        let idle_ms = s["time"]["idle"].as_u64();
+                        let busy = busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i));
                         Some(SessionInfo {
                             id: s["id"].as_str()?.to_string(),
                             agent: s["agent"].as_str().unwrap_or_default().to_string(),
@@ -229,6 +236,7 @@ impl AgentSessionGateway for OpencodeClient {
                             outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
                             total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
                                 + s["tokens"]["output"].as_u64().unwrap_or_default(),
+                            busy,
                         })
                     })
                     .collect()

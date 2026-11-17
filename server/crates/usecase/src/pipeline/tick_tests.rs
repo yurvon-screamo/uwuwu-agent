@@ -143,6 +143,11 @@ struct FakeSessions {
     specs: Mutex<Vec<SessionSpec>>,
     /// живые сессии исполнителя: (agent-имя, outcome; пустой outcome = живая)
     live: Mutex<Vec<(String, String)>>,
+    /// Сессии с ходом в полёте (busy по union-скану, #1231).
+    busy_ids: Mutex<Vec<String>>,
+    /// Синтетические записи union-скана (регрессы busy-учёта: сессии 2+
+    /// хода, непайплайн-агенты) — попадают в список как есть.
+    extra: Mutex<Vec<crate::ports::SessionInfo>>,
 }
 
 impl FakeSessions {
@@ -156,6 +161,8 @@ impl FakeSessions {
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
+            busy_ids: Mutex::default(),
+            extra: Mutex::default(),
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -214,19 +221,25 @@ impl AgentSessionGateway for FakeSessions {
                 "list недоступен (мок)".into(),
             ));
         }
-        // spawned = живые сессии (outcome пуст — финала нет);
-        // live = синтетические роли для alive-гвардов тестов аналитики (#1135)
+        // spawned = созданные тиком сессии (idle между ходами — кап не
+        // держат, #1244); live = синтетические роли для alive-гвардов
+        // тестов аналитики (#1135); extra = записи union-скана (#1231).
+        // Мёртвых в списке нет — реальный opencode удалённые не отдаёт.
+        let dead = self.dead_sessions.lock().unwrap().clone();
+        let busy = self.busy_ids.lock().unwrap().clone();
         let mut out: Vec<crate::ports::SessionInfo> = self
             .spawned
             .lock()
             .unwrap()
             .iter()
+            .filter(|id| !dead.contains(*id))
             .map(|id| crate::ports::SessionInfo {
                 id: id.clone(),
                 agent: String::new(),
                 updated_ms: 0,
                 outcome: String::new(),
                 total_tokens: 0,
+                busy: busy.contains(id),
             })
             .collect();
         for (agent, outcome) in self.live.lock().unwrap().iter() {
@@ -236,8 +249,10 @@ impl AgentSessionGateway for FakeSessions {
                 updated_ms: 0,
                 outcome: outcome.clone(),
                 total_tokens: 0,
+                busy: false,
             });
         }
+        out.extend(self.extra.lock().unwrap().iter().cloned());
         Ok(out)
     }
     async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
@@ -552,6 +567,8 @@ fn peak_usecase(
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -1003,6 +1020,8 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -1012,6 +1031,62 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
     );
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
     assert_eq!(out.spawns_done, 0, "fallback держит консервативный кап");
+    assert_eq!(out.held_cup, 1);
+}
+
+#[tokio::test]
+async fn cup_counts_second_turn_sessions() {
+    // Регресс #1231 (12 активных при cap=7): outcome — атрибут последнего
+    // завершённого хода и при новом ходе не очищается. Сессия стадии на
+    // 2+ ходе (busy, финал уже был) раньше выпадала из alive-фильтра
+    // outcome.is_empty() и кап не держала — утренний штурм будильников
+    // делал невидимыми почти все тратящие сессии.
+    let mut working = task(150, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_2nd_150").unwrap(),
+    );
+    working.apply_fields(f);
+    let candidate = task(151, Status::InProgress);
+    let (u, _, sessions, _) = usecase(vec![working, candidate], PrState::Missing);
+    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        id: "ses_2nd_150".into(),
+        agent: "developer".into(),
+        updated_ms: 0,
+        outcome: "succeeded".into(),
+        total_tokens: 5000,
+        busy: true,
+    });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "busy-сессия 2+ хода держит кап — кандидат ждёт"
+    );
+    assert_eq!(out.held_cup, 1);
+    assert_eq!(out.sessions_busy, 1, "наблюдаемость: busy в исходе тика");
+}
+
+#[tokio::test]
+async fn cup_busy_counts_non_pipeline_sessions() {
+    // Единый учёт (#1231): busy-сессия без строки доски (бот, крон-ран,
+    // сайдкар, ручная сессия владельца) тратит тот же LLM-бюджет —
+    // union-скан считает ВСЕ ходы исполнителя, не только stage-строки.
+    let candidate = task(160, Status::InProgress);
+    let (u, _, sessions, _) = usecase(vec![candidate], PrState::Missing);
+    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        id: "ses_bot".into(),
+        agent: String::new(),
+        updated_ms: 0,
+        outcome: String::new(),
+        total_tokens: 9000,
+        busy: true,
+    });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "непайплайн busy-сессия держит единый кап"
+    );
     assert_eq!(out.held_cup, 1);
 }
 
@@ -1288,6 +1363,8 @@ async fn undelivered_comment_is_not_marked_seen() {
             idle_reply: false,
             specs: Mutex::default(),
             live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -1340,6 +1417,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -1402,6 +1481,8 @@ async fn multi_comment_tail_delivered_together() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1516,6 +1597,8 @@ async fn busy_session_not_pinged_early() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         ..Default::default()
     });
     let u = TickUseCase {

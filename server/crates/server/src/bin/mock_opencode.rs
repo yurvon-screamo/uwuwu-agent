@@ -40,6 +40,10 @@ struct MockSession {
     tokens_out: u64,
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
+    /// time.busy/time.idle API (Started/idle): busy ⟺ busy_ms > idle_ms
+    /// (нулевое значение = нет события) — семантика CUP-учёта (#1231).
+    busy_ms: u64,
+    idle_ms: u64,
     dead: bool,
     /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
     /// читает хвост как ответ сессии.
@@ -306,6 +310,8 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
+        busy_ms: 0,
+        idle_ms: 0,
         dead: mode == "dead",
         reply: None,
     };
@@ -321,7 +327,13 @@ async fn create_session(
 
 async fn list_sessions(store: Arc<Store>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    let list: Vec<Value> = sessions.values().map(session_json).collect();
+    // мёртвые (удалённые) в списке не числятся — семантика реального
+    // опенкода, на неё опирается busy-учёт CUP (#1231)
+    let list: Vec<Value> = sessions
+        .values()
+        .filter(|s| !s.dead)
+        .map(session_json)
+        .collect();
     (StatusCode::OK, Json(Value::Array(list)))
 }
 
@@ -330,7 +342,12 @@ fn session_json(s: &MockSession) -> Value {
         "id": s.id,
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
-        "time": { "created": s.updated_ms, "updated": s.updated_ms },
+        "time": {
+            "created": s.updated_ms,
+            "updated": s.updated_ms,
+            "busy": if s.busy_ms == 0 { Value::Null } else { json!(s.busy_ms) },
+            "idle": if s.idle_ms == 0 { Value::Null } else { json!(s.idle_ms) },
+        },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
     })
@@ -371,6 +388,7 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
         // реплай бота готов сразу (storm — исключение: прерывание без ответа)
         if mode != "storm" {
             let tail = text
@@ -389,6 +407,7 @@ async fn prompt(
             let mut sessions = store.sessions.lock().expect("store");
             if let Some(s) = sessions.get_mut(&id) {
                 s.outcome = "interrupted".into();
+                s.idle_ms = now_ms(); // прерванный ход завершён (CUP-учёт)
             }
             tracing::warn!(event = "mock.storm_interrupted", %id, "шторм-сценарий");
         }

@@ -27,6 +27,7 @@ impl FakeGw {
                         updated_ms: 0,
                         outcome: String::new(),
                         total_tokens: 0,
+                        busy: false,
                     })
                     .collect(),
             ),
