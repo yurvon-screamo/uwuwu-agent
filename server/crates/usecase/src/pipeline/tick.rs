@@ -118,6 +118,23 @@ struct RowContext<'a> {
 }
 
 impl TickUseCase {
+    /// Гард сработал: в env строки живёт сессия той же семьи (second
+    /// source #1163). Скан недоступен — не держит (never worse).
+    fn spawn_held_by_live(
+        &self,
+        ctx: &RowContext<'_>,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        now_ms: u64,
+    ) -> bool {
+        let Some(list) = ctx.sightings else {
+            return false;
+        };
+        let env_repo = format!("{}/{}", board.env_root, task.number());
+        spawn_guard(list, &env_repo, slot, now_ms) == SpawnGuard::Hold
+    }
+
     pub async fn run(&self, plan: &TickPlan) -> UsecaseResult<TickOutcome> {
         let mut out = TickOutcome::default();
         // CUP-кап глобальный по проектам (канон #1133): активные строки
@@ -402,18 +419,15 @@ impl TickUseCase {
                     // источник поверх ячейки — сироты спавна, клеймы в
                     // гонке с тиком, невидимые ячейки не дублируют раунд.
                     // Strict-скан недоступен → гард пропущен (never worse).
-                    if let Some(list) = ctx.sightings {
-                        let env_repo = format!("{}/{}", board.env_root, task.number());
-                        if spawn_guard(list, &env_repo, slot, now_ms) == SpawnGuard::Hold {
-                            out.held_live += 1;
-                            tracing::info!(
-                                event = "spawn.held_live_session",
-                                number = task.number(),
-                                slot = naming::slot_key(slot),
-                                "Spawn held: живая сессия в env строки (second source #1163)"
-                            );
-                            continue;
-                        }
+                    if self.spawn_held_by_live(ctx, board, task, slot, now_ms) {
+                        out.held_live += 1;
+                        tracing::info!(
+                            event = "spawn.held_live_session",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Spawn held: живая сессия в env строки (second source #1163)"
+                        );
+                        continue;
                     }
                     let gated = gate(task, &action, plan.policy, *active_now, now);
                     match gated {
