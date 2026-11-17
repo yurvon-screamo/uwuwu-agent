@@ -337,6 +337,14 @@ impl Task {
         Ok(())
     }
 
+    /// Запись известного значения носителя мимо канона: write-through
+    /// кэша доски после успешной мутации (#1235). Канон-гард лежит в
+    /// usecase edit(); здесь значение только фиксируется — носитель
+    /// уже принял его.
+    pub fn override_status(&mut self, to: Status) {
+        self.status = to;
+    }
+
     pub fn number(&self) -> u64 {
         self.number
     }

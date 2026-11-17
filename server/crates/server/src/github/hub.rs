@@ -98,9 +98,37 @@ impl<T> TtlCache<T> {
             .insert(key.to_string(), (now, arc.clone()));
         arc
     }
+
+    /// Точечный сброс ключа: мутация доски — read-your-writes (#1235).
+    fn invalidate(&self, key: &str) {
+        self.cells.write().expect("ttl cache lock").remove(key);
+    }
+
+    /// Сброс всех ключей: тайтл строки живёт в снапшотах всех досок.
+    fn invalidate_all(&self) {
+        self.cells.write().expect("ttl cache lock").clear();
+    }
 }
 
-#[derive(Default)]
+/// Исход verify-after-write (#1235, семья #1213).
+enum VerifyOutcome {
+    /// Чтение подтвердило запись.
+    Ok,
+    /// Rate limit: ретраи не продолжаем — мутация принята GitHub,
+    /// write-through сохранён (окно возможно-ложного кэша ограничено TTL).
+    SkippedRateLimited,
+    /// Три чтения не подтвердили запись — громкий отказ + откат write-through.
+    Mismatch,
+}
+
+/// Rate-limit маркеры в текстах отказа транспорта: gherr classify
+/// («GitHub rate limit …») и бэкофф-блок gql («RATE_LIMITED бэкофф …»).
+fn is_rate_limited(e: &UsecaseError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("rate limit") || msg.contains("rate_limit")
+}
+
+#[derive(Default, Clone)]
 struct BoardMeta {
     project_id: String,
     status_field_id: String,
@@ -378,6 +406,56 @@ impl GitHubHub {
         Ok(String::new())
     }
 
+    /// Сброс снимка доски: мутация могла изменить строки/мету (#1235).
+    fn invalidate_snapshot(&self, board: &str) {
+        self.snap_cache.invalidate(board);
+    }
+
+    /// Write-through известного статуса в снапшот (#1235): клон с
+    /// обновлённой строкой под тем же ключом — read-лаг Projects v2
+    /// минутного масштаба не отдаёт собственную запись старой.
+    fn write_through_status(&self, board: &str, number: u64, status: Status) {
+        let now = std::time::Instant::now();
+        let Some(hit) = self.snap_cache.get(board, now) else {
+            return;
+        };
+        let (mut rows, meta) = hit.as_ref().clone();
+        for task in rows.iter_mut().filter(|t| t.number() == number) {
+            task.override_status(status);
+        }
+        self.snap_cache.put(board, (rows, meta), now);
+    }
+
+    /// Write-through статусного кэша строки (task_get читает отсюда).
+    fn write_through_status_cache(&self, number: u64, status: Status) {
+        let now = std::time::Instant::now();
+        self.status_cache.put(
+            &number.to_string(),
+            uwuwu_usecase::status_name(status).to_string(),
+            now,
+        );
+    }
+
+    /// Контрольное чтение после мутации статуса (семья #1213): до 3
+    /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
+    /// (мутация принята GitHub); сетевой сбой и рассогласование —
+    /// полный цикл, дальше громкий отказ.
+    async fn verify_status(&self, number: u64, expected: Status) -> VerifyOutcome {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            match self.board_status_fetch(number).await {
+                Ok(fetched) if uwuwu_usecase::parse_status(&fetched) == expected => {
+                    return VerifyOutcome::Ok;
+                }
+                Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
+                _ => {}
+            }
+        }
+        VerifyOutcome::Mismatch
+    }
+
     /// Комменты задачи: свежий хвост (direction=desc, последние 100),
     /// возврат по возрастанию. GitHub без direction отдаёт старейшие —
     /// wakeup был слеп к свежим комментам при длинных тредах (раунд 3).
@@ -575,6 +653,31 @@ impl TaskBoardRepo for GitHubHub {
             json!({ "p": project_id, "i": item, "f": status_field_id, "o": option }),
         )
         .await?;
+        // read-your-writes (#1235): собственная запись обслуживается кэшем,
+        // а не refetch'ем — read-лаг Projects v2 минутного масштаба не виден.
+        self.write_through_status(board, number, status);
+        self.write_through_status_cache(number, status);
+        // verify-after-write (семья #1213): мутация либо подтверждена
+        // чтением, либо громкая ошибка с откатом write-through.
+        match self.verify_status(number, status).await {
+            VerifyOutcome::Ok => {}
+            VerifyOutcome::SkippedRateLimited => tracing::warn!(
+                event = "board.verify_skipped",
+                number,
+                to = %uwuwu_usecase::status_name(status),
+                "verify пропущен (rate limit): мутация принята GitHub, write-through сохранён"
+            ),
+            VerifyOutcome::Mismatch => {
+                // откат write-through: не держим возможно-ложное значение
+                self.invalidate_snapshot(board);
+                self.status_cache.invalidate(&number.to_string());
+                return Err(UsecaseError::Board(format!(
+                    "статус #{number}: запись «{}» не подтвердилась чтением — \
+                     GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
+                    uwuwu_usecase::status_name(status)
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -595,7 +698,9 @@ impl TaskBoardRepo for GitHubHub {
         };
         self.fields
             .store(number, &[(name, Some(session.to_string()))])
-            .await
+            .await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
     }
 
     async fn set_branch(
@@ -612,7 +717,9 @@ impl TaskBoardRepo for GitHubHub {
                     Some(branch.as_str().to_string()),
                 )],
             )
-            .await
+            .await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
     }
 
     async fn clear_session(
@@ -630,7 +737,9 @@ impl TaskBoardRepo for GitHubHub {
             }
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
         };
-        self.fields.store(number, &[(name, None)]).await
+        self.fields.store(number, &[(name, None)]).await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
     }
 
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
@@ -737,6 +846,8 @@ impl TaskBoardRepo for GitHubHub {
                 "rename #{number}: HTTP {status}"
             )));
         }
+        // тайтл живёт в снапшотах всех досок — сброс целиком (#1235)
+        self.snap_cache.invalidate_all();
         Ok(())
     }
 
@@ -834,6 +945,7 @@ impl GitHubHub {
             )
             .await?;
         }
+        self.invalidate_snapshot(board);
         Ok(())
     }
 }
@@ -935,8 +1047,55 @@ mod tests {
     }
 
     #[test]
-    fn ttl_cache_hits_within_ttl_and_misses_after() {
-        // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
+    fn ttl_cache_invalidate_drops_key_only() {
+        let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
+        let now = std::time::Instant::now();
+        cache.put("a", 1, now);
+        cache.put("b", 2, now);
+        cache.invalidate("a");
+        assert!(cache.get("a", now).is_none(), "сброшенный ключ — мимо");
+        assert_eq!(cache.get("b", now).as_deref(), Some(&2), "сосед жив");
+    }
+
+    #[test]
+    fn ttl_cache_invalidate_all_clears_every_key() {
+        let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
+        let now = std::time::Instant::now();
+        cache.put("a", 1, now);
+        cache.put("b", 2, now);
+        cache.invalidate_all();
+        assert!(cache.get("a", now).is_none() && cache.get("b", now).is_none());
+    }
+
+    #[test]
+    fn write_through_status_updates_cached_row() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        let now = std::time::Instant::now();
+        let rows = vec![Task::new(7, "строка".into(), Status::Analys)];
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.write_through_status("B", 7, Status::InProgress);
+        let snap = hub
+            .snap_cache.get("B", std::time::Instant::now())
+            .expect("write-through сохраняет ключ");
+        assert_eq!(
+            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
+            Status::InProgress,
+            "собственная запись видна из кэша сразу (read-your-writes #1235)"
+        );
+    }
+
+    #[test]
+    fn write_through_status_without_snapshot_is_noop() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.write_through_status("B", 7, Status::InProgress);
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "нет снапшота — write-through не создаёт пустой записи"
+        );
+    }
+
+    #[test]
+    fn ttl_cache_hits_within_ttl_and_misses_after() {        // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
         // после, перезапись по ключу
         let ttl = std::time::Duration::from_secs(120);
         let cache: TtlCache<u64> = TtlCache::new(ttl);
