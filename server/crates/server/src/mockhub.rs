@@ -461,7 +461,13 @@ impl IssueFieldStore for MemoryHub {
                     }
                     ("PR", Some(v)) => {
                         if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
-                            let _ = f.open_pr(p);
+                            // зеркально мапперу носителя (#1155): ветка есть —
+                            // кодовый PullRequest, нет — безветочный артефакт
+                            if f.branch().is_some() {
+                                let _ = f.open_pr(p);
+                            } else {
+                                f.set_artifact(p);
+                            }
                         }
                     }
                     _ => {}

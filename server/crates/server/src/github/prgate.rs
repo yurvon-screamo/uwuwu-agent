@@ -11,12 +11,21 @@ pub struct GhPrGateway {
 }
 
 /// owner/repo/number из URL PR (github.com/owner/repo/pull/N).
+/// Строгая форма PR-URL: literal github.com/{owner}/{repo}/pull/{number}.
+/// Остальные http(s)-URL (issues/blob/чужой-вендор) — None: probe/merge
+/// не пробуют чужие сущности по числовым сегментам пути (#1155).
 pub fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     let rest = url.trim().strip_prefix("https://github.com/")?;
     let mut parts = rest.trim_end_matches('/').split('/');
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.to_string();
-    let number = parts.find_map(|p| p.parse().ok())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some((owner, repo, number))
 }
 
@@ -264,5 +273,32 @@ mod tests {
         assert_eq!(classify_check_runs(&runs), None);
         let queued = vec![json!({ "status": "queued", "conclusion": null })];
         assert_eq!(classify_check_runs(&queued), None);
+    fn rejects_non_pull_urls() {
+        // #1155: артефакт/чужие сущности не пробуются как PR
+        assert_eq!(
+            parse_pr_url("https://github.com/a/b/issues/52"),
+            None,
+            "issue-URL — не PR"
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/a/b/blob/main/docs/x.md"),
+            None,
+            "вики-артефакт"
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/a/b/blob/123/x"),
+            None,
+            "число в пути без pull больше не парсится"
+        );
+        assert_eq!(
+            parse_pr_url("https://git.true-wash.com/a/b/pulls/9"),
+            None,
+            "чужой вендор"
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/a/b/pull/293/files"),
+            None,
+            "хвост за номером — не canonical"
+        );
     }
 }

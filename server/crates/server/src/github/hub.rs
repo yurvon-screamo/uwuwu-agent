@@ -701,8 +701,11 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         .get(crate::github::fields::F_PRIORITY)
         .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
-    // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
-    // отбрасываем (домен PullRequest требует ветку)
+    // VCS-жизненный цикл явный; пара (Branch, PR) — кодовый цикл с веткой.
+    // Безветочная PR-ячейка — Artifact (канон ADR-021: ячейка несёт URL
+    // и без ветки кода — вики/issue/чужой-вендор PR; #1155 — рендер,
+    // не отброс). Кодовый инвариант «PR требует ветку» живёт в мутаторах
+    // домена (open_pr), не в загрузчике носителя.
     let vcs = match (
         raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
@@ -710,10 +713,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     ) {
         (Some(branch), Some(url)) => Vcs::PullRequest { branch, url },
         (Some(branch), None) => Vcs::Branch(branch),
-        (None, Some(_)) => {
-            tracing::warn!(event = "hub.pr_without_branch", "PR без ветки — отброшен");
-            Vcs::Local
-        }
+        (None, Some(url)) => Vcs::Artifact { url },
         (None, None) => Vcs::Local,
     };
     TaskFields::new(assignments, vcs, priority)
