@@ -3272,6 +3272,61 @@ async fn dead_respawn_held_when_orphan_in_env() {
     assert_eq!(out.wakeups_deferred, 0);
 }
 
+#[tokio::test]
+async fn strict_scan_down_plain_spawn_not_held() {
+    // never-worse (#1163): strict-скан недоступен (исполнитель за релеем
+    // лёг) — гард пропускается, спавн идёт прежним путём, hold не ставится
+    let mut sessions = FakeSessions::new();
+    sessions.list_fails = true;
+    let (u, _, _, _) = usecase_with_sessions(
+        vec![task(61, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "list недоступен — гард не держит (never worse)"
+    );
+    assert_eq!(out.held_live, 0);
+}
+
+#[tokio::test]
+async fn strict_scan_down_dead_respawn_not_held() {
+    // never-worse на respawn-пути: скан недоступен — second source и
+    // env-гард молчат (unwrap_or пустого списка), мёртвая сессия
+    // респавнится как раньше
+    let mut t = task(62, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_62").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((62, Status::InProgress));
+    let mut sessions = FakeSessions::new();
+    sessions.list_fails = true;
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_62".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "скан недоступен — респавн не держится (never worse)"
+    );
+    assert_eq!(out.held_live, 0);
+}
+
 #[test]
 fn env_repo_dir_formula_is_pinned() {
     // ревью Low: формула env-директории одна — спавн и гард строят путь
