@@ -201,6 +201,22 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn set_branch(
+        &self,
+        _board: &str,
+        number: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            state
+                .fields
+                .entry(number)
+                .or_default()
+                .set_branch(branch.clone());
+            Ok(())
+        })
+    }
+
     async fn clear_session(&self, _board: &str, number: u64, slot: Slot) -> UsecaseResult<()> {
         self.with_state(|state| {
             state.fields.entry(number).or_default().clear_session(slot);
@@ -236,11 +252,16 @@ impl TaskBoardRepo for MemoryHub {
     async fn read_issue(&self, _board: &str, number: u64) -> UsecaseResult<IssueView> {
         self.with_state(|state| {
             self.ensure_seed(state);
-            let task = state
+            let mut task = state
                 .tasks
                 .get(&number)
                 .cloned()
                 .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
+            // поля (сессии/ветка/PR) — часть строки: рид синхронен
+            // read_board (реальный hub несёт поля inline в GET issue)
+            if let Some(f) = state.fields.get(&number) {
+                task.apply_fields(f.clone());
+            }
             let body = state.bodies.get(&number).cloned().unwrap_or_default();
             let comments = state.comments.get(&number).cloned().unwrap_or_default();
             Ok(IssueView {

@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
+use uwuwu_domain::{AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -24,6 +24,10 @@ pub trait TaskBoardRepo: Send + Sync {
         slot: Slot,
         session: &str,
     ) -> UsecaseResult<()>;
+
+    /// Заявка ветки задачи (фабрика при спавне: task-env создал env,
+    /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
+    async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
 
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
     /// ревью/тест-сессии не переживают смену стадии — канон сессий).
