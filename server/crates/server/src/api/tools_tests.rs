@@ -602,8 +602,7 @@ fn descriptors_expose_automerge() {
             .unwrap()
             .iter()
             .find(|t| t["name"].as_str() == Some(name))
-            .unwrap_or_else(|| panic!("{name} на поверхности"))
-            ["inputSchema"]["properties"]
+            .unwrap_or_else(|| panic!("{name} на поверхности"))["inputSchema"]["properties"]
             .clone()
     };
     let create = find("task_create");
