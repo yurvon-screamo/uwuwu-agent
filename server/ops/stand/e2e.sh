@@ -235,7 +235,7 @@ d = json.load(sys.stdin)
 row = d.get('data') or d
 print(row.get('id',''))")
 [ -n "$ORPHAN_ID" ] || fail "мок не создал сироту-сессию: [$ORPHAN_RESP]"
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_MODE=live PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
   "$BIN_DIR/uwuwu-server" >"$LOG_SRV_LIVE" 2>&1 &
