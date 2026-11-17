@@ -716,11 +716,15 @@ impl TickUseCase {
             return false;
         }
         let Some(victim) = ctx.preempts.take(task) else {
+            // Причины пустого пула для разбора: fallback-режим (скана нет
+            // — пул структурно пуст), в скане нет busy low/empty-строк,
+            // либо ранги не строго ниже (жертвы-low заняты равным/
+            // высшим кандидатом или уже изъяты этим тиком).
             tracing::info!(
                 event = "cup.preempt.no_victim",
                 number = task.number(),
                 active = *active_now,
-                "CUP: жертвы нет (слот держат high/medium или не-строка; cap — policy.cup)"
+                "CUP: жертвы в пуле нет — слот не отдаётся"
             );
             return false;
         };
