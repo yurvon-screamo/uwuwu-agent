@@ -139,9 +139,15 @@ pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
 pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
 rm -f "$STATE"
-MOCK2_PORT=8098
-LOG_MOCK2=/tmp/uwuwu-stand-mock2.log
-LOG_SRV_MULTI=/tmp/uwuwu-stand-server-multi.log
+MOCK2_PORT=$((PORT_MOCK + 1))   # сессионная изоляция: константа 8098
+                                # сталкивала параллельные стенды на фазе 3
+LOG_MOCK2="$RUN_DIR/mock2.log"
+LOG_SRV_MULTI="$RUN_DIR/server-multi.log"
+CONFIG_MULTI="$RUN_DIR/config.memory-multi.toml"
+# портируемый конфиг: статические порты 8099/8098 → прогонные
+sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
+    -e "s|http://127.0.0.1:8098|http://127.0.0.1:$MOCK2_PORT|" \
+    ops/config.memory-multi.toml > "$CONFIG_MULTI"
 # мок-1 (дефолтный executor): agent-режим — ведёт uwuwu-цикл до Review
 MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
   MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 MOCK_VERDICTS="result:approve" \
@@ -155,7 +161,7 @@ MOCK_MODE=dead MOCK_PORT=$MOCK2_PORT \
   "$BIN_DIR/mock_opencode" >"$LOG_MOCK2" 2>&1 &
 MOCK2_PID=$!
 sleep 1
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
+UWUWU_SERVER_CONFIG=$CONFIG_MULTI UWUWU_SERVER_MODE=live PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
   RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_MULTI" 2>&1 &
