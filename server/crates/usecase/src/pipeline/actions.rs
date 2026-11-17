@@ -238,7 +238,15 @@ impl TickUseCase {
             // застынет ниже коммента» заменена честным idle-критерием)
             let idle = !fresh && self.session_idle(board, session).await;
             if fresh || idle {
-                let body = tail
+                let foreign = self.slice_self_echo(task.number(), &tail, activity);
+                if foreign.is_empty() {
+                    // Хвост целиком свой (#1204): тихо двигаем бейзлайн —
+                    // следующий чужой коммент доставится без накопленного эха
+                    self.state
+                        .set_last_comment_id(&board.board, task.number(), &last.id);
+                    return Ok(WakeAct::None);
+                }
+                let body = foreign
                     .iter()
                     .map(|c| c.body.as_str())
                     .collect::<Vec<_>>()
@@ -268,6 +276,38 @@ impl TickUseCase {
             // seen НЕ пишем, доставка повторится на тике после ответа
             Ok(WakeAct::None)
         }
+    }
+
+    /// Own-срез self-эха (#1204): коммент хвоста — «свой» для держащей
+    /// сессии, если он из реестра серверных постов (MCP task_comment) и не
+    /// свежее её последней активности — ход после поста двигает активность
+    /// (инвариант own-среза ADR-050). Чужие агентские (вердикты других
+    /// стадий) и юзерские будят. Активность недоступна — без среза:
+    /// лишняя эхо-будка лучше потерянного коммента (fail-open, семантика TS).
+    fn slice_self_echo<'a>(
+        &self,
+        number: u64,
+        tail: &'a [CommentRef],
+        activity: Option<u64>,
+    ) -> Vec<&'a CommentRef> {
+        let Some(active_at) = activity else {
+            return tail.iter().collect();
+        };
+        let foreign: Vec<&CommentRef> = tail
+            .iter()
+            .filter(|c| !(self.state.own_comment(&c.id) && c.created_ms <= active_at))
+            .collect();
+        let own = tail.len() - foreign.len();
+        if own > 0 {
+            tracing::info!(
+                event = "wakeup.self_echo_sliced",
+                number,
+                own,
+                foreign = foreign.len(),
+                "Self-echo sliced: own comments do not wake the holder"
+            );
+        }
+        foreign
     }
 
     /// Ход сессии завершён: последнее сообщение — финальный ассистентский

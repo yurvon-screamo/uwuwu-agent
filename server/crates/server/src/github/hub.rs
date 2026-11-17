@@ -633,8 +633,8 @@ impl TaskBoardRepo for GitHubHub {
         self.fields.store(number, &[(name, None)]).await
     }
 
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
-        let (status, _) = self
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
+        let (status, resp) = self
             .rest(
                 reqwest::Method::POST,
                 &format!("/repos/{}/issues/{number}/comments", self.repo),
@@ -646,7 +646,9 @@ impl TaskBoardRepo for GitHubHub {
                 "comment #{number}: HTTP {status}"
             )));
         }
-        Ok(())
+        // node_id — та же идентичность, что в журнале latest_comments;
+        // пусто (нестандартный ответ) — маркировка невозможна, fail-open.
+        Ok(resp["node_id"].as_str().unwrap_or_default().to_string())
     }
 
     async fn close_issue(&self, number: u64) -> UsecaseResult<()> {
