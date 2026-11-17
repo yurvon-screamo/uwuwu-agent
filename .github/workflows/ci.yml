@@ -11,13 +11,18 @@
 # Агрегатор «CI» держит required-контекст branch protection (гейт
 # матчит имя посимвольно) и принимает success|skipped, краснея от
 # failure|cancelled.
+# Autodeploy (#1211): deploy-джоба гоняется ТОЛЬКО на push-ране мастера при
+# изменении входов образа (server_deploy из changes). Гейт деплоя — полный
+# Rust-контур (fmt + rust); в needs агрегатора «CI» deploy НЕ входит —
+# деплой пост-мержный сайд-эффект, required-контекст мержей не трогает.
 name: CI
 
+# ВРЕМЕННО ОТКЛЮЧЕН (17.11, биллинг Actions исчерпан — PR-ивенты не создают
+# ранов, #1238/#1239): авто-триггеры сняты, запуск только вручную
+# (workflow_dispatch). Вернуть on: pull_request + push при восстановлении
+# биллинга. Локальная верификация обязательна: cargo fmt/clippy/test + qlty.
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,12 +35,17 @@ jobs:
     outputs:
       rust: ${{ steps.areas.outputs.rust }}
       plugins: ${{ steps.areas.outputs.plugins }}
+      server_deploy: ${{ steps.areas.outputs.server_deploy }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Diff → области
         id: areas
+        env:
+          # SHA мастер-коммита ДО пуша (для deploy-диффа); пустой/нулевой
+          # SHA (форс-пуш) — гард ниже падает на HEAD^.
+          PUSH_BASE: ${{ github.event.before }}
         run: |
           run_all=0
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
@@ -47,19 +57,36 @@ jobs:
           if [ "$run_all" = 1 ]; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "plugins=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            files="$(git diff --name-only origin/master...HEAD)"
+            rust=false
+            plugins=false
+            while IFS= read -r f; do
+              case "$f" in
+                server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
+                plugins/*|lib/*) plugins=true ;;
+              esac
+            done <<< "$files"
+            echo "rust=$rust" >> "$GITHUB_OUTPUT"
+            echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
           fi
-          files="$(git diff --name-only origin/master...HEAD)"
-          rust=false
-          plugins=false
-          while IFS= read -r f; do
-            case "$f" in
-              server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
-              plugins/*|lib/*) plugins=true ;;
-            esac
-          done <<< "$files"
-          echo "rust=$rust" >> "$GITHUB_OUTPUT"
-          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
+          # server_deploy (#1211): только на push-ране мастера, дифф пуша
+          # (PUSH_BASE..HEAD — устойчив к merge-commit/squash/rebase и
+          # мульти-коммитным пушам; форс-пуш — фоллбек HEAD^) по входам
+          # образа server/Dockerfile. На PR всегда false — деплой не на PR.
+          server_deploy=false
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            base="$PUSH_BASE"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base" 2>/dev/null; then
+              base="HEAD^"
+            fi
+            while IFS= read -r f; do
+              case "$f" in
+                server/crates/*|server/Cargo.toml|server/Cargo.lock|server/Dockerfile|server/config.example.toml) server_deploy=true ;;
+              esac
+            done <<< "$(git diff --name-only "$base..HEAD")"
+          fi
+          echo "server_deploy=$server_deploy" >> "$GITHUB_OUTPUT"
 
   fmt:
     name: rust fmt
@@ -153,6 +180,32 @@ jobs:
       # строка, скоуп --upstream-прогона не отменяет.
       - name: qlty check
         run: $HOME/.qlty/bin/qlty check --no-fix --no-progress --upstream origin/master
+
+  # Autodeploy uwuwu-server (#1211): только на push-ране мастера и только
+  # при изменении входов образа (server_deploy из changes). Гейт — полный
+  # Rust-контур (fmt + rust); упавший need скипает джобу каскадом needs.
+  # В needs агрегатора «CI» не входит — required-контекст мержей не трогает:
+  # красный деплой ловится красным мастер-раном + email (ADR-097).
+  deploy:
+    name: deploy (Railway)
+    needs: [changes, fmt, rust]
+    if: github.event_name == 'push' && needs.changes.outputs.server_deploy == 'true'
+    runs-on: ubuntu-latest
+    # холодный билд Railway ~17-20 мин (#1162) + запас
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      # Пин версии = пин локального CLI владельца (Railway CLI Operations)
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli@5.74.0
+      # Без .railway.json в репо — явные -p/-e/-s обязательны (Railway CLI
+      # Operations: «вне linked-каталога всегда передавай -p, -e, -s»).
+      # Без -d: джоба ждёт результат билда — красная джоба = честный
+      # упавший деплой, а не зелёная с синхронным аплоадом.
+      - name: railway up --ci (server)
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: cd server && railway up --ci --project uwuwu --environment production --service uwuwu-server
 
   # Агрегатор: держит required-контекст «CI» (branch protection матчит
   # имя) — краснеет от любого упавшего входа, пропускает скипнутые

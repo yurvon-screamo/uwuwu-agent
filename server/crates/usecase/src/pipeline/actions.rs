@@ -5,6 +5,7 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
+use crate::router::Gateway;
 use uwuwu_domain::{
     gate, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop, SpawnPolicy,
     Status, Task,
@@ -33,10 +34,10 @@ impl TickUseCase {
         task: &Task,
         slot: Slot,
     ) -> UsecaseResult<String> {
+        let sessions = self.sessions.project(&board.project);
         let env_repo = format!("{}/{}", board.env_root, task.number());
         let title = format!("#{} {}", task.number(), task.title());
-        let bootstrap = self
-            .sessions
+        let bootstrap = sessions
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
@@ -49,29 +50,28 @@ impl TickUseCase {
             .await?;
         // любой сбой после создания bootstrap гасит его (нет утечки сессий)
         let result = self
-            .spawn_stage_inner(&bootstrap, &env_repo, board, task, slot, &title)
+            .spawn_stage_inner(sessions, &bootstrap, &env_repo, board, task, slot)
             .await;
-        let _ = self.sessions.delete_session(&bootstrap).await;
+        let _ = sessions.delete_session(&bootstrap).await;
         result
     }
 
     async fn spawn_stage_inner(
         &self,
+        sessions: &Gateway,
         bootstrap: &str,
         env_repo: &str,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
-        title: &str,
     ) -> UsecaseResult<String> {
-        self.sessions
+        sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
             .await?;
-        let work = self
-            .sessions
+        let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
-                title: title.to_string(),
+                title: format!("#{} {}", task.number(), task.title()),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
@@ -80,7 +80,7 @@ impl TickUseCase {
             })
             .await?;
         let prompt = spawn_prompt(board, task, slot);
-        self.sessions.prompt(&work, &prompt).await?;
+        sessions.prompt(&work, &prompt).await?;
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
@@ -111,7 +111,12 @@ impl TickUseCase {
         // Unknown (гейт недоступен — рестарт serve, сеть) ≠ мёртвая:
         // спешный respawn плодил бы дубли на каждом окне недоступности
         // (15.11: рестарт opencode serve) — пропускаем тик, повторим.
-        match self.sessions.liveness(session).await {
+        match self
+            .sessions
+            .project(&board.project)
+            .liveness(session)
+            .await
+        {
             Liveness::Alive => {
                 // будильник: пик держит не-high (живой агент в окне не будим)
                 if policy.peak.holds(now) && task.priority() != Priority::High {
@@ -173,14 +178,15 @@ impl TickUseCase {
             return Ok(WakeAct::None);
         };
         {
-            let activity = self.sessions.last_activity_ms(session).await?;
+            let sessions = self.sessions.project(&board.project);
+            let activity = sessions.last_activity_ms(session).await?;
             let fresh = last.created_ms > activity.unwrap_or(0);
             // Ход завершён (последнее сообщение сессии — финальный ответ
             // агента): коммиты хвоста созданы во время хода — активность
             // всегда новее, fresh=false навсегда; доставляем сразу после
             // ответа агента (High-1 #1206: недостижимая «активность
             // застынет ниже коммента» заменена честным idle-критерием)
-            let idle = !fresh && self.session_idle(session).await;
+            let idle = !fresh && self.session_idle(board, session).await;
             if fresh || idle {
                 let foreign = self.slice_self_echo(task.number(), &tail, activity);
                 if foreign.is_empty() {
@@ -195,7 +201,7 @@ impl TickUseCase {
                     .map(|c| c.body.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
-                self.sessions
+                sessions
                     .prompt(
                         session,
                         &format!(
@@ -257,9 +263,13 @@ impl TickUseCase {
     /// Ход сессии завершён: последнее сообщение — финальный ассистентский
     /// ответ (после него нет ни промптов, ни tool-call'ов). Err трактуем
     /// консервативно («не завершён») — пинги и доставки не спешат.
-    pub(crate) async fn session_idle(&self, session: &str) -> bool {
+    /// Гейтвей — исполнителя проекта (#1203).
+    pub(crate) async fn session_idle(&self, board: &BoardPlan, session: &str) -> bool {
         matches!(
-            self.sessions.last_assistant_reply(session).await,
+            self.sessions
+                .project(&board.project)
+                .last_assistant_reply(session)
+                .await,
             Ok(Some(reply)) if reply.is_latest && reply.finished
         )
     }

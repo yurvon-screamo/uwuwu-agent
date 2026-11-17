@@ -13,6 +13,29 @@ pub struct OpencodeClient {
     http: reqwest::Client,
 }
 
+/// Активность сообщения (ms): opencode 2.3 не несёт `time.updated` в
+/// message-ответе — живые поля created/firstToken/streamed/completed
+/// (живая проба прода 17.11: хвост = {created} для idle, {created,
+/// firstToken, streamed, completed} для assistant). Порядок: самое
+/// позднее из доступных.
+fn message_activity_ms(msg: &Value) -> Option<u64> {
+    let t = &msg["time"];
+    t["updated"]
+        .as_u64()
+        .or_else(|| t["completed"].as_u64())
+        .or_else(|| t["streamed"].as_u64())
+        .or_else(|| t["firstToken"].as_u64())
+        .or_else(|| t["created"].as_u64())
+}
+
+/// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
+/// {data: [...]} (обе формы в живом проде, opencode 2.3 — инцидент
+/// «строки стоят, сессии спят» 17.11: last_activity_ms не знал обёртки,
+/// вечное Ok(None) выключало сталл-детект целиком).
+fn message_array(resp: &Value) -> Option<&Vec<Value>> {
+    resp.as_array().or_else(|| resp["data"].as_array())
+}
+
 /// Хвост журнала (order=desc): является ли самый свежий содержательный
 /// блок (user|assistant) ассистентским. Служебные записи поверх ответа
 /// (idle и пр., #1150/#1206 Common-1) пропускаются.
@@ -241,10 +264,11 @@ impl AgentSessionGateway for OpencodeClient {
             )
             .await?;
         Self::check(status, &format!("message tail {session}"))?;
-        Ok(resp
-            .as_array()
+        // обе формы ответа: массив и {data:[...]} (opencode 2.3) — иначе
+        // вечное Ok(None) гасит сталл-детект (инцидент 17.11)
+        Ok(message_array(&resp)
             .and_then(|msgs| msgs.first())
-            .and_then(|m| m["time"]["updated"].as_u64()))
+            .and_then(message_activity_ms))
     }
 
     /// Форма хвоста сверена живой пробой опенкода 2.3.0 (задача #1150):
@@ -260,12 +284,7 @@ impl AgentSessionGateway for OpencodeClient {
             )
             .await?;
         Self::check(status, &format!("message tail {session}"))?;
-        let raw = if resp.is_array() {
-            resp
-        } else {
-            resp["data"].clone()
-        };
-        let msgs = raw.as_array();
+        let msgs = message_array(&resp);
         // Самый свежий СОДЕРЖАТЕЛЬНЫЙ блок журнала (order=desc): служебные
         // события поверх финального ответа (#1150: «в хвосте могут висеть
         // idle») не делают завершённую сессию busy — пропускаем их
@@ -297,6 +316,41 @@ impl AgentSessionGateway for OpencodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_array_takes_both_response_shapes() {
+        // 17.11: opencode 2.3 отдаёт {data:[...]} — last_activity_ms знал
+        // только голый массив, вечное Ok(None) гасил сталл-детект
+        let bare = serde_json::json!([{ "type": "assistant" }]);
+        let wrapped = serde_json::json!({ "data": [{ "type": "assistant" }] });
+        assert_eq!(message_array(&bare).map(Vec::len), Some(1));
+        assert_eq!(message_array(&wrapped).map(Vec::len), Some(1));
+        assert!(message_array(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn message_activity_reads_live_203_shape() {
+        // живой прод-ответ 17.11 (сессия #1202, хвост order=desc):
+        // idle-событие несёт только time.created, assistant —
+        // created/firstToken/streamed/completed; time.updated НЕТ —
+        // чтение по updated давало вечное None, гася сталл-детект
+        let idle = serde_json::json!({
+            "id": "msg_a", "type": "idle", "outcome": "succeeded",
+            "time": { "created": 1794872146623u64 }
+        });
+        assert_eq!(message_activity_ms(&idle), Some(1794872146623));
+        let assistant = serde_json::json!({
+            "id": "msg_b", "type": "assistant",
+            "time": {
+                "created": 1794872138576u64, "firstToken": 1794872139843u64,
+                "streamed": 1794872146589u64, "completed": 1794872146593u64
+            }
+        });
+        assert_eq!(message_activity_ms(&assistant), Some(1794872146593));
+        // легаси-форма с updated — по-прежнему читается
+        let legacy = serde_json::json!({ "time": { "updated": 42u64, "created": 1u64 } });
+        assert_eq!(message_activity_ms(&legacy), Some(42));
+    }
 
     #[test]
     fn latest_meaningful_skips_service_events() {

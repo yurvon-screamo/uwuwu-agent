@@ -17,10 +17,24 @@ pub struct GitHubHub {
     http: reqwest::Client,
     /// Нативные поля issue (сессии/ветка/PR/тип).
     pub fields: Arc<IssueFields>,
+    /// TTL-кеш снапшотов досок (#1243): мутации одного тика шарят снимок —
+    /// без кеша каждый set_status тянул полную доску пагинацией и выжигал
+    /// GraphQL-бюджет (инцидент 17.11: конвейер fail-loop до reset окна).
+    snap_cache: TtlCache<(Vec<Task>, BoardMeta)>,
+    /// TTL-кеш статусов строк: board_status — самый горячий GraphQL-путь
+    /// (task_get/MCP), 60 сек свежести не разрывают консистентность ходов.
+    status_cache: TtlCache<String>,
+    /// GraphQL-бюджет: отказ RATE_LIMITED → fail-fast всех вызовов до
+    /// разблокировки, без ретраев в лоб каждые poll_sec (#1243).
+    gql_block: std::sync::RwLock<Option<std::time::Instant>>,
+    /// Последний бюджет (remaining, resetAt) из GraphQL-ответов —
+    /// наблюдаемость + контекст бэкоффа.
+    last_rate_limit: std::sync::RwLock<Option<(u64, String)>>,
 }
 
 const QUERY: &str = r#"
   query($owner:String!,$name:String!,$board:String!,$after:String){
+    rateLimit{ remaining resetAt }
     repository(owner:$owner, name:$name){
       projectsV2(first:20, query:$board){
         nodes{
@@ -47,6 +61,40 @@ const QUERY: &str = r#"
 
 const MAX_PAGES: usize = 10;
 
+/// TTL-кеш значений по ключу (#1243): цена обращения к GitHub GraphQL
+/// высока (полный снимок доски — сотни поинтов), а данные между тиками
+/// меняются редко. `now` прокидывается для тестируемости.
+struct TtlCache<T> {
+    ttl: std::time::Duration,
+    cells: std::sync::RwLock<std::collections::HashMap<String, (std::time::Instant, Arc<T>)>>,
+}
+
+impl<T> TtlCache<T> {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            cells: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str, now: std::time::Instant) -> Option<Arc<T>> {
+        let guard = self.cells.read().expect("ttl cache lock");
+        match guard.get(key) {
+            Some((at, v)) if now.duration_since(*at) < self.ttl => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    fn put(&self, key: &str, value: T, now: std::time::Instant) -> Arc<T> {
+        let arc = Arc::new(value);
+        self.cells
+            .write()
+            .expect("ttl cache lock")
+            .insert(key.to_string(), (now, arc.clone()));
+        arc
+    }
+}
+
 #[derive(Default)]
 struct BoardMeta {
     project_id: String,
@@ -65,6 +113,12 @@ impl GitHubHub {
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client"),
+            // 120 c ≤ тик (poll 180 c): снимок освежается раз в тик,
+            // мутации тика шарят один снимок
+            snap_cache: TtlCache::new(std::time::Duration::from_secs(120)),
+            status_cache: TtlCache::new(std::time::Duration::from_secs(60)),
+            gql_block: std::sync::RwLock::new(None),
+            last_rate_limit: std::sync::RwLock::new(None),
         }
     }
 
@@ -72,7 +126,36 @@ impl GitHubHub {
         self.fields.clone()
     }
 
+    /// Бюджет заблокирован до момента (#1243): RATE_LIMITED → пауза,
+    /// чтобы тик-луп не молотил GraphQL вхолостую каждые poll_sec.
+    fn gql_blocked(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.gql_block
+            .read()
+            .expect("gql block lock")
+            .filter(|until| *until > now)
+    }
+
+    fn block_gql_until(&self, until: std::time::Instant) {
+        *self.gql_block.write().expect("gql block lock") = Some(until);
+    }
+
+    /// Детект исчерпания GraphQL-бюджета по телу errors (#1243).
+    /// Два живых формата GitHub: легаси `type:"RATE_LIMITED"` и новый
+    /// `type:"RATE_LIMIT", code:"graphql_rate_limit"` — общий знаменатель
+    /// «RATE_LIMIT» покрывает оба (регистр type стабильно верхний).
+    fn is_rate_limited(errors: &Value) -> bool {
+        let text = errors.to_string().to_uppercase();
+        text.contains("RATE_LIMIT")
+    }
+
     async fn gql(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
+        let now = std::time::Instant::now();
+        if let Some(until) = self.gql_blocked(now) {
+            return Err(UsecaseError::Board(format!(
+                "graphql budget: RATE_LIMITED бэкофф ещё {:?}",
+                until.duration_since(now)
+            )));
+        }
         let resp = self
             .http
             .post("https://api.github.com/graphql")
@@ -95,6 +178,17 @@ impl GitHubHub {
             )));
         }
         if let Some(errors) = body.get("errors") {
+            // RATE_LIMIT (#1243): блокируем все GraphQL-вызовы на 5 мин —
+            // окно rolling, лобовые ретраи каждые poll_sec только шумят
+            if Self::is_rate_limited(errors) {
+                let until = now + std::time::Duration::from_secs(5 * 60);
+                self.block_gql_until(until);
+                tracing::warn!(
+                    event = "gql.rate_limited",
+                    until = ?until,
+                    "GraphQL RATE_LIMITED: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
+                );
+            }
             return Err(UsecaseError::Board(format!("graphql errors: {errors}")));
         }
         body.get("data")
@@ -134,7 +228,33 @@ impl GitHubHub {
     }
 
     /// Снимок доски: bulk-задачи (Status/Приоритет/Autodone) + мета мутаций.
-    async fn snapshot(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
+    /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
+    /// добавленная на доску младше TTL, может не иметь item-id в мете —
+    /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
+    async fn snapshot(&self, board: &str) -> UsecaseResult<Arc<(Vec<Task>, BoardMeta)>> {
+        let now = std::time::Instant::now();
+        if let Some(hit) = self.snap_cache.get(board, now) {
+            return Ok(hit);
+        }
+        let fetched = self.snapshot_fetch(board).await?;
+        // бюджетная наблюдаемость: remaining несёт каждый снимок (QUERY)
+        if let Some(rl) = self.last_rate_limit.read().expect("rl lock").as_ref() {
+            let remaining = rl.0;
+            if remaining < 300 {
+                tracing::warn!(
+                    event = "gql.budget_low",
+                    remaining,
+                    reset_at = %rl.1,
+                    "GraphQL-бюджет на исходе"
+                );
+            }
+        }
+        let arc = self.snap_cache.put(board, fetched, now);
+        Ok(arc)
+    }
+
+    /// Полное чтение доски пагинацией (мимо кеша).
+    async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
             UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
         })?;
@@ -148,6 +268,13 @@ impl GitHubHub {
                     json!({ "owner": owner, "name": name, "board": board, "after": cursor }),
                 )
                 .await?;
+            // бюджет с каждого снимка (QUERY несёт rateLimit) — #1243
+            if let Some(rl) = data.get("rateLimit") {
+                if let Some(remaining) = rl["remaining"].as_u64() {
+                    let reset_at = rl["resetAt"].as_str().unwrap_or_default().to_string();
+                    *self.last_rate_limit.write().expect("rl lock") = Some((remaining, reset_at));
+                }
+            }
             let nodes = data["repository"]["projectsV2"]["nodes"]
                 .as_array()
                 .ok_or_else(|| UsecaseError::Board("projectsV2.nodes не массив".into()))?;
@@ -195,6 +322,19 @@ impl GitHubHub {
 
     /// Статус строки на доске (по номеру issue, через projectItems).
     async fn board_status(&self, number: u64) -> UsecaseResult<String> {
+        // TTL-кеш (#1243): task_get/MCP — самый горячий GraphQL-путь;
+        // 60 сек свежести не разрывают консистентность ходов конвейера
+        let key = number.to_string();
+        let now = std::time::Instant::now();
+        if let Some(hit) = self.status_cache.get(&key, now) {
+            return Ok((*hit).clone());
+        }
+        let status = self.board_status_fetch(number).await?;
+        self.status_cache.put(&key, status.clone(), now);
+        Ok(status)
+    }
+
+    async fn board_status_fetch(&self, number: u64) -> UsecaseResult<String> {
         let q = r#"
           query($owner:String!,$name:String!,$n:Int!){
             repository(owner:$owner,name:$name){
@@ -390,21 +530,23 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
 #[async_trait]
 impl TaskBoardRepo for GitHubHub {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
-        Ok(self.snapshot(board).await?.0)
+        Ok(self.snapshot(board).await?.0.clone())
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
-        let (_, mut meta) = self.snapshot(board).await?;
-        let option = meta
+        let snap = self.snapshot(board).await?;
+        let option = snap
+            .1
             .options
-            .remove(uwuwu_usecase::status_name(status))
+            .get(uwuwu_usecase::status_name(status))
+            .cloned()
             .ok_or_else(|| {
                 UsecaseError::Board(format!(
                     "Status-опция «{}» не найдена",
                     uwuwu_usecase::status_name(status)
                 ))
             })?;
-        let item = meta.items.remove(&number).ok_or_else(|| {
+        let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
             UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
         })?;
         let mutation = r#"
@@ -413,9 +555,11 @@ impl TaskBoardRepo for GitHubHub {
               projectId:$p, itemId:$i, fieldId:$f, value:{singleSelectOptionId:$o}
             }){ projectV2Item{ id } }
           }"#;
+        let (project_id, status_field_id) =
+            (snap.1.project_id.clone(), snap.1.status_field_id.clone());
         self.gql(
             mutation,
-            json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": option }),
+            json!({ "p": project_id, "i": item, "f": status_field_id, "o": option }),
         )
         .await?;
         Ok(())
@@ -628,12 +772,17 @@ impl GitHubHub {
     }
 
     async fn add_to_board(&self, board: &str, number: u64, node_id: &str) -> UsecaseResult<()> {
-        let (_, meta) = self.snapshot(board).await?;
+        let snap = self.snapshot(board).await?;
+        let (project_id, status_field_id, analys) = (
+            snap.1.project_id.clone(),
+            snap.1.status_field_id.clone(),
+            snap.1.options.get("Analys").cloned(),
+        );
         let mutation = r#"
           mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){
             item{ id } } }"#;
         let added = self
-            .gql(mutation, json!({ "p": meta.project_id, "c": node_id }))
+            .gql(mutation, json!({ "p": project_id, "c": node_id }))
             .await?;
         let item = added["addProjectV2ItemById"]["item"]["id"]
             .as_str()
@@ -644,14 +793,14 @@ impl GitHubHub {
         }
         // create-дефолт Analys (#1135): опция ставится по имени колонки;
         // колонки нет — строка остаётся без статуса (rollout плана)
-        if let Some(analys) = meta.options.get("Analys") {
+        if let Some(analys) = analys {
             let set = r#"
               mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
                 updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
                   value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }"#;
             self.gql(
                 set,
-                json!({ "p": meta.project_id, "i": item, "f": meta.status_field_id, "o": analys }),
+                json!({ "p": project_id, "i": item, "f": status_field_id, "o": analys }),
             )
             .await?;
         }
@@ -714,6 +863,64 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttl_cache_hits_within_ttl_and_misses_after() {
+        // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
+        // после, перезапись по ключу
+        let ttl = std::time::Duration::from_secs(120);
+        let cache: TtlCache<u64> = TtlCache::new(ttl);
+        let t0 = std::time::Instant::now();
+        cache.put("board", 1, t0);
+        assert_eq!(cache.get("board", t0 + ttl / 2).as_deref(), Some(&1));
+        assert!(cache
+            .get("board", t0 + ttl + std::time::Duration::from_secs(1))
+            .is_none());
+        cache.put("board", 2, t0 + ttl);
+        assert_eq!(
+            cache.get("board", t0 + ttl + ttl / 2).as_deref(),
+            Some(&2),
+            "перезапись продлевает окно"
+        );
+        assert!(cache.get("other", t0).is_none(), "чужой ключ — мимо");
+    }
+
+    #[test]
+    fn gql_block_gates_only_until_deadline() {
+        // #1243: RATE_LIMITED блокирует fail-fast до дедлайна, затем
+        // разблокирует (окно rolling)
+        let hub = GitHubHub::new("a/b".into(), "t".into());
+        let t0 = std::time::Instant::now();
+        assert!(hub.gql_blocked(t0).is_none(), "изначально не блокирован");
+        hub.block_gql_until(t0 + std::time::Duration::from_secs(300));
+        assert!(hub
+            .gql_blocked(t0 + std::time::Duration::from_secs(299))
+            .is_some());
+        assert!(
+            hub.gql_blocked(t0 + std::time::Duration::from_secs(301))
+                .is_none(),
+            "после дедлайна — разблокирован"
+        );
+    }
+
+    #[test]
+    fn rate_limit_detects_both_github_error_formats() {
+        // #1243: живой прод-ответ 23:10 UTC принёс НОВЫЙ формат
+        // (type RATE_LIMIT без D, code graphql_rate_limit) — легаси-детект
+        // «RATE_LIMITED» его пропускал, бэкофф не взводился
+        let legacy = serde_json::json!([
+            { "type": "RATE_LIMITED", "message": "API rate limit exceeded for user ID 1." }
+        ]);
+        let modern = serde_json::json!([
+            { "type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded" }
+        ]);
+        let other = serde_json::json!([
+            { "type": "NOT_FOUND", "message": "Could not resolve to an Issue" }
+        ]);
+        assert!(GitHubHub::is_rate_limited(&legacy));
+        assert!(GitHubHub::is_rate_limited(&modern));
+        assert!(!GitHubHub::is_rate_limited(&other));
+    }
 
     #[test]
     fn item_values_maps_board_columns() {

@@ -143,7 +143,9 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
     let board: Arc<dyn TaskBoardRepo> = memory.clone();
     let fields: Arc<dyn IssueFieldStore> = memory.clone();
     let wiki: Arc<dyn WikiRepo> = Arc::new(StubWiki);
-    let sessions: Arc<dyn AgentSessionGateway> = Arc::new(StubSessions);
+    let sessions = Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+        StubSessions,
+    )));
     let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
     let tools = Arc::new(ToolHub {
         tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
@@ -161,7 +163,9 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
         search: Arc::new(SearchUseCase { semantic: None }),
         crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: Arc::new(StubWiki),
-            sessions: Arc::new(StubSessions),
+            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+                StubSessions,
+            ))),
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),
@@ -624,11 +628,13 @@ async fn fast_track_from_draft_and_todo() {
             state: Arc::new(StubState),
         }),
         wiki,
-        sessions,
+        sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
         crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: Arc::new(StubWiki),
-            sessions: Arc::new(StubSessions),
+            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+                StubSessions,
+            ))),
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),

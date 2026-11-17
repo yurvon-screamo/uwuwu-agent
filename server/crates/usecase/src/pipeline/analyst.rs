@@ -3,21 +3,25 @@
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
 use crate::error::UsecaseResult;
-use crate::ports::{AgentSessionGateway, SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, Status, Task};
 
 /// Кулдаун волны по строке (анти-шторм, как у спавнов слотов).
 const WAVE_COOLDOWN_MS: u64 = 15 * 60_000;
-/// Цикл-гвард: три круга (волна→ревью) без выхода в Todo — тупик
-/// владельцу (канон «третий круг»); четвёртая волна не спавнится.
+/// Цикл-гвард: три круга без выхода в Todo — тупик владельцу (канон
+/// «третий круг»). Круг = возврат строки из Review Analys в Analys
+/// (#1241): счётчик инкрементится наблюдением смены статусов, захват
+/// волны кругом НЕ считается (умирающая безвердиктная сессия — ретрай
+/// кулдауном, без эскалации).
 const CYCLE_LIMIT: u32 = 3;
 
 pub struct AnalystUseCase {
     pub board: Arc<dyn TaskBoardRepo>,
     /// Доски аналитики: (проект, доска, чекаут) — волна собирает со всех.
     pub boards: Vec<AnalystBoard>,
-    pub sessions: Arc<dyn AgentSessionGateway>,
+    /// Роутер «проект → executor»: спавн волны — гейтвей проекта доски.
+    pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
 }
@@ -41,7 +45,10 @@ impl AnalystUseCase {
     /// проект — своей доски, C3 ревью).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // ≤1 живого аналитика одновременно (паттерн дримера)
-        if self.sessions.list_sessions().await?.iter().any(|s| {
+        // Strict union (#1203): живой аналитик на офлайн-исполнителе не
+        // должен порождать дубль-спавн волны на другом — как CUP, отказ
+        // любого исполнителя честно останавливает волну до следующего тика
+        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
             s.outcome.is_empty() && crate::naming::parse_agent(&s.agent) == Some(Agent::Analyst)
         }) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
@@ -82,6 +89,35 @@ impl AnalystUseCase {
                     && t.status() != Status::ReviewAnalys
                 {
                     self.state.clear_analys_review_loop(&tb.board, t.number());
+                }
+                // Круг-наблюдение (#1241): счётчик цикл-гварда считают
+                // реальные круги — строка сходила в Review Analys и
+                // вернулась. Пара хранит последний увиденный статус цикла:
+                // возврат из ревью инкрементит, уход в ревью только
+                // фиксируется. Захват волны круг НЕ сжигает — умирающая
+                // без вердикта сессия аналитика ретраится кулдауном
+                // без ложной эскалации (инцидент 17.11: три волны за час
+                // сжигали счётчик при одном видимом переходе).
+                if let Some((last, rounds)) = self.state.analys_loop(&tb.board, t.number()) {
+                    match t.status() {
+                        Status::Analys if last == Status::ReviewAnalys => {
+                            self.state.set_analys_loop(
+                                &tb.board,
+                                t.number(),
+                                Status::Analys,
+                                rounds + 1,
+                            );
+                        }
+                        Status::ReviewAnalys if last == Status::Analys => {
+                            self.state.set_analys_loop(
+                                &tb.board,
+                                t.number(),
+                                Status::ReviewAnalys,
+                                rounds,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 if t.status() != Status::Analys || t.title().is_empty() {
                     continue;
@@ -127,17 +163,21 @@ impl AnalystUseCase {
                 variant: None,
                 bootstrap: false,
             };
-            let session = self.sessions.create_session(&spec).await?;
+            let sessions = self.sessions.project(&tb.project);
+            let session = sessions.create_session(&spec).await?;
             let prompt = analyst_prompt(&tb.project, &wave);
-            self.sessions.prompt(&session, &prompt).await?;
+            sessions.prompt(&session, &prompt).await?;
             for t in &wave {
                 let rounds = self
                     .state
                     .analys_loop(&tb.board, t.number())
                     .map(|(_, r)| r)
                     .unwrap_or(0);
+                // Захват волны круг не сжигает (#1241): пара только
+                // фиксируется (свежие строки — (Analys, 0)), rounds не
+                // растут — ретрай безвердиктной волны не является петлёй
                 self.state
-                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds + 1);
+                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
                 self.state.mark_analys_spawn(&tb.board, t.number(), now);
             }
             tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
@@ -179,8 +219,9 @@ impl AnalystUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Цикл-гвард аналитики: {rounds} круга Analys↔Review Analys без выхода \
-                     в Todo. Строка переведена в Needs attention — разбор владельца."
+                    "⚠︎ Цикл-гвард аналитики: {rounds} реальных круга (Review Analys → Analys) \
+                     без выхода в Todo — строка ходила на ревью и возвращалась. Строка переведена \
+                     в Needs attention — разбор владельца."
                 ),
             )
             .await

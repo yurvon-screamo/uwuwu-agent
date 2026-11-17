@@ -13,19 +13,22 @@ use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct BudgetedSessions {
     inner: Arc<dyn AgentSessionGateway>,
-    budget: Mutex<SpawnBudget>,
+    budget: Arc<Mutex<SpawnBudget>>,
     clock: Arc<dyn uwuwu_usecase::Clock>,
 }
 
 impl BudgetedSessions {
-    pub fn new(
+    /// Разделяемый бюджет (#1203): per-project хэндлы нескольких
+    /// исполнителей тратят ОДИН глобальный кап — семантика бюджета
+    /// не меняется с появлением маршрутизации.
+    pub fn with_shared(
         inner: Arc<dyn AgentSessionGateway>,
-        cap_per_hour: usize,
+        budget: Arc<Mutex<SpawnBudget>>,
         clock: Arc<dyn uwuwu_usecase::Clock>,
     ) -> Self {
         Self {
             inner,
-            budget: Mutex::new(SpawnBudget::new(cap_per_hour)),
+            budget,
             clock,
         }
     }
@@ -158,7 +161,11 @@ mod tests {
         // e2e 15.11: полный цикл с ре-энтри съедал капу bootstrap-парами;
         // логический спавн тарифа = рабочая сессия
         let inner = Arc::new(Counting(Arc::new(AtomicUsize::new(1))));
-        let budgeted = BudgetedSessions::new(inner.clone(), 2, Arc::new(ConstClock));
+        let budgeted = BudgetedSessions::with_shared(
+            inner.clone(),
+            Arc::new(Mutex::new(SpawnBudget::new(2))),
+            Arc::new(ConstClock),
+        );
         for _ in 0..5 {
             budgeted.create_session(&spec(true)).await.unwrap(); // bootstrap — мимо кассы
         }

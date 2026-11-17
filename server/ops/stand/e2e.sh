@@ -112,7 +112,81 @@ DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$L
 [ "$DEV_SPAWNS" -ge 2 ] || fail "ре-энтри не случился (dev-спавнов: $DEV_SPAWNS)"
 say "фаза 2 ок: ре-энтри круг пройден (dev-спавнов: $DEV_SPAWNS), эскалаций нет"
 
-say "фаза 3: self-эхо — свой MCP-коммент не будит держащую сессию (#1204)"
+say "фаза 3: мульти-экзекьютор — маршрутизация проект → executor + отказ исполнителя (#1203)"
+# фаза 2 оставила свой стек (сервер 8090 + мок 8099) — чистим перед стендом
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
+rm -f "$STATE"
+MOCK2_PORT=8098
+LOG_MOCK2=/tmp/uwuwu-stand-mock2.log
+LOG_SRV_MULTI=/tmp/uwuwu-stand-server-multi.log
+# мок-1 (дефолтный executor): agent-режим — ведёт uwuwu-цикл до Review
+MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
+  MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 MOCK_VERDICTS="result:approve" \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+sleep 1
+# мок-2 (named executor «mock2»): dead-режим — спавн «успешен» (create/
+# command/prompt живут), но сессия сразу 404 на чтение: красный исполнитель
+# идёт по существующей семантике dead-respawn-петли (луп-гвард → Needs
+# attention), без тишины
+MOCK_MODE=dead MOCK_PORT=$MOCK2_PORT \
+  ./target/debug/mock_opencode >"$LOG_MOCK2" 2>&1 &
+MOCK2_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
+  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &
+sleep 25   # 2+ тика: оба проекта спавнятся каждый на своём исполнителе
+sessions_of() { curl -s --max-time 5 "http://127.0.0.1:$1/api/session" 2>/dev/null | \
+  python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+rows = d if isinstance(d, list) else d.get('data', [])
+print(' '.join(str(s.get('title') or s.get('id','')) for s in rows))" 2>/dev/null || true; }
+M1="$(sessions_of $PORT_MOCK)"; M2="$(sessions_of $MOCK2_PORT)"
+echo "$M1" | grep -q "#$SEED_N" || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): [$M1]"
+echo "$M2" | grep -q "#2047" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): [$M2]"
+echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
+echo "$M2" | grep -q "#$SEED_N" && fail "кросс-маршрут: uwuwu ушел на mock2"
+say "маршрутизация ок: uwuwu → мок-1, 1xgames-mock → мок-2 (без кроссов)"
+
+task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 -c "
+import json,sys
+t = json.load(sys.stdin)['result']['content'][0]['text']
+print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null; }
+sleep 40   # dead-детект + респавны мёртвой сессии 2047 → луп-гвард
+grep -q 'loop_escalated' "$LOG_SRV_MULTI" || fail "нет loop_escalated (семантика респавн-петли красного исполнителя сломана)"
+S2047="$(task_status_num 2047 1xgames-mock)"
+case "$S2047" in
+  *attention*|*Needs*) say "красный executor: 2047 → Needs attention (луп-гвард сработал)" ;;
+  *) fail "2047 не эскалировал в Needs attention, статус: [$S2047]" ;;
+esac
+
+# kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
+# подсчёт, best-effort дример → warn, тик конвейера продолжает жить
+BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
+kill "$MOCK2_PID" 2>/dev/null || true
+sleep 25   # 2+ тика на отказе
+AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
+[ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
+grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
+grep -q 'router.list_partial' "$LOG_SRV_MULTI" || fail "нет warn union-скана дримера (best-effort не отработал)"
+curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
+say "отказ исполнителя: CUP-фолбэк + warn дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
+say "фаза 3 ок: маршрутизация по проектам, отказ исполнителя без паралича"
+
+# после глобальной чистки фазы #1203 трекинг pid-ов фаз 1-2 протух — сброс:
+# фаза 4 стартует свои процессы с чистого листа, trap добьёт живые
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+
+say "фаза 4: self-эхо — свой MCP-коммент не будит держащую сессию (#1204)"
 # Гасим СВОИ сервер и быстрый мок фаз 1-2 (pid-scoped: параллельные
 # стенды соседних сессий не трогаем) и поднимаем медленный мок
 # (акт 11с при тике 10с) — каждый свежий сеанс на первом wake-тике видит
@@ -153,6 +227,6 @@ DELIVERED=$(grep -c '"event":"wakeup.delivered"' "$LOG_SRV_ECHO" || true)
 SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
 [ "$SLICED" -ge 1 ] || fail "own-срез не сработал ни разу (sliced: $SLICED)"
 [ "$DELIVERED" -eq 0 ] || fail "wake-доставок: $DELIVERED (ожидался 0 — эхо?)"
-say "фаза 3 ок: sliced=$SLICED, delivered=0 — свои комменты не будят"
+say "фаза 4 ок: sliced=$SLICED, delivered=0 — свои комменты не будят"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + self-эхо); логи: $RUN_DIR"
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + self-эхо); логи: $RUN_DIR"
