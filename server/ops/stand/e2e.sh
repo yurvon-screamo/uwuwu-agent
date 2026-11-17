@@ -125,13 +125,13 @@ UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
   RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &
 sleep 25   # 2+ тика: оба проекта спавнятся каждый на своём исполнителе
 # диагностика маршрутизации — по журналам моков (list endpoint честно
-# фильтрует мёртвые: #1163, dead-сессии mock-2 в list не попадают)
-titles_in() { grep -o 'title=[^ ,]*' "$1" 2>/dev/null | sort -u | tr '\n' ' '; }
-M1="$(titles_in "$LOG_MOCK")"; M2="$(titles_in "$LOG_MOCK2")"
-echo "$M1" | grep -q "#$SEED_N" || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): [$M1]"
-echo "$M2" | grep -q "#2047" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): [$M2]"
-echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
-echo "$M2" | grep -q "#$SEED_N" && fail "кросс-маршрут: uwuwu ушел на mock2"
+# фильтрует мёртвые: #1163, dead-сессии mock-2 в list не попадают;
+# grep по номеру строки — tracing рендерит поля с ANSI-кодами)
+M1="$(grep -c "#$SEED_N" "$LOG_MOCK" 2>/dev/null || true)"; M2="$(grep -c "#2047" "$LOG_MOCK2" 2>/dev/null || true)"
+[ "$M1" -ge 1 ] || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): журналов #$SEED_N нет"
+[ "$M2" -ge 1 ] || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): журналов #2047 нет"
+grep -q "#2047" "$LOG_MOCK" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
+grep -q "#$SEED_N" "$LOG_MOCK2" && fail "кросс-маршрут: uwuwu ушел на mock2"
 say "маршрутизация ок: uwuwu → мок-1, 1xgames-mock → мок-2 (без кроссов)"
 
 task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 -c "

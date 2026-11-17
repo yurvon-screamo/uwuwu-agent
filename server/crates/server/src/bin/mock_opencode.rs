@@ -205,6 +205,13 @@ async fn main() {
     tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
         verdicts_left, "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
+    // случайный префикс id: инстансы на стенде не должны делить id-пространство
+    // (second source #1163 матчит сессии по id в union-скане — коллизия
+    // детерминированных id двух моков ложноположительно «знает» чужую сессию)
+    let id_salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
 
     let app = Router::new()
         .route(
@@ -212,12 +219,14 @@ async fn main() {
             post({
                 let store = store.clone();
                 let counter = counter.clone();
+                let salt = id_salt;
                 let mode = mode.clone();
                 move |headers: HeaderMap, Json(body): Json<Value>| {
                     let store = store.clone();
                     let counter = counter.clone();
+                    let salt = salt;
                     let mode = mode.clone();
-                    async move { create_session(store, counter, mode, headers, body).await }
+                    async move { create_session(store, counter, salt, mode, headers, body).await }
                 }
             }),
         )
@@ -293,12 +302,13 @@ type Resp = (StatusCode, Json<Value>);
 async fn create_session(
     store: Arc<Store>,
     counter: Arc<AtomicU64>,
+    salt: u32,
     mode: String,
     _headers: HeaderMap,
     body: Value,
 ) -> Resp {
     let n = counter.fetch_add(1, Ordering::SeqCst);
-    let id = format!("ses_mock{n:04}");
+    let id = format!("ses_mock{n:04}{salt:08x}");
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
