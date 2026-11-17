@@ -76,17 +76,23 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> Option<GhFail> {
     None
 }
 
-/// Классификация GraphQL-лимита внутри 200-ответа: errors[].type =
-/// RATE_LIMITED или message про rate limit. Заголовков квоты в теле
-/// нет — reset неизвестен.
+/// Классификация GraphQL-лимита внутри 200-ответа. Два живых формата
+/// GitHub (#1243): легаси `type:"RATE_LIMITED"` и новый `type:"RATE_LIMIT",
+/// code:"graphql_rate_limit"` — общий знаменатель type-подстроки
+/// «RATE_LIMIT» покрывает оба; fallback — message про rate limit.
+/// Заголовков квоты в теле нет — reset неизвестен.
 pub fn classify_gql_errors(body: &serde_json::Value) -> Option<GhFail> {
     let errors = body.get("errors")?.as_array()?;
     let limited = errors.iter().any(|error| {
-        error.get("type").and_then(|t| t.as_str()) == Some("RATE_LIMITED")
-            || error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"))
+        let is_limited_type = error
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.to_uppercase().contains("RATE_LIMIT"));
+        let is_limited_message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"));
+        is_limited_type || is_limited_message
     });
     limited.then_some(GhFail::Core { reset_epoch: None })
 }

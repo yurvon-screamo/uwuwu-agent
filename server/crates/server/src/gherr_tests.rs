@@ -128,6 +128,27 @@ fn graphql_rate_limited_errors_are_detected() {
 }
 
 #[test]
+fn rate_limit_detects_both_github_error_formats() {
+    // #1243: живой прод-ответ 23:10 UTC принёс НОВЫЙ формат
+    // (type RATE_LIMIT без D, code graphql_rate_limit) — детект
+    // «RATE_LIMITED» только точно его пропускал
+    let legacy = json!({ "errors": [
+        { "type": "RATE_LIMITED", "message": "API rate limit exceeded for user ID 1." }
+    ] });
+    let modern = json!({ "errors": [
+        { "type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded" }
+    ] });
+    assert_eq!(
+        classify_gql_errors(&legacy),
+        Some(GhFail::Core { reset_epoch: None })
+    );
+    assert_eq!(
+        classify_gql_errors(&modern),
+        Some(GhFail::Core { reset_epoch: None })
+    );
+}
+
+#[test]
 fn graphql_unrelated_errors_and_success_are_not_classified() {
     let body =
         json!({ "errors": [{ "type": "NOT_FOUND", "message": "Could not resolve to an Issue" }] });

@@ -9,6 +9,8 @@ use uwuwu_domain::{Agent, Priority, Schedule, ScheduleKind, Slot, Status, TaskTy
 pub fn status_name(s: Status) -> &'static str {
     match s {
         Status::Draft => "Draft",
+        Status::Analys => "Analys",
+        Status::ReviewAnalys => "Review Analys",
         Status::Todo => "Todo",
         Status::Design => "Design",
         Status::ReviewPlan => "Ревью плана",
@@ -29,6 +31,8 @@ pub fn status_name(s: Status) -> &'static str {
 pub fn parse_status(raw: &str) -> Status {
     match raw.trim() {
         "Draft" => Status::Draft,
+        "Analys" => Status::Analys,
+        "Review Analys" => Status::ReviewAnalys,
         "Todo" => Status::Todo,
         "Design" => Status::Design,
         "Ревью плана" => Status::ReviewPlan,
@@ -52,7 +56,8 @@ pub fn agent_name(a: Agent) -> &'static str {
         Agent::CodeQualityReviewer => "code-quality-reviewer",
         Agent::Tester => "tester",
         Agent::Dreamer => "dreamer",
-        Agent::Triage => "triage",
+        Agent::Analyst => "analyst",
+        Agent::AnalystReviewer => "analyst-reviewer",
     }
 }
 
@@ -64,7 +69,8 @@ pub fn parse_agent(raw: &str) -> Option<Agent> {
         "code-quality-reviewer" => Agent::CodeQualityReviewer,
         "tester" => Agent::Tester,
         "dreamer" => Agent::Dreamer,
-        "triage" => Agent::Triage,
+        "analyst" => Agent::Analyst,
+        "analyst-reviewer" => Agent::AnalystReviewer,
         _ => return None,
     })
 }
@@ -74,30 +80,27 @@ pub fn task_type_name(t: TaskType) -> &'static str {
     match t {
         TaskType::Bug => "bug",
         TaskType::Spike => "spike",
-        TaskType::Analys => "analys",
         TaskType::Docs => "docs",
         TaskType::Other => "other",
         TaskType::Feature => "feature",
         TaskType::Refactoring => "refactoring",
         TaskType::Legacy => "legacy",
-        TaskType::Idea => "idea",
         TaskType::Qa => "qa",
         TaskType::Infrastructure => "infrastructure",
     }
 }
 
-/// Парсинг типа; None — неизвестное имя.
+/// Парсинг типа; None — неизвестное имя (idea/analys выведены #1135:
+/// старые значения читаются как пустой тип, без громких ошибок).
 pub fn parse_task_type(raw: &str) -> Option<TaskType> {
     Some(match raw.trim().to_lowercase().as_str() {
         "bug" => TaskType::Bug,
         "spike" => TaskType::Spike,
-        "analys" | "analysis" => TaskType::Analys,
         "docs" => TaskType::Docs,
         "other" => TaskType::Other,
         "feature" => TaskType::Feature,
         "refactoring" => TaskType::Refactoring,
         "legacy" => TaskType::Legacy,
-        "idea" => TaskType::Idea,
         "qa" => TaskType::Qa,
         "infrastructure" => TaskType::Infrastructure,
         _ => return None,
@@ -163,16 +166,14 @@ pub fn schedule_label(s: &Schedule) -> String {
 }
 
 /// Все типы канона (порядок = порядок опций поля «Тип»).
-pub const TASK_TYPES: [TaskType; 11] = [
+pub const TASK_TYPES: [TaskType; 9] = [
     TaskType::Bug,
     TaskType::Spike,
-    TaskType::Analys,
     TaskType::Docs,
     TaskType::Other,
     TaskType::Feature,
     TaskType::Refactoring,
     TaskType::Legacy,
-    TaskType::Idea,
     TaskType::Qa,
     TaskType::Infrastructure,
 ];
@@ -199,6 +200,8 @@ mod tests {
     fn status_round_trip() {
         for s in [
             Status::Draft,
+            Status::Analys,
+            Status::ReviewAnalys,
             Status::Todo,
             Status::Design,
             Status::ReviewPlan,
@@ -225,26 +228,29 @@ mod tests {
             Agent::CodeQualityReviewer,
             Agent::Tester,
             Agent::Dreamer,
-            Agent::Triage,
+            Agent::Analyst,
+            Agent::AnalystReviewer,
         ] {
             assert_eq!(parse_agent(agent_name(a)), Some(a));
         }
         assert_eq!(parse_agent("nope"), None);
+        assert_eq!(parse_agent("triage"), None, "триаж выведен (#1135)");
         for t in [
             TaskType::Bug,
             TaskType::Spike,
-            TaskType::Analys,
             TaskType::Docs,
             TaskType::Other,
             TaskType::Feature,
             TaskType::Refactoring,
             TaskType::Legacy,
-            TaskType::Idea,
             TaskType::Qa,
             TaskType::Infrastructure,
         ] {
             assert_eq!(parse_task_type(task_type_name(t)), Some(t));
         }
+        // idea/analys выведены: старые значения — неизвестный тип
+        assert_eq!(parse_task_type("idea"), None);
+        assert_eq!(parse_task_type("analys"), None);
     }
 
     #[test]

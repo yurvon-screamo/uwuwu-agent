@@ -10,6 +10,9 @@ mod fm_lite;
 mod naming;
 mod pipeline;
 mod ports;
+mod router;
+#[cfg(test)]
+mod router_tests;
 mod search;
 mod tasks;
 
@@ -24,13 +27,15 @@ pub use naming::{
     schedule_label, slot_key, status_name, task_type_name, F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::{
-    BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, TriageBoard, TriageUseCase,
+    AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode,
+    TickOutcome, TickPlan, TickUseCase,
 };
 pub use ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
+pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use tasks::body_hash;
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};

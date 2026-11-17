@@ -1,0 +1,39 @@
+# uwuwu-server — memory-стенд мульти-экзекьютора (#1203): два исполнителя,
+# проекты на разных executor'ах. Запуск — ops/stand/e2e.sh, фаза 3
+# (моки: 8099 = дефолтный mock1 agent-режим, 8098 = mock2).
+mode = "live"
+poll_sec = 10
+port = 8090
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "mock1"
+url = "http://127.0.0.1:8099"
+
+[[executors]]
+name = "mock2"
+url = "http://127.0.0.1:8098"
+
+[policy]
+cup = 7
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+
+# Проект на втором исполнителе: чекаут — Windows-путь (как 1xgames на
+# redmi), строки с тегом доски видны только на этой доске (mockhub).
+[[project]]
+name = "1xgames-mock"
+board = "Задачи 1xgames-mock"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "D:/1xgames/game-service"
+env_root = "D:/agents-env"
+executor = "mock2"
