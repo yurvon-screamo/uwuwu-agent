@@ -295,6 +295,14 @@ impl TickUseCase {
                             .unwrap_or(u64::MAX)
                     };
                     if cooldown_left < SPAWN_COOLDOWN_MS {
+                        // диагностика 17.11: строка в Spawn-руке под кулдауном
+                        tracing::info!(
+                            event = "spawn.cooldown_block",
+                            number = task.number(),
+                            status = ?task.status(),
+                            cooldown_left_ms = cooldown_left,
+                            "Spawn arm: кулдаун держит строку"
+                        );
                         out.observed += 1;
                         continue;
                     }
@@ -427,6 +435,17 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
+                        // диагностика 17.11: видит ли тик сессию стадии
+                        tracing::info!(
+                            event = "observe.enter",
+                            number = task.number(),
+                            status = ?task.status(),
+                            session = task
+                                .stage_slot()
+                                .and_then(|s| task.session_of(s))
+                                .unwrap_or("НЕТ"),
+                            "observe_stage_session: вход"
+                        );
                         self.observe_stage_session(board, plan, task, active_now, &mut out)
                             .await;
                     } else {
