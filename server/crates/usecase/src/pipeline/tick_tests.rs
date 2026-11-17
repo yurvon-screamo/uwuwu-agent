@@ -96,10 +96,7 @@ impl TaskBoardRepo for FakeBoard {
             .unwrap_or_default())
     }
     async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<()> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("comment#{n}={}", body.len()));
+        self.log.lock().unwrap().push(format!("comment#{n}={body}"));
         Ok(())
     }
     async fn close_issue(&self, n: u64) -> UsecaseResult<()> {
@@ -2270,6 +2267,124 @@ async fn analyst_review_seen_updates_pair_without_increment() {
         analyst_pair_after_tick((Status::Analys, 1), Status::ReviewAnalys).await,
         (Status::ReviewAnalys, 1),
         "наблюдение ревью без инкремента"
+    );
+}
+
+#[tokio::test]
+async fn analyst_three_real_rounds_escalate_with_honest_message() {
+    // #1241: гвард не вырожден — три РЕАЛЬНЫХ круга (уход в Review Analys
+    // и возврат, собранные наблюдением статуса) эскалируют в Needs
+    // attention, спавнов после лимита нет, текст коммента владельцу
+    // честный («реальных круга», не захваты волн); до лимита строка
+    // ретраится волнами как обычно
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct AdvClock(AtomicU64);
+    impl Clock for AdvClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let row = |status: Status| vec![titled(1, "закольцованная", status)];
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
+    let board = |status: Status| {
+        Arc::new(FakeBoard {
+            rows: row(status),
+            log: Mutex::default(),
+            comments: vec![],
+        })
+    };
+    let mut u = AnalystUseCase {
+        board: board(Status::Analys),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: clock.clone(),
+    };
+    let pair = |state: &Arc<MemState>| {
+        state
+            .0
+            .lock()
+            .unwrap()
+            .analys_loops
+            .iter()
+            .find(|(n, _, _)| *n == 1)
+            .map(|(_, st, r)| (*st, *r))
+    };
+    // захват волны: спавн, пара (Analys, 0), круг не сжигается
+    u.tick().await.unwrap();
+    assert_eq!(pair(&state), Some((Status::Analys, 0)), "захват без круга");
+    let mut cur;
+    // круг 1 и круг 2 — пинг-понг: волна на возврате ретраит строку
+    for round in 1..=2u32 {
+        cur = board(Status::ReviewAnalys);
+        u.board = cur.clone();
+        u.tick().await.unwrap();
+        assert_eq!(
+            pair(&state),
+            Some((Status::ReviewAnalys, round - 1)),
+            "уход в ревью круга {round} зафиксирован"
+        );
+        clock.0.fetch_add(16 * 60_000, Ordering::SeqCst);
+        cur = board(Status::Analys);
+        u.board = cur.clone();
+        u.tick().await.unwrap();
+        assert_eq!(
+            pair(&state),
+            Some((Status::Analys, round)),
+            "круг {round} засчитан"
+        );
+    }
+    assert_eq!(
+        sessions.spawned.lock().unwrap().len(),
+        3,
+        "захват + два возврата — строка ретраится до лимита"
+    );
+    // круг 3: возврат инкрементит до лимита — эскалация на том же тике
+    cur = board(Status::ReviewAnalys);
+    u.board = cur.clone();
+    u.tick().await.unwrap();
+    assert_eq!(
+        pair(&state),
+        Some((Status::ReviewAnalys, 2)),
+        "уход в ревью круга 3 зафиксирован"
+    );
+    clock.0.fetch_add(16 * 60_000, Ordering::SeqCst);
+    cur = board(Status::Analys);
+    u.board = cur.clone();
+    u.tick().await.unwrap();
+    assert_eq!(
+        sessions.spawned.lock().unwrap().len(),
+        3,
+        "за лимитом волна не спавнится"
+    );
+    let log = cur.log.lock().unwrap().clone(); // борд возврата круга 3 — эскалация здесь
+    assert!(
+        log.iter().any(|l| l == "status#1=NeedsAttention"),
+        "строка ушла в Needs attention: {log:?}"
+    );
+    let comment = log
+        .iter()
+        .find(|l| l.starts_with("comment#1="))
+        .expect("коммент владельцу есть");
+    assert!(
+        comment.contains("3 реальных круга (Review Analys → Analys)"),
+        "текст эскалации честный: {comment:?}"
+    );
+    assert!(
+        !comment.contains("Analys↔Review Analys"),
+        "старой формулировки «захваты = круги» нет"
+    );
+    assert!(
+        state.0.lock().unwrap().analys_loops.is_empty(),
+        "счётчик после эскалации сброшен"
     );
 }
 
