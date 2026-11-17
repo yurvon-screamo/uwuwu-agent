@@ -1461,11 +1461,81 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
     );
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
     assert_eq!(out.spawns_done, 0, "слепой спавн невозможен — hold (#1263)");
+    assert_eq!(out.held_blind, 1, "кандидат в слепом hold",);
     assert_eq!(
-        out.held_blind, 1,
-        "кандидат в слепом hold; строка с живой probe-сессией — в Observe"
+        out.wakeups, 0,
+        "строка с probe-живой сессией прошла Observe: будки и доставки нет"
     );
     assert_eq!(out.held_cup, 0, "до CUP-гейта слепой hold не доходит");
+}
+
+#[tokio::test]
+async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
+    // смешанное здоровье (ревью Common #1263): ЧУЖОЙ исполнитель отказной
+    // (дефолтный redmi), свой (kisa) жив — зрение проекта Some, кандидат
+    // без сестры доходит до CUP-гейта и решается СТАТУСНЫМ подсчётом
+    // fallback'а: строка с сессией + кандидат дают fallback_active=2 —
+    // кап 1 держит кандидата (held_cup), кап 7 пропускает спавн
+    // (консервативный кап против шторма при деградации, не паралич)
+    let rows = || {
+        let mut session_row = task(66, Status::InProgress);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse("ses_live_66").unwrap(),
+        );
+        session_row.apply_fields(f);
+        vec![session_row, task(67, Status::InProgress)]
+    };
+    let build = || {
+        let mut redmi = FakeSessions::new();
+        redmi.list_fails = true;
+        let kisa = FakeSessions::new();
+        let mut by_project = std::collections::HashMap::new();
+        by_project.insert(
+            "p".to_string(),
+            Arc::new(kisa) as Arc<dyn AgentSessionGateway>,
+        );
+        let router = SessionRouter::new(
+            "redmi",
+            Arc::new(redmi) as Arc<dyn AgentSessionGateway>,
+            vec![("kisa".to_string(), by_project["p"].clone())],
+            by_project,
+        );
+        let board = Arc::new(FakeBoard {
+            rows: rows(),
+            log: Mutex::default(),
+            comments: Vec::default(),
+            fields_fails: false,
+            set_session_fails: false,
+        });
+        let prs = Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        });
+        TickUseCase {
+            board: board.clone(),
+            sessions: Arc::new(router),
+            prs: prs.clone(),
+            clock: Arc::new(FixedClock),
+            state: Arc::new(MemState(Mutex::default())),
+            spawn_model: None,
+        }
+    };
+    let held = build().run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        held.held_cup, 1,
+        "кандидат решён статусным подсчётом fallback'а (не слепотой и не сестрой)"
+    );
+    assert_eq!(held.spawns_done, 0);
+    assert_eq!(held.held_blind, 0, "чужой отказ не слепит зрение проекта");
+    assert_eq!(held.held_live, 0);
+    let under_cap = build().run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        under_cap.spawns_done, 1,
+        "под-каповый спавн идёт по статусному fallback'у — деградация не паралич"
+    );
+    assert_eq!(under_cap.held_blind, 0);
 }
 
 #[tokio::test]
