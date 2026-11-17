@@ -4,7 +4,7 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
+use uwuwu_domain::{AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -24,6 +24,10 @@ pub trait TaskBoardRepo: Send + Sync {
         slot: Slot,
         session: &str,
     ) -> UsecaseResult<()>;
+
+    /// Заявка ветки задачи (фабрика при спавне: task-env создал env,
+    /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
+    async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
 
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
     /// ревью/тест-сессии не переживают смену стадии — канон сессий).
@@ -140,6 +144,11 @@ pub struct AssistantReply {
     /// Ответ — самое свежее сообщение сессии: после него нет ни промптов,
     /// ни tool-call'ов. «Ход завершён»: агент ответил и ждёт (#1206).
     pub is_latest: bool,
+    /// Сырое значение finish-маркера API («stop» | «tool-calls» | …);
+    /// None — сообщение ещё стримится. Различает шаг хода
+    /// («tool-calls» — тула позади, ход продолжается) и финал хода
+    /// (#1209, живая проба 17.11).
+    pub finish: Option<String>,
 }
 
 #[async_trait]
@@ -165,6 +174,9 @@ pub trait AgentSessionGateway: Send + Sync {
 pub struct SessionInfo {
     pub id: String,
     pub agent: String,
+    /// Директория сессии (cwd); пустая — исполнитель не отдал location:
+    /// вне раскладки гарда спавна (#1163), никогда не матчится.
+    pub directory: String,
     /// ms эпохи последнего обновления.
     pub updated_ms: u64,
     /// «succeeded»|«failed»|… финала (пусто — живая).

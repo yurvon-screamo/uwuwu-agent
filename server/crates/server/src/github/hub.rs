@@ -50,6 +50,11 @@ const QUERY: &str = r#"
                   ...on ProjectV2ItemFieldSingleSelectValue{
                     name field{ ...on ProjectV2FieldCommon{ name } }
                   }
+                  ...on ProjectV2ItemIssueFieldValue{
+                    field{ ...on ProjectV2FieldCommon{ name } }
+                    issueFieldValue{ __typename
+                      ...on IssueFieldSingleSelectValue{ name } }
+                  }
                 }
               }
             }
@@ -139,15 +144,6 @@ impl GitHubHub {
         *self.gql_block.write().expect("gql block lock") = Some(until);
     }
 
-    /// Детект исчерпания GraphQL-бюджета по телу errors (#1243).
-    /// Два живых формата GitHub: легаси `type:"RATE_LIMITED"` и новый
-    /// `type:"RATE_LIMIT", code:"graphql_rate_limit"` — общий знаменатель
-    /// «RATE_LIMIT» покрывает оба (регистр type стабильно верхний).
-    fn is_rate_limited(errors: &Value) -> bool {
-        let text = errors.to_string().to_uppercase();
-        text.contains("RATE_LIMIT")
-    }
-
     async fn gql(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
         let now = std::time::Instant::now();
         if let Some(until) = self.gql_blocked(now) {
@@ -165,10 +161,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql transport: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+        }
         let body: Value = serde_json::from_str(&text)
             .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
@@ -178,16 +178,19 @@ impl GitHubHub {
             )));
         }
         if let Some(errors) = body.get("errors") {
-            // RATE_LIMIT (#1243): блокируем все GraphQL-вызовы на 5 мин —
+            // rate limit: детект — одна точка gherr (оба формата GitHub:
+            // легаси RATE_LIMITED и новый RATE_LIMIT — #1243/#1156).
+            // Классифицированный отказ громкий; бэкофф-блок 5 мин поверх —
             // окно rolling, лобовые ретраи каждые poll_sec только шумят
-            if Self::is_rate_limited(errors) {
+            if let Some(fail) = crate::gherr::classify_gql_errors(&body) {
                 let until = now + std::time::Duration::from_secs(5 * 60);
                 self.block_gql_until(until);
                 tracing::warn!(
                     event = "gql.rate_limited",
                     until = ?until,
-                    "GraphQL RATE_LIMITED: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
+                    "GraphQL rate limit: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
                 );
+                return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
             }
             return Err(UsecaseError::Board(format!("graphql errors: {errors}")));
         }
@@ -215,10 +218,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("rest transport {path}: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("rest body {path}: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh api {path}: {fail}")));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {
@@ -455,7 +462,13 @@ fn item_values(item: &Value) -> ItemValues {
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
             let field = v["field"]["name"].as_str().unwrap_or_default();
-            let value = v["name"].as_str().unwrap_or_default();
+            // Pv2-own поля несут значение на верхнем уровне узла;
+            // issue-backed (каталог /user/issue-fields: «Приоритет»,
+            // «Autodone») — вложенным issueFieldValue (#1174)
+            let value = v["name"]
+                .as_str()
+                .or(v["issueFieldValue"]["name"].as_str())
+                .unwrap_or_default();
             match field {
                 "Status" => out.status = value.to_string(),
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
@@ -512,7 +525,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
     // отбрасываем (домен PullRequest требует ветку)
     let vcs = match (
-        raw.get("Branch")
+        raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
         raw.get("PR").and_then(|s| uwuwu_domain::PrUrl::parse(s)),
     ) {
@@ -582,6 +595,23 @@ impl TaskBoardRepo for GitHubHub {
         };
         self.fields
             .store(number, &[(name, Some(session.to_string()))])
+            .await
+    }
+
+    async fn set_branch(
+        &self,
+        _board: &str,
+        number: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.fields
+            .store(
+                number,
+                &[(
+                    crate::github::fields::F_BRANCH,
+                    Some(branch.as_str().to_string()),
+                )],
+            )
             .await
     }
 
@@ -863,6 +893,46 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::{gate, Gate, PeakWindow, Priority, SpawnPolicy, UtcMinute};
+
+    #[test]
+    fn issue_backed_priority_reaches_peak_gate() {
+        // #1174 (потребительский чекпоинт ревью плана): приоритет, прочитанный
+        // с issue-backed ячейки снапшота, доезжает до пик-гейта — до фикса
+        // снапшот всегда был пуст и high-строки деферились (инцидент #1170)
+        let item = json!({
+            "id": "IT_x",
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "__typename": "ProjectV2ItemIssueFieldValue",
+                  "field": { "__typename": "ProjectV2SingleSelectField", "name": "Приоритет" },
+                  "issueFieldValue": { "__typename": "IssueFieldSingleSelectValue",
+                                       "name": "high", "value": "high", "optionId": "IFSSO_x" } },
+            ]}
+        });
+        let mut meta = BoardMeta::default();
+        let task = &parse_page(&[item], &mut meta)[0];
+        assert_eq!(task.priority(), Priority::High);
+
+        let policy = SpawnPolicy {
+            cup: 2,
+            peak: PeakWindow {
+                enabled: true,
+                start_min: 360,
+                end_min: 600,
+            },
+        };
+        let in_peak = UtcMinute {
+            minute_of_day: 540,
+            weekday: 3,
+        };
+        let spawn = uwuwu_domain::decide(task);
+        assert_eq!(
+            gate(task, &spawn, policy, 0, in_peak),
+            Gate::Allowed,
+            "high с снапшота проходит пик-окно"
+        );
+    }
 
     #[test]
     fn ttl_cache_hits_within_ttl_and_misses_after() {
@@ -904,22 +974,72 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_detects_both_github_error_formats() {
-        // #1243: живой прод-ответ 23:10 UTC принёс НОВЫЙ формат
-        // (type RATE_LIMIT без D, code graphql_rate_limit) — легаси-детект
-        // «RATE_LIMITED» его пропускал, бэкофф не взводился
-        let legacy = serde_json::json!([
-            { "type": "RATE_LIMITED", "message": "API rate limit exceeded for user ID 1." }
-        ]);
-        let modern = serde_json::json!([
-            { "type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded" }
-        ]);
-        let other = serde_json::json!([
-            { "type": "NOT_FOUND", "message": "Could not resolve to an Issue" }
-        ]);
-        assert!(GitHubHub::is_rate_limited(&legacy));
-        assert!(GitHubHub::is_rate_limited(&modern));
-        assert!(!GitHubHub::is_rate_limited(&other));
+    fn item_values_parses_issue_backed_cells() {
+        // #1174: поля каталога /user/issue-fields («Приоритет», «Autodone»)
+        // приходят в Pv2 типом ProjectV2ItemIssueFieldValue с вложенным
+        // issueFieldValue — шейп живой пробы доски «Задачи uwuwу»
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 1174, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "__typename": "ProjectV2ItemFieldRepositoryValue" },
+                { "__typename": "ProjectV2ItemFieldLabelValue" },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Приоритет" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "medium", "value": "medium", "optionId": "IFSSO_x"
+                    }
+                },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Autodone" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "on", "value": "on", "optionId": "IFSSO_y"
+                    }
+                },
+                { "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                  "name": "Design", "field": { "__typename": "ProjectV2FieldCommon", "name": "Status" } },
+            ]}
+        });
+        let v = item_values(&item);
+        assert_eq!(v.priority, "medium");
+        assert!(v.autodone);
+        assert_eq!(v.status, "Design");
+    }
+
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_snapshot_reads_issue_backed_priorities() {
+        // #1174: живой e2e read-path — снапшот доски «Задачи uwuwu»
+        // против реального hub; сверка с REST-носителем issue_field_values
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rows: Vec<Task> = rt
+            .block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                hub.read_board("Задачи uwuwu").await
+            })
+            .expect("read_board");
+        assert!(!rows.is_empty(), "доска не пуста");
+
+        // #1174: на носителе medium (REST issue_field_values) — снапшот
+        // обязан показать то же; до фикса priority был всегда Empty
+        let t = rows
+            .iter()
+            .find(|t| t.number() == 1174)
+            .expect("#1174 на доске");
+        assert_eq!(t.priority(), Priority::Medium);
+
+        let filled = rows
+            .iter()
+            .filter(|t| t.priority() != Priority::Empty)
+            .count();
+        println!("строк с приоритетом на снапшоте: {filled}");
+        assert!(filled > 0, "снапшот видит приоритеты строк");
     }
 
     #[test]

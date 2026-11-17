@@ -1,14 +1,14 @@
 //! Действия тика: спавн стадии (bootstrap /command → сессия в env),
 //! wakeup по свежим комментам, автодон (проба PR → мерж/Done/bounce).
 
-use crate::error::UsecaseResult;
+use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, TickUseCase};
+use crate::pipeline::tick::{BoardPlan, RowContext, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
 use uwuwu_domain::{
-    gate, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop, SpawnPolicy,
-    Status, Task,
+    gate, sighting_known, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop,
+    SpawnPolicy, Status, Task,
 };
 
 /// Итог попытки будильника/респавна stage-сессии.
@@ -20,6 +20,8 @@ pub enum WakeAct {
     Respawned,
     /// Запуск агента отложен политикой (пик/CUP) — сталл-пасс не нужен.
     Deferred,
+    /// Гард «живая сессия в env» держит запуск (#1163).
+    Guarded,
     /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
 }
@@ -35,7 +37,7 @@ impl TickUseCase {
         slot: Slot,
     ) -> UsecaseResult<String> {
         let sessions = self.sessions.project(&board.project);
-        let env_repo = format!("{}/{}", board.env_root, task.number());
+        let env_repo = board.env_repo_dir(task.number());
         let title = format!("#{} {}", task.number(), task.title());
         let bootstrap = sessions
             .create_session(&SessionSpec {
@@ -68,6 +70,21 @@ impl TickUseCase {
         sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
             .await?;
+        // Фабрика пишет Branch-ячейку: env готов, ветка work/task-N
+        // существует (ADR-041 «ячейки доски пишет фабрика»); без неё PR
+        // финализации невидим на карточке (инцидент #1152). Сбой записи =
+        // сбой спавна: bootstrap гасится, ретрай следующим тиком (без
+        // LLM-бюджета — bootstrap мимо кассы, рабочая сессия не создана).
+        let branch = uwuwu_domain::BranchName::parse(&format!("work/task-{}", task.number()))
+            .ok_or_else(|| {
+                UsecaseError::Board(format!(
+                    "ветка work/task-{} не проходит BranchName::parse",
+                    task.number()
+                ))
+            })?;
+        self.board
+            .set_branch(&board.board, task.number(), &branch)
+            .await?;
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
@@ -80,7 +97,12 @@ impl TickUseCase {
             })
             .await?;
         let prompt = spawn_prompt(board, task, slot);
-        sessions.prompt(&work, &prompt).await?;
+        if let Err(e) = sessions.prompt(&work, &prompt).await {
+            // Сирота (#1163): сессия создана без промпта — работать ей не
+            // дано, гасим (симметрично bootstrap-зачистке вызывающего).
+            let _ = sessions.delete_session(&work).await;
+            return Err(e);
+        }
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
@@ -92,12 +114,13 @@ impl TickUseCase {
     /// Политика запуска едина для всех путей (UC-05, #1200): пик-окно
     /// откладывает не-high и будильник, и респавн; CUP-кап держит респавн
     /// (новая сессия — новый LLM-слот; будильник будит уже учтённую строку).
-    pub async fn wakeup_if_fresh(
+    pub(crate) async fn wakeup_if_fresh(
         &self,
         board: &BoardPlan,
         policy: SpawnPolicy,
         task: &Task,
         global_active: usize,
+        ctx: &RowContext<'_>,
     ) -> UsecaseResult<WakeAct> {
         let now = self.clock.utc_minute();
         let Some(slot) = task.stage_slot() else {
@@ -135,6 +158,33 @@ impl TickUseCase {
                 return Ok(WakeAct::None);
             }
             Liveness::Dead => {
+                // Second source (#1072→#1163): сессия в списке исполнителя —
+                // проба солгала (serve-шторм 13.11 давал 404 живым ходам);
+                // респавн отменяется, вердикт уйдёт wakeup-путём на тике,
+                // когда проба вернётся к правде. Штормы false-dead закрыты
+                // этим чеком — кулдаун-чек на респавн не вешается: он
+                // замедлял бы attention-механику (луп-гвард) в 5 раз
+                // (эскалация петли час вместо ~15 мин).
+                if sighting_known(ctx.sightings.unwrap_or(&[]), session) {
+                    tracing::warn!(event = "wakeup.second_source_alive", number = task.number(),
+                        session = %session,
+                        "Проба Dead при живой сессии в списке исполнителя — респавн отменён");
+                    return Ok(WakeAct::None);
+                }
+                // Env-гард на респавне (ревью Common-2): сеанс ячейки мёртв
+                // по-настоящему, но в env строки может жить сирота из
+                // crash-окна (падение процесса между prompt и set_session
+                // до зачистки) — респавн поверх живого хода = тот же класс
+                // дубля, что и на plain-пути.
+                if self.spawn_held_by_live(ctx, board, task, slot, self.clock.now_ms()) {
+                    tracing::warn!(
+                        event = "respawn.held_live_session",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        "Респавн держится: живая сессия в env строки (second source #1163)"
+                    );
+                    return Ok(WakeAct::Guarded);
+                }
                 // респавн = фактический спавн — полный гейт (пик + CUP)
                 let spawn = Action::Spawn { slot };
                 if gate(task, &spawn, policy, global_active, now) != Gate::Allowed {
@@ -329,9 +379,23 @@ impl TickUseCase {
             guard.repeats(),
         );
         let fresh = self.spawn_stage(board, task, slot).await?;
-        self.board
+        // кулдаун едина с plain-путём (#1163): заряд до записи ячейки —
+        // отказ set_session не открывает респавн-шторм (ночь 15.11)
+        self.state
+            .mark_spawn(&board.board, task.number(), slot, self.clock.now_ms());
+        if let Err(e) = self
+            .board
             .set_session(&board.board, task.number(), slot, &fresh)
-            .await?;
+            .await
+        {
+            // сирота (#1163): сеанс без ячейки гасим — будить его некому
+            let _ = self
+                .sessions
+                .project(&board.project)
+                .delete_session(&fresh)
+                .await;
+            return Err(e);
+        }
         Ok(true)
     }
 

@@ -1,7 +1,7 @@
 //! Юнит-тесты тика на in-memory фейках портов (тест-стратегия L2:
 //! юзкейсы — с фейками, без сети/досок).
 
-use crate::error::UsecaseResult;
+use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
@@ -20,6 +20,10 @@ struct FakeBoard {
     log: Mutex<Vec<String>>,
     /// Журнал комментов задач (будильник-сценарии: latest_comments).
     comments: Vec<CommentRef>,
+    /// Отказ enrichment (issue_fields) — skip-строка тика (#1163).
+    fields_fails: bool,
+    /// Отказ set_session (записи ячейки) — сирота-зачистка (#1163).
+    set_session_fails: bool,
 }
 
 #[async_trait]
@@ -32,7 +36,22 @@ impl TaskBoardRepo for FakeBoard {
         Ok(())
     }
     async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
+        if self.set_session_fails {
+            return Err(UsecaseError::Session("set_session недоступен (мок)".into()));
+        }
         self.log.lock().unwrap().push(format!("session#{n}={s}"));
+        Ok(())
+    }
+    async fn set_branch(
+        &self,
+        _b: &str,
+        n: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("branch#{n}={}", branch.as_str()));
         Ok(())
     }
     async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
@@ -43,6 +62,10 @@ impl TaskBoardRepo for FakeBoard {
         Ok(())
     }
     async fn issue_fields(&self, n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
+        // Отказ enrichment (#1163): строка тиком пропускается
+        if self.fields_fails {
+            return Err(UsecaseError::Session("fields недоступны (мок)".into()));
+        }
         // enrichment-фейк: поля несут строки (как настоящий hub из REST)
         Ok(self
             .rows
@@ -142,8 +165,23 @@ struct FakeSessions {
     idle_reply: bool,
     /// спеки созданных сессий (агент/директория — для ассертов)
     specs: Mutex<Vec<SessionSpec>>,
-    /// живые сессии исполнителя: (agent-имя, outcome; пустой outcome = живая)
-    live: Mutex<Vec<(String, String)>>,
+    /// Живые сессии исполнителя — слепки для second source (#1163):
+    /// синтетические роли аналитики и матрица гарда (директория/финал/след).
+    live: Mutex<Vec<LiveSighting>>,
+    /// Отказ prompt (сирота спавна #1163).
+    prompt_fails: bool,
+    /// Журнал удалений сессий (ассерты сирота-зачистки).
+    deleted: Mutex<Vec<String>>,
+}
+
+/// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
+#[derive(Clone)]
+struct LiveSighting {
+    id: String,
+    agent: String,
+    directory: String,
+    outcome: String,
+    updated_ms: u64,
 }
 
 impl FakeSessions {
@@ -157,11 +195,38 @@ impl FakeSessions {
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
+            prompt_fails: false,
+            deleted: Mutex::default(),
         }
     }
     fn with_live(agent: &str) -> Self {
         Self {
-            live: Mutex::new(vec![(agent.into(), String::new())]),
+            live: Mutex::new(vec![LiveSighting {
+                id: format!("ses_live_{agent}"),
+                agent: agent.into(),
+                directory: String::new(),
+                outcome: String::new(),
+                updated_ms: 0,
+            }]),
+            ..Self::new()
+        }
+    }
+    /// Живая сессия в env-директории строки — сценарий сироты/клейма (#1163).
+    fn with_env_session(
+        id: &str,
+        directory: &str,
+        agent: &str,
+        outcome: &str,
+        updated_ms: u64,
+    ) -> Self {
+        Self {
+            live: Mutex::new(vec![LiveSighting {
+                id: id.into(),
+                agent: agent.into(),
+                directory: directory.into(),
+                outcome: outcome.into(),
+                updated_ms,
+            }]),
             ..Self::new()
         }
     }
@@ -176,6 +241,9 @@ impl AgentSessionGateway for FakeSessions {
         Ok(id)
     }
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
+        if self.prompt_fails {
+            return Err(UsecaseError::Session("prompt недоступен (мок)".into()));
+        }
         self.prompts
             .lock()
             .unwrap()
@@ -192,7 +260,8 @@ impl AgentSessionGateway for FakeSessions {
             Liveness::Alive
         }
     }
-    async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
+    async fn delete_session(&self, s: &str) -> UsecaseResult<()> {
+        self.deleted.lock().unwrap().push(s.into());
         Ok(())
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
@@ -207,6 +276,7 @@ impl AgentSessionGateway for FakeSessions {
             text: String::new(),
             finished: true,
             is_latest: true,
+            finish: Some("stop".into()),
         }))
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
@@ -215,27 +285,34 @@ impl AgentSessionGateway for FakeSessions {
                 "list недоступен (мок)".into(),
             ));
         }
-        // spawned = живые сессии (outcome пуст — финала нет);
-        // live = синтетические роли для alive-гвардов тестов аналитики (#1135)
+        // spawned = живые сессии (outcome пуст — финала нет), мёртвые вне
+        // списка: list и GET согласованы, сессия, которую serve 404-ит,
+        // в list не попадает (контракт second source #1163);
+        // live = синтетические роли для alive-гвардов тестов аналитики
+        // (#1135) и матрица гарда спавна (#1163)
+        let dead = self.dead_sessions.lock().unwrap().clone();
         let mut out: Vec<crate::ports::SessionInfo> = self
             .spawned
             .lock()
             .unwrap()
             .iter()
+            .filter(|id| !dead.contains(*id))
             .map(|id| crate::ports::SessionInfo {
                 id: id.clone(),
                 agent: String::new(),
+                directory: String::new(),
                 updated_ms: 0,
                 outcome: String::new(),
                 total_tokens: 0,
             })
             .collect();
-        for (agent, outcome) in self.live.lock().unwrap().iter() {
+        for s in self.live.lock().unwrap().iter() {
             out.push(crate::ports::SessionInfo {
-                id: format!("ses_live_{agent}"),
-                agent: agent.clone(),
-                updated_ms: 0,
-                outcome: outcome.clone(),
+                id: s.id.clone(),
+                agent: s.agent.clone(),
+                directory: s.directory.clone(),
+                updated_ms: s.updated_ms,
+                outcome: s.outcome.clone(),
                 total_tokens: 0,
             });
         }
@@ -291,6 +368,8 @@ struct MemStateInner {
     resets: Vec<(u64, Status)>,
     /// сталл-детект: (number, статус раунда, ms пинга)
     stalls: Vec<(u64, Status, u64)>,
+    /// mark_spawn-журнал: (number, slot, ms) — кулдаун-сценарии (#1163)
+    spawn_ms: Vec<(u64, Slot, u64)>,
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
 }
@@ -323,11 +402,27 @@ impl TickStateStore for MemState {
         0
     }
     fn mark_dreamer_spawn(&self, _day: &str) {}
-    fn last_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) -> Option<u64> {
-        None
+    fn last_spawn_ms(&self, _b: &str, n: u64, s: Slot) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .spawn_ms
+            .iter()
+            .rev()
+            .find(|(num, slot, _)| *num == n && *slot == s)
+            .map(|(_, _, ts)| *ts)
     }
-    fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
-    fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
+    fn mark_spawn(&self, _b: &str, n: u64, s: Slot, at: u64) {
+        self.0.lock().unwrap().spawn_ms.push((n, s, at));
+    }
+    fn clear_spawn_ms(&self, _b: &str, n: u64, s: Slot) {
+        self.0
+            .lock()
+            .unwrap()
+            .spawn_ms
+            .retain(|(num, slot, _)| !(*num == n && *slot == s));
+    }
+
     fn last_analys_ms(&self, _b: &str, n: u64) -> Option<u64> {
         self.0
             .lock()
@@ -508,6 +603,8 @@ fn usecase_with_state(
         rows,
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions::new());
     let prs = Arc::new(FakePrs {
@@ -551,6 +648,8 @@ fn peak_usecase(
         rows,
         log: Mutex::default(),
         comments,
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -561,6 +660,9 @@ fn peak_usecase(
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+
+        prompt_fails: false,
+        deleted: Mutex::default(),
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -588,6 +690,8 @@ fn usecase_with_sessions(
         rows,
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(sessions);
     let prs = Arc::new(FakePrs {
@@ -959,6 +1063,27 @@ async fn live_spawns_and_claims_session() {
 }
 
 #[tokio::test]
+async fn live_spawn_writes_branch_cell_from_worktree_name() {
+    // #1166: фабрика пишет Branch при спавне — PR-финализация без ручного
+    // `--branch` перестаёт рендериться «—» (рид гейтится веткой).
+    let (u, board, _sessions, _) = usecase(vec![task(7, Status::InProgress)], PrState::Missing);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1);
+    let log = board.log.lock().unwrap().clone();
+    let branch = log
+        .iter()
+        .find(|l| l.starts_with("branch#7="))
+        .expect("Branch-ячейка записана фабрикой");
+    assert_eq!(branch, "branch#7=work/task-7", "имя ветки ворктри task-env");
+    let branch_pos = log.iter().position(|l| l.starts_with("branch#")).unwrap();
+    let session_pos = log.iter().position(|l| l.starts_with("session#")).unwrap();
+    assert!(
+        branch_pos < session_pos,
+        "ячейка пишется до привязки сессии (env уже готов)"
+    );
+}
+
+#[tokio::test]
 async fn cup_holds_spawn_in_live() {
     // #1244: кап держат фактические запуски (busy + состоявшиеся спавны
     // тика), не очередь кандидатов — 8 кандидатов при cap 7: 7 спавнов
@@ -1141,6 +1266,9 @@ async fn multi_round_reentry_never_escalates() {
     let state = Arc::new(MemState(Mutex::default()));
     let mut escalations = 0usize;
     for round in 0..3 {
+        // между кругами проходит время > кулдауна слота (фейк-часы заморожены —
+        // кулдаун иначе держал бы спавн круга: прод-семантика, #1163)
+        state.0.lock().unwrap().spawn_ms.clear();
         // круг: спавн dev → результат (ReviewResult) → вердикт на доработку
         let (u1, _, sessions, _) = usecase_with_state(
             vec![task(20, Status::InProgress)],
@@ -1315,6 +1443,8 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        prompt_fails: false,
+        deleted: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -1585,6 +1715,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         let board = Arc::new(FakeBoard {
             rows: vec![t],
             log: Mutex::default(),
+            fields_fails: false,
+            set_session_fails: false,
             comments: vec![CommentRef {
                 id: "verdict".into(),
                 created_ms: 3000,
@@ -1600,6 +1732,9 @@ async fn undelivered_comment_is_not_marked_seen() {
             idle_reply: false,
             specs: Mutex::default(),
             live: Mutex::default(),
+
+            prompt_fails: false,
+            deleted: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -1637,6 +1772,8 @@ async fn undelivered_comment_is_not_marked_seen() {
     let board = Arc::new(FakeBoard {
         rows: vec![t2],
         log: Mutex::default(),
+        fields_fails: false,
+        set_session_fails: false,
         comments: vec![CommentRef {
             id: "verdict".into(),
             created_ms: 3000,
@@ -1652,6 +1789,9 @@ async fn undelivered_comment_is_not_marked_seen() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+
+        prompt_fails: false,
+        deleted: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -1687,6 +1827,8 @@ async fn multi_comment_tail_delivered_together() {
     let board = Arc::new(FakeBoard {
         rows: vec![t],
         log: Mutex::default(),
+        fields_fails: false,
+        set_session_fails: false,
         comments: vec![
             CommentRef {
                 id: "A".into(),
@@ -1714,6 +1856,9 @@ async fn multi_comment_tail_delivered_together() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+
+        prompt_fails: false,
+        deleted: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1759,6 +1904,8 @@ async fn inflight_comment_delivered_after_agent_reply() {
     let board = Arc::new(FakeBoard {
         rows: vec![t],
         log: Mutex::default(),
+        fields_fails: false,
+        set_session_fails: false,
         comments: vec![CommentRef {
             id: "verdict".into(),
             created_ms: 3000,
@@ -1770,6 +1917,8 @@ async fn inflight_comment_delivered_after_agent_reply() {
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(5000),
         idle_reply: true,
+        prompt_fails: false,
+        deleted: Mutex::default(),
         ..Default::default()
     });
     let u = TickUseCase {
@@ -1821,6 +1970,8 @@ async fn busy_session_not_pinged_early() {
         rows: vec![t],
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sess = Arc::new(FakeSessions {
         // молчание ~30 мин (tool-call висит), idle_reply = false
@@ -1828,6 +1979,8 @@ async fn busy_session_not_pinged_early() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        prompt_fails: false,
+        deleted: Mutex::default(),
         ..Default::default()
     });
     let u = TickUseCase {
@@ -1877,11 +2030,15 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         rows: vec![t],
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sess = Arc::new(FakeSessions {
         // молчание 16 мин, ход завершён (idle)
         activity_ms: Some(100_000_000 - 16 * 60_000),
         idle_reply: true,
+        prompt_fails: false,
+        deleted: Mutex::default(),
         ..Default::default()
     });
     let u = TickUseCase {
@@ -1953,10 +2110,14 @@ async fn idle_sessions_do_not_hold_cup() {
         rows,
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     // все спящие сессии — живые в API (spawned), но idle (ход завершён)
     let sessions = Arc::new(FakeSessions {
         idle_reply: true,
+        prompt_fails: false,
+        deleted: Mutex::default(),
         ..Default::default()
     });
     sessions
@@ -2110,6 +2271,8 @@ fn analyst_uc(
         rows,
         log: Mutex::default(),
         comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -2130,6 +2293,8 @@ fn review_uc(
         rows,
         log: Mutex::default(),
         comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let u = AnalystReviewUseCase {
         board: board.clone(),
@@ -2337,6 +2502,8 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         rows: vec![titled(1, "заявка", Status::Analys)],
         log: Mutex::default(),
         comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
     let u = AnalystUseCase {
@@ -2565,6 +2732,9 @@ impl TaskBoardRepo for FakeMultiBoard {
         Ok(())
     }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
@@ -2966,6 +3136,9 @@ impl TaskBoardRepo for CloseBoard {
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3104,4 +3277,408 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         log.is_empty(),
         "промах close не мутирует доски, лог: {log:?}"
     );
+}
+
+// ===== Гард «одна живая сессия на строку» + зачистка спавн-путей (#1163) =====
+
+/// Часы с большим now_ms — сценарий протухшего следа (зомби-страховка).
+struct LateClock;
+impl Clock for LateClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 100,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        20_000_000
+    }
+}
+
+fn tick_with_clock(
+    rows: Vec<Task>,
+    sessions: FakeSessions,
+    state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(sessions);
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock,
+        state,
+        spawn_model: None,
+    };
+    (u, board, sessions, prs)
+}
+
+#[tokio::test]
+async fn spawn_held_when_live_session_in_env_dir() {
+    // сирота спавна/клейм в гонке с тиком: дев-сессия живёт в env строки
+    // при пустой ячейке — второй источник держит дублирующий спавн (#1150)
+    let sessions = FakeSessions::with_env_session("ses_orphan", "/tmp/env/50", "", "", 2000);
+    let (u, board, sessions, _) = usecase_with_sessions(
+        vec![task(50, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "спавн поверх живой сессии env не состоялся"
+    );
+    assert_eq!(out.held_live, 1, "гард держит и считает hold");
+    assert_eq!(out.spawns_done, 0);
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("session#50")),
+        "ячейка не перезаписана"
+    );
+}
+
+#[tokio::test]
+async fn spawn_allowed_when_env_session_finished() {
+    // финал хода (outcome succeeded) — спавн нового раунда не держится
+    let sessions = FakeSessions::with_env_session("ses_done", "/tmp/env/51", "", "succeeded", 2000);
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![task(51, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "завершённая сессия спавну не мешает");
+    assert_eq!(out.held_live, 0);
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reviewer_env_session_does_not_hold_dev_spawn() {
+    // ревьювер, досматривающий вердикт прошлого раунда (та же env-
+    // директория), спавн дева не держит — семьи разные
+    let sessions =
+        FakeSessions::with_env_session("ses_rev", "/tmp/env/52", "code-quality-reviewer", "", 2000);
+    let (u, _, _, _) = usecase_with_sessions(
+        vec![task(52, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "чужая семья не держит дев-спавн");
+    assert_eq!(out.held_live, 0);
+}
+
+#[tokio::test]
+async fn stale_env_session_does_not_hold_spawn() {
+    // зомби-страховка: ход без финала и след протух за окно — спавн идёт
+    // (луп-гвард каппирует повтор, строка не зависает навсегда)
+    let sessions = FakeSessions::with_env_session(
+        "ses_zombie",
+        "/tmp/env/53",
+        "",
+        "",
+        1_000_000, // now 20_000_000 — след старше окна 2ч
+    );
+    let (u, _, sessions, _) = tick_with_clock(
+        vec![task(53, Status::InProgress)],
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+        Arc::new(LateClock),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "протухший след спавн не держит");
+    assert_eq!(out.held_live, 0);
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn dead_respawn_cancelled_when_serve_lists_session() {
+    // проба лжёт (404 живому ходу, serve-шторм 13.11): сессия числится
+    // в списке исполнителя — респавн отменён (#1072 → #1163)
+    let mut t = task(54, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_lie_54").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((54, Status::InProgress));
+    let sessions = FakeSessions::with_env_session("ses_lie_54", "/tmp/env/54", "", "", 2000);
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_lie_54".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "респавн живой (по second source) сессии не состоялся"
+    );
+    assert_eq!(out.wakeups_deferred, 0);
+    assert_eq!(out.spawns_done, 0);
+}
+
+#[tokio::test]
+async fn respawn_not_held_by_cooldown_attention_speed() {
+    // кулдаун-ЧЕК на респавн не вешается (#1163): он замедлял бы
+    // attention-механику (луп-гвард эскалирует час вместо ~15 мин).
+    // Свежий mark_spawn respawn не держит — спавн идёт, mark обновляется
+    // (единый учёт темпа слота: plain-путь держит по нему спавн).
+    let mut t = task(55, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_55").unwrap(),
+    );
+    t.apply_fields(f);
+    let inner = MemStateInner {
+        spawn_ms: vec![(55, Slot::Dev, 2000)], // только что спавнились
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((55, Status::InProgress));
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![t],
+        PrState::Missing,
+        FakeSessions::new(),
+        state.clone(),
+    );
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_55".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "респавн мёртвой сессии не замедлен кулдауном"
+    );
+    assert_eq!(out.wakeups_deferred, 0);
+    let marks = state.0.lock().unwrap().spawn_ms.clone();
+    assert!(
+        marks.iter().any(|(n, s, _)| *n == 55 && *s == Slot::Dev),
+        "респавн заряжает mark_spawn: {marks:?}"
+    );
+}
+
+#[tokio::test]
+async fn enrichment_failure_skips_row() {
+    // отказ enrichment (#1163): строка пропущена тиком — решение по
+    // невидимым ячейкам не принимается, дубль-спавн не случается
+    let board = Arc::new(FakeBoard {
+        rows: vec![task(57, Status::InProgress)],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: true,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions::new());
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.enrich_skipped, 1, "строка пропущена, не решена");
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "спавна по невидимым ячейкам нет"
+    );
+    assert!(
+        board.log.lock().unwrap().is_empty(),
+        "доска не мутируется по неполным данным"
+    );
+}
+
+#[tokio::test]
+async fn orphan_deleted_when_set_session_fails() {
+    // спавн состоялся, запись ячейки упала: сеанс гасится — иначе живой
+    // сеанс вне ячейки вечно держит гард, а будить его некому (#1163)
+    let board = Arc::new(FakeBoard {
+        rows: vec![task(58, Status::InProgress)],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: true,
+    });
+    let sessions = Arc::new(FakeSessions::new());
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.actions_failed, 1, "отказ записи ячейки виден");
+    assert_eq!(out.spawns_done, 0);
+    let deleted = sessions.deleted.lock().unwrap();
+    assert!(
+        deleted.len() >= 2,
+        "гасятся и work-сирота, и bootstrap: {deleted:?}"
+    );
+}
+
+#[tokio::test]
+async fn orphan_deleted_when_prompt_fails() {
+    // промпт не дошёл: сессия без промпта — мусор, гасится симметрично
+    // bootstrap-зачистке (#1163)
+    let sessions = FakeSessions {
+        prompt_fails: true,
+        ..FakeSessions::new()
+    };
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![task(59, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.actions_failed, 1);
+    assert_eq!(out.spawns_done, 0);
+    let deleted = sessions.deleted.lock().unwrap();
+    assert!(
+        deleted.iter().any(|d| d.starts_with("ses_")),
+        "work-сессия без промпта удалена: {deleted:?}"
+    );
+}
+
+#[tokio::test]
+async fn dead_respawn_held_when_orphan_in_env() {
+    // ревью Common-2: сеанс ячейки мёртв по-настоящему (вне списка), но
+    // в env строки живёт сирота из crash-окна — респавн держится env-гардом
+    let mut t = task(60, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_60").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((60, Status::InProgress));
+    let sessions = FakeSessions::with_env_session("ses_orphan_60", "/tmp/env/60", "", "", 2000);
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_60".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "респавн поверх живой сироты env не состоялся"
+    );
+    assert_eq!(
+        out.held_live, 1,
+        "env-гард держит и считает hold на респавне"
+    );
+    assert_eq!(out.wakeups_deferred, 0);
+}
+
+#[tokio::test]
+async fn strict_scan_down_plain_spawn_not_held() {
+    // never-worse (#1163): strict-скан недоступен (исполнитель за релеем
+    // лёг) — гард пропускается, спавн идёт прежним путём, hold не ставится
+    let mut sessions = FakeSessions::new();
+    sessions.list_fails = true;
+    let (u, _, _, _) = usecase_with_sessions(
+        vec![task(61, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "list недоступен — гард не держит (never worse)"
+    );
+    assert_eq!(out.held_live, 0);
+}
+
+#[tokio::test]
+async fn strict_scan_down_dead_respawn_not_held() {
+    // never-worse на respawn-пути: скан недоступен — second source и
+    // env-гард молчат (unwrap_or пустого списка), мёртвая сессия
+    // респавнится как раньше
+    let mut t = task(62, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_62").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((62, Status::InProgress));
+    let mut sessions = FakeSessions::new();
+    sessions.list_fails = true;
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_62".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "скан недоступен — респавн не держится (never worse)"
+    );
+    assert_eq!(out.held_live, 0);
+}
+
+#[test]
+fn env_repo_dir_formula_is_pinned() {
+    // ревью Low: формула env-директории одна — спавн и гард строят путь
+    // одной функцией; формат пинится тестом (расхождение = тихая слепота)
+    assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
+    assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
 }
