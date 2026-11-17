@@ -429,6 +429,10 @@ mod tests {
 
     #[async_trait]
     impl TaskBoardRepo for FakeBoard {
+        async fn row_status(&self, _board: &str, _number: u64) -> UsecaseResult<Option<Status>> {
+            Ok(None)
+        }
+
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
             Ok(Vec::new())
         }

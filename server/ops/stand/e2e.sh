@@ -215,7 +215,13 @@ d = json.load(sys.stdin)
 row = d.get('data') or d
 print(row.get('id',''))")
 [ -n "$ORPHAN_ID" ] || fail "мок не создал сироту-сессию: [$ORPHAN_RESP]"
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
+# конфиг фазы 4 — в ран-дир: state пишется config-adjacent; конфиг из ops/
+# делал state общим между прогонами (server/ops/state.json ворктри,
+# ревью #1231 раунд 4 Common)
+CONFIG_P4="$RUN_DIR/config-memory-p4.toml"
+sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:8090|http://127.0.0.1:$PORT_SRV|" \
+  ops/config.memory.toml > "$CONFIG_P4"
+UWUWU_SERVER_CONFIG=$CONFIG_P4 PORT=$PORT_SRV UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
   ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &

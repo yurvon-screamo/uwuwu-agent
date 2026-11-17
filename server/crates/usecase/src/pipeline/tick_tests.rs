@@ -4065,6 +4065,7 @@ async fn dreamer_title_carries_marker() {
         clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
         spawn_model: None,
         checkout: "/tmp/checkout".into(),
+        cup: 7,
     };
     assert_eq!(u.tick().await.unwrap(), 1);
     let specs = sessions.specs.lock().unwrap();
