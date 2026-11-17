@@ -132,6 +132,47 @@ echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock у
 echo "$M2" | grep -q "#$SEED_N" && fail "кросс-маршрут: uwuwu ушел на mock2"
 say "маршрутизация ок: uwuwu → мок-1, 1xgames-mock → мок-2 (без кроссов)"
 
+# Инвариант lifecycle (#1248): create + начальный prompt — ОДИН исполнитель.
+# Промпт в чужую сессию — HTTP 404 → action.failed в логе сервера (мок
+# отвечает 404 до лога mock.prompt); каждая work-сессия получает свой
+# начальный промпт на своём моке. Класс «lifecycle-вызов мимо роутера»
+# закрыт стендом, а не разовым фиксом.
+if grep -q 'action.failed' "$LOG_SRV_MULTI"; then
+  fail "action.failed при живых исполнителях (lifecycle мимо роутера?): $(grep -m1 'action.failed' "$LOG_SRV_MULTI")"
+fi
+python3 - "$LOG_MOCK" "$LOG_MOCK2" <<'PY' || fail "lifecycle-инвариант: create+начальный prompt на разных исполнителях"
+import json, sys
+
+def events(path):
+    out = []
+    for line in open(path, errors="ignore"):
+        try:
+            f = json.loads(line).get("fields")
+        except Exception:
+            continue
+        if isinstance(f, dict):
+            out.append(f)
+    return out
+
+def check(evs, num, label):
+    created = [e for e in evs
+               if e.get("event") == "mock.session_created"
+               and f"#{num}" in str(e.get("title", ""))
+               and "bootstrap" not in str(e.get("title", ""))]
+    assert created, f"{label}: нет work-сессий #{num} (спавн не дошёл?)"
+    prompted = {e.get("id") for e in evs if e.get("event") == "mock.prompt"}
+    missing = sorted({e.get("id") for e in created if e.get("id") not in prompted})
+    assert not missing, (
+        f"{label}: work-сессии #{num} без начального промпта "
+        f"на своём исполнителе: {missing}"
+    )
+
+check(events(sys.argv[1]), 2046, "mock1")
+check(events(sys.argv[2]), 2047, "mock2")
+print("[e2e] lifecycle-инвариант: create + начальный prompt на одном исполнителе (обе доски)")
+PY
+say "lifecycle-инвариант ок: create + начальный prompt — один исполнитель"
+
 task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 -c "
 import json,sys
 t = json.load(sys.stdin)['result']['content'][0]['text']

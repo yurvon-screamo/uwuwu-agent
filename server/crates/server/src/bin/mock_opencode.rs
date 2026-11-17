@@ -177,7 +177,10 @@ async fn mcp_call(base: &str, token: &str, tool: &str, args: Value) -> String {
 
 #[tokio::main]
 async fn main() {
+    // json-формат: единый парсинг логов мока и сервера в e2e-инвариантах
+    // (lifecycle-пин «create + начальный prompt — один исполнитель», #1248)
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
