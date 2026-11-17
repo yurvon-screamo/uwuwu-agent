@@ -20,6 +20,26 @@ pub fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     Some((owner, repo, number))
 }
 
+/// Чек-раны → вердикт: Some(true) зелёный, Some(false) красный, None —
+/// есть незавершённые раны (pending). Пусто (CI выключен/не настроен) —
+/// зелёный: мерж-гейт только CI-red. Ран без conclusion (queued/
+/// in_progress) — pending, не зелёный (#1232: прежний `unwrap_or(true)`
+/// пропускал мерж при бегущих чеках).
+fn classify_check_runs(runs: &[Value]) -> Option<bool> {
+    if runs.is_empty() {
+        return Some(true);
+    }
+    let mut any_red = false;
+    for r in runs {
+        match r["conclusion"].as_str() {
+            Some("success") | Some("skipped") | Some("neutral") => {}
+            Some(_) => any_red = true,
+            None => return None,
+        }
+    }
+    Some(!any_red)
+}
+
 impl GhPrGateway {
     pub fn new(token: String) -> Self {
         Self {
@@ -57,8 +77,9 @@ impl GhPrGateway {
         Ok((status, value))
     }
 
-    /// CI зелёный: все чек-раны head-коммита завершились успехом.
-    async fn ci_green(&self, owner: &str, repo: &str, sha: &str) -> UsecaseResult<bool> {
+    /// CI-вердикт по чек-ранам head-коммита: Some(true) — зелёный,
+    /// Some(false) — красный, None — есть незавершённые раны (pending).
+    async fn ci_verdict(&self, owner: &str, repo: &str, sha: &str) -> UsecaseResult<Option<bool>> {
         let (status, body) = self
             .get(&format!("/repos/{owner}/{repo}/commits/{sha}/check-runs"))
             .await?;
@@ -66,15 +87,10 @@ impl GhPrGateway {
             // 403 сюда не доходит — gherr::classify выше отдаёт громкий Err
             // (rate limit/permission); ветка осмысленна для 404 и прочих
             // не-success: нет чеков — считаем зелёным (мерж-гейт только CI-ред)
-            return Ok(true);
+            return Ok(Some(true));
         }
         let runs = body["check_runs"].as_array().cloned().unwrap_or_default();
-        Ok(runs.iter().all(|r| {
-            r["conclusion"]
-                .as_str()
-                .map(|c| c == "success" || c == "skipped" || c == "neutral")
-                .unwrap_or(true)
-        }))
+        Ok(classify_check_runs(&runs))
     }
 
     async fn probe_pull(
@@ -100,12 +116,18 @@ impl GhPrGateway {
         if pr["state"].as_str() == Some("closed") {
             return Ok(Some(PrState::Closed));
         }
-        let mergeable = pr["mergeable"].as_bool().unwrap_or(false);
+        // mergeable=null — GitHub ещё считает: pending, не ложный конфликт
+        // (#1232: прежний `unwrap_or(false)` давал ложный bounce)
+        let Some(mergeable) = pr["mergeable"].as_bool() else {
+            return Ok(Some(PrState::Pending));
+        };
         let sha = pr["head"]["sha"].as_str().unwrap_or_default().to_string();
-        let ci = self.ci_green(owner, repo, &sha).await?;
+        let Some(ci_green) = self.ci_verdict(owner, repo, &sha).await? else {
+            return Ok(Some(PrState::Pending));
+        };
         Ok(Some(PrState::Open {
             mergeable,
-            ci_green: ci,
+            ci_green,
         }))
     }
 
@@ -203,5 +225,44 @@ mod tests {
         );
         assert_eq!(parse_pr_url("https://github.com/a/b/pull/x"), None);
         assert_eq!(parse_pr_url("мусор"), None);
+    }
+
+    #[test]
+    fn classify_check_runs_empty_is_green() {
+        // CI выключен/не настроен — мерж-гейт только CI-red (#1232,
+        // биллинг Actions снят: чеков нет, автомерж не молчит)
+        assert_eq!(classify_check_runs(&[]), Some(true));
+    }
+
+    #[test]
+    fn classify_check_runs_success_skipped_neutral_is_green() {
+        let runs = vec![
+            json!({ "conclusion": "success" }),
+            json!({ "conclusion": "skipped" }),
+            json!({ "conclusion": "neutral" }),
+        ];
+        assert_eq!(classify_check_runs(&runs), Some(true));
+    }
+
+    #[test]
+    fn classify_check_runs_failure_is_red() {
+        let runs = vec![
+            json!({ "conclusion": "success" }),
+            json!({ "conclusion": "failure" }),
+        ];
+        assert_eq!(classify_check_runs(&runs), Some(false));
+    }
+
+    #[test]
+    fn classify_check_runs_unfinished_is_pending() {
+        // queued/in_progress — ран без conclusion: вердикт следующего
+        // прогона, не зелёный (баг #1232: unwrap_or(true) пропускал мерж)
+        let runs = vec![
+            json!({ "conclusion": "success" }),
+            json!({ "status": "in_progress" }),
+        ];
+        assert_eq!(classify_check_runs(&runs), None);
+        let queued = vec![json!({ "status": "queued", "conclusion": null })];
+        assert_eq!(classify_check_runs(&queued), None);
     }
 }

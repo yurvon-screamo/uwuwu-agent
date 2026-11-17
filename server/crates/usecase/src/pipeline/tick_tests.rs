@@ -35,6 +35,13 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
+    async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|t| t.number() == n)
+            .map(|t| t.status()))
+    }
     async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
         if self.set_session_fails {
             return Err(UsecaseError::Session("set_session недоступен (мок)".into()));
@@ -175,6 +182,7 @@ struct FakeSessions {
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
+/// total_tokens — кандидатность дримера (токены > 0 = реальная работа).
 #[derive(Clone)]
 struct LiveSighting {
     id: String,
@@ -182,6 +190,7 @@ struct LiveSighting {
     directory: String,
     outcome: String,
     updated_ms: u64,
+    total_tokens: u64,
 }
 
 impl FakeSessions {
@@ -207,6 +216,7 @@ impl FakeSessions {
                 directory: String::new(),
                 outcome: String::new(),
                 updated_ms: 0,
+                total_tokens: 0,
             }]),
             ..Self::new()
         }
@@ -226,6 +236,21 @@ impl FakeSessions {
                 directory: directory.into(),
                 outcome: outcome.into(),
                 updated_ms,
+                total_tokens: 0,
+            }]),
+            ..Self::new()
+        }
+    }
+    /// Завершённая сессия с финалом и токенами — дример-кандидат.
+    fn with_finished(agent: &str, outcome: &str) -> Self {
+        Self {
+            live: Mutex::new(vec![LiveSighting {
+                id: format!("ses_live_{agent}"),
+                agent: agent.into(),
+                directory: String::new(),
+                outcome: outcome.into(),
+                updated_ms: 0,
+                total_tokens: 1000,
             }]),
             ..Self::new()
         }
@@ -313,7 +338,7 @@ impl AgentSessionGateway for FakeSessions {
                 directory: s.directory.clone(),
                 updated_ms: s.updated_ms,
                 outcome: s.outcome.clone(),
-                total_tokens: 0,
+                total_tokens: s.total_tokens,
             });
         }
         Ok(out)
@@ -339,7 +364,7 @@ impl PrGateway for FakePrs {
     }
 }
 
-struct FixedClock;
+pub(crate) struct FixedClock;
 impl Clock for FixedClock {
     fn utc_minute(&self) -> UtcMinute {
         UtcMinute {
@@ -373,7 +398,14 @@ struct MemStateInner {
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
 }
-struct MemState(Mutex<MemStateInner>);
+pub(crate) struct MemState(Mutex<MemStateInner>);
+
+impl MemState {
+    /// Пустое состояние: no-op-реестры для тестов вне тика (write/т.п.).
+    pub(crate) fn empty() -> Self {
+        Self(Mutex::default())
+    }
+}
 impl TickStateStore for MemState {
     fn last_comment_id(&self, _b: &str, _n: u64) -> Option<String> {
         self.0.lock().unwrap().comments.last().cloned()
@@ -1263,6 +1295,32 @@ async fn live_spawns_and_claims_session() {
         .any(|l| l.starts_with("session#1")));
 }
 
+/// Тайтл спавн-сессии несёт эмодзи-маркер стадии между номером и тайтлом
+/// (задача #1212); bootstrap наследует тем же значением.
+#[tokio::test]
+async fn spawn_title_carries_stage_marker() {
+    // Dev-слот (In Progress): маркер 🔨, bootstrap и work — одинаково
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    {
+        let specs = sessions.specs.lock().unwrap();
+        assert_eq!(specs.len(), 2, "bootstrap + work");
+        assert_eq!(specs[0].title, "bootstrap #1 🔨 t1");
+        assert_eq!(specs[1].title, "#1 🔨 t1");
+    }
+
+    // PlanReview-слот: маркер 🔍 и агент plan-reviewer
+    let (u, _, sessions, _) = usecase(vec![task(2, Status::ReviewPlan)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs.last().expect("рабочая сессия");
+    assert_eq!(work.title, "#2 🔍 t2");
+    assert!(
+        matches!(work.agent, AgentSlot::Role(Agent::PlanReviewer)),
+        "ревью-план спавнится кастомным агентом"
+    );
+}
+
 #[tokio::test]
 async fn live_spawn_writes_branch_cell_from_worktree_name() {
     // #1166: фабрика пишет Branch при спавне — PR-финализация без ручного
@@ -1306,22 +1364,42 @@ async fn cup_holds_spawn_in_live() {
     );
 }
 
-#[tokio::test]
-async fn autodone_merged_finishes() {
-    let mut t = task(3, Status::UserReview);
-    t.set_autodone(true);
-    let (u, board, _, _) = usecase(vec![t], PrState::Merged);
-    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(out.autodone_done, 1);
-    let log = board.log.lock().unwrap();
-    assert!(log.iter().any(|l| l.contains("status#3=Done")), "{log:?}");
-    assert!(log.iter().any(|l| l.contains("close#3")));
+/// Фикстура носителя мержа: ветка (+PR) + automerge — для кейсов
+/// действия Automerge.
+fn carrier(t: &mut Task, n: u64, with_pr: bool) {
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::parse(&format!("work/task-{n}")).unwrap());
+    if with_pr {
+        f.open_pr(PrUrl::parse(&format!("https://github.com/a/c/pull/{n}")).unwrap())
+            .unwrap();
+    }
+    t.apply_fields(f);
+    t.set_automerge(true);
 }
 
 #[tokio::test]
-async fn autodone_red_ci_bounces_to_in_progress() {
+async fn automerge_merged_is_noop_row_stays_review() {
+    // #1232: PR уже влит (вручную/раньше) — no-op: merge-API не зовётся,
+    // Done/close не ставятся, строка ждёт владельца в Review
+    // (инцидент #1151/#1162 — ложный bounce смерженной строки недопустим)
+    let mut t = task(3, Status::UserReview);
+    carrier(&mut t, 3, true);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0, "no-op не считается мержем");
+    assert_eq!(prs.merges.lock().unwrap().len(), 0, "merge-API не зовётся");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#3")),
+        "статус не трогается: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#3")));
+}
+
+#[tokio::test]
+async fn automerge_red_ci_bounces_to_in_progress() {
     let mut t = task(4, Status::UserReview);
-    t.set_autodone(true);
+    carrier(&mut t, 4, true);
     let (u, board, _, _) = usecase(
         vec![t],
         PrState::Open {
@@ -1335,18 +1413,19 @@ async fn autodone_red_ci_bounces_to_in_progress() {
         log.iter().any(|l| l.contains("status#4=InProgress")),
         "{log:?}"
     );
+    assert!(
+        log.iter().any(|l| l.contains("comment#4=")),
+        "bounce несёт коммент: {log:?}"
+    );
     assert!(!log.iter().any(|l| l.contains("close#4")));
 }
 
 #[tokio::test]
-async fn autodone_green_merges() {
+async fn automerge_green_merges_row_stays_review() {
+    // #1232: зелёный мержит, но строка остаётся в Review — Done всегда
+    // за владельцем
     let mut t = task(5, Status::UserReview);
-    t.set_autodone(true);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-5").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap())
-        .unwrap();
-    t.apply_fields(f);
+    carrier(&mut t, 5, true);
     let (u, board, _, prs) = usecase(
         vec![t],
         PrState::Open {
@@ -1354,23 +1433,40 @@ async fn autodone_green_merges() {
             ci_green: true,
         },
     );
-    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(prs.merges.lock().unwrap().len(), 1);
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#5=Done")));
+    assert_eq!(out.automerged, 1);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#5")),
+        "статус не трогается (остаётся Review): {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#5")));
 }
 
 #[tokio::test]
-async fn autodone_missing_pr_with_branch_bounces() {
+async fn automerge_conflict_bounces_to_in_progress() {
+    let mut t = task(8, Status::UserReview);
+    carrier(&mut t, 8, true);
+    let (u, board, _, _) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: false,
+            ci_green: true,
+        },
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.contains("status#8=InProgress")),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
-    t.set_autodone(true);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-6").unwrap());
-    t.apply_fields(f);
+    carrier(&mut t, 6, false);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
@@ -1381,17 +1477,36 @@ async fn autodone_missing_pr_with_branch_bounces() {
 }
 
 #[tokio::test]
-async fn autodone_docs_only_done() {
-    let mut t = task(7, Status::UserReview);
-    t.set_autodone(true);
-    let (u, board, _, _) = usecase(vec![t], PrState::Missing);
+async fn automerge_pending_is_quiet() {
+    // mergeable считается / чеки бегут — вердикт следующего тика,
+    // строку не трогаем (#1232: ложный конфликт/green недопустим)
+    let mut t = task(9, Status::UserReview);
+    carrier(&mut t, 9, true);
+    let (u, board, _, _) = usecase(vec![t], PrState::Pending);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#7=Done")));
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#9") || l.contains("comment#9")),
+        "pending тих: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_docs_only_is_not_probed() {
+    // docs-only (нет PR и ветки) — домен не решает Automerge: тик не
+    // прощупывает PR, строка ждёт владельца в Review (#1232)
+    let mut t = task(7, Status::UserReview);
+    t.set_automerge(true);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(prs.merges.lock().unwrap().len(), 0);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#7") || l.contains("comment#7")),
+        "docs-only строка не трогается: {log:?}"
+    );
 }
 
 #[tokio::test]
@@ -3056,6 +3171,14 @@ impl TaskBoardRepo for FakeMultiBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
+    async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self
+            .boards
+            .iter()
+            .find(|(b, _)| b == board)
+            .and_then(|(_, rows)| rows.iter().find(|t| t.number() == n))
+            .map(|t| t.status()))
+    }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3458,6 +3581,9 @@ impl TaskBoardRepo for CloseBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
+    async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self.board_of(board)?.contains(&n).then_some(Status::Todo))
+    }
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3602,6 +3728,86 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         log.is_empty(),
         "промах close не мутирует доски, лог: {log:?}"
     );
+}
+
+// ===== Тайтлы вневых ролей — эмодзи-маркер (#1212): спавн-тайтл каждой
+// роли несёт маркер таблицы Agent::emoji; если маппинг отломают — тест падает.
+
+#[tokio::test]
+async fn analyst_wave_title_carries_marker() {
+    // 🧠 в тайтле волновой сессии аналитика (свой юзкейс, вне конвейерного тика)
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "заявка", Status::Analys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("волновая сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} аналитика волны", Agent::Analyst.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Analyst)));
+}
+
+#[tokio::test]
+async fn analyst_review_title_carries_marker() {
+    // ⚖️ в тайтле парной сессии ревью-аналитики
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (r, _) = review_uc(
+        vec![titled(1, "заявка", Status::ReviewAnalys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(r.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("сессия ревью-аналитики");
+    assert_eq!(
+        spec.title,
+        format!("{} ревью аналитики", Agent::AnalystReviewer.emoji())
+    );
+    assert!(matches!(
+        spec.agent,
+        AgentSlot::Role(Agent::AnalystReviewer)
+    ));
+}
+
+#[tokio::test]
+async fn dreamer_title_carries_marker() {
+    // 🌙 в тайтле дример-сессии пост-обработки (кандидат: финал + токены + idle)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct FarClock(AtomicU64);
+    impl crate::ports::Clock for FarClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let sessions = Arc::new(FakeSessions::with_finished("dev", "готово"));
+    let u = crate::pipeline::dreamer::DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: Arc::new(MemState(Mutex::default())),
+        clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
+        spawn_model: None,
+        checkout: "/tmp/checkout".into(),
+    };
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("дример-сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} дример ses_live_dev", Agent::Dreamer.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Dreamer)));
 }
 
 // ===== Гард «одна живая сессия на строку» + зачистка спавн-путей (#1163) =====

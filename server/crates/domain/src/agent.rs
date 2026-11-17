@@ -31,6 +31,21 @@ impl Agent {
             Slot::Test => Some(Self::Tester),
         }
     }
+
+    /// Эмодзи-маркер роли в тайтле спавн-сессии (1:1 черновику владельца,
+    /// задача #1212). Пара Design/Dev == 🔨 осознанна и связана тестом
+    /// в task.rs — слот без агента это тот же исполнитель.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Developer => "🔨",
+            Self::PlanReviewer => "🔍",
+            Self::CodeQualityReviewer => "🔬",
+            Self::Tester => "🧪",
+            Self::Dreamer => "🌙",
+            Self::Analyst => "🧠",
+            Self::AnalystReviewer => "⚖️",
+        }
+    }
 }
 
 /// Агент исполнения: явное «дефолтная сессия» вместо Option.
@@ -104,5 +119,25 @@ mod tests {
         let m = ModelRef::new("zai", "glm-4.7");
         assert_eq!(m.provider(), "zai");
         assert_eq!(m.id(), "glm-4.7");
+    }
+
+    /// Маркеры ролей попарно различимы (критерий #1212: по списку сессий
+    /// мгновенно видно, где какая стадия).
+    #[test]
+    fn agent_emojis_are_pairwise_distinct() {
+        let emojis: [&str; 7] = [
+            Agent::Developer.emoji(),
+            Agent::PlanReviewer.emoji(),
+            Agent::CodeQualityReviewer.emoji(),
+            Agent::Tester.emoji(),
+            Agent::Dreamer.emoji(),
+            Agent::Analyst.emoji(),
+            Agent::AnalystReviewer.emoji(),
+        ];
+        for i in 0..emojis.len() {
+            for j in i + 1..emojis.len() {
+                assert_ne!(emojis[i], emojis[j]);
+            }
+        }
     }
 }
