@@ -1030,9 +1030,21 @@ mod tests {
 
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
-    fn live_snapshot_reads_issue_backed_priorities() {
-        // #1174: живой e2e read-path — снапшот доски «Задачи uwuwu»
-        // против реального hub; сверка с REST-носителем issue_field_values
+    fn live_snapshot_reads_issue_backed_automerge() {
+        // #1174: живой e2e read-path — снапшот парсит issue-backed
+        // single-select значения (каталог /user/issue-fields) из Pv2-отражения.
+        // Носитель — sandbox #1265 (Autodone=on, раунд тестирования #1232,
+        // строка открыта): отражение стабильно с 17.11.
+        //
+        // NB дрейф GitHub (дельта-раунд #1232, 18.11): Pv2-отражение
+        // issue-backed значений стало избирательным. Приоритет перестал
+        // отражаться вовсе (носители #1174/#1232/#1272 живы по REST,
+        // ProjectV2ItemIssueFieldValue для «Приоритет» отсутствует); у
+        // закрытой #1174 отражение существовало 17.11 и исчезло. Пин на
+        // priority-через-снапшот на живом носителе не держится; приоритет
+        // конвейерных стадий читается enrichment'ом (REST, #1163), для
+        // не-stage строк (#1174-срез CUP-очереди) — слепота, флаг
+        // владельцу в отчёте #1232.
         let repo =
             std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
         let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
@@ -1040,25 +1052,21 @@ mod tests {
         let rows: Vec<Task> = rt
             .block_on(async {
                 let hub = GitHubHub::new(repo, token);
-                hub.read_board("Задачи uwuwu").await
+                hub.read_board("Задачи sandbox").await
             })
             .expect("read_board");
         assert!(!rows.is_empty(), "доска не пуста");
 
-        // #1174: на носителе medium (REST issue_field_values) — снапшот
-        // обязан показать то же; до фикса priority был всегда Empty
+        // носитель on (REST issue_field_values) — снапшот обязан показать то же
         let t = rows
             .iter()
-            .find(|t| t.number() == 1174)
-            .expect("#1174 на доске");
-        assert_eq!(t.priority(), Priority::Medium);
-
-        let filled = rows
-            .iter()
-            .filter(|t| t.priority() != Priority::Empty)
-            .count();
-        println!("строк с приоритетом на снапшоте: {filled}");
-        assert!(filled > 0, "снапшот видит приоритеты строк");
+            .find(|t| t.number() == 1265)
+            .expect("#1265 на доске");
+        assert!(
+            t.automerge(),
+            "снапшот слеп к issue-backed automerge-носителю (Autodone=on у #1265): \
+             #1174-срез парсинга Pv2-отражения деградировал"
+        );
     }
 
     #[test]
