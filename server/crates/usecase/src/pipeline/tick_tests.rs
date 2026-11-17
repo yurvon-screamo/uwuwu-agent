@@ -730,6 +730,8 @@ fn routed_usecase(
             rows,
             log: Mutex::default(),
             comments,
+            fields_fails: false,
+            set_session_fails: false,
         }),
         sessions: Arc::new(SessionRouter::new(
             "kisa",
@@ -2492,6 +2494,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
             rows: row(status),
             log: Mutex::default(),
             comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
         })
     };
     let mut u = AnalystUseCase {
