@@ -1582,3 +1582,84 @@ mod slot_mapping_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod vcs_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn branchless_artifact_url_renders_pr() {
+        // #1155: вики-артефакт без ветки (канон ADR-021, жертва #1153) —
+        // рендер pr без Branch, а не отброс
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+                .into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(
+            f.pr().is_some(),
+            "безветочный артефакт-URL обязан рендериться в fm"
+        );
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branchless_foreign_pull_url_renders_pr() {
+        // #1155/true-washing#379: forgejo-pull на безветочной строке —
+        // значение живо в носителе, рендер обязан его показывать
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://git.true-wash.com/true-wash/deploy/pulls/9".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some(), "чужовендорный pull без ветки — рендер");
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branch_and_pr_pair_maps_pull_request() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-1".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-agent/pull/293".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-1"));
+    }
+
+    #[test]
+    fn branch_with_artifact_url_pair_maps_pull_request() {
+        // #1153 после воркараунда: Branch=main + blob-URL — кодовая пара
+        // с артефакт-URL живёт в PullRequest до очистки ветки
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "main".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/x.md".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("main"));
+    }
+
+    #[test]
+    fn branch_without_pr_maps_branch() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-2".into());
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_none());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-2"));
+    }
+
+    #[test]
+    fn empty_vcs_fields_map_local() {
+        let f = map_task_fields(&Fields::new());
+        assert!(f.pr().is_none());
+        assert!(f.branch().is_none());
+    }
+}
