@@ -186,6 +186,20 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self.with_state(|state| {
+            self.ensure_seed(state);
+            state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .map(|t| t.status())
+        }))
+    }
+
     async fn set_session(
         &self,
         _board: &str,

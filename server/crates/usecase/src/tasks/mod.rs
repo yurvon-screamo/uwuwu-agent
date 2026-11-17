@@ -2,6 +2,8 @@
 
 mod md_section;
 #[cfg(test)]
+mod edit_guard_tests;
+#[cfg(test)]
 mod md_section_tests;
 pub mod views;
 pub mod write;

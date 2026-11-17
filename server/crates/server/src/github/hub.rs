@@ -681,6 +681,16 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    async fn row_status(&self, _board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        let fetched = self.board_status_fetch(number).await?;
+        // пустая выборка — Status-значения на носителе нет (строка не на
+        // доске / поле не задано); непустое непарсящееся — Some(Empty)
+        if fetched.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(uwuwu_usecase::parse_status(&fetched)))
+    }
+
     async fn set_session(
         &self,
         _board: &str,

@@ -35,6 +35,9 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
+    async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self.rows.iter().find(|t| t.number() == n).map(|t| t.status()))
+    }
     async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
         if self.set_session_fails {
             return Err(UsecaseError::Session("set_session недоступен (мок)".into()));
@@ -2861,6 +2864,14 @@ impl TaskBoardRepo for FakeMultiBoard {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
+    async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self
+            .boards
+            .iter()
+            .find(|(b, _)| b == board)
+            .and_then(|(_, rows)| rows.iter().find(|t| t.number() == n))
+            .map(|t| t.status()))
+    }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3262,6 +3273,12 @@ impl TaskBoardRepo for CloseBoard {
         }
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
+    }
+    async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self
+            .board_of(board)?
+            .contains(&n)
+            .then_some(Status::Todo))
     }
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
         Ok(())
