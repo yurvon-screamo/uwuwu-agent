@@ -654,8 +654,18 @@ impl TaskBoardRepo for GitHubHub {
         } else {
             uwuwu_usecase::parse_status(&status)
         };
+        let raw = parse_field_values(&issue);
         let mut task = Task::new(number, title, status);
-        task.apply_fields(map_task_fields(&parse_field_values(&issue)));
+        task.apply_fields(map_task_fields(&raw));
+        // automerge с носителя (fm-вью честен, баг-репорт тестировщика #1232:
+        // read_issue не мапил значение — task_get врал automerge: false);
+        // тик-путь (snapshot item_values) уже читал, это REST-путь MCP
+        let automerge = raw
+            .get("Automerge")
+            .or_else(|| raw.get("Autodone"))
+            .map(|v| v == "on" || v == "true")
+            .unwrap_or(false);
+        task.set_automerge(automerge);
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
