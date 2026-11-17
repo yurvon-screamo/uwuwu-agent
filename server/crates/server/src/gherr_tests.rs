@@ -155,3 +155,72 @@ fn graphql_unrelated_errors_and_success_are_not_classified() {
     assert_eq!(classify_gql_errors(&body), None);
     assert_eq!(classify_gql_errors(&json!({ "data": {} })), None);
 }
+
+/// Живые шапки GitHub 403, снятые при прогоне #1156 (17.11: дренаж
+/// unauth per-IP бакета curl'ом + POST в архивное репо) — пин реальных
+/// форматов: имена lowercase (HTTP/2), remaining целым, reset epoch-секундами.
+#[test]
+fn classify_matches_live_github_403_shapes() {
+    // core-исчерпание (unauth 60/ч): remaining: 0, reset-epoch, Retry-After нет
+    let core_live = hdr(&[
+        ("x-ratelimit-limit", "60"),
+        ("x-ratelimit-remaining", "0"),
+        ("x-ratelimit-used", "60"),
+        ("x-ratelimit-resource", "core"),
+        ("x-ratelimit-reset", "1794878220"),
+    ]);
+    assert_eq!(
+        classify(StatusCode::FORBIDDEN, &core_live),
+        Some(GhFail::Core {
+            reset_epoch: Some(1794878220)
+        })
+    );
+
+    // search-семейство (unauth search 10/мин): ресурс другой, remaining: 0
+    // тот же — класс core (спецификация приоритета: remaining: 0 первичен)
+    let search_live = hdr(&[
+        ("x-ratelimit-limit", "10"),
+        ("x-ratelimit-remaining", "0"),
+        ("x-ratelimit-used", "10"),
+        ("x-ratelimit-resource", "search"),
+        ("x-ratelimit-reset", "1794876946"),
+    ]);
+    assert_eq!(
+        classify(StatusCode::FORBIDDEN, &search_live),
+        Some(GhFail::Core {
+            reset_epoch: Some(1794876946)
+        })
+    );
+
+    // permission (POST issue в архивное репо): 403 с НЕнулевой квотой —
+    // не rate limit, отказ доступа
+    let arch_live = hdr(&[
+        ("x-ratelimit-limit", "5000"),
+        ("x-ratelimit-remaining", "4885"),
+        ("x-ratelimit-used", "115"),
+        ("x-ratelimit-resource", "core"),
+        ("x-ratelimit-reset", "1794878581"),
+    ]);
+    assert_eq!(
+        classify(StatusCode::FORBIDDEN, &arch_live),
+        Some(GhFail::Permission)
+    );
+}
+
+/// Reset-время в тексте по живому epoch (1794878220 = 2026-11-17 01:17 UTC):
+/// Display печатает абсолют UTC (детерминирован), относительное
+/// «через ~N мин» считается от часов в момент ошибки — проверяется
+/// детерминированно через format_reset с фикс-настоящим.
+#[test]
+fn core_message_renders_live_reset_epoch() {
+    let text = GhFail::Core {
+        reset_epoch: Some(1794878220),
+    }
+    .to_string();
+    assert!(text.contains("2026-11-17 01:17 UTC"), "absolute: {text}");
+    assert!(text.contains("подожди или отложи ход"), "recipe: {text}");
+    let now = Utc.timestamp_opt(1794876940, 0).single().expect("now");
+    let rendered = format_reset(1794878220, now);
+    assert!(rendered.contains("2026-11-17 01:17 UTC"), "abs: {rendered}");
+    assert!(rendered.contains("~21 мин"), "relative: {rendered}");
+}
