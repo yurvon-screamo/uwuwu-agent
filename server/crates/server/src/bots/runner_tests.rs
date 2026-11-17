@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 use uwuwu_domain::{BotModel, Slot, Status};
-use uwuwu_usecase::bots::{BotStateStore, TelegramGateway, TgMessage, TgUpdate};
+use uwuwu_usecase::bots::{
+    BotAssetStore, BotStateStore, MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpdate,
+};
 use uwuwu_usecase::{
     AgentSessionGateway, AssistantReply, Clock, Liveness, SessionInfo, SessionSpec, TickStateStore,
     UsecaseError, UsecaseResult, WikiRepo,
@@ -80,6 +82,8 @@ impl WikiRepo for FakeWiki {
 /// FakeTg: async-поллинг очереди (прод — long-poll HTTP); panic_mode —
 /// смерть задачи для теста луп-гварда. Апдейты остаются в очереди до
 /// сдвига offset (семантика TG), fail_send — сбой sendMessage.
+/// download_file: байты по file_id из fixture; fail_download/oversize —
+/// сценарии отказов для media-веток (#1171).
 struct FakeTg {
     queue: Mutex<Vec<TgUpdate>>,
     sent: Mutex<Vec<(i64, String)>>,
@@ -87,6 +91,9 @@ struct FakeTg {
     panic: AtomicBool,
     fail_send: AtomicBool,
     polls: AtomicU32,
+    files: Mutex<HashMap<String, Vec<u8>>>,
+    fail_download: Mutex<Option<UsecaseError>>,
+    downloads: AtomicU32,
 }
 
 impl FakeTg {
@@ -98,6 +105,9 @@ impl FakeTg {
             panic: AtomicBool::new(false),
             fail_send: AtomicBool::new(false),
             polls: AtomicU32::new(0),
+            files: Mutex::new(HashMap::new()),
+            fail_download: Mutex::new(None),
+            downloads: AtomicU32::new(0),
         })
     }
     fn inject(&self, update: TgUpdate) {
@@ -105,6 +115,15 @@ impl FakeTg {
     }
     fn sent_snapshot(&self) -> Vec<(i64, String)> {
         self.sent.lock().expect("tg lock").clone()
+    }
+    fn with_file(&self, file_id: &str, bytes: &[u8]) {
+        self.files
+            .lock()
+            .expect("tg lock")
+            .insert(file_id.into(), bytes.to_vec());
+    }
+    fn fail_download_with(&self, e: UsecaseError) {
+        *self.fail_download.lock().expect("tg lock") = Some(e);
     }
 }
 
@@ -154,6 +173,61 @@ impl TelegramGateway for FakeTg {
             .expect("tg lock")
             .push((chat_id, text.to_string()));
         Ok(())
+    }
+    async fn download_file(&self, file_id: &str) -> UsecaseResult<Vec<u8>> {
+        self.downloads.fetch_add(1, Ordering::SeqCst);
+        if let Some(e) = self.fail_download.lock().expect("tg lock").take() {
+            return Err(e);
+        }
+        self.files
+            .lock()
+            .expect("tg lock")
+            .get(file_id)
+            .cloned()
+            .ok_or_else(|| UsecaseError::Telegram("fake tg: неизвестный file_id".into()))
+    }
+}
+
+/// FakeAssets: url фиксируется, байты — для проверок содержимого.
+type AssetPut = (String, MediaKind, Option<String>, Vec<u8>);
+
+struct FakeAssets {
+    puts: Mutex<Vec<AssetPut>>,
+    fail: AtomicBool,
+}
+
+impl FakeAssets {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            puts: Mutex::new(vec![]),
+            fail: AtomicBool::new(false),
+        })
+    }
+    fn snapshot(&self) -> Vec<AssetPut> {
+        self.puts.lock().expect("assets lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BotAssetStore for FakeAssets {
+    async fn put(
+        &self,
+        bot: &str,
+        kind: MediaKind,
+        filename: Option<&str>,
+        bytes: &[u8],
+    ) -> UsecaseResult<String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(UsecaseError::Board("fake assets: put refused".into()));
+        }
+        let url = format!("memory://assets/bots/{bot}/asset");
+        self.puts.lock().expect("assets lock").push((
+            url.clone(),
+            kind,
+            filename.map(String::from),
+            bytes.to_vec(),
+        ));
+        Ok(url)
     }
 }
 
@@ -448,6 +522,40 @@ fn private_update(id: u64, username: &str, text: &str) -> TgUpdate {
             chat_id: 42,
             from_username: Some(username.into()),
             text: Some(text.into()),
+            caption: None,
+            media: None,
+        }),
+    }
+}
+
+/// Media-апдейт от владельца (#1171): photo/file_id + caption.
+fn media_update(
+    id: u64,
+    username: &str,
+    kind: MediaKind,
+    file_id: &str,
+    caption: Option<&str>,
+    size: Option<i64>,
+) -> TgUpdate {
+    TgUpdate {
+        update_id: id,
+        message: Some(TgMessage {
+            chat_type: "private".into(),
+            chat_id: 42,
+            from_username: Some(username.into()),
+            text: None,
+            caption: caption.map(String::from),
+            media: Some(TgMedia {
+                kind,
+                file_id: file_id.into(),
+                file_name: if kind == MediaKind::Document {
+                    Some("скрин.png".into())
+                } else {
+                    None
+                },
+                file_size: size,
+                mime: None,
+            }),
         }),
     }
 }
@@ -460,6 +568,8 @@ fn group_update(id: u64) -> TgUpdate {
             chat_id: -100,
             from_username: Some("yurvon".into()),
             text: Some("из группы".into()),
+            caption: None,
+            media: None,
         }),
     }
 }
@@ -499,6 +609,7 @@ fn deps(
         tg,
         sessions,
         state: state.clone(),
+        assets: FakeAssets::new(),
         tick_state: Arc::new(MemTickState::default()),
         reply_cap_ms,
         reply_poll_ms,
@@ -524,6 +635,7 @@ fn supervisor(
         wiki,
         sessions,
         state,
+        FakeAssets::new(),
         Arc::new(MemTickState::default()),
         clock,
         Arc::new(move |_| {
@@ -556,6 +668,9 @@ impl TelegramGateway for TgHandle {
     }
     async fn send_message(&self, chat_id: i64, text: &str) -> UsecaseResult<()> {
         self.0.send_message(chat_id, text).await
+    }
+    async fn download_file(&self, file_id: &str) -> UsecaseResult<Vec<u8>> {
+        self.0.download_file(file_id).await
     }
 }
 
@@ -1392,4 +1507,243 @@ async fn agent_mode_prompt_is_raw_text() {
         ps.iter().any(|(_, p)| p == "чистый вопрос"),
         "agent-режим: промпт без методички, только текст: {ps:?}"
     );
+}
+
+// ---------- media (#1171) ----------
+
+fn deps_with_assets(
+    tg: Arc<FakeTg>,
+    sessions: Arc<FakeSessions>,
+    assets: Arc<FakeAssets>,
+) -> BotDeps {
+    let mut d = deps(
+        tg,
+        sessions,
+        Arc::new(FakeState::default()),
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.assets = assets;
+    d
+}
+
+/// Фото владельца: скачан → залит в asset store → URL и caption в промпте
+/// сессии; ни одно сообщение не потерялось молча.
+#[tokio::test]
+async fn owner_photo_reaches_session_prompt_with_url() {
+    let tg = FakeTg::new(vec![media_update(
+        21,
+        "yurvon",
+        MediaKind::Photo,
+        "agg1",
+        Some("от МПНЧ"),
+        Some(10_000),
+    )]);
+    tg.with_file("agg1", b"\x89PNG-data");
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    assert_eq!(tg.downloads.load(Ordering::SeqCst), 1, "файл скачан");
+    let puts = assets.snapshot();
+    let [(url, kind, filename, bytes)] = puts.as_slice() else {
+        panic!("asset put не выполнен: {puts:?}");
+    };
+    assert!(matches!(kind, MediaKind::Photo));
+    assert!(filename.is_none(), "photo без file_name");
+    assert_eq!(bytes, b"\x89PNG-data");
+    let ps = sessions.prompts_snapshot();
+    let [(s, p)] = ps.as_slice() else {
+        panic!("промпт не отправлен: {ps:?}")
+    };
+    assert!(p.contains(url), "URL в промпте: {p}");
+    assert!(p.contains("от МПНЧ"), "caption в промпте: {p}");
+    assert!(p.contains("вложи эту ссылку"), "инструкция в промпте: {p}");
+    // reply владельцу уходит (эхо последней строки промпта)
+    let sent = tg.sent_snapshot();
+    assert!(
+        sent.iter().any(|(_, t)| t.contains("эхо:")),
+        "реплай не доставлен: {sent:?}"
+    );
+    let _ = s;
+}
+
+/// Oversize-гард: file_size > 20 MiB в апдейте — явный отказ без
+/// скачивания и без prompt; апдейт поглощён (Ok).
+#[tokio::test]
+async fn oversized_document_refused_without_download() {
+    let big: i64 = 30 * 1024 * 1024;
+    let tg = FakeTg::new(vec![
+        media_update(22, "yurvon", MediaKind::Document, "doc1", None, Some(big)),
+        private_update(23, "yurvon", "следующее сообщение"),
+    ]);
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.expect("отказ — не Err");
+
+    let sent = tg.sent_snapshot();
+    assert!(
+        sent.iter().any(|(_, t)| t.contains("слишком большой")),
+        "oversize-отказ владельцу не отправлен: {sent:?}"
+    );
+    assert_eq!(tg.downloads.load(Ordering::SeqCst), 0, "оверсайз качается");
+    assert!(assets.snapshot().is_empty(), "оверсайз залит в store");
+    // апдейт поглощён: следующее сообщение доходит до сессии
+    let m2 = tg.queue.lock().expect("l")[1].message.clone().unwrap();
+    process_message(&d, &m2).await.unwrap();
+    assert_eq!(sessions.prompts_snapshot().len(), 1);
+}
+
+/// Второй гард: file_size не заполнен — 400 «file is too big» от getFile
+/// уходит в тот же oversize-отказ, не в общий сбой.
+#[tokio::test]
+async fn get_file_too_big_refused_as_oversize() {
+    let tg = FakeTg::new(vec![media_update(
+        24,
+        "yurvon",
+        MediaKind::Document,
+        "doc2",
+        None,
+        None,
+    )]);
+    tg.fail_download_with(UsecaseError::TelegramTooBig("400 file is too big".into()));
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m)
+        .await
+        .expect("too-big — отказ, не Err");
+
+    assert!(
+        tg.sent_snapshot()
+            .iter()
+            .any(|(_, t)| t.contains("слишком большой")),
+        "oversize-отказ не доставлен"
+    );
+    assert!(assets.snapshot().is_empty());
+    assert!(sessions.prompts_snapshot().is_empty());
+}
+
+/// Сбой скачивания (транспорт) — явный отказ «не смог забрать», поглощён.
+#[tokio::test]
+async fn download_failure_refused_not_silent() {
+    let tg = FakeTg::new(vec![media_update(
+        25,
+        "yurvon",
+        MediaKind::Document,
+        "doc3",
+        None,
+        Some(100),
+    )]);
+    tg.fail_download_with(UsecaseError::Telegram("fake transport down".into()));
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m)
+        .await
+        .expect("сбой скачивания — отказ, не Err");
+
+    assert!(
+        tg.sent_snapshot()
+            .iter()
+            .any(|(_, t)| t.contains("Не смог забрать файл")),
+        "отказ о сбое не доставлен"
+    );
+    assert!(assets.snapshot().is_empty());
+    assert!(sessions.prompts_snapshot().is_empty());
+}
+
+/// Сбой upload в asset store — тот же явный отказ (ff-коллизия и пр.).
+#[tokio::test]
+async fn asset_upload_failure_refused_not_silent() {
+    let tg = FakeTg::new(vec![media_update(
+        26,
+        "yurvon",
+        MediaKind::Photo,
+        "agg3",
+        None,
+        Some(10),
+    )]);
+    tg.with_file("agg3", b"bytes");
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    assets.fail.store(true, Ordering::SeqCst);
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m)
+        .await
+        .expect("сбой upload — отказ, не Err");
+
+    assert!(
+        tg.sent_snapshot()
+            .iter()
+            .any(|(_, t)| t.contains("Не смог забрать файл")),
+        "отказ о сбое upload не доставлен"
+    );
+    assert!(sessions.prompts_snapshot().is_empty());
+}
+
+/// Не-текстовые типы вне photo/document (видео/войс/стикер) — явный
+/// отказ «не принимаю», без скачивания; документом тот же контент доехал бы.
+#[tokio::test]
+async fn unsupported_media_kind_refused_explicitly() {
+    let tg = FakeTg::new(vec![media_update(
+        27,
+        "yurvon",
+        MediaKind::Other,
+        "vid1",
+        None,
+        Some(1000),
+    )]);
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    assert!(
+        tg.sent_snapshot()
+            .iter()
+            .any(|(_, t)| t.contains("не принимаю")),
+        "отказ о типе не доставлен"
+    );
+    assert_eq!(tg.downloads.load(Ordering::SeqCst), 0);
+    assert!(assets.snapshot().is_empty());
+    assert!(sessions.prompts_snapshot().is_empty());
+}
+
+/// У граничного размера (ровно 20 MiB) файл качается — decimal-гард
+/// 20 000 000 отбрасывал бы валидные файлы (план #1171).
+#[tokio::test]
+async fn file_at_exact_binary_limit_is_accepted() {
+    let edge: i64 = 20 * 1024 * 1024;
+    let tg = FakeTg::new(vec![media_update(
+        28,
+        "yurvon",
+        MediaKind::Document,
+        "doc4",
+        None,
+        Some(edge),
+    )]);
+    tg.with_file("doc4", b"edge");
+    let sessions = FakeSessions::new();
+    let assets = FakeAssets::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), assets.clone());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    assert_eq!(
+        tg.downloads.load(Ordering::SeqCst),
+        1,
+        "граничный файл скачан"
+    );
+    assert_eq!(assets.snapshot().len(), 1);
+    assert!(!sessions.prompts_snapshot().is_empty());
 }

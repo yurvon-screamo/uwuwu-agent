@@ -186,4 +186,63 @@ sleep 5
 grep -q '"event":"bot.skipped"' "$LOG_SRV" || fail "групповое сообщение не поглощено (bot.skipped нет)"
 say "группа поглощена: private-only работает"
 
-say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only)"
+# ---------- media-аттачи (#1171): фото → getFile → URL в промпте ----------
+say "инжект фото владельца…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":6,"chat_id":42,"username":"yurvon","media":{"kind":"photo","file_id":"photo-e2e","file_size":2048,"caption":"скрин для стенда"}}' >/dev/null
+MEDIA_OK=""
+for _ in $(seq 1 20); do
+  sleep 1
+  grep -q '"event":"bot.media_delivered"' "$LOG_SRV" && MEDIA_OK=1 && break
+done
+[ -n "$MEDIA_OK" ] || fail "фото не доставлено в сессию (bot.media_delivered нет; лог: $LOG_SRV)"
+# эхо-реплай сессии = промпт с URL доехал (последняя строка промпта — инструкция)
+MEDIA_REPLY=""
+for _ in $(seq 1 20); do
+  sleep 1
+  MEDIA_REPLY=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'вложи эту ссылку' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$MEDIA_REPLY" ] && break
+done
+[ -n "$MEDIA_REPLY" ] || fail "реплай с media-инструкцией не дошёл до ТГ"
+say "фото доставлено: getFile → asset → URL в промпте сессии"
+
+# oversize (>20 MiB): getFile 400 too big → явный отказ, тишины нет
+say "инжект oversized-документа…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":7,"chat_id":42,"username":"yurvon","media":{"kind":"document","file_id":"big-e2e","file_size":31457280,"file_name":"big.bin"}}' >/dev/null
+OVER=""
+for _ in $(seq 1 20); do
+  sleep 1
+  OVER=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'слишком большой' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$OVER" ] && break
+done
+[ -n "$OVER" ] || fail "oversize-отказ владельцу не отправлен (лог: $LOG_SRV)"
+grep -q '"event":"bot.media_oversize"' "$LOG_SRV" || fail "нет bot.media_oversize в логе"
+say "oversize: getFile 400 → явный отказ владельцу"
+
+# не-текстовый тип (видео): явный отказ «не принимаю»
+say "инжект видео…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":8,"chat_id":42,"username":"yurvon","media":{"kind":"video","file_id":"vid-e2e","file_size":5000}}' >/dev/null
+KIND=""
+for _ in $(seq 1 20); do
+  sleep 1
+  KIND=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'не принимаю' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$KIND" ] && break
+done
+[ -n "$KIND" ] || fail "отказ о не-поддержанном типе не отправлен (лог: $LOG_SRV)"
+say "видео: явный отказ, тихой потери нет"
+
+say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media)"

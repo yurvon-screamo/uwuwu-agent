@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
-use uwuwu_usecase::bots::{TelegramGateway, TgMessage, TgUpdate};
+use uwuwu_usecase::bots::{MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpdate};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 const API_BASE: &str = "https://api.telegram.org";
@@ -99,7 +99,61 @@ impl TelegramClient {
                 chat_id: m["chat"]["id"].as_i64().unwrap_or_default(),
                 from_username: m["from"]["username"].as_str().map(String::from),
                 text: m["text"].as_str().map(String::from),
+                caption: m["caption"].as_str().map(String::from),
+                media: Self::parse_media(m),
             }),
+        }
+    }
+
+    /// Media-факт сообщения (#1171): photo — массив PhotoSize, последний
+    /// элемент — максимальный размер; document — с именем/mime/размером;
+    /// прочие не-текстовые вложения (video/voice/audio/animation/
+    /// video_note/sticker) — Other (факт для явного отказа раннера).
+    fn parse_media(m: &Value) -> Option<TgMedia> {
+        if let Some(sizes) = m["photo"].as_array() {
+            return sizes.last().map(|p| TgMedia {
+                kind: MediaKind::Photo,
+                file_id: p["file_id"].as_str().unwrap_or_default().to_string(),
+                file_name: None,
+                file_size: p["file_size"].as_i64(),
+                mime: Some("image/jpeg".to_string()),
+            });
+        }
+        if let Some(kind) = [
+            "document",
+            "video",
+            "video_note",
+            "voice",
+            "audio",
+            "animation",
+            "sticker",
+        ]
+        .into_iter()
+        .find(|k| m[k].is_object())
+        {
+            let v = &m[kind];
+            let k = match kind {
+                "document" => MediaKind::Document,
+                _ => MediaKind::Other,
+            };
+            return Some(TgMedia {
+                kind: k,
+                file_id: v["file_id"].as_str().unwrap_or_default().to_string(),
+                file_name: v["file_name"].as_str().map(String::from),
+                file_size: v["file_size"].as_i64(),
+                mime: v["mime_type"].as_str().map(String::from),
+            });
+        }
+        None
+    }
+
+    /// Перманентный отказ getFile на файл > 20 MiB (`400 file is too
+    /// big`) — отдельный типизированный маршрут, не общий сбой (#1171).
+    fn classify_download_err(e: UsecaseError) -> UsecaseError {
+        if e.to_string().contains("file is too big") {
+            UsecaseError::TelegramTooBig(e.to_string())
+        } else {
+            e
         }
     }
 }
@@ -131,6 +185,40 @@ impl TelegramGateway for TelegramClient {
         self.call("sendMessage", json!({ "chat_id": chat_id, "text": text }))
             .await
             .map(|_| ())
+    }
+
+    /// getFile → `GET /file/bot<token>/<file_path>` (#1171). Токен в пути
+    /// обоих запросов — любые ошибки только через describe() (NFT-04).
+    /// oversize: getFile сам отвечает 400 «file is too big» на файлы
+    /// > 20 MiB — маршрутизируется в TelegramTooBig (не общий сбой).
+    async fn download_file(&self, file_id: &str) -> UsecaseResult<Vec<u8>> {
+        let info = match self.call("getFile", json!({ "file_id": file_id })).await {
+            Ok(v) => v,
+            Err(e) => return Err(Self::classify_download_err(e)),
+        };
+        let path = info["file_path"].as_str().unwrap_or_default();
+        if path.is_empty() {
+            return Err(UsecaseError::Telegram(format!(
+                "tg getFile: нет file_path (file_id {file_id})"
+            )));
+        }
+        let resp = self
+            .http
+            .get(format!("{}/file/bot{}/{}", self.base, self.token, path))
+            .send()
+            .await
+            .map_err(|e| UsecaseError::Telegram(format!("tg file: {}", Self::describe(&e))))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| UsecaseError::Telegram(format!("tg file body: {}", Self::describe(&e))))?;
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes).to_string();
+            let err = UsecaseError::Telegram(format!("tg file: HTTP {status} {body}"));
+            return Err(Self::classify_download_err(err));
+        }
+        Ok(bytes.to_vec())
     }
 }
 
@@ -170,6 +258,109 @@ mod tests {
         let u = TelegramClient::parse_update(&raw);
         assert_eq!(u.update_id, 8);
         assert!(u.message.is_none());
+    }
+
+    /// #1171: photo-апдейт — массив PhotoSize, берём максимальный
+    /// (последний), caption в media-сообщении — не text.
+    #[test]
+    fn parses_photo_update_with_largest_size_and_caption() {
+        let raw = json!({
+            "update_id": 9,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "caption": "от МПНЧ",
+                "photo": [
+                    {"file_id": "small", "file_size": 1000},
+                    {"file_id": "large", "file_size": 99999}
+                ]
+            }
+        });
+        let u = TelegramClient::parse_update(&raw);
+        let m = u.message.expect("message");
+        assert!(m.text.is_none());
+        assert_eq!(m.caption.as_deref(), Some("от МПНЧ"));
+        let media = m.media.expect("media");
+        assert_eq!(media.kind, MediaKind::Photo);
+        assert_eq!(media.file_id, "large", "берём максимальный размер");
+        assert_eq!(media.file_size, Some(99999));
+        assert_eq!(media.file_name, None);
+        assert_eq!(media.mime.as_deref(), Some("image/jpeg"));
+    }
+
+    /// #1171: document — file_name/mime/size доезжают в media-факт.
+    #[test]
+    fn parses_document_update_with_metadata() {
+        let raw = json!({
+            "update_id": 10,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "document": {
+                    "file_id": "doc1",
+                    "file_name": "отчёт МПНЧ.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 500_000
+                }
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        let media = m.media.expect("media");
+        assert_eq!(media.kind, MediaKind::Document);
+        assert_eq!(media.file_name.as_deref(), Some("отчёт МПНЧ.pdf"));
+        assert_eq!(media.mime.as_deref(), Some("application/pdf"));
+        assert_eq!(media.file_size, Some(500_000));
+    }
+
+    /// #1171: не-текстовые вложения вне photo/document (видео/стикер/…)
+    /// — факты presence с kind=Other, чтобы раннер отказал явно, не тихо.
+    #[test]
+    fn other_media_classified_as_other_kind() {
+        let raw = json!({
+            "update_id": 11,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "video": {"file_id": "vid1", "file_size": 42}
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        let media = m.media.expect("media");
+        assert_eq!(media.kind, MediaKind::Other);
+        assert_eq!(media.file_id, "vid1");
+    }
+
+    /// Чисто текстовое сообщение — media нет (регресс поля).
+    #[test]
+    fn text_message_has_no_media() {
+        let raw = json!({
+            "update_id": 12,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "привет"
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        assert!(m.media.is_none());
+        assert!(m.caption.is_none());
+    }
+
+    /// Перманентный oversize-отказ getFile — типизированный маршрут
+    /// TelegramTooBig (не общий Telegram-сбой), по строке описания API.
+    #[test]
+    fn get_file_too_big_error_is_typed() {
+        let plain =
+            UsecaseError::Telegram("tg getFile: HTTP 400 Bad Request: file is too big".into());
+        assert!(matches!(
+            TelegramClient::classify_download_err(plain),
+            UsecaseError::TelegramTooBig(_)
+        ));
+        let other = UsecaseError::Telegram("tg getFile: HTTP 500".into());
+        assert!(matches!(
+            TelegramClient::classify_download_err(other),
+            UsecaseError::Telegram(_)
+        ));
     }
 
     /// Пин токен-маскировки (#1150, High ревью раунда 1): Display reqwest
