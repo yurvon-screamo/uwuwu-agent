@@ -1353,6 +1353,44 @@ async fn autodone_branchless_pr_url_reaches_gateway() {
 }
 
 #[tokio::test]
+async fn autodone_branchless_real_pull_url_is_probed_and_merged() {
+    // #1155 (закрытие класса «ложный Done при живом PR»): безветочная строка
+    // с РЕАЛЬНЫМ github pull-URL — probe получает URL, зелёный Open мержится,
+    // Done по мержу; до фикса pr() на безветочной строке был None и строка
+    // уходила в Done «docs-only» с живым несмерженным PR
+    let mut t = task(9, Status::UserReview);
+    t.set_autodone(true);
+    let mut f = TaskFields::default();
+    f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        prs.merges.lock().unwrap().last().map(String::as_str),
+        Some("https://github.com/a/c/pull/9"),
+        "реальный PR на безветочной строке мержится автодоном"
+    );
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("status#9=Done")));
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("close#9")));
+}
+
+#[tokio::test]
 async fn observe_does_not_charge_spawn_loops() {
     // Инцидент #1046 (15.11): observe-тики заряжали счётчик спавн-петли
     // (set_spawn_loop звался до Live-гейта) — live эскалировал строку
