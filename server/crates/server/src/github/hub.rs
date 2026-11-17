@@ -1300,6 +1300,26 @@ mod tests {
     }
 
     #[test]
+    fn write_through_status_row_absent_keeps_snapshot_intact() {
+        // Живой случай тест-раунда #1235: GitHub-лаг — мутируемой строки
+        // нет в снапшоте (проектный вью отдаёт частичное представление).
+        // Write-through не паникует и не портит снапшот: недостающую
+        // строку покажет refetch после TTL, чужие строки не тронуты.
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        let now = std::time::Instant::now();
+        let rows = vec![Task::new(8, "другая строка".into(), Status::Todo)];
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.write_through_status("B", 7, Status::InProgress);
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("ключ снапшота жив");
+        assert_eq!(snap.0.len(), 1, "мусор в снапшот не добавлен");
+        assert_eq!(snap.0[0].number(), 8, "чужие строки не тронуты");
+        assert_eq!(snap.0[0].status(), Status::Todo);
+    }
+
+    #[test]
     fn ttl_cache_hits_within_ttl_and_misses_after() {
         // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
         // после, перезапись по ключу
