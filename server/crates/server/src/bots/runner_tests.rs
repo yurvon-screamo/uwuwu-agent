@@ -611,6 +611,90 @@ async fn intermediate_toolcall_step_not_delivered() {
     assert_eq!(sent[0].1, "полный финальный ответ");
 }
 
+/// Ход в стриме (проба #1209): в окне стрима finish=None — сообщение
+/// не доставляется даже с is_latest=true; доставляется только финал
+/// после появления finish='stop'.
+#[tokio::test]
+async fn streaming_step_not_delivered_until_stop() {
+    let tg = FakeTg::new(vec![private_update(9, "yurvon", "ход в стриме")]);
+    let sessions = FakeSessions::new();
+    sessions.auto_reply.store(false, Ordering::SeqCst);
+    sessions.script.lock().expect("lock").push(AssistantReply {
+        created_ms: 1_000,
+        text: "недостримленный кусок".into(),
+        finished: false,
+        is_latest: true,
+        finish: None,
+    });
+    sessions
+        .script
+        .lock()
+        .expect("lock")
+        .push(step_reply(2_000, "стрим дошёл до финала", "stop"));
+    let state = Arc::new(FakeState::default());
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(
+        || {
+            tg.sent_snapshot()
+                .iter()
+                .any(|(_, t)| t.contains("стрим дошёл до финала"))
+        },
+        2000,
+    )
+    .await;
+    task.abort();
+    assert!(ok, "финал стрима не доставлен");
+    let sent = tg.sent_snapshot();
+    assert_eq!(sent.len(), 1, "полустрим ушёл в ТГ: {sent:?}");
+    assert_eq!(sent[0].1, "стрим дошёл до финала");
+}
+
+/// Финал без текста (инцидент 16.11): finish='stop' при пустом тексте —
+/// не ответ, в ТГ уходит только честный фоллбек по cap, пустота не
+/// доставляется.
+#[tokio::test]
+async fn finished_empty_text_not_answered() {
+    let tg = FakeTg::new(vec![private_update(10, "yurvon", "вопрос без ответа")]);
+    let sessions = FakeSessions::new();
+    sessions.auto_reply.store(false, Ordering::SeqCst);
+    // залипающий шаг: тула отработали (finish='stop'), текста нет
+    sessions
+        .script
+        .lock()
+        .expect("lock")
+        .push(step_reply(1_000, "   ", "stop"));
+    let state = Arc::new(FakeState::default());
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        80,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(
+        || {
+            tg.sent_snapshot()
+                .iter()
+                .any(|(_, t)| t.contains("напиши ещё раз"))
+        },
+        2000,
+    )
+    .await;
+    task.abort();
+    assert!(ok, "фоллбек на безтекстовом финале не отправлен");
+    let sent = tg.sent_snapshot();
+    assert_eq!(sent.len(), 1, "кроме фоллбека ушло лишнее: {sent:?}");
+    assert_eq!(sent[0].1, "Не успел ответить — напиши ещё раз.");
+}
+
 #[tokio::test]
 async fn private_owner_message_prompts_and_replies() {
     let tg = FakeTg::new(vec![private_update(7, "yurvon", "заявка из ТГ")]);
