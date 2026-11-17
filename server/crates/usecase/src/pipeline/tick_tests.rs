@@ -2173,6 +2173,107 @@ async fn spawn_backlog_fills_cap_without_deadlock() {
 }
 
 #[tokio::test]
+async fn busy_rows_hold_cup_for_backlog() {
+    // #1244, обратная сторона фикса: busy-строки кап ДЕРЖАТ (ход идёт —
+    // LLM тратит) — 3 busy при cap 7 оставляют очереди 4 слота: 10
+    // кандидатов → 4 спавна + 6 held. Старая формула #1200 считала и
+    // кандидатов (13 ≥ 7 → held всем, 0 спавнов); регресс
+    // global_active = 0 дал бы 7 спавнов — оба ломают этот ассерт.
+    let mut rows: Vec<Task> = (1..=3)
+        .map(|n| dev_task(n, &format!("ses_busy_{n}")))
+        .collect();
+    rows.extend((4..=13).map(|n| task(n, Status::InProgress)));
+    // тот же раунд для busy-строк (prev=In Progress) — мимо round_transition
+    let state = Arc::new(MemState(Mutex::default()));
+    {
+        let mut g = state.0.lock().unwrap();
+        for n in 1..=3 {
+            g.statuses.push((n, Status::InProgress));
+        }
+    }
+    let (u, _, sessions, _) = usecase_with_state(rows, PrState::Missing, state);
+    sessions
+        .spawned
+        .lock()
+        .unwrap()
+        .extend((1..=3).map(|n| format!("ses_busy_{n}")));
+    // idle_reply=false (дефолт new()) → ses_busy_* busy: ход идёт
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 4,
+        "кап держат busy-строки: 7 − 3 busy = 4 слота очереди"
+    );
+    assert_eq!(out.held_cup, 6, "излишек очереди ждёт следующего тика");
+}
+
+#[tokio::test]
+async fn multi_board_backlog_shares_cup_across_boards() {
+    // #1244: счётчик капа один на весь тик (поднят из run_board в run(),
+    // передаётся по ссылке) — бэклог на двух досках: суммарно спавнится
+    // ровно кап, вторая доска видит занятость первой. Per-board счётчик
+    // (до #1244) оверселил кап по разу на доску: 7+7 спавнов при cap 7.
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![
+            (
+                "B1".into(),
+                (201..=208).map(|n| task(n, Status::InProgress)).collect(),
+            ),
+            (
+                "B2".into(),
+                (301..=308).map(|n| task(n, Status::InProgress)).collect(),
+            ),
+        ],
+        fail_reads: vec![],
+        log: Mutex::default(),
+    });
+    let sessions = Arc::new(FakeSessions::new());
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    };
+    let mut p = plan(Mode::Live, 7);
+    p.boards = vec![
+        BoardPlan {
+            project: "p".into(),
+            board: "B1".into(),
+            repo: "a/c".into(),
+            checkout: "/tmp/checkout".into(),
+            env_root: "/tmp/env".into(),
+        },
+        BoardPlan {
+            project: "p".into(),
+            board: "B2".into(),
+            repo: "a/c".into(),
+            checkout: "/tmp/checkout".into(),
+            env_root: "/tmp/env2".into(),
+        },
+    ];
+    let out = u.run(&p).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 7,
+        "кап общий на тик: суммарно ровно кап, не по капу на доску"
+    );
+    assert_eq!(out.held_cup, 9, "излишек B1 (1) + весь B2 (8) ждут");
+    let oversell_b2 = sessions
+        .specs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.directory.starts_with("/tmp/env2"));
+    assert!(
+        !oversell_b2,
+        "вторая доска в общий кап не лезет: спавнов на B2 нет"
+    );
+}
+
+#[tokio::test]
 async fn dev_session_survives_all_transitions() {
     // Канон сессий: дев-сессия едина между этапами и откатами —
     // переходы стадий её никогда не снимают
