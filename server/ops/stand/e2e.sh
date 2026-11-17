@@ -47,6 +47,12 @@ print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null
 
 say "сборка…"
 cargo build -q --bin uwuwu-server --bin mock_opencode
+# пред-чистка стека: утечка сервера прошлого прогона (убитая сессия не
+# отвела trap) занимает 8090 — новый сервер молча exit(1) по bind_failed,
+# а цикл ведёт чужой процесс (инцидент прогона тестировщика 17.11)
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
 rm -f "$STATE"
 
 say "фаза 1: observe не заряжает счётчики петель"
