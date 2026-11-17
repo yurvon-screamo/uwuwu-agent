@@ -449,6 +449,7 @@ mod tests {
                 .map(|n| crate::ports::SessionInfo {
                     id: format!("ses_busy_{n}"),
                     agent: String::new(),
+                    directory: String::new(),
                     updated_ms: 0,
                     outcome: String::new(),
                     total_tokens: 0,

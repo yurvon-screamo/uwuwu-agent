@@ -778,6 +778,8 @@ fn wake_usecase(
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply,
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
         specs: Mutex::default(),
@@ -1510,6 +1512,7 @@ async fn cup_counts_second_turn_sessions() {
             updated_ms: 0,
             outcome: "succeeded".into(),
             total_tokens: 5000,
+            directory: String::new(),
             busy: true,
         });
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
@@ -1538,6 +1541,7 @@ async fn cup_busy_counts_non_pipeline_sessions() {
             updated_ms: 0,
             outcome: String::new(),
             total_tokens: 9000,
+            directory: String::new(),
             busy: true,
         });
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
@@ -1569,9 +1573,11 @@ async fn wakeup_held_when_cup_full() {
             created_ms: 3000,
             body: "свежий коммент владельца".into(),
         }],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
-        activity_ms: 1000, // коммент свежее активности сессии → fresh
+        activity_ms: Some(1000), // коммент свежее активности сессии → fresh
         ..Default::default()
     });
     // сама строка idle + чужой ход в полёте — единый кап занят
@@ -1583,6 +1589,7 @@ async fn wakeup_held_when_cup_full() {
             .push(crate::ports::SessionInfo {
                 id: id.into(),
                 agent: String::new(),
+                directory: String::new(),
                 updated_ms: 0,
                 outcome: "succeeded".into(),
                 total_tokens: 0,
@@ -1636,9 +1643,11 @@ async fn wakeup_delivery_occupies_cup_slot() {
             created_ms: 3000,
             body: "свежий коммент владельца".into(),
         }],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
-        activity_ms: 1000,
+        activity_ms: Some(1000),
         ..Default::default()
     });
     sessions
@@ -1651,6 +1660,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
             updated_ms: 0,
             outcome: "succeeded".into(),
             total_tokens: 0,
+            directory: String::new(),
             busy: false,
         });
     let prs = Arc::new(FakePrs {
@@ -2577,6 +2587,8 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         ],
         log: Mutex::default(),
         comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -2618,6 +2630,7 @@ fn fake_session(
     crate::ports::SessionInfo {
         id: id.into(),
         agent: agent.into(),
+        directory: String::new(),
         updated_ms: 0,
         outcome: outcome.into(),
         total_tokens: tokens,
@@ -3074,6 +3087,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        cup: 7,
     };
     let pair = |state: &Arc<MemState>| {
         state
