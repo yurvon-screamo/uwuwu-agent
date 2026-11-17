@@ -582,16 +582,7 @@ impl TickUseCase {
         if silence < STALL_SOFT_SILENCE_MS {
             return Ok(StallAct::None);
         }
-        // диагностика «строки стоят, сессии спят» (17.11): вход stall_pass
         let idle = self.session_idle(board, &session).await;
-        tracing::info!(
-            event = "stall.probe",
-            number = task.number(),
-            session = %session,
-            silence_ms = silence,
-            idle,
-            "stall_pass: проба тишины/idle"
-        );
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
