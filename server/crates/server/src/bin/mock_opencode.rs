@@ -600,6 +600,7 @@ async fn work_like_agent(
     if let Some(s) = sessions.get_mut(&session.id) {
         s.busy = false;
         s.updated_ms = now_ms();
+        s.idle_ms = now_ms(); // idle: ход завершён — busy снимается (CUP-учёт, #1231)
         s.outcome = "succeeded".into();
         s.tokens_in = 900;
         s.tokens_out = 100;

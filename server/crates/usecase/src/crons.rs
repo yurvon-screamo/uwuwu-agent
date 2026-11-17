@@ -57,7 +57,10 @@ impl CronUseCase {
         // CUP-гвард (#1231): крон-ран — запуск хода, ему нужен свободный
         // слот единого капа. Strict union (#1203): отказ скана — файр
         // откладывается (ран не считается состоявшимся, журнал не пишется).
-        let busy = match self.sessions.list_sessions_strict().await {
+        // busy — счётчик на весь тик: файр текущего тика занимает слот
+        // (инкремент после успешного запуска), иначе мульти-файр при
+        // неполном капе оверселлит до cap+N-1 (#1244-класс, ревью #1231).
+        let mut busy = match self.sessions.list_sessions_strict().await {
             Ok(list) => crate::router::busy_count(&list),
             Err(e) => {
                 tracing::warn!(
@@ -127,6 +130,7 @@ impl CronUseCase {
             let sessions = self.sessions.project(project);
             let session = sessions.create_session(&spec).await?;
             sessions.prompt(&session, &prompt).await?;
+            busy += 1; // файр этого тика занимает слот капа
             tracing::info!(event = "cron.fired", cron = %slug, session = %session, "Cron fired");
             fired.push(FireOutcome { slug, session });
         }
@@ -568,5 +572,29 @@ mod tests {
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
         let journal = wiki.0.lock().unwrap()["Projects/uwuwu/Кроны/тест/Журнал"].clone();
         assert!(journal.contains("запуск (демон)"), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn cron_multi_fire_no_oversell_within_tick() {
+        // Оверселл внутри прохода (#1244-класс, ревью #1231): два due-мастера
+        // при cup=1 — первый файр занимает слот, второй откладывается;
+        // без инкремента busy между файрами оба улетают (cap+1 ход).
+        let mut docs = std::collections::HashMap::new();
+        for (name, title) in [("тест-1", "Тест 1"), ("тест-2", "Тест 2")] {
+            let slug = format!("Projects/uwuwu/Кроны/{name}");
+            docs.insert(
+                slug,
+                format!("---\ntitle: {title}\nschedule: 5m\n---\nТело"),
+            );
+        }
+        let wiki = Arc::new(MemWiki(Mutex::new(docs)));
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+        });
+        let u = cron_uc(wiki, sessions.clone(), 1);
+        let fired = u.tick("uwuwu").await.unwrap();
+        assert_eq!(fired.len(), 1, "второй файр отложен занятым первым слотом");
+        assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
     }
 }

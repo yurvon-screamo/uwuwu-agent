@@ -38,10 +38,7 @@ impl AnalystReviewUseCase {
         // аналитика — живой ревьювер волны на офлайн-исполнителе не
         // порождает дубль-спавн на другом
         let scan = self.sessions.list_sessions_strict().await?;
-        if scan
-            .iter()
-            .any(|s| s.busy && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer))
-        {
+        if crate::router::has_busy_agent(&scan, Agent::AnalystReviewer) {
             tracing::debug!(
                 event = "analys_review.alive_skip",
                 "Живой ревьювер — волна ждёт"
