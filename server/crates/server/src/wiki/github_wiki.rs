@@ -53,10 +53,14 @@ impl GitHubWiki {
             .await
             .map_err(|e| UsecaseError::Board(format!("wiki transport {path}: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("wiki body {path}: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("wiki {path}: {fail}")));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {

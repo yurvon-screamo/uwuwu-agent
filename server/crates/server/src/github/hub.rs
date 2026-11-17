@@ -139,15 +139,6 @@ impl GitHubHub {
         *self.gql_block.write().expect("gql block lock") = Some(until);
     }
 
-    /// Детект исчерпания GraphQL-бюджета по телу errors (#1243).
-    /// Два живых формата GitHub: легаси `type:"RATE_LIMITED"` и новый
-    /// `type:"RATE_LIMIT", code:"graphql_rate_limit"` — общий знаменатель
-    /// «RATE_LIMIT» покрывает оба (регистр type стабильно верхний).
-    fn is_rate_limited(errors: &Value) -> bool {
-        let text = errors.to_string().to_uppercase();
-        text.contains("RATE_LIMIT")
-    }
-
     async fn gql(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
         let now = std::time::Instant::now();
         if let Some(until) = self.gql_blocked(now) {
@@ -165,10 +156,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql transport: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+        }
         let body: Value = serde_json::from_str(&text)
             .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
@@ -178,16 +173,19 @@ impl GitHubHub {
             )));
         }
         if let Some(errors) = body.get("errors") {
-            // RATE_LIMIT (#1243): блокируем все GraphQL-вызовы на 5 мин —
+            // rate limit: детект — одна точка gherr (оба формата GitHub:
+            // легаси RATE_LIMITED и новый RATE_LIMIT — #1243/#1156).
+            // Классифицированный отказ громкий; бэкофф-блок 5 мин поверх —
             // окно rolling, лобовые ретраи каждые poll_sec только шумят
-            if Self::is_rate_limited(errors) {
+            if let Some(fail) = crate::gherr::classify_gql_errors(&body) {
                 let until = now + std::time::Duration::from_secs(5 * 60);
                 self.block_gql_until(until);
                 tracing::warn!(
                     event = "gql.rate_limited",
                     until = ?until,
-                    "GraphQL RATE_LIMITED: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
+                    "GraphQL rate limit: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
                 );
+                return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
             }
             return Err(UsecaseError::Board(format!("graphql errors: {errors}")));
         }
@@ -215,10 +213,14 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("rest transport {path}: {e}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Board(format!("rest body {path}: {e}")))?;
+        if let Some(fail) = crate::gherr::classify(status, &headers) {
+            return Err(UsecaseError::Board(format!("gh api {path}: {fail}")));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {
@@ -899,25 +901,6 @@ mod tests {
                 .is_none(),
             "после дедлайна — разблокирован"
         );
-    }
-
-    #[test]
-    fn rate_limit_detects_both_github_error_formats() {
-        // #1243: живой прод-ответ 23:10 UTC принёс НОВЫЙ формат
-        // (type RATE_LIMIT без D, code graphql_rate_limit) — легаси-детект
-        // «RATE_LIMITED» его пропускал, бэкофф не взводился
-        let legacy = serde_json::json!([
-            { "type": "RATE_LIMITED", "message": "API rate limit exceeded for user ID 1." }
-        ]);
-        let modern = serde_json::json!([
-            { "type": "RATE_LIMIT", "code": "graphql_rate_limit", "message": "API rate limit already exceeded" }
-        ]);
-        let other = serde_json::json!([
-            { "type": "NOT_FOUND", "message": "Could not resolve to an Issue" }
-        ]);
-        assert!(GitHubHub::is_rate_limited(&legacy));
-        assert!(GitHubHub::is_rate_limited(&modern));
-        assert!(!GitHubHub::is_rate_limited(&other));
     }
 
     #[test]

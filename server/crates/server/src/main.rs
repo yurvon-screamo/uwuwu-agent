@@ -9,6 +9,9 @@ mod bots;
 mod clock;
 mod config;
 mod executor;
+mod gherr;
+#[cfg(test)]
+mod gherr_tests;
 mod github;
 mod mockhub;
 mod search;
