@@ -432,6 +432,9 @@ mod tests {
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
             Ok(Vec::new())
         }
+        async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
+            Ok(None)
+        }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
             Ok(())
         }
