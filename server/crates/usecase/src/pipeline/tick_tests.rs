@@ -861,6 +861,9 @@ fn wake_usecase(
         deleted: Mutex::default(),
         specs: Mutex::default(),
         live: Mutex::default(),
+        aborted: Mutex::default(),
+        abort_fails: AtomicBool::new(false),
+        spawn_probe: AtomicBool::new(true),
     });
     let u = TickUseCase {
         board,
@@ -4887,6 +4890,7 @@ fn live_busy(sessions: &Arc<FakeSessions>, id: &str) {
         directory: String::new(),
         outcome: String::new(),
         updated_ms: 0,
+        total_tokens: 0,
     });
 }
 
@@ -5100,4 +5104,46 @@ async fn cup_preempted_victim_respawns_when_slot_frees() {
             .any(|l| l.starts_with("session#1=")),
         "ячейка жертвы перезаписана новой сессией"
     );
+}
+
+#[tokio::test]
+async fn cup_preempt_empty_victim_by_medium_waiter() {
+    // Empty-приоритет ниже low в очереди — жертва для medium-кандидата
+    let v = row_with_session(1, "ses_v1", Priority::Empty);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::Medium);
+    let (u, _, sessions, _) = usecase(vec![v, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1, "Empty-актив гасится medium-кандидатом");
+    assert_eq!(out.spawns_done, 1);
+    let victims: Vec<_> = sessions
+        .deleted
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|d| d.starts_with("ses_v"))
+        .cloned()
+        .collect();
+    assert_eq!(victims, ["ses_v1"]);
+}
+
+#[tokio::test]
+async fn cup_no_preempt_in_peak_for_low_waiter() {
+    // Пин порядка гейтов: DeferredPeak раньше HeldCup — не-high
+    // кандидат в пик-окно жертв не гасит (его спавн всё равно заморожен)
+    let v = row_with_session(1, "ses_v1", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::Low);
+    let (u, _, sessions, _) = peak_usecase(
+        vec![v, waiter],
+        Vec::default(),
+        Arc::new(MemState(Mutex::default())),
+    );
+    live_busy(&sessions, "ses_v1");
+    let out = u.run(&peak_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.deferred_peak, 1, "low-кандидат заморожен окном");
+    assert_eq!(out.preempts, 0, "замороженный кандидат жертв не гасит");
+    assert!(sessions.aborted.lock().unwrap().is_empty());
+    assert!(sessions.deleted.lock().unwrap().is_empty());
 }

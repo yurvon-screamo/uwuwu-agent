@@ -153,6 +153,9 @@ pub(crate) struct PreemptCandidate {
 
 /// Пул жертв тика: собирается в run() из union-скана, расходуется
 /// HeldCup-ветками run_board (по одной жертве на отдачу слота).
+/// Mutex — не для параллелизма (доски обходятся последовательно):
+/// interior mutability для изъятия жертв между досками сквозь await
+/// и Send-ность будущего тика.
 #[derive(Default)]
 pub(crate) struct PreemptPool {
     candidates: Mutex<Vec<PreemptCandidate>>,
@@ -732,6 +735,11 @@ impl TickUseCase {
         };
         match (aborted, deleted) {
             (Ok(()), Ok(())) => {
+                // Burn-down корректен: жертва попала в пул только из
+                // busy-учёта фазы 2 (idle не держат кап и в пул не
+                // попадают) — вычёт одного слота ровно соответствует
+                // погашенной трате; сатуратинг страховка от рассинхрона
+                // снапшота и счётчика (спавны тика поверх busy).
                 *active_now = active_now.saturating_sub(1);
                 out.preempts += 1;
                 tracing::info!(

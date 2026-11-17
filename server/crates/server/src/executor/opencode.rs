@@ -322,15 +322,15 @@ impl AgentSessionGateway for OpencodeClient {
     }
 
     async fn abort_session(&self, session: &str) -> UsecaseResult<()> {
-        // Префикс /api добавляется в call(). Живая проба 18.11 (бинарь
-        // 2.3.0, throwaway serve): /api/session/:id/abort — 404 (ход
-        // продолжается!), /api/session/:id/interrupt — 200, ход остановлен
-        // (busy снят). Фоллбек abort→interrupt: если оба 404/405 — Err
-        // (преемпшен остаётся held, ретрай следующим тиком), тихого
-        // no-op нет. 404 на обоех путях при несуществующей сессии —
-        // тоже Err? Нет: interrupt 404 по несуществующей сессии
-        // трактуем идемпотентно (сессия погашена между сканом и
-        // абортом) — см. хвост метода.
+        // Остановка хода для преемпшена (#1259). Живая проба бинаря
+        // 2.3.0 (18.11, throwaway serve): POST /session/:id/abort даёт
+        // 404 при живом ходе (тихий no-op недопустим), рабочий путь —
+        // interrupt: ход остановлен, busy снят. Фоллбек abort→interrupt
+        // покрывает обе раскладки билдов; 404 на interrupt = сессия уже
+        // погашена между сканом и абортом (идемпотентно), прочие
+        // неуспехи → Err: преемпшен остаётся held, ретрай следующим
+        // тиком. Выбор interrupt зафиксирован живой пробой в задаче
+        // #1259 (санкция владельца — в теле задачи).
         if let Ok((status, _)) = self
             .call(
                 &format!("/session/{session}/abort"),
@@ -352,10 +352,7 @@ impl AgentSessionGateway for OpencodeClient {
             .await
         {
             Ok((status, _)) if status.is_success() => Ok(()),
-            Ok((status, _)) if status.as_u16() == 404 => {
-                // сессии уже нет (погашена между сканом и абортом) — ок
-                Ok(())
-            }
+            Ok((status, _)) if status.as_u16() == 404 => Ok(()),
             Ok((status, _)) => Err(UsecaseError::Session(format!(
                 "abort {session}: HTTP {status}"
             ))),
