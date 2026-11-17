@@ -1,6 +1,6 @@
 //! gh-hub adapter: доска (bulk select-колонки) + issue REST (тело/комменты/
 //! нативные поля). fm-зеркало снесено (владелец 15.11): операционные данные —
-//! Status/Приоритет/Autodone на доске, сессии/ветка/PR — глобальные поля issue
+//! Status/Приоритет/Automerge на доске, сессии/ветка/PR — глобальные поля issue
 //! (fields.rs). Тело задачи — чистый контент.
 
 use super::fields::{parse_field_values, Fields, IssueFields};
@@ -234,7 +234,7 @@ impl GitHubHub {
         Ok((status, value))
     }
 
-    /// Снимок доски: bulk-задачи (Status/Приоритет/Autodone) + мета мутаций.
+    /// Снимок доски: bulk-задачи (Status/Приоритет/Automerge) + мета мутаций.
     /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
     /// добавленная на доску младше TTL, может не иметь item-id в мете —
     /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
@@ -438,7 +438,7 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             };
             let mut task = Task::new(number, title, status);
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
-            task.set_autodone(v.autodone);
+            task.set_automerge(v.automerge);
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -450,21 +450,21 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
 struct ItemValues {
     status: String,
     priority: String,
-    autodone: bool,
+    automerge: bool,
 }
 
 fn item_values(item: &Value) -> ItemValues {
     let mut out = ItemValues {
         status: String::new(),
         priority: String::new(),
-        autodone: false,
+        automerge: false,
     };
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
             let field = v["field"]["name"].as_str().unwrap_or_default();
             // Pv2-own поля несут значение на верхнем уровне узла;
             // issue-backed (каталог /user/issue-fields: «Приоритет»,
-            // «Autodone») — вложенным issueFieldValue (#1174)
+            // «Automerge») — вложенным issueFieldValue (#1174)
             let value = v["name"]
                 .as_str()
                 .or(v["issueFieldValue"]["name"].as_str())
@@ -472,7 +472,8 @@ fn item_values(item: &Value) -> ItemValues {
             match field {
                 "Status" => out.status = value.to_string(),
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
-                "Autodone" => out.autodone = value == "on" || value == "true",
+                // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
+                "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 _ => {}
             }
         }
@@ -980,13 +981,21 @@ mod tests {
                         "name": "on", "value": "on", "optionId": "IFSSO_y"
                     }
                 },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Automerge" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "on", "value": "on", "optionId": "IFSSO_z"
+                    }
+                },
                 { "__typename": "ProjectV2ItemFieldSingleSelectValue",
                   "name": "Design", "field": { "__typename": "ProjectV2FieldCommon", "name": "Status" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.priority, "medium");
-        assert!(v.autodone);
+        assert!(v.automerge);
         assert_eq!(v.status, "Design");
     }
 
@@ -1031,12 +1040,13 @@ mod tests {
                 { "name": "In Progress", "field": { "name": "Status" } },
                 { "name": "high", "field": { "name": "Приоритет" } },
                 { "name": "on", "field": { "name": "Autodone" } },
+                { "name": "on", "field": { "name": "Automerge" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.status, "In Progress");
         assert_eq!(v.priority, "high");
-        assert!(v.autodone);
+        assert!(v.automerge);
     }
 
     #[test]

@@ -21,6 +21,20 @@ pub const F_PRIORITY: &str = uwuwu_usecase::F_PRIORITY;
 /// Карта значений полей задачи (непустые).
 pub type Fields = HashMap<String, String>;
 
+/// Резолв имени в каталоге с legacy-алиасом автомержа (#1232): пишем
+/// «Automerge», при отсутствии в каталоге — legacy-поле «Autodone»
+/// (id 49841025, опции off/on); оба отсутствуют → None (ensure_field
+/// создаст «Automerge» single_select off/on).
+fn resolve_field(catalog: &HashMap<String, u64>, name: &str) -> Option<u64> {
+    if let Some(f) = catalog.get(name) {
+        return Some(*f);
+    }
+    if name == uwuwu_usecase::F_AUTOMERGE {
+        return catalog.get("Autodone").copied();
+    }
+    None
+}
+
 pub struct IssueFields {
     repo: String,
     token: String,
@@ -126,12 +140,12 @@ impl IssueFields {
         for (name, value) in patch {
             // self-heal: отсутствующее поле создаём (инцидент #1149 —
             // create задачи падал целиком из-за неготового «Тип»)
-            let fid = match catalog.get(*name) {
-                Some(f) => *f,
+            let fid = match resolve_field(&catalog, name) {
+                Some(f) => f,
                 None => {
                     self.ensure_field(name).await?;
                     catalog = self.catalog().await?;
-                    *catalog.get(*name).ok_or_else(|| {
+                    resolve_field(&catalog, name).ok_or_else(|| {
                         UsecaseError::Board(format!("глобальное поле «{name}» не найдено"))
                     })?
                 }
@@ -180,27 +194,36 @@ impl IssueFields {
     #[allow(dead_code)] // применяется при заведении «Тип» первым create
     pub async fn ensure_field(&self, name: &str) -> UsecaseResult<()> {
         let catalog = self.catalog().await?;
-        if catalog.contains_key(name) {
+        if resolve_field(&catalog, name).is_some() {
             return Ok(());
         }
         // «Тип» — single-select канона (create без поля падал «глобальное
-        // поле не найдено», инцидент #1149); прочие имена — текст
-        let body = if name == "Тип" {
-            let colors = [
-                "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
-                "green", "blue",
-            ];
-            let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
-                            "priority": i + 1 })
-                })
-                .collect();
-            json!({ "name": name, "data_type": "single_select", "options": options })
-        } else {
-            json!({ "name": name, "data_type": "text" })
+        // поле не найдено», инцидент #1149); автомерж (#1232) —
+        // single_select off/on; прочие имена — текст
+        let body = match name {
+            "Тип" => {
+                let colors = [
+                    "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
+                    "green", "blue",
+                ];
+                let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
+                                "priority": i + 1 })
+                    })
+                    .collect();
+                json!({ "name": name, "data_type": "single_select", "options": options })
+            }
+            "Automerge" | "Autodone" => json!({
+                "name": name, "data_type": "single_select",
+                "options": [
+                    { "name": "off", "color": "gray" },
+                    { "name": "on", "color": "green" },
+                ]
+            }),
+            _ => json!({ "name": name, "data_type": "text" }),
         };
         let (status, _resp) = self
             .rest(reqwest::Method::POST, "/user/issue-fields", Some(body))
