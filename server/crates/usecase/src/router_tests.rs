@@ -206,8 +206,9 @@ async fn export_fails_when_session_nowhere_found() {
     let err = router
         .export_session_any("ses-нет")
         .await
-        .expect_err("нет нигде — Err");
-    assert!(err.to_string().contains("нет сессии"), "{err}");
+        .expect_err("нет нигде — Err перечисляет причины каждого исполнителя");
+    let err = err.to_string();
+    assert!(err.contains("«kisa»") && err.contains("«redmi»"), "{err}");
 }
 
 fn spec() -> SessionSpec {

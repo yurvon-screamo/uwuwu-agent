@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Гейтвей одного исполнителя (OpencodeClient или бюджетный декоратор).
-type Gateway = Arc<dyn AgentSessionGateway>;
+pub type Gateway = Arc<dyn AgentSessionGateway>;
 
 pub struct SessionRouter {
     default: Gateway,
@@ -104,18 +104,19 @@ impl SessionRouter {
 
     /// Экспорт сессии с веером по исполнителям: дефолт → остальные,
     /// первый успех выигрывает (MCP session_export без привязки к проекту).
+    /// Все исполнители ответили неудачей — Err перечисляет причины КАЖДОГО
+    /// (диагностика: красный дефолт не маскируется «нет сессии» на остальных).
     pub async fn export_session_any(&self, session: &str) -> UsecaseResult<String> {
-        let mut last_err: Option<UsecaseError> = None;
-        for (_, gateway) in &self.all {
+        let mut failures: Vec<String> = Vec::new();
+        for (name, gateway) in &self.all {
             match gateway.export_session(session).await {
                 Ok(text) => return Ok(text),
-                Err(e) => last_err = Some(e),
+                Err(e) => failures.push(format!("«{name}»: {e}")),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            UsecaseError::Session(format!(
-                "export_session: сессия {session} не найдена ни на одном исполнителе"
-            ))
-        }))
+        Err(UsecaseError::Session(format!(
+            "export_session {session} — исполнители: {}",
+            failures.join("; ")
+        )))
     }
 }

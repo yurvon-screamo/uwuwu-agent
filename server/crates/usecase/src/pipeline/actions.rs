@@ -5,6 +5,7 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
+use crate::router::Gateway;
 use uwuwu_domain::{
     gate, sighting_known, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, SessionSighting,
     Slot, SpawnLoop, SpawnPolicy, Status, Task,
@@ -33,11 +34,10 @@ impl TickUseCase {
         task: &Task,
         slot: Slot,
     ) -> UsecaseResult<String> {
+        let sessions = self.sessions.project(&board.project);
         let env_repo = format!("{}/{}", board.env_root, task.number());
         let title = format!("#{} {}", task.number(), task.title());
-        let bootstrap = self
-            .sessions
-            .project(&board.project)
+        let bootstrap = sessions
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
@@ -50,33 +50,28 @@ impl TickUseCase {
             .await?;
         // любой сбой после создания bootstrap гасит его (нет утечки сессий)
         let result = self
-            .spawn_stage_inner(&bootstrap, &env_repo, board, task, slot, &title)
+            .spawn_stage_inner(sessions, &bootstrap, &env_repo, board, task, slot)
             .await;
-        let _ = self
-            .sessions
-            .project(&board.project)
-            .delete_session(&bootstrap)
-            .await;
+        let _ = sessions.delete_session(&bootstrap).await;
         result
     }
 
     async fn spawn_stage_inner(
         &self,
+        sessions: &Gateway,
         bootstrap: &str,
         env_repo: &str,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
-        title: &str,
     ) -> UsecaseResult<String> {
-        let sessions = self.sessions.project(&board.project);
         sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
             .await?;
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
-                title: title.to_string(),
+                title: format!("#{} {}", task.number(), task.title()),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: self.spawn_model.clone(),
@@ -85,19 +80,10 @@ impl TickUseCase {
             })
             .await?;
         let prompt = spawn_prompt(board, task, slot);
-        if let Err(e) = self
-            .sessions
-            .project(&board.project)
-            .prompt(&work, &prompt)
-            .await
-        {
+        if let Err(e) = sessions.prompt(&work, &prompt).await {
             // Сирота (#1163): сессия создана без промпта — работать ей не
             // дано, гасим (симметрично bootstrap-зачистке вызывающего).
-            let _ = self
-                .sessions
-                .project(&board.project)
-                .delete_session(&work)
-                .await;
+            let _ = sessions.delete_session(&work).await;
             return Err(e);
         }
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
