@@ -3,7 +3,7 @@
 //! цикла супервизора (spawn/stop/recreate/re-arm/hot/state/бэкофф).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -169,6 +169,12 @@ struct FakeSessions {
     /// Реплай, «создаваемый сессией» в момент prompt (baseline-семантика
     /// раннера: ответ должен появиться после промпта).
     on_prompt: Mutex<Option<AssistantReply>>,
+    /// Сценарий многосообщного хода (наблюдённая модель пробы #1209):
+    /// шаги выдаются только после первого prompt (baseline-вызов раннера
+    /// идёт до prompt и видит прежнюю логику), по одному на вызов,
+    /// последний залипает (ход завершился — сессия не меняется).
+    script: Mutex<Vec<AssistantReply>>,
+    script_pos: AtomicUsize,
     auto_reply: AtomicBool,
 }
 
@@ -182,6 +188,8 @@ impl FakeSessions {
             liveness: Mutex::new(HashMap::new()),
             reply: Mutex::new(None),
             on_prompt: Mutex::new(None),
+            script: Mutex::new(Vec::new()),
+            script_pos: AtomicUsize::new(0),
             auto_reply: AtomicBool::new(true),
         })
     }
@@ -230,6 +238,7 @@ impl AgentSessionGateway for FakeSessions {
                 text: format!("эхо: {tail}"),
                 finished: true,
                 is_latest: true,
+                finish: Some("stop".into()),
             });
         }
         Ok(())
@@ -252,6 +261,14 @@ impl AgentSessionGateway for FakeSessions {
         Ok(None)
     }
     async fn last_assistant_reply(&self, _s: &str) -> UsecaseResult<Option<AssistantReply>> {
+        {
+            let script = self.script.lock().expect("sessions lock");
+            if !script.is_empty() && !self.prompts.lock().expect("sessions lock").is_empty() {
+                let pos = self.script_pos.fetch_add(1, Ordering::SeqCst);
+                let idx = pos.min(script.len() - 1);
+                return Ok(Some(script[idx].clone()));
+            }
+        }
         Ok(self.reply.lock().expect("sessions lock").clone())
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
@@ -540,6 +557,60 @@ impl TelegramGateway for TgHandle {
 
 // ---------- раннер ----------
 
+/// Шаг сценария хода (наблюдённая модель пробы #1209).
+fn step_reply(created_ms: u64, text: &str, finish: &str) -> AssistantReply {
+    AssistantReply {
+        created_ms,
+        text: text.into(),
+        finished: true,
+        is_latest: true,
+        finish: Some(finish.into()),
+    }
+}
+
+/// Ход из двух сообщений (живая проба 17.11): промежуточный шаг с
+/// finish='tool-calls' и is_latest=true — НЕ ответ (зазор после тула
+/// ловится поллингом), доставляется только финальный finish='stop'.
+#[tokio::test]
+async fn intermediate_toolcall_step_not_delivered() {
+    let tg = FakeTg::new(vec![private_update(6, "yurvon", "многошаговый ход")]);
+    let sessions = FakeSessions::new();
+    sessions.auto_reply.store(false, Ordering::SeqCst);
+    sessions.script.lock().expect("lock").push(step_reply(
+        1_000,
+        "Смотрю конфиг сервера и поля досок:",
+        "tool-calls",
+    ));
+    sessions
+        .script
+        .lock()
+        .expect("lock")
+        .push(step_reply(2_000, "полный финальный ответ", "stop"));
+    let state = Arc::new(FakeState::default());
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(
+        || {
+            tg.sent_snapshot()
+                .iter()
+                .any(|(_, t)| t.contains("финальный ответ"))
+        },
+        2000,
+    )
+    .await;
+    task.abort();
+    assert!(ok, "финальный шаг не доставлен");
+    let sent = tg.sent_snapshot();
+    assert_eq!(sent.len(), 1, "промежуточный шаг ушёл в ТГ: {sent:?}");
+    assert_eq!(sent[0].1, "полный финальный ответ");
+}
+
 #[tokio::test]
 async fn private_owner_message_prompts_and_replies() {
     let tg = FakeTg::new(vec![private_update(7, "yurvon", "заявка из ТГ")]);
@@ -662,6 +733,7 @@ async fn long_reply_chunked() {
         text: "а".repeat(9500),
         finished: true,
         is_latest: true,
+        finish: Some("stop".into()),
     });
     let state = Arc::new(FakeState::default());
     let task = spawn_bot_task(deps(

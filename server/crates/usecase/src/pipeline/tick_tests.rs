@@ -206,6 +206,7 @@ impl AgentSessionGateway for FakeSessions {
             text: String::new(),
             finished: true,
             is_latest: true,
+            finish: Some("stop".into()),
         }))
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {

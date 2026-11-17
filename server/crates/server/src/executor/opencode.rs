@@ -309,6 +309,7 @@ impl AgentSessionGateway for OpencodeClient {
             text: text.join("\n"),
             finished: msg["finish"].as_str().is_some(),
             is_latest: latest_is_assistant,
+            finish: msg["finish"].as_str().map(String::from),
         }))
     }
 }
