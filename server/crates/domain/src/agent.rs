@@ -84,13 +84,6 @@ pub struct SpawnModel {
 }
 
 impl SpawnModel {
-    pub fn new(provider: impl Into<String>, id: impl Into<String>, variant: Option<&str>) -> Self {
-        Self {
-            model: ModelRef::new(provider, id),
-            variant: variant.filter(|v| !v.is_empty()).map(str::to_string),
-        }
-    }
-
     /// `provider/id[#variant]` → SpawnModel.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let (prov_id, variant) = raw
