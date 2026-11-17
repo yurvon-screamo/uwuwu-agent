@@ -1051,14 +1051,18 @@ async fn cup_counts_second_turn_sessions() {
     working.apply_fields(f);
     let candidate = task(151, Status::InProgress);
     let (u, _, sessions, _) = usecase(vec![working, candidate], PrState::Missing);
-    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-        id: "ses_2nd_150".into(),
-        agent: "developer".into(),
-        updated_ms: 0,
-        outcome: "succeeded".into(),
-        total_tokens: 5000,
-        busy: true,
-    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_2nd_150".into(),
+            agent: "developer".into(),
+            updated_ms: 0,
+            outcome: "succeeded".into(),
+            total_tokens: 5000,
+            busy: true,
+        });
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
         out.spawns_done, 0,
@@ -1075,14 +1079,18 @@ async fn cup_busy_counts_non_pipeline_sessions() {
     // union-скан считает ВСЕ ходы исполнителя, не только stage-строки.
     let candidate = task(160, Status::InProgress);
     let (u, _, sessions, _) = usecase(vec![candidate], PrState::Missing);
-    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-        id: "ses_bot".into(),
-        agent: String::new(),
-        updated_ms: 0,
-        outcome: String::new(),
-        total_tokens: 9000,
-        busy: true,
-    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_bot".into(),
+            agent: String::new(),
+            updated_ms: 0,
+            outcome: String::new(),
+            total_tokens: 9000,
+            busy: true,
+        });
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
         out.spawns_done, 0,
@@ -1119,14 +1127,18 @@ async fn wakeup_held_when_cup_full() {
     });
     // сама строка idle + чужой ход в полёте — единый кап занят
     for (id, busy) in [("ses_wake_170", false), ("ses_other", true)] {
-        sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-            id: id.into(),
-            agent: String::new(),
-            updated_ms: 0,
-            outcome: "succeeded".into(),
-            total_tokens: 0,
-            busy,
-        });
+        sessions
+            .extra
+            .lock()
+            .unwrap()
+            .push(crate::ports::SessionInfo {
+                id: id.into(),
+                agent: String::new(),
+                updated_ms: 0,
+                outcome: "succeeded".into(),
+                total_tokens: 0,
+                busy,
+            });
     }
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -1180,14 +1192,18 @@ async fn wakeup_delivery_occupies_cup_slot() {
         activity_ms: 1000,
         ..Default::default()
     });
-    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-        id: "ses_wake_180".into(),
-        agent: String::new(),
-        updated_ms: 0,
-        outcome: "succeeded".into(),
-        total_tokens: 0,
-        busy: false,
-    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_wake_180".into(),
+            agent: String::new(),
+            updated_ms: 0,
+            outcome: "succeeded".into(),
+            total_tokens: 0,
+            busy: false,
+        });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
@@ -1487,8 +1503,8 @@ async fn undelivered_comment_is_not_marked_seen() {
             idle_reply: false,
             specs: Mutex::default(),
             live: Mutex::default(),
-        busy_ids: Mutex::default(),
-        extra: Mutex::default(),
+            busy_ids: Mutex::default(),
+            extra: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -2061,7 +2077,13 @@ fn titled(n: u64, title: &str, status: Status) -> Task {
     Task::new(n, title.into(), status)
 }
 
-fn fake_session(id: &str, agent: &str, outcome: &str, tokens: u64, busy: bool) -> crate::ports::SessionInfo {
+fn fake_session(
+    id: &str,
+    agent: &str,
+    outcome: &str,
+    tokens: u64,
+    busy: bool,
+) -> crate::ports::SessionInfo {
     crate::ports::SessionInfo {
         id: id.into(),
         agent: agent.into(),
@@ -2092,10 +2114,7 @@ async fn analyst_wave_held_when_cup_full() {
     );
     let spawned = u.tick().await.unwrap();
     assert_eq!(spawned, 0, "волна при полном капе не спавнится");
-    assert!(
-        sessions.spawned.lock().unwrap().is_empty(),
-        "спавна нет"
-    );
+    assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
     assert!(
         state.0.lock().unwrap().analys_ms.is_empty(),
         "кулдауны строк не заряжаются отложкой"
@@ -2115,11 +2134,13 @@ async fn analyst_alive_guard_sees_second_turn() {
     // живого аналитика.
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
-    sessions
-        .extra
-        .lock()
-        .unwrap()
-        .push(fake_session("ses_analyst", "analyst", "succeeded", 71_000, true));
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_analyst",
+        "analyst",
+        "succeeded",
+        71_000,
+        true,
+    ));
     let (u, _) = analyst_uc_with_cup(
         vec![titled(301, "заявка на разбор", Status::Analys)],
         state,
@@ -2169,15 +2190,21 @@ async fn dreamer_held_when_cup_full() {
     }
     let sessions = Arc::new(FakeSessions::new());
     // готовая цель дримера (финал, токены, idle > 30 мин) + чужой ход
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_target",
+        "developer",
+        "succeeded",
+        500,
+        false,
+    ));
     sessions
         .extra
         .lock()
         .unwrap()
-        .push(fake_session("ses_target", "developer", "succeeded", 500, false));
-    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-        updated_ms: 100_000_000 - 31 * 60_000,
-        ..fake_session("ses_stage", "developer", "", 0, true)
-    });
+        .push(crate::ports::SessionInfo {
+            updated_ms: 100_000_000 - 31 * 60_000,
+            ..fake_session("ses_stage", "developer", "", 0, true)
+        });
     let u = DreamerUseCase {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),

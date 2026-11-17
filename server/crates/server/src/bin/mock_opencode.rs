@@ -389,7 +389,7 @@ async fn prompt(
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
         s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
-        // реплай бота готов сразу (storm — исключение: прерывание без ответа)
+                              // реплай бота готов сразу (storm — исключение: прерывание без ответа)
         if mode != "storm" {
             let tail = text
                 .lines()

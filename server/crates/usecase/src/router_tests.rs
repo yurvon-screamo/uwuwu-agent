@@ -149,8 +149,6 @@ async fn strict_union_fails_when_any_executor_down() {
     assert!(err.to_string().contains("redmi"), "{err}");
 }
 
-
-
 #[tokio::test]
 async fn export_falls_over_to_other_executor() {
     let router = SessionRouter::new(
