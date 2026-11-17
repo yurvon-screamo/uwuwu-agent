@@ -1429,9 +1429,10 @@ async fn dead_stage_session_does_not_hold_cup() {
 }
 
 #[tokio::test]
-async fn dead_stage_session_holds_cup_when_list_unavailable() {
-    // fallback: исполнитель недоступен — сессионные считаются активными
-    // (статусный подсчёт), консервативно против спавн-шторма
+async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
+    // инверсия деградации (#1263): исполнитель проекта недоступен — спавны
+    // не идут вовсе (hold без зрения), CUP-гейт не достигается; статусный
+    // консервативный подсчёт остаётся для смешанного здоровья исполнителей
     let mut dead = task(42, Status::InProgress);
     let mut f = TaskFields::default();
     f.set_session(
@@ -1459,8 +1460,60 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         Arc::new(MemState(Mutex::default())),
     );
     let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
-    assert_eq!(out.spawns_done, 0, "fallback держит консервативный кап");
-    assert_eq!(out.held_cup, 1);
+    assert_eq!(out.spawns_done, 0, "слепой спавн невозможен — hold (#1263)");
+    assert_eq!(
+        out.held_blind, 1,
+        "кандидат в слепом hold; строка с живой probe-сессией — в Observe"
+    );
+    assert_eq!(out.held_cup, 0, "до CUP-гейта слепой hold не доходит");
+}
+
+#[tokio::test]
+async fn foreign_executor_failure_does_not_blind_project_guard() {
+    // пер-проектное зрение (#1263): упал ЧУЖОЙ исполнитель (дефолтный
+    // redmi) — зрение проекта p (свой исполнитель kisa) живо: сестра в env
+    // держит спавн как live-hold, а не как слепой; без сестры спавн идёт
+    let sister = FakeSessions::with_env_session("ses_sis_65", "/tmp/env/65", "", "", 2000);
+    let mut redmi = FakeSessions::new();
+    redmi.list_fails = true;
+    let mut by_project = std::collections::HashMap::new();
+    by_project.insert(
+        "p".to_string(),
+        Arc::new(sister) as Arc<dyn AgentSessionGateway>,
+    );
+    let router = SessionRouter::new(
+        "redmi",
+        Arc::new(redmi) as Arc<dyn AgentSessionGateway>,
+        vec![("kisa".to_string(), by_project["p"].clone())],
+        by_project,
+    );
+    let state = Arc::new(MemState(Mutex::default()));
+    let board = Arc::new(FakeBoard {
+        rows: vec![task(65, Status::InProgress)],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(router),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state,
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.held_live, 1,
+        "зрение проекта живо при чужом отказе: сестра держит live-hold"
+    );
+    assert_eq!(out.held_blind, 0, "чужой отказ не слепит проект");
+    assert_eq!(out.spawns_done, 0);
 }
 
 #[tokio::test]
@@ -3751,9 +3804,10 @@ async fn dead_respawn_held_when_orphan_in_env() {
 }
 
 #[tokio::test]
-async fn strict_scan_down_plain_spawn_not_held() {
-    // never-worse (#1163): strict-скан недоступен (исполнитель за релеем
-    // лёг) — гард пропускается, спавн идёт прежним путём, hold не ставится
+async fn strict_scan_down_plain_spawn_held() {
+    // инверсия деградации (#1263): скан исполнителя недоступен — спавн
+    // без зрения невозможен (слепой спавн поверх живой сестры = инцидент
+    // #1241); hold до восстановления списка, луп-гвард не заряжается
     let mut sessions = FakeSessions::new();
     sessions.list_fails = true;
     let (u, _, _, _) = usecase_with_sessions(
@@ -3763,18 +3817,16 @@ async fn strict_scan_down_plain_spawn_not_held() {
         Arc::new(MemState(Mutex::default())),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(
-        out.spawns_done, 1,
-        "list недоступен — гард не держит (never worse)"
-    );
+    assert_eq!(out.spawns_done, 0, "слепой спавн невозможен — hold (#1263)");
+    assert_eq!(out.held_blind, 1);
     assert_eq!(out.held_live, 0);
 }
 
 #[tokio::test]
-async fn strict_scan_down_dead_respawn_not_held() {
-    // never-worse на respawn-пути: скан недоступен — second source и
-    // env-гард молчат (unwrap_or пустого списка), мёртвая сессия
-    // респавнится как раньше
+async fn strict_scan_down_dead_respawn_held() {
+    // инверсия деградации на respawn-пути (#1263): скан недоступен —
+    // second source и env-гард не оцениваются вовсе, респавн держится
+    // слепотой до восстановления скана (probe-лжец без списка не решает)
     let mut t = task(62, Status::InProgress);
     let mut f = TaskFields::default();
     f.set_session(
@@ -3799,10 +3851,115 @@ async fn strict_scan_down_dead_respawn_not_held() {
         .push("ses_dead_62".into());
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        out.spawns_done, 1,
-        "скан недоступен — респавн не держится (never worse)"
+        out.spawns_done, 0,
+        "слепой респавн невозможен — hold (#1263)"
     );
+    assert_eq!(out.held_blind, 1);
     assert_eq!(out.held_live, 0);
+}
+
+#[tokio::test]
+async fn blind_scan_test_respawn_over_live_sister_holds() {
+    // #1263 (красный на pre-fix): список исполнителя недоступен, probe
+    // лжёт Dead, в env строки жива сестра (tester) — респавн поверх неё
+    // = класс инцидента #1241 (пять сессий в одном env). Инвариант:
+    // спавн преемника при живой сестре невозможен — hold без спавна.
+    let mut t = task(63, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_dead_63").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().statuses.push((63, Status::Testing));
+    let mut sessions =
+        FakeSessions::with_env_session("ses_sister_63", "/tmp/env/63", "tester", "", 2000);
+    sessions.list_fails = true;
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_63".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "респавн тест-слота поверх живой сестры при слепом скане невозможен (#1263)"
+    );
+    assert_eq!(out.held_blind, 1, "слепой hold считается отдельно");
+}
+
+#[tokio::test]
+async fn blind_scan_plain_spawn_over_live_sister_holds() {
+    // #1263 (красный на pre-fix): список недоступен, в env строки живёт
+    // дев-сестра — плейн-спавн поверх неё идёт вслепую. Инвариант тот же:
+    // hold без спавна.
+    let mut sessions = FakeSessions::with_env_session("ses_sister_64", "/tmp/env/64", "", "", 2000);
+    sessions.list_fails = true;
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![task(64, Status::InProgress)],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "плейн-спавн поверх живой сестры при слепом скане невозможен (#1263)"
+    );
+    assert_eq!(out.held_blind, 1);
+}
+
+#[tokio::test]
+async fn blind_scan_respawn_holds_for_every_stage_slot() {
+    // матрица слотов (#1263, ревью Low): инвариант «спавн преемника при
+    // живой сестре невозможен» слот-генеричен — Design/Dev (деф-семья),
+    // план/результат-ревью и тест (именованные); слепой респавн держится
+    // на каждом статусном пути
+    let cases = [
+        (Status::Design, Slot::Design, ""),
+        (Status::InProgress, Slot::Dev, ""),
+        (Status::ReviewPlan, Slot::PlanReview, "plan-reviewer"),
+        (
+            Status::ReviewResult,
+            Slot::ResultReview,
+            "code-quality-reviewer",
+        ),
+        (Status::Testing, Slot::Test, "tester"),
+    ];
+    for (i, (status, slot, agent)) in cases.iter().enumerate() {
+        let n = 70 + i as u64;
+        let mut t = task(n, *status);
+        let mut f = TaskFields::default();
+        f.set_session(
+            *slot,
+            uwuwu_domain::SessionRef::parse(&format!("ses_dead_{n}")).unwrap(),
+        );
+        t.apply_fields(f);
+        let state = Arc::new(MemState(Mutex::default()));
+        state.0.lock().unwrap().statuses.push((n, *status));
+        let mut sessions = FakeSessions::with_env_session(
+            &format!("ses_sister_{n}"),
+            &format!("/tmp/env/{n}"),
+            agent,
+            "",
+            2000,
+        );
+        sessions.list_fails = true;
+        let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+        sessions
+            .dead_sessions
+            .lock()
+            .unwrap()
+            .push(format!("ses_dead_{n}"));
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert!(
+            sessions.spawned.lock().unwrap().is_empty(),
+            "слот {slot:?}: слепой респавн поверх живой сестры невозможен (#1263)"
+        );
+        assert_eq!(out.held_blind, 1, "слот {slot:?}: слепой hold посчитан");
+    }
 }
 
 #[test]
