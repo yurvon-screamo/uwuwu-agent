@@ -1662,7 +1662,7 @@ async fn idle_sessions_do_not_hold_cup() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -2042,6 +2042,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
     // не двигается) — старый код сжигал круг за кругом и эскалировал

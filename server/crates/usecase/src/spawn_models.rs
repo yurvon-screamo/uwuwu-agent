@@ -69,15 +69,13 @@ impl SpawnModels {
             "Карта моделей: нет ключа — секция [executor.models] неполна, \
              применён канон-дефолт"
         );
+        // канон несёт все ключи агентов — expect достижим только при
+        // недействительном agent_name (невозможно: ключи из naming)
         SpawnModels::canonical()
-            .by_key(key)
+            .map
+            .get(key)
             .cloned()
-            .unwrap_or_else(|| {
-                SpawnModels::canonical()
-                    .by_key("default")
-                    .cloned()
-                    .expect("канон несёт default")
-            })
+            .expect("канон несёт ключ агента")
     }
 }
 

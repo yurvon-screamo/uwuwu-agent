@@ -274,7 +274,7 @@ async fn analyst_spawn_carries_model_from_server_map() {
 }
 
 #[tokio::test]
-async fn dreamer_spawn_passes_no_model() {
+async fn dreamer_spawn_carries_model_from_server_map() {
     // Arrange: уснувшая dev-сессия с финалом и реальной работой
     let sessions = CaptureSessions::new(vec![SessionInfo {
         id: "ses_dev1".into(),
@@ -304,7 +304,7 @@ async fn dreamer_spawn_passes_no_model() {
 }
 
 #[tokio::test]
-async fn cron_run_passes_no_model() {
+async fn cron_run_carries_model_from_server_map() {
     // Arrange
     let sessions = CaptureSessions::new(vec![]);
     let u = CronUseCase {
