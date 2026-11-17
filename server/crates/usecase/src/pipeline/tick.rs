@@ -107,6 +107,16 @@ pub struct TickUseCase {
     pub spawn_model: Option<ModelRef>,
 }
 
+/// Контекст строки тика: данные union-скана и enrichment, общие для
+/// прохода доски (#1163). Не решение — вход решений.
+struct RowContext<'a> {
+    /// Слепки сессий исполнителя (strict); None — скан недоступен,
+    /// гард спавна пропущен (never worse).
+    sightings: Option<&'a [SessionSighting]>,
+    /// Строки с отказом enrichment — тиком пропускаются.
+    enrich_failed: &'a HashSet<u64>,
+}
+
 impl TickUseCase {
     pub async fn run(&self, plan: &TickPlan) -> UsecaseResult<TickOutcome> {
         let mut out = TickOutcome::default();
@@ -244,8 +254,10 @@ impl TickUseCase {
                     board,
                     tasks,
                     &mut active_now,
-                    sightings.as_deref(),
-                    &enrich_failed,
+                    &RowContext {
+                        sightings: sightings.as_deref(),
+                        enrich_failed: &enrich_failed,
+                    },
                     out,
                 )
                 .await?;
@@ -277,8 +289,7 @@ impl TickUseCase {
         board: &BoardPlan,
         mut tasks: Vec<Task>,
         active_now: &mut usize,
-        sightings: Option<&[SessionSighting]>,
-        enrich_failed: &HashSet<u64>,
+        ctx: &RowContext<'_>,
         mut out: TickOutcome,
     ) -> UsecaseResult<TickOutcome> {
         let now = self.clock.utc_minute();
@@ -300,7 +311,7 @@ impl TickUseCase {
             // Отказ enrichment (#1163): строка пропускается — ячейки не
             // видны, decide по снапшоту даст вечный needs_spawn (механизм
             // дубль-спавнов ночи 15.11). Пропущенный тик ретраится даром.
-            if enrich_failed.contains(&task_ref.number()) {
+            if ctx.enrich_failed.contains(&task_ref.number()) {
                 out.enrich_skipped += 1;
                 continue;
             }
@@ -391,7 +402,7 @@ impl TickUseCase {
                     // источник поверх ячейки — сироты спавна, клеймы в
                     // гонке с тиком, невидимые ячейки не дублируют раунд.
                     // Strict-скан недоступен → гард пропущен (never worse).
-                    if let Some(list) = sightings {
+                    if let Some(list) = ctx.sightings {
                         let env_repo = format!("{}/{}", board.env_root, task.number());
                         if spawn_guard(list, &env_repo, slot, now_ms) == SpawnGuard::Hold {
                             out.held_live += 1;
@@ -502,7 +513,12 @@ impl TickUseCase {
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
                         self.observe_stage_session(
-                            board, plan, task, active_now, sightings, &mut out,
+                            board,
+                            plan,
+                            task,
+                            active_now,
+                            ctx.sightings,
+                            &mut out,
                         )
                         .await;
                     } else {

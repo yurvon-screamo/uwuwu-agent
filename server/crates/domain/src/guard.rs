@@ -168,7 +168,12 @@ mod tests {
     fn named_slot_held_by_same_agent_only() {
         let reviewer = sighting("s1", ENV, "code-quality-reviewer", "", NOW - 60_000);
         assert_eq!(
-            spawn_guard(&[reviewer.clone()], ENV, Slot::ResultReview, NOW),
+            spawn_guard(
+                std::slice::from_ref(&reviewer),
+                ENV,
+                Slot::ResultReview,
+                NOW
+            ),
             SpawnGuard::Hold,
             "живой ревьювер держит спавн своего слота"
         );
