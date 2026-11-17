@@ -17,14 +17,17 @@ const DAY_CAP: u32 = 24;
 const SKIP_AGENTS: [Agent; 3] = [Agent::Dreamer, Agent::Analyst, Agent::AnalystReviewer];
 
 pub struct DreamerUseCase {
-    /// Роутер «проект → executor» (#1203): скан сессий — best-effort union
-    /// по всем исполнителям (офлайн одного не останавливает пост-обработку),
+    /// Роутер «проект → executor» (#1203): скан сессий — strict union
+    /// (busy-учёт капа и alive-гвард — решения по агрегату, #1203/#1231),
     /// собственный спавн — дефолтный исполнитель.
     pub sessions: Arc<SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
     pub spawn_model: Option<ModelRef>,
     pub checkout: String,
+    /// Единый кап активных ходов исполнителя (policy.cup): дример-спавн
+    /// откладывается при полном капе (#1231).
+    pub cup: usize,
 }
 
 impl DreamerUseCase {
@@ -33,13 +36,29 @@ impl DreamerUseCase {
     /// сессии с финалом И реальной работой (токены > 0, не пустышки).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         let now = self.clock.now_ms();
-        let list = self.sessions.list_sessions_best_effort().await?;
-        // ≤1 живого дримера одновременно
+        // Strict union (#1203/#1231): busy-учёт капа и alive-гвард —
+        // решения по агрегату, частичный список искажает подсчёт.
+        // Офлайн-исполнитель останавливает тик дримера до возврата
+        // (пост-обработка догоняет на следующем тике).
+        let list = self.sessions.list_sessions_strict().await?;
+        // ≤1 живого дримера — busy-признак (ход в полёте, #1231): outcome
+        // при новом ходе не очищается, дубль-дример на 2+ ходе был незаметен
         if list
             .iter()
-            .any(|s| s.outcome.is_empty() && naming::parse_agent(&s.agent) == Some(Agent::Dreamer))
+            .any(|s| s.busy && naming::parse_agent(&s.agent) == Some(Agent::Dreamer))
         {
             tracing::debug!(event = "dreamer.alive_skip", "Живой дример — спавна нет");
+            return Ok(0);
+        }
+        // CUP-гвард (#1231): дример-спавн откладывается при полном капе.
+        let busy = list.iter().filter(|s| s.busy).count();
+        if busy >= self.cup {
+            tracing::info!(
+                event = "dreamer.held_cup",
+                active = busy,
+                cap = self.cup,
+                "Дример-спавн отложен: CUP cap"
+            );
             return Ok(0);
         }
         // дневной кап (сутки JST — канон расписаний)

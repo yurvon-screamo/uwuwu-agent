@@ -1,7 +1,6 @@
 //! Маршрутизатор сессий «проект → executor» (#1203): per-project гейтвеи,
-//! дефолт — [executor]. Union-сканы с разной семантикой отказа: strict
-//! (CUP: all-or-Err — частичный список искажает подсчёт) и best-effort
-//! (дример: merge успешных + warn по отказавшему; отказ всех — Err).
+//! дефолт — [executor]. Union-скан strict: all-or-Err — частичный список
+//! искажает busy-подсчёт CUP и alive-гварды (#1231).
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, SessionInfo};
@@ -70,34 +69,6 @@ impl SessionRouter {
                     )))
                 }
             }
-        }
-        Ok(out)
-    }
-
-    /// Список сессий по успешным исполнителям: пост-обработка (дример)
-    /// не должна останавливаться из-за одного офлайн-ноутбука. Отказ
-    /// части — warn с именем исполнителя; пропущенные сессии не теряются
-    /// (idle-детект и dreamer_done дообрабатывают их при его возврате).
-    /// Отказ всех — Err, как сегодня при единственном исполнителе.
-    pub async fn list_sessions_best_effort(&self) -> UsecaseResult<Vec<SessionInfo>> {
-        let mut out = Vec::new();
-        let mut failures = 0usize;
-        let mut last_err: Option<UsecaseError> = None;
-        for (name, gateway) in &self.all {
-            match gateway.list_sessions().await {
-                Ok(list) => out.extend(list),
-                Err(e) => {
-                    failures += 1;
-                    tracing::warn!(event = "router.list_partial", executor = %name, error = %e,
-                        "Union-скан: исполнитель недоступен — сессии пропущены (дообработка при возврате)");
-                    last_err = Some(e);
-                }
-            }
-        }
-        if failures == self.all.len() {
-            return Err(last_err.unwrap_or_else(|| {
-                UsecaseError::Session("list_sessions: все исполнители недоступны".into())
-            }));
         }
         Ok(out)
     }

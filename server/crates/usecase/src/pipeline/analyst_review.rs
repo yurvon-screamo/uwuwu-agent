@@ -20,6 +20,9 @@ pub struct AnalystReviewUseCase {
     pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
+    /// Единый кап активных ходов исполнителя (policy.cup): ревью-волна не
+    /// спавнится при полном капе (#1231).
+    pub cup: usize,
 }
 
 impl AnalystReviewUseCase {
@@ -29,16 +32,30 @@ impl AnalystReviewUseCase {
     /// владельца 16.11, >4) — систематически умирающий ревьювер не ретраится
     /// вечно, строка уходит в Needs attention.
     pub async fn tick(&self) -> UsecaseResult<usize> {
-        // парность: ≤1 живого ревьювера аналитики одновременно
-        // Strict union (#1203): как у аналитика — живой ревьювер волны на
-        // офлайн-исполнителе не порождает дубль-спавн на другом
-        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
-            s.outcome.is_empty()
-                && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer)
+        // парность: ≤1 живого ревьювера аналитики — busy-признак (ход в
+        // полёте, #1231): outcome при новом ходе не очищается, дубль-волна
+        // на 2+ ходе ревьювера была незаметна. Strict union (#1203): как у
+        // аналитика — живой ревьювер волны на офлайн-исполнителе не
+        // порождает дубль-спавн на другом
+        let scan = self.sessions.list_sessions_strict().await?;
+        if scan.iter().any(|s| {
+            s.busy && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer)
         }) {
             tracing::debug!(
                 event = "analys_review.alive_skip",
                 "Живой ревьювер — волна ждёт"
+            );
+            return Ok(0);
+        }
+        // CUP-гвард (#1231): ревью-волна — запуск хода, отложка при полном
+        // капе; гарды строк не заряжаются (отложка — не спавн).
+        let busy = scan.iter().filter(|s| s.busy).count();
+        if busy >= self.cup {
+            tracing::info!(
+                event = "analys_review.held_cup",
+                active = busy,
+                cap = self.cup,
+                "Ревью-волна отложена: CUP cap"
             );
             return Ok(0);
         }
