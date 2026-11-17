@@ -134,6 +134,15 @@ pub fn gate(
     Gate::Allowed
 }
 
+/// Правило жертвы преемпшена CUP (#1259): понижение приоритета активной
+/// строки отдаёт слот кандидату строже нижнего ранга. Жертва — только
+/// низкоприоритетный актив (Low/Empty): high/medium не гасятся никогда,
+/// сайдкары/кроны/боты/ручные сессии вне множества жертв (они не строки
+/// доски — отбор жертв живёт в тике поверх этого правила).
+pub fn can_preempt(waiter: Priority, victim: Priority) -> bool {
+    matches!(victim, Priority::Low | Priority::Empty) && waiter.rank() < victim.rank()
+}
+
 /// Attention-механика (директива владельца 15.11): спавн слота при
 /// неизменном статусе строки — повтор; третий повтор = петля, строка
 /// эскалируется владельцу (Needs attention), конвейер её бросает.
@@ -190,6 +199,24 @@ mod tests {
 
     fn task(status: Status) -> Task {
         Task::new(7, "t".into(), status)
+    }
+
+    #[test]
+    fn can_preempt_matrix() {
+        // Жертвы — только Low/Empty; жертву гасит строго высший кандидат
+        use Priority::{Empty, High, Low, Medium};
+        assert!(can_preempt(High, Low));
+        assert!(can_preempt(Medium, Low));
+        assert!(can_preempt(High, Empty));
+        assert!(can_preempt(Medium, Empty));
+        assert!(can_preempt(Low, Empty));
+        // гарды: high/medium не гасятся никогда
+        assert!(!can_preempt(High, High));
+        assert!(!can_preempt(High, Medium));
+        // равный и низший кандидат слот не отбирает
+        assert!(!can_preempt(Medium, Medium));
+        assert!(!can_preempt(Low, Low));
+        assert!(!can_preempt(Empty, Low));
     }
 
     #[test]

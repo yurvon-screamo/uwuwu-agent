@@ -10,9 +10,10 @@ use crate::ports::{
 use crate::router::SessionRouter;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    BranchName, PeakWindow, PrUrl, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
+    BranchName, PeakWindow, PrUrl, Priority, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
 };
 
 struct FakeBoard {
@@ -200,6 +201,12 @@ struct FakeSessions {
     prompt_fails: bool,
     /// Журнал удалений сессий (ассерты сирота-зачистки).
     deleted: Mutex<Vec<String>>,
+    /// Журнал абортов сессий (преемпшен #1259).
+    aborted: Mutex<Vec<String>>,
+    /// Отказ abort_session (гашение не удалось — кандидат остаётся held).
+    abort_fails: AtomicBool,
+    /// Бюджетная проба spawn_allowed (false — преемпшен не начинается).
+    spawn_probe: AtomicBool,
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
@@ -229,6 +236,9 @@ impl FakeSessions {
             extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
+            aborted: Mutex::default(),
+            abort_fails: AtomicBool::new(false),
+            spawn_probe: AtomicBool::new(true),
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -311,6 +321,16 @@ impl AgentSessionGateway for FakeSessions {
     async fn delete_session(&self, s: &str) -> UsecaseResult<()> {
         self.deleted.lock().unwrap().push(s.into());
         Ok(())
+    }
+    async fn abort_session(&self, s: &str) -> UsecaseResult<()> {
+        if self.abort_fails.load(Ordering::SeqCst) {
+            return Err(UsecaseError::Session("abort недоступен (мок)".into()));
+        }
+        self.aborted.lock().unwrap().push(s.into());
+        Ok(())
+    }
+    fn spawn_allowed(&self) -> bool {
+        self.spawn_probe.load(Ordering::SeqCst)
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
         Ok(self.activity_ms)
@@ -734,6 +754,9 @@ fn peak_usecase(
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        aborted: Mutex::default(),
+        abort_fails: AtomicBool::new(false),
+        spawn_probe: AtomicBool::new(true),
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -1666,6 +1689,9 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        aborted: Mutex::default(),
+        abort_fails: AtomicBool::new(false),
+        spawn_probe: AtomicBool::new(true),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -2286,6 +2312,9 @@ async fn undelivered_comment_is_not_marked_seen() {
             extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
+            aborted: Mutex::default(),
+            abort_fails: AtomicBool::new(false),
+            spawn_probe: AtomicBool::new(true),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -2345,6 +2374,9 @@ async fn undelivered_comment_is_not_marked_seen() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        aborted: Mutex::default(),
+        abort_fails: AtomicBool::new(false),
+        spawn_probe: AtomicBool::new(true),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -2414,6 +2446,9 @@ async fn multi_comment_tail_delivered_together() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        aborted: Mutex::default(),
+        abort_fails: AtomicBool::new(false),
+        spawn_probe: AtomicBool::new(true),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -4829,4 +4864,240 @@ fn env_repo_dir_formula_is_pinned() {
     // одной функцией; формат пинится тестом (расхождение = тихая слепота)
     assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
     assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
+}
+
+// ---- преемпшен CUP: понижение приоритета отдаёт слот (#1259) ----
+
+/// Активная строка с привязанной dev-сессией (busy-актив при
+/// idle_reply=false).
+fn row_with_session(n: u64, session: &str, priority: Priority) -> Task {
+    let mut t = task(n, Status::InProgress);
+    t.set_priority(priority);
+    let mut f = TaskFields::default();
+    f.set_session(Slot::Dev, uwuwu_domain::SessionRef::parse(session).unwrap());
+    t.apply_fields(f);
+    t
+}
+
+/// Живая busy-сессия исполнителя (union-скан: outcome пуст).
+fn live_busy(sessions: &Arc<FakeSessions>, id: &str) {
+    sessions.live.lock().unwrap().push(LiveSighting {
+        id: id.into(),
+        agent: String::new(),
+        directory: String::new(),
+        outcome: String::new(),
+        updated_ms: 0,
+    });
+}
+
+#[tokio::test]
+async fn cup_preempt_yields_slot_on_priority_drop() {
+    // Канонический BDD: кап из busy low-активов, high в очереди → тик
+    // гасит жертву (abort+delete), слот уходит high-кандидату
+    let v1 = row_with_session(1, "ses_v1", Priority::Low);
+    let v2 = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, board, sessions, _) = usecase(vec![v1, v2, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.preempts, 1, "одна жертва на отдачу слота");
+    assert_eq!(out.spawns_done, 1, "high-кандидат получил слот");
+    assert_eq!(out.held_cup, 0);
+    let deleted = sessions.deleted.lock().unwrap();
+    let victims: Vec<_> = deleted
+        .iter()
+        .filter(|d| d.starts_with("ses_v"))
+        .cloned()
+        .collect();
+    assert_eq!(victims, ["ses_v1"], "гасится ровно одна low-жертва");
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#")),
+        "жертве статус не трогается (возобновление — respawn'ом)"
+    );
+}
+
+#[tokio::test]
+async fn cup_no_preempt_of_medium_active() {
+    // Гард: high/medium-активы не гасятся никогда — high-кандидат ждёт
+    let v = row_with_session(1, "ses_v1", Priority::Medium);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![v, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 0);
+    assert_eq!(out.held_cup, 1, "medium-актив держит слот");
+    assert_eq!(out.spawns_done, 0);
+    assert!(sessions.deleted.lock().unwrap().is_empty());
+    assert!(sessions.aborted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cup_preempt_skipped_when_budget_exhausted() {
+    // Контракт порядка (круг 1): бюджетная проба ДО гашения — жертва
+    // зря не гибнет, кандидат остаётся held до свободного бюджета
+    let v = row_with_session(1, "ses_v1", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![v, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    sessions.spawn_probe.store(false, Ordering::SeqCst);
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 0, "без готовности кандидата гашения нет");
+    assert_eq!(out.held_cup, 1);
+    assert!(sessions.deleted.lock().unwrap().is_empty());
+    assert!(sessions.aborted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cup_preempt_abort_failure_holds_spawn() {
+    // abort/delete не прошли — кандидат остаётся held, ретрай следующим
+    // тиком; жертва не удалена (abort-first порядок)
+    let v = row_with_session(1, "ses_v1", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![v, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    sessions.abort_fails.store(true, Ordering::SeqCst);
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 0);
+    assert_eq!(out.held_cup, 1);
+    assert_eq!(out.actions_failed, 1, "отказ гашения — громкий");
+    assert!(
+        sessions.deleted.lock().unwrap().is_empty(),
+        "abort не прошёл — delete не вызывается"
+    );
+}
+
+#[tokio::test]
+async fn cup_preempt_picks_freshest_lowest() {
+    // Детерминизм: среди low-жертв — минимальный ранг, при равенстве
+    // свежее заспавненная (контекст младше — дешевле потерять)
+    let v1 = row_with_session(1, "ses_v1", Priority::Low);
+    let v2 = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().spawn_ms = vec![(1, Slot::Dev, 5000), (2, Slot::Dev, 1000)];
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![v1, v2, waiter],
+        PrState::Missing,
+        FakeSessions::new(),
+        state,
+    );
+    live_busy(&sessions, "ses_v1");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.preempts, 1);
+    let deleted = sessions.deleted.lock().unwrap();
+    let victims: Vec<_> = deleted
+        .iter()
+        .filter(|d| d.starts_with("ses_v"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        victims,
+        ["ses_v1"],
+        "свежее заспавненная жертва гасится первой"
+    );
+}
+
+#[tokio::test]
+async fn cup_nonrow_sessions_never_aborted() {
+    // Структурный гард: не-строки (боты/кроны/ручные) вне множества
+    // жертв — преемпшен трогает только сессии строк досок
+    let v = row_with_session(1, "ses_v1", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![v, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    live_busy(&sessions, "ses_bot_busy");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1);
+    let deleted = sessions.deleted.lock().unwrap();
+    let victims: Vec<_> = deleted
+        .iter()
+        .filter(|d| d.starts_with("ses_v"))
+        .cloned()
+        .collect();
+    assert_eq!(victims, ["ses_v1"], "жертва — строка доски");
+    assert!(sessions.aborted.lock().unwrap().as_slice() == ["ses_v1"]);
+    assert!(!deleted.contains(&"ses_bot_busy".to_string()));
+}
+
+#[tokio::test]
+async fn cup_preempted_victim_defers_while_cap_full() {
+    // Пин resume-пути: погашенная жертва (dead-сессия) не респавнится,
+    // пока кап полон — respawn Deferred, строка ждёт свободного слота
+    // cap=1: тик 1 — кап держат v1+v2 (busy), high-кандидат получает
+    // жертву, но слот по-прежнему занят (busy остался ≥ cap) → без спавна
+    let v1 = row_with_session(1, "ses_v1", Priority::Low);
+    let v2 = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![v1, v2, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1, "жертва отдана кандидату");
+    assert_eq!(out.spawns_done, 0, "слот всё ещё занят вторым busy-активом");
+    // тик 2: v1 погашена (вне списка и 404 на пробе); кап держит v2 →
+    // кандидат гасит v2 и занимает слот; v1 (dead) — Deferred: кап полон
+    sessions.live.lock().unwrap().retain(|s| s.id != "ses_v1");
+    sessions.dead_sessions.lock().unwrap().push("ses_v1".into());
+    let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out2.preempts, 1, "вторая жертва — под спавн кандидата");
+    assert_eq!(out2.spawns_done, 1, "кандидат занял отнятый слот");
+    assert_eq!(
+        out2.wakeups_deferred, 1,
+        "жертва без слота ждёт — Deferred, не петля"
+    );
+}
+
+#[tokio::test]
+async fn cup_preempted_victim_respawns_when_slot_frees() {
+    // Пин resume-пути: слот освободился (прочие активы ушли с исполнителя)
+    // — жертва возобновляется штатным respawn'ом в тот же task-env
+    let v1 = row_with_session(1, "ses_v1", Priority::Low);
+    let v2 = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, board, sessions, _) = usecase(vec![v1, v2, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_v1");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.preempts, 1);
+    // слоты свободны: обе старые сессии вне списка исполнителя (v1 —
+    // гашение, v2 — завершилась между тиками), busy=0
+    sessions
+        .live
+        .lock()
+        .unwrap()
+        .retain(|s| s.id != "ses_v1" && s.id != "ses_v2");
+    {
+        let mut dead = sessions.dead_sessions.lock().unwrap();
+        dead.push("ses_v1".into());
+        dead.push("ses_v2".into());
+    }
+    let out2 = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(
+        out2.spawns_done, 2,
+        "жертвы возобновились respawn'ом при свободных слотах"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("session#1=")),
+        "ячейка жертвы перезаписана новой сессией"
+    );
 }

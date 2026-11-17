@@ -321,6 +321,48 @@ impl AgentSessionGateway for OpencodeClient {
         }
     }
 
+    async fn abort_session(&self, session: &str) -> UsecaseResult<()> {
+        // Префикс /api добавляется в call(). Живая проба 18.11 (бинарь
+        // 2.3.0, throwaway serve): /api/session/:id/abort — 404 (ход
+        // продолжается!), /api/session/:id/interrupt — 200, ход остановлен
+        // (busy снят). Фоллбек abort→interrupt: если оба 404/405 — Err
+        // (преемпшен остаётся held, ретрай следующим тиком), тихого
+        // no-op нет. 404 на обоех путях при несуществующей сессии —
+        // тоже Err? Нет: interrupt 404 по несуществующей сессии
+        // трактуем идемпотентно (сессия погашена между сканом и
+        // абортом) — см. хвост метода.
+        if let Ok((status, _)) = self
+            .call(
+                &format!("/session/{session}/abort"),
+                reqwest::Method::POST,
+                None,
+            )
+            .await
+        {
+            if status.is_success() {
+                return Ok(());
+            }
+        }
+        match self
+            .call(
+                &format!("/session/{session}/interrupt"),
+                reqwest::Method::POST,
+                None,
+            )
+            .await
+        {
+            Ok((status, _)) if status.is_success() => Ok(()),
+            Ok((status, _)) if status.as_u16() == 404 => {
+                // сессии уже нет (погашена между сканом и абортом) — ок
+                Ok(())
+            }
+            Ok((status, _)) => Err(UsecaseError::Session(format!(
+                "abort {session}: HTTP {status}"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
         // Пагинация (#1163 ревью Common-1): список пагинирован newest-first —
         // слепая зона «новейших-100» прятала ходы в полёте с тишиной

@@ -294,6 +294,20 @@ async fn main() {
             }),
         )
         .route(
+            "/api/session/{id}/abort",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>| abort_session(store, id)
+            }),
+        )
+        .route(
+            "/api/session/{id}/interrupt",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>| abort_session(store, id)
+            }),
+        )
+        .route(
             "/api/session/{id}/prompt",
             post({
                 let store = store.clone();
@@ -509,6 +523,20 @@ async fn delete_session(store: Arc<Store>, id: String) -> Resp {
     tracing::info!(event = "mock.session_deleted", %id, "DELETE /session");
     if removed.is_some() {
         (StatusCode::OK, Json(json!({ "data": { "id": id } })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })))
+    }
+}
+
+/// Abort/interrupt (преемпшен #1259): мок принимает оба пути клиента.
+/// Ход в моке не эмулируется долгим стримом для этого сценария — факт
+/// аборта в логе; после #1231 (мок несёт time.busy/time.idle) сюда
+/// ложится сброс busy.
+async fn abort_session(store: Arc<Store>, id: String) -> Resp {
+    tracing::info!(event = "mock.session_aborted", %id, "POST /session/{id}/abort");
+    let sessions = store.sessions.lock().expect("store");
+    if sessions.contains_key(&id) {
+        (StatusCode::OK, Json(json!({ "interrupted": true })))
     } else {
         (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })))
     }
