@@ -814,6 +814,7 @@ fn wake_usecase(
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
