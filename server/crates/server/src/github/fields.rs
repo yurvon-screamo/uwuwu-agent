@@ -289,4 +289,35 @@ mod tests {
         assert_eq!(f.get("Приоритет").map(String::as_str), Some("high"));
         assert!(!f.contains_key("PR"), "пустые значения не в карте");
     }
+
+    #[test]
+    fn resolve_field_prefers_new_name() {
+        let mut catalog = HashMap::new();
+        catalog.insert("Automerge".to_string(), 1);
+        catalog.insert("Autodone".to_string(), 2);
+        assert_eq!(
+            resolve_field(&catalog, "Automerge"),
+            Some(1),
+            "новое имя бьёт legacy-алиас"
+        );
+    }
+
+    #[test]
+    fn resolve_field_falls_back_to_legacy_autodone() {
+        // живой каталог 17.11: Autodone id 49841025, опции off/on; поля
+        // Automerge в каталоге нет — значение приземляется в legacy-поле
+        let mut catalog = HashMap::new();
+        catalog.insert("Autodone".to_string(), 49841025);
+        assert_eq!(resolve_field(&catalog, "Automerge"), Some(49841025));
+    }
+
+    #[test]
+    fn resolve_field_misses_yield_none() {
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(resolve_field(&empty, "Automerge"), None, "ensure_field");
+        assert_eq!(resolve_field(&empty, "Приоритет"), None);
+        let mut no_legacy = HashMap::new();
+        no_legacy.insert("Приоритет".to_string(), 49841008);
+        assert_eq!(resolve_field(&no_legacy, "Automerge"), None);
+    }
 }
