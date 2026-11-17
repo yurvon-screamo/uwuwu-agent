@@ -24,6 +24,7 @@ impl FakeGw {
                     .map(|id| SessionInfo {
                         id: (*id).to_string(),
                         agent: String::new(),
+                        directory: String::new(),
                         updated_ms: 0,
                         outcome: String::new(),
                         total_tokens: 0,

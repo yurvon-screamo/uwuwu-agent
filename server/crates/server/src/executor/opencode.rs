@@ -202,6 +202,10 @@ impl AgentSessionGateway for OpencodeClient {
                         Some(SessionInfo {
                             id: s["id"].as_str()?.to_string(),
                             agent: s["agent"].as_str().unwrap_or_default().to_string(),
+                            directory: s["location"]["directory"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
                             updated_ms: s["time"]["updated"].as_u64().unwrap_or_default(),
                             outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
                             total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()

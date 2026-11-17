@@ -162,6 +162,9 @@ pub trait AgentSessionGateway: Send + Sync {
 pub struct SessionInfo {
     pub id: String,
     pub agent: String,
+    /// Директория сессии (cwd); пустая — исполнитель не отдал location:
+    /// вне раскладки гарда спавна (#1163), никогда не матчится.
+    pub directory: String,
     /// ms эпохи последнего обновления.
     pub updated_ms: u64,
     /// «succeeded»|«failed»|… финала (пусто — живая).

@@ -34,6 +34,8 @@ struct MockSession {
     id: String,
     agent: String,
     title: String,
+    /// Директория сессии (location из create) — гард спавна (#1163).
+    directory: String,
     updated_ms: u64,
     outcome: String,
     tokens_in: u64,
@@ -301,6 +303,10 @@ async fn create_session(
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
         title: body["title"].as_str().unwrap_or_default().to_string(),
+        directory: body["location"]["directory"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         updated_ms: now_ms(),
         outcome: String::new(),
         tokens_in: 0,
@@ -321,7 +327,13 @@ async fn create_session(
 
 async fn list_sessions(store: Arc<Store>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    let list: Vec<Value> = sessions.values().map(session_json).collect();
+    // мёртвые вне списка: list и GET согласованы (сессии, которых serve
+    // не знает, 404-ят и в list не попадают) — контракт second source #1163
+    let list: Vec<Value> = sessions
+        .values()
+        .filter(|s| !s.dead)
+        .map(session_json)
+        .collect();
     (StatusCode::OK, Json(Value::Array(list)))
 }
 
@@ -330,6 +342,7 @@ fn session_json(s: &MockSession) -> Value {
         "id": s.id,
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
+        "location": { "directory": s.directory },
         "time": { "created": s.updated_ms, "updated": s.updated_ms },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
