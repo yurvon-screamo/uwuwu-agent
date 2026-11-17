@@ -1328,38 +1328,38 @@ async fn automerge_docs_only_is_not_probed() {
 }
 
 #[tokio::test]
-async fn autodone_branchless_pr_url_reaches_gateway() {
-    // #1155: безветочная PR-ячейка (Artifact) доезжает до probe как URL —
-    // реальный gateway пробит реальный PR; Missing (артефакт-URL не парсится
-    // strict-формой) → ветки нет → Done «задача без PR (docs-only)»
+async fn branchless_pr_cell_is_not_probed_and_waits_for_owner() {
+    // #1155 + #1232: безветочная ячейка (Artifact) — мержить нечего, тик
+    // строку не прощупывает (никаких probe/bounce/Done) — она ждёт владельца
+    // в Review; URL при этом виден на карточке (fm, см. e2e tools_tests).
+    // До #1232 исходом был Done «без PR» — класс ложного Done закрыт гейтом.
     let mut t = task(8, Status::UserReview);
-    t.set_autodone(true);
+    t.set_automerge(true);
     let mut f = TaskFields::default();
     f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
     t.apply_fields(f);
     let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(
-        prs.probes.lock().unwrap().last().and_then(|u| u.as_deref()),
-        Some("https://github.com/a/c/pull/9"),
-        "артефакт-URL доходит до gateway"
+    assert!(
+        prs.probes.lock().unwrap().is_empty(),
+        "нечего мержить — probe не зовётся"
     );
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#8=Done")));
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#8")),
+        "строка ждёт владельца — статус не меняется"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#8")));
 }
 
 #[tokio::test]
-async fn autodone_branchless_real_pull_url_is_probed_and_merged() {
-    // #1155 (закрытие класса «ложный Done при живом PR»): безветочная строка
-    // с РЕАЛЬНЫМ github pull-URL — probe получает URL, зелёный Open мержится,
-    // Done по мержу; до фикса pr() на безветочной строке был None и строка
-    // уходила в Done «docs-only» с живым несмерженным PR
+async fn branchless_real_pull_url_also_waits_for_owner() {
+    // #1155 (пин 52fda41, семантика #1232): даже РЕАЛЬНЫЙ github pull-URL
+    // на безветочной строке не мерж-гейт — ветки нет, кодовый цикл не начат;
+    // строка ждёт владельца (PR виден на карточке — fm рендерит Artifact),
+    // данные чинятся у источника (#1166 — фабрика пишет Branch при спавне)
     let mut t = task(9, Status::UserReview);
-    t.set_autodone(true);
+    t.set_automerge(true);
     let mut f = TaskFields::default();
     f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
     t.apply_fields(f);
@@ -1371,23 +1371,13 @@ async fn autodone_branchless_real_pull_url_is_probed_and_merged() {
         },
     );
     u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(
-        prs.merges.lock().unwrap().last().map(String::as_str),
-        Some("https://github.com/a/c/pull/9"),
-        "реальный PR на безветочной строке мержится автодоном"
+    assert!(
+        prs.probes.lock().unwrap().is_empty() && prs.merges.lock().unwrap().is_empty(),
+        "без ветки кодового цикла нет — probe/merge не зовутся"
     );
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("status#9=Done")));
-    assert!(board
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|l| l.contains("close#9")));
+    let log = board.log.lock().unwrap();
+    assert!(!log.iter().any(|l| l.contains("status#9")));
+    assert!(!log.iter().any(|l| l.contains("close#9")));
 }
 
 #[tokio::test]

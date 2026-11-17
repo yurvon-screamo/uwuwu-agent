@@ -465,11 +465,14 @@ impl Task {
         self.fields = fields;
     }
 
-    /// Автомерж-кандидат (#1232): Review + automerge + носитель мержа
-    /// (PR или ветка). Docs-only (Vcs::Local) мержить нечего — строка
-    /// ждёт владельца в Review, тик её не прощупывает.
+    /// Автомерж-кандидат (#1232): Review + automerge + кодовый носитель
+    /// (ветка/PR). Безветочная ячейка (Local и Artifact — docs-only
+    /// артефакт/чужой-вендор URL, #1155) мержить нечего — строка ждёт
+    /// владельца в Review, тик её не прощупывает.
     pub fn automerge_ready(&self) -> bool {
-        self.status == Status::UserReview && self.automerge && self.fields.vcs() != &Vcs::Local
+        self.status == Status::UserReview
+            && self.automerge
+            && matches!(self.fields.vcs(), Vcs::Branch(_) | Vcs::PullRequest { .. })
     }
 }
 

@@ -20,6 +20,9 @@ struct HubState {
     board_tags: HashMap<u64, String>,
     /// number → поля (сессии/ветка/PR)
     fields: HashMap<u64, TaskFields>,
+    /// number → автомерж (#1232: колонка «Automerge», legacy «Autodone» —
+    /// read-алиас; mock-носитель ячейки — мерж-гейт тика на стенде)
+    automerge: HashMap<u64, bool>,
     /// number → тело issue
     bodies: HashMap<u64, String>,
     /// number → комменты
@@ -169,6 +172,9 @@ impl TaskBoardRepo for MemoryHub {
                 if let Some(f) = state.fields.get(&t.number()) {
                     t.apply_fields(f.clone());
                 }
+                if let Some(on) = state.automerge.get(&t.number()) {
+                    t.set_automerge(*on);
+                }
             }
             rows.sort_by_key(|t| t.number());
             Ok(rows)
@@ -276,6 +282,9 @@ impl TaskBoardRepo for MemoryHub {
             // read_board (реальный hub несёт поля inline в GET issue)
             if let Some(f) = state.fields.get(&number) {
                 task.apply_fields(f.clone());
+            }
+            if let Some(on) = state.automerge.get(&number) {
+                task.set_automerge(*on);
             }
             let body = state.bodies.get(&number).cloned().unwrap_or_default();
             let comments = state.comments.get(&number).cloned().unwrap_or_default();
@@ -459,6 +468,15 @@ impl IssueFieldStore for MemoryHub {
                             f.set_branch(b);
                         }
                     }
+                    ("Automerge" | "Autodone", Some(v)) => {
+                        // автомерж-ячейка (#1232): canonical «Automerge»,
+                        // legacy «Autodone» — в одну клетку; on/true — вкл
+                        state.automerge.insert(number, v == "on" || v == "true");
+                    }
+                    ("Automerge" | "Autodone", None) => {
+                        // очистка по контракту store (None — снять)
+                        state.automerge.remove(&number);
+                    }
                     ("PR", Some(v)) => {
                         if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
                             // зеркально мапперу носителя (#1155): ветка есть —
@@ -531,6 +549,42 @@ mod tests {
             fresh,
             Some(Status::ReviewAnalys),
             "свежая запись видна сразу"
+        );
+    }
+
+    #[tokio::test]
+    async fn automerge_field_persists_to_rows() {
+        // #1155 (поручение владельца): mock-носитель хранит автомерж-ячейку —
+        // write-path («Automerge», legacy «Autodone» в одну клетку) →
+        // снапшот-риды несут флаг; без этого тик стенда слеп к мерж-гейту
+        // (automerge_ready всегда false) и fm врёт «automerge: false»
+        let hub = MemoryHub::with_seed(Some((9, Status::UserReview)));
+        use uwuwu_usecase::IssueFieldStore;
+        // сид материализуется лениво (ensure_seed на ридах) — как в пине
+        // row_status #1235: чтение до записи
+        hub.read_board("B").await.expect("материализация сида");
+        hub.store(9, &[(uwuwu_usecase::F_AUTOMERGE, Some("on".to_string()))])
+            .await
+            .expect("canonical write");
+        let rows = hub.read_board("B").await.expect("board");
+        assert!(
+            rows.iter().find(|t| t.number() == 9).unwrap().automerge(),
+            "canonical «Automerge»: on → true на строке снапшота"
+        );
+        assert!(hub.read_issue("B", 9).await.unwrap().task.automerge());
+
+        hub.store(9, &[("Autodone", Some("off".to_string()))])
+            .await
+            .expect("legacy write");
+        assert!(
+            !hub.read_board("B").await.unwrap()[0].automerge(),
+            "legacy «Autodone» пишет в ту же ячейку (off)"
+        );
+
+        hub.store(9, &[("Automerge", None)]).await.expect("clear");
+        assert!(
+            !hub.read_board("B").await.unwrap()[0].automerge(),
+            "None — очистка по контракту store"
         );
     }
 }

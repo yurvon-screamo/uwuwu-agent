@@ -273,6 +273,9 @@ mod tests {
         assert_eq!(classify_check_runs(&runs), None);
         let queued = vec![json!({ "status": "queued", "conclusion": null })];
         assert_eq!(classify_check_runs(&queued), None);
+    }
+
+    #[test]
     fn rejects_non_pull_urls() {
         // #1155: артефакт/чужие сущности не пробуются как PR
         assert_eq!(

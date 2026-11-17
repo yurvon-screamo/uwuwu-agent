@@ -837,3 +837,36 @@ async fn task_get_renders_foreign_vendor_pull_url() {
     );
     assert!(card.contains("branch: —"), "{card}");
 }
+
+/// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
+/// create пишет дефолт on, edit переключает, fm рендерит фактическое
+/// состояние (без хранения на носителе fm и тик стенда врали «false»).
+#[tokio::test]
+async fn automerge_cell_roundtrips_on_mock_carrier() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: automerge roundtrip", "## Постановка\n\nx.\n").await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: true"),
+        "create-дефолт on рендерится: {card}"
+    );
+
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "automerge": false }),
+    )
+    .await
+    .expect("automerge edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: false"),
+        "edit off рендерится: {card}"
+    );
+}
