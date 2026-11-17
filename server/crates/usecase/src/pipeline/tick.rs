@@ -568,17 +568,30 @@ impl TickUseCase {
             .await
         {
             Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
-            _ => 0,
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!(
+                    event = "stall.activity_err",
+                    number = task.number(),
+                    error = %e,
+                    "stall_pass: last_activity_ms ошибка"
+                );
+                0
+            }
         };
         if silence < STALL_SOFT_SILENCE_MS {
             return Ok(StallAct::None);
         }
-        // Два класса тишины (#1206, санкция владельца): ход завершён
-        // (последнее содержательное сообщение — финальный ответ агента),
-        // а статусная транзакция не закрыта → мягкий пинг прямо в сессию
-        // через 15 мин; ход идёт (промпт в обработке / ответ стримится) →
-        // классический порог 60 мин (длинные операции, #161).
+        // диагностика «строки стоят, сессии спят» (17.11): вход stall_pass
         let idle = self.session_idle(board, &session).await;
+        tracing::info!(
+            event = "stall.probe",
+            number = task.number(),
+            session = %session,
+            silence_ms = silence,
+            idle,
+            "stall_pass: проба тишины/idle"
+        );
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
