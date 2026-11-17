@@ -353,6 +353,35 @@ mod tests {
     }
 
     #[test]
+    fn message_activity_falls_back_field_by_field() {
+        // цепочка updated → completed → streamed → firstToken → created:
+        // каждая ступень читается, самая поздняя из доступных побеждает,
+        // пустой time — None (сталл-детект деградирует к прежней семантике)
+        let step = |fields: serde_json::Value| {
+            message_activity_ms(&serde_json::json!({ "type": "assistant", "time": fields }))
+        };
+        assert_eq!(
+            step(serde_json::json!({ "created": 1u64, "streamed": 3u64 })),
+            Some(3)
+        );
+        assert_eq!(
+            step(serde_json::json!({ "created": 1u64, "firstToken": 2u64 })),
+            Some(2)
+        );
+        assert_eq!(
+            step(serde_json::json!({
+                "created": 1u64, "firstToken": 2u64, "completed": 4u64
+            })),
+            Some(4)
+        );
+        assert_eq!(step(serde_json::json!({})), None);
+        assert_eq!(
+            message_activity_ms(&serde_json::json!({ "type": "idle" })),
+            None
+        );
+    }
+
+    #[test]
     fn latest_meaningful_skips_service_events() {
         // #1206 Common-1: служебные события (idle и пр.) поверх финального
         // ответа не делают завершённую сессию busy
