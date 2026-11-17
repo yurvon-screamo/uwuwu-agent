@@ -164,7 +164,8 @@ pub struct SessionInfo {
     pub agent: String,
     /// ms эпохи последнего обновления.
     pub updated_ms: u64,
-    /// «succeeded»|«failed»|… финала (пусто — живая).
+    /// «succeeded»|«failed»|… финал ПОСЛЕДНЕГО завершённого хода (при новом
+    /// ходе не очищается — живость не выражает, для этого `busy`).
     pub outcome: String,
     /// Токены сессии (in+out): пустышки-прерывания = 0 — дример их не берёт.
     pub total_tokens: u64,

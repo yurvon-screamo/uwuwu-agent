@@ -125,11 +125,13 @@ import json,sys
 d = json.load(sys.stdin)
 rows = d if isinstance(d, list) else d.get('data', [])
 print(' '.join(str(s.get('title') or s.get('id','')) for s in rows))" 2>/dev/null || true; }
-M1="$(sessions_of $PORT_MOCK)"; M2="$(sessions_of $MOCK2_PORT)"
+M1="$(sessions_of $PORT_MOCK)"
 echo "$M1" | grep -q "#$SEED_N" || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): [$M1]"
-echo "$M2" | grep -q "#2047" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): [$M2]"
+# мок-2 в dead-режиме: созданные сессии сразу мертвы и в списке не числятся
+# (семантика реального опенкода, #1231) — маршрутизацию проверяем по логу
+grep -q "session_created.*#2047" "$LOG_MOCK2" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает)"
 echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
-echo "$M2" | grep -q "#$SEED_N" && fail "кросс-маршрут: uwuwu ушел на mock2"
+grep -q "session_created.*#$SEED_N" "$LOG_MOCK2" && fail "кросс-маршрут: uwuwu ушел на mock2"
 say "маршрутизация ок: uwuwu → мок-1, 1xgames-mock → мок-2 (без кроссов)"
 
 task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 -c "
@@ -145,16 +147,17 @@ case "$S2047" in
 esac
 
 # kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт, best-effort дример → warn, тик конвейера продолжает жить
+# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
+# агрегату честно останавливаются), тик конвейера продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
 grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
-grep -q 'router.list_partial' "$LOG_SRV_MULTI" || fail "нет warn union-скана дримера (best-effort не отработал)"
+grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + warn дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
 pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
 sleep 1
