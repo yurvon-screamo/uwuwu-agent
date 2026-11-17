@@ -1571,6 +1571,37 @@ async fn owner_photo_reaches_session_prompt_with_url() {
     let _ = s;
 }
 
+/// Фото БЕЗ подписи: промпт несёт явную метку «Подписи нет» — агент
+/// отличает «владелец ничего не написал» от потерянной строки (#1171).
+#[tokio::test]
+async fn photo_without_caption_gets_no_caption_marker() {
+    let tg = FakeTg::new(vec![media_update(
+        29,
+        "yurvon",
+        MediaKind::Photo,
+        "agg5",
+        None,
+        Some(10),
+    )]);
+    tg.with_file("agg5", b"px");
+    let sessions = FakeSessions::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), FakeAssets::new());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    let ps = sessions.prompts_snapshot();
+    let [(s, p)] = ps.as_slice() else {
+        panic!("промпт не отправлен: {ps:?}")
+    };
+    assert!(p.contains("Подписи нет"), "метка no-caption в промпте: {p}");
+    assert!(
+        p.contains("Владелец прислал файл"),
+        "media-шапка в промпте: {p}"
+    );
+    assert!(p.contains("вложи эту ссылку"), "инструкция в промпте: {p}");
+    let _ = s;
+}
+
 /// Oversize-гард: file_size > 20 MiB в апдейте — явный отказ без
 /// скачивания и без prompt; апдейт поглощён (Ok).
 #[tokio::test]
