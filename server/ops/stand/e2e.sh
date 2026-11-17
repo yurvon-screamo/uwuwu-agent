@@ -93,7 +93,7 @@ case "$S" in *Review*) ;; *) fail "цикл не замкнут за 5 мин, �
 
 grep -q "loop_escalated" "$LOG_SRV_LIVE" && fail "loop_escalated в live-логе"
 # ре-энти был: два dev-спавна (круг 1 + после request_changes)
-DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$LOG_SRV_LIVE" | wc -l)
+DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$LOG_SRV_LIVE" | wc -l || true)
 [ "$DEV_SPAWNS" -ge 2 ] || fail "ре-энтри не случился (dev-спавнов: $DEV_SPAWNS)"
 say "фаза 2 ок: ре-энтри круг пройден (dev-спавнов: $DEV_SPAWNS), эскалаций нет"
 
@@ -185,7 +185,7 @@ UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
   ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &
 sleep 25   # 2+ тика: спавн держится гардом
-SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" | wc -l)
+SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" | wc -l || true)
 [ "$SPAWNS" -eq 0 ] || fail "спавн случился поверх живой сессии env (гард молчит): $SPAWNS"
 grep -q '"event":"spawn.held_live_session"' "$LOG_SRV_LIVE" || fail "нет spawn.held_live_session (гард не сработал)"
 say "гард держит: сирота в env, спавнов 0"
